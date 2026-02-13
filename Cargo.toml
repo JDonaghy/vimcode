@@ -1,0 +1,12 @@
+[package]
+name = "vimcode"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gtk4 = { version = "0.7", features = ["v4_10"] }
+relm4 = "0.7"
+pangocairo = "0.18"
+ropey = "1.6.1"
+tree-sitter = "0.20"
+tree-sitter-rust = "0.20"
