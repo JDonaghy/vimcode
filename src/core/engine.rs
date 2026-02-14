@@ -53,6 +53,10 @@ pub struct Engine {
     // --- Visual mode state ---
     /// Visual mode anchor point (where visual selection started).
     pub visual_anchor: Option<Cursor>,
+
+    // --- Count state ---
+    /// Accumulated count for commands (e.g., 5j, 3dd). None means no count entered yet.
+    pub count: Option<usize>,
 }
 
 impl Engine {
@@ -84,6 +88,7 @@ impl Engine {
             registers: HashMap::new(),
             selected_register: None,
             visual_anchor: None,
+            count: None,
         }
     }
 
@@ -740,16 +745,22 @@ impl Engine {
             match key_name {
                 "d" => {
                     // Half-page down
+                    let count = self.take_count();
                     let half = self.viewport_lines() / 2;
+                    let scroll_amount = half * count;
                     let max_line = self.buffer().len_lines().saturating_sub(1);
-                    self.view_mut().cursor.line = (self.view().cursor.line + half).min(max_line);
+                    self.view_mut().cursor.line =
+                        (self.view().cursor.line + scroll_amount).min(max_line);
                     self.clamp_cursor_col();
                     return EngineAction::None;
                 }
                 "u" => {
                     // Ctrl-U: Half-page up
+                    let count = self.take_count();
                     let half = self.viewport_lines() / 2;
-                    self.view_mut().cursor.line = self.view().cursor.line.saturating_sub(half);
+                    let scroll_amount = half * count;
+                    self.view_mut().cursor.line =
+                        self.view().cursor.line.saturating_sub(scroll_amount);
                     self.clamp_cursor_col();
                     return EngineAction::None;
                 }
@@ -760,17 +771,22 @@ impl Engine {
                 }
                 "f" => {
                     // Full page down
+                    let count = self.take_count();
                     let viewport = self.viewport_lines();
+                    let scroll_amount = viewport * count;
                     let max_line = self.buffer().len_lines().saturating_sub(1);
                     self.view_mut().cursor.line =
-                        (self.view().cursor.line + viewport).min(max_line);
+                        (self.view().cursor.line + scroll_amount).min(max_line);
                     self.clamp_cursor_col();
                     return EngineAction::None;
                 }
                 "b" => {
                     // Full page up
+                    let count = self.take_count();
                     let viewport = self.viewport_lines();
-                    self.view_mut().cursor.line = self.view().cursor.line.saturating_sub(viewport);
+                    let scroll_amount = viewport * count;
+                    self.view_mut().cursor.line =
+                        self.view().cursor.line.saturating_sub(scroll_amount);
                     self.clamp_cursor_col();
                     return EngineAction::None;
                 }
@@ -783,6 +799,38 @@ impl Engine {
             }
         }
 
+        // Handle count accumulation (digits 1-9, and 0 when count already exists)
+        if let Some(ch) = unicode {
+            match ch {
+                '1'..='9' => {
+                    let digit = ch.to_digit(10).unwrap() as usize;
+                    let new_count = self.count.unwrap_or(0) * 10 + digit;
+                    if new_count > 10_000 {
+                        self.count = Some(10_000);
+                        self.message = "Count limited to 10,000".to_string();
+                    } else {
+                        self.count = Some(new_count);
+                    }
+                    return EngineAction::None;
+                }
+                '0' => {
+                    if self.count.is_some() {
+                        // Accumulate: 10, 20, 100, etc.
+                        let new_count = self.count.unwrap() * 10;
+                        if new_count > 10_000 {
+                            self.count = Some(10_000);
+                            self.message = "Count limited to 10,000".to_string();
+                        } else {
+                            self.count = Some(new_count);
+                        }
+                        return EngineAction::None;
+                    }
+                    // Fall through to handle '0' as "go to column 0" below
+                }
+                _ => {}
+            }
+        }
+
         // Handle pending multi-key sequences (gg, dd, Ctrl-W x, gt)
         if let Some(pending) = self.pending_key.take() {
             return self.handle_pending_key(pending, key_name, unicode, changed);
@@ -790,13 +838,34 @@ impl Engine {
 
         // In normal mode, check the unicode char for vim keys
         match unicode {
-            Some('h') => self.move_left(),
-            Some('j') => self.move_down(),
-            Some('k') => self.move_up(),
-            Some('l') => self.move_right(),
+            Some('h') => {
+                let count = self.take_count();
+                for _ in 0..count {
+                    self.move_left();
+                }
+            }
+            Some('j') => {
+                let count = self.take_count();
+                for _ in 0..count {
+                    self.move_down();
+                }
+            }
+            Some('k') => {
+                let count = self.take_count();
+                for _ in 0..count {
+                    self.move_up();
+                }
+            }
+            Some('l') => {
+                let count = self.take_count();
+                for _ in 0..count {
+                    self.move_right();
+                }
+            }
             Some('i') => {
                 self.start_undo_group();
                 self.mode = Mode::Insert;
+                self.count = None; // Clear count when entering insert mode
             }
             Some('a') => {
                 self.start_undo_group();
@@ -809,12 +878,14 @@ impl Engine {
                     self.view_mut().cursor.col = insert_max;
                 }
                 self.mode = Mode::Insert;
+                self.count = None; // Clear count when entering insert mode
             }
             Some('A') => {
                 self.start_undo_group();
                 let line = self.view().cursor.line;
                 self.view_mut().cursor.col = self.get_line_len_for_insert(line);
                 self.mode = Mode::Insert;
+                self.count = None; // Clear count when entering insert mode
             }
             Some('I') => {
                 self.start_undo_group();
@@ -831,8 +902,10 @@ impl Engine {
                 }
                 self.view_mut().cursor.col = col;
                 self.mode = Mode::Insert;
+                self.count = None; // Clear count when entering insert mode
             }
             Some('o') => {
+                let count = self.take_count();
                 self.start_undo_group();
                 let line = self.view().cursor.line;
                 let line_end =
@@ -847,19 +920,26 @@ impl Engine {
                 } else {
                     line_end
                 };
-                self.insert_with_undo(insert_pos, "\n");
+                // Insert count newlines
+                let newlines = "\n".repeat(count);
+                self.insert_with_undo(insert_pos, &newlines);
                 self.view_mut().cursor.line += 1;
                 self.view_mut().cursor.col = 0;
                 self.mode = Mode::Insert;
+                self.count = None; // Clear count when entering insert mode
                 *changed = true;
             }
             Some('O') => {
+                let count = self.take_count();
                 self.start_undo_group();
                 let line = self.view().cursor.line;
                 let line_start = self.buffer().line_to_char(line);
-                self.insert_with_undo(line_start, "\n");
+                // Insert count newlines
+                let newlines = "\n".repeat(count);
+                self.insert_with_undo(line_start, &newlines);
                 self.view_mut().cursor.col = 0;
                 self.mode = Mode::Insert;
+                self.count = None; // Clear count when entering insert mode
                 *changed = true;
             }
             Some('0') => self.view_mut().cursor.col = 0,
@@ -868,50 +948,92 @@ impl Engine {
                 self.view_mut().cursor.col = self.get_max_cursor_col(line);
             }
             Some('x') => {
+                let count = self.take_count();
                 let line = self.view().cursor.line;
                 let col = self.view().cursor.col;
                 let max_col = self.get_max_cursor_col(line);
                 if max_col > 0 || self.buffer().line_len_chars(line) > 0 {
                     let char_idx = self.buffer().line_to_char(line) + col;
-                    if char_idx < self.buffer().len_chars() {
-                        // Save deleted char to register (characterwise)
-                        let deleted_char: String = self
+                    // Calculate how many chars we can actually delete
+                    let line_end =
+                        self.buffer().line_to_char(line) + self.buffer().line_len_chars(line);
+                    let available = line_end - char_idx;
+                    let to_delete = count.min(available);
+
+                    if to_delete > 0 && char_idx < self.buffer().len_chars() {
+                        // Save deleted chars to register (characterwise)
+                        let deleted_chars: String = self
                             .buffer()
                             .content
-                            .slice(char_idx..char_idx + 1)
+                            .slice(char_idx..char_idx + to_delete)
                             .chars()
                             .collect();
                         let reg = self.active_register();
-                        self.set_register(reg, deleted_char, false);
+                        self.set_register(reg, deleted_chars, false);
                         self.clear_selected_register();
 
                         self.start_undo_group();
-                        self.delete_with_undo(char_idx, char_idx + 1);
+                        self.delete_with_undo(char_idx, char_idx + to_delete);
                         self.finish_undo_group();
                         self.clamp_cursor_col();
                         *changed = true;
                     }
                 }
             }
-            Some('w') => self.move_word_forward(),
-            Some('b') => self.move_word_backward(),
-            Some('e') => self.move_word_end(),
-            Some('{') => self.move_paragraph_backward(),
-            Some('}') => self.move_paragraph_forward(),
+            Some('w') => {
+                let count = self.take_count();
+                for _ in 0..count {
+                    self.move_word_forward();
+                }
+            }
+            Some('b') => {
+                let count = self.take_count();
+                for _ in 0..count {
+                    self.move_word_backward();
+                }
+            }
+            Some('e') => {
+                let count = self.take_count();
+                for _ in 0..count {
+                    self.move_word_end();
+                }
+            }
+            Some('{') => {
+                let count = self.take_count();
+                for _ in 0..count {
+                    self.move_paragraph_backward();
+                }
+            }
+            Some('}') => {
+                let count = self.take_count();
+                for _ in 0..count {
+                    self.move_paragraph_forward();
+                }
+            }
             Some('d') => {
                 self.pending_key = Some('d');
             }
             Some('D') => {
+                let count = self.take_count();
                 self.start_undo_group();
-                self.delete_to_end_of_line(changed);
+                // D with count deletes from cursor to end of line, then (count-1) full lines below
+                self.delete_to_end_of_line_with_count(count, changed);
                 self.finish_undo_group();
             }
             Some('g') => {
                 self.pending_key = Some('g');
             }
             Some('G') => {
-                let last = self.buffer().len_lines().saturating_sub(1);
-                self.view_mut().cursor.line = last;
+                if self.peek_count().is_some() {
+                    // Count provided: go to line N (1-indexed)
+                    let count = self.take_count();
+                    let target_line = (count - 1).min(self.buffer().len_lines().saturating_sub(1));
+                    self.view_mut().cursor.line = target_line;
+                } else {
+                    // No count: go to last line
+                    let last = self.buffer().len_lines().saturating_sub(1);
+                    self.view_mut().cursor.line = last;
+                }
                 self.clamp_cursor_col();
             }
             Some('u') => {
@@ -921,19 +1043,36 @@ impl Engine {
                 self.pending_key = Some('y');
             }
             Some('Y') => {
-                self.yank_current_line();
+                let count = self.take_count();
+                self.yank_lines(count);
             }
             Some('p') => {
-                self.paste_after(changed);
+                let count = self.take_count();
+                for _ in 0..count {
+                    self.paste_after(changed);
+                }
             }
             Some('P') => {
-                self.paste_before(changed);
+                let count = self.take_count();
+                for _ in 0..count {
+                    self.paste_before(changed);
+                }
             }
             Some('"') => {
                 self.pending_key = Some('"');
             }
-            Some('n') => self.search_next(),
-            Some('N') => self.search_prev(),
+            Some('n') => {
+                let count = self.take_count();
+                for _ in 0..count {
+                    self.search_next();
+                }
+            }
+            Some('N') => {
+                let count = self.take_count();
+                for _ in 0..count {
+                    self.search_prev();
+                }
+            }
             Some('v') => {
                 self.mode = Mode::Visual;
                 self.visual_anchor = Some(self.view().cursor);
@@ -945,16 +1084,43 @@ impl Engine {
             Some(':') => {
                 self.mode = Mode::Command;
                 self.command_buffer.clear();
+                self.count = None; // Clear count when entering command mode
             }
             Some('/') => {
                 self.mode = Mode::Search;
                 self.command_buffer.clear();
+                self.count = None; // Clear count when entering search mode
             }
             _ => match key_name {
-                "Left" => self.move_left(),
-                "Down" => self.move_down(),
-                "Up" => self.move_up(),
-                "Right" => self.move_right(),
+                "Escape" => {
+                    // Clear count and pending key in normal mode
+                    self.count = None;
+                    self.pending_key = None;
+                }
+                "Left" => {
+                    let count = self.take_count();
+                    for _ in 0..count {
+                        self.move_left();
+                    }
+                }
+                "Down" => {
+                    let count = self.take_count();
+                    for _ in 0..count {
+                        self.move_down();
+                    }
+                }
+                "Up" => {
+                    let count = self.take_count();
+                    for _ in 0..count {
+                        self.move_up();
+                    }
+                }
+                "Right" => {
+                    let count = self.take_count();
+                    for _ in 0..count {
+                        self.move_right();
+                    }
+                }
                 "Home" => self.view_mut().cursor.col = 0,
                 "End" => {
                     let line = self.view().cursor.line;
@@ -976,7 +1142,16 @@ impl Engine {
         match pending {
             'g' => match unicode {
                 Some('g') => {
-                    self.view_mut().cursor.line = 0;
+                    if self.peek_count().is_some() {
+                        // Count provided: go to line N (1-indexed)
+                        let count = self.take_count();
+                        let target_line =
+                            (count - 1).min(self.buffer().len_lines().saturating_sub(1));
+                        self.view_mut().cursor.line = target_line;
+                    } else {
+                        // No count: go to first line
+                        self.view_mut().cursor.line = 0;
+                    }
                     self.view_mut().cursor.col = 0;
                 }
                 Some('t') => {
@@ -989,14 +1164,16 @@ impl Engine {
             },
             'd' => {
                 if unicode == Some('d') {
+                    let count = self.take_count();
                     self.start_undo_group();
-                    self.delete_current_line(changed);
+                    self.delete_lines(count, changed);
                     self.finish_undo_group();
                 }
             }
             'y' => {
                 if unicode == Some('y') {
-                    self.yank_current_line();
+                    let count = self.take_count();
+                    self.yank_lines(count);
                 }
             }
             '"' => {
@@ -1205,7 +1382,31 @@ impl Engine {
         if key_name == "Escape" {
             self.mode = Mode::Normal;
             self.visual_anchor = None;
+            self.count = None; // Clear count on mode exit
             return EngineAction::None;
+        }
+
+        // Handle digit accumulation for count (same logic as normal mode)
+        if let Some(ch) = unicode {
+            if ch.is_ascii_digit() {
+                let digit = ch.to_digit(10).unwrap() as usize;
+                // Special case: '0' alone should NOT start count accumulation (reserved for column 0)
+                // But '0' after a digit (like "10") should accumulate
+                if digit == 0 && self.count.is_none() {
+                    // Let '0' be handled as a motion command (go to column 0)
+                } else {
+                    // Accumulate digit into count
+                    let current = self.count.unwrap_or(0);
+                    let new_count = current * 10 + digit;
+                    if new_count > 10000 {
+                        self.message = "Count limited to 10,000".to_string();
+                        self.count = Some(10000);
+                    } else {
+                        self.count = Some(new_count);
+                    }
+                    return EngineAction::None;
+                }
+            }
         }
 
         // Handle mode switching: v toggles to Visual, V toggles to VisualLine
@@ -1216,6 +1417,7 @@ impl Engine {
                         // Exit to normal mode
                         self.mode = Mode::Normal;
                         self.visual_anchor = None;
+                        self.count = None; // Clear count on mode exit
                     } else {
                         // Switch to Visual mode, preserve anchor
                         self.mode = Mode::Visual;
@@ -1227,6 +1429,7 @@ impl Engine {
                         // Exit to normal mode
                         self.mode = Mode::Normal;
                         self.visual_anchor = None;
+                        self.count = None; // Clear count on mode exit
                     } else {
                         // Switch to VisualLine mode, preserve anchor
                         self.mode = Mode::VisualLine;
@@ -1238,17 +1441,21 @@ impl Engine {
         }
 
         // Handle operators: d (delete), y (yank), c (change)
+        // Note: count is NOT applied to visual operators - they operate on the selection
         if let Some(ch) = unicode {
             match ch {
                 'd' => {
+                    self.count = None; // Clear count (not used for visual operators)
                     self.delete_visual_selection(changed);
                     return EngineAction::None;
                 }
                 'y' => {
+                    self.count = None; // Clear count (not used for visual operators)
                     self.yank_visual_selection();
                     return EngineAction::None;
                 }
                 'c' => {
+                    self.count = None; // Clear count (not used for visual operators)
                     self.change_visual_selection(changed);
                     return EngineAction::None;
                 }
@@ -1261,29 +1468,36 @@ impl Engine {
         if ctrl {
             match key_name {
                 "d" => {
+                    let count = self.take_count();
                     let half = self.viewport_lines() / 2;
                     let max_line = self.buffer().len_lines().saturating_sub(1);
-                    self.view_mut().cursor.line = (self.view().cursor.line + half).min(max_line);
+                    self.view_mut().cursor.line =
+                        (self.view().cursor.line + half * count).min(max_line);
                     self.clamp_cursor_col();
                     return EngineAction::None;
                 }
                 "u" => {
+                    let count = self.take_count();
                     let half = self.viewport_lines() / 2;
-                    self.view_mut().cursor.line = self.view().cursor.line.saturating_sub(half);
+                    self.view_mut().cursor.line =
+                        self.view().cursor.line.saturating_sub(half * count);
                     self.clamp_cursor_col();
                     return EngineAction::None;
                 }
                 "f" => {
+                    let count = self.take_count();
                     let viewport = self.viewport_lines();
                     let max_line = self.buffer().len_lines().saturating_sub(1);
                     self.view_mut().cursor.line =
-                        (self.view().cursor.line + viewport).min(max_line);
+                        (self.view().cursor.line + viewport * count).min(max_line);
                     self.clamp_cursor_col();
                     return EngineAction::None;
                 }
                 "b" => {
+                    let count = self.take_count();
                     let viewport = self.viewport_lines();
-                    self.view_mut().cursor.line = self.view().cursor.line.saturating_sub(viewport);
+                    self.view_mut().cursor.line =
+                        self.view().cursor.line.saturating_sub(viewport * count);
                     self.clamp_cursor_col();
                     return EngineAction::None;
                 }
@@ -1294,7 +1508,15 @@ impl Engine {
         // Handle multi-key sequences (gg, {, })
         if let Some(pending) = self.pending_key.take() {
             if pending == 'g' && unicode == Some('g') {
-                self.view_mut().cursor.line = 0;
+                // gg in visual mode: with count, go to line N; without count, go to first line
+                if let Some(count) = self.peek_count() {
+                    self.count = None; // Consume count
+                    let target_line = count.saturating_sub(1); // 1-indexed to 0-indexed
+                    let max_line = self.buffer().len_lines().saturating_sub(1);
+                    self.view_mut().cursor.line = target_line.min(max_line);
+                } else {
+                    self.view_mut().cursor.line = 0;
+                }
                 self.view_mut().cursor.col = 0;
                 return EngineAction::None;
             }
@@ -1302,13 +1524,48 @@ impl Engine {
 
         // Single-key navigation
         match unicode {
-            Some('h') => self.move_left(),
-            Some('j') => self.move_down(),
-            Some('k') => self.move_up(),
-            Some('l') => self.move_right(),
-            Some('w') => self.move_word_forward(),
-            Some('b') => self.move_word_backward(),
-            Some('e') => self.move_word_end(),
+            Some('h') => {
+                let count = self.take_count();
+                for _ in 0..count {
+                    self.move_left();
+                }
+            }
+            Some('j') => {
+                let count = self.take_count();
+                for _ in 0..count {
+                    self.move_down();
+                }
+            }
+            Some('k') => {
+                let count = self.take_count();
+                for _ in 0..count {
+                    self.move_up();
+                }
+            }
+            Some('l') => {
+                let count = self.take_count();
+                for _ in 0..count {
+                    self.move_right();
+                }
+            }
+            Some('w') => {
+                let count = self.take_count();
+                for _ in 0..count {
+                    self.move_word_forward();
+                }
+            }
+            Some('b') => {
+                let count = self.take_count();
+                for _ in 0..count {
+                    self.move_word_backward();
+                }
+            }
+            Some('e') => {
+                let count = self.take_count();
+                for _ in 0..count {
+                    self.move_word_end();
+                }
+            }
             Some('0') => self.view_mut().cursor.col = 0,
             Some('$') => {
                 let line = self.view().cursor.line;
@@ -1322,13 +1579,43 @@ impl Engine {
                 self.view_mut().cursor.line = last_line;
                 self.clamp_cursor_col();
             }
-            Some('{') => self.move_paragraph_backward(),
-            Some('}') => self.move_paragraph_forward(),
+            Some('{') => {
+                let count = self.take_count();
+                for _ in 0..count {
+                    self.move_paragraph_backward();
+                }
+            }
+            Some('}') => {
+                let count = self.take_count();
+                for _ in 0..count {
+                    self.move_paragraph_forward();
+                }
+            }
             _ => match key_name {
-                "Left" => self.move_left(),
-                "Down" => self.move_down(),
-                "Up" => self.move_up(),
-                "Right" => self.move_right(),
+                "Left" => {
+                    let count = self.take_count();
+                    for _ in 0..count {
+                        self.move_left();
+                    }
+                }
+                "Down" => {
+                    let count = self.take_count();
+                    for _ in 0..count {
+                        self.move_down();
+                    }
+                }
+                "Up" => {
+                    let count = self.take_count();
+                    for _ in 0..count {
+                        self.move_up();
+                    }
+                }
+                "Right" => {
+                    let count = self.take_count();
+                    for _ in 0..count {
+                        self.move_right();
+                    }
+                }
                 "Home" => self.view_mut().cursor.col = 0,
                 "End" => {
                     let line = self.view().cursor.line;
@@ -1957,27 +2244,41 @@ impl Engine {
 
     // --- Line operations ---
 
+    #[allow(dead_code)]
     fn delete_current_line(&mut self, changed: &mut bool) {
+        self.delete_lines(1, changed);
+    }
+
+    /// Delete count lines starting from current line
+    fn delete_lines(&mut self, count: usize, changed: &mut bool) {
         let num_lines = self.buffer().len_lines();
         if num_lines == 0 {
             return;
         }
 
-        let line = self.view().cursor.line;
-        let line_start = self.buffer().line_to_char(line);
-        let line_char_len = self.buffer().line_len_chars(line);
+        let start_line = self.view().cursor.line;
+        let end_line = (start_line + count).min(num_lines);
+        let actual_count = end_line - start_line;
 
-        if line_char_len == 0 && num_lines <= 1 {
+        if actual_count == 0 {
             return;
         }
 
-        // Save deleted line to register (linewise)
+        let line_start = self.buffer().line_to_char(start_line);
+        let line_end = if end_line < num_lines {
+            self.buffer().line_to_char(end_line)
+        } else {
+            self.buffer().len_chars()
+        };
+
+        // Save deleted lines to register (linewise)
         let deleted_content: String = self
             .buffer()
             .content
-            .slice(line_start..line_start + line_char_len)
+            .slice(line_start..line_end)
             .chars()
             .collect();
+
         // Ensure linewise content ends with newline
         let deleted_content = if deleted_content.ends_with('\n') {
             deleted_content
@@ -1988,15 +2289,18 @@ impl Engine {
         self.set_register(reg, deleted_content, true);
         self.clear_selected_register();
 
-        let line_content = self.buffer().content.line(line);
-        let ends_with_newline = line_content.chars().last() == Some('\n');
-
-        let (delete_start, delete_end) = if ends_with_newline {
-            (line_start, line_start + line_char_len)
-        } else if line > 0 {
-            (line_start - 1, line_start + line_char_len)
+        // Determine what to delete
+        let (delete_start, delete_end) = if end_line < num_lines {
+            // Delete lines including their newlines
+            (line_start, line_end)
         } else {
-            (line_start, line_start + line_char_len)
+            // Deleting to end of buffer
+            if start_line > 0 {
+                // Delete the newline before the first line being deleted
+                (line_start - 1, line_end)
+            } else {
+                (line_start, line_end)
+            }
         };
 
         self.delete_with_undo(delete_start, delete_end);
@@ -2010,33 +2314,120 @@ impl Engine {
         self.clamp_cursor_col();
     }
 
+    #[allow(dead_code)]
     fn delete_to_end_of_line(&mut self, changed: &mut bool) {
-        let line = self.view().cursor.line;
+        self.delete_to_end_of_line_with_count(1, changed);
+    }
+
+    fn delete_to_end_of_line_with_count(&mut self, count: usize, changed: &mut bool) {
+        let start_line = self.view().cursor.line;
         let col = self.view().cursor.col;
-        let char_idx = self.buffer().line_to_char(line) + col;
-        let line_content = self.buffer().content.line(line);
-        let line_start = self.buffer().line_to_char(line);
-        let line_end = line_start + line_content.len_chars();
+        let char_idx = self.buffer().line_to_char(start_line) + col;
 
-        let delete_end = if line_content.chars().last() == Some('\n') {
-            line_end - 1
+        if count == 1 {
+            // Single D: delete to end of current line, excluding newline
+            let line_content = self.buffer().content.line(start_line);
+            let line_start = self.buffer().line_to_char(start_line);
+            let line_end = line_start + line_content.len_chars();
+
+            let delete_end = if line_content.chars().last() == Some('\n') {
+                line_end - 1
+            } else {
+                line_end
+            };
+
+            if char_idx < delete_end {
+                let deleted_content: String = self
+                    .buffer()
+                    .content
+                    .slice(char_idx..delete_end)
+                    .chars()
+                    .collect();
+                let reg = self.active_register();
+                self.set_register(reg, deleted_content, false);
+                self.clear_selected_register();
+
+                self.delete_with_undo(char_idx, delete_end);
+                self.clamp_cursor_col();
+                *changed = true;
+            }
         } else {
-            line_end
-        };
+            // Multiple D: delete to end of current line (excluding newline) + (count-1) full lines below
+            let total_lines = self.buffer().len_lines();
+            let line_content = self.buffer().content.line(start_line);
+            let line_start = self.buffer().line_to_char(start_line);
+            let line_end = line_start + line_content.len_chars();
 
-        if char_idx < delete_end {
-            // Save deleted text to register (characterwise)
-            let deleted_content: String = self
+            // End of current line excluding newline
+            let first_part_end = if line_content.chars().last() == Some('\n') {
+                line_end - 1
+            } else {
+                line_end
+            };
+
+            // Build the content to delete (for register)
+            let to_eol: String = self
                 .buffer()
                 .content
-                .slice(char_idx..delete_end)
+                .slice(char_idx..first_part_end)
                 .chars()
                 .collect();
+
+            let mut deleted_content = to_eol;
+            deleted_content.push('\n');
+
+            // Add (count-1) full lines
+            if count > 1 {
+                let last_line = (start_line + count - 1).min(total_lines - 1);
+                let lines_start = line_end; // After newline of current line
+                let lines_end = if last_line + 1 < total_lines {
+                    self.buffer().line_to_char(last_line + 1)
+                } else {
+                    self.buffer().len_chars()
+                };
+
+                let full_lines: String = self
+                    .buffer()
+                    .content
+                    .slice(lines_start..lines_end)
+                    .chars()
+                    .collect();
+                deleted_content.push_str(&full_lines);
+            }
+
             let reg = self.active_register();
             self.set_register(reg, deleted_content, false);
             self.clear_selected_register();
 
-            self.delete_with_undo(char_idx, delete_end);
+            // Perform the actual deletion: from char_idx to first_part_end
+            self.delete_with_undo(char_idx, first_part_end);
+
+            // Now delete the (count-1) full lines that follow
+            if count > 1 {
+                // After deleting to EOL, the cursor position hasn't moved
+                // The newline is at char_idx, and we want to delete starting from char_idx + 1
+                let lines_to_delete = count - 1;
+                let delete_from = char_idx + 1; // Start after the newline
+
+                // Calculate how many chars to delete
+                let remaining_lines = self.buffer().len_lines() - start_line - 1;
+                let actual_lines_to_delete = lines_to_delete.min(remaining_lines);
+
+                if actual_lines_to_delete > 0 {
+                    let delete_to =
+                        if start_line + 1 + actual_lines_to_delete < self.buffer().len_lines() {
+                            self.buffer()
+                                .line_to_char(start_line + 1 + actual_lines_to_delete)
+                        } else {
+                            self.buffer().len_chars()
+                        };
+
+                    if delete_from < delete_to {
+                        self.delete_with_undo(delete_from, delete_to);
+                    }
+                }
+            }
+
             self.clamp_cursor_col();
             *changed = true;
         }
@@ -2126,7 +2517,20 @@ impl Engine {
         self.selected_register = None;
     }
 
+    /// Takes and consumes the count, returning it (or 1 if no count was entered).
+    /// This clears the count field.
+    #[allow(dead_code)] // Will be used in Step 2 for motion commands
+    pub fn take_count(&mut self) -> usize {
+        self.count.take().unwrap_or(1)
+    }
+
+    /// Peeks at the current count without consuming it. Used for UI display.
+    pub fn peek_count(&self) -> Option<usize> {
+        self.count
+    }
+
     /// Yank the current line into the active register (linewise).
+    #[allow(dead_code)]
     fn yank_current_line(&mut self) {
         let line = self.view().cursor.line;
         let line_start = self.buffer().line_to_char(line);
@@ -2149,6 +2553,50 @@ impl Engine {
         self.set_register(reg, content, true);
         self.clear_selected_register();
         self.message = "1 line yanked".to_string();
+    }
+
+    /// Yank count lines starting from current line
+    fn yank_lines(&mut self, count: usize) {
+        let start_line = self.view().cursor.line;
+        let total_lines = self.buffer().len_lines();
+        let end_line = (start_line + count).min(total_lines);
+        let actual_count = end_line - start_line;
+
+        if actual_count == 0 {
+            return;
+        }
+
+        let start_char = self.buffer().line_to_char(start_line);
+        let end_char = if end_line < total_lines {
+            self.buffer().line_to_char(end_line)
+        } else {
+            self.buffer().len_chars()
+        };
+
+        let content: String = self
+            .buffer()
+            .content
+            .slice(start_char..end_char)
+            .chars()
+            .collect();
+
+        // Ensure linewise content ends with newline
+        let content = if content.ends_with('\n') {
+            content
+        } else {
+            format!("{}\n", content)
+        };
+
+        let reg = self.active_register();
+        self.set_register(reg, content, true);
+        self.clear_selected_register();
+
+        let msg = if actual_count == 1 {
+            "1 line yanked".to_string()
+        } else {
+            format!("{} lines yanked", actual_count)
+        };
+        self.message = msg;
     }
 
     /// Paste after cursor (p). Linewise pastes below current line.
@@ -3806,5 +4254,749 @@ mod tests {
 
         assert_eq!(engine.buffer().to_string(), "a\ne");
         assert_eq!(engine.view().cursor.line, 1);
+    }
+
+    // ===================================================================
+    // Count infrastructure tests (Step 1)
+    // ===================================================================
+
+    #[test]
+    fn test_count_accumulation() {
+        let mut engine = Engine::new();
+        press_char(&mut engine, '1');
+        assert_eq!(engine.peek_count(), Some(1));
+        press_char(&mut engine, '2');
+        assert_eq!(engine.peek_count(), Some(12));
+        press_char(&mut engine, '3');
+        assert_eq!(engine.peek_count(), Some(123));
+        assert_eq!(engine.take_count(), 123);
+        assert_eq!(engine.peek_count(), None);
+    }
+
+    #[test]
+    fn test_zero_goes_to_line_start() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "Hello world");
+        engine.view_mut().cursor.col = 5;
+        assert_eq!(engine.view().cursor.col, 5);
+
+        press_char(&mut engine, '0');
+        assert_eq!(engine.view().cursor.col, 0);
+        assert_eq!(engine.peek_count(), None);
+    }
+
+    #[test]
+    fn test_count_with_zero() {
+        let mut engine = Engine::new();
+        press_char(&mut engine, '1');
+        assert_eq!(engine.peek_count(), Some(1));
+        press_char(&mut engine, '0');
+        assert_eq!(engine.peek_count(), Some(10));
+
+        // take_count() should return 10 and clear
+        assert_eq!(engine.take_count(), 10);
+        assert_eq!(engine.peek_count(), None);
+    }
+
+    #[test]
+    fn test_count_max_limit() {
+        let mut engine = Engine::new();
+        // Type 99999 to exceed 10,000 limit
+        for ch in ['9', '9', '9', '9', '9'] {
+            press_char(&mut engine, ch);
+        }
+        assert_eq!(engine.peek_count(), Some(10_000));
+        assert!(engine.message.contains("limit") || engine.message.contains("10,000"));
+    }
+
+    #[test]
+    fn test_count_display() {
+        let mut engine = Engine::new();
+        press_char(&mut engine, '5');
+
+        // peek_count should not consume
+        assert_eq!(engine.peek_count(), Some(5));
+        assert_eq!(engine.peek_count(), Some(5));
+        assert_eq!(engine.peek_count(), Some(5));
+
+        // take_count should consume
+        assert_eq!(engine.take_count(), 5);
+        assert_eq!(engine.peek_count(), None);
+    }
+
+    #[test]
+    fn test_count_cleared_on_escape() {
+        let mut engine = Engine::new();
+        press_char(&mut engine, '5');
+        assert_eq!(engine.peek_count(), Some(5));
+
+        press_special(&mut engine, "Escape");
+        assert_eq!(engine.peek_count(), None);
+    }
+
+    // --- Count-based motion tests (Step 2) ---
+
+    #[test]
+    fn test_count_hjkl_motions() {
+        let mut engine = Engine::new();
+        engine
+            .buffer_mut()
+            .insert(0, "ABCDEFGH\nIJKLMNOP\nQRSTUVWX\nYZ");
+        engine.update_syntax();
+
+        // Test 5l - move right 5 times
+        press_char(&mut engine, '5');
+        press_char(&mut engine, 'l');
+        assert_eq!(engine.view().cursor.col, 5);
+        assert_eq!(engine.peek_count(), None); // count consumed
+
+        // Test 2j - move down 2 times
+        press_char(&mut engine, '2');
+        press_char(&mut engine, 'j');
+        assert_eq!(engine.view().cursor.line, 2);
+
+        // Test 3h - move left 3 times
+        press_char(&mut engine, '3');
+        press_char(&mut engine, 'h');
+        assert_eq!(engine.view().cursor.col, 2);
+
+        // Test 1k - move up 1 time
+        press_char(&mut engine, '1');
+        press_char(&mut engine, 'k');
+        assert_eq!(engine.view().cursor.line, 1);
+    }
+
+    #[test]
+    fn test_count_arrow_keys() {
+        let mut engine = Engine::new();
+        engine
+            .buffer_mut()
+            .insert(0, "ABCDEFGH\nIJKLMNOP\nQRSTUVWX");
+        engine.update_syntax();
+
+        // Test 3 Right
+        press_char(&mut engine, '3');
+        press_special(&mut engine, "Right");
+        assert_eq!(engine.view().cursor.col, 3);
+
+        // Test 2 Down
+        press_char(&mut engine, '2');
+        press_special(&mut engine, "Down");
+        assert_eq!(engine.view().cursor.line, 2);
+
+        // Test 2 Up
+        press_char(&mut engine, '2');
+        press_special(&mut engine, "Up");
+        assert_eq!(engine.view().cursor.line, 0);
+
+        // Test 2 Left
+        press_char(&mut engine, '2');
+        press_special(&mut engine, "Left");
+        assert_eq!(engine.view().cursor.col, 1);
+    }
+
+    #[test]
+    fn test_count_word_motions() {
+        let mut engine = Engine::new();
+        engine
+            .buffer_mut()
+            .insert(0, "one two three four five six seven");
+        engine.update_syntax();
+
+        // Test 3w - move forward 3 words
+        press_char(&mut engine, '3');
+        press_char(&mut engine, 'w');
+        // Should be at start of "four"
+        assert_eq!(engine.view().cursor.col, 14);
+
+        // Test 2b - move backward 2 words
+        press_char(&mut engine, '2');
+        press_char(&mut engine, 'b');
+        // Should be at start of "two"
+        assert_eq!(engine.view().cursor.col, 4);
+
+        // Test 2e - move to end of 2nd word from here
+        press_char(&mut engine, '2');
+        press_char(&mut engine, 'e');
+        // Should be at end of "three"
+        assert_eq!(engine.view().cursor.col, 12);
+    }
+
+    #[test]
+    fn test_count_paragraph_motions() {
+        let mut engine = Engine::new();
+        engine
+            .buffer_mut()
+            .insert(0, "para1\npara1\n\npara2\npara2\n\npara3\n\npara4");
+        engine.update_syntax();
+        // Line 0: para1
+        // Line 1: para1
+        // Line 2: empty
+        // Line 3: para2
+        // Line 4: para2
+        // Line 5: empty
+        // Line 6: para3
+        // Line 7: empty
+        // Line 8: para4
+
+        // Test 2} - move forward 2 empty lines
+        press_char(&mut engine, '2');
+        press_char(&mut engine, '}');
+        assert_eq!(engine.view().cursor.line, 5);
+
+        // Test 1{ - move backward 1 empty line
+        press_char(&mut engine, '1');
+        press_char(&mut engine, '{');
+        assert_eq!(engine.view().cursor.line, 2);
+
+        // Test 2{ - move backward 2 empty lines (but there's only line 0 before)
+        press_char(&mut engine, '2');
+        press_char(&mut engine, '{');
+        assert_eq!(engine.view().cursor.line, 0);
+    }
+
+    #[test]
+    fn test_count_scroll_commands() {
+        let mut engine = Engine::new();
+        // Create a buffer with 100 lines
+        let mut text = String::new();
+        for i in 0..100 {
+            text.push_str(&format!("Line {}\n", i));
+        }
+        engine.buffer_mut().insert(0, &text);
+        engine.update_syntax();
+        engine.set_viewport_lines(20); // Simulate 20 lines visible
+
+        // Test 2 Ctrl-D (2 half-pages down = 20 lines)
+        press_char(&mut engine, '2');
+        press_ctrl(&mut engine, 'd');
+        assert_eq!(engine.view().cursor.line, 20);
+
+        // Test 1 Ctrl-U (1 half-page up = 10 lines)
+        press_char(&mut engine, '1');
+        press_ctrl(&mut engine, 'u');
+        assert_eq!(engine.view().cursor.line, 10);
+
+        // Test 3 Ctrl-F (3 full pages down = 60 lines)
+        press_char(&mut engine, '3');
+        press_ctrl(&mut engine, 'f');
+        assert_eq!(engine.view().cursor.line, 70);
+
+        // Test 2 Ctrl-B (2 full pages up = 40 lines)
+        press_char(&mut engine, '2');
+        press_ctrl(&mut engine, 'b');
+        assert_eq!(engine.view().cursor.line, 30);
+    }
+
+    #[test]
+    fn test_count_motion_bounds_checking() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "ABC\nDEF");
+        engine.update_syntax();
+
+        // Test 100l - should stop at line end
+        press_char(&mut engine, '1');
+        press_char(&mut engine, '0');
+        press_char(&mut engine, '0');
+        press_char(&mut engine, 'l');
+        assert!(engine.view().cursor.col <= 2);
+
+        // Test 100j - should stop at last line
+        press_char(&mut engine, '1');
+        press_char(&mut engine, '0');
+        press_char(&mut engine, '0');
+        press_char(&mut engine, 'j');
+        assert_eq!(engine.view().cursor.line, 1);
+    }
+
+    #[test]
+    fn test_count_large_values() {
+        let mut engine = Engine::new();
+        // Create text with many words
+        let text = "a b c d e f g h i j k l m n o p q r s t u v w x y z";
+        engine.buffer_mut().insert(0, text);
+        engine.update_syntax();
+
+        // Test 10w - move forward 10 words
+        press_char(&mut engine, '1');
+        press_char(&mut engine, '0');
+        press_char(&mut engine, 'w');
+        // Should be at 'k' (10th word from start)
+        assert_eq!(engine.view().cursor.col, 20);
+    }
+
+    // --- Count-based line operation tests (Step 3) ---
+
+    #[test]
+    fn test_count_x_delete_chars() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "ABCDEFGH");
+        engine.update_syntax();
+
+        // Test 3x - delete 3 characters
+        press_char(&mut engine, '3');
+        press_char(&mut engine, 'x');
+        assert_eq!(engine.buffer().to_string(), "DEFGH");
+
+        // Check register contains deleted chars
+        let (content, is_linewise) = engine.registers.get(&'"').unwrap();
+        assert_eq!(content, "ABC");
+        assert!(!is_linewise);
+    }
+
+    #[test]
+    fn test_count_x_bounds() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "ABC");
+        engine.update_syntax();
+
+        // Test 100x - should only delete 3 chars (all available)
+        press_char(&mut engine, '1');
+        press_char(&mut engine, '0');
+        press_char(&mut engine, '0');
+        press_char(&mut engine, 'x');
+        assert_eq!(engine.buffer().to_string(), "");
+    }
+
+    #[test]
+    fn test_count_dd_delete_lines() {
+        let mut engine = Engine::new();
+        engine
+            .buffer_mut()
+            .insert(0, "line1\nline2\nline3\nline4\nline5");
+        engine.update_syntax();
+
+        // Test 3dd - delete 3 lines
+        press_char(&mut engine, '3');
+        press_char(&mut engine, 'd');
+        press_char(&mut engine, 'd');
+        assert_eq!(engine.buffer().to_string(), "line4\nline5");
+
+        // Check register contains all 3 lines
+        let (content, is_linewise) = engine.registers.get(&'"').unwrap();
+        assert_eq!(content, "line1\nline2\nline3\n");
+        assert!(is_linewise);
+    }
+
+    #[test]
+    fn test_count_yy_yank_lines() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "alpha\nbeta\ngamma\ndelta");
+        engine.update_syntax();
+
+        // Test 2yy - yank 2 lines
+        press_char(&mut engine, '2');
+        press_char(&mut engine, 'y');
+        press_char(&mut engine, 'y');
+
+        let (content, is_linewise) = engine.registers.get(&'"').unwrap();
+        assert_eq!(content, "alpha\nbeta\n");
+        assert!(is_linewise);
+        assert!(engine.message.contains("2 lines yanked"));
+
+        // Buffer should be unchanged
+        assert_eq!(engine.buffer().to_string(), "alpha\nbeta\ngamma\ndelta");
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn test_count_Y_yank_lines() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "one\ntwo\nthree\nfour");
+        engine.update_syntax();
+
+        // Test 3Y - yank 3 lines
+        press_char(&mut engine, '3');
+        press_char(&mut engine, 'Y');
+
+        let (content, is_linewise) = engine.registers.get(&'"').unwrap();
+        assert_eq!(content, "one\ntwo\nthree\n");
+        assert!(is_linewise);
+        assert!(engine.message.contains("3 lines yanked"));
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn test_count_D_delete_to_eol() {
+        let mut engine = Engine::new();
+        engine
+            .buffer_mut()
+            .insert(0, "ABCDEFGH\nIJKLMNOP\nQRSTUVWX\nYZ");
+        engine.update_syntax();
+
+        // Move to column 2 of first line
+        press_char(&mut engine, 'l');
+        press_char(&mut engine, 'l');
+        assert_eq!(engine.view().cursor.col, 2);
+
+        // Test 2D - delete to end of line + 1 more full line
+        press_char(&mut engine, '2');
+        press_char(&mut engine, 'D');
+
+        // Should delete "CDEFGH\nIJKLMNOP\n" (to EOL + next line)
+        assert_eq!(engine.buffer().to_string(), "AB\nQRSTUVWX\nYZ");
+
+        let (content, _) = engine.registers.get(&'"').unwrap();
+        assert_eq!(content, "CDEFGH\nIJKLMNOP\n");
+    }
+
+    #[test]
+    fn test_count_dd_last_lines() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "line1\nline2\nline3");
+        engine.update_syntax();
+
+        // Move to line 2 (0-indexed: line 1)
+        press_char(&mut engine, 'j');
+
+        // Test 5dd - delete more lines than available (should delete 2 lines)
+        press_char(&mut engine, '5');
+        press_char(&mut engine, 'd');
+        press_char(&mut engine, 'd');
+
+        assert_eq!(engine.buffer().to_string(), "line1");
+    }
+
+    #[test]
+    fn test_count_yy_last_lines() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "A\nB\nC");
+        engine.update_syntax();
+
+        // Move to line B
+        press_char(&mut engine, 'j');
+
+        // Test 10yy - yank more than available (should yank 2 lines: B and C)
+        press_char(&mut engine, '1');
+        press_char(&mut engine, '0');
+        press_char(&mut engine, 'y');
+        press_char(&mut engine, 'y');
+
+        let (content, _) = engine.registers.get(&'"').unwrap();
+        assert_eq!(content, "B\nC\n");
+    }
+
+    // Step 4 tests: Special commands and mode changes
+
+    #[test]
+    fn test_count_G_goto_line() {
+        let mut engine = Engine::new();
+        engine
+            .buffer_mut()
+            .insert(0, "line1\nline2\nline3\nline4\nline5");
+        engine.update_syntax();
+
+        // Start at line 0
+        assert_eq!(engine.view().cursor.line, 0);
+
+        // Test 3G - go to line 3 (1-indexed, so line index 2)
+        press_char(&mut engine, '3');
+        press_char(&mut engine, 'G');
+
+        assert_eq!(engine.view().cursor.line, 2);
+
+        // Test G with no count - go to last line
+        press_char(&mut engine, 'G');
+        assert_eq!(engine.view().cursor.line, 4);
+
+        // Test 1G - go to first line
+        press_char(&mut engine, '1');
+        press_char(&mut engine, 'G');
+        assert_eq!(engine.view().cursor.line, 0);
+    }
+
+    #[test]
+    fn test_count_gg_goto_line() {
+        let mut engine = Engine::new();
+        engine
+            .buffer_mut()
+            .insert(0, "line1\nline2\nline3\nline4\nline5");
+        engine.update_syntax();
+
+        // Move to last line
+        press_char(&mut engine, 'G');
+        assert_eq!(engine.view().cursor.line, 4);
+
+        // Test 2gg - go to line 2 (1-indexed, so line index 1)
+        press_char(&mut engine, '2');
+        press_char(&mut engine, 'g');
+        press_char(&mut engine, 'g');
+
+        assert_eq!(engine.view().cursor.line, 1);
+
+        // Test gg with no count - go to first line
+        press_char(&mut engine, 'G');
+        press_char(&mut engine, 'g');
+        press_char(&mut engine, 'g');
+        assert_eq!(engine.view().cursor.line, 0);
+    }
+
+    #[test]
+    fn test_count_paste() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello");
+        engine.update_syntax();
+
+        // Yank "hello"
+        press_char(&mut engine, 'y');
+        press_char(&mut engine, 'y');
+
+        // Move to next line (insert blank line)
+        press_char(&mut engine, 'o');
+        press_special(&mut engine, "Escape");
+
+        // Test 3p - paste 3 times
+        press_char(&mut engine, '3');
+        press_char(&mut engine, 'p');
+
+        // Should have: hello\n + 3 copies of "hello\n"
+        let text = engine.buffer().to_string();
+        assert_eq!(text, "hello\n\nhello\nhello\nhello\n");
+    }
+
+    #[test]
+    fn test_count_search_next() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "x\nx\nx\nx\nx");
+        engine.update_syntax();
+
+        // Search for "x" - should find 5 matches (one per line)
+        press_char(&mut engine, '/');
+        press_char(&mut engine, 'x');
+        press_special(&mut engine, "Return");
+
+        // After search from line 0, we jump to first match after cursor (line 1, since line 0 col 0 has 'x' but search looks AFTER cursor)
+        // Actually, search should jump to line 0 if that's the first match
+        // Let me check: cursor starts at 0,0. Search for 'x' finds match at 0,0
+        // But search_next looks for matches > cursor position
+        // So it finds line 1 as first match > position 0
+        let first_line = engine.view().cursor.line;
+        assert_eq!(engine.search_matches.len(), 5);
+
+        // Test 3n - should move forward 3 more times
+        press_char(&mut engine, '3');
+        press_char(&mut engine, 'n');
+
+        // Should have moved forward 3 times from first_line
+        assert_eq!(engine.view().cursor.line, first_line + 3);
+
+        // Test 2N - should move backward 2 times
+        press_char(&mut engine, '2');
+        press_char(&mut engine, 'N');
+
+        // Should be back 2 lines
+        assert_eq!(engine.view().cursor.line, first_line + 1);
+    }
+
+    #[test]
+    fn test_count_cleared_on_insert_mode() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello");
+        engine.update_syntax();
+
+        // Set count to 5
+        press_char(&mut engine, '5');
+        assert_eq!(engine.peek_count(), Some(5));
+
+        // Enter insert mode with 'i'
+        press_char(&mut engine, 'i');
+        assert_eq!(engine.peek_count(), None);
+
+        // Exit insert mode
+        press_special(&mut engine, "Escape");
+
+        // Set count again
+        press_char(&mut engine, '3');
+        assert_eq!(engine.peek_count(), Some(3));
+
+        // Enter insert mode with 'a'
+        press_char(&mut engine, 'a');
+        assert_eq!(engine.peek_count(), None);
+
+        // Exit and test 'A'
+        press_special(&mut engine, "Escape");
+        press_char(&mut engine, '7');
+        press_char(&mut engine, 'A');
+        assert_eq!(engine.peek_count(), None);
+
+        // Exit and test 'I'
+        press_special(&mut engine, "Escape");
+        press_char(&mut engine, '9');
+        press_char(&mut engine, 'I');
+        assert_eq!(engine.peek_count(), None);
+    }
+
+    #[test]
+    fn test_count_cleared_on_mode_changes() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello world");
+        engine.update_syntax();
+
+        // Test visual mode PRESERVES count (for use with motions)
+        press_char(&mut engine, '5');
+        assert_eq!(engine.peek_count(), Some(5));
+        press_char(&mut engine, 'v');
+        assert_eq!(engine.peek_count(), Some(5)); // Count preserved
+        press_special(&mut engine, "Escape"); // Escape clears count
+
+        // Test visual line mode PRESERVES count (for use with motions)
+        press_char(&mut engine, '3');
+        assert_eq!(engine.peek_count(), Some(3));
+        press_char(&mut engine, 'V');
+        assert_eq!(engine.peek_count(), Some(3)); // Count preserved
+        press_special(&mut engine, "Escape"); // Escape clears count
+
+        // Test command mode clears count
+        press_char(&mut engine, '7');
+        assert_eq!(engine.peek_count(), Some(7));
+        press_char(&mut engine, ':');
+        assert_eq!(engine.peek_count(), None);
+        press_special(&mut engine, "Escape");
+
+        // Test search mode clears count
+        press_char(&mut engine, '9');
+        assert_eq!(engine.peek_count(), Some(9));
+        press_char(&mut engine, '/');
+        assert_eq!(engine.peek_count(), None);
+        press_special(&mut engine, "Escape");
+    }
+
+    #[test]
+    fn test_count_visual_motion() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(
+            0,
+            "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8",
+        );
+        engine.update_syntax();
+
+        // Start at line 0
+        assert_eq!(engine.view().cursor.line, 0);
+
+        // Enter visual mode
+        press_char(&mut engine, 'v');
+        assert_eq!(engine.mode, Mode::Visual);
+
+        // Test 5j - should extend selection 5 lines down
+        press_char(&mut engine, '5');
+        press_char(&mut engine, 'j');
+        assert_eq!(engine.view().cursor.line, 5);
+        assert_eq!(engine.mode, Mode::Visual); // Should still be in visual mode
+
+        // Test 2k - should move up 2 lines
+        press_char(&mut engine, '2');
+        press_char(&mut engine, 'k');
+        assert_eq!(engine.view().cursor.line, 3);
+
+        // Exit visual mode
+        press_special(&mut engine, "Escape");
+        assert_eq!(engine.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn test_count_visual_word() {
+        let mut engine = Engine::new();
+        engine
+            .buffer_mut()
+            .insert(0, "one two three four five six seven eight");
+        engine.update_syntax();
+
+        // Start at beginning
+        assert_eq!(engine.view().cursor, Cursor { line: 0, col: 0 });
+
+        // Enter visual mode
+        press_char(&mut engine, 'v');
+        assert_eq!(engine.mode, Mode::Visual);
+
+        // Test 3w - should extend by 3 words
+        press_char(&mut engine, '3');
+        press_char(&mut engine, 'w');
+
+        // After 3 word-forwards from position 0, we should be at "four"
+        // one(0) -> two(4) -> three(8) -> four(14)
+        assert_eq!(engine.view().cursor.col, 14);
+
+        // Test 2b - should move back 2 words
+        press_char(&mut engine, '2');
+        press_char(&mut engine, 'b');
+
+        // four(14) -> three(8) -> two(4)
+        assert_eq!(engine.view().cursor.col, 4);
+
+        // Exit visual mode
+        press_special(&mut engine, "Escape");
+        assert_eq!(engine.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn test_count_visual_line_mode() {
+        let mut engine = Engine::new();
+        engine
+            .buffer_mut()
+            .insert(0, "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7");
+        engine.update_syntax();
+
+        // Start at line 0
+        assert_eq!(engine.view().cursor.line, 0);
+
+        // Enter visual line mode
+        press_char(&mut engine, 'V');
+        assert_eq!(engine.mode, Mode::VisualLine);
+
+        // Test 3j - should extend selection 3 lines down
+        press_char(&mut engine, '3');
+        press_char(&mut engine, 'j');
+        assert_eq!(engine.view().cursor.line, 3);
+        assert_eq!(engine.mode, Mode::VisualLine);
+
+        // Yank the selection
+        press_char(&mut engine, 'y');
+        assert_eq!(engine.mode, Mode::Normal);
+
+        // Should have yanked 4 lines (lines 0-3)
+        let (content, is_linewise) = engine.registers.get(&'"').unwrap();
+        assert!(is_linewise);
+        assert!(content.contains("line 1"));
+        assert!(content.contains("line 4"));
+    }
+
+    #[test]
+    fn test_count_not_applied_to_visual_operators() {
+        let mut engine = Engine::new();
+        engine
+            .buffer_mut()
+            .insert(0, "line 1\nline 2\nline 3\nline 4\nline 5");
+        engine.update_syntax();
+
+        // Start at line 0
+        assert_eq!(engine.view().cursor.line, 0);
+
+        // Enter visual mode
+        press_char(&mut engine, 'v');
+
+        // Move down 2 lines to create selection
+        press_char(&mut engine, 'j');
+        press_char(&mut engine, 'j');
+        assert_eq!(engine.view().cursor.line, 2);
+
+        // Now type "3" then "d" - should delete the selection ONCE, not 3 times
+        press_char(&mut engine, '3');
+        assert_eq!(engine.peek_count(), Some(3));
+
+        press_char(&mut engine, 'd');
+
+        // Should be back in normal mode
+        assert_eq!(engine.mode, Mode::Normal);
+
+        // Count should be cleared (not applied to operator)
+        assert_eq!(engine.peek_count(), None);
+
+        // Buffer should have deleted lines 0-2 (3 lines), leaving lines 3-4
+        let text = engine.buffer().to_string();
+        assert!(text.contains("line 4"));
+        assert!(text.contains("line 5"));
+        assert!(!text.contains("line 1"));
+        assert!(!text.contains("line 2"));
+        assert!(!text.contains("line 3"));
     }
 }

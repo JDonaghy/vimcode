@@ -721,12 +721,32 @@ fn draw_command_line(
     let cmd_text = match engine.mode {
         Mode::Command => format!(":{}", engine.command_buffer),
         Mode::Search => format!("/{}", engine.command_buffer),
+        Mode::Normal | Mode::Visual | Mode::VisualLine => {
+            // Display count if present, otherwise show message
+            if let Some(count) = engine.peek_count() {
+                count.to_string()
+            } else {
+                engine.message.clone()
+            }
+        }
         _ => engine.message.clone(),
     };
 
     if !cmd_text.is_empty() {
         layout.set_text(&cmd_text);
-        cr.move_to(0.0, y);
+
+        // Right-align count in Normal/Visual modes
+        if (engine.mode == Mode::Normal
+            || engine.mode == Mode::Visual
+            || engine.mode == Mode::VisualLine)
+            && engine.peek_count().is_some()
+        {
+            let (text_w, _) = layout.pixel_size();
+            cr.move_to(width - text_w as f64, y);
+        } else {
+            cr.move_to(0.0, y);
+        }
+
         cr.set_source_rgb(0.9, 0.9, 0.9);
         pangocairo::show_layout(cr, layout);
     }

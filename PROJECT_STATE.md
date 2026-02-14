@@ -6,9 +6,12 @@ Last updated: February 2026
 
 VimCode is a Vim-like code editor built in Rust with GTK4/Relm4. The goal is to create a VS Code-like editor with a first-class Vim mode that is cross-platform, fast, and does not require GPU acceleration.
 
-## Current Status: Visual Mode
+## Current Status: Preparing for Line Numbers
 
-The editor now supports character and line visual modes (`v`, `V`), building on paragraph navigation (`{`, `}`), yank/paste with named registers, undo/redo, and the full buffer/window/tab model.
+The editor now has full count-based command repetition (e.g., `5j`, `3dd`, `10yy`) working across all modes. Next up: implementing line numbers (both absolute and relative) controlled by a settings.json file.
+
+**Just Completed:** Count-based command repetition (Steps 1-5 complete)  
+**Next Feature:** Line numbers (absolute and relative) with settings.json configuration
 
 ### What Works Today
 
@@ -149,8 +152,20 @@ The editor now supports character and line visual modes (`v`, `V`), building on 
 - Unnamed register (`"`) always receives deleted/yanked text
 - Visual mode yank/delete operations work with registers
 
+**Count-Based Repetition (NEW - Complete)**
+- All motion commands: `5j`, `10k`, `3w`, `2b`, `2{`, `3}`, etc.
+- Line operations: `3dd`, `5yy`, `10x`, `2D`
+- Special commands: `42G`, `2gg`, `3p`, `5n`, `3o`
+- Visual mode: `v5j`, `V3k`, `3w` in visual mode
+- Digit accumulation: Type "123" → accumulates to 123
+- Smart zero handling: `0` alone → column 0, `10j` → count of 10
+- 10,000 limit with user-friendly message
+- Vim-style right-aligned display in command line
+- Count preserved when entering visual mode
+- Helper methods: `take_count()` and `peek_count()`
+
 **Test Suite**
-- 115 passing tests covering all major functionality
+- 146 passing tests covering all major functionality (31 new count tests)
 - Clippy-clean, formatted with rustfmt
 
 ---
@@ -163,21 +178,23 @@ vimcode/
 ├── README.md               # Project overview and roadmap
 ├── AGENTS.md               # AI agent instructions
 ├── PROJECT_STATE.md        # This file
+├── PLAN.md                 # Current feature implementation plan
+├── PLAN_ARCHIVE_count_repetition.md  # Archived: Count-based repetition (complete)
 └── src/
-    ├── main.rs             # GTK4/Relm4 UI, window, input handling, rendering (~773 lines)
+    ├── main.rs             # GTK4/Relm4 UI, window, input handling, rendering (~788 lines)
     └── core/               # Platform-agnostic editor logic
         ├── mod.rs          # Module declarations (~15 lines)
-        ├── engine.rs       # Engine struct, orchestrates buffers/windows/tabs (~3810 lines)
+        ├── engine.rs       # Engine struct, orchestrates buffers/windows/tabs (~4500 lines)
         ├── buffer.rs       # Rope-based text storage, file I/O (~120 lines)
         ├── buffer_manager.rs # BufferManager: owns all buffers, tracks recent files (~360 lines)
-        ├── cursor.rs       # Cursor position struct (~11 lines)
+        ├── cursor.rs       # Cursor position struct with PartialEq (~12 lines)
         ├── mode.rs         # Mode enum: Normal, Insert, Visual, VisualLine, Command, Search (~10 lines)
         ├── syntax.rs       # Tree-sitter parsing for highlights (~60 lines)
         ├── view.rs         # View: per-window cursor and scroll state (~70 lines)
         ├── window.rs       # Window, WindowLayout (split tree), WindowRect (~280 lines)
         └── tab.rs          # Tab: window layout collection (~70 lines)
 
-Total: ~5,844 lines of Rust
+Total: ~6,500 lines of Rust
 ```
 
 ### Architecture Rules
@@ -223,13 +240,17 @@ Engine
 - [x] **Yank and paste** (`y`, `yy`, `Y`, `p`, `P`) with named registers — DONE
 - [x] **Paragraph navigation** (`{`, `}`) — DONE
 - [x] **Visual mode** (character `v`, line `V`) — DONE
+- [x] **Count-based repetition** (`5j`, `3dd`, `10yy`) — DONE
+  - All motion commands, line operations, special commands, and visual mode support count
 - [ ] **Visual block mode** (`Ctrl-V` for rectangular selections)
 - [ ] **More motions** (`ge`, `f`/`F`/`t`/`T` find char, `%` matching bracket)
 - [ ] **More delete/change** (`dw`, `cw`, `c`, `C`, `s`, `S`)
 - [ ] **Text objects** (`iw`, `aw`, `i"`, `a(`, etc.)
 - [ ] **Repeat** (`.`) — repeat last change
 - [ ] **Reverse search** (`?`)
-- [ ] **Line numbers** (absolute and relative)
+- [ ] **Line numbers** (absolute and relative) — NEXT UP
+  - Controlled by settings.json configuration file
+  - Support both `:set number` and `:set relativenumber` styles
 
 ### Medium Priority (Editor Features)
 
@@ -287,7 +308,7 @@ Engine
 ```bash
 cargo build              # Compile
 cargo run -- <file>      # Run with a file
-cargo test               # Run all 115 tests
+cargo test               # Run all 146 tests
 cargo test <name>        # Run specific test
 cargo clippy -- -D warnings   # Lint (must pass)
 cargo fmt                # Format code
@@ -297,7 +318,80 @@ cargo fmt                # Format code
 
 ## Session History
 
-### Session: Visual Mode (Current)
+### Session: Count-Based Command Repetition - Complete (Current)
+
+Completed all 5 steps of count-based command repetition implementation. Full Vim-style count prefixes now work across all modes and commands.
+
+**Summary:**
+- **Total Changes:** ~600 lines across 3 files
+- **Tests Added:** 31 new tests (115 → 146)
+- **Files Modified:** `src/core/engine.rs`, `src/core/cursor.rs`, `src/main.rs`
+
+**Steps Completed:**
+1. ✅ **Step 1:** Core count infrastructure with digit accumulation and UI display
+2. ✅ **Step 2:** Motion commands (h/j/k/l, w/b/e, {/}, arrows, Ctrl-D/U/F/B)
+3. ✅ **Step 3:** Line operations (yy, dd, x, D) with count support
+4. ✅ **Step 4:** Special commands (G, gg, p, P, n, N, o, O)
+5. ✅ **Step 5:** Visual mode motions with count support
+
+**Key Features:**
+- Count accumulation: `123` → 123, max 10,000
+- Smart zero: `0` → column 0, `10j` → count of 10
+- Visual mode: count preserved when entering, cleared on exit
+- Operators: count NOT applied to visual operators (y/d/c operate on selection)
+- UI: Right-aligned count display in command line (Vim-style)
+
+**Test Coverage:**
+- 6 tests for core infrastructure
+- 7 tests for motion commands
+- 8 tests for line operations
+- 6 tests for special commands
+- 4 tests for visual mode
+- All 146 tests passing, clippy clean
+
+**Next Feature:** Line numbers (absolute and relative) with settings.json configuration.
+
+**Archived Plan:** See `PLAN_ARCHIVE_count_repetition.md` for full implementation details.
+
+### Session: Count Infrastructure - Step 1 (Previous)
+
+Implemented foundational count infrastructure for Vim-style count prefixes (first of 5 steps):
+
+1. **Engine state** (`engine.rs`):
+   - Added `count: Option<usize>` field to Engine struct
+   - Initialized `count: None` in Engine::new()
+   - Added `take_count()` method to consume count (returns 1 if none)
+   - Added `peek_count()` method for UI display without consuming
+
+2. **Digit capture logic** (`engine.rs`, lines 792-824):
+   - Placed before pending_key check to allow `10dd`, `20yy`, etc.
+   - Digits 1-9 always accumulate into count
+   - `0` accumulates only if count already exists (allows `10`, `20`)
+   - `0` alone still moves cursor to column 0 (existing behavior preserved)
+   - Enforces 10,000 maximum limit with user-friendly message
+   - Returns early to prevent digit from being processed as command
+
+3. **Escape handling** (`engine.rs`, lines 1023-1027):
+   - Escape in normal mode clears both count and pending_key
+   - Allows user to cancel incomplete commands
+
+4. **UI rendering** (`main.rs`, lines 721-741):
+   - Modified `draw_command_line()` to display count
+   - Shows count in Normal, Visual, and VisualLine modes
+   - Right-aligned display (Vim-style, bottom-right corner)
+   - Falls back to message display when no count present
+
+5. **Tests**: 6 new tests (121 total), all passing
+   - `test_count_accumulation()` - verify "123" accumulates correctly
+   - `test_zero_goes_to_line_start()` - verify `0` moves to column 0
+   - `test_count_with_zero()` - verify "10" accumulates as count
+   - `test_count_max_limit()` - verify 10,000 cap with message
+   - `test_count_display()` - verify peek_count() doesn't consume
+   - `test_count_cleared_on_escape()` - verify Escape clears count
+
+**Result:** Count infrastructure is in place. Steps 2-5 will apply count to motion commands, line operations, special commands, and visual mode.
+
+### Session: Visual Mode
 
 Implemented Vim-style character and line visual modes:
 
