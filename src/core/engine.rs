@@ -218,6 +218,72 @@ impl Engine {
         self.active_buffer_state_mut().update_syntax();
     }
 
+    // =======================================================================
+    // Undo/Redo operations
+    // =======================================================================
+
+    /// Start a new undo group for the active buffer.
+    pub fn start_undo_group(&mut self) {
+        let cursor = *self.cursor();
+        self.active_buffer_state_mut().start_undo_group(cursor);
+    }
+
+    /// Finish the current undo group for the active buffer.
+    pub fn finish_undo_group(&mut self) {
+        self.active_buffer_state_mut().finish_undo_group();
+    }
+
+    /// Insert text with undo recording.
+    pub fn insert_with_undo(&mut self, pos: usize, text: &str) {
+        self.active_buffer_state_mut().record_insert(pos, text);
+        self.buffer_mut().insert(pos, text);
+    }
+
+    /// Delete a range with undo recording.
+    pub fn delete_with_undo(&mut self, start: usize, end: usize) {
+        // Capture the text being deleted before deleting
+        let deleted_text: String = self.buffer().content.slice(start..end).chars().collect();
+        self.active_buffer_state_mut()
+            .record_delete(start, &deleted_text);
+        self.buffer_mut().delete_range(start, end);
+    }
+
+    /// Perform undo on the active buffer. Returns true if undo was performed.
+    pub fn undo(&mut self) -> bool {
+        if let Some(cursor) = self.active_buffer_state_mut().undo() {
+            self.view_mut().cursor = cursor;
+            self.clamp_cursor_col();
+            true
+        } else {
+            self.message = "Already at oldest change".to_string();
+            false
+        }
+    }
+
+    /// Perform redo on the active buffer. Returns true if redo was performed.
+    pub fn redo(&mut self) -> bool {
+        if let Some(cursor) = self.active_buffer_state_mut().redo() {
+            self.view_mut().cursor = cursor;
+            self.clamp_cursor_col();
+            true
+        } else {
+            self.message = "Already at newest change".to_string();
+            false
+        }
+    }
+
+    /// Check if undo is available.
+    #[allow(dead_code)]
+    pub fn can_undo(&self) -> bool {
+        self.active_buffer_state().can_undo()
+    }
+
+    /// Check if redo is available.
+    #[allow(dead_code)]
+    pub fn can_redo(&self) -> bool {
+        self.active_buffer_state().can_redo()
+    }
+
     /// Save the active buffer to its file.
     pub fn save(&mut self) -> Result<(), String> {
         let state = self.active_buffer_state_mut();
@@ -665,10 +731,15 @@ impl Engine {
                     return EngineAction::None;
                 }
                 "u" => {
-                    // Half-page up
+                    // Ctrl-U: Half-page up
                     let half = self.viewport_lines() / 2;
                     self.view_mut().cursor.line = self.view().cursor.line.saturating_sub(half);
                     self.clamp_cursor_col();
+                    return EngineAction::None;
+                }
+                "r" => {
+                    // Ctrl-R: Redo
+                    self.redo();
                     return EngineAction::None;
                 }
                 "f" => {
@@ -707,8 +778,12 @@ impl Engine {
             Some('j') => self.move_down(),
             Some('k') => self.move_up(),
             Some('l') => self.move_right(),
-            Some('i') => self.mode = Mode::Insert,
+            Some('i') => {
+                self.start_undo_group();
+                self.mode = Mode::Insert;
+            }
             Some('a') => {
+                self.start_undo_group();
                 let max_col = self.get_max_cursor_col(self.view().cursor.line);
                 if self.view().cursor.col < max_col {
                     self.view_mut().cursor.col += 1;
@@ -720,11 +795,13 @@ impl Engine {
                 self.mode = Mode::Insert;
             }
             Some('A') => {
+                self.start_undo_group();
                 let line = self.view().cursor.line;
                 self.view_mut().cursor.col = self.get_line_len_for_insert(line);
                 self.mode = Mode::Insert;
             }
             Some('I') => {
+                self.start_undo_group();
                 let line = self.view().cursor.line;
                 let line_start = self.buffer().line_to_char(line);
                 let line_len = self.buffer().line_len_chars(line);
@@ -740,6 +817,7 @@ impl Engine {
                 self.mode = Mode::Insert;
             }
             Some('o') => {
+                self.start_undo_group();
                 let line = self.view().cursor.line;
                 let line_end =
                     self.buffer().line_to_char(line) + self.buffer().line_len_chars(line);
@@ -753,16 +831,17 @@ impl Engine {
                 } else {
                     line_end
                 };
-                self.buffer_mut().insert(insert_pos, "\n");
+                self.insert_with_undo(insert_pos, "\n");
                 self.view_mut().cursor.line += 1;
                 self.view_mut().cursor.col = 0;
                 self.mode = Mode::Insert;
                 *changed = true;
             }
             Some('O') => {
+                self.start_undo_group();
                 let line = self.view().cursor.line;
                 let line_start = self.buffer().line_to_char(line);
-                self.buffer_mut().insert(line_start, "\n");
+                self.insert_with_undo(line_start, "\n");
                 self.view_mut().cursor.col = 0;
                 self.mode = Mode::Insert;
                 *changed = true;
@@ -779,7 +858,9 @@ impl Engine {
                 if max_col > 0 || self.buffer().line_len_chars(line) > 0 {
                     let char_idx = self.buffer().line_to_char(line) + col;
                     if char_idx < self.buffer().len_chars() {
-                        self.buffer_mut().delete_range(char_idx, char_idx + 1);
+                        self.start_undo_group();
+                        self.delete_with_undo(char_idx, char_idx + 1);
+                        self.finish_undo_group();
                         self.clamp_cursor_col();
                         *changed = true;
                     }
@@ -792,7 +873,9 @@ impl Engine {
                 self.pending_key = Some('d');
             }
             Some('D') => {
+                self.start_undo_group();
                 self.delete_to_end_of_line(changed);
+                self.finish_undo_group();
             }
             Some('g') => {
                 self.pending_key = Some('g');
@@ -801,6 +884,9 @@ impl Engine {
                 let last = self.buffer().len_lines().saturating_sub(1);
                 self.view_mut().cursor.line = last;
                 self.clamp_cursor_col();
+            }
+            Some('u') => {
+                self.undo();
             }
             Some('n') => self.search_next(),
             Some('N') => self.search_prev(),
@@ -851,7 +937,9 @@ impl Engine {
             },
             'd' => {
                 if unicode == Some('d') {
+                    self.start_undo_group();
                     self.delete_current_line(changed);
+                    self.finish_undo_group();
                 }
             }
             '\x17' => {
@@ -896,6 +984,7 @@ impl Engine {
     fn handle_insert_key(&mut self, key_name: &str, unicode: Option<char>, changed: &mut bool) {
         match key_name {
             "Escape" => {
+                self.finish_undo_group();
                 self.mode = Mode::Normal;
                 self.clamp_cursor_col();
             }
@@ -904,7 +993,7 @@ impl Engine {
                 let col = self.view().cursor.col;
                 let char_idx = self.buffer().line_to_char(line) + col;
                 if col > 0 {
-                    self.buffer_mut().delete_range(char_idx - 1, char_idx);
+                    self.delete_with_undo(char_idx - 1, char_idx);
                     self.view_mut().cursor.col -= 1;
                     *changed = true;
                 } else if line > 0 {
@@ -914,7 +1003,7 @@ impl Engine {
                     } else {
                         0
                     };
-                    self.buffer_mut().delete_range(char_idx - 1, char_idx);
+                    self.delete_with_undo(char_idx - 1, char_idx);
                     self.view_mut().cursor.line -= 1;
                     self.view_mut().cursor.col = new_col;
                     *changed = true;
@@ -925,7 +1014,7 @@ impl Engine {
                 let col = self.view().cursor.col;
                 let char_idx = self.buffer().line_to_char(line) + col;
                 if char_idx < self.buffer().len_chars() {
-                    self.buffer_mut().delete_range(char_idx, char_idx + 1);
+                    self.delete_with_undo(char_idx, char_idx + 1);
                     *changed = true;
                 }
             }
@@ -933,7 +1022,7 @@ impl Engine {
                 let line = self.view().cursor.line;
                 let col = self.view().cursor.col;
                 let char_idx = self.buffer().line_to_char(line) + col;
-                self.buffer_mut().insert(char_idx, "\n");
+                self.insert_with_undo(char_idx, "\n");
                 self.view_mut().cursor.line += 1;
                 self.view_mut().cursor.col = 0;
                 *changed = true;
@@ -942,7 +1031,7 @@ impl Engine {
                 let line = self.view().cursor.line;
                 let col = self.view().cursor.col;
                 let char_idx = self.buffer().line_to_char(line) + col;
-                self.buffer_mut().insert(char_idx, "    ");
+                self.insert_with_undo(char_idx, "    ");
                 self.view_mut().cursor.col += 4;
                 *changed = true;
             }
@@ -973,7 +1062,7 @@ impl Engine {
                     let char_idx = self.buffer().line_to_char(line) + col;
                     let mut buf = [0u8; 4];
                     let s = ch.encode_utf8(&mut buf);
-                    self.buffer_mut().insert(char_idx, s);
+                    self.insert_with_undo(char_idx, s);
                     self.view_mut().cursor.col += 1;
                     *changed = true;
                 }
@@ -1452,7 +1541,7 @@ impl Engine {
             (line_start, line_start + line_char_len)
         };
 
-        self.buffer_mut().delete_range(delete_start, delete_end);
+        self.delete_with_undo(delete_start, delete_end);
         *changed = true;
 
         let new_num_lines = self.buffer().len_lines();
@@ -1478,7 +1567,7 @@ impl Engine {
         };
 
         if char_idx < delete_end {
-            self.buffer_mut().delete_range(char_idx, delete_end);
+            self.delete_with_undo(char_idx, delete_end);
             self.clamp_cursor_col();
             *changed = true;
         }
@@ -2245,5 +2334,198 @@ mod tests {
         press_char(&mut engine, 'g');
         press_char(&mut engine, 'T');
         assert_eq!(engine.active_tab, 0);
+    }
+
+    // --- Undo/Redo tests ---
+
+    #[test]
+    fn test_undo_insert_mode_typing() {
+        let mut engine = Engine::new();
+
+        // Type "hello" in insert mode
+        press_char(&mut engine, 'i');
+        for ch in "hello".chars() {
+            press_char(&mut engine, ch);
+        }
+        press_special(&mut engine, "Escape");
+
+        assert_eq!(engine.buffer().to_string(), "hello");
+
+        // Undo should remove entire "hello" (single undo group for insert session)
+        press_char(&mut engine, 'u');
+        assert_eq!(engine.buffer().to_string(), "");
+    }
+
+    #[test]
+    fn test_undo_x_delete() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "ABC");
+        engine.update_syntax();
+
+        // Delete 'A' with x
+        press_char(&mut engine, 'x');
+        assert_eq!(engine.buffer().to_string(), "BC");
+
+        // Undo should restore 'A'
+        press_char(&mut engine, 'u');
+        assert_eq!(engine.buffer().to_string(), "ABC");
+    }
+
+    #[test]
+    fn test_undo_dd_delete_line() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "line1\nline2\nline3");
+        engine.update_syntax();
+
+        // Delete first line with dd
+        press_char(&mut engine, 'd');
+        press_char(&mut engine, 'd');
+        assert_eq!(engine.buffer().to_string(), "line2\nline3");
+
+        // Undo should restore the line
+        press_char(&mut engine, 'u');
+        assert_eq!(engine.buffer().to_string(), "line1\nline2\nline3");
+    }
+
+    #[test]
+    fn test_undo_D_delete_to_eol() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello world\nline2");
+        engine.update_syntax();
+
+        // Move to 'w' and delete to end of line
+        for _ in 0..6 {
+            press_char(&mut engine, 'l');
+        }
+        press_char(&mut engine, 'D');
+        assert_eq!(engine.buffer().to_string(), "hello \nline2");
+
+        // Undo should restore "world"
+        press_char(&mut engine, 'u');
+        assert_eq!(engine.buffer().to_string(), "hello world\nline2");
+    }
+
+    #[test]
+    fn test_undo_o_open_line() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "line1\nline2");
+        engine.update_syntax();
+
+        // Open line below and type "new"
+        press_char(&mut engine, 'o');
+        for ch in "new".chars() {
+            press_char(&mut engine, ch);
+        }
+        press_special(&mut engine, "Escape");
+
+        assert_eq!(engine.buffer().to_string(), "line1\nnew\nline2");
+
+        // Undo should remove the new line and text
+        press_char(&mut engine, 'u');
+        assert_eq!(engine.buffer().to_string(), "line1\nline2");
+    }
+
+    #[test]
+    fn test_redo_after_undo() {
+        let mut engine = Engine::new();
+
+        // Type "hello"
+        press_char(&mut engine, 'i');
+        for ch in "hello".chars() {
+            press_char(&mut engine, ch);
+        }
+        press_special(&mut engine, "Escape");
+
+        assert_eq!(engine.buffer().to_string(), "hello");
+
+        // Undo
+        press_char(&mut engine, 'u');
+        assert_eq!(engine.buffer().to_string(), "");
+
+        // Redo with Ctrl-r
+        press_ctrl(&mut engine, 'r');
+        assert_eq!(engine.buffer().to_string(), "hello");
+    }
+
+    #[test]
+    fn test_redo_cleared_on_new_edit() {
+        let mut engine = Engine::new();
+
+        // Type "hello"
+        press_char(&mut engine, 'i');
+        for ch in "hello".chars() {
+            press_char(&mut engine, ch);
+        }
+        press_special(&mut engine, "Escape");
+
+        // Undo
+        press_char(&mut engine, 'u');
+        assert_eq!(engine.buffer().to_string(), "");
+
+        // New edit (type "world")
+        press_char(&mut engine, 'i');
+        for ch in "world".chars() {
+            press_char(&mut engine, ch);
+        }
+        press_special(&mut engine, "Escape");
+
+        // Redo should do nothing (redo stack was cleared)
+        press_ctrl(&mut engine, 'r');
+        assert_eq!(engine.buffer().to_string(), "world");
+        assert!(engine.message.contains("Already at newest"));
+    }
+
+    #[test]
+    fn test_multiple_undos() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "ABC");
+        engine.update_syntax();
+
+        // Delete three chars one by one
+        press_char(&mut engine, 'x'); // removes A
+        press_char(&mut engine, 'x'); // removes B
+        press_char(&mut engine, 'x'); // removes C
+
+        assert_eq!(engine.buffer().to_string(), "");
+
+        // Three undos should restore ABC
+        press_char(&mut engine, 'u');
+        assert_eq!(engine.buffer().to_string(), "C");
+
+        press_char(&mut engine, 'u');
+        assert_eq!(engine.buffer().to_string(), "BC");
+
+        press_char(&mut engine, 'u');
+        assert_eq!(engine.buffer().to_string(), "ABC");
+    }
+
+    #[test]
+    fn test_undo_at_empty_stack() {
+        let mut engine = Engine::new();
+
+        // Try to undo with nothing to undo
+        press_char(&mut engine, 'u');
+        assert!(engine.message.contains("Already at oldest"));
+    }
+
+    #[test]
+    fn test_undo_cursor_position_restored() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello world");
+        engine.update_syntax();
+
+        // Move to column 6 ('w') and delete with x
+        for _ in 0..6 {
+            press_char(&mut engine, 'l');
+        }
+        assert_eq!(engine.view().cursor.col, 6);
+
+        press_char(&mut engine, 'x'); // delete 'w'
+        assert_eq!(engine.buffer().to_string(), "hello orld");
+
+        // Undo should restore cursor to column 6
+        press_char(&mut engine, 'u');
+        assert_eq!(engine.buffer().to_string(), "hello world");
+        assert_eq!(engine.view().cursor.col, 6);
     }
 }

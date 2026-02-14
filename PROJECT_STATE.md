@@ -6,9 +6,9 @@ Last updated: February 2026
 
 VimCode is a Vim-like code editor built in Rust with GTK4/Relm4. The goal is to create a VS Code-like editor with a first-class Vim mode that is cross-platform, fast, and does not require GPU acceleration.
 
-## Current Status: Multiple Buffers, Windows, and Tabs
+## Current Status: Undo/Redo + Multiple Buffers, Windows, and Tabs
 
-The editor now supports Vim's full buffer/window/tab model: multiple buffers can be open simultaneously, displayed in split windows within tab pages.
+The editor now supports undo/redo (`u` / `Ctrl-r`) with Vim-style undo groups, plus the full buffer/window/tab model.
 
 ### What Works Today
 
@@ -71,6 +71,8 @@ The editor now supports Vim's full buffer/window/tab model: multiple buffers can
 | `x` | Delete character |
 | `dd` | Delete line |
 | `D` | Delete to end of line |
+| `u` | Undo |
+| `Ctrl-r` | Redo |
 | `n` `N` | Next/previous search match |
 | `/` | Enter search mode |
 | `:` | Enter command mode |
@@ -186,7 +188,7 @@ Engine
 
 ### High Priority (Core Vim Experience)
 
-- [ ] **Undo/redo** (`u`, `Ctrl-r`) — critical for usability
+- [x] **Undo/redo** (`u`, `Ctrl-r`) — DONE
 - [ ] **Yank and paste** (`y`, `yy`, `p`, `P`) — essential clipboard operations
 - [ ] **Visual mode** (character `v`, line `V`, block `Ctrl-V`)
 - [ ] **More motions** (`ge`, `f`/`F`/`t`/`T` find char, `%` matching bracket)
@@ -241,10 +243,9 @@ Engine
 ## Known Issues / Technical Debt
 
 1. **Syntax re-parsing**: Currently re-parses the entire file on every buffer change. Should use Tree-sitter's incremental parsing.
-2. **No undo**: Buffer modifications are not tracked for undo/redo.
-3. **Hardcoded theme**: Colors are hardcoded in rendering functions. Should be configurable.
-4. **Window direction navigation**: `Ctrl-W h/j/k/l` currently just cycles; should navigate by geometry.
-5. **Search is basic**: No regex support, no incremental highlighting.
+2. **Hardcoded theme**: Colors are hardcoded in rendering functions. Should be configurable.
+3. **Window direction navigation**: `Ctrl-W h/j/k/l` currently just cycles; should navigate by geometry.
+4. **Search is basic**: No regex support, no incremental highlighting.
 
 ---
 
@@ -253,7 +254,7 @@ Engine
 ```bash
 cargo build              # Compile
 cargo run -- <file>      # Run with a file
-cargo test               # Run all 65 tests
+cargo test               # Run all 75 tests
 cargo test <name>        # Run specific test
 cargo clippy -- -D warnings   # Lint (must pass)
 cargo fmt                # Format code
@@ -263,7 +264,31 @@ cargo fmt                # Format code
 
 ## Session History
 
-### Session: Multiple Buffers, Windows, and Tabs (Current)
+### Session: Undo/Redo (Current)
+
+Implemented Vim-style undo/redo with operation-based tracking:
+
+1. **Data structures** (`buffer_manager.rs`):
+   - `EditOp` enum — Insert/Delete operations with position and text
+   - `UndoEntry` — Group of operations + cursor position before edit
+   - Added `undo_stack`, `redo_stack`, `current_undo_group` to `BufferState`
+
+2. **Undo group lifecycle**:
+   - Normal mode commands (x, dd, D) create single-op undo groups
+   - Insert mode creates one undo group for entire session (i→typing→Escape)
+   - `o`/`O` start a group that includes the newline + subsequent typing
+
+3. **Key bindings**:
+   - `u` — Undo (restores cursor position)
+   - `Ctrl-r` — Redo
+   - Status messages: "Already at oldest/newest change"
+
+4. **Tests**: 10 new tests (75 total), all passing
+   - Insert mode undo, x/dd/D undo, o undo
+   - Redo after undo, redo cleared on new edit
+   - Multiple undos, cursor position restoration
+
+### Session: Multiple Buffers, Windows, and Tabs
 
 Implemented full Vim buffer/window/tab model:
 

@@ -3,9 +3,50 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use super::buffer::{Buffer, BufferId};
+use super::cursor::Cursor;
 use super::syntax::Syntax;
 
-/// Metadata for a buffer (file path, dirty state, syntax highlights).
+// =============================================================================
+// Undo/Redo Data Structures
+// =============================================================================
+
+/// A single text edit operation (insert or delete).
+#[derive(Clone, Debug)]
+pub enum EditOp {
+    /// Text was inserted at position `pos`.
+    Insert { pos: usize, text: String },
+    /// Text was deleted from position `pos`.
+    Delete { pos: usize, text: String },
+}
+
+/// A group of edits that form one undoable action.
+/// In Vim, this corresponds to a single Normal mode command or an entire Insert mode session.
+#[derive(Clone, Debug)]
+pub struct UndoEntry {
+    /// The operations in this undo group (in order of execution).
+    pub ops: Vec<EditOp>,
+    /// Cursor position before the operations (restored on undo).
+    pub cursor_before: Cursor,
+}
+
+impl UndoEntry {
+    pub fn new(cursor: Cursor) -> Self {
+        Self {
+            ops: Vec::new(),
+            cursor_before: cursor,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ops.is_empty()
+    }
+}
+
+// =============================================================================
+// BufferState
+// =============================================================================
+
+/// Metadata for a buffer (file path, dirty state, syntax highlights, undo history).
 pub struct BufferState {
     pub buffer: Buffer,
     /// Path to the file being edited, if any.
@@ -16,6 +57,12 @@ pub struct BufferState {
     pub syntax: Syntax,
     /// Cached syntax highlights (byte ranges + scope names).
     pub highlights: Vec<(usize, usize, String)>,
+    /// Undo stack (most recent at the end).
+    pub undo_stack: Vec<UndoEntry>,
+    /// Redo stack (most recent at the end).
+    pub redo_stack: Vec<UndoEntry>,
+    /// Current undo group being accumulated (during Insert mode or multi-op commands).
+    pub current_undo_group: Option<UndoEntry>,
 }
 
 impl std::fmt::Debug for BufferState {
@@ -25,6 +72,8 @@ impl std::fmt::Debug for BufferState {
             .field("file_path", &self.file_path)
             .field("dirty", &self.dirty)
             .field("highlights", &self.highlights.len())
+            .field("undo_stack", &self.undo_stack.len())
+            .field("redo_stack", &self.redo_stack.len())
             .finish()
     }
 }
@@ -37,6 +86,9 @@ impl BufferState {
             dirty: false,
             syntax: Syntax::new(),
             highlights: Vec::new(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            current_undo_group: None,
         };
         state.update_syntax();
         state
@@ -49,6 +101,9 @@ impl BufferState {
             dirty: false,
             syntax: Syntax::new(),
             highlights: Vec::new(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            current_undo_group: None,
         };
         state.update_syntax();
         state
@@ -78,6 +133,168 @@ impl BufferState {
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "[No Name]".to_string())
+    }
+
+    // =========================================================================
+    // Undo/Redo Methods
+    // =========================================================================
+
+    /// Start a new undo group. Call this before a series of related edits.
+    /// For Insert mode, call this when entering Insert mode.
+    /// For Normal mode commands, call this before executing the command.
+    pub fn start_undo_group(&mut self, cursor: Cursor) {
+        // If there's already a group in progress, finish it first
+        self.finish_undo_group();
+        self.current_undo_group = Some(UndoEntry::new(cursor));
+    }
+
+    /// Record an insert operation in the current undo group.
+    pub fn record_insert(&mut self, pos: usize, text: &str) {
+        if let Some(ref mut group) = self.current_undo_group {
+            group.ops.push(EditOp::Insert {
+                pos,
+                text: text.to_string(),
+            });
+        }
+        // Clear redo stack on any new edit
+        self.redo_stack.clear();
+    }
+
+    /// Record a delete operation in the current undo group.
+    /// `text` is the text that was deleted (needed for undo).
+    pub fn record_delete(&mut self, pos: usize, text: &str) {
+        if let Some(ref mut group) = self.current_undo_group {
+            group.ops.push(EditOp::Delete {
+                pos,
+                text: text.to_string(),
+            });
+        }
+        // Clear redo stack on any new edit
+        self.redo_stack.clear();
+    }
+
+    /// Finish the current undo group and push it to the undo stack.
+    /// Call this after a Normal mode command completes, or when leaving Insert mode.
+    pub fn finish_undo_group(&mut self) {
+        if let Some(group) = self.current_undo_group.take() {
+            if !group.is_empty() {
+                self.undo_stack.push(group);
+            }
+        }
+    }
+
+    /// Undo the last change. Returns the cursor position to restore, or None if nothing to undo.
+    pub fn undo(&mut self) -> Option<Cursor> {
+        // Finish any in-progress group first
+        self.finish_undo_group();
+
+        let entry = self.undo_stack.pop()?;
+        let cursor_to_restore = entry.cursor_before;
+
+        // Build the redo entry by recording the inverse operations
+        let mut redo_ops = Vec::new();
+
+        // Apply inverse operations in reverse order
+        for op in entry.ops.iter().rev() {
+            match op {
+                EditOp::Insert { pos, text } => {
+                    // Undo an insert by deleting the text
+                    let end = pos + text.chars().count();
+                    self.buffer.delete_range(*pos, end);
+                    // For redo, we'll need to re-insert
+                    redo_ops.push(EditOp::Insert {
+                        pos: *pos,
+                        text: text.clone(),
+                    });
+                }
+                EditOp::Delete { pos, text } => {
+                    // Undo a delete by re-inserting the text
+                    self.buffer.insert(*pos, text);
+                    // For redo, we'll need to delete again
+                    redo_ops.push(EditOp::Delete {
+                        pos: *pos,
+                        text: text.clone(),
+                    });
+                }
+            }
+        }
+
+        // Reverse redo_ops so they're in the correct order for redo
+        redo_ops.reverse();
+
+        // Push to redo stack with the current cursor position
+        // (which will be restored if they redo)
+        self.redo_stack.push(UndoEntry {
+            ops: entry.ops,
+            cursor_before: cursor_to_restore,
+        });
+
+        self.update_syntax();
+        Some(cursor_to_restore)
+    }
+
+    /// Redo the last undone change. Returns the cursor position after redo, or None if nothing to redo.
+    pub fn redo(&mut self) -> Option<Cursor> {
+        let entry = self.redo_stack.pop()?;
+
+        // Calculate cursor position after redo (end of last operation)
+        let mut cursor_after = entry.cursor_before;
+
+        // Re-apply the operations in forward order
+        for op in entry.ops.iter() {
+            match op {
+                EditOp::Insert { pos, text } => {
+                    self.buffer.insert(*pos, text);
+                    // Position cursor at end of inserted text
+                    let line = self
+                        .buffer
+                        .content
+                        .char_to_line(*pos + text.chars().count());
+                    let line_start = self.buffer.line_to_char(line);
+                    cursor_after = Cursor {
+                        line,
+                        col: (*pos + text.chars().count()) - line_start,
+                    };
+                }
+                EditOp::Delete { pos, text } => {
+                    // Delete the text that was originally deleted
+                    let end = pos + text.chars().count();
+                    self.buffer.delete_range(*pos, end);
+                    // Position cursor at the deletion point
+                    let safe_pos = (*pos).min(self.buffer.len_chars().saturating_sub(1).max(0));
+                    let line = if self.buffer.len_chars() == 0 {
+                        0
+                    } else {
+                        self.buffer.content.char_to_line(safe_pos)
+                    };
+                    let line_start = self.buffer.line_to_char(line);
+                    cursor_after = Cursor {
+                        line,
+                        col: pos.saturating_sub(line_start),
+                    };
+                }
+            }
+        }
+
+        // Push back to undo stack
+        self.undo_stack.push(entry);
+
+        self.update_syntax();
+        Some(cursor_after)
+    }
+
+    /// Check if undo is available.
+    pub fn can_undo(&self) -> bool {
+        !self.undo_stack.is_empty()
+            || self
+                .current_undo_group
+                .as_ref()
+                .map_or(false, |g| !g.is_empty())
+    }
+
+    /// Check if redo is available.
+    pub fn can_redo(&self) -> bool {
+        !self.redo_stack.is_empty()
     }
 }
 
