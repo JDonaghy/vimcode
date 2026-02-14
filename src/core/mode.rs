@@ -4,4 +4,6 @@ pub enum Mode {
     Insert,
     Command,
     Search,
+    Visual,
+    VisualLine,
 }

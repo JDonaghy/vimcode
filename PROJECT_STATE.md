@@ -6,9 +6,9 @@ Last updated: February 2026
 
 VimCode is a Vim-like code editor built in Rust with GTK4/Relm4. The goal is to create a VS Code-like editor with a first-class Vim mode that is cross-platform, fast, and does not require GPU acceleration.
 
-## Current Status: Paragraph Navigation
+## Current Status: Visual Mode
 
-The editor now supports paragraph navigation with `{` and `}` keys, building on yank/paste (`y`, `yy`, `Y`, `p`, `P`) with named registers (`"a`-`"z`), undo/redo, and the full buffer/window/tab model.
+The editor now supports character and line visual modes (`v`, `V`), building on paragraph navigation (`{`, `}`), yank/paste with named registers, undo/redo, and the full buffer/window/tab model.
 
 ### What Works Today
 
@@ -52,9 +52,11 @@ The editor now supports paragraph navigation with `{` and `}` keys, building on 
 - Quit with `:q` (blocked if dirty), `:q!` (force), `:wq` or `:x` (save+quit)
 - Dirty indicator `[+]` in status bar and tab bar
 
-**Four Modes**
+**Six Modes**
 - **Normal** — navigation and commands (block cursor)
 - **Insert** — text input (line cursor)
+- **Visual** — character-wise visual selection (block cursor)
+- **Visual Line** — line-wise visual selection (block cursor)
 - **Command** — `:` commands with command-line input
 - **Search** — `/` search with command-line input
 
@@ -80,12 +82,26 @@ The editor now supports paragraph navigation with `{` and `}` keys, building on 
 | `p` | Paste after cursor/below line |
 | `P` | Paste before cursor/above line |
 | `"x` | Select register `x` for next yank/delete/paste |
+| `v` | Enter character visual mode |
+| `V` | Enter line visual mode |
 | `/` | Enter search mode |
 | `:` | Enter command mode |
 | `Ctrl-D` `Ctrl-U` | Half-page down/up |
 | `Ctrl-F` `Ctrl-B` | Full-page down/up |
 | `Ctrl-W` + key | Window commands |
 | Arrow keys, Home, End | Navigation |
+
+**Visual Mode (Character and Line)**
+- Enter with `v` (character) or `V` (line)
+- Navigation keys extend selection (h/j/k/l, w/b/e, 0/$, gg/G, {/}, etc.)
+- `y` — Yank selection to register
+- `d` — Delete selection (with undo)
+- `c` — Change selection (delete and enter insert mode)
+- `v` — Switch to character mode or exit
+- `V` — Switch to line mode or exit
+- `Escape` — Return to normal mode
+- `"x` — Named registers work with visual operators
+- Semi-transparent blue highlight shows selection
 
 **Insert Mode**
 - Full text input (all printable characters)
@@ -131,9 +147,10 @@ The editor now supports paragraph navigation with `{` and `}` keys, building on 
 - `"x` prefix — Select named register (`a`-`z`) for next operation
 - Delete operations (`x`, `dd`, `D`) also fill the register
 - Unnamed register (`"`) always receives deleted/yanked text
+- Visual mode yank/delete operations work with registers
 
 **Test Suite**
-- 98 passing tests covering all major functionality
+- 115 passing tests covering all major functionality
 - Clippy-clean, formatted with rustfmt
 
 ---
@@ -147,20 +164,20 @@ vimcode/
 ├── AGENTS.md               # AI agent instructions
 ├── PROJECT_STATE.md        # This file
 └── src/
-    ├── main.rs             # GTK4/Relm4 UI, window, input handling, rendering (~550 lines)
+    ├── main.rs             # GTK4/Relm4 UI, window, input handling, rendering (~773 lines)
     └── core/               # Platform-agnostic editor logic
         ├── mod.rs          # Module declarations (~15 lines)
-        ├── engine.rs       # Engine struct, orchestrates buffers/windows/tabs (~3150 lines)
+        ├── engine.rs       # Engine struct, orchestrates buffers/windows/tabs (~3810 lines)
         ├── buffer.rs       # Rope-based text storage, file I/O (~120 lines)
         ├── buffer_manager.rs # BufferManager: owns all buffers, tracks recent files (~360 lines)
         ├── cursor.rs       # Cursor position struct (~11 lines)
-        ├── mode.rs         # Mode enum: Normal, Insert, Command, Search (~7 lines)
+        ├── mode.rs         # Mode enum: Normal, Insert, Visual, VisualLine, Command, Search (~10 lines)
         ├── syntax.rs       # Tree-sitter parsing for highlights (~60 lines)
         ├── view.rs         # View: per-window cursor and scroll state (~70 lines)
         ├── window.rs       # Window, WindowLayout (split tree), WindowRect (~280 lines)
         └── tab.rs          # Tab: window layout collection (~70 lines)
 
-Total: ~4,650 lines of Rust
+Total: ~5,844 lines of Rust
 ```
 
 ### Architecture Rules
@@ -205,7 +222,8 @@ Engine
 - [x] **Undo/redo** (`u`, `Ctrl-r`) — DONE
 - [x] **Yank and paste** (`y`, `yy`, `Y`, `p`, `P`) with named registers — DONE
 - [x] **Paragraph navigation** (`{`, `}`) — DONE
-- [ ] **Visual mode** (character `v`, line `V`, block `Ctrl-V`)
+- [x] **Visual mode** (character `v`, line `V`) — DONE
+- [ ] **Visual block mode** (`Ctrl-V` for rectangular selections)
 - [ ] **More motions** (`ge`, `f`/`F`/`t`/`T` find char, `%` matching bracket)
 - [ ] **More delete/change** (`dw`, `cw`, `c`, `C`, `s`, `S`)
 - [ ] **Text objects** (`iw`, `aw`, `i"`, `a(`, etc.)
@@ -269,7 +287,7 @@ Engine
 ```bash
 cargo build              # Compile
 cargo run -- <file>      # Run with a file
-cargo test               # Run all 98 tests
+cargo test               # Run all 115 tests
 cargo test <name>        # Run specific test
 cargo clippy -- -D warnings   # Lint (must pass)
 cargo fmt                # Format code
@@ -279,7 +297,59 @@ cargo fmt                # Format code
 
 ## Session History
 
-### Session: Paragraph Navigation (Current)
+### Session: Visual Mode (Current)
+
+Implemented Vim-style character and line visual modes:
+
+1. **Mode variants** (`mode.rs`):
+   - Added `Visual` — character-wise visual selection
+   - Added `VisualLine` — line-wise visual selection
+   - Block mode (`Ctrl-V`) deferred to future implementation
+
+2. **Engine state** (`engine.rs`):
+   - Added `visual_anchor: Option<Cursor>` field to track selection start
+   - Implemented `handle_visual_key()` method for visual mode key handling
+   - Added visual selection helper methods:
+     - `get_visual_selection_range()` — normalize anchor/cursor to start/end
+     - `get_visual_selection_text()` — extract selected text with linewise flag
+   - Implemented visual mode operators:
+     - `yank_visual_selection()` — yank to register
+     - `delete_visual_selection()` — delete with undo support
+     - `change_visual_selection()` — delete + enter insert mode
+
+3. **Key bindings**:
+   - `v` — Enter character visual mode
+   - `V` — Enter line visual mode
+   - All navigation keys extend selection (h/j/k/l, w/b/e, 0/$, gg/G, {/}, Ctrl-D/U/F/B)
+   - `y` — Yank selection to register
+   - `d` — Delete selection
+   - `c` — Change selection (delete + insert mode)
+   - `v`/`V` — Switch between visual modes or exit to normal
+   - `Escape` — Exit visual mode
+   - `"x` — Named registers work with visual operators
+
+4. **Visual rendering** (`main.rs`):
+   - Added `draw_visual_selection()` function
+   - Semi-transparent blue highlight (rgba 0.3, 0.5, 0.7, 0.3)
+   - Character mode: precise character-level highlighting, multi-line support
+   - Line mode: full-width line highlighting
+   - Selection rendered under text (text remains readable)
+   - Updated cursor rendering: visual modes use block cursor
+   - Updated status line: displays "VISUAL" or "VISUAL LINE"
+
+5. **Tests**: 17 new tests (115 total), all passing
+   - Enter visual modes (v, V)
+   - Yank forward/backward selections
+   - Delete character and line selections
+   - Change operator (enters insert mode)
+   - Navigation extends selection
+   - Mode switching (v↔V)
+   - Multi-line selections
+   - Named register support
+   - Word motion in visual mode
+   - Line mode with multiple lines
+
+### Session: Paragraph Navigation
 
 Implemented Vim-style paragraph navigation with `{` and `}` keys:
 

@@ -14,11 +14,12 @@ VimCode's long-term goal is to be a full-featured code editor that:
 
 ## Current Status
 
-VimCode now supports a functional Vim-like workflow with **multiple buffers, split windows, and tabs** — the core primitives for editing multiple files.
+VimCode now supports a functional Vim-like workflow with **visual mode, multiple buffers, split windows, and tabs** — the core primitives for editing multiple files.
 
 ### What works today
 
-- **Four modes** — Normal, Insert, Command (`:`) and Search (`/`)
+- **Six modes** — Normal, Insert, Visual (character), Visual Line, Command (`:`) and Search (`/`)
+- **Visual mode** — `v` character selection, `V` line selection with `y`/`d`/`c` operators
 - **Multiple buffers** — Open multiple files, switch with `:bn`/`:bp`/`:b#`/`:b <n>`
 - **Split windows** — `:split`, `:vsplit`, `Ctrl-W` commands
 - **Tabs** — `:tabnew`, `:tabclose`, `gt`/`gT` navigation
@@ -29,7 +30,7 @@ VimCode now supports a functional Vim-like workflow with **multiple buffers, spl
 - **Undo/Redo** — `u` undo, `Ctrl-r` redo with Vim-style undo groups
 - **Search** — `/` forward search, `n`/`N` next/previous match
 - **Syntax highlighting** — Tree-sitter for Rust
-- **98 passing tests**, clippy-clean
+- **115 passing tests**, clippy-clean
 
 ### Key Commands
 
@@ -40,6 +41,8 @@ VimCode now supports a functional Vim-like workflow with **multiple buffers, spl
 | `{` `}` | Paragraph motions (prev/next empty line) |
 | `gg` `G` | File start/end |
 | `0` `$` | Line start/end |
+| `v` | Enter character visual mode |
+| `V` | Enter line visual mode |
 | `i` `I` `a` `A` `o` `O` | Enter insert mode |
 | `x` `dd` `D` | Delete char/line/to-EOL (fills register) |
 | `yy` `Y` | Yank line |
@@ -55,6 +58,16 @@ VimCode now supports a functional Vim-like workflow with **multiple buffers, spl
 | `Ctrl-W c` | Close window |
 | `/` | Search |
 | `:` | Command mode |
+
+| Visual Mode | Action |
+|-------------|--------|
+| `h` `j` `k` `l` `w` `b` `e` etc. | Extend selection |
+| `y` | Yank selection |
+| `d` | Delete selection |
+| `c` | Change (delete + insert) |
+| `v` | Switch to char mode / exit |
+| `V` | Switch to line mode / exit |
+| `Escape` | Exit to normal mode |
 
 | Command | Action |
 |---------|--------|
@@ -73,7 +86,8 @@ VimCode now supports a functional Vim-like workflow with **multiple buffers, spl
 - [x] Undo/redo (`u`, `Ctrl-r`) ✓
 - [x] Yank and paste (`y`, `yy`, `Y`, `p`, `P`) ✓
 - [x] Paragraph navigation (`{`, `}`) ✓
-- [ ] Visual mode (`v`, `V`, `Ctrl-V`)
+- [x] Visual mode (`v`, `V`) ✓
+- [ ] Visual block mode (`Ctrl-V`)
 - [ ] More motions (`ge`, `f`/`F`/`t`/`T`, `%`)
 - [ ] Change commands (`c`, `cw`, `C`)
 - [ ] Text objects (`iw`, `aw`, `i"`, `a(`)

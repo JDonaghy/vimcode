@@ -9,8 +9,9 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 mod core;
+use core::buffer::Buffer;
 use core::engine::EngineAction;
-use core::{Engine, Mode, WindowRect};
+use core::{Cursor, Engine, Mode, WindowRect};
 
 struct App {
     engine: Rc<RefCell<Engine>>,
@@ -330,6 +331,29 @@ fn draw_window(
     cr.rectangle(rect.x, rect.y, rect.width, rect.height);
     cr.fill().unwrap();
 
+    // Render visual selection highlight (if in visual mode and this is active window)
+    if is_active {
+        match engine.mode {
+            Mode::Visual | Mode::VisualLine => {
+                if let Some(anchor) = engine.visual_anchor {
+                    draw_visual_selection(
+                        cr,
+                        layout,
+                        engine,
+                        buffer,
+                        &anchor,
+                        &view.cursor,
+                        rect,
+                        line_height,
+                        view.scroll_top,
+                        visible_lines,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
     // Render text with highlights
     let scroll_top = view.scroll_top;
     let total_lines = buffer.content.len_lines();
@@ -413,7 +437,7 @@ fn draw_window(
             let cursor_y = rect.y + (view.cursor.line - scroll_top) as f64 * line_height;
 
             match engine.mode {
-                Mode::Normal => {
+                Mode::Normal | Mode::Visual | Mode::VisualLine => {
                     cr.set_source_rgba(1.0, 1.0, 1.0, 0.5);
                     let w = if char_w > 0.0 {
                         char_w
@@ -457,6 +481,137 @@ fn draw_window(
         cr.move_to(rect.x, status_y);
         cr.set_source_rgb(0.9, 0.9, 0.9);
         pangocairo::show_layout(cr, layout);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_visual_selection(
+    cr: &Context,
+    layout: &pango::Layout,
+    engine: &Engine,
+    buffer: &Buffer,
+    anchor: &Cursor,
+    cursor: &Cursor,
+    rect: &WindowRect,
+    line_height: f64,
+    scroll_top: usize,
+    visible_lines: usize,
+) {
+    // Normalize selection (start <= end)
+    let (start, end) =
+        if anchor.line < cursor.line || (anchor.line == cursor.line && anchor.col <= cursor.col) {
+            (*anchor, *cursor)
+        } else {
+            (*cursor, *anchor)
+        };
+
+    // Set highlight color (semi-transparent blue)
+    cr.set_source_rgba(0.3, 0.5, 0.7, 0.3);
+
+    match engine.mode {
+        Mode::VisualLine => {
+            // Line mode: highlight full lines
+            for line_idx in start.line..=end.line {
+                // Only draw if line is visible
+                if line_idx >= scroll_top && line_idx < scroll_top + visible_lines {
+                    let view_idx = line_idx - scroll_top;
+                    let y = rect.y + view_idx as f64 * line_height;
+                    cr.rectangle(rect.x, y, rect.width, line_height);
+                }
+            }
+            cr.fill().unwrap();
+        }
+        Mode::Visual => {
+            // Character mode: highlight from start to end (inclusive)
+            if start.line == end.line {
+                // Single-line selection
+                if start.line >= scroll_top && start.line < scroll_top + visible_lines {
+                    let view_idx = start.line - scroll_top;
+                    let y = rect.y + view_idx as f64 * line_height;
+
+                    if let Some(line) = buffer.content.lines().nth(start.line) {
+                        let line_text = line.to_string();
+                        layout.set_text(&line_text);
+                        layout.set_attributes(None);
+
+                        // Calculate x position for start column
+                        let start_byte: usize = line_text
+                            .char_indices()
+                            .nth(start.col)
+                            .map(|(i, _)| i)
+                            .unwrap_or(line_text.len());
+                        let start_pos = layout.index_to_pos(start_byte as i32);
+                        let start_x = rect.x + start_pos.x() as f64 / pango::SCALE as f64;
+
+                        // Calculate x position for end column (inclusive, so +1)
+                        let end_col = (end.col + 1).min(line_text.chars().count());
+                        let end_byte: usize = line_text
+                            .char_indices()
+                            .nth(end_col)
+                            .map(|(i, _)| i)
+                            .unwrap_or(line_text.len());
+                        let end_pos = layout.index_to_pos(end_byte as i32);
+                        let end_x = rect.x + end_pos.x() as f64 / pango::SCALE as f64;
+
+                        cr.rectangle(start_x, y, end_x - start_x, line_height);
+                        cr.fill().unwrap();
+                    }
+                }
+            } else {
+                // Multi-line selection
+                for line_idx in start.line..=end.line {
+                    if line_idx >= scroll_top && line_idx < scroll_top + visible_lines {
+                        let view_idx = line_idx - scroll_top;
+                        let y = rect.y + view_idx as f64 * line_height;
+
+                        if let Some(line) = buffer.content.lines().nth(line_idx) {
+                            let line_text = line.to_string();
+                            layout.set_text(&line_text);
+                            layout.set_attributes(None);
+
+                            if line_idx == start.line {
+                                // First line: from start.col to end of line
+                                let start_byte: usize = line_text
+                                    .char_indices()
+                                    .nth(start.col)
+                                    .map(|(i, _)| i)
+                                    .unwrap_or(line_text.len());
+                                let start_pos = layout.index_to_pos(start_byte as i32);
+                                let start_x = rect.x + start_pos.x() as f64 / pango::SCALE as f64;
+
+                                let (line_width, _) = layout.pixel_size();
+                                cr.rectangle(
+                                    start_x,
+                                    y,
+                                    rect.x + line_width as f64 - start_x,
+                                    line_height,
+                                );
+                                cr.fill().unwrap();
+                            } else if line_idx == end.line {
+                                // Last line: from start of line to end.col (inclusive)
+                                let end_col = (end.col + 1).min(line_text.chars().count());
+                                let end_byte: usize = line_text
+                                    .char_indices()
+                                    .nth(end_col)
+                                    .map(|(i, _)| i)
+                                    .unwrap_or(line_text.len());
+                                let end_pos = layout.index_to_pos(end_byte as i32);
+                                let end_x = rect.x + end_pos.x() as f64 / pango::SCALE as f64;
+
+                                cr.rectangle(rect.x, y, end_x - rect.x, line_height);
+                                cr.fill().unwrap();
+                            } else {
+                                // Middle lines: full line
+                                let (line_width, _) = layout.pixel_size();
+                                cr.rectangle(rect.x, y, line_width as f64, line_height);
+                                cr.fill().unwrap();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -515,6 +670,8 @@ fn draw_status_line(
     let mode_str = match engine.mode {
         Mode::Normal | Mode::Command | Mode::Search => "NORMAL",
         Mode::Insert => "INSERT",
+        Mode::Visual => "VISUAL",
+        Mode::VisualLine => "VISUAL LINE",
     };
 
     let filename = match engine.file_path() {

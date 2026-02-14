@@ -49,6 +49,10 @@ pub struct Engine {
     pub registers: HashMap<char, (String, bool)>,
     /// Currently selected register for next yank/delete/paste (set by "x prefix).
     pub selected_register: Option<char>,
+
+    // --- Visual mode state ---
+    /// Visual mode anchor point (where visual selection started).
+    pub visual_anchor: Option<Cursor>,
 }
 
 impl Engine {
@@ -79,6 +83,7 @@ impl Engine {
             pending_key: None,
             registers: HashMap::new(),
             selected_register: None,
+            visual_anchor: None,
         }
     }
 
@@ -709,6 +714,9 @@ impl Engine {
             Mode::Search => {
                 self.handle_search_key(key_name, unicode);
             }
+            Mode::Visual | Mode::VisualLine => {
+                action = self.handle_visual_key(key_name, unicode, ctrl, &mut changed);
+            }
         }
 
         if changed {
@@ -926,6 +934,14 @@ impl Engine {
             }
             Some('n') => self.search_next(),
             Some('N') => self.search_prev(),
+            Some('v') => {
+                self.mode = Mode::Visual;
+                self.visual_anchor = Some(self.view().cursor);
+            }
+            Some('V') => {
+                self.mode = Mode::VisualLine;
+                self.visual_anchor = Some(self.view().cursor);
+            }
             Some(':') => {
                 self.mode = Mode::Command;
                 self.command_buffer.clear();
@@ -1176,6 +1192,310 @@ impl Engine {
                 }
             }
         }
+    }
+
+    fn handle_visual_key(
+        &mut self,
+        key_name: &str,
+        unicode: Option<char>,
+        ctrl: bool,
+        changed: &mut bool,
+    ) -> EngineAction {
+        // Handle Escape to exit visual mode
+        if key_name == "Escape" {
+            self.mode = Mode::Normal;
+            self.visual_anchor = None;
+            return EngineAction::None;
+        }
+
+        // Handle mode switching: v toggles to Visual, V toggles to VisualLine
+        if let Some(ch) = unicode {
+            match ch {
+                'v' => {
+                    if self.mode == Mode::Visual {
+                        // Exit to normal mode
+                        self.mode = Mode::Normal;
+                        self.visual_anchor = None;
+                    } else {
+                        // Switch to Visual mode, preserve anchor
+                        self.mode = Mode::Visual;
+                    }
+                    return EngineAction::None;
+                }
+                'V' => {
+                    if self.mode == Mode::VisualLine {
+                        // Exit to normal mode
+                        self.mode = Mode::Normal;
+                        self.visual_anchor = None;
+                    } else {
+                        // Switch to VisualLine mode, preserve anchor
+                        self.mode = Mode::VisualLine;
+                    }
+                    return EngineAction::None;
+                }
+                _ => {}
+            }
+        }
+
+        // Handle operators: d (delete), y (yank), c (change)
+        if let Some(ch) = unicode {
+            match ch {
+                'd' => {
+                    self.delete_visual_selection(changed);
+                    return EngineAction::None;
+                }
+                'y' => {
+                    self.yank_visual_selection();
+                    return EngineAction::None;
+                }
+                'c' => {
+                    self.change_visual_selection(changed);
+                    return EngineAction::None;
+                }
+                _ => {}
+            }
+        }
+
+        // Handle navigation keys (extend selection)
+        // These use the same movement logic as normal mode
+        if ctrl {
+            match key_name {
+                "d" => {
+                    let half = self.viewport_lines() / 2;
+                    let max_line = self.buffer().len_lines().saturating_sub(1);
+                    self.view_mut().cursor.line = (self.view().cursor.line + half).min(max_line);
+                    self.clamp_cursor_col();
+                    return EngineAction::None;
+                }
+                "u" => {
+                    let half = self.viewport_lines() / 2;
+                    self.view_mut().cursor.line = self.view().cursor.line.saturating_sub(half);
+                    self.clamp_cursor_col();
+                    return EngineAction::None;
+                }
+                "f" => {
+                    let viewport = self.viewport_lines();
+                    let max_line = self.buffer().len_lines().saturating_sub(1);
+                    self.view_mut().cursor.line =
+                        (self.view().cursor.line + viewport).min(max_line);
+                    self.clamp_cursor_col();
+                    return EngineAction::None;
+                }
+                "b" => {
+                    let viewport = self.viewport_lines();
+                    self.view_mut().cursor.line = self.view().cursor.line.saturating_sub(viewport);
+                    self.clamp_cursor_col();
+                    return EngineAction::None;
+                }
+                _ => {}
+            }
+        }
+
+        // Handle multi-key sequences (gg, {, })
+        if let Some(pending) = self.pending_key.take() {
+            if pending == 'g' && unicode == Some('g') {
+                self.view_mut().cursor.line = 0;
+                self.view_mut().cursor.col = 0;
+                return EngineAction::None;
+            }
+        }
+
+        // Single-key navigation
+        match unicode {
+            Some('h') => self.move_left(),
+            Some('j') => self.move_down(),
+            Some('k') => self.move_up(),
+            Some('l') => self.move_right(),
+            Some('w') => self.move_word_forward(),
+            Some('b') => self.move_word_backward(),
+            Some('e') => self.move_word_end(),
+            Some('0') => self.view_mut().cursor.col = 0,
+            Some('$') => {
+                let line = self.view().cursor.line;
+                self.view_mut().cursor.col = self.get_max_cursor_col(line);
+            }
+            Some('g') => {
+                self.pending_key = Some('g');
+            }
+            Some('G') => {
+                let last_line = self.buffer().len_lines().saturating_sub(1);
+                self.view_mut().cursor.line = last_line;
+                self.clamp_cursor_col();
+            }
+            Some('{') => self.move_paragraph_backward(),
+            Some('}') => self.move_paragraph_forward(),
+            _ => match key_name {
+                "Left" => self.move_left(),
+                "Down" => self.move_down(),
+                "Up" => self.move_up(),
+                "Right" => self.move_right(),
+                "Home" => self.view_mut().cursor.col = 0,
+                "End" => {
+                    let line = self.view().cursor.line;
+                    self.view_mut().cursor.col = self.get_max_cursor_col(line);
+                }
+                _ => {}
+            },
+        }
+
+        EngineAction::None
+    }
+
+    // =======================================================================
+    // Visual mode helpers
+    // =======================================================================
+
+    /// Get normalized visual selection range (start, end).
+    /// Start is always before or equal to end.
+    fn get_visual_selection_range(&self) -> Option<(Cursor, Cursor)> {
+        let anchor = self.visual_anchor?;
+        let cursor = self.view().cursor;
+
+        // Normalize so start <= end
+        let (start, end) = if anchor.line < cursor.line
+            || (anchor.line == cursor.line && anchor.col <= cursor.col)
+        {
+            (anchor, cursor)
+        } else {
+            (cursor, anchor)
+        };
+
+        Some((start, end))
+    }
+
+    /// Extract the text from the visual selection.
+    /// Returns (text, is_linewise).
+    fn get_visual_selection_text(&self) -> Option<(String, bool)> {
+        let (start, end) = self.get_visual_selection_range()?;
+
+        match self.mode {
+            Mode::VisualLine => {
+                // Line mode: extract full lines from start.line to end.line (inclusive)
+                let start_char = self.buffer().line_to_char(start.line);
+                let end_line = end.line;
+                let end_char = if end_line + 1 < self.buffer().len_lines() {
+                    self.buffer().line_to_char(end_line + 1)
+                } else {
+                    self.buffer().len_chars()
+                };
+
+                let text = self
+                    .buffer()
+                    .content
+                    .slice(start_char..end_char)
+                    .to_string();
+
+                // Ensure it ends with newline for linewise
+                let text = if text.ends_with('\n') {
+                    text
+                } else {
+                    format!("{}\n", text)
+                };
+
+                Some((text, true))
+            }
+            Mode::Visual => {
+                // Character mode: extract from start to end (inclusive)
+                let start_char = self.buffer().line_to_char(start.line) + start.col;
+                let end_char = self.buffer().line_to_char(end.line) + end.col;
+
+                // Include the character at the end position (Vim-like inclusive)
+                let end_char_inclusive = (end_char + 1).min(self.buffer().len_chars());
+
+                let text = self
+                    .buffer()
+                    .content
+                    .slice(start_char..end_char_inclusive)
+                    .to_string();
+
+                Some((text, false))
+            }
+            _ => None,
+        }
+    }
+
+    fn yank_visual_selection(&mut self) {
+        if let Some((text, is_linewise)) = self.get_visual_selection_text() {
+            // Store in selected register (or unnamed register)
+            let reg = self.selected_register.unwrap_or('"');
+            self.registers.insert(reg, (text.clone(), is_linewise));
+
+            // Also store in unnamed register if we used a named one
+            if reg != '"' {
+                self.registers.insert('"', (text, is_linewise));
+            }
+
+            self.selected_register = None;
+            self.message = format!("{} yanked", if is_linewise { "Line(s)" } else { "Text" });
+        }
+
+        // Exit visual mode
+        self.mode = Mode::Normal;
+        self.visual_anchor = None;
+    }
+
+    fn delete_visual_selection(&mut self, changed: &mut bool) {
+        if let Some((text, is_linewise)) = self.get_visual_selection_text() {
+            // Store in register
+            let reg = self.selected_register.unwrap_or('"');
+            self.registers.insert(reg, (text.clone(), is_linewise));
+            if reg != '"' {
+                self.registers.insert('"', (text, is_linewise));
+            }
+            self.selected_register = None;
+
+            // Delete the selection
+            let (start, end) = self.get_visual_selection_range().unwrap();
+
+            self.start_undo_group();
+
+            match self.mode {
+                Mode::VisualLine => {
+                    // Delete full lines
+                    let start_char = self.buffer().line_to_char(start.line);
+                    let end_char = if end.line + 1 < self.buffer().len_lines() {
+                        self.buffer().line_to_char(end.line + 1)
+                    } else {
+                        self.buffer().len_chars()
+                    };
+
+                    self.delete_with_undo(start_char, end_char);
+
+                    // Position cursor at start of line
+                    self.view_mut().cursor.line = start.line;
+                    self.view_mut().cursor.col = 0;
+                }
+                Mode::Visual => {
+                    // Delete characters
+                    let start_char = self.buffer().line_to_char(start.line) + start.col;
+                    let end_char = self.buffer().line_to_char(end.line) + end.col + 1;
+
+                    self.delete_with_undo(start_char, end_char.min(self.buffer().len_chars()));
+
+                    // Position cursor at start
+                    self.view_mut().cursor = start;
+                }
+                _ => {}
+            }
+
+            self.finish_undo_group();
+            *changed = true;
+            self.clamp_cursor_col();
+        }
+
+        // Exit visual mode
+        self.mode = Mode::Normal;
+        self.visual_anchor = None;
+    }
+
+    fn change_visual_selection(&mut self, changed: &mut bool) {
+        // Change is like delete, but then enter insert mode
+        self.delete_visual_selection(changed);
+
+        // The delete already finished the undo group and set mode to Normal
+        // Now start a new undo group for the insert mode typing
+        self.start_undo_group();
+        self.mode = Mode::Insert;
     }
 
     fn execute_command(&mut self, cmd: &str) -> EngineAction {
@@ -2698,7 +3018,7 @@ mod tests {
 
     #[test]
     fn test_list_buffers() {
-        let mut engine = Engine::new();
+        let engine = Engine::new();
         let listing = engine.list_buffers();
         assert!(listing.contains("[No Name]"));
     }
@@ -3158,5 +3478,333 @@ mod tests {
         let (content, is_linewise) = engine.registers.get(&'"').unwrap();
         assert_eq!(content, "last\n");
         assert!(is_linewise);
+    }
+
+    // --- Visual Mode Tests ---
+
+    #[test]
+    fn test_enter_visual_mode() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello world");
+        engine.update_syntax();
+
+        // Enter visual mode with v
+        press_char(&mut engine, 'v');
+        assert_eq!(engine.mode, Mode::Visual);
+        assert!(engine.visual_anchor.is_some());
+        assert_eq!(engine.visual_anchor.unwrap().line, 0);
+        assert_eq!(engine.visual_anchor.unwrap().col, 0);
+    }
+
+    #[test]
+    fn test_enter_visual_line_mode() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "line1\nline2");
+        engine.update_syntax();
+
+        // Enter visual line mode with V
+        press_char(&mut engine, 'V');
+        assert_eq!(engine.mode, Mode::VisualLine);
+        assert!(engine.visual_anchor.is_some());
+    }
+
+    #[test]
+    fn test_visual_mode_escape_exits() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "test");
+        engine.update_syntax();
+
+        press_char(&mut engine, 'v');
+        assert_eq!(engine.mode, Mode::Visual);
+
+        press_special(&mut engine, "Escape");
+        assert_eq!(engine.mode, Mode::Normal);
+        assert!(engine.visual_anchor.is_none());
+    }
+
+    #[test]
+    fn test_visual_yank_forward() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello world");
+        engine.update_syntax();
+
+        // Select "hello" (5 chars)
+        press_char(&mut engine, 'v');
+        for _ in 0..4 {
+            press_char(&mut engine, 'l');
+        }
+
+        // Yank
+        press_char(&mut engine, 'y');
+
+        // Check register
+        let (content, is_linewise) = engine.registers.get(&'"').unwrap();
+        assert_eq!(content, "hello");
+        assert!(!is_linewise);
+
+        // Should be back in normal mode
+        assert_eq!(engine.mode, Mode::Normal);
+        assert!(engine.visual_anchor.is_none());
+    }
+
+    #[test]
+    fn test_visual_yank_backward() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello world");
+        engine.update_syntax();
+
+        // Move to 'w' (position 6)
+        for _ in 0..6 {
+            press_char(&mut engine, 'l');
+        }
+
+        // Select backward to 'h'
+        press_char(&mut engine, 'v');
+        for _ in 0..6 {
+            press_char(&mut engine, 'h');
+        }
+
+        // Yank
+        press_char(&mut engine, 'y');
+
+        // Should yank "hello " (anchor at 6, cursor at 0, inclusive)
+        let (content, _) = engine.registers.get(&'"').unwrap();
+        assert_eq!(content, "hello w");
+    }
+
+    #[test]
+    fn test_visual_delete() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello world");
+        engine.update_syntax();
+
+        // Select "hello"
+        press_char(&mut engine, 'v');
+        for _ in 0..4 {
+            press_char(&mut engine, 'l');
+        }
+
+        // Delete
+        press_char(&mut engine, 'd');
+
+        assert_eq!(engine.buffer().to_string(), " world");
+        assert_eq!(engine.mode, Mode::Normal);
+
+        // Check register
+        let (content, _) = engine.registers.get(&'"').unwrap();
+        assert_eq!(content, "hello");
+    }
+
+    #[test]
+    fn test_visual_line_yank() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "line1\nline2\nline3");
+        engine.update_syntax();
+
+        // Select 2 lines
+        press_char(&mut engine, 'V');
+        press_char(&mut engine, 'j');
+
+        // Yank
+        press_char(&mut engine, 'y');
+
+        let (content, is_linewise) = engine.registers.get(&'"').unwrap();
+        assert_eq!(content, "line1\nline2\n");
+        assert!(is_linewise);
+    }
+
+    #[test]
+    fn test_visual_line_delete() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "line1\nline2\nline3");
+        engine.update_syntax();
+
+        // Select middle line
+        press_char(&mut engine, 'j');
+        press_char(&mut engine, 'V');
+
+        // Delete
+        press_char(&mut engine, 'd');
+
+        assert_eq!(engine.buffer().to_string(), "line1\nline3");
+        assert_eq!(engine.view().cursor.line, 1); // cursor at start of next line
+        assert_eq!(engine.view().cursor.col, 0);
+    }
+
+    #[test]
+    fn test_visual_change() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello world");
+        engine.update_syntax();
+
+        // Select "hello"
+        press_char(&mut engine, 'v');
+        for _ in 0..4 {
+            press_char(&mut engine, 'l');
+        }
+
+        // Change (should delete and enter insert mode)
+        press_char(&mut engine, 'c');
+
+        assert_eq!(engine.buffer().to_string(), " world");
+        assert_eq!(engine.mode, Mode::Insert);
+        assert_eq!(engine.view().cursor.col, 0);
+
+        // Type replacement
+        for ch in "hi".chars() {
+            press_char(&mut engine, ch);
+        }
+        press_special(&mut engine, "Escape");
+
+        assert_eq!(engine.buffer().to_string(), "hi world");
+    }
+
+    #[test]
+    fn test_visual_line_change() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "line1\nline2\nline3");
+        engine.update_syntax();
+
+        press_char(&mut engine, 'V');
+        press_char(&mut engine, 'c');
+
+        assert_eq!(engine.buffer().to_string(), "line2\nline3");
+        assert_eq!(engine.mode, Mode::Insert);
+    }
+
+    #[test]
+    fn test_visual_mode_navigation() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello world");
+        engine.update_syntax();
+
+        press_char(&mut engine, 'v');
+        assert_eq!(engine.view().cursor.col, 0);
+
+        // Move right extends selection
+        press_char(&mut engine, 'l');
+        assert_eq!(engine.view().cursor.col, 1);
+        assert_eq!(engine.mode, Mode::Visual); // still in visual mode
+
+        press_char(&mut engine, 'l');
+        press_char(&mut engine, 'l');
+        assert_eq!(engine.view().cursor.col, 3);
+    }
+
+    #[test]
+    fn test_visual_mode_switching() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "line1\nline2");
+        engine.update_syntax();
+
+        // Start in character visual
+        press_char(&mut engine, 'v');
+        assert_eq!(engine.mode, Mode::Visual);
+
+        // Switch to line visual
+        press_char(&mut engine, 'V');
+        assert_eq!(engine.mode, Mode::VisualLine);
+        assert!(engine.visual_anchor.is_some()); // anchor preserved
+
+        // Press V again to exit
+        press_char(&mut engine, 'V');
+        assert_eq!(engine.mode, Mode::Normal);
+        assert!(engine.visual_anchor.is_none());
+    }
+
+    #[test]
+    fn test_visual_mode_toggle_with_v() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "test");
+        engine.update_syntax();
+
+        // Enter visual mode
+        press_char(&mut engine, 'v');
+        assert_eq!(engine.mode, Mode::Visual);
+
+        // Press v again to exit
+        press_char(&mut engine, 'v');
+        assert_eq!(engine.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn test_visual_multiline_selection() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "line1\nline2\nline3");
+        engine.update_syntax();
+
+        // Select from beginning of line1 to middle of line2
+        press_char(&mut engine, 'v');
+        press_char(&mut engine, 'j'); // move to line 2
+        for _ in 0..2 {
+            press_char(&mut engine, 'l'); // move right 2 chars
+        }
+
+        press_char(&mut engine, 'y');
+
+        let (content, _) = engine.registers.get(&'"').unwrap();
+        assert_eq!(content, "line1\nlin");
+    }
+
+    #[test]
+    fn test_visual_with_named_register() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello world");
+        engine.update_syntax();
+
+        // Select text and yank to register 'a'
+        press_char(&mut engine, '"');
+        press_char(&mut engine, 'a');
+        press_char(&mut engine, 'v');
+        for _ in 0..4 {
+            press_char(&mut engine, 'l');
+        }
+        press_char(&mut engine, 'y');
+
+        // Check register 'a'
+        let (content, _) = engine.registers.get(&'a').unwrap();
+        assert_eq!(content, "hello");
+
+        // Also in unnamed register
+        let (content, _) = engine.registers.get(&'"').unwrap();
+        assert_eq!(content, "hello");
+    }
+
+    #[test]
+    fn test_visual_word_motion() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello world foo bar");
+        engine.update_syntax();
+
+        // Select with word motion
+        press_char(&mut engine, 'v');
+        press_char(&mut engine, 'w'); // cursor moves to 'w' (start of "world")
+        press_char(&mut engine, 'w'); // cursor moves to 'f' (start of "foo")
+
+        press_char(&mut engine, 'y');
+
+        // Visual mode is inclusive, so we get from 'h' to 'f' inclusive
+        let (content, _) = engine.registers.get(&'"').unwrap();
+        assert_eq!(content, "hello world f");
+    }
+
+    #[test]
+    fn test_visual_line_multiple_lines() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "a\nb\nc\nd\ne");
+        engine.update_syntax();
+
+        // Move to line 2 (b)
+        press_char(&mut engine, 'j');
+
+        // Select 3 lines (b, c, d)
+        press_char(&mut engine, 'V');
+        press_char(&mut engine, 'j');
+        press_char(&mut engine, 'j');
+
+        press_char(&mut engine, 'd');
+
+        assert_eq!(engine.buffer().to_string(), "a\ne");
+        assert_eq!(engine.view().cursor.line, 1);
     }
 }
