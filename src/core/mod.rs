@@ -1,11 +1,14 @@
 pub mod buffer;
+pub mod buffer_manager;
 pub mod cursor;
 pub mod engine;
 pub mod mode;
 pub mod syntax;
+pub mod tab;
+pub mod view;
+pub mod window;
 
-pub use buffer::Buffer;
 pub use cursor::Cursor;
 pub use engine::Engine;
 pub use mode::Mode;
-pub use syntax::Syntax;
+pub use window::{WindowId, WindowRect};

@@ -2,4 +2,6 @@
 pub enum Mode {
     Normal,
     Insert,
+    Command,
+    Search,
 }

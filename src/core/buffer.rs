@@ -1,21 +1,49 @@
+use std::fmt;
+use std::fs;
+use std::io;
+use std::path::Path;
+
 use ropey::Rope;
+
+/// Unique identifier for a buffer within the editor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BufferId(pub usize);
 
 #[derive(Debug, Clone)]
 pub struct Buffer {
+    #[allow(dead_code)]
+    pub id: BufferId,
     pub content: Rope,
 }
 
 impl Buffer {
-    pub fn new() -> Self {
+    pub fn new(id: BufferId) -> Self {
         Self {
+            id,
             content: Rope::new(),
         }
     }
 
-    pub fn from_text(text: &str) -> Self {
+    #[allow(dead_code)]
+    pub fn from_text(id: BufferId, text: &str) -> Self {
         Self {
+            id,
             content: Rope::from_str(text),
         }
+    }
+
+    /// Load buffer contents from a file. Returns an io::Error if reading fails.
+    pub fn from_file(id: BufferId, path: &Path) -> Result<Self, io::Error> {
+        let text = fs::read_to_string(path)?;
+        Ok(Self {
+            id,
+            content: Rope::from_str(&text),
+        })
+    }
+
+    /// Write buffer contents to a file.
+    pub fn save_to_file(&self, path: &Path) -> Result<(), io::Error> {
+        fs::write(path, self.to_string())
     }
 
     pub fn insert(&mut self, char_idx: usize, text: &str) {
@@ -30,6 +58,7 @@ impl Buffer {
         }
     }
 
+    #[allow(dead_code)]
     pub fn len_chars(&self) -> usize {
         self.content.len_chars()
     }
@@ -38,8 +67,34 @@ impl Buffer {
         self.content.line_to_char(line_idx)
     }
 
-    pub fn to_string(&self) -> String {
-        self.content.to_string()
+    /// Returns the number of visible lines in the buffer.
+    ///
+    /// Ropey's `len_lines()` counts a trailing `\n` as starting a new (empty)
+    /// line. For cursor navigation we want the count of lines that actually
+    /// contain content, so we subtract 1 when the text ends with `\n`.
+    pub fn len_lines(&self) -> usize {
+        let n = self.content.len_lines();
+        if n > 1
+            && self.content.len_chars() > 0
+            && self.content.char(self.content.len_chars() - 1) == '\n'
+        {
+            n - 1
+        } else {
+            n
+        }
+    }
+
+    pub fn line_len_chars(&self, line_idx: usize) -> usize {
+        if line_idx >= self.len_lines() {
+            return 0;
+        }
+        self.content.line(line_idx).len_chars()
+    }
+}
+
+impl fmt::Display for Buffer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.content)
     }
 }
 
@@ -49,7 +104,7 @@ mod tests {
 
     #[test]
     fn test_buffer_editing() {
-        let mut buffer = Buffer::new();
+        let mut buffer = Buffer::new(BufferId(1));
         buffer.insert(0, "Hello");
         assert_eq!(buffer.to_string(), "Hello");
 
