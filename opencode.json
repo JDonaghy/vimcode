@@ -1,0 +1,11 @@
+{
+  "mode": {
+    "build": {
+      "model": "anthropic/claude-3-5-sonnet-latest"
+    },
+    "plan": {
+      "model": "anthropic/claude-3-5-sonnet-latest"
+    }
+  }
+}
+

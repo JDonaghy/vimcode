@@ -43,6 +43,12 @@ pub struct Engine {
     pub search_index: Option<usize>,
     /// Pending key for multi-key sequences (e.g. 'g' for gg, 'd' for dd).
     pub pending_key: Option<char>,
+
+    // --- Registers (yank/delete storage) ---
+    /// Named registers: 'a'-'z' plus '"' (unnamed default). Value is (content, is_linewise).
+    pub registers: HashMap<char, (String, bool)>,
+    /// Currently selected register for next yank/delete/paste (set by "x prefix).
+    pub selected_register: Option<char>,
 }
 
 impl Engine {
@@ -71,6 +77,8 @@ impl Engine {
             search_matches: Vec::new(),
             search_index: None,
             pending_key: None,
+            registers: HashMap::new(),
+            selected_register: None,
         }
     }
 
@@ -858,6 +866,17 @@ impl Engine {
                 if max_col > 0 || self.buffer().line_len_chars(line) > 0 {
                     let char_idx = self.buffer().line_to_char(line) + col;
                     if char_idx < self.buffer().len_chars() {
+                        // Save deleted char to register (characterwise)
+                        let deleted_char: String = self
+                            .buffer()
+                            .content
+                            .slice(char_idx..char_idx + 1)
+                            .chars()
+                            .collect();
+                        let reg = self.active_register();
+                        self.set_register(reg, deleted_char, false);
+                        self.clear_selected_register();
+
                         self.start_undo_group();
                         self.delete_with_undo(char_idx, char_idx + 1);
                         self.finish_undo_group();
@@ -887,6 +906,21 @@ impl Engine {
             }
             Some('u') => {
                 self.undo();
+            }
+            Some('y') => {
+                self.pending_key = Some('y');
+            }
+            Some('Y') => {
+                self.yank_current_line();
+            }
+            Some('p') => {
+                self.paste_after(changed);
+            }
+            Some('P') => {
+                self.paste_before(changed);
+            }
+            Some('"') => {
+                self.pending_key = Some('"');
             }
             Some('n') => self.search_next(),
             Some('N') => self.search_prev(),
@@ -940,6 +974,19 @@ impl Engine {
                     self.start_undo_group();
                     self.delete_current_line(changed);
                     self.finish_undo_group();
+                }
+            }
+            'y' => {
+                if unicode == Some('y') {
+                    self.yank_current_line();
+                }
+            }
+            '"' => {
+                // Register selection: "x sets selected_register for next operation
+                if let Some(ch) = unicode {
+                    if ch.is_ascii_lowercase() || ch == '"' {
+                        self.selected_register = Some(ch);
+                    }
                 }
             }
             '\x17' => {
@@ -1530,6 +1577,23 @@ impl Engine {
             return;
         }
 
+        // Save deleted line to register (linewise)
+        let deleted_content: String = self
+            .buffer()
+            .content
+            .slice(line_start..line_start + line_char_len)
+            .chars()
+            .collect();
+        // Ensure linewise content ends with newline
+        let deleted_content = if deleted_content.ends_with('\n') {
+            deleted_content
+        } else {
+            format!("{}\n", deleted_content)
+        };
+        let reg = self.active_register();
+        self.set_register(reg, deleted_content, true);
+        self.clear_selected_register();
+
         let line_content = self.buffer().content.line(line);
         let ends_with_newline = line_content.chars().last() == Some('\n');
 
@@ -1567,6 +1631,17 @@ impl Engine {
         };
 
         if char_idx < delete_end {
+            // Save deleted text to register (characterwise)
+            let deleted_content: String = self
+                .buffer()
+                .content
+                .slice(char_idx..delete_end)
+                .chars()
+                .collect();
+            let reg = self.active_register();
+            self.set_register(reg, deleted_content, false);
+            self.clear_selected_register();
+
             self.delete_with_undo(char_idx, delete_end);
             self.clamp_cursor_col();
             *changed = true;
@@ -1629,6 +1704,148 @@ impl Engine {
         if self.view().cursor.col > max {
             self.view_mut().cursor.col = max;
         }
+    }
+
+    // --- Register operations ---
+
+    /// Returns the active register name (selected or default '"').
+    fn active_register(&self) -> char {
+        self.selected_register.unwrap_or('"')
+    }
+
+    /// Sets a register's content. `is_linewise` affects paste behavior.
+    fn set_register(&mut self, reg: char, content: String, is_linewise: bool) {
+        self.registers.insert(reg, (content.clone(), is_linewise));
+        // Also copy to unnamed register if using a named register
+        if reg != '"' {
+            self.registers.insert('"', (content, is_linewise));
+        }
+    }
+
+    /// Gets a register's content and linewise flag.
+    fn get_register(&self, reg: char) -> Option<&(String, bool)> {
+        self.registers.get(&reg)
+    }
+
+    /// Clears the selected register after an operation.
+    fn clear_selected_register(&mut self) {
+        self.selected_register = None;
+    }
+
+    /// Yank the current line into the active register (linewise).
+    fn yank_current_line(&mut self) {
+        let line = self.view().cursor.line;
+        let line_start = self.buffer().line_to_char(line);
+        let line_len = self.buffer().line_len_chars(line);
+        let content: String = self
+            .buffer()
+            .content
+            .slice(line_start..line_start + line_len)
+            .chars()
+            .collect();
+
+        // Ensure linewise content ends with newline
+        let content = if content.ends_with('\n') {
+            content
+        } else {
+            format!("{}\n", content)
+        };
+
+        let reg = self.active_register();
+        self.set_register(reg, content, true);
+        self.clear_selected_register();
+        self.message = "1 line yanked".to_string();
+    }
+
+    /// Paste after cursor (p). Linewise pastes below current line.
+    fn paste_after(&mut self, changed: &mut bool) {
+        let reg = self.active_register();
+        let (content, is_linewise) = match self.get_register(reg) {
+            Some((c, l)) => (c.clone(), *l),
+            None => {
+                self.clear_selected_register();
+                return;
+            }
+        };
+
+        self.start_undo_group();
+
+        if is_linewise {
+            // Paste below current line
+            let line = self.view().cursor.line;
+            let line_end = self.buffer().line_to_char(line) + self.buffer().line_len_chars(line);
+            // If current line doesn't end with newline, we need to add one
+            let line_content = self.buffer().content.line(line);
+            if line_content.chars().last() == Some('\n') {
+                self.insert_with_undo(line_end, &content);
+            } else {
+                // Insert newline + content
+                let content_with_newline = format!("\n{}", content);
+                self.insert_with_undo(line_end, &content_with_newline);
+            };
+            // Move cursor to first non-blank of new line
+            self.view_mut().cursor.line += 1;
+            self.view_mut().cursor.col = 0;
+        } else {
+            // Paste after cursor position
+            let line = self.view().cursor.line;
+            let col = self.view().cursor.col;
+            let char_idx = self.buffer().line_to_char(line) + col;
+            // Insert after current char (if line not empty)
+            let insert_pos = if self.buffer().line_len_chars(line) > 0 {
+                char_idx + 1
+            } else {
+                char_idx
+            };
+            self.insert_with_undo(insert_pos, &content);
+            // Move cursor to end of pasted text (last char)
+            let paste_len = content.chars().count();
+            if paste_len > 0 {
+                self.view_mut().cursor.col = col + paste_len;
+            }
+        }
+
+        self.finish_undo_group();
+        self.clear_selected_register();
+        *changed = true;
+    }
+
+    /// Paste before cursor (P). Linewise pastes above current line.
+    fn paste_before(&mut self, changed: &mut bool) {
+        let reg = self.active_register();
+        let (content, is_linewise) = match self.get_register(reg) {
+            Some((c, l)) => (c.clone(), *l),
+            None => {
+                self.clear_selected_register();
+                return;
+            }
+        };
+
+        self.start_undo_group();
+
+        if is_linewise {
+            // Paste above current line
+            let line = self.view().cursor.line;
+            let line_start = self.buffer().line_to_char(line);
+            self.insert_with_undo(line_start, &content);
+            // Cursor stays on same line number (which is now the pasted line)
+            self.view_mut().cursor.col = 0;
+        } else {
+            // Paste before cursor position
+            let line = self.view().cursor.line;
+            let col = self.view().cursor.col;
+            let char_idx = self.buffer().line_to_char(line) + col;
+            self.insert_with_undo(char_idx, &content);
+            // Cursor moves to end of pasted text
+            let paste_len = content.chars().count();
+            if paste_len > 0 {
+                self.view_mut().cursor.col = col + paste_len - 1;
+            }
+        }
+
+        self.finish_undo_group();
+        self.clear_selected_register();
+        *changed = true;
     }
 }
 
@@ -2527,5 +2744,225 @@ mod tests {
         press_char(&mut engine, 'u');
         assert_eq!(engine.buffer().to_string(), "hello world");
         assert_eq!(engine.view().cursor.col, 6);
+    }
+
+    // --- Yank/Paste/Register Tests ---
+
+    #[test]
+    fn test_yank_line_yy() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "line1\nline2\nline3");
+        engine.update_syntax();
+
+        // Yank first line with yy
+        press_char(&mut engine, 'y');
+        press_char(&mut engine, 'y');
+
+        // Check register content
+        let (content, is_linewise) = engine.registers.get(&'"').unwrap();
+        assert_eq!(content, "line1\n");
+        assert!(is_linewise);
+        assert!(engine.message.contains("yanked"));
+    }
+
+    #[test]
+    fn test_yank_line_Y() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "first\nsecond");
+        engine.update_syntax();
+
+        press_char(&mut engine, 'j'); // move to line 2
+        press_char(&mut engine, 'Y');
+
+        let (content, is_linewise) = engine.registers.get(&'"').unwrap();
+        assert_eq!(content, "second\n");
+        assert!(is_linewise);
+    }
+
+    #[test]
+    fn test_paste_after_linewise() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "line1\nline2");
+        engine.update_syntax();
+
+        // Yank line1
+        press_char(&mut engine, 'y');
+        press_char(&mut engine, 'y');
+
+        // Paste after (p) - should insert below current line
+        press_char(&mut engine, 'p');
+
+        assert_eq!(engine.buffer().to_string(), "line1\nline1\nline2");
+        assert_eq!(engine.view().cursor.line, 1); // cursor on pasted line
+    }
+
+    #[test]
+    fn test_paste_before_linewise() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "line1\nline2");
+        engine.update_syntax();
+
+        press_char(&mut engine, 'j'); // move to line2
+        press_char(&mut engine, 'y');
+        press_char(&mut engine, 'y'); // yank line2
+
+        press_char(&mut engine, 'k'); // back to line1
+        press_char(&mut engine, 'P'); // paste before
+
+        assert_eq!(engine.buffer().to_string(), "line2\nline1\nline2");
+        assert_eq!(engine.view().cursor.line, 0);
+    }
+
+    #[test]
+    fn test_delete_x_fills_register() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "ABC");
+        engine.update_syntax();
+
+        press_char(&mut engine, 'x'); // delete 'A'
+
+        let (content, is_linewise) = engine.registers.get(&'"').unwrap();
+        assert_eq!(content, "A");
+        assert!(!is_linewise);
+    }
+
+    #[test]
+    fn test_delete_dd_fills_register() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "first\nsecond\nthird");
+        engine.update_syntax();
+
+        press_char(&mut engine, 'j'); // move to "second"
+        press_char(&mut engine, 'd');
+        press_char(&mut engine, 'd'); // delete line
+
+        let (content, is_linewise) = engine.registers.get(&'"').unwrap();
+        assert_eq!(content, "second\n");
+        assert!(is_linewise);
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn test_delete_D_fills_register() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello world");
+        engine.update_syntax();
+
+        press_char(&mut engine, 'l');
+        press_char(&mut engine, 'l'); // cursor on 'l'
+        press_char(&mut engine, 'D'); // delete to end
+
+        let (content, is_linewise) = engine.registers.get(&'"').unwrap();
+        assert_eq!(content, "llo world");
+        assert!(!is_linewise);
+    }
+
+    #[test]
+    fn test_named_register_yank() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "test line");
+        engine.update_syntax();
+
+        // Use "a register
+        press_char(&mut engine, '"');
+        press_char(&mut engine, 'a');
+        press_char(&mut engine, 'y');
+        press_char(&mut engine, 'y');
+
+        // Check 'a' register has content
+        let (content, _) = engine.registers.get(&'a').unwrap();
+        assert_eq!(content, "test line\n");
+
+        // Unnamed register should also have it
+        let (content2, _) = engine.registers.get(&'"').unwrap();
+        assert_eq!(content2, "test line\n");
+    }
+
+    #[test]
+    fn test_named_register_paste() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "AAA\nBBB");
+        engine.update_syntax();
+
+        // Yank to "a
+        press_char(&mut engine, '"');
+        press_char(&mut engine, 'a');
+        press_char(&mut engine, 'y');
+        press_char(&mut engine, 'y');
+
+        // Move down and yank to "b
+        press_char(&mut engine, 'j');
+        press_char(&mut engine, '"');
+        press_char(&mut engine, 'b');
+        press_char(&mut engine, 'y');
+        press_char(&mut engine, 'y');
+
+        // Now paste from "a
+        press_char(&mut engine, '"');
+        press_char(&mut engine, 'a');
+        press_char(&mut engine, 'p');
+
+        assert!(engine.buffer().to_string().contains("AAA"));
+    }
+
+    #[test]
+    fn test_delete_and_paste_workflow() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "line1\nline2\nline3");
+        engine.update_syntax();
+
+        // Delete line2 with dd
+        press_char(&mut engine, 'j');
+        press_char(&mut engine, 'd');
+        press_char(&mut engine, 'd');
+
+        assert_eq!(engine.buffer().to_string(), "line1\nline3");
+
+        // Paste it back
+        press_char(&mut engine, 'p');
+
+        assert_eq!(engine.buffer().to_string(), "line1\nline3\nline2\n");
+    }
+
+    #[test]
+    fn test_x_delete_and_paste() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "ABCD");
+        engine.update_syntax();
+
+        press_char(&mut engine, 'x'); // delete 'A'
+        press_char(&mut engine, 'l');
+        press_char(&mut engine, 'l'); // cursor after 'D'
+        press_char(&mut engine, 'p'); // paste after
+
+        assert_eq!(engine.buffer().to_string(), "BCDA");
+    }
+
+    #[test]
+    fn test_paste_empty_register() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "test");
+        engine.update_syntax();
+
+        // Try to paste from empty register - should do nothing
+        press_char(&mut engine, 'p');
+
+        assert_eq!(engine.buffer().to_string(), "test");
+    }
+
+    #[test]
+    fn test_yank_last_line_no_newline() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "first\nlast");
+        engine.update_syntax();
+
+        press_char(&mut engine, 'j'); // move to "last" (no trailing newline)
+        press_char(&mut engine, 'y');
+        press_char(&mut engine, 'y');
+
+        // Should still be linewise with newline added
+        let (content, is_linewise) = engine.registers.get(&'"').unwrap();
+        assert_eq!(content, "last\n");
+        assert!(is_linewise);
     }
 }

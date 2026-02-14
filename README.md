@@ -25,9 +25,11 @@ VimCode now supports a functional Vim-like workflow with **multiple buffers, spl
 - **File I/O** — Open from CLI, `:w` save, `:e` open, `:q` quit with dirty-buffer protection
 - **Navigation** — `h`/`j`/`k`/`l`, `w`/`b`/`e` words, `gg`/`G`, `0`/`$`, `Ctrl-D`/`Ctrl-U`
 - **Editing** — `i`/`a`/`o`/`O`/`I`/`A` insert modes, `x`/`dd`/`D` delete
+- **Yank/Paste** — `yy`/`Y` yank line, `p`/`P` paste, `"x` named registers
+- **Undo/Redo** — `u` undo, `Ctrl-r` redo with Vim-style undo groups
 - **Search** — `/` forward search, `n`/`N` next/previous match
 - **Syntax highlighting** — Tree-sitter for Rust
-- **65 passing tests**, clippy-clean
+- **88 passing tests**, clippy-clean
 
 ### Key Commands
 
@@ -38,7 +40,12 @@ VimCode now supports a functional Vim-like workflow with **multiple buffers, spl
 | `gg` `G` | File start/end |
 | `0` `$` | Line start/end |
 | `i` `I` `a` `A` `o` `O` | Enter insert mode |
-| `x` `dd` `D` | Delete char/line/to-EOL |
+| `x` `dd` `D` | Delete char/line/to-EOL (fills register) |
+| `yy` `Y` | Yank line |
+| `p` `P` | Paste after/before |
+| `"x` | Select register for next op |
+| `u` | Undo |
+| `Ctrl-r` | Redo |
 | `n` `N` | Search next/prev |
 | `gt` `gT` | Next/prev tab |
 | `Ctrl-W s` | Horizontal split |
@@ -62,8 +69,8 @@ VimCode now supports a functional Vim-like workflow with **multiple buffers, spl
 ## Roadmap
 
 ### High Priority (Core Vim)
-- [ ] Undo/redo (`u`, `Ctrl-r`)
-- [ ] Yank and paste (`y`, `yy`, `p`, `P`)
+- [x] Undo/redo (`u`, `Ctrl-r`) ✓
+- [x] Yank and paste (`y`, `yy`, `Y`, `p`, `P`) ✓
 - [ ] Visual mode (`v`, `V`, `Ctrl-V`)
 - [ ] More motions (`f`/`F`/`t`/`T`, `%`)
 - [ ] Change commands (`c`, `cw`, `C`)
@@ -74,7 +81,7 @@ VimCode now supports a functional Vim-like workflow with **multiple buffers, spl
 ### Medium Priority
 - [x] Multiple buffers / tabs ✓
 - [x] Split windows ✓
-- [ ] Registers
+- [x] Registers (`"a`-`"z`) ✓
 - [ ] Marks (`m`, `'`)
 - [ ] Macros (`q`, `@`)
 - [ ] `:s` substitute
@@ -142,7 +149,7 @@ sudo pacman -S gtk4 pango
 ```bash
 cargo build              # Compile
 cargo run -- <file>      # Run with a file
-cargo test               # Run 65 tests
+cargo test               # Run 88 tests
 cargo clippy -- -D warnings   # Lint
 cargo fmt                # Format
 ```

@@ -42,7 +42,10 @@ Engine
 │           ├── file_path: Option<PathBuf>
 │           ├── dirty: bool
 │           ├── syntax: Syntax         # Tree-sitter parser
-│           └── highlights: Vec<(usize, usize, String)>
+│           ├── highlights: Vec<(usize, usize, String)>
+│           ├── undo_stack: Vec<UndoEntry>    # Undo history
+│           ├── redo_stack: Vec<UndoEntry>    # Redo history
+│           └── current_undo_group: Option<UndoEntry>
 │
 ├── windows: HashMap<WindowId, Window> # All windows across all tabs
 │   └── Window
@@ -54,13 +57,16 @@ Engine
 │       ├── layout: WindowLayout       # Binary split tree
 │       └── active_window: WindowId
 │
+├── registers: HashMap<char, (String, bool)>  # Yank/delete storage (content, is_linewise)
+├── selected_register: Option<char>           # Set by "x prefix
+│
 └── Global state
     ├── mode: Mode                     # Normal, Insert, Command, Search
     ├── command_buffer: String         # Current :command or /search
     ├── message: String                # Status message
     ├── search_query: String
     ├── search_matches: Vec<(usize, usize)>
-    └── pending_key: Option<char>      # For multi-key sequences (gg, dd)
+    └── pending_key: Option<char>      # For multi-key sequences (gg, dd, "x)
 ```
 
 ### Key Concepts
@@ -79,7 +85,7 @@ src/
 ├── main.rs                 # GTK4/Relm4 UI, rendering (~550 lines)
 └── core/
     ├── mod.rs              # Module declarations
-    ├── engine.rs           # Engine: orchestrates everything (~2200 lines)
+    ├── engine.rs           # Engine: orchestrates everything (~2950 lines)
     ├── buffer.rs           # Buffer: Rope-based text storage
     ├── buffer_manager.rs   # BufferManager: owns all buffers
     ├── view.rs             # View: per-window cursor/scroll
@@ -102,7 +108,7 @@ cargo run -- <file>      # Run with a file
 
 ### Testing Strategy
 ```bash
-cargo test                           # Run all 65 tests
+cargo test                           # Run all 88 tests
 cargo test test_buffer_editing       # Run single test
 cargo test core::engine::tests::     # Run all engine tests
 ```

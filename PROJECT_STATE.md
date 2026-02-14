@@ -6,9 +6,9 @@ Last updated: February 2026
 
 VimCode is a Vim-like code editor built in Rust with GTK4/Relm4. The goal is to create a VS Code-like editor with a first-class Vim mode that is cross-platform, fast, and does not require GPU acceleration.
 
-## Current Status: Undo/Redo + Multiple Buffers, Windows, and Tabs
+## Current Status: Yank/Paste with Named Registers
 
-The editor now supports undo/redo (`u` / `Ctrl-r`) with Vim-style undo groups, plus the full buffer/window/tab model.
+The editor now supports yank and paste (`y`, `yy`, `Y`, `p`, `P`) with named registers (`"a`-`"z`), plus undo/redo and the full buffer/window/tab model.
 
 ### What Works Today
 
@@ -74,6 +74,11 @@ The editor now supports undo/redo (`u` / `Ctrl-r`) with Vim-style undo groups, p
 | `u` | Undo |
 | `Ctrl-r` | Redo |
 | `n` `N` | Next/previous search match |
+| `y` | Start yank (followed by `y` for line) |
+| `yy` `Y` | Yank current line |
+| `p` | Paste after cursor/below line |
+| `P` | Paste before cursor/above line |
+| `"x` | Select register `x` for next yank/delete/paste |
 | `/` | Enter search mode |
 | `:` | Enter command mode |
 | `Ctrl-D` `Ctrl-U` | Half-page down/up |
@@ -118,8 +123,16 @@ The editor now supports undo/redo (`u` / `Ctrl-r`) with Vim-style undo groups, p
 - Command line: shows `:cmd` or `/query` during input, status messages otherwise
 - Syntax highlighting for Rust (Tree-sitter)
 
+**Yank/Paste/Registers**
+- `yy` / `Y` — Yank current line (linewise)
+- `p` — Paste after cursor (characterwise) or below line (linewise)
+- `P` — Paste before cursor or above line
+- `"x` prefix — Select named register (`a`-`z`) for next operation
+- Delete operations (`x`, `dd`, `D`) also fill the register
+- Unnamed register (`"`) always receives deleted/yanked text
+
 **Test Suite**
-- 65 passing tests covering all major functionality
+- 88 passing tests covering all major functionality
 - Clippy-clean, formatted with rustfmt
 
 ---
@@ -189,7 +202,7 @@ Engine
 ### High Priority (Core Vim Experience)
 
 - [x] **Undo/redo** (`u`, `Ctrl-r`) — DONE
-- [ ] **Yank and paste** (`y`, `yy`, `p`, `P`) — essential clipboard operations
+- [x] **Yank and paste** (`y`, `yy`, `Y`, `p`, `P`) with named registers — DONE
 - [ ] **Visual mode** (character `v`, line `V`, block `Ctrl-V`)
 - [ ] **More motions** (`ge`, `f`/`F`/`t`/`T` find char, `%` matching bracket)
 - [ ] **More delete/change** (`dw`, `cw`, `c`, `C`, `s`, `S`)
@@ -201,7 +214,7 @@ Engine
 ### Medium Priority (Editor Features)
 
 - [x] **Multiple buffers / tabs** — DONE
-- [ ] **Registers** (named clipboards)
+- [x] **Registers** (named clipboards `"a`-`"z`) — DONE
 - [ ] **Marks** (`m` to set, `'` to jump)
 - [ ] **Macros** (`q` to record, `@` to play)
 - [ ] **`:s` substitute** command
@@ -254,7 +267,7 @@ Engine
 ```bash
 cargo build              # Compile
 cargo run -- <file>      # Run with a file
-cargo test               # Run all 75 tests
+cargo test               # Run all 88 tests
 cargo test <name>        # Run specific test
 cargo clippy -- -D warnings   # Lint (must pass)
 cargo fmt                # Format code
@@ -264,7 +277,33 @@ cargo fmt                # Format code
 
 ## Session History
 
-### Session: Undo/Redo (Current)
+### Session: Yank/Paste with Registers (Current)
+
+Implemented Vim-style yank and paste with named registers:
+
+1. **Data structures** (`engine.rs`):
+   - `registers: HashMap<char, (String, bool)>` — stores content and linewise flag
+   - `selected_register: Option<char>` — set by `"x` prefix
+
+2. **Key bindings**:
+   - `yy` / `Y` — Yank current line (linewise)
+   - `p` — Paste after cursor (characterwise) or below line (linewise)
+   - `P` — Paste before cursor or above line
+   - `"x` — Select named register for next operation
+
+3. **Vim-compatible behavior**:
+   - Delete operations (`x`, `dd`, `D`) fill the register
+   - Named register also copies to unnamed register (`"`)
+   - Linewise content always ends with newline
+
+4. **Tests**: 13 new tests (88 total), all passing
+   - Yank: `yy`, `Y`, last line without newline
+   - Paste: `p`/`P` linewise and characterwise
+   - Delete fills register: `x`, `dd`, `D`
+   - Named registers: yank to `"a`, paste from `"a`
+   - Workflow: delete-and-paste, empty register handling
+
+### Session: Undo/Redo
 
 Implemented Vim-style undo/redo with operation-based tracking:
 
