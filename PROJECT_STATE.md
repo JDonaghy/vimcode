@@ -6,9 +6,9 @@ Last updated: February 2026
 
 VimCode is a Vim-like code editor built in Rust with GTK4/Relm4. The goal is to create a VS Code-like editor with a first-class Vim mode that is cross-platform, fast, and does not require GPU acceleration.
 
-## Current Status: Yank/Paste with Named Registers
+## Current Status: Paragraph Navigation
 
-The editor now supports yank and paste (`y`, `yy`, `Y`, `p`, `P`) with named registers (`"a`-`"z`), plus undo/redo and the full buffer/window/tab model.
+The editor now supports paragraph navigation with `{` and `}` keys, building on yank/paste (`y`, `yy`, `Y`, `p`, `P`) with named registers (`"a`-`"z`), undo/redo, and the full buffer/window/tab model.
 
 ### What Works Today
 
@@ -63,6 +63,7 @@ The editor now supports yank and paste (`y`, `yy`, `Y`, `p`, `P`) with named reg
 |-----|--------|
 | `h` `j` `k` `l` | Character/line movement |
 | `w` `b` `e` | Word motions (forward, backward, end) |
+| `{` `}` | Paragraph motions (previous/next empty line) |
 | `0` `$` | Line start/end |
 | `gg` `G` | File start/end |
 | `gt` `gT` | Next/previous tab |
@@ -132,7 +133,7 @@ The editor now supports yank and paste (`y`, `yy`, `Y`, `p`, `P`) with named reg
 - Unnamed register (`"`) always receives deleted/yanked text
 
 **Test Suite**
-- 88 passing tests covering all major functionality
+- 98 passing tests covering all major functionality
 - Clippy-clean, formatted with rustfmt
 
 ---
@@ -149,7 +150,7 @@ vimcode/
     ├── main.rs             # GTK4/Relm4 UI, window, input handling, rendering (~550 lines)
     └── core/               # Platform-agnostic editor logic
         ├── mod.rs          # Module declarations (~15 lines)
-        ├── engine.rs       # Engine struct, orchestrates buffers/windows/tabs (~2200 lines)
+        ├── engine.rs       # Engine struct, orchestrates buffers/windows/tabs (~3150 lines)
         ├── buffer.rs       # Rope-based text storage, file I/O (~120 lines)
         ├── buffer_manager.rs # BufferManager: owns all buffers, tracks recent files (~360 lines)
         ├── cursor.rs       # Cursor position struct (~11 lines)
@@ -159,7 +160,7 @@ vimcode/
         ├── window.rs       # Window, WindowLayout (split tree), WindowRect (~280 lines)
         └── tab.rs          # Tab: window layout collection (~70 lines)
 
-Total: ~3,700 lines of Rust
+Total: ~4,650 lines of Rust
 ```
 
 ### Architecture Rules
@@ -203,6 +204,7 @@ Engine
 
 - [x] **Undo/redo** (`u`, `Ctrl-r`) — DONE
 - [x] **Yank and paste** (`y`, `yy`, `Y`, `p`, `P`) with named registers — DONE
+- [x] **Paragraph navigation** (`{`, `}`) — DONE
 - [ ] **Visual mode** (character `v`, line `V`, block `Ctrl-V`)
 - [ ] **More motions** (`ge`, `f`/`F`/`t`/`T` find char, `%` matching bracket)
 - [ ] **More delete/change** (`dw`, `cw`, `c`, `C`, `s`, `S`)
@@ -267,7 +269,7 @@ Engine
 ```bash
 cargo build              # Compile
 cargo run -- <file>      # Run with a file
-cargo test               # Run all 88 tests
+cargo test               # Run all 98 tests
 cargo test <name>        # Run specific test
 cargo clippy -- -D warnings   # Lint (must pass)
 cargo fmt                # Format code
@@ -277,7 +279,34 @@ cargo fmt                # Format code
 
 ## Session History
 
-### Session: Yank/Paste with Registers (Current)
+### Session: Paragraph Navigation (Current)
+
+Implemented Vim-style paragraph navigation with `{` and `}` keys:
+
+1. **Key bindings** (`engine.rs`):
+   - `{` — Jump backward to previous empty line (line with only whitespace)
+   - `}` — Jump forward to next empty line
+
+2. **Implementation details**:
+   - Empty line defined as: line containing only spaces, tabs, newline, or nothing
+   - Cursor moves to end of empty line (column 0 for truly empty lines)
+   - From an empty line, jumps to next/previous empty line (not stay put)
+   - At beginning/end of file, cursor stays still (no movement)
+   - Navigates consecutive empty lines one at a time
+
+3. **Methods added** (`engine.rs`):
+   - `move_paragraph_forward()` — Navigate to next empty line
+   - `move_paragraph_backward()` — Navigate to previous empty line
+   - `is_line_empty()` — Helper to check if a line is empty/whitespace-only
+
+4. **Tests**: 10 new tests (98 total), all passing
+   - Forward navigation through multiple paragraphs
+   - Backward navigation through multiple paragraphs
+   - Edge cases: EOF, BOF, consecutive empty lines
+   - Starting from an empty line
+   - Empty buffers and single-line buffers
+
+### Session: Yank/Paste with Registers
 
 Implemented Vim-style yank and paste with named registers:
 

@@ -888,6 +888,8 @@ impl Engine {
             Some('w') => self.move_word_forward(),
             Some('b') => self.move_word_backward(),
             Some('e') => self.move_word_end(),
+            Some('{') => self.move_paragraph_backward(),
+            Some('}') => self.move_paragraph_forward(),
             Some('d') => {
                 self.pending_key = Some('d');
             }
@@ -1559,6 +1561,78 @@ impl Engine {
         let line_start = self.buffer().line_to_char(new_line);
         self.view_mut().cursor.line = new_line;
         self.view_mut().cursor.col = pos - line_start;
+    }
+
+    // --- Paragraph motions ---
+
+    fn move_paragraph_forward(&mut self) {
+        let total_lines = self.buffer().len_lines();
+        let mut line = self.view().cursor.line;
+
+        // Move forward at least one line to find the next empty line
+        if line + 1 >= total_lines {
+            // Already at or past last line, don't move
+            return;
+        }
+        line += 1;
+
+        // Search for the next empty line
+        while line < total_lines && !self.is_line_empty(line) {
+            line += 1;
+        }
+
+        // If we found an empty line, move there
+        if line < total_lines {
+            self.view_mut().cursor.line = line;
+            // Move to end of line (column 0 for empty lines)
+            self.view_mut().cursor.col = self.get_line_len_for_insert(line);
+        }
+        // Otherwise stay at current position (EOF case)
+    }
+
+    fn move_paragraph_backward(&mut self) {
+        let mut line = self.view().cursor.line;
+
+        // Already at top, don't move
+        if line == 0 {
+            return;
+        }
+        line -= 1;
+
+        // Search backward for an empty line
+        while line > 0 && !self.is_line_empty(line) {
+            line -= 1;
+        }
+
+        // Move to the found empty line (or line 0 if that's where we stopped)
+        self.view_mut().cursor.line = line;
+        // Move to end of line (column 0 for empty lines)
+        self.view_mut().cursor.col = self.get_line_len_for_insert(line);
+    }
+
+    /// Returns true if the line is empty or contains only whitespace.
+    fn is_line_empty(&self, line: usize) -> bool {
+        if line >= self.buffer().len_lines() {
+            return false;
+        }
+
+        let line_len = self.buffer().line_len_chars(line);
+
+        // Line with no characters or just newline
+        if line_len == 0 || line_len == 1 {
+            return true;
+        }
+
+        // Check if all characters are whitespace
+        let line_start = self.buffer().line_to_char(line);
+        for i in 0..line_len {
+            let ch = self.buffer().content.char(line_start + i);
+            if ch != '\n' && !ch.is_whitespace() {
+                return false;
+            }
+        }
+
+        true
     }
 
     // --- Line operations ---
@@ -2256,6 +2330,126 @@ mod tests {
 
         press_char(&mut engine, 'e');
         assert_eq!(engine.view().cursor.col, 10);
+    }
+
+    #[test]
+    fn test_paragraph_forward_basic() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "text1\ntext2\n\ntext3");
+        // Cursor at line 0 (text1)
+
+        press_char(&mut engine, '}');
+        assert_eq!(engine.view().cursor.line, 2); // Empty line
+        assert_eq!(engine.view().cursor.col, 0);
+    }
+
+    #[test]
+    fn test_paragraph_backward_basic() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "text1\n\ntext2\ntext3");
+        engine.view_mut().cursor.line = 3;
+
+        press_char(&mut engine, '{');
+        assert_eq!(engine.view().cursor.line, 1); // Empty line
+        assert_eq!(engine.view().cursor.col, 0);
+    }
+
+    #[test]
+    fn test_paragraph_forward_from_empty_line() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "text1\n\ntext2\n\ntext3");
+        engine.view_mut().cursor.line = 1; // First empty line
+
+        press_char(&mut engine, '}');
+        assert_eq!(engine.view().cursor.line, 3); // Next empty line
+        assert_eq!(engine.view().cursor.col, 0);
+    }
+
+    #[test]
+    fn test_paragraph_backward_from_empty_line() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "text1\n\ntext2\n\ntext3");
+        engine.view_mut().cursor.line = 3; // Second empty line
+
+        press_char(&mut engine, '{');
+        assert_eq!(engine.view().cursor.line, 1); // First empty line
+        assert_eq!(engine.view().cursor.col, 0);
+    }
+
+    #[test]
+    fn test_paragraph_forward_at_eof() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "text1\ntext2\ntext3");
+        engine.view_mut().cursor.line = 2; // Last line
+
+        press_char(&mut engine, '}');
+        assert_eq!(engine.view().cursor.line, 2); // Stays at last line
+    }
+
+    #[test]
+    fn test_paragraph_backward_at_bof() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "text1\ntext2\ntext3");
+        // Cursor at line 0
+
+        press_char(&mut engine, '{');
+        assert_eq!(engine.view().cursor.line, 0); // Stays at line 0
+    }
+
+    #[test]
+    fn test_paragraph_whitespace_lines() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "text1\n  \t  \ntext2");
+
+        press_char(&mut engine, '}');
+        assert_eq!(engine.view().cursor.line, 1); // Whitespace line
+        assert_eq!(engine.view().cursor.col, 5); // End of whitespace line
+    }
+
+    #[test]
+    fn test_paragraph_forward_multiple() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "a\n\nb\n\nc\n\nd");
+
+        press_char(&mut engine, '}');
+        assert_eq!(engine.view().cursor.line, 1);
+
+        press_char(&mut engine, '}');
+        assert_eq!(engine.view().cursor.line, 3);
+
+        press_char(&mut engine, '}');
+        assert_eq!(engine.view().cursor.line, 5);
+    }
+
+    #[test]
+    fn test_paragraph_backward_multiple() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "a\n\nb\n\nc\n\nd");
+        engine.view_mut().cursor.line = 6;
+
+        press_char(&mut engine, '{');
+        assert_eq!(engine.view().cursor.line, 5);
+
+        press_char(&mut engine, '{');
+        assert_eq!(engine.view().cursor.line, 3);
+
+        press_char(&mut engine, '{');
+        assert_eq!(engine.view().cursor.line, 1);
+    }
+
+    #[test]
+    fn test_paragraph_consecutive_empty_lines() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "text\n\n\n\nmore");
+
+        press_char(&mut engine, '}');
+        assert_eq!(engine.view().cursor.line, 1); // First empty
+
+        press_char(&mut engine, '}');
+        assert_eq!(engine.view().cursor.line, 2); // Second empty
+
+        press_char(&mut engine, '}');
+        assert_eq!(engine.view().cursor.line, 3); // Third empty
     }
 
     #[test]

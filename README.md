@@ -23,13 +23,13 @@ VimCode now supports a functional Vim-like workflow with **multiple buffers, spl
 - **Split windows** — `:split`, `:vsplit`, `Ctrl-W` commands
 - **Tabs** — `:tabnew`, `:tabclose`, `gt`/`gT` navigation
 - **File I/O** — Open from CLI, `:w` save, `:e` open, `:q` quit with dirty-buffer protection
-- **Navigation** — `h`/`j`/`k`/`l`, `w`/`b`/`e` words, `gg`/`G`, `0`/`$`, `Ctrl-D`/`Ctrl-U`
+- **Navigation** — `h`/`j`/`k`/`l`, `w`/`b`/`e` words, `{`/`}` paragraphs, `gg`/`G`, `0`/`$`, `Ctrl-D`/`Ctrl-U`
 - **Editing** — `i`/`a`/`o`/`O`/`I`/`A` insert modes, `x`/`dd`/`D` delete
 - **Yank/Paste** — `yy`/`Y` yank line, `p`/`P` paste, `"x` named registers
 - **Undo/Redo** — `u` undo, `Ctrl-r` redo with Vim-style undo groups
 - **Search** — `/` forward search, `n`/`N` next/previous match
 - **Syntax highlighting** — Tree-sitter for Rust
-- **88 passing tests**, clippy-clean
+- **98 passing tests**, clippy-clean
 
 ### Key Commands
 
@@ -37,6 +37,7 @@ VimCode now supports a functional Vim-like workflow with **multiple buffers, spl
 |-------------|--------|
 | `h` `j` `k` `l` | Character/line movement |
 | `w` `b` `e` | Word motions |
+| `{` `}` | Paragraph motions (prev/next empty line) |
 | `gg` `G` | File start/end |
 | `0` `$` | Line start/end |
 | `i` `I` `a` `A` `o` `O` | Enter insert mode |
@@ -71,8 +72,9 @@ VimCode now supports a functional Vim-like workflow with **multiple buffers, spl
 ### High Priority (Core Vim)
 - [x] Undo/redo (`u`, `Ctrl-r`) ✓
 - [x] Yank and paste (`y`, `yy`, `Y`, `p`, `P`) ✓
+- [x] Paragraph navigation (`{`, `}`) ✓
 - [ ] Visual mode (`v`, `V`, `Ctrl-V`)
-- [ ] More motions (`f`/`F`/`t`/`T`, `%`)
+- [ ] More motions (`ge`, `f`/`F`/`t`/`T`, `%`)
 - [ ] Change commands (`c`, `cw`, `C`)
 - [ ] Text objects (`iw`, `aw`, `i"`, `a(`)
 - [ ] Repeat (`.`)
@@ -102,8 +104,8 @@ VimCode now supports a functional Vim-like workflow with **multiple buffers, spl
 ```
 src/
 ├── main.rs                 # GTK4/Relm4 UI, rendering (~550 lines)
-└── core/                   # Platform-agnostic logic (~3,150 lines)
-    ├── engine.rs           # Orchestrates buffers, windows, tabs, commands
+└── core/                   # Platform-agnostic logic (~4,100 lines)
+    ├── engine.rs           # Orchestrates buffers, windows, tabs, commands (~3,150 lines)
     ├── buffer.rs           # Rope-based text storage
     ├── buffer_manager.rs   # Manages all open buffers
     ├── view.rs             # Per-window cursor and scroll state
@@ -149,7 +151,7 @@ sudo pacman -S gtk4 pango
 ```bash
 cargo build              # Compile
 cargo run -- <file>      # Run with a file
-cargo test               # Run 88 tests
+cargo test               # Run 98 tests
 cargo clippy -- -D warnings   # Lint
 cargo fmt                # Format
 ```
