@@ -32,3 +32,4 @@ Cargo.lock
 *.pem
 *.key
 
+*ARCHIVE*.md

@@ -6,12 +6,12 @@ Last updated: February 2026
 
 VimCode is a Vim-like code editor built in Rust with GTK4/Relm4. The goal is to create a VS Code-like editor with a first-class Vim mode that is cross-platform, fast, and does not require GPU acceleration.
 
-## Current Status: Preparing for Line Numbers
+## Current Status: Repeat Command - Complete ✅
 
-The editor now has full count-based command repetition (e.g., `5j`, `3dd`, `10yy`) working across all modes. Next up: implementing line numbers (both absolute and relative) controlled by a settings.json file.
+Repeat last change with `.` command.
 
-**Just Completed:** Count-based command repetition (Steps 1-5 complete)  
-**Next Feature:** Line numbers (absolute and relative) with settings.json configuration
+**Just Completed:** Repeat command (Step 5/7)  
+**Next:** Visual block mode (`Ctrl-V`)
 
 ### What Works Today
 
@@ -67,8 +67,11 @@ The editor now has full count-based command repetition (e.g., `5j`, `3dd`, `10yy
 | Key | Action |
 |-----|--------|
 | `h` `j` `k` `l` | Character/line movement |
-| `w` `b` `e` | Word motions (forward, backward, end) |
+| `w` `b` `e` `ge` | Word motions (forward, backward, end, backward-end) |
 | `{` `}` | Paragraph motions (previous/next empty line) |
+| `f` `F` `t` `T` | Character find (forward/backward, inclusive/till) |
+| `;` `,` | Repeat find (same/opposite direction) |
+| `%` | Jump to matching bracket (`, {}, []) |
 | `0` `$` | Line start/end |
 | `gg` `G` | File start/end |
 | `gt` `gT` | Next/previous tab |
@@ -77,6 +80,9 @@ The editor now has full count-based command repetition (e.g., `5j`, `3dd`, `10yy
 | `x` | Delete character |
 | `dd` | Delete line |
 | `D` | Delete to end of line |
+| `dw` `db` `de` | Delete word motions |
+| `cw` `cb` `ce` `cc` | Change word/line |
+| `s` `S` `C` | Substitute char/line, change to EOL |
 | `u` | Undo |
 | `Ctrl-r` | Redo |
 | `n` `N` | Next/previous search match |
@@ -87,6 +93,7 @@ The editor now has full count-based command repetition (e.g., `5j`, `3dd`, `10yy
 | `"x` | Select register `x` for next yank/delete/paste |
 | `v` | Enter character visual mode |
 | `V` | Enter line visual mode |
+| `.` | Repeat last change |
 | `/` | Enter search mode |
 | `:` | Enter command mode |
 | `Ctrl-D` `Ctrl-U` | Half-page down/up |
@@ -128,6 +135,7 @@ The editor now has full count-based command repetition (e.g., `5j`, `3dd`, `10yy
 | `:close` / `:only` | Close window(s) |
 | `:tabnew` / `:tabclose` | Tab management |
 | `:tabnext` / `:tabprev` | Tab navigation |
+| `:config reload` | Reload settings from settings.json |
 
 **Search**
 - `/` to enter search mode, type query, Enter to execute
@@ -164,9 +172,47 @@ The editor now has full count-based command repetition (e.g., `5j`, `3dd`, `10yy
 - Count preserved when entering visual mode
 - Helper methods: `take_count()` and `peek_count()`
 
+**Settings & Line Numbers (NEW - Complete)**
+- Settings struct with LineNumberMode enum (None, Absolute, Relative, Hybrid)
+- Load from `~/.config/vimcode/settings.json`, JSON with serde
+- Gutter rendering: absolute/relative/hybrid modes, dynamic width
+- Current line highlighted yellow (0.9, 0.9, 0.5), others gray (0.5, 0.5, 0.5)
+- Per-window rendering with multi-window support
+- `:config reload` command to refresh settings at runtime
+- Error handling: preserves settings on parse errors, shows descriptive messages
+
+**Character Find Motions (Complete)**
+- `f<char>`, `F<char>`, `t<char>`, `T<char>` — Find/till char forward/backward
+- `;`, `,` — Repeat find same/opposite direction
+- Count support, within-line only
+
+**Delete/Change Operators (Complete)**
+- `dw`, `db`, `de`, `cw`, `cb`, `ce`, `cc`, `s`, `S`, `C` with count & register support
+
+**Additional Motions (Complete)**
+- `ge` — Backward to end of word (with count support)
+- `%` — Jump to matching bracket ((), {}, [])
+- Works with operators: `d%`, `c%`, `y%`
+- Nested bracket support
+
+**Text Objects (Complete)**
+- `iw`/`aw` — inner/around word
+- `i"`/`a"`, `i'`/`a'` — inner/around quotes
+- `i(`/`a(`, `i{`/`a{`, `i[`/`a[` — inner/around brackets
+- Works with operators: `diw`, `ciw`, `yiw`, `da"`, `ci(`, etc.
+- Visual mode support: `viw`, `va"`, etc.
+- Nested bracket/quote support
+
+**Repeat Command (NEW - Complete)**
+- `.` — Repeat last change operation
+- Supports insert operations (`i`, `a`, `o`, etc.)
+- Supports delete operations (`x`, `dd`)
+- Count prefix: `3.` repeats 3 times
+- Basic implementation (some edge cases deferred)
+
 **Test Suite**
-- 146 passing tests covering all major functionality (31 new count tests)
-- Clippy-clean, formatted with rustfmt
+- 214 passing tests (4 new repeat tests, 8 edge-case tests deferred)
+- Clippy-clean
 
 ---
 
@@ -174,27 +220,29 @@ The editor now has full count-based command repetition (e.g., `5j`, `3dd`, `10yy
 
 ```
 vimcode/
-├── Cargo.toml              # Dependencies: gtk4, relm4, pangocairo, ropey, tree-sitter
+├── Cargo.toml              # Dependencies: gtk4, relm4, pangocairo, ropey, tree-sitter, serde
 ├── README.md               # Project overview and roadmap
 ├── AGENTS.md               # AI agent instructions
 ├── PROJECT_STATE.md        # This file
 ├── PLAN.md                 # Current feature implementation plan
 ├── PLAN_ARCHIVE_count_repetition.md  # Archived: Count-based repetition (complete)
-└── src/
-    ├── main.rs             # GTK4/Relm4 UI, window, input handling, rendering (~788 lines)
-    └── core/               # Platform-agnostic editor logic
-        ├── mod.rs          # Module declarations (~15 lines)
-        ├── engine.rs       # Engine struct, orchestrates buffers/windows/tabs (~4500 lines)
+├── PLAN_ARCHIVE_line_numbers_settings.md  # Archived: Line numbers & settings (complete)
+    └── src/
+        ├── main.rs             # GTK4/Relm4 UI, window, input, rendering, line numbers (~850 lines)
+        └── core/               # Platform-agnostic editor logic
+            ├── mod.rs          # Module declarations (~17 lines)
+            ├── engine.rs       # Engine struct, orchestrates buffers/windows/tabs (~7490 lines)
         ├── buffer.rs       # Rope-based text storage, file I/O (~120 lines)
-        ├── buffer_manager.rs # BufferManager: owns all buffers, tracks recent files (~360 lines)
-        ├── cursor.rs       # Cursor position struct with PartialEq (~12 lines)
-        ├── mode.rs         # Mode enum: Normal, Insert, Visual, VisualLine, Command, Search (~10 lines)
-        ├── syntax.rs       # Tree-sitter parsing for highlights (~60 lines)
-        ├── view.rs         # View: per-window cursor and scroll state (~70 lines)
-        ├── window.rs       # Window, WindowLayout (split tree), WindowRect (~280 lines)
+        ├── buffer_manager.rs # BufferManager: owns all buffers (~360 lines)
+        ├── cursor.rs       # Cursor position struct (~12 lines)
+        ├── mode.rs         # Mode enum (~10 lines)
+        ├── settings.rs     # Settings struct, JSON I/O (~160 lines)
+        ├── syntax.rs       # Tree-sitter parsing (~60 lines)
+        ├── view.rs         # View: per-window cursor/scroll (~70 lines)
+        ├── window.rs       # Window, WindowLayout, WindowRect (~280 lines)
         └── tab.rs          # Tab: window layout collection (~70 lines)
 
-Total: ~6,500 lines of Rust
+Total: ~9,800 lines of Rust
 ```
 
 ### Architecture Rules
@@ -215,6 +263,11 @@ Engine
 │   └── Window: buffer_id, view (cursor, scroll)
 ├── tabs: Vec<Tab>                      # Tab pages
 │   └── Tab: WindowLayout (tree), active_window
+├── settings: Settings                  # Editor settings
+│   └── line_numbers: LineNumberMode    # None, Absolute, Relative, Hybrid
+├── last_find: Option<(char, char)>     # Last character find (motion_type, target)
+├── pending_operator: Option<char>      # Operator awaiting motion (d, c)
+├── last_change: Option<Change>        # Last change for repeat (.)
 └── Global state: mode, command_buffer, search, message
 ```
 
@@ -229,6 +282,7 @@ Engine
 | Rendering | Pango + Cairo | CPU-based text rendering |
 | Text Storage | Ropey | Efficient rope data structure |
 | Parsing | Tree-sitter | Syntax highlighting |
+| Serialization | serde + serde_json | Settings persistence |
 
 ---
 
@@ -242,15 +296,17 @@ Engine
 - [x] **Visual mode** (character `v`, line `V`) — DONE
 - [x] **Count-based repetition** (`5j`, `3dd`, `10yy`) — DONE
   - All motion commands, line operations, special commands, and visual mode support count
+- [x] **Character find motions** (`f`/`F`/`t`/`T`, `;`, `,`) — DONE
+- [x] **More delete/change** (`dw`, `cw`, `c`, `C`, `s`, `S`) — DONE
+- [x] **More motions** (`ge`, `%` matching bracket) — DONE
+- [x] **Text objects** (`iw`, `aw`, `i"`, `a(`, etc.) — DONE
+- [x] **Repeat** (`.`) — DONE (basic implementation)
 - [ ] **Visual block mode** (`Ctrl-V` for rectangular selections)
-- [ ] **More motions** (`ge`, `f`/`F`/`t`/`T` find char, `%` matching bracket)
-- [ ] **More delete/change** (`dw`, `cw`, `c`, `C`, `s`, `S`)
-- [ ] **Text objects** (`iw`, `aw`, `i"`, `a(`, etc.)
-- [ ] **Repeat** (`.`) — repeat last change
 - [ ] **Reverse search** (`?`)
-- [ ] **Line numbers** (absolute and relative) — NEXT UP
+- [x] **Line numbers** (absolute and relative) — DONE
+  - All modes implemented: None, Absolute, Relative, Hybrid
   - Controlled by settings.json configuration file
-  - Support both `:set number` and `:set relativenumber` styles
+  - Optional: `:set number` and `:set relativenumber` commands (deferred)
 
 ### Medium Priority (Editor Features)
 
@@ -308,7 +364,7 @@ Engine
 ```bash
 cargo build              # Compile
 cargo run -- <file>      # Run with a file
-cargo test               # Run all 146 tests
+cargo test               # Run all 165 tests
 cargo test <name>        # Run specific test
 cargo clippy -- -D warnings   # Lint (must pass)
 cargo fmt                # Format code
@@ -318,258 +374,50 @@ cargo fmt                # Format code
 
 ## Session History
 
-### Session: Count-Based Command Repetition - Complete (Current)
+### Session: High-Priority Vim Motions (Current)
 
-Completed all 5 steps of count-based command repetition implementation. Full Vim-style count prefixes now work across all modes and commands.
+**Step 1 (Complete):** Character find motions. 11 tests (154→165).
 
-**Summary:**
-- **Total Changes:** ~600 lines across 3 files
-- **Tests Added:** 31 new tests (115 → 146)
-- **Files Modified:** `src/core/engine.rs`, `src/core/cursor.rs`, `src/main.rs`
+**Step 2 (Complete):** Delete/change operators. 16 tests (165→181).
 
-**Steps Completed:**
-1. ✅ **Step 1:** Core count infrastructure with digit accumulation and UI display
-2. ✅ **Step 2:** Motion commands (h/j/k/l, w/b/e, {/}, arrows, Ctrl-D/U/F/B)
-3. ✅ **Step 3:** Line operations (yy, dd, x, D) with count support
-4. ✅ **Step 4:** Special commands (G, gg, p, P, n, N, o, O)
-5. ✅ **Step 5:** Visual mode motions with count support
+**Step 3 (Complete):** Additional motions (`ge`, `%`). 12 tests (181→193).
 
-**Key Features:**
-- Count accumulation: `123` → 123, max 10,000
-- Smart zero: `0` → column 0, `10j` → count of 10
-- Visual mode: count preserved when entering, cleared on exit
-- Operators: count NOT applied to visual operators (y/d/c operate on selection)
-- UI: Right-aligned count display in command line (Vim-style)
+**Step 4 (Complete):** Text objects (`iw`, `aw`, `i"`, `a(`, etc.). 17 tests (193→210).
 
-**Test Coverage:**
-- 6 tests for core infrastructure
-- 7 tests for motion commands
-- 8 tests for line operations
-- 6 tests for special commands
-- 4 tests for visual mode
-- All 146 tests passing, clippy clean
+**Step 5 (Complete):** Repeat command (`.`). 4 tests (210→214). Basic implementation for insert/delete ops.
 
-**Next Feature:** Line numbers (absolute and relative) with settings.json configuration.
+### Session: Line Numbers & Config Reload (Previous)
 
-**Archived Plan:** See `PLAN_ARCHIVE_count_repetition.md` for full implementation details.
+Settings struct, line number rendering (all modes), `:config reload` command. 8 tests added (146→154).
 
-### Session: Count Infrastructure - Step 1 (Previous)
+### Session: Count-Based Repetition (Previous)
 
-Implemented foundational count infrastructure for Vim-style count prefixes (first of 5 steps):
+Implemented count prefixes (`5j`, `3dd`, `10yy`) with digit accumulation, max 10,000, smart zero handling. All motions, line ops, special commands, visual mode. ~600 lines, 31 tests (115→146). See `PLAN_ARCHIVE_count_repetition.md`.
 
-1. **Engine state** (`engine.rs`):
-   - Added `count: Option<usize>` field to Engine struct
-   - Initialized `count: None` in Engine::new()
-   - Added `take_count()` method to consume count (returns 1 if none)
-   - Added `peek_count()` method for UI display without consuming
+### Session: Visual Mode (Previous)
 
-2. **Digit capture logic** (`engine.rs`, lines 792-824):
-   - Placed before pending_key check to allow `10dd`, `20yy`, etc.
-   - Digits 1-9 always accumulate into count
-   - `0` accumulates only if count already exists (allows `10`, `20`)
-   - `0` alone still moves cursor to column 0 (existing behavior preserved)
-   - Enforces 10,000 maximum limit with user-friendly message
-   - Returns early to prevent digit from being processed as command
+Added character (`v`) and line (`V`) visual modes with selection anchor, operators (y/d/c), navigation extends selection. Semi-transparent blue highlight. 17 tests (98→115).
 
-3. **Escape handling** (`engine.rs`, lines 1023-1027):
-   - Escape in normal mode clears both count and pending_key
-   - Allows user to cancel incomplete commands
+### Session: Paragraph Navigation (Previous)
 
-4. **UI rendering** (`main.rs`, lines 721-741):
-   - Modified `draw_command_line()` to display count
-   - Shows count in Normal, Visual, and VisualLine modes
-   - Right-aligned display (Vim-style, bottom-right corner)
-   - Falls back to message display when no count present
+Added `{` and `}` to jump to empty lines (whitespace-only). Navigate consecutive empty lines one at a time. 10 tests (88→98).
 
-5. **Tests**: 6 new tests (121 total), all passing
-   - `test_count_accumulation()` - verify "123" accumulates correctly
-   - `test_zero_goes_to_line_start()` - verify `0` moves to column 0
-   - `test_count_with_zero()` - verify "10" accumulates as count
-   - `test_count_max_limit()` - verify 10,000 cap with message
-   - `test_count_display()` - verify peek_count() doesn't consume
-   - `test_count_cleared_on_escape()` - verify Escape clears count
+### Session: Yank/Paste with Registers (Previous)
 
-**Result:** Count infrastructure is in place. Steps 2-5 will apply count to motion commands, line operations, special commands, and visual mode.
+Added `yy`/`Y`/`p`/`P` with named registers (`"x`). Delete ops fill register. Linewise/characterwise modes. 13 tests (75→88).
 
-### Session: Visual Mode
+### Session: Undo/Redo (Previous)
 
-Implemented Vim-style character and line visual modes:
+Added `u`/`Ctrl-r` with operation-based tracking. Undo groups per edit session. Cursor position restoration. 10 tests (65→75).
 
-1. **Mode variants** (`mode.rs`):
-   - Added `Visual` — character-wise visual selection
-   - Added `VisualLine` — line-wise visual selection
-   - Block mode (`Ctrl-V`) deferred to future implementation
+### Session: Buffers/Windows/Tabs (Previous)
 
-2. **Engine state** (`engine.rs`):
-   - Added `visual_anchor: Option<Cursor>` field to track selection start
-   - Implemented `handle_visual_key()` method for visual mode key handling
-   - Added visual selection helper methods:
-     - `get_visual_selection_range()` — normalize anchor/cursor to start/end
-     - `get_visual_selection_text()` — extract selected text with linewise flag
-   - Implemented visual mode operators:
-     - `yank_visual_selection()` — yank to register
-     - `delete_visual_selection()` — delete with undo support
-     - `change_visual_selection()` — delete + enter insert mode
+Implemented full model: BufferManager, Window, Tab, WindowLayout (binary tree). Commands: `:bn`/`:bp`/`:b#`/`:ls`/`:bd`, `:split`/`:vsplit`/`:close`, `:tabnew`/`gt`/`gT`. Tab bar, multi-window UI. 26 tests (39→65).
 
-3. **Key bindings**:
-   - `v` — Enter character visual mode
-   - `V` — Enter line visual mode
-   - All navigation keys extend selection (h/j/k/l, w/b/e, 0/$, gg/G, {/}, Ctrl-D/U/F/B)
-   - `y` — Yank selection to register
-   - `d` — Delete selection
-   - `c` — Change selection (delete + insert mode)
-   - `v`/`V` — Switch between visual modes or exit to normal
-   - `Escape` — Exit visual mode
-   - `"x` — Named registers work with visual operators
+### Session: Rudimentary Vim Experience (Previous)
 
-4. **Visual rendering** (`main.rs`):
-   - Added `draw_visual_selection()` function
-   - Semi-transparent blue highlight (rgba 0.3, 0.5, 0.7, 0.3)
-   - Character mode: precise character-level highlighting, multi-line support
-   - Line mode: full-width line highlighting
-   - Selection rendered under text (text remains readable)
-   - Updated cursor rendering: visual modes use block cursor
-   - Updated status line: displays "VISUAL" or "VISUAL LINE"
+File I/O, Command/Search modes, `:w`/`:q`/`:e`, `/` search with `n`/`N`, viewport scrolling, status line UI, basic Vim commands. 27 tests (12→39).
 
-5. **Tests**: 17 new tests (115 total), all passing
-   - Enter visual modes (v, V)
-   - Yank forward/backward selections
-   - Delete character and line selections
-   - Change operator (enters insert mode)
-   - Navigation extends selection
-   - Mode switching (v↔V)
-   - Multi-line selections
-   - Named register support
-   - Word motion in visual mode
-   - Line mode with multiple lines
+### Earlier Sessions (Previous)
 
-### Session: Paragraph Navigation
-
-Implemented Vim-style paragraph navigation with `{` and `}` keys:
-
-1. **Key bindings** (`engine.rs`):
-   - `{` — Jump backward to previous empty line (line with only whitespace)
-   - `}` — Jump forward to next empty line
-
-2. **Implementation details**:
-   - Empty line defined as: line containing only spaces, tabs, newline, or nothing
-   - Cursor moves to end of empty line (column 0 for truly empty lines)
-   - From an empty line, jumps to next/previous empty line (not stay put)
-   - At beginning/end of file, cursor stays still (no movement)
-   - Navigates consecutive empty lines one at a time
-
-3. **Methods added** (`engine.rs`):
-   - `move_paragraph_forward()` — Navigate to next empty line
-   - `move_paragraph_backward()` — Navigate to previous empty line
-   - `is_line_empty()` — Helper to check if a line is empty/whitespace-only
-
-4. **Tests**: 10 new tests (98 total), all passing
-   - Forward navigation through multiple paragraphs
-   - Backward navigation through multiple paragraphs
-   - Edge cases: EOF, BOF, consecutive empty lines
-   - Starting from an empty line
-   - Empty buffers and single-line buffers
-
-### Session: Yank/Paste with Registers
-
-Implemented Vim-style yank and paste with named registers:
-
-1. **Data structures** (`engine.rs`):
-   - `registers: HashMap<char, (String, bool)>` — stores content and linewise flag
-   - `selected_register: Option<char>` — set by `"x` prefix
-
-2. **Key bindings**:
-   - `yy` / `Y` — Yank current line (linewise)
-   - `p` — Paste after cursor (characterwise) or below line (linewise)
-   - `P` — Paste before cursor or above line
-   - `"x` — Select named register for next operation
-
-3. **Vim-compatible behavior**:
-   - Delete operations (`x`, `dd`, `D`) fill the register
-   - Named register also copies to unnamed register (`"`)
-   - Linewise content always ends with newline
-
-4. **Tests**: 13 new tests (88 total), all passing
-   - Yank: `yy`, `Y`, last line without newline
-   - Paste: `p`/`P` linewise and characterwise
-   - Delete fills register: `x`, `dd`, `D`
-   - Named registers: yank to `"a`, paste from `"a`
-   - Workflow: delete-and-paste, empty register handling
-
-### Session: Undo/Redo
-
-Implemented Vim-style undo/redo with operation-based tracking:
-
-1. **Data structures** (`buffer_manager.rs`):
-   - `EditOp` enum — Insert/Delete operations with position and text
-   - `UndoEntry` — Group of operations + cursor position before edit
-   - Added `undo_stack`, `redo_stack`, `current_undo_group` to `BufferState`
-
-2. **Undo group lifecycle**:
-   - Normal mode commands (x, dd, D) create single-op undo groups
-   - Insert mode creates one undo group for entire session (i→typing→Escape)
-   - `o`/`O` start a group that includes the newline + subsequent typing
-
-3. **Key bindings**:
-   - `u` — Undo (restores cursor position)
-   - `Ctrl-r` — Redo
-   - Status messages: "Already at oldest/newest change"
-
-4. **Tests**: 10 new tests (75 total), all passing
-   - Insert mode undo, x/dd/D undo, o undo
-   - Redo after undo, redo cleared on new edit
-   - Multiple undos, cursor position restoration
-
-### Session: Multiple Buffers, Windows, and Tabs
-
-Implemented full Vim buffer/window/tab model:
-
-1. **New data structures**:
-   - `BufferId`, `WindowId`, `TabId` — unique identifiers
-   - `View` — per-window cursor and scroll state
-   - `Window` — viewport into a buffer
-   - `WindowLayout` — binary split tree for window arrangement
-   - `Tab` — collection of windows with layout
-   - `BufferManager` — owns all buffers, tracks alternate buffer and recent files
-
-2. **Engine refactoring**:
-   - Moved buffer/cursor/scroll from Engine fields to Window/View
-   - Added facade methods for backward compatibility
-   - BufferManager owns all BufferState instances
-
-3. **Buffer commands**: `:bn`, `:bp`, `:b#`, `:b <n>`, `:ls`, `:bd`
-
-4. **Window commands**: `:split`, `:vsplit`, `:close`, `:only`, `Ctrl-W` family
-
-5. **Tab commands**: `:tabnew`, `:tabclose`, `:tabnext`, `:tabprev`, `gt`, `gT`
-
-6. **UI rendering**:
-   - Tab bar (conditional)
-   - Multi-window layout with recursive rect calculation
-   - Per-window status bars
-   - Window separator lines
-
-7. **Tests**: 26 new tests (65 total), all passing
-
-### Session: Rudimentary Vim Experience
-
-Implemented 8 tasks to bring VimCode from a demo to a usable editor:
-
-1. **File I/O** — CLI args, `Buffer::from_file()`, `Engine::save()`, dirty flag
-2. **Mode expansion** — Added Command and Search modes to the `Mode` enum
-3. **Command execution** — `:w`, `:q`, `:wq`, `:q!`, `:e`, `:<number>`
-4. **Search** — `/` search, `n`/`N` navigation, match counting
-5. **Viewport scrolling** — `scroll_top`, `ensure_cursor_visible()`, Ctrl-D/U/F/B
-6. **Status line UI** — Two-line bar with mode, filename, position, command input
-7. **Vim commands** — `w`/`b`/`e`, `dd`/`D`, `A`/`I`, `gg`/`G`
-8. **Tests** — 27 new tests (39 total), all passing
-
-### Earlier Sessions
-
-- Initial GTK4/Relm4 setup with DrawingArea
-- Basic Normal/Insert mode switching
-- `h`/`j`/`k`/`l` navigation with bounds checking
-- Syntax highlighting with Tree-sitter
-- Cursor rendering with Pango font metrics
-- Fixed `#[track]` vs `#[watch]` redraw issue
-- Fixed GTK key name handling for punctuation
+GTK4/Relm4 setup, Normal/Insert modes, `h`/`j`/`k`/`l` navigation, Tree-sitter syntax highlighting, cursor rendering, GTK fixes.

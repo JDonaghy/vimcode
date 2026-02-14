@@ -11,6 +11,7 @@ use std::rc::Rc;
 mod core;
 use core::buffer::Buffer;
 use core::engine::EngineAction;
+use core::settings::LineNumberMode;
 use core::{Cursor, Engine, Mode, WindowRect};
 
 struct App {
@@ -171,6 +172,44 @@ impl SimpleComponent for App {
     }
 }
 
+/// Calculate gutter width in pixels based on line number mode and buffer size
+fn calculate_gutter_width(mode: LineNumberMode, total_lines: usize, char_width: f64) -> f64 {
+    match mode {
+        LineNumberMode::None => 0.0,
+        LineNumberMode::Absolute => {
+            // Width = number of digits + 2 chars padding (1 on each side)
+            let digits = total_lines.to_string().len().max(1);
+            (digits + 2) as f64 * char_width
+        }
+        LineNumberMode::Relative | LineNumberMode::Hybrid => {
+            // Relative numbers can be large for long files, use at least 3 digits + 2 padding
+            let max_relative = total_lines.saturating_sub(1);
+            let digits = max_relative.to_string().len().max(3);
+            (digits + 2) as f64 * char_width
+        }
+    }
+}
+
+/// Format a line number based on mode, current line, and cursor position
+fn format_line_number(mode: LineNumberMode, line_idx: usize, cursor_line: usize) -> String {
+    match mode {
+        LineNumberMode::None => String::new(),
+        LineNumberMode::Absolute => format!("{}", line_idx + 1),
+        LineNumberMode::Relative => {
+            let distance = line_idx.abs_diff(cursor_line);
+            distance.to_string()
+        }
+        LineNumberMode::Hybrid => {
+            if line_idx == cursor_line {
+                format!("{}", line_idx + 1)
+            } else {
+                let distance = line_idx.abs_diff(cursor_line);
+                distance.to_string()
+            }
+        }
+    }
+}
+
 fn draw_editor(cr: &Context, engine: &Engine, width: i32, height: i32) {
     // 1. Background
     cr.set_source_rgb(0.1, 0.1, 0.1);
@@ -322,6 +361,13 @@ fn draw_window(
     let text_area_height = rect.height - per_window_status;
     let visible_lines = (text_area_height / line_height).floor() as usize;
 
+    // Calculate gutter width for line numbers
+    let total_lines = buffer.content.len_lines();
+    let char_width = font_metrics.approximate_char_width() as f64 / pango::SCALE as f64;
+    let gutter_width =
+        calculate_gutter_width(engine.settings.line_numbers, total_lines, char_width);
+    let text_x_offset = rect.x + gutter_width;
+
     // Window background (slightly different for active)
     if is_active && engine.windows.len() > 1 {
         cr.set_source_rgb(0.12, 0.12, 0.12);
@@ -347,6 +393,7 @@ fn draw_window(
                         line_height,
                         view.scroll_top,
                         visible_lines,
+                        text_x_offset,
                     );
                 }
             }
@@ -354,9 +401,8 @@ fn draw_window(
         }
     }
 
-    // Render text with highlights
+    // Render text with highlights and line numbers
     let scroll_top = view.scroll_top;
-    let total_lines = buffer.content.len_lines();
 
     for view_idx in 0..visible_lines {
         let line_idx = scroll_top + view_idx;
@@ -366,6 +412,31 @@ fn draw_window(
 
         let line = buffer.content.line(line_idx);
         let y = rect.y + view_idx as f64 * line_height;
+
+        // Render line number in gutter (if enabled)
+        if engine.settings.line_numbers != LineNumberMode::None {
+            let line_num_text =
+                format_line_number(engine.settings.line_numbers, line_idx, view.cursor.line);
+
+            layout.set_text(&line_num_text);
+            layout.set_attributes(None);
+
+            // Right-align line number within gutter
+            let (num_width, _) = layout.pixel_size();
+            let num_x = rect.x + gutter_width - num_width as f64 - char_width;
+
+            // Highlight current line number
+            if is_active && line_idx == view.cursor.line {
+                cr.set_source_rgb(0.9, 0.9, 0.5); // Brighter yellow for current line
+            } else {
+                cr.set_source_rgb(0.5, 0.5, 0.5); // Dimmed gray for other lines
+            }
+
+            cr.move_to(num_x, y);
+            pangocairo::show_layout(cr, layout);
+        }
+
+        // Render line text with syntax highlighting
         layout.set_text(&line.to_string());
 
         let line_start_byte = buffer.content.line_to_byte(line_idx);
@@ -412,7 +483,7 @@ fn draw_window(
         }
         layout.set_attributes(Some(&attrs));
 
-        cr.move_to(rect.x, y);
+        cr.move_to(text_x_offset, y);
         cr.set_source_rgb(0.9, 0.9, 0.9);
         pangocairo::show_layout(cr, layout);
     }
@@ -432,7 +503,7 @@ fn draw_window(
                 .unwrap_or(line_text.len());
 
             let pos = layout.index_to_pos(byte_offset as i32);
-            let cursor_x = rect.x + pos.x() as f64 / pango::SCALE as f64;
+            let cursor_x = text_x_offset + pos.x() as f64 / pango::SCALE as f64;
             let char_w = pos.width() as f64 / pango::SCALE as f64;
             let cursor_y = rect.y + (view.cursor.line - scroll_top) as f64 * line_height;
 
@@ -496,6 +567,7 @@ fn draw_visual_selection(
     line_height: f64,
     scroll_top: usize,
     visible_lines: usize,
+    text_x_offset: f64,
 ) {
     // Normalize selection (start <= end)
     let (start, end) =
@@ -510,13 +582,14 @@ fn draw_visual_selection(
 
     match engine.mode {
         Mode::VisualLine => {
-            // Line mode: highlight full lines
+            // Line mode: highlight full lines (text area only, not gutter)
             for line_idx in start.line..=end.line {
                 // Only draw if line is visible
                 if line_idx >= scroll_top && line_idx < scroll_top + visible_lines {
                     let view_idx = line_idx - scroll_top;
                     let y = rect.y + view_idx as f64 * line_height;
-                    cr.rectangle(rect.x, y, rect.width, line_height);
+                    let highlight_width = rect.width - (text_x_offset - rect.x);
+                    cr.rectangle(text_x_offset, y, highlight_width, line_height);
                 }
             }
             cr.fill().unwrap();
@@ -541,7 +614,7 @@ fn draw_visual_selection(
                             .map(|(i, _)| i)
                             .unwrap_or(line_text.len());
                         let start_pos = layout.index_to_pos(start_byte as i32);
-                        let start_x = rect.x + start_pos.x() as f64 / pango::SCALE as f64;
+                        let start_x = text_x_offset + start_pos.x() as f64 / pango::SCALE as f64;
 
                         // Calculate x position for end column (inclusive, so +1)
                         let end_col = (end.col + 1).min(line_text.chars().count());
@@ -551,7 +624,7 @@ fn draw_visual_selection(
                             .map(|(i, _)| i)
                             .unwrap_or(line_text.len());
                         let end_pos = layout.index_to_pos(end_byte as i32);
-                        let end_x = rect.x + end_pos.x() as f64 / pango::SCALE as f64;
+                        let end_x = text_x_offset + end_pos.x() as f64 / pango::SCALE as f64;
 
                         cr.rectangle(start_x, y, end_x - start_x, line_height);
                         cr.fill().unwrap();
@@ -577,13 +650,14 @@ fn draw_visual_selection(
                                     .map(|(i, _)| i)
                                     .unwrap_or(line_text.len());
                                 let start_pos = layout.index_to_pos(start_byte as i32);
-                                let start_x = rect.x + start_pos.x() as f64 / pango::SCALE as f64;
+                                let start_x =
+                                    text_x_offset + start_pos.x() as f64 / pango::SCALE as f64;
 
                                 let (line_width, _) = layout.pixel_size();
                                 cr.rectangle(
                                     start_x,
                                     y,
-                                    rect.x + line_width as f64 - start_x,
+                                    text_x_offset + line_width as f64 - start_x,
                                     line_height,
                                 );
                                 cr.fill().unwrap();
@@ -596,14 +670,15 @@ fn draw_visual_selection(
                                     .map(|(i, _)| i)
                                     .unwrap_or(line_text.len());
                                 let end_pos = layout.index_to_pos(end_byte as i32);
-                                let end_x = rect.x + end_pos.x() as f64 / pango::SCALE as f64;
+                                let end_x =
+                                    text_x_offset + end_pos.x() as f64 / pango::SCALE as f64;
 
-                                cr.rectangle(rect.x, y, end_x - rect.x, line_height);
+                                cr.rectangle(text_x_offset, y, end_x - text_x_offset, line_height);
                                 cr.fill().unwrap();
                             } else {
                                 // Middle lines: full line
                                 let (line_width, _) = layout.pixel_size();
-                                cr.rectangle(rect.x, y, line_width as f64, line_height);
+                                cr.rectangle(text_x_offset, y, line_width as f64, line_height);
                                 cr.fill().unwrap();
                             }
                         }
