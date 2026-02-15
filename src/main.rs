@@ -565,21 +565,23 @@ impl SimpleComponent for App {
             }
             Msg::OpenFileFromSidebar(path) => {
                 let mut engine = self.engine.borrow_mut();
-                match engine.open_file_with_mode(&path, OpenMode::Permanent) {
-                    Ok(()) => {
-                        drop(engine);
-                        if let Some(ref tree) = *self.file_tree_view.borrow() {
-                            highlight_file_in_tree(tree, &path);
-                        }
-                        if let Some(ref drawing) = *self.drawing_area.borrow() {
-                            drawing.grab_focus();
-                        }
-                        self.tree_has_focus = false;
-                    }
-                    Err(e) => {
-                        engine.message = e;
-                    }
+                // Double-click opens in new tab (permanent mode)
+                engine.new_tab(Some(&path));
+
+                // Promote to permanent if it was opened as preview
+                let buffer_id = engine.active_buffer_id();
+                if engine.preview_buffer_id == Some(buffer_id) {
+                    engine.promote_preview(buffer_id);
                 }
+
+                drop(engine);
+                if let Some(ref tree) = *self.file_tree_view.borrow() {
+                    highlight_file_in_tree(tree, &path);
+                }
+                if let Some(ref drawing) = *self.drawing_area.borrow() {
+                    drawing.grab_focus();
+                }
+                self.tree_has_focus = false;
                 self.redraw = !self.redraw;
             }
             Msg::PreviewFileFromSidebar(path) => {
@@ -822,11 +824,7 @@ fn draw_editor(cr: &Context, engine: &Engine, width: i32, height: i32) {
     let line_height = (font_metrics.ascent() + font_metrics.descent()) as f64 / pango::SCALE as f64;
 
     // Calculate layout regions
-    let tab_bar_height = if engine.tabs.len() > 1 {
-        line_height
-    } else {
-        0.0
-    };
+    let tab_bar_height = line_height; // Always show tab bar
     let status_bar_height = line_height * 2.0; // status + command line
 
     // Calculate window rects for the current tab
@@ -838,10 +836,8 @@ fn draw_editor(cr: &Context, engine: &Engine, width: i32, height: i32) {
     );
     let window_rects = engine.calculate_window_rects(content_bounds);
 
-    // 3. Draw tab bar if multiple tabs
-    if engine.tabs.len() > 1 {
-        draw_tab_bar(cr, &layout, engine, width as f64, line_height);
-    }
+    // 3. Draw tab bar (always visible)
+    draw_tab_bar(cr, &layout, engine, width as f64, line_height);
 
     // 4. Draw each window
     for (window_id, rect) in &window_rects {
@@ -1481,15 +1477,54 @@ fn handle_mouse_click(engine: &mut Engine, x: f64, y: f64, width: f64, height: f
     let font_metrics = pango_ctx.metrics(Some(&font_desc), None);
     let line_height = (font_metrics.ascent() + font_metrics.descent()) as f64 / pango::SCALE as f64;
 
-    let tab_bar_height = if engine.tabs.len() > 1 {
-        line_height
-    } else {
-        0.0
-    };
+    let tab_bar_height = line_height; // Always show tab bar
 
     // Check if click is in tab bar
     if y < tab_bar_height {
-        // TODO: Handle tab clicks in future
+        // Calculate which tab was clicked
+        let layout = pangocairo::create_layout(&cr);
+        layout.set_font_description(Some(&font_desc));
+
+        let normal_font = font_desc.clone();
+        let mut italic_font = font_desc.clone();
+        italic_font.set_style(pango::Style::Italic);
+
+        let mut tab_x = 0.0;
+        for (i, tab) in engine.tabs.iter().enumerate() {
+            // Get buffer name and preview state (same logic as draw_tab_bar)
+            let window_id = tab.active_window;
+            let (name, is_preview) = if let Some(window) = engine.windows.get(&window_id) {
+                if let Some(state) = engine.buffer_manager.get(window.buffer_id) {
+                    let dirty = if state.dirty { "*" } else { "" };
+                    (
+                        format!(" {}: {}{} ", i + 1, state.display_name(), dirty),
+                        state.preview,
+                    )
+                } else {
+                    (format!(" {}: [No Name] ", i + 1), false)
+                }
+            } else {
+                (format!(" {}: [No Name] ", i + 1), false)
+            };
+
+            // Use correct font for measuring
+            if is_preview {
+                layout.set_font_description(Some(&italic_font));
+            } else {
+                layout.set_font_description(Some(&normal_font));
+            }
+
+            layout.set_text(&name);
+            let (tab_width, _) = layout.pixel_size();
+
+            // Check if click is in this tab's bounds
+            if x >= tab_x && x < tab_x + tab_width as f64 {
+                engine.goto_tab(i);
+                return;
+            }
+
+            tab_x += tab_width as f64 + 2.0;
+        }
         return;
     }
 

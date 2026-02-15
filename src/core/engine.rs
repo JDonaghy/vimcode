@@ -360,6 +360,10 @@ impl Engine {
         if let Some(cursor) = self.active_buffer_state_mut().undo() {
             self.view_mut().cursor = cursor;
             self.clamp_cursor_col();
+            // Clear dirty flag if we've undone all changes
+            if !self.active_buffer_state().can_undo() {
+                self.set_dirty(false);
+            }
             true
         } else {
             self.message = "Already at oldest change".to_string();

@@ -21,6 +21,10 @@
 - Auto-promote on text modification & save
 - GestureClick single-click handler
 - Italic font + dimmed colors in tabs
+- Tab bar always visible (even with 1 tab)
+- Double-click opens in new tab
+- Undo clears dirty flag at oldest change
+- Tab clicking to switch tabs
 
 ### Files Modified
 - `src/core/buffer_manager.rs` — preview field
