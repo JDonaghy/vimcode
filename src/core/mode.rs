@@ -2,4 +2,8 @@
 pub enum Mode {
     Normal,
     Insert,
+    Command,
+    Search,
+    Visual,
+    VisualLine,
 }

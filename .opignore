@@ -1,0 +1,35 @@
+# Build artifacts (The biggest token hog)
+target/
+
+# Version control
+.git/
+
+# IDE and OS metadata
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Large assets/data
+node_modules/
+dist/
+build/
+*.bin
+*.exe
+*.so
+*.dll
+
+# Dependency lock files (Optional, but saves tokens)
+# Only ignore Cargo.lock if the agent doesn't need to debug dependency versions
+Cargo.lock
+
+# OpenCode internal state
+.opencode/sessions/
+.opencode/cache/
+
+# Local env secrets (Security!)
+.env
+*.pem
+*.key
+
+*ARCHIVE*.md
