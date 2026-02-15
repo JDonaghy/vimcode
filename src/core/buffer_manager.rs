@@ -53,6 +53,8 @@ pub struct BufferState {
     pub file_path: Option<PathBuf>,
     /// Whether the buffer has unsaved changes.
     pub dirty: bool,
+    /// Whether this is a preview buffer (single-click in file explorer).
+    pub preview: bool,
     /// Syntax highlighter for this buffer.
     pub syntax: Syntax,
     /// Cached syntax highlights (byte ranges + scope names).
@@ -84,6 +86,7 @@ impl BufferState {
             buffer,
             file_path: None,
             dirty: false,
+            preview: false,
             syntax: Syntax::new(),
             highlights: Vec::new(),
             undo_stack: Vec::new(),
@@ -99,6 +102,7 @@ impl BufferState {
             buffer,
             file_path: Some(path),
             dirty: false,
+            preview: false,
             syntax: Syntax::new(),
             highlights: Vec::new(),
             undo_stack: Vec::new(),

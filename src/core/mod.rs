@@ -11,5 +11,6 @@ pub mod window;
 
 pub use cursor::Cursor;
 pub use engine::Engine;
+pub use engine::OpenMode;
 pub use mode::Mode;
 pub use window::{WindowId, WindowRect};

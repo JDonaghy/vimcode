@@ -21,6 +21,13 @@ pub enum EngineAction {
     Error,
 }
 
+/// How a file should be opened: as a temporary preview or permanent buffer.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum OpenMode {
+    Preview,
+    Permanent,
+}
+
 /// Represents a change operation that can be repeated with `.`
 #[derive(Debug, Clone)]
 struct Change {
@@ -75,6 +82,10 @@ pub struct Engine {
     pub active_tab: usize,
     next_window_id: usize,
     next_tab_id: usize,
+
+    // --- Preview mode ---
+    /// The buffer currently in preview mode (at most one at a time).
+    pub preview_buffer_id: Option<BufferId>,
 
     // --- Global state (not per-window) ---
     pub mode: Mode,
@@ -148,6 +159,7 @@ impl Engine {
             active_tab: 0,
             next_window_id: 2,
             next_tab_id: 2,
+            preview_buffer_id: None,
             mode: Mode::Normal,
             command_buffer: String::new(),
             message: String::new(),
@@ -290,6 +302,7 @@ impl Engine {
     }
 
     /// Set scroll_top for the active window.
+    #[allow(dead_code)]
     pub fn set_scroll_top(&mut self, scroll_top: usize) {
         self.view_mut().scroll_top = scroll_top;
     }
@@ -380,6 +393,11 @@ impl Engine {
 
     /// Save the active buffer to its file.
     pub fn save(&mut self) -> Result<(), String> {
+        // Promote preview on save
+        let active_id = self.active_buffer_id();
+        if self.preview_buffer_id == Some(active_id) {
+            self.promote_preview(active_id);
+        }
         let state = self.active_buffer_state_mut();
         if let Some(ref path) = state.file_path.clone() {
             match state.save() {
@@ -396,6 +414,85 @@ impl Engine {
             self.message = "No file name".to_string();
             Err(self.message.clone())
         }
+    }
+
+    // =======================================================================
+    // Preview mode
+    // =======================================================================
+
+    /// Promote a preview buffer to permanent.
+    pub fn promote_preview(&mut self, buffer_id: BufferId) {
+        if let Some(state) = self.buffer_manager.get_mut(buffer_id) {
+            state.preview = false;
+        }
+        if self.preview_buffer_id == Some(buffer_id) {
+            self.preview_buffer_id = None;
+        }
+    }
+
+    /// Open a file in the current window with the given mode.
+    ///
+    /// - `Preview`: Replaces any existing preview buffer. The tab shows italic/dimmed.
+    /// - `Permanent`: Opens the file as a normal, persistent buffer.
+    ///
+    /// If the file is already open as a permanent buffer, just switches to it regardless of mode.
+    pub fn open_file_with_mode(&mut self, path: &Path, mode: OpenMode) -> Result<(), String> {
+        // Check which buffers exist before opening (to detect reuse vs creation)
+        let existing_ids: Vec<_> = self.buffer_manager.list();
+
+        let buffer_id = self
+            .buffer_manager
+            .open_file(path)
+            .map_err(|e| format!("Error: {}", e))?;
+
+        let already_existed = existing_ids.contains(&buffer_id);
+        let is_already_permanent = already_existed
+            && self
+                .buffer_manager
+                .get(buffer_id)
+                .map_or(false, |s| !s.preview);
+
+        // If buffer already exists as permanent, just switch to it
+        if is_already_permanent && self.preview_buffer_id != Some(buffer_id) {
+            let current = self.active_buffer_id();
+            if current != buffer_id {
+                self.buffer_manager.alternate_buffer = Some(current);
+            }
+            self.switch_window_buffer(buffer_id);
+            self.message = format!("\"{}\"", path.display());
+            return Ok(());
+        }
+
+        match mode {
+            OpenMode::Preview => {
+                // Close old preview if it's a different buffer
+                if let Some(old_preview) = self.preview_buffer_id {
+                    if old_preview != buffer_id {
+                        // Only close if no other window shows it
+                        let _ = self.delete_buffer(old_preview, true);
+                    }
+                }
+                // Mark as preview
+                if let Some(state) = self.buffer_manager.get_mut(buffer_id) {
+                    state.preview = true;
+                }
+                self.preview_buffer_id = Some(buffer_id);
+            }
+            OpenMode::Permanent => {
+                // If it was a preview, promote it
+                if self.preview_buffer_id == Some(buffer_id) {
+                    self.promote_preview(buffer_id);
+                }
+            }
+        }
+
+        let current = self.active_buffer_id();
+        if current != buffer_id {
+            self.buffer_manager.alternate_buffer = Some(current);
+        }
+        self.switch_window_buffer(buffer_id);
+        self.message = format!("\"{}\"", path.display());
+        Ok(())
     }
 
     // =======================================================================
@@ -723,6 +820,11 @@ impl Engine {
             }
         }
 
+        // Clear preview tracking if deleting the preview buffer
+        if self.preview_buffer_id == Some(id) {
+            self.preview_buffer_id = None;
+        }
+
         self.buffer_manager.delete(id, force)
     }
 
@@ -739,9 +841,10 @@ impl Engine {
             let alt_flag = if Some(*id) == alternate { "#" } else { " " };
             let dirty_flag = if state.dirty { "+" } else { " " };
             let name = state.display_name();
+            let preview_flag = if state.preview { " [Preview]" } else { "" };
             lines.push(format!(
-                "{:3} {}{}{} \"{}\"",
-                num, active_flag, alt_flag, dirty_flag, name
+                "{:3} {}{}{} \"{}\"{}",
+                num, active_flag, alt_flag, dirty_flag, name, preview_flag
             ));
         }
         lines.join("\n")
@@ -826,6 +929,11 @@ impl Engine {
         if changed {
             self.set_dirty(true);
             self.update_syntax();
+            // Auto-promote preview buffer on text modification
+            let active_id = self.active_buffer_id();
+            if self.preview_buffer_id == Some(active_id) {
+                self.promote_preview(active_id);
+            }
         }
 
         self.ensure_cursor_visible();
@@ -7840,5 +7948,260 @@ mod tests {
         engine.set_cursor_for_window(window_id, 1, 5);
         assert_eq!(engine.cursor().line, 1);
         assert_eq!(engine.cursor().col, 0); // Clamped to 0 (last valid pos of "b")
+    }
+
+    // --- Preview mode tests ---
+
+    #[test]
+    fn test_preview_open_marks_buffer() {
+        use std::io::Write;
+        let path = std::env::temp_dir().join("vimcode_test_preview1.txt");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(b"preview").unwrap();
+        }
+
+        let mut engine = Engine::new();
+        engine
+            .open_file_with_mode(&path, OpenMode::Preview)
+            .unwrap();
+
+        let bid = engine.active_buffer_id();
+        assert!(engine.buffer_manager.get(bid).unwrap().preview);
+        assert_eq!(engine.preview_buffer_id, Some(bid));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_permanent_open_not_preview() {
+        use std::io::Write;
+        let path = std::env::temp_dir().join("vimcode_test_preview2.txt");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(b"permanent").unwrap();
+        }
+
+        let mut engine = Engine::new();
+        engine
+            .open_file_with_mode(&path, OpenMode::Permanent)
+            .unwrap();
+
+        let bid = engine.active_buffer_id();
+        assert!(!engine.buffer_manager.get(bid).unwrap().preview);
+        assert_eq!(engine.preview_buffer_id, None);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_preview_replaced_by_new_preview() {
+        use std::io::Write;
+        let path1 = std::env::temp_dir().join("vimcode_test_preview3a.txt");
+        let path2 = std::env::temp_dir().join("vimcode_test_preview3b.txt");
+        {
+            let mut f = std::fs::File::create(&path1).unwrap();
+            f.write_all(b"file1").unwrap();
+        }
+        {
+            let mut f = std::fs::File::create(&path2).unwrap();
+            f.write_all(b"file2").unwrap();
+        }
+
+        let mut engine = Engine::new();
+        engine
+            .open_file_with_mode(&path1, OpenMode::Preview)
+            .unwrap();
+        let bid1 = engine.active_buffer_id();
+
+        engine
+            .open_file_with_mode(&path2, OpenMode::Preview)
+            .unwrap();
+        let bid2 = engine.active_buffer_id();
+
+        // Old preview should be deleted
+        assert!(engine.buffer_manager.get(bid1).is_none());
+        // New preview should be active
+        assert!(engine.buffer_manager.get(bid2).unwrap().preview);
+        assert_eq!(engine.preview_buffer_id, Some(bid2));
+
+        let _ = std::fs::remove_file(&path1);
+        let _ = std::fs::remove_file(&path2);
+    }
+
+    #[test]
+    fn test_double_click_promotes_preview() {
+        use std::io::Write;
+        let path = std::env::temp_dir().join("vimcode_test_preview4.txt");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(b"promote").unwrap();
+        }
+
+        let mut engine = Engine::new();
+        // Single-click: preview
+        engine
+            .open_file_with_mode(&path, OpenMode::Preview)
+            .unwrap();
+        let bid = engine.active_buffer_id();
+        assert!(engine.buffer_manager.get(bid).unwrap().preview);
+
+        // Double-click: permanent
+        engine
+            .open_file_with_mode(&path, OpenMode::Permanent)
+            .unwrap();
+        assert!(!engine.buffer_manager.get(bid).unwrap().preview);
+        assert_eq!(engine.preview_buffer_id, None);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_edit_promotes_preview() {
+        use std::io::Write;
+        let path = std::env::temp_dir().join("vimcode_test_preview5.txt");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(b"editme").unwrap();
+        }
+
+        let mut engine = Engine::new();
+        engine
+            .open_file_with_mode(&path, OpenMode::Preview)
+            .unwrap();
+        let bid = engine.active_buffer_id();
+        assert!(engine.buffer_manager.get(bid).unwrap().preview);
+
+        // Enter insert mode and type a character
+        press_char(&mut engine, 'i');
+        press_char(&mut engine, 'x');
+        press_special(&mut engine, "Escape");
+
+        // Should be promoted
+        assert!(!engine.buffer_manager.get(bid).unwrap().preview);
+        assert_eq!(engine.preview_buffer_id, None);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_save_promotes_preview() {
+        use std::io::Write;
+        let path = std::env::temp_dir().join("vimcode_test_preview6.txt");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(b"saveme").unwrap();
+        }
+
+        let mut engine = Engine::new();
+        engine
+            .open_file_with_mode(&path, OpenMode::Preview)
+            .unwrap();
+        let bid = engine.active_buffer_id();
+        assert!(engine.buffer_manager.get(bid).unwrap().preview);
+
+        // Save
+        let _ = engine.save();
+
+        assert!(!engine.buffer_manager.get(bid).unwrap().preview);
+        assert_eq!(engine.preview_buffer_id, None);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_ls_shows_preview_flag() {
+        use std::io::Write;
+        let path = std::env::temp_dir().join("vimcode_test_preview7.txt");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(b"ls").unwrap();
+        }
+
+        let mut engine = Engine::new();
+        engine
+            .open_file_with_mode(&path, OpenMode::Preview)
+            .unwrap();
+
+        let listing = engine.list_buffers();
+        assert!(listing.contains("[Preview]"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_already_permanent_ignores_preview_mode() {
+        use std::io::Write;
+        let path = std::env::temp_dir().join("vimcode_test_preview8.txt");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(b"perm").unwrap();
+        }
+
+        let mut engine = Engine::new();
+        // Open as permanent first
+        engine
+            .open_file_with_mode(&path, OpenMode::Permanent)
+            .unwrap();
+        let bid = engine.active_buffer_id();
+
+        // Trying to preview the same file should NOT mark it as preview
+        engine
+            .open_file_with_mode(&path, OpenMode::Preview)
+            .unwrap();
+        assert!(!engine.buffer_manager.get(bid).unwrap().preview);
+        assert_eq!(engine.preview_buffer_id, None);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_delete_preview_clears_tracking() {
+        use std::io::Write;
+        let path = std::env::temp_dir().join("vimcode_test_preview9.txt");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(b"del").unwrap();
+        }
+
+        let mut engine = Engine::new();
+        engine
+            .open_file_with_mode(&path, OpenMode::Preview)
+            .unwrap();
+        let bid = engine.active_buffer_id();
+        assert_eq!(engine.preview_buffer_id, Some(bid));
+
+        let _ = engine.delete_buffer(bid, true);
+        assert_eq!(engine.preview_buffer_id, None);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_preview_never_dirty_and_preview() {
+        use std::io::Write;
+        let path = std::env::temp_dir().join("vimcode_test_preview10.txt");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(b"dirtytest").unwrap();
+        }
+
+        let mut engine = Engine::new();
+        engine
+            .open_file_with_mode(&path, OpenMode::Preview)
+            .unwrap();
+        let bid = engine.active_buffer_id();
+
+        // Type to make dirty — should auto-promote
+        press_char(&mut engine, 'i');
+        press_char(&mut engine, 'z');
+        press_special(&mut engine, "Escape");
+
+        let state = engine.buffer_manager.get(bid).unwrap();
+        // Should be dirty but NOT preview (promoted)
+        assert!(state.dirty);
+        assert!(!state.preview);
+
+        let _ = std::fs::remove_file(&path);
     }
 }

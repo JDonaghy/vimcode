@@ -17,7 +17,7 @@ mod core;
 use core::buffer::Buffer;
 use core::engine::EngineAction;
 use core::settings::LineNumberMode;
-use core::{Cursor, Engine, Mode, WindowRect};
+use core::{Cursor, Engine, Mode, OpenMode, WindowRect};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[allow(dead_code)] // Variants used in later phases
@@ -63,8 +63,10 @@ enum Msg {
     ToggleSidebar,
     /// Switch to a different sidebar panel.
     SwitchPanel(SidebarPanel),
-    /// Open file from sidebar tree view.
+    /// Open file from sidebar tree view (permanent).
     OpenFileFromSidebar(PathBuf),
+    /// Preview file from sidebar single-click (reusable preview tab).
+    PreviewFileFromSidebar(PathBuf),
     /// Create a new file with the given name.
     CreateFile(String),
     /// Create a new folder with the given name.
@@ -436,6 +438,32 @@ impl SimpleComponent for App {
                 }
             });
 
+        // Connect single-click for preview mode
+        let sender_for_click = sender.clone();
+        let gesture = gtk4::GestureClick::new();
+        gesture.set_button(1); // Left mouse button
+        gesture.connect_released(move |gesture, n_press, x, y| {
+            if n_press != 1 {
+                return; // Double-click handled by row_activated
+            }
+            let widget = gesture.widget();
+            if let Some(tree_view) = widget.downcast_ref::<gtk4::TreeView>() {
+                if let Some((Some(path), _, _, _)) = tree_view.path_at_pos(x as i32, y as i32) {
+                    if let Some(model) = tree_view.model() {
+                        if let Some(iter) = model.iter(&path) {
+                            let full_path: String =
+                                model.get_value(&iter, 2).get().unwrap_or_default();
+                            let path_buf = PathBuf::from(full_path);
+                            if path_buf.is_file() {
+                                sender_for_click.input(Msg::PreviewFileFromSidebar(path_buf));
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        widgets.file_tree_view.add_controller(gesture);
+
         // Set the actual title after widget creation
         root.set_title(Some(&title));
 
@@ -485,33 +513,20 @@ impl SimpleComponent for App {
                     }
                     EngineAction::OpenFile(path) => {
                         let mut engine = self.engine.borrow_mut();
-                        // Use buffer manager to open the file in current window
-                        match engine.buffer_manager.open_file(&path) {
-                            Ok(buffer_id) => {
-                                // Switch current window to the new buffer
-                                let current = engine.active_buffer_id();
-                                engine.buffer_manager.alternate_buffer = Some(current);
-                                engine.active_window_mut().buffer_id = buffer_id;
-                                engine.view_mut().cursor.line = 0;
-                                engine.view_mut().cursor.col = 0;
-                                engine.set_scroll_top(0);
-                                engine.message = format!("\"{}\"", path.display());
-
-                                drop(engine); // Release borrow before calling highlight
-
-                                // Highlight in tree
+                        // :e and other explicit commands always open as permanent
+                        match engine.open_file_with_mode(&path, OpenMode::Permanent) {
+                            Ok(()) => {
+                                drop(engine);
                                 if let Some(ref tree) = *self.file_tree_view.borrow() {
                                     highlight_file_in_tree(tree, &path);
                                 }
-
-                                // Ensure editor has focus after opening file
                                 if let Some(ref drawing) = *self.drawing_area.borrow() {
                                     drawing.grab_focus();
                                 }
                                 self.tree_has_focus = false;
                             }
                             Err(e) => {
-                                engine.message = format!("Error: {}", e);
+                                engine.message = e;
                             }
                         }
                     }
@@ -550,38 +565,38 @@ impl SimpleComponent for App {
             }
             Msg::OpenFileFromSidebar(path) => {
                 let mut engine = self.engine.borrow_mut();
-                match engine.buffer_manager.open_file(&path) {
-                    Ok(buffer_id) => {
-                        // Save current buffer as alternate
-                        let current = engine.active_buffer_id();
-                        engine.buffer_manager.alternate_buffer = Some(current);
-
-                        // Switch to new buffer
-                        engine.active_window_mut().buffer_id = buffer_id;
-
-                        // Reset view
-                        engine.view_mut().cursor.line = 0;
-                        engine.view_mut().cursor.col = 0;
-                        engine.set_scroll_top(0);
-
-                        // Update message
-                        engine.message = format!("\"{}\"", path.display());
-
-                        drop(engine); // Release borrow before calling highlight
-
-                        // Highlight in tree
+                match engine.open_file_with_mode(&path, OpenMode::Permanent) {
+                    Ok(()) => {
+                        drop(engine);
                         if let Some(ref tree) = *self.file_tree_view.borrow() {
                             highlight_file_in_tree(tree, &path);
                         }
-
-                        // Switch focus to editor after opening file
                         if let Some(ref drawing) = *self.drawing_area.borrow() {
                             drawing.grab_focus();
                         }
                         self.tree_has_focus = false;
                     }
                     Err(e) => {
-                        engine.message = format!("Error: {}", e);
+                        engine.message = e;
+                    }
+                }
+                self.redraw = !self.redraw;
+            }
+            Msg::PreviewFileFromSidebar(path) => {
+                let mut engine = self.engine.borrow_mut();
+                match engine.open_file_with_mode(&path, OpenMode::Preview) {
+                    Ok(()) => {
+                        drop(engine);
+                        if let Some(ref tree) = *self.file_tree_view.borrow() {
+                            highlight_file_in_tree(tree, &path);
+                        }
+                        if let Some(ref drawing) = *self.drawing_area.borrow() {
+                            drawing.grab_focus();
+                        }
+                        self.tree_has_focus = false;
+                    }
+                    Err(e) => {
+                        engine.message = e;
                     }
                 }
                 self.redraw = !self.redraw;
@@ -867,22 +882,39 @@ fn draw_tab_bar(
     cr.rectangle(0.0, 0.0, width, line_height);
     cr.fill().unwrap();
 
+    // Save current font description so we can restore after rendering previews
+    let normal_font = layout
+        .font_description()
+        .unwrap_or_else(|| FontDescription::from_string("Monospace 14"));
+    let mut italic_font = normal_font.clone();
+    italic_font.set_style(pango::Style::Italic);
+
     let mut x = 0.0;
     for (i, tab) in engine.tabs.iter().enumerate() {
         let is_active = i == engine.active_tab;
 
-        // Get first buffer name in this tab
+        // Get first buffer name and preview state in this tab
         let window_id = tab.active_window;
-        let name = if let Some(window) = engine.windows.get(&window_id) {
+        let (name, is_preview) = if let Some(window) = engine.windows.get(&window_id) {
             if let Some(state) = engine.buffer_manager.get(window.buffer_id) {
                 let dirty = if state.dirty { "*" } else { "" };
-                format!(" {}: {}{} ", i + 1, state.display_name(), dirty)
+                (
+                    format!(" {}: {}{} ", i + 1, state.display_name(), dirty),
+                    state.preview,
+                )
             } else {
-                format!(" {}: [No Name] ", i + 1)
+                (format!(" {}: [No Name] ", i + 1), false)
             }
         } else {
-            format!(" {}: [No Name] ", i + 1)
+            (format!(" {}: [No Name] ", i + 1), false)
         };
+
+        // Use italic font for preview tabs
+        if is_preview {
+            layout.set_font_description(Some(&italic_font));
+        } else {
+            layout.set_font_description(Some(&normal_font));
+        }
 
         layout.set_text(&name);
         let (tab_width, _) = layout.pixel_size();
@@ -896,9 +928,15 @@ fn draw_tab_bar(
         cr.rectangle(x, 0.0, tab_width as f64, line_height);
         cr.fill().unwrap();
 
-        // Tab text
+        // Tab text — dimmed colors for preview tabs
         cr.move_to(x, 0.0);
-        if is_active {
+        if is_preview {
+            if is_active {
+                cr.set_source_rgb(0.8, 0.8, 0.8);
+            } else {
+                cr.set_source_rgb(0.5, 0.5, 0.5);
+            }
+        } else if is_active {
             cr.set_source_rgb(1.0, 1.0, 1.0);
         } else {
             cr.set_source_rgb(0.7, 0.7, 0.7);
@@ -907,6 +945,9 @@ fn draw_tab_bar(
 
         x += tab_width as f64 + 2.0;
     }
+
+    // Restore normal font for subsequent rendering
+    layout.set_font_description(Some(&normal_font));
 }
 
 #[allow(clippy::too_many_arguments)]
