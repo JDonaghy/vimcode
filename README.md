@@ -14,7 +14,7 @@ VimCode's long-term goal is to be a full-featured code editor that:
 
 ## Current Status
 
-VimCode now supports a functional Vim-like workflow with **visual mode, multiple buffers, split windows, and tabs** — the core primitives for editing multiple files.
+VimCode now supports a functional Vim-like workflow with **visual mode, multiple buffers, split windows, tabs, and a VSCode-style file explorer** — the core primitives for editing multiple files.
 
 ### What works today
 
@@ -23,14 +23,16 @@ VimCode now supports a functional Vim-like workflow with **visual mode, multiple
 - **Multiple buffers** — Open multiple files, switch with `:bn`/`:bp`/`:b#`/`:b <n>`
 - **Split windows** — `:split`, `:vsplit`, `Ctrl-W` commands
 - **Tabs** — `:tabnew`, `:tabclose`, `gt`/`gT` navigation
+- **File explorer** — VSCode-style collapsible sidebar with tree view, Ctrl-Shift-E to focus, file operations (create/delete), active file highlighting
 - **File I/O** — Open from CLI, `:w` save, `:e` open, `:q` quit with dirty-buffer protection
 - **Navigation** — `h`/`j`/`k`/`l`, `w`/`b`/`e` words, `{`/`}` paragraphs, `gg`/`G`, `0`/`$`, `Ctrl-D`/`Ctrl-U`
-- **Editing** — `i`/`a`/`o`/`O`/`I`/`A` insert modes, `x`/`dd`/`D` delete
+- **Editing** — `i`/`a`/`o`/`O`/`I`/`A` insert modes, `x`/`dd`/`D` delete, operators with motions/text-objects
 - **Yank/Paste** — `yy`/`Y` yank line, `p`/`P` paste, `"x` named registers
 - **Undo/Redo** — `u` undo, `Ctrl-r` redo with Vim-style undo groups
 - **Search** — `/` forward search, `n`/`N` next/previous match
+- **Repeat** — `.` repeats last change
 - **Syntax highlighting** — Tree-sitter for Rust
-- **115 passing tests**, clippy-clean
+- **232 passing tests**, clippy-clean
 
 ### Key Commands
 
@@ -79,6 +81,12 @@ VimCode now supports a functional Vim-like workflow with **visual mode, multiple
 | `:bd` | Delete buffer |
 | `:split` `:vsplit` | Split window |
 | `:tabnew` `:tabclose` | Tab management |
+
+| UI Keybindings | Action |
+|----------------|--------|
+| `Ctrl-B` | Toggle sidebar visibility |
+| `Ctrl-Shift-E` | Focus file explorer |
+| `Escape` (in explorer) | Return focus to editor |
 
 ## Roadmap
 

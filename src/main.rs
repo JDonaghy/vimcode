@@ -1,3 +1,7 @@
+// TreeView/TreeStore are deprecated in GTK4 4.10+ but still functional
+// TODO: Migrate to ListView/ColumnView in a future phase
+#![allow(deprecated)]
+
 use gtk4::cairo::Context;
 use gtk4::gdk;
 use gtk4::pango::{self, AttrColor, AttrList, FontDescription};
@@ -5,7 +9,8 @@ use gtk4::prelude::*;
 use pangocairo::functions as pangocairo;
 use relm4::prelude::*;
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 mod core;
@@ -14,12 +19,29 @@ use core::engine::EngineAction;
 use core::settings::LineNumberMode;
 use core::{Cursor, Engine, Mode, WindowRect};
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(dead_code)] // Variants used in later phases
+enum SidebarPanel {
+    Explorer,
+    Search,
+    Git,
+    Settings,
+    None,
+}
+
 struct App {
     engine: Rc<RefCell<Engine>>,
     redraw: bool,
+    sidebar_visible: bool,
+    active_panel: SidebarPanel,
+    tree_store: Option<gtk4::TreeStore>,
+    tree_has_focus: bool,
+    file_tree_view: Rc<RefCell<Option<gtk4::TreeView>>>,
+    drawing_area: Rc<RefCell<Option<gtk4::DrawingArea>>>,
 }
 
 #[derive(Debug)]
+#[allow(dead_code)] // Variants used in later phases
 enum Msg {
     /// Carries the key name (e.g. "Escape", "Return", "Left") and the
     /// Unicode character the key maps to (if any), plus modifier state.
@@ -30,6 +52,31 @@ enum Msg {
     },
     /// Notify that a resize happened (triggers redraw).
     Resize,
+    /// Mouse click at (x, y) coordinates in drawing area.
+    MouseClick {
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+    },
+    /// Toggle sidebar visibility.
+    ToggleSidebar,
+    /// Switch to a different sidebar panel.
+    SwitchPanel(SidebarPanel),
+    /// Open file from sidebar tree view.
+    OpenFileFromSidebar(PathBuf),
+    /// Create a new file with the given name.
+    CreateFile(String),
+    /// Create a new folder with the given name.
+    CreateFolder(String),
+    /// Delete a file or folder at the given path.
+    DeletePath(PathBuf),
+    /// Refresh the file tree from current working directory.
+    RefreshFileTree,
+    /// Focus the explorer panel (Ctrl-Shift-E).
+    FocusExplorer,
+    /// Focus the editor (Escape from tree).
+    FocusEditor,
 }
 
 #[relm4::component]
@@ -43,31 +90,255 @@ impl SimpleComponent for App {
             set_title: Some("VimCode"),
             set_default_size: (800, 600),
 
+            #[name = "main_hbox"]
             gtk4::Box {
-                set_orientation: gtk4::Orientation::Vertical,
+                set_orientation: gtk4::Orientation::Horizontal,
 
-                #[name = "drawing_area"]
-                gtk4::DrawingArea {
-                    set_hexpand: true,
-                    set_vexpand: true,
-                    set_focusable: true,
-                    grab_focus: (),
+                // Activity Bar (48px, always visible)
+                #[name = "activity_bar"]
+                gtk4::Box {
+                    set_orientation: gtk4::Orientation::Vertical,
+                    set_width_request: 48,
+                    set_css_classes: &["activity-bar"],
 
-                    add_controller = gtk4::EventControllerKey {
-                        connect_key_pressed[sender] => move |_, key, _, modifier| {
-                            let key_name = key.name().map(|s| s.to_string()).unwrap_or_default();
-                            let unicode = key.to_unicode().filter(|c| !c.is_control());
-                            let ctrl = modifier.contains(gdk::ModifierType::CONTROL_MASK);
-                            sender.input(Msg::KeyPress { key_name, unicode, ctrl });
-                            gtk4::glib::Propagation::Stop
+                    #[name = "explorer_button"]
+                    gtk4::Button {
+                        set_label: "📁",
+                        set_tooltip_text: Some("Explorer (Ctrl+Shift+E)"),
+                        set_width_request: 48,
+                        set_height_request: 48,
+
+                        #[watch]
+                        set_css_classes: if model.active_panel == SidebarPanel::Explorer && model.sidebar_visible {
+                            &["activity-button", "active"]
+                        } else {
+                            &["activity-button"]
+                        },
+
+                        connect_clicked[sender] => move |_| {
+                            sender.input(Msg::SwitchPanel(SidebarPanel::Explorer));
                         }
                     },
 
-                    #[watch]
-                    set_css_classes: {
-                        drawing_area.queue_draw();
-                        if model.redraw { &["vim-code", "even"] } else { &["vim-code", "odd"] }
+                    gtk4::Button {
+                        set_label: "🔍",
+                        set_tooltip_text: Some("Search (disabled)"),
+                        set_width_request: 48,
+                        set_height_request: 48,
+                        set_css_classes: &["activity-button"],
+                        set_sensitive: false,
                     },
+
+                    gtk4::Button {
+                        set_label: "🌿",
+                        set_tooltip_text: Some("Git (disabled)"),
+                        set_width_request: 48,
+                        set_height_request: 48,
+                        set_css_classes: &["activity-button"],
+                        set_sensitive: false,
+                    },
+
+                    gtk4::Separator {
+                        set_vexpand: true, // Pushes settings to bottom
+                    },
+
+                    gtk4::Button {
+                        set_label: "⚙️",
+                        set_tooltip_text: Some("Settings (disabled)"),
+                        set_width_request: 48,
+                        set_height_request: 48,
+                        set_css_classes: &["activity-button"],
+                        set_sensitive: false,
+                    },
+                },
+
+                // Sidebar (collapsible with Revealer)
+                #[name = "sidebar_revealer"]
+                gtk4::Revealer {
+                    set_transition_type: gtk4::RevealerTransitionType::SlideRight,
+                    set_transition_duration: 200,
+
+                    #[watch]
+                    set_reveal_child: model.sidebar_visible,
+
+                    gtk4::Box {
+                        set_orientation: gtk4::Orientation::Vertical,
+                        set_width_request: 300,
+                        set_css_classes: &["sidebar"],
+
+                        // Toolbar with file operation buttons
+                        #[name = "explorer_toolbar"]
+                        gtk4::Box {
+                            set_orientation: gtk4::Orientation::Horizontal,
+                            set_margin_all: 5,
+                            set_spacing: 5,
+                            set_css_classes: &["explorer-toolbar"],
+
+                            gtk4::Button {
+                                set_label: "📄",
+                                set_tooltip_text: Some("New File"),
+                                set_width_request: 32,
+                                set_height_request: 32,
+                                connect_clicked[sender] => move |_| {
+                                    // Generate filename: newfile_1.txt, newfile_2.txt, etc.
+                                    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                                    let mut counter = 1;
+                                    let mut filename = format!("newfile_{}.txt", counter);
+
+                                    // Find next available number
+                                    while cwd.join(&filename).exists() {
+                                        counter += 1;
+                                        filename = format!("newfile_{}.txt", counter);
+                                    }
+
+                                    sender.input(Msg::CreateFile(filename));
+                                }
+                            },
+
+                            gtk4::Button {
+                                set_label: "📁",
+                                set_tooltip_text: Some("New Folder"),
+                                set_width_request: 32,
+                                set_height_request: 32,
+                                connect_clicked[sender] => move |_| {
+                                    // Generate folder name: newfolder_1, newfolder_2, etc.
+                                    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                                    let mut counter = 1;
+                                    let mut foldername = format!("newfolder_{}", counter);
+
+                                    // Find next available number
+                                    while cwd.join(&foldername).exists() {
+                                        counter += 1;
+                                        foldername = format!("newfolder_{}", counter);
+                                    }
+
+                                    sender.input(Msg::CreateFolder(foldername));
+                                }
+                            },
+
+                            gtk4::Button {
+                                set_label: "🗑️",
+                                set_tooltip_text: Some("Delete"),
+                                set_width_request: 32,
+                                set_height_request: 32,
+                                connect_clicked[sender, file_tree_view] => move |_| {
+                                    // Get selected row
+                                    if let Some(selection) = file_tree_view.selection().selected() {
+                                        let (model, iter) = selection;
+                                        // Column 2 contains the full path
+                                        let path_str: String = model.get_value(&iter, 2).get().unwrap_or_default();
+                                        if !path_str.is_empty() {
+                                            let path = PathBuf::from(path_str);
+                                            sender.input(Msg::DeletePath(path));
+                                        }
+                                    }
+                                }
+                            },
+
+                            gtk4::Button {
+                                set_label: "🔄",
+                                set_tooltip_text: Some("Refresh"),
+                                set_width_request: 32,
+                                set_height_request: 32,
+                                connect_clicked[sender] => move |_| {
+                                    sender.input(Msg::RefreshFileTree);
+                                }
+                            },
+                        },
+
+                        // Scrollable tree view
+                        #[name = "file_tree_scroll"]
+                        gtk4::ScrolledWindow {
+                            set_vexpand: true,
+                            set_hscrollbar_policy: gtk4::PolicyType::Automatic,
+                            set_vscrollbar_policy: gtk4::PolicyType::Automatic,
+
+                            #[name = "file_tree_view"]
+                            gtk4::TreeView {
+                                set_headers_visible: false,
+                                set_enable_tree_lines: false,
+                                set_show_expanders: true,
+                                set_level_indentation: 0,
+                                set_focusable: true,
+                                set_enable_search: false,
+
+                                add_controller = gtk4::EventControllerKey {
+                                    connect_key_pressed[sender] => move |_, key, _, _| {
+                                        let key_name = key.name().map(|s| s.to_string()).unwrap_or_default();
+
+                                        // Escape returns focus to editor
+                                        if key_name == "Escape" {
+                                            sender.input(Msg::FocusEditor);
+                                            return gtk4::glib::Propagation::Stop;
+                                        }
+
+                                        // Arrow keys for navigation - let TreeView handle them
+                                        if matches!(key_name.as_str(), "Up" | "Down" | "Left" | "Right" | "Return" | "space") {
+                                            return gtk4::glib::Propagation::Proceed;
+                                        }
+
+                                        // Stop all other keys from triggering TreeView search
+                                        gtk4::glib::Propagation::Stop
+                                    }
+                                },
+                            },
+                        },
+                    }
+                },
+
+                // Editor area (existing DrawingArea)
+                gtk4::Box {
+                    set_orientation: gtk4::Orientation::Vertical,
+                    set_hexpand: true,
+
+                    #[name = "drawing_area"]
+                    gtk4::DrawingArea {
+                        set_hexpand: true,
+                        set_vexpand: true,
+                        set_focusable: true,
+                        grab_focus: (),
+
+                        add_controller = gtk4::EventControllerKey {
+                            connect_key_pressed[sender] => move |_, key, _, modifier| {
+                                let key_name = key.name().map(|s| s.to_string()).unwrap_or_default();
+                                let unicode = key.to_unicode().filter(|c| !c.is_control());
+                                let ctrl = modifier.contains(gdk::ModifierType::CONTROL_MASK);
+                                let shift = modifier.contains(gdk::ModifierType::SHIFT_MASK);
+
+                                // Check for Ctrl-B to toggle sidebar
+                                if ctrl && !shift && unicode == Some('b') {
+                                    sender.input(Msg::ToggleSidebar);
+                                    return gtk4::glib::Propagation::Stop;
+                                }
+
+                                // Check for Ctrl-Shift-E to focus explorer
+                                if ctrl && shift && (unicode == Some('E') || unicode == Some('e')) {
+                                    sender.input(Msg::FocusExplorer);
+                                    return gtk4::glib::Propagation::Stop;
+                                }
+
+                                sender.input(Msg::KeyPress { key_name, unicode, ctrl });
+                                gtk4::glib::Propagation::Stop
+                            }
+                        },
+
+                        add_controller = gtk4::GestureClick {
+                            connect_pressed[sender, drawing_area] => move |_, _, x, y| {
+                                // Grab focus when clicking in editor
+                                drawing_area.grab_focus();
+
+                                let width = drawing_area.width() as f64;
+                                let height = drawing_area.height() as f64;
+                                sender.input(Msg::MouseClick { x, y, width, height });
+                            }
+                        },
+
+                        #[watch]
+                        set_css_classes: {
+                            drawing_area.queue_draw();
+                            if model.redraw { &["vim-code", "even"] } else { &["vim-code", "odd"] }
+                        },
+                    }
                 }
             }
         }
@@ -78,6 +349,9 @@ impl SimpleComponent for App {
         root: Self::Root,
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
+        // Load CSS before creating widgets
+        load_css();
+
         let engine = match file_path {
             Some(ref path) => Engine::open(path),
             None => Engine::new(),
@@ -91,11 +365,76 @@ impl SimpleComponent for App {
 
         let engine = Rc::new(RefCell::new(engine));
 
+        // Create TreeStore with 3 columns: Icon(String), Name(String), FullPath(String)
+        let tree_store = gtk4::TreeStore::new(&[
+            gtk4::glib::Type::STRING, // Icon
+            gtk4::glib::Type::STRING, // Name
+            gtk4::glib::Type::STRING, // Full path
+        ]);
+
+        let file_tree_view_ref = Rc::new(RefCell::new(None));
+        let drawing_area_ref = Rc::new(RefCell::new(None));
+
         let model = App {
             engine: engine.clone(),
             redraw: false,
+            sidebar_visible: true,
+            active_panel: SidebarPanel::Explorer,
+            tree_store: Some(tree_store.clone()),
+            tree_has_focus: false,
+            file_tree_view: file_tree_view_ref.clone(),
+            drawing_area: drawing_area_ref.clone(),
         };
         let widgets = view_output!();
+
+        // Store widget references
+        *file_tree_view_ref.borrow_mut() = Some(widgets.file_tree_view.clone());
+        *drawing_area_ref.borrow_mut() = Some(widgets.drawing_area.clone());
+
+        // Build tree from current working directory
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        build_file_tree(&tree_store, None, &cwd);
+
+        // Debug: print entry count
+        eprintln!("Tree entries: {}", tree_store.iter_n_children(None));
+
+        // Setup TreeView columns
+        // Single column with icon + filename (so they indent together)
+        let col = gtk4::TreeViewColumn::new();
+
+        // Icon cell renderer (non-expanding)
+        let icon_cell = gtk4::CellRendererText::new();
+        col.pack_start(&icon_cell, false);
+        col.add_attribute(&icon_cell, "text", 0);
+
+        // Filename cell renderer (expanding)
+        let name_cell = gtk4::CellRendererText::new();
+        col.pack_start(&name_cell, true);
+        col.add_attribute(&name_cell, "text", 1);
+
+        widgets.file_tree_view.append_column(&col);
+
+        // Set the model on the TreeView
+        widgets.file_tree_view.set_model(Some(&tree_store));
+
+        // Connect double-click signal to open files
+        let sender_for_tree = sender.clone();
+        widgets
+            .file_tree_view
+            .connect_row_activated(move |tree_view, tree_path, _column| {
+                if let Some(model) = tree_view.model() {
+                    if let Some(iter) = model.iter(tree_path) {
+                        // Use TreeModelExt::get to retrieve the value
+                        let full_path: String = model.get_value(&iter, 2).get().unwrap_or_default();
+
+                        let path_buf = PathBuf::from(full_path);
+                        if path_buf.is_file() {
+                            sender_for_tree.input(Msg::OpenFileFromSidebar(path_buf));
+                        }
+                        // If directory, do nothing for now (expand/collapse works automatically)
+                    }
+                }
+            });
 
         // Set the actual title after widget creation
         root.set_title(Some(&title));
@@ -121,6 +460,9 @@ impl SimpleComponent for App {
                 let engine = engine_clone.borrow();
                 draw_editor(cr, &engine, width, height);
             });
+
+        // Ensure drawing area has focus on startup
+        widgets.drawing_area.grab_focus();
 
         ComponentParts { model, widgets }
     }
@@ -154,6 +496,19 @@ impl SimpleComponent for App {
                                 engine.view_mut().cursor.col = 0;
                                 engine.set_scroll_top(0);
                                 engine.message = format!("\"{}\"", path.display());
+
+                                drop(engine); // Release borrow before calling highlight
+
+                                // Highlight in tree
+                                if let Some(ref tree) = *self.file_tree_view.borrow() {
+                                    highlight_file_in_tree(tree, &path);
+                                }
+
+                                // Ensure editor has focus after opening file
+                                if let Some(ref drawing) = *self.drawing_area.borrow() {
+                                    drawing.grab_focus();
+                                }
+                                self.tree_has_focus = false;
                             }
                             Err(e) => {
                                 engine.message = format!("Error: {}", e);
@@ -166,6 +521,232 @@ impl SimpleComponent for App {
                 self.redraw = !self.redraw;
             }
             Msg::Resize => {
+                self.redraw = !self.redraw;
+            }
+            Msg::MouseClick {
+                x,
+                y,
+                width,
+                height,
+            } => {
+                let mut engine = self.engine.borrow_mut();
+                handle_mouse_click(&mut engine, x, y, width, height);
+                self.redraw = !self.redraw;
+            }
+            Msg::ToggleSidebar => {
+                self.sidebar_visible = !self.sidebar_visible;
+                self.redraw = !self.redraw;
+            }
+            Msg::SwitchPanel(panel) => {
+                if self.active_panel == panel {
+                    // Same panel - toggle visibility
+                    self.sidebar_visible = !self.sidebar_visible;
+                } else {
+                    // Different panel - switch and ensure visible
+                    self.active_panel = panel;
+                    self.sidebar_visible = true;
+                }
+                self.redraw = !self.redraw;
+            }
+            Msg::OpenFileFromSidebar(path) => {
+                let mut engine = self.engine.borrow_mut();
+                match engine.buffer_manager.open_file(&path) {
+                    Ok(buffer_id) => {
+                        // Save current buffer as alternate
+                        let current = engine.active_buffer_id();
+                        engine.buffer_manager.alternate_buffer = Some(current);
+
+                        // Switch to new buffer
+                        engine.active_window_mut().buffer_id = buffer_id;
+
+                        // Reset view
+                        engine.view_mut().cursor.line = 0;
+                        engine.view_mut().cursor.col = 0;
+                        engine.set_scroll_top(0);
+
+                        // Update message
+                        engine.message = format!("\"{}\"", path.display());
+
+                        drop(engine); // Release borrow before calling highlight
+
+                        // Highlight in tree
+                        if let Some(ref tree) = *self.file_tree_view.borrow() {
+                            highlight_file_in_tree(tree, &path);
+                        }
+
+                        // Switch focus to editor after opening file
+                        if let Some(ref drawing) = *self.drawing_area.borrow() {
+                            drawing.grab_focus();
+                        }
+                        self.tree_has_focus = false;
+                    }
+                    Err(e) => {
+                        engine.message = format!("Error: {}", e);
+                    }
+                }
+                self.redraw = !self.redraw;
+            }
+            Msg::CreateFile(name) => {
+                // Validate name
+                if let Err(msg) = validate_name(&name) {
+                    self.engine.borrow_mut().message = msg;
+                    self.redraw = !self.redraw;
+                    return;
+                }
+
+                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                let file_path = cwd.join(&name);
+
+                // Check if already exists
+                if file_path.exists() {
+                    self.engine.borrow_mut().message = format!("'{}' already exists", name);
+                    self.redraw = !self.redraw;
+                    return;
+                }
+
+                // Create file
+                match std::fs::File::create(&file_path) {
+                    Ok(_) => {
+                        self.engine.borrow_mut().message = format!("Created: {}", name);
+
+                        // Trigger tree refresh
+                        _sender.input(Msg::RefreshFileTree);
+
+                        // Open the new file
+                        _sender.input(Msg::OpenFileFromSidebar(file_path));
+                    }
+                    Err(e) => {
+                        self.engine.borrow_mut().message =
+                            format!("Error creating '{}': {}", name, e);
+                    }
+                }
+                self.redraw = !self.redraw;
+            }
+            Msg::CreateFolder(name) => {
+                // Validate name
+                if let Err(msg) = validate_name(&name) {
+                    self.engine.borrow_mut().message = msg;
+                    self.redraw = !self.redraw;
+                    return;
+                }
+
+                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                let folder_path = cwd.join(&name);
+
+                // Check if already exists
+                if folder_path.exists() {
+                    self.engine.borrow_mut().message = format!("'{}' already exists", name);
+                    self.redraw = !self.redraw;
+                    return;
+                }
+
+                // Create folder
+                match std::fs::create_dir(&folder_path) {
+                    Ok(_) => {
+                        self.engine.borrow_mut().message = format!("Created folder: {}", name);
+                        _sender.input(Msg::RefreshFileTree);
+                    }
+                    Err(e) => {
+                        self.engine.borrow_mut().message =
+                            format!("Error creating folder '{}': {}", name, e);
+                    }
+                }
+                self.redraw = !self.redraw;
+            }
+            Msg::DeletePath(path) => {
+                // Get filename for message
+                let filename = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown");
+
+                let is_dir = path.is_dir();
+                let item_type = if is_dir { "folder" } else { "file" };
+
+                // Check if path exists
+                if !path.exists() {
+                    self.engine.borrow_mut().message = format!("'{}' does not exist", filename);
+                    self.redraw = !self.redraw;
+                    return;
+                }
+
+                // Attempt deletion
+                let result = if is_dir {
+                    std::fs::remove_dir_all(&path)
+                } else {
+                    std::fs::remove_file(&path)
+                };
+
+                match result {
+                    Ok(_) => {
+                        self.engine.borrow_mut().message =
+                            format!("Deleted {}: '{}'", item_type, filename);
+
+                        // If deleted file was open, close its buffer
+                        // Find buffer by path and delete it
+                        if !is_dir {
+                            let path_str = path.to_string_lossy();
+                            let mut engine = self.engine.borrow_mut();
+                            if let Some(buffer_id) = engine.buffer_manager.find_by_path(&path_str) {
+                                // Delete the buffer (force=true since file is gone anyway)
+                                let _ = engine.delete_buffer(buffer_id, true);
+                            }
+                        }
+
+                        _sender.input(Msg::RefreshFileTree);
+                    }
+                    Err(e) => {
+                        let msg = match e.kind() {
+                            std::io::ErrorKind::PermissionDenied => {
+                                format!("Permission denied: '{}'", filename)
+                            }
+                            std::io::ErrorKind::NotFound => format!("'{}' not found", filename),
+                            _ => format!("Error deleting '{}': {}", filename, e),
+                        };
+                        self.engine.borrow_mut().message = msg;
+                    }
+                }
+                self.redraw = !self.redraw;
+            }
+            Msg::RefreshFileTree => {
+                if let Some(ref store) = self.tree_store {
+                    match std::env::current_dir() {
+                        Ok(cwd) => {
+                            // Clear tree
+                            store.clear();
+
+                            // Rebuild
+                            build_file_tree(store, None, &cwd);
+                        }
+                        Err(e) => {
+                            self.engine.borrow_mut().message =
+                                format!("Error refreshing tree: {}", e);
+                        }
+                    }
+                }
+                self.redraw = !self.redraw;
+            }
+            Msg::FocusExplorer => {
+                // Ensure sidebar is visible and explorer is active
+                self.sidebar_visible = true;
+                self.active_panel = SidebarPanel::Explorer;
+                self.tree_has_focus = true;
+
+                // Grab focus on tree view
+                if let Some(ref tree) = *self.file_tree_view.borrow() {
+                    tree.grab_focus();
+                }
+
+                self.redraw = !self.redraw;
+            }
+            Msg::FocusEditor => {
+                self.tree_has_focus = false;
+
+                // Grab focus on drawing area
+                if let Some(ref drawing) = *self.drawing_area.borrow() {
+                    drawing.grab_focus();
+                }
+
                 self.redraw = !self.redraw;
             }
         }
@@ -842,15 +1423,467 @@ fn draw_command_line(
     }
 }
 
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let file_path = args.get(1).map(PathBuf::from);
+/// Handle mouse click by converting coordinates to buffer position.
+/// This determines which window was clicked and moves the cursor there.
+fn handle_mouse_click(engine: &mut Engine, x: f64, y: f64, width: f64, height: f64) {
+    // Create Pango context to measure font metrics (matching draw_editor)
+    use gtk4::cairo::{Context as CairoContext, Format, ImageSurface};
 
-    // NON_UNIQUE prevents GTK from trying to pass files to an existing instance.
-    // HANDLES_COMMAND_LINE lets us handle args ourselves instead of GTK treating
-    // positional args as files to open.
+    // Create a temporary surface for Pango measurements
+    let surface = ImageSurface::create(Format::Rgb24, 1, 1).unwrap();
+    let cr = CairoContext::new(&surface).unwrap();
+
+    let pango_ctx = pangocairo::create_context(&cr);
+    let font_desc = FontDescription::from_string("Monospace 14");
+
+    // Get actual font metrics (matching draw_editor line 250-251)
+    let font_metrics = pango_ctx.metrics(Some(&font_desc), None);
+    let line_height = (font_metrics.ascent() + font_metrics.descent()) as f64 / pango::SCALE as f64;
+
+    let tab_bar_height = if engine.tabs.len() > 1 {
+        line_height
+    } else {
+        0.0
+    };
+
+    // Check if click is in tab bar
+    if y < tab_bar_height {
+        // TODO: Handle tab clicks in future
+        return;
+    }
+
+    let status_bar_height = line_height * 2.0;
+
+    let content_bounds = WindowRect::new(
+        0.0,
+        tab_bar_height,
+        width,
+        height - tab_bar_height - status_bar_height,
+    );
+
+    // Check if click is in status/command area
+    if y >= content_bounds.y + content_bounds.height {
+        // Click in status bar or command line - ignore for now
+        return;
+    }
+
+    // Get window rects
+    let window_rects = engine.calculate_window_rects(content_bounds);
+
+    // Find which window was clicked
+    let clicked_window = window_rects.iter().find(|(_, rect)| {
+        x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
+    });
+
+    let (window_id, rect) = match clicked_window {
+        Some((id, r)) => (*id, r),
+        None => return, // Click outside any window
+    };
+
+    // Get window and buffer info
+    let window = match engine.windows.get(&window_id) {
+        Some(w) => w,
+        None => return,
+    };
+
+    let buffer_state = match engine.buffer_manager.get(window.buffer_id) {
+        Some(s) => s,
+        None => return,
+    };
+
+    let buffer = &buffer_state.buffer;
+    let view = &window.view;
+
+    // Calculate gutter width using real char width from font metrics (matching draw_window line 391)
+    let char_width = font_metrics.approximate_char_width() as f64 / pango::SCALE as f64;
+    let total_lines = buffer.content.len_lines();
+    let gutter_width =
+        calculate_gutter_width(engine.settings.line_numbers, total_lines, char_width);
+
+    // Check if click is in gutter - if so, ignore
+    if x < rect.x + gutter_width {
+        return;
+    }
+
+    // Calculate per-window status bar height
+    let per_window_status = if engine.windows.len() > 1 {
+        line_height
+    } else {
+        0.0
+    };
+    let text_area_height = rect.height - per_window_status;
+
+    // Check if click is in per-window status bar
+    if y >= rect.y + text_area_height {
+        return;
+    }
+
+    // Convert y coordinate to line number
+    let relative_y = y - rect.y;
+    let view_line = (relative_y / line_height).floor() as usize;
+    let line = view.scroll_top + view_line;
+
+    // Convert x coordinate to column using pixel-perfect Pango layout measurement
+    let relative_x = x - (rect.x + gutter_width);
+
+    // Get the actual line text (clamp line to valid range)
+    let line = line.min(buffer.content.len_lines().saturating_sub(1));
+    let line_text = buffer.content.line(line).to_string();
+
+    // Create Pango layout with the line text
+    let layout = pango::Layout::new(&pango_ctx);
+    layout.set_font_description(Some(&font_desc));
+
+    // Find column by measuring text width character by character
+    let mut col = 0;
+
+    if !line_text.is_empty() {
+        // Handle tabs by expanding them to spaces (4 spaces per tab)
+        let expanded_text = line_text.replace('\t', "    ");
+        layout.set_text(&expanded_text);
+
+        let mut best_col = 0;
+        let mut prev_width = 0.0;
+
+        // Find which character the click falls within
+        let char_indices: Vec<(usize, char)> = expanded_text.char_indices().collect();
+
+        for i in 0..char_indices.len() {
+            let (byte_idx, _) = char_indices[i];
+
+            // Measure width up to and including this character
+            let next_byte_idx = if i + 1 < char_indices.len() {
+                char_indices[i + 1].0
+            } else {
+                expanded_text.len()
+            };
+
+            layout.set_text(&expanded_text[..next_byte_idx]);
+            let (curr_width, _) = layout.pixel_size();
+            let curr_width_f64 = curr_width as f64;
+
+            // Check if click falls between prev_width and curr_width
+            if relative_x >= prev_width && relative_x < curr_width_f64 {
+                // Click is within this character, use its starting position
+                best_col = byte_idx;
+                break;
+            }
+
+            prev_width = curr_width_f64;
+
+            // If we're at the last character and click is past it
+            if i == char_indices.len() - 1 && relative_x >= curr_width_f64 {
+                best_col = next_byte_idx;
+            }
+        }
+
+        // If line is empty or click is before first character
+        if relative_x < 0.0 {
+            best_col = 0;
+        }
+
+        // Convert byte position in expanded text to column in original text
+        // Account for tabs (each tab in original becomes 4 spaces in expanded)
+        let mut original_col = 0;
+        let mut expanded_pos = 0;
+        for ch in line_text.chars() {
+            if expanded_pos >= best_col {
+                break;
+            }
+            if ch == '\t' {
+                expanded_pos += 4; // Tab expands to 4 spaces
+            } else {
+                expanded_pos += ch.len_utf8();
+            }
+            original_col += 1;
+        }
+        col = original_col;
+    }
+
+    // Set cursor position for this window
+    engine.set_cursor_for_window(window_id, line, col);
+}
+
+fn load_css() {
+    let provider = gtk4::CssProvider::new();
+    provider.load_from_data(
+        "
+        /* Activity Bar */
+        .activity-bar {
+            background-color: #252526;
+            border-right: 1px solid #3e3e42;
+        }
+        
+        .activity-button {
+            background: transparent;
+            border: none;
+            border-radius: 0;
+            font-size: 24px;
+            color: #cccccc;
+            padding: 0;
+        }
+        
+        .activity-button:hover {
+            background-color: #2a2d2e;
+        }
+        
+        .activity-button.active {
+            background-color: #094771;
+            border-left: 2px solid #0e639c;
+        }
+        
+        .activity-button:disabled {
+            opacity: 0.4;
+        }
+        
+        /* Sidebar */
+        .sidebar {
+            background-color: #252526;
+            border-right: 1px solid #3e3e42;
+        }
+        
+        .sidebar label {
+            color: #cccccc;
+        }
+        
+        /* Explorer Toolbar */
+        .explorer-toolbar {
+            background-color: #2d2d30;
+            border-bottom: 1px solid #3e3e42;
+        }
+        
+        .explorer-toolbar button {
+            background: transparent;
+            border: 1px solid transparent;
+            border-radius: 2px;
+            color: #cccccc;
+            font-size: 16px;
+            padding: 4px;
+        }
+        
+        .explorer-toolbar button:hover {
+            background-color: #2a2d2e;
+            border-color: #0e639c;
+        }
+        
+        .explorer-toolbar button:active {
+            background-color: #094771;
+        }
+        
+        /* Tree View - VSCode Style */
+        treeview {
+            background-color: #252526;
+            color: #cccccc;
+            border: none;
+            font-family: Ubuntu, Roboto, sans-serif;
+            font-size: 13px;
+            outline: none;
+        }
+        
+        /* Selection - VSCode style with left accent */
+        treeview:selected {
+            background-color: rgba(9, 71, 113, 0.3);
+            border-left: 3px solid #0e639c;
+        }
+        
+        treeview:selected:focus {
+            background-color: rgba(9, 71, 113, 0.5);
+        }
+        
+        /* Hover - very subtle */
+        treeview row:hover {
+            background-color: rgba(42, 45, 46, 0.5);
+        }
+        
+        /* Better padding and spacing */
+        treeview row {
+            padding: 4px 8px;
+            min-height: 22px;
+        }
+        
+        /* Expander (arrow) styling - more subtle */
+        treeview expander {
+            min-width: 16px;
+            min-height: 16px;
+        }
+        
+        treeview expander:checked {
+            color: #cccccc;
+        }
+        
+        treeview expander:not(:checked) {
+            color: #999999;
+        }
+        ",
+    );
+
+    gtk4::style_context_add_provider_for_display(
+        &gtk4::gdk::Display::default().unwrap(),
+        &provider,
+        gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+}
+
+/// Build file tree recursively
+/// TreeStore columns: [Icon(String), Name(String), FullPath(String)]
+fn build_file_tree(store: &gtk4::TreeStore, parent: Option<&gtk4::TreeIter>, path: &Path) {
+    let entries = match fs::read_dir(path) {
+        Ok(e) => e,
+        Err(_) => return, // Handle permission errors silently
+    };
+
+    let mut entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+
+    // Sort: directories first, then files, both alphabetically
+    entries.sort_by(|a, b| {
+        let a_is_dir = a.path().is_dir();
+        let b_is_dir = b.path().is_dir();
+
+        match (a_is_dir, b_is_dir) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.file_name().cmp(&b.file_name()),
+        }
+    });
+
+    for entry in entries {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+
+        // Skip hidden files (optional - can make configurable later)
+        if name.starts_with('.') && name != "." && name != ".." {
+            continue; // Skip dotfiles for now
+        }
+
+        let is_dir = path.is_dir();
+        let icon = if is_dir { "📁" } else { "📄" };
+
+        let iter = store.insert_with_values(
+            parent,
+            None,
+            &[
+                (0, &icon),
+                (1, &name),
+                (2, &path.to_string_lossy().to_string()),
+            ],
+        );
+
+        // Recursively add subdirectories
+        if is_dir {
+            // Limit recursion depth to prevent hanging on deep trees
+            let depth = parent.map_or(0, |_| 1); // Simple depth tracking
+            if depth < 10 {
+                build_file_tree(store, Some(&iter), &path);
+            }
+        }
+    }
+}
+
+/// Validate filename for file/folder creation
+fn validate_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("Name cannot be empty".to_string());
+    }
+
+    if name.contains('/') || name.contains('\\') {
+        return Err("Name cannot contain slashes".to_string());
+    }
+
+    if name.contains('\0') {
+        return Err("Name cannot contain null characters".to_string());
+    }
+
+    // Platform-specific invalid characters
+    #[cfg(windows)]
+    {
+        if name.contains(['<', '>', ':', '"', '|', '?', '*']) {
+            return Err("Name contains invalid characters".to_string());
+        }
+    }
+
+    // Reserved names
+    if name == "." || name == ".." {
+        return Err("Invalid name".to_string());
+    }
+
+    Ok(())
+}
+
+/// Find and select file in tree, expanding parents if needed
+fn highlight_file_in_tree(tree_view: &gtk4::TreeView, file_path: &Path) {
+    let Some(model) = tree_view.model() else {
+        return;
+    };
+    let Some(tree_store) = model.downcast_ref::<gtk4::TreeStore>() else {
+        return;
+    };
+
+    // Find the file in tree by full path (column 2)
+    let path_str = file_path.to_string_lossy().to_string();
+
+    if let Some(tree_path) = find_tree_path_for_file(tree_store, &path_str, None) {
+        // Expand parents
+        if tree_path.depth() > 1 {
+            let mut parent_path = tree_path.clone();
+            parent_path.up();
+            tree_view.expand_to_path(&parent_path);
+        }
+
+        // Select the row
+        tree_view.selection().select_path(&tree_path);
+
+        // Scroll to make visible
+        tree_view.scroll_to_cell(
+            Some(&tree_path),
+            None::<&gtk4::TreeViewColumn>,
+            false,
+            0.0,
+            0.0,
+        );
+    }
+}
+
+/// Recursively find tree path for given file path string
+fn find_tree_path_for_file(
+    model: &gtk4::TreeStore,
+    target_path: &str,
+    parent: Option<&gtk4::TreeIter>,
+) -> Option<gtk4::TreePath> {
+    let n = model.iter_n_children(parent);
+
+    for i in 0..n {
+        let iter = if let Some(parent) = parent {
+            model.iter_nth_child(Some(parent), i)?
+        } else {
+            model.iter_nth_child(None, i)?
+        };
+
+        // Check if this row matches
+        let path_str: String = model.get_value(&iter, 2).get().ok()?;
+        if path_str == target_path {
+            return Some(model.path(&iter));
+        }
+
+        // Recursively check children
+        if let Some(found) = find_tree_path_for_file(model, target_path, Some(&iter)) {
+            return Some(found);
+        }
+    }
+
+    None
+}
+
+fn main() {
+    // Parse CLI args to get optional file path
+    let args: Vec<String> = std::env::args().collect();
+    let file_path = if args.len() > 1 {
+        Some(PathBuf::from(&args[1]))
+    } else {
+        None
+    };
+
     let gtk_app = gtk4::Application::builder()
-        .application_id("org.vimcode.editor")
+        .application_id("com.vimcode.VimCode")
         .flags(
             gtk4::gio::ApplicationFlags::NON_UNIQUE
                 | gtk4::gio::ApplicationFlags::HANDLES_COMMAND_LINE,

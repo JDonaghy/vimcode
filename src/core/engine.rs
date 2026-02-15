@@ -537,6 +537,29 @@ impl Engine {
         self.active_tab().layout.calculate_rects(bounds)
     }
 
+    /// Set cursor position for a specific window and make it active.
+    /// Clamps line and col to valid buffer positions.
+    pub fn set_cursor_for_window(&mut self, window_id: WindowId, line: usize, col: usize) {
+        // Make the window active
+        if self.windows.contains_key(&window_id) {
+            self.active_tab_mut().active_window = window_id;
+
+            // Get buffer and clamp line
+            let buffer = self.buffer();
+            let max_line = buffer.content.len_lines().saturating_sub(1);
+            let clamped_line = line.min(max_line);
+
+            // Get max col for this line (excludes newline)
+            let max_col = self.get_max_cursor_col(clamped_line);
+            let clamped_col = col.min(max_col);
+
+            // Set cursor position
+            let view = self.view_mut();
+            view.cursor.line = clamped_line;
+            view.cursor.col = clamped_col;
+        }
+    }
+
     // =======================================================================
     // Tab operations
     // =======================================================================
@@ -7489,5 +7512,333 @@ mod tests {
         // Repeat (should delete 2 more lines)
         press_char(&mut engine, '.');
         assert_eq!(engine.buffer().to_string(), "e\nf");
+    }
+
+    // =======================================================================
+    // Mouse click tests
+    // =======================================================================
+
+    #[test]
+    fn test_mouse_click_sets_cursor() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "line0\nline1\nline2\nline3");
+        engine.update_syntax();
+
+        // Get the active window ID
+        let window_id = engine.active_window_id();
+
+        // Click to move cursor to line 2, col 3
+        engine.set_cursor_for_window(window_id, 2, 3);
+        assert_eq!(engine.cursor().line, 2);
+        assert_eq!(engine.cursor().col, 3);
+    }
+
+    #[test]
+    fn test_mouse_click_clamps_line() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "line0\nline1\nline2");
+        engine.update_syntax();
+
+        let window_id = engine.active_window_id();
+
+        // Click beyond last line (should clamp to line 2)
+        engine.set_cursor_for_window(window_id, 10, 0);
+        assert_eq!(engine.cursor().line, 2);
+        assert_eq!(engine.cursor().col, 0);
+    }
+
+    #[test]
+    fn test_mouse_click_clamps_col() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "short\nline1\nline2");
+        engine.update_syntax();
+
+        let window_id = engine.active_window_id();
+
+        // Click beyond line length (should clamp to 4, last char of "short")
+        engine.set_cursor_for_window(window_id, 0, 100);
+        assert_eq!(engine.cursor().line, 0);
+        assert_eq!(engine.cursor().col, 4); // "short" has 5 chars, max cursor pos is 4
+    }
+
+    #[test]
+    fn test_mouse_click_switches_window_in_split() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "buffer1\nline1");
+        engine.update_syntax();
+
+        // Create a split
+        engine.split_window(SplitDirection::Horizontal, None);
+
+        // Modify second buffer
+        let len = engine.buffer().len_chars();
+        engine.buffer_mut().delete_range(0, len);
+        engine.buffer_mut().insert(0, "buffer2\nline2");
+        engine.update_syntax();
+
+        // Get both window IDs
+        let all_windows: Vec<WindowId> = engine.windows.keys().copied().collect();
+        assert_eq!(all_windows.len(), 2);
+        let window1 = all_windows[0];
+        let window2 = all_windows[1];
+
+        // Make window1 active first
+        engine.set_cursor_for_window(window1, 0, 0);
+        assert_eq!(engine.active_window_id(), window1);
+
+        // Click in window2 should switch to it
+        engine.set_cursor_for_window(window2, 0, 3);
+        assert_eq!(engine.active_window_id(), window2);
+        assert_eq!(engine.cursor().line, 0);
+        assert_eq!(engine.cursor().col, 3);
+    }
+
+    #[test]
+    fn test_mouse_click_empty_line() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "line0\n\nline2");
+        engine.update_syntax();
+
+        let window_id = engine.active_window_id();
+
+        // Click on empty line (line 1)
+        engine.set_cursor_for_window(window_id, 1, 5);
+        assert_eq!(engine.cursor().line, 1);
+        assert_eq!(engine.cursor().col, 0); // Should clamp to 0 for empty line
+    }
+
+    #[test]
+    fn test_mouse_click_single_window() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "abc\ndef\nghi");
+        engine.update_syntax();
+
+        let window_id = engine.active_window_id();
+
+        // Click to line 1, col 2
+        engine.set_cursor_for_window(window_id, 1, 2);
+        assert_eq!(engine.cursor().line, 1);
+        assert_eq!(engine.cursor().col, 2);
+
+        // Verify we're still in normal mode
+        assert_eq!(engine.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn test_mouse_click_preserves_mode() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "line0\nline1\nline2");
+        engine.update_syntax();
+
+        let window_id = engine.active_window_id();
+
+        // Enter insert mode
+        press_char(&mut engine, 'i');
+        assert_eq!(engine.mode, Mode::Insert);
+
+        // Click should move cursor but mode is handled by UI layer
+        // The engine method itself doesn't change mode
+        engine.set_cursor_for_window(window_id, 2, 1);
+        assert_eq!(engine.cursor().line, 2);
+        assert_eq!(engine.cursor().col, 1);
+    }
+
+    #[test]
+    fn test_mouse_click_invalid_window_id() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "line0\nline1");
+        engine.update_syntax();
+
+        let old_cursor = *engine.cursor();
+        let old_window = engine.active_window_id();
+
+        // Click with invalid window ID (should do nothing)
+        engine.set_cursor_for_window(WindowId(9999), 1, 1);
+
+        // Cursor and active window should be unchanged
+        assert_eq!(*engine.cursor(), old_cursor);
+        assert_eq!(engine.active_window_id(), old_window);
+    }
+
+    #[test]
+    fn test_mouse_click_at_exact_line_end() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello\nworld");
+        engine.update_syntax();
+
+        let window_id = engine.active_window_id();
+
+        // Click at column 5 of "hello" (length is 5, so max cursor pos is 4)
+        engine.set_cursor_for_window(window_id, 0, 5);
+        assert_eq!(engine.cursor().line, 0);
+        assert_eq!(engine.cursor().col, 4); // Clamped to last valid position
+    }
+
+    #[test]
+    fn test_mouse_click_way_past_last_line() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "a\nb\nc");
+        engine.update_syntax();
+
+        let window_id = engine.active_window_id();
+
+        // Click at line 1000 (way past the 3 lines we have)
+        engine.set_cursor_for_window(window_id, 1000, 0);
+        assert_eq!(engine.cursor().line, 2); // Clamped to last line
+        assert_eq!(engine.cursor().col, 0);
+    }
+
+    #[test]
+    fn test_mouse_click_on_line_with_tabs() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "\thello\t world");
+        engine.update_syntax();
+
+        let window_id = engine.active_window_id();
+
+        // Click at column 0 (before tab)
+        engine.set_cursor_for_window(window_id, 0, 0);
+        assert_eq!(engine.cursor().col, 0);
+
+        // Click at column 1 (on the tab character itself)
+        engine.set_cursor_for_window(window_id, 0, 1);
+        assert_eq!(engine.cursor().col, 1);
+
+        // Click at column 6 (in "hello", after tab)
+        engine.set_cursor_for_window(window_id, 0, 6);
+        assert_eq!(engine.cursor().col, 6);
+    }
+
+    #[test]
+    fn test_mouse_click_on_unicode_line() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "Hello 世界 World");
+        engine.update_syntax();
+
+        let window_id = engine.active_window_id();
+
+        // Click at various positions
+        engine.set_cursor_for_window(window_id, 0, 0);
+        assert_eq!(engine.cursor().col, 0);
+
+        engine.set_cursor_for_window(window_id, 0, 6);
+        assert_eq!(engine.cursor().col, 6); // First unicode char position
+
+        engine.set_cursor_for_window(window_id, 0, 7);
+        assert_eq!(engine.cursor().col, 7); // Second unicode char position
+    }
+
+    #[test]
+    fn test_mouse_click_at_column_zero() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "abc\ndef\nghi");
+        engine.update_syntax();
+
+        let window_id = engine.active_window_id();
+
+        // Click at column 0 on various lines
+        engine.set_cursor_for_window(window_id, 0, 0);
+        assert_eq!(engine.cursor().line, 0);
+        assert_eq!(engine.cursor().col, 0);
+
+        engine.set_cursor_for_window(window_id, 1, 0);
+        assert_eq!(engine.cursor().line, 1);
+        assert_eq!(engine.cursor().col, 0);
+
+        engine.set_cursor_for_window(window_id, 2, 0);
+        assert_eq!(engine.cursor().line, 2);
+        assert_eq!(engine.cursor().col, 0);
+    }
+
+    #[test]
+    fn test_mouse_click_very_large_column() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "short");
+        engine.update_syntax();
+
+        let window_id = engine.active_window_id();
+
+        // Click at column 99999 on a short line
+        engine.set_cursor_for_window(window_id, 0, 99999);
+        assert_eq!(engine.cursor().line, 0);
+        assert_eq!(engine.cursor().col, 4); // Clamped to "short".len() - 1
+    }
+
+    #[test]
+    fn test_mouse_click_on_very_long_line() {
+        let mut engine = Engine::new();
+        let long_line = "x".repeat(1000);
+        engine.buffer_mut().insert(0, &long_line);
+        engine.update_syntax();
+
+        let window_id = engine.active_window_id();
+
+        // Click at various positions on long line
+        engine.set_cursor_for_window(window_id, 0, 0);
+        assert_eq!(engine.cursor().col, 0);
+
+        engine.set_cursor_for_window(window_id, 0, 500);
+        assert_eq!(engine.cursor().col, 500);
+
+        engine.set_cursor_for_window(window_id, 0, 999);
+        assert_eq!(engine.cursor().col, 999);
+
+        // Past the end should clamp to 999 (last valid position)
+        engine.set_cursor_for_window(window_id, 0, 1000);
+        assert_eq!(engine.cursor().col, 999);
+    }
+
+    #[test]
+    fn test_mouse_click_mixed_tabs_and_spaces() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "\t  hello  \tworld");
+        engine.update_syntax();
+
+        let window_id = engine.active_window_id();
+
+        // Click at start (tab)
+        engine.set_cursor_for_window(window_id, 0, 0);
+        assert_eq!(engine.cursor().col, 0);
+
+        // Click in middle (after spaces)
+        engine.set_cursor_for_window(window_id, 0, 5);
+        assert_eq!(engine.cursor().col, 5);
+
+        // Click near end
+        engine.set_cursor_for_window(window_id, 0, 15);
+        assert_eq!(engine.cursor().col, 15);
+    }
+
+    #[test]
+    fn test_mouse_click_on_last_character_of_file() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "line1\nline2\nend");
+        engine.update_syntax();
+
+        let window_id = engine.active_window_id();
+
+        // Click on the 'd' in "end" (line 2, col 2)
+        engine.set_cursor_for_window(window_id, 2, 2);
+        assert_eq!(engine.cursor().line, 2);
+        assert_eq!(engine.cursor().col, 2);
+    }
+
+    #[test]
+    fn test_mouse_click_single_character_line() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "a\nb\nc");
+        engine.update_syntax();
+
+        let window_id = engine.active_window_id();
+
+        // Click on single character lines
+        engine.set_cursor_for_window(window_id, 0, 0);
+        assert_eq!(engine.cursor().line, 0);
+        assert_eq!(engine.cursor().col, 0);
+
+        // Click past the single character
+        engine.set_cursor_for_window(window_id, 1, 5);
+        assert_eq!(engine.cursor().line, 1);
+        assert_eq!(engine.cursor().col, 0); // Clamped to 0 (last valid pos of "b")
     }
 }

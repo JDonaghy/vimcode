@@ -6,12 +6,12 @@ Last updated: February 2026
 
 VimCode is a Vim-like code editor built in Rust with GTK4/Relm4. The goal is to create a VS Code-like editor with a first-class Vim mode that is cross-platform, fast, and does not require GPU acceleration.
 
-## Current Status: Repeat Command - Complete ✅
+## Current Status: Phase 3 COMPLETE - Integration & Polish
 
-Repeat last change with `.` command.
-
-**Just Completed:** Repeat command (Step 5/7)  
-**Next:** Visual block mode (`Ctrl-V`)
+**Phase 1 COMPLETE:** Activity bar + collapsible sidebar with VSCode theme (232 tests)  
+**Phase 2 COMPLETE:** File explorer tree view with full CRUD operations (239 tests)  
+**Phase 3 COMPLETE:** Integration & Polish - Keybindings, focus management, file highlighting, error handling (232 tests passing)  
+**Next:** Advanced features or other priorities (search in files, Git integration, etc.)
 
 ### What Works Today
 
@@ -151,6 +151,26 @@ Repeat last change with `.` command.
 - Command line: shows `:cmd` or `/query` during input, status messages otherwise
 - Syntax highlighting for Rust (Tree-sitter)
 
+**File Explorer (NEW - Complete)**
+- Activity bar with file explorer button (📁)
+- Collapsible sidebar (Ctrl-B to toggle)
+- VSCode-style file tree with icons (📁 folders, 📄 files)
+- Double-click to open files
+- Click folders to expand/collapse
+- Toolbar with file operations:
+  - ➕ New file (timestamp-based naming)
+  - 📁➕ New folder (timestamp-based naming)
+  - 🗑️ Delete selected file/folder
+  - 🔄 Refresh tree
+- **Ctrl-Shift-E:** Focus file explorer
+- **Escape:** Return focus from explorer to editor
+- **Auto-focus:** Opening files automatically switches focus to editor
+- Active file highlighted in tree with blue selection
+- Auto-expand parent folders when highlighting files
+- TreeView search disabled (no popup interference)
+- Comprehensive error handling with user-friendly messages
+- File/folder name validation (no slashes, null chars, reserved names)
+
 **Yank/Paste/Registers**
 - `yy` / `Y` — Yank current line (linewise)
 - `p` — Paste after cursor (characterwise) or below line (linewise)
@@ -210,9 +230,15 @@ Repeat last change with `.` command.
 - Count prefix: `3.` repeats 3 times
 - Basic implementation (some edge cases deferred)
 
+**Mouse Click**
+- Pixel-perfect positioning using Pango layout measurement
+- Real window dimensions and font metrics
+- Tab and unicode support
+- 18 comprehensive tests covering edge cases
+
 **Test Suite**
-- 214 passing tests (4 new repeat tests, 8 edge-case tests deferred)
-- Clippy-clean
+- 232 passing tests (18 mouse tests, all core features tested)
+- Clippy-clean (with TreeView deprecation warnings allowed)
 
 ---
 
@@ -364,7 +390,7 @@ Engine
 ```bash
 cargo build              # Compile
 cargo run -- <file>      # Run with a file
-cargo test               # Run all 165 tests
+cargo test               # Run all 232 tests
 cargo test <name>        # Run specific test
 cargo clippy -- -D warnings   # Lint (must pass)
 cargo fmt                # Format code
@@ -372,52 +398,45 @@ cargo fmt                # Format code
 
 ---
 
-## Session History
+## Recent Development Summary
 
-### Session: High-Priority Vim Motions (Current)
+*For detailed session logs, see HISTORY.md*
 
-**Step 1 (Complete):** Character find motions. 11 tests (154→165).
+**Session 17:** Phase 3 COMPLETE (3A-3D) - Integration & Polish (232 tests passing).
+  - **3A:** Ctrl-Shift-E keybinding to focus explorer
+  - **3B:** Focus management with Escape key to return to editor
+  - **3C:** Active file highlighting in tree with auto-expand parents
+  - **3D:** Comprehensive error handling with validate_name() and detailed error messages
+  - **Focus fixes:** Disabled TreeView search, auto-focus editor on file open, proper navigation keys
+  - Technical: Used Rc<RefCell<>> pattern for widget references in Relm4
+  - Added #![allow(deprecated)] for TreeView/TreeStore (functional, ListView migration deferred)
 
-**Step 2 (Complete):** Delete/change operators. 16 tests (165→181).
+**Session 16:** Phase 2A-E complete - Tree display + file opening + expandable folders + toolbar UI (232 tests). 
+  - VSCode-style CSS polish: subtle selection with left accent, refined hover, better spacing
+  - Fixed: Single column for icon+name (proper indentation), level_indentation=0 (tight spacing)
 
-**Step 3 (Complete):** Additional motions (`ge`, `%`). 12 tests (181→193).
+**Session 15:** Phase 1 COMPLETE (1A-1E) - Activity bar, collapsible sidebar, buttons, active indicator, VSCode CSS theme (232 tests).
 
-**Step 4 (Complete):** Text objects (`iw`, `aw`, `i"`, `a(`, etc.). 17 tests (193→210).
+**Session 14:** Phase 1A complete - Activity bar and collapsible sidebar layout structure (232 tests).
 
-**Step 5 (Complete):** Repeat command (`.`). 4 tests (210→214). Basic implementation for insert/delete ops.
+**Session 13:** Phase 0.5A/B/C complete - Mouse click uses real dimensions, font metrics, pixel-perfect column detection (222 tests).
 
-### Session: Line Numbers & Config Reload (Previous)
+**Session 12:** High-priority Vim motions complete (5 steps, 154→214 tests). Remaining: Visual block mode, reverse search.
 
-Settings struct, line number rendering (all modes), `:config reload` command. 8 tests added (146→154).
+**Session 11:** Line numbers & config reload (146→154 tests). Remaining: `:set` commands.
 
-### Session: Count-Based Repetition (Previous)
+**Session 10:** Count-based repetition (115→146 tests). All motions, ops, and visual mode support counts.
 
-Implemented count prefixes (`5j`, `3dd`, `10yy`) with digit accumulation, max 10,000, smart zero handling. All motions, line ops, special commands, visual mode. ~600 lines, 31 tests (115→146). See `PLAN_ARCHIVE_count_repetition.md`.
+**Session 9:** Visual mode (98→115 tests). Character (`v`) and line (`V`) modes complete.
 
-### Session: Visual Mode (Previous)
+**Session 8:** Paragraph navigation `{`/`}` (88→98 tests).
 
-Added character (`v`) and line (`V`) visual modes with selection anchor, operators (y/d/c), navigation extends selection. Semi-transparent blue highlight. 17 tests (98→115).
+**Session 7:** Yank/paste with registers (75→88 tests).
 
-### Session: Paragraph Navigation (Previous)
+**Session 6:** Undo/redo (65→75 tests).
 
-Added `{` and `}` to jump to empty lines (whitespace-only). Navigate consecutive empty lines one at a time. 10 tests (88→98).
+**Session 5:** Buffers/windows/tabs (39→65 tests). Multi-buffer, split panes, tab bar complete.
 
-### Session: Yank/Paste with Registers (Previous)
+**Session 4:** Rudimentary Vim experience (12→39 tests). File I/O, command/search modes.
 
-Added `yy`/`Y`/`p`/`P` with named registers (`"x`). Delete ops fill register. Linewise/characterwise modes. 13 tests (75→88).
-
-### Session: Undo/Redo (Previous)
-
-Added `u`/`Ctrl-r` with operation-based tracking. Undo groups per edit session. Cursor position restoration. 10 tests (65→75).
-
-### Session: Buffers/Windows/Tabs (Previous)
-
-Implemented full model: BufferManager, Window, Tab, WindowLayout (binary tree). Commands: `:bn`/`:bp`/`:b#`/`:ls`/`:bd`, `:split`/`:vsplit`/`:close`, `:tabnew`/`gt`/`gT`. Tab bar, multi-window UI. 26 tests (39→65).
-
-### Session: Rudimentary Vim Experience (Previous)
-
-File I/O, Command/Search modes, `:w`/`:q`/`:e`, `/` search with `n`/`N`, viewport scrolling, status line UI, basic Vim commands. 27 tests (12→39).
-
-### Earlier Sessions (Previous)
-
-GTK4/Relm4 setup, Normal/Insert modes, `h`/`j`/`k`/`l` navigation, Tree-sitter syntax highlighting, cursor rendering, GTK fixes.
+**Sessions 1-3:** GTK4/Relm4 setup, Normal/Insert modes, navigation, Tree-sitter, rendering.
