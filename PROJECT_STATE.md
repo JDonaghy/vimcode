@@ -1,19 +1,19 @@
 # VimCode Project State
 
-**Last updated:** Feb 2026
+**Last updated:** Feb 15, 2026
 
 ## Status
 
-**Phase 4 COMPLETE:** Preview mode for file explorer (242 tests passing)
+**Visual Block Mode COMPLETE:** Ctrl-V for rectangular selections (255 tests passing)
 
 ### Core Vim (Complete)
-- Six modes (Normal/Insert/Visual/Visual Line/Command/Search)
+- Seven modes (Normal/Insert/Visual/Visual Line/Visual Block/Command/Search)
 - Navigation (hjkl, w/b/e, {}, gg/G, f/F/t/T, %, 0/$, Ctrl-D/U/F/B)
 - Operators (d/c/y with motions, x/dd/D/s/S/C)
 - Text objects (iw/aw, quotes, brackets)
 - Registers (unnamed + a-z)
 - Undo/redo, repeat (.), count prefix
-- Visual mode (v/V with y/d/c)
+- Visual modes (v/V/Ctrl-V with y/d/c, rectangular block selections)
 - Search (/, n/N)
 - Buffers (:bn/:bp/:b#/:ls/:bd)
 - Windows (:split/:vsplit, Ctrl-W)
@@ -46,15 +46,15 @@
 ```
 vimcode/
 ├── src/
-│   ├── main.rs (~1100 lines) — GTK4/Relm4 UI, rendering
-│   └── core/ (~8200 lines) — Platform-agnostic logic
-│       ├── engine.rs (~8000 lines) — Orchestrates everything
+│   ├── main.rs (~1150 lines) — GTK4/Relm4 UI, rendering
+│   └── core/ (~8500 lines) — Platform-agnostic logic
+│       ├── engine.rs (~8500 lines) — Orchestrates everything
 │       ├── buffer_manager.rs (~600 lines) — Buffer lifecycle
 │       ├── buffer.rs (~120 lines) — Rope-based storage
 │       ├── settings.rs (~160 lines) — JSON persistence
 │       ├── window.rs, tab.rs, view.rs, cursor.rs, mode.rs, syntax.rs
-│       └── Tests: 242 passing
-└── Total: ~9,800 lines
+│       └── Tests: 255 passing
+└── Total: ~10,150 lines
 ```
 
 ## Architecture
@@ -82,7 +82,7 @@ cargo fmt
 ```
 
 ## Roadmap (High Priority)
-- [ ] Visual block mode (Ctrl-V)
+- [x] **Visual block mode (Ctrl-V)** — COMPLETE
 - [ ] Reverse search (?)
 - [ ] Marks (m, ')
 - [ ] Macros (q, @)
@@ -91,10 +91,10 @@ cargo fmt
 - [ ] More grammars (Python/JS/Go/C++)
 
 ## Recent Work
+**Session 19:** Visual block mode (Ctrl-V) complete — rectangular selections (242→255 tests).
 **Session 18:** Phase 4 complete — Preview mode (242 tests).
 **Session 17:** Phase 3 complete — Focus, highlighting, errors (232 tests).
 **Session 16:** Phase 2 complete — File tree + CRUD (232 tests).
 **Session 15:** Phase 1 complete — Activity bar + sidebar (232 tests).
 **Session 12:** High-priority motions (154→214 tests).
 **Session 11:** Line numbers & config (146→154 tests).
-**Session 10:** Count repetition (115→146 tests).

@@ -6,4 +6,5 @@ pub enum Mode {
     Search,
     Visual,
     VisualLine,
+    VisualBlock,
 }

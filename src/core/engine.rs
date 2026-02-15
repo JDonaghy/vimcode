@@ -925,7 +925,7 @@ impl Engine {
             Mode::Search => {
                 self.handle_search_key(key_name, unicode);
             }
-            Mode::Visual | Mode::VisualLine => {
+            Mode::Visual | Mode::VisualLine | Mode::VisualBlock => {
                 action = self.handle_visual_key(key_name, unicode, ctrl, &mut changed);
             }
         }
@@ -1004,6 +1004,12 @@ impl Engine {
                 "w" => {
                     // Ctrl-W prefix for window commands
                     self.pending_key = Some('\x17'); // Ctrl-W marker
+                    return EngineAction::None;
+                }
+                "v" => {
+                    // Ctrl-V: Enter visual block mode
+                    self.mode = Mode::VisualBlock;
+                    self.visual_anchor = Some(self.view().cursor);
                     return EngineAction::None;
                 }
                 _ => {}
@@ -2079,6 +2085,20 @@ impl Engine {
             }
         }
 
+        // Handle Ctrl-V for visual block mode switching
+        if ctrl && key_name == "v" {
+            if self.mode == Mode::VisualBlock {
+                // Exit to normal mode
+                self.mode = Mode::Normal;
+                self.visual_anchor = None;
+                self.count = None;
+            } else {
+                // Switch to VisualBlock mode, preserve anchor
+                self.mode = Mode::VisualBlock;
+            }
+            return EngineAction::None;
+        }
+
         // Handle mode switching: v toggles to Visual, V toggles to VisualLine
         if let Some(ch) = unicode {
             match ch {
@@ -2408,6 +2428,39 @@ impl Engine {
 
                 Some((text, false))
             }
+            Mode::VisualBlock => {
+                // Block mode: extract rectangular region
+                // Use anchor and cursor columns directly for block selection
+                let anchor = self.visual_anchor?;
+                let cursor = self.view().cursor;
+                let start_col = anchor.col.min(cursor.col);
+                let end_col = anchor.col.max(cursor.col);
+
+                let mut lines = Vec::new();
+
+                for line_idx in start.line..=end.line {
+                    if let Some(line) = self.buffer().content.lines().nth(line_idx) {
+                        let line_str = line.to_string();
+                        let line_chars: Vec<char> = line_str.chars().collect();
+
+                        // Extract the block portion of this line
+                        let block_start = start_col.min(line_chars.len());
+                        let block_end = (end_col + 1).min(line_chars.len());
+
+                        let block_text: String = if block_start < line_chars.len() {
+                            line_chars[block_start..block_end].iter().collect()
+                        } else {
+                            // Line is too short, just use empty string
+                            String::new()
+                        };
+
+                        lines.push(block_text);
+                    }
+                }
+
+                let text = lines.join("\n");
+                Some((text, false))
+            }
             _ => None,
         }
     }
@@ -2472,6 +2525,34 @@ impl Engine {
 
                     // Position cursor at start
                     self.view_mut().cursor = start;
+                }
+                Mode::VisualBlock => {
+                    // Delete rectangular block (work backwards to avoid offset issues)
+                    // Use anchor and cursor columns directly for block selection
+                    let anchor = self.visual_anchor.unwrap();
+                    let cursor = self.view().cursor;
+                    let start_col = anchor.col.min(cursor.col);
+                    let end_col = anchor.col.max(cursor.col);
+
+                    for line_idx in (start.line..=end.line).rev() {
+                        let line_start_char = self.buffer().line_to_char(line_idx);
+                        if let Some(line) = self.buffer().content.lines().nth(line_idx) {
+                            let line_str = line.to_string();
+                            let line_len = line_str.chars().count();
+
+                            // Only delete if the line is long enough to have characters in the block
+                            if start_col < line_len {
+                                let block_end = (end_col + 1).min(line_len);
+                                let del_start = line_start_char + start_col;
+                                let del_end = line_start_char + block_end;
+                                self.delete_with_undo(del_start, del_end);
+                            }
+                        }
+                    }
+
+                    // Position cursor at start of block
+                    self.view_mut().cursor.line = start.line;
+                    self.view_mut().cursor.col = start_col;
                 }
                 _ => {}
             }
@@ -8207,5 +8288,312 @@ mod tests {
         assert!(!state.preview);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // =======================================================================
+    // Visual Block Mode Tests
+    // =======================================================================
+
+    #[test]
+    fn test_visual_block_mode_entry() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "test");
+        engine.update_syntax();
+
+        // Enter visual block mode with Ctrl-V
+        press_ctrl(&mut engine, 'v');
+        assert_eq!(engine.mode, Mode::VisualBlock);
+        assert!(engine.visual_anchor.is_some());
+        assert_eq!(engine.visual_anchor.unwrap().line, 0);
+        assert_eq!(engine.visual_anchor.unwrap().col, 0);
+    }
+
+    #[test]
+    fn test_visual_block_mode_escape_exits() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "test");
+        engine.update_syntax();
+
+        press_ctrl(&mut engine, 'v');
+        assert_eq!(engine.mode, Mode::VisualBlock);
+
+        press_special(&mut engine, "Escape");
+        assert_eq!(engine.mode, Mode::Normal);
+        assert!(engine.visual_anchor.is_none());
+    }
+
+    #[test]
+    fn test_visual_block_mode_switching() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "test");
+        engine.update_syntax();
+
+        // Start in visual block
+        press_ctrl(&mut engine, 'v');
+        assert_eq!(engine.mode, Mode::VisualBlock);
+
+        // Switch to character visual with v
+        press_char(&mut engine, 'v');
+        assert_eq!(engine.mode, Mode::Visual);
+        assert!(engine.visual_anchor.is_some()); // anchor preserved
+
+        // Switch to line visual with V
+        press_char(&mut engine, 'V');
+        assert_eq!(engine.mode, Mode::VisualLine);
+
+        // Switch back to block visual with Ctrl-V
+        press_ctrl(&mut engine, 'v');
+        assert_eq!(engine.mode, Mode::VisualBlock);
+
+        // Ctrl-V again to exit
+        press_ctrl(&mut engine, 'v');
+        assert_eq!(engine.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn test_visual_block_yank() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "abc\ndef\nghi");
+        engine.update_syntax();
+
+        // Enter visual block mode
+        press_ctrl(&mut engine, 'v');
+
+        // Select 2x2 block: "ab", "de"
+        press_char(&mut engine, 'l'); // col 1
+        press_char(&mut engine, 'j'); // line 1
+
+        // Yank
+        press_char(&mut engine, 'y');
+
+        // Check register - should have "ab\nde"
+        let (content, is_linewise) = engine.registers.get(&'"').unwrap();
+        assert_eq!(content, "ab\nde");
+        assert!(!is_linewise);
+
+        // Should be back in normal mode
+        assert_eq!(engine.mode, Mode::Normal);
+        assert!(engine.visual_anchor.is_none());
+    }
+
+    #[test]
+    fn test_visual_block_delete() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "abc\ndef\nghi");
+        engine.update_syntax();
+
+        // Enter visual block mode
+        press_ctrl(&mut engine, 'v');
+
+        // Select 2x2 block: "ab", "de"
+        press_char(&mut engine, 'l'); // col 1
+        press_char(&mut engine, 'j'); // line 1
+
+        // Delete
+        press_char(&mut engine, 'd');
+
+        // Check buffer - should be "c\nf\nghi"
+        let text = engine.buffer().to_string();
+        assert_eq!(text, "c\nf\nghi");
+
+        // Check register
+        let (content, _) = engine.registers.get(&'"').unwrap();
+        assert_eq!(content, "ab\nde");
+
+        // Should be back in normal mode at start of block
+        assert_eq!(engine.mode, Mode::Normal);
+        assert_eq!(engine.view().cursor.line, 0);
+        assert_eq!(engine.view().cursor.col, 0);
+    }
+
+    #[test]
+    fn test_visual_block_simple_delete() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "abc\ndef\nghi");
+        engine.update_syntax();
+
+        // Start at (0, 1) - character 'b'
+        press_char(&mut engine, 'l');
+
+        // Enter visual block
+        press_ctrl(&mut engine, 'v');
+
+        // Select 2x2 block: move right once, down once
+        // This should select cols 1-2 on lines 0-1
+        press_char(&mut engine, 'l'); // Now at col 2
+        press_char(&mut engine, 'j'); // Now at line 1
+
+        // Delete
+        press_char(&mut engine, 'd');
+
+        // Should have deleted "bc" from line 0 and "ef" from line 1
+        // Result: "a\nd\nghi"
+        let text = engine.buffer().to_string();
+        assert_eq!(text, "a\nd\nghi");
+    }
+
+    #[test]
+    fn test_visual_block_cursor_positions() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "abcdef");
+        engine.update_syntax();
+
+        // Start at col 0
+        assert_eq!(engine.view().cursor.col, 0);
+
+        // Move to col 1
+        press_char(&mut engine, 'l');
+        assert_eq!(engine.view().cursor.col, 1);
+
+        // Enter visual block
+        press_ctrl(&mut engine, 'v');
+        assert_eq!(engine.visual_anchor.unwrap().col, 1);
+
+        // Move right once more
+        press_char(&mut engine, 'l');
+        assert_eq!(engine.view().cursor.col, 2);
+
+        // Check anchor and cursor
+        assert_eq!(engine.visual_anchor.unwrap().col, 1);
+        assert_eq!(engine.view().cursor.col, 2);
+    }
+
+    #[test]
+    fn test_visual_block_yank_simple() {
+        // Note: Visual block with uneven line lengths is simplified
+        // Full Vim behavior with "virtual columns" is a future enhancement
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "abcdef\nghijkl");
+        engine.update_syntax();
+
+        // Start at col 1 (character 'b')
+        press_char(&mut engine, 'l');
+        press_ctrl(&mut engine, 'v');
+
+        // Select cols 1-2 on 2 lines
+        press_char(&mut engine, 'l'); // Now at col 2 (character 'c')
+        press_char(&mut engine, 'j'); // Move down to line 1
+
+        // Yank
+        press_char(&mut engine, 'y');
+
+        // Check register - should have "bc\nhi"
+        let (content, _) = engine.registers.get(&'"').unwrap();
+        assert_eq!(content, "bc\nhi");
+    }
+
+    #[test]
+    fn test_visual_block_delete_uniform_lines() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "abcdef\nghijkl\nmnopqr");
+        engine.update_syntax();
+
+        // Start at col 1 (character 'b')
+        press_char(&mut engine, 'l');
+        press_ctrl(&mut engine, 'v');
+
+        // Select cols 1-2 on 3 lines
+        press_char(&mut engine, 'l'); // Now at col 2 (character 'c')
+        press_char(&mut engine, 'j');
+        press_char(&mut engine, 'j'); // line 2
+
+        // Delete
+        press_char(&mut engine, 'd');
+
+        // Check buffer - should have deleted "bc", "hi", "no"
+        let text = engine.buffer().to_string();
+        assert_eq!(text, "adef\ngjkl\nmpqr");
+    }
+
+    #[test]
+    fn test_visual_block_change() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "abc\ndef\nghi");
+        engine.update_syntax();
+
+        // Enter visual block mode
+        press_ctrl(&mut engine, 'v');
+
+        // Select 2x2 block
+        press_char(&mut engine, 'l');
+        press_char(&mut engine, 'j');
+
+        // Change
+        press_char(&mut engine, 'c');
+
+        // Should be in insert mode
+        assert_eq!(engine.mode, Mode::Insert);
+
+        // Buffer should have block deleted
+        let text = engine.buffer().to_string();
+        assert_eq!(text, "c\nf\nghi");
+    }
+
+    #[test]
+    fn test_visual_block_navigation() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "line1\nline2\nline3\nline4");
+        engine.update_syntax();
+
+        // Enter visual block mode
+        press_ctrl(&mut engine, 'v');
+        assert_eq!(engine.mode, Mode::VisualBlock);
+
+        // Move right extends block horizontally
+        press_char(&mut engine, 'l');
+        assert_eq!(engine.view().cursor.col, 1);
+        press_char(&mut engine, 'l');
+        assert_eq!(engine.view().cursor.col, 2);
+
+        // Move down extends block vertically
+        press_char(&mut engine, 'j');
+        assert_eq!(engine.view().cursor.line, 1);
+        press_char(&mut engine, 'j');
+        assert_eq!(engine.view().cursor.line, 2);
+
+        // Still in visual block mode
+        assert_eq!(engine.mode, Mode::VisualBlock);
+    }
+
+    #[test]
+    fn test_visual_block_yank_single_column() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "abc\ndef\nghi");
+        engine.update_syntax();
+
+        // Enter visual block mode
+        press_ctrl(&mut engine, 'v');
+
+        // Select single column, 3 lines (just move down, don't move right)
+        press_char(&mut engine, 'j');
+        press_char(&mut engine, 'j');
+
+        // Yank
+        press_char(&mut engine, 'y');
+
+        // Check register - should have "a\nd\ng" (first character of each line)
+        let (content, _) = engine.registers.get(&'"').unwrap();
+        assert_eq!(content, "a\nd\ng");
+    }
+
+    #[test]
+    fn test_visual_block_with_count() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "abc\ndef\nghi\njkl");
+        engine.update_syntax();
+
+        // Enter visual block mode
+        press_ctrl(&mut engine, 'v');
+
+        // Use count to move: 2j should move down 2 lines
+        press_char(&mut engine, '2');
+        press_char(&mut engine, 'j');
+        assert_eq!(engine.view().cursor.line, 2);
+        assert_eq!(engine.mode, Mode::VisualBlock);
+
+        // Use count to move right: 2l
+        press_char(&mut engine, '2');
+        press_char(&mut engine, 'l');
+        assert_eq!(engine.view().cursor.col, 2);
     }
 }

@@ -998,7 +998,7 @@ fn draw_window(
     // Render visual selection highlight (if in visual mode and this is active window)
     if is_active {
         match engine.mode {
-            Mode::Visual | Mode::VisualLine => {
+            Mode::Visual | Mode::VisualLine | Mode::VisualBlock => {
                 if let Some(anchor) = engine.visual_anchor {
                     draw_visual_selection(
                         cr,
@@ -1126,7 +1126,7 @@ fn draw_window(
             let cursor_y = rect.y + (view.cursor.line - scroll_top) as f64 * line_height;
 
             match engine.mode {
-                Mode::Normal | Mode::Visual | Mode::VisualLine => {
+                Mode::Normal | Mode::Visual | Mode::VisualLine | Mode::VisualBlock => {
                     cr.set_source_rgba(1.0, 1.0, 1.0, 0.5);
                     let w = if char_w > 0.0 {
                         char_w
@@ -1304,6 +1304,51 @@ fn draw_visual_selection(
                 }
             }
         }
+        Mode::VisualBlock => {
+            // Block mode: highlight rectangular region
+            let start_col = start.col.min(end.col);
+            let end_col = start.col.max(end.col);
+
+            for line_idx in start.line..=end.line {
+                if line_idx >= scroll_top && line_idx < scroll_top + visible_lines {
+                    let view_idx = line_idx - scroll_top;
+                    let y = rect.y + view_idx as f64 * line_height;
+
+                    if let Some(line) = buffer.content.lines().nth(line_idx) {
+                        let line_text = line.to_string();
+                        layout.set_text(&line_text);
+                        layout.set_attributes(None);
+
+                        let line_len = line_text.chars().count();
+
+                        // Only draw if the line has characters in the block region
+                        if start_col < line_len {
+                            // Calculate x position for start column
+                            let start_byte: usize = line_text
+                                .char_indices()
+                                .nth(start_col)
+                                .map(|(i, _)| i)
+                                .unwrap_or(line_text.len());
+                            let start_pos = layout.index_to_pos(start_byte as i32);
+                            let start_x = text_x_offset + start_pos.x() as f64 / pango::SCALE as f64;
+
+                            // Calculate x position for end column (inclusive, so +1)
+                            let block_end_col = (end_col + 1).min(line_len);
+                            let end_byte: usize = line_text
+                                .char_indices()
+                                .nth(block_end_col)
+                                .map(|(i, _)| i)
+                                .unwrap_or(line_text.len());
+                            let end_pos = layout.index_to_pos(end_byte as i32);
+                            let end_x = text_x_offset + end_pos.x() as f64 / pango::SCALE as f64;
+
+                            cr.rectangle(start_x, y, end_x - start_x, line_height);
+                        }
+                    }
+                }
+            }
+            cr.fill().unwrap();
+        }
         _ => {}
     }
 }
@@ -1365,6 +1410,7 @@ fn draw_status_line(
         Mode::Insert => "INSERT",
         Mode::Visual => "VISUAL",
         Mode::VisualLine => "VISUAL LINE",
+        Mode::VisualBlock => "VISUAL BLOCK",
     };
 
     let filename = match engine.file_path() {
