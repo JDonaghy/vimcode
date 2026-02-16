@@ -2127,15 +2127,16 @@ impl Engine {
             self.view_mut().cursor = end_cursor;
         }
 
-        self.clamp_cursor_col();
         *changed = true;
 
         // If operator is 'c', enter insert mode
         if operator == 'c' {
             self.mode = Mode::Insert;
             self.count = None;
-            // Don't finish_undo_group - let insert mode do it
+            self.clamp_cursor_col_insert(); // Use insert-mode clamping
+                                            // Don't finish_undo_group - let insert mode do it
         } else {
+            self.clamp_cursor_col(); // Use normal-mode clamping
             self.finish_undo_group();
         }
     }
@@ -8051,6 +8052,48 @@ mod tests {
     }
 
     #[test]
+    fn test_cw_on_last_word() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "abc def");
+        engine.update_syntax();
+
+        // Move to 'd' in "def"
+        engine.view_mut().cursor.col = 4;
+
+        // cw should delete "def", leaving "abc " (with trailing space)
+        press_char(&mut engine, 'c');
+        press_char(&mut engine, 'w');
+
+        assert_eq!(
+            engine.buffer().to_string(),
+            "abc ",
+            "cw on last word should preserve preceding space"
+        );
+        assert_eq!(engine.mode, Mode::Insert);
+    }
+
+    #[test]
+    fn test_ce_on_last_word() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "abc def");
+        engine.update_syntax();
+
+        // Move to 'd' in "def"
+        engine.view_mut().cursor.col = 4;
+
+        // ce should delete "def", leaving "abc " (with trailing space)
+        press_char(&mut engine, 'c');
+        press_char(&mut engine, 'e');
+
+        assert_eq!(
+            engine.buffer().to_string(),
+            "abc ",
+            "ce on last word should preserve preceding space"
+        );
+        assert_eq!(engine.mode, Mode::Insert);
+    }
+
+    #[test]
     fn test_s_substitute_char() {
         let mut engine = Engine::new();
         engine.buffer_mut().insert(0, "hello");
@@ -10297,6 +10340,60 @@ mod tests {
         assert_eq!(
             engine.buffer().to_string(),
             "vi is great\nvi is powerful\nvi rocks\n"
+        );
+    }
+
+    #[test]
+    fn test_cw_cursor_position_after_last_word() {
+        // Verify cursor is positioned AFTER the space when using cw on last word
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "abc def");
+        engine.update_syntax();
+
+        // Move to 'd' in "def"
+        engine.view_mut().cursor.col = 4;
+
+        // cw should delete "def" and position cursor after the space for insertion
+        press_char(&mut engine, 'c');
+        press_char(&mut engine, 'w');
+
+        assert_eq!(
+            engine.buffer().to_string(),
+            "abc ",
+            "cw should leave 'abc '"
+        );
+        assert_eq!(engine.mode, Mode::Insert, "should be in insert mode");
+        assert_eq!(
+            engine.view().cursor.col,
+            4,
+            "cursor should be after the space (col 4)"
+        );
+    }
+
+    #[test]
+    fn test_ce_cursor_position_after_last_word() {
+        // Verify cursor is positioned AFTER the space when using ce on last word
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "abc def");
+        engine.update_syntax();
+
+        // Move to 'd' in "def"
+        engine.view_mut().cursor.col = 4;
+
+        // ce should delete "def" and position cursor after the space for insertion
+        press_char(&mut engine, 'c');
+        press_char(&mut engine, 'e');
+
+        assert_eq!(
+            engine.buffer().to_string(),
+            "abc ",
+            "ce should leave 'abc '"
+        );
+        assert_eq!(engine.mode, Mode::Insert, "should be in insert mode");
+        assert_eq!(
+            engine.view().cursor.col,
+            4,
+            "cursor should be after the space (col 4)"
         );
     }
 }
