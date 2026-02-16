@@ -11,6 +11,22 @@ pub enum LineNumberMode {
     Hybrid,
 }
 
+/// User settings loaded from ~/.config/vimcode/settings.json
+///
+/// IMPORTANT: When adding new settings fields:
+/// 1. Add the field with #[serde(default = "default_function_name")]
+/// 2. Create a default function that returns a sensible default value
+/// 3. Update the Default impl to include the new field
+/// 4. The Settings::load() method will automatically update existing settings files
+///    to include the new field with its default value, preserving all existing settings
+///
+/// Example:
+/// ```rust
+/// #[serde(default = "default_my_feature")]
+/// pub my_feature: bool,
+///
+/// fn default_my_feature() -> bool { true }
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
     #[serde(default)]
@@ -62,9 +78,21 @@ impl Default for Settings {
 impl Settings {
     /// Load settings from ~/.config/vimcode/settings.json
     /// Falls back to defaults if file doesn't exist or is invalid
+    ///
+    /// IMPORTANT: This method automatically updates the settings file to include any new
+    /// settings with their default values, preserving all existing user settings.
+    /// This ensures that when new settings are added to VimCode, they appear in the user's
+    /// settings.json file with sensible defaults without requiring manual editing.
     pub fn load() -> Self {
         match Self::load_with_validation() {
-            Ok(settings) => settings,
+            Ok(settings) => {
+                // Automatically update settings file to include any new fields with defaults
+                // This preserves existing settings while adding new ones
+                if let Err(e) = settings.save() {
+                    eprintln!("Warning: Failed to update settings file: {}", e);
+                }
+                settings
+            }
             Err(e) => {
                 eprintln!("Warning: {}. Using defaults.", e);
                 Settings::default()
@@ -109,7 +137,9 @@ impl Settings {
     }
 
     /// Ensure settings.json exists with default values
-    /// Creates the file if missing, leaves existing files unchanged
+    /// Creates the file if missing. Note that existing files are automatically updated
+    /// when Settings::load() is called - it adds new fields with defaults while preserving
+    /// existing user settings.
     pub fn ensure_exists() -> Result<(), std::io::Error> {
         let path = Self::settings_path();
 

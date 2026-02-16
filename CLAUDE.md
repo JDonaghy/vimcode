@@ -59,3 +59,10 @@ This prevents CI failures and maintains code quality.
 **Ctrl-W Command:** `handle_pending_key()` under `'\x17'` case
 
 **Engine Facade Methods:** `buffer()`, `buffer_mut()`, `view()`, `view_mut()`, `cursor()` — all operate on active window's buffer
+
+**Add New Setting:** When adding a new user-configurable setting:
+1. Add field to `Settings` struct in `settings.rs` with `#[serde(default = "default_fn_name")]`
+2. Create default function returning sensible default value
+3. Update `Default` impl to include the field
+4. Settings are automatically merged: new fields are added to existing settings files without overwriting user values
+5. Document the setting name and purpose in comments
