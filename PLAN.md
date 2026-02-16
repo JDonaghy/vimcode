@@ -49,8 +49,8 @@
 
 ### Known Bugs
 - [ ] Reverse search (`?`) displays "/" in command line instead of "?"
-- [ ] `cw` at the last word in a line immediately deletes the newline character
-- [ ] `ce` incorrectly deletes the character before the word
+- [x] ~~`cw` at the last word in a line immediately deletes the newline character~~ - FIXED
+- [x] ~~`ce` incorrectly deletes the character before the word~~ - FIXED
 
 ### High Priority
 - [ ] Visual mode case change (u/U in visual mode for lowercase/uppercase)

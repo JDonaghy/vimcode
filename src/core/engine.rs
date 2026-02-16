@@ -2024,8 +2024,13 @@ impl Engine {
             }
             Some('w') => {
                 // dw/cw: delete/change to start of next word
+                // Special case: cw behaves like ce (Vim compatibility)
                 let count = self.take_count();
-                self.apply_operator_with_motion(operator, 'w', count, changed);
+                if operator == 'c' {
+                    self.apply_operator_with_motion(operator, 'e', count, changed);
+                } else {
+                    self.apply_operator_with_motion(operator, 'w', count, changed);
+                }
             }
             Some('b') => {
                 // db/cb: delete/change back to start of word
@@ -3819,21 +3824,46 @@ impl Engine {
         let col = self.view().cursor.col;
         let mut pos = self.buffer().line_to_char(line) + col;
 
-        if pos + 1 >= total_chars {
+        if pos >= total_chars {
             return;
         }
-        pos += 1;
 
-        while pos < total_chars && self.buffer().content.char(pos).is_whitespace() {
+        let current_char = self.buffer().content.char(pos);
+
+        // Check if we're already at the end of a word
+        let at_word_end = if pos + 1 < total_chars {
+            let next_char = self.buffer().content.char(pos + 1);
+            (is_word_char(current_char) && !is_word_char(next_char))
+                || (!is_word_char(current_char)
+                    && !current_char.is_whitespace()
+                    && (is_word_char(next_char) || next_char.is_whitespace()))
+        } else {
+            false
+        };
+
+        // If at end of word, move to next word; otherwise move within current word
+        if at_word_end || current_char.is_whitespace() {
+            // Skip past current position
             pos += 1;
+            // Skip whitespace
+            while pos < total_chars && self.buffer().content.char(pos).is_whitespace() {
+                pos += 1;
+            }
+        } else {
+            // We're in the middle of a word, find its end
+            // Don't increment pos here - stay on current character
         }
 
-        let ch = self.buffer().content.char(pos.min(total_chars - 1));
+        if pos >= total_chars {
+            pos = total_chars - 1;
+        }
+
+        let ch = self.buffer().content.char(pos);
         if is_word_char(ch) {
             while pos + 1 < total_chars && is_word_char(self.buffer().content.char(pos + 1)) {
                 pos += 1;
             }
-        } else {
+        } else if !ch.is_whitespace() {
             while pos + 1 < total_chars {
                 let next = self.buffer().content.char(pos + 1);
                 if is_word_char(next) || next.is_whitespace() {
@@ -7934,11 +7964,11 @@ mod tests {
         engine.buffer_mut().insert(0, "hello world");
         engine.update_syntax();
 
-        // cw should delete "hello " and enter insert mode
+        // cw behaves like ce (Vim compatibility) - deletes "hello" only
         press_char(&mut engine, 'c');
         press_char(&mut engine, 'w');
 
-        assert_eq!(engine.buffer().to_string(), "world");
+        assert_eq!(engine.buffer().to_string(), " world");
         assert_eq!(engine.mode, Mode::Insert);
         assert_eq!(engine.view().cursor.col, 0);
     }
@@ -7996,13 +8026,28 @@ mod tests {
         engine.buffer_mut().insert(0, "one two three");
         engine.update_syntax();
 
-        // 2cw should delete "one two " and enter insert mode
+        // 2cw behaves like 2ce - deletes "one two" (not the trailing space)
         press_char(&mut engine, '2');
         press_char(&mut engine, 'c');
         press_char(&mut engine, 'w');
 
-        assert_eq!(engine.buffer().to_string(), "three");
+        assert_eq!(engine.buffer().to_string(), " three");
         assert_eq!(engine.mode, Mode::Insert);
+    }
+
+    #[test]
+    fn test_cw_at_end_of_line() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello\nworld");
+        engine.update_syntax();
+
+        // cw at "hello" should NOT delete the newline
+        press_char(&mut engine, 'c');
+        press_char(&mut engine, 'w');
+
+        assert_eq!(engine.buffer().to_string(), "\nworld");
+        assert_eq!(engine.mode, Mode::Insert);
+        assert_eq!(engine.view().cursor.line, 0);
     }
 
     #[test]
