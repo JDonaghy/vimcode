@@ -613,18 +613,19 @@ impl SimpleComponent for App {
             .unwrap_or_else(|_| ".config/vimcode/settings.json".to_string());
 
         let file = gio::File::for_path(&settings_path);
-        let settings_monitor = match file.monitor_file(gio::FileMonitorFlags::NONE, gio::Cancellable::NONE) {
-            Ok(monitor) => {
-                let sender_for_monitor = sender.input_sender().clone();
-                monitor.connect_changed(move |_, _, _, event| {
-                    if event == gio::FileMonitorEvent::Changed {
-                        sender_for_monitor.send(Msg::SettingsFileChanged).ok();
-                    }
-                });
-                Some(monitor)
-            }
-            Err(_) => None,
-        };
+        let settings_monitor =
+            match file.monitor_file(gio::FileMonitorFlags::NONE, gio::Cancellable::NONE) {
+                Ok(monitor) => {
+                    let sender_for_monitor = sender.input_sender().clone();
+                    monitor.connect_changed(move |_, _, _, event| {
+                        if event == gio::FileMonitorEvent::Changed {
+                            sender_for_monitor.send(Msg::SettingsFileChanged).ok();
+                        }
+                    });
+                    Some(monitor)
+                }
+                Err(_) => None,
+            };
 
         let model = App {
             engine: engine.clone(),
@@ -1414,18 +1415,22 @@ impl App {
         // Connect signals (always, for all windows)
         let sender_v = sender.clone();
         v_adj.connect_value_changed(move |adj| {
-            sender_v.send(Msg::VerticalScrollbarChanged {
-                window_id,
-                value: adj.value(),
-            }).ok();
+            sender_v
+                .send(Msg::VerticalScrollbarChanged {
+                    window_id,
+                    value: adj.value(),
+                })
+                .ok();
         });
 
         let sender_h = sender.clone();
         h_adj.connect_value_changed(move |adj| {
-            sender_h.send(Msg::HorizontalScrollbarChanged {
-                window_id,
-                value: adj.value(),
-            }).ok();
+            sender_h
+                .send(Msg::HorizontalScrollbarChanged {
+                    window_id,
+                    value: adj.value(),
+                })
+                .ok();
         });
 
         WindowScrollbars {
@@ -1474,7 +1479,13 @@ fn format_line_number(mode: LineNumberMode, line_idx: usize, cursor_line: usize)
     }
 }
 
-fn draw_editor(cr: &Context, engine: &Engine, width: i32, height: i32, sender: &relm4::Sender<Msg>) {
+fn draw_editor(
+    cr: &Context,
+    engine: &Engine,
+    width: i32,
+    height: i32,
+    sender: &relm4::Sender<Msg>,
+) {
     // 1. Background
     cr.set_source_rgb(0.1, 0.1, 0.1);
     cr.paint().expect("Invalid cairo surface");
@@ -1484,7 +1495,10 @@ fn draw_editor(cr: &Context, engine: &Engine, width: i32, height: i32, sender: &
     let layout = pango::Layout::new(&pango_ctx);
 
     // Use configurable font from settings
-    let font_str = format!("{} {}", engine.settings.font_family, engine.settings.font_size);
+    let font_str = format!(
+        "{} {}",
+        engine.settings.font_family, engine.settings.font_size
+    );
     let font_desc = FontDescription::from_string(&font_str);
     layout.set_font_description(Some(&font_desc));
 
@@ -1552,7 +1566,10 @@ fn draw_tab_bar(
 
     // Save current font description so we can restore after rendering previews
     let normal_font = layout.font_description().unwrap_or_else(|| {
-        let font_str = format!("{} {}", engine.settings.font_family, engine.settings.font_size);
+        let font_str = format!(
+            "{} {}",
+            engine.settings.font_family, engine.settings.font_size
+        );
         FontDescription::from_string(&font_str)
     });
     let mut italic_font = normal_font.clone();
@@ -2088,7 +2105,10 @@ fn draw_status_line(
         String::new()
     };
 
-    let left_status = format!(" -- {}{} -- {}{}", mode_str, recording_indicator, filename, dirty_indicator);
+    let left_status = format!(
+        " -- {}{} -- {}{}",
+        mode_str, recording_indicator, filename, dirty_indicator
+    );
     let cursor = engine.cursor();
     let right_status = format!(
         "Ln {}, Col {}  ({} lines) ",
