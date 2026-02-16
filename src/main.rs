@@ -2263,7 +2263,12 @@ fn handle_mouse_click(engine: &mut Engine, x: f64, y: f64, width: f64, height: f
     let cr = CairoContext::new(&surface).unwrap();
 
     let pango_ctx = pangocairo::create_context(&cr);
-    let font_desc = FontDescription::from_string("Monospace 14");
+    // Use configurable font from settings (matching draw_editor)
+    let font_str = format!(
+        "{} {}",
+        engine.settings.font_family, engine.settings.font_size
+    );
+    let font_desc = FontDescription::from_string(&font_str);
 
     // Get actual font metrics (matching draw_editor line 250-251)
     let font_metrics = pango_ctx.metrics(Some(&font_desc), None);
