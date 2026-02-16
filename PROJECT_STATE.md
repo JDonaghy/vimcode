@@ -34,27 +34,31 @@
 ### Rendering
 - Syntax highlighting (Tree-sitter, Rust)
 - Line numbers (absolute/relative/hybrid via settings.json)
-- Tab bar, status lines, command line
+- Tab bar, single global status line, command line
 - Mouse click positioning (pixel-perfect)
+- **Scrollbars (FIXED):** Per-window vertical/horizontal scrollbars with cursor indicators
+- **Font configuration:** Customizable font family and size
 
 ### Settings
-- `~/.config/vimcode/settings.json`
+- `~/.config/vimcode/settings.json` (auto-created with defaults on first run)
 - LineNumberMode (None/Absolute/Relative/Hybrid)
+- Font family and size (hot-reload on save)
 - `:config reload` runtime refresh
+- File watcher for automatic reload
 
 ## File Structure
 ```
 vimcode/
 ├── src/
-│   ├── main.rs (~1150 lines) — GTK4/Relm4 UI, rendering
+│   ├── main.rs (~2000 lines) — GTK4/Relm4 UI, rendering, scrollbars
 │   └── core/ (~8500 lines) — Platform-agnostic logic
 │       ├── engine.rs (~8500 lines) — Orchestrates everything
 │       ├── buffer_manager.rs (~600 lines) — Buffer lifecycle
 │       ├── buffer.rs (~120 lines) — Rope-based storage
-│       ├── settings.rs (~160 lines) — JSON persistence
+│       ├── settings.rs (~180 lines) — JSON persistence, auto-init
 │       ├── window.rs, tab.rs, view.rs, cursor.rs, mode.rs, syntax.rs
-│       └── Tests: 255 passing
-└── Total: ~10,150 lines
+│       └── Tests: 256 passing
+└── Total: ~10,500 lines
 ```
 
 ## Architecture
@@ -76,7 +80,7 @@ vimcode/
 ```bash
 cargo build
 cargo run -- <file>
-cargo test    # 242 tests
+cargo test    # 256 tests
 cargo clippy -- -D warnings
 cargo fmt
 ```
@@ -91,6 +95,7 @@ cargo fmt
 - [ ] More grammars (Python/JS/Go/C++)
 
 ## Recent Work
+**Session 20:** Critical bug fixes — Scrollbars visible, explorer button working, settings auto-init/reload, single status line (256 tests).
 **Session 19:** Visual block mode (Ctrl-V) complete — rectangular selections (242→255 tests).
 **Session 18:** Phase 4 complete — Preview mode (242 tests).
 **Session 17:** Phase 3 complete — Focus, highlighting, errors (232 tests).
