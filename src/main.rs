@@ -1154,12 +1154,8 @@ impl SimpleComponent for App {
                     .unwrap_or_else(|_| ".config/vimcode/settings.json".to_string());
 
                 let mut engine = self.engine.borrow_mut();
-                match engine.open_file_with_mode(Path::new(&settings_path), OpenMode::Permanent) {
-                    Ok(()) => {}
-                    Err(e) => {
-                        engine.message = format!("Error opening settings: {}", e);
-                    }
-                }
+                // Open settings in a new tab
+                engine.new_tab(Some(Path::new(&settings_path)));
                 drop(engine);
                 self.redraw = !self.redraw;
             }
