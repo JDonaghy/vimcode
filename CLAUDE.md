@@ -32,6 +32,16 @@ cargo clippy -- -D warnings  # Lint (must pass)
 cargo fmt                 # Format
 ```
 
+## Quality Checks (MANDATORY Before Commits)
+**CRITICAL:** After making ANY code changes and before creating commits, ALWAYS run:
+1. `cargo fmt` - Format code
+2. `cargo clippy -- -D warnings` - Check linting (must have zero warnings)
+3. `cargo test` - Verify all tests pass
+4. `cargo build` - Ensure compilation succeeds
+
+If any check fails, fix immediately and re-run. Only commit when ALL checks pass.
+This prevents CI failures and maintains code quality.
+
 ## Code Style
 - `rustfmt` defaults (4-space indent)
 - `PascalCase` types, `snake_case` functions/vars
