@@ -674,6 +674,44 @@ impl SimpleComponent for App {
                     EngineAction::None | EngineAction::Error => {}
                 }
 
+                // Process macro playback queue if active
+                loop {
+                    let (has_more, action) = {
+                        let mut engine = self.engine.borrow_mut();
+                        engine.advance_macro_playback()
+                    };
+
+                    // Handle actions from macro playback
+                    match action {
+                        EngineAction::Quit | EngineAction::SaveQuit => {
+                            std::process::exit(0);
+                        }
+                        EngineAction::OpenFile(path) => {
+                            let mut engine = self.engine.borrow_mut();
+                            match engine.open_file_with_mode(&path, OpenMode::Permanent) {
+                                Ok(()) => {
+                                    drop(engine);
+                                    if let Some(ref tree) = *self.file_tree_view.borrow() {
+                                        highlight_file_in_tree(tree, &path);
+                                    }
+                                    if let Some(ref drawing) = *self.drawing_area.borrow() {
+                                        drawing.grab_focus();
+                                    }
+                                    self.tree_has_focus = false;
+                                }
+                                Err(e) => {
+                                    engine.message = e;
+                                }
+                            }
+                        }
+                        EngineAction::None | EngineAction::Error => {}
+                    }
+
+                    if !has_more {
+                        break;
+                    }
+                }
+
                 self.redraw = !self.redraw;
             }
             Msg::Resize => {
@@ -1813,7 +1851,13 @@ fn draw_status_line(
 
     let dirty_indicator = if engine.dirty() { " [+]" } else { "" };
 
-    let left_status = format!(" -- {} -- {}{}", mode_str, filename, dirty_indicator);
+    let recording_indicator = if let Some(reg) = engine.macro_recording {
+        format!(" [recording @{}]", reg)
+    } else {
+        String::new()
+    };
+
+    let left_status = format!(" -- {}{} -- {}{}", mode_str, recording_indicator, filename, dirty_indicator);
     let cursor = engine.cursor();
     let right_status = format!(
         "Ln {}, Col {}  ({} lines) ",

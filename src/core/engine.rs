@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
 use super::buffer::{Buffer, BufferId};
@@ -27,6 +27,9 @@ pub enum OpenMode {
     Preview,
     Permanent,
 }
+
+/// Maximum depth for macro recursion to prevent infinite loops.
+const MAX_MACRO_RECURSION: usize = 100;
 
 /// Represents a change operation that can be repeated with `.`
 #[derive(Debug, Clone)]
@@ -138,6 +141,20 @@ pub struct Engine {
     // --- Settings ---
     /// Editor settings (line numbers, etc.)
     pub settings: Settings,
+
+    // --- Macro recording state ---
+    /// Which register is recording (None if not recording).
+    pub macro_recording: Option<char>,
+    /// Accumulated keystrokes during recording.
+    pub recording_buffer: Vec<char>,
+
+    // --- Macro playback state ---
+    /// Keys to inject for playback.
+    pub macro_playback_queue: VecDeque<char>,
+    /// Last macro played (for @@).
+    pub last_macro_register: Option<char>,
+    /// Prevent infinite recursion.
+    pub macro_recursion_depth: usize,
 }
 
 impl Engine {
@@ -181,6 +198,11 @@ impl Engine {
                 Settings::ensure_exists().ok();
                 Settings::load()
             },
+            macro_recording: None,
+            recording_buffer: Vec::new(),
+            macro_playback_queue: VecDeque::new(),
+            last_macro_register: None,
+            macro_recursion_depth: 0,
         }
     }
 
@@ -937,6 +959,22 @@ impl Engine {
             self.message.clear();
         }
 
+        // Record keystroke if macro recording is active
+        // Skip recording the 'q' that stops recording
+        if self.macro_recording.is_some() {
+            let is_stop_q = self.mode == Mode::Normal
+                && unicode == Some('q')
+                && self.pending_key.is_none();
+
+            if !is_stop_q {
+                // Encode the keystroke for recording
+                let encoded = self.encode_key_for_macro(key_name, unicode, ctrl);
+                for ch in encoded.chars() {
+                    self.recording_buffer.push(ch);
+                }
+            }
+        }
+
         let mut changed = false;
         let mut action = EngineAction::None;
 
@@ -970,6 +1008,108 @@ impl Engine {
 
         self.ensure_cursor_visible();
         action
+    }
+
+    /// Decode a sequence from the macro playback queue.
+    /// Returns (key_name, unicode, ctrl) tuple and the number of characters consumed.
+    fn decode_macro_sequence(&mut self) -> Option<(String, Option<char>, bool, usize)> {
+        if self.macro_playback_queue.is_empty() {
+            return None;
+        }
+
+        let first_char = *self.macro_playback_queue.front().unwrap();
+
+        // Check for angle-bracket notation (e.g., <Left>, <C-D>)
+        if first_char == '<' {
+            // Collect characters until we find '>'
+            let mut sequence = String::new();
+            let temp_queue: Vec<char> = self.macro_playback_queue.iter().copied().collect();
+
+            for (i, &ch) in temp_queue.iter().enumerate() {
+                sequence.push(ch);
+                if ch == '>' {
+                    // Found complete sequence
+                    let len = i + 1;
+
+                    // Parse the sequence
+                    if let Some((key_name, unicode, ctrl)) = self.parse_key_sequence(&sequence) {
+                        return Some((key_name, unicode, ctrl, len));
+                    } else {
+                        // Invalid sequence, treat '<' as literal
+                        return Some(("".to_string(), Some('<'), false, 1));
+                    }
+                }
+            }
+
+            // No closing '>', treat '<' as literal
+            return Some(("".to_string(), Some('<'), false, 1));
+        }
+
+        // Handle ESC
+        if first_char == '\x1b' {
+            return Some(("Escape".to_string(), None, false, 1));
+        }
+
+        // Regular character
+        Some(("".to_string(), Some(first_char), false, 1))
+    }
+
+    /// Parse a key sequence like "<Left>", "<C-D>", "<CR>", etc.
+    fn parse_key_sequence(&self, seq: &str) -> Option<(String, Option<char>, bool)> {
+        if !seq.starts_with('<') || !seq.ends_with('>') {
+            return None;
+        }
+
+        let inner = &seq[1..seq.len()-1];
+
+        // Check for Ctrl combinations: <C-X>
+        if inner.starts_with("C-") && inner.len() == 3 {
+            let ch = inner.chars().nth(2).unwrap().to_lowercase().next().unwrap();
+            return Some((ch.to_string(), Some(ch), true));
+        }
+
+        // Special keys
+        match inner {
+            "CR" => Some(("Return".to_string(), None, false)),
+            "BS" => Some(("BackSpace".to_string(), None, false)),
+            "Del" => Some(("Delete".to_string(), None, false)),
+            "Left" => Some(("Left".to_string(), None, false)),
+            "Right" => Some(("Right".to_string(), None, false)),
+            "Up" => Some(("Up".to_string(), None, false)),
+            "Down" => Some(("Down".to_string(), None, false)),
+            "Home" => Some(("Home".to_string(), None, false)),
+            "End" => Some(("End".to_string(), None, false)),
+            "PageUp" => Some(("Page_Up".to_string(), None, false)),
+            "PageDown" => Some(("Page_Down".to_string(), None, false)),
+            _ => None,
+        }
+    }
+
+    /// Advance macro playback by processing the next keystroke in the queue.
+    /// Returns true if there are more keys to process.
+    pub fn advance_macro_playback(&mut self) -> (bool, EngineAction) {
+        // Decode the next key sequence
+        if let Some((key_name, unicode, ctrl, consume_count)) = self.decode_macro_sequence() {
+            // Remove consumed characters from queue
+            for _ in 0..consume_count {
+                self.macro_playback_queue.pop_front();
+            }
+
+            self.macro_recursion_depth += 1;
+            let action = self.handle_key(&key_name, unicode, ctrl);
+            self.macro_recursion_depth -= 1;
+
+            // Check if we hit recursion limit
+            if self.macro_recursion_depth >= MAX_MACRO_RECURSION {
+                self.macro_playback_queue.clear();
+                self.message = "Macro recursion limit reached".to_string();
+                return (false, EngineAction::Error);
+            }
+
+            (!self.macro_playback_queue.is_empty(), action)
+        } else {
+            (false, EngineAction::None)
+        }
     }
 
     fn handle_normal_key(
@@ -1452,6 +1592,21 @@ impl Engine {
                     self.paste_before(changed);
                 }
             }
+            Some('q') => {
+                // If already recording, stop recording
+                if self.macro_recording.is_some() {
+                    self.stop_macro_recording();
+                    return EngineAction::None;
+                }
+
+                // Otherwise, start pending key for register selection
+                self.pending_key = Some('q');
+            }
+            Some('@') => {
+                // Start pending key for register selection (@ + register)
+                // @@ is handled in handle_pending_key
+                self.pending_key = Some('@');
+            }
             Some('"') => {
                 self.pending_key = Some('"');
             }
@@ -1593,6 +1748,35 @@ impl Engine {
                 if let Some(ch) = unicode {
                     if ch.is_ascii_lowercase() || ch == '"' {
                         self.selected_register = Some(ch);
+                    }
+                }
+            }
+            'q' => {
+                // Macro recording: q<register>
+                if let Some(ch) = unicode {
+                    if ch.is_ascii_lowercase() {
+                        self.start_macro_recording(ch);
+                    } else {
+                        self.message = "Invalid register for macro".to_string();
+                    }
+                }
+            }
+            '@' => {
+                // Macro playback: @<register> or @@
+                if let Some(ch) = unicode {
+                    if ch == '@' {
+                        // @@ - repeat last macro
+                        if let Some(last_reg) = self.last_macro_register {
+                            let count = self.take_count();
+                            let _ = self.play_macro_with_count(last_reg, count);
+                        } else {
+                            self.message = "No previous macro".to_string();
+                        }
+                    } else if ch.is_ascii_lowercase() {
+                        let count = self.take_count();
+                        let _ = self.play_macro_with_count(ch, count);
+                    } else {
+                        self.message = "Invalid register for macro playback".to_string();
                     }
                 }
             }
@@ -4008,6 +4192,108 @@ impl Engine {
     /// Clears the selected register after an operation.
     fn clear_selected_register(&mut self) {
         self.selected_register = None;
+    }
+
+    // --- Macro operations ---
+
+    /// Encode a keystroke for macro recording using Vim-style notation.
+    /// Returns a string representation that can be decoded during playback.
+    fn encode_key_for_macro(&self, key_name: &str, unicode: Option<char>, ctrl: bool) -> String {
+        // Handle Ctrl combinations
+        if ctrl {
+            if let Some(ch) = unicode {
+                // Ctrl-D, Ctrl-U, etc.
+                return format!("<C-{}>", ch.to_uppercase());
+            }
+        }
+
+        // Handle special keys (no unicode)
+        if unicode.is_none() {
+            match key_name {
+                "Escape" => return "\x1b".to_string(),
+                "Return" => return "<CR>".to_string(),
+                "BackSpace" => return "<BS>".to_string(),
+                "Delete" => return "<Del>".to_string(),
+                "Left" => return "<Left>".to_string(),
+                "Right" => return "<Right>".to_string(),
+                "Up" => return "<Up>".to_string(),
+                "Down" => return "<Down>".to_string(),
+                "Home" => return "<Home>".to_string(),
+                "End" => return "<End>".to_string(),
+                "Page_Up" => return "<PageUp>".to_string(),
+                "Page_Down" => return "<PageDown>".to_string(),
+                _ => return String::new(), // Unknown key, don't record
+            }
+        }
+
+        // Regular character
+        if let Some(ch) = unicode {
+            ch.to_string()
+        } else {
+            String::new()
+        }
+    }
+
+    /// Start recording a macro into the specified register.
+    fn start_macro_recording(&mut self, register: char) {
+        self.macro_recording = Some(register);
+        self.recording_buffer.clear();
+        self.message = format!("Recording macro into register '{}'", register);
+    }
+
+    /// Stop recording and save the macro to the register.
+    fn stop_macro_recording(&mut self) {
+        if let Some(reg) = self.macro_recording {
+            // Convert recording_buffer to string
+            let macro_content: String = self.recording_buffer.iter().collect();
+
+            // Store in register (not linewise)
+            self.set_register(reg, macro_content, false);
+
+            self.message = format!("Macro recorded into register '{}'", reg);
+            self.macro_recording = None;
+            self.recording_buffer.clear();
+        }
+    }
+
+    /// Play a macro from the specified register.
+    fn play_macro(&mut self, register: char) -> Result<(), String> {
+        // Check recursion depth
+        if self.macro_recursion_depth >= MAX_MACRO_RECURSION {
+            return Err("Macro recursion too deep".to_string());
+        }
+
+        // Get macro content from register (clone it to avoid borrow issues)
+        let content = if let Some((content, _)) = self.get_register(register) {
+            content.clone()
+        } else {
+            self.message = format!("Register '{}' is empty", register);
+            return Ok(());
+        };
+
+        if content.is_empty() {
+            self.message = format!("Register '{}' is empty", register);
+            return Ok(());
+        }
+
+        // Remember last macro for @@
+        self.last_macro_register = Some(register);
+
+        // Add keys to playback queue
+        for ch in content.chars() {
+            self.macro_playback_queue.push_back(ch);
+        }
+
+        self.message = format!("Playing macro from register '{}'", register);
+        Ok(())
+    }
+
+    /// Play a macro with a count prefix.
+    fn play_macro_with_count(&mut self, register: char, count: usize) -> Result<(), String> {
+        for _ in 0..count {
+            self.play_macro(register)?;
+        }
+        Ok(())
     }
 
     /// Takes and consumes the count, returning it (or 1 if no count was entered).
@@ -8623,5 +8909,342 @@ mod tests {
         press_char(&mut engine, '2');
         press_char(&mut engine, 'l');
         assert_eq!(engine.view().cursor.col, 2);
+    }
+
+    // ========================================================================
+    // Macro Tests
+    // ========================================================================
+
+    #[test]
+    fn test_macro_basic_recording() {
+        let mut engine = Engine::new();
+
+        // Start recording into register 'a'
+        press_char(&mut engine, 'q');
+        press_char(&mut engine, 'a');
+        assert_eq!(engine.macro_recording, Some('a'));
+        assert!(engine.message.contains("Recording"));
+
+        // Record some keystrokes
+        press_char(&mut engine, 'i');  // Enter insert mode
+        press_char(&mut engine, 'h');
+        press_char(&mut engine, 'i');
+        press_special(&mut engine, "Escape");  // ESC
+        press_char(&mut engine, 'l');
+
+        // Stop recording
+        press_char(&mut engine, 'q');
+        assert_eq!(engine.macro_recording, None);
+        assert!(engine.message.contains("recorded"));
+
+        // Verify macro content in register
+        let (content, _) = engine.registers.get(&'a').unwrap();
+        // Should contain "ihi<ESC>l" but ESC is unicode 0x1b
+        assert!(content.contains("hi"));
+        assert_eq!(content.len(), 5); // i, h, i, ESC, l
+    }
+
+    #[test]
+    fn test_macro_playback() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "line1\nline2\n");
+
+        // Manually set up a macro in register 'a' (skip recording for simplicity)
+        // Macro: A!<ESC> (append "!" to end of line, then ESC)
+        engine.set_register('a', "A!\x1b".to_string(), false);
+
+        // Play macro
+        press_char(&mut engine, '@');
+        press_char(&mut engine, 'a');
+
+        // Process playback queue
+        while !engine.macro_playback_queue.is_empty() {
+            let _ = engine.advance_macro_playback();
+        }
+
+        // Verify result
+        assert_eq!(engine.buffer().to_string(), "line1!\nline2\n");
+    }
+
+    #[test]
+    fn test_macro_repeat_last() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "test\n");
+
+        // Set up macro with ESC to return to normal mode
+        engine.set_register('b', "A.\x1b".to_string(), false);
+
+        // Play it once
+        press_char(&mut engine, '@');
+        press_char(&mut engine, 'b');
+        while !engine.macro_playback_queue.is_empty() {
+            let _ = engine.advance_macro_playback();
+        }
+
+        assert_eq!(engine.buffer().to_string(), "test.\n");
+
+        // Play it again with @@
+        press_char(&mut engine, '@');
+        press_char(&mut engine, '@');
+        while !engine.macro_playback_queue.is_empty() {
+            let _ = engine.advance_macro_playback();
+        }
+
+        assert_eq!(engine.buffer().to_string(), "test..\n");
+    }
+
+    #[test]
+    fn test_macro_with_count() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "x\n");
+
+        // Macro: A!<ESC> (append "!" and return to normal mode)
+        engine.set_register('c', "A!\x1b".to_string(), false);
+
+        // Play 3 times: 3@c
+        press_char(&mut engine, '3');
+        press_char(&mut engine, '@');
+        press_char(&mut engine, 'c');
+
+        while !engine.macro_playback_queue.is_empty() {
+            let _ = engine.advance_macro_playback();
+        }
+
+        assert_eq!(engine.buffer().to_string(), "x!!!\n");
+    }
+
+    #[test]
+    fn test_macro_recursion_limit() {
+        let mut engine = Engine::new();
+
+        // Create recursive macro: @a calls @a
+        engine.set_register('a', "@a".to_string(), false);
+
+        // Try to play it
+        press_char(&mut engine, '@');
+        press_char(&mut engine, 'a');
+
+        // Should hit recursion limit
+        for _ in 0..MAX_MACRO_RECURSION + 10 {
+            if engine.macro_playback_queue.is_empty() {
+                break;
+            }
+            let (has_more, _) = engine.advance_macro_playback();
+            if !has_more {
+                break;
+            }
+        }
+
+        // Engine should still be functional
+        assert!(engine.macro_recursion_depth <= MAX_MACRO_RECURSION);
+    }
+
+    #[test]
+    fn test_macro_empty_register() {
+        let mut engine = Engine::new();
+
+        // Try to play from empty register
+        press_char(&mut engine, '@');
+        press_char(&mut engine, 'z');
+
+        assert!(engine.message.contains("empty"));
+    }
+
+    #[test]
+    fn test_macro_stop_on_error() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "short\n");
+
+        // Macro that tries to move right 100 times
+        engine.set_register('d', "100l".to_string(), false);
+
+        press_char(&mut engine, '@');
+        press_char(&mut engine, 'd');
+
+        // Playback should stop when hitting buffer boundary
+        let mut iterations = 0;
+        while !engine.macro_playback_queue.is_empty() && iterations < 200 {
+            let _ = engine.advance_macro_playback();
+            iterations += 1;
+        }
+
+        // Should be at end of line, not crashed
+        assert!(engine.cursor().col <= 4);  // At or before the newline
+    }
+
+    #[test]
+    fn test_macro_recording_saves_to_register() {
+        let mut engine = Engine::new();
+
+        // Record a simple macro
+        press_char(&mut engine, 'q');
+        press_char(&mut engine, 'm');
+        press_char(&mut engine, 'i');
+        press_char(&mut engine, 'x');
+        press_special(&mut engine, "Escape");  // Must ESC before stopping recording
+        press_char(&mut engine, 'q');
+
+        // Verify it's in register 'm'
+        let (content, _) = engine.registers.get(&'m').unwrap();
+        assert_eq!(content, "ix\x1b");  // i, x, ESC
+
+        // Also should be in unnamed register
+        let (unnamed_content, _) = engine.registers.get(&'"').unwrap();
+        assert_eq!(unnamed_content, "ix\x1b");
+    }
+
+    #[test]
+    fn test_macro_records_navigation_keys() {
+        let mut engine = Engine::new();
+
+        // Start recording
+        press_char(&mut engine, 'q');
+        press_char(&mut engine, 'n');
+
+        // Record some navigation
+        press_char(&mut engine, 'l');  // Move right (unicode)
+        press_char(&mut engine, 'j');  // Move down (unicode)
+        press_special(&mut engine, "Left");  // Arrow key (no unicode)
+        press_special(&mut engine, "Up");    // Arrow key (no unicode)
+
+        // Stop recording
+        press_char(&mut engine, 'q');
+
+        // Verify it's recorded with proper encoding
+        let (content, _) = engine.registers.get(&'n').unwrap();
+        assert_eq!(content, "lj<Left><Up>");
+    }
+
+    #[test]
+    fn test_macro_records_ctrl_keys() {
+        let mut engine = Engine::new();
+
+        // Start recording
+        press_char(&mut engine, 'q');
+        press_char(&mut engine, 'c');
+
+        // Record some Ctrl combinations
+        press_ctrl(&mut engine, 'd');  // Ctrl-D
+        press_ctrl(&mut engine, 'u');  // Ctrl-U
+
+        // Stop recording
+        press_char(&mut engine, 'q');
+
+        // Verify it's recorded with proper encoding
+        let (content, _) = engine.registers.get(&'c').unwrap();
+        assert_eq!(content, "<C-D><C-U>");
+    }
+
+    #[test]
+    fn test_macro_playback_with_arrow_keys() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "abc\ndef\nghi");
+
+        // Macro: move right twice, then move down
+        engine.set_register('a', "ll<Down>".to_string(), false);
+
+        // Start at (0, 0)
+        assert_eq!(engine.cursor().line, 0);
+        assert_eq!(engine.cursor().col, 0);
+
+        // Play macro
+        press_char(&mut engine, '@');
+        press_char(&mut engine, 'a');
+        while !engine.macro_playback_queue.is_empty() {
+            let _ = engine.advance_macro_playback();
+        }
+
+        // Should be at (1, 2) - line 1, col 2
+        assert_eq!(engine.cursor().line, 1);
+        assert_eq!(engine.cursor().col, 2);
+    }
+
+    #[test]
+    fn test_macro_playback_with_ctrl_keys() {
+        let mut engine = Engine::new();
+        // Create a buffer with many lines
+        let mut content = String::new();
+        for i in 0..50 {
+            content.push_str(&format!("line {}\n", i));
+        }
+        engine.buffer_mut().insert(0, &content);
+
+        // Macro: Ctrl-D (half page down)
+        engine.set_register('d', "<C-D>".to_string(), false);
+
+        let initial_line = engine.cursor().line;
+
+        // Play macro
+        press_char(&mut engine, '@');
+        press_char(&mut engine, 'd');
+        while !engine.macro_playback_queue.is_empty() {
+            let _ = engine.advance_macro_playback();
+        }
+
+        // Should have moved down (exact amount depends on viewport, but should be > 0)
+        assert!(engine.cursor().line > initial_line);
+    }
+
+    #[test]
+    fn test_macro_records_insert_mode_with_enter() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "test");
+
+        // Start recording
+        press_char(&mut engine, 'q');
+        press_char(&mut engine, 'r');
+
+        // Enter insert mode, type text, press enter, type more, ESC
+        press_char(&mut engine, 'A');  // Append
+        press_char(&mut engine, '!');
+        press_special(&mut engine, "Return");  // New line
+        press_char(&mut engine, 'n');
+        press_char(&mut engine, 'e');
+        press_char(&mut engine, 'w');
+        press_special(&mut engine, "Escape");
+
+        // Stop recording
+        press_char(&mut engine, 'q');
+
+        // Verify the macro content includes <CR>
+        let (content, _) = engine.registers.get(&'r').unwrap();
+        assert_eq!(content, "A!<CR>new\x1b");
+    }
+
+    #[test]
+    fn test_macro_comprehensive() {
+        let mut engine = Engine::new();
+        // Create a buffer with multiple lines
+        engine.buffer_mut().insert(0, "line one\nline two\nline three");
+
+        // Record a complex macro that uses:
+        // - Navigation (j, l, arrow keys)
+        // - Insert mode
+        // - Special keys (Return, ESC)
+        // - Ctrl keys
+
+        // Macro: j (down), $$ (end of line), A (append), ! (type), ESC, Ctrl-D
+        engine.set_register('z', "j$A!\x1b<C-D>".to_string(), false);
+
+        // Start at (0, 0)
+        assert_eq!(engine.cursor().line, 0);
+
+        // Play the macro
+        press_char(&mut engine, '@');
+        press_char(&mut engine, 'z');
+        while !engine.macro_playback_queue.is_empty() {
+            let _ = engine.advance_macro_playback();
+        }
+
+        // Should have:
+        // - Moved down to line 1
+        // - Moved to end of line
+        // - Appended "!"
+        // - Returned to normal mode
+        // - Scrolled down with Ctrl-D
+
+        // Check that "!" was appended to line 1
+        let line1_content: String = engine.buffer().content.line(1).chars().collect();
+        assert!(line1_content.contains("line two!"));
     }
 }

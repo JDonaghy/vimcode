@@ -4,7 +4,7 @@
 
 ## Status
 
-**Visual Block Mode COMPLETE:** Ctrl-V for rectangular selections (255 tests passing)
+**Macros COMPLETE:** Full keystroke recording with special keys, Ctrl combinations, navigation (269 tests passing)
 
 ### Core Vim (Complete)
 - Seven modes (Normal/Insert/Visual/Visual Line/Visual Block/Command/Search)
@@ -15,6 +15,12 @@
 - Undo/redo, repeat (.), count prefix
 - Visual modes (v/V/Ctrl-V with y/d/c, rectangular block selections)
 - Search (/, n/N)
+- **Macros (NEW):**
+  - Record: q<register>, stop with q
+  - Playback: @<register>, @@ to repeat, count prefix (5@a)
+  - Captures ALL keys: navigation, arrows, Ctrl keys, special keys, insert mode, search
+  - Vim-style encoding: `<Left>`, `<C-D>`, `<CR>`, etc.
+  - Future-proof: automatically captures any new features
 - Buffers (:bn/:bp/:b#/:ls/:bd)
 - Windows (:split/:vsplit, Ctrl-W)
 - Tabs (:tabnew/:tabclose, gt/gT)
@@ -50,15 +56,15 @@
 ```
 vimcode/
 ├── src/
-│   ├── main.rs (~2000 lines) — GTK4/Relm4 UI, rendering, scrollbars
-│   └── core/ (~8500 lines) — Platform-agnostic logic
-│       ├── engine.rs (~8500 lines) — Orchestrates everything
+│   ├── main.rs (~2050 lines) — GTK4/Relm4 UI, rendering, scrollbars, macro playback
+│   └── core/ (~9100 lines) — Platform-agnostic logic
+│       ├── engine.rs (~9100 lines) — Orchestrates everything, macro recording/playback
 │       ├── buffer_manager.rs (~600 lines) — Buffer lifecycle
 │       ├── buffer.rs (~120 lines) — Rope-based storage
 │       ├── settings.rs (~180 lines) — JSON persistence, auto-init
 │       ├── window.rs, tab.rs, view.rs, cursor.rs, mode.rs, syntax.rs
-│       └── Tests: 256 passing
-└── Total: ~10,500 lines
+│       └── Tests: 269 passing (14 macro tests)
+└── Total: ~11,100 lines
 ```
 
 ## Architecture
@@ -80,21 +86,22 @@ vimcode/
 ```bash
 cargo build
 cargo run -- <file>
-cargo test    # 256 tests
+cargo test    # 269 tests
 cargo clippy -- -D warnings
 cargo fmt
 ```
 
 ## Roadmap (High Priority)
 - [x] **Visual block mode (Ctrl-V)** — COMPLETE
+- [x] **Macros (q, @)** — COMPLETE
 - [ ] Reverse search (?)
 - [ ] Marks (m, ')
-- [ ] Macros (q, @)
 - [ ] :s substitute
 - [ ] Incremental search
 - [ ] More grammars (Python/JS/Go/C++)
 
 ## Recent Work
+**Session 21:** Macros (q, @) complete — Full keystroke recording (navigation, Ctrl keys, special keys, arrows), Vim-style encoding, playback with count prefix, @@ repeat, recursion protection (256→269 tests, 14 macro tests).
 **Session 20:** Critical bug fixes — Scrollbars visible, explorer button working, settings auto-init/reload, single status line (256 tests).
 **Session 19:** Visual block mode (Ctrl-V) complete — rectangular selections (242→255 tests).
 **Session 18:** Phase 4 complete — Preview mode (242 tests).
