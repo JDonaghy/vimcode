@@ -2,6 +2,25 @@
 
 ## Recently Completed
 
+### ✅ Undo Line (Session 24)
+- `U` command to undo all changes on the current line
+- Tracks original line state when first modified
+- Works across multiple operations on the same line
+- Properly integrates with undo/redo stack
+- Tests: 295 → 300 passing (5 new tests)
+
+### ✅ Replace Character (Session 24)
+- `r` command to replace character under cursor
+- Count support (e.g., `3rx` replaces 3 chars with 'x')
+- Repeat support with `.` command
+- Respects line boundaries (doesn't cross newlines)
+- Tests: 288 → 295 passing (7 new tests)
+
+### ✅ Reverse Search (Session 24)
+- `?` command for backward search
+- Direction-aware `n` and `N` navigation
+- Tests: 284 → 288 passing (4 new tests)
+
 ### ✅ Session Persistence (Session 23)
 - **CRITICAL FIX:** Line numbers now visible in Absolute mode
 - Command/search history with Up/Down arrow navigation
@@ -28,8 +47,13 @@
 
 ## Future Tasks (Roadmap)
 
+### Known Bugs
+- [ ] Reverse search (`?`) displays "/" in command line instead of "?"
+- [ ] `cw` at the last word in a line immediately deletes the newline character
+- [ ] `ce` incorrectly deletes the character before the word
+
 ### High Priority
-- [ ] Reverse search (?)
+- [ ] Visual mode case change (u/U in visual mode for lowercase/uppercase)
 - [ ] Marks (m, ')
 - [ ] Incremental search
 - [ ] More grammars (Python/JS/Go/C++)

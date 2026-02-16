@@ -4,17 +4,20 @@
 
 ## Status
 
-**Session Persistence COMPLETE:** Command/search history, auto-complete, window geometry, line numbers bug fixed (284 tests passing)
+**Undo Line COMPLETE:** `U` command to restore current line (300 tests passing)
 
 ### Core Vim (Complete)
 - Seven modes (Normal/Insert/Visual/Visual Line/Visual Block/Command/Search)
 - Navigation (hjkl, w/b/e, {}, gg/G, f/F/t/T, %, 0/$, Ctrl-D/U/F/B)
-- Operators (d/c/y with motions, x/dd/D/s/S/C)
+- Operators (d/c/y with motions, x/dd/D/s/S/C, r for replace char)
 - Text objects (iw/aw, quotes, brackets)
 - Registers (unnamed + a-z)
-- Undo/redo, repeat (.), count prefix
+- Undo/redo (u/Ctrl-R), undo line (U), repeat (.), count prefix
 - Visual modes (v/V/Ctrl-V with y/d/c, rectangular block selections)
-- Search (/, n/N)
+- **Search:**
+  - Forward search: `/` + pattern, `n` for next, `N` for previous
+  - Reverse search: `?` + pattern, `n` for previous, `N` for next
+  - Direction-aware navigation (n/N respect last search direction)
 - **Find/Replace:**
   - Vim :s command (`:s/pattern/replacement/[flags]`)
   - Ranges: current line, :%s (all lines), :'<,'> (visual selection)
@@ -78,7 +81,7 @@ vimcode/
 │       ├── session.rs (~170 lines) — Session state persistence (NEW)
 │       ├── settings.rs (~190 lines) — JSON persistence, auto-init
 │       ├── window.rs, tab.rs, view.rs, cursor.rs, mode.rs, syntax.rs
-│       └── Tests: 284 passing (9 find/replace, 14 macro, 5 session tests)
+│       └── Tests: 300 passing (9 find/replace, 14 macro, 5 session, 4 reverse search, 7 replace char, 5 undo line tests)
 └── Total: ~12,200 lines
 ```
 
@@ -101,7 +104,7 @@ vimcode/
 ```bash
 cargo build
 cargo run -- <file>
-cargo test    # 284 tests
+cargo test    # 300 tests
 cargo clippy -- -D warnings
 cargo fmt
 ```
@@ -111,12 +114,16 @@ cargo fmt
 - [x] **Macros (q, @)** — COMPLETE
 - [x] **Find/Replace (:s + Ctrl-F)** — COMPLETE
 - [x] **Session Persistence** — COMPLETE
-- [ ] Reverse search (?)
+- [x] **Reverse search (?)** — COMPLETE
+- [x] **Replace character (r)** — COMPLETE
+- [x] **Undo line (U)** — COMPLETE
+- [ ] Visual mode case change (u/U)
 - [ ] Marks (m, ')
 - [ ] Incremental search
 - [ ] More grammars (Python/JS/Go/C++)
 
 ## Recent Work
+**Session 24:** Reverse Search + Replace Character + Undo Line complete — `?` command for backward search with direction-aware `n`/`N` navigation; `r` command to replace character(s) with count/repeat support; `U` command to restore current line to original state (284→300 tests, 4 reverse search + 7 replace char + 5 undo line tests).
 **Session 23:** Session Persistence complete — CRITICAL line numbers bug fixed (Absolute mode now visible), command/search history with Up/Down arrows (max 100, persisted), Tab auto-completion, window geometry persistence, explorer visibility state (279→284 tests, 5 session tests). Session state at ~/.config/vimcode/session.json.
 **Session 22:** Find/Replace complete — Vim :s command (current line, %s all lines, '<,'> visual selection with g/i flags), VSCode Ctrl-F dialog (live search, replace, replace all), proper undo/redo with insert_with_undo (269→279 tests, 9 find/replace tests).
 **Session 21:** Macros (q, @) complete — Full keystroke recording (navigation, Ctrl keys, special keys, arrows), Vim-style encoding, playback with count prefix, @@ repeat, recursion protection (256→269 tests, 14 macro tests).

@@ -65,6 +65,8 @@ pub struct BufferState {
     pub redo_stack: Vec<UndoEntry>,
     /// Current undo group being accumulated (during Insert mode or multi-op commands).
     pub current_undo_group: Option<UndoEntry>,
+    /// Original line content for U (undo line) command: (line_number, original_content)
+    pub line_undo_state: Option<(usize, String)>,
 }
 
 impl std::fmt::Debug for BufferState {
@@ -92,6 +94,7 @@ impl BufferState {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             current_undo_group: None,
+            line_undo_state: None,
         };
         state.update_syntax();
         state
@@ -108,6 +111,7 @@ impl BufferState {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             current_undo_group: None,
+            line_undo_state: None,
         };
         state.update_syntax();
         state
@@ -299,6 +303,67 @@ impl BufferState {
     /// Check if redo is available.
     pub fn can_redo(&self) -> bool {
         !self.redo_stack.is_empty()
+    }
+
+    /// Save the original content of a line before modifications (for U command)
+    pub fn save_line_for_undo(&mut self, line_num: usize) {
+        // Only save if we haven't already saved this line
+        if let Some((saved_line, _)) = self.line_undo_state {
+            if saved_line == line_num {
+                return; // Already saved this line
+            }
+        }
+
+        // Save the current line content
+        if line_num < self.buffer.len_lines() {
+            let line_content: String = self.buffer.content.line(line_num).chars().collect();
+            self.line_undo_state = Some((line_num, line_content));
+        }
+    }
+
+    /// Undo all changes on the current line (U command)
+    pub fn undo_line(&mut self, current_line: usize, cursor: Cursor) -> Option<Cursor> {
+        let (saved_line, original_content) = self.line_undo_state.take()?;
+
+        // Only undo if we're on the saved line
+        if saved_line != current_line {
+            return None;
+        }
+
+        // Get the current line content
+        if current_line >= self.buffer.len_lines() {
+            return None;
+        }
+
+        let line_start = self.buffer.line_to_char(current_line);
+        let line_len = self.buffer.line_len_chars(current_line);
+        let line_end = line_start + line_len;
+
+        // Start an undo group for the line restore
+        self.start_undo_group(cursor);
+
+        // Delete the current line content and insert the original
+        if line_len > 0 {
+            let deleted_text: String = self
+                .buffer
+                .content
+                .slice(line_start..line_end)
+                .chars()
+                .collect();
+            self.record_delete(line_start, &deleted_text);
+            self.buffer.delete_range(line_start, line_end);
+        }
+        self.record_insert(line_start, &original_content);
+        self.buffer.insert(line_start, &original_content);
+
+        self.finish_undo_group();
+        self.update_syntax();
+
+        // Return cursor at start of line
+        Some(Cursor {
+            line: current_line,
+            col: 0,
+        })
     }
 }
 

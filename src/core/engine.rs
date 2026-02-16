@@ -32,6 +32,13 @@ pub enum OpenMode {
 /// Maximum depth for macro recursion to prevent infinite loops.
 const MAX_MACRO_RECURSION: usize = 100;
 
+/// Direction of the last search operation
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SearchDirection {
+    Forward,  // Last search was '/'
+    Backward, // Last search was '?'
+}
+
 /// Represents a change operation that can be repeated with `.`
 #[derive(Debug, Clone)]
 struct Change {
@@ -55,6 +62,7 @@ enum ChangeOp {
     SubstituteLine,
     DeleteToEnd,
     ChangeToEnd,
+    Replace,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -97,12 +105,14 @@ pub struct Engine {
     pub command_buffer: String,
     /// Status message shown in the command line area (e.g. "written", errors).
     pub message: String,
-    /// Current search query (from last `/` search).
+    /// Current search query (from last `/` or `?` search).
     pub search_query: String,
     /// Char-offset pairs (start, end) for all search matches in active buffer.
     pub search_matches: Vec<(usize, usize)>,
     /// Index into `search_matches` for the current match.
     pub search_index: Option<usize>,
+    /// Direction of the last search operation.
+    search_direction: SearchDirection,
 
     // --- Find/Replace state ---
     /// Replacement text for current operation
@@ -209,6 +219,7 @@ impl Engine {
             search_query: String::new(),
             search_matches: Vec::new(),
             search_index: None,
+            search_direction: SearchDirection::Forward,
             replace_text: String::new(),
             replace_flags: String::new(),
             pending_key: None,
@@ -415,6 +426,8 @@ impl Engine {
     /// Start a new undo group for the active buffer.
     pub fn start_undo_group(&mut self) {
         let cursor = *self.cursor();
+        // Save line state before modification (for U command)
+        self.save_line_for_undo();
         self.active_buffer_state_mut().start_undo_group(cursor);
     }
 
@@ -476,6 +489,32 @@ impl Engine {
     #[allow(dead_code)]
     pub fn can_redo(&self) -> bool {
         self.active_buffer_state().can_redo()
+    }
+
+    /// Undo all changes on the current line (U command). Returns true if undo was performed.
+    pub fn undo_line(&mut self) -> bool {
+        let current_line = self.view().cursor.line;
+        let cursor = self.view().cursor;
+
+        if let Some(restored_cursor) = self
+            .active_buffer_state_mut()
+            .undo_line(current_line, cursor)
+        {
+            self.view_mut().cursor = restored_cursor;
+            self.clamp_cursor_col();
+            self.message = "Line restored".to_string();
+            true
+        } else {
+            self.message = "No changes to undo on this line".to_string();
+            false
+        }
+    }
+
+    /// Save the current line state before modification (for U command)
+    pub fn save_line_for_undo(&mut self) {
+        let current_line = self.view().cursor.line;
+        self.active_buffer_state_mut()
+            .save_line_for_undo(current_line);
     }
 
     /// Save the active buffer to its file.
@@ -1446,6 +1485,9 @@ impl Engine {
             Some('T') => {
                 self.pending_key = Some('T');
             }
+            Some('r') => {
+                self.pending_key = Some('r');
+            }
             Some(';') => {
                 let count = self.take_count();
                 for _ in 0..count {
@@ -1600,6 +1642,9 @@ impl Engine {
             Some('u') => {
                 self.undo();
             }
+            Some('U') => {
+                *changed = self.undo_line();
+            }
             Some('.') => {
                 // Repeat last change
                 let count = self.take_count();
@@ -1645,13 +1690,19 @@ impl Engine {
             Some('n') => {
                 let count = self.take_count();
                 for _ in 0..count {
-                    self.search_next();
+                    match self.search_direction {
+                        SearchDirection::Forward => self.search_next(),
+                        SearchDirection::Backward => self.search_prev(),
+                    }
                 }
             }
             Some('N') => {
                 let count = self.take_count();
                 for _ in 0..count {
-                    self.search_prev();
+                    match self.search_direction {
+                        SearchDirection::Forward => self.search_prev(),
+                        SearchDirection::Backward => self.search_next(),
+                    }
                 }
             }
             Some('v') => {
@@ -1673,6 +1724,13 @@ impl Engine {
             Some('/') => {
                 self.mode = Mode::Search;
                 self.command_buffer.clear();
+                self.search_direction = SearchDirection::Forward;
+                self.count = None; // Clear count when entering search mode
+            }
+            Some('?') => {
+                self.mode = Mode::Search;
+                self.command_buffer.clear();
+                self.search_direction = SearchDirection::Backward;
                 self.count = None; // Clear count when entering search mode
             }
             _ => match key_name {
@@ -1821,6 +1879,23 @@ impl Engine {
                     }
                     // Remember this find for ; and , repeat
                     self.last_find = Some((pending, target));
+                }
+            }
+            'r' => {
+                // Replace character: r followed by a character replaces char under cursor
+                if let Some(replacement) = unicode {
+                    let count = self.take_count();
+                    self.start_undo_group();
+                    self.replace_chars(replacement, count, changed);
+                    self.finish_undo_group();
+
+                    // Record for repeat (.)
+                    self.last_change = Some(Change {
+                        op: ChangeOp::Replace,
+                        text: replacement.to_string(),
+                        count,
+                        motion: None,
+                    });
                 }
             }
             '\x17' => {
@@ -2372,7 +2447,11 @@ impl Engine {
 
                     self.search_query = query;
                     self.run_search();
-                    self.search_next();
+                    // Move to first match in the appropriate direction
+                    match self.search_direction {
+                        SearchDirection::Forward => self.search_next(),
+                        SearchDirection::Backward => self.search_prev(),
+                    }
                 }
             }
             "Up" => {
@@ -3093,18 +3172,46 @@ impl Engine {
             ChangeOp::SubstituteLine | ChangeOp::DeleteToEnd | ChangeOp::ChangeToEnd => {
                 // Handle other operations
             }
+            ChangeOp::Replace => {
+                // Repeat r command
+                if let Some(replacement_char) = change.text.chars().next() {
+                    for _ in 0..final_count {
+                        self.start_undo_group();
+                        self.replace_chars(replacement_char, change.count, changed);
+                        self.finish_undo_group();
+                    }
+                }
+            }
         }
     }
 
     /// Available commands for auto-completion
     fn available_commands() -> &'static [&'static str] {
         &[
-            "w", "q", "q!", "wq", "wq!", "wa", "qa", "qa!",
-            "e ", "e!", "enew",
-            "bn", "bp", "bd", "b#", "ls",
-            "split", "vsplit",
-            "tabnew", "tabnext", "tabprev", "tabclose",
-            "s/", "%s/",
+            "w",
+            "q",
+            "q!",
+            "wq",
+            "wq!",
+            "wa",
+            "qa",
+            "qa!",
+            "e ",
+            "e!",
+            "enew",
+            "bn",
+            "bp",
+            "bd",
+            "b#",
+            "ls",
+            "split",
+            "vsplit",
+            "tabnew",
+            "tabnext",
+            "tabprev",
+            "tabclose",
+            "s/",
+            "%s/",
             "config reload",
         ]
     }
@@ -4765,6 +4872,41 @@ impl Engine {
         self.message = "1 line yanked".to_string();
     }
 
+    /// Replace count characters with the replacement character
+    fn replace_chars(&mut self, replacement: char, count: usize, changed: &mut bool) {
+        let line = self.view().cursor.line;
+        let col = self.view().cursor.col;
+        let char_idx = self.buffer().line_to_char(line) + col;
+
+        // Calculate how many chars we can replace on this line (not crossing newline)
+        let line_end = self.buffer().line_to_char(line) + self.buffer().line_len_chars(line);
+        let available = line_end.saturating_sub(char_idx);
+
+        // Don't count the newline character at the end of line
+        let line_content = self.buffer().content.line(line);
+        let available = if line_content.chars().last() == Some('\n') {
+            available.saturating_sub(1)
+        } else {
+            available
+        };
+
+        let to_replace = count.min(available);
+
+        if to_replace > 0 && char_idx < self.buffer().len_chars() {
+            // Build the replacement string
+            let replacement_str: String = std::iter::repeat(replacement).take(to_replace).collect();
+
+            // Delete the old characters and insert the new ones
+            self.delete_with_undo(char_idx, char_idx + to_replace);
+            self.insert_with_undo(char_idx, &replacement_str);
+
+            // Keep cursor at the start position (Vim behavior)
+            self.view_mut().cursor.col = col;
+            self.clamp_cursor_col();
+            *changed = true;
+        }
+    }
+
     /// Yank count lines starting from current line
     fn yank_lines(&mut self, count: usize) {
         let start_line = self.view().cursor.line;
@@ -5271,6 +5413,110 @@ mod tests {
         press_special(&mut engine, "Escape");
         assert_eq!(engine.mode, Mode::Normal);
         assert!(engine.search_query.is_empty());
+    }
+
+    #[test]
+    fn test_reverse_search_basic() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "foo bar foo baz foo");
+
+        // Enter reverse search mode with '?'
+        press_char(&mut engine, '?');
+        assert_eq!(engine.mode, Mode::Search);
+
+        // Type search pattern
+        for ch in "foo".chars() {
+            engine.handle_key(&ch.to_string(), Some(ch), false);
+        }
+        press_special(&mut engine, "Return");
+
+        assert_eq!(engine.mode, Mode::Normal);
+        assert_eq!(engine.search_query, "foo");
+        assert_eq!(engine.search_matches.len(), 3);
+    }
+
+    #[test]
+    fn test_reverse_search_n_goes_backward() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "line1 X\nline2 X\nline3 X");
+
+        // Move to line 3
+        engine.view_mut().cursor.line = 2;
+        engine.view_mut().cursor.col = 6;
+
+        // Reverse search for 'X'
+        press_char(&mut engine, '?');
+        engine.handle_key("X", Some('X'), false);
+        press_special(&mut engine, "Return");
+
+        assert_eq!(engine.search_matches.len(), 3);
+
+        // After '?', 'n' should go to previous match (backward)
+        let start_line = engine.view().cursor.line;
+        press_char(&mut engine, 'n');
+
+        // Should move to an earlier line or same line with earlier column
+        assert!(
+            engine.view().cursor.line < start_line
+                || (engine.view().cursor.line == start_line && engine.view().cursor.col < 6),
+            "n after ? should go backward"
+        );
+    }
+
+    #[test]
+    fn test_reverse_search_n_goes_forward() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "line1 X\nline2 X\nline3 X");
+
+        // Move to line 2, after the last match
+        engine.view_mut().cursor.line = 2;
+        engine.view_mut().cursor.col = 7;
+
+        // Reverse search for 'X' - should find the match on line 2
+        press_char(&mut engine, '?');
+        engine.handle_key("X", Some('X'), false);
+        press_special(&mut engine, "Return");
+
+        assert_eq!(engine.search_matches.len(), 3);
+        assert_eq!(engine.view().cursor.line, 2);
+        assert_eq!(engine.view().cursor.col, 6);
+
+        // After '?', 'N' should go to next match (forward), wrapping to line 0
+        press_char(&mut engine, 'N');
+        assert_eq!(engine.view().cursor.line, 0, "N after ? should go forward");
+    }
+
+    #[test]
+    fn test_forward_then_reverse_search() {
+        let mut engine = Engine::new();
+        engine
+            .buffer_mut()
+            .insert(0, "line1 X\nline2 X\nline3 X\nline4 X");
+
+        // Start at line 1
+        engine.view_mut().cursor.line = 1;
+        engine.view_mut().cursor.col = 0;
+
+        // Forward search with '/' - should find X on line 1
+        press_char(&mut engine, '/');
+        engine.handle_key("X", Some('X'), false);
+        press_special(&mut engine, "Return");
+        assert_eq!(engine.search_matches.len(), 4);
+        assert_eq!(engine.view().cursor.line, 1);
+
+        // 'n' should go forward to line 2
+        press_char(&mut engine, 'n');
+        assert_eq!(engine.view().cursor.line, 2, "n after / should go forward");
+
+        // Now do a reverse search with '?' - should find X on line 1 (previous match)
+        press_char(&mut engine, '?');
+        engine.handle_key("X", Some('X'), false);
+        press_special(&mut engine, "Return");
+        assert_eq!(engine.view().cursor.line, 1);
+
+        // 'n' should now go backward to line 0
+        press_char(&mut engine, 'n');
+        assert_eq!(engine.view().cursor.line, 0, "n after ? should go backward");
     }
 
     #[test]
@@ -5919,6 +6165,113 @@ mod tests {
         assert_eq!(engine.view().cursor.col, 6);
     }
 
+    #[test]
+    fn test_undo_line_basic() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello world");
+        engine.update_syntax();
+
+        // Make some changes to the line
+        press_char(&mut engine, 'x'); // delete 'h' -> "ello world"
+        press_char(&mut engine, 'x'); // delete 'e' -> "llo world"
+
+        assert_eq!(engine.buffer().to_string(), "llo world");
+
+        // Undo line with U
+        press_char(&mut engine, 'U');
+
+        assert_eq!(engine.buffer().to_string(), "hello world");
+        assert_eq!(engine.view().cursor.line, 0);
+    }
+
+    #[test]
+    fn test_undo_line_multiple_operations() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "test");
+        engine.update_syntax();
+
+        // Multiple operations on the line
+        press_char(&mut engine, 'A'); // append mode
+        engine.handle_key("1", Some('1'), false);
+        engine.handle_key("2", Some('2'), false);
+        engine.handle_key("3", Some('3'), false);
+        press_special(&mut engine, "Escape");
+
+        assert_eq!(engine.buffer().to_string(), "test123");
+
+        // Delete some chars
+        press_char(&mut engine, 'x'); // delete '3'
+        press_char(&mut engine, 'x'); // delete '2'
+
+        assert_eq!(engine.buffer().to_string(), "test1");
+
+        // U should restore original line
+        press_char(&mut engine, 'U');
+
+        assert_eq!(engine.buffer().to_string(), "test");
+    }
+
+    #[test]
+    fn test_undo_line_no_changes() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello");
+        engine.update_syntax();
+
+        // Try U without making any changes
+        press_char(&mut engine, 'U');
+
+        // Should show message but not crash
+        assert_eq!(engine.buffer().to_string(), "hello");
+    }
+
+    #[test]
+    fn test_undo_line_multiline() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "line1\nline2\nline3");
+        engine.update_syntax();
+
+        // Modify line 1
+        press_char(&mut engine, 'x'); // delete 'l' -> "ine1"
+        assert_eq!(engine.buffer().to_string(), "ine1\nline2\nline3");
+
+        // Move to line 2
+        press_char(&mut engine, 'j');
+        assert_eq!(engine.view().cursor.line, 1);
+
+        // Modify line 2
+        press_char(&mut engine, 'x'); // delete 'l' -> "ine2"
+        assert_eq!(engine.buffer().to_string(), "ine1\nine2\nline3");
+
+        // U should only restore line 2
+        press_char(&mut engine, 'U');
+        assert_eq!(engine.buffer().to_string(), "ine1\nline2\nline3");
+
+        // Move back to line 1 - U won't work because we moved away
+        press_char(&mut engine, 'k');
+        press_char(&mut engine, 'U');
+        // Line 1 stays modified because we moved away from it
+        assert_eq!(engine.buffer().to_string(), "ine1\nline2\nline3");
+    }
+
+    #[test]
+    fn test_undo_line_is_undoable() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello");
+        engine.update_syntax();
+
+        // Make a change
+        press_char(&mut engine, 'x'); // "ello"
+        assert_eq!(engine.buffer().to_string(), "ello");
+
+        // U to restore
+        press_char(&mut engine, 'U');
+        assert_eq!(engine.buffer().to_string(), "hello");
+
+        // Regular undo should undo the U operation
+        press_char(&mut engine, 'u');
+        assert_eq!(engine.buffer().to_string(), "ello");
+    }
+
     // --- Yank/Paste/Register Tests ---
 
     #[test]
@@ -6109,6 +6462,112 @@ mod tests {
         press_char(&mut engine, 'p'); // paste after
 
         assert_eq!(engine.buffer().to_string(), "BCDA");
+    }
+
+    #[test]
+    fn test_replace_char_basic() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello");
+
+        // Replace 'h' with 'j'
+        press_char(&mut engine, 'r');
+        press_char(&mut engine, 'j');
+
+        assert_eq!(engine.buffer().to_string(), "jello");
+        assert_eq!(engine.view().cursor.col, 0);
+    }
+
+    #[test]
+    fn test_replace_char_with_count() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello");
+
+        // Replace 3 chars with 'x': "xxxlo"
+        press_char(&mut engine, '3');
+        press_char(&mut engine, 'r');
+        press_char(&mut engine, 'x');
+
+        assert_eq!(engine.buffer().to_string(), "xxxlo");
+        // Cursor should stay at starting position
+        assert_eq!(engine.view().cursor.col, 0);
+    }
+
+    #[test]
+    fn test_replace_char_at_line_end() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "test");
+
+        // Move to last char
+        engine.view_mut().cursor.col = 3;
+
+        // Replace 't' with 'x'
+        press_char(&mut engine, 'r');
+        press_char(&mut engine, 'x');
+
+        assert_eq!(engine.buffer().to_string(), "tesx");
+    }
+
+    #[test]
+    fn test_replace_char_doesnt_cross_line() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hi\nbye");
+
+        // Move to 'i' (last char of first line)
+        engine.view_mut().cursor.col = 1;
+
+        // Try to replace 3 chars - should only replace 'i' (not crossing newline)
+        press_char(&mut engine, '3');
+        press_char(&mut engine, 'r');
+        press_char(&mut engine, 'x');
+
+        assert_eq!(engine.buffer().to_string(), "hx\nbye");
+    }
+
+    #[test]
+    fn test_replace_char_with_space() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello");
+
+        // Replace 'h' with space
+        press_char(&mut engine, 'r');
+        press_char(&mut engine, ' ');
+
+        assert_eq!(engine.buffer().to_string(), " ello");
+    }
+
+    #[test]
+    fn test_replace_char_repeat() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello");
+
+        // Replace 'h' with 'j'
+        press_char(&mut engine, 'r');
+        press_char(&mut engine, 'j');
+        assert_eq!(engine.buffer().to_string(), "jello");
+
+        // Move forward and repeat
+        press_char(&mut engine, 'l');
+        press_char(&mut engine, '.');
+
+        assert_eq!(engine.buffer().to_string(), "jjllo");
+    }
+
+    #[test]
+    fn test_replace_char_multicount_repeat() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello world");
+
+        // Replace 2 chars with 'x'
+        press_char(&mut engine, '2');
+        press_char(&mut engine, 'r');
+        press_char(&mut engine, 'x');
+        assert_eq!(engine.buffer().to_string(), "xxllo world");
+
+        // Move forward and repeat (should replace 2 chars again)
+        engine.view_mut().cursor.col = 6;
+        press_char(&mut engine, '.');
+
+        assert_eq!(engine.buffer().to_string(), "xxllo xxrld");
     }
 
     #[test]

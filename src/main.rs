@@ -137,15 +137,9 @@ enum Msg {
     /// Close find dialog.
     CloseFindDialog,
     /// Window size changed.
-    WindowResized {
-        width: i32,
-        height: i32,
-    },
+    WindowResized { width: i32, height: i32 },
     /// Window closing (save session state).
-    WindowClosing {
-        width: i32,
-        height: i32,
-    },
+    WindowClosing { width: i32, height: i32 },
 }
 
 #[relm4::component]
