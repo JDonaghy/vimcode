@@ -113,6 +113,8 @@ pub struct Engine {
     pub search_index: Option<usize>,
     /// Direction of the last search operation.
     pub search_direction: SearchDirection,
+    /// Cursor position when search mode was entered (for incremental search)
+    search_start_cursor: Option<Cursor>,
 
     // --- Find/Replace state ---
     /// Replacement text for current operation
@@ -130,6 +132,11 @@ pub struct Engine {
     pub registers: HashMap<char, (String, bool)>,
     /// Currently selected register for next yank/delete/paste (set by "x prefix).
     pub selected_register: Option<char>,
+
+    // --- Marks ---
+    /// Marks per buffer: BufferId -> (mark_char -> Cursor position)
+    /// Supports 'a'-'z' for file-local marks
+    pub marks: HashMap<BufferId, HashMap<char, Cursor>>,
 
     // --- Visual mode state ---
     /// Visual mode anchor point (where visual selection started).
@@ -220,11 +227,13 @@ impl Engine {
             search_matches: Vec::new(),
             search_index: None,
             search_direction: SearchDirection::Forward,
+            search_start_cursor: None,
             replace_text: String::new(),
             replace_flags: String::new(),
             pending_key: None,
             registers: HashMap::new(),
             selected_register: None,
+            marks: HashMap::new(),
             visual_anchor: None,
             count: None,
             last_find: None,
@@ -1626,6 +1635,18 @@ impl Engine {
             Some('g') => {
                 self.pending_key = Some('g');
             }
+            Some('m') => {
+                // Set mark: m{a-z}
+                self.pending_key = Some('m');
+            }
+            Some('\'') => {
+                // Jump to mark line: '{a-z}
+                self.pending_key = Some('\'');
+            }
+            Some('`') => {
+                // Jump to exact mark position: `{a-z}
+                self.pending_key = Some('`');
+            }
             Some('G') => {
                 if self.peek_count().is_some() {
                     // Count provided: go to line N (1-indexed)
@@ -1725,12 +1746,14 @@ impl Engine {
                 self.mode = Mode::Search;
                 self.command_buffer.clear();
                 self.search_direction = SearchDirection::Forward;
+                self.search_start_cursor = Some(self.view().cursor);
                 self.count = None; // Clear count when entering search mode
             }
             Some('?') => {
                 self.mode = Mode::Search;
                 self.command_buffer.clear();
                 self.search_direction = SearchDirection::Backward;
+                self.search_start_cursor = Some(self.view().cursor);
                 self.count = None; // Clear count when entering search mode
             }
             _ => match key_name {
@@ -1929,6 +1952,60 @@ impl Engine {
                             "Right" => self.focus_window_direction(SplitDirection::Vertical, true),
                             _ => {}
                         }
+                    }
+                }
+            }
+            'm' => {
+                // Set mark: m{a-z}
+                if let Some(ch) = unicode {
+                    if ch.is_ascii_lowercase() {
+                        let buffer_id = self.active_window().buffer_id;
+                        let cursor = self.view().cursor;
+                        self.marks.entry(buffer_id).or_default().insert(ch, cursor);
+                        self.message = format!("Mark '{}' set", ch);
+                    } else {
+                        self.message = "Only lowercase marks (a-z) are supported".to_string();
+                    }
+                }
+            }
+            '\'' => {
+                // Jump to mark line: '{a-z}
+                if let Some(ch) = unicode {
+                    if ch.is_ascii_lowercase() {
+                        let buffer_id = self.active_window().buffer_id;
+                        if let Some(buffer_marks) = self.marks.get(&buffer_id) {
+                            if let Some(mark_cursor) = buffer_marks.get(&ch) {
+                                self.view_mut().cursor.line = mark_cursor.line;
+                                self.view_mut().cursor.col = 0;
+                                self.clamp_cursor_col();
+                            } else {
+                                self.message = format!("Mark '{}' not set", ch);
+                            }
+                        } else {
+                            self.message = format!("Mark '{}' not set", ch);
+                        }
+                    } else {
+                        self.message = "Only lowercase marks (a-z) are supported".to_string();
+                    }
+                }
+            }
+            '`' => {
+                // Jump to exact mark position: `{a-z}
+                if let Some(ch) = unicode {
+                    if ch.is_ascii_lowercase() {
+                        let buffer_id = self.active_window().buffer_id;
+                        if let Some(buffer_marks) = self.marks.get(&buffer_id) {
+                            if let Some(mark_cursor) = buffer_marks.get(&ch) {
+                                self.view_mut().cursor = *mark_cursor;
+                                self.clamp_cursor_col();
+                            } else {
+                                self.message = format!("Mark `{}` not set", ch);
+                            }
+                        } else {
+                            self.message = format!("Mark `{}` not set", ch);
+                        }
+                    } else {
+                        self.message = "Only lowercase marks (a-z) are supported".to_string();
                     }
                 }
             }
@@ -2436,11 +2513,21 @@ impl Engine {
                 self.command_buffer.clear();
                 self.search_history_index = None;
                 self.search_typing_buffer.clear();
+
+                // Restore cursor to original position (incremental search)
+                if let Some(start_cursor) = self.search_start_cursor.take() {
+                    self.view_mut().cursor = start_cursor;
+                    // Clear search matches and query
+                    self.search_matches.clear();
+                    self.search_index = None;
+                    self.search_query.clear();
+                }
             }
             "Return" => {
                 self.mode = Mode::Normal;
                 let query = self.command_buffer.clone();
                 self.command_buffer.clear();
+                self.search_start_cursor = None; // Clear saved cursor position
 
                 // Add to search history
                 if !query.is_empty() {
@@ -2453,11 +2540,8 @@ impl Engine {
 
                     self.search_query = query;
                     self.run_search();
-                    // Move to first match in the appropriate direction
-                    match self.search_direction {
-                        SearchDirection::Forward => self.search_next(),
-                        SearchDirection::Backward => self.search_prev(),
-                    }
+                    // With incremental search, cursor is already at the correct match
+                    // No need to call search_next/search_prev
                 }
             }
             "Up" => {
@@ -2509,6 +2593,16 @@ impl Engine {
                 self.command_buffer.pop();
                 if self.command_buffer.is_empty() {
                     self.mode = Mode::Normal;
+                    // Restore cursor to original position
+                    if let Some(start_cursor) = self.search_start_cursor.take() {
+                        self.view_mut().cursor = start_cursor;
+                        self.search_matches.clear();
+                        self.search_index = None;
+                        self.search_query.clear();
+                    }
+                } else {
+                    // Incremental search: update search as user types
+                    self.perform_incremental_search();
                 }
             }
             _ => {
@@ -2518,6 +2612,8 @@ impl Engine {
 
                 if let Some(ch) = unicode {
                     self.command_buffer.push(ch);
+                    // Incremental search: update search as user types
+                    self.perform_incremental_search();
                 }
             }
         }
@@ -3718,6 +3814,59 @@ impl Engine {
             self.view_mut().cursor.line = line;
             self.view_mut().cursor.col = col;
             self.message = format!("match {} of {}", idx + 1, self.search_matches.len());
+        }
+    }
+
+    /// Perform incremental search as user types
+    fn perform_incremental_search(&mut self) {
+        // Update search query from command buffer
+        self.search_query = self.command_buffer.clone();
+
+        if self.search_query.is_empty() {
+            // Restore to start position if search is empty
+            if let Some(start_cursor) = self.search_start_cursor {
+                self.view_mut().cursor = start_cursor;
+            }
+            self.search_matches.clear();
+            self.search_index = None;
+            self.message.clear();
+            return;
+        }
+
+        // Run the search
+        self.run_search();
+
+        // Jump to the first match from the start position
+        if !self.search_matches.is_empty() {
+            // Get the starting cursor position
+            let start_cursor = self.search_start_cursor.unwrap_or(self.view().cursor);
+            let start_char = self.buffer().line_to_char(start_cursor.line) + start_cursor.col;
+
+            // Find the appropriate match based on search direction
+            let idx = match self.search_direction {
+                SearchDirection::Forward => {
+                    // Find first match at or after start position
+                    self.search_matches
+                        .iter()
+                        .position(|(start, _)| *start >= start_char)
+                        .unwrap_or(0)
+                }
+                SearchDirection::Backward => {
+                    // Find last match strictly before start position
+                    self.search_matches
+                        .iter()
+                        .rposition(|(start, _)| *start < start_char)
+                        .unwrap_or(self.search_matches.len() - 1)
+                }
+            };
+
+            self.search_index = Some(idx);
+            self.jump_to_search_match(idx);
+        } else {
+            // No matches, restore to start position
+            if let Some(start_cursor) = self.search_start_cursor {
+                self.view_mut().cursor = start_cursor;
+            }
         }
     }
 
@@ -5552,6 +5701,135 @@ mod tests {
         press_special(&mut engine, "Escape");
         assert_eq!(engine.mode, Mode::Normal);
         assert!(engine.search_query.is_empty());
+    }
+
+    #[test]
+    fn test_incremental_search_forward() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "foo bar baz foo");
+        engine.update_syntax();
+
+        // Start at beginning
+        assert_eq!(engine.view().cursor.line, 0);
+        assert_eq!(engine.view().cursor.col, 0);
+
+        // Enter search mode
+        press_char(&mut engine, '/');
+        assert_eq!(engine.mode, Mode::Search);
+
+        // Type 'f' - should jump to first 'foo'
+        press_char(&mut engine, 'f');
+        assert_eq!(engine.view().cursor.col, 0); // Already at first 'f'
+
+        // Type 'o' - should still be at 'foo'
+        press_char(&mut engine, 'o');
+        assert_eq!(engine.view().cursor.col, 0);
+
+        // Type 'o' - complete 'foo'
+        press_char(&mut engine, 'o');
+        assert_eq!(engine.view().cursor.col, 0);
+        assert_eq!(engine.search_matches.len(), 2);
+
+        // Press Enter to confirm
+        press_special(&mut engine, "Return");
+        assert_eq!(engine.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn test_incremental_search_backward() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "foo bar baz foo");
+        engine.update_syntax();
+
+        // Move to end of line
+        for _ in 0..15 {
+            press_char(&mut engine, 'l');
+        }
+        let start_col = engine.view().cursor.col;
+
+        // Enter reverse search mode
+        press_char(&mut engine, '?');
+
+        // Type 'foo' - should jump to last 'foo' before cursor
+        press_char(&mut engine, 'f');
+        press_char(&mut engine, 'o');
+        press_char(&mut engine, 'o');
+
+        // Should have jumped to the second 'foo' (at col 12)
+        assert!(engine.view().cursor.col < start_col);
+        assert_eq!(engine.view().cursor.col, 12);
+    }
+
+    #[test]
+    fn test_incremental_search_escape_restores_cursor() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello world test");
+        engine.update_syntax();
+
+        // Move to col 6 (start of 'world')
+        for _ in 0..6 {
+            press_char(&mut engine, 'l');
+        }
+        assert_eq!(engine.view().cursor.col, 6);
+
+        // Start search
+        press_char(&mut engine, '/');
+
+        // Type 'test' - cursor should jump to 'test'
+        for ch in "test".chars() {
+            press_char(&mut engine, ch);
+        }
+        assert_eq!(engine.view().cursor.col, 12);
+
+        // Escape - should restore to original position (col 6)
+        press_special(&mut engine, "Escape");
+        assert_eq!(engine.mode, Mode::Normal);
+        assert_eq!(engine.view().cursor.col, 6);
+    }
+
+    #[test]
+    fn test_incremental_search_backspace() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "foo food fool");
+        engine.update_syntax();
+
+        // Start search
+        press_char(&mut engine, '/');
+
+        // Type 'fool' - should jump to 'fool'
+        for ch in "fool".chars() {
+            press_char(&mut engine, ch);
+        }
+        assert_eq!(engine.view().cursor.col, 9);
+
+        // Backspace to 'foo' - should update to first 'foo'
+        press_special(&mut engine, "BackSpace");
+        assert_eq!(engine.view().cursor.col, 0);
+    }
+
+    #[test]
+    fn test_incremental_search_no_match() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello world");
+        engine.update_syntax();
+
+        // Move to col 5
+        for _ in 0..5 {
+            press_char(&mut engine, 'l');
+        }
+        assert_eq!(engine.view().cursor.col, 5);
+
+        // Start search
+        press_char(&mut engine, '/');
+
+        // Type pattern that doesn't exist
+        for ch in "xyz".chars() {
+            press_char(&mut engine, ch);
+        }
+
+        // Cursor should stay at original position
+        assert_eq!(engine.view().cursor.col, 5);
+        assert!(engine.message.contains("not found"));
     }
 
     #[test]
@@ -10165,6 +10443,165 @@ mod tests {
         press_char(&mut engine, 'u');
 
         assert_eq!(engine.buffer().to_string(), "hello123world!");
+    }
+
+    // ========================================================================
+    // Marks Tests
+    // ========================================================================
+
+    #[test]
+    fn test_mark_set_and_jump_line() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "line1\nline2\nline3\nline4");
+        engine.update_syntax();
+
+        // Go to line 2
+        press_char(&mut engine, 'j');
+        press_char(&mut engine, 'j');
+        assert_eq!(engine.view().cursor.line, 2);
+
+        // Set mark 'a'
+        press_char(&mut engine, 'm');
+        press_char(&mut engine, 'a');
+        assert!(engine.message.contains("Mark 'a' set"));
+
+        // Move to line 0
+        press_char(&mut engine, 'g');
+        press_char(&mut engine, 'g');
+        assert_eq!(engine.view().cursor.line, 0);
+
+        // Jump to mark 'a' line
+        press_char(&mut engine, '\'');
+        press_char(&mut engine, 'a');
+        assert_eq!(engine.view().cursor.line, 2);
+        assert_eq!(engine.view().cursor.col, 0); // ' jumps to start of line
+    }
+
+    #[test]
+    fn test_mark_jump_exact_position() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello world\nfoo bar baz");
+        engine.update_syntax();
+
+        // Move to line 1, col 4
+        press_char(&mut engine, 'j');
+        for _ in 0..4 {
+            press_char(&mut engine, 'l');
+        }
+        assert_eq!(engine.view().cursor.line, 1);
+        assert_eq!(engine.view().cursor.col, 4);
+
+        // Set mark 'b'
+        press_char(&mut engine, 'm');
+        press_char(&mut engine, 'b');
+
+        // Move to line 0, col 0
+        press_char(&mut engine, 'g');
+        press_char(&mut engine, 'g');
+        assert_eq!(engine.view().cursor.line, 0);
+        assert_eq!(engine.view().cursor.col, 0);
+
+        // Jump to exact mark position with backtick
+        press_char(&mut engine, '`');
+        press_char(&mut engine, 'b');
+        assert_eq!(engine.view().cursor.line, 1);
+        assert_eq!(engine.view().cursor.col, 4);
+    }
+
+    #[test]
+    fn test_mark_not_set() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "test");
+        engine.update_syntax();
+
+        // Try to jump to mark that doesn't exist
+        press_char(&mut engine, '\'');
+        press_char(&mut engine, 'x');
+        assert!(engine.message.contains("Mark 'x' not set"));
+    }
+
+    #[test]
+    fn test_mark_multiple_marks() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "a\nb\nc\nd\ne");
+        engine.update_syntax();
+
+        // Set mark 'a' at line 1
+        press_char(&mut engine, 'j');
+        press_char(&mut engine, 'm');
+        press_char(&mut engine, 'a');
+
+        // Set mark 'b' at line 3
+        press_char(&mut engine, 'j');
+        press_char(&mut engine, 'j');
+        press_char(&mut engine, 'm');
+        press_char(&mut engine, 'b');
+
+        // Jump to mark 'a'
+        press_char(&mut engine, '\'');
+        press_char(&mut engine, 'a');
+        assert_eq!(engine.view().cursor.line, 1);
+
+        // Jump to mark 'b'
+        press_char(&mut engine, '\'');
+        press_char(&mut engine, 'b');
+        assert_eq!(engine.view().cursor.line, 3);
+    }
+
+    #[test]
+    fn test_mark_overwrite() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "a\nb\nc");
+        engine.update_syntax();
+
+        // Set mark 'a' at line 0
+        press_char(&mut engine, 'm');
+        press_char(&mut engine, 'a');
+
+        // Move to line 2 and overwrite mark 'a'
+        press_char(&mut engine, 'j');
+        press_char(&mut engine, 'j');
+        press_char(&mut engine, 'm');
+        press_char(&mut engine, 'a');
+
+        // Jump to mark 'a' should go to line 2
+        press_char(&mut engine, 'g');
+        press_char(&mut engine, 'g');
+        press_char(&mut engine, '\'');
+        press_char(&mut engine, 'a');
+        assert_eq!(engine.view().cursor.line, 2);
+    }
+
+    #[test]
+    fn test_mark_per_buffer() {
+        let mut engine = Engine::new();
+        engine
+            .buffer_mut()
+            .insert(0, "buffer1 line1\nbuffer1 line2");
+        engine.update_syntax();
+
+        // Set mark 'a' in first buffer
+        press_char(&mut engine, 'j');
+        press_char(&mut engine, 'm');
+        press_char(&mut engine, 'a');
+
+        // Create second buffer
+        let buffer2_id = engine.buffer_manager.create();
+        engine
+            .buffer_manager
+            .get_mut(buffer2_id)
+            .unwrap()
+            .buffer
+            .insert(0, "buffer2 line1\nbuffer2 line2");
+
+        // Switch to second buffer
+        let window_id = engine.active_window().id;
+        engine.windows.get_mut(&window_id).unwrap().buffer_id = buffer2_id;
+
+        // Mark 'a' shouldn't exist in buffer 2
+        press_char(&mut engine, '\'');
+        press_char(&mut engine, 'a');
+        assert!(engine.message.contains("Mark 'a' not set"));
     }
 
     // ========================================================================

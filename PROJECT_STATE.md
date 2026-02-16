@@ -4,7 +4,7 @@
 
 ## Status
 
-**Visual Mode Case Change COMPLETE:** `u`/`U` commands in visual mode for lowercase/uppercase (313 tests passing)
+**Incremental Search COMPLETE:** Real-time search as you type (324 tests passing)
 
 ### Core Vim (Complete)
 - Seven modes (Normal/Insert/Visual/Visual Line/Visual Block/Command/Search)
@@ -17,7 +17,13 @@
 - **Search:**
   - Forward search: `/` + pattern, `n` for next, `N` for previous
   - Reverse search: `?` + pattern, `n` for previous, `N` for next
+  - **Incremental search:** Real-time updates as you type, Escape to cancel
   - Direction-aware navigation (n/N respect last search direction)
+- **Marks:**
+  - Set marks: `m{a-z}` for file-local marks
+  - Jump to line: `'{a-z}` jumps to mark line
+  - Jump to position: `` `{a-z}`` jumps to exact mark position
+  - Marks stored per buffer
 - **Find/Replace:**
   - Vim :s command (`:s/pattern/replacement/[flags]`)
   - Ranges: current line, :%s (all lines), :'<,'> (visual selection)
@@ -81,7 +87,7 @@ vimcode/
 │       ├── session.rs (~170 lines) — Session state persistence (NEW)
 │       ├── settings.rs (~190 lines) — JSON persistence, auto-init
 │       ├── window.rs, tab.rs, view.rs, cursor.rs, mode.rs, syntax.rs
-│       └── Tests: 313 passing (9 find/replace, 14 macro, 5 session, 4 reverse search, 7 replace char, 5 undo line, 8 case change tests)
+│       └── Tests: 324 passing (9 find/replace, 14 macro, 5 session, 4 reverse search, 7 replace char, 5 undo line, 8 case change, 6 marks, 5 incremental search tests)
 └── Total: ~12,200 lines
 ```
 
@@ -104,7 +110,7 @@ vimcode/
 ```bash
 cargo build
 cargo run -- <file>
-cargo test    # 313 tests
+cargo test    # 324 tests
 cargo clippy -- -D warnings
 cargo fmt
 ```
@@ -118,12 +124,13 @@ cargo fmt
 - [x] **Replace character (r)** — COMPLETE
 - [x] **Undo line (U)** — COMPLETE
 - [x] **Visual mode case change (u/U)** — COMPLETE
-- [ ] Marks (m, ')
-- [ ] Incremental search
+- [x] **Marks (m, ')** — COMPLETE
+- [x] **Incremental search** — COMPLETE
 - [ ] More grammars (Python/JS/Go/C++)
 
 ## Recent Work
-**Session 25:** Visual Mode Case Change complete — `u`/`U` commands in visual mode (character, line, and block) for lowercase/uppercase transformation with proper undo/redo support (305→313 tests, 8 case change tests).
+**Session 25:** Marks + Incremental Search + Visual Mode Case Change complete — `m{a-z}` to set marks, `'` and `` ` `` to jump to marks; real-time incremental search as you type with Escape to cancel; `u`/`U` commands in visual mode for case transformation (313→324 tests, 6 marks + 5 incremental search + 8 case change tests).
+**Session 25 (earlier):** Visual Mode Case Change complete — `u`/`U` commands in visual mode (character, line, and block) for lowercase/uppercase transformation with proper undo/redo support (305→313 tests, 8 case change tests).
 **Session 24:** Reverse Search + Replace Character + Undo Line complete — `?` command for backward search with direction-aware `n`/`N` navigation; `r` command to replace character(s) with count/repeat support; `U` command to restore current line to original state (284→300 tests, 4 reverse search + 7 replace char + 5 undo line tests).
 **Session 23:** Session Persistence complete — CRITICAL line numbers bug fixed (Absolute mode now visible), command/search history with Up/Down arrows (max 100, persisted), Tab auto-completion, window geometry persistence, explorer visibility state (279→284 tests, 5 session tests). Session state at ~/.config/vimcode/session.json.
 **Session 22:** Find/Replace complete — Vim :s command (current line, %s all lines, '<,'> visual selection with g/i flags), VSCode Ctrl-F dialog (live search, replace, replace all), proper undo/redo with insert_with_undo (269→279 tests, 9 find/replace tests).

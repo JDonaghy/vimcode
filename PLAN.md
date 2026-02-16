@@ -2,6 +2,20 @@
 
 ## Recently Completed
 
+### ✅ Incremental Search (Session 25)
+- Real-time search as you type
+- Cursor jumps to matches immediately while typing
+- Escape restores original cursor position
+- Backspace updates search results dynamically
+- Tests: 319 → 324 passing (5 new tests)
+
+### ✅ Marks (Session 25)
+- `m{a-z}` to set file-local marks
+- `'{a-z}` to jump to mark line (start of line)
+- `` `{a-z}`` to jump to exact mark position (line and column)
+- Marks are stored per buffer
+- Tests: 313 → 319 passing (6 new tests)
+
 ### ✅ Visual Mode Case Change (Session 25)
 - `u` command in visual mode to convert selection to lowercase
 - `U` command in visual mode to convert selection to uppercase
@@ -60,8 +74,8 @@
 
 ### High Priority
 - [x] ~~Visual mode case change (u/U in visual mode for lowercase/uppercase)~~ - COMPLETE
-- [ ] Marks (m, ')
-- [ ] Incremental search
+- [x] ~~Marks (m, ')~~ - COMPLETE
+- [x] ~~Incremental search~~ - COMPLETE
 - [ ] More grammars (Python/JS/Go/C++)
 
 ### Session Persistence Enhancements
