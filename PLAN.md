@@ -65,10 +65,10 @@ Implemented Vim's visual block mode for column-based selections and operations.
 ## Future Tasks (Roadmap)
 
 ### High Priority
+- [x] Macros (q, @) — COMPLETE (Session 21)
+- [x] :s substitute — COMPLETE (Session 22, includes Ctrl-F dialog)
 - [ ] Reverse search (?)
 - [ ] Marks (m, ')
-- [ ] Macros (q, @)
-- [ ] :s substitute
 - [ ] Incremental search
 - [ ] More grammars (Python/JS/Go/C++)
 

@@ -1,10 +1,10 @@
 # VimCode Project State
 
-**Last updated:** Feb 15, 2026
+**Last updated:** Feb 16, 2026
 
 ## Status
 
-**Macros COMPLETE:** Full keystroke recording with special keys, Ctrl combinations, navigation (269 tests passing)
+**Find/Replace COMPLETE:** Vim :s command + VSCode Ctrl-F dialog with undo support (279 tests passing)
 
 ### Core Vim (Complete)
 - Seven modes (Normal/Insert/Visual/Visual Line/Visual Block/Command/Search)
@@ -15,7 +15,13 @@
 - Undo/redo, repeat (.), count prefix
 - Visual modes (v/V/Ctrl-V with y/d/c, rectangular block selections)
 - Search (/, n/N)
-- **Macros (NEW):**
+- **Find/Replace:**
+  - Vim :s command (`:s/pattern/replacement/[flags]`)
+  - Ranges: current line, :%s (all lines), :'<,'> (visual selection)
+  - Flags: g (global), i (case-insensitive)
+  - VSCode-style Ctrl-F dialog (live search, replace, replace all)
+  - Proper undo/redo support
+- **Macros:**
   - Record: q<register>, stop with q
   - Playback: @<register>, @@ to repeat, count prefix (5@a)
   - Captures ALL keys: navigation, arrows, Ctrl keys, special keys, insert mode, search
@@ -56,15 +62,15 @@
 ```
 vimcode/
 ├── src/
-│   ├── main.rs (~2050 lines) — GTK4/Relm4 UI, rendering, scrollbars, macro playback
-│   └── core/ (~9100 lines) — Platform-agnostic logic
-│       ├── engine.rs (~9100 lines) — Orchestrates everything, macro recording/playback
+│   ├── main.rs (~2300 lines) — GTK4/Relm4 UI, rendering, find dialog
+│   └── core/ (~9700 lines) — Platform-agnostic logic
+│       ├── engine.rs (~9700 lines) — Orchestrates everything, find/replace, macros
 │       ├── buffer_manager.rs (~600 lines) — Buffer lifecycle
 │       ├── buffer.rs (~120 lines) — Rope-based storage
 │       ├── settings.rs (~180 lines) — JSON persistence, auto-init
 │       ├── window.rs, tab.rs, view.rs, cursor.rs, mode.rs, syntax.rs
-│       └── Tests: 269 passing (14 macro tests)
-└── Total: ~11,100 lines
+│       └── Tests: 279 passing (9 find/replace tests, 14 macro tests)
+└── Total: ~11,700 lines
 ```
 
 ## Architecture
@@ -86,7 +92,7 @@ vimcode/
 ```bash
 cargo build
 cargo run -- <file>
-cargo test    # 269 tests
+cargo test    # 279 tests
 cargo clippy -- -D warnings
 cargo fmt
 ```
@@ -94,13 +100,14 @@ cargo fmt
 ## Roadmap (High Priority)
 - [x] **Visual block mode (Ctrl-V)** — COMPLETE
 - [x] **Macros (q, @)** — COMPLETE
+- [x] **Find/Replace (:s + Ctrl-F)** — COMPLETE
 - [ ] Reverse search (?)
 - [ ] Marks (m, ')
-- [ ] :s substitute
 - [ ] Incremental search
 - [ ] More grammars (Python/JS/Go/C++)
 
 ## Recent Work
+**Session 22:** Find/Replace complete — Vim :s command (current line, %s all lines, '<,'> visual selection with g/i flags), VSCode Ctrl-F dialog (live search, replace, replace all), proper undo/redo with insert_with_undo (269→279 tests, 9 find/replace tests).
 **Session 21:** Macros (q, @) complete — Full keystroke recording (navigation, Ctrl keys, special keys, arrows), Vim-style encoding, playback with count prefix, @@ repeat, recursion protection (256→269 tests, 14 macro tests).
 **Session 20:** Critical bug fixes — Scrollbars visible, explorer button working, settings auto-init/reload, single status line (256 tests).
 **Session 19:** Visual block mode (Ctrl-V) complete — rectangular selections (242→255 tests).
