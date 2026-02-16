@@ -3,6 +3,7 @@ pub mod buffer_manager;
 pub mod cursor;
 pub mod engine;
 pub mod mode;
+pub mod session;
 pub mod settings;
 pub mod syntax;
 pub mod tab;

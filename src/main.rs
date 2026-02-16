@@ -136,6 +136,16 @@ enum Msg {
     ReplaceAll,
     /// Close find dialog.
     CloseFindDialog,
+    /// Window size changed.
+    WindowResized {
+        width: i32,
+        height: i32,
+    },
+    /// Window closing (save session state).
+    WindowClosing {
+        width: i32,
+        height: i32,
+    },
 }
 
 #[relm4::component]
@@ -148,6 +158,14 @@ impl SimpleComponent for App {
         gtk4::Window {
             set_title: Some("VimCode"),
             set_default_size: (800, 600),
+
+            // Save window geometry on close
+            connect_close_request[sender] => move |window| {
+                let width = window.default_width();
+                let height = window.default_height();
+                sender.input(Msg::WindowClosing { width, height });
+                gtk4::glib::Propagation::Proceed
+            },
 
             #[name = "main_hbox"]
             gtk4::Box {
@@ -627,10 +645,16 @@ impl SimpleComponent for App {
                 Err(_) => None,
             };
 
+        // Initialize sidebar visibility from session state or settings
+        let sidebar_visible = {
+            let eng = engine.borrow();
+            eng.session.explorer_visible || eng.settings.explorer_visible_on_startup
+        };
+
         let model = App {
             engine: engine.clone(),
             redraw: false,
-            sidebar_visible: true,
+            sidebar_visible,
             active_panel: SidebarPanel::Explorer,
             tree_store: Some(tree_store.clone()),
             tree_has_focus: false,
@@ -653,6 +677,13 @@ impl SimpleComponent for App {
         *file_tree_view_ref.borrow_mut() = Some(widgets.file_tree_view.clone());
         *drawing_area_ref.borrow_mut() = Some(widgets.drawing_area.clone());
         *overlay_ref.borrow_mut() = Some(widgets.editor_overlay.clone());
+
+        // Apply saved window geometry from session state
+        {
+            let eng = engine.borrow();
+            let geom = &eng.session.window;
+            root.set_default_size(geom.width, geom.height);
+        }
 
         // Build tree from current working directory
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -880,6 +911,11 @@ impl SimpleComponent for App {
             Msg::ToggleSidebar => {
                 self.sidebar_visible = !self.sidebar_visible;
                 self.redraw = !self.redraw;
+
+                // Save sidebar visibility to session state
+                let mut engine = self.engine.borrow_mut();
+                engine.session.explorer_visible = self.sidebar_visible;
+                let _ = engine.session.save();
             }
             Msg::SwitchPanel(panel) => {
                 if self.active_panel == panel {
@@ -1229,6 +1265,24 @@ impl SimpleComponent for App {
                 }
 
                 self.redraw = !self.redraw;
+            }
+            Msg::WindowResized { width, height } => {
+                // Update session state with new window geometry (debounced save)
+                let mut engine = self.engine.borrow_mut();
+                engine.session.window.width = width;
+                engine.session.window.height = height;
+                // Note: We don't save on every resize event (too frequent)
+                // Window geometry is saved on close instead
+            }
+            Msg::WindowClosing { width, height } => {
+                // Save window geometry and session state on close
+                let mut engine = self.engine.borrow_mut();
+                engine.session.window.width = width;
+                engine.session.window.height = height;
+                engine.session.explorer_visible = self.sidebar_visible;
+
+                // Save session state
+                let _ = engine.session.save();
             }
         }
 
@@ -1708,17 +1762,7 @@ fn draw_window(
         }
     }
 
-    // Set up clipping rectangle for text area (excluding gutter)
-    cr.save().unwrap();
-    cr.rectangle(
-        rect.x + gutter_width,
-        rect.y,
-        rect.width - gutter_width,
-        text_area_height,
-    );
-    cr.clip();
-
-    // Render text with highlights and line numbers
+    // Render line numbers FIRST (before clipping) so they're not clipped out
     let scroll_top = view.scroll_top;
 
     for view_idx in 0..visible_lines {
@@ -1727,7 +1771,6 @@ fn draw_window(
             break;
         }
 
-        let line = buffer.content.line(line_idx);
         let y = rect.y + view_idx as f64 * line_height;
 
         // Render line number in gutter (if enabled)
@@ -1746,12 +1789,33 @@ fn draw_window(
             if is_active && line_idx == view.cursor.line {
                 cr.set_source_rgb(0.9, 0.9, 0.5); // Brighter yellow for current line
             } else {
-                cr.set_source_rgb(0.5, 0.5, 0.5); // Dimmed gray for other lines
+                cr.set_source_rgb(0.7, 0.7, 0.7); // Brighter gray for better visibility
             }
 
             cr.move_to(num_x, y);
             pangocairo::show_layout(cr, layout);
         }
+    }
+
+    // Set up clipping rectangle for text area (excluding gutter)
+    cr.save().unwrap();
+    cr.rectangle(
+        rect.x + gutter_width,
+        rect.y,
+        rect.width - gutter_width,
+        text_area_height,
+    );
+    cr.clip();
+
+    // Render text with highlights
+    for view_idx in 0..visible_lines {
+        let line_idx = scroll_top + view_idx;
+        if line_idx >= total_lines {
+            break;
+        }
+
+        let line = buffer.content.line(line_idx);
+        let y = rect.y + view_idx as f64 * line_height;
 
         // Render line text with syntax highlighting
         layout.set_text(&line.to_string());

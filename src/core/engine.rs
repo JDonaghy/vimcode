@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use super::buffer::{Buffer, BufferId};
 use super::buffer_manager::{BufferManager, BufferState};
+use super::session::SessionState;
 use super::settings::Settings;
 use super::tab::{Tab, TabId};
 use super::view::View;
@@ -151,6 +152,22 @@ pub struct Engine {
     /// Editor settings (line numbers, etc.)
     pub settings: Settings,
 
+    // --- Session state (history, window geometry, etc.) ---
+    /// Session state persisted across restarts
+    pub session: SessionState,
+
+    /// Current position in command history (None = typing new command)
+    pub command_history_index: Option<usize>,
+
+    /// Temporary buffer for current typing when cycling history
+    pub command_typing_buffer: String,
+
+    /// Current position in search history
+    pub search_history_index: Option<usize>,
+
+    /// Temporary buffer for search typing
+    pub search_typing_buffer: String,
+
     // --- Macro recording state ---
     /// Which register is recording (None if not recording).
     pub macro_recording: Option<char>,
@@ -209,6 +226,11 @@ impl Engine {
                 Settings::ensure_exists().ok();
                 Settings::load()
             },
+            session: SessionState::load(),
+            command_history_index: None,
+            command_typing_buffer: String::new(),
+            search_history_index: None,
+            search_typing_buffer: String::new(),
             macro_recording: None,
             recording_buffer: Vec::new(),
             macro_playback_queue: VecDeque::new(),
@@ -2215,15 +2237,98 @@ impl Engine {
             "Escape" => {
                 self.mode = Mode::Normal;
                 self.command_buffer.clear();
+                self.command_history_index = None;
+                self.command_typing_buffer.clear();
                 EngineAction::None
             }
             "Return" => {
                 self.mode = Mode::Normal;
                 let cmd = self.command_buffer.clone();
                 self.command_buffer.clear();
+
+                // Add to history
+                self.session.add_command(&cmd);
+                self.command_history_index = None;
+                self.command_typing_buffer.clear();
+
+                // Save session state
+                let _ = self.session.save();
+
                 self.execute_command(&cmd)
             }
+            "Up" => {
+                // Cycle to previous command
+                if self.session.command_history.is_empty() {
+                    return EngineAction::None;
+                }
+
+                // First Up press: save current typing
+                if self.command_history_index.is_none() {
+                    self.command_typing_buffer = self.command_buffer.clone();
+                    self.command_history_index = Some(self.session.command_history.len() - 1);
+                } else if let Some(idx) = self.command_history_index {
+                    if idx > 0 {
+                        self.command_history_index = Some(idx - 1);
+                    }
+                }
+
+                // Load history entry
+                if let Some(idx) = self.command_history_index {
+                    if let Some(cmd) = self.session.command_history.get(idx) {
+                        self.command_buffer = cmd.clone();
+                    }
+                }
+
+                EngineAction::None
+            }
+            "Down" => {
+                // Cycle to next command (or back to typing buffer)
+                if self.command_history_index.is_none() {
+                    return EngineAction::None;
+                }
+
+                let idx = self.command_history_index.unwrap();
+                if idx + 1 >= self.session.command_history.len() {
+                    // Reached end, restore typing buffer
+                    self.command_buffer = self.command_typing_buffer.clone();
+                    self.command_history_index = None;
+                } else {
+                    self.command_history_index = Some(idx + 1);
+                    if let Some(cmd) = self.session.command_history.get(idx + 1) {
+                        self.command_buffer = cmd.clone();
+                    }
+                }
+
+                EngineAction::None
+            }
+            "Tab" => {
+                // Command auto-completion
+                let completions = self.complete_command(&self.command_buffer);
+
+                if completions.is_empty() {
+                    // No completions
+                    return EngineAction::None;
+                } else if completions.len() == 1 {
+                    // Single completion: auto-fill
+                    self.command_buffer = completions[0].clone();
+                } else {
+                    // Multiple completions: complete common prefix
+                    let common = Self::find_common_prefix(&completions);
+                    if common.len() > self.command_buffer.len() {
+                        self.command_buffer = common;
+                    } else {
+                        // Show completions in message line
+                        self.message = format!("Completions: {}", completions.join(", "));
+                    }
+                }
+
+                EngineAction::None
+            }
             "BackSpace" => {
+                // Reset history navigation when editing
+                self.command_history_index = None;
+                self.command_typing_buffer.clear();
+
                 self.command_buffer.pop();
                 if self.command_buffer.is_empty() {
                     self.mode = Mode::Normal;
@@ -2231,6 +2336,10 @@ impl Engine {
                 EngineAction::None
             }
             _ => {
+                // Reset history navigation when typing
+                self.command_history_index = None;
+                self.command_typing_buffer.clear();
+
                 if let Some(ch) = unicode {
                     self.command_buffer.push(ch);
                 }
@@ -2244,24 +2353,84 @@ impl Engine {
             "Escape" => {
                 self.mode = Mode::Normal;
                 self.command_buffer.clear();
+                self.search_history_index = None;
+                self.search_typing_buffer.clear();
             }
             "Return" => {
                 self.mode = Mode::Normal;
                 let query = self.command_buffer.clone();
                 self.command_buffer.clear();
+
+                // Add to search history
                 if !query.is_empty() {
+                    self.session.add_search(&query);
+                    self.search_history_index = None;
+                    self.search_typing_buffer.clear();
+
+                    // Save session state
+                    let _ = self.session.save();
+
                     self.search_query = query;
                     self.run_search();
                     self.search_next();
                 }
             }
+            "Up" => {
+                // Cycle to previous search
+                if self.session.search_history.is_empty() {
+                    return;
+                }
+
+                // First Up press: save current typing
+                if self.search_history_index.is_none() {
+                    self.search_typing_buffer = self.command_buffer.clone();
+                    self.search_history_index = Some(self.session.search_history.len() - 1);
+                } else if let Some(idx) = self.search_history_index {
+                    if idx > 0 {
+                        self.search_history_index = Some(idx - 1);
+                    }
+                }
+
+                // Load history entry
+                if let Some(idx) = self.search_history_index {
+                    if let Some(query) = self.session.search_history.get(idx) {
+                        self.command_buffer = query.clone();
+                    }
+                }
+            }
+            "Down" => {
+                // Cycle to next search (or back to typing buffer)
+                if self.search_history_index.is_none() {
+                    return;
+                }
+
+                let idx = self.search_history_index.unwrap();
+                if idx + 1 >= self.session.search_history.len() {
+                    // Reached end, restore typing buffer
+                    self.command_buffer = self.search_typing_buffer.clone();
+                    self.search_history_index = None;
+                } else {
+                    self.search_history_index = Some(idx + 1);
+                    if let Some(query) = self.session.search_history.get(idx + 1) {
+                        self.command_buffer = query.clone();
+                    }
+                }
+            }
             "BackSpace" => {
+                // Reset history navigation when editing
+                self.search_history_index = None;
+                self.search_typing_buffer.clear();
+
                 self.command_buffer.pop();
                 if self.command_buffer.is_empty() {
                     self.mode = Mode::Normal;
                 }
             }
             _ => {
+                // Reset history navigation when typing
+                self.search_history_index = None;
+                self.search_typing_buffer.clear();
+
                 if let Some(ch) = unicode {
                     self.command_buffer.push(ch);
                 }
@@ -2925,6 +3094,52 @@ impl Engine {
                 // Handle other operations
             }
         }
+    }
+
+    /// Available commands for auto-completion
+    fn available_commands() -> &'static [&'static str] {
+        &[
+            "w", "q", "q!", "wq", "wq!", "wa", "qa", "qa!",
+            "e ", "e!", "enew",
+            "bn", "bp", "bd", "b#", "ls",
+            "split", "vsplit",
+            "tabnew", "tabnext", "tabprev", "tabclose",
+            "s/", "%s/",
+            "config reload",
+        ]
+    }
+
+    /// Find completions for partial command
+    fn complete_command(&self, partial: &str) -> Vec<String> {
+        if partial.is_empty() {
+            return Vec::new();
+        }
+
+        Self::available_commands()
+            .iter()
+            .filter(|cmd| cmd.starts_with(partial))
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    /// Find common prefix of strings
+    fn find_common_prefix(strings: &[String]) -> String {
+        if strings.is_empty() {
+            return String::new();
+        }
+
+        let first = &strings[0];
+        let mut common = String::new();
+
+        for (i, ch) in first.chars().enumerate() {
+            if strings.iter().all(|s| s.chars().nth(i) == Some(ch)) {
+                common.push(ch);
+            } else {
+                break;
+            }
+        }
+
+        common
     }
 
     fn execute_command(&mut self, cmd: &str) -> EngineAction {

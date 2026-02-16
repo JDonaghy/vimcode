@@ -4,7 +4,7 @@
 
 ## Status
 
-**Find/Replace COMPLETE:** Vim :s command + VSCode Ctrl-F dialog with undo support (279 tests passing)
+**Session Persistence COMPLETE:** Command/search history, auto-complete, window geometry, line numbers bug fixed (284 tests passing)
 
 ### Core Vim (Complete)
 - Seven modes (Normal/Insert/Visual/Visual Line/Visual Block/Command/Search)
@@ -27,6 +27,13 @@
   - Captures ALL keys: navigation, arrows, Ctrl keys, special keys, insert mode, search
   - Vim-style encoding: `<Left>`, `<C-D>`, `<CR>`, etc.
   - Future-proof: automatically captures any new features
+- **Session Persistence:**
+  - Command history (Up/Down arrows, max 100, persisted)
+  - Search history (Up/Down arrows, max 100, persisted)
+  - Tab auto-completion in command mode
+  - Window geometry persistence (size restored on startup)
+  - Explorer visibility state (persisted across sessions)
+  - Session state at `~/.config/vimcode/session.json`
 - Buffers (:bn/:bp/:b#/:ls/:bd)
 - Windows (:split/:vsplit, Ctrl-W)
 - Tabs (:tabnew/:tabclose, gt/gT)
@@ -45,7 +52,7 @@
 
 ### Rendering
 - Syntax highlighting (Tree-sitter, Rust)
-- Line numbers (absolute/relative/hybrid via settings.json)
+- **Line numbers (FIXED):** Absolute/relative/hybrid modes now render correctly with proper visibility
 - Tab bar, single global status line, command line
 - Mouse click positioning (pixel-perfect)
 - **Scrollbars (FIXED):** Per-window vertical/horizontal scrollbars with cursor indicators
@@ -55,6 +62,7 @@
 - `~/.config/vimcode/settings.json` (auto-created with defaults on first run)
 - LineNumberMode (None/Absolute/Relative/Hybrid)
 - Font family and size (hot-reload on save)
+- Explorer visibility on startup (default: hidden)
 - `:config reload` runtime refresh
 - File watcher for automatic reload
 
@@ -62,15 +70,16 @@
 ```
 vimcode/
 ├── src/
-│   ├── main.rs (~2300 lines) — GTK4/Relm4 UI, rendering, find dialog
-│   └── core/ (~9700 lines) — Platform-agnostic logic
-│       ├── engine.rs (~9700 lines) — Orchestrates everything, find/replace, macros
+│   ├── main.rs (~2400 lines) — GTK4/Relm4 UI, rendering, find dialog
+│   └── core/ (~10,100 lines) — Platform-agnostic logic
+│       ├── engine.rs (~10,100 lines) — Orchestrates everything, find/replace, macros, history
 │       ├── buffer_manager.rs (~600 lines) — Buffer lifecycle
 │       ├── buffer.rs (~120 lines) — Rope-based storage
-│       ├── settings.rs (~180 lines) — JSON persistence, auto-init
+│       ├── session.rs (~170 lines) — Session state persistence (NEW)
+│       ├── settings.rs (~190 lines) — JSON persistence, auto-init
 │       ├── window.rs, tab.rs, view.rs, cursor.rs, mode.rs, syntax.rs
-│       └── Tests: 279 passing (9 find/replace tests, 14 macro tests)
-└── Total: ~11,700 lines
+│       └── Tests: 284 passing (9 find/replace, 14 macro, 5 session tests)
+└── Total: ~12,200 lines
 ```
 
 ## Architecture
@@ -92,7 +101,7 @@ vimcode/
 ```bash
 cargo build
 cargo run -- <file>
-cargo test    # 279 tests
+cargo test    # 284 tests
 cargo clippy -- -D warnings
 cargo fmt
 ```
@@ -101,12 +110,14 @@ cargo fmt
 - [x] **Visual block mode (Ctrl-V)** — COMPLETE
 - [x] **Macros (q, @)** — COMPLETE
 - [x] **Find/Replace (:s + Ctrl-F)** — COMPLETE
+- [x] **Session Persistence** — COMPLETE
 - [ ] Reverse search (?)
 - [ ] Marks (m, ')
 - [ ] Incremental search
 - [ ] More grammars (Python/JS/Go/C++)
 
 ## Recent Work
+**Session 23:** Session Persistence complete — CRITICAL line numbers bug fixed (Absolute mode now visible), command/search history with Up/Down arrows (max 100, persisted), Tab auto-completion, window geometry persistence, explorer visibility state (279→284 tests, 5 session tests). Session state at ~/.config/vimcode/session.json.
 **Session 22:** Find/Replace complete — Vim :s command (current line, %s all lines, '<,'> visual selection with g/i flags), VSCode Ctrl-F dialog (live search, replace, replace all), proper undo/redo with insert_with_undo (269→279 tests, 9 find/replace tests).
 **Session 21:** Macros (q, @) complete — Full keystroke recording (navigation, Ctrl keys, special keys, arrows), Vim-style encoding, playback with count prefix, @@ repeat, recursion protection (256→269 tests, 14 macro tests).
 **Session 20:** Critical bug fixes — Scrollbars visible, explorer button working, settings auto-init/reload, single status line (256 tests).
