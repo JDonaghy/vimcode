@@ -15,12 +15,28 @@ pub enum LineNumberMode {
 pub struct Settings {
     #[serde(default)]
     pub line_numbers: LineNumberMode,
+
+    #[serde(default = "default_font_family")]
+    pub font_family: String,
+
+    #[serde(default = "default_font_size")]
+    pub font_size: i32,
+}
+
+fn default_font_family() -> String {
+    "Monospace".to_string()
+}
+
+fn default_font_size() -> i32 {
+    14
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Settings {
             line_numbers: LineNumberMode::None,
+            font_family: default_font_family(),
+            font_size: default_font_size(),
         }
     }
 }
@@ -73,6 +89,25 @@ impl Settings {
             .join("vimcode")
             .join("settings.json")
     }
+
+    /// Ensure settings.json exists with default values
+    /// Creates the file if missing, leaves existing files unchanged
+    pub fn ensure_exists() -> Result<(), std::io::Error> {
+        let path = Self::settings_path();
+
+        // Only create if file doesn't exist
+        if !path.exists() {
+            // Create parent directories
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+
+            // Write default settings
+            Self::default().save()?;
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -88,6 +123,8 @@ mod tests {
     fn test_settings_default() {
         let settings = Settings::default();
         assert_eq!(settings.line_numbers, LineNumberMode::None);
+        assert_eq!(settings.font_family, "Monospace");
+        assert_eq!(settings.font_size, 14);
     }
 
     #[test]

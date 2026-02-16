@@ -176,7 +176,11 @@ impl Engine {
             pending_text_object: None,
             last_change: None,
             insert_text_buffer: String::new(),
-            settings: Settings::load(),
+            settings: {
+                // Ensure settings.json exists with defaults
+                Settings::ensure_exists().ok();
+                Settings::load()
+            },
         }
     }
 
@@ -315,6 +319,30 @@ impl Engine {
     /// Set viewport_lines for the active window.
     pub fn set_viewport_lines(&mut self, lines: usize) {
         self.view_mut().viewport_lines = lines;
+    }
+
+    /// Get scroll_left for the active window.
+    #[allow(dead_code)]
+    pub fn scroll_left(&self) -> usize {
+        self.view().scroll_left
+    }
+
+    /// Set scroll_left for the active window.
+    #[allow(dead_code)]
+    pub fn set_scroll_left(&mut self, scroll_left: usize) {
+        self.view_mut().scroll_left = scroll_left;
+    }
+
+    /// Get viewport_cols for the active window.
+    #[allow(dead_code)]
+    pub fn viewport_cols(&self) -> usize {
+        self.view().viewport_cols
+    }
+
+    /// Set viewport_cols for the active window.
+    #[allow(dead_code)]
+    pub fn set_viewport_cols(&mut self, cols: usize) {
+        self.view_mut().viewport_cols = cols;
     }
 
     // =======================================================================

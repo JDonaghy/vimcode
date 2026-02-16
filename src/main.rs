@@ -2,6 +2,7 @@
 // TODO: Migrate to ListView/ColumnView in a future phase
 #![allow(deprecated)]
 
+use gio::prelude::{FileExt, FileMonitorExt};
 use gtk4::cairo::Context;
 use gtk4::gdk;
 use gtk4::pango::{self, AttrColor, AttrList, FontDescription};
@@ -29,6 +30,8 @@ enum SidebarPanel {
     None,
 }
 
+use std::collections::HashMap;
+
 struct App {
     engine: Rc<RefCell<Engine>>,
     redraw: bool,
@@ -38,6 +41,20 @@ struct App {
     tree_has_focus: bool,
     file_tree_view: Rc<RefCell<Option<gtk4::TreeView>>>,
     drawing_area: Rc<RefCell<Option<gtk4::DrawingArea>>>,
+    // Per-window scrollbars and indicators
+    window_scrollbars: Rc<RefCell<HashMap<core::WindowId, WindowScrollbars>>>,
+    overlay: Rc<RefCell<Option<gtk4::Overlay>>>,
+    cached_line_height: f64,
+    #[allow(dead_code)] // Kept alive to continue monitoring settings.json
+    settings_monitor: Option<gio::FileMonitor>,
+    sender: relm4::Sender<Msg>,
+}
+
+/// Scrollbars and indicators for a single window
+struct WindowScrollbars {
+    vertical: gtk4::Scrollbar,
+    horizontal: gtk4::Scrollbar,
+    cursor_indicator: gtk4::DrawingArea,
 }
 
 #[derive(Debug)]
@@ -79,6 +96,22 @@ enum Msg {
     FocusExplorer,
     /// Focus the editor (Escape from tree).
     FocusEditor,
+    /// Vertical scrollbar value changed.
+    VerticalScrollbarChanged {
+        window_id: core::WindowId,
+        value: f64,
+    },
+    /// Horizontal scrollbar value changed.
+    HorizontalScrollbarChanged {
+        window_id: core::WindowId,
+        value: f64,
+    },
+    /// Cache line height from draw_editor.
+    CacheLineHeight(f64),
+    /// Open settings.json in editor.
+    OpenSettingsFile,
+    /// Settings file changed on disk.
+    SettingsFileChanged,
 }
 
 #[relm4::component]
@@ -146,11 +179,15 @@ impl SimpleComponent for App {
 
                     gtk4::Button {
                         set_label: "⚙️",
-                        set_tooltip_text: Some("Settings (disabled)"),
+                        set_tooltip_text: Some("Settings"),
                         set_width_request: 48,
                         set_height_request: 48,
                         set_css_classes: &["activity-button"],
-                        set_sensitive: false,
+                        set_sensitive: true,
+
+                        connect_clicked[sender] => move |_| {
+                            sender.input(Msg::SwitchPanel(SidebarPanel::Settings));
+                        }
                     },
                 },
 
@@ -163,10 +200,18 @@ impl SimpleComponent for App {
                     #[watch]
                     set_reveal_child: model.sidebar_visible,
 
+                    // Container for both panels (Explorer and Settings)
                     gtk4::Box {
                         set_orientation: gtk4::Orientation::Vertical,
                         set_width_request: 300,
-                        set_css_classes: &["sidebar"],
+
+                        // Explorer panel
+                        gtk4::Box {
+                            set_orientation: gtk4::Orientation::Vertical,
+                            set_css_classes: &["sidebar"],
+
+                            #[watch]
+                            set_visible: model.active_panel == SidebarPanel::Explorer,
 
                         // Toolbar with file operation buttons
                         #[name = "explorer_toolbar"]
@@ -285,61 +330,100 @@ impl SimpleComponent for App {
                                 },
                             },
                         },
-                    }
+                        },
+
+                        // Settings panel
+                        gtk4::Box {
+                            set_orientation: gtk4::Orientation::Vertical,
+                            set_css_classes: &["sidebar"],
+
+                            #[watch]
+                            set_visible: model.active_panel == SidebarPanel::Settings,
+
+                        gtk4::Box {
+                            set_orientation: gtk4::Orientation::Vertical,
+                            set_margin_all: 12,
+                            set_spacing: 12,
+
+                            gtk4::Label {
+                                set_text: "Settings",
+                                set_halign: gtk4::Align::Start,
+                                set_css_classes: &["heading"],
+                            },
+
+                            gtk4::Button {
+                                set_label: "Open settings.json",
+
+                                connect_clicked[sender] => move |_| {
+                                    sender.input(Msg::OpenSettingsFile);
+                                }
+                            },
+
+                            gtk4::Label {
+                                set_text: "Settings file will auto-reload on save",
+                                set_halign: gtk4::Align::Start,
+                                set_css_classes: &["dim-label"],
+                            },
+                        },
+                        },
+                    },
                 },
 
-                // Editor area (existing DrawingArea)
+                // Editor area (DrawingArea wrapped in Overlay for scrollbars)
                 gtk4::Box {
                     set_orientation: gtk4::Orientation::Vertical,
                     set_hexpand: true,
 
-                    #[name = "drawing_area"]
-                    gtk4::DrawingArea {
-                        set_hexpand: true,
-                        set_vexpand: true,
-                        set_focusable: true,
-                        grab_focus: (),
+                    #[name = "editor_overlay"]
+                    gtk4::Overlay {
+                        #[name = "drawing_area"]
+                        gtk4::DrawingArea {
+                            set_hexpand: true,
+                            set_vexpand: true,
+                            set_focusable: true,
+                            grab_focus: (),
 
-                        add_controller = gtk4::EventControllerKey {
-                            connect_key_pressed[sender] => move |_, key, _, modifier| {
-                                let key_name = key.name().map(|s| s.to_string()).unwrap_or_default();
-                                let unicode = key.to_unicode().filter(|c| !c.is_control());
-                                let ctrl = modifier.contains(gdk::ModifierType::CONTROL_MASK);
-                                let shift = modifier.contains(gdk::ModifierType::SHIFT_MASK);
+                            add_controller = gtk4::EventControllerKey {
+                                connect_key_pressed[sender] => move |_, key, _, modifier| {
+                                    let key_name = key.name().map(|s| s.to_string()).unwrap_or_default();
+                                    let unicode = key.to_unicode().filter(|c| !c.is_control());
+                                    let ctrl = modifier.contains(gdk::ModifierType::CONTROL_MASK);
+                                    let shift = modifier.contains(gdk::ModifierType::SHIFT_MASK);
 
-                                // Check for Ctrl-B to toggle sidebar
-                                if ctrl && !shift && unicode == Some('b') {
-                                    sender.input(Msg::ToggleSidebar);
-                                    return gtk4::glib::Propagation::Stop;
+                                    // Check for Ctrl-B to toggle sidebar
+                                    if ctrl && !shift && unicode == Some('b') {
+                                        sender.input(Msg::ToggleSidebar);
+                                        return gtk4::glib::Propagation::Stop;
+                                    }
+
+                                    // Check for Ctrl-Shift-E to focus explorer
+                                    if ctrl && shift && (unicode == Some('E') || unicode == Some('e')) {
+                                        sender.input(Msg::FocusExplorer);
+                                        return gtk4::glib::Propagation::Stop;
+                                    }
+
+                                    sender.input(Msg::KeyPress { key_name, unicode, ctrl });
+                                    gtk4::glib::Propagation::Stop
                                 }
+                            },
 
-                                // Check for Ctrl-Shift-E to focus explorer
-                                if ctrl && shift && (unicode == Some('E') || unicode == Some('e')) {
-                                    sender.input(Msg::FocusExplorer);
-                                    return gtk4::glib::Propagation::Stop;
+                            add_controller = gtk4::GestureClick {
+                                connect_pressed[sender, drawing_area] => move |_, _, x, y| {
+                                    // Grab focus when clicking in editor
+                                    drawing_area.grab_focus();
+
+                                    let width = drawing_area.width() as f64;
+                                    let height = drawing_area.height() as f64;
+                                    sender.input(Msg::MouseClick { x, y, width, height });
                                 }
+                            },
 
-                                sender.input(Msg::KeyPress { key_name, unicode, ctrl });
-                                gtk4::glib::Propagation::Stop
-                            }
-                        },
-
-                        add_controller = gtk4::GestureClick {
-                            connect_pressed[sender, drawing_area] => move |_, _, x, y| {
-                                // Grab focus when clicking in editor
-                                drawing_area.grab_focus();
-
-                                let width = drawing_area.width() as f64;
-                                let height = drawing_area.height() as f64;
-                                sender.input(Msg::MouseClick { x, y, width, height });
-                            }
-                        },
-
-                        #[watch]
-                        set_css_classes: {
-                            drawing_area.queue_draw();
-                            if model.redraw { &["vim-code", "even"] } else { &["vim-code", "odd"] }
-                        },
+                            #[watch]
+                            set_css_classes: {
+                                drawing_area.queue_draw();
+                                if model.redraw { &["vim-code", "even"] } else { &["vim-code", "odd"] }
+                            },
+                        }
                     }
                 }
             }
@@ -376,6 +460,27 @@ impl SimpleComponent for App {
 
         let file_tree_view_ref = Rc::new(RefCell::new(None));
         let drawing_area_ref = Rc::new(RefCell::new(None));
+        let overlay_ref = Rc::new(RefCell::new(None));
+        let window_scrollbars_ref = Rc::new(RefCell::new(HashMap::new()));
+
+        // Set up file watcher for settings.json
+        let settings_path = std::env::var("HOME")
+            .map(|h| format!("{}/.config/vimcode/settings.json", h))
+            .unwrap_or_else(|_| ".config/vimcode/settings.json".to_string());
+
+        let file = gio::File::for_path(&settings_path);
+        let settings_monitor = match file.monitor_file(gio::FileMonitorFlags::NONE, gio::Cancellable::NONE) {
+            Ok(monitor) => {
+                let sender_for_monitor = sender.input_sender().clone();
+                monitor.connect_changed(move |_, _, _, event| {
+                    if event == gio::FileMonitorEvent::Changed {
+                        sender_for_monitor.send(Msg::SettingsFileChanged).ok();
+                    }
+                });
+                Some(monitor)
+            }
+            Err(_) => None,
+        };
 
         let model = App {
             engine: engine.clone(),
@@ -386,12 +491,18 @@ impl SimpleComponent for App {
             tree_has_focus: false,
             file_tree_view: file_tree_view_ref.clone(),
             drawing_area: drawing_area_ref.clone(),
+            window_scrollbars: window_scrollbars_ref.clone(),
+            overlay: overlay_ref.clone(),
+            cached_line_height: 24.0,
+            settings_monitor,
+            sender: sender.input_sender().clone(),
         };
         let widgets = view_output!();
 
         // Store widget references
         *file_tree_view_ref.borrow_mut() = Some(widgets.file_tree_view.clone());
         *drawing_area_ref.borrow_mut() = Some(widgets.drawing_area.clone());
+        *overlay_ref.borrow_mut() = Some(widgets.editor_overlay.clone());
 
         // Build tree from current working directory
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -467,26 +578,50 @@ impl SimpleComponent for App {
         // Set the actual title after widget creation
         root.set_title(Some(&title));
 
-        // Track resize to update viewport_lines
+        // Create initial scrollbars for the first window
+        {
+            let initial_window_id = engine.borrow().active_window_id();
+            let ws = model.create_window_scrollbars(
+                &widgets.editor_overlay,
+                initial_window_id,
+                sender.input_sender(),
+            );
+            model
+                .window_scrollbars
+                .borrow_mut()
+                .insert(initial_window_id, ws);
+        }
+
+        // Track resize to update viewport_lines and viewport_cols
         let sender_clone = sender.clone();
         let engine_for_resize = engine.clone();
-        widgets.drawing_area.connect_resize(move |_, _, height| {
-            let line_height_approx = 24.0_f64;
-            let total_lines = (height as f64 / line_height_approx).floor() as usize;
-            let viewport = total_lines.saturating_sub(2);
-            {
-                let mut e = engine_for_resize.borrow_mut();
-                e.set_viewport_lines(viewport.max(1));
-            }
-            sender_clone.input(Msg::Resize);
-        });
+        widgets
+            .drawing_area
+            .connect_resize(move |_, width, height| {
+                let line_height_approx = 24.0_f64;
+                let char_width_approx = 9.0_f64; // Approximate for monospace font
+
+                let total_lines = (height as f64 / line_height_approx).floor() as usize;
+                let viewport_lines = total_lines.saturating_sub(2);
+
+                let total_cols = (width as f64 / char_width_approx).floor() as usize;
+                let viewport_cols = total_cols.saturating_sub(5); // Account for gutter
+
+                {
+                    let mut e = engine_for_resize.borrow_mut();
+                    e.set_viewport_lines(viewport_lines.max(1));
+                    e.set_viewport_cols(viewport_cols.max(40));
+                }
+                sender_clone.input(Msg::Resize);
+            });
 
         let engine_clone = engine.clone();
+        let sender_for_draw = sender.input_sender().clone();
         widgets
             .drawing_area
             .set_draw_func(move |_, cr, width, height| {
                 let engine = engine_clone.borrow();
-                draw_editor(cr, &engine, width, height);
+                draw_editor(cr, &engine, width, height, &sender_for_draw);
             });
 
         // Ensure drawing area has focus on startup
@@ -496,6 +631,12 @@ impl SimpleComponent for App {
     }
 
     fn update(&mut self, msg: Self::Input, _sender: ComponentSender<Self>) {
+        // Track if this is a scrollbar change to avoid syncing feedback loop
+        let is_scrollbar_msg = matches!(
+            &msg,
+            Msg::VerticalScrollbarChanged { .. } | Msg::HorizontalScrollbarChanged { .. }
+        );
+
         match msg {
             Msg::KeyPress {
                 key_name,
@@ -766,6 +907,262 @@ impl SimpleComponent for App {
 
                 self.redraw = !self.redraw;
             }
+            Msg::VerticalScrollbarChanged { window_id, value } => {
+                // Update specific window's scroll_top based on scrollbar value
+                let mut engine = self.engine.borrow_mut();
+                // For now, only scroll if it's the active window
+                if engine.active_window_id() == window_id {
+                    engine.set_scroll_top(value.round() as usize);
+                }
+                drop(engine);
+                self.redraw = !self.redraw;
+            }
+            Msg::HorizontalScrollbarChanged { window_id, value } => {
+                // Update specific window's scroll_left based on scrollbar value
+                let mut engine = self.engine.borrow_mut();
+                // For now, only scroll if it's the active window
+                if engine.active_window_id() == window_id {
+                    engine.set_scroll_left(value.round() as usize);
+                }
+                drop(engine);
+                self.redraw = !self.redraw;
+            }
+            Msg::CacheLineHeight(height) => {
+                self.cached_line_height = height;
+            }
+            Msg::OpenSettingsFile => {
+                let settings_path = std::env::var("HOME")
+                    .map(|h| format!("{}/.config/vimcode/settings.json", h))
+                    .unwrap_or_else(|_| ".config/vimcode/settings.json".to_string());
+
+                let mut engine = self.engine.borrow_mut();
+                match engine.open_file_with_mode(Path::new(&settings_path), OpenMode::Permanent) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        engine.message = format!("Error opening settings: {}", e);
+                    }
+                }
+                drop(engine);
+                self.redraw = !self.redraw;
+            }
+            Msg::SettingsFileChanged => {
+                // Reload settings from disk
+                let new_settings = core::settings::Settings::load();
+
+                let mut engine = self.engine.borrow_mut();
+                engine.settings = new_settings;
+                engine.message = "Settings reloaded".to_string();
+                drop(engine);
+
+                // Force redraw to apply new font/line number settings
+                if let Some(drawing_area) = self.drawing_area.borrow().as_ref() {
+                    drawing_area.queue_draw();
+                }
+                self.redraw = !self.redraw;
+            }
+        }
+
+        // Sync scrollbar position to match engine state (except when scrollbar itself changed)
+        if !is_scrollbar_msg {
+            self.sync_scrollbar();
+        }
+    }
+}
+
+impl App {
+    /// Rebuild and sync scrollbars for all windows
+    fn sync_scrollbar(&self) {
+        let overlay = match self.overlay.borrow().as_ref() {
+            Some(o) => o.clone(),
+            None => return,
+        };
+
+        let drawing_area = match self.drawing_area.borrow().as_ref() {
+            Some(da) => da.clone(),
+            None => return,
+        };
+
+        let engine = self.engine.borrow();
+        let mut scrollbars = self.window_scrollbars.borrow_mut();
+
+        // Calculate window rects (same logic as draw_editor)
+        let da_width = drawing_area.width() as f64;
+        let da_height = drawing_area.height() as f64;
+
+        let line_height = self.cached_line_height;
+        let tab_bar_height = line_height;
+        let status_bar_height = line_height * 2.0;
+
+        let content_bounds = WindowRect::new(
+            0.0,
+            tab_bar_height,
+            da_width,
+            da_height - tab_bar_height - status_bar_height - 10.0, // Reserve 10px for h-scrollbar
+        );
+
+        let window_rects = engine.calculate_window_rects(content_bounds);
+
+        // Remove scrollbars for windows that no longer exist
+        scrollbars.retain(|window_id, _| engine.windows.contains_key(window_id));
+
+        // Create/update scrollbars for each window
+        for (window_id, rect) in &window_rects {
+            let window = match engine.windows.get(window_id) {
+                Some(w) => w,
+                None => continue,
+            };
+
+            let buffer_state = match engine.buffer_manager.get(window.buffer_id) {
+                Some(s) => s,
+                None => continue,
+            };
+
+            // Create new scrollbars if needed
+            if !scrollbars.contains_key(window_id) {
+                let ws = self.create_window_scrollbars(&overlay, *window_id, &self.sender);
+                scrollbars.insert(*window_id, ws);
+            }
+
+            // Get scrollbars for this window
+            let ws = match scrollbars.get(window_id) {
+                Some(ws) => ws,
+                None => continue,
+            };
+
+            // Position and sync vertical scrollbar
+            // Use absolute positioning with Start alignment
+            ws.vertical.set_halign(gtk4::Align::Start);
+            ws.vertical.set_valign(gtk4::Align::Start);
+
+            let scrollbar_x = rect.x as i32 + (rect.width - 10.0) as i32;
+            ws.vertical.set_margin_start(scrollbar_x);
+            ws.vertical.set_margin_top(rect.y as i32);
+            ws.vertical.set_height_request((rect.height - 10.0) as i32);
+
+            let total_lines = buffer_state.buffer.content.len_lines();
+            let v_adj = ws.vertical.adjustment();
+            v_adj.set_upper(total_lines as f64);
+            v_adj.set_page_size(window.view.viewport_lines as f64);
+            v_adj.set_value(window.view.scroll_top as f64);
+
+            // Position cursor indicator (fix: ensure height stays constant at 4px)
+            let cursor_line = window.view.cursor.line;
+            if total_lines > 0 {
+                let ratio = cursor_line as f64 / total_lines as f64;
+
+                // Calculate Y position within the scrollbar's visible area
+                // Use the vertical scrollbar's actual height
+                let scrollbar_height = ws.vertical.height() as f64;
+                let indicator_y = rect.y + (ratio * scrollbar_height);
+
+                let indicator_x = rect.x as i32 + (rect.width - 10.0) as i32;
+                ws.cursor_indicator.set_margin_start(indicator_x);
+                ws.cursor_indicator.set_margin_top(indicator_y as i32);
+
+                // Ensure size stays fixed (defensive coding)
+                ws.cursor_indicator.set_width_request(10);
+                ws.cursor_indicator.set_height_request(4);
+            }
+
+            // Position and sync horizontal scrollbar in the 10px gap above status line
+            let h_scrollbar_y = da_height - status_bar_height - 10.0;
+
+            // Use absolute positioning with Start alignment
+            ws.horizontal.set_halign(gtk4::Align::Start);
+            ws.horizontal.set_valign(gtk4::Align::Start);
+
+            ws.horizontal.set_margin_start(rect.x as i32);
+            ws.horizontal.set_margin_top(h_scrollbar_y as i32);
+            ws.horizontal.set_width_request(rect.width as i32);
+            ws.horizontal.set_height_request(10);
+
+            let max_line_length = buffer_state
+                .buffer
+                .content
+                .lines()
+                .map(|line| line.chars().count())
+                .max()
+                .unwrap_or(80);
+
+            let h_adj = ws.horizontal.adjustment();
+            h_adj.set_upper(max_line_length as f64);
+            h_adj.set_page_size(window.view.viewport_cols as f64);
+            h_adj.set_value(window.view.scroll_left as f64);
+        }
+
+        // Remove overlay widgets for deleted windows
+        // (GTK will automatically remove them when we drop the references)
+    }
+
+    /// Create scrollbars and indicator for a window
+    fn create_window_scrollbars(
+        &self,
+        overlay: &gtk4::Overlay,
+        window_id: core::WindowId,
+        sender: &relm4::Sender<Msg>,
+    ) -> WindowScrollbars {
+        // Vertical scrollbar
+        let v_adj = gtk4::Adjustment::new(0.0, 0.0, 100.0, 1.0, 10.0, 20.0);
+        let vertical = gtk4::Scrollbar::new(gtk4::Orientation::Vertical, Some(&v_adj));
+        vertical.set_width_request(10);
+        vertical.set_hexpand(false);
+        vertical.set_vexpand(false);
+
+        // Horizontal scrollbar
+        let h_adj = gtk4::Adjustment::new(0.0, 0.0, 200.0, 1.0, 10.0, 80.0);
+        let horizontal = gtk4::Scrollbar::new(gtk4::Orientation::Horizontal, Some(&h_adj));
+        horizontal.set_height_request(10);
+        horizontal.set_hexpand(false);
+        horizontal.set_vexpand(false);
+
+        // Cursor indicator
+        let cursor_indicator = gtk4::DrawingArea::new();
+        cursor_indicator.set_width_request(10);
+        cursor_indicator.set_height_request(4);
+        cursor_indicator.set_can_target(false);
+        // Set alignments and prevent expansion to maintain fixed 4px height
+        cursor_indicator.set_halign(gtk4::Align::Start);
+        cursor_indicator.set_valign(gtk4::Align::Start);
+        cursor_indicator.set_hexpand(false);
+        cursor_indicator.set_vexpand(false);
+        cursor_indicator.set_draw_func(|_, cr, w, h| {
+            // Darker grey color like VSCode (darker than scrollbar handle)
+            cr.set_source_rgba(0.5, 0.5, 0.5, 0.8);
+            cr.rectangle(0.0, 0.0, w as f64, h as f64);
+            let _ = cr.fill();
+        });
+
+        // Add to overlay
+        overlay.add_overlay(&vertical);
+        overlay.add_overlay(&horizontal);
+        overlay.add_overlay(&cursor_indicator);
+
+        // Make scrollbars visible
+        vertical.show();
+        horizontal.show();
+        cursor_indicator.show();
+
+        // Connect signals (always, for all windows)
+        let sender_v = sender.clone();
+        v_adj.connect_value_changed(move |adj| {
+            sender_v.send(Msg::VerticalScrollbarChanged {
+                window_id,
+                value: adj.value(),
+            }).ok();
+        });
+
+        let sender_h = sender.clone();
+        h_adj.connect_value_changed(move |adj| {
+            sender_h.send(Msg::HorizontalScrollbarChanged {
+                window_id,
+                value: adj.value(),
+            }).ok();
+        });
+
+        WindowScrollbars {
+            vertical,
+            horizontal,
+            cursor_indicator,
         }
     }
 }
@@ -808,7 +1205,7 @@ fn format_line_number(mode: LineNumberMode, line_idx: usize, cursor_line: usize)
     }
 }
 
-fn draw_editor(cr: &Context, engine: &Engine, width: i32, height: i32) {
+fn draw_editor(cr: &Context, engine: &Engine, width: i32, height: i32, sender: &relm4::Sender<Msg>) {
     // 1. Background
     cr.set_source_rgb(0.1, 0.1, 0.1);
     cr.paint().expect("Invalid cairo surface");
@@ -816,12 +1213,18 @@ fn draw_editor(cr: &Context, engine: &Engine, width: i32, height: i32) {
     // 2. Setup Pango
     let pango_ctx = pangocairo::create_context(cr);
     let layout = pango::Layout::new(&pango_ctx);
-    let font_desc = FontDescription::from_string("Monospace 14");
+
+    // Use configurable font from settings
+    let font_str = format!("{} {}", engine.settings.font_family, engine.settings.font_size);
+    let font_desc = FontDescription::from_string(&font_str);
     layout.set_font_description(Some(&font_desc));
 
     // Derive line height from font metrics
     let font_metrics = pango_ctx.metrics(Some(&font_desc), None);
     let line_height = (font_metrics.ascent() + font_metrics.descent()) as f64 / pango::SCALE as f64;
+
+    // Cache line height for use in sync_scrollbar
+    sender.send(Msg::CacheLineHeight(line_height)).ok();
 
     // Calculate layout regions
     let tab_bar_height = line_height; // Always show tab bar
@@ -832,7 +1235,7 @@ fn draw_editor(cr: &Context, engine: &Engine, width: i32, height: i32) {
         0.0,
         tab_bar_height,
         width as f64,
-        height as f64 - tab_bar_height - status_bar_height,
+        height as f64 - tab_bar_height - status_bar_height - 10.0, // Reserve 10px for h-scrollbar
     );
     let window_rects = engine.calculate_window_rects(content_bounds);
 
@@ -879,9 +1282,10 @@ fn draw_tab_bar(
     cr.fill().unwrap();
 
     // Save current font description so we can restore after rendering previews
-    let normal_font = layout
-        .font_description()
-        .unwrap_or_else(|| FontDescription::from_string("Monospace 14"));
+    let normal_font = layout.font_description().unwrap_or_else(|| {
+        let font_str = format!("{} {}", engine.settings.font_family, engine.settings.font_size);
+        FontDescription::from_string(&font_str)
+    });
     let mut italic_font = normal_font.clone();
     italic_font.set_style(pango::Style::Italic);
 
@@ -970,13 +1374,8 @@ fn draw_window(
     let buffer = &buffer_state.buffer;
     let view = &window.view;
 
-    // Calculate visible area (leave room for per-window status bar)
-    let per_window_status = if engine.windows.len() > 1 {
-        line_height
-    } else {
-        0.0
-    };
-    let text_area_height = rect.height - per_window_status;
+    // Calculate visible area
+    let text_area_height = rect.height;
     let visible_lines = (text_area_height / line_height).floor() as usize;
 
     // Calculate gutter width for line numbers
@@ -984,7 +1383,11 @@ fn draw_window(
     let char_width = font_metrics.approximate_char_width() as f64 / pango::SCALE as f64;
     let gutter_width =
         calculate_gutter_width(engine.settings.line_numbers, total_lines, char_width);
-    let text_x_offset = rect.x + gutter_width;
+
+    // Apply horizontal scroll offset to text rendering
+    let scroll_left = view.scroll_left;
+    let h_scroll_offset = scroll_left as f64 * char_width;
+    let text_x_offset = rect.x + gutter_width - h_scroll_offset;
 
     // Window background (slightly different for active)
     if is_active && engine.windows.len() > 1 {
@@ -1018,6 +1421,16 @@ fn draw_window(
             _ => {}
         }
     }
+
+    // Set up clipping rectangle for text area (excluding gutter)
+    cr.save().unwrap();
+    cr.rectangle(
+        rect.x + gutter_width,
+        rect.y,
+        rect.width - gutter_width,
+        text_area_height,
+    );
+    cr.clip();
 
     // Render text with highlights and line numbers
     let scroll_top = view.scroll_top;
@@ -1106,6 +1519,9 @@ fn draw_window(
         pangocairo::show_layout(cr, layout);
     }
 
+    // Restore cairo context (remove clipping)
+    cr.restore().unwrap();
+
     // Render cursor (only in active window)
     if is_active && view.cursor.line >= scroll_top && view.cursor.line < scroll_top + visible_lines
     {
@@ -1121,6 +1537,7 @@ fn draw_window(
                 .unwrap_or(line_text.len());
 
             let pos = layout.index_to_pos(byte_offset as i32);
+            // Note: text_x_offset already includes horizontal scroll offset
             let cursor_x = text_x_offset + pos.x() as f64 / pango::SCALE as f64;
             let char_w = pos.width() as f64 / pango::SCALE as f64;
             let cursor_y = rect.y + (view.cursor.line - scroll_top) as f64 * line_height;
@@ -1145,31 +1562,6 @@ fn draw_window(
             }
             cr.fill().unwrap();
         }
-    }
-
-    // Per-window status bar (only if multiple windows)
-    if engine.windows.len() > 1 {
-        let status_y = rect.y + rect.height - line_height;
-
-        // Status bar background (different for active)
-        if is_active {
-            cr.set_source_rgb(0.25, 0.25, 0.35);
-        } else {
-            cr.set_source_rgb(0.18, 0.18, 0.25);
-        }
-        cr.rectangle(rect.x, status_y, rect.width, line_height);
-        cr.fill().unwrap();
-
-        let filename = buffer_state.display_name();
-        let dirty_indicator = if buffer_state.dirty { " [+]" } else { "" };
-
-        let status_text = format!(" {}{}", filename, dirty_indicator);
-        layout.set_text(&status_text);
-        layout.set_attributes(None);
-
-        cr.move_to(rect.x, status_y);
-        cr.set_source_rgb(0.9, 0.9, 0.9);
-        pangocairo::show_layout(cr, layout);
     }
 }
 
@@ -1330,7 +1722,8 @@ fn draw_visual_selection(
                                 .map(|(i, _)| i)
                                 .unwrap_or(line_text.len());
                             let start_pos = layout.index_to_pos(start_byte as i32);
-                            let start_x = text_x_offset + start_pos.x() as f64 / pango::SCALE as f64;
+                            let start_x =
+                                text_x_offset + start_pos.x() as f64 / pango::SCALE as f64;
 
                             // Calculate x position for end column (inclusive, so +1)
                             let block_end_col = (end_col + 1).min(line_len);
@@ -1835,6 +2228,46 @@ fn load_css() {
         
         treeview expander:not(:checked) {
             color: #999999;
+        }
+
+        /* Thin overlay scrollbars */
+        scrollbar {
+            background: transparent;
+            transition: opacity 200ms ease-out;
+        }
+
+        scrollbar.vertical {
+            min-width: 10px;
+        }
+
+        scrollbar.horizontal {
+            min-height: 10px;
+            max-height: 10px;
+        }
+
+        scrollbar.horizontal slider {
+            min-height: 10px;
+            max-height: 10px;
+        }
+
+        scrollbar slider {
+            min-width: 10px;
+            min-height: 40px;
+            background: rgba(255, 255, 255, 0.3);
+            border-radius: 5px;
+        }
+
+        scrollbar slider:hover {
+            background: rgba(255, 255, 255, 0.5);
+        }
+
+        scrollbar slider:active {
+            background: rgba(255, 255, 255, 0.7);
+        }
+
+        /* Auto-hide when not in use */
+        scrollbar:not(:hover):not(:active) {
+            opacity: 0;
         }
         ",
     );

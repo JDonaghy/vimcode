@@ -11,6 +11,10 @@ pub struct View {
     pub scroll_top: usize,
     /// Number of lines that fit in this window's text viewport.
     pub viewport_lines: usize,
+    /// First visible column (for horizontal scrolling).
+    pub scroll_left: usize,
+    /// Number of columns that fit in this window's text viewport.
+    pub viewport_cols: usize,
 }
 
 impl View {
@@ -19,6 +23,8 @@ impl View {
             cursor: Cursor::new(),
             scroll_top: 0,
             viewport_lines: 40, // sensible default, overridden by UI
+            scroll_left: 0,
+            viewport_cols: 80, // sensible default, overridden by UI
         }
     }
 
