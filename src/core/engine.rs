@@ -973,9 +973,8 @@ impl Engine {
         // Record keystroke if macro recording is active
         // Skip recording the 'q' that stops recording
         if self.macro_recording.is_some() {
-            let is_stop_q = self.mode == Mode::Normal
-                && unicode == Some('q')
-                && self.pending_key.is_none();
+            let is_stop_q =
+                self.mode == Mode::Normal && unicode == Some('q') && self.pending_key.is_none();
 
             if !is_stop_q {
                 // Encode the keystroke for recording
@@ -1071,7 +1070,7 @@ impl Engine {
             return None;
         }
 
-        let inner = &seq[1..seq.len()-1];
+        let inner = &seq[1..seq.len() - 1];
 
         // Check for Ctrl combinations: <C-X>
         if inner.starts_with("C-") && inner.len() == 3 {
@@ -9143,10 +9142,10 @@ mod tests {
         assert!(engine.message.contains("Recording"));
 
         // Record some keystrokes
-        press_char(&mut engine, 'i');  // Enter insert mode
+        press_char(&mut engine, 'i'); // Enter insert mode
         press_char(&mut engine, 'h');
         press_char(&mut engine, 'i');
-        press_special(&mut engine, "Escape");  // ESC
+        press_special(&mut engine, "Escape"); // ESC
         press_char(&mut engine, 'l');
 
         // Stop recording
@@ -9286,7 +9285,7 @@ mod tests {
         }
 
         // Should be at end of line, not crashed
-        assert!(engine.cursor().col <= 4);  // At or before the newline
+        assert!(engine.cursor().col <= 4); // At or before the newline
     }
 
     #[test]
@@ -9298,12 +9297,12 @@ mod tests {
         press_char(&mut engine, 'm');
         press_char(&mut engine, 'i');
         press_char(&mut engine, 'x');
-        press_special(&mut engine, "Escape");  // Must ESC before stopping recording
+        press_special(&mut engine, "Escape"); // Must ESC before stopping recording
         press_char(&mut engine, 'q');
 
         // Verify it's in register 'm'
         let (content, _) = engine.registers.get(&'m').unwrap();
-        assert_eq!(content, "ix\x1b");  // i, x, ESC
+        assert_eq!(content, "ix\x1b"); // i, x, ESC
 
         // Also should be in unnamed register
         let (unnamed_content, _) = engine.registers.get(&'"').unwrap();
@@ -9319,10 +9318,10 @@ mod tests {
         press_char(&mut engine, 'n');
 
         // Record some navigation
-        press_char(&mut engine, 'l');  // Move right (unicode)
-        press_char(&mut engine, 'j');  // Move down (unicode)
-        press_special(&mut engine, "Left");  // Arrow key (no unicode)
-        press_special(&mut engine, "Up");    // Arrow key (no unicode)
+        press_char(&mut engine, 'l'); // Move right (unicode)
+        press_char(&mut engine, 'j'); // Move down (unicode)
+        press_special(&mut engine, "Left"); // Arrow key (no unicode)
+        press_special(&mut engine, "Up"); // Arrow key (no unicode)
 
         // Stop recording
         press_char(&mut engine, 'q');
@@ -9341,8 +9340,8 @@ mod tests {
         press_char(&mut engine, 'c');
 
         // Record some Ctrl combinations
-        press_ctrl(&mut engine, 'd');  // Ctrl-D
-        press_ctrl(&mut engine, 'u');  // Ctrl-U
+        press_ctrl(&mut engine, 'd'); // Ctrl-D
+        press_ctrl(&mut engine, 'u'); // Ctrl-U
 
         // Stop recording
         press_char(&mut engine, 'q');
@@ -9412,9 +9411,9 @@ mod tests {
         press_char(&mut engine, 'r');
 
         // Enter insert mode, type text, press enter, type more, ESC
-        press_char(&mut engine, 'A');  // Append
+        press_char(&mut engine, 'A'); // Append
         press_char(&mut engine, '!');
-        press_special(&mut engine, "Return");  // New line
+        press_special(&mut engine, "Return"); // New line
         press_char(&mut engine, 'n');
         press_char(&mut engine, 'e');
         press_char(&mut engine, 'w');
@@ -9432,7 +9431,9 @@ mod tests {
     fn test_macro_comprehensive() {
         let mut engine = Engine::new();
         // Create a buffer with multiple lines
-        engine.buffer_mut().insert(0, "line one\nline two\nline three");
+        engine
+            .buffer_mut()
+            .insert(0, "line one\nline two\nline three");
 
         // Record a complex macro that uses:
         // - Navigation (j, l, arrow keys)
@@ -9561,14 +9562,22 @@ mod tests {
     #[test]
     fn test_substitute_multiple_lines_undo() {
         let mut engine = Engine::new();
-        engine.buffer_mut().insert(0, "vi is great\nvi is powerful\nvi rocks\n");
+        engine
+            .buffer_mut()
+            .insert(0, "vi is great\nvi is powerful\nvi rocks\n");
 
         // Replace all occurrences across all lines
         engine.execute_command("%s/vi/vim/gi");
-        assert_eq!(engine.buffer().to_string(), "vim is great\nvim is powerful\nvim rocks\n");
+        assert_eq!(
+            engine.buffer().to_string(),
+            "vim is great\nvim is powerful\nvim rocks\n"
+        );
 
         // Undo should restore all original text
         engine.undo();
-        assert_eq!(engine.buffer().to_string(), "vi is great\nvi is powerful\nvi rocks\n");
+        assert_eq!(
+            engine.buffer().to_string(),
+            "vi is great\nvi is powerful\nvi rocks\n"
+        );
     }
 }
