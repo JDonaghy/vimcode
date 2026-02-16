@@ -48,6 +48,14 @@ struct App {
     #[allow(dead_code)] // Kept alive to continue monitoring settings.json
     settings_monitor: Option<gio::FileMonitor>,
     sender: relm4::Sender<Msg>,
+    // Find/Replace dialog state
+    find_dialog_visible: bool,
+    find_text: String,
+    replace_text: String,
+    #[allow(dead_code)] // For future case-sensitive search feature
+    find_case_sensitive: bool,
+    #[allow(dead_code)] // For future whole word search feature
+    find_whole_word: bool,
 }
 
 /// Scrollbars and indicators for a single window
@@ -112,6 +120,22 @@ enum Msg {
     OpenSettingsFile,
     /// Settings file changed on disk.
     SettingsFileChanged,
+    /// Toggle find dialog visibility.
+    ToggleFindDialog,
+    /// Find text input changed.
+    FindTextChanged(String),
+    /// Replace text input changed.
+    ReplaceTextChanged(String),
+    /// Find next match.
+    FindNext,
+    /// Find previous match.
+    FindPrevious,
+    /// Replace current match and find next.
+    ReplaceNext,
+    /// Replace all matches.
+    ReplaceAll,
+    /// Close find dialog.
+    CloseFindDialog,
 }
 
 #[relm4::component]
@@ -390,6 +414,12 @@ impl SimpleComponent for App {
                                     let ctrl = modifier.contains(gdk::ModifierType::CONTROL_MASK);
                                     let shift = modifier.contains(gdk::ModifierType::SHIFT_MASK);
 
+                                    // Check for Ctrl-F to toggle find dialog
+                                    if ctrl && !shift && unicode == Some('f') {
+                                        sender.input(Msg::ToggleFindDialog);
+                                        return gtk4::glib::Propagation::Stop;
+                                    }
+
                                     // Check for Ctrl-B to toggle sidebar
                                     if ctrl && !shift && unicode == Some('b') {
                                         sender.input(Msg::ToggleSidebar);
@@ -423,6 +453,120 @@ impl SimpleComponent for App {
                                 drawing_area.queue_draw();
                                 if model.redraw { &["vim-code", "even"] } else { &["vim-code", "odd"] }
                             },
+                        },
+
+                        // Find/Replace Dialog (overlay at top-right)
+                        add_overlay = &gtk4::Revealer {
+                            set_transition_type: gtk4::RevealerTransitionType::SlideDown,
+                            set_transition_duration: 200,
+                            set_halign: gtk4::Align::End,
+                            set_valign: gtk4::Align::Start,
+                            set_margin_top: 10,
+                            set_margin_end: 10,
+
+                            #[watch]
+                            set_reveal_child: model.find_dialog_visible,
+
+                            gtk4::Box {
+                                set_orientation: gtk4::Orientation::Vertical,
+                                set_spacing: 8,
+                                set_css_classes: &["find-dialog"],
+                                set_width_request: 400,
+
+                                // Find input row
+                                gtk4::Box {
+                                    set_orientation: gtk4::Orientation::Horizontal,
+                                    set_spacing: 4,
+
+                                    gtk4::Label {
+                                        set_text: "Find:",
+                                        set_width_request: 60,
+                                    },
+
+                                    #[name = "find_entry"]
+                                    gtk4::Entry {
+                                        set_placeholder_text: Some("Find in buffer"),
+                                        set_hexpand: true,
+
+                                        connect_changed[sender] => move |entry| {
+                                            let text = entry.text().to_string();
+                                            sender.input(Msg::FindTextChanged(text));
+                                        },
+
+                                        connect_activate[sender] => move |_| {
+                                            sender.input(Msg::FindNext);
+                                        },
+                                    },
+
+                                    gtk4::Button {
+                                        set_label: "↑",
+                                        set_tooltip_text: Some("Previous (Shift+Enter)"),
+                                        connect_clicked[sender] => move |_| {
+                                            sender.input(Msg::FindPrevious);
+                                        },
+                                    },
+
+                                    gtk4::Button {
+                                        set_label: "↓",
+                                        set_tooltip_text: Some("Next (Enter)"),
+                                        connect_clicked[sender] => move |_| {
+                                            sender.input(Msg::FindNext);
+                                        },
+                                    },
+
+                                    gtk4::Button {
+                                        set_label: "×",
+                                        set_tooltip_text: Some("Close (Escape)"),
+                                        connect_clicked[sender] => move |_| {
+                                            sender.input(Msg::CloseFindDialog);
+                                        },
+                                    },
+                                },
+
+                                // Replace input row
+                                gtk4::Box {
+                                    set_orientation: gtk4::Orientation::Horizontal,
+                                    set_spacing: 4,
+
+                                    gtk4::Label {
+                                        set_text: "Replace:",
+                                        set_width_request: 60,
+                                    },
+
+                                    #[name = "replace_entry"]
+                                    gtk4::Entry {
+                                        set_placeholder_text: Some("Replace with"),
+                                        set_hexpand: true,
+
+                                        connect_changed[sender] => move |entry| {
+                                            let text = entry.text().to_string();
+                                            sender.input(Msg::ReplaceTextChanged(text));
+                                        },
+                                    },
+
+                                    gtk4::Button {
+                                        set_label: "Replace",
+                                        connect_clicked[sender] => move |_| {
+                                            sender.input(Msg::ReplaceNext);
+                                        },
+                                    },
+
+                                    gtk4::Button {
+                                        set_label: "Replace All",
+                                        connect_clicked[sender] => move |_| {
+                                            sender.input(Msg::ReplaceAll);
+                                        },
+                                    },
+                                },
+
+                                // Match count label
+                                #[name = "match_count_label"]
+                                gtk4::Label {
+                                    set_text: "No matches",
+                                    set_halign: gtk4::Align::Start,
+                                    set_css_classes: &["find-match-count"],
+                                },
+                            }
                         }
                     }
                 }
@@ -496,6 +640,11 @@ impl SimpleComponent for App {
             cached_line_height: 24.0,
             settings_monitor,
             sender: sender.input_sender().clone(),
+            find_dialog_visible: false,
+            find_text: String::new(),
+            replace_text: String::new(),
+            find_case_sensitive: false,
+            find_whole_word: false,
         };
         let widgets = view_output!();
 
@@ -996,6 +1145,88 @@ impl SimpleComponent for App {
                 if let Some(drawing_area) = self.drawing_area.borrow().as_ref() {
                     drawing_area.queue_draw();
                 }
+                self.redraw = !self.redraw;
+            }
+            Msg::ToggleFindDialog => {
+                self.find_dialog_visible = !self.find_dialog_visible;
+                self.redraw = !self.redraw;
+            }
+            Msg::FindTextChanged(text) => {
+                self.find_text = text.clone();
+                let mut engine = self.engine.borrow_mut();
+                engine.search_query = text;
+                engine.run_search();
+                self.redraw = !self.redraw;
+            }
+            Msg::ReplaceTextChanged(text) => {
+                self.replace_text = text;
+            }
+            Msg::FindNext => {
+                let mut engine = self.engine.borrow_mut();
+                engine.search_next();
+                self.redraw = !self.redraw;
+            }
+            Msg::FindPrevious => {
+                let mut engine = self.engine.borrow_mut();
+                engine.search_prev();
+                self.redraw = !self.redraw;
+            }
+            Msg::ReplaceNext => {
+                let mut engine = self.engine.borrow_mut();
+
+                // Replace current match and find next
+                if let Some(current_idx) = engine.search_index {
+                    if let Some(&(start, end)) = engine.search_matches.get(current_idx) {
+                        engine.start_undo_group();
+                        engine.delete_with_undo(start, end);
+                        engine.insert_with_undo(start, &self.replace_text);
+                        engine.finish_undo_group();
+
+                        // Re-run search and move to next
+                        engine.run_search();
+                        engine.search_next();
+                    }
+                }
+
+                self.redraw = !self.redraw;
+            }
+            Msg::ReplaceAll => {
+                let mut engine = self.engine.borrow_mut();
+                let pattern = engine.search_query.clone();
+                let replacement = self.replace_text.clone();
+
+                // Replace in entire buffer
+                let last_line = engine.buffer().len_lines().saturating_sub(1);
+                match engine.replace_in_range(Some((0, last_line)), &pattern, &replacement, "g") {
+                    Ok(count) => {
+                        engine.message = format!(
+                            "Replaced {} occurrence{}",
+                            count,
+                            if count == 1 { "" } else { "s" }
+                        );
+                    }
+                    Err(e) => {
+                        engine.message = e;
+                    }
+                }
+
+                // Re-run search to update highlights
+                engine.run_search();
+                self.redraw = !self.redraw;
+            }
+            Msg::CloseFindDialog => {
+                self.find_dialog_visible = false;
+
+                // Clear search highlights
+                let mut engine = self.engine.borrow_mut();
+                engine.search_matches.clear();
+                engine.search_index = None;
+
+                // Return focus to editor
+                if let Some(ref drawing_area) = *self.drawing_area.borrow() {
+                    drawing_area.grab_focus();
+                }
+
                 self.redraw = !self.redraw;
             }
         }
@@ -2312,6 +2543,39 @@ fn load_css() {
         /* Auto-hide when not in use */
         scrollbar:not(:hover):not(:active) {
             opacity: 0;
+        }
+
+        /* Find/Replace Dialog */
+        .find-dialog {
+            background-color: #2d2d30;
+            border: 1px solid #3e3e42;
+            border-radius: 4px;
+            padding: 12px;
+        }
+
+        .find-dialog entry {
+            background-color: #3c3c3c;
+            color: #cccccc;
+            padding: 6px;
+            border: 1px solid #3e3e42;
+            border-radius: 2px;
+        }
+
+        .find-dialog button {
+            background: transparent;
+            border: 1px solid #3e3e42;
+            color: #cccccc;
+            padding: 6px 12px;
+            border-radius: 2px;
+        }
+
+        .find-dialog button:hover {
+            background-color: #2a2d2e;
+        }
+
+        .find-match-count {
+            color: #858585;
+            font-size: 11px;
         }
         ",
     );

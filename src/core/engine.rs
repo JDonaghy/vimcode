@@ -102,6 +102,15 @@ pub struct Engine {
     pub search_matches: Vec<(usize, usize)>,
     /// Index into `search_matches` for the current match.
     pub search_index: Option<usize>,
+
+    // --- Find/Replace state ---
+    /// Replacement text for current operation
+    #[allow(dead_code)] // Reserved for future UI state tracking
+    pub replace_text: String,
+    /// Replace flags: 'g' (global), 'c' (confirm), 'i' (case-insensitive)
+    #[allow(dead_code)] // Reserved for future UI state tracking
+    pub replace_flags: String,
+
     /// Pending key for multi-key sequences (e.g. 'g' for gg, 'd' for dd).
     pub pending_key: Option<char>,
 
@@ -183,6 +192,8 @@ impl Engine {
             search_query: String::new(),
             search_matches: Vec::new(),
             search_index: None,
+            replace_text: String::new(),
+            replace_flags: String::new(),
             pending_key: None,
             registers: HashMap::new(),
             selected_register: None,
@@ -2369,6 +2380,12 @@ impl Engine {
                     self.change_visual_selection(changed);
                     return EngineAction::None;
                 }
+                ':' => {
+                    self.mode = Mode::Command;
+                    self.command_buffer = "'<,'>".to_string(); // Auto-populate visual range
+                    self.count = None;
+                    return EngineAction::None;
+                }
                 _ => {}
             }
         }
@@ -3079,6 +3096,11 @@ impl Engine {
             return EngineAction::None;
         }
 
+        // Substitute command: :s/pattern/replacement/flags or :%s/...
+        if cmd.starts_with("s/") || cmd.starts_with("%s/") || cmd.starts_with("'<,'>s/") {
+            return self.execute_substitute_command(cmd);
+        }
+
         // Handle :N (jump to line number)
         if let Ok(line_num) = cmd.parse::<usize>() {
             let target = if line_num > 0 { line_num - 1 } else { 0 };
@@ -3117,9 +3139,74 @@ impl Engine {
         }
     }
 
+    fn execute_substitute_command(&mut self, cmd: &str) -> EngineAction {
+        // Parse: [range]s/pattern/replacement/[flags]
+        // Supported ranges: none (current line), % (all lines), '<,'> (visual selection)
+
+        // Determine if this is :%s (all lines) or :s (current line/visual selection)
+        let (range_str, rest) = if cmd.starts_with("%s/") {
+            ("%", &cmd[2..]) // Skip "%s"
+        } else if cmd.starts_with("s/") {
+            ("", &cmd[1..]) // Skip "s"
+        } else if cmd.starts_with("'<,'>s/") {
+            // Visual selection range (set when entering command mode from visual)
+            ("'<,'>", &cmd[6..]) // Skip "'<,'>s"
+        } else {
+            self.message = "Invalid substitute command".to_string();
+            return EngineAction::Error;
+        };
+
+        // Parse /pattern/replacement/flags
+        // rest is like "/foo/baz/" or "/foo/baz/g"
+        // Splitting by '/' gives: ["", "foo", "baz", ""] or ["", "foo", "baz", "g"]
+        let parts: Vec<&str> = rest.split('/').collect();
+        if parts.len() < 3 {
+            self.message = "Usage: :s/pattern/replacement/[flags]".to_string();
+            return EngineAction::Error;
+        }
+
+        let pattern = parts[1];
+        let replacement = parts.get(2).unwrap_or(&"");
+        let flags = parts.get(3).unwrap_or(&"");
+
+        // Determine line range
+        let range = if range_str == "%" {
+            // All lines
+            let last = self.buffer().len_lines().saturating_sub(1);
+            Some((0, last))
+        } else if range_str == "'<,'>" {
+            // Visual selection (if we have one)
+            if let Some((start, end)) = self.get_visual_selection_range() {
+                Some((start.line, end.line))
+            } else {
+                self.message = "No visual selection".to_string();
+                return EngineAction::Error;
+            }
+        } else {
+            // Current line only
+            None
+        };
+
+        // Execute replacement
+        match self.replace_in_range(range, pattern, replacement, flags) {
+            Ok(count) => {
+                self.message = format!(
+                    "{} substitution{}",
+                    count,
+                    if count == 1 { "" } else { "s" }
+                );
+                EngineAction::None
+            }
+            Err(e) => {
+                self.message = e;
+                EngineAction::Error
+            }
+        }
+    }
+
     // --- Search ---
 
-    fn run_search(&mut self) {
+    pub fn run_search(&mut self) {
         self.search_matches.clear();
         self.search_index = None;
 
@@ -3144,7 +3231,7 @@ impl Engine {
         }
     }
 
-    fn search_next(&mut self) {
+    pub fn search_next(&mut self) {
         if self.search_matches.is_empty() {
             if !self.search_query.is_empty() {
                 self.message = format!("Pattern not found: {}", self.search_query);
@@ -3166,7 +3253,7 @@ impl Engine {
         self.jump_to_search_match(idx);
     }
 
-    fn search_prev(&mut self) {
+    pub fn search_prev(&mut self) {
         if self.search_matches.is_empty() {
             if !self.search_query.is_empty() {
                 self.message = format!("Pattern not found: {}", self.search_query);
@@ -3196,6 +3283,136 @@ impl Engine {
             self.view_mut().cursor.line = line;
             self.view_mut().cursor.col = col;
             self.message = format!("match {} of {}", idx + 1, self.search_matches.len());
+        }
+    }
+
+    // --- Find/Replace methods ---
+
+    /// Replace text in a given range
+    /// range: None = current line, Some((start_line, end_line)) = line range
+    /// pattern: string to find (will use simple substring matching for now)
+    /// replacement: string to replace with
+    /// flags: "g" (all), "c" (confirm), "i" (case-insensitive)
+    /// Returns: (num_replacements, modified_text_preview)
+    pub fn replace_in_range(
+        &mut self,
+        range: Option<(usize, usize)>,
+        pattern: &str,
+        replacement: &str,
+        flags: &str,
+    ) -> Result<usize, String> {
+        if pattern.is_empty() {
+            return Err("Pattern cannot be empty".to_string());
+        }
+
+        let global = flags.contains('g');
+        let _confirm = flags.contains('c'); // For Phase 2
+        let case_insensitive = flags.contains('i');
+
+        // Determine line range
+        let (start_line, end_line) = match range {
+            Some((s, e)) => (s, e),
+            None => {
+                let current = self.view().cursor.line;
+                (current, current)
+            }
+        };
+
+        let mut replacements = 0;
+        self.start_undo_group();
+
+        // Process each line in range
+        for line_num in start_line..=end_line {
+            if line_num >= self.buffer().len_lines() {
+                break;
+            }
+
+            let line_start_char = self.buffer().line_to_char(line_num);
+            let line_len = self.buffer().line_len_chars(line_num);
+            let line_text: String = self
+                .buffer()
+                .content
+                .slice(line_start_char..line_start_char + line_len)
+                .chars()
+                .collect();
+
+            // Find and replace in this line
+            let new_line = if global {
+                self.replace_all_in_string(&line_text, pattern, replacement, case_insensitive)
+            } else {
+                self.replace_first_in_string(&line_text, pattern, replacement, case_insensitive)
+            };
+
+            if new_line != line_text {
+                // Delete old line content and insert new
+                self.delete_with_undo(line_start_char, line_start_char + line_len);
+                self.insert_with_undo(line_start_char, &new_line);
+                replacements += 1;
+            }
+        }
+
+        self.finish_undo_group();
+        Ok(replacements)
+    }
+
+    /// Helper: Replace all occurrences in a string
+    fn replace_all_in_string(
+        &self,
+        text: &str,
+        pattern: &str,
+        replacement: &str,
+        case_insensitive: bool,
+    ) -> String {
+        if case_insensitive {
+            // Case-insensitive: convert to lowercase for comparison
+            let pattern_lower = pattern.to_lowercase();
+            let text_lower = text.to_lowercase();
+
+            let mut result = String::new();
+            let mut last_pos = 0;
+
+            while let Some(pos) = text_lower[last_pos..].find(&pattern_lower) {
+                let absolute_pos = last_pos + pos;
+                result.push_str(&text[last_pos..absolute_pos]);
+                result.push_str(replacement);
+                last_pos = absolute_pos + pattern.len();
+            }
+            result.push_str(&text[last_pos..]);
+            result
+        } else {
+            text.replace(pattern, replacement)
+        }
+    }
+
+    /// Helper: Replace first occurrence in a string
+    fn replace_first_in_string(
+        &self,
+        text: &str,
+        pattern: &str,
+        replacement: &str,
+        case_insensitive: bool,
+    ) -> String {
+        if case_insensitive {
+            let pattern_lower = pattern.to_lowercase();
+            let text_lower = text.to_lowercase();
+
+            if let Some(pos) = text_lower.find(&pattern_lower) {
+                let mut result = String::new();
+                result.push_str(&text[..pos]);
+                result.push_str(replacement);
+                result.push_str(&text[pos + pattern.len()..]);
+                result
+            } else {
+                text.to_string()
+            }
+        } else if let Some(pos) = text.find(pattern) {
+            let mut result = String::new();
+            result.push_str(&text[..pos]);
+            result.push_str(replacement);
+            result.push_str(&text[pos + pattern.len()..]);
+            result
+        } else {
+            text.to_string()
         }
     }
 
@@ -9246,5 +9463,112 @@ mod tests {
         // Check that "!" was appended to line 1
         let line1_content: String = engine.buffer().content.line(1).chars().collect();
         assert!(line1_content.contains("line two!"));
+    }
+
+    #[test]
+    fn test_replace_current_line() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello world\nhello again\n");
+
+        // Replace "hello" with "hi" on current line only (no g flag)
+        let result = engine.replace_in_range(None, "hello", "hi", "");
+        assert_eq!(result.unwrap(), 1);
+        assert_eq!(engine.buffer().to_string(), "hi world\nhello again\n");
+    }
+
+    #[test]
+    fn test_replace_all_lines() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello world\nhello again\n");
+
+        // Replace all "hello" with "hi" across both lines
+        let result = engine.replace_in_range(Some((0, 1)), "hello", "hi", "g");
+        assert_eq!(result.unwrap(), 2);
+        assert_eq!(engine.buffer().to_string(), "hi world\nhi again\n");
+    }
+
+    #[test]
+    fn test_replace_case_insensitive() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "Hello HELLO hello\n");
+
+        // Replace all case variations
+        let result = engine.replace_in_range(None, "hello", "hi", "gi");
+        assert_eq!(result.unwrap(), 1); // Replaces all in one line
+        assert_eq!(engine.buffer().to_string(), "hi hi hi\n");
+    }
+
+    #[test]
+    fn test_substitute_command_current_line() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "foo bar foo\n");
+
+        engine.execute_command("s/foo/baz/");
+        assert_eq!(engine.buffer().to_string(), "baz bar foo\n"); // Only first
+    }
+
+    #[test]
+    fn test_substitute_command_global() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "foo bar foo\n");
+
+        engine.execute_command("s/foo/baz/g");
+        assert_eq!(engine.buffer().to_string(), "baz bar baz\n"); // All on line
+    }
+
+    #[test]
+    fn test_substitute_command_all_lines() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "foo\nbar foo\nfoo\n");
+
+        engine.execute_command("%s/foo/baz/g");
+        assert_eq!(engine.buffer().to_string(), "baz\nbar baz\nbaz\n");
+    }
+
+    #[test]
+    fn test_substitute_visual_range() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "foo\nbar\nbaz\n");
+
+        // Simulate visual selection on lines 0-1
+        engine.mode = Mode::VisualLine;
+        engine.visual_anchor = Some(Cursor { line: 0, col: 0 });
+        engine.view_mut().cursor = Cursor { line: 1, col: 0 };
+
+        engine.execute_command("'<,'>s/bar/qux/");
+        // Should only affect line 1, not lines 0 or 2
+        assert_eq!(engine.buffer().to_string(), "foo\nqux\nbaz\n");
+    }
+
+    #[test]
+    fn test_substitute_undo() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello world\n");
+
+        // Do a substitution
+        engine.execute_command("s/hello/goodbye/");
+        assert_eq!(engine.buffer().to_string(), "goodbye world\n");
+
+        // Undo should restore original text completely
+        engine.undo();
+        assert_eq!(engine.buffer().to_string(), "hello world\n");
+
+        // Redo should apply the substitution again
+        engine.redo();
+        assert_eq!(engine.buffer().to_string(), "goodbye world\n");
+    }
+
+    #[test]
+    fn test_substitute_multiple_lines_undo() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "vi is great\nvi is powerful\nvi rocks\n");
+
+        // Replace all occurrences across all lines
+        engine.execute_command("%s/vi/vim/gi");
+        assert_eq!(engine.buffer().to_string(), "vim is great\nvim is powerful\nvim rocks\n");
+
+        // Undo should restore all original text
+        engine.undo();
+        assert_eq!(engine.buffer().to_string(), "vi is great\nvi is powerful\nvi rocks\n");
     }
 }
