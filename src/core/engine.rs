@@ -2540,8 +2540,14 @@ impl Engine {
 
                     self.search_query = query;
                     self.run_search();
-                    // With incremental search, cursor is already at the correct match
-                    // No need to call search_next/search_prev
+                    // If incremental search is enabled, cursor is already at the correct match
+                    // Otherwise, jump to first match in the appropriate direction
+                    if !self.settings.incremental_search {
+                        match self.search_direction {
+                            SearchDirection::Forward => self.search_next(),
+                            SearchDirection::Backward => self.search_prev(),
+                        }
+                    }
                 }
             }
             "Up" => {
@@ -2600,7 +2606,7 @@ impl Engine {
                         self.search_index = None;
                         self.search_query.clear();
                     }
-                } else {
+                } else if self.settings.incremental_search {
                     // Incremental search: update search as user types
                     self.perform_incremental_search();
                 }
@@ -2613,7 +2619,9 @@ impl Engine {
                 if let Some(ch) = unicode {
                     self.command_buffer.push(ch);
                     // Incremental search: update search as user types
-                    self.perform_incremental_search();
+                    if self.settings.incremental_search {
+                        self.perform_incremental_search();
+                    }
                 }
             }
         }

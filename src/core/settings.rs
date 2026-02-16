@@ -25,10 +25,18 @@ pub struct Settings {
     /// Show file explorer sidebar on startup
     #[serde(default = "default_explorer_visible")]
     pub explorer_visible_on_startup: bool,
+
+    /// Enable incremental search (search as you type)
+    #[serde(default = "default_incremental_search")]
+    pub incremental_search: bool,
 }
 
 fn default_explorer_visible() -> bool {
     false // Default: hidden
+}
+
+fn default_incremental_search() -> bool {
+    true // Default: enabled
 }
 
 fn default_font_family() -> String {
@@ -46,6 +54,7 @@ impl Default for Settings {
             font_family: default_font_family(),
             font_size: default_font_size(),
             explorer_visible_on_startup: default_explorer_visible(),
+            incremental_search: default_incremental_search(),
         }
     }
 }

@@ -72,6 +72,7 @@
 - LineNumberMode (None/Absolute/Relative/Hybrid)
 - Font family and size (hot-reload on save)
 - Explorer visibility on startup (default: hidden)
+- Incremental search (default: enabled, set to false to disable)
 - `:config reload` runtime refresh
 - File watcher for automatic reload
 

@@ -7,6 +7,7 @@
 - Cursor jumps to matches immediately while typing
 - Escape restores original cursor position
 - Backspace updates search results dynamically
+- Configurable in settings.json (default: enabled)
 - Tests: 319 → 324 passing (5 new tests)
 
 ### ✅ Marks (Session 25)
