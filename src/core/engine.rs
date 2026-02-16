@@ -34,7 +34,7 @@ const MAX_MACRO_RECURSION: usize = 100;
 
 /// Direction of the last search operation
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum SearchDirection {
+pub enum SearchDirection {
     Forward,  // Last search was '/'
     Backward, // Last search was '?'
 }
@@ -112,7 +112,7 @@ pub struct Engine {
     /// Index into `search_matches` for the current match.
     pub search_index: Option<usize>,
     /// Direction of the last search operation.
-    search_direction: SearchDirection,
+    pub search_direction: SearchDirection,
 
     // --- Find/Replace state ---
     /// Replacement text for current operation

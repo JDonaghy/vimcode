@@ -48,7 +48,7 @@
 ## Future Tasks (Roadmap)
 
 ### Known Bugs
-- [ ] Reverse search (`?`) displays "/" in command line instead of "?"
+- [x] ~~Reverse search (`?`) displays "/" in command line instead of "?"~~ - FIXED
 - [x] ~~`cw`/`ce` cursor positioning bug (was placing cursor before space instead of after)~~ - FIXED
 
 ### High Priority

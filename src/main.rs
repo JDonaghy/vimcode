@@ -2205,7 +2205,13 @@ fn draw_command_line(
 
     let cmd_text = match engine.mode {
         Mode::Command => format!(":{}", engine.command_buffer),
-        Mode::Search => format!("/{}", engine.command_buffer),
+        Mode::Search => {
+            let search_char = match engine.search_direction {
+                core::engine::SearchDirection::Forward => '/',
+                core::engine::SearchDirection::Backward => '?',
+            };
+            format!("{}{}", search_char, engine.command_buffer)
+        }
         Mode::Normal | Mode::Visual | Mode::VisualLine => {
             // Display count if present, otherwise show message
             if let Some(count) = engine.peek_count() {
@@ -2241,7 +2247,10 @@ fn draw_command_line(
         let prefix = if engine.mode == Mode::Command {
             ":"
         } else {
-            "/"
+            match engine.search_direction {
+                core::engine::SearchDirection::Forward => "/",
+                core::engine::SearchDirection::Backward => "?",
+            }
         };
         let full = format!("{}{}", prefix, engine.command_buffer);
         layout.set_text(&full);
