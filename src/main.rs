@@ -1815,6 +1815,7 @@ fn draw_window(
 
         let attrs = AttrList::new();
 
+        // Syntax highlighting
         for (start, end, scope) in &buffer_state.highlights {
             if *end <= line_start_byte || *start >= line_end_byte {
                 continue;
@@ -1852,6 +1853,56 @@ fn draw_window(
                 attrs.insert(attr);
             }
         }
+
+        // Search match highlighting (yellow background for all matches, brighter for current)
+        if !engine.search_matches.is_empty() {
+            let line_start_char = buffer.content.line_to_char(line_idx);
+            let line_end_char = line_start_char + line.to_string().chars().count();
+
+            for (match_idx, (match_start, match_end)) in engine.search_matches.iter().enumerate() {
+                // Check if this match overlaps with the current line
+                if *match_end <= line_start_char || *match_start >= line_end_char {
+                    continue;
+                }
+
+                // Calculate byte offsets within the line
+                let match_start_char = (*match_start).max(line_start_char);
+                let match_end_char = (*match_end).min(line_end_char);
+
+                // Convert char offsets to byte offsets
+                let line_str = line.to_string();
+                let rel_start_byte = line_str
+                    .char_indices()
+                    .nth(match_start_char - line_start_char)
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                let rel_end_byte = line_str
+                    .char_indices()
+                    .nth(match_end_char - line_start_char)
+                    .map(|(i, _)| i)
+                    .unwrap_or(line_str.len());
+
+                // Highlight current match with brighter yellow, others with dimmer yellow
+                let is_current_match = engine.search_index == Some(match_idx);
+                let (r, g, b) = if is_current_match {
+                    (255 * 256, 200 * 256, 0) // Bright yellow/orange for current match
+                } else {
+                    (180 * 256, 150 * 256, 0) // Dimmer yellow for other matches
+                };
+
+                let mut bg_attr = pango::AttrColor::new_background(r, g, b);
+                bg_attr.set_start_index(rel_start_byte as u32);
+                bg_attr.set_end_index(rel_end_byte as u32);
+                attrs.insert(bg_attr);
+
+                // Add black foreground for better contrast on yellow background
+                let mut fg_attr = pango::AttrColor::new_foreground(0, 0, 0);
+                fg_attr.set_start_index(rel_start_byte as u32);
+                fg_attr.set_end_index(rel_end_byte as u32);
+                attrs.insert(fg_attr);
+            }
+        }
+
         layout.set_attributes(Some(&attrs));
 
         cr.move_to(text_x_offset, y);
