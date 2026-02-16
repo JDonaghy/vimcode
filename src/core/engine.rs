@@ -2614,7 +2614,7 @@ impl Engine {
             }
         }
 
-        // Handle operators: d (delete), y (yank), c (change)
+        // Handle operators: d (delete), y (yank), c (change), u (lowercase), U (uppercase)
         // Note: count is NOT applied to visual operators - they operate on the selection
         if let Some(ch) = unicode {
             match ch {
@@ -2631,6 +2631,16 @@ impl Engine {
                 'c' => {
                     self.count = None; // Clear count (not used for visual operators)
                     self.change_visual_selection(changed);
+                    return EngineAction::None;
+                }
+                'u' => {
+                    self.count = None; // Clear count (not used for visual operators)
+                    self.lowercase_visual_selection(changed);
+                    return EngineAction::None;
+                }
+                'U' => {
+                    self.count = None; // Clear count (not used for visual operators)
+                    self.uppercase_visual_selection(changed);
                     return EngineAction::None;
                 }
                 ':' => {
@@ -3058,6 +3068,104 @@ impl Engine {
         self.start_undo_group();
         self.insert_text_buffer.clear();
         self.mode = Mode::Insert;
+    }
+
+    fn lowercase_visual_selection(&mut self, changed: &mut bool) {
+        self.transform_visual_selection(|s| s.to_lowercase(), changed);
+    }
+
+    fn uppercase_visual_selection(&mut self, changed: &mut bool) {
+        self.transform_visual_selection(|s| s.to_uppercase(), changed);
+    }
+
+    fn transform_visual_selection<F>(&mut self, transform: F, changed: &mut bool)
+    where
+        F: Fn(&str) -> String,
+    {
+        let (start, end) = match self.get_visual_selection_range() {
+            Some(range) => range,
+            None => return,
+        };
+
+        self.start_undo_group();
+
+        match self.mode {
+            Mode::VisualLine => {
+                // Transform full lines
+                for line_idx in start.line..=end.line {
+                    if let Some(line) = self.buffer().content.lines().nth(line_idx) {
+                        let line_str = line.to_string();
+                        let transformed = transform(&line_str);
+
+                        // Replace the line
+                        let line_start_char = self.buffer().line_to_char(line_idx);
+                        let line_end_char = line_start_char + line_str.chars().count();
+                        self.delete_with_undo(line_start_char, line_end_char);
+                        self.insert_with_undo(line_start_char, &transformed);
+                    }
+                }
+
+                // Position cursor at start of first line
+                self.view_mut().cursor.line = start.line;
+                self.view_mut().cursor.col = 0;
+            }
+            Mode::Visual => {
+                // Transform character selection
+                if let Some((text, _)) = self.get_visual_selection_text() {
+                    let transformed = transform(&text);
+
+                    let start_char = self.buffer().line_to_char(start.line) + start.col;
+                    let end_char = self.buffer().line_to_char(end.line) + end.col + 1;
+
+                    self.delete_with_undo(start_char, end_char.min(self.buffer().len_chars()));
+                    self.insert_with_undo(start_char, &transformed);
+
+                    // Position cursor at start
+                    self.view_mut().cursor = start;
+                }
+            }
+            Mode::VisualBlock => {
+                // Transform rectangular block (work backwards to maintain positions)
+                let anchor = self.visual_anchor.unwrap();
+                let cursor = self.view().cursor;
+                let start_col = anchor.col.min(cursor.col);
+                let end_col = anchor.col.max(cursor.col);
+
+                for line_idx in (start.line..=end.line).rev() {
+                    let line_start_char = self.buffer().line_to_char(line_idx);
+                    if let Some(line) = self.buffer().content.lines().nth(line_idx) {
+                        let line_str = line.to_string();
+                        let line_chars: Vec<char> = line_str.chars().collect();
+
+                        // Extract and transform the block portion
+                        if start_col < line_chars.len() {
+                            let block_end = (end_col + 1).min(line_chars.len());
+                            let block_text: String =
+                                line_chars[start_col..block_end].iter().collect();
+                            let transformed = transform(&block_text);
+
+                            let del_start = line_start_char + start_col;
+                            let del_end = line_start_char + block_end;
+                            self.delete_with_undo(del_start, del_end);
+                            self.insert_with_undo(del_start, &transformed);
+                        }
+                    }
+                }
+
+                // Position cursor at start of block
+                self.view_mut().cursor.line = start.line;
+                self.view_mut().cursor.col = start_col;
+            }
+            _ => {}
+        }
+
+        self.finish_undo_group();
+        *changed = true;
+        self.clamp_cursor_col();
+
+        // Exit visual mode
+        self.mode = Mode::Normal;
+        self.visual_anchor = None;
     }
 
     // =======================================================================
@@ -9887,6 +9995,176 @@ mod tests {
         press_char(&mut engine, '2');
         press_char(&mut engine, 'l');
         assert_eq!(engine.view().cursor.col, 2);
+    }
+
+    // ========================================================================
+    // Visual Mode Case Change Tests
+    // ========================================================================
+
+    #[test]
+    fn test_visual_lowercase() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "HELLO World");
+        engine.update_syntax();
+
+        // Select "HELLO"
+        press_char(&mut engine, 'v');
+        for _ in 0..4 {
+            press_char(&mut engine, 'l');
+        }
+
+        // Lowercase
+        press_char(&mut engine, 'u');
+
+        assert_eq!(engine.buffer().to_string(), "hello World");
+        assert_eq!(engine.mode, Mode::Normal);
+        assert_eq!(engine.view().cursor.line, 0);
+        assert_eq!(engine.view().cursor.col, 0);
+    }
+
+    #[test]
+    fn test_visual_uppercase() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello WORLD");
+        engine.update_syntax();
+
+        // Select "hello"
+        press_char(&mut engine, 'v');
+        for _ in 0..4 {
+            press_char(&mut engine, 'l');
+        }
+
+        // Uppercase
+        press_char(&mut engine, 'U');
+
+        assert_eq!(engine.buffer().to_string(), "HELLO WORLD");
+        assert_eq!(engine.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn test_visual_line_lowercase() {
+        let mut engine = Engine::new();
+        engine
+            .buffer_mut()
+            .insert(0, "FIRST Line\nSECOND Line\nthird");
+        engine.update_syntax();
+
+        // Select first two lines
+        press_char(&mut engine, 'V');
+        press_char(&mut engine, 'j');
+
+        // Lowercase
+        press_char(&mut engine, 'u');
+
+        assert_eq!(
+            engine.buffer().to_string(),
+            "first line\nsecond line\nthird"
+        );
+        assert_eq!(engine.mode, Mode::Normal);
+        assert_eq!(engine.view().cursor.line, 0);
+        assert_eq!(engine.view().cursor.col, 0);
+    }
+
+    #[test]
+    fn test_visual_line_uppercase() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "first\nsecond\nthird");
+        engine.update_syntax();
+
+        // Select middle line
+        press_char(&mut engine, 'j');
+        press_char(&mut engine, 'V');
+
+        // Uppercase
+        press_char(&mut engine, 'U');
+
+        assert_eq!(engine.buffer().to_string(), "first\nSECOND\nthird");
+        assert_eq!(engine.mode, Mode::Normal);
+        assert_eq!(engine.view().cursor.line, 1);
+    }
+
+    #[test]
+    fn test_visual_block_lowercase() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "ABC\nDEF\nGHI");
+        engine.update_syntax();
+
+        // Enter visual block mode
+        press_ctrl(&mut engine, 'v');
+
+        // Select 2x2 block (AB, DE)
+        press_char(&mut engine, 'l');
+        press_char(&mut engine, 'j');
+
+        // Lowercase
+        press_char(&mut engine, 'u');
+
+        assert_eq!(engine.buffer().to_string(), "abC\ndeF\nGHI");
+        assert_eq!(engine.mode, Mode::Normal);
+        assert_eq!(engine.view().cursor.line, 0);
+        assert_eq!(engine.view().cursor.col, 0);
+    }
+
+    #[test]
+    fn test_visual_block_uppercase() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "abc\ndef\nghi");
+        engine.update_syntax();
+
+        // Move to column 1
+        press_char(&mut engine, 'l');
+
+        // Enter visual block mode
+        press_ctrl(&mut engine, 'v');
+
+        // Select 2x3 block (bc, ef, hi)
+        press_char(&mut engine, 'l');
+        press_char(&mut engine, 'j');
+        press_char(&mut engine, 'j');
+
+        // Uppercase
+        press_char(&mut engine, 'U');
+
+        assert_eq!(engine.buffer().to_string(), "aBC\ndEF\ngHI");
+        assert_eq!(engine.mode, Mode::Normal);
+        assert_eq!(engine.view().cursor.line, 0);
+        assert_eq!(engine.view().cursor.col, 1);
+    }
+
+    #[test]
+    fn test_visual_case_change_with_undo() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello world");
+        engine.update_syntax();
+
+        // Select and uppercase "hello"
+        press_char(&mut engine, 'v');
+        for _ in 0..4 {
+            press_char(&mut engine, 'l');
+        }
+        press_char(&mut engine, 'U');
+
+        assert_eq!(engine.buffer().to_string(), "HELLO world");
+
+        // Undo
+        press_char(&mut engine, 'u');
+        assert_eq!(engine.buffer().to_string(), "hello world");
+    }
+
+    #[test]
+    fn test_visual_case_mixed_content() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "Hello123WORLD!");
+        engine.update_syntax();
+
+        // Select all
+        press_char(&mut engine, 'v');
+        press_char(&mut engine, '$');
+
+        // Lowercase
+        press_char(&mut engine, 'u');
+
+        assert_eq!(engine.buffer().to_string(), "hello123world!");
     }
 
     // ========================================================================

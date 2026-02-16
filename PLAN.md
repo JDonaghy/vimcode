@@ -2,6 +2,13 @@
 
 ## Recently Completed
 
+### ✅ Visual Mode Case Change (Session 25)
+- `u` command in visual mode to convert selection to lowercase
+- `U` command in visual mode to convert selection to uppercase
+- Works in all visual modes: character, line, and block
+- Proper undo/redo support
+- Tests: 305 → 313 passing (8 new tests)
+
 ### ✅ Undo Line (Session 24)
 - `U` command to undo all changes on the current line
 - Tracks original line state when first modified
@@ -52,7 +59,7 @@
 - [x] ~~`cw`/`ce` cursor positioning bug (was placing cursor before space instead of after)~~ - FIXED
 
 ### High Priority
-- [ ] Visual mode case change (u/U in visual mode for lowercase/uppercase)
+- [x] ~~Visual mode case change (u/U in visual mode for lowercase/uppercase)~~ - COMPLETE
 - [ ] Marks (m, ')
 - [ ] Incremental search
 - [ ] More grammars (Python/JS/Go/C++)
