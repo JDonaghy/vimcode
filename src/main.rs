@@ -832,6 +832,25 @@ impl SimpleComponent for App {
 
                 match action {
                     EngineAction::Quit | EngineAction::SaveQuit => {
+                        // Save current file position before exiting
+                        let mut engine = self.engine.borrow_mut();
+                        let buffer_id = engine.active_buffer_id();
+                        if let Some(path) = engine
+                            .buffer_manager
+                            .get(buffer_id)
+                            .and_then(|s| s.file_path.as_deref())
+                            .map(|p| p.to_path_buf())
+                        {
+                            let view = engine.active_window().view.clone();
+                            engine.session.save_file_position(
+                                &path,
+                                view.cursor.line,
+                                view.cursor.col,
+                                view.scroll_top,
+                            );
+                        }
+                        let _ = engine.session.save();
+                        drop(engine);
                         std::process::exit(0);
                     }
                     EngineAction::OpenFile(path) => {
@@ -866,6 +885,24 @@ impl SimpleComponent for App {
                     // Handle actions from macro playback
                     match action {
                         EngineAction::Quit | EngineAction::SaveQuit => {
+                            let mut engine = self.engine.borrow_mut();
+                            let buffer_id = engine.active_buffer_id();
+                            if let Some(path) = engine
+                                .buffer_manager
+                                .get(buffer_id)
+                                .and_then(|s| s.file_path.as_deref())
+                                .map(|p| p.to_path_buf())
+                            {
+                                let view = engine.active_window().view.clone();
+                                engine.session.save_file_position(
+                                    &path,
+                                    view.cursor.line,
+                                    view.cursor.col,
+                                    view.scroll_top,
+                                );
+                            }
+                            let _ = engine.session.save();
+                            drop(engine);
                             std::process::exit(0);
                         }
                         EngineAction::OpenFile(path) => {

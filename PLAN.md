@@ -90,8 +90,8 @@
 
 ### Session Persistence Enhancements
 - [ ] Window position (x, y) persistence - requires platform-specific code
-- [ ] Cursor position persistence per file
-- [ ] Scroll position persistence per file
+- [x] ~~Cursor position persistence per file~~ - COMPLETE
+- [x] ~~Scroll position persistence per file~~ - COMPLETE
 - [ ] Command history search (Ctrl-R style reverse search)
 - [ ] Regex-based command completion
 - [ ] Multi-session support (save/restore named sessions)

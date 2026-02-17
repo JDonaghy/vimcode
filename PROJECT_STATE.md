@@ -4,7 +4,7 @@
 
 ## Status
 
-**Multi-Language Syntax Highlighting COMPLETE:** Python, JS, Go, C++ (336 tests passing)
+**Cursor/Scroll Position Persistence COMPLETE:** Reopening a file restores where you were (340 tests passing)
 
 ### Core Vim (Complete)
 - Seven modes (Normal/Insert/Visual/Visual Line/Visual Block/Command/Search)
@@ -88,7 +88,7 @@ vimcode/
 │       ├── session.rs (~170 lines) — Session state persistence (NEW)
 │       ├── settings.rs (~190 lines) — JSON persistence, auto-init
 │       ├── window.rs, tab.rs, view.rs, cursor.rs, mode.rs, syntax.rs
-│       └── Tests: 336 passing (9 find/replace, 14 macro, 5 session, 4 reverse search, 7 replace char, 5 undo line, 8 case change, 6 marks, 5 incremental search, 12 syntax/language tests)
+│       └── Tests: 340 passing (9 find/replace, 14 macro, 8 session, 4 reverse search, 7 replace char, 5 undo line, 8 case change, 6 marks, 5 incremental search, 12 syntax/language tests)
 └── Total: ~12,200 lines
 ```
 
@@ -130,6 +130,7 @@ cargo fmt
 - [x] **More grammars (Python/JS/Go/C++)** — COMPLETE
 
 ## Recent Work
+**Session 27:** Cursor + Scroll Position Persistence complete — reopening a file restores exact cursor line/col and scroll position; positions saved on buffer switch and at quit; also fixed settings file watcher feedback loop freeze and `r` + digit bug (pending key check now runs before count accumulation) (336→340 tests, 3 new session tests).
 **Session 26:** Multi-Language Syntax Highlighting complete — Python, JavaScript, Go, C++ support via Tree-sitter. Language auto-detected from file extension. New `SyntaxLanguage` enum, `Syntax::new_from_path()` constructor, buffers now get correct highlighting when opened (324→336 tests, 12 new tests).
 **Session 25:** Marks + Incremental Search + Visual Mode Case Change complete — `m{a-z}` to set marks, `'` and `` ` `` to jump to marks; real-time incremental search as you type with Escape to cancel; `u`/`U` commands in visual mode for case transformation (313→324 tests, 6 marks + 5 incremental search + 8 case change tests).
 **Session 25 (earlier):** Visual Mode Case Change complete — `u`/`U` commands in visual mode (character, line, and block) for lowercase/uppercase transformation with proper undo/redo support (305→313 tests, 8 case change tests).

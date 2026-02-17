@@ -1,5 +1,14 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+/// Saved cursor and scroll position for a file
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FilePosition {
+    pub line: usize,
+    pub col: usize,
+    pub scroll_top: usize,
+}
 
 /// Session state persisted across restarts
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,6 +31,10 @@ pub struct SessionState {
     /// Last opened files (future: cursor positions)
     #[serde(default)]
     pub recent_files: Vec<PathBuf>,
+
+    /// Saved cursor/scroll positions per file (keyed by canonical path)
+    #[serde(default)]
+    pub file_positions: HashMap<PathBuf, FilePosition>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,8 +61,9 @@ impl Default for SessionState {
             },
             command_history: Vec::new(),
             search_history: Vec::new(),
-            explorer_visible: false, // Default: hidden
+            explorer_visible: false,
             recent_files: Vec::new(),
+            file_positions: HashMap::new(),
         }
     }
 }
@@ -106,6 +120,25 @@ impl SessionState {
         if self.search_history.len() > 100 {
             self.search_history.remove(0);
         }
+    }
+
+    /// Save cursor and scroll position for a file path
+    pub fn save_file_position(&mut self, path: &Path, line: usize, col: usize, scroll_top: usize) {
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        self.file_positions.insert(
+            canonical,
+            FilePosition {
+                line,
+                col,
+                scroll_top,
+            },
+        );
+    }
+
+    /// Get saved cursor/scroll position for a file path, if any
+    pub fn get_file_position(&self, path: &Path) -> Option<&FilePosition> {
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        self.file_positions.get(&canonical)
     }
 }
 
@@ -166,5 +199,52 @@ mod tests {
         session.add_search("");
         assert_eq!(session.command_history.len(), 0);
         assert_eq!(session.search_history.len(), 0);
+    }
+
+    #[test]
+    fn test_save_and_get_file_position() {
+        let mut session = SessionState::default();
+        let path = Path::new("/tmp/test_vimcode_position.rs");
+
+        // Nothing saved yet
+        assert!(session.get_file_position(path).is_none());
+
+        // Save a position
+        session.save_file_position(path, 42, 7, 30);
+        let pos = session.get_file_position(path).unwrap();
+        assert_eq!(pos.line, 42);
+        assert_eq!(pos.col, 7);
+        assert_eq!(pos.scroll_top, 30);
+    }
+
+    #[test]
+    fn test_file_position_overwrite() {
+        let mut session = SessionState::default();
+        let path = Path::new("/tmp/test_vimcode_position.rs");
+
+        session.save_file_position(path, 10, 5, 0);
+        session.save_file_position(path, 20, 3, 15);
+
+        let pos = session.get_file_position(path).unwrap();
+        assert_eq!(pos.line, 20);
+        assert_eq!(pos.col, 3);
+        assert_eq!(pos.scroll_top, 15);
+    }
+
+    #[test]
+    fn test_file_positions_serialization() {
+        let mut session = SessionState::default();
+        let path = Path::new("/tmp/test_vimcode_serialize.py");
+        session.save_file_position(path, 5, 2, 0);
+
+        // Round-trip through JSON
+        let json = serde_json::to_string(&session).unwrap();
+        let restored: SessionState = serde_json::from_str(&json).unwrap();
+
+        // Position should survive serialization (using canonical path)
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let pos = restored.file_positions.get(&canonical).unwrap();
+        assert_eq!(pos.line, 5);
+        assert_eq!(pos.col, 2);
     }
 }

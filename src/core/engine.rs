@@ -273,6 +273,11 @@ impl Engine {
                 if let Some(window) = engine.windows.get_mut(&engine.active_window_id()) {
                     window.buffer_id = buffer_id;
                 }
+                // Restore saved cursor/scroll position from previous session
+                let view = engine.restore_file_position(buffer_id);
+                if let Some(window) = engine.windows.get_mut(&engine.active_window_id()) {
+                    window.view = view;
+                }
                 if !path.exists() {
                     engine.message = format!("\"{}\" [New File]", path.display());
                 }
@@ -919,11 +924,69 @@ impl Engine {
 
     /// Switch the current window to a different buffer.
     fn switch_window_buffer(&mut self, buffer_id: BufferId) {
-        if self.buffer_manager.get(buffer_id).is_some() {
-            self.active_window_mut().buffer_id = buffer_id;
-            self.active_window_mut().view = View::new(); // Reset view
-            self.search_matches.clear();
-            self.search_index = None;
+        if self.buffer_manager.get(buffer_id).is_none() {
+            return;
+        }
+
+        // Save current buffer's cursor/scroll position before switching
+        let current_id = self.active_window().buffer_id;
+        if current_id != buffer_id {
+            if let Some(path) = self
+                .buffer_manager
+                .get(current_id)
+                .and_then(|s| s.file_path.as_deref())
+                .map(|p| p.to_path_buf())
+            {
+                let view = &self.active_window().view;
+                self.session.save_file_position(
+                    &path,
+                    view.cursor.line,
+                    view.cursor.col,
+                    view.scroll_top,
+                );
+            }
+        }
+
+        // Switch to the new buffer
+        self.active_window_mut().buffer_id = buffer_id;
+
+        // Restore saved position, clamped to actual buffer bounds
+        let new_view = self.restore_file_position(buffer_id);
+        self.active_window_mut().view = new_view;
+
+        self.search_matches.clear();
+        self.search_index = None;
+    }
+
+    /// Build a View restoring the saved position for a buffer, or return View::new().
+    fn restore_file_position(&self, buffer_id: BufferId) -> View {
+        let path = match self
+            .buffer_manager
+            .get(buffer_id)
+            .and_then(|s| s.file_path.as_deref())
+            .map(|p| p.to_path_buf())
+        {
+            Some(p) => p,
+            None => return View::new(),
+        };
+
+        let pos = match self.session.get_file_position(&path) {
+            Some(p) => p,
+            None => return View::new(),
+        };
+
+        let buf = self.buffer_manager.get(buffer_id).unwrap();
+        let max_line = buf.buffer.len_lines().saturating_sub(1);
+        let line = pos.line.min(max_line);
+        let line_len = buf.buffer.line_len_chars(line);
+        let max_col = line_len.saturating_sub(1);
+        let col = pos.col.min(max_col);
+        let scroll_top = pos.scroll_top.min(max_line);
+
+        View {
+            cursor: Cursor { line, col },
+            scroll_top,
+            ..View::new()
         }
     }
 
