@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Feb 17, 2026
+**Last updated:** Feb 17, 2026 (Session 32)
 
 ## Status
 
@@ -44,6 +44,7 @@
   - Window geometry persistence (size restored on startup)
   - Explorer visibility state (persisted across sessions)
   - Cursor + scroll position per file (restored on reopen)
+  - **Open file list restored on startup** (all open buffers + active file saved on quit, reopened next launch when no CLI file given)
   - Session state at `~/.config/vimcode/session.json`
 - Buffers (:bn/:bp/:b#/:ls/:bd)
 - Windows (:split/:vsplit, Ctrl-W)
@@ -69,6 +70,7 @@
 - **Scrollbars (FIXED):** Per-window vertical/horizontal scrollbars with cursor indicators (GTK + TUI)
 - **Font configuration:** Customizable font family and size
 - **Nerd Font icons:** File-type icons in both GTK sidebar and TUI sidebar (`src/icons.rs`)
+- **Code folding:** `+`/`-` gutter indicators; entire gutter column is clickable in both GTK and TUI
 
 ### TUI Backend (`src/tui_main.rs`)
 - Full editor in terminal via ratatui 0.27 + crossterm
@@ -153,7 +155,8 @@ cargo fmt
 - [x] **Code Folding (za/zo/zc/zR)** — COMPLETE
 
 ## Recent Work
-**Session 31:** Code Folding complete — indentation-based manual folding with `za` (toggle), `zo` (open), `zc` (close), `zR` (open all); fold state stored in `View` (per-window); `move_down`/`move_up` skip hidden lines; `▶` gutter indicator for closed fold headers; fold-aware rendering in both GTK + TUI backends via `render.rs` (346→357 tests, 11 new fold tests).
+**Session 32:** Session file restore + fold click polish — open file list (and active buffer) now saved on quit and restored on next launch; entire gutter width is clickable for fold toggle in both GTK and TUI (was pixel-precise single column); GTK gutter text has 3px left padding gap (357 tests, no change).
+**Session 31:** Code Folding complete — indentation-based manual folding with `za` (toggle), `zo` (open), `zc` (close), `zR` (open all); fold state stored in `View` (per-window); `move_down`/`move_up` skip hidden lines; `+`/`-` gutter indicators (block-opener heuristic, always visible regardless of line number mode); clickable gutter column; fold-aware rendering in both GTK + TUI backends via `render.rs` (346→357 tests, 11 new fold tests).
 **Session 30:** Nerd Font Icons + TUI Sidebar + Mouse + Resize complete — `src/icons.rs` shared icon module; GTK activity bar, toolbar, and file tree all use Nerd Font glyphs; TUI sidebar with full file explorer (j/k/l/h/Enter, CRUD via a/A/D/R, Ctrl-B toggle, Ctrl-Shift-E focus); TUI activity bar (Explorer/Settings panels); drag-to-resize sidebar in GTK (GestureDrag, saved to session) and TUI (mouse drag + Alt+Left/Alt+Right); full TUI mouse support: click-to-position, scroll wheel, scrollbar click-to-jump; per-window `█`/`░` scrollbars in TUI (346 tests, no change).
 **Session 29:** TUI backend (Stage 2) + rendering abstraction — `src/render.rs` ScreenLayout bridge; ratatui/crossterm TUI entry point; cursor shapes (bar insert, underline replace-r); Ctrl key combos; viewport sync (346 tests, no change).
 **Session 28:** Ctrl-R Command History Search complete — reverse incremental search through command history in command mode; Ctrl-R activates, typing narrows matches, Ctrl-R again cycles to older entries, Escape/Ctrl-G cancels, Enter executes (340→346 tests, 6 new tests).
