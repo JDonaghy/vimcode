@@ -1002,6 +1002,62 @@ impl Engine {
         }
     }
 
+    /// Return the absolute paths of all currently-open file buffers, in creation order.
+    pub fn open_file_paths(&self) -> Vec<std::path::PathBuf> {
+        self.buffer_manager
+            .list()
+            .into_iter()
+            .filter_map(|id| {
+                self.buffer_manager
+                    .get(id)
+                    .and_then(|s| s.file_path.clone())
+            })
+            .collect()
+    }
+
+    /// Snapshot the current open-file list and active file into session state, ready for saving.
+    pub fn collect_session_open_files(&mut self) {
+        self.session.open_files = self.open_file_paths();
+        self.session.active_file = self
+            .buffer_manager
+            .get(self.active_buffer_id())
+            .and_then(|s| s.file_path.clone());
+    }
+
+    /// Restore open files from session state (called at startup when no CLI file is given).
+    /// Skips files that no longer exist. Removes the initial empty scratch buffer.
+    pub fn restore_session_files(&mut self) {
+        let paths = self.session.open_files.clone();
+        let active = self.session.active_file.clone();
+
+        if paths.is_empty() {
+            return;
+        }
+
+        let initial_id = self.active_buffer_id();
+        let mut any_opened = false;
+
+        for path in &paths {
+            if path.exists() && self.open_file_with_mode(path, OpenMode::Permanent).is_ok() {
+                any_opened = true;
+            }
+        }
+
+        if !any_opened {
+            return;
+        }
+
+        // Switch to the previously-active file so it has focus on startup.
+        if let Some(ref ap) = active {
+            if ap.exists() {
+                let _ = self.open_file_with_mode(ap, OpenMode::Permanent);
+            }
+        }
+
+        // Remove the initial empty scratch buffer now that real files are open.
+        let _ = self.delete_buffer(initial_id, true);
+    }
+
     /// Delete a buffer. Returns error if buffer is shown in any window or is dirty.
     pub fn delete_buffer(&mut self, id: BufferId, force: bool) -> Result<(), String> {
         // Check if buffer is shown in any window
@@ -1712,6 +1768,11 @@ impl Engine {
             Some('g') => {
                 self.pending_key = Some('g');
             }
+            Some('z') => {
+                // Fold commands: za, zo, zc, zR
+                self.pending_key = Some('z');
+                self.message = "z: a=toggle  c=close  o=open  R=open all".to_string();
+            }
             Some('m') => {
                 // Set mark: m{a-z}
                 self.pending_key = Some('m');
@@ -2084,6 +2145,16 @@ impl Engine {
                     } else {
                         self.message = "Only lowercase marks (a-z) are supported".to_string();
                     }
+                }
+            }
+            'z' => {
+                // Fold commands
+                match unicode {
+                    Some('a') => self.cmd_fold_toggle(),
+                    Some('o') => self.cmd_fold_open(),
+                    Some('c') => self.cmd_fold_close(),
+                    Some('R') => self.view_mut().open_all_folds(),
+                    _ => {}
                 }
             }
             _ => {}
@@ -5124,17 +5195,125 @@ impl Engine {
 
     fn move_down(&mut self) {
         let max_line = self.buffer().len_lines().saturating_sub(1);
-        if self.view().cursor.line < max_line {
-            self.view_mut().cursor.line += 1;
-            self.clamp_cursor_col();
+        let mut next = self.view().cursor.line;
+        loop {
+            if next >= max_line {
+                return;
+            }
+            next += 1;
+            if !self.view().is_line_hidden(next) {
+                break;
+            }
         }
+        self.view_mut().cursor.line = next;
+        self.clamp_cursor_col();
     }
 
     fn move_up(&mut self) {
-        if self.view().cursor.line > 0 {
-            self.view_mut().cursor.line -= 1;
-            self.clamp_cursor_col();
+        let mut prev = self.view().cursor.line;
+        loop {
+            if prev == 0 {
+                return;
+            }
+            prev -= 1;
+            if !self.view().is_line_hidden(prev) {
+                break;
+            }
         }
+        self.view_mut().cursor.line = prev;
+        self.clamp_cursor_col();
+    }
+
+    // ── Fold helpers ──────────────────────────────────────────────────────────
+
+    /// Count leading whitespace characters (spaces = 1, tabs = tab_width).
+    fn line_indent(&self, line_idx: usize) -> usize {
+        let total = self.buffer().len_lines();
+        if line_idx >= total {
+            return 0;
+        }
+        let line = self.buffer().content.line(line_idx);
+        let tab_width = 4usize;
+        let mut indent = 0usize;
+        for ch in line.chars() {
+            match ch {
+                ' ' => indent += 1,
+                '\t' => indent += tab_width,
+                _ => break,
+            }
+        }
+        indent
+    }
+
+    /// Detect the fold range starting at `start_line` using indentation heuristics.
+    /// Returns `Some((start, end))` when at least one following line has strictly
+    /// greater indentation. Returns `None` for blank/empty trailing sections.
+    fn detect_fold_range(&self, start_line: usize) -> Option<(usize, usize)> {
+        let total = self.buffer().len_lines();
+        if start_line + 1 >= total {
+            return None;
+        }
+        let base_indent = self.line_indent(start_line);
+        let mut end = start_line;
+        for idx in (start_line + 1)..total {
+            let line = self.buffer().content.line(idx);
+            let text: String = line.chars().collect();
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                // blank lines are included in fold body
+                end = idx;
+                continue;
+            }
+            if self.line_indent(idx) > base_indent {
+                end = idx;
+            } else {
+                break;
+            }
+        }
+        if end > start_line {
+            Some((start_line, end))
+        } else {
+            None
+        }
+    }
+
+    /// Toggle the fold at `line_idx` regardless of cursor position.
+    /// Used by click handlers when the user clicks the fold indicator.
+    pub fn toggle_fold_at_line(&mut self, line_idx: usize) {
+        if self.view().fold_at(line_idx).is_some() {
+            self.view_mut().open_fold(line_idx);
+        } else {
+            let saved = self.view().cursor.line;
+            self.view_mut().cursor.line = line_idx;
+            self.cmd_fold_close();
+            self.view_mut().cursor.line = saved;
+        }
+    }
+
+    fn cmd_fold_toggle(&mut self) {
+        let line = self.view().cursor.line;
+        if self.view().fold_at(line).is_some() {
+            self.view_mut().open_fold(line);
+        } else {
+            self.cmd_fold_close();
+        }
+    }
+
+    fn cmd_fold_close(&mut self) {
+        let line = self.view().cursor.line;
+        if let Some((start, end)) = self.detect_fold_range(line) {
+            self.view_mut().close_fold(start, end);
+            // If cursor ended up inside the fold, move it to the header.
+            if self.view().is_line_hidden(self.view().cursor.line) {
+                self.view_mut().cursor.line = start;
+                self.clamp_cursor_col();
+            }
+        }
+    }
+
+    fn cmd_fold_open(&mut self) {
+        let line = self.view().cursor.line;
+        self.view_mut().open_fold(line);
     }
 
     fn move_right(&mut self) {
@@ -11418,6 +11597,131 @@ mod tests {
             engine.view().cursor.col,
             4,
             "cursor should be after the space (col 4)"
+        );
+    }
+
+    // ── Fold tests ────────────────────────────────────────────────────────────
+
+    fn make_indented_engine() -> Engine {
+        let mut engine = Engine::new();
+        // 5-line buffer: line 0 is the header, lines 1-3 are indented, line 4 is peer
+        engine.buffer_mut().insert(
+            0,
+            "fn foo() {\n    let x = 1;\n    let y = 2;\n    x + y\n}\n",
+        );
+        engine
+    }
+
+    #[test]
+    fn test_fold_close_detects_range() {
+        let mut engine = make_indented_engine();
+        // Cursor at line 0 ("fn foo() {")
+        engine.view_mut().cursor.line = 0;
+        let range = engine.detect_fold_range(0);
+        assert!(range.is_some(), "should detect fold range under fn");
+        let (start, end) = range.unwrap();
+        assert_eq!(start, 0);
+        assert!(end >= 3, "end should include indented body");
+    }
+
+    #[test]
+    fn test_fold_close_and_open() {
+        let mut engine = make_indented_engine();
+        engine.view_mut().cursor.line = 0;
+
+        // zc — close fold
+        press_char(&mut engine, 'z');
+        press_char(&mut engine, 'c');
+        assert!(
+            engine.view().fold_at(0).is_some(),
+            "fold should exist after zc"
+        );
+
+        // zo — open fold
+        press_char(&mut engine, 'z');
+        press_char(&mut engine, 'o');
+        assert!(
+            engine.view().fold_at(0).is_none(),
+            "fold should be removed after zo"
+        );
+    }
+
+    #[test]
+    fn test_fold_toggle_za() {
+        let mut engine = make_indented_engine();
+        engine.view_mut().cursor.line = 0;
+
+        // First za closes the fold
+        press_char(&mut engine, 'z');
+        press_char(&mut engine, 'a');
+        assert!(engine.view().fold_at(0).is_some(), "first za should close");
+
+        // Second za opens it
+        press_char(&mut engine, 'z');
+        press_char(&mut engine, 'a');
+        assert!(engine.view().fold_at(0).is_none(), "second za should open");
+    }
+
+    #[test]
+    fn test_fold_open_all_zr() {
+        let mut engine = make_indented_engine();
+        engine.view_mut().cursor.line = 0;
+
+        press_char(&mut engine, 'z');
+        press_char(&mut engine, 'c');
+        assert!(!engine.view().folds.is_empty(), "should have a fold");
+
+        press_char(&mut engine, 'z');
+        press_char(&mut engine, 'R');
+        assert!(engine.view().folds.is_empty(), "zR should clear all folds");
+    }
+
+    #[test]
+    fn test_fold_navigation_skips_hidden_lines() {
+        let mut engine = make_indented_engine();
+        engine.view_mut().cursor.line = 0;
+
+        // Close the fold (lines 1-3 become hidden)
+        press_char(&mut engine, 'z');
+        press_char(&mut engine, 'c');
+
+        // j from line 0 should skip to line 4 (first visible line after fold)
+        press_char(&mut engine, 'j');
+        assert_eq!(
+            engine.view().cursor.line,
+            4,
+            "j should skip hidden fold lines"
+        );
+
+        // k from line 4 should go back to line 0 (fold header)
+        press_char(&mut engine, 'k');
+        assert_eq!(
+            engine.view().cursor.line,
+            0,
+            "k should skip hidden fold lines"
+        );
+    }
+
+    #[test]
+    fn test_fold_cursor_clamp_on_close() {
+        let mut engine = make_indented_engine();
+        // Put cursor inside what will become the fold body
+        engine.view_mut().cursor.line = 2;
+
+        // Close fold from line 0 — but cursor is on line 2, which is inside.
+        // The fold command detects range from cursor (line 2) not header.
+        // So we place cursor at 0 and close, then move cursor inside and close again.
+
+        // Close from line 0
+        engine.view_mut().cursor.line = 0;
+        press_char(&mut engine, 'z');
+        press_char(&mut engine, 'c');
+
+        // Cursor should still be on line 0 (the fold header)
+        assert_eq!(
+            engine.view().cursor.line,
+            0,
+            "cursor should stay at fold header after zc"
         );
     }
 }

@@ -632,7 +632,11 @@ impl SimpleComponent for App {
 
         let engine = match file_path {
             Some(ref path) => Engine::open(path),
-            None => Engine::new(),
+            None => {
+                let mut e = Engine::new();
+                e.restore_session_files();
+                e
+            }
         };
 
         // Set window title based on file
@@ -901,6 +905,7 @@ impl SimpleComponent for App {
                                 view.scroll_top,
                             );
                         }
+                        engine.collect_session_open_files();
                         let _ = engine.session.save();
                         drop(engine);
                         std::process::exit(0);
@@ -953,6 +958,7 @@ impl SimpleComponent for App {
                                     view.scroll_top,
                                 );
                             }
+                            engine.collect_session_open_files();
                             let _ = engine.session.save();
                             drop(engine);
                             std::process::exit(0);
@@ -1396,6 +1402,7 @@ impl SimpleComponent for App {
                     );
                 }
 
+                engine.collect_session_open_files();
                 let _ = engine.session.save();
             }
         }
@@ -1609,7 +1616,37 @@ impl App {
     }
 }
 
+/// Map a visible row index (0-based from scroll_top) to the corresponding
+/// buffer line index, skipping lines hidden inside closed folds.
+fn view_row_to_buf_line(
+    view: &crate::core::view::View,
+    scroll_top: usize,
+    view_row: usize,
+    total_lines: usize,
+) -> usize {
+    let mut buf_line = scroll_top;
+    let mut visible = 0usize;
+    while buf_line < total_lines {
+        if view.is_line_hidden(buf_line) {
+            buf_line += 1;
+            continue;
+        }
+        if visible == view_row {
+            return buf_line;
+        }
+        visible += 1;
+        if let Some(fold) = view.fold_at(buf_line) {
+            buf_line = fold.end + 1;
+        } else {
+            buf_line += 1;
+        }
+    }
+    // Clamp to last valid line
+    total_lines.saturating_sub(1)
+}
+
 /// Calculate gutter width in pixels based on line number mode and buffer size
+#[allow(dead_code)]
 fn calculate_gutter_width(mode: LineNumberMode, total_lines: usize, char_width: f64) -> f64 {
     match mode {
         LineNumberMode::None => 0.0,
@@ -1840,29 +1877,28 @@ fn draw_window(
         );
     }
 
-    // Render line numbers (before clipping so they're never clipped out)
-    for (view_idx, rl) in rw.lines.iter().enumerate() {
-        if rl.gutter_text.is_empty() {
-            break; // line numbers disabled — nothing to render for any line
+    // Render gutter (fold indicators + optional line numbers)
+    if rw.gutter_char_width > 0 {
+        for (view_idx, rl) in rw.lines.iter().enumerate() {
+            let y = rect.y + view_idx as f64 * line_height;
+
+            layout.set_text(&rl.gutter_text);
+            layout.set_attributes(None);
+
+            let (num_width, _) = layout.pixel_size();
+            let num_x = rect.x + gutter_width - num_width as f64 - char_width + 3.0;
+
+            let num_color = if rw.is_active && rl.is_current_line {
+                theme.line_number_active_fg
+            } else {
+                theme.line_number_fg
+            };
+            let (nr, ng, nb) = num_color.to_cairo();
+            cr.set_source_rgb(nr, ng, nb);
+            cr.move_to(num_x, y);
+            pangocairo::show_layout(cr, layout);
         }
-        let y = rect.y + view_idx as f64 * line_height;
-
-        layout.set_text(&rl.gutter_text);
-        layout.set_attributes(None);
-
-        let (num_width, _) = layout.pixel_size();
-        let num_x = rect.x + gutter_width - num_width as f64 - char_width;
-
-        let num_color = if rw.is_active && rl.is_current_line {
-            theme.line_number_active_fg
-        } else {
-            theme.line_number_fg
-        };
-        let (nr, ng, nb) = num_color.to_cairo();
-        cr.set_source_rgb(nr, ng, nb);
-        cr.move_to(num_x, y);
-        pangocairo::show_layout(cr, layout);
-    }
+    } // end gutter rendering block
 
     // Clip text area (excluding gutter)
     cr.save().unwrap();
@@ -2335,16 +2371,12 @@ fn handle_mouse_click(engine: &mut Engine, x: f64, y: f64, width: f64, height: f
     let buffer = &buffer_state.buffer;
     let view = &window.view;
 
-    // Calculate gutter width using real char width from font metrics (matching draw_window line 391)
+    // Calculate gutter width from render module (matches the actual draw function).
     let char_width = font_metrics.approximate_char_width() as f64 / pango::SCALE as f64;
     let total_lines = buffer.content.len_lines();
-    let gutter_width =
-        calculate_gutter_width(engine.settings.line_numbers, total_lines, char_width);
-
-    // Check if click is in gutter - if so, ignore
-    if x < rect.x + gutter_width {
-        return;
-    }
+    let gutter_char_width =
+        render::calculate_gutter_cols(engine.settings.line_numbers, total_lines, char_width);
+    let gutter_width = gutter_char_width as f64 * char_width;
 
     // Calculate per-window status bar height
     let per_window_status = if engine.windows.len() > 1 {
@@ -2359,10 +2391,18 @@ fn handle_mouse_click(engine: &mut Engine, x: f64, y: f64, width: f64, height: f
         return;
     }
 
-    // Convert y coordinate to line number
+    // Convert y coordinate to visible row index
     let relative_y = y - rect.y;
-    let view_line = (relative_y / line_height).floor() as usize;
-    let line = view.scroll_top + view_line;
+    let view_row = (relative_y / line_height).floor() as usize;
+
+    // Map view_row → buffer line (fold-aware: skip hidden lines)
+    let line = view_row_to_buf_line(view, view.scroll_top, view_row, total_lines);
+
+    // Entire gutter is a click target for fold toggle
+    if x >= rect.x && x < rect.x + gutter_width && gutter_width > 0.0 {
+        engine.toggle_fold_at_line(line);
+        return;
+    }
 
     // Convert x coordinate to column using pixel-perfect Pango layout measurement
     let relative_x = x - (rect.x + gutter_width);

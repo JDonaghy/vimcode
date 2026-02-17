@@ -12,9 +12,11 @@
 // are expected for unused-in-this-binary items.
 #![allow(dead_code)]
 
+use crate::core::buffer::Buffer;
 use crate::core::buffer_manager::BufferState;
 use crate::core::engine::{Engine, SearchDirection};
 use crate::core::settings::LineNumberMode;
+use crate::core::view::View;
 use crate::core::{Cursor, Mode, WindowId, WindowRect};
 
 // ─── Color ───────────────────────────────────────────────────────────────────
@@ -98,6 +100,13 @@ pub struct RenderedLine {
     pub is_current_line: bool,
     /// Syntax-highlight + search-match spans (byte-offset based).
     pub spans: Vec<StyledSpan>,
+    /// True when this line is the header of a closed fold.
+    pub is_fold_header: bool,
+    /// Number of lines hidden in the fold (0 when `is_fold_header` is false).
+    pub folded_line_count: usize,
+    /// The buffer line index this rendered row corresponds to.
+    /// Used by click handlers to map screen row → buffer line.
+    pub line_idx: usize,
 }
 
 // ─── Cursor ───────────────────────────────────────────────────────────────────
@@ -493,17 +502,23 @@ fn build_rendered_window(
     let total_lines = buffer.content.len_lines();
     let cursor_line = view.cursor.line;
 
-    // Gutter width in character columns
+    // Gutter width in character columns (always includes fold indicator column).
     let gutter_char_width =
         calculate_gutter_cols(engine.settings.line_numbers, total_lines, char_width);
 
-    // Build rendered lines
+    // Build rendered lines (fold-aware: skip hidden lines, jump over fold bodies)
     let mut lines = Vec::with_capacity(visible_lines);
-    for view_idx in 0..visible_lines {
-        let line_idx = scroll_top + view_idx;
-        if line_idx >= total_lines {
-            break;
+    let mut line_idx = scroll_top;
+    while lines.len() < visible_lines && line_idx < total_lines {
+        // Skip hidden lines (fold bodies).
+        if view.is_line_hidden(line_idx) {
+            line_idx += 1;
+            continue;
         }
+
+        let is_fold_header = view.fold_at(line_idx).is_some();
+        let folded_line_count = view.fold_at(line_idx).map(|f| f.end - f.start).unwrap_or(0);
+
         let line = buffer.content.line(line_idx);
         let line_str = line.to_string();
         let line_start_byte = buffer.content.line_to_byte(line_idx);
@@ -520,11 +535,13 @@ fn build_rendered_window(
             line_end_byte,
         );
 
-        let gutter_text = format_gutter(
+        let fold_char = fold_indicator_char(buffer, view, line_idx);
+        let gutter_text = format_gutter_with_fold(
             engine.settings.line_numbers,
             line_idx,
             cursor_line,
             gutter_char_width,
+            fold_char,
         );
 
         lines.push(RenderedLine {
@@ -532,29 +549,41 @@ fn build_rendered_window(
             gutter_text,
             is_current_line: line_idx == cursor_line,
             spans,
+            is_fold_header,
+            folded_line_count,
+            line_idx,
         });
+
+        // Jump past the fold body for fold headers.
+        if let Some(fold) = view.fold_at(line_idx) {
+            line_idx = fold.end + 1;
+        } else {
+            line_idx += 1;
+        }
     }
 
-    // Cursor (only if visible)
-    let cursor = if is_active
-        && view.cursor.line >= scroll_top
-        && view.cursor.line < scroll_top + visible_lines
-    {
-        let shape = if engine.pending_key == Some('r') {
-            CursorShape::Underline
-        } else {
-            match engine.mode {
-                Mode::Insert => CursorShape::Bar,
-                _ => CursorShape::Block,
-            }
-        };
-        Some((
-            CursorPos {
-                view_line: view.cursor.line - scroll_top,
-                col: view.cursor.col,
-            },
-            shape,
-        ))
+    // Cursor (only if visible) — find its index in the rendered lines array.
+    let cursor = if is_active {
+        lines
+            .iter()
+            .position(|l| l.is_current_line)
+            .map(|view_line| {
+                let shape = if engine.pending_key == Some('r') {
+                    CursorShape::Underline
+                } else {
+                    match engine.mode {
+                        Mode::Insert => CursorShape::Bar,
+                        _ => CursorShape::Block,
+                    }
+                };
+                (
+                    CursorPos {
+                        view_line,
+                        col: view.cursor.col,
+                    },
+                    shape,
+                )
+            })
     } else {
         None
     };
@@ -708,6 +737,82 @@ fn normalise_selection(a: Cursor, b: Cursor) -> (Cursor, Cursor) {
     }
 }
 
+/// Count leading whitespace of a buffer line (tabs = 4 spaces).
+fn line_indent_of(buffer: &Buffer, line_idx: usize) -> usize {
+    let line = buffer.content.line(line_idx);
+    let mut indent = 0usize;
+    for ch in line.chars() {
+        match ch {
+            ' ' => indent += 1,
+            '\t' => indent += 4,
+            _ => break,
+        }
+    }
+    indent
+}
+
+/// Determine the fold indicator character for a rendered line.
+/// `+` = closed fold header, `-` = open foldable region, ` ` = neither.
+///
+/// To avoid false positives (e.g. blank lines, function-call continuations),
+/// `-` is only shown when the current line is a **block opener**: non-blank
+/// and whose trimmed text ends with `{` or `:`.
+fn fold_indicator_char(buffer: &Buffer, view: &View, line_idx: usize) -> char {
+    // Closed fold header takes priority.
+    if view.fold_at(line_idx).is_some() {
+        return '+';
+    }
+    // Only show `-` for genuine block-opener lines.
+    let cur_line = buffer.content.line(line_idx);
+    let cur_text: String = cur_line.chars().collect();
+    let trimmed = cur_text
+        .trim_end_matches('\n')
+        .trim_end_matches('\r')
+        .trim();
+    if trimmed.is_empty() {
+        return ' ';
+    }
+    let is_block_opener = trimmed.ends_with('{') || trimmed.ends_with(':');
+    if !is_block_opener {
+        return ' ';
+    }
+    // Confirm the next non-blank line has greater indentation.
+    let total = buffer.content.len_lines();
+    if line_idx + 1 < total {
+        let next_line = buffer.content.line(line_idx + 1);
+        let next_text: String = next_line.chars().collect();
+        if !next_text.trim().is_empty()
+            && line_indent_of(buffer, line_idx + 1) > line_indent_of(buffer, line_idx)
+        {
+            return '-';
+        }
+    }
+    ' '
+}
+
+/// Compute the line-number text for a given mode/indices.
+fn gutter_num_text(mode: LineNumberMode, line_idx: usize, cursor_line: usize) -> Option<String> {
+    match mode {
+        LineNumberMode::None => None,
+        LineNumberMode::Absolute => Some((line_idx + 1).to_string()),
+        LineNumberMode::Relative => {
+            let dist = line_idx.abs_diff(cursor_line);
+            if dist == 0 {
+                Some((line_idx + 1).to_string())
+            } else {
+                Some(dist.to_string())
+            }
+        }
+        LineNumberMode::Hybrid => {
+            if line_idx == cursor_line {
+                Some((line_idx + 1).to_string())
+            } else {
+                Some(line_idx.abs_diff(cursor_line).to_string())
+            }
+        }
+    }
+}
+
 /// Pre-format the gutter string for one line.
 /// Returns an empty string when line numbers are disabled.
 fn format_gutter(
@@ -719,24 +824,9 @@ fn format_gutter(
     if gutter_char_width == 0 {
         return String::new();
     }
-    let num_text = match mode {
-        LineNumberMode::None => return String::new(),
-        LineNumberMode::Absolute => (line_idx + 1).to_string(),
-        LineNumberMode::Relative => {
-            let dist = line_idx.abs_diff(cursor_line);
-            if dist == 0 {
-                (line_idx + 1).to_string()
-            } else {
-                dist.to_string()
-            }
-        }
-        LineNumberMode::Hybrid => {
-            if line_idx == cursor_line {
-                (line_idx + 1).to_string()
-            } else {
-                line_idx.abs_diff(cursor_line).to_string()
-            }
-        }
+    let num_text = match gutter_num_text(mode, line_idx, cursor_line) {
+        Some(t) => t,
+        None => return String::new(),
     };
     // Right-align within gutter_char_width - 1 (leave one char gap on the right)
     format!(
@@ -746,21 +836,59 @@ fn format_gutter(
     )
 }
 
+/// Pre-format the gutter string with a fold indicator prefix.
+///
+/// Layout: `[fold_char][number right-aligned in gutter_char_width-2 cols]`
+/// where the trailing column is the gap before code starts.
+/// `fold_char` is `+` (closed fold), `-` (open foldable region), or ` `.
+/// When `gutter_char_width == 1` (fold indicator only, no line numbers),
+/// returns just the single fold character.
+fn format_gutter_with_fold(
+    mode: LineNumberMode,
+    line_idx: usize,
+    cursor_line: usize,
+    gutter_char_width: usize,
+    fold_char: char,
+) -> String {
+    if gutter_char_width == 0 {
+        return String::new();
+    }
+    // Fold indicator only (line numbers disabled).
+    if gutter_char_width == 1 {
+        return fold_char.to_string();
+    }
+    let num_text = match gutter_num_text(mode, line_idx, cursor_line) {
+        Some(t) => t,
+        // Line numbers disabled but fold col is still present.
+        None => return fold_char.to_string(),
+    };
+    // Number is right-aligned in gutter_char_width - 2 (1 for fold indicator, 1 trailing gap)
+    let num_part = format!(
+        "{:>width$}",
+        num_text,
+        width = gutter_char_width.saturating_sub(2)
+    );
+    format!("{}{}", fold_char, num_part)
+}
+
 /// Calculate the gutter width in *character columns* (0 = no gutter).
 ///
+/// When line numbers are enabled the gutter always includes one extra column
+/// for the fold indicator (`+`, `-`, or space).
 /// The GTK backend multiplies this by `char_width` pixels to get the pixel
 /// gutter width; a TUI backend uses it directly as cell count.
 pub fn calculate_gutter_cols(mode: LineNumberMode, total_lines: usize, _char_width: f64) -> usize {
     match mode {
-        LineNumberMode::None => 0,
+        // No line numbers: show only the 1-column fold indicator.
+        LineNumberMode::None => 1,
         LineNumberMode::Absolute => {
             let digits = total_lines.to_string().len().max(1);
-            digits + 2 // one space padding each side
+            digits + 2 + 1 // digits + padding + fold indicator
         }
         LineNumberMode::Relative | LineNumberMode::Hybrid => {
             let max_relative = total_lines.saturating_sub(1);
             let digits = max_relative.to_string().len().max(3);
-            digits + 2
+            digits + 2 + 1
         }
     }
 }

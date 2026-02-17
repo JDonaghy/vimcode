@@ -39,6 +39,14 @@ pub struct SessionState {
     /// Saved cursor/scroll positions per file (keyed by canonical path)
     #[serde(default)]
     pub file_positions: HashMap<PathBuf, FilePosition>,
+
+    /// All files that were open when the session was last saved (for restore on startup)
+    #[serde(default)]
+    pub open_files: Vec<PathBuf>,
+
+    /// The active (focused) file when the session was last saved
+    #[serde(default)]
+    pub active_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,6 +81,8 @@ impl Default for SessionState {
             sidebar_width: default_sidebar_width(),
             recent_files: Vec::new(),
             file_positions: HashMap::new(),
+            open_files: Vec::new(),
+            active_file: None,
         }
     }
 }

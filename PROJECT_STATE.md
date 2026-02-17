@@ -104,7 +104,7 @@ vimcode/
 │       ├── session.rs (~175 lines) — Session state persistence (sidebar_width added)
 │       ├── settings.rs (~190 lines) — JSON persistence, auto-init
 │       ├── window.rs, tab.rs, view.rs, cursor.rs, mode.rs, syntax.rs
-│       └── Tests: 346 passing (9 find/replace, 14 macro, 8 session, 4 reverse search, 7 replace char, 5 undo line, 8 case change, 6 marks, 5 incremental search, 12 syntax/language, 6 history search tests)
+│       └── Tests: 357 passing (9 find/replace, 14 macro, 8 session, 4 reverse search, 7 replace char, 5 undo line, 8 case change, 6 marks, 5 incremental search, 12 syntax/language, 6 history search, 11 fold tests)
 └── Total: ~15,800 lines
 ```
 
@@ -150,8 +150,10 @@ cargo fmt
 - [x] **TUI sidebar with CRUD** — COMPLETE
 - [x] **Mouse support in TUI** — COMPLETE
 - [x] **Sidebar resize bar (GTK + TUI)** — COMPLETE
+- [x] **Code Folding (za/zo/zc/zR)** — COMPLETE
 
 ## Recent Work
+**Session 31:** Code Folding complete — indentation-based manual folding with `za` (toggle), `zo` (open), `zc` (close), `zR` (open all); fold state stored in `View` (per-window); `move_down`/`move_up` skip hidden lines; `▶` gutter indicator for closed fold headers; fold-aware rendering in both GTK + TUI backends via `render.rs` (346→357 tests, 11 new fold tests).
 **Session 30:** Nerd Font Icons + TUI Sidebar + Mouse + Resize complete — `src/icons.rs` shared icon module; GTK activity bar, toolbar, and file tree all use Nerd Font glyphs; TUI sidebar with full file explorer (j/k/l/h/Enter, CRUD via a/A/D/R, Ctrl-B toggle, Ctrl-Shift-E focus); TUI activity bar (Explorer/Settings panels); drag-to-resize sidebar in GTK (GestureDrag, saved to session) and TUI (mouse drag + Alt+Left/Alt+Right); full TUI mouse support: click-to-position, scroll wheel, scrollbar click-to-jump; per-window `█`/`░` scrollbars in TUI (346 tests, no change).
 **Session 29:** TUI backend (Stage 2) + rendering abstraction — `src/render.rs` ScreenLayout bridge; ratatui/crossterm TUI entry point; cursor shapes (bar insert, underline replace-r); Ctrl key combos; viewport sync (346 tests, no change).
 **Session 28:** Ctrl-R Command History Search complete — reverse incremental search through command history in command mode; Ctrl-R activates, typing narrows matches, Ctrl-R again cycles to older entries, Escape/Ctrl-G cancels, Enter executes (340→346 tests, 6 new tests).

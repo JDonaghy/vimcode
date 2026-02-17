@@ -183,6 +183,8 @@ pub fn run(file_path: Option<PathBuf>) {
         if let Err(e) = engine.open_file_with_mode(&path, OpenMode::Permanent) {
             eprintln!("vimcode: {}", e);
         }
+    } else {
+        engine.restore_session_files();
     }
 
     enable_raw_mode().expect("enable raw mode");
@@ -672,13 +674,25 @@ fn handle_mouse(
                     return sidebar_width;
                 }
 
-                // Text area click
+                // Check gutter area
                 let gutter = rw.gutter_char_width as u16;
-                if rel_col < wx + gutter {
-                    return sidebar_width; // gutter click — ignore
+                let view_row = (editor_row - wy) as usize;
+                if gutter > 0 && rel_col >= wx && rel_col < wx + gutter {
+                    // Any click in gutter toggles fold if there's a fold indicator
+                    if let Some(rl) = rw.lines.get(view_row) {
+                        let fc = rl.gutter_text.chars().next().unwrap_or(' ');
+                        if fc == '+' || fc == '-' {
+                            engine.toggle_fold_at_line(rl.line_idx);
+                        }
+                    }
+                    return sidebar_width;
                 }
-                let view_line = (editor_row - wy) as usize;
-                let buf_line = rw.scroll_top + view_line;
+                // Text area click — fold-aware row → buffer line mapping
+                let buf_line = rw
+                    .lines
+                    .get(view_row)
+                    .map(|l| l.line_idx)
+                    .unwrap_or_else(|| rw.scroll_top + view_row);
                 let col_in_text = (rel_col - wx - gutter) as usize + rw.scroll_left;
                 engine.set_cursor_for_window(rw.window_id, buf_line, col_in_text);
                 return sidebar_width;
@@ -1709,6 +1723,7 @@ fn save_session(engine: &mut Engine) {
             view.scroll_top,
         );
     }
+    engine.collect_session_open_files();
     let _ = engine.session.save();
 }
 
