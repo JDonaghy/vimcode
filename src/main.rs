@@ -632,7 +632,12 @@ impl SimpleComponent for App {
                 Ok(monitor) => {
                     let sender_for_monitor = sender.input_sender().clone();
                     monitor.connect_changed(move |_, _, _, event| {
-                        if event == gio::FileMonitorEvent::Changed {
+                        // ChangesDoneHint fires once after the write completes, avoiding
+                        // multiple events during a single save. Fall back to Changed on
+                        // filesystems that don't emit ChangesDoneHint.
+                        if event == gio::FileMonitorEvent::ChangesDoneHint
+                            || event == gio::FileMonitorEvent::Changed
+                        {
                             sender_for_monitor.send(Msg::SettingsFileChanged).ok();
                         }
                     });
@@ -1162,19 +1167,21 @@ impl SimpleComponent for App {
                 self.redraw = !self.redraw;
             }
             Msg::SettingsFileChanged => {
-                // Reload settings from disk
-                let new_settings = core::settings::Settings::load();
+                // Use load_with_validation (not load) to avoid writing back to the file,
+                // which would trigger the watcher again and cause an infinite reload loop.
+                // Silently ignore errors — the file may be mid-write.
+                if let Ok(new_settings) = core::settings::Settings::load_with_validation() {
+                    let mut engine = self.engine.borrow_mut();
+                    engine.settings = new_settings;
+                    engine.message = "Settings reloaded".to_string();
+                    drop(engine);
 
-                let mut engine = self.engine.borrow_mut();
-                engine.settings = new_settings;
-                engine.message = "Settings reloaded".to_string();
-                drop(engine);
-
-                // Force redraw to apply new font/line number settings
-                if let Some(drawing_area) = self.drawing_area.borrow().as_ref() {
-                    drawing_area.queue_draw();
+                    // Force redraw to apply new font/line number settings
+                    if let Some(drawing_area) = self.drawing_area.borrow().as_ref() {
+                        drawing_area.queue_draw();
+                    }
+                    self.redraw = !self.redraw;
                 }
-                self.redraw = !self.redraw;
             }
             Msg::ToggleFindDialog => {
                 self.find_dialog_visible = !self.find_dialog_visible;
