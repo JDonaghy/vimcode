@@ -95,7 +95,12 @@ impl Settings {
             }
             Err(e) => {
                 eprintln!("Warning: {}. Using defaults.", e);
-                Settings::default()
+                let defaults = Settings::default();
+                // Repair empty/corrupt file by writing defaults
+                if let Err(save_err) = defaults.save() {
+                    eprintln!("Warning: Failed to write default settings: {}", save_err);
+                }
+                defaults
             }
         }
     }
