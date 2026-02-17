@@ -179,6 +179,15 @@ pub struct Engine {
     /// Temporary buffer for current typing when cycling history
     pub command_typing_buffer: String,
 
+    /// Whether Ctrl-R reverse history search is active
+    pub history_search_active: bool,
+
+    /// The search string typed during Ctrl-R history search
+    pub history_search_query: String,
+
+    /// The index into command history where the current match was found
+    pub history_search_index: Option<usize>,
+
     /// Current position in search history
     pub search_history_index: Option<usize>,
 
@@ -249,6 +258,9 @@ impl Engine {
             session: SessionState::load(),
             command_history_index: None,
             command_typing_buffer: String::new(),
+            history_search_active: false,
+            history_search_query: String::new(),
+            history_search_index: None,
             search_history_index: None,
             search_typing_buffer: String::new(),
             macro_recording: None,
@@ -1129,7 +1141,7 @@ impl Engine {
                 self.handle_insert_key(key_name, unicode, &mut changed);
             }
             Mode::Command => {
-                action = self.handle_command_key(key_name, unicode);
+                action = self.handle_command_key(key_name, unicode, ctrl);
             }
             Mode::Search => {
                 self.handle_search_key(key_name, unicode);
@@ -2455,37 +2467,80 @@ impl Engine {
         }
     }
 
-    fn handle_command_key(&mut self, key_name: &str, unicode: Option<char>) -> EngineAction {
+    fn handle_command_key(
+        &mut self,
+        key_name: &str,
+        unicode: Option<char>,
+        ctrl: bool,
+    ) -> EngineAction {
+        // --- Ctrl-R: activate / cycle reverse history search ---
+        if ctrl && key_name == "r" {
+            if self.session.command_history.is_empty() {
+                return EngineAction::None;
+            }
+            if !self.history_search_active {
+                // Enter history search: save current command buffer
+                self.history_search_active = true;
+                self.history_search_query = String::new();
+                self.history_search_index = None;
+                self.command_typing_buffer = self.command_buffer.clone();
+            }
+            // Find next (older) match from current index
+            self.history_search_step(true);
+            return EngineAction::None;
+        }
+
+        // --- Ctrl-G: cancel history search ---
+        if ctrl && key_name == "g" && self.history_search_active {
+            self.history_search_active = false;
+            self.history_search_query.clear();
+            self.history_search_index = None;
+            self.command_buffer = self.command_typing_buffer.clone();
+            self.command_typing_buffer.clear();
+            return EngineAction::None;
+        }
+
         match key_name {
             "Escape" => {
-                self.mode = Mode::Normal;
-                self.command_buffer.clear();
-                self.command_history_index = None;
-                self.command_typing_buffer.clear();
+                if self.history_search_active {
+                    // Cancel history search, restore original buffer
+                    self.history_search_active = false;
+                    self.history_search_query.clear();
+                    self.history_search_index = None;
+                    self.command_buffer = self.command_typing_buffer.clone();
+                    self.command_typing_buffer.clear();
+                } else {
+                    self.mode = Mode::Normal;
+                    self.command_buffer.clear();
+                    self.command_history_index = None;
+                    self.command_typing_buffer.clear();
+                }
                 EngineAction::None
             }
             "Return" => {
                 self.mode = Mode::Normal;
+                // If in history search, the matched command is already in command_buffer
+                self.history_search_active = false;
+                self.history_search_query.clear();
+                self.history_search_index = None;
+
                 let cmd = self.command_buffer.clone();
                 self.command_buffer.clear();
-
-                // Add to history
                 self.session.add_command(&cmd);
                 self.command_history_index = None;
                 self.command_typing_buffer.clear();
-
-                // Save session state
                 let _ = self.session.save();
-
                 self.execute_command(&cmd)
             }
             "Up" => {
-                // Cycle to previous command
+                // Exit history search first
+                self.history_search_active = false;
+                self.history_search_query.clear();
+                self.history_search_index = None;
+
                 if self.session.command_history.is_empty() {
                     return EngineAction::None;
                 }
-
-                // First Up press: save current typing
                 if self.command_history_index.is_none() {
                     self.command_typing_buffer = self.command_buffer.clone();
                     self.command_history_index = Some(self.session.command_history.len() - 1);
@@ -2494,25 +2549,24 @@ impl Engine {
                         self.command_history_index = Some(idx - 1);
                     }
                 }
-
-                // Load history entry
                 if let Some(idx) = self.command_history_index {
                     if let Some(cmd) = self.session.command_history.get(idx) {
                         self.command_buffer = cmd.clone();
                     }
                 }
-
                 EngineAction::None
             }
             "Down" => {
-                // Cycle to next command (or back to typing buffer)
+                // Exit history search first
+                self.history_search_active = false;
+                self.history_search_query.clear();
+                self.history_search_index = None;
+
                 if self.command_history_index.is_none() {
                     return EngineAction::None;
                 }
-
                 let idx = self.command_history_index.unwrap();
                 if idx + 1 >= self.session.command_history.len() {
-                    // Reached end, restore typing buffer
                     self.command_buffer = self.command_typing_buffer.clone();
                     self.command_history_index = None;
                 } else {
@@ -2521,52 +2575,105 @@ impl Engine {
                         self.command_buffer = cmd.clone();
                     }
                 }
-
                 EngineAction::None
             }
             "Tab" => {
-                // Command auto-completion
-                let completions = self.complete_command(&self.command_buffer);
+                // Exit history search, then complete
+                self.history_search_active = false;
+                self.history_search_query.clear();
+                self.history_search_index = None;
 
+                let completions = self.complete_command(&self.command_buffer);
                 if completions.is_empty() {
-                    // No completions
                     return EngineAction::None;
                 } else if completions.len() == 1 {
-                    // Single completion: auto-fill
                     self.command_buffer = completions[0].clone();
                 } else {
-                    // Multiple completions: complete common prefix
                     let common = Self::find_common_prefix(&completions);
                     if common.len() > self.command_buffer.len() {
                         self.command_buffer = common;
                     } else {
-                        // Show completions in message line
                         self.message = format!("Completions: {}", completions.join(", "));
                     }
                 }
-
                 EngineAction::None
             }
             "BackSpace" => {
-                // Reset history navigation when editing
-                self.command_history_index = None;
-                self.command_typing_buffer.clear();
-
-                self.command_buffer.pop();
-                if self.command_buffer.is_empty() {
-                    self.mode = Mode::Normal;
+                if self.history_search_active {
+                    // Remove last char from search query and re-search
+                    self.history_search_query.pop();
+                    self.history_search_index = None; // restart from most recent
+                    self.history_search_step(false);
+                } else {
+                    self.command_history_index = None;
+                    self.command_typing_buffer.clear();
+                    self.command_buffer.pop();
+                    if self.command_buffer.is_empty() {
+                        self.mode = Mode::Normal;
+                    }
                 }
                 EngineAction::None
             }
             _ => {
-                // Reset history navigation when typing
-                self.command_history_index = None;
-                self.command_typing_buffer.clear();
-
-                if let Some(ch) = unicode {
-                    self.command_buffer.push(ch);
+                if self.history_search_active {
+                    // Append char to search query and find match
+                    if let Some(ch) = unicode {
+                        if !ch.is_control() {
+                            self.history_search_query.push(ch);
+                            self.history_search_index = None; // restart from most recent
+                            self.history_search_step(false);
+                        }
+                    }
+                } else {
+                    self.command_history_index = None;
+                    self.command_typing_buffer.clear();
+                    if let Some(ch) = unicode {
+                        self.command_buffer.push(ch);
+                    }
                 }
                 EngineAction::None
+            }
+        }
+    }
+
+    /// Find a history match for the current `history_search_query`.
+    /// If `next` is true, start searching one step older than `history_search_index`.
+    /// Updates `command_buffer` with the match, or shows "no match" message.
+    fn history_search_step(&mut self, next: bool) {
+        let query = self.history_search_query.clone();
+        let history = &self.session.command_history;
+        if history.is_empty() {
+            return;
+        }
+
+        // Determine start index: search from end (most recent) backwards
+        let start = if next {
+            // Step one older than current match
+            match self.history_search_index {
+                Some(0) => {
+                    self.message = "(reverse-i-search): no more matches".to_string();
+                    return;
+                }
+                Some(idx) => idx - 1,
+                None => history.len() - 1,
+            }
+        } else {
+            history.len() - 1
+        };
+
+        // Search backwards from start
+        let found = (0..=start)
+            .rev()
+            .find(|&i| history[i].contains(query.as_str()));
+
+        match found {
+            Some(idx) => {
+                self.history_search_index = Some(idx);
+                self.command_buffer = history[idx].clone();
+                self.message.clear();
+            }
+            None => {
+                self.message = format!("(reverse-i-search): no match for '{}'", query);
             }
         }
     }
@@ -5652,6 +5759,122 @@ mod tests {
         let mut engine = Engine::new();
         type_command(&mut engine, "notacommand");
         assert!(engine.message.contains("Not an editor command"));
+    }
+
+    #[test]
+    fn test_history_search_basic() {
+        let mut engine = Engine::new();
+        engine.session.add_command("write");
+        engine.session.add_command("quit");
+        engine.session.add_command("wall");
+
+        // Enter command mode, then Ctrl-R
+        press_char(&mut engine, ':');
+        press_ctrl(&mut engine, 'r');
+
+        assert!(engine.history_search_active);
+        // Most recent match with empty query: "wall"
+        assert_eq!(engine.command_buffer, "wall");
+    }
+
+    #[test]
+    fn test_history_search_typing_filters() {
+        let mut engine = Engine::new();
+        engine.session.add_command("write");
+        engine.session.add_command("quit");
+        engine.session.add_command("wall");
+
+        press_char(&mut engine, ':');
+        press_ctrl(&mut engine, 'r');
+
+        // Type "w" - should match most recent command containing "w": "wall"
+        engine.handle_key("w", Some('w'), false);
+        assert_eq!(engine.history_search_query, "w");
+        assert_eq!(engine.command_buffer, "wall");
+
+        // Type "r" -> "wr" - should match "write"
+        engine.handle_key("r", Some('r'), false);
+        assert_eq!(engine.history_search_query, "wr");
+        assert_eq!(engine.command_buffer, "write");
+    }
+
+    #[test]
+    fn test_history_search_ctrl_r_cycles() {
+        let mut engine = Engine::new();
+        engine.session.add_command("write");
+        engine.session.add_command("wquit");
+        engine.session.add_command("wall");
+
+        press_char(&mut engine, ':');
+        press_ctrl(&mut engine, 'r');
+        engine.handle_key("w", Some('w'), false);
+
+        // First match: "wall" (most recent with "w")
+        assert_eq!(engine.command_buffer, "wall");
+
+        // Ctrl-R again: next older match "wquit"
+        press_ctrl(&mut engine, 'r');
+        assert_eq!(engine.command_buffer, "wquit");
+
+        // Ctrl-R again: next older match "write"
+        press_ctrl(&mut engine, 'r');
+        assert_eq!(engine.command_buffer, "write");
+    }
+
+    #[test]
+    fn test_history_search_escape_cancels() {
+        let mut engine = Engine::new();
+        engine.session.add_command("write");
+        engine.session.add_command("quit");
+
+        press_char(&mut engine, ':');
+        engine.handle_key("w", Some('w'), false); // type "w" normally
+        press_ctrl(&mut engine, 'r');
+
+        assert!(engine.history_search_active);
+
+        // Escape should cancel and restore original buffer ("w")
+        press_special(&mut engine, "Escape");
+        assert!(!engine.history_search_active);
+        assert_eq!(engine.command_buffer, "w");
+        // Mode is still Command (Escape from search returns to command line)
+        assert_eq!(engine.mode, Mode::Command);
+    }
+
+    #[test]
+    fn test_history_search_enter_accepts() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello\nworld\nfoo");
+        engine.session.add_command("3");
+
+        press_char(&mut engine, ':');
+        press_ctrl(&mut engine, 'r');
+
+        // Found "3" (only history entry)
+        assert_eq!(engine.command_buffer, "3");
+
+        // Enter executes it
+        press_special(&mut engine, "Return");
+        assert!(!engine.history_search_active);
+        assert_eq!(engine.mode, Mode::Normal);
+        assert_eq!(engine.view().cursor.line, 2); // jumped to line 3
+    }
+
+    #[test]
+    fn test_history_search_backspace_narrows() {
+        let mut engine = Engine::new();
+        engine.session.add_command("write");
+        engine.session.add_command("wall");
+
+        press_char(&mut engine, ':');
+        press_ctrl(&mut engine, 'r');
+        engine.handle_key("r", Some('r'), false); // query = "r", matches "write"
+        assert_eq!(engine.command_buffer, "write");
+
+        // Backspace removes "r" -> query = "", matches "wall" (most recent)
+        press_special(&mut engine, "BackSpace");
+        assert_eq!(engine.history_search_query, "");
+        assert_eq!(engine.command_buffer, "wall");
     }
 
     #[test]

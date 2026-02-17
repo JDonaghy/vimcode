@@ -2308,6 +2308,10 @@ fn draw_command_line(
     cr.fill().unwrap();
 
     let cmd_text = match engine.mode {
+        Mode::Command if engine.history_search_active => format!(
+            "(reverse-i-search)'{}': {}",
+            engine.history_search_query, engine.command_buffer
+        ),
         Mode::Command => format!(":{}", engine.command_buffer),
         Mode::Search => {
             let search_char = match engine.search_direction {
