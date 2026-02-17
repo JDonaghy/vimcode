@@ -18,6 +18,7 @@ use std::rc::Rc;
 
 mod core;
 mod render;
+mod tui_main;
 
 use core::engine::EngineAction;
 use core::settings::LineNumberMode;
@@ -2726,7 +2727,19 @@ fn find_tree_path_for_file(
 fn main() {
     // Parse CLI args to get optional file path
     let args: Vec<String> = std::env::args().collect();
-    let file_path = if args.len() > 1 {
+
+    // --tui flag: launch the terminal UI instead of GTK
+    if args.iter().any(|a| a == "--tui") {
+        let file_path = args
+            .iter()
+            .skip(1)
+            .find(|a| !a.starts_with('-'))
+            .map(PathBuf::from);
+        tui_main::run(file_path);
+        return;
+    }
+
+    let file_path = if args.len() > 1 && !args[1].starts_with('-') {
         Some(PathBuf::from(&args[1]))
     } else {
         None
