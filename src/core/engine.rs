@@ -1264,6 +1264,13 @@ impl Engine {
             }
         }
 
+        // Handle pending multi-key sequences (gg, dd, Ctrl-W x, gt, r, f, t, m, etc.)
+        // MUST come before count accumulation: pending keys like 'r' expect the next
+        // character verbatim, including digits (e.g. r1 replaces with '1', not a count).
+        if let Some(pending) = self.pending_key.take() {
+            return self.handle_pending_key(pending, key_name, unicode, changed);
+        }
+
         // Handle count accumulation (digits 1-9, and 0 when count already exists)
         if let Some(ch) = unicode {
             match ch {
@@ -1294,11 +1301,6 @@ impl Engine {
                 }
                 _ => {}
             }
-        }
-
-        // Handle pending multi-key sequences (gg, dd, Ctrl-W x, gt)
-        if let Some(pending) = self.pending_key.take() {
-            return self.handle_pending_key(pending, key_name, unicode, changed);
         }
 
         // Handle pending operator + motion (dw, cw, etc.)
@@ -6958,6 +6960,19 @@ mod tests {
         press_char(&mut engine, ' ');
 
         assert_eq!(engine.buffer().to_string(), " ello");
+    }
+
+    #[test]
+    fn test_replace_char_with_digit() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello");
+
+        // r followed by a digit should replace with that digit, not treat it as count
+        press_char(&mut engine, 'r');
+        press_char(&mut engine, '1');
+
+        assert_eq!(engine.buffer().to_string(), "1ello");
+        assert_eq!(engine.view().cursor.col, 0);
     }
 
     #[test]
