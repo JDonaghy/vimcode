@@ -2,6 +2,22 @@
 
 ## Recently Completed
 
+### ✅ Ctrl-R Reverse Command History Search (Session 28)
+- `Ctrl-R` in command mode activates incremental reverse history search
+- Status line shows `(reverse-i-search)'query': matched_command`
+- Typing narrows matches in real-time; `Ctrl-R` again cycles to older entries
+- `BackSpace` shrinks query and re-searches from most recent match
+- `Enter` accepts and executes the found command
+- `Escape` / `Ctrl-G` cancel and restore original command buffer
+- Tests: 340 → 346 passing (6 new tests)
+
+### ✅ Cursor + Scroll Position Persistence (Session 27)
+- Reopening a file restores exact cursor line/col and scroll position
+- Positions saved on buffer switch and at quit (`:q`, `:wq`, window close)
+- Fixed settings file watcher feedback loop freeze
+- Fixed `r` + digit bug (pending key check now before count accumulation)
+- Tests: 336 → 340 passing (3 new session tests)
+
 ### ✅ Multi-Language Syntax Highlighting (Session 26)
 - Added Python, JavaScript, Go, and C++ syntax highlighting via Tree-sitter
 - Language auto-detected from file extension (.py, .js/.jsx/.mjs/.cjs, .go, .cpp/.cc/.cxx/.h/.hpp etc)
@@ -92,7 +108,7 @@
 - [ ] Window position (x, y) persistence - requires platform-specific code
 - [x] ~~Cursor position persistence per file~~ - COMPLETE
 - [x] ~~Scroll position persistence per file~~ - COMPLETE
-- [ ] Command history search (Ctrl-R style reverse search)
+- [x] ~~Command history search (Ctrl-R style reverse search)~~ - COMPLETE
 - [ ] Regex-based command completion
 - [ ] Multi-session support (save/restore named sessions)
 

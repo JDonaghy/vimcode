@@ -4,7 +4,7 @@
 
 ## Status
 
-**Cursor/Scroll Position Persistence COMPLETE:** Reopening a file restores where you were (340 tests passing)
+**Ctrl-R History Search COMPLETE:** Reverse incremental command history search in command mode (346 tests passing)
 
 ### Core Vim (Complete)
 - Seven modes (Normal/Insert/Visual/Visual Line/Visual Block/Command/Search)
@@ -39,9 +39,11 @@
 - **Session Persistence:**
   - Command history (Up/Down arrows, max 100, persisted)
   - Search history (Up/Down arrows, max 100, persisted)
+  - **Ctrl-R reverse history search** in command mode (incremental, cycles through matches)
   - Tab auto-completion in command mode
   - Window geometry persistence (size restored on startup)
   - Explorer visibility state (persisted across sessions)
+  - Cursor + scroll position per file (restored on reopen)
   - Session state at `~/.config/vimcode/session.json`
 - Buffers (:bn/:bp/:b#/:ls/:bd)
 - Windows (:split/:vsplit, Ctrl-W)
@@ -80,16 +82,16 @@
 ```
 vimcode/
 ├── src/
-│   ├── main.rs (~2400 lines) — GTK4/Relm4 UI, rendering, find dialog
-│   └── core/ (~10,100 lines) — Platform-agnostic logic
-│       ├── engine.rs (~10,100 lines) — Orchestrates everything, find/replace, macros, history
+│   ├── main.rs (~2960 lines) — GTK4/Relm4 UI, rendering, find dialog
+│   └── core/ (~11,400 lines) — Platform-agnostic logic
+│       ├── engine.rs (~11,400 lines) — Orchestrates everything, find/replace, macros, history
 │       ├── buffer_manager.rs (~600 lines) — Buffer lifecycle
 │       ├── buffer.rs (~120 lines) — Rope-based storage
 │       ├── session.rs (~170 lines) — Session state persistence (NEW)
 │       ├── settings.rs (~190 lines) — JSON persistence, auto-init
 │       ├── window.rs, tab.rs, view.rs, cursor.rs, mode.rs, syntax.rs
-│       └── Tests: 340 passing (9 find/replace, 14 macro, 8 session, 4 reverse search, 7 replace char, 5 undo line, 8 case change, 6 marks, 5 incremental search, 12 syntax/language tests)
-└── Total: ~12,200 lines
+│       └── Tests: 346 passing (9 find/replace, 14 macro, 8 session, 4 reverse search, 7 replace char, 5 undo line, 8 case change, 6 marks, 5 incremental search, 12 syntax/language, 6 history search tests)
+└── Total: ~14,400 lines
 ```
 
 ## Architecture
@@ -111,7 +113,7 @@ vimcode/
 ```bash
 cargo build
 cargo run -- <file>
-cargo test    # 324 tests
+cargo test    # 346 tests
 cargo clippy -- -D warnings
 cargo fmt
 ```
@@ -130,6 +132,7 @@ cargo fmt
 - [x] **More grammars (Python/JS/Go/C++)** — COMPLETE
 
 ## Recent Work
+**Session 28:** Ctrl-R Command History Search complete — reverse incremental search through command history in command mode; Ctrl-R activates, typing narrows matches, Ctrl-R again cycles to older entries, Escape/Ctrl-G cancels, Enter executes (340→346 tests, 6 new tests).
 **Session 27:** Cursor + Scroll Position Persistence complete — reopening a file restores exact cursor line/col and scroll position; positions saved on buffer switch and at quit; also fixed settings file watcher feedback loop freeze and `r` + digit bug (pending key check now runs before count accumulation) (336→340 tests, 3 new session tests).
 **Session 26:** Multi-Language Syntax Highlighting complete — Python, JavaScript, Go, C++ support via Tree-sitter. Language auto-detected from file extension. New `SyntaxLanguage` enum, `Syntax::new_from_path()` constructor, buffers now get correct highlighting when opened (324→336 tests, 12 new tests).
 **Session 25:** Marks + Incremental Search + Visual Mode Case Change complete — `m{a-z}` to set marks, `'` and `` ` `` to jump to marks; real-time incremental search as you type with Escape to cancel; `u`/`U` commands in visual mode for case transformation (313→324 tests, 6 marks + 5 incremental search + 8 case change tests).
