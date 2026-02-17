@@ -1311,13 +1311,28 @@ impl SimpleComponent for App {
                 // Window geometry is saved on close instead
             }
             Msg::WindowClosing { width, height } => {
-                // Save window geometry and session state on close
                 let mut engine = self.engine.borrow_mut();
                 engine.session.window.width = width;
                 engine.session.window.height = height;
                 engine.session.explorer_visible = self.sidebar_visible;
 
-                // Save session state
+                // Save cursor/scroll position for the active file
+                let buffer_id = engine.active_buffer_id();
+                if let Some(path) = engine
+                    .buffer_manager
+                    .get(buffer_id)
+                    .and_then(|s| s.file_path.as_deref())
+                    .map(|p| p.to_path_buf())
+                {
+                    let view = engine.active_window().view.clone();
+                    engine.session.save_file_position(
+                        &path,
+                        view.cursor.line,
+                        view.cursor.col,
+                        view.scroll_top,
+                    );
+                }
+
                 let _ = engine.session.save();
             }
         }
