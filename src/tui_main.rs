@@ -74,6 +74,15 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
     let theme = Theme::onedark();
 
     loop {
+        // Sync viewport dimensions so ensure_cursor_visible uses real terminal size.
+        if let Ok(size) = terminal.size() {
+            let content_rows = size.height.saturating_sub(3); // tab + status + cmd rows
+            let gutter_approx = 4u16;
+            let content_cols = size.width.saturating_sub(gutter_approx);
+            engine.set_viewport_lines(content_rows.max(1) as usize);
+            engine.set_viewport_cols(content_cols.max(1) as usize);
+        }
+
         terminal
             .draw(|frame| {
                 let area = frame.size();
