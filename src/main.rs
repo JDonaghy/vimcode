@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 mod core;
+mod icons;
 mod render;
 mod tui_main;
 
@@ -49,6 +50,7 @@ struct App {
     tree_has_focus: bool,
     file_tree_view: Rc<RefCell<Option<gtk4::TreeView>>>,
     drawing_area: Rc<RefCell<Option<gtk4::DrawingArea>>>,
+    sidebar_inner_box: Rc<RefCell<Option<gtk4::Box>>>,
     // Per-window scrollbars and indicators
     window_scrollbars: Rc<RefCell<HashMap<core::WindowId, WindowScrollbars>>>,
     overlay: Rc<RefCell<Option<gtk4::Overlay>>>,
@@ -148,6 +150,8 @@ enum Msg {
     WindowResized { width: i32, height: i32 },
     /// Window closing (save session state).
     WindowClosing { width: i32, height: i32 },
+    /// Sidebar was resized via drag handle — save new width.
+    SidebarResized,
 }
 
 #[relm4::component]
@@ -182,7 +186,7 @@ impl SimpleComponent for App {
 
                     #[name = "explorer_button"]
                     gtk4::Button {
-                        set_label: "📁",
+                        set_label: "\u{f07c}",
                         set_tooltip_text: Some("Explorer (Ctrl+Shift+E)"),
                         set_width_request: 48,
                         set_height_request: 48,
@@ -200,7 +204,7 @@ impl SimpleComponent for App {
                     },
 
                     gtk4::Button {
-                        set_label: "🔍",
+                        set_label: "\u{f002}",
                         set_tooltip_text: Some("Search (disabled)"),
                         set_width_request: 48,
                         set_height_request: 48,
@@ -209,7 +213,7 @@ impl SimpleComponent for App {
                     },
 
                     gtk4::Button {
-                        set_label: "🌿",
+                        set_label: "\u{f418}",
                         set_tooltip_text: Some("Git (disabled)"),
                         set_width_request: 48,
                         set_height_request: 48,
@@ -222,7 +226,7 @@ impl SimpleComponent for App {
                     },
 
                     gtk4::Button {
-                        set_label: "⚙️",
+                        set_label: "\u{f013}",
                         set_tooltip_text: Some("Settings"),
                         set_width_request: 48,
                         set_height_request: 48,
@@ -245,6 +249,7 @@ impl SimpleComponent for App {
                     set_reveal_child: model.sidebar_visible,
 
                     // Container for both panels (Explorer and Settings)
+                    #[name = "sidebar_inner_box"]
                     gtk4::Box {
                         set_orientation: gtk4::Orientation::Vertical,
                         set_width_request: 300,
@@ -266,7 +271,7 @@ impl SimpleComponent for App {
                             set_css_classes: &["explorer-toolbar"],
 
                             gtk4::Button {
-                                set_label: "📄",
+                                set_label: "\u{f15b}",
                                 set_tooltip_text: Some("New File"),
                                 set_width_request: 32,
                                 set_height_request: 32,
@@ -287,7 +292,7 @@ impl SimpleComponent for App {
                             },
 
                             gtk4::Button {
-                                set_label: "📁",
+                                set_label: "\u{f07b}",
                                 set_tooltip_text: Some("New Folder"),
                                 set_width_request: 32,
                                 set_height_request: 32,
@@ -308,7 +313,7 @@ impl SimpleComponent for App {
                             },
 
                             gtk4::Button {
-                                set_label: "🗑️",
+                                set_label: "\u{f1f8}",
                                 set_tooltip_text: Some("Delete"),
                                 set_width_request: 32,
                                 set_height_request: 32,
@@ -327,7 +332,7 @@ impl SimpleComponent for App {
                             },
 
                             gtk4::Button {
-                                set_label: "🔄",
+                                set_label: "\u{f021}",
                                 set_tooltip_text: Some("Refresh"),
                                 set_width_request: 32,
                                 set_height_request: 32,
@@ -409,6 +414,29 @@ impl SimpleComponent for App {
                                 set_css_classes: &["dim-label"],
                             },
                         },
+                        },
+                    },
+                },
+
+                // Sidebar resize drag handle (6px wide, ew-resize cursor)
+                #[name = "sidebar_resize_handle"]
+                gtk4::Box {
+                    set_width_request: 6,
+                    set_css_classes: &["sidebar-resize-handle"],
+
+                    #[watch]
+                    set_visible: model.sidebar_visible,
+
+                    add_controller = gtk4::GestureDrag {
+                        connect_drag_update[sidebar_inner_box_ref] => move |_, dx, _| {
+                            if let Some(ref sb) = *sidebar_inner_box_ref.borrow() {
+                                let current = sb.width_request();
+                                let new_w = (current as f64 + dx).round() as i32;
+                                sb.set_width_request(new_w.clamp(100, 600));
+                            }
+                        },
+                        connect_drag_end[sender] => move |_, _, _| {
+                            sender.input(Msg::SidebarResized);
                         },
                     },
                 },
@@ -626,6 +654,7 @@ impl SimpleComponent for App {
         let drawing_area_ref = Rc::new(RefCell::new(None));
         let overlay_ref = Rc::new(RefCell::new(None));
         let window_scrollbars_ref = Rc::new(RefCell::new(HashMap::new()));
+        let sidebar_inner_box_ref: Rc<RefCell<Option<gtk4::Box>>> = Rc::new(RefCell::new(None));
 
         // Set up file watcher for settings.json
         let settings_path = std::env::var("HOME")
@@ -677,6 +706,7 @@ impl SimpleComponent for App {
             replace_text: String::new(),
             find_case_sensitive: false,
             find_whole_word: false,
+            sidebar_inner_box: sidebar_inner_box_ref.clone(),
         };
         let widgets = view_output!();
 
@@ -684,6 +714,18 @@ impl SimpleComponent for App {
         *file_tree_view_ref.borrow_mut() = Some(widgets.file_tree_view.clone());
         *drawing_area_ref.borrow_mut() = Some(widgets.drawing_area.clone());
         *overlay_ref.borrow_mut() = Some(widgets.editor_overlay.clone());
+        *sidebar_inner_box_ref.borrow_mut() = Some(widgets.sidebar_inner_box.clone());
+
+        // Restore saved sidebar width
+        {
+            let saved_width = engine.borrow().session.sidebar_width;
+            widgets.sidebar_inner_box.set_width_request(saved_width);
+        }
+
+        // Set ew-resize cursor on drag handle
+        widgets
+            .sidebar_resize_handle
+            .set_cursor_from_name(Some("ew-resize"));
 
         // Apply saved window geometry from session state
         {
@@ -699,12 +741,16 @@ impl SimpleComponent for App {
         // Debug: print entry count
         eprintln!("Tree entries: {}", tree_store.iter_n_children(None));
 
+        // Read font family for nerd font icon rendering
+        let nf_font = engine.borrow().settings.font_family.clone();
+
         // Setup TreeView columns
         // Single column with icon + filename (so they indent together)
         let col = gtk4::TreeViewColumn::new();
 
-        // Icon cell renderer (non-expanding)
+        // Icon cell renderer (non-expanding) — must use the nerd font for glyph support
         let icon_cell = gtk4::CellRendererText::new();
+        icon_cell.set_property("font", &nf_font);
         col.pack_start(&icon_cell, false);
         col.add_attribute(&icon_cell, "text", 0);
 
@@ -1316,11 +1362,22 @@ impl SimpleComponent for App {
                 // Note: We don't save on every resize event (too frequent)
                 // Window geometry is saved on close instead
             }
+            Msg::SidebarResized => {
+                if let Some(ref sb) = *self.sidebar_inner_box.borrow() {
+                    let w = sb.width_request();
+                    self.engine.borrow_mut().session.sidebar_width = w;
+                    let _ = self.engine.borrow().session.save();
+                }
+            }
             Msg::WindowClosing { width, height } => {
                 let mut engine = self.engine.borrow_mut();
                 engine.session.window.width = width;
                 engine.session.window.height = height;
                 engine.session.explorer_visible = self.sidebar_visible;
+                // Save sidebar width on close too
+                if let Some(ref sb) = *self.sidebar_inner_box.borrow() {
+                    engine.session.sidebar_width = sb.width_request();
+                }
 
                 // Save cursor/scroll position for the active file
                 let buffer_id = engine.active_buffer_id();
@@ -2613,7 +2670,12 @@ fn build_file_tree(store: &gtk4::TreeStore, parent: Option<&gtk4::TreeIter>, pat
         }
 
         let is_dir = path.is_dir();
-        let icon = if is_dir { "📁" } else { "📄" };
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let icon = if is_dir {
+            ""
+        } else {
+            crate::icons::file_icon(ext)
+        };
 
         let iter = store.insert_with_values(
             parent,
