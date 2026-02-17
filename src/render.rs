@@ -109,6 +109,8 @@ pub enum CursorShape {
     Block,
     /// Thin vertical bar (Insert mode).
     Bar,
+    /// Underline (pending replace-char `r` command).
+    Underline,
 }
 
 /// Cursor position within the visible window area.
@@ -538,9 +540,13 @@ fn build_rendered_window(
         && view.cursor.line >= scroll_top
         && view.cursor.line < scroll_top + visible_lines
     {
-        let shape = match engine.mode {
-            Mode::Insert => CursorShape::Bar,
-            _ => CursorShape::Block,
+        let shape = if engine.pending_key == Some('r') {
+            CursorShape::Underline
+        } else {
+            match engine.mode {
+                Mode::Insert => CursorShape::Bar,
+                _ => CursorShape::Block,
+            }
         };
         Some((
             CursorPos {

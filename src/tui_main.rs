@@ -17,6 +17,7 @@ use ratatui::crossterm::event::{
     self as ct_event, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
 };
 use ratatui::crossterm::execute;
+use ratatui::crossterm::cursor::SetCursorStyle;
 use ratatui::crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
@@ -25,7 +26,7 @@ use ratatui::style::{Color as RColor, Modifier};
 use ratatui::Terminal;
 
 use crate::core::engine::EngineAction;
-use crate::core::{Engine, OpenMode, WindowRect};
+use crate::core::{Engine, Mode, OpenMode, WindowRect};
 use crate::render::{
     self, build_screen_layout, Color, CursorShape, RenderedLine, RenderedWindow, SelectionKind,
     Theme,
@@ -90,6 +91,17 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                 draw_frame(frame, &screen, &theme);
             })
             .expect("draw frame");
+
+        // Set terminal cursor shape to match mode / pending key.
+        let cursor_style = if engine.pending_key == Some('r') {
+            SetCursorStyle::SteadyUnderScore
+        } else {
+            match engine.mode {
+                Mode::Insert => SetCursorStyle::BlinkingBar,
+                _ => SetCursorStyle::SteadyBlock,
+            }
+        };
+        let _ = execute!(terminal.backend_mut(), cursor_style);
 
         if !ct_event::poll(Duration::from_millis(20)).expect("poll") {
             continue;
@@ -335,7 +347,8 @@ fn render_window(frame: &mut ratatui::Frame, area: Rect, window: &RenderedWindow
                     cell.set_fg(old_bg).set_bg(old_fg);
                 }
             }
-            CursorShape::Bar => {
+            CursorShape::Bar | CursorShape::Underline => {
+                // Terminal cursor shape is set via SetCursorStyle in the event loop.
                 frame.set_cursor(cursor_screen_x, cursor_screen_y);
             }
         }

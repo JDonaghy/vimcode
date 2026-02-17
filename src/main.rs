@@ -1853,20 +1853,26 @@ fn draw_window(
             let cursor_y = rect.y + cursor_pos.view_line as f64 * line_height;
 
             let (cr_r, cr_g, cr_b) = theme.cursor.to_cairo();
+            let char_w = if char_w > 0.0 {
+                char_w
+            } else {
+                font_metrics.approximate_char_width() as f64 / pango::SCALE as f64
+            };
             match cursor_shape {
                 CursorShape::Block => {
                     cr.set_source_rgba(cr_r, cr_g, cr_b, theme.cursor_normal_alpha);
-                    let w = if char_w > 0.0 {
-                        char_w
-                    } else {
-                        font_metrics.approximate_char_width() as f64 / pango::SCALE as f64
-                    };
-                    cr.rectangle(cursor_x, cursor_y, w, line_height);
+                    cr.rectangle(cursor_x, cursor_y, char_w, line_height);
                     cr.fill().unwrap();
                 }
                 CursorShape::Bar => {
                     cr.set_source_rgb(cr_r, cr_g, cr_b);
                     cr.rectangle(cursor_x, cursor_y, 2.0, line_height);
+                    cr.fill().unwrap();
+                }
+                CursorShape::Underline => {
+                    cr.set_source_rgb(cr_r, cr_g, cr_b);
+                    let bar_h = (line_height * 0.12).max(2.0);
+                    cr.rectangle(cursor_x, cursor_y + line_height - bar_h, char_w, bar_h);
                     cr.fill().unwrap();
                 }
             }
