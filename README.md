@@ -12,19 +12,20 @@ High-performance Vim+VSCode hybrid editor in Rust. Modal editing meets modern UX
 
 ## Status
 
-**Session Persistence complete** — 284 tests passing, production-ready
+**336 tests passing** — Multi-language syntax highlighting complete
 
 ### Working Features
 
 **Vim Core:**
 - 7 modes (Normal/Insert/Visual/Visual Line/Visual Block/Command/Search)
 - Navigation (hjkl, w/b/e, {}, gg/G, f/F/t/T, %, 0/$, Ctrl-D/U/F/B)
-- Operators (d/c/y + motions, x/dd/D/s/S/C)
+- Operators (d/c/y + motions, x/dd/D/s/S/C, r for replace char)
 - Text objects (iw/aw, quotes, brackets)
-- Registers (unnamed + a-z), undo/redo, repeat (.)
+- Registers (unnamed + a-z), undo/redo (u/Ctrl-R), undo line (U), repeat (.)
 - Count prefix (5j, 3dd, 10yy)
-- Visual modes (v/V/Ctrl-V with y/d/c, rectangular block selections)
-- Search (/, n/N)
+- Visual modes (v/V/Ctrl-V with y/d/c/u/U, rectangular block, case change)
+- Search: `/` forward, `?` backward, `n`/`N` direction-aware, incremental (real-time)
+- **Marks:** `m{a-z}` set, `'{a-z}` jump to line, `` `{a-z} `` jump to position
 - **Macros:** Record (q), playback (@), repeat (@@), count prefix (5@a)
 - **Find/Replace:** Vim :s command + VSCode Ctrl-F dialog with undo support
 
@@ -43,11 +44,11 @@ High-performance Vim+VSCode hybrid editor in Rust. Modal editing meets modern UX
   - `:ls` shows [Preview]
 
 **UI:**
-- Syntax highlighting (Tree-sitter, Rust)
+- Syntax highlighting (Tree-sitter): **Rust, Python, JavaScript, Go, C++** — auto-detected by extension
 - Line numbers (absolute/relative/hybrid)
-- Tab bar, status lines, mouse click
+- Tab bar, status lines, mouse click, scrollbars
 
-**Settings:** `~/.config/vimcode/settings.json`, `:config reload`
+**Settings:** `~/.config/vimcode/settings.json`, `:config reload`, font family/size, incremental search toggle
 
 **Session Persistence:**
 - Command/search history (Up/Down arrows, Tab auto-complete)
@@ -83,11 +84,12 @@ High-performance Vim+VSCode hybrid editor in Rust. Modal editing meets modern UX
 - [x] Macros (q, @)
 - [x] :s substitute + Ctrl-F find/replace
 - [x] Session persistence (history, window geometry)
-
-**High Priority:**
-- [ ] Reverse search (?)
-- [ ] Marks (m, ')
-- [ ] Incremental search
+- [x] Reverse search (?)
+- [x] Replace character (r), undo line (U)
+- [x] Visual mode case change (u/U)
+- [x] Marks (m, ')
+- [x] Incremental search
+- [x] Multi-language syntax highlighting (Python/JS/Go/C++)
 
 **Future:**
 - [ ] VS Code keybinding mode
@@ -137,7 +139,7 @@ sudo pacman -S gtk4 pango
 ```bash
 cargo build
 cargo run -- <file>
-cargo test              # 284 tests
+cargo test              # 336 tests
 cargo clippy -- -D warnings
 cargo fmt
 ```
