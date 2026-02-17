@@ -585,7 +585,7 @@ impl Engine {
             && self
                 .buffer_manager
                 .get(buffer_id)
-                .map_or(false, |s| !s.preview);
+                .is_some_and(|s| !s.preview);
 
         // If buffer already exists as permanent, just switch to it
         if is_already_permanent && self.preview_buffer_id != Some(buffer_id) {
@@ -5190,7 +5190,7 @@ impl Engine {
 
         if to_replace > 0 && char_idx < self.buffer().len_chars() {
             // Build the replacement string
-            let replacement_str: String = std::iter::repeat(replacement).take(to_replace).collect();
+            let replacement_str: String = std::iter::repeat_n(replacement, to_replace).collect();
 
             // Delete the old characters and insert the new ones
             self.delete_with_undo(char_idx, char_idx + to_replace);

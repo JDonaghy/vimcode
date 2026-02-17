@@ -300,7 +300,7 @@ impl BufferState {
             || self
                 .current_undo_group
                 .as_ref()
-                .map_or(false, |g| !g.is_empty())
+                .is_some_and(|g| !g.is_empty())
     }
 
     /// Check if redo is available.

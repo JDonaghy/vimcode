@@ -1,6 +1,8 @@
 // TreeView/TreeStore are deprecated in GTK4 4.10+ but still functional
 // TODO: Migrate to ListView/ColumnView in a future phase
 #![allow(deprecated)]
+// Relm4 view! macro generates #[name = "..."] bindings that trigger this lint
+#![allow(unused_assignments)]
 
 use gio::prelude::{FileExt, FileMonitorExt};
 use gtk4::cairo::Context;
@@ -1821,11 +1823,7 @@ fn draw_window(
                 continue;
             }
 
-            let rel_start = if *start < line_start_byte {
-                0
-            } else {
-                *start - line_start_byte
-            };
+            let rel_start = (*start).saturating_sub(line_start_byte);
             let rel_end = if *end > line_end_byte {
                 line.len_bytes()
             } else {
