@@ -4,7 +4,7 @@
 
 ## Status
 
-**Incremental Search COMPLETE:** Real-time search as you type (324 tests passing)
+**Multi-Language Syntax Highlighting COMPLETE:** Python, JS, Go, C++ (336 tests passing)
 
 ### Core Vim (Complete)
 - Seven modes (Normal/Insert/Visual/Visual Line/Visual Block/Command/Search)
@@ -60,7 +60,7 @@
 - Error handling, name validation
 
 ### Rendering
-- Syntax highlighting (Tree-sitter, Rust)
+- Syntax highlighting (Tree-sitter, Rust/Python/JavaScript/Go/C++, auto-detected by extension)
 - **Line numbers (FIXED):** Absolute/relative/hybrid modes now render correctly with proper visibility
 - Tab bar, single global status line, command line
 - Mouse click positioning (pixel-perfect)
@@ -88,7 +88,7 @@ vimcode/
 │       ├── session.rs (~170 lines) — Session state persistence (NEW)
 │       ├── settings.rs (~190 lines) — JSON persistence, auto-init
 │       ├── window.rs, tab.rs, view.rs, cursor.rs, mode.rs, syntax.rs
-│       └── Tests: 324 passing (9 find/replace, 14 macro, 5 session, 4 reverse search, 7 replace char, 5 undo line, 8 case change, 6 marks, 5 incremental search tests)
+│       └── Tests: 336 passing (9 find/replace, 14 macro, 5 session, 4 reverse search, 7 replace char, 5 undo line, 8 case change, 6 marks, 5 incremental search, 12 syntax/language tests)
 └── Total: ~12,200 lines
 ```
 
@@ -127,9 +127,10 @@ cargo fmt
 - [x] **Visual mode case change (u/U)** — COMPLETE
 - [x] **Marks (m, ')** — COMPLETE
 - [x] **Incremental search** — COMPLETE
-- [ ] More grammars (Python/JS/Go/C++)
+- [x] **More grammars (Python/JS/Go/C++)** — COMPLETE
 
 ## Recent Work
+**Session 26:** Multi-Language Syntax Highlighting complete — Python, JavaScript, Go, C++ support via Tree-sitter. Language auto-detected from file extension. New `SyntaxLanguage` enum, `Syntax::new_from_path()` constructor, buffers now get correct highlighting when opened (324→336 tests, 12 new tests).
 **Session 25:** Marks + Incremental Search + Visual Mode Case Change complete — `m{a-z}` to set marks, `'` and `` ` `` to jump to marks; real-time incremental search as you type with Escape to cancel; `u`/`U` commands in visual mode for case transformation (313→324 tests, 6 marks + 5 incremental search + 8 case change tests).
 **Session 25 (earlier):** Visual Mode Case Change complete — `u`/`U` commands in visual mode (character, line, and block) for lowercase/uppercase transformation with proper undo/redo support (305→313 tests, 8 case change tests).
 **Session 24:** Reverse Search + Replace Character + Undo Line complete — `?` command for backward search with direction-aware `n`/`N` navigation; `r` command to replace character(s) with count/repeat support; `U` command to restore current line to original state (284→300 tests, 4 reverse search + 7 replace char + 5 undo line tests).

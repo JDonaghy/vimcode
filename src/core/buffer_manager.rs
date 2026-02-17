@@ -101,12 +101,15 @@ impl BufferState {
     }
 
     pub fn with_file(buffer: Buffer, path: PathBuf) -> Self {
+        // Try to detect language from file path, fallback to Rust
+        let syntax = Syntax::new_from_path(path.to_str()).unwrap_or_else(Syntax::new);
+
         let mut state = Self {
             buffer,
             file_path: Some(path),
             dirty: false,
             preview: false,
-            syntax: Syntax::new(),
+            syntax,
             highlights: Vec::new(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),

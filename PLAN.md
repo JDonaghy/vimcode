@@ -2,6 +2,15 @@
 
 ## Recently Completed
 
+### ✅ Multi-Language Syntax Highlighting (Session 26)
+- Added Python, JavaScript, Go, and C++ syntax highlighting via Tree-sitter
+- Language auto-detected from file extension (.py, .js/.jsx/.mjs/.cjs, .go, .cpp/.cc/.cxx/.h/.hpp etc)
+- New `SyntaxLanguage` enum with `from_path()` for extension detection
+- New `Syntax::new_from_path()` for automatic language selection
+- Buffers opened with `BufferState::with_file()` now auto-detect language
+- Files with unknown extension fall back to Rust highlighting
+- Tests: 324 → 336 passing (12 new tests: language detection + parser tests per language)
+
 ### ✅ Incremental Search (Session 25)
 - Real-time search as you type
 - Cursor jumps to matches immediately while typing
@@ -77,7 +86,7 @@
 - [x] ~~Visual mode case change (u/U in visual mode for lowercase/uppercase)~~ - COMPLETE
 - [x] ~~Marks (m, ')~~ - COMPLETE
 - [x] ~~Incremental search~~ - COMPLETE
-- [ ] More grammars (Python/JS/Go/C++)
+- [x] ~~More grammars (Python/JS/Go/C++)~~ - COMPLETE
 
 ### Session Persistence Enhancements
 - [ ] Window position (x, y) persistence - requires platform-specific code
