@@ -28,6 +28,10 @@ pub struct SessionState {
     #[serde(default)]
     pub explorer_visible: bool,
 
+    /// Sidebar panel width in pixels (GTK only, default 300)
+    #[serde(default = "default_sidebar_width")]
+    pub sidebar_width: i32,
+
     /// Last opened files (future: cursor positions)
     #[serde(default)]
     pub recent_files: Vec<PathBuf>,
@@ -49,6 +53,10 @@ pub struct WindowGeometry {
     pub maximized: bool,
 }
 
+fn default_sidebar_width() -> i32 {
+    300
+}
+
 impl Default for SessionState {
     fn default() -> Self {
         Self {
@@ -62,6 +70,7 @@ impl Default for SessionState {
             command_history: Vec::new(),
             search_history: Vec::new(),
             explorer_visible: false,
+            sidebar_width: default_sidebar_width(),
             recent_files: Vec::new(),
             file_positions: HashMap::new(),
         }

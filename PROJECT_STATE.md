@@ -1,10 +1,10 @@
 # VimCode Project State
 
-**Last updated:** Feb 16, 2026
+**Last updated:** Feb 17, 2026
 
 ## Status
 
-**Ctrl-R History Search COMPLETE:** Reverse incremental command history search in command mode (346 tests passing)
+**TUI Sidebar + Icons + Mouse COMPLETE:** Nerd Font icons throughout, TUI sidebar with CRUD, full mouse support, resize bar (346 tests passing)
 
 ### Core Vim (Complete)
 - Seven modes (Normal/Insert/Visual/Visual Line/Visual Block/Command/Search)
@@ -65,9 +65,20 @@
 - Syntax highlighting (Tree-sitter, Rust/Python/JavaScript/Go/C++, auto-detected by extension)
 - **Line numbers (FIXED):** Absolute/relative/hybrid modes now render correctly with proper visibility
 - Tab bar, single global status line, command line
-- Mouse click positioning (pixel-perfect)
-- **Scrollbars (FIXED):** Per-window vertical/horizontal scrollbars with cursor indicators
+- Mouse click positioning (pixel-perfect) — both GTK and TUI
+- **Scrollbars (FIXED):** Per-window vertical/horizontal scrollbars with cursor indicators (GTK + TUI)
 - **Font configuration:** Customizable font family and size
+- **Nerd Font icons:** File-type icons in both GTK sidebar and TUI sidebar (`src/icons.rs`)
+
+### TUI Backend (`src/tui_main.rs`)
+- Full editor in terminal via ratatui 0.27 + crossterm
+- **Sidebar:** File explorer tree (Ctrl-B toggle, Ctrl-Shift-E focus), j/k navigation, l/Enter open, h collapse, a/A/D CRUD, R refresh
+- **Activity bar:** 3-col strip with Explorer / Settings panel icons (Nerd Font)
+- **Layout:** activity bar | sidebar | editor col (with its own tab bar); status + cmd full-width at bottom
+- **Mouse support:** click-to-position cursor, window switching, scroll wheel, scrollbar click-to-jump
+- **Resize bar:** drag separator column to resize sidebar; Alt+Left/Alt+Right keyboard resize; min 15, max 60 cols
+- **Scrollbars:** per-window `█`/`░` scrollbar rendered in rightmost editor column when content overflows
+- Cursor shapes: bar in insert, underline in replace-r
 
 ### Settings
 - `~/.config/vimcode/settings.json` (auto-created with defaults on first run)
@@ -82,16 +93,19 @@
 ```
 vimcode/
 ├── src/
-│   ├── main.rs (~2960 lines) — GTK4/Relm4 UI, rendering, find dialog
+│   ├── main.rs (~3100 lines) — GTK4/Relm4 UI, rendering, find dialog, sidebar resize
+│   ├── tui_main.rs (~900 lines) — ratatui/crossterm TUI backend, sidebar, mouse
+│   ├── icons.rs (~30 lines) — Nerd Font file-type icons (shared by GTK + TUI)
+│   ├── render.rs (~350 lines) — Platform-agnostic rendering abstraction (ScreenLayout)
 │   └── core/ (~11,400 lines) — Platform-agnostic logic
 │       ├── engine.rs (~11,400 lines) — Orchestrates everything, find/replace, macros, history
 │       ├── buffer_manager.rs (~600 lines) — Buffer lifecycle
 │       ├── buffer.rs (~120 lines) — Rope-based storage
-│       ├── session.rs (~170 lines) — Session state persistence (NEW)
+│       ├── session.rs (~175 lines) — Session state persistence (sidebar_width added)
 │       ├── settings.rs (~190 lines) — JSON persistence, auto-init
 │       ├── window.rs, tab.rs, view.rs, cursor.rs, mode.rs, syntax.rs
 │       └── Tests: 346 passing (9 find/replace, 14 macro, 8 session, 4 reverse search, 7 replace char, 5 undo line, 8 case change, 6 marks, 5 incremental search, 12 syntax/language, 6 history search tests)
-└── Total: ~14,400 lines
+└── Total: ~15,800 lines
 ```
 
 ## Architecture
@@ -103,8 +117,9 @@ vimcode/
 | Component | Library |
 |-----------|---------|
 | Language | Rust 2021 |
-| UI | GTK4 + Relm4 |
-| Rendering | Pango + Cairo (CPU) |
+| GTK UI | GTK4 + Relm4 |
+| TUI UI | ratatui 0.27 + crossterm |
+| Rendering | Pango + Cairo (GTK) / ratatui cells (TUI) |
 | Text | Ropey |
 | Parsing | Tree-sitter |
 | Config | serde + serde_json |
@@ -130,8 +145,15 @@ cargo fmt
 - [x] **Marks (m, ')** — COMPLETE
 - [x] **Incremental search** — COMPLETE
 - [x] **More grammars (Python/JS/Go/C++)** — COMPLETE
+- [x] **TUI backend (ratatui)** — COMPLETE
+- [x] **Nerd Font icons (GTK + TUI)** — COMPLETE
+- [x] **TUI sidebar with CRUD** — COMPLETE
+- [x] **Mouse support in TUI** — COMPLETE
+- [x] **Sidebar resize bar (GTK + TUI)** — COMPLETE
 
 ## Recent Work
+**Session 30:** Nerd Font Icons + TUI Sidebar + Mouse + Resize complete — `src/icons.rs` shared icon module; GTK activity bar, toolbar, and file tree all use Nerd Font glyphs; TUI sidebar with full file explorer (j/k/l/h/Enter, CRUD via a/A/D/R, Ctrl-B toggle, Ctrl-Shift-E focus); TUI activity bar (Explorer/Settings panels); drag-to-resize sidebar in GTK (GestureDrag, saved to session) and TUI (mouse drag + Alt+Left/Alt+Right); full TUI mouse support: click-to-position, scroll wheel, scrollbar click-to-jump; per-window `█`/`░` scrollbars in TUI (346 tests, no change).
+**Session 29:** TUI backend (Stage 2) + rendering abstraction — `src/render.rs` ScreenLayout bridge; ratatui/crossterm TUI entry point; cursor shapes (bar insert, underline replace-r); Ctrl key combos; viewport sync (346 tests, no change).
 **Session 28:** Ctrl-R Command History Search complete — reverse incremental search through command history in command mode; Ctrl-R activates, typing narrows matches, Ctrl-R again cycles to older entries, Escape/Ctrl-G cancels, Enter executes (340→346 tests, 6 new tests).
 **Session 27:** Cursor + Scroll Position Persistence complete — reopening a file restores exact cursor line/col and scroll position; positions saved on buffer switch and at quit; also fixed settings file watcher feedback loop freeze and `r` + digit bug (pending key check now runs before count accumulation) (336→340 tests, 3 new session tests).
 **Session 26:** Multi-Language Syntax Highlighting complete — Python, JavaScript, Go, C++ support via Tree-sitter. Language auto-detected from file extension. New `SyntaxLanguage` enum, `Syntax::new_from_path()` constructor, buffers now get correct highlighting when opened (324→336 tests, 12 new tests).
