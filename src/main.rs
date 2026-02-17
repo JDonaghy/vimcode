@@ -17,10 +17,15 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 mod core;
-use core::buffer::Buffer;
+mod render;
+
 use core::engine::EngineAction;
 use core::settings::LineNumberMode;
-use core::{Cursor, Engine, Mode, OpenMode, WindowRect};
+use core::{Engine, OpenMode, WindowRect};
+use render::{
+    build_screen_layout, CommandLineData, CursorShape, RenderedWindow, SelectionKind,
+    SelectionRange, StyledSpan, TabInfo, Theme,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[allow(dead_code)] // Variants used in later phases
@@ -1564,26 +1569,6 @@ fn calculate_gutter_width(mode: LineNumberMode, total_lines: usize, char_width: 
     }
 }
 
-/// Format a line number based on mode, current line, and cursor position
-fn format_line_number(mode: LineNumberMode, line_idx: usize, cursor_line: usize) -> String {
-    match mode {
-        LineNumberMode::None => String::new(),
-        LineNumberMode::Absolute => format!("{}", line_idx + 1),
-        LineNumberMode::Relative => {
-            let distance = line_idx.abs_diff(cursor_line);
-            distance.to_string()
-        }
-        LineNumberMode::Hybrid => {
-            if line_idx == cursor_line {
-                format!("{}", line_idx + 1)
-            } else {
-                let distance = line_idx.abs_diff(cursor_line);
-                distance.to_string()
-            }
-        }
-    }
-}
-
 fn draw_editor(
     cr: &Context,
     engine: &Engine,
@@ -1591,8 +1576,11 @@ fn draw_editor(
     height: i32,
     sender: &relm4::Sender<Msg>,
 ) {
+    let theme = Theme::onedark();
+
     // 1. Background
-    cr.set_source_rgb(0.1, 0.1, 0.1);
+    let (bg_r, bg_g, bg_b) = theme.background.to_cairo();
+    cr.set_source_rgb(bg_r, bg_g, bg_b);
     cr.paint().expect("Invalid cairo surface");
 
     // 2. Setup Pango
@@ -1607,9 +1595,10 @@ fn draw_editor(
     let font_desc = FontDescription::from_string(&font_str);
     layout.set_font_description(Some(&font_desc));
 
-    // Derive line height from font metrics
+    // Derive line height and char width from font metrics
     let font_metrics = pango_ctx.metrics(Some(&font_desc), None);
     let line_height = (font_metrics.ascent() + font_metrics.descent()) as f64 / pango::SCALE as f64;
+    let char_width = font_metrics.approximate_char_width() as f64 / pango::SCALE as f64;
 
     // Cache line height for use in sync_scrollbar
     sender.send(Msg::CacheLineHeight(line_height)).ok();
@@ -1627,111 +1616,118 @@ fn draw_editor(
     );
     let window_rects = engine.calculate_window_rects(content_bounds);
 
+    // Build the platform-agnostic screen layout
+    let screen = build_screen_layout(engine, &theme, &window_rects, line_height, char_width);
+
     // 3. Draw tab bar (always visible)
-    draw_tab_bar(cr, &layout, engine, width as f64, line_height);
+    draw_tab_bar(
+        cr,
+        &layout,
+        &theme,
+        &screen.tab_bar,
+        width as f64,
+        line_height,
+    );
 
     // 4. Draw each window
-    for (window_id, rect) in &window_rects {
-        let is_active = *window_id == engine.active_window_id();
+    for rendered_window in &screen.windows {
         draw_window(
             cr,
             &layout,
             &font_metrics,
-            engine,
-            *window_id,
-            rect,
+            &theme,
+            rendered_window,
+            char_width,
             line_height,
-            is_active,
         );
     }
 
     // 5. Draw window separators
-    draw_window_separators(cr, &window_rects);
+    draw_window_separators(cr, &window_rects, &theme);
 
     // 6. Status Line (second-to-last line)
     let status_y = height as f64 - status_bar_height;
-    draw_status_line(cr, &layout, engine, width as f64, status_y, line_height);
+    draw_status_line(
+        cr,
+        &layout,
+        &theme,
+        &screen.status_left,
+        &screen.status_right,
+        width as f64,
+        status_y,
+        line_height,
+    );
 
     // 7. Command Line (last line)
     let cmd_y = status_y + line_height;
-    draw_command_line(cr, &layout, engine, width as f64, cmd_y, line_height);
+    draw_command_line(
+        cr,
+        &layout,
+        &theme,
+        &screen.command,
+        width as f64,
+        cmd_y,
+        line_height,
+    );
 }
 
 fn draw_tab_bar(
     cr: &Context,
     layout: &pango::Layout,
-    engine: &Engine,
+    theme: &Theme,
+    tabs: &[TabInfo],
     width: f64,
     line_height: f64,
 ) {
     // Tab bar background
-    cr.set_source_rgb(0.15, 0.15, 0.2);
+    let (r, g, b) = theme.tab_bar_bg.to_cairo();
+    cr.set_source_rgb(r, g, b);
     cr.rectangle(0.0, 0.0, width, line_height);
     cr.fill().unwrap();
 
     // Save current font description so we can restore after rendering previews
-    let normal_font = layout.font_description().unwrap_or_else(|| {
-        let font_str = format!(
-            "{} {}",
-            engine.settings.font_family, engine.settings.font_size
-        );
-        FontDescription::from_string(&font_str)
-    });
+    let normal_font = layout.font_description().unwrap_or_default();
     let mut italic_font = normal_font.clone();
     italic_font.set_style(pango::Style::Italic);
 
     let mut x = 0.0;
-    for (i, tab) in engine.tabs.iter().enumerate() {
-        let is_active = i == engine.active_tab;
-
-        // Get first buffer name and preview state in this tab
-        let window_id = tab.active_window;
-        let (name, is_preview) = if let Some(window) = engine.windows.get(&window_id) {
-            if let Some(state) = engine.buffer_manager.get(window.buffer_id) {
-                let dirty = if state.dirty { "*" } else { "" };
-                (
-                    format!(" {}: {}{} ", i + 1, state.display_name(), dirty),
-                    state.preview,
-                )
-            } else {
-                (format!(" {}: [No Name] ", i + 1), false)
-            }
-        } else {
-            (format!(" {}: [No Name] ", i + 1), false)
-        };
-
+    for tab in tabs {
         // Use italic font for preview tabs
-        if is_preview {
+        if tab.preview {
             layout.set_font_description(Some(&italic_font));
         } else {
             layout.set_font_description(Some(&normal_font));
         }
 
-        layout.set_text(&name);
+        layout.set_text(&tab.name);
         let (tab_width, _) = layout.pixel_size();
 
         // Tab background
-        if is_active {
-            cr.set_source_rgb(0.25, 0.25, 0.35);
+        let bg = if tab.active {
+            theme.tab_active_bg
         } else {
-            cr.set_source_rgb(0.15, 0.15, 0.2);
-        }
+            theme.tab_bar_bg
+        };
+        let (br, bg_g, bb) = bg.to_cairo();
+        cr.set_source_rgb(br, bg_g, bb);
         cr.rectangle(x, 0.0, tab_width as f64, line_height);
         cr.fill().unwrap();
 
-        // Tab text — dimmed colors for preview tabs
+        // Tab text — dimmed colours for preview tabs
         cr.move_to(x, 0.0);
-        if is_preview {
-            if is_active {
-                cr.set_source_rgb(0.8, 0.8, 0.8);
+        let fg = if tab.preview {
+            if tab.active {
+                theme.tab_preview_active_fg
             } else {
-                cr.set_source_rgb(0.5, 0.5, 0.5);
+                theme.tab_preview_inactive_fg
             }
-        } else if is_active {
-            cr.set_source_rgb(1.0, 1.0, 1.0);
+        } else if tab.active {
+            theme.tab_active_fg
         } else {
-            cr.set_source_rgb(0.7, 0.7, 0.7);
-        }
+            theme.tab_inactive_fg
+        };
+        let (fr, fg_g, fb) = fg.to_cairo();
+        cr.set_source_rgb(fr, fg_g, fb);
         pangocairo::show_layout(cr, layout);
 
         x += tab_width as f64 + 2.0;
@@ -1746,303 +1742,177 @@ fn draw_window(
     cr: &Context,
     layout: &pango::Layout,
     font_metrics: &pango::FontMetrics,
-    engine: &Engine,
-    window_id: core::WindowId,
-    rect: &WindowRect,
+    theme: &Theme,
+    rw: &RenderedWindow,
+    char_width: f64,
     line_height: f64,
-    is_active: bool,
 ) {
-    let window = match engine.windows.get(&window_id) {
-        Some(w) => w,
-        None => return,
-    };
+    let rect = &rw.rect;
 
-    let buffer_state = match engine.buffer_manager.get(window.buffer_id) {
-        Some(s) => s,
-        None => return,
-    };
+    // Gutter pixel width
+    let gutter_width = rw.gutter_char_width as f64 * char_width;
 
-    let buffer = &buffer_state.buffer;
-    let view = &window.view;
-
-    // Calculate visible area
-    let text_area_height = rect.height;
-    let visible_lines = (text_area_height / line_height).floor() as usize;
-
-    // Calculate gutter width for line numbers
-    let total_lines = buffer.content.len_lines();
-    let char_width = font_metrics.approximate_char_width() as f64 / pango::SCALE as f64;
-    let gutter_width =
-        calculate_gutter_width(engine.settings.line_numbers, total_lines, char_width);
-
-    // Apply horizontal scroll offset to text rendering
-    let scroll_left = view.scroll_left;
-    let h_scroll_offset = scroll_left as f64 * char_width;
+    // Apply horizontal scroll offset
+    let h_scroll_offset = rw.scroll_left as f64 * char_width;
     let text_x_offset = rect.x + gutter_width - h_scroll_offset;
 
-    // Window background (slightly different for active)
-    if is_active && engine.windows.len() > 1 {
-        cr.set_source_rgb(0.12, 0.12, 0.12);
+    // Window background
+    let bg = if rw.show_active_bg {
+        theme.active_background
     } else {
-        cr.set_source_rgb(0.1, 0.1, 0.1);
-    }
+        theme.background
+    };
+    let (br, bg_g, bb) = bg.to_cairo();
+    cr.set_source_rgb(br, bg_g, bb);
     cr.rectangle(rect.x, rect.y, rect.width, rect.height);
     cr.fill().unwrap();
 
-    // Render visual selection highlight (if in visual mode and this is active window)
-    if is_active {
-        match engine.mode {
-            Mode::Visual | Mode::VisualLine | Mode::VisualBlock => {
-                if let Some(anchor) = engine.visual_anchor {
-                    draw_visual_selection(
-                        cr,
-                        layout,
-                        engine,
-                        buffer,
-                        &anchor,
-                        &view.cursor,
-                        rect,
-                        line_height,
-                        view.scroll_top,
-                        visible_lines,
-                        text_x_offset,
-                    );
-                }
-            }
-            _ => {}
-        }
+    // Visual selection highlight (drawn before text so text renders on top)
+    if let Some(sel) = &rw.selection {
+        draw_visual_selection(
+            cr,
+            layout,
+            sel,
+            &rw.lines,
+            rect,
+            line_height,
+            rw.scroll_top,
+            text_x_offset,
+            theme,
+        );
     }
 
-    // Render line numbers FIRST (before clipping) so they're not clipped out
-    let scroll_top = view.scroll_top;
-
-    for view_idx in 0..visible_lines {
-        let line_idx = scroll_top + view_idx;
-        if line_idx >= total_lines {
-            break;
+    // Render line numbers (before clipping so they're never clipped out)
+    for (view_idx, rl) in rw.lines.iter().enumerate() {
+        if rl.gutter_text.is_empty() {
+            break; // line numbers disabled — nothing to render for any line
         }
-
         let y = rect.y + view_idx as f64 * line_height;
 
-        // Render line number in gutter (if enabled)
-        if engine.settings.line_numbers != LineNumberMode::None {
-            let line_num_text =
-                format_line_number(engine.settings.line_numbers, line_idx, view.cursor.line);
+        layout.set_text(&rl.gutter_text);
+        layout.set_attributes(None);
 
-            layout.set_text(&line_num_text);
-            layout.set_attributes(None);
+        let (num_width, _) = layout.pixel_size();
+        let num_x = rect.x + gutter_width - num_width as f64 - char_width;
 
-            // Right-align line number within gutter
-            let (num_width, _) = layout.pixel_size();
-            let num_x = rect.x + gutter_width - num_width as f64 - char_width;
-
-            // Highlight current line number
-            if is_active && line_idx == view.cursor.line {
-                cr.set_source_rgb(0.9, 0.9, 0.5); // Brighter yellow for current line
-            } else {
-                cr.set_source_rgb(0.7, 0.7, 0.7); // Brighter gray for better visibility
-            }
-
-            cr.move_to(num_x, y);
-            pangocairo::show_layout(cr, layout);
-        }
+        let num_color = if rw.is_active && rl.is_current_line {
+            theme.line_number_active_fg
+        } else {
+            theme.line_number_fg
+        };
+        let (nr, ng, nb) = num_color.to_cairo();
+        cr.set_source_rgb(nr, ng, nb);
+        cr.move_to(num_x, y);
+        pangocairo::show_layout(cr, layout);
     }
 
-    // Set up clipping rectangle for text area (excluding gutter)
+    // Clip text area (excluding gutter)
     cr.save().unwrap();
     cr.rectangle(
         rect.x + gutter_width,
         rect.y,
         rect.width - gutter_width,
-        text_area_height,
+        rect.height,
     );
     cr.clip();
 
-    // Render text with highlights
-    for view_idx in 0..visible_lines {
-        let line_idx = scroll_top + view_idx;
-        if line_idx >= total_lines {
-            break;
-        }
-
-        let line = buffer.content.line(line_idx);
+    // Render each visible line
+    for (view_idx, rl) in rw.lines.iter().enumerate() {
         let y = rect.y + view_idx as f64 * line_height;
 
-        // Render line text with syntax highlighting
-        layout.set_text(&line.to_string());
+        layout.set_text(&rl.raw_text);
 
-        let line_start_byte = buffer.content.line_to_byte(line_idx);
-        let line_end_byte = line_start_byte + line.len_bytes();
-
-        let attrs = AttrList::new();
-
-        // Syntax highlighting
-        for (start, end, scope) in &buffer_state.highlights {
-            if *end <= line_start_byte || *start >= line_end_byte {
-                continue;
-            }
-
-            let rel_start = (*start).saturating_sub(line_start_byte);
-            let rel_end = if *end > line_end_byte {
-                line.len_bytes()
-            } else {
-                *end - line_start_byte
-            };
-
-            let color_hex = match scope.as_str() {
-                "keyword" | "operator" => "#c678dd",
-                "string" => "#98c379",
-                "comment" => "#5c6370",
-                "function" | "method" => "#61afef",
-                "type" | "class" | "struct" => "#e5c07b",
-                "variable" => "#e06c75",
-                _ => "#abb2bf",
-            };
-
-            if let Ok(pango_color) = pango::Color::parse(color_hex) {
-                let mut attr = AttrColor::new_foreground(
-                    pango_color.red(),
-                    pango_color.green(),
-                    pango_color.blue(),
-                );
-                attr.set_start_index(rel_start as u32);
-                attr.set_end_index(rel_end as u32);
-                attrs.insert(attr);
-            }
-        }
-
-        // Search match highlighting (yellow background for all matches, brighter for current)
-        if !engine.search_matches.is_empty() {
-            let line_start_char = buffer.content.line_to_char(line_idx);
-            let line_end_char = line_start_char + line.to_string().chars().count();
-
-            for (match_idx, (match_start, match_end)) in engine.search_matches.iter().enumerate() {
-                // Check if this match overlaps with the current line
-                if *match_end <= line_start_char || *match_start >= line_end_char {
-                    continue;
-                }
-
-                // Calculate byte offsets within the line
-                let match_start_char = (*match_start).max(line_start_char);
-                let match_end_char = (*match_end).min(line_end_char);
-
-                // Convert char offsets to byte offsets
-                let line_str = line.to_string();
-                let rel_start_byte = line_str
-                    .char_indices()
-                    .nth(match_start_char - line_start_char)
-                    .map(|(i, _)| i)
-                    .unwrap_or(0);
-                let rel_end_byte = line_str
-                    .char_indices()
-                    .nth(match_end_char - line_start_char)
-                    .map(|(i, _)| i)
-                    .unwrap_or(line_str.len());
-
-                // Highlight current match with brighter yellow, others with dimmer yellow
-                let is_current_match = engine.search_index == Some(match_idx);
-                let (r, g, b) = if is_current_match {
-                    (255 * 256, 200 * 256, 0) // Bright yellow/orange for current match
-                } else {
-                    (180 * 256, 150 * 256, 0) // Dimmer yellow for other matches
-                };
-
-                let mut bg_attr = pango::AttrColor::new_background(r, g, b);
-                bg_attr.set_start_index(rel_start_byte as u32);
-                bg_attr.set_end_index(rel_end_byte as u32);
-                attrs.insert(bg_attr);
-
-                // Add black foreground for better contrast on yellow background
-                let mut fg_attr = pango::AttrColor::new_foreground(0, 0, 0);
-                fg_attr.set_start_index(rel_start_byte as u32);
-                fg_attr.set_end_index(rel_end_byte as u32);
-                attrs.insert(fg_attr);
-            }
-        }
-
+        let attrs = build_pango_attrs(&rl.spans);
         layout.set_attributes(Some(&attrs));
 
+        let (fr, fg_g, fb) = theme.foreground.to_cairo();
+        cr.set_source_rgb(fr, fg_g, fb);
         cr.move_to(text_x_offset, y);
-        cr.set_source_rgb(0.9, 0.9, 0.9);
         pangocairo::show_layout(cr, layout);
     }
 
-    // Restore cairo context (remove clipping)
     cr.restore().unwrap();
 
-    // Render cursor (only in active window)
-    if is_active && view.cursor.line >= scroll_top && view.cursor.line < scroll_top + visible_lines
-    {
-        if let Some(line) = buffer.content.lines().nth(view.cursor.line) {
-            let line_text = line.to_string();
-            layout.set_text(&line_text);
+    // Render cursor
+    if let Some((cursor_pos, cursor_shape)) = &rw.cursor {
+        if let Some(rl) = rw.lines.get(cursor_pos.view_line) {
+            layout.set_text(&rl.raw_text);
             layout.set_attributes(None);
 
-            let byte_offset: usize = line_text
+            let byte_offset: usize = rl
+                .raw_text
                 .char_indices()
-                .nth(view.cursor.col)
+                .nth(cursor_pos.col)
                 .map(|(i, _)| i)
-                .unwrap_or(line_text.len());
+                .unwrap_or(rl.raw_text.len());
 
             let pos = layout.index_to_pos(byte_offset as i32);
-            // Note: text_x_offset already includes horizontal scroll offset
             let cursor_x = text_x_offset + pos.x() as f64 / pango::SCALE as f64;
             let char_w = pos.width() as f64 / pango::SCALE as f64;
-            let cursor_y = rect.y + (view.cursor.line - scroll_top) as f64 * line_height;
+            let cursor_y = rect.y + cursor_pos.view_line as f64 * line_height;
 
-            match engine.mode {
-                Mode::Normal | Mode::Visual | Mode::VisualLine | Mode::VisualBlock => {
-                    cr.set_source_rgba(1.0, 1.0, 1.0, 0.5);
+            let (cr_r, cr_g, cr_b) = theme.cursor.to_cairo();
+            match cursor_shape {
+                CursorShape::Block => {
+                    cr.set_source_rgba(cr_r, cr_g, cr_b, theme.cursor_normal_alpha);
                     let w = if char_w > 0.0 {
                         char_w
                     } else {
                         font_metrics.approximate_char_width() as f64 / pango::SCALE as f64
                     };
                     cr.rectangle(cursor_x, cursor_y, w, line_height);
+                    cr.fill().unwrap();
                 }
-                Mode::Insert => {
-                    cr.set_source_rgb(1.0, 1.0, 1.0);
+                CursorShape::Bar => {
+                    cr.set_source_rgb(cr_r, cr_g, cr_b);
                     cr.rectangle(cursor_x, cursor_y, 2.0, line_height);
-                }
-                Mode::Command | Mode::Search => {
-                    // No text cursor shown — cursor is in the command line
+                    cr.fill().unwrap();
                 }
             }
-            cr.fill().unwrap();
         }
     }
+}
+
+/// Convert a slice of [`StyledSpan`]s into a Pango [`AttrList`].
+fn build_pango_attrs(spans: &[StyledSpan]) -> AttrList {
+    let attrs = AttrList::new();
+    for span in spans {
+        let (fr, fg_g, fb) = span.style.fg.to_pango_u16();
+        let mut fg_attr = AttrColor::new_foreground(fr, fg_g, fb);
+        fg_attr.set_start_index(span.start_byte as u32);
+        fg_attr.set_end_index(span.end_byte as u32);
+        attrs.insert(fg_attr);
+
+        if let Some(bg) = span.style.bg {
+            let (br, bg_g, bb) = bg.to_pango_u16();
+            let mut bg_attr = AttrColor::new_background(br, bg_g, bb);
+            bg_attr.set_start_index(span.start_byte as u32);
+            bg_attr.set_end_index(span.end_byte as u32);
+            attrs.insert(bg_attr);
+        }
+    }
+    attrs
 }
 
 #[allow(clippy::too_many_arguments)]
 fn draw_visual_selection(
     cr: &Context,
     layout: &pango::Layout,
-    engine: &Engine,
-    buffer: &Buffer,
-    anchor: &Cursor,
-    cursor: &Cursor,
+    sel: &SelectionRange,
+    lines: &[render::RenderedLine],
     rect: &WindowRect,
     line_height: f64,
     scroll_top: usize,
-    visible_lines: usize,
     text_x_offset: f64,
+    theme: &Theme,
 ) {
-    // Normalize selection (start <= end)
-    let (start, end) =
-        if anchor.line < cursor.line || (anchor.line == cursor.line && anchor.col <= cursor.col) {
-            (*anchor, *cursor)
-        } else {
-            (*cursor, *anchor)
-        };
+    let visible_lines = lines.len();
+    let (sr, sg, sb) = theme.selection.to_cairo();
+    cr.set_source_rgba(sr, sg, sb, theme.selection_alpha);
 
-    // Set highlight color (semi-transparent blue)
-    cr.set_source_rgba(0.3, 0.5, 0.7, 0.3);
-
-    match engine.mode {
-        Mode::VisualLine => {
-            // Line mode: highlight full lines (text area only, not gutter)
-            for line_idx in start.line..=end.line {
-                // Only draw if line is visible
+    match sel.kind {
+        SelectionKind::Line => {
+            for line_idx in sel.start_line..=sel.end_line {
                 if line_idx >= scroll_top && line_idx < scroll_top + visible_lines {
                     let view_idx = line_idx - scroll_top;
                     let y = rect.y + view_idx as f64 * line_height;
@@ -2052,154 +1922,134 @@ fn draw_visual_selection(
             }
             cr.fill().unwrap();
         }
-        Mode::Visual => {
-            // Character mode: highlight from start to end (inclusive)
-            if start.line == end.line {
+        SelectionKind::Char => {
+            if sel.start_line == sel.end_line {
                 // Single-line selection
-                if start.line >= scroll_top && start.line < scroll_top + visible_lines {
-                    let view_idx = start.line - scroll_top;
+                if sel.start_line >= scroll_top && sel.start_line < scroll_top + visible_lines {
+                    let view_idx = sel.start_line - scroll_top;
                     let y = rect.y + view_idx as f64 * line_height;
+                    let line_text = &lines[view_idx].raw_text;
 
-                    if let Some(line) = buffer.content.lines().nth(start.line) {
-                        let line_text = line.to_string();
-                        layout.set_text(&line_text);
+                    layout.set_text(line_text);
+                    layout.set_attributes(None);
+
+                    let start_byte = line_text
+                        .char_indices()
+                        .nth(sel.start_col)
+                        .map(|(i, _)| i)
+                        .unwrap_or(line_text.len());
+                    let start_pos = layout.index_to_pos(start_byte as i32);
+                    let start_x = text_x_offset + start_pos.x() as f64 / pango::SCALE as f64;
+
+                    let end_col = (sel.end_col + 1).min(line_text.chars().count());
+                    let end_byte = line_text
+                        .char_indices()
+                        .nth(end_col)
+                        .map(|(i, _)| i)
+                        .unwrap_or(line_text.len());
+                    let end_pos = layout.index_to_pos(end_byte as i32);
+                    let end_x = text_x_offset + end_pos.x() as f64 / pango::SCALE as f64;
+
+                    cr.rectangle(start_x, y, end_x - start_x, line_height);
+                    cr.fill().unwrap();
+                }
+            } else {
+                // Multi-line selection
+                for line_idx in sel.start_line..=sel.end_line {
+                    if line_idx >= scroll_top && line_idx < scroll_top + visible_lines {
+                        let view_idx = line_idx - scroll_top;
+                        let y = rect.y + view_idx as f64 * line_height;
+                        let line_text = &lines[view_idx].raw_text;
+
+                        layout.set_text(line_text);
                         layout.set_attributes(None);
 
-                        // Calculate x position for start column
-                        let start_byte: usize = line_text
+                        if line_idx == sel.start_line {
+                            let start_byte = line_text
+                                .char_indices()
+                                .nth(sel.start_col)
+                                .map(|(i, _)| i)
+                                .unwrap_or(line_text.len());
+                            let start_pos = layout.index_to_pos(start_byte as i32);
+                            let start_x =
+                                text_x_offset + start_pos.x() as f64 / pango::SCALE as f64;
+                            let (line_width, _) = layout.pixel_size();
+                            cr.rectangle(
+                                start_x,
+                                y,
+                                text_x_offset + line_width as f64 - start_x,
+                                line_height,
+                            );
+                            cr.fill().unwrap();
+                        } else if line_idx == sel.end_line {
+                            let end_col = (sel.end_col + 1).min(line_text.chars().count());
+                            let end_byte = line_text
+                                .char_indices()
+                                .nth(end_col)
+                                .map(|(i, _)| i)
+                                .unwrap_or(line_text.len());
+                            let end_pos = layout.index_to_pos(end_byte as i32);
+                            let end_x = text_x_offset + end_pos.x() as f64 / pango::SCALE as f64;
+                            cr.rectangle(text_x_offset, y, end_x - text_x_offset, line_height);
+                            cr.fill().unwrap();
+                        } else {
+                            let (line_width, _) = layout.pixel_size();
+                            cr.rectangle(text_x_offset, y, line_width as f64, line_height);
+                            cr.fill().unwrap();
+                        }
+                    }
+                }
+            }
+        }
+        SelectionKind::Block => {
+            for line_idx in sel.start_line..=sel.end_line {
+                if line_idx >= scroll_top && line_idx < scroll_top + visible_lines {
+                    let view_idx = line_idx - scroll_top;
+                    let y = rect.y + view_idx as f64 * line_height;
+                    let line_text = &lines[view_idx].raw_text;
+                    let line_len = line_text.chars().count();
+
+                    layout.set_text(line_text);
+                    layout.set_attributes(None);
+
+                    if sel.start_col < line_len {
+                        let start_byte = line_text
                             .char_indices()
-                            .nth(start.col)
+                            .nth(sel.start_col)
                             .map(|(i, _)| i)
                             .unwrap_or(line_text.len());
                         let start_pos = layout.index_to_pos(start_byte as i32);
                         let start_x = text_x_offset + start_pos.x() as f64 / pango::SCALE as f64;
 
-                        // Calculate x position for end column (inclusive, so +1)
-                        let end_col = (end.col + 1).min(line_text.chars().count());
-                        let end_byte: usize = line_text
+                        let block_end_col = (sel.end_col + 1).min(line_len);
+                        let end_byte = line_text
                             .char_indices()
-                            .nth(end_col)
+                            .nth(block_end_col)
                             .map(|(i, _)| i)
                             .unwrap_or(line_text.len());
                         let end_pos = layout.index_to_pos(end_byte as i32);
                         let end_x = text_x_offset + end_pos.x() as f64 / pango::SCALE as f64;
 
                         cr.rectangle(start_x, y, end_x - start_x, line_height);
-                        cr.fill().unwrap();
-                    }
-                }
-            } else {
-                // Multi-line selection
-                for line_idx in start.line..=end.line {
-                    if line_idx >= scroll_top && line_idx < scroll_top + visible_lines {
-                        let view_idx = line_idx - scroll_top;
-                        let y = rect.y + view_idx as f64 * line_height;
-
-                        if let Some(line) = buffer.content.lines().nth(line_idx) {
-                            let line_text = line.to_string();
-                            layout.set_text(&line_text);
-                            layout.set_attributes(None);
-
-                            if line_idx == start.line {
-                                // First line: from start.col to end of line
-                                let start_byte: usize = line_text
-                                    .char_indices()
-                                    .nth(start.col)
-                                    .map(|(i, _)| i)
-                                    .unwrap_or(line_text.len());
-                                let start_pos = layout.index_to_pos(start_byte as i32);
-                                let start_x =
-                                    text_x_offset + start_pos.x() as f64 / pango::SCALE as f64;
-
-                                let (line_width, _) = layout.pixel_size();
-                                cr.rectangle(
-                                    start_x,
-                                    y,
-                                    text_x_offset + line_width as f64 - start_x,
-                                    line_height,
-                                );
-                                cr.fill().unwrap();
-                            } else if line_idx == end.line {
-                                // Last line: from start of line to end.col (inclusive)
-                                let end_col = (end.col + 1).min(line_text.chars().count());
-                                let end_byte: usize = line_text
-                                    .char_indices()
-                                    .nth(end_col)
-                                    .map(|(i, _)| i)
-                                    .unwrap_or(line_text.len());
-                                let end_pos = layout.index_to_pos(end_byte as i32);
-                                let end_x =
-                                    text_x_offset + end_pos.x() as f64 / pango::SCALE as f64;
-
-                                cr.rectangle(text_x_offset, y, end_x - text_x_offset, line_height);
-                                cr.fill().unwrap();
-                            } else {
-                                // Middle lines: full line
-                                let (line_width, _) = layout.pixel_size();
-                                cr.rectangle(text_x_offset, y, line_width as f64, line_height);
-                                cr.fill().unwrap();
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        Mode::VisualBlock => {
-            // Block mode: highlight rectangular region
-            let start_col = start.col.min(end.col);
-            let end_col = start.col.max(end.col);
-
-            for line_idx in start.line..=end.line {
-                if line_idx >= scroll_top && line_idx < scroll_top + visible_lines {
-                    let view_idx = line_idx - scroll_top;
-                    let y = rect.y + view_idx as f64 * line_height;
-
-                    if let Some(line) = buffer.content.lines().nth(line_idx) {
-                        let line_text = line.to_string();
-                        layout.set_text(&line_text);
-                        layout.set_attributes(None);
-
-                        let line_len = line_text.chars().count();
-
-                        // Only draw if the line has characters in the block region
-                        if start_col < line_len {
-                            // Calculate x position for start column
-                            let start_byte: usize = line_text
-                                .char_indices()
-                                .nth(start_col)
-                                .map(|(i, _)| i)
-                                .unwrap_or(line_text.len());
-                            let start_pos = layout.index_to_pos(start_byte as i32);
-                            let start_x =
-                                text_x_offset + start_pos.x() as f64 / pango::SCALE as f64;
-
-                            // Calculate x position for end column (inclusive, so +1)
-                            let block_end_col = (end_col + 1).min(line_len);
-                            let end_byte: usize = line_text
-                                .char_indices()
-                                .nth(block_end_col)
-                                .map(|(i, _)| i)
-                                .unwrap_or(line_text.len());
-                            let end_pos = layout.index_to_pos(end_byte as i32);
-                            let end_x = text_x_offset + end_pos.x() as f64 / pango::SCALE as f64;
-
-                            cr.rectangle(start_x, y, end_x - start_x, line_height);
-                        }
                     }
                 }
             }
             cr.fill().unwrap();
         }
-        _ => {}
     }
 }
 
-fn draw_window_separators(cr: &Context, window_rects: &[(core::WindowId, WindowRect)]) {
+fn draw_window_separators(
+    cr: &Context,
+    window_rects: &[(core::WindowId, WindowRect)],
+    theme: &Theme,
+) {
     if window_rects.len() <= 1 {
         return;
     }
 
-    cr.set_source_rgb(0.3, 0.3, 0.4);
+    let (sr, sg, sb) = theme.separator.to_cairo();
+    cr.set_source_rgb(sr, sg, sb);
     cr.set_line_width(1.0);
 
     // Draw separators between adjacent windows
@@ -2233,62 +2083,32 @@ fn draw_window_separators(cr: &Context, window_rects: &[(core::WindowId, WindowR
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_status_line(
     cr: &Context,
     layout: &pango::Layout,
-    engine: &Engine,
+    theme: &Theme,
+    left: &str,
+    right: &str,
     width: f64,
     y: f64,
     line_height: f64,
 ) {
-    // Status bar background
-    cr.set_source_rgb(0.2, 0.2, 0.3);
+    let (br, bg, bb) = theme.status_bg.to_cairo();
+    cr.set_source_rgb(br, bg, bb);
     cr.rectangle(0.0, y, width, line_height);
     cr.fill().unwrap();
 
-    let mode_str = match engine.mode {
-        Mode::Normal | Mode::Command | Mode::Search => "NORMAL",
-        Mode::Insert => "INSERT",
-        Mode::Visual => "VISUAL",
-        Mode::VisualLine => "VISUAL LINE",
-        Mode::VisualBlock => "VISUAL BLOCK",
-    };
-
-    let filename = match engine.file_path() {
-        Some(p) => p.display().to_string(),
-        None => "[No Name]".to_string(),
-    };
-
-    let dirty_indicator = if engine.dirty() { " [+]" } else { "" };
-
-    let recording_indicator = if let Some(reg) = engine.macro_recording {
-        format!(" [recording @{}]", reg)
-    } else {
-        String::new()
-    };
-
-    let left_status = format!(
-        " -- {}{} -- {}{}",
-        mode_str, recording_indicator, filename, dirty_indicator
-    );
-    let cursor = engine.cursor();
-    let right_status = format!(
-        "Ln {}, Col {}  ({} lines) ",
-        cursor.line + 1,
-        cursor.col + 1,
-        engine.buffer().len_lines()
-    );
-
     layout.set_attributes(None);
 
-    // Left side
-    layout.set_text(&left_status);
+    let (fr, fg, fb) = theme.status_fg.to_cairo();
+    cr.set_source_rgb(fr, fg, fb);
+
+    layout.set_text(left);
     cr.move_to(0.0, y);
-    cr.set_source_rgb(0.9, 0.9, 0.9);
     pangocairo::show_layout(cr, layout);
 
-    // Right side
-    layout.set_text(&right_status);
+    layout.set_text(right);
     let (right_w, _) = layout.pixel_size();
     cr.move_to(width - right_w as f64, y);
     pangocairo::show_layout(cr, layout);
@@ -2297,73 +2117,40 @@ fn draw_status_line(
 fn draw_command_line(
     cr: &Context,
     layout: &pango::Layout,
-    engine: &Engine,
+    theme: &Theme,
+    cmd: &CommandLineData,
     width: f64,
     y: f64,
     line_height: f64,
 ) {
-    // Command line background
-    cr.set_source_rgb(0.1, 0.1, 0.1);
+    let (br, bg, bb) = theme.command_bg.to_cairo();
+    cr.set_source_rgb(br, bg, bb);
     cr.rectangle(0.0, y, width, line_height);
     cr.fill().unwrap();
 
-    let cmd_text = match engine.mode {
-        Mode::Command if engine.history_search_active => format!(
-            "(reverse-i-search)'{}': {}",
-            engine.history_search_query, engine.command_buffer
-        ),
-        Mode::Command => format!(":{}", engine.command_buffer),
-        Mode::Search => {
-            let search_char = match engine.search_direction {
-                core::engine::SearchDirection::Forward => '/',
-                core::engine::SearchDirection::Backward => '?',
-            };
-            format!("{}{}", search_char, engine.command_buffer)
-        }
-        Mode::Normal | Mode::Visual | Mode::VisualLine => {
-            // Display count if present, otherwise show message
-            if let Some(count) = engine.peek_count() {
-                count.to_string()
-            } else {
-                engine.message.clone()
-            }
-        }
-        _ => engine.message.clone(),
-    };
+    if !cmd.text.is_empty() {
+        layout.set_text(&cmd.text);
+        layout.set_attributes(None);
 
-    if !cmd_text.is_empty() {
-        layout.set_text(&cmd_text);
+        let (fr, fg, fb) = theme.command_fg.to_cairo();
+        cr.set_source_rgb(fr, fg, fb);
 
-        // Right-align count in Normal/Visual modes
-        if (engine.mode == Mode::Normal
-            || engine.mode == Mode::Visual
-            || engine.mode == Mode::VisualLine)
-            && engine.peek_count().is_some()
-        {
+        if cmd.right_align {
             let (text_w, _) = layout.pixel_size();
             cr.move_to(width - text_w as f64, y);
         } else {
             cr.move_to(0.0, y);
         }
-
-        cr.set_source_rgb(0.9, 0.9, 0.9);
         pangocairo::show_layout(cr, layout);
     }
 
-    // Command-line cursor in Command/Search mode
-    if engine.mode == Mode::Command || engine.mode == Mode::Search {
-        let prefix = if engine.mode == Mode::Command {
-            ":"
-        } else {
-            match engine.search_direction {
-                core::engine::SearchDirection::Forward => "/",
-                core::engine::SearchDirection::Backward => "?",
-            }
-        };
-        let full = format!("{}{}", prefix, engine.command_buffer);
-        layout.set_text(&full);
+    // Command-line insert cursor
+    if cmd.show_cursor {
+        layout.set_text(&cmd.cursor_anchor_text);
+        layout.set_attributes(None);
         let (text_w, _) = layout.pixel_size();
-        cr.set_source_rgb(1.0, 1.0, 1.0);
+        let (cr_r, cr_g, cr_b) = theme.cursor.to_cairo();
+        cr.set_source_rgb(cr_r, cr_g, cr_b);
         cr.rectangle(text_w as f64, y, 2.0, line_height);
         cr.fill().unwrap();
     }
