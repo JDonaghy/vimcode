@@ -579,12 +579,14 @@ fn translate_key(event: KeyEvent) -> Option<(String, Option<char>, bool)> {
     let ctrl = event.modifiers.contains(KeyModifiers::CONTROL);
     match event.code {
         KeyCode::Char(c) => {
-            let unicode = if ctrl {
-                Some(c.to_ascii_lowercase())
+            let lower = c.to_ascii_lowercase();
+            let (key_name, unicode) = if ctrl {
+                // Engine dispatches Ctrl combos via key_name (e.g. "d" for Ctrl-D)
+                (lower.to_string(), Some(lower))
             } else {
-                Some(c)
+                ("".to_string(), Some(c))
             };
-            Some(("".to_string(), unicode, ctrl))
+            Some((key_name, unicode, ctrl))
         }
         KeyCode::Esc => Some(("Escape".to_string(), None, false)),
         KeyCode::Enter => Some(("Return".to_string(), None, false)),
