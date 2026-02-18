@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Feb 18, 2026 (Session 37)
+**Last updated:** Feb 18, 2026 (Session 38)
 
 ## Status
 
@@ -94,6 +94,14 @@
 - Explorer visibility on startup (default: hidden)
 - Incremental search (default: enabled, set to false to disable)
 - Auto-indent (default: enabled — Enter/o/O copy leading whitespace from current line)
+- **`:set` command** — runtime changes to options (write-through to settings.json):
+  - `number`/`nonumber`, `relativenumber`/`norelativenumber` — line number mode
+  - `expandtab`/`noexpandtab` (alias `et`) — Tab inserts spaces vs literal tab
+  - `tabstop=N` (alias `ts`) — spaces per Tab key press / tab display width
+  - `shiftwidth=N` (alias `sw`) — indent width for future `>>` / `<<`
+  - `autoindent`/`noautoindent` (alias `ai`), `incsearch`/`noincsearch` (alias `is`)
+  - `:set option?` — query current value without changing it
+  - `:set` (no args) — show all settings summary
 - `:config reload` runtime refresh
 - File watcher for automatic reload
 
@@ -110,11 +118,11 @@ vimcode/
 │       ├── buffer_manager.rs (~600 lines) — Buffer lifecycle
 │       ├── buffer.rs (~120 lines) — Rope-based storage
 │       ├── session.rs (~175 lines) — Session state persistence (sidebar_width added)
-│       ├── settings.rs (~190 lines) — JSON persistence, auto-init
+│       ├── settings.rs (~360 lines) — JSON persistence, auto-init, :set parsing
 │       ├── window.rs, tab.rs, view.rs, cursor.rs, mode.rs, syntax.rs
 │       ├── git.rs (~240 lines) — git subprocess integration (diff/blame parsing, branch detection)
-│       └── Tests: 388 passing (9 find/replace, 14 macro, 8 session, 4 reverse search, 7 replace char, 5 undo line, 8 case change, 6 marks, 5 incremental search, 12 syntax/language, 6 history search, 11 fold tests, 8 git tests, 4 sidebar-preview tests, 5 auto-indent tests, 4 completion tests, 9 quit/ctrl-s tests, 1 session-restore test)
-└── Total: ~16,400 lines
+│       └── Tests: 410 passing (9 find/replace, 14 macro, 8 session, 4 reverse search, 7 replace char, 5 undo line, 8 case change, 6 marks, 5 incremental search, 12 syntax/language, 6 history search, 11 fold tests, 8 git tests, 4 sidebar-preview tests, 5 auto-indent tests, 4 completion tests, 9 quit/ctrl-s tests, 1 session-restore test, 22 set-command tests)
+└── Total: ~16,800 lines
 ```
 
 ## Architecture
@@ -137,7 +145,7 @@ vimcode/
 ```bash
 cargo build
 cargo run -- <file>
-cargo test -- --test-threads=1    # 388 tests
+cargo test -- --test-threads=1    # 410 tests
 cargo clippy -- -D warnings
 cargo fmt
 ```
@@ -176,7 +184,7 @@ cargo fmt
 ### Editor features
 - [x] **Auto-indent** — copies current line's leading whitespace on Enter/o/O; `auto_indent` setting (default: true)
 - [x] **Completion menu** — Ctrl-N/Ctrl-P word completion from buffer in insert mode; floating popup in GTK + TUI
-- [ ] **:set command** — runtime setting changes (`tabwidth`, `expandtab`, `number`, etc.)
+- [x] **:set command** — runtime setting changes; write-through to settings.json; number/rnu/expandtab/tabstop/shiftwidth/autoindent/incsearch; query with `?`
 - [ ] **:grep / :vimgrep** — project-wide search, populate quickfix list
 - [ ] **Quickfix window** — `:copen`, `:cn`, `:cp` quickfix navigation
 - [ ] **More text objects** — `is`/`as` sentence, `ip`/`ap` paragraph, `it`/`at` tag
@@ -187,6 +195,8 @@ cargo fmt
 - [ ] **`:norm`** — execute normal command on a range of lines
 
 ## Recent Work
+**Session 38:** `:set` command — vim-compatible runtime setting changes that write through to `settings.json` immediately (VSCode-friendly). New settings fields: `expand_tab` (default true), `tabstop` (default 4), `shift_width` (default 4). Supported syntax: `:set` (show all), `:set number`/`:set nonumber`, `:set tabstop=2`, `:set ts?` (query). Boolean options: `number`/`nu`, `relativenumber`/`rnu`, `expandtab`/`et`, `autoindent`/`ai`, `incsearch`/`is`. Numeric options: `tabstop`/`ts`, `shiftwidth`/`sw`. Line number options interact vim-style: `number` + `relativenumber` = Hybrid mode. Tab key now respects `expand_tab`/`tabstop` instead of hardcoded 4 spaces. (388→410 tests, 22 new.)
+
 **Session 37 (cont):** Session restore + quit fixes — `:q` closes the current tab (quits when it's the last one); `:q!` force-closes; `:qa`/`:qa!` quit all. `Ctrl-S` saves in any mode. Session restore now opens each saved file in its own tab and focuses the previously-active file. `open_file_paths()` filters to window-visible buffers only so files explicitly closed via `:q` are not restored on next launch. (387→388 tests, 1 new session-restore test.)
 
 **Session 37:** Auto-indent + Completion menu + Quit/Save — Auto-indent: pressing Enter/`o`/`O` in insert mode copies the leading whitespace of the current line to the new line; controlled by `auto_indent` setting (default: true). Completion menu: Ctrl-N/Ctrl-P in insert mode scans the current buffer for words matching the prefix at the cursor, shows a floating popup (max 10 items), cycles through them on repeated presses; any other key dismisses and accepts. GTK renders popup via Cairo/Pango; TUI renders via ratatui buffer cells. New engine fields: `completion_candidates`, `completion_idx`, `completion_start_col`. New render types: `CompletionMenu` + four completion colours in `Theme`. (369→388 tests total.)

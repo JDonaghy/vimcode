@@ -1,5 +1,19 @@
 # VimCode Implementation Plan
 
+## Recently Completed (Session 38)
+
+### ✅ :set Command
+- Vim-compatible `:set option`, `:set nooption`, `:set option=N`, `:set option?`, `:set` (show all)
+- Write-through: every change immediately saved to `settings.json`
+- Boolean options: `number`/`nu`, `relativenumber`/`rnu`, `expandtab`/`et`, `autoindent`/`ai`, `incsearch`/`is`
+- Numeric options: `tabstop`/`ts`, `shiftwidth`/`sw`
+- `number` + `relativenumber` → Hybrid line number mode (vim-accurate)
+- New settings fields: `expand_tab` (default true), `tabstop` (default 4), `shift_width` (default 4)
+- Tab key uses `expand_tab`/`tabstop` instead of hardcoded 4 spaces
+- Tests: 22 new (388→410)
+
+---
+
 ## Recently Completed (Session 37)
 
 ### ✅ Auto-Indent
@@ -61,7 +75,7 @@
 - [ ] **Stage hunks** — interactive `git add -p` style hunk staging
 
 ### Editor Features
-- [ ] **`:set` command** — runtime setting changes (`tabwidth`, `expandtab`, `number`, etc.)
+- [x] **`:set` command** — runtime setting changes; write-through to settings.json; number/rnu/expandtab/tabstop/shiftwidth/autoindent/incsearch; query with `?`
 - [ ] **`:grep` / `:vimgrep`** — project-wide search, populate quickfix list
 - [ ] **Quickfix window** — `:copen`, `:cn`, `:cp` navigation
 - [ ] **More text objects** — `is`/`as` sentence, `ip`/`ap` paragraph, `it`/`at` tag
