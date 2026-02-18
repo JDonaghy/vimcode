@@ -1,132 +1,74 @@
 # VimCode Implementation Plan
 
-## Recently Completed
+## Recently Completed (Session 37)
 
-### ✅ Ctrl-R Reverse Command History Search (Session 28)
-- `Ctrl-R` in command mode activates incremental reverse history search
-- Status line shows `(reverse-i-search)'query': matched_command`
-- Typing narrows matches in real-time; `Ctrl-R` again cycles to older entries
-- `BackSpace` shrinks query and re-searches from most recent match
-- `Enter` accepts and executes the found command
-- `Escape` / `Ctrl-G` cancel and restore original command buffer
-- Tests: 340 → 346 passing (6 new tests)
+### ✅ Auto-Indent
+- Enter/`o`/`O` in insert mode copies leading whitespace of current line to new line
+- Controlled by `auto_indent` setting (default: true)
+- Tests: 5 new (369→374)
 
-### ✅ Cursor + Scroll Position Persistence (Session 27)
-- Reopening a file restores exact cursor line/col and scroll position
-- Positions saved on buffer switch and at quit (`:q`, `:wq`, window close)
-- Fixed settings file watcher feedback loop freeze
-- Fixed `r` + digit bug (pending key check now before count accumulation)
-- Tests: 336 → 340 passing (3 new session tests)
+### ✅ Completion Menu (Ctrl-N / Ctrl-P)
+- In insert mode: scans buffer for words matching prefix at cursor
+- Floating popup (max 10 candidates), cycles on repeated Ctrl-N/P
+- Any other key dismisses and accepts current candidate
+- GTK: Cairo/Pango popup; TUI: ratatui buffer cells with border
+- New engine fields: `completion_candidates`, `completion_idx`, `completion_start_col`
+- New render types: `CompletionMenu` + four completion colours in `Theme`
+- Tests: 4 new (374→378)
 
-### ✅ Multi-Language Syntax Highlighting (Session 26)
-- Added Python, JavaScript, Go, and C++ syntax highlighting via Tree-sitter
-- Language auto-detected from file extension (.py, .js/.jsx/.mjs/.cjs, .go, .cpp/.cc/.cxx/.h/.hpp etc)
-- New `SyntaxLanguage` enum with `from_path()` for extension detection
-- New `Syntax::new_from_path()` for automatic language selection
-- Buffers opened with `BufferState::with_file()` now auto-detect language
-- Files with unknown extension fall back to Rust highlighting
-- Tests: 324 → 336 passing (12 new tests: language detection + parser tests per language)
+### ✅ Quit / Save Commands
+- `:q` — closes current tab; quits if it's the last one (blocked if dirty)
+- `:q!` — force-closes current tab; force-quits if last
+- `:qa` — quit all (blocked if any dirty buffer)
+- `:qa!` — force-quit all
+- `Ctrl-S` — save current buffer in any mode without changing mode
+- Tests: 9 new (378→387)
 
-### ✅ Incremental Search (Session 25)
-- Real-time search as you type
-- Cursor jumps to matches immediately while typing
-- Escape restores original cursor position
-- Backspace updates search results dynamically
-- Configurable in settings.json (default: enabled)
-- Tests: 319 → 324 passing (5 new tests)
-
-### ✅ Marks (Session 25)
-- `m{a-z}` to set file-local marks
-- `'{a-z}` to jump to mark line (start of line)
-- `` `{a-z}`` to jump to exact mark position (line and column)
-- Marks are stored per buffer
-- Tests: 313 → 319 passing (6 new tests)
-
-### ✅ Visual Mode Case Change (Session 25)
-- `u` command in visual mode to convert selection to lowercase
-- `U` command in visual mode to convert selection to uppercase
-- Works in all visual modes: character, line, and block
-- Proper undo/redo support
-- Tests: 305 → 313 passing (8 new tests)
-
-### ✅ Undo Line (Session 24)
-- `U` command to undo all changes on the current line
-- Tracks original line state when first modified
-- Works across multiple operations on the same line
-- Properly integrates with undo/redo stack
-- Tests: 295 → 300 passing (5 new tests)
-
-### ✅ Replace Character (Session 24)
-- `r` command to replace character under cursor
-- Count support (e.g., `3rx` replaces 3 chars with 'x')
-- Repeat support with `.` command
-- Respects line boundaries (doesn't cross newlines)
-- Tests: 288 → 295 passing (7 new tests)
-
-### ✅ Reverse Search (Session 24)
-- `?` command for backward search
-- Direction-aware `n` and `N` navigation
-- Tests: 284 → 288 passing (4 new tests)
-
-### ✅ Session Persistence (Session 23)
-- **CRITICAL FIX:** Line numbers now visible in Absolute mode
-- Command/search history with Up/Down arrow navigation
-- Tab auto-completion for commands
-- Window geometry persistence (width/height)
-- Explorer visibility state persistence
-- Session state at `~/.config/vimcode/session.json`
-- Tests: 279 → 284 passing
-
-### ✅ Find/Replace (Session 22)
-- Vim :s command with ranges and flags
-- VSCode-style Ctrl-F dialog
-- Replace/Replace All with undo support
-
-### ✅ Macros (Session 21)
-- Record (q), playback (@), repeat (@@)
-- Full keystroke capture with Vim encoding
-
-### ✅ Visual Block Mode (Session 19)
-- Ctrl-V for rectangular selections
-- Block yank/delete/change operations
+### ✅ Session Restore Fix
+- Each file in `open_files` restored into its own tab on startup
+- Previously-active file's tab is focused
+- `open_file_paths()` filters to window-visible buffers so files closed via
+  `:q` are not re-opened next session
+- Tests: 1 new (387→388)
 
 ---
 
-## Future Tasks (Roadmap)
+## Recently Completed (Sessions 29–36)
 
-### Known Bugs
-- [x] ~~Reverse search (`?`) displays "/" in command line instead of "?"~~ - FIXED
-- [x] ~~`cw`/`ce` cursor positioning bug (was placing cursor before space instead of after)~~ - FIXED
+### ✅ TUI Backend (Sessions 29–30)
+- Full ratatui/crossterm terminal UI with sidebar, mouse, scrollbars, resize
 
-### High Priority
-- [x] ~~Visual mode case change (u/U in visual mode for lowercase/uppercase)~~ - COMPLETE
-- [x] ~~Marks (m, ')~~ - COMPLETE
-- [x] ~~Incremental search~~ - COMPLETE
-- [x] ~~More grammars (Python/JS/Go/C++)~~ - COMPLETE
+### ✅ Code Folding (Session 31)
+- `za`/`zo`/`zc`/`zR`; gutter indicators; clickable gutter column
 
-### Session Persistence Enhancements
-- [ ] Window position (x, y) persistence - requires platform-specific code
-- [x] ~~Cursor position persistence per file~~ - COMPLETE
-- [x] ~~Scroll position persistence per file~~ - COMPLETE
-- [x] ~~Command history search (Ctrl-R style reverse search)~~ - COMPLETE
-- [ ] Regex-based command completion
-- [ ] Multi-session support (save/restore named sessions)
+### ✅ Session File Restore (Session 32)
+- Open file list saved on quit and restored on next launch
 
-### Medium Priority
-- [ ] Multiple cursors
-- [ ] Code folding
-- [ ] Git integration
-- [ ] LSP support
+### ✅ Git Integration (Sessions 33–35)
+- Gutter markers, branch in status bar, `:Gdiff`, `:Gstatus`, `:Gadd`, `:Gcommit`, `:Gpush`, `:Gblame`
 
-### Low Priority
-- [ ] Themes
-- [ ] Plugin system
+### ✅ Explorer Preview (Session 35)
+- Single-click → preview tab (italic); double-click → permanent
 
-### Major Architectural Enhancements (Deferred)
-- [ ] **TUI Mode (Terminal UI)** - requires major refactoring
-  - Trait-based rendering abstraction (Cairo vs Ratatui)
-  - Input abstraction layer (GTK vs crossterm/termion)
-  - Color/theme system extraction
-  - ~2000+ lines of changes
-  - Benefits: SSH sessions, lightweight environments
-  - Keep `src/core/` clean to ease future abstraction
+### ✅ Scrollbar Polish (Session 36)
+- Per-window vertical + horizontal scrollbars in TUI; drag support; scroll sync
+
+---
+
+## Roadmap
+
+### Git
+- [ ] **Stage hunks** — interactive `git add -p` style hunk staging
+
+### Editor Features
+- [ ] **`:set` command** — runtime setting changes (`tabwidth`, `expandtab`, `number`, etc.)
+- [ ] **`:grep` / `:vimgrep`** — project-wide search, populate quickfix list
+- [ ] **Quickfix window** — `:copen`, `:cn`, `:cp` navigation
+- [ ] **More text objects** — `is`/`as` sentence, `ip`/`ap` paragraph, `it`/`at` tag
+
+### Big Features
+- [ ] **LSP support** — completions, go-to-definition, hover, diagnostics
+- [ ] **`gd` / `gD`** — go-to-definition (ctags/ripgrep stub before LSP)
+- [ ] **`:norm`** — execute normal command on a range of lines
+- [ ] **Multiple cursors**
+- [ ] **Themes / plugin system**

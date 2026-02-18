@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Feb 17, 2026 (Session 36)
+**Last updated:** Feb 18, 2026 (Session 37)
 
 ## Status
 
@@ -44,11 +44,12 @@
   - Window geometry persistence (size restored on startup)
   - Explorer visibility state (persisted across sessions)
   - Cursor + scroll position per file (restored on reopen)
-  - **Open file list restored on startup** (all open buffers + active file saved on quit, reopened next launch when no CLI file given)
+  - **Open file list restored on startup** — each previously-open file restored into its own tab; active file focused; files explicitly closed via `:q` are excluded from the next session
   - Session state at `~/.config/vimcode/session.json`
 - Buffers (:bn/:bp/:b#/:ls/:bd)
 - Windows (:split/:vsplit, Ctrl-W)
 - Tabs (:tabnew/:tabclose, gt/gT)
+- **Quit / save commands:** `:q` closes current tab (quits if last); `:q!` force-closes; `:qa` / `:qa!` close all; `Ctrl-S` saves in any mode
 
 ### File Explorer (Complete)
 - VSCode-style sidebar (Ctrl-B toggle, Ctrl-Shift-E focus)
@@ -92,6 +93,7 @@
 - Font family and size (hot-reload on save)
 - Explorer visibility on startup (default: hidden)
 - Incremental search (default: enabled, set to false to disable)
+- Auto-indent (default: enabled — Enter/o/O copy leading whitespace from current line)
 - `:config reload` runtime refresh
 - File watcher for automatic reload
 
@@ -111,8 +113,8 @@ vimcode/
 │       ├── settings.rs (~190 lines) — JSON persistence, auto-init
 │       ├── window.rs, tab.rs, view.rs, cursor.rs, mode.rs, syntax.rs
 │       ├── git.rs (~240 lines) — git subprocess integration (diff/blame parsing, branch detection)
-│       └── Tests: 369 passing (9 find/replace, 14 macro, 8 session, 4 reverse search, 7 replace char, 5 undo line, 8 case change, 6 marks, 5 incremental search, 12 syntax/language, 6 history search, 11 fold tests, 8 git tests, 4 sidebar-preview tests)
-└── Total: ~16,300 lines
+│       └── Tests: 388 passing (9 find/replace, 14 macro, 8 session, 4 reverse search, 7 replace char, 5 undo line, 8 case change, 6 marks, 5 incremental search, 12 syntax/language, 6 history search, 11 fold tests, 8 git tests, 4 sidebar-preview tests, 5 auto-indent tests, 4 completion tests, 9 quit/ctrl-s tests, 1 session-restore test)
+└── Total: ~16,400 lines
 ```
 
 ## Architecture
@@ -135,7 +137,7 @@ vimcode/
 ```bash
 cargo build
 cargo run -- <file>
-cargo test -- --test-threads=1    # 369 tests
+cargo test -- --test-threads=1    # 388 tests
 cargo clippy -- -D warnings
 cargo fmt
 ```
@@ -172,9 +174,9 @@ cargo fmt
 - [ ] **Stage hunks** — stage individual diff hunks interactively (like `git add -p`)
 
 ### Editor features
-- [ ] **Auto-indent** — smart indentation on Enter; respect `shiftwidth`/`expandtab`
+- [x] **Auto-indent** — copies current line's leading whitespace on Enter/o/O; `auto_indent` setting (default: true)
+- [x] **Completion menu** — Ctrl-N/Ctrl-P word completion from buffer in insert mode; floating popup in GTK + TUI
 - [ ] **:set command** — runtime setting changes (`tabwidth`, `expandtab`, `number`, etc.)
-- [ ] **Completion menu** — Ctrl-N/Ctrl-P word completion from buffer in insert mode
 - [ ] **:grep / :vimgrep** — project-wide search, populate quickfix list
 - [ ] **Quickfix window** — `:copen`, `:cn`, `:cp` quickfix navigation
 - [ ] **More text objects** — `is`/`as` sentence, `ip`/`ap` paragraph, `it`/`at` tag
@@ -185,6 +187,10 @@ cargo fmt
 - [ ] **`:norm`** — execute normal command on a range of lines
 
 ## Recent Work
+**Session 37 (cont):** Session restore + quit fixes — `:q` closes the current tab (quits when it's the last one); `:q!` force-closes; `:qa`/`:qa!` quit all. `Ctrl-S` saves in any mode. Session restore now opens each saved file in its own tab and focuses the previously-active file. `open_file_paths()` filters to window-visible buffers only so files explicitly closed via `:q` are not restored on next launch. (387→388 tests, 1 new session-restore test.)
+
+**Session 37:** Auto-indent + Completion menu + Quit/Save — Auto-indent: pressing Enter/`o`/`O` in insert mode copies the leading whitespace of the current line to the new line; controlled by `auto_indent` setting (default: true). Completion menu: Ctrl-N/Ctrl-P in insert mode scans the current buffer for words matching the prefix at the cursor, shows a floating popup (max 10 items), cycles through them on repeated presses; any other key dismisses and accepts. GTK renders popup via Cairo/Pango; TUI renders via ratatui buffer cells. New engine fields: `completion_candidates`, `completion_idx`, `completion_start_col`. New render types: `CompletionMenu` + four completion colours in `Theme`. (369→388 tests total.)
+
 **Session 36:** TUI scrollbar overhaul + GTK h-scroll fix — TUI vsplit separator now renders `█`/`░` scrollbar chars for the left pane (the separator column IS the left-pane vertical scrollbar; click-to-jump already worked, now it looks right too). Added horizontal scrollbar row (`█`/`░` thumb/track) at the bottom of every TUI window when content is wider than the viewport; `┘` corner when both axes have scrollbars. Vertical scrollbar shortens by 1 row when h-scrollbar is present. All TUI scrollbar thumbs are draggable (unified `ScrollDragState` with `is_horizontal` flag). Scroll wheel now scrolls whichever pane the mouse is over, not always the active one. `sync_scroll_binds()` called after every mouse scroll/drag so `:Gblame` pairs stay in sync. Per-window `set_viewport_for_window` called each frame so `ensure_cursor_visible` uses the actual pane width — fixes horizontal scrolling in vsplit. GTK `HorizontalScrollbarChanged` now routes through new `set_scroll_left_for_window` so dragging a non-active pane's h-scrollbar works. New engine methods: `set_viewport_for_window`, `set_scroll_top_for_window`, `set_scroll_left_for_window`. `max_col` (max line length across full buffer) added to `RenderedWindow`. (369 tests, no change.)
 **Session 35:** `:Gblame` + explorer preview fix + scrollbar fixes — Added `:Gblame`/`:Gb` command: runs `git blame --porcelain`, formats output as `<hash> (<author> <date> <lineno>) <content>`, opens in a vertical split with scroll-bound sync so both panes stay in step during keyboard nav and scrollbar drag. Fixed a latent bug in `:Gdiff`/`:Gstatus`/`:Gblame` that deleted the original buffer after splitting (leaving left pane as [No Name]). Fixed explorer single-click regression introduced in session 34: single-click now calls `open_file_preview` (new engine method) which opens a preview tab that is replaced by the next single-click; double-click still calls `open_file_in_tab` for permanent open. Fixed horizontal scrollbar `page_size` incorrectly using the full-editor `viewport_cols` value — now computed per-window from the real Pango `char_width` (cached via `CacheFontMetrics` message), minus the gutter and vertical scrollbar pixels. Fixed vertical scroll sync not firing when the GTK scrollbar is dragged (scrollbar events bypass `process_key`; `sync_scroll_binds` is now also called in `VerticalScrollbarChanged`). (365→369 tests, 4 new sidebar-preview tests + 5 new blame/epoch tests.)
 **Session 34:** Explorer tab bug fix + extended git commands — sidebar clicks now call `open_file_in_tab` (new engine method): switches to existing tab if file is already open, else creates a new tab; never replaces current tab's content. Added `:Gstatus`/`:Gs` (git status in vsplit), `:Gadd`/`:Gadd!` (stage current file or all), `:Gcommit <msg>` (commit with message, refreshes diff markers), `:Gpush` (push to remote). All git helpers in `src/core/git.rs`. Roadmap updated with full backlog. (360 tests, no change.)
