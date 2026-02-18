@@ -3014,9 +3014,17 @@ impl Engine {
                 let line = self.view().cursor.line;
                 let col = self.view().cursor.col;
                 let char_idx = self.buffer().line_to_char(line) + col;
-                self.insert_with_undo(char_idx, "    ");
-                self.insert_text_buffer.push_str("    ");
-                self.view_mut().cursor.col += 4;
+                if self.settings.expand_tab {
+                    let n = self.settings.tabstop as usize;
+                    let spaces = " ".repeat(n);
+                    self.insert_with_undo(char_idx, &spaces);
+                    self.insert_text_buffer.push_str(&spaces);
+                    self.view_mut().cursor.col += n;
+                } else {
+                    self.insert_with_undo(char_idx, "\t");
+                    self.insert_text_buffer.push('\t');
+                    self.view_mut().cursor.col += 1;
+                }
                 *changed = true;
             }
             "Left" => self.move_left(),
@@ -4393,6 +4401,28 @@ impl Engine {
         // Handle :tabprev / :tabp
         if cmd == "tabprev" || cmd == "tabp" || cmd == "tabprevious" {
             self.prev_tab();
+            return EngineAction::None;
+        }
+
+        // Handle :set [option]
+        if cmd == "set" {
+            self.message = self.settings.display_all();
+            return EngineAction::None;
+        }
+        if let Some(args) = cmd.strip_prefix("set ") {
+            match self.settings.parse_set_option(args.trim()) {
+                Ok(msg) => {
+                    if let Err(e) = self.settings.save() {
+                        self.message = format!("Setting changed but failed to save: {e}");
+                    } else {
+                        self.message = msg;
+                    }
+                }
+                Err(e) => {
+                    self.message = e;
+                    return EngineAction::Error;
+                }
+            }
             return EngineAction::None;
         }
 
@@ -12803,5 +12833,70 @@ mod tests {
         press_char(&mut engine, 'x');
         assert!(engine.completion_idx.is_none());
         assert!(engine.completion_candidates.is_empty());
+    }
+
+    // ── :set command (engine-level) ───────────────────────────────────────────
+
+    #[test]
+    fn test_set_number_via_command() {
+        let mut engine = Engine::new();
+        engine.settings.line_numbers = crate::core::settings::LineNumberMode::None;
+        // Use parse_set_option directly to avoid writing to disk in unit tests
+        engine.settings.parse_set_option("number").unwrap();
+        assert_eq!(
+            engine.settings.line_numbers,
+            crate::core::settings::LineNumberMode::Absolute
+        );
+    }
+
+    #[test]
+    fn test_set_relativenumber_after_number_gives_hybrid() {
+        let mut engine = Engine::new();
+        engine.settings.line_numbers = crate::core::settings::LineNumberMode::Absolute;
+        engine.settings.parse_set_option("relativenumber").unwrap();
+        assert_eq!(
+            engine.settings.line_numbers,
+            crate::core::settings::LineNumberMode::Hybrid
+        );
+    }
+
+    #[test]
+    fn test_set_expandtab_false_tab_inserts_tab_char() {
+        let mut engine = Engine::new();
+        engine.settings.expand_tab = false;
+        press_char(&mut engine, 'i');
+        press_special(&mut engine, "Tab");
+        press_special(&mut engine, "Escape");
+        let text: String = engine.buffer().content.chars().collect();
+        assert!(text.starts_with('\t'), "expected tab char, got: {:?}", text);
+    }
+
+    #[test]
+    fn test_set_expandtab_true_tab_inserts_spaces() {
+        let mut engine = Engine::new();
+        engine.settings.expand_tab = true;
+        engine.settings.tabstop = 2;
+        press_char(&mut engine, 'i');
+        press_special(&mut engine, "Tab");
+        press_special(&mut engine, "Escape");
+        let text: String = engine.buffer().content.chars().collect();
+        assert!(text.starts_with("  "), "expected 2 spaces, got: {:?}", text);
+        assert!(!text.starts_with('\t'));
+    }
+
+    #[test]
+    fn test_set_unknown_option_sets_error_message() {
+        let mut engine = Engine::new();
+        let result = engine.settings.parse_set_option("badoption");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_set_display_all() {
+        let engine = Engine::new();
+        let display = engine.settings.display_all();
+        assert!(!display.is_empty());
+        assert!(display.contains("ts="));
+        assert!(display.contains("sw="));
     }
 }
