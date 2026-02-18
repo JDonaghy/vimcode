@@ -1230,12 +1230,8 @@ impl SimpleComponent for App {
                 self.redraw = !self.redraw;
             }
             Msg::HorizontalScrollbarChanged { window_id, value } => {
-                // Update specific window's scroll_left based on scrollbar value
                 let mut engine = self.engine.borrow_mut();
-                // For now, only scroll if it's the active window
-                if engine.active_window_id() == window_id {
-                    engine.set_scroll_left(value.round() as usize);
-                }
+                engine.set_scroll_left_for_window(window_id, value.round() as usize);
                 drop(engine);
                 self.redraw = !self.redraw;
             }

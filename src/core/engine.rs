@@ -471,6 +471,13 @@ impl Engine {
         }
     }
 
+    /// Set scroll_left for a specific window without changing the active window.
+    pub fn set_scroll_left_for_window(&mut self, window_id: WindowId, scroll_left: usize) {
+        if let Some(window) = self.windows.get_mut(&window_id) {
+            window.view.scroll_left = scroll_left;
+        }
+    }
+
     // =======================================================================
     // Buffer operations
     // =======================================================================

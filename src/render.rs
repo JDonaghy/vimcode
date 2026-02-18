@@ -203,6 +203,9 @@ pub struct RenderedWindow {
     pub show_active_bg: bool,
     /// Whether the buffer has git diff data (controls git column in gutter).
     pub has_git_diff: bool,
+    /// Maximum line length across the whole buffer (character cells, excluding
+    /// trailing newline).  Used by backends to size the horizontal scrollbar.
+    pub max_col: usize,
 }
 
 // ─── CommandLineData ──────────────────────────────────────────────────────────
@@ -499,6 +502,7 @@ fn build_rendered_window(
         is_active,
         show_active_bg: false,
         has_git_diff: false,
+        max_col: 0,
     };
 
     let window = match engine.windows.get(&window_id) {
@@ -634,6 +638,14 @@ fn build_rendered_window(
         None
     };
 
+    // Maximum line length across the whole buffer (excluding trailing \n).
+    let max_col = buffer
+        .content
+        .lines()
+        .map(|l| l.chars().count().saturating_sub(1))
+        .max()
+        .unwrap_or(0);
+
     RenderedWindow {
         window_id,
         rect: *rect,
@@ -647,6 +659,7 @@ fn build_rendered_window(
         is_active,
         show_active_bg: is_active && multi_window,
         has_git_diff: has_git,
+        max_col,
     }
 }
 

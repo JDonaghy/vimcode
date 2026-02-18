@@ -175,15 +175,20 @@ struct SidebarPrompt {
 
 // ─── Public entry point ───────────────────────────────────────────────────────
 
-/// State for an active scrollbar drag.
+/// State for an active scrollbar drag (vertical or horizontal).
 struct ScrollDragState {
     window_id: crate::core::WindowId,
-    /// Absolute terminal row of the top of the scrollbar track.
-    track_abs_y: u16,
-    /// Height of the scrollbar track in rows.
-    track_h: u16,
-    /// Total lines in the buffer at drag start.
-    total_lines: usize,
+    /// `false` = vertical scrollbar, `true` = horizontal scrollbar.
+    is_horizontal: bool,
+    /// For vertical: absolute terminal row of track top.
+    /// For horizontal: absolute terminal column of track start.
+    track_abs_start: u16,
+    /// For vertical: track height in rows.
+    /// For horizontal: track width in columns.
+    track_len: u16,
+    /// For vertical: total buffer lines.
+    /// For horizontal: max line length (max_col).
+    total: usize,
 }
 
 /// Initialise the engine, set up the terminal, run the event loop, and restore
@@ -578,15 +583,24 @@ fn handle_mouse(
             return new_w.clamp(15, 60);
         }
         MouseEventKind::Drag(MouseButton::Left) => {
-            // Scrollbar thumb drag
+            // Scrollbar thumb drag (vertical or horizontal)
             if let Some(ref drag) = *dragging_scrollbar {
-                if drag.track_h > 0 && drag.total_lines > 0 {
-                    let clamped = row.clamp(drag.track_abs_y, drag.track_abs_y + drag.track_h - 1);
-                    let ratio = (clamped - drag.track_abs_y) as f64 / drag.track_h as f64;
-                    let new_top = (ratio * drag.total_lines as f64) as usize;
-                    engine.set_cursor_for_window(drag.window_id, new_top, 0);
-                    engine.ensure_cursor_visible();
-                    engine.sync_scroll_binds();
+                if drag.track_len > 0 && drag.total > 0 {
+                    if drag.is_horizontal {
+                        let end = drag.track_abs_start + drag.track_len - 1;
+                        let clamped = col.clamp(drag.track_abs_start, end);
+                        let ratio = (clamped - drag.track_abs_start) as f64 / drag.track_len as f64;
+                        let new_left = (ratio * drag.total as f64) as usize;
+                        engine.set_scroll_left_for_window(drag.window_id, new_left);
+                    } else {
+                        let end = drag.track_abs_start + drag.track_len - 1;
+                        let clamped = row.clamp(drag.track_abs_start, end);
+                        let ratio = (clamped - drag.track_abs_start) as f64 / drag.track_len as f64;
+                        let new_top = (ratio * drag.total as f64) as usize;
+                        engine.set_cursor_for_window(drag.window_id, new_top, 0);
+                        engine.ensure_cursor_visible();
+                        engine.sync_scroll_binds();
+                    }
                 }
                 return sidebar_width;
             }
@@ -724,19 +738,31 @@ fn handle_mouse(
 
             if rel_col >= wx && rel_col < wx + ww && editor_row >= wy && editor_row < wy + wh {
                 let viewport_lines = wh as usize;
-                let has_scrollbar = rw.total_lines > viewport_lines;
+                let has_v_scrollbar = rw.total_lines > viewport_lines;
+                let gutter = rw.gutter_char_width as u16;
+                let viewport_cols = (ww as usize)
+                    .saturating_sub(gutter as usize + if has_v_scrollbar { 1 } else { 0 });
+                let has_h_scrollbar = rw.max_col > viewport_cols && wh > 1;
 
-                // Scrollbar click/drag-start (rightmost column when scrollbar is shown)
-                if has_scrollbar && rel_col == wx + ww - 1 {
+                // Vertical scrollbar click/drag-start (rightmost column)
+                if has_v_scrollbar && rel_col == wx + ww - 1 {
                     // row 1 = tab bar offset; wy = window top in editor area
-                    let track_abs_y = 1 + wy;
+                    let track_abs_start = 1 + wy;
+                    // If there's also a h-scrollbar, v-track is 1 row shorter
+                    let track_len = if has_h_scrollbar {
+                        wh.saturating_sub(1)
+                    } else {
+                        wh
+                    };
                     *dragging_scrollbar = Some(ScrollDragState {
                         window_id: rw.window_id,
-                        track_abs_y,
-                        track_h: wh,
-                        total_lines: rw.total_lines,
+                        is_horizontal: false,
+                        track_abs_start,
+                        track_len,
+                        total: rw.total_lines,
                     });
-                    let ratio = (editor_row - wy) as f64 / wh as f64;
+                    let track_rel_row = editor_row.saturating_sub(wy);
+                    let ratio = track_rel_row as f64 / track_len as f64;
                     let new_top = (ratio * rw.total_lines as f64) as usize;
                     engine.set_cursor_for_window(rw.window_id, new_top, 0);
                     engine.ensure_cursor_visible();
@@ -744,8 +770,27 @@ fn handle_mouse(
                     return sidebar_width;
                 }
 
+                // Horizontal scrollbar click/drag-start (bottom row)
+                if has_h_scrollbar && editor_row == wy + wh - 1 {
+                    let track_x = wx + gutter;
+                    let track_w = ww.saturating_sub(gutter + if has_v_scrollbar { 1 } else { 0 });
+                    if rel_col >= track_x && rel_col < track_x + track_w && track_w > 0 {
+                        let track_abs_start = editor_left + track_x;
+                        *dragging_scrollbar = Some(ScrollDragState {
+                            window_id: rw.window_id,
+                            is_horizontal: true,
+                            track_abs_start,
+                            track_len: track_w,
+                            total: rw.max_col,
+                        });
+                        let ratio = (rel_col - track_x) as f64 / track_w as f64;
+                        let new_left = (ratio * rw.max_col as f64) as usize;
+                        engine.set_scroll_left_for_window(rw.window_id, new_left);
+                        return sidebar_width;
+                    }
+                }
+
                 // Check gutter area
-                let gutter = rw.gutter_char_width as u16;
                 let view_row = (editor_row - wy) as usize;
                 if gutter > 0 && rel_col >= wx && rel_col < wx + gutter {
                     // Any click in gutter toggles fold if there's a fold indicator
@@ -1054,6 +1099,9 @@ fn render_window(frame: &mut ratatui::Frame, area: Rect, window: &RenderedWindow
     let gutter_w = window.gutter_char_width as u16;
     let viewport_lines = area.height as usize;
     let has_scrollbar = window.total_lines > viewport_lines && area.width > gutter_w + 1;
+    let viewport_cols =
+        (area.width as usize).saturating_sub(gutter_w as usize + if has_scrollbar { 1 } else { 0 });
+    let has_h_scrollbar = window.max_col > viewport_cols && area.height > 1;
 
     // Fill background
     for row in 0..area.height {
@@ -1123,7 +1171,7 @@ fn render_window(frame: &mut ratatui::Frame, area: Rect, window: &RenderedWindow
         render_selection(frame.buffer_mut(), area, window, sel, window_bg, theme);
     }
 
-    // Scrollbar
+    // Vertical scrollbar
     if has_scrollbar {
         render_scrollbar(
             frame.buffer_mut(),
@@ -1131,6 +1179,21 @@ fn render_window(frame: &mut ratatui::Frame, area: Rect, window: &RenderedWindow
             window.scroll_top,
             window.total_lines,
             viewport_lines,
+            has_h_scrollbar,
+            theme,
+        );
+    }
+
+    // Horizontal scrollbar
+    if has_h_scrollbar {
+        render_h_scrollbar(
+            frame.buffer_mut(),
+            area,
+            window.scroll_left,
+            window.max_col,
+            viewport_cols,
+            gutter_w,
+            has_scrollbar,
             theme,
         );
     }
@@ -1168,6 +1231,8 @@ fn render_scrollbar(
     scroll_top: usize,
     total_lines: usize,
     viewport_lines: usize,
+    // When true, leave the last row for the horizontal scrollbar (don't draw there)
+    has_h_scrollbar: bool,
     theme: &Theme,
 ) {
     if area.height == 0 || total_lines == 0 {
@@ -1176,18 +1241,74 @@ fn render_scrollbar(
     let track_fg = rc(theme.separator);
     let thumb_fg = rc(theme.status_fg);
     let sb_bg = rc(theme.background);
-    let h = area.height as f64;
+    // Track height: reserve last row for h-scrollbar if present
+    let track_h = if has_h_scrollbar {
+        area.height.saturating_sub(1)
+    } else {
+        area.height
+    };
+    if track_h == 0 {
+        return;
+    }
+    let h = track_h as f64;
     let thumb_size = ((viewport_lines as f64 / total_lines as f64) * h)
         .ceil()
         .max(1.0) as u16;
     let thumb_top = ((scroll_top as f64 / total_lines as f64) * h).floor() as u16;
     let sb_x = area.x + area.width - 1;
-    for dy in 0..area.height {
+    for dy in 0..track_h {
         let y = area.y + dy;
         let in_thumb = dy >= thumb_top && dy < thumb_top + thumb_size;
         let ch = if in_thumb { '█' } else { '░' };
         let fg = if in_thumb { thumb_fg } else { track_fg };
         set_cell(buf, sb_x, y, ch, fg, sb_bg);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_h_scrollbar(
+    buf: &mut ratatui::buffer::Buffer,
+    area: Rect,
+    scroll_left: usize,
+    max_col: usize,
+    viewport_cols: usize,
+    gutter_w: u16,
+    has_v_scrollbar: bool,
+    theme: &Theme,
+) {
+    if area.height == 0 || max_col == 0 || viewport_cols == 0 {
+        return;
+    }
+    let track_fg = rc(theme.separator);
+    let thumb_fg = rc(theme.status_fg);
+    let sb_bg = rc(theme.background);
+
+    let sb_y = area.y + area.height - 1;
+    let track_x = area.x + gutter_w;
+    // Leave the rightmost cell for the v-scrollbar corner / separator
+    let track_w = area
+        .width
+        .saturating_sub(gutter_w + if has_v_scrollbar { 1 } else { 0 });
+    if track_w == 0 {
+        return;
+    }
+
+    let w = track_w as f64;
+    let thumb_size = ((viewport_cols as f64 / max_col as f64) * w)
+        .ceil()
+        .max(1.0) as u16;
+    let thumb_left = ((scroll_left as f64 / max_col as f64) * w).floor() as u16;
+
+    for dx in 0..track_w {
+        let x = track_x + dx;
+        let in_thumb = dx >= thumb_left && dx < thumb_left + thumb_size;
+        let ch = if in_thumb { '█' } else { '░' };
+        let fg = if in_thumb { thumb_fg } else { track_fg };
+        set_cell(buf, x, sb_y, ch, fg, sb_bg);
+    }
+    // Corner cell (intersection of v-scrollbar column and h-scrollbar row)
+    if has_v_scrollbar {
+        set_cell(buf, area.x + area.width - 1, sb_y, '┘', track_fg, sb_bg);
     }
 }
 
