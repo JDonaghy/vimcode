@@ -1,5 +1,20 @@
 # VimCode Implementation Plan
 
+## Recently Completed (Session 39)
+
+### ✅ Stage Hunks
+- `]c` / `[c` — jump to next/previous `@@` hunk header in diff buffer
+- `gs` (via `g` + `s` pending key) — stage hunk under cursor using `git apply --cached`
+- `:Ghs` / `:Ghunk` — command-line aliases for stage hunk
+- `Hunk` struct + `parse_diff_hunks()` in `git.rs` — pure string parsing, no subprocess
+- `run_git_stdin()` — pipes patch text to git subprocess stdin
+- `stage_hunk()` — builds minimal patch and feeds it to `git apply --cached -`
+- `BufferState.source_file: Option<PathBuf>` — set by `:Gdiff` so hunk staging knows which file to patch
+- After staging: refreshes gutter markers on the source buffer if it's open
+- Tests: 10 new (410→420)
+
+---
+
 ## Recently Completed (Session 38)
 
 ### ✅ :set Command
@@ -72,7 +87,7 @@
 ## Roadmap
 
 ### Git
-- [ ] **Stage hunks** — interactive `git add -p` style hunk staging
+- [x] **Stage hunks** — `]c`/`[c` navigation, `gs`/`:Ghs` to stage hunk under cursor
 
 ### Editor Features
 - [x] **`:set` command** — runtime setting changes; write-through to settings.json; number/rnu/expandtab/tabstop/shiftwidth/autoindent/incsearch; query with `?`

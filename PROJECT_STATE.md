@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Feb 18, 2026 (Session 38)
+**Last updated:** Feb 18, 2026 (Session 39)
 
 ## Status
 
@@ -72,7 +72,7 @@
 - **Font configuration:** Customizable font family and size
 - **Nerd Font icons:** File-type icons in both GTK sidebar and TUI sidebar (`src/icons.rs`)
 - **Code folding:** `+`/`-` gutter indicators; entire gutter column is clickable in both GTK and TUI
-- **Git integration:** `▌` gutter markers (green=added, yellow=modified); branch name in status bar; `:Gdiff`/`:Gd` command opens unified diff in vertical split; `:Gblame`/`:Gb` command opens `git blame` annotation in a scroll-synced vertical split
+- **Git integration:** `▌` gutter markers (green=added, yellow=modified); branch name in status bar; `:Gdiff`/`:Gd` command opens unified diff in vertical split; `:Gblame`/`:Gb` command opens `git blame` annotation in a scroll-synced vertical split; **Stage hunks:** `]c`/`[c` navigate between `@@` hunks, `gs`/`:Ghs`/`:Ghunk` stages the hunk under the cursor via `git apply --cached`
 
 ### TUI Backend (`src/tui_main.rs`)
 - Full editor in terminal via ratatui 0.27 + crossterm
@@ -120,8 +120,8 @@ vimcode/
 │       ├── session.rs (~175 lines) — Session state persistence (sidebar_width added)
 │       ├── settings.rs (~360 lines) — JSON persistence, auto-init, :set parsing
 │       ├── window.rs, tab.rs, view.rs, cursor.rs, mode.rs, syntax.rs
-│       ├── git.rs (~240 lines) — git subprocess integration (diff/blame parsing, branch detection)
-│       └── Tests: 410 passing (9 find/replace, 14 macro, 8 session, 4 reverse search, 7 replace char, 5 undo line, 8 case change, 6 marks, 5 incremental search, 12 syntax/language, 6 history search, 11 fold tests, 8 git tests, 4 sidebar-preview tests, 5 auto-indent tests, 4 completion tests, 9 quit/ctrl-s tests, 1 session-restore test, 22 set-command tests)
+│       ├── git.rs (~310 lines) — git subprocess integration (diff/blame/hunk parsing, branch detection, stage_hunk)
+│       └── Tests: 420 passing (9 find/replace, 14 macro, 8 session, 4 reverse search, 7 replace char, 5 undo line, 8 case change, 6 marks, 5 incremental search, 12 syntax/language, 6 history search, 11 fold tests, 12 git tests, 4 sidebar-preview tests, 5 auto-indent tests, 4 completion tests, 9 quit/ctrl-s tests, 1 session-restore test, 22 set-command tests, 10 hunk-staging tests)
 └── Total: ~16,800 lines
 ```
 
@@ -145,7 +145,7 @@ vimcode/
 ```bash
 cargo build
 cargo run -- <file>
-cargo test -- --test-threads=1    # 410 tests
+cargo test -- --test-threads=1    # 420 tests
 cargo clippy -- -D warnings
 cargo fmt
 ```
@@ -179,7 +179,7 @@ cargo fmt
 - [x] **TUI scrollbar polish: vsplit left-pane separator-as-scrollbar, h-scrollbar row, drag support, scroll sync via mouse, per-pane viewport**
 
 ### Git (next)
-- [ ] **Stage hunks** — stage individual diff hunks interactively (like `git add -p`)
+- [x] **Stage hunks** — `]c`/`[c` hunk navigation, `gs`/`:Ghs` stages hunk under cursor via `git apply --cached`
 
 ### Editor features
 - [x] **Auto-indent** — copies current line's leading whitespace on Enter/o/O; `auto_indent` setting (default: true)
@@ -195,6 +195,8 @@ cargo fmt
 - [ ] **`:norm`** — execute normal command on a range of lines
 
 ## Recent Work
+**Session 39:** Stage hunks — interactive hunk staging from a `:Gdiff` buffer. New `Hunk` struct and `parse_diff_hunks()` in `git.rs` (pure string parsing, no I/O); `run_git_stdin()` pipes text to git subprocess stdin; `stage_hunk()` builds a minimal patch and runs `git apply --cached -`. `BufferState.source_file` (new field) records which file a diff buffer was generated from. In `engine.rs`: `jump_next_hunk()`/`jump_prev_hunk()` scan for `@@` lines, `cmd_git_stage_hunk()` identifies the hunk under the cursor and stages it. Key wiring: `]c`/`[c` navigate hunks; `gs` (pending `g` + `s`) and `:Ghs`/`:Ghunk` stage the hunk. After staging, gutter markers on the source buffer are refreshed automatically. (410→420 tests, 10 new: 4 hunk-parse unit tests + 6 engine integration tests.)
+
 **Session 38:** `:set` command — vim-compatible runtime setting changes that write through to `settings.json` immediately (VSCode-friendly). New settings fields: `expand_tab` (default true), `tabstop` (default 4), `shift_width` (default 4). Supported syntax: `:set` (show all), `:set number`/`:set nonumber`, `:set tabstop=2`, `:set ts?` (query). Boolean options: `number`/`nu`, `relativenumber`/`rnu`, `expandtab`/`et`, `autoindent`/`ai`, `incsearch`/`is`. Numeric options: `tabstop`/`ts`, `shiftwidth`/`sw`. Line number options interact vim-style: `number` + `relativenumber` = Hybrid mode. Tab key now respects `expand_tab`/`tabstop` instead of hardcoded 4 spaces. (388→410 tests, 22 new.)
 
 **Session 37 (cont):** Session restore + quit fixes — `:q` closes the current tab (quits when it's the last one); `:q!` force-closes; `:qa`/`:qa!` quit all. `Ctrl-S` saves in any mode. Session restore now opens each saved file in its own tab and focuses the previously-active file. `open_file_paths()` filters to window-visible buffers only so files explicitly closed via `:q` are not restored on next launch. (387→388 tests, 1 new session-restore test.)

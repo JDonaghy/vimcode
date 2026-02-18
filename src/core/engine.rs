@@ -655,6 +655,7 @@ impl Engine {
                 let buf_id = self.buffer_manager.create();
                 if let Some(state) = self.buffer_manager.get_mut(buf_id) {
                     state.buffer.content = ropey::Rope::from_str(&text);
+                    state.source_file = Some(path.clone());
                 }
                 // Split vertically; the new window (now active) shares the original buffer.
                 // Redirect it to the diff buffer without touching the original.
@@ -666,6 +667,97 @@ impl Engine {
             None => {
                 self.message = "No changes (clean working tree)".to_string();
                 EngineAction::None
+            }
+        }
+    }
+
+    /// Jump to the next `@@` hunk header below the cursor in the current buffer.
+    fn jump_next_hunk(&mut self) {
+        let start = self.view().cursor.line + 1;
+        let total = self.buffer().len_lines();
+        for i in start..total {
+            let line: String = self.buffer().content.line(i).chars().collect();
+            if line.starts_with("@@") {
+                self.view_mut().cursor.line = i;
+                self.view_mut().cursor.col = 0;
+                return;
+            }
+        }
+        self.message = "No more hunks".to_string();
+    }
+
+    /// Jump to the previous `@@` hunk header above the cursor in the current buffer.
+    fn jump_prev_hunk(&mut self) {
+        let cur = self.view().cursor.line;
+        for i in (0..cur).rev() {
+            let line: String = self.buffer().content.line(i).chars().collect();
+            if line.starts_with("@@") {
+                self.view_mut().cursor.line = i;
+                self.view_mut().cursor.col = 0;
+                return;
+            }
+        }
+        self.message = "No more hunks".to_string();
+    }
+
+    /// Stage the hunk under the cursor using `git apply --cached`.
+    fn cmd_git_stage_hunk(&mut self) -> EngineAction {
+        let source_file = match self.active_buffer_state().source_file.clone() {
+            Some(p) => p,
+            None => {
+                self.message = "Not a diff buffer (use :Gdiff first)".to_string();
+                return EngineAction::None;
+            }
+        };
+        let repo_dir = match git::find_repo_root(&source_file) {
+            Some(d) => d,
+            None => {
+                self.message = "Not a git repository".to_string();
+                return EngineAction::Error;
+            }
+        };
+        let diff_text: String = self.buffer().content.chars().collect();
+        let cursor_line = self.view().cursor.line;
+        let (file_header, hunks) = git::parse_diff_hunks(&diff_text);
+        if hunks.is_empty() {
+            self.message = "No hunks in buffer".to_string();
+            return EngineAction::None;
+        }
+        // Find which hunk the cursor is in by walking line positions.
+        let header_lines = if file_header.is_empty() {
+            0
+        } else {
+            file_header.lines().count()
+        };
+        let mut pos = header_lines;
+        let mut target = hunks.len() - 1; // default: last hunk
+        for (i, hunk) in hunks.iter().enumerate() {
+            let end = pos + 1 + hunk.lines.len(); // +1 for @@ line
+            if cursor_line < end {
+                target = i;
+                break;
+            }
+            pos = end;
+        }
+        let hunk = hunks[target].clone();
+        match git::stage_hunk(&repo_dir, &file_header, &hunk) {
+            Ok(()) => {
+                // Refresh gutter markers on the source buffer if it is open.
+                let source_buf_id = self.buffer_manager.list().into_iter().find(|&id| {
+                    self.buffer_manager
+                        .get(id)
+                        .and_then(|s| s.file_path.as_deref())
+                        == Some(source_file.as_path())
+                });
+                if let Some(id) = source_buf_id {
+                    self.refresh_git_diff(id);
+                }
+                self.message = format!("Hunk {} staged", target + 1);
+                EngineAction::None
+            }
+            Err(e) => {
+                self.message = format!("Stage hunk failed: {e}");
+                EngineAction::Error
             }
         }
     }
@@ -2232,6 +2324,12 @@ impl Engine {
             Some('g') => {
                 self.pending_key = Some('g');
             }
+            Some(']') => {
+                self.pending_key = Some(']');
+            }
+            Some('[') => {
+                self.pending_key = Some('[');
+            }
             Some('z') => {
                 // Fold commands: za, zo, zc, zR
                 self.pending_key = Some('z');
@@ -2434,8 +2532,21 @@ impl Engine {
                 Some('T') => {
                     self.prev_tab();
                 }
+                Some('s') => {
+                    return self.cmd_git_stage_hunk();
+                }
                 _ => {}
             },
+            ']' => {
+                if unicode == Some('c') {
+                    self.jump_next_hunk();
+                }
+            }
+            '[' => {
+                if unicode == Some('c') {
+                    self.jump_prev_hunk();
+                }
+            }
             'd' => {
                 // This should not be reached - 'd' is now handled as pending_operator
                 // But keep for backward compatibility during transition
@@ -4276,6 +4387,11 @@ impl Engine {
         // Handle :Gblame / :Gb
         if cmd == "Gblame" || cmd == "Gb" {
             return self.cmd_git_blame();
+        }
+
+        // Handle :Ghs / :Ghunk — stage hunk under cursor
+        if cmd == "Ghs" || cmd == "Ghunk" {
+            return self.cmd_git_stage_hunk();
         }
 
         // Handle :e <filename>
@@ -12898,5 +13014,78 @@ mod tests {
         assert!(!display.is_empty());
         assert!(display.contains("ts="));
         assert!(display.contains("sw="));
+    }
+
+    // ── hunk navigation / staging ─────────────────────────────────────────
+
+    fn make_diff_engine(diff_text: &str) -> Engine {
+        let mut engine = Engine::new();
+        let content = ropey::Rope::from_str(diff_text);
+        engine.active_buffer_state_mut().buffer.content = content;
+        engine
+    }
+
+    #[test]
+    fn test_jump_next_hunk_basic() {
+        let diff = "diff --git a/foo.rs b/foo.rs\n--- a/foo.rs\n+++ b/foo.rs\n@@ -1,2 +1,3 @@\n line1\n+added\n line2\n";
+        let mut engine = make_diff_engine(diff);
+        engine.view_mut().cursor.line = 0;
+        engine.jump_next_hunk();
+        // Cursor should be on line 3 (0-indexed), the "@@ -1,2 +1,3 @@" line
+        assert_eq!(engine.view().cursor.line, 3);
+        assert_eq!(engine.view().cursor.col, 0);
+    }
+
+    #[test]
+    fn test_jump_next_hunk_no_more() {
+        let diff = "diff --git a/foo.rs b/foo.rs\n@@ -1,2 +1,3 @@\n line1\n+added\n line2\n";
+        let mut engine = make_diff_engine(diff);
+        // Put cursor after the only @@
+        engine.view_mut().cursor.line = 4;
+        engine.jump_next_hunk();
+        assert!(engine.message.contains("No more hunks"));
+    }
+
+    #[test]
+    fn test_jump_prev_hunk_basic() {
+        let diff = "diff --git a/foo.rs b/foo.rs\n--- a/foo.rs\n+++ b/foo.rs\n@@ -1,2 +1,3 @@\n line1\n+added\n line2\n@@ -10,2 +11,2 @@\n lineA\n-lineB\n+lineC\n";
+        let mut engine = make_diff_engine(diff);
+        // Put cursor on the second @@ (line 7)
+        engine.view_mut().cursor.line = 7;
+        engine.jump_prev_hunk();
+        assert_eq!(engine.view().cursor.line, 3);
+        assert_eq!(engine.view().cursor.col, 0);
+    }
+
+    #[test]
+    fn test_jump_prev_hunk_no_more() {
+        let diff = "diff --git a/foo.rs b/foo.rs\n@@ -1,2 +1,3 @@\n line1\n+added\n line2\n";
+        let mut engine = make_diff_engine(diff);
+        // Put cursor exactly on the @@ line
+        engine.view_mut().cursor.line = 1;
+        engine.jump_prev_hunk();
+        assert!(engine.message.contains("No more hunks"));
+    }
+
+    #[test]
+    fn test_gs_no_op_in_normal_buffer() {
+        let mut engine = Engine::new();
+        // No source_file set — should show "Not a diff buffer"
+        engine.cmd_git_stage_hunk();
+        assert!(
+            engine.message.contains("Not a diff buffer"),
+            "expected 'Not a diff buffer', got: {}",
+            engine.message
+        );
+    }
+
+    #[test]
+    fn test_bracket_c_pending_key_routing() {
+        // Buffer with no @@ lines — ]c should show "No more hunks"
+        let diff = "just some text\nno hunks here\n";
+        let mut engine = make_diff_engine(diff);
+        engine.view_mut().cursor.line = 0;
+        engine.jump_next_hunk();
+        assert!(engine.message.contains("No more hunks"));
     }
 }

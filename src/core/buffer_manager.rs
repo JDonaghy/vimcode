@@ -55,6 +55,8 @@ pub struct BufferState {
     pub dirty: bool,
     /// Whether this is a preview buffer (single-click in file explorer).
     pub preview: bool,
+    /// For diff buffers: the source file the diff was generated from.
+    pub source_file: Option<PathBuf>,
     /// Syntax highlighter for this buffer.
     pub syntax: Syntax,
     /// Cached syntax highlights (byte ranges + scope names).
@@ -91,6 +93,7 @@ impl BufferState {
             file_path: None,
             dirty: false,
             preview: false,
+            source_file: None,
             syntax: Syntax::new(),
             highlights: Vec::new(),
             undo_stack: Vec::new(),
@@ -112,6 +115,7 @@ impl BufferState {
             file_path: Some(path),
             dirty: false,
             preview: false,
+            source_file: None,
             syntax,
             highlights: Vec::new(),
             undo_stack: Vec::new(),

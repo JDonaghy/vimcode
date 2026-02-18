@@ -1,11 +1,18 @@
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GitLineStatus {
     Added,
     Modified,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Hunk {
+    pub header: String,     // full "@@ -a,b +c,d @@" line
+    pub lines: Vec<String>, // body lines (with +/-/space prefix)
 }
 
 fn run_git(dir: &Path, args: &[&str]) -> Option<String> {
@@ -186,6 +193,70 @@ pub fn stage_all(dir: &Path) -> Result<(), String> {
             err
         })
     }
+}
+
+/// Parse a unified diff string into a file header and a list of hunks.
+pub fn parse_diff_hunks(diff: &str) -> (String, Vec<Hunk>) {
+    let mut file_header = String::new();
+    let mut hunks: Vec<Hunk> = Vec::new();
+    let mut in_hunk = false;
+    for line in diff.lines() {
+        if line.starts_with("@@") {
+            in_hunk = true;
+            hunks.push(Hunk {
+                header: line.to_string(),
+                lines: Vec::new(),
+            });
+        } else if !in_hunk {
+            if !file_header.is_empty() {
+                file_header.push('\n');
+            }
+            file_header.push_str(line);
+        } else if let Some(last) = hunks.last_mut() {
+            last.lines.push(line.to_string());
+        }
+    }
+    (file_header, hunks)
+}
+
+/// Run a git command with stdin input, returning stdout or an error string.
+fn run_git_stdin(dir: &Path, args: &[&str], input: &str) -> Result<String, String> {
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("git spawn failed: {e}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(input.as_bytes())
+            .map_err(|e| format!("stdin write: {e}"))?;
+    }
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("git wait: {e}"))?;
+    if out.status.success() {
+        String::from_utf8(out.stdout).map_err(|e| format!("utf8: {e}"))
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+/// Stage a single hunk by piping a minimal patch to `git apply --cached`.
+pub fn stage_hunk(dir: &Path, file_header: &str, hunk: &Hunk) -> Result<(), String> {
+    let mut patch = String::new();
+    patch.push_str(file_header);
+    patch.push('\n');
+    patch.push_str(&hunk.header);
+    patch.push('\n');
+    for line in &hunk.lines {
+        patch.push_str(line);
+        patch.push('\n');
+    }
+    run_git_stdin(dir, &["apply", "--cached", "-"], &patch).map(|_| ())
 }
 
 // ─── Commit / push ────────────────────────────────────────────────────────────
@@ -423,6 +494,46 @@ fn parse_unified_diff(diff: &str, total_lines: usize) -> Vec<Option<GitLineStatu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── parse_diff_hunks ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_diff_hunks_empty() {
+        let (header, hunks) = parse_diff_hunks("");
+        assert!(header.is_empty());
+        assert!(hunks.is_empty());
+    }
+
+    #[test]
+    fn test_parse_diff_hunks_single_hunk() {
+        let diff = "diff --git a/foo.rs b/foo.rs\n--- a/foo.rs\n+++ b/foo.rs\n@@ -1,3 +1,4 @@\n line1\n+line2\n line3\n line4\n";
+        let (header, hunks) = parse_diff_hunks(diff);
+        assert!(header.contains("diff --git"));
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].header, "@@ -1,3 +1,4 @@");
+        assert_eq!(hunks[0].lines.len(), 4);
+    }
+
+    #[test]
+    fn test_parse_diff_hunks_multi_hunk() {
+        let diff = "diff --git a/foo.rs b/foo.rs\n--- a/foo.rs\n+++ b/foo.rs\n@@ -1,2 +1,3 @@\n line1\n+added\n line2\n@@ -10,2 +11,2 @@\n lineA\n-lineB\n+lineC\n";
+        let (_header, hunks) = parse_diff_hunks(diff);
+        assert_eq!(hunks.len(), 2);
+        assert_eq!(hunks[0].header, "@@ -1,2 +1,3 @@");
+        assert_eq!(hunks[1].header, "@@ -10,2 +11,2 @@");
+        // No cross-contamination
+        assert!(hunks[0].lines.iter().all(|l| !l.starts_with("-lineB")));
+        assert!(hunks[1].lines.iter().all(|l| !l.starts_with("+added")));
+    }
+
+    #[test]
+    fn test_parse_diff_hunks_no_file_header() {
+        let diff = "@@ -1,2 +1,3 @@\n line1\n+new\n line2\n";
+        let (header, hunks) = parse_diff_hunks(diff);
+        assert!(header.is_empty());
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].lines.len(), 3);
+    }
 
     #[test]
     fn test_parse_unified_diff_added_lines() {

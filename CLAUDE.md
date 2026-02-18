@@ -3,6 +3,20 @@
 2. Check `.opencode/specs/` for detailed feature specs before starting
 3. Prompt user to update `PROJECT_STATE.md` after significant tasks
 
+## Documentation Maintenance (MANDATORY)
+After completing any feature or significant change, update ALL of these files:
+- **`README.md`** — the primary user-facing reference; keep the feature tables, key reference, and command list accurate and complete; update the test count in the intro line
+- **`PROJECT_STATE.md`** — internal progress tracker; update session date, test counts, file sizes, recent work entry, and roadmap checkboxes
+- **`PLAN.md`** — update recently completed section at top; tick off roadmap items
+
+**README.md update rules:**
+- Add new keys/commands to the appropriate Key Reference table
+- Add new `:` commands to the Command Mode table
+- Add new git commands to the git commands table
+- Add new settings to the settings table
+- Update architecture section if new files are added or line counts change significantly
+- Do NOT add speculative/planned features — only document what is implemented
+
 ## Architecture
 
 **VimCode**: Vim-like code editor in Rust with GTK4/Relm4. Clean separation: `src/core/` (platform-agnostic logic) vs `src/main.rs` (UI).
