@@ -1,5 +1,17 @@
 # VimCode Implementation Plan
 
+## Recently Completed (Session 40)
+
+### ✅ Paragraph and Sentence Text Objects
+- `ip` / `ap` — inner/around paragraph (contiguous non-blank lines); `ap` includes trailing blank lines
+- `is` / `as` — inner/around sentence (`.`/`!`/`?`-terminated); `as` includes trailing whitespace
+- Both work with all operators: `d`, `c`, `y`, `v` (visual selection)
+- `ip` on a blank line selects the contiguous blank-line block
+- Paragraph boundary (blank line) also terminates a sentence
+- Tests: 9 new (420→429)
+
+---
+
 ## Recently Completed (Session 39)
 
 ### ✅ Stage Hunks
@@ -91,13 +103,17 @@
 
 ### Editor Features
 - [x] **`:set` command** — runtime setting changes; write-through to settings.json; number/rnu/expandtab/tabstop/shiftwidth/autoindent/incsearch; query with `?`
-- [ ] **`:grep` / `:vimgrep`** — project-wide search, populate quickfix list
-- [ ] **Quickfix window** — `:copen`, `:cn`, `:cp` navigation
-- [ ] **More text objects** — `is`/`as` sentence, `ip`/`ap` paragraph, `it`/`at` tag
+- [x] **`ip`/`ap` paragraph text objects** — inner/around paragraph (contiguous non-blank lines)
+- [x] **`is`/`as` sentence text objects** — inner/around sentence (`.`/`!`/`?`-delimited)
+- [ ] **VSCode-style search & replace across files** — Ctrl-Shift-F panel; find in project, replace all, show matches list; no shell dependency
+- [ ] **`:grep` / `:vimgrep`** — project-wide search, populate quickfix list *(lower priority)*
+- [ ] **Quickfix window** — `:copen`, `:cn`, `:cp` navigation *(lower priority)*
+- [ ] **`it`/`at` tag text objects** — inner/around HTML/XML tag
 
 ### Big Features
 - [ ] **LSP support** — completions, go-to-definition, hover, diagnostics
 - [ ] **`gd` / `gD`** — go-to-definition (ctags/ripgrep stub before LSP)
 - [ ] **`:norm`** — execute normal command on a range of lines
+- [ ] **Fuzzy finder / Telescope-style** — live fuzzy file + buffer + symbol search in a floating panel *(consider after VSCode search)*
 - [ ] **Multiple cursors**
 - [ ] **Themes / plugin system**

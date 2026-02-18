@@ -74,6 +74,8 @@ cargo fmt
 - `iw` / `aw` — inner/around word
 - `i"` / `a"`, `i'` / `a'` — inner/around quotes
 - `i(` / `a(`, `i[` / `a[`, `i{` / `a{` — inner/around brackets
+- `ip` / `ap` — inner/around paragraph (contiguous non-blank lines); `ap` includes trailing blank lines
+- `is` / `as` — inner/around sentence (`.`/`!`/`?`-terminated); `as` includes trailing whitespace
 
 **Count prefix** — prepend any number to multiply: `5j`, `3dd`, `10yy`, `2w`, etc.
 

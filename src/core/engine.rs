@@ -5487,6 +5487,8 @@ impl Engine {
             '(' | ')' => self.find_bracket_object(modifier, '(', ')', cursor_pos),
             '{' | '}' => self.find_bracket_object(modifier, '{', '}', cursor_pos),
             '[' | ']' => self.find_bracket_object(modifier, '[', ']', cursor_pos),
+            'p' => self.find_paragraph_object(modifier, cursor_pos),
+            's' => self.find_sentence_object(modifier, cursor_pos),
             _ => None,
         }
     }
@@ -5667,6 +5669,168 @@ impl Engine {
         } else {
             // Around: include brackets
             Some((open_pos, close_pos + 1))
+        }
+    }
+
+    /// Find paragraph text object range (ip/ap).
+    ///
+    /// A paragraph is a contiguous block of lines that are all blank or all non-blank.
+    /// `ip` (inner) selects those lines; `ap` (around) also includes any trailing blank lines
+    /// (or leading ones when the paragraph is at the end of the buffer).
+    fn find_paragraph_object(&self, modifier: char, cursor_pos: usize) -> Option<(usize, usize)> {
+        let total_lines = self.buffer().len_lines();
+        if total_lines == 0 {
+            return None;
+        }
+
+        let safe_pos = cursor_pos.min(self.buffer().len_chars().saturating_sub(1));
+        let cursor_line = self.buffer().content.char_to_line(safe_pos);
+        let on_blank = self.is_line_empty(cursor_line);
+
+        // Extend upward while lines share the same blank/non-blank type.
+        let mut start_line = cursor_line;
+        while start_line > 0 && self.is_line_empty(start_line - 1) == on_blank {
+            start_line -= 1;
+        }
+
+        // Extend downward while lines share the same blank/non-blank type.
+        let mut end_line = cursor_line;
+        while end_line + 1 < total_lines && self.is_line_empty(end_line + 1) == on_blank {
+            end_line += 1;
+        }
+
+        // `ap` on a non-blank paragraph: include the following blank lines.
+        // If there are no following blank lines (end of file), include any preceding ones.
+        if modifier == 'a' && !on_blank {
+            if end_line + 1 < total_lines && self.is_line_empty(end_line + 1) {
+                while end_line + 1 < total_lines && self.is_line_empty(end_line + 1) {
+                    end_line += 1;
+                }
+            } else if start_line > 0 && self.is_line_empty(start_line - 1) {
+                while start_line > 0 && self.is_line_empty(start_line - 1) {
+                    start_line -= 1;
+                }
+            }
+        }
+
+        let start_pos = self.buffer().line_to_char(start_line);
+        let end_pos = if end_line + 1 < total_lines {
+            self.buffer().line_to_char(end_line + 1)
+        } else {
+            self.buffer().len_chars()
+        };
+
+        if start_pos < end_pos {
+            Some((start_pos, end_pos))
+        } else {
+            None
+        }
+    }
+
+    /// Find sentence text object range (is/as).
+    ///
+    /// A sentence ends at `.`, `!`, or `?` followed by whitespace or end-of-buffer.
+    /// A blank line also terminates a sentence (paragraph boundary).
+    /// `is` (inner) selects the sentence text without leading whitespace.
+    /// `as` (around) additionally includes the trailing whitespace after the punctuation.
+    fn find_sentence_object(&self, modifier: char, cursor_pos: usize) -> Option<(usize, usize)> {
+        let total_chars = self.buffer().len_chars();
+        if total_chars == 0 || cursor_pos >= total_chars {
+            return None;
+        }
+
+        // Returns true if the character at `pos` is sentence-ending punctuation AND
+        // it is followed by whitespace (or is at the end of the buffer).
+        let is_sentence_end_punct = |pos: usize| -> bool {
+            if pos >= total_chars {
+                return false;
+            }
+            let ch = self.buffer().content.char(pos);
+            if !matches!(ch, '.' | '!' | '?') {
+                return false;
+            }
+            pos + 1 >= total_chars || self.buffer().content.char(pos + 1).is_whitespace()
+        };
+
+        // Returns true if `pos` is the start of a blank line (the \n of a blank line).
+        let is_blank_line = |pos: usize| -> bool {
+            if pos >= total_chars {
+                return false;
+            }
+            let ch = self.buffer().content.char(pos);
+            ch == '\n' && (pos == 0 || self.buffer().content.char(pos.saturating_sub(1)) == '\n')
+        };
+
+        // --- Find start of current sentence (scan backward) ---
+        let mut sent_start = 0usize;
+        if cursor_pos > 0 {
+            let mut pos = cursor_pos - 1;
+            loop {
+                if is_sentence_end_punct(pos) {
+                    sent_start = pos + 1;
+                    break;
+                }
+                if is_blank_line(pos) {
+                    // Paragraph boundary — sentence starts right after this \n.
+                    sent_start = pos + 1;
+                    break;
+                }
+                if pos == 0 {
+                    sent_start = 0;
+                    break;
+                }
+                pos -= 1;
+            }
+        }
+
+        // --- Find end of current sentence (scan forward) ---
+        let mut sent_end = total_chars; // default: end of buffer
+        let mut pos = cursor_pos;
+        while pos < total_chars {
+            if is_sentence_end_punct(pos) {
+                sent_end = pos + 1; // include the punctuation
+                break;
+            }
+            // Blank line ends the sentence too.
+            if self.buffer().content.char(pos) == '\n'
+                && pos + 1 < total_chars
+                && self.buffer().content.char(pos + 1) == '\n'
+            {
+                sent_end = pos + 1; // include up to the blank-line newline
+                break;
+            }
+            pos += 1;
+        }
+
+        // Skip leading whitespace for the inner start.
+        let mut inner_start = sent_start;
+        while inner_start < sent_end {
+            let ch = self.buffer().content.char(inner_start);
+            if !ch.is_whitespace() {
+                break;
+            }
+            inner_start += 1;
+        }
+
+        let (start, end) = if modifier == 'i' {
+            (inner_start, sent_end)
+        } else {
+            // `as`: include trailing whitespace (spaces/tabs only, not newlines).
+            let mut e = sent_end;
+            while e < total_chars {
+                let ch = self.buffer().content.char(e);
+                if ch == '\n' || !ch.is_whitespace() {
+                    break;
+                }
+                e += 1;
+            }
+            (inner_start, e)
+        };
+
+        if start < end {
+            Some((start, end))
+        } else {
+            None
         }
     }
 
@@ -13087,5 +13251,178 @@ mod tests {
         engine.view_mut().cursor.line = 0;
         engine.jump_next_hunk();
         assert!(engine.message.contains("No more hunks"));
+    }
+
+    // ─── Paragraph text objects (ip / ap) ───────────────────────────────────
+
+    fn make_paragraph_engine(text: &str) -> Engine {
+        let mut engine = Engine::new();
+        engine.buffer_mut().content = ropey::Rope::from_str(text);
+        engine.update_syntax();
+        engine
+    }
+
+    #[test]
+    fn test_ip_selects_paragraph_lines() {
+        // Buffer: blank / para / blank
+        let text = "\nfirst line\nsecond line\n\n";
+        let mut engine = make_paragraph_engine(text);
+        // Place cursor on "first line" (line 1)
+        engine.view_mut().cursor.line = 1;
+        engine.view_mut().cursor.col = 0;
+        // dip should delete both non-blank lines
+        engine.handle_key("", Some('d'), false);
+        engine.handle_key("", Some('i'), false);
+        engine.handle_key("", Some('p'), false);
+        let result: String = engine.buffer().content.chars().collect();
+        assert!(
+            !result.contains("first line"),
+            "ip should delete first line"
+        );
+        assert!(
+            !result.contains("second line"),
+            "ip should delete second line"
+        );
+    }
+
+    #[test]
+    fn test_ap_includes_trailing_blanks() {
+        // Buffer: "para\n\n\n"  — paragraph followed by two blank lines
+        let text = "para line\n\n\n";
+        let mut engine = make_paragraph_engine(text);
+        engine.view_mut().cursor.line = 0;
+        engine.view_mut().cursor.col = 0;
+        engine.handle_key("", Some('d'), false);
+        engine.handle_key("", Some('a'), false);
+        engine.handle_key("", Some('p'), false);
+        let result: String = engine.buffer().content.chars().collect();
+        // dap should remove the paragraph AND its trailing blank lines
+        assert!(
+            result.trim().is_empty(),
+            "dap should remove paragraph and trailing blanks, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ip_on_blank_line_selects_blank_block() {
+        // Buffer: "code\n\n\ncode2\n"
+        // Cursor on second blank line (line 2); ip should select both blank lines
+        let text = "code\n\n\ncode2\n";
+        let mut engine = make_paragraph_engine(text);
+        engine.view_mut().cursor.line = 2; // second blank line
+        engine.handle_key("", Some('d'), false);
+        engine.handle_key("", Some('i'), false);
+        engine.handle_key("", Some('p'), false);
+        let result: String = engine.buffer().content.chars().collect();
+        assert!(result.contains("code\n"), "non-blank lines should survive");
+        assert!(result.contains("code2"), "non-blank lines should survive");
+        // The two blank lines should be gone
+        assert!(
+            !result.contains("\n\n"),
+            "blank block should be deleted, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_yip_yanks_paragraph() {
+        let text = "alpha\nbeta\n\ngamma\n";
+        let mut engine = make_paragraph_engine(text);
+        engine.view_mut().cursor.line = 0;
+        engine.handle_key("", Some('y'), false);
+        engine.handle_key("", Some('i'), false);
+        engine.handle_key("", Some('p'), false);
+        let reg = engine.get_register('"').map(|(s, _)| s.as_str()).unwrap_or("");
+        assert!(reg.contains("alpha"), "yanked text should contain alpha");
+        assert!(reg.contains("beta"), "yanked text should contain beta");
+        assert!(!reg.contains("gamma"), "should not yank past blank line");
+    }
+
+    #[test]
+    fn test_vip_visual_paragraph() {
+        let text = "line one\nline two\n\nother\n";
+        let mut engine = make_paragraph_engine(text);
+        engine.view_mut().cursor.line = 0;
+        // Enter visual, then ip
+        engine.handle_key("", Some('v'), false);
+        engine.handle_key("", Some('i'), false);
+        engine.handle_key("", Some('p'), false);
+        assert_eq!(engine.mode, Mode::Visual);
+        let anchor = engine.visual_anchor.unwrap();
+        assert_eq!(anchor.line, 0, "selection should start at line 0");
+        assert_eq!(
+            engine.view().cursor.line,
+            1,
+            "selection should end at line 1"
+        );
+    }
+
+    // ─── Sentence text objects (is / as) ────────────────────────────────────
+
+    #[test]
+    fn test_dis_deletes_sentence() {
+        // Two sentences on the same line
+        let text = "Hello world. Goodbye world.\n";
+        let mut engine = make_paragraph_engine(text);
+        // Cursor at start
+        engine.view_mut().cursor.line = 0;
+        engine.view_mut().cursor.col = 0;
+        engine.handle_key("", Some('d'), false);
+        engine.handle_key("", Some('i'), false);
+        engine.handle_key("", Some('s'), false);
+        let result: String = engine.buffer().content.chars().collect();
+        assert!(
+            !result.contains("Hello"),
+            "dis should delete 'Hello world.'"
+        );
+    }
+
+    #[test]
+    fn test_das_deletes_sentence_and_trailing_space() {
+        let text = "First sentence. Second sentence.\n";
+        let mut engine = make_paragraph_engine(text);
+        engine.view_mut().cursor.line = 0;
+        engine.view_mut().cursor.col = 0;
+        engine.handle_key("", Some('d'), false);
+        engine.handle_key("", Some('a'), false);
+        engine.handle_key("", Some('s'), false);
+        let result: String = engine.buffer().content.chars().collect();
+        // das removes "First sentence. " (with trailing space)
+        assert!(
+            !result.contains("First"),
+            "das should delete first sentence"
+        );
+        // Second sentence should remain
+        assert!(result.contains("Second"), "second sentence should survive");
+    }
+
+    #[test]
+    fn test_cis_enters_insert_mode() {
+        let text = "Replace me. Keep me.\n";
+        let mut engine = make_paragraph_engine(text);
+        engine.view_mut().cursor.line = 0;
+        engine.view_mut().cursor.col = 0;
+        engine.handle_key("", Some('c'), false);
+        engine.handle_key("", Some('i'), false);
+        engine.handle_key("", Some('s'), false);
+        assert_eq!(engine.mode, Mode::Insert, "cis should enter insert mode");
+    }
+
+    #[test]
+    fn test_vis_selects_sentence_in_visual() {
+        let text = "Sentence one. Sentence two.\n";
+        let mut engine = make_paragraph_engine(text);
+        engine.view_mut().cursor.line = 0;
+        engine.view_mut().cursor.col = 0;
+        engine.handle_key("", Some('v'), false);
+        engine.handle_key("", Some('i'), false);
+        engine.handle_key("", Some('s'), false);
+        assert_eq!(engine.mode, Mode::Visual);
+        // Cursor should have moved past the first sentence
+        assert!(
+            engine.view().cursor.col > 0 || engine.view().cursor.line > 0,
+            "cursor should have moved to end of sentence"
+        );
     }
 }

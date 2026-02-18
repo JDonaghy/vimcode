@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Feb 18, 2026 (Session 39)
+**Last updated:** Feb 18, 2026 (Session 40)
 
 ## Status
 
@@ -121,7 +121,7 @@ vimcode/
 │       ├── settings.rs (~360 lines) — JSON persistence, auto-init, :set parsing
 │       ├── window.rs, tab.rs, view.rs, cursor.rs, mode.rs, syntax.rs
 │       ├── git.rs (~310 lines) — git subprocess integration (diff/blame/hunk parsing, branch detection, stage_hunk)
-│       └── Tests: 420 passing (9 find/replace, 14 macro, 8 session, 4 reverse search, 7 replace char, 5 undo line, 8 case change, 6 marks, 5 incremental search, 12 syntax/language, 6 history search, 11 fold tests, 12 git tests, 4 sidebar-preview tests, 5 auto-indent tests, 4 completion tests, 9 quit/ctrl-s tests, 1 session-restore test, 22 set-command tests, 10 hunk-staging tests)
+│       └── Tests: 429 passing (9 find/replace, 14 macro, 8 session, 4 reverse search, 7 replace char, 5 undo line, 8 case change, 6 marks, 5 incremental search, 12 syntax/language, 6 history search, 11 fold tests, 12 git tests, 4 sidebar-preview tests, 5 auto-indent tests, 4 completion tests, 9 quit/ctrl-s tests, 1 session-restore test, 22 set-command tests, 10 hunk-staging tests, 9 text-object tests)
 └── Total: ~16,800 lines
 ```
 
@@ -145,7 +145,7 @@ vimcode/
 ```bash
 cargo build
 cargo run -- <file>
-cargo test -- --test-threads=1    # 420 tests
+cargo test -- --test-threads=1    # 429 tests
 cargo clippy -- -D warnings
 cargo fmt
 ```
@@ -185,9 +185,11 @@ cargo fmt
 - [x] **Auto-indent** — copies current line's leading whitespace on Enter/o/O; `auto_indent` setting (default: true)
 - [x] **Completion menu** — Ctrl-N/Ctrl-P word completion from buffer in insert mode; floating popup in GTK + TUI
 - [x] **:set command** — runtime setting changes; write-through to settings.json; number/rnu/expandtab/tabstop/shiftwidth/autoindent/incsearch; query with `?`
-- [ ] **:grep / :vimgrep** — project-wide search, populate quickfix list
-- [ ] **Quickfix window** — `:copen`, `:cn`, `:cp` quickfix navigation
-- [ ] **More text objects** — `is`/`as` sentence, `ip`/`ap` paragraph, `it`/`at` tag
+- [x] **`ip`/`ap` + `is`/`as` text objects** — paragraph and sentence text objects for all operators and visual mode
+- [ ] **VSCode-style search & replace across files** — Ctrl-Shift-F panel; find in project, replace all, show matches list
+- [ ] **:grep / :vimgrep** — project-wide search, populate quickfix list *(lower priority)*
+- [ ] **Quickfix window** — `:copen`, `:cn`, `:cp` quickfix navigation *(lower priority)*
+- [ ] **`it`/`at` tag text objects** — inner/around HTML/XML tag
 
 ### Big features
 - [ ] **LSP support** — completions, go-to-definition, hover, diagnostics
@@ -195,6 +197,8 @@ cargo fmt
 - [ ] **`:norm`** — execute normal command on a range of lines
 
 ## Recent Work
+**Session 40:** Paragraph and sentence text objects — `ip`/`ap` (inner/around paragraph) and `is`/`as` (inner/around sentence) added to `find_text_object_range` in `engine.rs`. `find_paragraph_object`: scans up/down from cursor while lines share blank/non-blank type; `ap` extends to include trailing (or leading) blank lines. `find_sentence_object`: scans backward for previous `.`/`!`/`?`+whitespace end, forward to next; paragraph boundaries also terminate sentences; `as` includes trailing whitespace. Both work with all operators (`d`/`c`/`y`) and visual mode (`v`). (420→429 tests, 9 new: 5 paragraph + 4 sentence tests.)
+
 **Session 39:** Stage hunks — interactive hunk staging from a `:Gdiff` buffer. New `Hunk` struct and `parse_diff_hunks()` in `git.rs` (pure string parsing, no I/O); `run_git_stdin()` pipes text to git subprocess stdin; `stage_hunk()` builds a minimal patch and runs `git apply --cached -`. `BufferState.source_file` (new field) records which file a diff buffer was generated from. In `engine.rs`: `jump_next_hunk()`/`jump_prev_hunk()` scan for `@@` lines, `cmd_git_stage_hunk()` identifies the hunk under the cursor and stages it. Key wiring: `]c`/`[c` navigate hunks; `gs` (pending `g` + `s`) and `:Ghs`/`:Ghunk` stage the hunk. After staging, gutter markers on the source buffer are refreshed automatically. (410→420 tests, 10 new: 4 hunk-parse unit tests + 6 engine integration tests.)
 
 **Session 38:** `:set` command — vim-compatible runtime setting changes that write through to `settings.json` immediately (VSCode-friendly). New settings fields: `expand_tab` (default true), `tabstop` (default 4), `shift_width` (default 4). Supported syntax: `:set` (show all), `:set number`/`:set nonumber`, `:set tabstop=2`, `:set ts?` (query). Boolean options: `number`/`nu`, `relativenumber`/`rnu`, `expandtab`/`et`, `autoindent`/`ai`, `incsearch`/`is`. Numeric options: `tabstop`/`ts`, `shiftwidth`/`sw`. Line number options interact vim-style: `number` + `relativenumber` = Hybrid mode. Tab key now respects `expand_tab`/`tabstop` instead of hardcoded 4 spaces. (388→410 tests, 22 new.)
