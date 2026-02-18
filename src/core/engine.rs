@@ -456,6 +456,21 @@ impl Engine {
         self.view_mut().viewport_cols = cols;
     }
 
+    /// Set viewport dimensions for a specific window (used by TUI for per-pane sizing).
+    pub fn set_viewport_for_window(&mut self, window_id: WindowId, lines: usize, cols: usize) {
+        if let Some(window) = self.windows.get_mut(&window_id) {
+            window.view.viewport_lines = lines;
+            window.view.viewport_cols = cols;
+        }
+    }
+
+    /// Set scroll_top for a specific window without changing the active window.
+    pub fn set_scroll_top_for_window(&mut self, window_id: WindowId, scroll_top: usize) {
+        if let Some(window) = self.windows.get_mut(&window_id) {
+            window.view.scroll_top = scroll_top;
+        }
+    }
+
     // =======================================================================
     // Buffer operations
     // =======================================================================

@@ -175,6 +175,17 @@ struct SidebarPrompt {
 
 // ─── Public entry point ───────────────────────────────────────────────────────
 
+/// State for an active scrollbar drag.
+struct ScrollDragState {
+    window_id: crate::core::WindowId,
+    /// Absolute terminal row of the top of the scrollbar track.
+    track_abs_y: u16,
+    /// Height of the scrollbar track in rows.
+    track_h: u16,
+    /// Total lines in the buffer at drag start.
+    total_lines: usize,
+}
+
 /// Initialise the engine, set up the terminal, run the event loop, and restore
 /// the terminal on exit.
 pub fn run(file_path: Option<PathBuf>) {
@@ -232,8 +243,10 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
 
     // Mutable sidebar width (default SIDEBAR_WIDTH, clamped 15..60)
     let mut sidebar_width: u16 = SIDEBAR_WIDTH;
-    // True while user is dragging the resize handle
+    // True while user is dragging the sidebar resize handle
     let mut dragging_sidebar = false;
+    // Non-None while user is dragging a scrollbar thumb
+    let mut dragging_scrollbar: Option<ScrollDragState> = None;
     // Cache of the last rendered layout for mouse hit-testing
     let mut last_layout: Option<render::ScreenLayout> = None;
 
@@ -270,6 +283,18 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
         } else {
             last_layout.as_ref()
         };
+
+        // Update per-window viewport dimensions so ensure_cursor_visible uses
+        // the actual pane width (critical for horizontal scrolling in vsplit).
+        if let Some(ref layout) = last_layout {
+            for rw in &layout.windows {
+                let gutter = rw.gutter_char_width as u16;
+                // -1 for the vertical scrollbar column
+                let pane_cols = (rw.rect.width as u16).saturating_sub(gutter + 1).max(1) as usize;
+                let pane_rows = (rw.rect.height as u16).max(1) as usize;
+                engine.set_viewport_for_window(rw.window_id, pane_rows, pane_cols);
+            }
+        }
 
         terminal
             .draw(|frame| {
@@ -507,6 +532,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                     &terminal.size().ok(),
                     sidebar_width,
                     &mut dragging_sidebar,
+                    &mut dragging_scrollbar,
                     last_layout.as_ref(),
                 );
             }
@@ -526,13 +552,21 @@ fn handle_mouse(
     terminal_size: &Option<ratatui::layout::Rect>,
     sidebar_width: u16,
     dragging_sidebar: &mut bool,
+    dragging_scrollbar: &mut Option<ScrollDragState>,
     last_layout: Option<&render::ScreenLayout>,
 ) -> u16 {
     let col = ev.column;
     let row = ev.row;
     let term_height = terminal_size.map(|s| s.height).unwrap_or(24);
 
-    // ── Separator drag (works anywhere, regardless of row) ────────────────────
+    let editor_left = ACTIVITY_BAR_WIDTH
+        + if sidebar.visible {
+            sidebar_width + 1
+        } else {
+            0
+        };
+
+    // ── Sidebar separator drag (works anywhere, regardless of row) ────────────
     let sep_col = ACTIVITY_BAR_WIDTH + if sidebar.visible { sidebar_width } else { 0 };
     match ev.kind {
         MouseEventKind::Down(MouseButton::Left) if sidebar.visible && col == sep_col => {
@@ -543,27 +577,66 @@ fn handle_mouse(
             let new_w = col.saturating_sub(ACTIVITY_BAR_WIDTH);
             return new_w.clamp(15, 60);
         }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            // Scrollbar thumb drag
+            if let Some(ref drag) = *dragging_scrollbar {
+                if drag.track_h > 0 && drag.total_lines > 0 {
+                    let clamped = row.clamp(drag.track_abs_y, drag.track_abs_y + drag.track_h - 1);
+                    let ratio = (clamped - drag.track_abs_y) as f64 / drag.track_h as f64;
+                    let new_top = (ratio * drag.total_lines as f64) as usize;
+                    engine.set_cursor_for_window(drag.window_id, new_top, 0);
+                    engine.ensure_cursor_visible();
+                    engine.sync_scroll_binds();
+                }
+                return sidebar_width;
+            }
+        }
         MouseEventKind::Up(MouseButton::Left) => {
             *dragging_sidebar = false;
+            *dragging_scrollbar = None;
             return sidebar_width;
         }
-        // Scroll wheel in editor area
+        // Scroll wheel in editor area — scroll the window under the cursor
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-            let editor_left = ACTIVITY_BAR_WIDTH
-                + if sidebar.visible {
-                    sidebar_width + 1
-                } else {
-                    0
-                };
             if col >= editor_left && row + 2 < term_height {
-                let lines = engine.buffer().len_lines().saturating_sub(1);
-                let st = engine.view().scroll_top;
-                if matches!(ev.kind, MouseEventKind::ScrollUp) {
-                    engine.set_scroll_top(st.saturating_sub(3));
+                let rel_col = col - editor_left;
+                let editor_row = row.saturating_sub(1);
+                // Find which window the mouse is over; scroll that window
+                let scrolled = last_layout.and_then(|layout| {
+                    layout.windows.iter().find(|rw| {
+                        let wx = rw.rect.x as u16;
+                        let wy = rw.rect.y as u16;
+                        let ww = rw.rect.width as u16;
+                        let wh = rw.rect.height as u16;
+                        rel_col >= wx
+                            && rel_col < wx + ww
+                            && editor_row >= wy
+                            && editor_row < wy + wh
+                    })
+                });
+                if let Some(rw) = scrolled {
+                    let total = rw.total_lines.saturating_sub(1);
+                    let st = rw.scroll_top;
+                    let new_top = if matches!(ev.kind, MouseEventKind::ScrollUp) {
+                        st.saturating_sub(3)
+                    } else {
+                        (st + 3).min(total)
+                    };
+                    engine.set_scroll_top_for_window(rw.window_id, new_top);
+                    engine.sync_scroll_binds();
                 } else {
-                    engine.set_scroll_top((st + 3).min(lines));
+                    // Fallback: scroll active window
+                    let lines = engine.buffer().len_lines().saturating_sub(1);
+                    let st = engine.view().scroll_top;
+                    let new_top = if matches!(ev.kind, MouseEventKind::ScrollUp) {
+                        st.saturating_sub(3)
+                    } else {
+                        (st + 3).min(lines)
+                    };
+                    engine.set_scroll_top(new_top);
+                    engine.ensure_cursor_visible();
+                    engine.sync_scroll_binds();
                 }
-                engine.ensure_cursor_visible();
             }
             return sidebar_width;
         }
@@ -635,12 +708,6 @@ fn handle_mouse(
 
     // ── Editor area ───────────────────────────────────────────────────────────
     sidebar.has_focus = false;
-    let editor_left = ACTIVITY_BAR_WIDTH
-        + if sidebar.visible {
-            sidebar_width + 1
-        } else {
-            0
-        };
     if col < editor_left {
         return sidebar_width; // separator column
     }
@@ -659,12 +726,21 @@ fn handle_mouse(
                 let viewport_lines = wh as usize;
                 let has_scrollbar = rw.total_lines > viewport_lines;
 
-                // Scrollbar click (rightmost column, if scrollbar is shown)
+                // Scrollbar click/drag-start (rightmost column when scrollbar is shown)
                 if has_scrollbar && rel_col == wx + ww - 1 {
+                    // row 1 = tab bar offset; wy = window top in editor area
+                    let track_abs_y = 1 + wy;
+                    *dragging_scrollbar = Some(ScrollDragState {
+                        window_id: rw.window_id,
+                        track_abs_y,
+                        track_h: wh,
+                        total_lines: rw.total_lines,
+                    });
                     let ratio = (editor_row - wy) as f64 / wh as f64;
                     let new_top = (ratio * rw.total_lines as f64) as usize;
                     engine.set_cursor_for_window(rw.window_id, new_top, 0);
                     engine.ensure_cursor_visible();
+                    engine.sync_scroll_binds();
                     return sidebar_width;
                 }
 
@@ -1232,28 +1308,61 @@ fn render_separators(
         return;
     }
     let sep_fg = rc(theme.separator);
+    let thumb_fg = rc(theme.status_fg);
+    let track_fg = sep_fg;
     let sep_bg = rc(theme.background);
 
     for i in 0..windows.len() {
         for j in (i + 1)..windows.len() {
-            let a = &windows[i].rect;
-            let b = &windows[j].rect;
+            let a = &windows[i];
+            let b = &windows[j];
 
-            // Vertical separator
-            if (a.x + a.width - b.x).abs() < 1.0 {
-                let sep_x = editor_area.x + (a.x + a.width) as u16;
-                let y_start = editor_area.y + a.y.max(b.y) as u16;
-                let y_end = editor_area.y + (a.y + a.height).min(b.y + b.height) as u16;
-                for y in y_start..y_end {
-                    set_cell(buf, sep_x.saturating_sub(1), y, '│', sep_fg, sep_bg);
+            // Vertical separator: window a is the left pane, b is the right pane.
+            // The separator is drawn in the last column of a. We draw scrollbar
+            // chars there so the user can see and interact with a's scroll position.
+            if (a.rect.x + a.rect.width - b.rect.x).abs() < 1.0 {
+                let sep_x = editor_area.x + (a.rect.x + a.rect.width) as u16;
+                let y_start = editor_area.y + a.rect.y.max(b.rect.y) as u16;
+                let y_end =
+                    editor_area.y + (a.rect.y + a.rect.height).min(b.rect.y + b.rect.height) as u16;
+                let track_h = (y_end - y_start) as usize;
+                let viewport_lines = a.rect.height as usize;
+                let has_scroll = a.total_lines > viewport_lines && track_h > 0;
+
+                let (thumb_top, thumb_size) = if has_scroll {
+                    let h = track_h as f64;
+                    let size = ((viewport_lines as f64 / a.total_lines as f64) * h)
+                        .ceil()
+                        .max(1.0) as usize;
+                    let top = ((a.scroll_top as f64 / a.total_lines as f64) * h).floor() as usize;
+                    (top, size)
+                } else {
+                    (0, track_h)
+                };
+
+                for dy in 0..(y_end - y_start) {
+                    let y = y_start + dy;
+                    let (ch, fg) = if has_scroll {
+                        let in_thumb =
+                            (dy as usize) >= thumb_top && (dy as usize) < thumb_top + thumb_size;
+                        if in_thumb {
+                            ('█', thumb_fg)
+                        } else {
+                            ('░', track_fg)
+                        }
+                    } else {
+                        ('│', sep_fg)
+                    };
+                    set_cell(buf, sep_x.saturating_sub(1), y, ch, fg, sep_bg);
                 }
             }
 
             // Horizontal separator
-            if (a.y + a.height - b.y).abs() < 1.0 {
-                let sep_y = editor_area.y + (a.y + a.height) as u16;
-                let x_start = editor_area.x + a.x.max(b.x) as u16;
-                let x_end = editor_area.x + (a.x + a.width).min(b.x + b.width) as u16;
+            if (a.rect.y + a.rect.height - b.rect.y).abs() < 1.0 {
+                let sep_y = editor_area.y + (a.rect.y + a.rect.height) as u16;
+                let x_start = editor_area.x + a.rect.x.max(b.rect.x) as u16;
+                let x_end =
+                    editor_area.x + (a.rect.x + a.rect.width).min(b.rect.x + b.rect.width) as u16;
                 for x in x_start..x_end {
                     set_cell(buf, x, sep_y.saturating_sub(1), '─', sep_fg, sep_bg);
                 }
