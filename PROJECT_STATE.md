@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Feb 17, 2026 (Session 35)
+**Last updated:** Feb 17, 2026 (Session 36)
 
 ## Status
 
@@ -67,7 +67,7 @@
 - **Line numbers (FIXED):** Absolute/relative/hybrid modes now render correctly with proper visibility
 - Tab bar, single global status line, command line
 - Mouse click positioning (pixel-perfect) — both GTK and TUI
-- **Scrollbars (FIXED):** Per-window vertical/horizontal scrollbars with cursor indicators (GTK + TUI)
+- **Scrollbars:** Per-window vertical/horizontal scrollbars with cursor indicators (GTK + TUI); horizontal scrollbar driven by `max_col` field in `RenderedWindow`
 - **Font configuration:** Customizable font family and size
 - **Nerd Font icons:** File-type icons in both GTK sidebar and TUI sidebar (`src/icons.rs`)
 - **Code folding:** `+`/`-` gutter indicators; entire gutter column is clickable in both GTK and TUI
@@ -78,9 +78,12 @@
 - **Sidebar:** File explorer tree (Ctrl-B toggle, Ctrl-Shift-E focus), j/k navigation, l/Enter open, h collapse, a/A/D CRUD, R refresh
 - **Activity bar:** 3-col strip with Explorer / Settings panel icons (Nerd Font)
 - **Layout:** activity bar | sidebar | editor col (with its own tab bar); status + cmd full-width at bottom
-- **Mouse support:** click-to-position cursor, window switching, scroll wheel, scrollbar click-to-jump
+- **Mouse support:** click-to-position cursor, window switching, scroll wheel (targets window under cursor), scrollbar click-to-jump and drag (vertical + horizontal)
 - **Resize bar:** drag separator column to resize sidebar; Alt+Left/Alt+Right keyboard resize; min 15, max 60 cols
-- **Scrollbars:** per-window `█`/`░` scrollbar rendered in rightmost editor column when content overflows
+- **Vertical scrollbars:** per-window `█`/`░` in rightmost column; in vsplit the separator column doubles as left-pane scrollbar
+- **Horizontal scrollbars:** `█`/`░` thumb/track in last row when content is wider than viewport; `┘` corner when both scrollbars present
+- **Per-window viewport:** each split pane tracks its own viewport_lines/cols for correct `ensure_cursor_visible` in hsplit/vsplit
+- **Scroll sync:** `sync_scroll_binds()` called after keyboard nav and all mouse scroll/drag events (`:Gblame` pairs stay in sync)
 - Cursor shapes: bar in insert, underline in replace-r
 
 ### Settings
@@ -97,9 +100,9 @@
 vimcode/
 ├── src/
 │   ├── main.rs (~3100 lines) — GTK4/Relm4 UI, rendering, find dialog, sidebar resize
-│   ├── tui_main.rs (~900 lines) — ratatui/crossterm TUI backend, sidebar, mouse
+│   ├── tui_main.rs (~1050 lines) — ratatui/crossterm TUI backend, sidebar, mouse
 │   ├── icons.rs (~30 lines) — Nerd Font file-type icons (shared by GTK + TUI)
-│   ├── render.rs (~350 lines) — Platform-agnostic rendering abstraction (ScreenLayout)
+│   ├── render.rs (~360 lines) — Platform-agnostic rendering abstraction (ScreenLayout, max_col)
 │   └── core/ (~11,400 lines) — Platform-agnostic logic
 │       ├── engine.rs (~11,400 lines) — Orchestrates everything, find/replace, macros, history
 │       ├── buffer_manager.rs (~600 lines) — Buffer lifecycle
@@ -132,7 +135,7 @@ vimcode/
 ```bash
 cargo build
 cargo run -- <file>
-cargo test -- --test-threads=1    # 360 tests
+cargo test -- --test-threads=1    # 369 tests
 cargo clippy -- -D warnings
 cargo fmt
 ```
@@ -163,6 +166,7 @@ cargo fmt
 - [x] **:Gblame / :Gb** — git blame in a scroll-synced vertical split
 - [x] **Explorer preview fix: single-click opens preview tab (italic/dimmed); double-click makes permanent**
 - [x] **Horizontal scrollbar fix: per-window visible-column calculation using real Pango char_width**
+- [x] **TUI scrollbar polish: vsplit left-pane separator-as-scrollbar, h-scrollbar row, drag support, scroll sync via mouse, per-pane viewport**
 
 ### Git (next)
 - [ ] **Stage hunks** — stage individual diff hunks interactively (like `git add -p`)
@@ -181,6 +185,7 @@ cargo fmt
 - [ ] **`:norm`** — execute normal command on a range of lines
 
 ## Recent Work
+**Session 36:** TUI scrollbar overhaul + GTK h-scroll fix — TUI vsplit separator now renders `█`/`░` scrollbar chars for the left pane (the separator column IS the left-pane vertical scrollbar; click-to-jump already worked, now it looks right too). Added horizontal scrollbar row (`█`/`░` thumb/track) at the bottom of every TUI window when content is wider than the viewport; `┘` corner when both axes have scrollbars. Vertical scrollbar shortens by 1 row when h-scrollbar is present. All TUI scrollbar thumbs are draggable (unified `ScrollDragState` with `is_horizontal` flag). Scroll wheel now scrolls whichever pane the mouse is over, not always the active one. `sync_scroll_binds()` called after every mouse scroll/drag so `:Gblame` pairs stay in sync. Per-window `set_viewport_for_window` called each frame so `ensure_cursor_visible` uses the actual pane width — fixes horizontal scrolling in vsplit. GTK `HorizontalScrollbarChanged` now routes through new `set_scroll_left_for_window` so dragging a non-active pane's h-scrollbar works. New engine methods: `set_viewport_for_window`, `set_scroll_top_for_window`, `set_scroll_left_for_window`. `max_col` (max line length across full buffer) added to `RenderedWindow`. (369 tests, no change.)
 **Session 35:** `:Gblame` + explorer preview fix + scrollbar fixes — Added `:Gblame`/`:Gb` command: runs `git blame --porcelain`, formats output as `<hash> (<author> <date> <lineno>) <content>`, opens in a vertical split with scroll-bound sync so both panes stay in step during keyboard nav and scrollbar drag. Fixed a latent bug in `:Gdiff`/`:Gstatus`/`:Gblame` that deleted the original buffer after splitting (leaving left pane as [No Name]). Fixed explorer single-click regression introduced in session 34: single-click now calls `open_file_preview` (new engine method) which opens a preview tab that is replaced by the next single-click; double-click still calls `open_file_in_tab` for permanent open. Fixed horizontal scrollbar `page_size` incorrectly using the full-editor `viewport_cols` value — now computed per-window from the real Pango `char_width` (cached via `CacheFontMetrics` message), minus the gutter and vertical scrollbar pixels. Fixed vertical scroll sync not firing when the GTK scrollbar is dragged (scrollbar events bypass `process_key`; `sync_scroll_binds` is now also called in `VerticalScrollbarChanged`). (365→369 tests, 4 new sidebar-preview tests + 5 new blame/epoch tests.)
 **Session 34:** Explorer tab bug fix + extended git commands — sidebar clicks now call `open_file_in_tab` (new engine method): switches to existing tab if file is already open, else creates a new tab; never replaces current tab's content. Added `:Gstatus`/`:Gs` (git status in vsplit), `:Gadd`/`:Gadd!` (stage current file or all), `:Gcommit <msg>` (commit with message, refreshes diff markers), `:Gpush` (push to remote). All git helpers in `src/core/git.rs`. Roadmap updated with full backlog. (360 tests, no change.)
 **Session 33:** Git integration complete — `src/core/git.rs` (new) with subprocess-based diff parsing; `▌` gutter markers in green (Added) or yellow (Modified) in both GTK and TUI backends; current branch name shown in status bar as `[branch]`; `:Gdiff`/`:Gd` command opens unified diff in vertical split; `has_git_diff` flag drives the extra gutter column; TUI fold-click detection fixed to use `any()` so it works when the git column is prepended (357→360 tests, 3 new git diff parser tests).
