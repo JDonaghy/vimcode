@@ -31,8 +31,8 @@ use ratatui::Terminal;
 use crate::core::engine::EngineAction;
 use crate::core::{Engine, GitLineStatus, Mode, OpenMode, WindowRect};
 use crate::render::{
-    self, build_screen_layout, Color, CursorShape, RenderedLine, RenderedWindow, SelectionKind,
-    Theme,
+    self, build_screen_layout, Color, CompletionMenu, CursorShape, RenderedLine, RenderedWindow,
+    SelectionKind, Theme,
 };
 
 // ─── Sidebar constants ────────────────────────────────────────────────────────
@@ -921,6 +921,25 @@ fn draw_frame(
     render_tab_bar(frame.buffer_mut(), tab_area, &screen.tab_bar, theme);
     render_all_windows(frame, editor_area, &screen.windows, theme);
 
+    // ── Completion popup (rendered on top of editor) ───────────────────────
+    if let Some(ref menu) = screen.completion {
+        if let Some(active_win) = screen
+            .windows
+            .iter()
+            .find(|w| w.window_id == screen.active_window_id)
+        {
+            if let Some((cursor_pos, _)) = &active_win.cursor {
+                let gutter_w = active_win.gutter_char_width as u16;
+                let win_x = editor_area.x + active_win.rect.x as u16;
+                let win_y = editor_area.y + active_win.rect.y as u16;
+                let vis_col = cursor_pos.col.saturating_sub(active_win.scroll_left) as u16;
+                let popup_x = win_x + gutter_w + vis_col;
+                let popup_y = win_y + cursor_pos.view_line as u16 + 1;
+                render_completion_popup(frame, menu, popup_x, popup_y, frame.size(), theme);
+            }
+        }
+    }
+
     // ── Status / command ──────────────────────────────────────────────────────
     render_status_line(
         frame.buffer_mut(),
@@ -1087,6 +1106,64 @@ fn render_all_windows(
         render_window(frame, win_rect, window, theme);
     }
     render_separators(frame.buffer_mut(), editor_area, windows, theme);
+}
+
+fn render_completion_popup(
+    frame: &mut ratatui::Frame,
+    menu: &CompletionMenu,
+    popup_x: u16,
+    popup_y: u16,
+    term_area: Rect,
+    theme: &Theme,
+) {
+    let visible = menu.candidates.len().min(10) as u16;
+    if visible == 0 {
+        return;
+    }
+    let width = (menu.max_width as u16 + 4).max(12);
+
+    // Clamp so popup doesn't go off the right/bottom edge
+    let x = popup_x.min(term_area.width.saturating_sub(width));
+    let y = popup_y.min(term_area.height.saturating_sub(visible));
+
+    let bg_color = rc(theme.completion_bg);
+    let sel_bg_color = rc(theme.completion_selected_bg);
+    let fg_color = rc(theme.completion_fg);
+    let border_color = rc(theme.completion_border);
+
+    let buf = frame.buffer_mut();
+    for (i, candidate) in menu.candidates.iter().enumerate().take(visible as usize) {
+        let row_y = y + i as u16;
+        let row_bg = if i == menu.selected_idx {
+            sel_bg_color
+        } else {
+            bg_color
+        };
+        // Fill the row background
+        for col in 0..width {
+            let cell_x = x + col;
+            if cell_x < term_area.width && row_y < term_area.height {
+                let cell = buf.get_mut(cell_x, row_y);
+                cell.set_bg(row_bg).set_fg(fg_color);
+                // Draw border chars on leftmost/rightmost or blank fill
+                let ch = if col == 0 || col == width - 1 {
+                    '│'
+                } else {
+                    ' '
+                };
+                cell.set_char(ch).set_fg(border_color);
+            }
+        }
+        // Render candidate text starting at col 1
+        let display = format!(" {}", candidate);
+        for (j, ch) in display.chars().enumerate() {
+            let cell_x = x + 1 + j as u16;
+            if cell_x + 1 < x + width && cell_x < term_area.width && row_y < term_area.height {
+                let cell = buf.get_mut(cell_x, row_y);
+                cell.set_char(ch).set_fg(fg_color).set_bg(row_bg);
+            }
+        }
+    }
 }
 
 fn render_window(frame: &mut ratatui::Frame, area: Rect, window: &RenderedWindow, theme: &Theme) {

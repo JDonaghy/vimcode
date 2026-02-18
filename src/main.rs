@@ -1748,6 +1748,9 @@ fn draw_editor(
     // 5. Draw window separators
     draw_window_separators(cr, &window_rects, &theme);
 
+    // 5b. Draw completion popup (on top of everything else)
+    draw_completion_popup(cr, &layout, &screen, &theme, line_height, char_width);
+
     // 6. Status Line (second-to-last line)
     let status_y = height as f64 - status_bar_height;
     draw_status_line(
@@ -2209,6 +2212,75 @@ fn draw_window_separators(
                 }
             }
         }
+    }
+}
+
+fn draw_completion_popup(
+    cr: &Context,
+    layout: &pango::Layout,
+    screen: &render::ScreenLayout,
+    theme: &Theme,
+    line_height: f64,
+    char_width: f64,
+) {
+    let Some(menu) = &screen.completion else {
+        return;
+    };
+    let Some(active_win) = screen
+        .windows
+        .iter()
+        .find(|w| w.window_id == screen.active_window_id)
+    else {
+        return;
+    };
+    let Some((cursor_pos, _)) = &active_win.cursor else {
+        return;
+    };
+
+    // Anchor popup below the cursor cell, to the right of the gutter.
+    let gutter_width = active_win.gutter_char_width as f64 * char_width;
+    let h_scroll_offset = active_win.scroll_left as f64 * char_width;
+    let popup_x =
+        active_win.rect.x + gutter_width + cursor_pos.col as f64 * char_width - h_scroll_offset;
+    let popup_y = active_win.rect.y + (cursor_pos.view_line + 1) as f64 * line_height;
+
+    let visible = menu.candidates.len().min(10);
+    let popup_w = ((menu.max_width + 2) as f64 * char_width).max(100.0);
+    let popup_h = visible as f64 * line_height;
+
+    // Background
+    let (r, g, b) = theme.completion_bg.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
+    cr.fill().ok();
+
+    // Border
+    let (r, g, b) = theme.completion_border.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    cr.set_line_width(1.0);
+    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
+    cr.stroke().ok();
+
+    // Items
+    for (i, candidate) in menu.candidates.iter().enumerate().take(visible) {
+        let item_y = popup_y + i as f64 * line_height;
+
+        // Selected row highlight
+        if i == menu.selected_idx {
+            let (r, g, b) = theme.completion_selected_bg.to_cairo();
+            cr.set_source_rgb(r, g, b);
+            cr.rectangle(popup_x, item_y, popup_w, line_height);
+            cr.fill().ok();
+        }
+
+        // Candidate text
+        let (r, g, b) = theme.completion_fg.to_cairo();
+        cr.set_source_rgb(r, g, b);
+        let display = format!(" {}", candidate);
+        layout.set_text(&display);
+        layout.set_attributes(None);
+        cr.move_to(popup_x, item_y);
+        pangocairo::show_layout(cr, layout);
     }
 }
 

@@ -220,6 +220,14 @@ pub struct Engine {
     /// Pairs of windows whose scroll_top should stay in sync (e.g. :Gblame).
     /// Each pair is (primary_window_id, secondary_window_id).
     scroll_bind_pairs: Vec<(WindowId, WindowId)>,
+
+    // --- Completion state ---
+    /// Current completion candidates (populated on first Ctrl-N/P).
+    pub completion_candidates: Vec<String>,
+    /// Index of the currently selected candidate, or None when inactive.
+    pub completion_idx: Option<usize>,
+    /// Buffer column where the prefix that triggered completion starts.
+    pub completion_start_col: usize,
 }
 
 impl Engine {
@@ -286,6 +294,9 @@ impl Engine {
                 git::current_branch(&cwd)
             },
             scroll_bind_pairs: Vec::new(),
+            completion_candidates: Vec::new(),
+            completion_idx: None,
+            completion_start_col: 0,
         }
     }
 
@@ -1365,11 +1376,16 @@ impl Engine {
         }
     }
 
-    /// Return the absolute paths of all currently-open file buffers, in creation order.
+    /// Return the absolute paths of buffers currently shown in at least one window.
+    /// Orphaned buffers (closed via :q but not yet freed) are intentionally excluded so
+    /// that files the user explicitly closed are not restored on the next startup.
     pub fn open_file_paths(&self) -> Vec<std::path::PathBuf> {
+        let in_window: std::collections::HashSet<BufferId> =
+            self.windows.values().map(|w| w.buffer_id).collect();
         self.buffer_manager
             .list()
             .into_iter()
+            .filter(|id| in_window.contains(id))
             .filter_map(|id| {
                 self.buffer_manager
                     .get(id)
@@ -1388,6 +1404,7 @@ impl Engine {
     }
 
     /// Restore open files from session state (called at startup when no CLI file is given).
+    /// Each file gets its own tab; the previously-active file's tab is focused.
     /// Skips files that no longer exist. Removes the initial empty scratch buffer.
     pub fn restore_session_files(&mut self) {
         let paths = self.session.open_files.clone();
@@ -1399,9 +1416,27 @@ impl Engine {
 
         let initial_id = self.active_buffer_id();
         let mut any_opened = false;
+        let mut first = true;
 
         for path in &paths {
-            if path.exists() && self.open_file_with_mode(path, OpenMode::Permanent).is_ok() {
+            if !path.exists() {
+                continue;
+            }
+            if first {
+                // Reuse the initial window for the first file.
+                if self.open_file_with_mode(path, OpenMode::Permanent).is_ok() {
+                    any_opened = true;
+                    first = false;
+                }
+            } else {
+                // Each subsequent file gets its own tab.
+                self.new_tab(Some(path));
+                let buf_id = self.active_buffer_id();
+                let view = self.restore_file_position(buf_id);
+                let win_id = self.active_tab().active_window;
+                if let Some(window) = self.windows.get_mut(&win_id) {
+                    window.view = view;
+                }
                 any_opened = true;
             }
         }
@@ -1410,15 +1445,25 @@ impl Engine {
             return;
         }
 
-        // Switch to the previously-active file so it has focus on startup.
-        if let Some(ref ap) = active {
-            if ap.exists() {
-                let _ = self.open_file_with_mode(ap, OpenMode::Permanent);
-            }
-        }
-
         // Remove the initial empty scratch buffer now that real files are open.
         let _ = self.delete_buffer(initial_id, true);
+
+        // Switch focus to the tab showing the previously-active file.
+        if let Some(ref ap) = active {
+            if let Ok(canonical_ap) = ap.canonicalize() {
+                let tab_idx = self.tabs.iter().position(|t| {
+                    self.windows
+                        .get(&t.active_window)
+                        .and_then(|w| self.buffer_manager.get(w.buffer_id))
+                        .and_then(|s| s.file_path.as_ref())
+                        .and_then(|p| p.canonicalize().ok())
+                        .map_or(false, |p| p == canonical_ap)
+                });
+                if let Some(idx) = tab_idx {
+                    self.active_tab = idx;
+                }
+            }
+        }
     }
 
     /// Delete a buffer. Returns error if buffer is shown in any window or is dirty.
@@ -1575,6 +1620,14 @@ impl Engine {
             }
         }
 
+        // Ctrl-S: save in any mode (does not change mode).
+        if ctrl && key_name == "s" {
+            if let Err(e) = self.save() {
+                self.message = format!("Save failed: {}", e);
+            }
+            return EngineAction::None;
+        }
+
         let mut changed = false;
         let mut action = EngineAction::None;
 
@@ -1583,7 +1636,7 @@ impl Engine {
                 action = self.handle_normal_key(key_name, unicode, ctrl, &mut changed);
             }
             Mode::Insert => {
-                self.handle_insert_key(key_name, unicode, &mut changed);
+                self.handle_insert_key(key_name, unicode, ctrl, &mut changed);
             }
             Mode::Command => {
                 action = self.handle_command_key(key_name, unicode, ctrl);
@@ -1905,6 +1958,12 @@ impl Engine {
                 let count = self.take_count();
                 self.start_undo_group();
                 let line = self.view().cursor.line;
+                let indent = if self.settings.auto_indent {
+                    self.get_line_indent_str(line)
+                } else {
+                    String::new()
+                };
+                let indent_len = indent.len();
                 let line_end =
                     self.buffer().line_to_char(line) + self.buffer().line_len_chars(line);
                 let line_content = self.buffer().content.line(line);
@@ -1917,12 +1976,17 @@ impl Engine {
                 } else {
                     line_end
                 };
-                // Insert count newlines
-                let newlines = "\n".repeat(count);
-                self.insert_with_undo(insert_pos, &newlines);
+                // Insert newlines (with indent on the first new line for count==1).
+                // For count > 1 only the first new line gets the indent; the rest are blank.
+                let text = if count == 1 {
+                    format!("\n{}", indent)
+                } else {
+                    format!("\n{}{}", indent, "\n".repeat(count - 1))
+                };
+                self.insert_with_undo(insert_pos, &text);
                 self.insert_text_buffer.clear();
                 self.view_mut().cursor.line += 1;
-                self.view_mut().cursor.col = 0;
+                self.view_mut().cursor.col = indent_len;
                 self.mode = Mode::Insert;
                 self.count = None; // Clear count when entering insert mode
                 *changed = true;
@@ -1931,12 +1995,22 @@ impl Engine {
                 let count = self.take_count();
                 self.start_undo_group();
                 let line = self.view().cursor.line;
+                let indent = if self.settings.auto_indent {
+                    self.get_line_indent_str(line)
+                } else {
+                    String::new()
+                };
+                let indent_len = indent.len();
                 let line_start = self.buffer().line_to_char(line);
-                // Insert count newlines
-                let newlines = "\n".repeat(count);
-                self.insert_with_undo(line_start, &newlines);
+                // Insert indent + newlines above current line.
+                let text = if count == 1 {
+                    format!("{}\n", indent)
+                } else {
+                    format!("{}\n{}", indent, "\n".repeat(count - 1))
+                };
+                self.insert_with_undo(line_start, &text);
                 self.insert_text_buffer.clear();
-                self.view_mut().cursor.col = 0;
+                self.view_mut().cursor.col = indent_len;
                 self.mode = Mode::Insert;
                 self.count = None; // Clear count when entering insert mode
                 *changed = true;
@@ -2827,7 +2901,53 @@ impl Engine {
         }
     }
 
-    fn handle_insert_key(&mut self, key_name: &str, unicode: Option<char>, changed: &mut bool) {
+    fn handle_insert_key(
+        &mut self,
+        key_name: &str,
+        unicode: Option<char>,
+        ctrl: bool,
+        changed: &mut bool,
+    ) {
+        // ── Ctrl-N / Ctrl-P: word completion ─────────────────────────────────
+        if ctrl && (key_name == "n" || key_name == "p") {
+            let next = key_name == "n";
+            if self.completion_idx.is_none() {
+                let (prefix, start_col) = self.completion_prefix_at_cursor();
+                let candidates = self.word_completions_for_prefix(&prefix);
+                if candidates.is_empty() {
+                    self.message = "No completions".to_string();
+                    return;
+                }
+                self.completion_start_col = start_col;
+                self.completion_candidates = candidates;
+                let idx = if next {
+                    0
+                } else {
+                    self.completion_candidates.len() - 1
+                };
+                self.completion_idx = Some(idx);
+                self.apply_completion_candidate(idx);
+            } else {
+                let len = self.completion_candidates.len();
+                let cur = self.completion_idx.unwrap();
+                let new_idx = if next {
+                    (cur + 1) % len
+                } else {
+                    (cur + len - 1) % len
+                };
+                self.completion_idx = Some(new_idx);
+                self.apply_completion_candidate(new_idx);
+            }
+            *changed = true;
+            return;
+        }
+
+        // Clear completion state on any non-completion key.
+        if self.completion_idx.is_some() {
+            self.completion_candidates.clear();
+            self.completion_idx = None;
+        }
+
         match key_name {
             "Escape" => {
                 self.finish_undo_group();
@@ -2877,10 +2997,17 @@ impl Engine {
                 let line = self.view().cursor.line;
                 let col = self.view().cursor.col;
                 let char_idx = self.buffer().line_to_char(line) + col;
-                self.insert_with_undo(char_idx, "\n");
+                let indent = if self.settings.auto_indent {
+                    self.get_line_indent_str(line)
+                } else {
+                    String::new()
+                };
+                let indent_len = indent.len();
+                let text = format!("\n{}", indent);
+                self.insert_with_undo(char_idx, &text);
                 self.insert_text_buffer.push('\n');
                 self.view_mut().cursor.line += 1;
-                self.view_mut().cursor.col = 0;
+                self.view_mut().cursor.col = indent_len;
                 *changed = true;
             }
             "Tab" => {
@@ -4329,14 +4456,56 @@ impl Engine {
                 EngineAction::None
             }
             "q" => {
+                // Block if the current buffer has unsaved changes.
                 if self.dirty() {
+                    self.message = "No write since last change (add ! to override)".to_string();
+                    return EngineAction::Error;
+                }
+                // If this is the very last window in the very last tab: quit the app.
+                let is_last = self.tabs.len() == 1 && self.active_tab().layout.is_single_window();
+                if is_last {
+                    return EngineAction::Quit;
+                }
+                // Otherwise close the current window (and the tab if it's the last
+                // window in it).  Drop the buffer if nothing else shows it so that
+                // collect_session_open_files() (which filters by window-visible buffers)
+                // correctly excludes explicitly-closed files from the next session.
+                let buf_id = self.active_buffer_id();
+                self.close_window();
+                if !self.windows.values().any(|w| w.buffer_id == buf_id) {
+                    let _ = self.buffer_manager.delete(buf_id, true);
+                }
+                EngineAction::None
+            }
+            "q!" => {
+                // If this is the very last window in the very last tab: force-quit.
+                let is_last = self.tabs.len() == 1 && self.active_tab().layout.is_single_window();
+                if is_last {
+                    return EngineAction::Quit;
+                }
+                // Force-close without checking dirty flag.
+                let buf_id = self.active_buffer_id();
+                self.close_window();
+                if !self.windows.values().any(|w| w.buffer_id == buf_id) {
+                    let _ = self.buffer_manager.delete(buf_id, true);
+                }
+                EngineAction::None
+            }
+            "qa" => {
+                // Quit all: block if any buffer is dirty.
+                let has_dirty = self
+                    .buffer_manager
+                    .list()
+                    .iter()
+                    .any(|id| self.buffer_manager.get(*id).map_or(false, |s| s.dirty));
+                if has_dirty {
                     self.message = "No write since last change (add ! to override)".to_string();
                     EngineAction::Error
                 } else {
                     EngineAction::Quit
                 }
             }
-            "q!" => EngineAction::Quit,
+            "qa!" => EngineAction::Quit,
             "wq" | "x" => {
                 if self.save().is_ok() {
                     EngineAction::SaveQuit
@@ -5654,6 +5823,86 @@ impl Engine {
         self.clamp_cursor_col();
     }
 
+    // ── Indent / completion helpers ───────────────────────────────────────────
+
+    /// Return the leading whitespace string (spaces/tabs) of the given buffer line.
+    fn get_line_indent_str(&self, line_idx: usize) -> String {
+        let total = self.buffer().len_lines();
+        if line_idx >= total {
+            return String::new();
+        }
+        self.buffer()
+            .content
+            .line(line_idx)
+            .chars()
+            .take_while(|&c| c == ' ' || c == '\t')
+            .collect()
+    }
+
+    /// True for word characters: [a-zA-Z0-9_].
+    fn is_word_char(c: char) -> bool {
+        c.is_alphanumeric() || c == '_'
+    }
+
+    /// Walk left from cursor to find the current word prefix.
+    /// Returns `(prefix, start_col)` where `start_col` is the column index
+    /// where the prefix begins.
+    fn completion_prefix_at_cursor(&self) -> (String, usize) {
+        let line = self.view().cursor.line;
+        let col = self.view().cursor.col;
+        let chars: Vec<char> = self.buffer().content.line(line).chars().collect();
+        let mut start = col;
+        while start > 0 && Self::is_word_char(chars[start - 1]) {
+            start -= 1;
+        }
+        let prefix: String = chars[start..col].iter().collect();
+        (prefix, start)
+    }
+
+    /// Collect all words in the current buffer that start with `prefix`,
+    /// deduplicated, sorted, excluding an exact match of `prefix` itself.
+    fn word_completions_for_prefix(&self, prefix: &str) -> Vec<String> {
+        let mut set: std::collections::HashSet<String> = Default::default();
+        for line_idx in 0..self.buffer().len_lines() {
+            let text: String = self.buffer().content.line(line_idx).chars().collect();
+            let chars: Vec<char> = text.chars().collect();
+            let len = chars.len();
+            let mut i = 0usize;
+            while i < len {
+                if Self::is_word_char(chars[i]) {
+                    let start = i;
+                    while i < len && Self::is_word_char(chars[i]) {
+                        i += 1;
+                    }
+                    let word: String = chars[start..i].iter().collect();
+                    if word.starts_with(prefix) && word != prefix {
+                        set.insert(word);
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        let mut v: Vec<String> = set.into_iter().collect();
+        v.sort();
+        v
+    }
+
+    /// Delete the previously inserted candidate (or prefix), insert the new
+    /// candidate at `completion_start_col`, and update the cursor column.
+    fn apply_completion_candidate(&mut self, idx: usize) {
+        let line = self.view().cursor.line;
+        let prev_end = self.view().cursor.col;
+        let start = self.completion_start_col;
+        let line_char = self.buffer().line_to_char(line);
+        if prev_end > start {
+            self.delete_with_undo(line_char + start, line_char + prev_end);
+        }
+        let candidate = self.completion_candidates[idx].clone();
+        self.insert_with_undo(line_char + start, &candidate);
+        self.view_mut().cursor.col = start + candidate.len();
+    }
+
     // ── Fold helpers ──────────────────────────────────────────────────────────
 
     /// Count leading whitespace characters (spaces = 1, tabs = tab_width).
@@ -6368,6 +6617,150 @@ mod tests {
         let mut engine = Engine::new();
         type_command(&mut engine, "notacommand");
         assert!(engine.message.contains("Not an editor command"));
+    }
+
+    #[test]
+    fn test_q_closes_tab_when_multiple_tabs() {
+        let mut engine = Engine::new();
+        // Tab 0 — first file
+        engine.buffer_mut().insert(0, "first");
+        engine.set_dirty(false);
+        let first_id = engine.active_buffer_id();
+        // Tab 1 — second file
+        engine.new_tab(None);
+        engine.buffer_mut().insert(0, "second");
+        engine.set_dirty(false);
+        assert_eq!(engine.tabs.len(), 2);
+        assert_eq!(engine.buffer_manager.len(), 2);
+        // :q closes the active tab, not the whole app
+        let action = type_command_action(&mut engine, "q");
+        assert_eq!(action, EngineAction::None);
+        assert_eq!(engine.tabs.len(), 1, "tab should be closed");
+        // The closed buffer is freed; session restore excludes it via window-filter.
+        assert_eq!(engine.buffer_manager.len(), 1);
+        assert!(engine.buffer_manager.get(first_id).is_some());
+    }
+
+    #[test]
+    fn test_q_quits_when_single_buffer_clean() {
+        let mut engine = Engine::new();
+        engine.set_dirty(false);
+        let action = type_command_action(&mut engine, "q");
+        assert_eq!(action, EngineAction::Quit);
+    }
+
+    #[test]
+    fn test_q_blocks_when_single_buffer_dirty() {
+        let mut engine = Engine::new();
+        engine.set_dirty(true);
+        type_command(&mut engine, "q");
+        assert!(engine.message.contains("No write since last change"));
+    }
+
+    #[test]
+    fn test_q_bang_closes_dirty_tab_when_multiple() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "first");
+        engine.set_dirty(false);
+        engine.new_tab(None);
+        engine.buffer_mut().insert(0, "second");
+        engine.set_dirty(true); // dirty but force-close with q!
+        assert_eq!(engine.tabs.len(), 2);
+        let action = type_command_action(&mut engine, "q!");
+        assert_eq!(action, EngineAction::None);
+        assert_eq!(engine.tabs.len(), 1, "tab should be closed");
+        assert_eq!(engine.buffer_manager.len(), 1);
+    }
+
+    #[test]
+    fn test_q_bang_quits_when_single_buffer() {
+        let mut engine = Engine::new();
+        engine.set_dirty(true);
+        let action = type_command_action(&mut engine, "q!");
+        assert_eq!(action, EngineAction::Quit);
+    }
+
+    #[test]
+    fn test_qa_quits_when_all_clean() {
+        let mut engine = Engine::new();
+        engine.set_dirty(false);
+        let action = type_command_action(&mut engine, "qa");
+        assert_eq!(action, EngineAction::Quit);
+    }
+
+    #[test]
+    fn test_qa_blocks_when_any_dirty() {
+        let mut engine = Engine::new();
+        engine.set_dirty(true);
+        type_command(&mut engine, "qa");
+        assert!(engine.message.contains("No write since last change"));
+    }
+
+    #[test]
+    fn test_qa_bang_force_quits() {
+        let mut engine = Engine::new();
+        engine.set_dirty(true);
+        let action = type_command_action(&mut engine, "qa!");
+        assert_eq!(action, EngineAction::Quit);
+    }
+
+    #[test]
+    fn test_restore_session_files_opens_separate_tabs() {
+        let dir = std::env::temp_dir();
+        let p1 = dir.join("vimcode_restore_a.txt");
+        let p2 = dir.join("vimcode_restore_b.txt");
+        let p3 = dir.join("vimcode_restore_c.txt");
+        std::fs::write(&p1, "aaa").unwrap();
+        std::fs::write(&p2, "bbb").unwrap();
+        std::fs::write(&p3, "ccc").unwrap();
+
+        let mut engine = Engine::new();
+        engine.session.open_files = vec![p1.clone(), p2.clone(), p3.clone()];
+        engine.session.active_file = Some(p2.clone());
+        engine.restore_session_files();
+
+        // Three files → three tabs.
+        assert_eq!(engine.tabs.len(), 3, "each file should get its own tab");
+        // Three buffers in manager (no scratch buffer).
+        assert_eq!(engine.buffer_manager.len(), 3);
+        // Active tab should be the one showing p2.
+        let active_buf = engine.active_buffer_id();
+        let active_path = engine
+            .buffer_manager
+            .get(active_buf)
+            .and_then(|s| s.file_path.clone());
+        assert_eq!(active_path.as_deref(), Some(p2.as_path()));
+
+        let _ = std::fs::remove_file(&p1);
+        let _ = std::fs::remove_file(&p2);
+        let _ = std::fs::remove_file(&p3);
+    }
+
+    #[test]
+    fn test_ctrl_s_saves_in_normal_mode() {
+        use std::io::Write;
+        let dir = std::env::temp_dir();
+        let path = dir.join("vimcode_test_ctrl_s.txt");
+        std::fs::write(&path, "original").unwrap();
+        let mut engine = Engine::open(&path);
+        // Edit the buffer (direct insert to simulate typing)
+        engine.buffer_mut().insert(0, "new ");
+        engine.set_dirty(true);
+        // Ctrl-S in normal mode
+        let action = engine.handle_key("s", Some('s'), true);
+        assert_eq!(action, EngineAction::None);
+        // File should be saved (not dirty)
+        assert!(!engine.dirty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Helper: type a command and return its EngineAction.
+    fn type_command_action(engine: &mut Engine, cmd: &str) -> EngineAction {
+        press_char(engine, ':');
+        for ch in cmd.chars() {
+            engine.handle_key(&ch.to_string(), Some(ch), false);
+        }
+        engine.handle_key("Return", None, false)
     }
 
     #[test]
@@ -12276,5 +12669,139 @@ mod tests {
             0,
             "cursor should stay at fold header after zc"
         );
+    }
+
+    // ── Auto-indent tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_auto_indent_enter() {
+        let mut engine = Engine::new();
+        engine.settings.auto_indent = true;
+        // Buffer has one indented line
+        engine.buffer_mut().insert(0, "    hello");
+        // Move cursor to end of line and press Enter
+        press_char(&mut engine, 'A'); // Append mode at end of line
+        press_special(&mut engine, "Return");
+        // New line should have same indent
+        assert_eq!(engine.view().cursor.line, 1);
+        assert_eq!(engine.view().cursor.col, 4);
+        let line1: String = engine.buffer().content.line(1).chars().collect();
+        assert!(
+            line1.starts_with("    "),
+            "new line should start with 4 spaces"
+        );
+    }
+
+    #[test]
+    fn test_auto_indent_no_indent() {
+        let mut engine = Engine::new();
+        engine.settings.auto_indent = true;
+        engine.buffer_mut().insert(0, "hello");
+        press_char(&mut engine, 'A');
+        press_special(&mut engine, "Return");
+        // Line with no indent should produce no indent on new line
+        assert_eq!(engine.view().cursor.line, 1);
+        assert_eq!(engine.view().cursor.col, 0);
+    }
+
+    #[test]
+    fn test_auto_indent_disabled() {
+        let mut engine = Engine::new();
+        engine.settings.auto_indent = false;
+        engine.buffer_mut().insert(0, "    hello");
+        press_char(&mut engine, 'A');
+        press_special(&mut engine, "Return");
+        // With auto_indent off, new line should have col 0
+        assert_eq!(engine.view().cursor.line, 1);
+        assert_eq!(engine.view().cursor.col, 0);
+    }
+
+    #[test]
+    fn test_auto_indent_o() {
+        let mut engine = Engine::new();
+        engine.settings.auto_indent = true;
+        engine.buffer_mut().insert(0, "    fn foo() {");
+        // 'o' opens a new line below with same indent
+        press_special(&mut engine, "Escape"); // ensure normal mode
+        press_char(&mut engine, 'o');
+        assert_eq!(engine.view().cursor.line, 1);
+        assert_eq!(engine.view().cursor.col, 4);
+        assert_eq!(engine.mode, Mode::Insert);
+    }
+
+    #[test]
+    fn test_auto_indent_capital_o() {
+        let mut engine = Engine::new();
+        engine.settings.auto_indent = true;
+        // Put cursor on line 1 (which is indented)
+        engine.buffer_mut().insert(0, "fn foo() {\n    body\n}");
+        press_char(&mut engine, 'j'); // move to "    body"
+        press_special(&mut engine, "Escape");
+        press_char(&mut engine, 'O');
+        // New line above "    body" should have same indent (4 spaces)
+        assert_eq!(engine.view().cursor.line, 1);
+        assert_eq!(engine.view().cursor.col, 4);
+        assert_eq!(engine.mode, Mode::Insert);
+    }
+
+    // ── Completion tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_completion_basic() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "foobar\nfoo");
+        // Position cursor at end of "foo" on line 1
+        press_char(&mut engine, 'G'); // last line
+        press_char(&mut engine, 'A'); // Append at end — now in insert mode at col 3
+                                      // Ctrl-N should complete to "foobar"
+        press_ctrl(&mut engine, 'n');
+        let line1: String = engine.buffer().content.line(1).chars().collect();
+        assert!(
+            line1.starts_with("foobar"),
+            "Ctrl-N should insert foobar, got: {}",
+            line1
+        );
+        assert_eq!(engine.completion_idx, Some(0));
+    }
+
+    #[test]
+    fn test_completion_cycle_next() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "foobar foobaz football\nfoo");
+        press_char(&mut engine, 'G');
+        press_char(&mut engine, 'A');
+        // First Ctrl-N selects first candidate
+        press_ctrl(&mut engine, 'n');
+        let first_idx = engine.completion_idx.unwrap();
+        // Second Ctrl-N moves to next
+        press_ctrl(&mut engine, 'n');
+        let second_idx = engine.completion_idx.unwrap();
+        assert_ne!(first_idx, second_idx, "Ctrl-N should cycle candidates");
+    }
+
+    #[test]
+    fn test_completion_cycle_prev() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "foobar foobaz football\nfoo");
+        press_char(&mut engine, 'G');
+        press_char(&mut engine, 'A');
+        // Ctrl-P starts from last candidate
+        press_ctrl(&mut engine, 'p');
+        let total = engine.completion_candidates.len();
+        assert_eq!(engine.completion_idx, Some(total - 1));
+    }
+
+    #[test]
+    fn test_completion_clear_on_other_key() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "foobar\nfoo");
+        press_char(&mut engine, 'G');
+        press_char(&mut engine, 'A');
+        press_ctrl(&mut engine, 'n');
+        assert!(engine.completion_idx.is_some());
+        // Any regular key clears completion state
+        press_char(&mut engine, 'x');
+        assert!(engine.completion_idx.is_none());
+        assert!(engine.completion_candidates.is_empty());
     }
 }

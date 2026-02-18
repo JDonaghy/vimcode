@@ -45,6 +45,10 @@ pub struct Settings {
     /// Enable incremental search (search as you type)
     #[serde(default = "default_incremental_search")]
     pub incremental_search: bool,
+
+    /// Auto-indent new lines to match current line's leading whitespace
+    #[serde(default = "default_auto_indent")]
+    pub auto_indent: bool,
 }
 
 fn default_explorer_visible() -> bool {
@@ -52,6 +56,10 @@ fn default_explorer_visible() -> bool {
 }
 
 fn default_incremental_search() -> bool {
+    true // Default: enabled
+}
+
+fn default_auto_indent() -> bool {
     true // Default: enabled
 }
 
@@ -71,6 +79,7 @@ impl Default for Settings {
             font_size: default_font_size(),
             explorer_visible_on_startup: default_explorer_visible(),
             incremental_search: default_incremental_search(),
+            auto_indent: default_auto_indent(),
         }
     }
 }

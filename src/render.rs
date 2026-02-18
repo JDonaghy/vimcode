@@ -224,6 +224,19 @@ pub struct CommandLineData {
     pub cursor_anchor_text: String,
 }
 
+// ─── CompletionMenu ────────────────────────────────────────────────────────────
+
+/// Data needed to render the word-completion popup in insert mode.
+#[derive(Debug, Clone)]
+pub struct CompletionMenu {
+    /// Sorted list of candidates.
+    pub candidates: Vec<String>,
+    /// Index of the currently highlighted candidate.
+    pub selected_idx: usize,
+    /// Length (in chars) of the longest candidate — used for popup width.
+    pub max_width: usize,
+}
+
 // ─── ScreenLayout ─────────────────────────────────────────────────────────────
 
 /// The complete, platform-agnostic description of one editor frame.
@@ -236,6 +249,8 @@ pub struct ScreenLayout {
     pub status_right: String,
     pub command: CommandLineData,
     pub active_window_id: WindowId,
+    /// Completion popup to show, or `None` when inactive.
+    pub completion: Option<CompletionMenu>,
 }
 
 // ─── Theme ────────────────────────────────────────────────────────────────────
@@ -299,6 +314,12 @@ pub struct Theme {
     // Git diff gutter markers
     pub git_added: Color,
     pub git_modified: Color,
+
+    // Completion popup
+    pub completion_bg: Color,
+    pub completion_selected_bg: Color,
+    pub completion_fg: Color,
+    pub completion_border: Color,
 }
 
 impl Theme {
@@ -370,6 +391,12 @@ impl Theme {
             // Git diff gutter markers
             git_added: Color::from_hex("#98c379"),    // green
             git_modified: Color::from_hex("#e5c07b"), // yellow
+
+            // Completion popup (OneDark palette)
+            completion_bg: Color::from_hex("#282c34"),
+            completion_selected_bg: Color::from_hex("#3e4451"),
+            completion_fg: Color::from_hex("#abb2bf"),
+            completion_border: Color::from_hex("#528bff"),
         }
     }
 
@@ -434,6 +461,20 @@ pub fn build_screen_layout(
     let (status_left, status_right) = build_status_line(engine);
     let command = build_command_line(engine);
 
+    let completion = engine.completion_idx.map(|idx| {
+        let max_width = engine
+            .completion_candidates
+            .iter()
+            .map(|s| s.len())
+            .max()
+            .unwrap_or(0);
+        CompletionMenu {
+            candidates: engine.completion_candidates.clone(),
+            selected_idx: idx,
+            max_width,
+        }
+    });
+
     ScreenLayout {
         tab_bar,
         windows,
@@ -441,6 +482,7 @@ pub fn build_screen_layout(
         status_right,
         command,
         active_window_id,
+        completion,
     }
 }
 
