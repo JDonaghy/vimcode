@@ -215,6 +215,11 @@ pub struct Engine {
     // --- Git integration ---
     /// Current git branch name (None if not in a git repo or git not available).
     pub git_branch: Option<String>,
+
+    // --- Scroll binding ---
+    /// Pairs of windows whose scroll_top should stay in sync (e.g. :Gblame).
+    /// Each pair is (primary_window_id, secondary_window_id).
+    scroll_bind_pairs: Vec<(WindowId, WindowId)>,
 }
 
 impl Engine {
@@ -280,6 +285,7 @@ impl Engine {
                 let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                 git::current_branch(&cwd)
             },
+            scroll_bind_pairs: Vec::new(),
         }
     }
 
@@ -617,11 +623,10 @@ impl Engine {
                 if let Some(state) = self.buffer_manager.get_mut(buf_id) {
                     state.buffer.content = ropey::Rope::from_str(&text);
                 }
-                // Split vertically and point the new window at the diff buffer
+                // Split vertically; the new window (now active) shares the original buffer.
+                // Redirect it to the diff buffer without touching the original.
                 self.split_window(SplitDirection::Vertical, None);
-                let old_buf = self.active_buffer_id();
                 self.active_window_mut().buffer_id = buf_id;
-                let _ = self.buffer_manager.delete(old_buf, true);
                 self.message = format!("Git diff: {}", path.display());
                 EngineAction::None
             }
@@ -649,9 +654,7 @@ impl Engine {
                     state.buffer.content = ropey::Rope::from_str(&text);
                 }
                 self.split_window(SplitDirection::Vertical, None);
-                let old_buf = self.active_buffer_id();
                 self.active_window_mut().buffer_id = buf_id;
-                let _ = self.buffer_manager.delete(old_buf, true);
                 self.message = "Git status".to_string();
                 EngineAction::None
             }
@@ -729,6 +732,37 @@ impl Engine {
             }
             Err(e) => {
                 self.message = e;
+                EngineAction::Error
+            }
+        }
+    }
+
+    /// Open `git blame` for the current file in a vertical split.
+    fn cmd_git_blame(&mut self) -> EngineAction {
+        let path = match self.file_path().map(|p| p.to_path_buf()) {
+            Some(p) => p,
+            None => {
+                self.message = "No file".to_string();
+                return EngineAction::Error;
+            }
+        };
+        match git::blame_text(&path) {
+            Some(text) => {
+                let buf_id = self.buffer_manager.create();
+                if let Some(state) = self.buffer_manager.get_mut(buf_id) {
+                    state.buffer.content = ropey::Rope::from_str(&text);
+                }
+                let source_win = self.active_window_id();
+                self.split_window(SplitDirection::Vertical, None);
+                let blame_win = self.active_window_id();
+                self.active_window_mut().buffer_id = buf_id;
+                self.scroll_bind_pairs.push((source_win, blame_win));
+                self.message = format!("Git blame: {}", path.display());
+                EngineAction::None
+            }
+            None => {
+                self.message =
+                    "No blame info (file not committed or not in a git repo)".to_string();
                 EngineAction::Error
             }
         }
@@ -898,8 +932,10 @@ impl Engine {
             }
         }
 
-        // Remove window from windows map
+        // Remove window from windows map and any scroll-bind pairs that referenced it.
         self.windows.remove(&window_id);
+        self.scroll_bind_pairs
+            .retain(|&(a, b)| a != window_id && b != window_id);
 
         true
     }
@@ -920,9 +956,10 @@ impl Engine {
         // Reset layout to single window
         tab.layout = WindowLayout::leaf(active_window_id);
 
-        // Remove closed windows
+        // Remove closed windows and any scroll-bind pairs referencing them.
         for id in windows_to_close {
             self.windows.remove(&id);
+            self.scroll_bind_pairs.retain(|&(a, b)| a != id && b != id);
         }
 
         self.message = String::new();
@@ -1103,6 +1140,89 @@ impl Engine {
         let view = self.restore_file_position(buffer_id);
         if let Some(w) = self.windows.get_mut(&window_id) {
             w.view = view;
+        }
+
+        self.refresh_git_diff(buffer_id);
+        self.message = format!("\"{}\"", path.display());
+    }
+
+    /// Open a file from the sidebar via single-click (preview mode).
+    ///
+    /// Behaviour mirrors VSCode:
+    /// - If the file is already shown in any tab, just switch to that tab.
+    /// - If there is an existing preview tab, replace it with this file.
+    /// - Otherwise open a new preview tab.
+    ///
+    /// A preview buffer is marked italic/dimmed and is replaced by the next
+    /// single-click. Double-clicking (or editing/saving) promotes it to
+    /// permanent.
+    pub fn open_file_preview(&mut self, path: &Path) {
+        let buffer_id = match self.buffer_manager.open_file(path) {
+            Ok(id) => id,
+            Err(e) => {
+                self.message = format!("Error: {}", e);
+                return;
+            }
+        };
+
+        // Already shown in any tab? Just switch to it (permanent or current preview).
+        for (tab_idx, tab) in self.tabs.iter().enumerate() {
+            if let Some(win) = self.windows.get(&tab.active_window) {
+                if win.buffer_id == buffer_id {
+                    self.active_tab = tab_idx;
+                    self.refresh_git_diff(buffer_id);
+                    self.message = format!("\"{}\"", path.display());
+                    return;
+                }
+            }
+        }
+
+        // Find the existing preview tab, if any.
+        let mut preview_slot: Option<(usize, WindowId, BufferId)> = None;
+        if let Some(preview_buf_id) = self.preview_buffer_id {
+            for (idx, tab) in self.tabs.iter().enumerate() {
+                if let Some(win) = self.windows.get(&tab.active_window) {
+                    if win.buffer_id == preview_buf_id {
+                        preview_slot = Some((idx, tab.active_window, preview_buf_id));
+                        break;
+                    }
+                }
+            }
+        }
+
+        if let Some((tab_idx, win_id, old_buf_id)) = preview_slot {
+            // Reuse the existing preview tab: close old preview buffer and
+            // point the window at the new one.
+            let _ = self.delete_buffer(old_buf_id, true);
+            if let Some(w) = self.windows.get_mut(&win_id) {
+                w.buffer_id = buffer_id;
+            }
+            if let Some(state) = self.buffer_manager.get_mut(buffer_id) {
+                state.preview = true;
+            }
+            self.preview_buffer_id = Some(buffer_id);
+            self.active_tab = tab_idx;
+            let view = self.restore_file_position(buffer_id);
+            if let Some(w) = self.windows.get_mut(&win_id) {
+                w.view = view;
+            }
+        } else {
+            // No preview tab yet — open a new one.
+            let window_id = self.new_window_id();
+            let window = Window::new(window_id, buffer_id);
+            self.windows.insert(window_id, window);
+            let tab_id = self.new_tab_id();
+            let tab = Tab::new(tab_id, window_id);
+            self.tabs.push(tab);
+            self.active_tab = self.tabs.len() - 1;
+            if let Some(state) = self.buffer_manager.get_mut(buffer_id) {
+                state.preview = true;
+            }
+            self.preview_buffer_id = Some(buffer_id);
+            let view = self.restore_file_position(buffer_id);
+            if let Some(w) = self.windows.get_mut(&window_id) {
+                w.view = view;
+            }
         }
 
         self.refresh_git_diff(buffer_id);
@@ -1376,6 +1496,32 @@ impl Engine {
         self.view_mut().ensure_cursor_visible();
     }
 
+    /// Synchronise the scroll_top of scroll-bound window pairs.
+    /// Called after every key that may move the cursor or scroll, and also
+    /// after direct scroll_top mutations (e.g. scrollbar drag).
+    pub fn sync_scroll_binds(&mut self) {
+        if self.scroll_bind_pairs.is_empty() {
+            return;
+        }
+        let active_id = self.active_window_id();
+        let active_scroll = self.active_window().view.scroll_top;
+        let pairs = self.scroll_bind_pairs.clone();
+        for (a, b) in pairs {
+            let partner = if a == active_id {
+                Some(b)
+            } else if b == active_id {
+                Some(a)
+            } else {
+                None
+            };
+            if let Some(pid) = partner {
+                if let Some(w) = self.windows.get_mut(&pid) {
+                    w.view.scroll_top = active_scroll;
+                }
+            }
+        }
+    }
+
     // =======================================================================
     // Key handling
     // =======================================================================
@@ -1439,6 +1585,7 @@ impl Engine {
         }
 
         self.ensure_cursor_visible();
+        self.sync_scroll_binds();
         action
     }
 
@@ -3967,6 +4114,11 @@ impl Engine {
         // Handle :Gpush / :Gp
         if cmd == "Gpush" || cmd == "Gp" {
             return self.cmd_git_push();
+        }
+
+        // Handle :Gblame / :Gb
+        if cmd == "Gblame" || cmd == "Gb" {
+            return self.cmd_git_blame();
         }
 
         // Handle :e <filename>
@@ -10710,6 +10862,129 @@ mod tests {
         assert!(!state.preview);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // =======================================================================
+    // open_file_preview (single-click sidebar) Tests
+    // =======================================================================
+
+    #[test]
+    fn test_open_file_preview_creates_preview_tab() {
+        use std::io::Write;
+        let path = std::env::temp_dir().join("vimcode_test_sidebar_preview1.txt");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(b"hello").unwrap();
+        }
+
+        let mut engine = Engine::new();
+        engine.open_file_preview(&path);
+
+        let bid = engine.active_buffer_id();
+        let state = engine.buffer_manager.get(bid).unwrap();
+        assert!(state.preview, "single-click should open as preview");
+        assert_eq!(engine.preview_buffer_id, Some(bid));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_open_file_preview_replaced_by_second_single_click() {
+        use std::io::Write;
+        let path1 = std::env::temp_dir().join("vimcode_test_sidebar_preview2a.txt");
+        let path2 = std::env::temp_dir().join("vimcode_test_sidebar_preview2b.txt");
+        {
+            let mut f = std::fs::File::create(&path1).unwrap();
+            f.write_all(b"file1").unwrap();
+            let mut f = std::fs::File::create(&path2).unwrap();
+            f.write_all(b"file2").unwrap();
+        }
+
+        let mut engine = Engine::new();
+        engine.open_file_preview(&path1);
+        let bid1 = engine.active_buffer_id();
+
+        engine.open_file_preview(&path2);
+        let bid2 = engine.active_buffer_id();
+
+        // The first preview buffer should be gone; only the second remains.
+        assert!(
+            engine.buffer_manager.get(bid1).is_none(),
+            "old preview buffer deleted"
+        );
+        assert!(
+            engine.buffer_manager.get(bid2).unwrap().preview,
+            "new buffer is preview"
+        );
+        assert_eq!(engine.preview_buffer_id, Some(bid2));
+        // Tab count should not have grown (reused the preview slot).
+        assert_eq!(
+            engine.tabs.len(),
+            2,
+            "still only 2 tabs (initial + 1 preview)"
+        );
+
+        let _ = std::fs::remove_file(&path1);
+        let _ = std::fs::remove_file(&path2);
+    }
+
+    #[test]
+    fn test_open_file_preview_double_click_promotes() {
+        use std::io::Write;
+        let path = std::env::temp_dir().join("vimcode_test_sidebar_preview3.txt");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(b"hello").unwrap();
+        }
+
+        let mut engine = Engine::new();
+        engine.open_file_preview(&path);
+        let bid = engine.active_buffer_id();
+        assert!(engine.buffer_manager.get(bid).unwrap().preview);
+
+        // Double-click: open_file_in_tab promotes the preview in-place.
+        engine.open_file_in_tab(&path);
+        assert!(
+            !engine.buffer_manager.get(bid).unwrap().preview,
+            "promoted to permanent"
+        );
+        assert_eq!(engine.preview_buffer_id, None);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_open_file_preview_permanent_file_just_switches() {
+        use std::io::Write;
+        let path1 = std::env::temp_dir().join("vimcode_test_sidebar_preview4a.txt");
+        let path2 = std::env::temp_dir().join("vimcode_test_sidebar_preview4b.txt");
+        {
+            let mut f = std::fs::File::create(&path1).unwrap();
+            f.write_all(b"file1").unwrap();
+            let mut f = std::fs::File::create(&path2).unwrap();
+            f.write_all(b"file2").unwrap();
+        }
+
+        let mut engine = Engine::new();
+        // Open file1 permanently in a second tab.
+        engine.open_file_in_tab(&path1);
+        let permanent_tab_idx = engine.active_tab;
+        let bid1 = engine.active_buffer_id();
+
+        // Single-click file1 — should just switch back to it, not make it a preview.
+        engine.open_file_preview(&path1);
+        assert_eq!(
+            engine.active_tab, permanent_tab_idx,
+            "switched to existing tab"
+        );
+        assert!(
+            !engine.buffer_manager.get(bid1).unwrap().preview,
+            "file stays permanent"
+        );
+        assert_eq!(engine.preview_buffer_id, None);
+
+        let _ = std::fs::remove_file(&path1);
+        let _ = std::fs::remove_file(&path2);
     }
 
     // =======================================================================

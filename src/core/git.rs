@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -236,6 +237,122 @@ pub fn push(dir: &Path) -> Result<String, String> {
     }
 }
 
+// ─── Blame ────────────────────────────────────────────────────────────────────
+
+fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+/// Convert a Unix timestamp (seconds since epoch) to a "YYYY-MM-DD" string (UTC).
+fn epoch_to_date(secs: i64) -> String {
+    let mut remaining = (secs / 86400) as i32;
+    let mut year = 1970i32;
+    loop {
+        let days_in_year = if is_leap_year(year) { 366 } else { 365 };
+        if remaining < days_in_year {
+            break;
+        }
+        remaining -= days_in_year;
+        year += 1;
+    }
+    let month_days: [i32; 12] = [
+        31,
+        if is_leap_year(year) { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    let mut month = 1i32;
+    for &m in &month_days {
+        if remaining < m {
+            break;
+        }
+        remaining -= m;
+        month += 1;
+    }
+    format!("{:04}-{:02}-{:02}", year, month, remaining + 1)
+}
+
+/// Parse `git blame --porcelain` output into a human-readable per-line format.
+///
+/// Each output line has the form:
+/// `<short-hash> (<author padded to 12> <YYYY-MM-DD>  <lineno>) <source content>`
+fn parse_blame_porcelain(text: &str) -> String {
+    // commit hash -> (author, date) — cached so repeated commits keep their info
+    let mut commit_info: HashMap<String, (String, String)> = HashMap::new();
+    let mut current_hash = String::new();
+    let mut current_author = String::new();
+    let mut current_date = String::new();
+    let mut current_lineno: usize = 0;
+    let mut out = String::new();
+
+    for line in text.lines() {
+        if let Some(content) = line.strip_prefix('\t') {
+            // Source-content line — emit one formatted blame annotation.
+            let (author, date) = commit_info
+                .get(&current_hash)
+                .map(|(a, d)| (a.as_str(), d.as_str()))
+                .unwrap_or(("?", "????-??-??"));
+            let short: String = current_hash.chars().take(8).collect();
+            let author_col: String = author.chars().take(12).collect();
+            out.push_str(&format!(
+                "{} ({:<12} {}  {:>4}) {}\n",
+                short, author_col, date, current_lineno, content
+            ));
+        } else if let Some(name) = line.strip_prefix("author ") {
+            current_author = name.to_string();
+        } else if let Some(ts) = line.strip_prefix("author-time ") {
+            if let Ok(epoch) = ts.trim().parse::<i64>() {
+                current_date = epoch_to_date(epoch);
+            }
+            // Register once we have both author and time (author line always precedes author-time).
+            commit_info.insert(
+                current_hash.clone(),
+                (current_author.clone(), current_date.clone()),
+            );
+        } else {
+            // Detect a blame header line: 40 hex chars, then a space, then numbers.
+            let bytes = line.as_bytes();
+            if bytes.len() >= 42
+                && bytes[40] == b' '
+                && bytes[..40].iter().all(|&b| b.is_ascii_hexdigit())
+            {
+                current_hash = line[..40].to_string();
+                // The final line number is the 3rd space-separated field (index 2).
+                let parts: Vec<&str> = line.splitn(5, ' ').collect();
+                current_lineno = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+                // Restore cached author/date for commits we've already seen.
+                if let Some((a, d)) = commit_info.get(&current_hash) {
+                    current_author = a.clone();
+                    current_date = d.clone();
+                }
+            }
+        }
+    }
+
+    out
+}
+
+/// Run `git blame --porcelain` on `path` and return a formatted blame buffer.
+/// Returns `None` when the file is untracked, the repo has no commits, or
+/// any other `git blame` failure occurs.
+pub fn blame_text(path: &Path) -> Option<String> {
+    let dir = path.parent()?;
+    let path_str = path.to_str()?;
+    let raw = run_git(dir, &["blame", "--porcelain", path_str])?;
+    if raw.trim().is_empty() {
+        return None;
+    }
+    Some(parse_blame_porcelain(&raw))
+}
+
 // ─── Diff ─────────────────────────────────────────────────────────────────────
 
 pub fn compute_file_diff(path: &Path) -> Vec<Option<GitLineStatus>> {
@@ -331,5 +448,77 @@ mod tests {
     fn test_parse_unified_diff_empty() {
         let result = parse_unified_diff("", 5);
         assert!(result.iter().all(|s| s.is_none()));
+    }
+
+    // ── blame helpers ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_epoch_to_date_epoch_zero() {
+        assert_eq!(epoch_to_date(0), "1970-01-01");
+    }
+
+    #[test]
+    fn test_epoch_to_date_one_day() {
+        assert_eq!(epoch_to_date(86400), "1970-01-02");
+    }
+
+    #[test]
+    fn test_parse_blame_porcelain_single_line() {
+        let hash = "a".repeat(40);
+        let input = format!(
+            "{h} 1 1 1\nauthor Alice\nauthor-mail <alice@example.com>\n\
+             author-time 0\nauthor-tz +0000\ncommitter Alice\n\
+             committer-mail <alice@example.com>\ncommitter-time 0\n\
+             committer-tz +0000\nsummary Initial commit\nfilename src/main.rs\n\
+             \tfn main() {{}}\n",
+            h = hash
+        );
+        let result = parse_blame_porcelain(&input);
+        assert!(result.contains("aaaaaaaa"), "should contain short hash");
+        assert!(result.contains("Alice"), "should contain author");
+        assert!(result.contains("1970-01-01"), "should contain date");
+        assert!(
+            result.contains("fn main()"),
+            "should contain source content"
+        );
+        assert_eq!(
+            result.lines().count(),
+            1,
+            "should produce exactly 1 output line"
+        );
+    }
+
+    #[test]
+    fn test_parse_blame_porcelain_repeated_commit() {
+        let hash = "b".repeat(40);
+        let input = format!(
+            "{h} 1 1 2\nauthor Bob\nauthor-mail <bob@example.com>\n\
+             author-time 86400\nauthor-tz +0000\ncommitter Bob\n\
+             committer-mail <bob@example.com>\ncommitter-time 86400\n\
+             committer-tz +0000\nsummary fix\nfilename f.rs\n\tline one\n\
+             {h} 2 2\nfilename f.rs\n\tline two\n",
+            h = hash
+        );
+        let result = parse_blame_porcelain(&input);
+        let lines: Vec<&str> = result.lines().collect();
+        assert_eq!(lines.len(), 2, "should produce 2 output lines");
+        assert!(
+            lines[0].contains("line one"),
+            "first line should contain content"
+        );
+        assert!(
+            lines[1].contains("line two"),
+            "second line should contain content"
+        );
+        assert!(lines[0].contains("Bob"), "first line should have author");
+        assert!(
+            lines[1].contains("Bob"),
+            "second line should have author (cached)"
+        );
+    }
+
+    #[test]
+    fn test_parse_blame_porcelain_empty() {
+        assert!(parse_blame_porcelain("").is_empty());
     }
 }

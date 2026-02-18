@@ -55,6 +55,7 @@ struct App {
     window_scrollbars: Rc<RefCell<HashMap<core::WindowId, WindowScrollbars>>>,
     overlay: Rc<RefCell<Option<gtk4::Overlay>>>,
     cached_line_height: f64,
+    cached_char_width: f64,
     #[allow(dead_code)] // Kept alive to continue monitoring settings.json
     settings_monitor: Option<gio::FileMonitor>,
     sender: relm4::Sender<Msg>,
@@ -98,8 +99,11 @@ enum Msg {
     ToggleSidebar,
     /// Switch to a different sidebar panel.
     SwitchPanel(SidebarPanel),
-    /// Open file from sidebar tree view (switches to existing tab or opens new tab).
+    /// Open file from sidebar tree view (switches to existing tab or opens new permanent tab).
+    /// Used for double-click.
     OpenFileFromSidebar(PathBuf),
+    /// Preview file from sidebar tree view (single-click, replaces current preview tab).
+    PreviewFileFromSidebar(PathBuf),
     /// Create a new file with the given name.
     CreateFile(String),
     /// Create a new folder with the given name.
@@ -122,8 +126,8 @@ enum Msg {
         window_id: core::WindowId,
         value: f64,
     },
-    /// Cache line height from draw_editor.
-    CacheLineHeight(f64),
+    /// Cache font metrics (line_height, char_width) from draw_editor.
+    CacheFontMetrics(f64, f64),
     /// Open settings.json in editor.
     OpenSettingsFile,
     /// Settings file changed on disk.
@@ -701,6 +705,7 @@ impl SimpleComponent for App {
             window_scrollbars: window_scrollbars_ref.clone(),
             overlay: overlay_ref.clone(),
             cached_line_height: 24.0,
+            cached_char_width: 9.0,
             settings_monitor,
             sender: sender.input_sender().clone(),
             find_dialog_visible: false,
@@ -802,7 +807,7 @@ impl SimpleComponent for App {
                                 model.get_value(&iter, 2).get().unwrap_or_default();
                             let path_buf = PathBuf::from(full_path);
                             if path_buf.is_file() {
-                                sender_for_click.input(Msg::OpenFileFromSidebar(path_buf));
+                                sender_for_click.input(Msg::PreviewFileFromSidebar(path_buf));
                             }
                         }
                     }
@@ -1036,6 +1041,20 @@ impl SimpleComponent for App {
                 self.tree_has_focus = false;
                 self.redraw = !self.redraw;
             }
+            Msg::PreviewFileFromSidebar(path) => {
+                let mut engine = self.engine.borrow_mut();
+                // Single-click: open as a preview tab (replaceable by next single-click).
+                engine.open_file_preview(&path);
+                drop(engine);
+                if let Some(ref tree) = *self.file_tree_view.borrow() {
+                    highlight_file_in_tree(tree, &path);
+                }
+                if let Some(ref drawing) = *self.drawing_area.borrow() {
+                    drawing.grab_focus();
+                }
+                self.tree_has_focus = false;
+                self.redraw = !self.redraw;
+            }
             Msg::CreateFile(name) => {
                 // Validate name
                 if let Err(msg) = validate_name(&name) {
@@ -1205,6 +1224,7 @@ impl SimpleComponent for App {
                 // For now, only scroll if it's the active window
                 if engine.active_window_id() == window_id {
                     engine.set_scroll_top(value.round() as usize);
+                    engine.sync_scroll_binds();
                 }
                 drop(engine);
                 self.redraw = !self.redraw;
@@ -1219,8 +1239,9 @@ impl SimpleComponent for App {
                 drop(engine);
                 self.redraw = !self.redraw;
             }
-            Msg::CacheLineHeight(height) => {
-                self.cached_line_height = height;
+            Msg::CacheFontMetrics(line_height, char_width) => {
+                self.cached_line_height = line_height;
+                self.cached_char_width = char_width;
             }
             Msg::OpenSettingsFile => {
                 let settings_path = std::env::var("HOME")
@@ -1501,9 +1522,26 @@ impl App {
                 .max()
                 .unwrap_or(80);
 
+            // Compute visible text columns for this specific window.
+            // We subtract the gutter (char cells × char_width) and the 10px
+            // vertical scrollbar so that the thumb correctly reflects how much
+            // of the longest line fits on screen.
+            let cw = self.cached_char_width.max(1.0);
+            let gutter_cols = render::calculate_gutter_cols(
+                engine.settings.line_numbers,
+                buffer_state.buffer.content.len_lines(),
+                cw,
+                !buffer_state.git_diff.is_empty(),
+            );
+            let gutter_px = gutter_cols as f64 * cw;
+            let v_scrollbar_px = 10.0_f64;
+            let visible_cols = ((rect.width - gutter_px - v_scrollbar_px) / cw)
+                .floor()
+                .max(1.0);
+
             let h_adj = ws.horizontal.adjustment();
             h_adj.set_upper(max_line_length as f64);
-            h_adj.set_page_size(window.view.viewport_cols as f64);
+            h_adj.set_page_size(visible_cols);
             h_adj.set_value(window.view.scroll_left as f64);
         }
 
@@ -1667,8 +1705,10 @@ fn draw_editor(
     let line_height = (font_metrics.ascent() + font_metrics.descent()) as f64 / pango::SCALE as f64;
     let char_width = font_metrics.approximate_char_width() as f64 / pango::SCALE as f64;
 
-    // Cache line height for use in sync_scrollbar
-    sender.send(Msg::CacheLineHeight(line_height)).ok();
+    // Cache font metrics for use in sync_scrollbar
+    sender
+        .send(Msg::CacheFontMetrics(line_height, char_width))
+        .ok();
 
     // Calculate layout regions
     let tab_bar_height = line_height; // Always show tab bar

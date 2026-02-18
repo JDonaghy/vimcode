@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Feb 17, 2026 (Session 34)
+**Last updated:** Feb 17, 2026 (Session 35)
 
 ## Status
 
@@ -71,7 +71,7 @@
 - **Font configuration:** Customizable font family and size
 - **Nerd Font icons:** File-type icons in both GTK sidebar and TUI sidebar (`src/icons.rs`)
 - **Code folding:** `+`/`-` gutter indicators; entire gutter column is clickable in both GTK and TUI
-- **Git integration:** `▌` gutter markers (green=added, yellow=modified); branch name in status bar; `:Gdiff`/`:Gd` command opens unified diff in vertical split
+- **Git integration:** `▌` gutter markers (green=added, yellow=modified); branch name in status bar; `:Gdiff`/`:Gd` command opens unified diff in vertical split; `:Gblame`/`:Gb` command opens `git blame` annotation in a scroll-synced vertical split
 
 ### TUI Backend (`src/tui_main.rs`)
 - Full editor in terminal via ratatui 0.27 + crossterm
@@ -107,9 +107,9 @@ vimcode/
 │       ├── session.rs (~175 lines) — Session state persistence (sidebar_width added)
 │       ├── settings.rs (~190 lines) — JSON persistence, auto-init
 │       ├── window.rs, tab.rs, view.rs, cursor.rs, mode.rs, syntax.rs
-│       ├── git.rs (~130 lines) — git subprocess integration (diff parsing, branch detection)
-│       └── Tests: 360 passing (9 find/replace, 14 macro, 8 session, 4 reverse search, 7 replace char, 5 undo line, 8 case change, 6 marks, 5 incremental search, 12 syntax/language, 6 history search, 11 fold tests, 3 git tests)
-└── Total: ~15,800 lines
+│       ├── git.rs (~240 lines) — git subprocess integration (diff/blame parsing, branch detection)
+│       └── Tests: 369 passing (9 find/replace, 14 macro, 8 session, 4 reverse search, 7 replace char, 5 undo line, 8 case change, 6 marks, 5 incremental search, 12 syntax/language, 6 history search, 11 fold tests, 8 git tests, 4 sidebar-preview tests)
+└── Total: ~16,300 lines
 ```
 
 ## Architecture
@@ -160,9 +160,11 @@ cargo fmt
 - [x] **Git: gutter markers, branch in status bar, :Gdiff**
 - [x] **Git: :Gstatus, :Gadd[!], :Gcommit, :Gpush**
 - [x] **Explorer bug fix: click opens new tab (not replace current)**
+- [x] **:Gblame / :Gb** — git blame in a scroll-synced vertical split
+- [x] **Explorer preview fix: single-click opens preview tab (italic/dimmed); double-click makes permanent**
+- [x] **Horizontal scrollbar fix: per-window visible-column calculation using real Pango char_width**
 
 ### Git (next)
-- [ ] **:Gblame** — inline blame annotation per line in a vsplit
 - [ ] **Stage hunks** — stage individual diff hunks interactively (like `git add -p`)
 
 ### Editor features
@@ -179,6 +181,7 @@ cargo fmt
 - [ ] **`:norm`** — execute normal command on a range of lines
 
 ## Recent Work
+**Session 35:** `:Gblame` + explorer preview fix + scrollbar fixes — Added `:Gblame`/`:Gb` command: runs `git blame --porcelain`, formats output as `<hash> (<author> <date> <lineno>) <content>`, opens in a vertical split with scroll-bound sync so both panes stay in step during keyboard nav and scrollbar drag. Fixed a latent bug in `:Gdiff`/`:Gstatus`/`:Gblame` that deleted the original buffer after splitting (leaving left pane as [No Name]). Fixed explorer single-click regression introduced in session 34: single-click now calls `open_file_preview` (new engine method) which opens a preview tab that is replaced by the next single-click; double-click still calls `open_file_in_tab` for permanent open. Fixed horizontal scrollbar `page_size` incorrectly using the full-editor `viewport_cols` value — now computed per-window from the real Pango `char_width` (cached via `CacheFontMetrics` message), minus the gutter and vertical scrollbar pixels. Fixed vertical scroll sync not firing when the GTK scrollbar is dragged (scrollbar events bypass `process_key`; `sync_scroll_binds` is now also called in `VerticalScrollbarChanged`). (365→369 tests, 4 new sidebar-preview tests + 5 new blame/epoch tests.)
 **Session 34:** Explorer tab bug fix + extended git commands — sidebar clicks now call `open_file_in_tab` (new engine method): switches to existing tab if file is already open, else creates a new tab; never replaces current tab's content. Added `:Gstatus`/`:Gs` (git status in vsplit), `:Gadd`/`:Gadd!` (stage current file or all), `:Gcommit <msg>` (commit with message, refreshes diff markers), `:Gpush` (push to remote). All git helpers in `src/core/git.rs`. Roadmap updated with full backlog. (360 tests, no change.)
 **Session 33:** Git integration complete — `src/core/git.rs` (new) with subprocess-based diff parsing; `▌` gutter markers in green (Added) or yellow (Modified) in both GTK and TUI backends; current branch name shown in status bar as `[branch]`; `:Gdiff`/`:Gd` command opens unified diff in vertical split; `has_git_diff` flag drives the extra gutter column; TUI fold-click detection fixed to use `any()` so it works when the git column is prepended (357→360 tests, 3 new git diff parser tests).
 **Session 32:** Session file restore + fold click polish — open file list (and active buffer) now saved on quit and restored on next launch; entire gutter width is clickable for fold toggle in both GTK and TUI (was pixel-precise single column); GTK gutter text has 3px left padding gap (357 tests, no change).
