@@ -43,6 +43,201 @@ pub fn file_diff_text(path: &Path) -> Option<String> {
     }
 }
 
+// ─── Git status ───────────────────────────────────────────────────────────────
+
+/// A single entry from `git status --porcelain`.
+#[derive(Debug, Clone)]
+pub struct StatusEntry {
+    /// Two-character XY status code (e.g. "M ", " M", "??").
+    pub xy: String,
+    /// File path relative to repo root.
+    pub path: String,
+}
+
+/// Run `git status --porcelain` and return structured entries.
+/// Returns an empty vec when not in a git repo or on error.
+pub fn status(dir: &Path) -> Vec<StatusEntry> {
+    let output = match run_git(dir, &["status", "--porcelain"]) {
+        Some(o) => o,
+        None => return vec![],
+    };
+    output
+        .lines()
+        .filter(|l| l.len() >= 4)
+        .map(|l| StatusEntry {
+            xy: l[..2].to_string(),
+            path: l[3..].to_string(),
+        })
+        .collect()
+}
+
+/// Format git status for display in a buffer (similar to `git status` output).
+pub fn status_text(dir: &Path) -> Option<String> {
+    let branch = current_branch(dir)
+        .map(|b| format!("On branch {}", b))
+        .unwrap_or_else(|| "HEAD detached".to_string());
+
+    let entries = status(dir);
+    if entries.is_empty() {
+        return Some(format!(
+            "{}\n\nnothing to commit, working tree clean\n",
+            branch
+        ));
+    }
+
+    let mut staged: Vec<&StatusEntry> = entries
+        .iter()
+        .filter(|e| e.xy.starts_with(['M', 'A', 'D', 'R', 'C']))
+        .collect();
+    let mut unstaged: Vec<&StatusEntry> = entries
+        .iter()
+        .filter(|e| {
+            let c = e.xy.chars().nth(1).unwrap_or(' ');
+            matches!(c, 'M' | 'D')
+        })
+        .collect();
+    let untracked: Vec<&StatusEntry> = entries.iter().filter(|e| e.xy == "??").collect();
+
+    // Deduplicate entries that appear in both staged and unstaged
+    staged.dedup_by_key(|e| e.path.clone());
+    unstaged.dedup_by_key(|e| e.path.clone());
+
+    let mut out = format!("{}\n\n", branch);
+
+    if !staged.is_empty() {
+        out.push_str("Changes to be committed:\n");
+        for e in &staged {
+            let label = match e.xy.chars().next().unwrap_or(' ') {
+                'M' => "modified",
+                'A' => "new file",
+                'D' => "deleted",
+                'R' => "renamed",
+                _ => "changed",
+            };
+            out.push_str(&format!("        {}: {}\n", label, e.path));
+        }
+        out.push('\n');
+    }
+
+    if !unstaged.is_empty() {
+        out.push_str("Changes not staged for commit:\n");
+        for e in &unstaged {
+            let label = match e.xy.chars().nth(1).unwrap_or(' ') {
+                'M' => "modified",
+                'D' => "deleted",
+                _ => "changed",
+            };
+            out.push_str(&format!("        {}: {}\n", label, e.path));
+        }
+        out.push('\n');
+    }
+
+    if !untracked.is_empty() {
+        out.push_str("Untracked files:\n");
+        for e in &untracked {
+            out.push_str(&format!("        {}\n", e.path));
+        }
+        out.push('\n');
+    }
+
+    Some(out)
+}
+
+// ─── Staging ──────────────────────────────────────────────────────────────────
+
+/// Run `git add <path>`. Returns Ok(()) on success, Err(message) on failure.
+pub fn stage_file(path: &Path) -> Result<(), String> {
+    let dir = path.parent().ok_or("no parent directory")?;
+    let path_str = path.to_str().ok_or("invalid path")?;
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["add", path_str])
+        .output()
+        .map_err(|e| format!("git add failed: {}", e))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(if err.is_empty() {
+            "git add failed".to_string()
+        } else {
+            err
+        })
+    }
+}
+
+/// Run `git add -A` to stage all changes. Returns Ok(()) on success.
+pub fn stage_all(dir: &Path) -> Result<(), String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["add", "-A"])
+        .output()
+        .map_err(|e| format!("git add -A failed: {}", e))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(if err.is_empty() {
+            "git add -A failed".to_string()
+        } else {
+            err
+        })
+    }
+}
+
+// ─── Commit / push ────────────────────────────────────────────────────────────
+
+/// Run `git commit -m <message>`. Returns Ok(summary) or Err(message).
+pub fn commit(dir: &Path, message: &str) -> Result<String, String> {
+    if message.trim().is_empty() {
+        return Err("commit message cannot be empty".to_string());
+    }
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["commit", "-m", message])
+        .output()
+        .map_err(|e| format!("git commit failed: {}", e))?;
+    if output.status.success() {
+        let out = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        // Return first line of git commit output (e.g. "[main abc1234] fix bug")
+        Ok(out.lines().next().unwrap_or("committed").to_string())
+    } else {
+        let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(if err.is_empty() {
+            "git commit failed".to_string()
+        } else {
+            err
+        })
+    }
+}
+
+/// Run `git push`. Returns Ok(summary) or Err(message).
+pub fn push(dir: &Path) -> Result<String, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["push"])
+        .output()
+        .map_err(|e| format!("git push failed: {}", e))?;
+    if output.status.success() {
+        let out = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let err_out = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Ok(if out.is_empty() { err_out } else { out })
+    } else {
+        let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(if err.is_empty() {
+            "git push failed".to_string()
+        } else {
+            err
+        })
+    }
+}
+
+// ─── Diff ─────────────────────────────────────────────────────────────────────
+
 pub fn compute_file_diff(path: &Path) -> Vec<Option<GitLineStatus>> {
     let dir = match path.parent() {
         Some(d) => d,

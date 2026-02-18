@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Feb 17, 2026 (Session 33)
+**Last updated:** Feb 17, 2026 (Session 34)
 
 ## Status
 
@@ -132,32 +132,54 @@ vimcode/
 ```bash
 cargo build
 cargo run -- <file>
-cargo test    # 346 tests
+cargo test -- --test-threads=1    # 360 tests
 cargo clippy -- -D warnings
 cargo fmt
 ```
 
-## Roadmap (High Priority)
-- [x] **Visual block mode (Ctrl-V)** — COMPLETE
-- [x] **Macros (q, @)** — COMPLETE
-- [x] **Find/Replace (:s + Ctrl-F)** — COMPLETE
-- [x] **Session Persistence** — COMPLETE
-- [x] **Reverse search (?)** — COMPLETE
-- [x] **Replace character (r)** — COMPLETE
-- [x] **Undo line (U)** — COMPLETE
-- [x] **Visual mode case change (u/U)** — COMPLETE
-- [x] **Marks (m, ')** — COMPLETE
-- [x] **Incremental search** — COMPLETE
-- [x] **More grammars (Python/JS/Go/C++)** — COMPLETE
-- [x] **TUI backend (ratatui)** — COMPLETE
-- [x] **Nerd Font icons (GTK + TUI)** — COMPLETE
-- [x] **TUI sidebar with CRUD** — COMPLETE
-- [x] **Mouse support in TUI** — COMPLETE
-- [x] **Sidebar resize bar (GTK + TUI)** — COMPLETE
-- [x] **Code Folding (za/zo/zc/zR)** — COMPLETE
-- [x] **Git Integration (gutter markers, branch in status, :Gdiff)** — COMPLETE
+## Roadmap
+
+### Completed
+- [x] **Visual block mode (Ctrl-V)**
+- [x] **Macros (q, @)**
+- [x] **Find/Replace (:s + Ctrl-F)**
+- [x] **Session Persistence**
+- [x] **Reverse search (?)**
+- [x] **Replace character (r)**
+- [x] **Undo line (U)**
+- [x] **Visual mode case change (u/U)**
+- [x] **Marks (m, ')**
+- [x] **Incremental search**
+- [x] **More grammars (Python/JS/Go/C++)**
+- [x] **TUI backend (ratatui)**
+- [x] **Nerd Font icons (GTK + TUI)**
+- [x] **TUI sidebar with CRUD**
+- [x] **Mouse support in TUI**
+- [x] **Sidebar resize bar (GTK + TUI)**
+- [x] **Code Folding (za/zo/zc/zR)**
+- [x] **Git: gutter markers, branch in status bar, :Gdiff**
+- [x] **Git: :Gstatus, :Gadd[!], :Gcommit, :Gpush**
+- [x] **Explorer bug fix: click opens new tab (not replace current)**
+
+### Git (next)
+- [ ] **:Gblame** — inline blame annotation per line in a vsplit
+- [ ] **Stage hunks** — stage individual diff hunks interactively (like `git add -p`)
+
+### Editor features
+- [ ] **Auto-indent** — smart indentation on Enter; respect `shiftwidth`/`expandtab`
+- [ ] **:set command** — runtime setting changes (`tabwidth`, `expandtab`, `number`, etc.)
+- [ ] **Completion menu** — Ctrl-N/Ctrl-P word completion from buffer in insert mode
+- [ ] **:grep / :vimgrep** — project-wide search, populate quickfix list
+- [ ] **Quickfix window** — `:copen`, `:cn`, `:cp` quickfix navigation
+- [ ] **More text objects** — `is`/`as` sentence, `ip`/`ap` paragraph, `it`/`at` tag
+
+### Big features
+- [ ] **LSP support** — completions, go-to-definition, hover, diagnostics
+- [ ] **`gd` / `gD`** — go-to-definition (ctags/ripgrep stub before LSP)
+- [ ] **`:norm`** — execute normal command on a range of lines
 
 ## Recent Work
+**Session 34:** Explorer tab bug fix + extended git commands — sidebar clicks now call `open_file_in_tab` (new engine method): switches to existing tab if file is already open, else creates a new tab; never replaces current tab's content. Added `:Gstatus`/`:Gs` (git status in vsplit), `:Gadd`/`:Gadd!` (stage current file or all), `:Gcommit <msg>` (commit with message, refreshes diff markers), `:Gpush` (push to remote). All git helpers in `src/core/git.rs`. Roadmap updated with full backlog. (360 tests, no change.)
 **Session 33:** Git integration complete — `src/core/git.rs` (new) with subprocess-based diff parsing; `▌` gutter markers in green (Added) or yellow (Modified) in both GTK and TUI backends; current branch name shown in status bar as `[branch]`; `:Gdiff`/`:Gd` command opens unified diff in vertical split; `has_git_diff` flag drives the extra gutter column; TUI fold-click detection fixed to use `any()` so it works when the git column is prepended (357→360 tests, 3 new git diff parser tests).
 **Session 32:** Session file restore + fold click polish — open file list (and active buffer) now saved on quit and restored on next launch; entire gutter width is clickable for fold toggle in both GTK and TUI (was pixel-precise single column); GTK gutter text has 3px left padding gap (357 tests, no change).
 **Session 31:** Code Folding complete — indentation-based manual folding with `za` (toggle), `zo` (open), `zc` (close), `zR` (open all); fold state stored in `View` (per-window); `move_down`/`move_up` skip hidden lines; `+`/`-` gutter indicators (block-opener heuristic, always visible regardless of line number mode); clickable gutter column; fold-aware rendering in both GTK + TUI backends via `render.rs` (346→357 tests, 11 new fold tests).

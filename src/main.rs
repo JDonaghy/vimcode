@@ -98,10 +98,8 @@ enum Msg {
     ToggleSidebar,
     /// Switch to a different sidebar panel.
     SwitchPanel(SidebarPanel),
-    /// Open file from sidebar tree view (permanent).
+    /// Open file from sidebar tree view (switches to existing tab or opens new tab).
     OpenFileFromSidebar(PathBuf),
-    /// Preview file from sidebar single-click (reusable preview tab).
-    PreviewFileFromSidebar(PathBuf),
     /// Create a new file with the given name.
     CreateFile(String),
     /// Create a new folder with the given name.
@@ -804,7 +802,7 @@ impl SimpleComponent for App {
                                 model.get_value(&iter, 2).get().unwrap_or_default();
                             let path_buf = PathBuf::from(full_path);
                             if path_buf.is_file() {
-                                sender_for_click.input(Msg::PreviewFileFromSidebar(path_buf));
+                                sender_for_click.input(Msg::OpenFileFromSidebar(path_buf));
                             }
                         }
                     }
@@ -1026,15 +1024,8 @@ impl SimpleComponent for App {
             }
             Msg::OpenFileFromSidebar(path) => {
                 let mut engine = self.engine.borrow_mut();
-                // Double-click opens in new tab (permanent mode)
-                engine.new_tab(Some(&path));
-
-                // Promote to permanent if it was opened as preview
-                let buffer_id = engine.active_buffer_id();
-                if engine.preview_buffer_id == Some(buffer_id) {
-                    engine.promote_preview(buffer_id);
-                }
-
+                // Open in a new tab, or switch to the existing tab that shows this file.
+                engine.open_file_in_tab(&path);
                 drop(engine);
                 if let Some(ref tree) = *self.file_tree_view.borrow() {
                     highlight_file_in_tree(tree, &path);
@@ -1043,25 +1034,6 @@ impl SimpleComponent for App {
                     drawing.grab_focus();
                 }
                 self.tree_has_focus = false;
-                self.redraw = !self.redraw;
-            }
-            Msg::PreviewFileFromSidebar(path) => {
-                let mut engine = self.engine.borrow_mut();
-                match engine.open_file_with_mode(&path, OpenMode::Preview) {
-                    Ok(()) => {
-                        drop(engine);
-                        if let Some(ref tree) = *self.file_tree_view.borrow() {
-                            highlight_file_in_tree(tree, &path);
-                        }
-                        if let Some(ref drawing) = *self.drawing_area.borrow() {
-                            drawing.grab_focus();
-                        }
-                        self.tree_has_focus = false;
-                    }
-                    Err(e) => {
-                        engine.message = e;
-                    }
-                }
                 self.redraw = !self.redraw;
             }
             Msg::CreateFile(name) => {

@@ -26,6 +26,9 @@ pub enum EngineAction {
 /// How a file should be opened: as a temporary preview or permanent buffer.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum OpenMode {
+    /// Preview mode: replaces the current window's buffer temporarily.
+    /// Used internally; sidebar clicks use `open_file_in_tab` instead.
+    #[allow(dead_code)]
     Preview,
     Permanent,
 }
@@ -629,6 +632,108 @@ impl Engine {
         }
     }
 
+    /// Helper: resolve the git repo dir from either the current file's directory or cwd.
+    fn git_dir(&self) -> PathBuf {
+        self.file_path()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+    }
+
+    /// Open `git status` output in a new read-only buffer (vertical split).
+    fn cmd_git_status(&mut self) -> EngineAction {
+        let dir = self.git_dir();
+        match git::status_text(&dir) {
+            Some(text) => {
+                let buf_id = self.buffer_manager.create();
+                if let Some(state) = self.buffer_manager.get_mut(buf_id) {
+                    state.buffer.content = ropey::Rope::from_str(&text);
+                }
+                self.split_window(SplitDirection::Vertical, None);
+                let old_buf = self.active_buffer_id();
+                self.active_window_mut().buffer_id = buf_id;
+                let _ = self.buffer_manager.delete(old_buf, true);
+                self.message = "Git status".to_string();
+                EngineAction::None
+            }
+            None => {
+                self.message = "Not a git repository".to_string();
+                EngineAction::Error
+            }
+        }
+    }
+
+    /// Stage the current file (`:Gadd`) or all changes (`:Gadd!`).
+    fn cmd_git_add(&mut self, all: bool) -> EngineAction {
+        let dir = self.git_dir();
+        let result = if all {
+            git::stage_all(&dir)
+        } else {
+            match self.file_path().map(|p| p.to_path_buf()) {
+                Some(path) => git::stage_file(&path),
+                None => Err("No file to stage".to_string()),
+            }
+        };
+        match result {
+            Ok(()) => {
+                // Refresh git diff markers for all open buffers.
+                let ids: Vec<_> = self.buffer_manager.list();
+                for id in ids {
+                    self.refresh_git_diff(id);
+                }
+                // Update branch (in case this was first commit)
+                self.git_branch = git::current_branch(&dir);
+                let label = if all { "all files" } else { "current file" };
+                self.message = format!("Staged {}", label);
+                EngineAction::None
+            }
+            Err(e) => {
+                self.message = e;
+                EngineAction::Error
+            }
+        }
+    }
+
+    /// Commit staged changes with the given message (`:Gcommit <msg>`).
+    fn cmd_git_commit(&mut self, message: &str) -> EngineAction {
+        let dir = self.git_dir();
+        match git::commit(&dir, message) {
+            Ok(summary) => {
+                // Update branch name (in case first commit on new branch).
+                self.git_branch = git::current_branch(&dir);
+                // Refresh diffs (committed changes are no longer "modified").
+                let ids: Vec<_> = self.buffer_manager.list();
+                for id in ids {
+                    self.refresh_git_diff(id);
+                }
+                self.message = summary;
+                EngineAction::None
+            }
+            Err(e) => {
+                self.message = e;
+                EngineAction::Error
+            }
+        }
+    }
+
+    /// Push current branch to remote (`:Gpush`).
+    fn cmd_git_push(&mut self) -> EngineAction {
+        let dir = self.git_dir();
+        match git::push(&dir) {
+            Ok(summary) => {
+                self.message = if summary.is_empty() {
+                    "Pushed".to_string()
+                } else {
+                    summary
+                };
+                EngineAction::None
+            }
+            Err(e) => {
+                self.message = e;
+                EngineAction::Error
+            }
+        }
+    }
+
     // =======================================================================
     // Preview mode
     // =======================================================================
@@ -948,6 +1053,60 @@ impl Engine {
         if index < self.tabs.len() {
             self.active_tab = index;
         }
+    }
+
+    /// Open a file from the explorer: switch to an existing tab that shows it,
+    /// or create a new tab when no tab currently displays it.
+    ///
+    /// This is the correct handler for sidebar file clicks — it never replaces
+    /// the current tab's contents.
+    pub fn open_file_in_tab(&mut self, path: &Path) {
+        let buffer_id = match self.buffer_manager.open_file(path) {
+            Ok(id) => id,
+            Err(e) => {
+                self.message = format!("Error: {}", e);
+                return;
+            }
+        };
+
+        // If this buffer is the current preview, just promote it in-place.
+        if self.preview_buffer_id == Some(buffer_id) {
+            self.promote_preview(buffer_id);
+            self.refresh_git_diff(buffer_id);
+            self.message = format!("\"{}\"", path.display());
+            return;
+        }
+
+        // Switch to any existing tab whose active window already shows this buffer.
+        for (tab_idx, tab) in self.tabs.iter().enumerate() {
+            if let Some(win) = self.windows.get(&tab.active_window) {
+                if win.buffer_id == buffer_id {
+                    self.active_tab = tab_idx;
+                    self.refresh_git_diff(buffer_id);
+                    self.message = format!("\"{}\"", path.display());
+                    return;
+                }
+            }
+        }
+
+        // No existing tab shows this file — open it in a new tab.
+        let window_id = self.new_window_id();
+        let window = Window::new(window_id, buffer_id);
+        self.windows.insert(window_id, window);
+
+        let tab_id = self.new_tab_id();
+        let tab = Tab::new(tab_id, window_id);
+        self.tabs.push(tab);
+        self.active_tab = self.tabs.len() - 1;
+
+        // Restore saved cursor/scroll position.
+        let view = self.restore_file_position(buffer_id);
+        if let Some(w) = self.windows.get_mut(&window_id) {
+            w.view = view;
+        }
+
+        self.refresh_git_diff(buffer_id);
+        self.message = format!("\"{}\"", path.display());
     }
 
     // =======================================================================
@@ -3778,6 +3937,36 @@ impl Engine {
         // Handle :Gdiff / :Gd
         if cmd == "Gdiff" || cmd == "Gd" {
             return self.cmd_git_diff();
+        }
+
+        // Handle :Gstatus / :Gs
+        if cmd == "Gstatus" || cmd == "Gs" {
+            return self.cmd_git_status();
+        }
+
+        // Handle :Gadd[!] — stage current file or all
+        if cmd == "Gadd" || cmd == "Ga" {
+            return self.cmd_git_add(false);
+        }
+        if cmd == "Gadd!" || cmd == "Ga!" {
+            return self.cmd_git_add(true);
+        }
+
+        // Handle :Gcommit <message> / :Gc <message>
+        if let Some(msg) = cmd
+            .strip_prefix("Gcommit ")
+            .or_else(|| cmd.strip_prefix("Gc "))
+        {
+            return self.cmd_git_commit(msg.trim());
+        }
+        if cmd == "Gcommit" || cmd == "Gc" {
+            self.message = "Usage: Gcommit <message>".to_string();
+            return EngineAction::Error;
+        }
+
+        // Handle :Gpush / :Gp
+        if cmd == "Gpush" || cmd == "Gp" {
+            return self.cmd_git_push();
         }
 
         // Handle :e <filename>

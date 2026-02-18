@@ -386,11 +386,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                                     sidebar.toggle_dir(idx);
                                 } else {
                                     let path = sidebar.rows[idx].path.clone();
-                                    if let Err(e) =
-                                        engine.open_file_with_mode(&path, OpenMode::Permanent)
-                                    {
-                                        engine.message = e;
-                                    }
+                                    engine.open_file_in_tab(&path);
                                     sidebar.has_focus = false;
                                 }
                             }
@@ -626,9 +622,7 @@ fn handle_mouse(
                         sidebar.toggle_dir(tree_row);
                     } else {
                         let path = sidebar.rows[tree_row].path.clone();
-                        if let Err(e) = engine.open_file_with_mode(&path, OpenMode::Permanent) {
-                            engine.message = e;
-                        }
+                        engine.open_file_in_tab(&path);
                         sidebar.has_focus = false;
                     }
                 } else {
