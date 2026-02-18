@@ -67,6 +67,8 @@ pub struct BufferState {
     pub current_undo_group: Option<UndoEntry>,
     /// Original line content for U (undo line) command: (line_number, original_content)
     pub line_undo_state: Option<(usize, String)>,
+    /// Per-line git diff status (Added/Modified/None). Empty when not in a git repo.
+    pub git_diff: Vec<Option<crate::core::git::GitLineStatus>>,
 }
 
 impl std::fmt::Debug for BufferState {
@@ -95,6 +97,7 @@ impl BufferState {
             redo_stack: Vec::new(),
             current_undo_group: None,
             line_undo_state: None,
+            git_diff: Vec::new(),
         };
         state.update_syntax();
         state
@@ -115,6 +118,7 @@ impl BufferState {
             redo_stack: Vec::new(),
             current_undo_group: None,
             line_undo_state: None,
+            git_diff: Vec::new(),
         };
         state.update_syntax();
         state

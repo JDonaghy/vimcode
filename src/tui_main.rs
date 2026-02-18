@@ -29,7 +29,7 @@ use ratatui::style::{Color as RColor, Modifier};
 use ratatui::Terminal;
 
 use crate::core::engine::EngineAction;
-use crate::core::{Engine, Mode, OpenMode, WindowRect};
+use crate::core::{Engine, GitLineStatus, Mode, OpenMode, WindowRect};
 use crate::render::{
     self, build_screen_layout, Color, CursorShape, RenderedLine, RenderedWindow, SelectionKind,
     Theme,
@@ -680,8 +680,9 @@ fn handle_mouse(
                 if gutter > 0 && rel_col >= wx && rel_col < wx + gutter {
                     // Any click in gutter toggles fold if there's a fold indicator
                     if let Some(rl) = rw.lines.get(view_row) {
-                        let fc = rl.gutter_text.chars().next().unwrap_or(' ');
-                        if fc == '+' || fc == '-' {
+                        let has_fold_indicator =
+                            rl.gutter_text.chars().any(|c| c == '+' || c == '-');
+                        if has_fold_indicator {
                             engine.toggle_fold_at_line(rl.line_idx);
                         }
                     }
@@ -1006,7 +1007,7 @@ fn render_window(frame: &mut ratatui::Frame, area: Rect, window: &RenderedWindow
 
         // Gutter
         if gutter_w > 0 {
-            let gutter_fg = rc(if line.is_current_line {
+            let line_num_fg = rc(if line.is_current_line {
                 theme.line_number_active_fg
             } else {
                 theme.line_number_fg
@@ -1016,7 +1017,16 @@ fn render_window(frame: &mut ratatui::Frame, area: Rect, window: &RenderedWindow
                 if gx >= area.x + gutter_w {
                     break;
                 }
-                set_cell(frame.buffer_mut(), gx, screen_y, ch, gutter_fg, window_bg);
+                let fg = if window.has_git_diff && i == 0 {
+                    rc(match line.git_diff {
+                        Some(GitLineStatus::Added) => theme.git_added,
+                        Some(GitLineStatus::Modified) => theme.git_modified,
+                        None => theme.line_number_fg,
+                    })
+                } else {
+                    line_num_fg
+                };
+                set_cell(frame.buffer_mut(), gx, screen_y, ch, fg, window_bg);
             }
         }
 

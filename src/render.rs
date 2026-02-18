@@ -17,7 +17,7 @@ use crate::core::buffer_manager::BufferState;
 use crate::core::engine::{Engine, SearchDirection};
 use crate::core::settings::LineNumberMode;
 use crate::core::view::View;
-use crate::core::{Cursor, Mode, WindowId, WindowRect};
+use crate::core::{Cursor, GitLineStatus, Mode, WindowId, WindowRect};
 
 // ─── Color ───────────────────────────────────────────────────────────────────
 
@@ -107,6 +107,9 @@ pub struct RenderedLine {
     /// The buffer line index this rendered row corresponds to.
     /// Used by click handlers to map screen row → buffer line.
     pub line_idx: usize,
+    /// Git diff status for this line (Added/Modified/None).
+    /// `None` when the buffer is not tracked by git or the line is unchanged.
+    pub git_diff: Option<GitLineStatus>,
 }
 
 // ─── Cursor ───────────────────────────────────────────────────────────────────
@@ -198,6 +201,8 @@ pub struct RenderedWindow {
     /// Whether to render with the slightly-different active-window background
     /// (only true when `is_active` AND there are multiple windows).
     pub show_active_bg: bool,
+    /// Whether the buffer has git diff data (controls git column in gutter).
+    pub has_git_diff: bool,
 }
 
 // ─── CommandLineData ──────────────────────────────────────────────────────────
@@ -287,6 +292,10 @@ pub struct Theme {
 
     // Window separator
     pub separator: Color,
+
+    // Git diff gutter markers
+    pub git_added: Color,
+    pub git_modified: Color,
 }
 
 impl Theme {
@@ -354,6 +363,10 @@ impl Theme {
 
             // (0.3, 0.3, 0.4)
             separator: Color::from_hex("#4c4c66"),
+
+            // Git diff gutter markers
+            git_added: Color::from_hex("#98c379"),    // green
+            git_modified: Color::from_hex("#e5c07b"), // yellow
         }
     }
 
@@ -485,6 +498,7 @@ fn build_rendered_window(
         gutter_char_width: 0,
         is_active,
         show_active_bg: false,
+        has_git_diff: false,
     };
 
     let window = match engine.windows.get(&window_id) {
@@ -502,9 +516,16 @@ fn build_rendered_window(
     let total_lines = buffer.content.len_lines();
     let cursor_line = view.cursor.line;
 
+    // Whether this buffer has git diff data.
+    let has_git = !buffer_state.git_diff.is_empty();
+
     // Gutter width in character columns (always includes fold indicator column).
-    let gutter_char_width =
-        calculate_gutter_cols(engine.settings.line_numbers, total_lines, char_width);
+    let gutter_char_width = calculate_gutter_cols(
+        engine.settings.line_numbers,
+        total_lines,
+        char_width,
+        has_git,
+    );
 
     // Build rendered lines (fold-aware: skip hidden lines, jump over fold bodies)
     let mut lines = Vec::with_capacity(visible_lines);
@@ -535,14 +556,31 @@ fn build_rendered_window(
             line_end_byte,
         );
 
+        // Git diff status for this line.
+        let git_status = if has_git {
+            buffer_state.git_diff.get(line_idx).copied().flatten()
+        } else {
+            None
+        };
+
         let fold_char = fold_indicator_char(buffer, view, line_idx);
-        let gutter_text = format_gutter_with_fold(
+        let base_gutter = format_gutter_with_fold(
             engine.settings.line_numbers,
             line_idx,
             cursor_line,
-            gutter_char_width,
+            // Pass gutter_char_width minus the git column so numbers fill correctly.
+            gutter_char_width.saturating_sub(if has_git { 1 } else { 0 }),
             fold_char,
         );
+        let gutter_text = if has_git {
+            let git_char = match git_status {
+                Some(GitLineStatus::Added) | Some(GitLineStatus::Modified) => '▌',
+                None => ' ',
+            };
+            format!("{}{}", git_char, base_gutter)
+        } else {
+            base_gutter
+        };
 
         lines.push(RenderedLine {
             raw_text: line_str,
@@ -552,6 +590,7 @@ fn build_rendered_window(
             is_fold_header,
             folded_line_count,
             line_idx,
+            git_diff: git_status,
         });
 
         // Jump past the fold body for fold headers.
@@ -607,6 +646,7 @@ fn build_rendered_window(
         gutter_char_width,
         is_active,
         show_active_bg: is_active && multi_window,
+        has_git_diff: has_git,
     }
 }
 
@@ -875,20 +915,28 @@ fn format_gutter_with_fold(
 ///
 /// When line numbers are enabled the gutter always includes one extra column
 /// for the fold indicator (`+`, `-`, or space).
+/// When `has_git_diff` is true, one additional column is prepended for the
+/// git diff marker (`▌` or space).
 /// The GTK backend multiplies this by `char_width` pixels to get the pixel
 /// gutter width; a TUI backend uses it directly as cell count.
-pub fn calculate_gutter_cols(mode: LineNumberMode, total_lines: usize, _char_width: f64) -> usize {
+pub fn calculate_gutter_cols(
+    mode: LineNumberMode,
+    total_lines: usize,
+    _char_width: f64,
+    has_git_diff: bool,
+) -> usize {
+    let git = if has_git_diff { 1 } else { 0 };
     match mode {
         // No line numbers: show only the 1-column fold indicator.
-        LineNumberMode::None => 1,
+        LineNumberMode::None => 1 + git,
         LineNumberMode::Absolute => {
             let digits = total_lines.to_string().len().max(1);
-            digits + 2 + 1 // digits + padding + fold indicator
+            digits + 2 + 1 + git // digits + padding + fold indicator + git
         }
         LineNumberMode::Relative | LineNumberMode::Hybrid => {
             let max_relative = total_lines.saturating_sub(1);
             let digits = max_relative.to_string().len().max(3);
-            digits + 2 + 1
+            digits + 2 + 1 + git
         }
     }
 }
@@ -915,7 +963,16 @@ fn build_status_line(engine: &Engine) -> (String, String) {
         String::new()
     };
 
-    let left = format!(" -- {}{} -- {}{}", mode_str, recording, filename, dirty);
+    let branch = engine
+        .git_branch
+        .as_deref()
+        .map(|b| format!(" [{}]", b))
+        .unwrap_or_default();
+
+    let left = format!(
+        " -- {}{} -- {}{}{}",
+        mode_str, recording, filename, dirty, branch
+    );
 
     let cursor = engine.cursor();
     let right = format!(

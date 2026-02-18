@@ -23,7 +23,7 @@ mod tui_main;
 
 use core::engine::EngineAction;
 use core::settings::LineNumberMode;
-use core::{Engine, OpenMode, WindowRect};
+use core::{Engine, GitLineStatus, OpenMode, WindowRect};
 use render::{
     build_screen_layout, CommandLineData, CursorShape, RenderedWindow, SelectionKind,
     SelectionRange, StyledSpan, TabInfo, Theme,
@@ -1877,13 +1877,34 @@ fn draw_window(
         );
     }
 
-    // Render gutter (fold indicators + optional line numbers)
+    // Render gutter (git marker + fold indicators + optional line numbers)
     if rw.gutter_char_width > 0 {
         for (view_idx, rl) in rw.lines.iter().enumerate() {
             let y = rect.y + view_idx as f64 * line_height;
 
-            layout.set_text(&rl.gutter_text);
-            layout.set_attributes(None);
+            if rw.has_git_diff {
+                // Render git marker (first char of gutter_text) with git color.
+                let git_ch: String = rl.gutter_text.chars().take(1).collect();
+                let git_color = match rl.git_diff {
+                    Some(GitLineStatus::Added) => theme.git_added,
+                    Some(GitLineStatus::Modified) => theme.git_modified,
+                    None => theme.line_number_fg,
+                };
+                layout.set_text(&git_ch);
+                layout.set_attributes(None);
+                let (gr, gg, gb) = git_color.to_cairo();
+                cr.set_source_rgb(gr, gg, gb);
+                cr.move_to(rect.x + 3.0, y);
+                pangocairo::show_layout(cr, layout);
+
+                // Render fold+numbers (rest of gutter_text) with normal color.
+                let rest: String = rl.gutter_text.chars().skip(1).collect();
+                layout.set_text(&rest);
+                layout.set_attributes(None);
+            } else {
+                layout.set_text(&rl.gutter_text);
+                layout.set_attributes(None);
+            }
 
             let (num_width, _) = layout.pixel_size();
             let num_x = rect.x + gutter_width - num_width as f64 - char_width + 3.0;
@@ -2374,8 +2395,13 @@ fn handle_mouse_click(engine: &mut Engine, x: f64, y: f64, width: f64, height: f
     // Calculate gutter width from render module (matches the actual draw function).
     let char_width = font_metrics.approximate_char_width() as f64 / pango::SCALE as f64;
     let total_lines = buffer.content.len_lines();
-    let gutter_char_width =
-        render::calculate_gutter_cols(engine.settings.line_numbers, total_lines, char_width);
+    let has_git = !buffer_state.git_diff.is_empty();
+    let gutter_char_width = render::calculate_gutter_cols(
+        engine.settings.line_numbers,
+        total_lines,
+        char_width,
+        has_git,
+    );
     let gutter_width = gutter_char_width as f64 * char_width;
 
     // Calculate per-window status bar height

@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use super::buffer::{Buffer, BufferId};
 use super::buffer_manager::{BufferManager, BufferState};
+use super::git;
 use super::session::SessionState;
 use super::settings::Settings;
 use super::tab::{Tab, TabId};
@@ -207,6 +208,10 @@ pub struct Engine {
     pub last_macro_register: Option<char>,
     /// Prevent infinite recursion.
     pub macro_recursion_depth: usize,
+
+    // --- Git integration ---
+    /// Current git branch name (None if not in a git repo or git not available).
+    pub git_branch: Option<String>,
 }
 
 impl Engine {
@@ -268,6 +273,10 @@ impl Engine {
             macro_playback_queue: VecDeque::new(),
             last_macro_register: None,
             macro_recursion_depth: 0,
+            git_branch: {
+                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                git::current_branch(&cwd)
+            },
         }
     }
 
@@ -290,6 +299,7 @@ impl Engine {
                 if let Some(window) = engine.windows.get_mut(&engine.active_window_id()) {
                     window.view = view;
                 }
+                engine.refresh_git_diff(buffer_id);
                 if !path.exists() {
                     engine.message = format!("\"{}\" [New File]", path.display());
                 }
@@ -555,6 +565,9 @@ impl Engine {
             match state.save() {
                 Ok(line_count) => {
                     self.message = format!("\"{}\" {}L written", path.display(), line_count);
+                    // Refresh git diff after save
+                    let id = self.active_buffer_id();
+                    self.refresh_git_diff(id);
                     Ok(())
                 }
                 Err(e) => {
@@ -565,6 +578,54 @@ impl Engine {
         } else {
             self.message = "No file name".to_string();
             Err(self.message.clone())
+        }
+    }
+
+    // =======================================================================
+    // Git integration
+    // =======================================================================
+
+    /// Refresh git diff markers for the given buffer.
+    fn refresh_git_diff(&mut self, buffer_id: BufferId) {
+        if let Some(path) = self
+            .buffer_manager
+            .get(buffer_id)
+            .and_then(|s| s.file_path.clone())
+        {
+            let diff = git::compute_file_diff(&path);
+            if let Some(state) = self.buffer_manager.get_mut(buffer_id) {
+                state.git_diff = diff;
+            }
+        }
+    }
+
+    /// Open the git diff for the current file in a vertical split.
+    fn cmd_git_diff(&mut self) -> EngineAction {
+        let path = match self.file_path().map(|p| p.to_path_buf()) {
+            Some(p) => p,
+            None => {
+                self.message = "No file".to_string();
+                return EngineAction::Error;
+            }
+        };
+        match git::file_diff_text(&path) {
+            Some(text) => {
+                let buf_id = self.buffer_manager.create();
+                if let Some(state) = self.buffer_manager.get_mut(buf_id) {
+                    state.buffer.content = ropey::Rope::from_str(&text);
+                }
+                // Split vertically and point the new window at the diff buffer
+                self.split_window(SplitDirection::Vertical, None);
+                let old_buf = self.active_buffer_id();
+                self.active_window_mut().buffer_id = buf_id;
+                let _ = self.buffer_manager.delete(old_buf, true);
+                self.message = format!("Git diff: {}", path.display());
+                EngineAction::None
+            }
+            None => {
+                self.message = "No changes (clean working tree)".to_string();
+                EngineAction::None
+            }
         }
     }
 
@@ -643,6 +704,7 @@ impl Engine {
             self.buffer_manager.alternate_buffer = Some(current);
         }
         self.switch_window_buffer(buffer_id);
+        self.refresh_git_diff(buffer_id);
         self.message = format!("\"{}\"", path.display());
         Ok(())
     }
@@ -3712,6 +3774,11 @@ impl Engine {
 
     fn execute_command(&mut self, cmd: &str) -> EngineAction {
         let cmd = cmd.trim();
+
+        // Handle :Gdiff / :Gd
+        if cmd == "Gdiff" || cmd == "Gd" {
+            return self.cmd_git_diff();
+        }
 
         // Handle :e <filename>
         if let Some(filename) = cmd.strip_prefix("e ") {
