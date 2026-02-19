@@ -698,7 +698,34 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                     }
                 }
             }
-            Event::Mouse(mouse_event) => {
+            Event::Mouse(mut mouse_event) => {
+                // Coalesce consecutive drag events to avoid render-per-pixel lag
+                if matches!(mouse_event.kind, MouseEventKind::Drag(_)) {
+                    while ct_event::poll(Duration::ZERO).unwrap_or(false) {
+                        if let Ok(Event::Mouse(next)) = ct_event::read() {
+                            if matches!(next.kind, MouseEventKind::Drag(_)) {
+                                mouse_event = next; // skip intermediate positions
+                                continue;
+                            }
+                            // Non-drag event: handle the coalesced drag first, then the new event
+                            sidebar_width = handle_mouse(
+                                mouse_event,
+                                &mut sidebar,
+                                engine,
+                                &terminal.size().ok(),
+                                sidebar_width,
+                                &mut dragging_sidebar,
+                                &mut dragging_scrollbar,
+                                &mut dragging_sidebar_search,
+                                last_layout.as_ref(),
+                            );
+                            mouse_event = next;
+                            break;
+                        } else {
+                            break; // non-mouse event; stop draining
+                        }
+                    }
+                }
                 sidebar_width = handle_mouse(
                     mouse_event,
                     &mut sidebar,
@@ -1605,7 +1632,7 @@ fn render_scrollbar(
         return;
     }
     let track_fg = rc(theme.separator);
-    let thumb_fg = rc(theme.status_fg);
+    let thumb_fg = RColor::Rgb(128, 128, 128);
     let sb_bg = rc(theme.background);
     // Track height: reserve last row for h-scrollbar if present
     let track_h = if has_h_scrollbar {
@@ -1645,9 +1672,9 @@ fn render_h_scrollbar(
     if area.height == 0 || max_col == 0 || viewport_cols == 0 {
         return;
     }
-    let track_fg = rc(theme.separator);
-    let thumb_fg = rc(theme.status_fg);
+    let thumb_fg = RColor::Rgb(128, 128, 128);
     let sb_bg = rc(theme.background);
+    let corner_fg = rc(theme.separator);
 
     let sb_y = area.y + area.height - 1;
     let track_x = area.x + gutter_w;
@@ -1668,13 +1695,13 @@ fn render_h_scrollbar(
     for dx in 0..track_w {
         let x = track_x + dx;
         let in_thumb = dx >= thumb_left && dx < thumb_left + thumb_size;
-        let ch = if in_thumb { '█' } else { '░' };
-        let fg = if in_thumb { thumb_fg } else { track_fg };
+        let ch = if in_thumb { '▄' } else { ' ' };
+        let fg = if in_thumb { thumb_fg } else { sb_bg };
         set_cell(buf, x, sb_y, ch, fg, sb_bg);
     }
     // Corner cell (intersection of v-scrollbar column and h-scrollbar row)
     if has_v_scrollbar {
-        set_cell(buf, area.x + area.width - 1, sb_y, '┘', track_fg, sb_bg);
+        set_cell(buf, area.x + area.width - 1, sb_y, '┘', corner_fg, sb_bg);
     }
 }
 
@@ -1795,7 +1822,7 @@ fn render_separators(
         return;
     }
     let sep_fg = rc(theme.separator);
-    let thumb_fg = rc(theme.status_fg);
+    let thumb_fg = RColor::Rgb(128, 128, 128);
     let track_fg = sep_fg;
     let sep_bg = rc(theme.background);
 

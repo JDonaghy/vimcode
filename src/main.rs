@@ -176,6 +176,8 @@ enum Msg {
     ProjectReplaceTextChanged(String),
     /// User clicked "Replace All" button — run replace across files.
     ProjectReplaceAll,
+    /// Mouse scroll wheel on editor drawing area.
+    MouseScroll { delta_x: f64, delta_y: f64 },
 }
 
 #[relm4::component]
@@ -691,6 +693,15 @@ impl SimpleComponent for App {
                                 }
                             },
 
+                            add_controller = gtk4::EventControllerScroll {
+                                set_flags: gtk4::EventControllerScrollFlags::VERTICAL
+                                         | gtk4::EventControllerScrollFlags::HORIZONTAL,
+                                connect_scroll[sender] => move |_, dx, dy| {
+                                    sender.input(Msg::MouseScroll { delta_x: dx, delta_y: dy });
+                                    gtk4::glib::Propagation::Stop
+                                },
+                            },
+
                             #[watch]
                             set_css_classes: {
                                 drawing_area.queue_draw();
@@ -942,9 +953,6 @@ impl SimpleComponent for App {
         // Build tree from current working directory
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         build_file_tree(&tree_store, None, &cwd);
-
-        // Debug: print entry count
-        eprintln!("Tree entries: {}", tree_store.iter_n_children(None));
 
         // Read font family for nerd font icon rendering
         let nf_font = engine.borrow().settings.font_family.clone();
@@ -1437,6 +1445,27 @@ impl SimpleComponent for App {
             Msg::HorizontalScrollbarChanged { window_id, value } => {
                 let mut engine = self.engine.borrow_mut();
                 engine.set_scroll_left_for_window(window_id, value.round() as usize);
+                drop(engine);
+                self.redraw = !self.redraw;
+            }
+            Msg::MouseScroll { delta_x, delta_y } => {
+                let mut engine = self.engine.borrow_mut();
+                if delta_y.abs() > 0.01 {
+                    let lines = engine.buffer().len_lines().saturating_sub(1);
+                    let scroll_amount = (delta_y * 3.0).round() as isize;
+                    let st = engine.view().scroll_top as isize;
+                    let new_top = (st + scroll_amount).clamp(0, lines as isize) as usize;
+                    engine.set_scroll_top(new_top);
+                    engine.ensure_cursor_visible();
+                    engine.sync_scroll_binds();
+                }
+                if delta_x.abs() > 0.01 {
+                    let win_id = engine.active_window_id();
+                    let current = engine.view().scroll_left;
+                    let scroll_amount = (delta_x * 3.0).round() as isize;
+                    let new_left = (current as isize + scroll_amount).max(0) as usize;
+                    engine.set_scroll_left_for_window(win_id, new_left);
+                }
                 drop(engine);
                 self.redraw = !self.redraw;
             }

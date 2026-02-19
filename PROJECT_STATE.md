@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Feb 18, 2026 (Session 45)
+**Last updated:** Feb 18, 2026 (Session 46)
 
 ## Status
 
@@ -93,6 +93,7 @@
 - **Horizontal scrollbars:** `█`/`░` thumb/track in last row when content is wider than viewport; `┘` corner when both scrollbars present
 - **Per-window viewport:** each split pane tracks its own viewport_lines/cols for correct `ensure_cursor_visible` in hsplit/vsplit
 - **Scroll sync:** `sync_scroll_binds()` called after keyboard nav and all mouse scroll/drag events (`:Gblame` pairs stay in sync)
+- **Drag event coalescing:** consecutive `MouseEventKind::Drag` events are coalesced (only the final position is rendered), eliminating render-per-pixel lag on all drag operations
 - Cursor shapes: bar in insert, underline in replace-r
 
 ### Settings
@@ -118,7 +119,7 @@
 vimcode/
 ├── src/
 │   ├── main.rs (~3400 lines) — GTK4/Relm4 UI, rendering, find dialog, sidebar resize, search/replace panel
-│   ├── tui_main.rs (~2760 lines) — ratatui/crossterm TUI backend, sidebar, mouse, search/replace panel
+│   ├── tui_main.rs (~2780 lines) — ratatui/crossterm TUI backend, sidebar, mouse, search/replace panel
 │   ├── icons.rs (~30 lines) — Nerd Font file-type icons (shared by GTK + TUI)
 │   ├── render.rs (~360 lines) — Platform-agnostic rendering abstraction (ScreenLayout, max_col)
 │   └── core/ (~11,500 lines) — Platform-agnostic logic
@@ -186,6 +187,7 @@ cargo fmt
 - [x] **Explorer preview fix: single-click opens preview tab (italic/dimmed); double-click makes permanent**
 - [x] **Horizontal scrollbar fix: per-window visible-column calculation using real Pango char_width**
 - [x] **TUI scrollbar polish: vsplit left-pane separator-as-scrollbar, h-scrollbar row, drag support, scroll sync via mouse, per-pane viewport**
+- [x] **TUI scrollbar drag fix: immediate h-scroll (no deferred apply), drag event coalescing, unified grey scrollbar color**
 
 ### Git (next)
 - [x] **Stage hunks** — `]c`/`[c` hunk navigation, `gs`/`:Ghs` stages hunk under cursor via `git apply --cached`
@@ -206,6 +208,8 @@ cargo fmt
 - [ ] **`:norm`** — execute normal command on a range of lines
 
 ## Recent Work
+**Session 46:** TUI scrollbar drag fix — removed deferred `pending_h_scroll` mechanism so h-scrollbar drag updates immediately (matching v-scrollbar behaviour); added drag event coalescing (consecutive `MouseEventKind::Drag` events are drained via `poll(Duration::ZERO)`, only the final position is rendered) benefiting all drag operations (h-scrollbar, v-scrollbar, sidebar resize); unified scrollbar thumb colour to `Rgb(128, 128, 128)` grey across vertical and horizontal scrollbars. (458 tests, no change.)
+
 **Session 45:** Replace across files — added `replace_in_project()` to `project_search.rs`: walks files via `ignore` crate, applies `regex::replace_all`, writes back only changed files; uses `NoExpand` wrapper in literal mode to prevent `$1` backreference expansion; files in `skip_paths` (dirty buffers) are skipped and reported. New `ReplaceResult` struct with counts and file lists. Extracted `build_search_regex()` helper shared by search and replace. Engine gains `project_replace_text`, `start_project_replace` (async), `poll_project_replace`, `apply_replace_result` (reloads open buffers, clears undo stacks, refreshes git diff). GTK: Replace `Entry` + "Replace All" button; 2 new `Msg` variants; replace poll piggybacked on `SearchPollTick`. TUI: `replace_input_focused` field; `Tab` switches inputs; `Enter` in replace box triggers replace; `Alt+H` shortcut; new `[Replace…]` row; all layout offsets shifted +1; mouse handling updated. (444→458 tests, 14 new: 9 replace + 5 engine.)
 
 **Session 44:** Enhanced project search — rewrote `project_search.rs` to use the `ignore` crate (same walker as ripgrep) for `.gitignore` support and the `regex` crate for pattern matching. Added `SearchOptions` struct with three toggles: case-sensitive (`Aa`), whole word (`Ab|`), and regex (`.*`). Results capped at 10,000 with status message indication. Engine gains `project_search_options` field and 3 toggle methods; async search thread now sends `Result<Vec<ProjectMatch>, SearchError>` for invalid-regex error handling. GTK: 3 `ToggleButton` widgets with CSS styling (dim inactive / blue active) between search input and status label; 3 new `Msg` variants. TUI: `Alt+C`/`Alt+W`/`Alt+R` toggle keys in both input and results mode; toggle indicator row replaces blank separator with active/inactive coloring and hint text. (438→444 tests, 6 new: case-sensitive, whole-word, regex, invalid-regex, whole-word+regex combo, gitignore-respected.)

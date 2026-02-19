@@ -287,9 +287,9 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 
 - **Layout:** activity bar (3 cols) | sidebar | editor area; status line + command line full-width at bottom
 - **Sidebar:** same file explorer as GTK with Nerd Font icons
-- **Mouse support:** click-to-position, window switching, scroll wheel (targets pane under cursor), scrollbar click-to-jump and drag
+- **Mouse support:** click-to-position, window switching, scroll wheel (targets pane under cursor), scrollbar click-to-jump and drag; drag event coalescing for smooth scrollbar tracking
 - **Sidebar resize:** drag separator column; `Alt+Left` / `Alt+Right` keyboard resize (min 15, max 60 cols)
-- **Scrollbars:** `█` / `░` thumb/track; vsplit separator doubles as left-pane vertical scrollbar; horizontal scrollbar row when content wider than viewport; `┘` corner when both axes present
+- **Scrollbars:** `█` / `░` thumb/track in uniform grey; vsplit separator doubles as left-pane vertical scrollbar; horizontal scrollbar row when content wider than viewport; `┘` corner when both axes present
 - **Scroll sync:** `:Gblame` pairs stay in sync across keyboard nav and mouse events
 - **Cursor shapes:** bar `|` in Insert mode, underline `_` in replace (`r`)
 
@@ -359,7 +359,7 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 ```
 src/
 ├── main.rs          (~3400 lines)  GTK4/Relm4 UI, rendering, sidebar resize, search panel
-├── tui_main.rs      (~2760 lines)  ratatui/crossterm TUI backend, search panel
+├── tui_main.rs      (~2780 lines)  ratatui/crossterm TUI backend, search panel
 ├── render.rs        (~1080 lines)  Platform-agnostic ScreenLayout bridge
 ├── icons.rs            (~30 lines)  Nerd Font file-type icons (GTK + TUI)
 └── core/            (~17600 lines)  Zero GTK/rendering deps — fully testable
