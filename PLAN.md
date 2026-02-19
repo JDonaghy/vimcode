@@ -1,5 +1,31 @@
 # VimCode Implementation Plan
 
+## Recently Completed (Session 45)
+
+### ✅ Replace Across Files
+- **`replace_in_project()`** in `project_search.rs`: walks files with `ignore` crate, applies `regex::replace_all`, writes back only changed files; `NoExpand` wrapper prevents `$` interpretation in literal mode; files in `skip_paths` are skipped and reported
+- **`ReplaceResult` struct**: `replacement_count`, `file_count`, `skipped_files`, `modified_files`
+- **`build_search_regex()` refactor**: extracted shared regex builder from `search_in_project` for reuse by both search and replace
+- **Engine integration**: `project_replace_text` field; `start_project_replace` (async) / `poll_project_replace` / `run_project_replace` (sync); `apply_replace_result` reloads open buffers, clears undo stacks, refreshes git diff, builds status message with skip info
+- **GTK**: Replace `Entry` + "Replace All" button between toggle row and status label; `ProjectReplaceTextChanged` / `ProjectReplaceAll` messages; replace poll piggybacked on `SearchPollTick`
+- **TUI**: `replace_input_focused` field; `Tab` switches between search/replace inputs; `Enter` in replace box triggers replace; `Alt+H` shortcut; new `[Replace…]` input row (row 2); all layout offsets shifted +1; mouse click routing updated
+- **Tests**: 14 new (9 project_search replace tests + 5 engine replace tests); 444→458 total
+
+---
+
+## Recently Completed (Session 44)
+
+### ✅ Enhanced Project Search (Regex, Whole Word, Case Toggle + Performance)
+- **`ignore` crate walker**: Replaced hand-rolled `walk_dir` with `ignore::WalkBuilder` (same as ripgrep) — respects `.gitignore`, skips `target/`, binary detection via UTF-8 decode
+- **`regex` crate matching**: `SearchOptions` struct with `case_sensitive`, `whole_word`, `use_regex` toggles; builds `regex::Regex` from query + options; invalid regex returns `SearchError`
+- **Result cap**: Max 10,000 matches to prevent memory issues; status message shows "(capped at 10000)" when hit
+- **Engine integration**: `project_search_options` field; async channel changed to `Result<Vec<ProjectMatch>, SearchError>`; 3 toggle methods
+- **GTK**: 3 `ToggleButton` widgets (`Aa`, `Ab|`, `.*`) with CSS styling; 3 new `Msg` variants
+- **TUI**: `Alt+C`/`Alt+W`/`Alt+R` toggles in both input and results mode; toggle indicator row with active/inactive coloring
+- **Tests**: 6 new (case-sensitive, whole-word, regex, invalid-regex, whole-word+regex combo, gitignore-respected); 438→444 total
+
+---
+
 ## Recently Completed (Session 43)
 
 ### ✅ Search Panel Bug Fixes
@@ -142,7 +168,8 @@
 - [x] **`:set` command** — runtime setting changes; write-through to settings.json; number/rnu/expandtab/tabstop/shiftwidth/autoindent/incsearch; query with `?`
 - [x] **`ip`/`ap` paragraph text objects** — inner/around paragraph (contiguous non-blank lines)
 - [x] **`is`/`as` sentence text objects** — inner/around sentence (`.`/`!`/`?`-delimited)
-- [ ] **VSCode-style search & replace across files** — Ctrl-Shift-F panel; find in project, replace all, show matches list; no shell dependency
+- [x] **Enhanced project search** — regex/case/whole-word toggles; `.gitignore`-aware via `ignore` crate; 10k result cap; GTK toggle buttons + TUI Alt+C/W/R
+- [x] **VSCode-style replace across files** — replace all matches in project; skip dirty buffers; reload open buffers; regex capture group backreferences
 - [ ] **`:grep` / `:vimgrep`** — project-wide search, populate quickfix list *(lower priority)*
 - [ ] **Quickfix window** — `:copen`, `:cn`, `:cp` navigation *(lower priority)*
 - [ ] **`it`/`at` tag text objects** — inner/around HTML/XML tag

@@ -71,6 +71,8 @@ struct TuiSidebar {
     expanded: HashSet<PathBuf>,
     /// True while typing in the search input box (Search panel only).
     search_input_mode: bool,
+    /// When true and `search_input_mode` is true, the replace input is focused.
+    replace_input_focused: bool,
     /// Scroll offset for the search results area (written back by render_search_panel).
     search_scroll_top: usize,
 }
@@ -87,6 +89,7 @@ impl TuiSidebar {
             root,
             expanded: HashSet::new(),
             search_input_mode: true,
+            replace_input_focused: false,
             search_scroll_top: 0,
         };
         sb.build_rows();
@@ -356,6 +359,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                 sidebar.search_input_mode = false;
             }
         }
+        engine.poll_project_replace();
 
         if !ct_event::poll(Duration::from_millis(20)).expect("poll") {
             continue;
@@ -411,6 +415,30 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
 
                     // ── Search panel keyboard handling ──────────────────────
                     if sidebar.active_panel == TuiPanel::Search {
+                        let alt = key_event.modifiers.contains(KeyModifiers::ALT);
+                        // Alt+C/W/R/H toggles work in both input and results mode
+                        if alt {
+                            match key_event.code {
+                                KeyCode::Char('c') => {
+                                    engine.toggle_project_search_case();
+                                    continue;
+                                }
+                                KeyCode::Char('w') => {
+                                    engine.toggle_project_search_whole_word();
+                                    continue;
+                                }
+                                KeyCode::Char('r') => {
+                                    engine.toggle_project_search_regex();
+                                    continue;
+                                }
+                                KeyCode::Char('h') => {
+                                    let root = sidebar.root.clone();
+                                    engine.start_project_replace(root);
+                                    continue;
+                                }
+                                _ => {}
+                            }
+                        }
                         match key_event.code {
                             KeyCode::Esc => {
                                 sidebar.has_focus = false;
@@ -418,20 +446,36 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                             KeyCode::Char('b') if ctrl => {
                                 sidebar.has_focus = false;
                             }
-                            // Input mode: typing into the search box
+                            // Input mode: typing into the search or replace box
                             _ if sidebar.search_input_mode => match key_event.code {
+                                KeyCode::Tab | KeyCode::BackTab => {
+                                    sidebar.replace_input_focused = !sidebar.replace_input_focused;
+                                }
                                 KeyCode::Enter => {
-                                    let root = sidebar.root.clone();
-                                    engine.start_project_search(root);
-                                    sidebar.search_scroll_top = 0;
+                                    if sidebar.replace_input_focused {
+                                        let root = sidebar.root.clone();
+                                        engine.start_project_replace(root);
+                                    } else {
+                                        let root = sidebar.root.clone();
+                                        engine.start_project_search(root);
+                                        sidebar.search_scroll_top = 0;
+                                    }
                                 }
                                 KeyCode::Backspace => {
-                                    engine.project_search_query.pop();
+                                    if sidebar.replace_input_focused {
+                                        engine.project_replace_text.pop();
+                                    } else {
+                                        engine.project_search_query.pop();
+                                    }
                                 }
                                 KeyCode::Char(c)
                                     if !key_event.modifiers.contains(KeyModifiers::CONTROL) =>
                                 {
-                                    engine.project_search_query.push(c);
+                                    if sidebar.replace_input_focused {
+                                        engine.project_replace_text.push(c);
+                                    } else {
+                                        engine.project_search_query.push(c);
+                                    }
                                 }
                                 _ => {}
                             },
@@ -441,7 +485,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                                     KeyCode::Char('j') | KeyCode::Down => {
                                         engine.project_search_select_next();
                                         if let Ok(size) = terminal.size() {
-                                            let rh = size.height.saturating_sub(6) as usize;
+                                            let rh = size.height.saturating_sub(7) as usize;
                                             ensure_search_selection_visible(
                                                 &engine.project_search_results,
                                                 engine.project_search_selected,
@@ -453,7 +497,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                                     KeyCode::Char('k') | KeyCode::Up => {
                                         engine.project_search_select_prev();
                                         if let Ok(size) = terminal.size() {
-                                            let rh = size.height.saturating_sub(6) as usize;
+                                            let rh = size.height.saturating_sub(7) as usize;
                                             ensure_search_selection_visible(
                                                 &engine.project_search_results,
                                                 engine.project_search_selected,
@@ -481,6 +525,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                                         if !key_event.modifiers.contains(KeyModifiers::CONTROL) =>
                                     {
                                         sidebar.search_input_mode = true;
+                                        sidebar.replace_input_focused = false;
                                         engine.project_search_query.push(c);
                                     }
                                     _ => {}
@@ -617,6 +662,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                         sidebar.active_panel = TuiPanel::Search;
                         sidebar.has_focus = true;
                         sidebar.search_input_mode = true;
+                        sidebar.replace_input_focused = false;
                         continue;
                     }
 
@@ -894,12 +940,12 @@ fn handle_mouse(
                 }
             }
         } else if sidebar.active_panel == TuiPanel::Search {
-            // results_height = (total height - 2 status rows) - 4 panel header rows
-            let results_height = term_height.saturating_sub(6) as usize;
+            // results_height = (total height - 2 status rows) - 5 panel header rows
+            let results_height = term_height.saturating_sub(7) as usize;
             let results = &engine.project_search_results;
 
             // Click on the scrollbar column in the results area → jump-scroll
-            if col == sb_col && !results.is_empty() && row >= 4 {
+            if col == sb_col && !results.is_empty() && row >= 5 {
                 // Count total display rows (result rows + file header rows)
                 let total_display = {
                     let mut count = 0usize;
@@ -914,14 +960,14 @@ fn handle_mouse(
                     count
                 };
                 if total_display > results_height {
-                    let rel_row = row.saturating_sub(4) as usize;
+                    let rel_row = row.saturating_sub(5) as usize;
                     let ratio = rel_row as f64 / results_height as f64;
                     let new_scroll = (ratio * total_display as f64) as usize;
                     sidebar.search_scroll_top =
                         new_scroll.min(total_display.saturating_sub(results_height));
                     // Arm drag state so subsequent Drag events continue scrolling
                     *dragging_sidebar_search = Some(SidebarScrollDrag {
-                        track_abs_start: 4,
+                        track_abs_start: 5,
                         track_len: results_height as u16,
                         total: total_display,
                     });
@@ -929,14 +975,16 @@ fn handle_mouse(
                 return sidebar_width;
             }
 
-            // Rows 0-2 are the search input box — clicking there enters input mode
+            // Rows 0-2: header + search + replace inputs — clicking enters input mode
             if row <= 2 {
                 sidebar.search_input_mode = true;
+                sidebar.replace_input_focused = row == 2;
             } else {
                 sidebar.search_input_mode = false;
-                // row 3 = status line; rows 4+ = results area
+                sidebar.replace_input_focused = false;
+                // row 3 = toggles, row 4 = status line; rows 5+ = results area
                 // Add scroll offset so clicks map to the correct result.
-                let content_row = (row as usize).saturating_sub(4) + sidebar.search_scroll_top;
+                let content_row = (row as usize).saturating_sub(5) + sidebar.search_scroll_top;
                 if !results.is_empty() {
                     let selected = visual_row_to_result_idx(results, content_row);
                     if let Some(idx) = selected {
@@ -2256,7 +2304,7 @@ fn render_search_panel(
         x += 1;
     }
     // Cursor blinking indicator: show │ at cursor position when in input mode
-    if sidebar.search_input_mode && x < end_bracket_x {
+    if sidebar.search_input_mode && !sidebar.replace_input_focused && x < end_bracket_x {
         set_cell(buf, x, input_y, '\u{258f}', rc(theme.cursor), input_bg); // ▏
     }
 
@@ -2264,17 +2312,106 @@ fn render_search_panel(
         return;
     }
 
-    // Row 2: blank separator
-    for x in area.x..area.x + area.width {
-        set_cell(buf, x, area.y + 2, ' ', dim_fg, bg);
+    // Row 2: replace input box  "[ replace_ ]"
+    let replace_y = area.y + 2;
+    let replace_text = &engine.project_replace_text;
+    let replace_bg = if sidebar.replace_input_focused && sidebar.search_input_mode {
+        input_bg
+    } else {
+        rc(theme.tab_bar_bg) // dimmer when unfocused
+    };
+    set_cell(buf, area.x, replace_y, '[', dim_fg, bg);
+    let rep_end_x = if area.width > 1 {
+        area.x + area.width - 1
+    } else {
+        area.x
+    };
+    set_cell(buf, rep_end_x, replace_y, ']', dim_fg, bg);
+    for x in (area.x + 1)..rep_end_x {
+        set_cell(buf, x, replace_y, ' ', input_fg, replace_bg);
+    }
+    // Placeholder or actual text
+    if replace_text.is_empty() && !(sidebar.replace_input_focused && sidebar.search_input_mode) {
+        let placeholder = "Replace…";
+        let mut x = area.x + 1;
+        for ch in placeholder.chars() {
+            if x >= rep_end_x {
+                break;
+            }
+            set_cell(buf, x, replace_y, ch, dim_fg, replace_bg);
+            x += 1;
+        }
+    } else {
+        let mut x = area.x + 1;
+        for ch in replace_text.chars() {
+            if x >= rep_end_x {
+                break;
+            }
+            set_cell(buf, x, replace_y, ch, input_fg, replace_bg);
+            x += 1;
+        }
+        if sidebar.replace_input_focused && sidebar.search_input_mode && x < rep_end_x {
+            set_cell(buf, x, replace_y, '\u{258f}', rc(theme.cursor), replace_bg);
+        }
     }
 
     if area.height < 4 {
         return;
     }
 
-    // Row 3: status / hint line
-    let status_y = area.y + 3;
+    // Row 3: toggle indicators (Aa / Ab| / .* ) + hint
+    let toggle_y = area.y + 3;
+    for x in area.x..area.x + area.width {
+        set_cell(buf, x, toggle_y, ' ', dim_fg, bg);
+    }
+    {
+        let opts = &engine.project_search_options;
+        let active_fg = rc(theme.keyword);
+        let mut tx = area.x;
+
+        // Helper: render a label with active/inactive coloring
+        let draw_toggle =
+            |buf: &mut ratatui::buffer::Buffer, label: &str, active: bool, x: &mut u16| {
+                let color = if active { active_fg } else { dim_fg };
+                for ch in label.chars() {
+                    if *x >= area.x + area.width {
+                        break;
+                    }
+                    set_cell(buf, *x, toggle_y, ch, color, bg);
+                    *x += 1;
+                }
+                // Space separator
+                if *x < area.x + area.width {
+                    set_cell(buf, *x, toggle_y, ' ', dim_fg, bg);
+                    *x += 1;
+                }
+            };
+
+        draw_toggle(buf, "Aa", opts.case_sensitive, &mut tx);
+        draw_toggle(buf, "Ab|", opts.whole_word, &mut tx);
+        draw_toggle(buf, ".*", opts.use_regex, &mut tx);
+
+        // Hint text
+        let hint = "Alt+C/W/R/H";
+        if tx + 1 < area.x + area.width {
+            // Small gap
+            tx += 1;
+            for ch in hint.chars() {
+                if tx >= area.x + area.width {
+                    break;
+                }
+                set_cell(buf, tx, toggle_y, ch, dim_fg, bg);
+                tx += 1;
+            }
+        }
+    }
+
+    if area.height < 5 {
+        return;
+    }
+
+    // Row 4: status / hint line
+    let status_y = area.y + 4;
     let status_text = if engine.project_search_results.is_empty() {
         if query.is_empty() {
             " Type to search, Enter to run"
@@ -2295,18 +2432,18 @@ fn render_search_panel(
         x += 1;
     }
 
-    if area.height < 5 {
+    if area.height < 6 {
         return;
     }
 
-    // Rows 4+: results
+    // Rows 5+: results
     let results = &engine.project_search_results;
     if results.is_empty() {
         return;
     }
 
-    let results_start_y = area.y + 4;
-    let results_height = area.height.saturating_sub(4) as usize;
+    let results_start_y = area.y + 5;
+    let results_height = area.height.saturating_sub(5) as usize;
 
     // Build the flat display list (file headers + result rows)
     struct DisplayRow {

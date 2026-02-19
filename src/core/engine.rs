@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use super::buffer::{Buffer, BufferId};
 use super::buffer_manager::{BufferManager, BufferState};
 use super::git;
-use super::project_search::{self, ProjectMatch};
+use super::project_search::{self, ProjectMatch, ReplaceResult, SearchError, SearchOptions};
 use super::session::SessionState;
 use super::settings::Settings;
 use super::tab::{Tab, TabId};
@@ -237,10 +237,22 @@ pub struct Engine {
     pub project_search_results: Vec<ProjectMatch>,
     /// Index of the currently highlighted result (0-based).
     pub project_search_selected: usize,
+    /// Search mode toggles (case-sensitive, whole word, regex).
+    pub project_search_options: SearchOptions,
     /// Receiver for async search results (set while a search thread is running).
-    pub project_search_receiver: Option<std::sync::mpsc::Receiver<Vec<ProjectMatch>>>,
+    pub project_search_receiver:
+        Option<std::sync::mpsc::Receiver<Result<Vec<ProjectMatch>, SearchError>>>,
     /// True while a background search thread is running.
     pub project_search_running: bool,
+
+    // --- Project replace state ---
+    /// Current text typed in the project replace input box.
+    pub project_replace_text: String,
+    /// Receiver for async replace results (set while a replace thread is running).
+    pub project_replace_receiver:
+        Option<std::sync::mpsc::Receiver<Result<ReplaceResult, SearchError>>>,
+    /// True while a background replace thread is running.
+    pub project_replace_running: bool,
 }
 
 impl Engine {
@@ -313,8 +325,12 @@ impl Engine {
             project_search_query: String::new(),
             project_search_results: Vec::new(),
             project_search_selected: 0,
+            project_search_options: SearchOptions::default(),
             project_search_receiver: None,
             project_search_running: false,
+            project_replace_text: String::new(),
+            project_replace_receiver: None,
+            project_replace_running: false,
         }
     }
 
@@ -1716,8 +1732,15 @@ impl Engine {
             self.message = "Search query is empty".to_string();
             return;
         }
-        let results = project_search::search_in_project(root, &query);
-        self.apply_search_results(results, &query);
+        let opts = self.project_search_options.clone();
+        match project_search::search_in_project(root, &query, &opts) {
+            Ok(results) => self.apply_search_results(results, &query),
+            Err(e) => {
+                self.project_search_results.clear();
+                self.project_search_selected = 0;
+                self.message = format!("Invalid regex: {}", e.0);
+            }
+        }
     }
 
     /// Spawn a background thread to search `root` for `self.project_search_query`.
@@ -1733,11 +1756,12 @@ impl Engine {
         }
         self.project_search_running = true;
         self.message = format!("Searching for \"{}\"…", query);
+        let opts = self.project_search_options.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         self.project_search_receiver = Some(rx);
         std::thread::spawn(move || {
-            let results = project_search::search_in_project(&root, &query);
-            let _ = tx.send(results);
+            let result = project_search::search_in_project(&root, &query, &opts);
+            let _ = tx.send(result);
         });
     }
 
@@ -1745,7 +1769,7 @@ impl Engine {
     ///
     /// Returns `true` when new results have just arrived (UI should redraw).
     pub fn poll_project_search(&mut self) -> bool {
-        let results = match self.project_search_receiver {
+        let result = match self.project_search_receiver {
             Some(ref rx) => match rx.try_recv() {
                 Ok(r) => r,
                 Err(_) => return false,
@@ -1755,12 +1779,20 @@ impl Engine {
         let query = self.project_search_query.clone();
         self.project_search_receiver = None;
         self.project_search_running = false;
-        self.apply_search_results(results, &query);
+        match result {
+            Ok(results) => self.apply_search_results(results, &query),
+            Err(e) => {
+                self.project_search_results.clear();
+                self.project_search_selected = 0;
+                self.message = format!("Invalid regex: {}", e.0);
+            }
+        }
         true
     }
 
     /// Store search results and update the status message. Called by both sync and async paths.
     fn apply_search_results(&mut self, results: Vec<ProjectMatch>, query: &str) {
+        let capped = results.len() >= 10_000;
         if results.is_empty() {
             self.message = format!("No results for \"{}\"", query);
         } else {
@@ -1772,15 +1804,31 @@ impl Engine {
                 files.len()
             };
             self.message = format!(
-                "{} match{} in {} file{}",
+                "{} match{} in {} file{}{}",
                 results.len(),
                 if results.len() == 1 { "" } else { "es" },
                 file_count,
-                if file_count == 1 { "" } else { "s" }
+                if file_count == 1 { "" } else { "s" },
+                if capped { " (capped at 10000)" } else { "" }
             );
         }
         self.project_search_results = results;
         self.project_search_selected = 0;
+    }
+
+    /// Toggle case-sensitive project search.
+    pub fn toggle_project_search_case(&mut self) {
+        self.project_search_options.case_sensitive = !self.project_search_options.case_sensitive;
+    }
+
+    /// Toggle whole-word project search.
+    pub fn toggle_project_search_whole_word(&mut self) {
+        self.project_search_options.whole_word = !self.project_search_options.whole_word;
+    }
+
+    /// Toggle regex project search.
+    pub fn toggle_project_search_regex(&mut self) {
+        self.project_search_options.use_regex = !self.project_search_options.use_regex;
     }
 
     /// Move the project search selection down by one, clamped to the last result.
@@ -1794,6 +1842,141 @@ impl Engine {
     /// Move the project search selection up by one, clamped to 0.
     pub fn project_search_select_prev(&mut self) {
         self.project_search_selected = self.project_search_selected.saturating_sub(1);
+    }
+
+    // =======================================================================
+    // Project replace
+    // =======================================================================
+
+    /// Collect canonical paths of all dirty (unsaved) buffers.
+    fn dirty_buffer_paths(&self) -> std::collections::HashSet<PathBuf> {
+        let mut paths = std::collections::HashSet::new();
+        for id in self.buffer_manager.list() {
+            if let Some(state) = self.buffer_manager.get(id) {
+                if state.dirty {
+                    if let Some(ref p) = state.file_path {
+                        let canonical = p.canonicalize().unwrap_or_else(|_| p.clone());
+                        paths.insert(canonical);
+                    }
+                }
+            }
+        }
+        paths
+    }
+
+    /// Run a project-wide replace synchronously (blocks until complete).
+    /// Used directly in tests.
+    #[allow(dead_code)]
+    pub fn run_project_replace(&mut self, root: &Path) {
+        let query = self.project_search_query.clone();
+        let replacement = self.project_replace_text.clone();
+        if query.is_empty() {
+            self.message = "Search query is empty".to_string();
+            return;
+        }
+        let opts = self.project_search_options.clone();
+        let skip = self.dirty_buffer_paths();
+        match project_search::replace_in_project(root, &query, &replacement, &opts, &skip) {
+            Ok(rr) => self.apply_replace_result(rr),
+            Err(e) => {
+                self.message = format!("Invalid regex: {}", e.0);
+            }
+        }
+    }
+
+    /// Spawn a background thread to replace across `root`.
+    ///
+    /// Call `poll_project_replace` on each UI tick to collect results.
+    pub fn start_project_replace(&mut self, root: PathBuf) {
+        let query = self.project_search_query.clone();
+        let replacement = self.project_replace_text.clone();
+        if query.is_empty() {
+            self.message = "Search query is empty".to_string();
+            return;
+        }
+        self.project_replace_running = true;
+        self.message = format!("Replacing \"{}\" → \"{}\"…", query, replacement);
+        let opts = self.project_search_options.clone();
+        let skip = self.dirty_buffer_paths();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.project_replace_receiver = Some(rx);
+        std::thread::spawn(move || {
+            let result =
+                project_search::replace_in_project(&root, &query, &replacement, &opts, &skip);
+            let _ = tx.send(result);
+        });
+    }
+
+    /// Check whether the background replace thread has finished.
+    ///
+    /// Returns `true` when the replace has just completed (UI should redraw).
+    pub fn poll_project_replace(&mut self) -> bool {
+        let result = match self.project_replace_receiver {
+            Some(ref rx) => match rx.try_recv() {
+                Ok(r) => r,
+                Err(_) => return false,
+            },
+            None => return false,
+        };
+        self.project_replace_receiver = None;
+        self.project_replace_running = false;
+        match result {
+            Ok(rr) => self.apply_replace_result(rr),
+            Err(e) => {
+                self.message = format!("Replace error: {}", e.0);
+            }
+        }
+        true
+    }
+
+    /// Apply a completed replace result: reload modified buffers, update status.
+    fn apply_replace_result(&mut self, rr: ReplaceResult) {
+        // Reload open buffers for modified files.
+        for modified_path in &rr.modified_files {
+            let canonical = modified_path
+                .canonicalize()
+                .unwrap_or_else(|_| modified_path.clone());
+            // Find the buffer for this file and reload its content from disk.
+            let buf_id = self.buffer_manager.list().into_iter().find(|&id| {
+                self.buffer_manager.get(id).is_some_and(|s| {
+                    s.file_path.as_ref().is_some_and(|p| {
+                        p.canonicalize().unwrap_or_else(|_| p.clone()) == canonical
+                    })
+                })
+            });
+            if let Some(id) = buf_id {
+                if let Ok(content) = std::fs::read_to_string(modified_path) {
+                    if let Some(state) = self.buffer_manager.get_mut(id) {
+                        state.buffer.content = ropey::Rope::from_str(&content);
+                        state.dirty = false;
+                        state.undo_stack.clear();
+                        state.redo_stack.clear();
+                    }
+                    self.refresh_git_diff(id);
+                }
+            }
+        }
+
+        // Build status message.
+        let mut msg = format!(
+            "Replaced {} occurrence{} in {} file{}",
+            rr.replacement_count,
+            if rr.replacement_count == 1 { "" } else { "s" },
+            rr.file_count,
+            if rr.file_count == 1 { "" } else { "s" },
+        );
+        if !rr.skipped_files.is_empty() {
+            msg.push_str(&format!(
+                " ({} file{} skipped — unsaved changes)",
+                rr.skipped_files.len(),
+                if rr.skipped_files.len() == 1 { "" } else { "s" },
+            ));
+        }
+        self.message = msg;
+
+        // Clear stale search results since files have changed.
+        self.project_search_results.clear();
+        self.project_search_selected = 0;
     }
 
     // =======================================================================
@@ -13616,5 +13799,102 @@ mod tests {
         );
         assert!(!engine.project_search_running);
         assert!(!engine.project_search_results.is_empty());
+    }
+
+    // ── Project replace ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_run_project_replace_basic() {
+        let dir = make_search_dir("engine_replace_basic");
+        let mut engine = Engine::new();
+        engine.project_search_query = "hello".to_string();
+        engine.project_replace_text = "hi".to_string();
+        engine.run_project_replace(&dir);
+        assert!(engine.message.contains("Replaced"));
+        assert!(engine.message.contains("1 file"));
+        let content = std::fs::read_to_string(dir.join("sample.txt")).unwrap();
+        assert!(content.contains("hi world"));
+        assert!(!content.contains("hello"));
+    }
+
+    #[test]
+    fn test_run_project_replace_empty_query() {
+        let dir = make_search_dir("engine_replace_empty");
+        let mut engine = Engine::new();
+        engine.project_search_query = String::new();
+        engine.project_replace_text = "hi".to_string();
+        engine.run_project_replace(&dir);
+        assert!(engine.message.contains("empty"));
+    }
+
+    #[test]
+    fn test_run_project_replace_skip_dirty() {
+        use std::io::Write;
+        let dir = make_search_dir("engine_replace_skip");
+        // Open the file in a buffer and make it dirty
+        let path = dir.join("sample.txt");
+        let mut engine = Engine::open(&path);
+        // Dirty the buffer
+        engine.buffer_mut().content =
+            ropey::Rope::from_str("hello world (modified)\nanother line\n");
+        engine
+            .buffer_manager
+            .get_mut(engine.active_buffer_id())
+            .unwrap()
+            .dirty = true;
+        // Add another file that should be replaced
+        let mut f2 = std::fs::File::create(dir.join("other.txt")).unwrap();
+        writeln!(f2, "hello there").unwrap();
+        drop(f2);
+
+        engine.project_search_query = "hello".to_string();
+        engine.project_replace_text = "hi".to_string();
+        engine.run_project_replace(&dir);
+        // The dirty file should be skipped
+        assert!(engine.message.contains("skipped"));
+        // other.txt should be replaced
+        let content = std::fs::read_to_string(dir.join("other.txt")).unwrap();
+        assert!(content.contains("hi there"));
+    }
+
+    #[test]
+    fn test_run_project_replace_reloads_buffer() {
+        let dir = make_search_dir("engine_replace_reload");
+        let path = dir.join("sample.txt");
+        let mut engine = Engine::open(&path);
+        // Buffer should have original content
+        let original = engine.buffer().content.to_string();
+        assert!(original.contains("hello"));
+        // Not dirty — so replace should modify it
+        engine.project_search_query = "hello".to_string();
+        engine.project_replace_text = "hi".to_string();
+        engine.run_project_replace(&dir);
+        // Buffer should now have reloaded content
+        let new_content = engine.buffer().content.to_string();
+        assert!(new_content.contains("hi world"));
+        assert!(!new_content.contains("hello"));
+    }
+
+    #[test]
+    fn test_start_and_poll_project_replace() {
+        let dir = make_search_dir("engine_replace_async");
+        let mut engine = Engine::new();
+        engine.project_search_query = "world".to_string();
+        engine.project_replace_text = "earth".to_string();
+        engine.start_project_replace(dir.clone());
+        assert!(engine.project_replace_running);
+        let mut got = false;
+        for _ in 0..200 {
+            if engine.poll_project_replace() {
+                got = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(got, "poll should return true after thread completes");
+        assert!(!engine.project_replace_running);
+        assert!(engine.message.contains("Replaced"));
+        let content = std::fs::read_to_string(dir.join("sample.txt")).unwrap();
+        assert!(content.contains("earth"));
     }
 }

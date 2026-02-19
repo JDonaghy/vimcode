@@ -166,6 +166,16 @@ enum Msg {
     ProjectSearchOpenResult(usize),
     /// Periodic tick to poll for background search results.
     SearchPollTick,
+    /// Toggle case-sensitive project search.
+    ProjectSearchToggleCase,
+    /// Toggle whole-word project search.
+    ProjectSearchToggleWholeWord,
+    /// Toggle regex project search.
+    ProjectSearchToggleRegex,
+    /// Project replace input text changed.
+    ProjectReplaceTextChanged(String),
+    /// User clicked "Replace All" button — run replace across files.
+    ProjectReplaceAll,
 }
 
 #[relm4::component]
@@ -481,6 +491,89 @@ impl SimpleComponent for App {
 
                                     connect_activate[sender] => move |_| {
                                         sender.input(Msg::ProjectSearchSubmit);
+                                    },
+                                },
+                            },
+
+                            // Toggle buttons row (Aa / Ab| / .*)
+                            gtk4::Box {
+                                set_orientation: gtk4::Orientation::Horizontal,
+                                set_margin_start: 6,
+                                set_margin_end: 6,
+                                set_margin_bottom: 4,
+                                set_spacing: 4,
+
+                                gtk4::ToggleButton {
+                                    set_label: "Aa",
+                                    set_tooltip_text: Some("Match Case"),
+                                    set_css_classes: &["search-toggle-btn"],
+
+                                    #[watch]
+                                    set_active: model.engine.borrow().project_search_options.case_sensitive,
+
+                                    connect_clicked[sender] => move |_| {
+                                        sender.input(Msg::ProjectSearchToggleCase);
+                                    },
+                                },
+
+                                gtk4::ToggleButton {
+                                    set_label: "Ab|",
+                                    set_tooltip_text: Some("Match Whole Word"),
+                                    set_css_classes: &["search-toggle-btn"],
+
+                                    #[watch]
+                                    set_active: model.engine.borrow().project_search_options.whole_word,
+
+                                    connect_clicked[sender] => move |_| {
+                                        sender.input(Msg::ProjectSearchToggleWholeWord);
+                                    },
+                                },
+
+                                gtk4::ToggleButton {
+                                    set_label: ".*",
+                                    set_tooltip_text: Some("Use Regular Expression"),
+                                    set_css_classes: &["search-toggle-btn"],
+
+                                    #[watch]
+                                    set_active: model.engine.borrow().project_search_options.use_regex,
+
+                                    connect_clicked[sender] => move |_| {
+                                        sender.input(Msg::ProjectSearchToggleRegex);
+                                    },
+                                },
+                            },
+
+                            // Replace input row
+                            gtk4::Box {
+                                set_orientation: gtk4::Orientation::Horizontal,
+                                set_margin_top: 2,
+                                set_margin_bottom: 4,
+                                set_margin_start: 6,
+                                set_margin_end: 6,
+                                set_spacing: 4,
+
+                                gtk4::Entry {
+                                    set_hexpand: true,
+                                    set_placeholder_text: Some("Replace…"),
+
+                                    connect_changed[sender] => move |entry| {
+                                        sender.input(Msg::ProjectReplaceTextChanged(
+                                            entry.text().to_string(),
+                                        ));
+                                    },
+
+                                    connect_activate[sender] => move |_| {
+                                        sender.input(Msg::ProjectReplaceAll);
+                                    },
+                                },
+
+                                gtk4::Button {
+                                    set_label: "Replace All",
+                                    set_tooltip_text: Some("Replace all matches in project"),
+                                    set_css_classes: &["search-toggle-btn"],
+
+                                    connect_clicked[sender] => move |_| {
+                                        sender.input(Msg::ProjectReplaceAll);
                                     },
                                 },
                             },
@@ -1479,6 +1572,28 @@ impl SimpleComponent for App {
             Msg::ProjectSearchQueryChanged(q) => {
                 self.engine.borrow_mut().project_search_query = q;
             }
+            Msg::ProjectSearchToggleCase => {
+                self.engine.borrow_mut().toggle_project_search_case();
+                self.redraw = true;
+            }
+            Msg::ProjectSearchToggleWholeWord => {
+                self.engine.borrow_mut().toggle_project_search_whole_word();
+                self.redraw = true;
+            }
+            Msg::ProjectSearchToggleRegex => {
+                self.engine.borrow_mut().toggle_project_search_regex();
+                self.redraw = true;
+            }
+            Msg::ProjectReplaceTextChanged(t) => {
+                self.engine.borrow_mut().project_replace_text = t;
+            }
+            Msg::ProjectReplaceAll => {
+                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                self.engine.borrow_mut().start_project_replace(cwd);
+                let status = self.engine.borrow().message.clone();
+                self.project_search_status = status;
+                self.redraw = true;
+            }
             Msg::ProjectSearchSubmit => {
                 let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                 self.engine.borrow_mut().start_project_search(cwd);
@@ -1488,6 +1603,13 @@ impl SimpleComponent for App {
             }
             Msg::SearchPollTick => {
                 if self.engine.borrow_mut().poll_project_search() {
+                    let status = self.engine.borrow().message.clone();
+                    self.project_search_status = status;
+                    let s = self.sender.clone();
+                    self.rebuild_search_results(&s);
+                    self.redraw = true;
+                }
+                if self.engine.borrow_mut().poll_project_replace() {
                     let status = self.engine.borrow().message.clone();
                     self.project_search_status = status;
                     let s = self.sender.clone();
@@ -3022,6 +3144,26 @@ fn load_css() {
         }
 
         .sidebar entry:focus {
+            border-color: #0e639c;
+        }
+
+        /* Search toggle buttons (Aa / Ab| / .*) */
+        .search-toggle-btn {
+            background: transparent;
+            color: #808080;
+            border: 1px solid #3e3e42;
+            border-radius: 2px;
+            padding: 2px 6px;
+            min-width: 0;
+            min-height: 0;
+            font-size: 12px;
+        }
+        .search-toggle-btn:hover {
+            background-color: #2a2d2e;
+        }
+        .search-toggle-btn:checked {
+            background-color: #0e639c;
+            color: #ffffff;
             border-color: #0e639c;
         }
 

@@ -1,10 +1,10 @@
 # VimCode Project State
 
-**Last updated:** Feb 18, 2026 (Session 43)
+**Last updated:** Feb 18, 2026 (Session 45)
 
 ## Status
 
-**TUI Sidebar + Icons + Mouse COMPLETE:** Nerd Font icons throughout, TUI sidebar with CRUD, full mouse support, resize bar (346 tests passing)
+**TUI Sidebar + Icons + Mouse COMPLETE:** Nerd Font icons throughout, TUI sidebar with CRUD, full mouse support, resize bar (458 tests passing)
 
 ### Core Vim (Complete)
 - Seven modes (Normal/Insert/Visual/Visual Line/Visual Block/Command/Search)
@@ -51,12 +51,13 @@
 - Tabs (:tabnew/:tabclose, gt/gT)
 - **Quit / save commands:** `:q` closes current tab (quits if last); `:q!` force-closes; `:qa` / `:qa!` close all; `Ctrl-S` saves in any mode
 
-### Project Search (Complete)
+### Project Search + Replace (Complete)
 - VSCode-style search panel accessed via Search icon in activity bar or Ctrl-Shift-F
 - Case-insensitive literal search across all text files under the project root
 - Grouped results list (file headers + `line: text` rows)
 - GTK: Entry input + ListBox results; click row opens file at that line
 - TUI: `[query]` input box; Enter to search; j/k navigate results; Enter opens file
+- **Replace across files:** Replace input + "Replace All" button (GTK) / Enter in replace box / Alt+H (TUI); skips dirty buffers; reloads open buffers; regex capture group backreferences in regex mode; literal `$` in literal mode
 
 ### File Explorer (Complete)
 - VSCode-style sidebar (Ctrl-B toggle, Ctrl-Shift-E focus)
@@ -116,21 +117,21 @@
 ```
 vimcode/
 ├── src/
-│   ├── main.rs (~3260 lines) — GTK4/Relm4 UI, rendering, find dialog, sidebar resize, search panel
-│   ├── tui_main.rs (~2620 lines) — ratatui/crossterm TUI backend, sidebar, mouse, search panel
+│   ├── main.rs (~3400 lines) — GTK4/Relm4 UI, rendering, find dialog, sidebar resize, search/replace panel
+│   ├── tui_main.rs (~2760 lines) — ratatui/crossterm TUI backend, sidebar, mouse, search/replace panel
 │   ├── icons.rs (~30 lines) — Nerd Font file-type icons (shared by GTK + TUI)
 │   ├── render.rs (~360 lines) — Platform-agnostic rendering abstraction (ScreenLayout, max_col)
 │   └── core/ (~11,500 lines) — Platform-agnostic logic
-│       ├── engine.rs (~13,620 lines) — Orchestrates everything, find/replace, macros, history, project search
-│       ├── project_search.rs (~160 lines) — Recursive file search (case-insensitive, no regex, skip hidden/binary)
+│       ├── engine.rs (~13,900 lines) — Orchestrates everything, find/replace, macros, history, project search/replace
+│       ├── project_search.rs (~630 lines) — Regex/case/whole-word search + replace (ignore + regex crates)
 │       ├── buffer_manager.rs (~600 lines) — Buffer lifecycle
 │       ├── buffer.rs (~120 lines) — Rope-based storage
 │       ├── session.rs (~175 lines) — Session state persistence (sidebar_width added)
 │       ├── settings.rs (~616 lines) — JSON persistence, auto-init, :set parsing
 │       ├── window.rs, tab.rs, view.rs, cursor.rs, mode.rs, syntax.rs
 │       ├── git.rs (~635 lines) — git subprocess integration (diff/blame/hunk parsing, branch detection, stage_hunk)
-│       └── Tests: 438 passing (9 find/replace, 14 macro, 8 session, 4 reverse search, 7 replace char, 5 undo line, 8 case change, 6 marks, 5 incremental search, 12 syntax/language, 6 history search, 11 fold tests, 12 git tests, 4 sidebar-preview tests, 5 auto-indent tests, 4 completion tests, 9 quit/ctrl-s tests, 1 session-restore test, 22 set-command tests, 10 hunk-staging tests, 9 text-object tests, 9 project-search tests)
-└── Total: ~17,150 lines
+│       └── Tests: 458 passing (9 find/replace, 14 macro, 8 session, 4 reverse search, 7 replace char, 5 undo line, 8 case change, 6 marks, 5 incremental search, 12 syntax/language, 6 history search, 11 fold tests, 12 git tests, 4 sidebar-preview tests, 5 auto-indent tests, 4 completion tests, 9 quit/ctrl-s tests, 1 session-restore test, 22 set-command tests, 10 hunk-staging tests, 9 text-object tests, 24 project-search tests, 5 engine-replace tests)
+└── Total: ~17,600 lines
 ```
 
 ## Architecture
@@ -194,7 +195,7 @@ cargo fmt
 - [x] **Completion menu** — Ctrl-N/Ctrl-P word completion from buffer in insert mode; floating popup in GTK + TUI
 - [x] **:set command** — runtime setting changes; write-through to settings.json; number/rnu/expandtab/tabstop/shiftwidth/autoindent/incsearch; query with `?`
 - [x] **`ip`/`ap` + `is`/`as` text objects** — paragraph and sentence text objects for all operators and visual mode
-- [x] **VSCode-style project search** — Ctrl-Shift-F panel; case-insensitive find in project, grouped results, click to open
+- [x] **VSCode-style project search** — Ctrl-Shift-F panel; regex/case/whole-word toggles; `.gitignore`-aware (ignore crate); grouped results, click to open
 - [ ] **:grep / :vimgrep** — project-wide search, populate quickfix list *(lower priority)*
 - [ ] **Quickfix window** — `:copen`, `:cn`, `:cp` quickfix navigation *(lower priority)*
 - [ ] **`it`/`at` tag text objects** — inner/around HTML/XML tag
@@ -205,6 +206,10 @@ cargo fmt
 - [ ] **`:norm`** — execute normal command on a range of lines
 
 ## Recent Work
+**Session 45:** Replace across files — added `replace_in_project()` to `project_search.rs`: walks files via `ignore` crate, applies `regex::replace_all`, writes back only changed files; uses `NoExpand` wrapper in literal mode to prevent `$1` backreference expansion; files in `skip_paths` (dirty buffers) are skipped and reported. New `ReplaceResult` struct with counts and file lists. Extracted `build_search_regex()` helper shared by search and replace. Engine gains `project_replace_text`, `start_project_replace` (async), `poll_project_replace`, `apply_replace_result` (reloads open buffers, clears undo stacks, refreshes git diff). GTK: Replace `Entry` + "Replace All" button; 2 new `Msg` variants; replace poll piggybacked on `SearchPollTick`. TUI: `replace_input_focused` field; `Tab` switches inputs; `Enter` in replace box triggers replace; `Alt+H` shortcut; new `[Replace…]` row; all layout offsets shifted +1; mouse handling updated. (444→458 tests, 14 new: 9 replace + 5 engine.)
+
+**Session 44:** Enhanced project search — rewrote `project_search.rs` to use the `ignore` crate (same walker as ripgrep) for `.gitignore` support and the `regex` crate for pattern matching. Added `SearchOptions` struct with three toggles: case-sensitive (`Aa`), whole word (`Ab|`), and regex (`.*`). Results capped at 10,000 with status message indication. Engine gains `project_search_options` field and 3 toggle methods; async search thread now sends `Result<Vec<ProjectMatch>, SearchError>` for invalid-regex error handling. GTK: 3 `ToggleButton` widgets with CSS styling (dim inactive / blue active) between search input and status label; 3 new `Msg` variants. TUI: `Alt+C`/`Alt+W`/`Alt+R` toggle keys in both input and results mode; toggle indicator row replaces blank separator with active/inactive coloring and hint text. (438→444 tests, 6 new: case-sensitive, whole-word, regex, invalid-regex, whole-word+regex combo, gitignore-respected.)
+
 **Session 43:** Search panel bug fixes — GTK: fixed search results appearing with light background and grey text by correcting CSS selectors (`listbox` → `.search-results-list`, `.search-results-list > row`; GTK4 uses `list` as the CSS node name, not `listbox`); fixed startup crash in `sync_scrollbar` when initial resize fires with near-zero dimensions (added early return guard and clamped `height-request` to non-negative). TUI: added scrollbar drag support for search results (new `SidebarScrollDrag` struct); `j`/`k` in search results now call `ensure_search_selection_visible` to keep selection in viewport. (438 tests, no change.)
 
 **Session 42:** Search panel polish + CI fix — TUI: redesigned search scroll to track viewport independently of selection (`search_scroll_top` driven by scroll wheel/scrollbar click; selection only adjusts scroll when it leaves the viewport); scrollbar column clicks now jump-scroll both Explorer and Search panels; scroll wheel scrolls sidebar content; removed unused `DisplayRow.result` field. GTK: dark background fixed via `.search-results-scroll > viewport { background-color: #252526; }` and `.search-results-list label { color: #cccccc; }`; overlay scrolling disabled on search results ScrolledWindow so scrollbar is always visible. Both backends: search now runs on a background thread (`start_project_search` + `poll_project_search` — 50 ms latency); GTK polls via `glib::timeout_add_local`; TUI polls each frame before `ct_event::poll()`. CI clippy fix: two `map_or(false, ...)` → `is_some_and(...)` in `engine.rs` (new `unnecessary_map_or` lint in Rust 1.84+). Also: 4 new engine-level project-search tests covering sync, empty query, select prev/next, and async poll. (434 → 438 tests.)

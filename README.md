@@ -7,7 +7,7 @@ High-performance Vim+VSCode hybrid editor in Rust. Modal editing meets modern UX
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 438 tests
+- **Clean architecture** — platform-agnostic core, 458 tests
 
 ## Building
 
@@ -166,10 +166,20 @@ cargo fmt
 
 - `Ctrl-Shift-F` — open search panel (or click the search icon in the activity bar)
 - Type a query and press `Enter` to search all text files under the project root
-- Search is case-insensitive; hidden files/directories (`.git`, etc.) and binary files are skipped
+- Respects `.gitignore` rules (powered by the `ignore` crate — same walker as ripgrep)
+- Hidden files/directories and binary files are skipped; results capped at 10,000
 - Results are grouped by file (`filename.rs`) then listed as `  42: matched line text`
-- **GTK:** click a result row to open the file at that line
-- **TUI:** `j`/`k` to navigate results; `Enter` to open file at matched line; any printable char while in results mode switches back to input mode
+- **Toggle buttons** (VS Code style):
+  - `Aa` — Match Case (case-sensitive search)
+  - `Ab|` — Match Whole Word (`\b` word boundaries)
+  - `.*` — Use Regular Expression (full regex syntax)
+- **Replace across files:** type replacement text in the Replace input; click "Replace All" (GTK) or press `Enter` in the replace box / `Alt+H` (TUI) to substitute all matches on disk
+  - Regex mode: `$1`, `$2` capture group backreferences work in replacement text
+  - Literal mode: `$` in replacement is treated literally (no backreference expansion)
+  - Files with unsaved changes (dirty buffers) are skipped and reported in the status message
+  - Open buffers for modified files are automatically reloaded from disk after replace
+- **GTK:** click toggle buttons below the search input; click a result to open the file; `Tab` or click to switch between search/replace inputs
+- **TUI:** `Alt+C` (case), `Alt+W` (whole word), `Alt+R` (regex), `Alt+H` (replace all); `Tab` to switch between search/replace inputs; `j`/`k` to navigate results; `Enter` to open
 
 ---
 
@@ -348,13 +358,13 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 
 ```
 src/
-├── main.rs          (~3260 lines)  GTK4/Relm4 UI, rendering, sidebar resize, search panel
-├── tui_main.rs      (~2620 lines)  ratatui/crossterm TUI backend, search panel
+├── main.rs          (~3400 lines)  GTK4/Relm4 UI, rendering, sidebar resize, search panel
+├── tui_main.rs      (~2760 lines)  ratatui/crossterm TUI backend, search panel
 ├── render.rs        (~1080 lines)  Platform-agnostic ScreenLayout bridge
 ├── icons.rs            (~30 lines)  Nerd Font file-type icons (GTK + TUI)
-└── core/            (~17150 lines)  Zero GTK/rendering deps — fully testable
-    ├── engine.rs                    Orchestrator: keys, commands, git, macros, project search
-    ├── project_search.rs            Recursive file search (case-insensitive, no regex)
+└── core/            (~17600 lines)  Zero GTK/rendering deps — fully testable
+    ├── engine.rs                    Orchestrator: keys, commands, git, macros, project search/replace
+    ├── project_search.rs            Regex/case/whole-word search + replace (ignore + regex crates)
     ├── buffer_manager.rs            Buffer lifecycle, undo/redo stacks
     ├── buffer.rs                    Rope-based text storage (ropey)
     ├── settings.rs                  JSON config, :set parsing
