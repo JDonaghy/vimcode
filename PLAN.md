@@ -1,5 +1,42 @@
 # VimCode Implementation Plan
 
+## Recently Completed (Session 43)
+
+### ✅ Search Panel Bug Fixes
+- **GTK CSS fix**: Changed CSS selectors from `listbox` / `listbox row` to `.search-results-list` / `.search-results-list > row` — GTK4 uses `list` as the CSS node name for `GtkListBox`, so the old selectors never matched; replaced `.search-results-scroll > viewport` with `.search-results-scroll` on the ScrolledWindow itself
+- **GTK startup crash fix**: `sync_scrollbar` called during initial `connect_resize` with near-zero dimensions caused `(rect.height - 10.0) as i32` to be negative, rejected by GTK; added early return guard (`da_width < 20.0 || da_height < 20.0`) and clamped `.max(0)`
+- **TUI search scrollbar drag**: New `SidebarScrollDrag` struct for drag state; `Down` click on search scrollbar column arms drag; `Drag` event proportionally scrolls `search_scroll_top`; `Up` clears drag
+- **TUI j/k scroll-into-view**: `j`/`k` in search results now call `ensure_search_selection_visible` to keep the selected result in the viewport
+
+---
+
+## Recently Completed (Session 42)
+
+### ✅ Search Panel Polish + CI Fix
+- **TUI scroll redesign**: `search_scroll_top` is now an independent viewport offset driven by scroll wheel/scrollbar clicks; selection only adjusts scroll when it leaves the viewport (mirrors how Explorer and Editor scrolling work)
+- **TUI scrollbar interactivity**: Explorer scrollbar column click → jump-scroll (`sidebar.scroll_top`); Search scrollbar column click → jump-scroll (`sidebar.search_scroll_top`); scroll wheel in sidebar area scrolls Explorer or Search content
+- **GTK dark background**: `.search-results-scroll > viewport` CSS targets the internal GTK viewport widget; `.search-results-list label { color: #cccccc; }` fixes grey text; `set_overlay_scrolling: false` makes scrollbar always visible
+- **Threaded search**: `engine.start_project_search(PathBuf)` spawns a thread and stores `Receiver`; `engine.poll_project_search() -> bool` checks for results non-blocking; GTK polls via `glib::timeout_add_local(50ms)`; TUI polls each frame
+- **CI clippy fix**: Two `map_or(false, ...)` → `is_some_and(...)` in `engine.rs` (lint added in Rust 1.84+)
+- **Tests**: 4 new engine-level project search tests (434 → 438 tests)
+
+---
+
+## Recently Completed (Session 41)
+
+### ✅ VSCode-Style Project Search Panel
+- Ctrl-Shift-F (GTK + TUI) opens Search panel in sidebar
+- `src/core/project_search.rs`: `ProjectMatch` struct + `search_in_project(root, query)`
+  - Recursive walk, skips hidden (`.`) dirs/files, skips binary (non-UTF-8) files
+  - Case-insensitive literal match; sorted by file path then line number
+- Engine: 3 new fields (`project_search_query/results/selected`) + 3 new methods
+- GTK: Search button in activity bar enabled; `gtk4::Entry` + `gtk4::ListBox`; file-header rows + result rows; click opens file at matched line
+- TUI: `TuiPanel::Search`; `search_input_mode` bool; `render_search_panel()`; input/results keyboard modes; j/k navigation; Enter opens file
+- Activity bar row order: Explorer (0) → Search (1) → Settings (2)
+- Tests: 5 new (429→434)
+
+---
+
 ## Recently Completed (Session 40)
 
 ### ✅ Paragraph and Sentence Text Objects

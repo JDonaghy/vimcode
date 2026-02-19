@@ -7,7 +7,7 @@ High-performance Vim+VSCode hybrid editor in Rust. Modal editing meets modern UX
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 420 tests
+- **Clean architecture** — platform-agnostic core, 438 tests
 
 ## Building
 
@@ -159,6 +159,17 @@ cargo fmt
 - `:q!` — force-close tab
 - `:qa` / `:qa!` — close all tabs (blocked / force)
 - `Ctrl-S` — save in any mode without changing mode
+
+---
+
+### Project Search
+
+- `Ctrl-Shift-F` — open search panel (or click the search icon in the activity bar)
+- Type a query and press `Enter` to search all text files under the project root
+- Search is case-insensitive; hidden files/directories (`.git`, etc.) and binary files are skipped
+- Results are grouped by file (`filename.rs`) then listed as `  42: matched line text`
+- **GTK:** click a result row to open the file at that line
+- **TUI:** `j`/`k` to navigate results; `Enter` to open file at matched line; any printable char while in results mode switches back to input mode
 
 ---
 
@@ -337,12 +348,13 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 
 ```
 src/
-├── main.rs          (~3100 lines)  GTK4/Relm4 UI, rendering, sidebar resize
-├── tui_main.rs      (~1050 lines)  ratatui/crossterm TUI backend
-├── render.rs          (~360 lines)  Platform-agnostic ScreenLayout bridge
+├── main.rs          (~3260 lines)  GTK4/Relm4 UI, rendering, sidebar resize, search panel
+├── tui_main.rs      (~2620 lines)  ratatui/crossterm TUI backend, search panel
+├── render.rs        (~1080 lines)  Platform-agnostic ScreenLayout bridge
 ├── icons.rs            (~30 lines)  Nerd Font file-type icons (GTK + TUI)
-└── core/            (~13000 lines)  Zero GTK/rendering deps — fully testable
-    ├── engine.rs                    Orchestrator: keys, commands, git, macros
+└── core/            (~17150 lines)  Zero GTK/rendering deps — fully testable
+    ├── engine.rs                    Orchestrator: keys, commands, git, macros, project search
+    ├── project_search.rs            Recursive file search (case-insensitive, no regex)
     ├── buffer_manager.rs            Buffer lifecycle, undo/redo stacks
     ├── buffer.rs                    Rope-based text storage (ropey)
     ├── settings.rs                  JSON config, :set parsing

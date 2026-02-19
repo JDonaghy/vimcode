@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Feb 18, 2026 (Session 40)
+**Last updated:** Feb 18, 2026 (Session 43)
 
 ## Status
 
@@ -51,6 +51,13 @@
 - Tabs (:tabnew/:tabclose, gt/gT)
 - **Quit / save commands:** `:q` closes current tab (quits if last); `:q!` force-closes; `:qa` / `:qa!` close all; `Ctrl-S` saves in any mode
 
+### Project Search (Complete)
+- VSCode-style search panel accessed via Search icon in activity bar or Ctrl-Shift-F
+- Case-insensitive literal search across all text files under the project root
+- Grouped results list (file headers + `line: text` rows)
+- GTK: Entry input + ListBox results; click row opens file at that line
+- TUI: `[query]` input box; Enter to search; j/k navigate results; Enter opens file
+
 ### File Explorer (Complete)
 - VSCode-style sidebar (Ctrl-B toggle, Ctrl-Shift-E focus)
 - Tree view with icons, expand/collapse folders
@@ -76,8 +83,8 @@
 
 ### TUI Backend (`src/tui_main.rs`)
 - Full editor in terminal via ratatui 0.27 + crossterm
-- **Sidebar:** File explorer tree (Ctrl-B toggle, Ctrl-Shift-E focus), j/k navigation, l/Enter open, h collapse, a/A/D CRUD, R refresh
-- **Activity bar:** 3-col strip with Explorer / Settings panel icons (Nerd Font)
+- **Sidebar:** File explorer tree (Ctrl-B toggle, Ctrl-Shift-E focus), j/k navigation, l/Enter open, h collapse, a/A/D CRUD, R refresh; **Search panel** (Ctrl-Shift-F): query input, Enter to run, j/k results, Enter opens file
+- **Activity bar:** 3-col strip with Explorer / Search / Settings panel icons (Nerd Font)
 - **Layout:** activity bar | sidebar | editor col (with its own tab bar); status + cmd full-width at bottom
 - **Mouse support:** click-to-position cursor, window switching, scroll wheel (targets window under cursor), scrollbar click-to-jump and drag (vertical + horizontal)
 - **Resize bar:** drag separator column to resize sidebar; Alt+Left/Alt+Right keyboard resize; min 15, max 60 cols
@@ -109,20 +116,21 @@
 ```
 vimcode/
 ├── src/
-│   ├── main.rs (~3100 lines) — GTK4/Relm4 UI, rendering, find dialog, sidebar resize
-│   ├── tui_main.rs (~1050 lines) — ratatui/crossterm TUI backend, sidebar, mouse
+│   ├── main.rs (~3260 lines) — GTK4/Relm4 UI, rendering, find dialog, sidebar resize, search panel
+│   ├── tui_main.rs (~2620 lines) — ratatui/crossterm TUI backend, sidebar, mouse, search panel
 │   ├── icons.rs (~30 lines) — Nerd Font file-type icons (shared by GTK + TUI)
 │   ├── render.rs (~360 lines) — Platform-agnostic rendering abstraction (ScreenLayout, max_col)
-│   └── core/ (~11,400 lines) — Platform-agnostic logic
-│       ├── engine.rs (~11,400 lines) — Orchestrates everything, find/replace, macros, history
+│   └── core/ (~11,500 lines) — Platform-agnostic logic
+│       ├── engine.rs (~13,620 lines) — Orchestrates everything, find/replace, macros, history, project search
+│       ├── project_search.rs (~160 lines) — Recursive file search (case-insensitive, no regex, skip hidden/binary)
 │       ├── buffer_manager.rs (~600 lines) — Buffer lifecycle
 │       ├── buffer.rs (~120 lines) — Rope-based storage
 │       ├── session.rs (~175 lines) — Session state persistence (sidebar_width added)
-│       ├── settings.rs (~360 lines) — JSON persistence, auto-init, :set parsing
+│       ├── settings.rs (~616 lines) — JSON persistence, auto-init, :set parsing
 │       ├── window.rs, tab.rs, view.rs, cursor.rs, mode.rs, syntax.rs
-│       ├── git.rs (~310 lines) — git subprocess integration (diff/blame/hunk parsing, branch detection, stage_hunk)
-│       └── Tests: 429 passing (9 find/replace, 14 macro, 8 session, 4 reverse search, 7 replace char, 5 undo line, 8 case change, 6 marks, 5 incremental search, 12 syntax/language, 6 history search, 11 fold tests, 12 git tests, 4 sidebar-preview tests, 5 auto-indent tests, 4 completion tests, 9 quit/ctrl-s tests, 1 session-restore test, 22 set-command tests, 10 hunk-staging tests, 9 text-object tests)
-└── Total: ~16,800 lines
+│       ├── git.rs (~635 lines) — git subprocess integration (diff/blame/hunk parsing, branch detection, stage_hunk)
+│       └── Tests: 438 passing (9 find/replace, 14 macro, 8 session, 4 reverse search, 7 replace char, 5 undo line, 8 case change, 6 marks, 5 incremental search, 12 syntax/language, 6 history search, 11 fold tests, 12 git tests, 4 sidebar-preview tests, 5 auto-indent tests, 4 completion tests, 9 quit/ctrl-s tests, 1 session-restore test, 22 set-command tests, 10 hunk-staging tests, 9 text-object tests, 9 project-search tests)
+└── Total: ~17,150 lines
 ```
 
 ## Architecture
@@ -145,7 +153,7 @@ vimcode/
 ```bash
 cargo build
 cargo run -- <file>
-cargo test -- --test-threads=1    # 429 tests
+cargo test -- --test-threads=1    # 438 tests
 cargo clippy -- -D warnings
 cargo fmt
 ```
@@ -186,7 +194,7 @@ cargo fmt
 - [x] **Completion menu** — Ctrl-N/Ctrl-P word completion from buffer in insert mode; floating popup in GTK + TUI
 - [x] **:set command** — runtime setting changes; write-through to settings.json; number/rnu/expandtab/tabstop/shiftwidth/autoindent/incsearch; query with `?`
 - [x] **`ip`/`ap` + `is`/`as` text objects** — paragraph and sentence text objects for all operators and visual mode
-- [ ] **VSCode-style search & replace across files** — Ctrl-Shift-F panel; find in project, replace all, show matches list
+- [x] **VSCode-style project search** — Ctrl-Shift-F panel; case-insensitive find in project, grouped results, click to open
 - [ ] **:grep / :vimgrep** — project-wide search, populate quickfix list *(lower priority)*
 - [ ] **Quickfix window** — `:copen`, `:cn`, `:cp` quickfix navigation *(lower priority)*
 - [ ] **`it`/`at` tag text objects** — inner/around HTML/XML tag
@@ -197,6 +205,12 @@ cargo fmt
 - [ ] **`:norm`** — execute normal command on a range of lines
 
 ## Recent Work
+**Session 43:** Search panel bug fixes — GTK: fixed search results appearing with light background and grey text by correcting CSS selectors (`listbox` → `.search-results-list`, `.search-results-list > row`; GTK4 uses `list` as the CSS node name, not `listbox`); fixed startup crash in `sync_scrollbar` when initial resize fires with near-zero dimensions (added early return guard and clamped `height-request` to non-negative). TUI: added scrollbar drag support for search results (new `SidebarScrollDrag` struct); `j`/`k` in search results now call `ensure_search_selection_visible` to keep selection in viewport. (438 tests, no change.)
+
+**Session 42:** Search panel polish + CI fix — TUI: redesigned search scroll to track viewport independently of selection (`search_scroll_top` driven by scroll wheel/scrollbar click; selection only adjusts scroll when it leaves the viewport); scrollbar column clicks now jump-scroll both Explorer and Search panels; scroll wheel scrolls sidebar content; removed unused `DisplayRow.result` field. GTK: dark background fixed via `.search-results-scroll > viewport { background-color: #252526; }` and `.search-results-list label { color: #cccccc; }`; overlay scrolling disabled on search results ScrolledWindow so scrollbar is always visible. Both backends: search now runs on a background thread (`start_project_search` + `poll_project_search` — 50 ms latency); GTK polls via `glib::timeout_add_local`; TUI polls each frame before `ct_event::poll()`. CI clippy fix: two `map_or(false, ...)` → `is_some_and(...)` in `engine.rs` (new `unnecessary_map_or` lint in Rust 1.84+). Also: 4 new engine-level project-search tests covering sync, empty query, select prev/next, and async poll. (434 → 438 tests.)
+
+**Session 41:** VSCode-style project search — new `src/core/project_search.rs` with `ProjectMatch` struct and `search_in_project()` (recursive walk, skip hidden/binary, case-insensitive, sorted by path then line). Engine gets 3 new fields (`project_search_query`, `project_search_results`, `project_search_selected`) and 3 new methods (`run_project_search`, `project_search_select_next/prev`). GTK: Search activity bar button enabled (Ctrl-Shift-F), Search panel with `gtk4::Entry` input + `gtk4::ListBox` results (file-header rows + result rows, click opens file at matched line). TUI: `TuiPanel::Search` added; activity bar gains Search icon at row 1 (Settings moves to row 2); `search_input_mode` field on `TuiSidebar`; `render_search_panel()` renders `[query]` input box, status line, scrollable results grouped by file; keyboard handling for input mode (type/Backspace/Enter) and results mode (j/k/Enter). (429→434 tests, 5 new project-search unit tests.)
+
 **Session 40:** Paragraph and sentence text objects — `ip`/`ap` (inner/around paragraph) and `is`/`as` (inner/around sentence) added to `find_text_object_range` in `engine.rs`. `find_paragraph_object`: scans up/down from cursor while lines share blank/non-blank type; `ap` extends to include trailing (or leading) blank lines. `find_sentence_object`: scans backward for previous `.`/`!`/`?`+whitespace end, forward to next; paragraph boundaries also terminate sentences; `as` includes trailing whitespace. Both work with all operators (`d`/`c`/`y`) and visual mode (`v`). (420→429 tests, 9 new: 5 paragraph + 4 sentence tests.)
 
 **Session 39:** Stage hunks — interactive hunk staging from a `:Gdiff` buffer. New `Hunk` struct and `parse_diff_hunks()` in `git.rs` (pure string parsing, no I/O); `run_git_stdin()` pipes text to git subprocess stdin; `stage_hunk()` builds a minimal patch and runs `git apply --cached -`. `BufferState.source_file` (new field) records which file a diff buffer was generated from. In `engine.rs`: `jump_next_hunk()`/`jump_prev_hunk()` scan for `@@` lines, `cmd_git_stage_hunk()` identifies the hunk under the cursor and stages it. Key wiring: `]c`/`[c` navigate hunks; `gs` (pending `g` + `s`) and `:Ghs`/`:Ghunk` stage the hunk. After staging, gutter markers on the source buffer are refreshed automatically. (410→420 tests, 10 new: 4 hunk-parse unit tests + 6 engine integration tests.)

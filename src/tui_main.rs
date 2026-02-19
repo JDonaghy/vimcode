@@ -45,6 +45,7 @@ const ACTIVITY_BAR_WIDTH: u16 = 3;
 #[derive(Clone, Copy, PartialEq)]
 enum TuiPanel {
     Explorer,
+    Search,
     Settings,
 }
 
@@ -68,6 +69,10 @@ struct TuiSidebar {
     root: PathBuf,
     /// Set of directory paths that are currently expanded.
     expanded: HashSet<PathBuf>,
+    /// True while typing in the search input box (Search panel only).
+    search_input_mode: bool,
+    /// Scroll offset for the search results area (written back by render_search_panel).
+    search_scroll_top: usize,
 }
 
 impl TuiSidebar {
@@ -81,6 +86,8 @@ impl TuiSidebar {
             rows: Vec::new(),
             root,
             expanded: HashSet::new(),
+            search_input_mode: true,
+            search_scroll_top: 0,
         };
         sb.build_rows();
         sb
@@ -191,6 +198,16 @@ struct ScrollDragState {
     total: usize,
 }
 
+/// State for an active drag on the sidebar search-panel vertical scrollbar.
+struct SidebarScrollDrag {
+    /// Absolute terminal row of the first row of the scrollbar track.
+    track_abs_start: u16,
+    /// Height of the track in rows.
+    track_len: u16,
+    /// Total number of display rows in the results list.
+    total: usize,
+}
+
 /// Initialise the engine, set up the terminal, run the event loop, and restore
 /// the terminal on exit.
 pub fn run(file_path: Option<PathBuf>) {
@@ -252,6 +269,8 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
     let mut dragging_sidebar = false;
     // Non-None while user is dragging a scrollbar thumb
     let mut dragging_scrollbar: Option<ScrollDragState> = None;
+    // Non-None while user is dragging the search-results scrollbar thumb
+    let mut dragging_sidebar_search: Option<SidebarScrollDrag> = None;
     // Cache of the last rendered layout for mouse hit-testing
     let mut last_layout: Option<render::ScreenLayout> = None;
 
@@ -308,7 +327,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                         frame,
                         s,
                         &theme,
-                        &sidebar,
+                        &mut sidebar,
                         engine,
                         &sidebar_prompt,
                         sidebar_width,
@@ -329,6 +348,14 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
             SetCursorStyle::SteadyBlock
         };
         let _ = execute!(terminal.backend_mut(), cursor_style);
+
+        // Poll for completed background search (runs every frame, ~20 ms latency).
+        if engine.poll_project_search() && !engine.project_search_results.is_empty() {
+            sidebar.search_scroll_top = 0;
+            if sidebar.active_panel == TuiPanel::Search {
+                sidebar.search_input_mode = false;
+            }
+        }
 
         if !ct_event::poll(Duration::from_millis(20)).expect("poll") {
             continue;
@@ -381,6 +408,88 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                 // ── Sidebar focused ─────────────────────────────────────────
                 if sidebar.has_focus && key_event.kind != KeyEventKind::Release {
                     let ctrl = key_event.modifiers.contains(KeyModifiers::CONTROL);
+
+                    // ── Search panel keyboard handling ──────────────────────
+                    if sidebar.active_panel == TuiPanel::Search {
+                        match key_event.code {
+                            KeyCode::Esc => {
+                                sidebar.has_focus = false;
+                            }
+                            KeyCode::Char('b') if ctrl => {
+                                sidebar.has_focus = false;
+                            }
+                            // Input mode: typing into the search box
+                            _ if sidebar.search_input_mode => match key_event.code {
+                                KeyCode::Enter => {
+                                    let root = sidebar.root.clone();
+                                    engine.start_project_search(root);
+                                    sidebar.search_scroll_top = 0;
+                                }
+                                KeyCode::Backspace => {
+                                    engine.project_search_query.pop();
+                                }
+                                KeyCode::Char(c)
+                                    if !key_event.modifiers.contains(KeyModifiers::CONTROL) =>
+                                {
+                                    engine.project_search_query.push(c);
+                                }
+                                _ => {}
+                            },
+                            // Results mode: navigating the results list
+                            _ => {
+                                match key_event.code {
+                                    KeyCode::Char('j') | KeyCode::Down => {
+                                        engine.project_search_select_next();
+                                        if let Ok(size) = terminal.size() {
+                                            let rh = size.height.saturating_sub(6) as usize;
+                                            ensure_search_selection_visible(
+                                                &engine.project_search_results,
+                                                engine.project_search_selected,
+                                                &mut sidebar.search_scroll_top,
+                                                rh,
+                                            );
+                                        }
+                                    }
+                                    KeyCode::Char('k') | KeyCode::Up => {
+                                        engine.project_search_select_prev();
+                                        if let Ok(size) = terminal.size() {
+                                            let rh = size.height.saturating_sub(6) as usize;
+                                            ensure_search_selection_visible(
+                                                &engine.project_search_results,
+                                                engine.project_search_selected,
+                                                &mut sidebar.search_scroll_top,
+                                                rh,
+                                            );
+                                        }
+                                    }
+                                    KeyCode::Enter => {
+                                        let idx = engine.project_search_selected;
+                                        let result = engine
+                                            .project_search_results
+                                            .get(idx)
+                                            .map(|m| (m.file.clone(), m.line));
+                                        if let Some((file, line)) = result {
+                                            engine.open_file_in_tab(&file);
+                                            let win_id = engine.active_window_id();
+                                            engine.set_cursor_for_window(win_id, line, 0);
+                                            engine.ensure_cursor_visible();
+                                            sidebar.has_focus = false;
+                                        }
+                                    }
+                                    // Any printable char: switch back to input mode
+                                    KeyCode::Char(c)
+                                        if !key_event.modifiers.contains(KeyModifiers::CONTROL) =>
+                                    {
+                                        sidebar.search_input_mode = true;
+                                        engine.project_search_query.push(c);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        continue;
+                    }
+
                     match key_event.code {
                         // Return focus to editor
                         KeyCode::Esc => {
@@ -486,14 +595,28 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                         continue;
                     }
 
-                    // Ctrl-Shift-E: show sidebar and focus it
+                    // Ctrl-Shift-E: show sidebar and focus it (explorer)
                     if key_event.kind != KeyEventKind::Release
                         && key_event.modifiers.contains(KeyModifiers::CONTROL)
                         && key_event.modifiers.contains(KeyModifiers::SHIFT)
                         && key_event.code == KeyCode::Char('e')
                     {
                         sidebar.visible = true;
+                        sidebar.active_panel = TuiPanel::Explorer;
                         sidebar.has_focus = true;
+                        continue;
+                    }
+
+                    // Ctrl-Shift-F: show sidebar in search mode and focus it
+                    if key_event.kind != KeyEventKind::Release
+                        && key_event.modifiers.contains(KeyModifiers::CONTROL)
+                        && key_event.modifiers.contains(KeyModifiers::SHIFT)
+                        && key_event.code == KeyCode::Char('f')
+                    {
+                        sidebar.visible = true;
+                        sidebar.active_panel = TuiPanel::Search;
+                        sidebar.has_focus = true;
+                        sidebar.search_input_mode = true;
                         continue;
                     }
 
@@ -538,6 +661,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                     sidebar_width,
                     &mut dragging_sidebar,
                     &mut dragging_scrollbar,
+                    &mut dragging_sidebar_search,
                     last_layout.as_ref(),
                 );
             }
@@ -558,6 +682,7 @@ fn handle_mouse(
     sidebar_width: u16,
     dragging_sidebar: &mut bool,
     dragging_scrollbar: &mut Option<ScrollDragState>,
+    dragging_sidebar_search: &mut Option<SidebarScrollDrag>,
     last_layout: Option<&render::ScreenLayout>,
 ) -> u16 {
     let col = ev.column;
@@ -583,6 +708,18 @@ fn handle_mouse(
             return new_w.clamp(15, 60);
         }
         MouseEventKind::Drag(MouseButton::Left) => {
+            // Sidebar search-results scrollbar drag
+            if let Some(ref drag) = *dragging_sidebar_search {
+                if drag.track_len > 0 && drag.total > 0 {
+                    let end = drag.track_abs_start + drag.track_len - 1;
+                    let clamped = row.clamp(drag.track_abs_start, end);
+                    let ratio = (clamped - drag.track_abs_start) as f64 / drag.track_len as f64;
+                    let new_scroll = (ratio * drag.total as f64) as usize;
+                    sidebar.search_scroll_top =
+                        new_scroll.min(drag.total.saturating_sub(drag.track_len as usize));
+                }
+                return sidebar_width;
+            }
             // Scrollbar thumb drag (vertical or horizontal)
             if let Some(ref drag) = *dragging_scrollbar {
                 if drag.track_len > 0 && drag.total > 0 {
@@ -608,10 +745,37 @@ fn handle_mouse(
         MouseEventKind::Up(MouseButton::Left) => {
             *dragging_sidebar = false;
             *dragging_scrollbar = None;
+            *dragging_sidebar_search = None;
             return sidebar_width;
         }
-        // Scroll wheel in editor area — scroll the window under the cursor
+        // Scroll wheel — sidebar or editor
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            // Sidebar scroll wheel
+            if sidebar.visible
+                && col >= ACTIVITY_BAR_WIDTH
+                && col < ACTIVITY_BAR_WIDTH + sidebar_width
+            {
+                if sidebar.active_panel == TuiPanel::Explorer {
+                    let tree_height = term_height.saturating_sub(3) as usize;
+                    let total = sidebar.rows.len();
+                    if total > tree_height {
+                        if matches!(ev.kind, MouseEventKind::ScrollUp) {
+                            sidebar.scroll_top = sidebar.scroll_top.saturating_sub(3);
+                        } else {
+                            sidebar.scroll_top =
+                                (sidebar.scroll_top + 3).min(total.saturating_sub(tree_height));
+                        }
+                    }
+                } else if sidebar.active_panel == TuiPanel::Search {
+                    // Scroll the viewport directly; render will keep selection visible.
+                    if matches!(ev.kind, MouseEventKind::ScrollUp) {
+                        sidebar.search_scroll_top = sidebar.search_scroll_top.saturating_sub(3);
+                    } else {
+                        sidebar.search_scroll_top += 3; // clamped in render_search_panel
+                    }
+                }
+                return sidebar_width;
+            }
             if col >= editor_left && row + 2 < term_height {
                 let rel_col = col - editor_left;
                 let editor_row = row.saturating_sub(1);
@@ -669,28 +833,25 @@ fn handle_mouse(
 
     // ── Activity bar ──────────────────────────────────────────────────────────
     if col < ACTIVITY_BAR_WIDTH {
-        match row {
-            0 => {
-                if sidebar.active_panel == TuiPanel::Explorer && sidebar.visible {
-                    sidebar.visible = false;
-                } else {
-                    sidebar.active_panel = TuiPanel::Explorer;
-                    sidebar.visible = true;
+        let target_panel = match row {
+            0 => Some(TuiPanel::Explorer),
+            1 => Some(TuiPanel::Search),
+            2 => Some(TuiPanel::Settings),
+            _ => None,
+        };
+        if let Some(panel) = target_panel {
+            if sidebar.active_panel == panel && sidebar.visible {
+                sidebar.visible = false;
+            } else {
+                sidebar.active_panel = panel;
+                sidebar.visible = true;
+                if panel == TuiPanel::Search {
+                    sidebar.has_focus = true;
+                    sidebar.search_input_mode = true;
                 }
-                engine.session.explorer_visible = sidebar.visible;
-                let _ = engine.session.save();
             }
-            1 => {
-                if sidebar.active_panel == TuiPanel::Settings && sidebar.visible {
-                    sidebar.visible = false;
-                } else {
-                    sidebar.active_panel = TuiPanel::Settings;
-                    sidebar.visible = true;
-                }
-                engine.session.explorer_visible = sidebar.visible;
-                let _ = engine.session.save();
-            }
-            _ => {}
+            engine.session.explorer_visible = sidebar.visible;
+            let _ = engine.session.save();
         }
         return sidebar_width;
     }
@@ -698,7 +859,23 @@ fn handle_mouse(
     // ── Sidebar panel area ────────────────────────────────────────────────────
     if sidebar.visible && col < ACTIVITY_BAR_WIDTH + sidebar_width {
         sidebar.has_focus = true;
+        // Rightmost column of the sidebar is the scrollbar column.
+        let sb_col = ACTIVITY_BAR_WIDTH + sidebar_width - 1;
+
         if sidebar.active_panel == TuiPanel::Explorer {
+            // tree_height = (total height - 2 status rows) - 1 header row
+            let tree_height = term_height.saturating_sub(3) as usize;
+            let total_rows = sidebar.rows.len();
+
+            // Click on the scrollbar column → jump-scroll
+            if col == sb_col && total_rows > tree_height && row >= 1 {
+                let rel_row = row.saturating_sub(1) as usize;
+                let ratio = rel_row as f64 / tree_height as f64;
+                let new_top = (ratio * total_rows as f64) as usize;
+                sidebar.scroll_top = new_top.min(total_rows.saturating_sub(tree_height));
+                return sidebar_width;
+            }
+
             if row == 0 {
                 return sidebar_width; // header row
             }
@@ -714,6 +891,69 @@ fn handle_mouse(
                     }
                 } else {
                     sidebar.selected = tree_row;
+                }
+            }
+        } else if sidebar.active_panel == TuiPanel::Search {
+            // results_height = (total height - 2 status rows) - 4 panel header rows
+            let results_height = term_height.saturating_sub(6) as usize;
+            let results = &engine.project_search_results;
+
+            // Click on the scrollbar column in the results area → jump-scroll
+            if col == sb_col && !results.is_empty() && row >= 4 {
+                // Count total display rows (result rows + file header rows)
+                let total_display = {
+                    let mut count = 0usize;
+                    let mut last_file: Option<&std::path::Path> = None;
+                    for m in results.iter() {
+                        if last_file != Some(m.file.as_path()) {
+                            last_file = Some(m.file.as_path());
+                            count += 1;
+                        }
+                        count += 1;
+                    }
+                    count
+                };
+                if total_display > results_height {
+                    let rel_row = row.saturating_sub(4) as usize;
+                    let ratio = rel_row as f64 / results_height as f64;
+                    let new_scroll = (ratio * total_display as f64) as usize;
+                    sidebar.search_scroll_top =
+                        new_scroll.min(total_display.saturating_sub(results_height));
+                    // Arm drag state so subsequent Drag events continue scrolling
+                    *dragging_sidebar_search = Some(SidebarScrollDrag {
+                        track_abs_start: 4,
+                        track_len: results_height as u16,
+                        total: total_display,
+                    });
+                }
+                return sidebar_width;
+            }
+
+            // Rows 0-2 are the search input box — clicking there enters input mode
+            if row <= 2 {
+                sidebar.search_input_mode = true;
+            } else {
+                sidebar.search_input_mode = false;
+                // row 3 = status line; rows 4+ = results area
+                // Add scroll offset so clicks map to the correct result.
+                let content_row = (row as usize).saturating_sub(4) + sidebar.search_scroll_top;
+                if !results.is_empty() {
+                    let selected = visual_row_to_result_idx(results, content_row);
+                    if let Some(idx) = selected {
+                        engine.project_search_selected = idx;
+                        // Open the file immediately on click
+                        let result = engine
+                            .project_search_results
+                            .get(idx)
+                            .map(|m| (m.file.clone(), m.line));
+                        if let Some((file, line)) = result {
+                            engine.open_file_in_tab(&file);
+                            let win_id = engine.active_window_id();
+                            engine.set_cursor_for_window(win_id, line, 0);
+                            engine.ensure_cursor_visible();
+                            sidebar.has_focus = false;
+                        }
+                    }
                 }
             }
         }
@@ -848,7 +1088,7 @@ fn draw_frame(
     frame: &mut ratatui::Frame,
     screen: &render::ScreenLayout,
     theme: &Theme,
-    sidebar: &TuiSidebar,
+    sidebar: &mut TuiSidebar,
     engine: &Engine,
     sidebar_prompt: &Option<SidebarPrompt>,
     sidebar_width: u16,
@@ -908,6 +1148,7 @@ fn draw_frame(
         let sep_x = sidebar_sep_area.x + sidebar_sep_area.width - 1;
 
         render_sidebar(frame.buffer_mut(), sidebar_area, sidebar, engine, theme);
+        // Note: render_sidebar / render_search_panel write back scroll_top to sidebar
 
         // Separator column
         let sep_fg = rc(theme.separator);
@@ -1592,7 +1833,8 @@ fn render_activity_bar(
     // Panel buttons: (row offset, panel, icon char)
     let buttons: &[(u16, TuiPanel, char)] = &[
         (0, TuiPanel::Explorer, '\u{f07c}'), // nf-fa-folder_open
-        (1, TuiPanel::Settings, '\u{f013}'), // nf-fa-cog
+        (1, TuiPanel::Search, '\u{f002}'),   // nf-fa-search
+        (2, TuiPanel::Settings, '\u{f013}'), // nf-fa-cog
     ];
 
     for &(row_off, panel, icon) in buttons {
@@ -1622,7 +1864,7 @@ fn render_activity_bar(
 fn render_sidebar(
     buf: &mut ratatui::buffer::Buffer,
     area: Rect,
-    sidebar: &TuiSidebar,
+    sidebar: &mut TuiSidebar,
     engine: &Engine,
     theme: &Theme,
 ) {
@@ -1637,6 +1879,12 @@ fn render_sidebar(
     // Settings panel
     if sidebar.active_panel == TuiPanel::Settings {
         render_settings_panel(buf, area, theme);
+        return;
+    }
+
+    // Search panel
+    if sidebar.active_panel == TuiPanel::Search {
+        render_search_panel(buf, area, sidebar, engine, theme);
         return;
     }
 
@@ -1783,6 +2031,31 @@ fn render_sidebar(
             x += 1;
         }
     }
+
+    // Vertical scrollbar (rightmost column, tree rows only — not header)
+    let total_rows = sidebar.rows.len();
+    let visible_rows_count = tree_height;
+    if total_rows > visible_rows_count && area.width >= 2 {
+        let track_fg = rc(theme.separator);
+        let thumb_fg = rc(theme.status_fg);
+        let sb_bg = rc(theme.tab_bar_bg);
+        let track_h = visible_rows_count as f64;
+        let thumb_size = ((visible_rows_count as f64 / total_rows as f64) * track_h)
+            .ceil()
+            .max(1.0) as u16;
+        let thumb_top = ((sidebar.scroll_top as f64 / total_rows as f64) * track_h).floor() as u16;
+        let sb_x = area.x + area.width - 1;
+        for dy in 0..visible_rows_count as u16 {
+            let y = area.y + 1 + dy; // +1 for header row
+            if y >= area.y + area.height {
+                break;
+            }
+            let in_thumb = dy >= thumb_top && dy < thumb_top + thumb_size;
+            let ch = if in_thumb { '█' } else { '░' };
+            let fg = if in_thumb { thumb_fg } else { track_fg };
+            set_cell(buf, sb_x, y, ch, fg, sb_bg);
+        }
+    }
 }
 
 /// Render the settings panel (placeholder — settings are file-based).
@@ -1845,6 +2118,299 @@ fn render_settings_panel(buf: &mut ratatui::buffer::Buffer, area: Rect, theme: &
             }
             set_cell(buf, x, y, ch, dim_fg, bg);
             x += 1;
+        }
+    }
+}
+
+/// Return the visual display row (0-based, including file-header rows) for a result index.
+fn result_idx_to_display_row(results: &[crate::core::ProjectMatch], target_idx: usize) -> usize {
+    let mut row = 0usize;
+    let mut last_file: Option<&std::path::Path> = None;
+    for (idx, m) in results.iter().enumerate() {
+        if last_file != Some(m.file.as_path()) {
+            last_file = Some(m.file.as_path());
+            row += 1; // file-header row
+        }
+        if idx == target_idx {
+            return row;
+        }
+        row += 1;
+    }
+    0
+}
+
+/// Adjust `search_scroll_top` so that `selected_idx` is within the viewport.
+/// Call this after changing the selection via keyboard — not during render.
+fn ensure_search_selection_visible(
+    results: &[crate::core::ProjectMatch],
+    selected_idx: usize,
+    scroll_top: &mut usize,
+    results_height: usize,
+) {
+    if results.is_empty() || results_height == 0 {
+        return;
+    }
+    let display_row = result_idx_to_display_row(results, selected_idx);
+    if display_row < *scroll_top {
+        *scroll_top = display_row;
+    } else if display_row >= *scroll_top + results_height {
+        *scroll_top = display_row + 1 - results_height;
+    }
+}
+
+/// Map a visual row index (0-based from top of results area) to a `project_search_results` index.
+///
+/// The results area interleaves file-header rows (not selectable) with result rows.
+/// Returns `None` if the row falls on a file header.
+fn visual_row_to_result_idx(
+    results: &[crate::core::ProjectMatch],
+    visual_row: usize,
+) -> Option<usize> {
+    let mut row = 0usize;
+    let mut last_file: Option<&std::path::Path> = None;
+    for (idx, m) in results.iter().enumerate() {
+        if last_file != Some(m.file.as_path()) {
+            last_file = Some(m.file.as_path());
+            if row == visual_row {
+                return None; // file header row
+            }
+            row += 1;
+        }
+        if row == visual_row {
+            return Some(idx);
+        }
+        row += 1;
+    }
+    None
+}
+
+/// Render the project search panel.
+fn render_search_panel(
+    buf: &mut ratatui::buffer::Buffer,
+    area: Rect,
+    sidebar: &mut TuiSidebar,
+    engine: &Engine,
+    theme: &Theme,
+) {
+    let header_fg = rc(theme.status_fg);
+    let header_bg = rc(theme.status_bg);
+    let fg = rc(theme.foreground);
+    let bg = rc(theme.tab_bar_bg);
+    let dim_fg = rc(theme.line_number_fg);
+    let sel_fg = bg;
+    let sel_bg = fg;
+    let file_header_fg = rc(theme.keyword);
+
+    if area.height == 0 {
+        return;
+    }
+
+    // Fill background
+    for y in area.y..area.y + area.height {
+        for x in area.x..area.x + area.width {
+            set_cell(buf, x, y, ' ', fg, bg);
+        }
+    }
+
+    // Row 0: panel header " SEARCH"
+    for x in area.x..area.x + area.width {
+        set_cell(buf, x, area.y, ' ', header_fg, header_bg);
+    }
+    let mut x = area.x;
+    for ch in " SEARCH".chars() {
+        if x >= area.x + area.width {
+            break;
+        }
+        set_cell(buf, x, area.y, ch, header_fg, header_bg);
+        x += 1;
+    }
+
+    if area.height < 2 {
+        return;
+    }
+
+    // Row 1: search input box  "[ query___ ]"
+    let input_y = area.y + 1;
+    let query = &engine.project_search_query;
+    let input_bg = rc(theme.active_background);
+    let input_fg = fg;
+    // Draw bracket prefix
+    set_cell(buf, area.x, input_y, '[', dim_fg, bg);
+    let end_bracket_x = if area.width > 1 {
+        area.x + area.width - 1
+    } else {
+        area.x
+    };
+    set_cell(buf, end_bracket_x, input_y, ']', dim_fg, bg);
+    // Fill input background
+    for x in (area.x + 1)..end_bracket_x {
+        set_cell(buf, x, input_y, ' ', input_fg, input_bg);
+    }
+    // Render query text
+    let mut x = area.x + 1;
+    for ch in query.chars() {
+        if x >= end_bracket_x {
+            break;
+        }
+        set_cell(buf, x, input_y, ch, input_fg, input_bg);
+        x += 1;
+    }
+    // Cursor blinking indicator: show │ at cursor position when in input mode
+    if sidebar.search_input_mode && x < end_bracket_x {
+        set_cell(buf, x, input_y, '\u{258f}', rc(theme.cursor), input_bg); // ▏
+    }
+
+    if area.height < 3 {
+        return;
+    }
+
+    // Row 2: blank separator
+    for x in area.x..area.x + area.width {
+        set_cell(buf, x, area.y + 2, ' ', dim_fg, bg);
+    }
+
+    if area.height < 4 {
+        return;
+    }
+
+    // Row 3: status / hint line
+    let status_y = area.y + 3;
+    let status_text = if engine.project_search_results.is_empty() {
+        if query.is_empty() {
+            " Type to search, Enter to run"
+        } else {
+            &engine.message
+        }
+    } else {
+        &engine.message
+    };
+    // We borrow status_text potentially as &engine.message which is a &str reference,
+    // so we just render it directly.
+    let mut x = area.x;
+    for ch in status_text.chars() {
+        if x >= area.x + area.width {
+            break;
+        }
+        set_cell(buf, x, status_y, ch, dim_fg, bg);
+        x += 1;
+    }
+
+    if area.height < 5 {
+        return;
+    }
+
+    // Rows 4+: results
+    let results = &engine.project_search_results;
+    if results.is_empty() {
+        return;
+    }
+
+    let results_start_y = area.y + 4;
+    let results_height = area.height.saturating_sub(4) as usize;
+
+    // Build the flat display list (file headers + result rows)
+    struct DisplayRow {
+        text: String,
+        is_header: bool,
+        result_idx: Option<usize>,
+    }
+
+    let mut display_rows: Vec<DisplayRow> = Vec::new();
+    let root = &sidebar.root;
+    let mut last_file: Option<&std::path::Path> = None;
+
+    for (idx, m) in results.iter().enumerate() {
+        if last_file != Some(m.file.as_path()) {
+            last_file = Some(m.file.as_path());
+            let rel = m.file.strip_prefix(root).unwrap_or(&m.file);
+            display_rows.push(DisplayRow {
+                text: rel.display().to_string(),
+                is_header: true,
+                result_idx: None,
+            });
+        }
+        let snippet = format!("  {}: {}", m.line + 1, m.line_text.trim());
+        display_rows.push(DisplayRow {
+            text: snippet,
+            is_header: false,
+            result_idx: Some(idx),
+        });
+    }
+
+    let total_display = display_rows.len();
+    let max_scroll = total_display.saturating_sub(results_height);
+
+    // Viewport scrolls freely — only clamped to valid range.
+    // Selection-tracking happens in the keyboard / poll handlers, not here.
+    let scroll_top = sidebar.search_scroll_top.min(max_scroll);
+    sidebar.search_scroll_top = scroll_top;
+
+    for (i, dr) in display_rows
+        .iter()
+        .skip(scroll_top)
+        .take(results_height)
+        .enumerate()
+    {
+        let screen_y = results_start_y + i as u16;
+        if screen_y >= area.y + area.height {
+            break;
+        }
+
+        // Fill row background first
+        for x in area.x..area.x + area.width {
+            set_cell(buf, x, screen_y, ' ', fg, bg);
+        }
+
+        let is_selected = !dr.is_header
+            && dr.result_idx == Some(engine.project_search_selected)
+            && !sidebar.search_input_mode;
+
+        let (row_fg, row_bg) = if is_selected {
+            (sel_fg, sel_bg)
+        } else if dr.is_header {
+            (file_header_fg, bg)
+        } else {
+            (fg, bg)
+        };
+
+        // Re-fill with correct bg for selected rows
+        if is_selected || dr.is_header {
+            for x in area.x..area.x + area.width {
+                set_cell(buf, x, screen_y, ' ', row_fg, row_bg);
+            }
+        }
+
+        let mut x = area.x;
+        for ch in dr.text.chars() {
+            if x >= area.x + area.width {
+                break;
+            }
+            set_cell(buf, x, screen_y, ch, row_fg, row_bg);
+            x += 1;
+        }
+    }
+
+    // Vertical scrollbar for results area
+    let total_display = display_rows.len();
+    if total_display > results_height && area.width >= 2 {
+        let track_fg = rc(theme.separator);
+        let thumb_fg = rc(theme.status_fg);
+        let sb_bg = bg;
+        let track_h = results_height as f64;
+        let thumb_size = ((results_height as f64 / total_display as f64) * track_h)
+            .ceil()
+            .max(1.0) as u16;
+        let thumb_top = ((scroll_top as f64 / total_display as f64) * track_h).floor() as u16;
+        let sb_x = area.x + area.width - 1;
+        for dy in 0..results_height as u16 {
+            let y = results_start_y + dy;
+            if y >= area.y + area.height {
+                break;
+            }
+            let in_thumb = dy >= thumb_top && dy < thumb_top + thumb_size;
+            let ch = if in_thumb { '█' } else { '░' };
+            let fg_color = if in_thumb { thumb_fg } else { track_fg };
+            set_cell(buf, sb_x, y, ch, fg_color, sb_bg);
         }
     }
 }

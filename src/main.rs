@@ -67,6 +67,10 @@ struct App {
     find_case_sensitive: bool,
     #[allow(dead_code)] // For future whole word search feature
     find_whole_word: bool,
+    /// Status text shown below the project search input ("N matches in M files").
+    project_search_status: String,
+    /// Ref to the search results ListBox so we can rebuild it after each search.
+    search_results_list: Rc<RefCell<Option<gtk4::ListBox>>>,
 }
 
 /// Scrollbars and indicators for a single window
@@ -154,6 +158,14 @@ enum Msg {
     WindowClosing { width: i32, height: i32 },
     /// Sidebar was resized via drag handle — save new width.
     SidebarResized,
+    /// Project search input text changed (query update, no search yet).
+    ProjectSearchQueryChanged(String),
+    /// User pressed Enter in the project search box — run the search.
+    ProjectSearchSubmit,
+    /// User clicked/activated a search result by index — open the file.
+    ProjectSearchOpenResult(usize),
+    /// Periodic tick to poll for background search results.
+    SearchPollTick,
 }
 
 #[relm4::component]
@@ -205,13 +217,23 @@ impl SimpleComponent for App {
                         }
                     },
 
+                    #[name = "search_button"]
                     gtk4::Button {
                         set_label: "\u{f002}",
-                        set_tooltip_text: Some("Search (disabled)"),
+                        set_tooltip_text: Some("Search (Ctrl+Shift+F)"),
                         set_width_request: 48,
                         set_height_request: 48,
-                        set_css_classes: &["activity-button"],
-                        set_sensitive: false,
+
+                        #[watch]
+                        set_css_classes: if model.active_panel == SidebarPanel::Search && model.sidebar_visible {
+                            &["activity-button", "active"]
+                        } else {
+                            &["activity-button"]
+                        },
+
+                        connect_clicked[sender] => move |_| {
+                            sender.input(Msg::SwitchPanel(SidebarPanel::Search));
+                        }
                     },
 
                     gtk4::Button {
@@ -417,6 +439,78 @@ impl SimpleComponent for App {
                             },
                         },
                         },
+
+                        // Search panel
+                        gtk4::Box {
+                            set_orientation: gtk4::Orientation::Vertical,
+                            set_css_classes: &["sidebar"],
+
+                            #[watch]
+                            set_visible: model.active_panel == SidebarPanel::Search,
+
+                            // Header
+                            gtk4::Box {
+                                set_orientation: gtk4::Orientation::Horizontal,
+                                set_css_classes: &["sidebar-header"],
+                                gtk4::Label {
+                                    set_text: " SEARCH",
+                                    set_halign: gtk4::Align::Start,
+                                    set_hexpand: true,
+                                    set_css_classes: &["sidebar-title"],
+                                },
+                            },
+
+                            // Search input row
+                            gtk4::Box {
+                                set_orientation: gtk4::Orientation::Horizontal,
+                                set_margin_top: 6,
+                                set_margin_bottom: 4,
+                                set_margin_start: 6,
+                                set_margin_end: 6,
+
+                                #[name = "project_search_entry"]
+                                gtk4::Entry {
+                                    set_hexpand: true,
+                                    set_placeholder_text: Some("Search files…"),
+
+                                    connect_changed[sender] => move |entry| {
+                                        sender.input(Msg::ProjectSearchQueryChanged(
+                                            entry.text().to_string(),
+                                        ));
+                                    },
+
+                                    connect_activate[sender] => move |_| {
+                                        sender.input(Msg::ProjectSearchSubmit);
+                                    },
+                                },
+                            },
+
+                            // Status label ("N results in M files" / empty)
+                            gtk4::Label {
+                                set_margin_start: 8,
+                                set_margin_bottom: 4,
+                                set_halign: gtk4::Align::Start,
+                                set_css_classes: &["dim-label"],
+
+                                #[watch]
+                                set_text: &model.project_search_status,
+                            },
+
+                            // Results list
+                            gtk4::ScrolledWindow {
+                                set_vexpand: true,
+                                set_hscrollbar_policy: gtk4::PolicyType::Never,
+                                set_vscrollbar_policy: gtk4::PolicyType::Automatic,
+                                set_overlay_scrolling: false,
+                                set_css_classes: &["search-results-scroll"],
+
+                                #[name = "search_results_list"]
+                                gtk4::ListBox {
+                                    set_selection_mode: gtk4::SelectionMode::Single,
+                                    set_css_classes: &["search-results-list"],
+                                },
+                            },
+                        },
                     },
                 },
 
@@ -479,6 +573,12 @@ impl SimpleComponent for App {
                                     // Check for Ctrl-Shift-E to focus explorer
                                     if ctrl && shift && (unicode == Some('E') || unicode == Some('e')) {
                                         sender.input(Msg::FocusExplorer);
+                                        return gtk4::glib::Propagation::Stop;
+                                    }
+
+                                    // Check for Ctrl-Shift-F to open project search
+                                    if ctrl && shift && (unicode == Some('F') || unicode == Some('f')) {
+                                        sender.input(Msg::SwitchPanel(SidebarPanel::Search));
                                         return gtk4::glib::Propagation::Stop;
                                     }
 
@@ -661,6 +761,8 @@ impl SimpleComponent for App {
         let overlay_ref = Rc::new(RefCell::new(None));
         let window_scrollbars_ref = Rc::new(RefCell::new(HashMap::new()));
         let sidebar_inner_box_ref: Rc<RefCell<Option<gtk4::Box>>> = Rc::new(RefCell::new(None));
+        let search_results_list_ref: Rc<RefCell<Option<gtk4::ListBox>>> =
+            Rc::new(RefCell::new(None));
 
         // Set up file watcher for settings.json
         let settings_path = std::env::var("HOME")
@@ -714,6 +816,8 @@ impl SimpleComponent for App {
             find_case_sensitive: false,
             find_whole_word: false,
             sidebar_inner_box: sidebar_inner_box_ref.clone(),
+            project_search_status: String::new(),
+            search_results_list: search_results_list_ref.clone(),
         };
         let widgets = view_output!();
 
@@ -722,6 +826,7 @@ impl SimpleComponent for App {
         *drawing_area_ref.borrow_mut() = Some(widgets.drawing_area.clone());
         *overlay_ref.borrow_mut() = Some(widgets.editor_overlay.clone());
         *sidebar_inner_box_ref.borrow_mut() = Some(widgets.sidebar_inner_box.clone());
+        *search_results_list_ref.borrow_mut() = Some(widgets.search_results_list.clone());
 
         // Restore saved sidebar width
         {
@@ -867,6 +972,13 @@ impl SimpleComponent for App {
 
         // Ensure drawing area has focus on startup
         widgets.drawing_area.grab_focus();
+
+        // Poll for background search results every 50 ms.
+        let sender_for_poll = sender.input_sender().clone();
+        gtk4::glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            sender_for_poll.send(Msg::SearchPollTick).ok();
+            gtk4::glib::ControlFlow::Continue
+        });
 
         ComponentParts { model, widgets }
     }
@@ -1364,6 +1476,43 @@ impl SimpleComponent for App {
                     let _ = self.engine.borrow().session.save();
                 }
             }
+            Msg::ProjectSearchQueryChanged(q) => {
+                self.engine.borrow_mut().project_search_query = q;
+            }
+            Msg::ProjectSearchSubmit => {
+                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                self.engine.borrow_mut().start_project_search(cwd);
+                let status = self.engine.borrow().message.clone();
+                self.project_search_status = status;
+                self.redraw = true;
+            }
+            Msg::SearchPollTick => {
+                if self.engine.borrow_mut().poll_project_search() {
+                    let status = self.engine.borrow().message.clone();
+                    self.project_search_status = status;
+                    let s = self.sender.clone();
+                    self.rebuild_search_results(&s);
+                    self.redraw = true;
+                }
+            }
+            Msg::ProjectSearchOpenResult(idx) => {
+                let result = self
+                    .engine
+                    .borrow()
+                    .project_search_results
+                    .get(idx)
+                    .map(|m| (m.file.clone(), m.line));
+                if let Some((file, line)) = result {
+                    self.engine.borrow_mut().open_file_in_tab(&file);
+                    // Jump cursor to the matched line
+                    let win_id = self.engine.borrow().active_window_id();
+                    self.engine
+                        .borrow_mut()
+                        .set_cursor_for_window(win_id, line, 0);
+                    self.engine.borrow_mut().ensure_cursor_visible();
+                }
+                self.redraw = true;
+            }
             Msg::WindowClosing { width, height } => {
                 let mut engine = self.engine.borrow_mut();
                 engine.session.window.width = width;
@@ -1404,6 +1553,75 @@ impl SimpleComponent for App {
 }
 
 impl App {
+    /// Rebuild the search results ListBox from current engine state.
+    fn rebuild_search_results(&self, sender: &relm4::Sender<Msg>) {
+        let list = match self.search_results_list.borrow().as_ref() {
+            Some(l) => l.clone(),
+            None => return,
+        };
+
+        // Remove all existing rows
+        while let Some(child) = list.first_child() {
+            list.remove(&child);
+        }
+
+        let engine = self.engine.borrow();
+        let results = &engine.project_search_results;
+        if results.is_empty() {
+            return;
+        }
+
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let mut last_file: Option<PathBuf> = None;
+
+        for (idx, m) in results.iter().enumerate() {
+            // Add a file header row when the file changes
+            if last_file.as_deref() != Some(&m.file) {
+                last_file = Some(m.file.clone());
+                let rel = m.file.strip_prefix(&cwd).unwrap_or(&m.file);
+                let file_label = gtk4::Label::new(None);
+                let header_markup = format!(
+                    "<b><span foreground='#569cd6'>{}</span></b>",
+                    gtk4::glib::markup_escape_text(&rel.display().to_string())
+                );
+                file_label.set_markup(&header_markup);
+                file_label.set_halign(gtk4::Align::Start);
+                file_label.set_margin_top(4);
+                file_label.set_margin_start(4);
+                let header_row = gtk4::ListBoxRow::new();
+                header_row.set_selectable(false);
+                header_row.set_child(Some(&file_label));
+                list.append(&header_row);
+            }
+
+            // Result row
+            let snippet = format!("  {}: {}", m.line + 1, m.line_text.trim());
+            let row_label = gtk4::Label::new(None);
+            let result_markup = format!(
+                "<span foreground='#cccccc'>{}</span>",
+                gtk4::glib::markup_escape_text(&snippet)
+            );
+            row_label.set_markup(&result_markup);
+            row_label.set_halign(gtk4::Align::Start);
+            row_label.set_ellipsize(pango::EllipsizeMode::End);
+            row_label.set_margin_start(4);
+            let result_row = gtk4::ListBoxRow::new();
+            result_row.set_selectable(true);
+
+            // Tag the row with its result index via the widget name
+            result_row.set_widget_name(&idx.to_string());
+            result_row.set_child(Some(&row_label));
+            list.append(&result_row);
+        }
+
+        let sender_clone = sender.clone();
+        list.connect_row_activated(move |_, row| {
+            if let Ok(idx) = row.widget_name().parse::<usize>() {
+                sender_clone.send(Msg::ProjectSearchOpenResult(idx)).ok();
+            }
+        });
+    }
+
     /// Rebuild and sync scrollbars for all windows
     fn sync_scrollbar(&self) {
         let overlay = match self.overlay.borrow().as_ref() {
@@ -1422,6 +1640,11 @@ impl App {
         // Calculate window rects (same logic as draw_editor)
         let da_width = drawing_area.width() as f64;
         let da_height = drawing_area.height() as f64;
+
+        // Skip if the drawing area hasn't been laid out yet (startup / minimised)
+        if da_width < 20.0 || da_height < 20.0 {
+            return;
+        }
 
         let line_height = self.cached_line_height;
         let tab_bar_height = line_height;
@@ -1471,7 +1694,8 @@ impl App {
             let scrollbar_x = rect.x as i32 + (rect.width - 10.0) as i32;
             ws.vertical.set_margin_start(scrollbar_x);
             ws.vertical.set_margin_top(rect.y as i32);
-            ws.vertical.set_height_request((rect.height - 10.0) as i32);
+            ws.vertical
+                .set_height_request(((rect.height - 10.0) as i32).max(0));
 
             let total_lines = buffer_state.buffer.content.len_lines();
             let v_adj = ws.vertical.adjustment();
@@ -2737,9 +2961,68 @@ fn load_css() {
             background: rgba(255, 255, 255, 0.7);
         }
 
-        /* Auto-hide when not in use */
+        /* Scrollbars — subtle but always visible */
         scrollbar:not(:hover):not(:active) {
-            opacity: 0;
+            opacity: 0.4;
+        }
+
+        /* Search results ListBox — GTK4 CSS node for GtkListBox is 'list' */
+        .search-results-list {
+            background-color: #252526;
+            color: #cccccc;
+        }
+
+        .search-results-list > row {
+            background-color: #252526;
+            color: #cccccc;
+            padding: 2px 4px;
+            min-height: 20px;
+        }
+
+        .search-results-list > row:hover {
+            background-color: #2a2d2e;
+        }
+
+        .search-results-list > row:selected,
+        .search-results-list > row:selected:focus {
+            background-color: rgba(9, 71, 113, 0.5);
+            color: #cccccc;
+        }
+
+        /* Search results ScrolledWindow background */
+        .search-results-scroll {
+            background-color: #252526;
+        }
+
+        /* Labels inside search results list */
+        .search-results-list label {
+            color: #cccccc;
+            background-color: transparent;
+        }
+
+        .search-results-list > row:selected label,
+        .search-results-list > row:selected:focus label {
+            color: #cccccc;
+        }
+
+        /* File-header rows in search results */
+        .search-file-header {
+            color: #569cd6;
+            font-weight: bold;
+            font-size: 12px;
+        }
+
+        /* Search input entry inside sidebar */
+        .sidebar entry {
+            background-color: #3c3c3c;
+            color: #cccccc;
+            border: 1px solid #3e3e42;
+            border-radius: 2px;
+            padding: 4px;
+        }
+
+        .sidebar entry:focus {
+            border-color: #0e639c;
         }
 
         /* Find/Replace Dialog */

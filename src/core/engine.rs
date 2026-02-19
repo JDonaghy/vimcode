@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use super::buffer::{Buffer, BufferId};
 use super::buffer_manager::{BufferManager, BufferState};
 use super::git;
+use super::project_search::{self, ProjectMatch};
 use super::session::SessionState;
 use super::settings::Settings;
 use super::tab::{Tab, TabId};
@@ -228,6 +229,18 @@ pub struct Engine {
     pub completion_idx: Option<usize>,
     /// Buffer column where the prefix that triggered completion starts.
     pub completion_start_col: usize,
+
+    // --- Project search state ---
+    /// Current text typed in the project search input box.
+    pub project_search_query: String,
+    /// Results from the last `run_project_search` call.
+    pub project_search_results: Vec<ProjectMatch>,
+    /// Index of the currently highlighted result (0-based).
+    pub project_search_selected: usize,
+    /// Receiver for async search results (set while a search thread is running).
+    pub project_search_receiver: Option<std::sync::mpsc::Receiver<Vec<ProjectMatch>>>,
+    /// True while a background search thread is running.
+    pub project_search_running: bool,
 }
 
 impl Engine {
@@ -297,6 +310,11 @@ impl Engine {
             completion_candidates: Vec::new(),
             completion_idx: None,
             completion_start_col: 0,
+            project_search_query: String::new(),
+            project_search_results: Vec::new(),
+            project_search_selected: 0,
+            project_search_receiver: None,
+            project_search_running: false,
         }
     }
 
@@ -1549,7 +1567,7 @@ impl Engine {
                         .and_then(|w| self.buffer_manager.get(w.buffer_id))
                         .and_then(|s| s.file_path.as_ref())
                         .and_then(|p| p.canonicalize().ok())
-                        .map_or(false, |p| p == canonical_ap)
+                        .is_some_and(|p| p == canonical_ap)
                 });
                 if let Some(idx) = tab_idx {
                     self.active_tab = idx;
@@ -1679,6 +1697,103 @@ impl Engine {
                 }
             }
         }
+    }
+
+    // =======================================================================
+    // Project search
+    // =======================================================================
+
+    /// Run a project-wide search synchronously (blocks until complete).
+    ///
+    /// Prefer `start_project_search` + `poll_project_search` for UI use.
+    /// Used directly in tests.
+    #[allow(dead_code)]
+    pub fn run_project_search(&mut self, root: &Path) {
+        let query = self.project_search_query.clone();
+        if query.is_empty() {
+            self.project_search_results.clear();
+            self.project_search_selected = 0;
+            self.message = "Search query is empty".to_string();
+            return;
+        }
+        let results = project_search::search_in_project(root, &query);
+        self.apply_search_results(results, &query);
+    }
+
+    /// Spawn a background thread to search `root` for `self.project_search_query`.
+    ///
+    /// Call `poll_project_search` on each UI tick to collect results.
+    pub fn start_project_search(&mut self, root: PathBuf) {
+        let query = self.project_search_query.clone();
+        if query.is_empty() {
+            self.project_search_results.clear();
+            self.project_search_selected = 0;
+            self.message = "Search query is empty".to_string();
+            return;
+        }
+        self.project_search_running = true;
+        self.message = format!("Searching for \"{}\"…", query);
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.project_search_receiver = Some(rx);
+        std::thread::spawn(move || {
+            let results = project_search::search_in_project(&root, &query);
+            let _ = tx.send(results);
+        });
+    }
+
+    /// Check whether the background search thread has finished and, if so, store results.
+    ///
+    /// Returns `true` when new results have just arrived (UI should redraw).
+    pub fn poll_project_search(&mut self) -> bool {
+        let results = match self.project_search_receiver {
+            Some(ref rx) => match rx.try_recv() {
+                Ok(r) => r,
+                Err(_) => return false,
+            },
+            None => return false,
+        };
+        let query = self.project_search_query.clone();
+        self.project_search_receiver = None;
+        self.project_search_running = false;
+        self.apply_search_results(results, &query);
+        true
+    }
+
+    /// Store search results and update the status message. Called by both sync and async paths.
+    fn apply_search_results(&mut self, results: Vec<ProjectMatch>, query: &str) {
+        if results.is_empty() {
+            self.message = format!("No results for \"{}\"", query);
+        } else {
+            let file_count = {
+                let mut files: Vec<&std::path::Path> =
+                    results.iter().map(|m| m.file.as_path()).collect();
+                files.sort();
+                files.dedup();
+                files.len()
+            };
+            self.message = format!(
+                "{} match{} in {} file{}",
+                results.len(),
+                if results.len() == 1 { "" } else { "es" },
+                file_count,
+                if file_count == 1 { "" } else { "s" }
+            );
+        }
+        self.project_search_results = results;
+        self.project_search_selected = 0;
+    }
+
+    /// Move the project search selection down by one, clamped to the last result.
+    pub fn project_search_select_next(&mut self) {
+        if !self.project_search_results.is_empty() {
+            self.project_search_selected =
+                (self.project_search_selected + 1).min(self.project_search_results.len() - 1);
+        }
+    }
+
+    /// Move the project search selection up by one, clamped to 0.
+    pub fn project_search_select_prev(&mut self) {
+        self.project_search_selected = self.project_search_selected.saturating_sub(1);
     }
 
     // =======================================================================
@@ -4643,7 +4758,7 @@ impl Engine {
                     .buffer_manager
                     .list()
                     .iter()
-                    .any(|id| self.buffer_manager.get(*id).map_or(false, |s| s.dirty));
+                    .any(|id| self.buffer_manager.get(*id).is_some_and(|s| s.dirty));
                 if has_dirty {
                     self.message = "No write since last change (add ! to override)".to_string();
                     EngineAction::Error
@@ -13333,7 +13448,10 @@ mod tests {
         engine.handle_key("", Some('y'), false);
         engine.handle_key("", Some('i'), false);
         engine.handle_key("", Some('p'), false);
-        let reg = engine.get_register('"').map(|(s, _)| s.as_str()).unwrap_or("");
+        let reg = engine
+            .get_register('"')
+            .map(|(s, _)| s.as_str())
+            .unwrap_or("");
         assert!(reg.contains("alpha"), "yanked text should contain alpha");
         assert!(reg.contains("beta"), "yanked text should contain beta");
         assert!(!reg.contains("gamma"), "should not yank past blank line");
@@ -13424,5 +13542,79 @@ mod tests {
             engine.view().cursor.col > 0 || engine.view().cursor.line > 0,
             "cursor should have moved to end of sentence"
         );
+    }
+
+    // ── Project search ────────────────────────────────────────────────────────
+
+    fn make_search_dir(test_name: &str) -> std::path::PathBuf {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("vimcode_engine_search_{}", test_name));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut f = std::fs::File::create(dir.join("sample.txt")).unwrap();
+        writeln!(f, "hello world").unwrap();
+        writeln!(f, "another line").unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_run_project_search_finds_matches() {
+        let dir = make_search_dir("engine_find");
+        let mut engine = Engine::new();
+        engine.project_search_query = "hello".to_string();
+        engine.run_project_search(&dir);
+        assert!(
+            !engine.project_search_results.is_empty(),
+            "should find 'hello'"
+        );
+        assert_eq!(engine.project_search_selected, 0);
+        assert!(engine.message.contains("match"));
+    }
+
+    #[test]
+    fn test_run_project_search_empty_query() {
+        let dir = make_search_dir("engine_empty");
+        let mut engine = Engine::new();
+        engine.project_search_query = String::new();
+        engine.run_project_search(&dir);
+        assert!(engine.project_search_results.is_empty());
+        assert!(engine.message.contains("empty"));
+    }
+
+    #[test]
+    fn test_project_search_select_next_prev() {
+        let dir = make_search_dir("engine_select");
+        let mut engine = Engine::new();
+        engine.project_search_query = "l".to_string(); // matches both lines
+        engine.run_project_search(&dir);
+        assert!(engine.project_search_results.len() >= 2);
+        engine.project_search_select_next();
+        assert_eq!(engine.project_search_selected, 1);
+        engine.project_search_select_prev();
+        assert_eq!(engine.project_search_selected, 0);
+    }
+
+    #[test]
+    fn test_start_and_poll_project_search() {
+        let dir = make_search_dir("engine_async");
+        let mut engine = Engine::new();
+        engine.project_search_query = "world".to_string();
+        engine.start_project_search(dir);
+        assert!(engine.project_search_running);
+        // Spin until results arrive (bounded by ~1 s in practice)
+        let mut got = false;
+        for _ in 0..200 {
+            if engine.poll_project_search() {
+                got = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            got,
+            "poll_project_search should return true after thread completes"
+        );
+        assert!(!engine.project_search_running);
+        assert!(!engine.project_search_results.is_empty());
     }
 }
