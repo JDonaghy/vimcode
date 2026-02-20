@@ -1,16 +1,16 @@
 # VimCode Project State
 
-**Last updated:** Feb 20, 2026 (Session 50)
+**Last updated:** Feb 20, 2026 (Session 51)
 
 ## Status
 
-**CPU Performance Fixes:** Cached `max_col` in `BufferState` (eliminates O(N) scan per render frame); 60fps frame rate cap in TUI event loop — 526 tests passing
+**it/at Tag Text Objects:** `it`/`at` inner/around HTML/XML tag text objects — case-insensitive, nesting-aware, handles attributes — 535 tests passing
 
 ### Core Vim (Complete)
 - Seven modes (Normal/Insert/Visual/Visual Line/Visual Block/Command/Search)
 - Navigation (hjkl, w/b/e, {}, gg/G, f/F/t/T, %, 0/$, Ctrl-D/U/F/B)
 - Operators (d/c/y with motions, x/dd/D/s/S/C, r for replace char, >>/<<)
-- Text objects (iw/aw, quotes, brackets)
+- Text objects (iw/aw, quotes, brackets, ip/ap paragraph, is/as sentence, it/at tag)
 - Registers (unnamed + a-z)
 - Undo/redo (u/Ctrl-R), undo line (U), repeat (.), count prefix
 - Visual modes (v/V/Ctrl-V with y/d/c/u/U/~/>/< , rectangular block selections, case change)
@@ -154,7 +154,7 @@ vimcode/
 │   ├── icons.rs (~30 lines) — Nerd Font file-type icons (shared by GTK + TUI)
 │   ├── render.rs (~1200 lines) — Platform-agnostic rendering abstraction (ScreenLayout, max_col)
 │   └── core/ (~20,200 lines) — Platform-agnostic logic
-│       ├── engine.rs (~14,600 lines) — Orchestrates everything, find/replace, macros, history, LSP, project search/replace
+│       ├── engine.rs (~14,750 lines) — Orchestrates everything, find/replace, macros, history, LSP, project search/replace
 │       ├── lsp.rs (~1,200 lines) — LSP protocol transport + single-server client (request ID tracking)
 │       ├── lsp_manager.rs (~400 lines) — Multi-server coordinator with initialization guards
 │       ├── project_search.rs (~630 lines) — Regex/case/whole-word search + replace (ignore + regex crates)
@@ -164,8 +164,8 @@ vimcode/
 │       ├── settings.rs (~640 lines) — JSON persistence, auto-init, :set parsing
 │       ├── window.rs, tab.rs, view.rs, cursor.rs, mode.rs, syntax.rs
 │       ├── git.rs (~635 lines) — git subprocess integration (diff/blame/hunk parsing, branch detection, stage_hunk)
-│       └── Tests: 495 passing (9 find/replace, 14 macro, 8 session, 4 reverse search, 7 replace char, 5 undo line, 8 case change, 6 marks, 5 incremental search, 12 syntax/language, 6 history search, 11 fold tests, 12 git tests, 4 sidebar-preview tests, 5 auto-indent tests, 4 completion tests, 9 quit/ctrl-s tests, 1 session-restore test, 22 set-command tests, 10 hunk-staging tests, 9 text-object tests, 24 project-search tests, 5 engine-replace tests, 27 lsp-protocol tests, 10 lsp-engine tests)
-└── Total: ~20,900 lines
+│       └── Tests: 535 passing (9 find/replace, 14 macro, 8 session, 4 reverse search, 7 replace char, 5 undo line, 8 case change, 6 marks, 5 incremental search, 12 syntax/language, 6 history search, 11 fold tests, 12 git tests, 4 sidebar-preview tests, 5 auto-indent tests, 4 completion tests, 9 quit/ctrl-s tests, 1 session-restore test, 22 set-command tests, 10 hunk-staging tests, 9 text-object tests, 24 project-search tests, 5 engine-replace tests, 27 lsp-protocol tests, 10 lsp-engine tests, 31 vim-features tests, 9 tag-object tests)
+└── Total: ~21,050 lines
 ```
 
 ## Architecture
@@ -235,13 +235,15 @@ cargo fmt
 - [x] **VSCode-style project search** — Ctrl-Shift-F panel; regex/case/whole-word toggles; `.gitignore`-aware (ignore crate); grouped results, click to open
 - [ ] **:grep / :vimgrep** — project-wide search, populate quickfix list *(lower priority)*
 - [ ] **Quickfix window** — `:copen`, `:cn`, `:cp` quickfix navigation *(lower priority)*
-- [ ] **`it`/`at` tag text objects** — inner/around HTML/XML tag
+- [x] **`it`/`at` tag text objects** — inner/around HTML/XML tag
 
 ### Big features
 - [x] **LSP support** — completions (Ctrl-Space), go-to-definition (gd), hover (K), diagnostics (]d/[d), auto-detect servers on PATH
 - [ ] **`:norm`** — execute normal command on a range of lines
 
 ## Recent Work
+**Session 51:** `it`/`at` tag text objects — inner/around HTML/XML tag pair. New `find_tag_text_object()` method in `engine.rs` dispatched from `find_text_object_range()` via `'t'` arm. Algorithm: scan backward from cursor for nearest enclosing `<tagname>` open tag; scan forward for matching `</tagname>` with nesting depth tracking; case-insensitive tag-name comparison (`<DIV>` matches `</div>`); handles tags with attributes (quoted values correctly skipped); self-closing tags (`<br/>`), comments (`<!--`), and processing instructions (`<?`) are not treated as enclosing elements. `it` returns `(inner_start, close_tag_start)`; `at` returns `(open_tag_start, close_tag_end)`. Works with all operators (`d`/`c`/`y`) and visual mode. (526→535 tests, 9 new.)
+
 **Session 50:** CPU performance fixes — two startup/runtime CPU issues resolved. (1) `max_col` (longest line length, used for h-scrollbar range) was computed by scanning all buffer lines on every render frame; now cached as `BufferState.max_col: usize`, initialized in both constructors, recomputed once inside `update_syntax()`; `render.rs` updated to read the cached value. (2) TUI event loop had no frame rate cap — rapid LSP events or search results could trigger uncapped rendering (100% CPU); added `min_frame = Duration::from_millis(16)` and `last_draw: Instant` so renders are gated to ~60fps. (526 tests, no change.)
 
 **Session 49:** 6 high-priority vim features — toggle case (`~` / visual `~`), scroll-to-cursor (`zz`/`zt`/`zb`), join lines (`J`), search word under cursor (`*`/`#` with word boundaries), jump list (`Ctrl-O`/`Ctrl-I`, cross-file, max 100, pushes on G/gg/n/N/%/{/}/gd/\*/#), indent/dedent (`>>`/`<<`, visual `>`/`<`, dot-repeatable). Plus two jump-list bug fixes: back-from-live-end saves position before going back; clearing pending_key after z/zz/zt/zb so they don't interfere with subsequent keys. (495→526 tests, 31 new.)

@@ -369,7 +369,9 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
         // When a redraw is pending but rate-limited, wait only until the next frame is due.
         // When idle, poll slowly to keep CPU near zero.
         let poll_timeout = if needs_redraw {
-            min_frame.saturating_sub(last_draw.elapsed()).max(Duration::from_millis(1))
+            min_frame
+                .saturating_sub(last_draw.elapsed())
+                .max(Duration::from_millis(1))
         } else {
             Duration::from_millis(50)
         };

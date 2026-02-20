@@ -70,6 +70,10 @@ enum ChangeOp {
     DeleteToEnd,
     ChangeToEnd,
     Replace,
+    ToggleCase,
+    Join,
+    Indent,
+    Dedent,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -274,6 +278,16 @@ pub struct Engine {
     pub lsp_pending_definition: Option<i64>,
     /// Tracks whether we need to send didChange on next poll (debounce).
     lsp_dirty_buffers: HashMap<BufferId, bool>,
+
+    // --- Jump list ---
+    /// List of (file_path, line, col) jump positions. Max 100 entries.
+    jump_list: Vec<(Option<PathBuf>, usize, usize)>,
+    /// Current position in jump list (points past the last entry when at newest).
+    jump_list_pos: usize,
+
+    // --- Search word under cursor ---
+    /// Whether current search uses word boundaries (set by * and #).
+    search_word_bounded: bool,
 }
 
 impl Engine {
@@ -360,6 +374,9 @@ impl Engine {
             lsp_pending_hover: None,
             lsp_pending_definition: None,
             lsp_dirty_buffers: HashMap::new(),
+            jump_list: Vec::new(),
+            jump_list_pos: 0,
+            search_word_bounded: false,
         }
     }
 
@@ -2261,6 +2278,16 @@ impl Engine {
                     self.visual_anchor = Some(self.view().cursor);
                     return EngineAction::None;
                 }
+                "o" => {
+                    // Ctrl-O: Jump list back
+                    self.jump_list_back();
+                    return EngineAction::None;
+                }
+                "i" => {
+                    // Ctrl-I: Jump list forward (same as Tab in many terminals)
+                    self.jump_list_forward();
+                    return EngineAction::None;
+                }
                 _ => {}
             }
         }
@@ -2535,12 +2562,14 @@ impl Engine {
             }
             Some('{') => {
                 let count = self.take_count();
+                self.push_jump_location();
                 for _ in 0..count {
                     self.move_paragraph_backward();
                 }
             }
             Some('}') => {
                 let count = self.take_count();
+                self.push_jump_location();
                 for _ in 0..count {
                     self.move_paragraph_forward();
                 }
@@ -2687,6 +2716,7 @@ impl Engine {
                 self.pending_key = Some('`');
             }
             Some('G') => {
+                self.push_jump_location();
                 if self.peek_count().is_some() {
                     // Count provided: go to line N (1-indexed)
                     let count = self.take_count();
@@ -2698,6 +2728,55 @@ impl Engine {
                     self.view_mut().cursor.line = last;
                 }
                 self.clamp_cursor_col();
+            }
+            Some('~') => {
+                // Toggle case of char(s) under cursor
+                let count = self.take_count();
+                self.toggle_case_at_cursor(count, changed);
+                self.last_change = Some(Change {
+                    op: ChangeOp::ToggleCase,
+                    text: String::new(),
+                    count,
+                    motion: None,
+                });
+            }
+            Some('J') => {
+                // Join lines
+                let count = self.take_count().max(1);
+                self.push_jump_location();
+                self.join_lines(count, changed);
+                self.last_change = Some(Change {
+                    op: ChangeOp::Join,
+                    text: String::new(),
+                    count,
+                    motion: None,
+                });
+            }
+            Some('*') => {
+                // Search forward for word under cursor
+                let count = self.take_count();
+                self.push_jump_location();
+                self.search_word_under_cursor(true);
+                for _ in 1..count {
+                    self.search_next();
+                }
+            }
+            Some('#') => {
+                // Search backward for word under cursor
+                let count = self.take_count();
+                self.push_jump_location();
+                self.search_word_under_cursor(false);
+                for _ in 1..count {
+                    self.search_prev();
+                }
+            }
+            Some('>') => {
+                // > operator: set pending for >>
+                self.pending_operator = Some('>');
+            }
+            Some('<') => {
+                // < operator: set pending for <<
+                self.pending_operator = Some('<');
             }
             Some('u') => {
                 self.undo();
@@ -2749,6 +2828,7 @@ impl Engine {
             }
             Some('n') => {
                 let count = self.take_count();
+                self.push_jump_location();
                 for _ in 0..count {
                     match self.search_direction {
                         SearchDirection::Forward => self.search_next(),
@@ -2758,6 +2838,7 @@ impl Engine {
             }
             Some('N') => {
                 let count = self.take_count();
+                self.push_jump_location();
                 for _ in 0..count {
                     match self.search_direction {
                         SearchDirection::Forward => self.search_prev(),
@@ -2774,6 +2855,7 @@ impl Engine {
                 self.visual_anchor = Some(self.view().cursor);
             }
             Some('%') => {
+                self.push_jump_location();
                 self.move_to_matching_bracket();
             }
             Some(':') => {
@@ -2786,6 +2868,7 @@ impl Engine {
                 self.command_buffer.clear();
                 self.search_direction = SearchDirection::Forward;
                 self.search_start_cursor = Some(self.view().cursor);
+                self.search_word_bounded = false; // Clear word-boundary mode
                 self.count = None; // Clear count when entering search mode
             }
             Some('?') => {
@@ -2793,6 +2876,7 @@ impl Engine {
                 self.command_buffer.clear();
                 self.search_direction = SearchDirection::Backward;
                 self.search_start_cursor = Some(self.view().cursor);
+                self.search_word_bounded = false; // Clear word-boundary mode
                 self.count = None; // Clear count when entering search mode
             }
             _ => match key_name {
@@ -2830,6 +2914,8 @@ impl Engine {
                     let line = self.view().cursor.line;
                     self.view_mut().cursor.col = self.get_max_cursor_col(line);
                 }
+                // Tab = Ctrl-I in terminals (same byte 0x09); both advance the jump list
+                "Tab" => self.jump_list_forward(),
                 _ => {}
             },
         }
@@ -2846,6 +2932,7 @@ impl Engine {
         match pending {
             'g' => match unicode {
                 Some('g') => {
+                    self.push_jump_location();
                     if self.peek_count().is_some() {
                         // Count provided: go to line N (1-indexed)
                         let count = self.take_count();
@@ -2875,6 +2962,7 @@ impl Engine {
                     return self.cmd_git_stage_hunk();
                 }
                 Some('d') => {
+                    self.push_jump_location();
                     self.lsp_request_definition();
                 }
                 _ => {}
@@ -3065,8 +3153,11 @@ impl Engine {
                 }
             }
             'z' => {
-                // Fold commands
+                // Scroll position + fold commands
                 match unicode {
+                    Some('z') => self.scroll_cursor_center(),
+                    Some('t') => self.scroll_cursor_top(),
+                    Some('b') => self.scroll_cursor_bottom(),
                     Some('a') => self.cmd_fold_toggle(),
                     Some('o') => self.cmd_fold_open(),
                     Some('c') => self.cmd_fold_close(),
@@ -3086,6 +3177,41 @@ impl Engine {
         unicode: Option<char>,
         changed: &mut bool,
     ) -> EngineAction {
+        // Handle indent/dedent operators (>> and <<)
+        if operator == '>' || operator == '<' {
+            match unicode {
+                Some('>') if operator == '>' => {
+                    // >>: indent count lines
+                    let count = self.take_count();
+                    let line = self.view().cursor.line;
+                    self.indent_lines(line, count, changed);
+                    self.last_change = Some(Change {
+                        op: ChangeOp::Indent,
+                        text: String::new(),
+                        count,
+                        motion: None,
+                    });
+                }
+                Some('<') if operator == '<' => {
+                    // <<: dedent count lines
+                    let count = self.take_count();
+                    let line = self.view().cursor.line;
+                    self.dedent_lines(line, count, changed);
+                    self.last_change = Some(Change {
+                        op: ChangeOp::Dedent,
+                        text: String::new(),
+                        count,
+                        motion: None,
+                    });
+                }
+                _ => {
+                    // Cancel operator
+                    self.count = None;
+                }
+            }
+            return EngineAction::None;
+        }
+
         // Check if we're waiting for a text object type (after 'i' or 'a')
         if let Some(modifier) = self.pending_text_object.take() {
             if let Some(obj_type) = unicode {
@@ -3754,10 +3880,21 @@ impl Engine {
                 self.mode = Mode::Normal;
                 let query = self.command_buffer.clone();
                 self.command_buffer.clear();
-                self.search_start_cursor = None; // Clear saved cursor position
 
                 // Add to search history
                 if !query.is_empty() {
+                    // Push the pre-search position to the jump list so Ctrl-O returns here.
+                    // With incremental search the cursor has already moved; push the saved
+                    // start position (where the cursor was before the user typed `/`).
+                    if let Some(start) = self.search_start_cursor {
+                        let live = self.view().cursor;
+                        self.view_mut().cursor = start;
+                        self.push_jump_location();
+                        self.view_mut().cursor = live;
+                    }
+
+                    self.search_start_cursor = None; // Clear saved cursor position
+
                     self.session.add_search(&query);
                     self.search_history_index = None;
                     self.search_typing_buffer.clear();
@@ -3775,6 +3912,8 @@ impl Engine {
                             SearchDirection::Backward => self.search_prev(),
                         }
                     }
+                } else {
+                    self.search_start_cursor = None;
                 }
             }
             "Up" => {
@@ -3972,6 +4111,69 @@ impl Engine {
                 'U' => {
                     self.count = None; // Clear count (not used for visual operators)
                     self.uppercase_visual_selection(changed);
+                    return EngineAction::None;
+                }
+                '>' => {
+                    // Visual indent: indent all selected lines
+                    self.count = None;
+                    if let Some((start, end)) = self.get_visual_selection_range() {
+                        let start_line = start.line;
+                        let end_line = end.line;
+                        let line_count = end_line - start_line + 1;
+                        // Exit visual mode first
+                        self.mode = Mode::Normal;
+                        self.visual_anchor = None;
+                        self.indent_lines(start_line, line_count, changed);
+                        self.view_mut().cursor.line = start_line;
+                        self.last_change = Some(Change {
+                            op: ChangeOp::Indent,
+                            text: String::new(),
+                            count: line_count,
+                            motion: None,
+                        });
+                    }
+                    return EngineAction::None;
+                }
+                '<' => {
+                    // Visual dedent: dedent all selected lines
+                    self.count = None;
+                    if let Some((start, end)) = self.get_visual_selection_range() {
+                        let start_line = start.line;
+                        let end_line = end.line;
+                        let line_count = end_line - start_line + 1;
+                        // Exit visual mode first
+                        self.mode = Mode::Normal;
+                        self.visual_anchor = None;
+                        self.dedent_lines(start_line, line_count, changed);
+                        self.view_mut().cursor.line = start_line;
+                        self.last_change = Some(Change {
+                            op: ChangeOp::Dedent,
+                            text: String::new(),
+                            count: line_count,
+                            motion: None,
+                        });
+                    }
+                    return EngineAction::None;
+                }
+                '~' => {
+                    // Visual toggle case
+                    self.count = None;
+                    self.transform_visual_selection(
+                        |s| {
+                            s.chars()
+                                .map(|c| {
+                                    if c.is_uppercase() {
+                                        c.to_lowercase().next().unwrap_or(c)
+                                    } else if c.is_lowercase() {
+                                        c.to_uppercase().next().unwrap_or(c)
+                                    } else {
+                                        c
+                                    }
+                                })
+                                .collect()
+                        },
+                        changed,
+                    );
                     return EngineAction::None;
                 }
                 ':' => {
@@ -4625,6 +4827,32 @@ impl Engine {
                         self.replace_chars(replacement_char, change.count, changed);
                         self.finish_undo_group();
                     }
+                }
+            }
+            ChangeOp::ToggleCase => {
+                // Repeat ~ command
+                for _ in 0..final_count {
+                    self.toggle_case_at_cursor(change.count, changed);
+                }
+            }
+            ChangeOp::Join => {
+                // Repeat J command
+                for _ in 0..final_count {
+                    self.join_lines(change.count, changed);
+                }
+            }
+            ChangeOp::Indent => {
+                // Repeat >> command
+                let line = self.view().cursor.line;
+                for _ in 0..final_count {
+                    self.indent_lines(line, change.count, changed);
+                }
+            }
+            ChangeOp::Dedent => {
+                // Repeat << command
+                let line = self.view().cursor.line;
+                for _ in 0..final_count {
+                    self.dedent_lines(line, change.count, changed);
                 }
             }
         }
@@ -5881,6 +6109,7 @@ impl Engine {
             '[' | ']' => self.find_bracket_object(modifier, '[', ']', cursor_pos),
             'p' => self.find_paragraph_object(modifier, cursor_pos),
             's' => self.find_sentence_object(modifier, cursor_pos),
+            't' => self.find_tag_text_object(modifier, cursor_pos),
             _ => None,
         }
     }
@@ -6223,6 +6452,165 @@ impl Engine {
             Some((start, end))
         } else {
             None
+        }
+    }
+
+    /// Find tag text object range (it/at).
+    ///
+    /// `it` (inner tag) selects the content between the nearest enclosing open and close tag.
+    /// `at` (around tag) includes the opening and closing tags themselves.
+    /// Tag-name comparison is case-insensitive; nested same-name tags are handled by
+    /// depth tracking during the forward scan for the closing tag.
+    fn find_tag_text_object(&self, modifier: char, cursor_pos: usize) -> Option<(usize, usize)> {
+        let total_chars = self.buffer().len_chars();
+        if total_chars == 0 || cursor_pos >= total_chars {
+            return None;
+        }
+
+        // Safe single-character accessor.
+        let ch = |pos: usize| -> char {
+            if pos < total_chars {
+                self.buffer().content.char(pos)
+            } else {
+                '\0'
+            }
+        };
+
+        // Try to parse an HTML/XML tag beginning at `start` (which must hold '<').
+        // Returns (tag_name_lowercase, is_closing, is_self_closing, pos_after_close_angle).
+        // Returns None for comments (<!--), processing instructions (<?), doctypes (<!),
+        // or malformed tags.
+        let parse_tag_at = |start: usize| -> Option<(String, bool, bool, usize)> {
+            if ch(start) != '<' {
+                return None;
+            }
+            let mut pos = start + 1;
+            if pos >= total_chars {
+                return None;
+            }
+            let c1 = ch(pos);
+            // Skip comments (<!), doctype (<!), processing instructions (<?)
+            if c1 == '!' || c1 == '?' {
+                return None;
+            }
+            let is_closing = c1 == '/';
+            if is_closing {
+                pos += 1;
+            }
+            // Tag name must start with an ASCII letter or underscore.
+            if !ch(pos).is_ascii_alphabetic() && ch(pos) != '_' {
+                return None;
+            }
+            let name_start = pos;
+            while pos < total_chars {
+                let c = ch(pos);
+                if c.is_alphanumeric() || matches!(c, '-' | '_' | ':' | '.') {
+                    pos += 1;
+                } else {
+                    break;
+                }
+            }
+            let tag_name: String = (name_start..pos)
+                .map(&ch)
+                .collect::<String>()
+                .to_ascii_lowercase();
+            if tag_name.is_empty() {
+                return None;
+            }
+            // Scan forward to the closing '>', handling quoted attribute values.
+            let mut in_quote: Option<char> = None;
+            let mut is_self_closing = false;
+            while pos < total_chars {
+                let c = ch(pos);
+                match in_quote {
+                    Some(q) => {
+                        if c == q {
+                            in_quote = None;
+                        }
+                    }
+                    None => match c {
+                        '"' | '\'' => {
+                            in_quote = Some(c);
+                        }
+                        '/' if ch(pos + 1) == '>' => {
+                            is_self_closing = true;
+                        }
+                        '>' => {
+                            return Some((tag_name, is_closing, is_self_closing, pos + 1));
+                        }
+                        _ => {}
+                    },
+                }
+                pos += 1;
+            }
+            None // unclosed tag
+        };
+
+        // Main loop: walk backward from cursor_pos looking for an enclosing open tag.
+        let mut scan_pos = cursor_pos;
+        loop {
+            // Walk backward to the nearest '<'.
+            while ch(scan_pos) != '<' {
+                if scan_pos == 0 {
+                    return None;
+                }
+                scan_pos -= 1;
+            }
+            let open_start = scan_pos;
+
+            if let Some((tag_name, is_closing, is_self_closing, inner_start)) =
+                parse_tag_at(open_start)
+            {
+                if !is_closing && !is_self_closing {
+                    // Scan forward for the matching </tag_name>, tracking nesting depth.
+                    let mut depth: usize = 1;
+                    let mut fwd = inner_start;
+                    let mut close_result: Option<(usize, usize)> = None;
+                    while fwd < total_chars {
+                        if ch(fwd) != '<' {
+                            fwd += 1;
+                            continue;
+                        }
+                        if let Some((tname, tclosing, tself, tend)) = parse_tag_at(fwd) {
+                            if tname == tag_name {
+                                if tclosing {
+                                    depth -= 1;
+                                    if depth == 0 {
+                                        close_result = Some((fwd, tend));
+                                        break;
+                                    }
+                                } else if !tself {
+                                    depth += 1;
+                                }
+                            }
+                            fwd = tend;
+                        } else {
+                            fwd += 1;
+                        }
+                    }
+
+                    if let Some((close_start, close_end)) = close_result {
+                        // Accept only if cursor is within this element's extent.
+                        if cursor_pos >= open_start && cursor_pos < close_end {
+                            return if modifier == 'i' {
+                                if inner_start <= close_start {
+                                    Some((inner_start, close_start))
+                                } else {
+                                    None
+                                }
+                            } else {
+                                Some((open_start, close_end))
+                            };
+                        }
+                    }
+                }
+            }
+
+            // This '<' didn't yield an enclosing tag; keep scanning backward.
+            if open_start == 0 {
+                return None;
+            }
+            scan_pos = open_start - 1;
         }
     }
 
@@ -7477,6 +7865,431 @@ impl Engine {
             .filter(|d| d.severity == DiagnosticSeverity::Warning)
             .count();
         (errors, warnings)
+    }
+
+    // =======================================================================
+    // Toggle case (~)
+    // =======================================================================
+
+    /// Toggle the case of `count` characters starting at the cursor, advance cursor.
+    fn toggle_case_at_cursor(&mut self, count: usize, changed: &mut bool) {
+        let line = self.view().cursor.line;
+        let col = self.view().cursor.col;
+        let char_idx = self.buffer().line_to_char(line) + col;
+
+        // How many chars are available on this line (excluding trailing newline)?
+        let line_len = self.buffer().line_len_chars(line);
+        let line_content = self.buffer().content.line(line);
+        let available = if line_content.chars().last() == Some('\n') {
+            line_len.saturating_sub(1)
+        } else {
+            line_len
+        };
+        let remaining = available.saturating_sub(col);
+        let to_toggle = count.min(remaining);
+
+        if to_toggle == 0 {
+            return;
+        }
+
+        // Read chars to toggle
+        let chars: Vec<char> = self
+            .buffer()
+            .content
+            .slice(char_idx..char_idx + to_toggle)
+            .chars()
+            .collect();
+
+        // Build replacement: toggle case of each char
+        let toggled: String = chars
+            .iter()
+            .map(|&c| {
+                if c.is_uppercase() {
+                    c.to_lowercase().next().unwrap_or(c)
+                } else if c.is_lowercase() {
+                    c.to_uppercase().next().unwrap_or(c)
+                } else {
+                    c
+                }
+            })
+            .collect();
+
+        self.start_undo_group();
+        self.delete_with_undo(char_idx, char_idx + to_toggle);
+        self.insert_with_undo(char_idx, &toggled);
+        self.finish_undo_group();
+
+        // Advance cursor by number of chars toggled (clamped to line end)
+        let new_col = (col + to_toggle).min(available.saturating_sub(1));
+        self.view_mut().cursor.col = new_col;
+        self.clamp_cursor_col();
+        *changed = true;
+    }
+
+    // =======================================================================
+    // Join lines (J)
+    // =======================================================================
+
+    /// Join `count` lines starting at cursor. Collapses the newline + leading
+    /// whitespace of the next line into a single space (no space before `)`).
+    fn join_lines(&mut self, count: usize, changed: &mut bool) {
+        let total_lines = self.buffer().len_lines();
+        let start_line = self.view().cursor.line;
+
+        // We join (count) times; each join merges current line with next
+        let joins = count.min(total_lines.saturating_sub(start_line + 1));
+        if joins == 0 {
+            return;
+        }
+
+        self.start_undo_group();
+        for _ in 0..joins {
+            let cur_line = self.view().cursor.line;
+            let next_line = cur_line + 1;
+            if next_line >= self.buffer().len_lines() {
+                break;
+            }
+
+            // Find position of newline at end of current line
+            let cur_line_len = self.buffer().line_len_chars(cur_line);
+            let cur_line_start = self.buffer().line_to_char(cur_line);
+            // The newline is the last char of the current line
+            let newline_pos = cur_line_start + cur_line_len - 1;
+
+            // Count leading whitespace on next line
+            let next_line_start = self.buffer().line_to_char(next_line);
+            let next_line_content: String = self.buffer().content.line(next_line).chars().collect();
+            let leading_ws = next_line_content
+                .chars()
+                .take_while(|c| *c == ' ' || *c == '\t')
+                .count();
+
+            // Determine what char comes after the whitespace on the next line
+            let next_non_ws = next_line_content.chars().nth(leading_ws);
+
+            // Delete: newline + leading whitespace of next line
+            let del_end = next_line_start + leading_ws;
+            self.delete_with_undo(newline_pos, del_end);
+
+            // Insert a space unless the next non-ws char is ')' or next line was empty/only ws
+            // Also don't add space if the current line ends with a space
+            let should_add_space = !matches!(next_non_ws, None | Some(')') | Some(']') | Some('}'));
+            // Check if current line ends with space (after the newline was removed)
+            let cur_end_char =
+                self.buffer().line_to_char(cur_line) + self.buffer().line_len_chars(cur_line);
+            let ends_with_space = cur_end_char > self.buffer().line_to_char(cur_line)
+                && self.buffer().content.char(cur_end_char - 1) == ' ';
+
+            if should_add_space && !ends_with_space {
+                self.insert_with_undo(newline_pos, " ");
+            }
+        }
+        self.finish_undo_group();
+
+        // Cursor stays at start of original line
+        self.clamp_cursor_col();
+        *changed = true;
+    }
+
+    // =======================================================================
+    // Scroll cursor to position (zz / zt / zb)
+    // =======================================================================
+
+    /// Scroll so that cursor line is centered in viewport.
+    fn scroll_cursor_center(&mut self) {
+        let cursor_line = self.view().cursor.line;
+        let half = self.viewport_lines() / 2;
+        let new_top = cursor_line.saturating_sub(half);
+        self.view_mut().scroll_top = new_top;
+    }
+
+    /// Scroll so that cursor line is at the top of viewport.
+    fn scroll_cursor_top(&mut self) {
+        let cursor_line = self.view().cursor.line;
+        self.view_mut().scroll_top = cursor_line;
+    }
+
+    /// Scroll so that cursor line is at the bottom of viewport.
+    fn scroll_cursor_bottom(&mut self) {
+        let cursor_line = self.view().cursor.line;
+        let viewport = self.viewport_lines();
+        let new_top = cursor_line.saturating_sub(viewport.saturating_sub(1));
+        self.view_mut().scroll_top = new_top;
+    }
+
+    // =======================================================================
+    // Search word under cursor (* / #)
+    // =======================================================================
+
+    /// Extract the word under the cursor. Returns None if cursor is not on a word char.
+    fn word_under_cursor(&self) -> Option<String> {
+        let line = self.view().cursor.line;
+        let col = self.view().cursor.col;
+        let line_content: String = self.buffer().content.line(line).chars().collect();
+        let chars: Vec<char> = line_content.chars().collect();
+
+        if col >= chars.len() {
+            return None;
+        }
+        if !Self::is_word_char(chars[col]) {
+            return None;
+        }
+
+        // Find start of word
+        let start = (0..=col)
+            .rev()
+            .take_while(|&i| Self::is_word_char(chars[i]))
+            .last()
+            .unwrap_or(col);
+        // Find end of word (exclusive)
+        let end = (col..chars.len())
+            .take_while(|&i| Self::is_word_char(chars[i]))
+            .last()
+            .map(|i| i + 1)
+            .unwrap_or(col + 1);
+
+        Some(chars[start..end].iter().collect())
+    }
+
+    /// Search forward (*) or backward (#) for the word under cursor with word boundaries.
+    fn search_word_under_cursor(&mut self, forward: bool) {
+        let word = match self.word_under_cursor() {
+            Some(w) => w,
+            None => {
+                self.message = "No word under cursor".to_string();
+                return;
+            }
+        };
+
+        self.search_query = word.clone();
+        self.search_direction = if forward {
+            SearchDirection::Forward
+        } else {
+            SearchDirection::Backward
+        };
+        self.search_word_bounded = true;
+
+        // Build word-boundary matches manually
+        self.build_word_bounded_matches();
+
+        if self.search_matches.is_empty() {
+            self.message = format!("Pattern not found: {}", word);
+            return;
+        }
+
+        // Jump to first match in the appropriate direction
+        if forward {
+            self.search_next();
+        } else {
+            self.search_prev();
+        }
+    }
+
+    /// Like run_search but only keeps matches that are whole words.
+    fn build_word_bounded_matches(&mut self) {
+        self.search_matches.clear();
+        self.search_index = None;
+
+        if self.search_query.is_empty() {
+            return;
+        }
+
+        let text = self.buffer().to_string();
+        let query = self.search_query.clone();
+        let mut byte_pos = 0;
+
+        while let Some(found) = text[byte_pos..].find(&query) {
+            let start_byte = byte_pos + found;
+            let end_byte = start_byte + query.len();
+
+            // Check word boundaries
+            let before_ok = start_byte == 0 || {
+                let c = text[..start_byte].chars().last().unwrap_or(' ');
+                !Self::is_word_char(c)
+            };
+            let after_ok = end_byte >= text.len() || {
+                let c = text[end_byte..].chars().next().unwrap_or(' ');
+                !Self::is_word_char(c)
+            };
+
+            if before_ok && after_ok {
+                let start_char = self.buffer().content.byte_to_char(start_byte);
+                let end_char = self.buffer().content.byte_to_char(end_byte);
+                self.search_matches.push((start_char, end_char));
+            }
+
+            byte_pos = start_byte + 1;
+        }
+    }
+
+    // =======================================================================
+    // Jump list (Ctrl-O / Ctrl-I)
+    // =======================================================================
+
+    /// Push the current cursor position onto the jump list.
+    pub fn push_jump_location(&mut self) {
+        let file = self.active_buffer_state().file_path.clone();
+        let line = self.view().cursor.line;
+        let col = self.view().cursor.col;
+
+        // Truncate forward history when a new jump is made
+        if self.jump_list_pos < self.jump_list.len() {
+            self.jump_list.truncate(self.jump_list_pos);
+        }
+
+        // Don't push a duplicate of the current top entry
+        if let Some(last) = self.jump_list.last() {
+            if last.0 == file && last.1 == line && last.2 == col {
+                return;
+            }
+        }
+
+        self.jump_list.push((file, line, col));
+
+        // Cap at 100 entries
+        if self.jump_list.len() > 100 {
+            self.jump_list.remove(0);
+        }
+
+        self.jump_list_pos = self.jump_list.len();
+    }
+
+    /// Navigate backward in the jump list (Ctrl-O).
+    pub fn jump_list_back(&mut self) {
+        // When at the "live" end (not stored in list), save current position
+        // so Ctrl-I can return to it, then jump to the previous entry.
+        if self.jump_list_pos == self.jump_list.len() {
+            if self.jump_list.is_empty() {
+                self.message = "Already at oldest position in jump list".to_string();
+                return;
+            }
+            let file = self.active_buffer_state().file_path.clone();
+            let line = self.view().cursor.line;
+            let col = self.view().cursor.col;
+            let should_push = self
+                .jump_list
+                .last()
+                .is_none_or(|last| last.0 != file || last.1 != line || last.2 != col);
+            if should_push {
+                self.jump_list.push((file, line, col));
+                if self.jump_list.len() > 100 {
+                    self.jump_list.remove(0);
+                }
+            }
+            // Jump to the entry BEFORE the one we just saved
+            // (list.len()-1 is current, list.len()-2 is the previous)
+            if self.jump_list.len() < 2 {
+                self.message = "Already at oldest position in jump list".to_string();
+                return;
+            }
+            self.jump_list_pos = self.jump_list.len() - 2;
+            self.apply_jump_list_entry(self.jump_list_pos);
+            return;
+        }
+
+        // We're inside the list — go to the previous entry
+        if self.jump_list_pos == 0 {
+            self.message = "Already at oldest position in jump list".to_string();
+            return;
+        }
+
+        self.jump_list_pos -= 1;
+        self.apply_jump_list_entry(self.jump_list_pos);
+    }
+
+    /// Navigate forward in the jump list (Ctrl-I / Tab).
+    pub fn jump_list_forward(&mut self) {
+        if self.jump_list_pos + 1 >= self.jump_list.len() {
+            self.message = "Already at newest position in jump list".to_string();
+            return;
+        }
+
+        self.jump_list_pos += 1;
+        self.apply_jump_list_entry(self.jump_list_pos);
+    }
+
+    /// Move to the position stored at the given jump list index.
+    fn apply_jump_list_entry(&mut self, idx: usize) {
+        let entry = match self.jump_list.get(idx) {
+            Some(e) => e.clone(),
+            None => return,
+        };
+
+        let (file, line, col) = entry;
+
+        // If cross-file, open the file
+        let current_file = self.active_buffer_state().file_path.clone();
+        if file != current_file {
+            if let Some(path) = &file {
+                let path = path.clone();
+                let _ = self.open_file_with_mode(&path, OpenMode::Permanent);
+            }
+        }
+
+        let max_line = self.buffer().len_lines().saturating_sub(1);
+        self.view_mut().cursor.line = line.min(max_line);
+        self.view_mut().cursor.col = col;
+        self.clamp_cursor_col();
+    }
+
+    // =======================================================================
+    // Indent / Dedent (>> / <<)
+    // =======================================================================
+
+    /// Indent `count` lines starting at `start_line` by shift_width.
+    fn indent_lines(&mut self, start_line: usize, count: usize, changed: &mut bool) {
+        let indent_str = if self.settings.expand_tab {
+            " ".repeat(self.settings.shift_width as usize)
+        } else {
+            "\t".to_string()
+        };
+
+        self.start_undo_group();
+        let total = self.buffer().len_lines();
+        for i in 0..count {
+            let line_idx = start_line + i;
+            if line_idx >= total {
+                break;
+            }
+            let line_start = self.buffer().line_to_char(line_idx);
+            self.insert_with_undo(line_start, &indent_str);
+        }
+        self.finish_undo_group();
+        *changed = true;
+    }
+
+    /// Dedent `count` lines starting at `start_line` by up to shift_width.
+    fn dedent_lines(&mut self, start_line: usize, count: usize, changed: &mut bool) {
+        let sw = self.settings.shift_width as usize;
+        self.start_undo_group();
+        // Work backwards to avoid invalidating positions
+        let total = self.buffer().len_lines();
+        for i in (0..count).rev() {
+            let line_idx = start_line + i;
+            if line_idx >= total {
+                continue;
+            }
+            let line_start = self.buffer().line_to_char(line_idx);
+            let line_content: String = self.buffer().content.line(line_idx).chars().collect();
+            let mut removed = 0;
+            for ch in line_content.chars() {
+                if removed >= sw {
+                    break;
+                }
+                match ch {
+                    ' ' => removed += 1,
+                    '\t' => removed += sw.min(sw - (removed % sw).max(1) + 1).min(sw - removed),
+                    _ => break,
+                }
+            }
+            if removed > 0 {
+                self.delete_with_undo(line_start, line_start + removed);
+            }
+        }
+        self.finish_undo_group();
+        if count > 0 {
+            *changed = true;
+        }
     }
 }
 
@@ -14585,5 +15398,574 @@ mod tests {
         engine.handle_key("a", Some('a'), false);
         let active_id = engine.active_buffer_id();
         assert!(engine.lsp_dirty_buffers.contains_key(&active_id));
+    }
+
+    // =======================================================================
+    // Tests: Toggle case (~)
+    // =======================================================================
+
+    #[test]
+    fn test_toggle_case_lowercase_to_upper() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello");
+        press_char(&mut engine, '~');
+        assert_eq!(engine.buffer().to_string(), "Hello");
+    }
+
+    #[test]
+    fn test_toggle_case_uppercase_to_lower() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "HELLO");
+        press_char(&mut engine, '~');
+        assert_eq!(engine.buffer().to_string(), "hELLO");
+    }
+
+    #[test]
+    fn test_toggle_case_count() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello");
+        press_char(&mut engine, '3');
+        press_char(&mut engine, '~');
+        assert_eq!(engine.buffer().to_string(), "HELlo");
+    }
+
+    #[test]
+    fn test_toggle_case_cursor_advances() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello");
+        press_char(&mut engine, '~');
+        assert_eq!(engine.view().cursor.col, 1);
+    }
+
+    #[test]
+    fn test_toggle_case_end_of_line_boundary() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hi");
+        // position at 'i'
+        press_char(&mut engine, 'l');
+        // toggle 5 chars but only 1 remains
+        press_char(&mut engine, '5');
+        press_char(&mut engine, '~');
+        assert_eq!(engine.buffer().to_string(), "hI");
+    }
+
+    #[test]
+    fn test_toggle_case_dot_repeat() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello");
+        press_char(&mut engine, '~'); // H at col 0, cursor moves to col 1
+        press_char(&mut engine, '.'); // toggles 'e' -> 'E'
+        assert_eq!(engine.buffer().to_string(), "HEllo");
+    }
+
+    // =======================================================================
+    // Tests: Scroll cursor position (zz / zt / zb)
+    // =======================================================================
+
+    #[test]
+    fn test_zz_centers_cursor() {
+        let mut engine = Engine::new();
+        let content: String = (0..50).map(|i| format!("line {}\n", i)).collect();
+        engine.buffer_mut().insert(0, &content);
+        engine.set_viewport_lines(10);
+        // Go to line 25
+        press_char(&mut engine, '2');
+        press_char(&mut engine, '5');
+        press_char(&mut engine, 'G');
+        press_char(&mut engine, 'z');
+        press_char(&mut engine, 'z');
+        // scroll_top should be approximately cursor - half_viewport
+        let scroll = engine.view().scroll_top;
+        let cursor = engine.view().cursor.line;
+        assert!(
+            cursor >= scroll + 3 && cursor <= scroll + 7,
+            "zz should center cursor (scroll={}, cursor={})",
+            scroll,
+            cursor
+        );
+    }
+
+    #[test]
+    fn test_zt_scrolls_top() {
+        let mut engine = Engine::new();
+        let content: String = (0..50).map(|i| format!("line {}\n", i)).collect();
+        engine.buffer_mut().insert(0, &content);
+        engine.set_viewport_lines(10);
+        press_char(&mut engine, '2');
+        press_char(&mut engine, '5');
+        press_char(&mut engine, 'G');
+        press_char(&mut engine, 'z');
+        press_char(&mut engine, 't');
+        let scroll = engine.view().scroll_top;
+        let cursor = engine.view().cursor.line;
+        assert_eq!(scroll, cursor, "zt should scroll cursor to top");
+    }
+
+    #[test]
+    fn test_zb_scrolls_bottom() {
+        let mut engine = Engine::new();
+        let content: String = (0..50).map(|i| format!("line {}\n", i)).collect();
+        engine.buffer_mut().insert(0, &content);
+        engine.set_viewport_lines(10);
+        press_char(&mut engine, '2');
+        press_char(&mut engine, '5');
+        press_char(&mut engine, 'G');
+        press_char(&mut engine, 'z');
+        press_char(&mut engine, 'b');
+        let scroll = engine.view().scroll_top;
+        let cursor = engine.view().cursor.line;
+        // cursor should be at scroll + viewport - 1
+        let vp = engine.viewport_lines();
+        assert_eq!(scroll + vp - 1, cursor, "zb should scroll cursor to bottom");
+    }
+
+    #[test]
+    fn test_zz_near_start_no_negative_scroll() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "line 0\nline 1\nline 2\n");
+        engine.set_viewport_lines(10);
+        press_char(&mut engine, 'z');
+        press_char(&mut engine, 'z');
+        assert_eq!(engine.view().scroll_top, 0);
+    }
+
+    // =======================================================================
+    // Tests: Join lines (J)
+    // =======================================================================
+
+    #[test]
+    fn test_join_lines_basic() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello\nworld\n");
+        press_char(&mut engine, 'J');
+        assert_eq!(engine.buffer().to_string(), "hello world\n");
+    }
+
+    #[test]
+    fn test_join_lines_strips_leading_whitespace() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello\n   world\n");
+        press_char(&mut engine, 'J');
+        assert_eq!(engine.buffer().to_string(), "hello world\n");
+    }
+
+    #[test]
+    fn test_join_lines_no_space_before_paren() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "foo\n)\n");
+        press_char(&mut engine, 'J');
+        assert_eq!(engine.buffer().to_string(), "foo)\n");
+    }
+
+    #[test]
+    fn test_join_lines_count() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "a\nb\nc\nd\n");
+        press_char(&mut engine, '3');
+        press_char(&mut engine, 'J');
+        // Should join 3 lines: a, b, c into "a b c"
+        let text = engine.buffer().to_string();
+        assert!(
+            text.starts_with("a b c"),
+            "expected 'a b c...', got '{}'",
+            text
+        );
+    }
+
+    #[test]
+    fn test_join_lines_last_line_noop() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "only line");
+        press_char(&mut engine, 'J');
+        assert_eq!(engine.buffer().to_string(), "only line");
+    }
+
+    // =======================================================================
+    // Tests: Search word under cursor (* / #)
+    // =======================================================================
+
+    #[test]
+    fn test_star_search_forward() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "foo bar foo baz");
+        // cursor at 'f' of first foo
+        press_char(&mut engine, '*');
+        // Should jump to the second "foo"
+        let col = engine.view().cursor.col;
+        assert_eq!(col, 8, "* should move to second 'foo' at col 8");
+    }
+
+    #[test]
+    fn test_hash_search_backward() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "foo bar foo baz");
+        // Move to second foo (col 8)
+        engine.view_mut().cursor.col = 8;
+        press_char(&mut engine, '#');
+        // Should jump back to first "foo" at col 0
+        let col = engine.view().cursor.col;
+        assert_eq!(col, 0, "# should move back to first 'foo' at col 0");
+    }
+
+    #[test]
+    fn test_star_word_boundaries() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "fo foo foobar foo");
+        // cursor at col 3 (on 'foo')
+        engine.view_mut().cursor.col = 3;
+        press_char(&mut engine, '*');
+        // "fo foo foobar foo": whole-word "foo" at col 3 and col 14; "foobar" at col 7 NOT a match
+        // From col 3, next whole-word "foo" is at col 14
+        let col = engine.view().cursor.col;
+        assert_eq!(col, 14, "* should only match whole words");
+    }
+
+    #[test]
+    fn test_star_no_word_under_cursor() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "   spaces");
+        // cursor at space (col 0)
+        press_char(&mut engine, '*');
+        assert!(engine.message.contains("No word under cursor"));
+    }
+
+    #[test]
+    fn test_star_n_continues_bounded() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "foo bar foo bar foo");
+        press_char(&mut engine, '*'); // jump to col 8
+        press_char(&mut engine, 'n'); // continue to col 16
+        let col = engine.view().cursor.col;
+        assert_eq!(col, 16);
+    }
+
+    // =======================================================================
+    // Tests: Jump list (Ctrl-O / Ctrl-I)
+    // =======================================================================
+
+    #[test]
+    fn test_jump_list_basic_back_forward() {
+        let mut engine = Engine::new();
+        let content: String = (0..20).map(|i| format!("line {}\n", i)).collect();
+        engine.buffer_mut().insert(0, &content);
+        // Go to line 10 (G)
+        press_char(&mut engine, '1');
+        press_char(&mut engine, '0');
+        press_char(&mut engine, 'G');
+        let line_after_G = engine.view().cursor.line;
+        // Go back with Ctrl-O
+        press_ctrl(&mut engine, 'o');
+        let line_after_back = engine.view().cursor.line;
+        assert!(line_after_back < line_after_G, "Ctrl-O should go back");
+        // Go forward with Ctrl-I
+        press_ctrl(&mut engine, 'i');
+        let line_after_fwd = engine.view().cursor.line;
+        assert_eq!(line_after_fwd, line_after_G, "Ctrl-I should go forward");
+    }
+
+    #[test]
+    fn test_jump_list_gg_triggers() {
+        let mut engine = Engine::new();
+        let content: String = (0..20).map(|i| format!("line {}\n", i)).collect();
+        engine.buffer_mut().insert(0, &content);
+        // Move to bottom
+        press_char(&mut engine, 'G');
+        let bottom_line = engine.view().cursor.line;
+        // gg should push jump and go to top
+        press_char(&mut engine, 'g');
+        press_char(&mut engine, 'g');
+        assert_eq!(engine.view().cursor.line, 0);
+        // Ctrl-O should go back to bottom
+        press_ctrl(&mut engine, 'o');
+        assert_eq!(engine.view().cursor.line, bottom_line);
+    }
+
+    #[test]
+    fn test_jump_list_truncates_forward_on_new_jump() {
+        let mut engine = Engine::new();
+        let content: String = (0..30).map(|i| format!("line {}\n", i)).collect();
+        engine.buffer_mut().insert(0, &content);
+        press_char(&mut engine, 'G'); // push line 0 -> last
+        press_ctrl(&mut engine, 'o'); // go back to line 0
+                                      // Now make a new jump (G again)
+        press_char(&mut engine, '1');
+        press_char(&mut engine, '5');
+        press_char(&mut engine, 'G'); // push line 0, go to 14
+                                      // Ctrl-I should report "already at newest"
+        press_ctrl(&mut engine, 'i');
+        assert_eq!(engine.view().cursor.line, 14);
+    }
+
+    #[test]
+    fn test_jump_list_paragraph_motion() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "a\nb\n\nc\nd\n");
+        press_char(&mut engine, '}'); // jumps to empty line (paragraph forward)
+        let after_brace = engine.view().cursor.line;
+        press_ctrl(&mut engine, 'o');
+        let after_back = engine.view().cursor.line;
+        assert!(after_back < after_brace);
+    }
+
+    // =======================================================================
+    // Tests: Indent / Dedent (>> / <<)
+    // =======================================================================
+
+    #[test]
+    fn test_indent_basic() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello\n");
+        press_char(&mut engine, '>');
+        press_char(&mut engine, '>');
+        let text = engine.buffer().to_string();
+        assert!(
+            text.starts_with("    hello"),
+            ">> should indent by 4 spaces"
+        );
+    }
+
+    #[test]
+    fn test_dedent_basic() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "    hello\n");
+        press_char(&mut engine, '<');
+        press_char(&mut engine, '<');
+        let text = engine.buffer().to_string();
+        assert!(text.starts_with("hello"), "<< should dedent by 4 spaces");
+    }
+
+    #[test]
+    fn test_indent_count() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "a\nb\nc\n");
+        press_char(&mut engine, '3');
+        press_char(&mut engine, '>');
+        press_char(&mut engine, '>');
+        let buf = engine.buffer().to_string();
+        let lines: Vec<&str> = buf.lines().collect();
+        assert!(lines[0].starts_with("    "));
+        assert!(lines[1].starts_with("    "));
+        assert!(lines[2].starts_with("    "));
+    }
+
+    #[test]
+    fn test_dedent_no_underflow() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "  hi\n");
+        press_char(&mut engine, '<');
+        press_char(&mut engine, '<');
+        let text = engine.buffer().to_string();
+        // Should remove 2 spaces (the 2 available), not go negative
+        assert!(text.starts_with("hi"));
+    }
+
+    #[test]
+    fn test_indent_dot_repeat() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello\n");
+        press_char(&mut engine, '>');
+        press_char(&mut engine, '>');
+        press_char(&mut engine, '.');
+        let text = engine.buffer().to_string();
+        assert!(
+            text.starts_with("        "),
+            "dot repeat of >> should double-indent"
+        );
+    }
+
+    #[test]
+    fn test_visual_indent() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "a\nb\nc\n");
+        // Enter visual line mode and select 2 lines
+        press_char(&mut engine, 'V');
+        press_char(&mut engine, 'j');
+        press_char(&mut engine, '>');
+        let buf = engine.buffer().to_string();
+        let lines: Vec<&str> = buf.lines().collect();
+        assert!(
+            lines[0].starts_with("    "),
+            "visual > should indent selected lines"
+        );
+        assert!(lines[1].starts_with("    "));
+        assert!(
+            !lines[2].starts_with("    "),
+            "visual > should not indent lines outside selection"
+        );
+    }
+
+    #[test]
+    fn test_visual_dedent() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "    a\n    b\nc\n");
+        press_char(&mut engine, 'V');
+        press_char(&mut engine, 'j');
+        press_char(&mut engine, '<');
+        let buf = engine.buffer().to_string();
+        let lines: Vec<&str> = buf.lines().collect();
+        assert!(
+            !lines[0].starts_with("    "),
+            "visual < should dedent selected lines"
+        );
+        assert!(!lines[1].starts_with("    "));
+    }
+
+    // ─── Tag text objects (it / at) ──────────────────────────────────────────
+
+    fn make_tag_engine(html: &str) -> Engine {
+        let mut engine = Engine::new();
+        engine.buffer_mut().content = ropey::Rope::from_str(html);
+        engine.update_syntax();
+        engine
+    }
+
+    #[test]
+    fn test_dit_basic() {
+        // <p>hello</p> — cursor inside "hello"; dit should leave <p></p>
+        let mut engine = make_tag_engine("<p>hello</p>");
+        engine.view_mut().cursor.col = 4; // on 'l' inside "hello"
+        press_char(&mut engine, 'd');
+        press_char(&mut engine, 'i');
+        press_char(&mut engine, 't');
+        let result: String = engine.buffer().content.chars().collect();
+        assert_eq!(result, "<p></p>", "dit should delete tag content");
+    }
+
+    #[test]
+    fn test_dat_basic() {
+        // <p>hello</p> — dat should delete the entire element
+        let mut engine = make_tag_engine("<p>hello</p>");
+        engine.view_mut().cursor.col = 4;
+        press_char(&mut engine, 'd');
+        press_char(&mut engine, 'a');
+        press_char(&mut engine, 't');
+        let result: String = engine.buffer().content.chars().collect();
+        assert!(
+            result.is_empty(),
+            "dat should delete entire element, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_yit_yanks_inner_tag() {
+        // yit should put the inner content into the default register
+        let mut engine = make_tag_engine("<span>world</span>");
+        engine.view_mut().cursor.col = 7; // inside "world"
+        press_char(&mut engine, 'y');
+        press_char(&mut engine, 'i');
+        press_char(&mut engine, 't');
+        let reg = engine
+            .get_register('"')
+            .map(|(s, _)| s.clone())
+            .unwrap_or_default();
+        assert_eq!(reg, "world", "yit should yank inner tag content");
+    }
+
+    #[test]
+    fn test_dit_multiline_tag() {
+        // Cursor on an inner content line; dit should delete all inner lines
+        let html = "<div>\nline1\nline2\n</div>";
+        let mut engine = make_tag_engine(html);
+        engine.view_mut().cursor.line = 1;
+        engine.view_mut().cursor.col = 0;
+        press_char(&mut engine, 'd');
+        press_char(&mut engine, 'i');
+        press_char(&mut engine, 't');
+        let result: String = engine.buffer().content.chars().collect();
+        assert!(!result.contains("line1"), "line1 should be deleted");
+        assert!(!result.contains("line2"), "line2 should be deleted");
+        assert!(result.contains("<div>"), "opening tag should survive");
+        assert!(result.contains("</div>"), "closing tag should survive");
+    }
+
+    #[test]
+    fn test_dit_nested_same_tag() {
+        // <div><div>inner</div>outer</div> — cursor inside inner div
+        // dit should delete only the inner "inner", not "outer"
+        let html = "<div><div>inner</div>outer</div>";
+        let mut engine = make_tag_engine(html);
+        engine.view_mut().cursor.col = 12; // inside "inner"
+        press_char(&mut engine, 'd');
+        press_char(&mut engine, 'i');
+        press_char(&mut engine, 't');
+        let result: String = engine.buffer().content.chars().collect();
+        assert!(!result.contains("inner"), "inner content should be deleted");
+        assert!(result.contains("outer"), "outer content should survive");
+        assert!(
+            result.contains("<div><div></div>"),
+            "outer structure should survive"
+        );
+    }
+
+    #[test]
+    fn test_dit_with_attributes() {
+        // Tag with attributes: cursor inside content
+        let html = "<div class=\"foo\">content</div>";
+        let mut engine = make_tag_engine(html);
+        engine.view_mut().cursor.col = 20; // inside "content"
+        press_char(&mut engine, 'd');
+        press_char(&mut engine, 'i');
+        press_char(&mut engine, 't');
+        let result: String = engine.buffer().content.chars().collect();
+        assert!(!result.contains("content"), "content should be deleted");
+        assert!(
+            result.contains("<div class=\"foo\">"),
+            "opening tag should be preserved"
+        );
+        assert!(result.contains("</div>"), "closing tag should be preserved");
+    }
+
+    #[test]
+    fn test_dit_no_enclosing_tag() {
+        // Plain text with no tags — should be a no-op
+        let text = "just plain text";
+        let mut engine = make_tag_engine(text);
+        engine.view_mut().cursor.col = 5;
+        press_char(&mut engine, 'd');
+        press_char(&mut engine, 'i');
+        press_char(&mut engine, 't');
+        let result: String = engine.buffer().content.chars().collect();
+        assert_eq!(result, text, "dit on plain text should be a no-op");
+    }
+
+    #[test]
+    fn test_vit_visual_selection() {
+        // vit should enter visual mode selecting the inner content "text"
+        // <span>text</span>  positions: <span>=0-5, inner_start=6, text=6-9, </span>=10-16
+        let html = "<span>text</span>";
+        let mut engine = make_tag_engine(html);
+        engine.view_mut().cursor.col = 7; // inside "text"
+        press_char(&mut engine, 'v');
+        press_char(&mut engine, 'i');
+        press_char(&mut engine, 't');
+        assert_eq!(engine.mode, Mode::Visual, "vit should enter visual mode");
+        let anchor = engine.visual_anchor.unwrap();
+        assert_eq!(
+            anchor.col, 6,
+            "selection should start at col 6 (after <span>)"
+        );
+        assert_eq!(
+            engine.view().cursor.col,
+            9,
+            "selection end should be at col 9 (last char of 'text')"
+        );
+    }
+
+    #[test]
+    fn test_dat_case_insensitive() {
+        // Mixed-case tag names: <DIV>text</div> — dat should delete the whole element
+        let html = "<DIV>text</div>";
+        let mut engine = make_tag_engine(html);
+        engine.view_mut().cursor.col = 6; // inside "text"
+        press_char(&mut engine, 'd');
+        press_char(&mut engine, 'a');
+        press_char(&mut engine, 't');
+        let result: String = engine.buffer().content.chars().collect();
+        assert!(
+            result.is_empty(),
+            "dat should handle case-insensitive tag names, got {:?}",
+            result
+        );
     }
 }

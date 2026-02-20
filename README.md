@@ -7,7 +7,7 @@ High-performance Vim+VSCode hybrid editor in Rust. Modal editing meets modern UX
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 526 tests, zero async runtime
+- **Clean architecture** — platform-agnostic core, 535 tests, zero async runtime
 
 ## Building
 
@@ -76,6 +76,7 @@ cargo fmt
 - `i(` / `a(`, `i[` / `a[`, `i{` / `a{` — inner/around brackets
 - `ip` / `ap` — inner/around paragraph (contiguous non-blank lines); `ap` includes trailing blank lines
 - `is` / `as` — inner/around sentence (`.`/`!`/`?`-terminated); `as` includes trailing whitespace
+- `it` / `at` — inner/around HTML/XML tag (`dit` deletes content, `dat` deletes element; case-insensitive, nesting-aware)
 
 **Count prefix** — prepend any number to multiply: `5j`, `3dd`, `10yy`, `2w`, etc.
 

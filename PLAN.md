@@ -1,5 +1,20 @@
 # VimCode Implementation Plan
 
+## Recently Completed (Session 51)
+
+### ✅ it/at Tag Text Objects
+- **`it` (inner tag)** — selects content between nearest enclosing HTML/XML open+close tag pair; works with all operators (`d`, `c`, `y`) and visual mode (`v`)
+- **`at` (around tag)** — selects the full element including opening and closing tags
+- **Algorithm:** backward scan for nearest `<tagname>` open tag, forward scan to matching `</tagname>` with nesting depth tracking; cursor must be within element extent
+- **Case-insensitive:** `<DIV>text</div>` treated as a valid pair
+- **Nested tags:** `<div><div>inner</div>outer</div>` — cursor in inner selects only inner content
+- **Attributes:** `<div class="foo">content</div>` — attribute values with `"` or `'` handled correctly
+- **Self-closing / comments skipped:** `<br/>`, `<!--...-->`, `<!DOCTYPE>`, `<?...?>` not treated as enclosing tags
+- File changes: `src/core/engine.rs` (`find_tag_text_object` method, `'t'` arm in `find_text_object_range`, 9 new tests)
+- Tests: 526 → 535 total
+
+---
+
 ## Recently Completed (Session 50)
 
 ### ✅ CPU Performance Fixes
@@ -244,7 +259,7 @@
 - [x] **VSCode-style replace across files** — replace all matches in project; skip dirty buffers; reload open buffers; regex capture group backreferences
 - [ ] **`:grep` / `:vimgrep`** — project-wide search, populate quickfix list *(lower priority)*
 - [ ] **Quickfix window** — `:copen`, `:cn`, `:cp` navigation *(lower priority)*
-- [ ] **`it`/`at` tag text objects** — inner/around HTML/XML tag
+- [x] **`it`/`at` tag text objects** — inner/around HTML/XML tag
 
 ### Big Features
 - [x] **LSP support** — completions, go-to-definition, hover, diagnostics (session 47 + 48 bug fixes)
