@@ -73,6 +73,9 @@ pub struct BufferState {
     pub git_diff: Vec<Option<crate::core::git::GitLineStatus>>,
     /// LSP language identifier (e.g. "rust", "python") for this buffer, if applicable.
     pub lsp_language_id: Option<String>,
+    /// Cached maximum line length (in chars) across the whole buffer.
+    /// Recomputed in `update_syntax` so renders don't need to scan every line.
+    pub max_col: usize,
 }
 
 impl std::fmt::Debug for BufferState {
@@ -104,6 +107,7 @@ impl BufferState {
             line_undo_state: None,
             git_diff: Vec::new(),
             lsp_language_id: None,
+            max_col: 0,
         };
         state.update_syntax();
         state
@@ -128,15 +132,18 @@ impl BufferState {
             line_undo_state: None,
             git_diff: Vec::new(),
             lsp_language_id,
+            max_col: 0,
         };
         state.update_syntax();
         state
     }
 
-    /// Re-parse the buffer and update syntax highlights.
+    /// Re-parse the buffer and update syntax highlights and max_col cache.
     pub fn update_syntax(&mut self) {
         let text = self.buffer.to_string();
         self.highlights = self.syntax.parse(&text);
+        // Cache max line length while we have the text; avoids O(N) scan every render.
+        self.max_col = text.lines().map(|l| l.chars().count()).max().unwrap_or(0);
     }
 
     /// Save the buffer to its associated file path.

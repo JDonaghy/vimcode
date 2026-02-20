@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::cursor::SetCursorStyle;
@@ -279,6 +279,11 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
     let mut last_layout: Option<render::ScreenLayout> = None;
 
     let mut needs_redraw = true;
+    // Track last draw time to cap frame rate at ~60 fps and keep CPU low.
+    let min_frame = Duration::from_millis(16);
+    let mut last_draw = Instant::now()
+        .checked_sub(min_frame)
+        .unwrap_or_else(Instant::now);
 
     loop {
         // Sync viewport dimensions so ensure_cursor_visible uses real terminal size.
@@ -299,7 +304,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
             engine.set_viewport_cols(content_cols.max(1) as usize);
         }
 
-        if needs_redraw {
+        if needs_redraw && last_draw.elapsed() >= min_frame {
             // Build layout before drawing so mouse handler can use it
             let screen = if let Ok(size) = terminal.size() {
                 let area = Rect {
@@ -357,13 +362,14 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
             };
             let _ = execute!(terminal.backend_mut(), cursor_style);
 
+            last_draw = Instant::now();
             needs_redraw = false;
         }
 
-        // Use shorter poll when a redraw is pending so it appears immediately,
-        // longer poll when idle to keep CPU near zero.
+        // When a redraw is pending but rate-limited, wait only until the next frame is due.
+        // When idle, poll slowly to keep CPU near zero.
         let poll_timeout = if needs_redraw {
-            Duration::from_millis(1)
+            min_frame.saturating_sub(last_draw.elapsed()).max(Duration::from_millis(1))
         } else {
             Duration::from_millis(50)
         };

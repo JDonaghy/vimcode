@@ -785,13 +785,9 @@ fn build_rendered_window(
         None
     };
 
-    // Maximum line length across the whole buffer (excluding trailing \n).
-    let max_col = buffer
-        .content
-        .lines()
-        .map(|l| l.chars().count().saturating_sub(1))
-        .max()
-        .unwrap_or(0);
+    // Maximum line length across the whole buffer.  Pre-computed in update_syntax()
+    // so we don't pay an O(N_lines) scan here on every render frame.
+    let max_col = buffer_state.max_col;
 
     // Build diagnostic gutter map (line → worst severity).
     let mut diagnostic_gutter = std::collections::HashMap::new();
