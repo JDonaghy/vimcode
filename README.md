@@ -398,6 +398,8 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `:ls` / `:bd` | List buffers / delete buffer |
 | `:s/pat/rep/[gi]` | Substitute on line |
 | `:%s/pat/rep/[gi]` | Substitute all lines |
+| `:norm[al][!] {keys}` | Execute normal-mode keys on current line |
+| `:[range]norm {keys}` | Execute on range (`%` all, `N,M` lines, `'<,'>` visual) |
 | `:set [option]` | Change / query setting |
 | `:Gdiff` / `:Gstatus` | Git diff / status |
 | `:Gadd` / `:Gadd!` | Stage file / stage all |

@@ -1,10 +1,10 @@
 # VimCode Project State
 
-**Last updated:** Feb 20, 2026 (Session 51)
+**Last updated:** Feb 20, 2026 (Session 52)
 
 ## Status
 
-**it/at Tag Text Objects:** `it`/`at` inner/around HTML/XML tag text objects — case-insensitive, nesting-aware, handles attributes — 535 tests passing
+**:norm command:** `:norm[al][!] {keys}` executes normal-mode keystrokes on a line range; supports `%`, `N,M`, `'<,'>` ranges; single-undo; `<CR>`/`<BS>`/`<C-x>` key notation — 544 tests passing
 
 ### Core Vim (Complete)
 - Seven modes (Normal/Insert/Visual/Visual Line/Visual Block/Command/Search)
@@ -164,8 +164,8 @@ vimcode/
 │       ├── settings.rs (~640 lines) — JSON persistence, auto-init, :set parsing
 │       ├── window.rs, tab.rs, view.rs, cursor.rs, mode.rs, syntax.rs
 │       ├── git.rs (~635 lines) — git subprocess integration (diff/blame/hunk parsing, branch detection, stage_hunk)
-│       └── Tests: 535 passing (9 find/replace, 14 macro, 8 session, 4 reverse search, 7 replace char, 5 undo line, 8 case change, 6 marks, 5 incremental search, 12 syntax/language, 6 history search, 11 fold tests, 12 git tests, 4 sidebar-preview tests, 5 auto-indent tests, 4 completion tests, 9 quit/ctrl-s tests, 1 session-restore test, 22 set-command tests, 10 hunk-staging tests, 9 text-object tests, 24 project-search tests, 5 engine-replace tests, 27 lsp-protocol tests, 10 lsp-engine tests, 31 vim-features tests, 9 tag-object tests)
-└── Total: ~21,050 lines
+│       └── Tests: 544 passing (9 find/replace, 14 macro, 8 session, 4 reverse search, 7 replace char, 5 undo line, 8 case change, 6 marks, 5 incremental search, 12 syntax/language, 6 history search, 11 fold tests, 12 git tests, 4 sidebar-preview tests, 5 auto-indent tests, 4 completion tests, 9 quit/ctrl-s tests, 1 session-restore test, 22 set-command tests, 10 hunk-staging tests, 9 text-object tests, 24 project-search tests, 5 engine-replace tests, 27 lsp-protocol tests, 10 lsp-engine tests, 31 vim-features tests, 9 tag-object tests, 9 norm-command tests)
+└── Total: ~21,150 lines
 ```
 
 ## Architecture
@@ -239,9 +239,11 @@ cargo fmt
 
 ### Big features
 - [x] **LSP support** — completions (Ctrl-Space), go-to-definition (gd), hover (K), diagnostics (]d/[d), auto-detect servers on PATH
-- [ ] **`:norm`** — execute normal command on a range of lines
+- [x] **`:norm`** — execute normal command on a range of lines
 
 ## Recent Work
+**Session 52:** `:norm` command — `:norm[al][!] {keys}` executes arbitrary normal-mode keystrokes on each line of a range. Ranges: no range (current line), `%` (all lines), `N,M` (1-based numeric, e.g. `1,5norm A;`), `'<,'>` (visual selection). Key notation: literal chars plus `<CR>`, `<BS>`, `<Del>`, `<Left>`/`<Right>`/`<Up>`/`<Down>`, `<C-x>` control keys. Implementation: local key-decode loop (does not touch `macro_playback_queue`, safe from within macros); cursor reset to col 0 + Normal mode for each line; undo entries from all lines merged into a single undoable step (by recording `undo_stack.len()` before execution and draining/merging new entries after). Fixed `trim()` ordering bug: norm check runs before `cmd.trim()` so trailing spaces in keys (e.g. `:%norm I// `) are preserved. `try_parse_norm()` + `norm_numeric_range_end()` free helpers. `UndoEntry` added to imports. (535→544 tests, 9 new.)
+
 **Session 51:** `it`/`at` tag text objects — inner/around HTML/XML tag pair. New `find_tag_text_object()` method in `engine.rs` dispatched from `find_text_object_range()` via `'t'` arm. Algorithm: scan backward from cursor for nearest enclosing `<tagname>` open tag; scan forward for matching `</tagname>` with nesting depth tracking; case-insensitive tag-name comparison (`<DIV>` matches `</div>`); handles tags with attributes (quoted values correctly skipped); self-closing tags (`<br/>`), comments (`<!--`), and processing instructions (`<?`) are not treated as enclosing elements. `it` returns `(inner_start, close_tag_start)`; `at` returns `(open_tag_start, close_tag_end)`. Works with all operators (`d`/`c`/`y`) and visual mode. (526→535 tests, 9 new.)
 
 **Session 50:** CPU performance fixes — two startup/runtime CPU issues resolved. (1) `max_col` (longest line length, used for h-scrollbar range) was computed by scanning all buffer lines on every render frame; now cached as `BufferState.max_col: usize`, initialized in both constructors, recomputed once inside `update_syntax()`; `render.rs` updated to read the cached value. (2) TUI event loop had no frame rate cap — rapid LSP events or search results could trigger uncapped rendering (100% CPU); added `min_frame = Duration::from_millis(16)` and `last_draw: Instant` so renders are gated to ~60fps. (526 tests, no change.)

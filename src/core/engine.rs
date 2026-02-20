@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
 use super::buffer::{Buffer, BufferId};
-use super::buffer_manager::{BufferManager, BufferState};
+use super::buffer_manager::{BufferManager, BufferState, UndoEntry};
 use super::git;
 use super::lsp::{self, Diagnostic, DiagnosticSeverity, LspEvent};
 use super::lsp_manager::LspManager;
@@ -4923,6 +4923,11 @@ impl Engine {
     }
 
     fn execute_command(&mut self, cmd: &str) -> EngineAction {
+        // Handle :norm[al][!] before trimming — keys may contain significant trailing whitespace
+        if let Some((range_str, keys)) = try_parse_norm(cmd.trim_start()) {
+            return self.execute_norm_command(range_str, keys);
+        }
+
         let cmd = cmd.trim();
 
         // Handle :LspInfo — show running LSP servers
@@ -5284,6 +5289,117 @@ impl Engine {
                 EngineAction::Error
             }
         }
+    }
+
+    fn execute_norm_command(&mut self, range_str: &str, keys: &str) -> EngineAction {
+        if keys.is_empty() {
+            self.message = "Usage: :norm[al][!] {keys}".to_string();
+            return EngineAction::Error;
+        }
+
+        let total_lines = self.buffer().len_lines();
+
+        // Resolve range to 0-based (start_line, end_line)
+        let (start_line, end_line) = if range_str == "%" {
+            (0usize, total_lines.saturating_sub(1))
+        } else if range_str == "'<,'>" {
+            match self.get_visual_selection_range() {
+                Some((start, end)) => (start.line, end.line),
+                None => {
+                    self.message = "No visual selection".to_string();
+                    return EngineAction::Error;
+                }
+            }
+        } else if !range_str.is_empty() {
+            // Numeric range "N,M" (1-based line numbers → 0-based)
+            let mut parts = range_str.splitn(2, ',');
+            let start: usize = parts.next().and_then(|s| s.parse().ok()).unwrap_or(1);
+            let end: usize = parts.next().and_then(|s| s.parse().ok()).unwrap_or(start);
+            let s = start.saturating_sub(1).min(total_lines.saturating_sub(1));
+            let e = end.saturating_sub(1).min(total_lines.saturating_sub(1));
+            (s, e)
+        } else {
+            let l = self.view().cursor.line;
+            (l, l)
+        };
+
+        let keys_chars: Vec<char> = keys.chars().collect();
+
+        // Save undo stack depth so we can merge all new entries into one step
+        let saved_undo_len = self.active_buffer_state_mut().undo_stack.len();
+
+        for line_num in start_line..=end_line {
+            if line_num >= self.buffer().len_lines() {
+                break;
+            }
+            // Position cursor at start of line in Normal mode
+            self.view_mut().cursor.line = line_num;
+            self.view_mut().cursor.col = 0;
+            self.mode = Mode::Normal;
+            self.pending_key = None;
+            self.count = None;
+
+            // Execute the key sequence using a local decode loop (does not
+            // disturb macro_playback_queue, safe even when called from a macro)
+            let mut pos = 0;
+            while pos < keys_chars.len() {
+                let (key_name, unicode, ctrl, consumed) = if keys_chars[pos] == '<' {
+                    // Collect up to closing '>'
+                    let mut seq = String::new();
+                    let mut found = false;
+                    for &c in &keys_chars[pos..] {
+                        seq.push(c);
+                        if c == '>' {
+                            found = true;
+                            break;
+                        }
+                    }
+                    let len = seq.len();
+                    if found && len > 1 {
+                        if let Some((kn, uc, ct)) = self.parse_key_sequence(&seq) {
+                            (kn, uc, ct, len)
+                        } else {
+                            ("".to_string(), Some('<'), false, 1)
+                        }
+                    } else {
+                        ("".to_string(), Some('<'), false, 1)
+                    }
+                } else if keys_chars[pos] == '\x1b' {
+                    ("Escape".to_string(), None, false, 1)
+                } else {
+                    ("".to_string(), Some(keys_chars[pos]), false, 1)
+                };
+
+                pos += consumed;
+                self.macro_recursion_depth += 1;
+                let _ = self.handle_key(&key_name, unicode, ctrl);
+                self.macro_recursion_depth -= 1;
+            }
+
+            // Ensure Normal mode after each line's key sequence
+            self.mode = Mode::Normal;
+            self.pending_key = None;
+        }
+
+        // Finalize the last open undo group (e.g. from trailing insert mode)
+        self.active_buffer_state_mut().finish_undo_group();
+
+        // Merge all undo entries created during :norm into a single undoable step
+        let state = self.active_buffer_state_mut();
+        if state.undo_stack.len() > saved_undo_len + 1 {
+            let new_entries: Vec<UndoEntry> = state.undo_stack.drain(saved_undo_len..).collect();
+            let cursor_before = new_entries[0].cursor_before;
+            let merged_ops: Vec<_> = new_entries.into_iter().flat_map(|e| e.ops).collect();
+            if !merged_ops.is_empty() {
+                state
+                    .undo_stack
+                    .push(UndoEntry { ops: merged_ops, cursor_before });
+            }
+        }
+
+        let n = end_line.saturating_sub(start_line) + 1;
+        self.message = format!("{} line{} affected", n, if n == 1 { "" } else { "s" });
+        EngineAction::None
     }
 
     fn execute_substitute_command(&mut self, cmd: &str) -> EngineAction {
@@ -8301,6 +8417,52 @@ impl Default for Engine {
 
 fn is_word_char(ch: char) -> bool {
     ch.is_alphanumeric() || ch == '_'
+}
+
+/// Try to parse a `:norm[al][!] {keys}` command with an optional range prefix.
+/// Returns `(range_str, keys)` if recognized, `None` otherwise.
+/// Supported ranges: `""` (current line), `"%"` (all), `"'<,'>"` (visual), `"N,M"` (numeric, 1-based).
+fn try_parse_norm(cmd: &str) -> Option<(&str, &str)> {
+    // Strip optional range prefix
+    let (range_str, rest) = if let Some(r) = cmd.strip_prefix("'<,'>") {
+        ("'<,'>", r)
+    } else if let Some(r) = cmd.strip_prefix('%') {
+        ("%", r)
+    } else if let Some(idx) = norm_numeric_range_end(cmd) {
+        (&cmd[..idx], &cmd[idx..])
+    } else {
+        ("", cmd)
+    };
+
+    // Strip "norm[al][!] " keyword — trailing space is required; keys must follow
+    let keys = rest
+        .strip_prefix("normal! ")
+        .or_else(|| rest.strip_prefix("normal "))
+        .or_else(|| rest.strip_prefix("norm! "))
+        .or_else(|| rest.strip_prefix("norm "))?;
+
+    Some((range_str, keys))
+}
+
+/// Returns the byte index right after a `"N,M"` numeric range prefix, or `None`.
+fn norm_numeric_range_end(cmd: &str) -> Option<usize> {
+    let bytes = cmd.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == 0 || i >= bytes.len() || bytes[i] != b',' {
+        return None;
+    }
+    i += 1; // skip ','
+    let j = i;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == j {
+        return None;
+    }
+    Some(i)
 }
 
 #[cfg(test)]
@@ -15967,5 +16129,109 @@ mod tests {
             "dat should handle case-insensitive tag names, got {:?}",
             result
         );
+    }
+
+    // ── :norm command ─────────────────────────────────────────────────────────
+
+    fn run_command(engine: &mut Engine, cmd: &str) {
+        press_char(engine, ':');
+        for ch in cmd.chars() {
+            press_char(engine, ch);
+        }
+        press_special(engine, "Return");
+    }
+
+    #[test]
+    fn test_norm_append_current_line() {
+        // :norm A; appends semicolon to the current line only
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello\nworld");
+        run_command(&mut engine, "norm A;");
+        let content: String = engine.buffer().content.chars().collect();
+        assert_eq!(content, "hello;\nworld");
+    }
+
+    #[test]
+    fn test_norm_all_lines_append() {
+        // :%norm A; appends semicolon to every line
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello\nworld");
+        run_command(&mut engine, "%norm A;");
+        let content: String = engine.buffer().content.chars().collect();
+        assert_eq!(content, "hello;\nworld;");
+    }
+
+    #[test]
+    fn test_norm_numeric_range() {
+        // :1,2norm A! appends ! to lines 1 and 2 (1-based), leaving line 3 alone
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "aaa\nbbb\nccc");
+        run_command(&mut engine, "1,2norm A!");
+        let content: String = engine.buffer().content.chars().collect();
+        assert_eq!(content, "aaa!\nbbb!\nccc");
+    }
+
+    #[test]
+    fn test_norm_prepend_comment() {
+        // :%norm I// prepends "// " to every line
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "foo\nbar");
+        run_command(&mut engine, "%norm I// ");
+        let content: String = engine.buffer().content.chars().collect();
+        assert_eq!(content, "// foo\n// bar");
+    }
+
+    #[test]
+    fn test_norm_normal_keyword() {
+        // :normal A; — "normal" is a synonym for "norm"
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello");
+        run_command(&mut engine, "normal A;");
+        let content: String = engine.buffer().content.chars().collect();
+        assert_eq!(content, "hello;");
+    }
+
+    #[test]
+    fn test_norm_bang_ignored() {
+        // :norm! A; — the ! is accepted and behaves the same as :norm A;
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello");
+        run_command(&mut engine, "norm! A;");
+        let content: String = engine.buffer().content.chars().collect();
+        assert_eq!(content, "hello;");
+    }
+
+    #[test]
+    fn test_norm_delete_first_word() {
+        // :%norm 0dw deletes the first word on every line
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "foo bar\nbaz qux");
+        run_command(&mut engine, "%norm 0dw");
+        let content: String = engine.buffer().content.chars().collect();
+        assert_eq!(content, "bar\nqux");
+    }
+
+    #[test]
+    fn test_norm_special_key_cr() {
+        // :norm A<CR>new appends a newline then "new" after "hello"
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello\nworld");
+        run_command(&mut engine, "norm A<CR>new");
+        let content: String = engine.buffer().content.chars().collect();
+        assert_eq!(content, "hello\nnew\nworld");
+    }
+
+    #[test]
+    fn test_norm_undo_single_group() {
+        // All changes from :%norm should be undone as one step
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "aaa\nbbb");
+        run_command(&mut engine, "%norm A;");
+        let after: String = engine.buffer().content.chars().collect();
+        assert_eq!(after, "aaa;\nbbb;");
+        // Undo should restore both lines at once
+        press_char(&mut engine, 'u');
+        let restored: String = engine.buffer().content.chars().collect();
+        assert_eq!(restored, "aaa\nbbb");
     }
 }

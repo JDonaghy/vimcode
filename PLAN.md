@@ -1,5 +1,19 @@
 # VimCode Implementation Plan
 
+## Recently Completed (Session 52)
+
+### ✅ :norm Command
+- **`:norm[al][!] {keys}`** — execute normal-mode keystrokes on a line range; `!` accepted and treated identically
+- **Ranges:** no range (current line), `%` (all lines), `'<,'>` (visual selection), `N,M` (1-based numeric)
+- **Key decoding:** local decode loop (does not touch `macro_playback_queue`); supports `<CR>`, `<BS>`, `<C-x>`, `<Left>`/`<Right>`/etc.
+- **Single undo:** all changes from `:norm` collapsed into one undo entry (undo with single `u`); achieved by recording undo-stack depth before execution and merging new entries after
+- **Trim fix:** norm check runs before `cmd.trim()` so trailing spaces in keys (e.g. `I// `) are preserved
+- **Free helpers:** `try_parse_norm()` and `norm_numeric_range_end()` (module-level)
+- File changes: `src/core/engine.rs` (`execute_norm_command` method, dispatch in `execute_command`, 2 free helpers, 9 new tests; `UndoEntry` added to imports)
+- Tests: 535 → 544 total
+
+---
+
 ## Recently Completed (Session 51)
 
 ### ✅ it/at Tag Text Objects
@@ -264,7 +278,7 @@
 ### Big Features
 - [x] **LSP support** — completions, go-to-definition, hover, diagnostics (session 47 + 48 bug fixes)
 - [x] **`gd` / `gD`** — go-to-definition via LSP
-- [ ] **`:norm`** — execute normal command on a range of lines
+- [x] **`:norm`** — execute normal command on a range of lines
 - [ ] **Fuzzy finder / Telescope-style** — live fuzzy file + buffer + symbol search in a floating panel *(consider after VSCode search)*
 - [ ] **Multiple cursors**
 - [ ] **Themes / plugin system**
