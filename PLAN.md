@@ -1,5 +1,22 @@
 # VimCode Implementation Plan
 
+## Recently Completed (Session 55)
+
+### ✅ Quickfix Window
+- **`:grep <pattern>`** / **`:vimgrep <pattern>`** — search project via `search_in_project()` (existing engine), populate `engine.quickfix_items: Vec<ProjectMatch>`; open panel automatically (`quickfix_open = true`, `quickfix_has_focus = false`); message shows match count
+- **`:copen`/`:cope`** — open panel with keyboard focus (errors if list empty); **`:cclose`/`:ccl`** — close panel, clear focus
+- **`:cn`/`:cnext`** / **`:cp`/`:cprev`/`:cN`** — next/prev item; clamps at boundaries; each calls `quickfix_jump()` which opens file + positions cursor
+- **`:cc N`** — jump to 1-based index N; uses `strip_prefix("cc ")` + `parse::<usize>()` + `filter(|&n| n > 0)`
+- **Key guard:** `handle_key()` checks `self.quickfix_has_focus` after `grep_open` guard; routes to `handle_quickfix_key()` — j/k/Ctrl-N/Ctrl-P navigate, Enter jumps + returns focus to editor, q/Escape closes panel
+- **Persistent bottom strip:** 6 rows (1 header + 5 results); not a floating modal
+- **GTK:** `qf_px = 6 * line_height` subtracted from editor `content_bounds` height when open; `draw_quickfix_panel()` draws header row (status_bg/fg) + result rows (fuzzy_selected_bg highlight on selected)
+- **TUI:** extra `Constraint::Length(qf_height)` slot (`qf_height = 6` or 0) in vertical layout; `render_quickfix_panel()` draws header + items; `quickfix_scroll_top: usize` local var with keep-selection-visible logic
+- **render.rs:** `QuickfixPanel { items, selected_idx, total_items, has_focus }`; `quickfix: Option<QuickfixPanel>` on `ScreenLayout`; populated in `build_screen_layout()` from `engine.quickfix_open && !engine.quickfix_items.is_empty()`
+- File changes: `src/core/engine.rs` (4 fields, new `impl Engine` block with 8 methods, commands, key guard, 8 tests), `src/render.rs` (QuickfixPanel struct, ScreenLayout field, population), `src/main.rs` (qf_px calc, draw_quickfix_panel fn + call), `src/tui_main.rs` (layout change, render_quickfix_panel fn, quickfix_scroll_top var + tracking, draw_frame param)
+- Tests: 563 → 571 total
+
+---
+
 ## Recently Completed (Session 54)
 
 ### ✅ Live Grep (Telescope-style)

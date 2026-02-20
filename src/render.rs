@@ -299,6 +299,21 @@ pub struct LiveGrepPanel {
     pub preview_lines: Vec<(usize, String, bool)>,
 }
 
+// ─── QuickfixPanel ────────────────────────────────────────────────────────────
+
+/// Data needed to render the quickfix bottom panel.
+#[derive(Debug, Clone)]
+pub struct QuickfixPanel {
+    /// Formatted display strings: "file.rs:12: line text"
+    pub items: Vec<String>,
+    /// Currently selected item index.
+    pub selected_idx: usize,
+    /// Total number of items in the list.
+    pub total_items: usize,
+    /// Whether the quickfix panel has keyboard focus.
+    pub has_focus: bool,
+}
+
 // ─── ScreenLayout ─────────────────────────────────────────────────────────────
 
 /// The complete, platform-agnostic description of one editor frame.
@@ -319,6 +334,8 @@ pub struct ScreenLayout {
     pub fuzzy: Option<FuzzyPanel>,
     /// Live grep modal, or `None` when inactive.
     pub live_grep: Option<LiveGrepPanel>,
+    /// Quickfix bottom panel, or `None` when closed.
+    pub quickfix: Option<QuickfixPanel>,
 }
 
 // ─── Theme ────────────────────────────────────────────────────────────────────
@@ -618,6 +635,24 @@ pub fn build_screen_layout(
         }
     });
 
+    let quickfix = (engine.quickfix_open && !engine.quickfix_items.is_empty()).then(|| {
+        let items = engine
+            .quickfix_items
+            .iter()
+            .map(|m| {
+                let f = m.file.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+                let snippet: String = m.line_text.trim().chars().take(80).collect();
+                format!("{}:{}: {}", f, m.line + 1, snippet)
+            })
+            .collect();
+        QuickfixPanel {
+            items,
+            selected_idx: engine.quickfix_selected,
+            total_items: engine.quickfix_items.len(),
+            has_focus: engine.quickfix_has_focus,
+        }
+    });
+
     ScreenLayout {
         tab_bar,
         windows,
@@ -629,6 +664,7 @@ pub fn build_screen_layout(
         hover,
         fuzzy,
         live_grep,
+        quickfix,
     }
 }
 

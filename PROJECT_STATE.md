@@ -1,10 +1,10 @@
 # VimCode Project State
 
-**Last updated:** Feb 20, 2026 (Session 54)
+**Last updated:** Feb 20, 2026 (Session 55)
 
 ## Status
 
-**Live grep:** Ctrl-G opens a Telescope-style two-column grep modal; live search (≥2 chars) with left pane results and right pane ±5-line preview; Ctrl-N/P/arrows navigate; Enter jumps to match; Escape closes — 563 tests passing
+**Quickfix window:** `:grep`/`:vimgrep` populates a persistent 6-row bottom panel; `:copen`/`:cclose`/`:cn`/`:cp`/`:cc N` commands; j/k/Enter/q navigate and jump when focused — 571 tests passing
 
 ### Core Vim (Complete)
 - Seven modes (Normal/Insert/Visual/Visual Line/Visual Block/Command/Search)
@@ -159,12 +159,12 @@
 ```
 vimcode/
 ├── src/
-│   ├── main.rs (~3700 lines) — GTK4/Relm4 UI, rendering, find dialog, sidebar resize, search/replace panel, fuzzy popup
-│   ├── tui_main.rs (~3100 lines) — ratatui/crossterm TUI backend, sidebar, mouse, search/replace panel, fuzzy popup
+│   ├── main.rs (~3870 lines) — GTK4/Relm4 UI, rendering, find dialog, sidebar resize, search/replace panel, fuzzy popup, quickfix panel
+│   ├── tui_main.rs (~3410 lines) — ratatui/crossterm TUI backend, sidebar, mouse, search/replace panel, fuzzy popup, quickfix panel
 │   ├── icons.rs (~30 lines) — Nerd Font file-type icons (shared by GTK + TUI)
-│   ├── render.rs (~1220 lines) — Platform-agnostic rendering abstraction (ScreenLayout, max_col)
-│   └── core/ (~16,700 lines) — Platform-agnostic logic
-│       ├── engine.rs (~16,500 lines) — Orchestrates everything, find/replace, macros, history, LSP, project search/replace, fuzzy finder
+│   ├── render.rs (~1240 lines) — Platform-agnostic rendering abstraction (ScreenLayout, max_col, QuickfixPanel)
+│   └── core/ (~17,100 lines) — Platform-agnostic logic
+│       ├── engine.rs (~17,100 lines) — Orchestrates everything, find/replace, macros, history, LSP, project search/replace, fuzzy finder, quickfix
 │       ├── lsp.rs (~1,200 lines) — LSP protocol transport + single-server client (request ID tracking)
 │       ├── lsp_manager.rs (~400 lines) — Multi-server coordinator with initialization guards
 │       ├── project_search.rs (~630 lines) — Regex/case/whole-word search + replace (ignore + regex crates)
@@ -199,7 +199,7 @@ vimcode/
 ```bash
 cargo build
 cargo run -- <file>
-cargo test -- --test-threads=1    # 526 tests
+cargo test -- --test-threads=1    # 571 tests
 cargo clippy -- -D warnings
 cargo fmt
 ```
@@ -243,8 +243,7 @@ cargo fmt
 - [x] **:set command** — runtime setting changes; write-through to settings.json; number/rnu/expandtab/tabstop/shiftwidth/autoindent/incsearch; query with `?`
 - [x] **`ip`/`ap` + `is`/`as` text objects** — paragraph and sentence text objects for all operators and visual mode
 - [x] **VSCode-style project search** — Ctrl-Shift-F panel; regex/case/whole-word toggles; `.gitignore`-aware (ignore crate); grouped results, click to open
-- [ ] **:grep / :vimgrep** — project-wide search, populate quickfix list *(lower priority)*
-- [ ] **Quickfix window** — `:copen`, `:cn`, `:cp` quickfix navigation *(lower priority)*
+- [x] **:grep / :vimgrep + Quickfix window** — `:grep`/`:vimgrep` populate the quickfix list; `:copen`/`:cclose`/`:cn`/`:cp`/`:cc N`; persistent 6-row bottom panel (GTK + TUI); j/k/Enter/q when focused
 - [x] **`it`/`at` tag text objects** — inner/around HTML/XML tag
 
 ### Big features
@@ -252,6 +251,10 @@ cargo fmt
 - [x] **`:norm`** — execute normal command on a range of lines
 
 ## Recent Work
+**Session 55:** Quickfix window — `:grep`/`:vimgrep <pattern>` searches project using the existing `search_in_project()` engine and populates `engine.quickfix_items: Vec<ProjectMatch>`; `:copen`/`:cclose` toggle the panel; `:cn`/`:cp`/`:cc N` navigate and jump (file opens in current tab, cursor positioned). The quickfix panel is a **persistent 6-row bottom strip** (not a floating modal) rendered below the editor area in both backends. TUI: extra `Constraint::Length(qf_height)` slot in the vertical layout + `render_quickfix_panel()`. GTK: editor `content_bounds` height reduced by `qf_px = 6 × line_height` when open + `draw_quickfix_panel()`. When open with focus (`quickfix_has_focus = true`), all keypresses are routed through `handle_quickfix_key()` — j/k/Ctrl-N/Ctrl-P navigate, Enter jumps and returns focus to editor, q/Escape closes. 8 new tests (563→571): copen guard, open/close, cn/cp clamp, cc 1-based jump, empty pattern, no matches, grep populates, vimgrep alias.
+
+**Session 54:** Telescope-style live grep modal — `src/core/engine.rs` (`grep_*` fields + `open_live_grep`, `handle_grep_key`, `grep_run_search`, `grep_load_preview`, `grep_confirm`), `render.rs` (`LiveGrepPanel`, populate), `tui_main.rs` (`render_live_grep_popup`, extra scroll var, `grep_scroll_top`), `main.rs` (`draw_live_grep_popup`). Ctrl-G opens; two-column split (35% results, 65% preview); ±5 context lines; `grep_open` guard intercepts all keys when modal open.
+
 **Session 52:** `:norm` command — `:norm[al][!] {keys}` executes arbitrary normal-mode keystrokes on each line of a range. Ranges: no range (current line), `%` (all lines), `N,M` (1-based numeric, e.g. `1,5norm A;`), `'<,'>` (visual selection). Key notation: literal chars plus `<CR>`, `<BS>`, `<Del>`, `<Left>`/`<Right>`/`<Up>`/`<Down>`, `<C-x>` control keys. Implementation: local key-decode loop (does not touch `macro_playback_queue`, safe from within macros); cursor reset to col 0 + Normal mode for each line; undo entries from all lines merged into a single undoable step (by recording `undo_stack.len()` before execution and draining/merging new entries after). Fixed `trim()` ordering bug: norm check runs before `cmd.trim()` so trailing spaces in keys (e.g. `:%norm I// `) are preserved. `try_parse_norm()` + `norm_numeric_range_end()` free helpers. `UndoEntry` added to imports. (535→544 tests, 9 new.)
 
 **Session 51:** `it`/`at` tag text objects — inner/around HTML/XML tag pair. New `find_tag_text_object()` method in `engine.rs` dispatched from `find_text_object_range()` via `'t'` arm. Algorithm: scan backward from cursor for nearest enclosing `<tagname>` open tag; scan forward for matching `</tagname>` with nesting depth tracking; case-insensitive tag-name comparison (`<DIV>` matches `</div>`); handles tags with attributes (quoted values correctly skipped); self-closing tags (`<br/>`), comments (`<!--`), and processing instructions (`<?`) are not treated as enclosing elements. `it` returns `(inner_start, close_tag_start)`; `at` returns `(open_tag_start, close_tag_end)`. Works with all operators (`d`/`c`/`y`) and visual mode. (526→535 tests, 9 new.)

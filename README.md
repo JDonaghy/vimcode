@@ -2,12 +2,16 @@
 
 High-performance Vim+VSCode hybrid editor in Rust. Modal editing meets modern UX, no GPU required.
 
+I started this project to see how far I could get with vibe-coding alone using Claude Code. I'm not going to read the code and I'm not going to review it either because I'd never have had the time for that. I wanted to find out what Claude could do if I just gave it the spec, or a description of a bug, and let it handle the rest. This is an experiment! The jury is still out. So far, however, I'm blown away. 
+
+There's a touch of irony here - using a cli tool to write the editor that I've wanted for years and may never use because editors might not matter anymore. It is not ready for daily use. I'm still not using it for anything. Neovim is my daily driver and that will likely be the case for a while yet. We shall see!
+
 ## Vision
 
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 563 tests, zero async runtime
+- **Clean architecture** — platform-agnostic core, 571 tests, zero async runtime
 
 ## Building
 
@@ -204,6 +208,19 @@ cargo fmt
 - Match line is highlighted in the preview pane
 - `Ctrl-N` / `↓` and `Ctrl-P` / `↑` — navigate results; preview updates as you move; `Enter` — open file at match line; `Escape` — close
 - Results capped at 200; uses `.gitignore`-aware search (same engine as project search panel)
+
+---
+
+### Quickfix Window
+
+- `:grep <pattern>` / `:vimgrep <pattern>` — search project and populate the quickfix list; opens panel automatically
+- `:copen` / `:cope` — open the quickfix panel with focus (shows all matches)
+- `:cclose` / `:ccl` — close the quickfix panel
+- `:cn` / `:cnext` — jump to next match (opens file, positions cursor)
+- `:cp` / `:cprev` / `:cN` — jump to previous match
+- `:cc N` — jump to Nth match (1-based)
+- The quickfix panel is a **persistent bottom strip** (6 rows) above the status bar — not a floating modal
+- When open with focus (`j`/`k`, `Ctrl-N`/`Ctrl-P` → navigate; `Enter` → jump and return focus to editor; `q`/`Escape` → close)
 
 ---
 
@@ -432,6 +449,10 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `:Gpush` | Push |
 | `:Gblame` | Blame (scroll-synced split) |
 | `:Ghs` / `:Ghunk` | Stage hunk under cursor |
+| `:grep <pat>` / `:vimgrep <pat>` | Search project, populate quickfix list |
+| `:copen` / `:ccl` | Open / close quickfix panel |
+| `:cn` / `:cp` | Next / previous quickfix item |
+| `:cc N` | Jump to Nth quickfix item (1-based) |
 | `:LspInfo` | Show running LSP servers |
 | `:LspRestart` | Restart server for current language |
 | `:LspStop` | Stop server for current language |

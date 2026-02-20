@@ -2096,12 +2096,20 @@ fn draw_editor(
     let tab_bar_height = line_height; // Always show tab bar
     let status_bar_height = line_height * 2.0; // status + command line
 
+    // Reserve space for the quickfix panel when open
+    const QUICKFIX_ROWS: usize = 6; // 1 header + 5 result rows
+    let qf_px = if engine.quickfix_open && !engine.quickfix_items.is_empty() {
+        QUICKFIX_ROWS as f64 * line_height
+    } else {
+        0.0
+    };
+
     // Calculate window rects for the current tab
     let content_bounds = WindowRect::new(
         0.0,
         tab_bar_height,
         width as f64,
-        height as f64 - tab_bar_height - status_bar_height - 10.0, // Reserve 10px for h-scrollbar
+        height as f64 - tab_bar_height - status_bar_height - qf_px - 10.0, // Reserve 10px for h-scrollbar
     );
     let window_rects = engine.calculate_window_rects(content_bounds);
 
@@ -2162,6 +2170,22 @@ fn draw_editor(
         height as f64,
         line_height,
     );
+
+    // 5f. Draw quickfix panel (persistent bottom strip above status bar)
+    if qf_px > 0.0 {
+        let qf_y = height as f64 - status_bar_height - qf_px;
+        draw_quickfix_panel(
+            cr,
+            &layout,
+            &screen,
+            &theme,
+            0.0,
+            qf_y,
+            width as f64,
+            qf_px,
+            line_height,
+        );
+    }
 
     // 6. Status Line (second-to-last line)
     let status_y = height as f64 - status_bar_height;
@@ -3072,6 +3096,62 @@ fn draw_live_grep_popup(
     }
 
     cr.restore().ok();
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_quickfix_panel(
+    cr: &Context,
+    layout: &pango::Layout,
+    screen: &render::ScreenLayout,
+    theme: &Theme,
+    editor_x: f64,
+    editor_y: f64,
+    editor_w: f64,
+    qf_px: f64,
+    line_height: f64,
+) {
+    let Some(qf) = &screen.quickfix else {
+        return;
+    };
+
+    // Header row
+    let (hr, hg, hb) = theme.status_bg.to_cairo();
+    cr.set_source_rgb(hr, hg, hb);
+    cr.rectangle(editor_x, editor_y, editor_w, line_height);
+    cr.fill().ok();
+    let focus_mark = if qf.has_focus { " [FOCUS]" } else { "" };
+    let title = format!("  QUICKFIX  ({} items){}", qf.total_items, focus_mark);
+    let (fr, fg, fb) = theme.status_fg.to_cairo();
+    cr.set_source_rgb(fr, fg, fb);
+    layout.set_attributes(None);
+    layout.set_text(&title);
+    cr.move_to(editor_x, editor_y);
+    pangocairo::show_layout(cr, layout);
+
+    // Result rows
+    let visible_rows = ((qf_px / line_height) as usize).saturating_sub(1);
+    let scroll_top = (qf.selected_idx + 1).saturating_sub(visible_rows);
+    for row_idx in 0..visible_rows {
+        let item_idx = scroll_top + row_idx;
+        if item_idx >= qf.items.len() {
+            break;
+        }
+        let ry = editor_y + line_height * (row_idx + 1) as f64;
+        let is_selected = item_idx == qf.selected_idx;
+        if is_selected {
+            let (sr, sg, sb) = theme.fuzzy_selected_bg.to_cairo();
+            cr.set_source_rgb(sr, sg, sb);
+            cr.rectangle(editor_x, ry, editor_w, line_height);
+            cr.fill().ok();
+        }
+        let prefix = if is_selected { "▶ " } else { "  " };
+        let text = format!("{}{}", prefix, qf.items[item_idx]);
+        let (ir, ig, ib) = theme.fuzzy_fg.to_cairo();
+        cr.set_source_rgb(ir, ig, ib);
+        layout.set_text(&text);
+        cr.move_to(editor_x, ry);
+        pangocairo::show_layout(cr, layout);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

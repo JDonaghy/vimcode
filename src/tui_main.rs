@@ -273,6 +273,8 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
     let mut fuzzy_scroll_top: usize = 0;
     // Scroll offset for the live grep results list
     let mut grep_scroll_top: usize = 0;
+    // Scroll offset for the quickfix panel
+    let mut quickfix_scroll_top: usize = 0;
     // True while user is dragging the sidebar resize handle
     let mut dragging_sidebar = false;
     // Non-None while user is dragging a scrollbar thumb
@@ -350,6 +352,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                             sidebar_width,
                             fuzzy_scroll_top,
                             grep_scroll_top,
+                            quickfix_scroll_top,
                         );
                     }
                 })
@@ -766,6 +769,17 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                         }
                     } else {
                         grep_scroll_top = 0;
+                    }
+                    // Adjust quickfix scroll to keep selected item visible
+                    if engine.quickfix_open {
+                        const QF_VISIBLE: usize = 5; // 6 rows - 1 header
+                        if engine.quickfix_selected < quickfix_scroll_top {
+                            quickfix_scroll_top = engine.quickfix_selected;
+                        } else if engine.quickfix_selected >= quickfix_scroll_top + QF_VISIBLE {
+                            quickfix_scroll_top = engine.quickfix_selected + 1 - QF_VISIBLE;
+                        }
+                    } else {
+                        quickfix_scroll_top = 0;
                     }
                 }
             }
@@ -1241,21 +1255,25 @@ fn draw_frame(
     sidebar_width: u16,
     fuzzy_scroll_top: usize,
     grep_scroll_top: usize,
+    quickfix_scroll_top: usize,
 ) {
     let area = frame.size();
 
-    // ── Global vertical split: [main_area] / [status(1)] / [cmd(1)] ──────────
+    // ── Global vertical split: [main_area] / [quickfix?] / [status(1)] / [cmd(1)] ──
+    let qf_height: u16 = if screen.quickfix.is_some() { 6 } else { 0 };
     let v_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(0),
+            Constraint::Length(qf_height),
             Constraint::Length(1),
             Constraint::Length(1),
         ])
         .split(area);
     let main_area = v_chunks[0];
-    let status_area = v_chunks[1];
-    let cmd_area = v_chunks[2];
+    let quickfix_area = v_chunks[1];
+    let status_area = v_chunks[2];
+    let cmd_area = v_chunks[3];
 
     // ── Horizontal split of main_area: [activity_bar] [sidebar?] [editor_col] ─
     let sidebar_constraint = if sidebar.visible {
@@ -1356,6 +1374,17 @@ fn draw_frame(
     // ── Live grep modal (rendered on top of everything) ───────────────────────
     if let Some(ref grep) = screen.live_grep {
         render_live_grep_popup(frame, grep, area, theme, grep_scroll_top);
+    }
+
+    // ── Quickfix panel (persistent bottom strip) ──────────────────────────────
+    if let Some(ref qf) = screen.quickfix {
+        render_quickfix_panel(
+            frame.buffer_mut(),
+            quickfix_area,
+            qf,
+            quickfix_scroll_top,
+            theme,
+        );
     }
 
     // ── Status / command ──────────────────────────────────────────────────────
@@ -3318,6 +3347,58 @@ fn save_session(engine: &mut Engine) {
     }
     engine.collect_session_open_files();
     let _ = engine.session.save();
+}
+
+// ─── Quickfix panel ───────────────────────────────────────────────────────────
+
+fn render_quickfix_panel(
+    buf: &mut ratatui::buffer::Buffer,
+    area: Rect,
+    qf: &render::QuickfixPanel,
+    scroll_top: usize,
+    theme: &Theme,
+) {
+    if area.height == 0 {
+        return;
+    }
+    let hdr_fg = rc(theme.status_fg);
+    let hdr_bg = rc(theme.status_bg);
+    let item_fg = rc(theme.fuzzy_fg);
+    let sel_bg = rc(theme.fuzzy_selected_bg);
+    let row_bg = rc(theme.background);
+
+    // Header row
+    let focus_mark = if qf.has_focus { " [FOCUS]" } else { "" };
+    let header = format!(" QUICKFIX ({} items){}", qf.total_items, focus_mark);
+    for x in area.x..area.x + area.width {
+        set_cell(buf, x, area.y, ' ', hdr_fg, hdr_bg);
+    }
+    for (i, ch) in header.chars().enumerate().take(area.width as usize) {
+        set_cell(buf, area.x + i as u16, area.y, ch, hdr_fg, hdr_bg);
+    }
+
+    // Result rows
+    let visible_rows = area.height.saturating_sub(1) as usize;
+    for row_idx in 0..visible_rows {
+        let item_idx = scroll_top + row_idx;
+        let ry = area.y + 1 + row_idx as u16;
+        if ry >= area.y + area.height {
+            break;
+        }
+        let is_selected = item_idx == qf.selected_idx;
+        let bg = if is_selected { sel_bg } else { row_bg };
+        // Clear the row
+        for x in area.x..area.x + area.width {
+            set_cell(buf, x, ry, ' ', item_fg, bg);
+        }
+        if item_idx < qf.items.len() {
+            let prefix = if is_selected { "▶ " } else { "  " };
+            let text = format!("{}{}", prefix, qf.items[item_idx]);
+            for (i, ch) in text.chars().enumerate().take(area.width as usize) {
+                set_cell(buf, area.x + i as u16, ry, ch, item_fg, bg);
+            }
+        }
+    }
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────

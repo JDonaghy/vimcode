@@ -314,6 +314,16 @@ pub struct Engine {
     pub grep_selected: usize,
     /// Context lines for the preview pane: (1-based line number, text, is_match_line).
     pub grep_preview_lines: Vec<(usize, String, bool)>,
+
+    // --- Quickfix state ---
+    /// Quickfix list populated by :grep / :vimgrep.
+    pub quickfix_items: Vec<ProjectMatch>,
+    /// Currently selected quickfix item (0-based).
+    pub quickfix_selected: usize,
+    /// Whether the quickfix panel is visible.
+    pub quickfix_open: bool,
+    /// Whether the quickfix panel has keyboard focus.
+    pub quickfix_has_focus: bool,
 }
 
 impl Engine {
@@ -414,6 +424,10 @@ impl Engine {
             grep_results: Vec::new(),
             grep_selected: 0,
             grep_preview_lines: Vec::new(),
+            quickfix_items: Vec::new(),
+            quickfix_selected: 0,
+            quickfix_open: false,
+            quickfix_has_focus: false,
         }
     }
 
@@ -2107,6 +2121,11 @@ impl Engine {
         // Live grep intercepts all keys when open.
         if self.grep_open {
             return self.handle_grep_key(key_name, unicode, ctrl);
+        }
+
+        // Quickfix panel intercepts all keys when it has focus.
+        if self.quickfix_has_focus {
+            return self.handle_quickfix_key(key_name, ctrl);
         }
 
         // Ctrl-S: save in any mode (does not change mode).
@@ -5260,6 +5279,36 @@ impl Engine {
         // Handle :b# (alternate buffer)
         if cmd == "b#" {
             self.alternate_buffer();
+            return EngineAction::None;
+        }
+
+        // Quickfix commands
+        if cmd == "copen" || cmd == "cope" {
+            return self.open_quickfix();
+        }
+        if cmd == "cclose" || cmd == "ccl" {
+            return self.close_quickfix();
+        }
+        if cmd == "cn" || cmd == "cnext" {
+            return self.quickfix_next();
+        }
+        if cmd == "cp" || cmd == "cprev" || cmd == "cN" {
+            return self.quickfix_prev();
+        }
+        if let Some(n_str) = cmd.strip_prefix("cc ") {
+            if let Some(n) = n_str.trim().parse::<usize>().ok().filter(|&n| n > 0) {
+                return self.quickfix_go(n - 1);
+            }
+        }
+        if let Some(pat) = cmd
+            .strip_prefix("grep ")
+            .or_else(|| cmd.strip_prefix("vimgrep "))
+        {
+            let cwd = self.cwd.clone();
+            return self.run_quickfix_grep(pat.trim(), cwd);
+        }
+        if cmd == "grep" || cmd == "vimgrep" {
+            self.message = "Usage: :grep <pattern>".to_string();
             return EngineAction::None;
         }
 
@@ -8818,6 +8867,112 @@ impl Engine {
             let is_match = (start + i) == match_line;
             self.grep_preview_lines
                 .push((lineno, text.to_string(), is_match));
+        }
+    }
+}
+
+// ─── Quickfix ─────────────────────────────────────────────────────────────────
+
+impl Engine {
+    /// Open the quickfix panel and give it focus.
+    pub fn open_quickfix(&mut self) -> EngineAction {
+        if self.quickfix_items.is_empty() {
+            self.message = "Quickfix list is empty".to_string();
+            return EngineAction::None;
+        }
+        self.quickfix_open = true;
+        self.quickfix_has_focus = true;
+        EngineAction::None
+    }
+
+    /// Close the quickfix panel.
+    pub fn close_quickfix(&mut self) -> EngineAction {
+        self.quickfix_open = false;
+        self.quickfix_has_focus = false;
+        EngineAction::None
+    }
+
+    /// Move to the next quickfix item and jump to it.
+    pub fn quickfix_next(&mut self) -> EngineAction {
+        let max = self.quickfix_items.len().saturating_sub(1);
+        self.quickfix_selected = (self.quickfix_selected + 1).min(max);
+        self.quickfix_jump()
+    }
+
+    /// Move to the previous quickfix item and jump to it.
+    pub fn quickfix_prev(&mut self) -> EngineAction {
+        self.quickfix_selected = self.quickfix_selected.saturating_sub(1);
+        self.quickfix_jump()
+    }
+
+    /// Jump to a specific quickfix item by index (0-based).
+    pub fn quickfix_go(&mut self, idx: usize) -> EngineAction {
+        self.quickfix_selected = idx.min(self.quickfix_items.len().saturating_sub(1));
+        self.quickfix_jump()
+    }
+
+    /// Jump to the currently selected quickfix item; return focus to the editor.
+    pub fn quickfix_jump(&mut self) -> EngineAction {
+        if let Some(m) = self.quickfix_items.get(self.quickfix_selected).cloned() {
+            self.quickfix_has_focus = false;
+            self.open_file_in_tab(&m.file.clone());
+            let win_id = self.active_window_id();
+            self.set_cursor_for_window(win_id, m.line, m.col);
+            self.ensure_cursor_visible();
+        }
+        EngineAction::None
+    }
+
+    /// Run a grep search and populate the quickfix list.
+    pub fn run_quickfix_grep(&mut self, pattern: &str, cwd: PathBuf) -> EngineAction {
+        if pattern.is_empty() {
+            self.message = "Usage: :grep <pattern>".to_string();
+            return EngineAction::None;
+        }
+        let opts = SearchOptions::default();
+        match project_search::search_in_project(&cwd, pattern, &opts) {
+            Ok(results) => {
+                let n = results.len();
+                self.quickfix_items = results;
+                self.quickfix_selected = 0;
+                self.quickfix_open = true;
+                self.quickfix_has_focus = false;
+                self.message = format!("{} match{}", n, if n == 1 { "" } else { "es" });
+            }
+            Err(e) => {
+                self.message = format!("grep error: {}", e.0);
+            }
+        }
+        EngineAction::None
+    }
+
+    /// Route a key press when the quickfix panel has focus.
+    pub fn handle_quickfix_key(&mut self, key_name: &str, ctrl: bool) -> EngineAction {
+        match key_name {
+            "Escape" | "q" => self.close_quickfix(),
+            "Return" => {
+                self.quickfix_jump();
+                EngineAction::None
+            }
+            "Down" | "j" => {
+                self.quickfix_selected =
+                    (self.quickfix_selected + 1).min(self.quickfix_items.len().saturating_sub(1));
+                EngineAction::None
+            }
+            "Up" | "k" => {
+                self.quickfix_selected = self.quickfix_selected.saturating_sub(1);
+                EngineAction::None
+            }
+            "n" if ctrl => {
+                self.quickfix_selected =
+                    (self.quickfix_selected + 1).min(self.quickfix_items.len().saturating_sub(1));
+                EngineAction::None
+            }
+            "p" if ctrl => {
+                self.quickfix_selected = self.quickfix_selected.saturating_sub(1);
+                EngineAction::None
+            }
+            _ => EngineAction::None,
         }
     }
 }
@@ -16990,5 +17145,153 @@ mod tests {
         press_ctrl(&mut engine, 'g');
 
         assert!(engine.grep_open);
+    }
+
+    // ─── Quickfix tests ──────────────────────────────────────────────────────
+
+    fn make_qf_item(path: &str) -> ProjectMatch {
+        ProjectMatch {
+            file: std::path::PathBuf::from(path),
+            line: 0,
+            col: 0,
+            line_text: "test line".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_copen_requires_items() {
+        let mut engine = Engine::new();
+        engine.execute_command("copen");
+        assert!(
+            !engine.quickfix_open,
+            "copen should not open with empty list"
+        );
+        assert!(engine.message.contains("empty"));
+    }
+
+    #[test]
+    fn test_copen_cclose() {
+        let mut engine = Engine::new();
+        engine.quickfix_items = vec![make_qf_item("test.rs")];
+        engine.execute_command("copen");
+        assert!(engine.quickfix_open);
+        assert!(engine.quickfix_has_focus);
+        engine.execute_command("cclose");
+        assert!(!engine.quickfix_open);
+        assert!(!engine.quickfix_has_focus);
+    }
+
+    #[test]
+    fn test_cn_cp_navigation() {
+        let mut engine = Engine::new();
+        engine.quickfix_items = vec![
+            make_qf_item("a.rs"),
+            make_qf_item("b.rs"),
+            make_qf_item("c.rs"),
+        ];
+        engine.quickfix_selected = 0;
+        engine.quickfix_open = true;
+
+        // cn moves forward
+        engine.execute_command("cn");
+        assert_eq!(engine.quickfix_selected, 1);
+        engine.execute_command("cn");
+        assert_eq!(engine.quickfix_selected, 2);
+
+        // cn at end clamps
+        engine.execute_command("cn");
+        assert_eq!(engine.quickfix_selected, 2, "cn should clamp at last item");
+
+        // cp moves back
+        engine.execute_command("cp");
+        assert_eq!(engine.quickfix_selected, 1);
+
+        // cp at start clamps
+        engine.execute_command("cp");
+        engine.execute_command("cp");
+        assert_eq!(engine.quickfix_selected, 0, "cp should clamp at first item");
+    }
+
+    #[test]
+    fn test_cc_jump() {
+        let mut engine = Engine::new();
+        engine.quickfix_items = vec![
+            make_qf_item("a.rs"),
+            make_qf_item("b.rs"),
+            make_qf_item("c.rs"),
+        ];
+        engine.quickfix_open = true;
+
+        engine.execute_command("cc 2");
+        assert_eq!(
+            engine.quickfix_selected, 1,
+            ":cc 2 should select index 1 (1-based)"
+        );
+    }
+
+    #[test]
+    fn test_grep_empty_pattern() {
+        let mut engine = Engine::new();
+        engine.execute_command("grep ");
+        assert!(engine.quickfix_items.is_empty());
+        assert!(engine.message.contains("Usage"));
+    }
+
+    #[test]
+    fn test_grep_no_matches() {
+        let dir = std::env::temp_dir().join("vimcode_qf_no_match");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut engine = Engine::new();
+        engine.cwd = dir.clone();
+        engine.execute_command("grep xyzzy_no_match_anywhere_qf_test");
+        assert_eq!(engine.quickfix_items.len(), 0);
+        assert!(engine.message.contains("0 match"));
+    }
+
+    #[test]
+    fn test_grep_populates_quickfix() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("vimcode_qf_grep_pop");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("qftest.rs");
+        let mut f = std::fs::File::create(&file_path).unwrap();
+        writeln!(f, "fn qfmain_unique_marker() {{}}").unwrap();
+        drop(f);
+
+        let mut engine = Engine::new();
+        engine.cwd = dir.clone();
+        engine.execute_command("grep qfmain_unique_marker");
+
+        assert!(
+            !engine.quickfix_items.is_empty(),
+            "grep should find matches"
+        );
+        assert!(engine.quickfix_open);
+        assert!(
+            !engine.quickfix_has_focus,
+            "focus should return to editor after :grep"
+        );
+        assert!(engine.message.contains("match"));
+    }
+
+    #[test]
+    fn test_vimgrep_alias() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("vimcode_qf_vimgrep");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("vgtest.rs");
+        let mut f = std::fs::File::create(&file_path).unwrap();
+        writeln!(f, "fn vghello_unique_marker() {{}}").unwrap();
+        drop(f);
+
+        let mut engine = Engine::new();
+        engine.cwd = dir.clone();
+        engine.execute_command("vimgrep vghello_unique_marker");
+
+        assert!(
+            !engine.quickfix_items.is_empty(),
+            "vimgrep should work same as grep"
+        );
+        assert!(engine.quickfix_open);
     }
 }
