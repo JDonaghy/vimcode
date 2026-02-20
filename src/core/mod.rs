@@ -3,6 +3,8 @@ pub mod buffer_manager;
 pub mod cursor;
 pub mod engine;
 pub mod git;
+pub mod lsp;
+pub mod lsp_manager;
 pub mod mode;
 pub mod project_search;
 pub mod session;

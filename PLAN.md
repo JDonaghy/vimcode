@@ -1,5 +1,42 @@
 # VimCode Implementation Plan
 
+## Recently Completed (Session 48)
+
+### ✅ LSP Bug Fixes + TUI Performance Optimizations
+- **Protocol compliance:** `notify_did_open` returns `Result<(), String>` with descriptive errors; initialization guards on all notification methods prevent premature `didOpen`/`didChange`/`didSave`/`didClose`
+- **Deterministic response routing:** `pending_requests: Arc<Mutex<HashMap<i64, String>>>` maps request ID → method name; reader thread uses this for correct routing instead of fragile content-based guessing
+- **Server request handling:** reader thread now responds to server-initiated requests (e.g. `window/workDoneProgress/create`) with `{"result": null}`; error responses generate proper events with empty data
+- **Diagnostic flood optimization:** events capped at 50 per `poll_lsp()` call; pre-computed visible buffer paths (computed once, not per-event); only trigger redraw for diagnostics affecting visible buffers
+- **Path mismatch fix:** LSP diagnostics keyed by absolute URI-derived paths; buffer `file_path` may be relative; added `canonicalize()` at lookup points in `render.rs`, `diagnostic_counts()`, `jump_next_diagnostic()`, `jump_prev_diagnostic()`
+- **TUI on-demand rendering:** `needs_redraw` flag eliminates unconditional 50 FPS rendering; adaptive poll timeout (1ms when redraw pending, 50ms when idle)
+- **Idle-only background work:** `lsp_flush_changes()`, `poll_lsp()`, `poll_project_search()`, `poll_project_replace()` moved to only run when no input is pending — prevents blocking pipe writes during typing
+- **stderr fix:** reverted `Stdio::inherit()` to `Stdio::null()` for child process stderr (rust-analyzer stderr was corrupting TUI display)
+- File changes: `lsp.rs` (750→1186 lines), `lsp_manager.rs` (340→394 lines), `engine.rs` (+400 lines), `tui_main.rs` (+80 lines), `render.rs` (+100 lines)
+- Tests: no change (495 total)
+
+---
+
+## Recently Completed (Session 47)
+
+### ✅ LSP Support (Language Server Protocol)
+- **New files:** `src/core/lsp.rs` (~750 lines), `src/core/lsp_manager.rs` (~340 lines)
+- **Dependency:** `lsp-types = "0.97"` (protocol type definitions, no runtime)
+- **Architecture:** lightweight custom LSP client using `std::thread` + `std::sync::mpsc` (same pattern as project search); no tokio/async runtime
+- **Built-in server registry:** rust-analyzer, pyright-langserver, typescript-language-server, gopls, clangd — auto-detected on `PATH`
+- **Protocol transport:** `LspServer::start()` spawns subprocess, reader thread parses JSON-RPC frames, dispatches `LspEvent`s via channel; full document sync
+- **Multi-server coordinator:** `LspManager` routes notifications/requests by language ID, lazy-starts servers on first use
+- **Engine integration:** 4 hook points (open/change/save/close); `poll_lsp()` processes diagnostics/completions/definition/hover events; debounced `didChange` via dirty buffer tracking
+- **Key bindings:** `]d`/`[d` (diagnostic nav), `gd` (go-to-definition), `K` (hover), `Ctrl-Space` (LSP completions)
+- **Commands:** `:LspInfo`, `:LspRestart`, `:LspStop`
+- **Settings:** `lsp_enabled` bool + `lsp_servers` array; `:set lsp`/`:set nolsp` toggle
+- **Render layer:** `DiagnosticMark` + `HoverPopup` types; `diagnostic_gutter` map; diagnostic/hover theme colours
+- **GTK backend:** wavy underlines via Cairo curves, colored gutter dots, hover popup, LSP poll in SearchPollTick, shutdown on quit
+- **TUI backend:** colored underlines + E/W/I/H gutter chars, hover popup, LSP poll in event loop, shutdown on quit
+- **Status bar:** `E:N W:N` diagnostic counts in right section
+- Tests: 37 new (27 lsp-protocol + 10 lsp-engine); 458→495 total
+
+---
+
 ## Recently Completed (Session 46)
 
 ### ✅ TUI Scrollbar Drag Fix
@@ -186,8 +223,8 @@
 - [ ] **`it`/`at` tag text objects** — inner/around HTML/XML tag
 
 ### Big Features
-- [ ] **LSP support** — completions, go-to-definition, hover, diagnostics
-- [ ] **`gd` / `gD`** — go-to-definition (ctags/ripgrep stub before LSP)
+- [x] **LSP support** — completions, go-to-definition, hover, diagnostics (session 47 + 48 bug fixes)
+- [x] **`gd` / `gD`** — go-to-definition via LSP
 - [ ] **`:norm`** — execute normal command on a range of lines
 - [ ] **Fuzzy finder / Telescope-style** — live fuzzy file + buffer + symbol search in a floating panel *(consider after VSCode search)*
 - [ ] **Multiple cursors**

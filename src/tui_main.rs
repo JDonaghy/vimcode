@@ -29,6 +29,7 @@ use ratatui::style::{Color as RColor, Modifier};
 use ratatui::Terminal;
 
 use crate::core::engine::EngineAction;
+use crate::core::lsp::DiagnosticSeverity;
 use crate::core::{Engine, GitLineStatus, Mode, OpenMode, WindowRect};
 use crate::render::{
     self, build_screen_layout, Color, CompletionMenu, CursorShape, RenderedLine, RenderedWindow,
@@ -277,6 +278,8 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
     // Cache of the last rendered layout for mouse hit-testing
     let mut last_layout: Option<render::ScreenLayout> = None;
 
+    let mut needs_redraw = true;
+
     loop {
         // Sync viewport dimensions so ensure_cursor_visible uses real terminal size.
         // Layout: [activity_bar(3)] [sidebar(sw+1sep, if visible)] [editor_col]
@@ -296,72 +299,91 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
             engine.set_viewport_cols(content_cols.max(1) as usize);
         }
 
-        // Build layout before drawing so mouse handler can use it
-        let screen = if let Ok(size) = terminal.size() {
-            let area = Rect {
-                x: 0,
-                y: 0,
-                width: size.width,
-                height: size.height,
+        if needs_redraw {
+            // Build layout before drawing so mouse handler can use it
+            let screen = if let Ok(size) = terminal.size() {
+                let area = Rect {
+                    x: 0,
+                    y: 0,
+                    width: size.width,
+                    height: size.height,
+                };
+                let s = build_screen_for_tui(engine, &theme, area, &sidebar, sidebar_width);
+                last_layout = Some(s);
+                last_layout.as_ref()
+            } else {
+                last_layout.as_ref()
             };
-            let s = build_screen_for_tui(engine, &theme, area, &sidebar, sidebar_width);
-            last_layout = Some(s);
-            last_layout.as_ref()
-        } else {
-            last_layout.as_ref()
-        };
 
-        // Update per-window viewport dimensions so ensure_cursor_visible uses
-        // the actual pane width (critical for horizontal scrolling in vsplit).
-        if let Some(ref layout) = last_layout {
-            for rw in &layout.windows {
-                let gutter = rw.gutter_char_width as u16;
-                // -1 for the vertical scrollbar column
-                let pane_cols = (rw.rect.width as u16).saturating_sub(gutter + 1).max(1) as usize;
-                let pane_rows = (rw.rect.height as u16).max(1) as usize;
-                engine.set_viewport_for_window(rw.window_id, pane_rows, pane_cols);
-            }
-        }
-
-        terminal
-            .draw(|frame| {
-                if let Some(s) = &screen {
-                    draw_frame(
-                        frame,
-                        s,
-                        &theme,
-                        &mut sidebar,
-                        engine,
-                        &sidebar_prompt,
-                        sidebar_width,
-                    );
+            // Update per-window viewport dimensions so ensure_cursor_visible uses
+            // the actual pane width (critical for horizontal scrolling in vsplit).
+            if let Some(ref layout) = last_layout {
+                for rw in &layout.windows {
+                    let gutter = rw.gutter_char_width as u16;
+                    // -1 for the vertical scrollbar column
+                    let pane_cols =
+                        (rw.rect.width as u16).saturating_sub(gutter + 1).max(1) as usize;
+                    let pane_rows = (rw.rect.height as u16).max(1) as usize;
+                    engine.set_viewport_for_window(rw.window_id, pane_rows, pane_cols);
                 }
-            })
-            .expect("draw frame");
-
-        // Set terminal cursor shape to match mode / pending key.
-        let cursor_style = if !sidebar.has_focus && engine.pending_key == Some('r') {
-            SetCursorStyle::SteadyUnderScore
-        } else if !sidebar.has_focus {
-            match engine.mode {
-                Mode::Insert => SetCursorStyle::BlinkingBar,
-                _ => SetCursorStyle::SteadyBlock,
             }
-        } else {
-            SetCursorStyle::SteadyBlock
-        };
-        let _ = execute!(terminal.backend_mut(), cursor_style);
 
-        // Poll for completed background search (runs every frame, ~20 ms latency).
-        if engine.poll_project_search() && !engine.project_search_results.is_empty() {
-            sidebar.search_scroll_top = 0;
-            if sidebar.active_panel == TuiPanel::Search {
-                sidebar.search_input_mode = false;
-            }
+            terminal
+                .draw(|frame| {
+                    if let Some(s) = &screen {
+                        draw_frame(
+                            frame,
+                            s,
+                            &theme,
+                            &mut sidebar,
+                            engine,
+                            &sidebar_prompt,
+                            sidebar_width,
+                        );
+                    }
+                })
+                .expect("draw frame");
+
+            // Set terminal cursor shape to match mode / pending key.
+            let cursor_style = if !sidebar.has_focus && engine.pending_key == Some('r') {
+                SetCursorStyle::SteadyUnderScore
+            } else if !sidebar.has_focus {
+                match engine.mode {
+                    Mode::Insert => SetCursorStyle::BlinkingBar,
+                    _ => SetCursorStyle::SteadyBlock,
+                }
+            } else {
+                SetCursorStyle::SteadyBlock
+            };
+            let _ = execute!(terminal.backend_mut(), cursor_style);
+
+            needs_redraw = false;
         }
-        engine.poll_project_replace();
 
-        if !ct_event::poll(Duration::from_millis(20)).expect("poll") {
+        // Use shorter poll when a redraw is pending so it appears immediately,
+        // longer poll when idle to keep CPU near zero.
+        let poll_timeout = if needs_redraw {
+            Duration::from_millis(1)
+        } else {
+            Duration::from_millis(50)
+        };
+        if !ct_event::poll(poll_timeout).expect("poll") {
+            // No input — good time to do background work without blocking typing.
+            // Flush LSP didChange (may block briefly on pipe write for large buffers).
+            engine.lsp_flush_changes();
+            if engine.poll_lsp() {
+                needs_redraw = true;
+            }
+            if engine.poll_project_search() && !engine.project_search_results.is_empty() {
+                sidebar.search_scroll_top = 0;
+                if sidebar.active_panel == TuiPanel::Search {
+                    sidebar.search_input_mode = false;
+                }
+                needs_redraw = true;
+            }
+            if engine.poll_project_replace() {
+                needs_redraw = true;
+            }
             continue;
         }
 
@@ -741,6 +763,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
             Event::Resize(_, _) => {}
             _ => {}
         }
+        needs_redraw = true;
     }
 }
 
@@ -1256,6 +1279,24 @@ fn draw_frame(
         }
     }
 
+    // ── Hover popup (rendered on top of editor) ──────────────────────────────
+    if let Some(ref hover) = screen.hover {
+        if let Some(active_win) = screen
+            .windows
+            .iter()
+            .find(|w| w.window_id == screen.active_window_id)
+        {
+            let gutter_w = active_win.gutter_char_width as u16;
+            let win_x = editor_area.x + active_win.rect.x as u16;
+            let win_y = editor_area.y + active_win.rect.y as u16;
+            let anchor_view = hover.anchor_line.saturating_sub(active_win.scroll_top) as u16;
+            let vis_col = hover.anchor_col.saturating_sub(active_win.scroll_left) as u16;
+            let popup_x = win_x + gutter_w + vis_col;
+            let popup_y = win_y + anchor_view;
+            render_hover_popup(frame, hover, popup_x, popup_y, frame.size(), theme);
+        }
+    }
+
     // ── Status / command ──────────────────────────────────────────────────────
     render_status_line(
         frame.buffer_mut(),
@@ -1482,6 +1523,66 @@ fn render_completion_popup(
     }
 }
 
+fn render_hover_popup(
+    frame: &mut ratatui::Frame,
+    hover: &render::HoverPopup,
+    popup_x: u16,
+    popup_y: u16,
+    term_area: Rect,
+    theme: &Theme,
+) {
+    let text_lines: Vec<&str> = hover.text.lines().collect();
+    let num_lines = text_lines.len().min(20) as u16;
+    if num_lines == 0 {
+        return;
+    }
+    let max_len = text_lines.iter().map(|l| l.len()).max().unwrap_or(10);
+    let width = (max_len as u16 + 4).max(12);
+
+    // Place above cursor if possible, otherwise below
+    let y = if popup_y > num_lines {
+        popup_y - num_lines
+    } else {
+        popup_y + 1
+    };
+
+    // Clamp to screen bounds
+    let x = popup_x.min(term_area.width.saturating_sub(width));
+    let y = y.min(term_area.height.saturating_sub(num_lines));
+
+    let bg_color = rc(theme.hover_bg);
+    let fg_color = rc(theme.hover_fg);
+    let border_color = rc(theme.hover_border);
+
+    let buf = frame.buffer_mut();
+    for (i, text_line) in text_lines.iter().enumerate().take(num_lines as usize) {
+        let row_y = y + i as u16;
+        // Fill row background
+        for col in 0..width {
+            let cell_x = x + col;
+            if cell_x < term_area.width && row_y < term_area.height {
+                let cell = buf.get_mut(cell_x, row_y);
+                cell.set_bg(bg_color);
+                let ch = if col == 0 || col == width - 1 {
+                    '│'
+                } else {
+                    ' '
+                };
+                cell.set_char(ch).set_fg(border_color);
+            }
+        }
+        // Render text starting at col 1
+        let display = format!(" {}", text_line);
+        for (j, ch) in display.chars().enumerate() {
+            let cell_x = x + 1 + j as u16;
+            if cell_x + 1 < x + width && cell_x < term_area.width && row_y < term_area.height {
+                let cell = buf.get_mut(cell_x, row_y);
+                cell.set_char(ch).set_fg(fg_color).set_bg(bg_color);
+            }
+        }
+    }
+}
+
 fn render_window(frame: &mut ratatui::Frame, area: Rect, window: &RenderedWindow, theme: &Theme) {
     let window_bg = rc(if window.show_active_bg {
         theme.active_background
@@ -1539,6 +1640,23 @@ fn render_window(frame: &mut ratatui::Frame, area: Rect, window: &RenderedWindow
                 };
                 set_cell(frame.buffer_mut(), gx, screen_y, ch, fg, window_bg);
             }
+            // Diagnostic gutter icon (overwrite leftmost gutter char)
+            if let Some(severity) = window.diagnostic_gutter.get(&line.line_idx) {
+                let (diag_ch, diag_color) = match severity {
+                    DiagnosticSeverity::Error => ('E', rc(theme.diagnostic_error)),
+                    DiagnosticSeverity::Warning => ('W', rc(theme.diagnostic_warning)),
+                    DiagnosticSeverity::Information => ('I', rc(theme.diagnostic_info)),
+                    DiagnosticSeverity::Hint => ('H', rc(theme.diagnostic_hint)),
+                };
+                set_cell(
+                    frame.buffer_mut(),
+                    area.x,
+                    screen_y,
+                    diag_ch,
+                    diag_color,
+                    window_bg,
+                );
+            }
         }
 
         // Text (narrowed by 1 when scrollbar is shown)
@@ -1557,6 +1675,31 @@ fn render_window(frame: &mut ratatui::Frame, area: Rect, window: &RenderedWindow
             theme,
             window_bg,
         );
+
+        // Diagnostic underlines (UNDERLINED modifier on diagnostic spans)
+        for dm in &line.diagnostics {
+            let diag_fg = rc(match dm.severity {
+                DiagnosticSeverity::Error => theme.diagnostic_error,
+                DiagnosticSeverity::Warning => theme.diagnostic_warning,
+                DiagnosticSeverity::Information => theme.diagnostic_info,
+                DiagnosticSeverity::Hint => theme.diagnostic_hint,
+            });
+            for col in dm.start_col..dm.end_col {
+                if col < window.scroll_left {
+                    continue;
+                }
+                let vis_col = (col - window.scroll_left) as u16;
+                if vis_col >= text_width {
+                    break;
+                }
+                let cx = text_area_x + vis_col;
+                if cx < area.x + area.width && screen_y < area.y + area.height {
+                    let cell = frame.buffer_mut().get_mut(cx, screen_y);
+                    cell.set_fg(diag_fg);
+                    cell.modifier |= Modifier::UNDERLINED;
+                }
+            }
+        }
     }
 
     // Selection overlay
@@ -2735,6 +2878,7 @@ fn translate_key(event: KeyEvent) -> Option<(String, Option<char>, bool)> {
 fn handle_action(engine: &mut Engine, action: EngineAction) -> bool {
     match action {
         EngineAction::Quit | EngineAction::SaveQuit => {
+            engine.lsp_shutdown();
             save_session(engine);
             true
         }

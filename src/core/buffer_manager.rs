@@ -71,6 +71,8 @@ pub struct BufferState {
     pub line_undo_state: Option<(usize, String)>,
     /// Per-line git diff status (Added/Modified/None). Empty when not in a git repo.
     pub git_diff: Vec<Option<crate::core::git::GitLineStatus>>,
+    /// LSP language identifier (e.g. "rust", "python") for this buffer, if applicable.
+    pub lsp_language_id: Option<String>,
 }
 
 impl std::fmt::Debug for BufferState {
@@ -101,6 +103,7 @@ impl BufferState {
             current_undo_group: None,
             line_undo_state: None,
             git_diff: Vec::new(),
+            lsp_language_id: None,
         };
         state.update_syntax();
         state
@@ -109,6 +112,7 @@ impl BufferState {
     pub fn with_file(buffer: Buffer, path: PathBuf) -> Self {
         // Try to detect language from file path, fallback to Rust
         let syntax = Syntax::new_from_path(path.to_str()).unwrap_or_else(Syntax::new);
+        let lsp_language_id = crate::core::lsp::language_id_from_path(&path);
 
         let mut state = Self {
             buffer,
@@ -123,6 +127,7 @@ impl BufferState {
             current_undo_group: None,
             line_undo_state: None,
             git_diff: Vec::new(),
+            lsp_language_id,
         };
         state.update_syntax();
         state

@@ -62,6 +62,14 @@ pub struct Settings {
     /// Number of spaces added/removed by indent operators (>> / <<)
     #[serde(default = "default_shift_width")]
     pub shift_width: u8,
+
+    /// Enable LSP support (auto-starts language servers for supported files)
+    #[serde(default = "default_lsp_enabled")]
+    pub lsp_enabled: bool,
+
+    /// User-configured LSP server overrides/additions
+    #[serde(default)]
+    pub lsp_servers: Vec<crate::core::lsp::LspServerConfig>,
 }
 
 fn default_explorer_visible() -> bool {
@@ -88,6 +96,10 @@ fn default_shift_width() -> u8 {
     4
 }
 
+fn default_lsp_enabled() -> bool {
+    true // Default: enabled
+}
+
 fn default_font_family() -> String {
     "Monospace".to_string()
 }
@@ -108,6 +120,8 @@ impl Default for Settings {
             expand_tab: default_expand_tab(),
             tabstop: default_tabstop(),
             shift_width: default_shift_width(),
+            lsp_enabled: default_lsp_enabled(),
+            lsp_servers: Vec::new(),
         }
     }
 }
@@ -214,9 +228,10 @@ impl Settings {
         } else {
             "noincsearch"
         };
+        let lsp = if self.lsp_enabled { "lsp" } else { "nolsp" };
         format!(
-            "{}  {}  ts={}  sw={}  {}  {}",
-            num, et, self.tabstop, self.shift_width, ai, is
+            "{}  {}  ts={}  sw={}  {}  {}  {}",
+            num, et, self.tabstop, self.shift_width, ai, is, lsp
         )
     }
 
@@ -251,6 +266,7 @@ impl Settings {
             "expandtab" | "et" => self.expand_tab = enable,
             "autoindent" | "ai" => self.auto_indent = enable,
             "incsearch" | "is" => self.incremental_search = enable,
+            "lsp" => self.lsp_enabled = enable,
             _ => return Err(format!("Unknown option: {opt}")),
         }
         Ok(())
@@ -318,6 +334,11 @@ impl Settings {
                 "incsearch".to_string()
             } else {
                 "noincsearch".to_string()
+            }),
+            "lsp" => Ok(if self.lsp_enabled {
+                "lsp".to_string()
+            } else {
+                "nolsp".to_string()
             }),
             _ => Err(format!("Unknown option: {opt}")),
         }

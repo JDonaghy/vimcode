@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use super::buffer::{Buffer, BufferId};
 use super::buffer_manager::{BufferManager, BufferState};
 use super::git;
+use super::lsp::{self, Diagnostic, DiagnosticSeverity, LspEvent};
+use super::lsp_manager::LspManager;
 use super::project_search::{self, ProjectMatch, ReplaceResult, SearchError, SearchOptions};
 use super::session::SessionState;
 use super::settings::Settings;
@@ -253,6 +255,25 @@ pub struct Engine {
         Option<std::sync::mpsc::Receiver<Result<ReplaceResult, SearchError>>>,
     /// True while a background replace thread is running.
     pub project_replace_running: bool,
+
+    // --- LSP state ---
+    /// Multi-server LSP coordinator. None until first LSP-capable file is opened.
+    pub lsp_manager: Option<LspManager>,
+    /// Per-file diagnostics from LSP servers.
+    pub lsp_diagnostics: HashMap<PathBuf, Vec<Diagnostic>>,
+    /// Hover text to display (set on K keypress, cleared on any movement).
+    pub lsp_hover_text: Option<String>,
+    /// Whether LSP completion is currently active (vs buffer-word completion).
+    #[allow(dead_code)]
+    pub lsp_completion_active: bool,
+    /// Request ID of the pending completion request.
+    pub lsp_pending_completion: Option<i64>,
+    /// Request ID of the pending hover request.
+    pub lsp_pending_hover: Option<i64>,
+    /// Request ID of the pending definition request.
+    pub lsp_pending_definition: Option<i64>,
+    /// Tracks whether we need to send didChange on next poll (debounce).
+    lsp_dirty_buffers: HashMap<BufferId, bool>,
 }
 
 impl Engine {
@@ -331,6 +352,14 @@ impl Engine {
             project_replace_text: String::new(),
             project_replace_receiver: None,
             project_replace_running: false,
+            lsp_manager: None,
+            lsp_diagnostics: HashMap::new(),
+            lsp_hover_text: None,
+            lsp_completion_active: false,
+            lsp_pending_completion: None,
+            lsp_pending_hover: None,
+            lsp_pending_definition: None,
+            lsp_dirty_buffers: HashMap::new(),
         }
     }
 
@@ -354,6 +383,7 @@ impl Engine {
                     window.view = view;
                 }
                 engine.refresh_git_diff(buffer_id);
+                engine.lsp_did_open(buffer_id);
                 if !path.exists() {
                     engine.message = format!("\"{}\" [New File]", path.display());
                 }
@@ -644,6 +674,7 @@ impl Engine {
                     // Refresh git diff after save
                     let id = self.active_buffer_id();
                     self.refresh_git_diff(id);
+                    self.lsp_did_save(id);
                     Ok(())
                 }
                 Err(e) => {
@@ -1004,6 +1035,7 @@ impl Engine {
         self.switch_window_buffer(buffer_id);
         self.refresh_git_diff(buffer_id);
         self.message = format!("\"{}\"", path.display());
+        self.lsp_did_open(buffer_id);
         Ok(())
     }
 
@@ -1625,6 +1657,7 @@ impl Engine {
             self.preview_buffer_id = None;
         }
 
+        self.lsp_did_close(id);
         self.buffer_manager.delete(id, force)
     }
 
@@ -1994,6 +2027,8 @@ impl Engine {
         if self.mode != Mode::Command && self.mode != Mode::Search {
             self.message.clear();
         }
+        // Dismiss LSP hover popup on any keypress
+        self.lsp_hover_text = None;
 
         // Record keystroke if macro recording is active
         // Skip recording the 'q' that stops recording
@@ -2047,6 +2082,8 @@ impl Engine {
             if self.preview_buffer_id == Some(active_id) {
                 self.promote_preview(active_id);
             }
+            // Mark buffer as needing an LSP didChange (debounced)
+            self.lsp_dirty_buffers.insert(active_id, true);
         }
 
         self.ensure_cursor_visible();
@@ -2619,6 +2656,10 @@ impl Engine {
                 self.mode = Mode::Insert;
                 self.count = None;
             }
+            Some('K') => {
+                // K: Show LSP hover information at cursor
+                self.lsp_request_hover();
+            }
             Some('g') => {
                 self.pending_key = Some('g');
             }
@@ -2833,18 +2874,21 @@ impl Engine {
                 Some('s') => {
                     return self.cmd_git_stage_hunk();
                 }
+                Some('d') => {
+                    self.lsp_request_definition();
+                }
                 _ => {}
             },
-            ']' => {
-                if unicode == Some('c') {
-                    self.jump_next_hunk();
-                }
-            }
-            '[' => {
-                if unicode == Some('c') {
-                    self.jump_prev_hunk();
-                }
-            }
+            ']' => match unicode {
+                Some('c') => self.jump_next_hunk(),
+                Some('d') => self.jump_next_diagnostic(),
+                _ => {}
+            },
+            '[' => match unicode {
+                Some('c') => self.jump_prev_hunk(),
+                Some('d') => self.jump_prev_diagnostic(),
+                _ => {}
+            },
             'd' => {
                 // This should not be reached - 'd' is now handled as pending_operator
                 // But keep for backward compatibility during transition
@@ -3317,6 +3361,12 @@ impl Engine {
         ctrl: bool,
         changed: &mut bool,
     ) {
+        // ── Ctrl-Space: trigger LSP completion ────────────────────────────────
+        if ctrl && key_name == "space" {
+            self.lsp_request_completion();
+            return;
+        }
+
         // ── Ctrl-N / Ctrl-P: word completion ─────────────────────────────────
         if ctrl && (key_name == "n" || key_name == "p") {
             let next = key_name == "n";
@@ -4646,6 +4696,50 @@ impl Engine {
 
     fn execute_command(&mut self, cmd: &str) -> EngineAction {
         let cmd = cmd.trim();
+
+        // Handle :LspInfo — show running LSP servers
+        if cmd == "LspInfo" {
+            if let Some(mgr) = &self.lsp_manager {
+                self.message = mgr.server_info().join("; ");
+            } else {
+                self.message = "No LSP servers running".to_string();
+            }
+            return EngineAction::None;
+        }
+
+        // Handle :LspRestart — restart server for current language
+        if cmd == "LspRestart" {
+            let lang = self
+                .buffer_manager
+                .get(self.active_buffer_id())
+                .and_then(|s| s.lsp_language_id.clone());
+            if let Some(lang) = lang {
+                if let Some(mgr) = &mut self.lsp_manager {
+                    mgr.restart_server_for_language(&lang);
+                    self.message = format!("LSP server restarted for {lang}");
+                }
+            } else {
+                self.message = "No LSP language for current buffer".to_string();
+            }
+            return EngineAction::None;
+        }
+
+        // Handle :LspStop — stop server for current language
+        if cmd == "LspStop" {
+            let lang = self
+                .buffer_manager
+                .get(self.active_buffer_id())
+                .and_then(|s| s.lsp_language_id.clone());
+            if let Some(lang) = lang {
+                if let Some(mgr) = &mut self.lsp_manager {
+                    mgr.stop_server_for_language(&lang);
+                    self.message = format!("LSP server stopped for {lang}");
+                }
+            } else {
+                self.message = "No LSP language for current buffer".to_string();
+            }
+            return EngineAction::None;
+        }
 
         // Handle :Gdiff / :Gd
         if cmd == "Gdiff" || cmd == "Gd" {
@@ -6975,6 +7069,415 @@ impl Engine {
         self.clear_selected_register();
         *changed = true;
     }
+
+    // =======================================================================
+    // LSP integration
+    // =======================================================================
+
+    /// Ensure the LSP manager is initialized (lazy — created on first use).
+    fn ensure_lsp_manager(&mut self) {
+        if !self.settings.lsp_enabled || self.lsp_manager.is_some() {
+            return;
+        }
+        let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        self.lsp_manager = Some(LspManager::new(root, &self.settings.lsp_servers));
+    }
+
+    /// Notify LSP that a file was opened.
+    fn lsp_did_open(&mut self, buffer_id: BufferId) {
+        if !self.settings.lsp_enabled {
+            return;
+        }
+        let (path, text) = {
+            let state = match self.buffer_manager.get(buffer_id) {
+                Some(s) => s,
+                None => return,
+            };
+            let path = match &state.file_path {
+                Some(p) => p.clone(),
+                None => return,
+            };
+            if state.lsp_language_id.is_none() {
+                return;
+            }
+            (path, state.buffer.to_string())
+        };
+        self.ensure_lsp_manager();
+        if let Some(mgr) = &mut self.lsp_manager {
+            if let Err(msg) = mgr.notify_did_open(&path, &text) {
+                self.message = format!("LSP: {}", msg);
+            }
+        }
+    }
+
+    /// Notify LSP that a file was saved.
+    fn lsp_did_save(&mut self, buffer_id: BufferId) {
+        if !self.settings.lsp_enabled {
+            return;
+        }
+        let (path, text) = {
+            let state = match self.buffer_manager.get(buffer_id) {
+                Some(s) => s,
+                None => return,
+            };
+            let path = match &state.file_path {
+                Some(p) => p.clone(),
+                None => return,
+            };
+            if state.lsp_language_id.is_none() {
+                return;
+            }
+            (path, state.buffer.to_string())
+        };
+        if let Some(mgr) = &mut self.lsp_manager {
+            mgr.notify_did_save(&path, &text);
+        }
+        // Also flush any pending didChange
+        self.lsp_dirty_buffers.remove(&buffer_id);
+    }
+
+    /// Notify LSP that a file was closed.
+    fn lsp_did_close(&mut self, buffer_id: BufferId) {
+        let path = self
+            .buffer_manager
+            .get(buffer_id)
+            .and_then(|s| s.file_path.clone());
+        if let Some(ref path) = path {
+            if let Some(mgr) = &mut self.lsp_manager {
+                mgr.notify_did_close(path);
+            }
+            self.lsp_diagnostics.remove(path);
+        }
+    }
+
+    /// Flush any pending didChange notifications (called from UI poll loop).
+    pub fn lsp_flush_changes(&mut self) {
+        if self.lsp_manager.is_none() {
+            return;
+        }
+        let dirty: Vec<BufferId> = self.lsp_dirty_buffers.keys().copied().collect();
+        for buffer_id in dirty {
+            self.lsp_dirty_buffers.remove(&buffer_id);
+            let (path, text) = {
+                let state = match self.buffer_manager.get(buffer_id) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let path = match &state.file_path {
+                    Some(p) => p.clone(),
+                    None => continue,
+                };
+                if state.lsp_language_id.is_none() {
+                    continue;
+                }
+                (path, state.buffer.to_string())
+            };
+            if let Some(mgr) = &mut self.lsp_manager {
+                mgr.notify_did_change(&path, &text);
+            }
+        }
+    }
+
+    /// Poll LSP for events. Called every frame from the UI event loop.
+    /// Returns true if a redraw is needed.
+    pub fn poll_lsp(&mut self) -> bool {
+        let events = match &mut self.lsp_manager {
+            Some(mgr) => mgr.poll_events(),
+            None => return false,
+        };
+        if events.is_empty() {
+            return false;
+        }
+
+        // Pre-compute canonical paths for visible buffers (once, not per-event).
+        let visible_paths: Vec<PathBuf> = self
+            .windows
+            .values()
+            .filter_map(|w| {
+                self.buffer_manager
+                    .get(w.buffer_id)?
+                    .file_path
+                    .as_ref()
+                    .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()))
+            })
+            .collect();
+
+        let mut redraw = false;
+        for event in events {
+            match event {
+                LspEvent::Initialized(_) => {
+                    // Server is ready — re-open any already-open buffers
+                    let buffers: Vec<(PathBuf, String)> = self
+                        .buffer_manager
+                        .list()
+                        .iter()
+                        .filter_map(|&bid| {
+                            let s = self.buffer_manager.get(bid)?;
+                            let p = s.file_path.as_ref()?.clone();
+                            if s.lsp_language_id.is_some() {
+                                Some((p, s.buffer.to_string()))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    if let Some(mgr) = &mut self.lsp_manager {
+                        for (path, text) in buffers {
+                            let _ = mgr.notify_did_open(&path, &text);
+                        }
+                    }
+                }
+                LspEvent::Diagnostics {
+                    path, diagnostics, ..
+                } => {
+                    // Only redraw if diagnostics affect a currently visible buffer.
+                    if !redraw && visible_paths.contains(&path) {
+                        redraw = true;
+                    }
+                    self.lsp_diagnostics.insert(path, diagnostics);
+                }
+                LspEvent::CompletionResponse { items, .. } => {
+                    self.lsp_pending_completion = None;
+                    if !items.is_empty() {
+                        self.lsp_completion_active = true;
+                        let (_, start_col) = self.completion_prefix_at_cursor();
+                        self.completion_start_col = start_col;
+                        self.completion_candidates = items
+                            .iter()
+                            .map(|item| {
+                                item.insert_text
+                                    .as_deref()
+                                    .unwrap_or(&item.label)
+                                    .to_string()
+                            })
+                            .collect();
+                        self.completion_idx = Some(0);
+                        self.apply_completion_candidate(0);
+                        redraw = true;
+                    } else {
+                        self.message = "No completions".to_string();
+                    }
+                }
+                LspEvent::DefinitionResponse { locations, .. } => {
+                    self.lsp_pending_definition = None;
+                    if let Some(loc) = locations.first() {
+                        let path = loc.path.clone();
+                        let line = loc.range.start.line as usize;
+                        // Open the file and jump
+                        if path
+                            != self
+                                .buffer_manager
+                                .get(self.active_buffer_id())
+                                .and_then(|s| s.file_path.clone())
+                                .unwrap_or_default()
+                        {
+                            let _ = self.open_file_with_mode(&path, OpenMode::Permanent);
+                        }
+                        // Jump to line/col
+                        self.view_mut().cursor.line = line;
+                        let line_text: String = self.buffer().content.line(line).chars().collect();
+                        let col = lsp::utf16_offset_to_char(&line_text, loc.range.start.character);
+                        self.view_mut().cursor.col = col;
+                        self.ensure_cursor_visible();
+                        redraw = true;
+                    } else {
+                        self.message = "No definition found".to_string();
+                    }
+                }
+                LspEvent::HoverResponse { contents, .. } => {
+                    self.lsp_pending_hover = None;
+                    if let Some(text) = contents {
+                        self.lsp_hover_text = Some(text);
+                        redraw = true;
+                    } else {
+                        self.message = "No hover info".to_string();
+                    }
+                }
+                LspEvent::ServerExited(id) => {
+                    self.message = format!("LSP server {} exited", id);
+                    redraw = true;
+                }
+            }
+        }
+        redraw
+    }
+
+    /// Request LSP completion at cursor position.
+    fn lsp_request_completion(&mut self) {
+        if !self.settings.lsp_enabled {
+            return;
+        }
+        self.ensure_lsp_manager();
+        let (path, line, col_utf16) = match self.lsp_cursor_position() {
+            Some(v) => v,
+            None => return,
+        };
+        if let Some(mgr) = &mut self.lsp_manager {
+            if let Some(id) = mgr.request_completion(&path, line, col_utf16) {
+                self.lsp_pending_completion = Some(id);
+            }
+        }
+    }
+
+    /// Request LSP go-to-definition at cursor position.
+    fn lsp_request_definition(&mut self) {
+        if !self.settings.lsp_enabled {
+            return;
+        }
+        self.ensure_lsp_manager();
+        let (path, line, col_utf16) = match self.lsp_cursor_position() {
+            Some(v) => v,
+            None => return,
+        };
+        if let Some(mgr) = &mut self.lsp_manager {
+            if let Some(id) = mgr.request_definition(&path, line, col_utf16) {
+                self.lsp_pending_definition = Some(id);
+                self.message = "Jumping to definition...".to_string();
+            } else if mgr.is_server_initializing(&path) {
+                self.message = "LSP server initializing...".to_string();
+            } else {
+                self.message = "No LSP server for this file".to_string();
+            }
+        }
+    }
+
+    /// Request LSP hover at cursor position.
+    fn lsp_request_hover(&mut self) {
+        if !self.settings.lsp_enabled {
+            return;
+        }
+        self.ensure_lsp_manager();
+        let (path, line, col_utf16) = match self.lsp_cursor_position() {
+            Some(v) => v,
+            None => return,
+        };
+        if let Some(mgr) = &mut self.lsp_manager {
+            if let Some(id) = mgr.request_hover(&path, line, col_utf16) {
+                self.lsp_pending_hover = Some(id);
+            } else if mgr.is_server_initializing(&path) {
+                self.message = "LSP server initializing...".to_string();
+            } else {
+                self.message = "No LSP server for this file".to_string();
+            }
+        }
+    }
+
+    /// Get the cursor's file path, line, and UTF-16 column for LSP requests.
+    fn lsp_cursor_position(&self) -> Option<(PathBuf, u32, u32)> {
+        let state = self.buffer_manager.get(self.active_buffer_id())?;
+        let path = state.file_path.as_ref()?.clone();
+        let line = self.view().cursor.line;
+        let col = self.view().cursor.col;
+        let line_text: String = state.buffer.content.line(line).chars().collect();
+        let col_utf16 = lsp::char_to_utf16_offset(&line_text, col);
+        Some((path, line as u32, col_utf16))
+    }
+
+    /// Jump to the next diagnostic in the current buffer.
+    pub fn jump_next_diagnostic(&mut self) {
+        let path = self
+            .buffer_manager
+            .get(self.active_buffer_id())
+            .and_then(|s| s.file_path.as_ref())
+            .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()));
+        let path = match path {
+            Some(p) => p,
+            None => return,
+        };
+        let diags = match self.lsp_diagnostics.get(&path) {
+            Some(d) if !d.is_empty() => d,
+            _ => {
+                self.message = "No diagnostics".to_string();
+                return;
+            }
+        };
+        let cur_line = self.view().cursor.line as u32;
+        let cur_char = self.view().cursor.col as u32;
+
+        // Find the first diagnostic after the current cursor position
+        let next = diags.iter().find(|d| {
+            d.range.start.line > cur_line
+                || (d.range.start.line == cur_line && d.range.start.character > cur_char)
+        });
+        let diag = next.unwrap_or(&diags[0]).clone();
+
+        let line = diag.range.start.line as usize;
+        self.view_mut().cursor.line = line;
+        let line_text: String = self.buffer().content.line(line).chars().collect();
+        self.view_mut().cursor.col =
+            lsp::utf16_offset_to_char(&line_text, diag.range.start.character);
+        self.message = format!("{}: {}", diag.severity.symbol(), diag.message);
+    }
+
+    /// Jump to the previous diagnostic in the current buffer.
+    pub fn jump_prev_diagnostic(&mut self) {
+        let path = self
+            .buffer_manager
+            .get(self.active_buffer_id())
+            .and_then(|s| s.file_path.as_ref())
+            .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()));
+        let path = match path {
+            Some(p) => p,
+            None => return,
+        };
+        let diags = match self.lsp_diagnostics.get(&path) {
+            Some(d) if !d.is_empty() => d,
+            _ => {
+                self.message = "No diagnostics".to_string();
+                return;
+            }
+        };
+        let cur_line = self.view().cursor.line as u32;
+        let cur_char = self.view().cursor.col as u32;
+
+        // Find the last diagnostic before the current cursor position
+        let prev = diags.iter().rev().find(|d| {
+            d.range.start.line < cur_line
+                || (d.range.start.line == cur_line && d.range.start.character < cur_char)
+        });
+        let diag = prev.unwrap_or(diags.last().unwrap()).clone();
+
+        let line = diag.range.start.line as usize;
+        self.view_mut().cursor.line = line;
+        let line_text: String = self.buffer().content.line(line).chars().collect();
+        self.view_mut().cursor.col =
+            lsp::utf16_offset_to_char(&line_text, diag.range.start.character);
+        self.message = format!("{}: {}", diag.severity.symbol(), diag.message);
+    }
+
+    /// Shut down all LSP servers (called on quit).
+    pub fn lsp_shutdown(&mut self) {
+        if let Some(mgr) = &mut self.lsp_manager {
+            mgr.shutdown_all();
+        }
+        self.lsp_manager = None;
+    }
+
+    /// Get diagnostic counts for the current buffer (for status bar).
+    pub fn diagnostic_counts(&self) -> (usize, usize) {
+        let path = self
+            .buffer_manager
+            .get(self.active_buffer_id())
+            .and_then(|s| s.file_path.as_ref())
+            .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()));
+        let path = match path {
+            Some(p) => p,
+            None => return (0, 0),
+        };
+        let diags = match self.lsp_diagnostics.get(&path) {
+            Some(d) => d,
+            None => return (0, 0),
+        };
+        let errors = diags
+            .iter()
+            .filter(|d| d.severity == DiagnosticSeverity::Error)
+            .count();
+        let warnings = diags
+            .iter()
+            .filter(|d| d.severity == DiagnosticSeverity::Warning)
+            .count();
+        (errors, warnings)
+    }
 }
 
 impl Default for Engine {
@@ -7346,7 +7849,6 @@ mod tests {
 
     #[test]
     fn test_ctrl_s_saves_in_normal_mode() {
-        use std::io::Write;
         let dir = std::env::temp_dir();
         let path = dir.join("vimcode_test_ctrl_s.txt");
         std::fs::write(&path, "original").unwrap();
@@ -13896,5 +14398,192 @@ mod tests {
         assert!(engine.message.contains("Replaced"));
         let content = std::fs::read_to_string(dir.join("sample.txt")).unwrap();
         assert!(content.contains("earth"));
+    }
+
+    // ── LSP integration tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_lsp_fields_initialized() {
+        let engine = Engine::new();
+        assert!(engine.lsp_manager.is_none());
+        assert!(engine.lsp_diagnostics.is_empty());
+        assert!(engine.lsp_hover_text.is_none());
+        assert!(engine.lsp_pending_completion.is_none());
+        assert!(engine.lsp_pending_hover.is_none());
+        assert!(engine.lsp_pending_definition.is_none());
+        assert!(engine.settings.lsp_enabled);
+    }
+
+    #[test]
+    fn test_lsp_jump_diagnostics_empty() {
+        let mut engine = Engine::new();
+        // Set a file path so the diagnostic lookup can proceed
+        engine.active_buffer_state_mut().file_path = Some(PathBuf::from("/tmp/test.rs"));
+        engine.jump_next_diagnostic();
+        assert_eq!(engine.message, "No diagnostics");
+        engine.jump_prev_diagnostic();
+        assert_eq!(engine.message, "No diagnostics");
+    }
+
+    #[test]
+    fn test_lsp_jump_diagnostics_navigation() {
+        use super::lsp::{Diagnostic, DiagnosticSeverity, LspPosition, LspRange};
+
+        let mut engine = Engine::new();
+        // Create a buffer with some content
+        let text = "line 0\nline 1\nline 2\nline 3\nline 4\n";
+        let buf = engine.buffer_mut();
+        buf.content = ropey::Rope::from_str(text);
+        // Set file_path on the buffer
+        engine.active_buffer_state_mut().file_path = Some(PathBuf::from("/tmp/test.rs"));
+
+        // Insert diagnostics
+        let diags = vec![
+            Diagnostic {
+                range: LspRange {
+                    start: LspPosition {
+                        line: 1,
+                        character: 0,
+                    },
+                    end: LspPosition {
+                        line: 1,
+                        character: 5,
+                    },
+                },
+                severity: DiagnosticSeverity::Error,
+                message: "error on line 1".to_string(),
+                source: None,
+            },
+            Diagnostic {
+                range: LspRange {
+                    start: LspPosition {
+                        line: 3,
+                        character: 0,
+                    },
+                    end: LspPosition {
+                        line: 3,
+                        character: 5,
+                    },
+                },
+                severity: DiagnosticSeverity::Warning,
+                message: "warning on line 3".to_string(),
+                source: None,
+            },
+        ];
+        engine
+            .lsp_diagnostics
+            .insert(PathBuf::from("/tmp/test.rs"), diags);
+
+        // Start at line 0 — next should jump to line 1
+        engine.jump_next_diagnostic();
+        assert_eq!(engine.view().cursor.line, 1);
+        assert!(engine.message.contains("error on line 1"));
+
+        // Next should jump to line 3
+        engine.jump_next_diagnostic();
+        assert_eq!(engine.view().cursor.line, 3);
+        assert!(engine.message.contains("warning on line 3"));
+
+        // Next should wrap to line 1
+        engine.jump_next_diagnostic();
+        assert_eq!(engine.view().cursor.line, 1);
+
+        // Prev from line 1 should wrap to line 3
+        engine.jump_prev_diagnostic();
+        assert_eq!(engine.view().cursor.line, 3);
+    }
+
+    #[test]
+    fn test_lsp_hover_dismissed_on_keypress() {
+        let mut engine = Engine::new();
+        engine.lsp_hover_text = Some("fn main()".to_string());
+        engine.handle_key("j", Some('j'), false);
+        assert!(engine.lsp_hover_text.is_none());
+    }
+
+    #[test]
+    fn test_lsp_set_option() {
+        let mut engine = Engine::new();
+        assert!(engine.settings.lsp_enabled);
+        engine.settings.parse_set_option("nolsp").unwrap();
+        assert!(!engine.settings.lsp_enabled);
+        engine.settings.parse_set_option("lsp").unwrap();
+        assert!(engine.settings.lsp_enabled);
+        let q = engine.settings.parse_set_option("lsp?").unwrap();
+        assert_eq!(q, "lsp");
+    }
+
+    #[test]
+    fn test_lsp_display_all_includes_lsp() {
+        let engine = Engine::new();
+        let display = engine.settings.display_all();
+        assert!(display.contains("lsp"));
+    }
+
+    #[test]
+    fn test_lsp_diagnostic_counts() {
+        use super::lsp::{Diagnostic, DiagnosticSeverity, LspRange};
+
+        let mut engine = Engine::new();
+        engine.active_buffer_state_mut().file_path = Some(PathBuf::from("/tmp/test.rs"));
+
+        let diags = vec![
+            Diagnostic {
+                range: LspRange::default(),
+                severity: DiagnosticSeverity::Error,
+                message: "e1".to_string(),
+                source: None,
+            },
+            Diagnostic {
+                range: LspRange::default(),
+                severity: DiagnosticSeverity::Error,
+                message: "e2".to_string(),
+                source: None,
+            },
+            Diagnostic {
+                range: LspRange::default(),
+                severity: DiagnosticSeverity::Warning,
+                message: "w1".to_string(),
+                source: None,
+            },
+        ];
+        engine
+            .lsp_diagnostics
+            .insert(PathBuf::from("/tmp/test.rs"), diags);
+
+        let (errors, warnings) = engine.diagnostic_counts();
+        assert_eq!(errors, 2);
+        assert_eq!(warnings, 1);
+    }
+
+    #[test]
+    fn test_lsp_commands() {
+        let mut engine = Engine::new();
+        // :LspInfo with no servers running
+        engine.execute_command("LspInfo");
+        assert_eq!(engine.message, "No LSP servers running");
+    }
+
+    #[test]
+    fn test_lsp_language_id_set_on_buffer() {
+        let rs_path = std::env::temp_dir().join("vimcode_lsp_test.rs");
+        std::fs::write(&rs_path, "fn main() {}\n").unwrap();
+
+        let mut engine = Engine::new();
+        let _ = engine.open_file_with_mode(&rs_path, OpenMode::Permanent);
+        let state = engine.active_buffer_state();
+        assert_eq!(state.lsp_language_id, Some("rust".to_string()));
+        let _ = std::fs::remove_file(&rs_path);
+    }
+
+    #[test]
+    fn test_lsp_dirty_buffer_tracking() {
+        let mut engine = Engine::new();
+        assert!(engine.lsp_dirty_buffers.is_empty());
+        // Typing in insert mode should mark buffer dirty for LSP
+        engine.handle_key("i", Some('i'), false);
+        engine.handle_key("a", Some('a'), false);
+        let active_id = engine.active_buffer_id();
+        assert!(engine.lsp_dirty_buffers.contains_key(&active_id));
     }
 }

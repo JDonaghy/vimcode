@@ -22,6 +22,7 @@ mod render;
 mod tui_main;
 
 use core::engine::EngineAction;
+use core::lsp::DiagnosticSeverity;
 use core::settings::LineNumberMode;
 use core::{Engine, GitLineStatus, OpenMode, WindowRect};
 use render::{
@@ -1123,6 +1124,7 @@ impl SimpleComponent for App {
                         }
                         engine.collect_session_open_files();
                         let _ = engine.session.save();
+                        engine.lsp_shutdown();
                         drop(engine);
                         std::process::exit(0);
                     }
@@ -1176,6 +1178,7 @@ impl SimpleComponent for App {
                             }
                             engine.collect_session_open_files();
                             let _ = engine.session.save();
+                            engine.lsp_shutdown();
                             drop(engine);
                             std::process::exit(0);
                         }
@@ -1644,6 +1647,14 @@ impl SimpleComponent for App {
                     let s = self.sender.clone();
                     self.rebuild_search_results(&s);
                     self.redraw = true;
+                }
+                // LSP: flush debounced didChange notifications and poll for events
+                {
+                    let mut engine = self.engine.borrow_mut();
+                    engine.lsp_flush_changes();
+                    if engine.poll_lsp() {
+                        self.redraw = true;
+                    }
                 }
             }
             Msg::ProjectSearchOpenResult(idx) => {
@@ -2126,6 +2137,9 @@ fn draw_editor(
     // 5b. Draw completion popup (on top of everything else)
     draw_completion_popup(cr, &layout, &screen, &theme, line_height, char_width);
 
+    // 5c. Draw hover popup (on top of everything else)
+    draw_hover_popup(cr, &layout, &screen, &theme, line_height, char_width);
+
     // 6. Status Line (second-to-last line)
     let status_y = height as f64 - status_bar_height;
     draw_status_line(
@@ -2304,6 +2318,23 @@ fn draw_window(
             cr.set_source_rgb(nr, ng, nb);
             cr.move_to(num_x, y);
             pangocairo::show_layout(cr, layout);
+
+            // Diagnostic gutter icon (colored dot overrides git marker position)
+            if let Some(severity) = rw.diagnostic_gutter.get(&rl.line_idx) {
+                let diag_color = match severity {
+                    DiagnosticSeverity::Error => theme.diagnostic_error,
+                    DiagnosticSeverity::Warning => theme.diagnostic_warning,
+                    DiagnosticSeverity::Information => theme.diagnostic_info,
+                    DiagnosticSeverity::Hint => theme.diagnostic_hint,
+                };
+                let (dr, dg, db) = diag_color.to_cairo();
+                cr.set_source_rgb(dr, dg, db);
+                let dot_r = line_height * 0.2;
+                let dot_cx = rect.x + 3.0 + dot_r;
+                let dot_cy = y + line_height * 0.5;
+                cr.arc(dot_cx, dot_cy, dot_r, 0.0, 2.0 * std::f64::consts::PI);
+                cr.fill().ok();
+            }
         }
     } // end gutter rendering block
 
@@ -2330,6 +2361,67 @@ fn draw_window(
         cr.set_source_rgb(fr, fg_g, fb);
         cr.move_to(text_x_offset, y);
         pangocairo::show_layout(cr, layout);
+
+        // Diagnostic underlines (wavy squiggles)
+        for dm in &rl.diagnostics {
+            let diag_color = match dm.severity {
+                DiagnosticSeverity::Error => theme.diagnostic_error,
+                DiagnosticSeverity::Warning => theme.diagnostic_warning,
+                DiagnosticSeverity::Information => theme.diagnostic_info,
+                DiagnosticSeverity::Hint => theme.diagnostic_hint,
+            };
+            let (dr, dg, db) = diag_color.to_cairo();
+            cr.set_source_rgb(dr, dg, db);
+            cr.set_line_width(1.0);
+
+            let start_byte = rl
+                .raw_text
+                .char_indices()
+                .nth(dm.start_col)
+                .map(|(i, _)| i)
+                .unwrap_or(rl.raw_text.len());
+            let end_byte = rl
+                .raw_text
+                .char_indices()
+                .nth(dm.end_col)
+                .map(|(i, _)| i)
+                .unwrap_or(rl.raw_text.len());
+
+            layout.set_text(&rl.raw_text);
+            layout.set_attributes(None);
+
+            let start_pos = layout.index_to_pos(start_byte as i32);
+            let end_pos = layout.index_to_pos(end_byte as i32);
+            let x0 = text_x_offset + start_pos.x() as f64 / pango::SCALE as f64;
+            let x1 = text_x_offset + end_pos.x() as f64 / pango::SCALE as f64;
+            let underline_y = y + line_height - 2.0;
+
+            // Draw wavy underline
+            let wave_h = 1.5;
+            let wave_len = 4.0;
+            cr.move_to(x0, underline_y);
+            let mut wx = x0;
+            let mut up = true;
+            while wx < x1 {
+                let next_x = (wx + wave_len).min(x1);
+                let cy = if up {
+                    underline_y - wave_h
+                } else {
+                    underline_y + wave_h
+                };
+                cr.curve_to(
+                    wx + (next_x - wx) * 0.5,
+                    cy,
+                    wx + (next_x - wx) * 0.5,
+                    cy,
+                    next_x,
+                    underline_y,
+                );
+                wx = next_x;
+                up = !up;
+            }
+            cr.stroke().ok();
+        }
     }
 
     cr.restore().unwrap();
@@ -2655,6 +2747,71 @@ fn draw_completion_popup(
         layout.set_text(&display);
         layout.set_attributes(None);
         cr.move_to(popup_x, item_y);
+        pangocairo::show_layout(cr, layout);
+    }
+}
+
+fn draw_hover_popup(
+    cr: &Context,
+    layout: &pango::Layout,
+    screen: &render::ScreenLayout,
+    theme: &Theme,
+    line_height: f64,
+    char_width: f64,
+) {
+    let Some(hover) = &screen.hover else {
+        return;
+    };
+    let Some(active_win) = screen
+        .windows
+        .iter()
+        .find(|w| w.window_id == screen.active_window_id)
+    else {
+        return;
+    };
+
+    // Position above the anchor line
+    let gutter_width = active_win.gutter_char_width as f64 * char_width;
+    let h_scroll_offset = active_win.scroll_left as f64 * char_width;
+    let anchor_view_line = hover.anchor_line.saturating_sub(active_win.scroll_top);
+    let popup_x =
+        active_win.rect.x + gutter_width + hover.anchor_col as f64 * char_width - h_scroll_offset;
+
+    // Split text into lines and measure
+    let text_lines: Vec<&str> = hover.text.lines().collect();
+    let num_lines = text_lines.len().min(20) as f64;
+    let max_line_len = text_lines.iter().map(|l| l.len()).max().unwrap_or(10);
+    let popup_w = ((max_line_len + 2) as f64 * char_width).max(100.0);
+    let popup_h = num_lines * line_height + 4.0;
+
+    // Place above cursor if possible, otherwise below
+    let popup_y = if anchor_view_line as f64 * line_height > popup_h {
+        active_win.rect.y + anchor_view_line as f64 * line_height - popup_h
+    } else {
+        active_win.rect.y + (anchor_view_line as f64 + 1.0) * line_height
+    };
+
+    // Background
+    let (r, g, b) = theme.hover_bg.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
+    cr.fill().ok();
+
+    // Border
+    let (r, g, b) = theme.hover_border.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    cr.set_line_width(1.0);
+    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
+    cr.stroke().ok();
+
+    // Text
+    let (r, g, b) = theme.hover_fg.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    for (i, text_line) in text_lines.iter().enumerate().take(20) {
+        let display = format!(" {}", text_line);
+        layout.set_text(&display);
+        layout.set_attributes(None);
+        cr.move_to(popup_x, popup_y + 2.0 + i as f64 * line_height);
         pangocairo::show_layout(cr, layout);
     }
 }

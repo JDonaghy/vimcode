@@ -7,7 +7,7 @@ High-performance Vim+VSCode hybrid editor in Rust. Modal editing meets modern UX
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 458 tests
+- **Clean architecture** — platform-agnostic core, 495 tests, zero async runtime
 
 ## Building
 
@@ -226,6 +226,49 @@ cargo fmt
 
 ---
 
+### LSP Support (Language Server Protocol)
+
+Automatic language server integration — open a file and diagnostics, completions, go-to-definition, and hover just work if the appropriate server is on `PATH`.
+
+**Built-in server registry** (auto-detected on `PATH`):
+
+| Language | Server |
+|----------|--------|
+| Rust | `rust-analyzer` |
+| Python | `pyright-langserver` |
+| JavaScript / TypeScript | `typescript-language-server` |
+| Go | `gopls` |
+| C / C++ | `clangd` |
+
+**Features:**
+- **Inline diagnostics** — wavy underlines (GTK) / colored underlines (TUI) with severity-colored gutter icons
+- **Diagnostic navigation** — `]d` / `[d` jump to next/previous diagnostic
+- **LSP completions** — `Ctrl-Space` in insert mode triggers server completions (merges with existing buffer word completion)
+- **Go-to-definition** — `gd` jumps to the definition of the symbol under the cursor
+- **Hover info** — `K` shows type/documentation popup above the cursor
+- **Diagnostic counts** — `E:N W:N` shown in status bar
+
+**Commands:**
+
+| Command | Action |
+|---------|--------|
+| `:LspInfo` | Show running servers and their status |
+| `:LspRestart` | Restart server for current file type |
+| `:LspStop` | Stop server for current file type |
+
+**Settings:**
+- `:set lsp` / `:set nolsp` — enable/disable LSP (default: enabled)
+- Custom servers in `settings.json`:
+```json
+{
+    "lsp_servers": [
+        { "command": "lua-language-server", "args": [], "languages": ["lua"] }
+    ]
+}
+```
+
+---
+
 ### Settings (`:set` command)
 
 Runtime changes are written through to `~/.config/vimcode/settings.json` immediately.
@@ -239,6 +282,7 @@ Runtime changes are written through to `~/.config/vimcode/settings.json` immedia
 | `shiftwidth=N` | `sw` | 4 | Indent width (for future `>>` / `<<`) |
 | `autoindent` / `noautoindent` | `ai` | on | Copy indent from current line on Enter/o/O |
 | `incsearch` / `noincsearch` | `is` | on | Incremental search as you type |
+| `lsp` / `nolsp` | | on | Enable/disable LSP language servers |
 
 - `:set option?` — query current value (e.g. `:set ts?` → `tabstop=4`)
 - `:set` (no args) — show one-line summary of all settings
@@ -324,8 +368,11 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `m{a-z}` / `'{a-z}` | Set mark / jump to mark |
 | `q{a-z}` / `@{a-z}` | Record macro / play macro |
 | `gt` / `gT` | Next / previous tab |
+| `gd` | Go to definition (LSP) |
 | `gs` | Stage hunk (in `:Gdiff` buffer) |
+| `K` | Show hover info (LSP) |
 | `]c` / `[c` | Next / previous hunk |
+| `]d` / `[d` | Next / previous diagnostic (LSP) |
 | `za` / `zo` / `zc` / `zR` | Fold toggle / open / close / open all |
 | `Ctrl-W h/j/k/l` | Focus window left/down/up/right |
 | `Ctrl-W w` / `c` / `o` | Cycle / close / close-others |
@@ -350,6 +397,9 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `:Gpush` | Push |
 | `:Gblame` | Blame (scroll-synced split) |
 | `:Ghs` / `:Ghunk` | Stage hunk under cursor |
+| `:LspInfo` | Show running LSP servers |
+| `:LspRestart` | Restart server for current language |
+| `:LspStop` | Stop server for current language |
 | `:config reload` | Reload settings from disk |
 
 ---
@@ -358,12 +408,14 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 
 ```
 src/
-├── main.rs          (~3400 lines)  GTK4/Relm4 UI, rendering, sidebar resize, search panel
-├── tui_main.rs      (~2780 lines)  ratatui/crossterm TUI backend, search panel
-├── render.rs        (~1080 lines)  Platform-agnostic ScreenLayout bridge
+├── main.rs          (~3600 lines)  GTK4/Relm4 UI, rendering, sidebar resize, search panel
+├── tui_main.rs      (~2900 lines)  ratatui/crossterm TUI backend, search panel
+├── render.rs        (~1200 lines)  Platform-agnostic ScreenLayout bridge
 ├── icons.rs            (~30 lines)  Nerd Font file-type icons (GTK + TUI)
-└── core/            (~17600 lines)  Zero GTK/rendering deps — fully testable
-    ├── engine.rs                    Orchestrator: keys, commands, git, macros, project search/replace
+└── core/            (~20200 lines)  Zero GTK/rendering deps — fully testable
+    ├── engine.rs                    Orchestrator: keys, commands, git, macros, LSP, project search/replace
+    ├── lsp.rs                       LSP protocol transport + single-server client (request ID tracking, JSON-RPC framing)
+    ├── lsp_manager.rs               Multi-server coordinator with initialization guards + built-in registry
     ├── project_search.rs            Regex/case/whole-word search + replace (ignore + regex crates)
     ├── buffer_manager.rs            Buffer lifecycle, undo/redo stacks
     ├── buffer.rs                    Rope-based text storage (ropey)
@@ -385,6 +437,7 @@ src/
 | Rendering | Pango + Cairo (CPU, no GPU) |
 | Text | Ropey (rope data structure) |
 | Parsing | Tree-sitter |
+| LSP | lsp-types (protocol definitions) |
 | Config | serde + serde_json |
 
 ## License

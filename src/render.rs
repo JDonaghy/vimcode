@@ -110,6 +110,21 @@ pub struct RenderedLine {
     /// Git diff status for this line (Added/Modified/None).
     /// `None` when the buffer is not tracked by git or the line is unchanged.
     pub git_diff: Option<GitLineStatus>,
+    /// LSP diagnostic marks on this line (may be empty).
+    pub diagnostics: Vec<DiagnosticMark>,
+}
+
+/// A single diagnostic mark on a rendered line (for inline underlines/squiggles).
+#[derive(Debug, Clone)]
+pub struct DiagnosticMark {
+    /// Start column (char index) within the line.
+    pub start_col: usize,
+    /// End column (char index, exclusive) within the line.
+    pub end_col: usize,
+    /// Severity level (drives colour).
+    pub severity: crate::core::lsp::DiagnosticSeverity,
+    /// Short message text (for tooltip/hover).
+    pub message: String,
 }
 
 // ─── Cursor ───────────────────────────────────────────────────────────────────
@@ -206,6 +221,8 @@ pub struct RenderedWindow {
     /// Maximum line length across the whole buffer (character cells, excluding
     /// trailing newline).  Used by backends to size the horizontal scrollbar.
     pub max_col: usize,
+    /// Per-line worst diagnostic severity (line index → severity). Used for gutter icons.
+    pub diagnostic_gutter: std::collections::HashMap<usize, crate::core::lsp::DiagnosticSeverity>,
 }
 
 // ─── CommandLineData ──────────────────────────────────────────────────────────
@@ -237,6 +254,19 @@ pub struct CompletionMenu {
     pub max_width: usize,
 }
 
+// ─── HoverPopup ──────────────────────────────────────────────────────────────
+
+/// Data needed to render the LSP hover popup.
+#[derive(Debug, Clone)]
+pub struct HoverPopup {
+    /// Text content to display.
+    pub text: String,
+    /// Buffer line where the hover was requested (for positioning).
+    pub anchor_line: usize,
+    /// Buffer column where the hover was requested.
+    pub anchor_col: usize,
+}
+
 // ─── ScreenLayout ─────────────────────────────────────────────────────────────
 
 /// The complete, platform-agnostic description of one editor frame.
@@ -251,6 +281,8 @@ pub struct ScreenLayout {
     pub active_window_id: WindowId,
     /// Completion popup to show, or `None` when inactive.
     pub completion: Option<CompletionMenu>,
+    /// Hover information popup, or `None` when inactive.
+    pub hover: Option<HoverPopup>,
 }
 
 // ─── Theme ────────────────────────────────────────────────────────────────────
@@ -320,6 +352,17 @@ pub struct Theme {
     pub completion_selected_bg: Color,
     pub completion_fg: Color,
     pub completion_border: Color,
+
+    // Diagnostic colours
+    pub diagnostic_error: Color,
+    pub diagnostic_warning: Color,
+    pub diagnostic_info: Color,
+    pub diagnostic_hint: Color,
+
+    // Hover popup
+    pub hover_bg: Color,
+    pub hover_fg: Color,
+    pub hover_border: Color,
 }
 
 impl Theme {
@@ -397,6 +440,17 @@ impl Theme {
             completion_selected_bg: Color::from_hex("#3e4451"),
             completion_fg: Color::from_hex("#abb2bf"),
             completion_border: Color::from_hex("#528bff"),
+
+            // Diagnostic colours
+            diagnostic_error: Color::from_hex("#e06c75"), // red
+            diagnostic_warning: Color::from_hex("#e5c07b"), // yellow
+            diagnostic_info: Color::from_hex("#61afef"),  // blue
+            diagnostic_hint: Color::from_hex("#5c6370"),  // grey
+
+            // Hover popup
+            hover_bg: Color::from_hex("#21252b"),
+            hover_fg: Color::from_hex("#abb2bf"),
+            hover_border: Color::from_hex("#528bff"),
         }
     }
 
@@ -475,6 +529,12 @@ pub fn build_screen_layout(
         }
     });
 
+    let hover = engine.lsp_hover_text.as_ref().map(|text| HoverPopup {
+        text: text.clone(),
+        anchor_line: engine.view().cursor.line,
+        anchor_col: engine.view().cursor.col,
+    });
+
     ScreenLayout {
         tab_bar,
         windows,
@@ -483,6 +543,7 @@ pub fn build_screen_layout(
         command,
         active_window_id,
         completion,
+        hover,
     }
 }
 
@@ -545,6 +606,7 @@ fn build_rendered_window(
         show_active_bg: false,
         has_git_diff: false,
         max_col: 0,
+        diagnostic_gutter: std::collections::HashMap::new(),
     };
 
     let window = match engine.windows.get(&window_id) {
@@ -564,6 +626,17 @@ fn build_rendered_window(
 
     // Whether this buffer has git diff data.
     let has_git = !buffer_state.git_diff.is_empty();
+
+    // Look up LSP diagnostics for this buffer.
+    // Diagnostics are keyed by absolute path (from LSP URIs), but buffer file_path
+    // may be relative, so canonicalize for the lookup.
+    let canonical_path = buffer_state
+        .file_path
+        .as_ref()
+        .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()));
+    let file_diagnostics = canonical_path
+        .as_ref()
+        .and_then(|p| engine.lsp_diagnostics.get(p));
 
     // Gutter width in character columns (always includes fold indicator column).
     let gutter_char_width = calculate_gutter_cols(
@@ -628,6 +701,37 @@ fn build_rendered_window(
             base_gutter
         };
 
+        // LSP diagnostics for this line.
+        let line_diagnostics: Vec<DiagnosticMark> = file_diagnostics
+            .map(|diags| {
+                diags
+                    .iter()
+                    .filter(|d| d.range.start.line as usize == line_idx)
+                    .map(|d| {
+                        let line_text: String = buffer.content.line(line_idx).chars().collect();
+                        let start_col = crate::core::lsp::utf16_offset_to_char(
+                            &line_text,
+                            d.range.start.character,
+                        );
+                        let end_col = if d.range.end.line as usize == line_idx {
+                            crate::core::lsp::utf16_offset_to_char(
+                                &line_text,
+                                d.range.end.character,
+                            )
+                        } else {
+                            line_text.len()
+                        };
+                        DiagnosticMark {
+                            start_col,
+                            end_col: end_col.max(start_col + 1),
+                            severity: d.severity,
+                            message: d.message.clone(),
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
         lines.push(RenderedLine {
             raw_text: line_str,
             gutter_text,
@@ -637,6 +741,7 @@ fn build_rendered_window(
             folded_line_count,
             line_idx,
             git_diff: git_status,
+            diagnostics: line_diagnostics,
         });
 
         // Jump past the fold body for fold headers.
@@ -688,6 +793,19 @@ fn build_rendered_window(
         .max()
         .unwrap_or(0);
 
+    // Build diagnostic gutter map (line → worst severity).
+    let mut diagnostic_gutter = std::collections::HashMap::new();
+    if let Some(diags) = file_diagnostics {
+        for d in diags {
+            let line = d.range.start.line as usize;
+            let entry = diagnostic_gutter.entry(line).or_insert(d.severity);
+            // Lower numeric value = worse severity (Error=1 < Warning=2 etc.)
+            if (d.severity as u8) < (*entry as u8) {
+                *entry = d.severity;
+            }
+        }
+    }
+
     RenderedWindow {
         window_id,
         rect: *rect,
@@ -702,6 +820,7 @@ fn build_rendered_window(
         show_active_bg: is_active && multi_window,
         has_git_diff: has_git,
         max_col,
+        diagnostic_gutter,
     }
 }
 
@@ -1030,11 +1149,18 @@ fn build_status_line(engine: &Engine) -> (String, String) {
     );
 
     let cursor = engine.cursor();
+    let (errors, warnings) = engine.diagnostic_counts();
+    let diag_str = if errors > 0 || warnings > 0 {
+        format!("  E:{} W:{}", errors, warnings)
+    } else {
+        String::new()
+    };
     let right = format!(
-        "Ln {}, Col {}  ({} lines) ",
+        "Ln {}, Col {}  ({} lines){} ",
         cursor.line + 1,
         cursor.col + 1,
-        engine.buffer().len_lines()
+        engine.buffer().len_lines(),
+        diag_str
     );
 
     (left, right)

@@ -1,10 +1,10 @@
 # VimCode Project State
 
-**Last updated:** Feb 18, 2026 (Session 46)
+**Last updated:** Feb 19, 2026 (Session 48)
 
 ## Status
 
-**TUI Sidebar + Icons + Mouse COMPLETE:** Nerd Font icons throughout, TUI sidebar with CRUD, full mouse support, resize bar (458 tests passing)
+**LSP Support STABLE:** Language server auto-detection, diagnostics (inline underlines + gutter icons), completions (Ctrl-Space), go-to-definition (gd), hover (K), diagnostic navigation (]d/[d); protocol compliance fixes + TUI performance optimizations — 495 tests passing
 
 ### Core Vim (Complete)
 - Seven modes (Normal/Insert/Visual/Visual Line/Visual Block/Command/Search)
@@ -82,6 +82,28 @@
 - **Code folding:** `+`/`-` gutter indicators; entire gutter column is clickable in both GTK and TUI
 - **Git integration:** `▌` gutter markers (green=added, yellow=modified); branch name in status bar; `:Gdiff`/`:Gd` command opens unified diff in vertical split; `:Gblame`/`:Gb` command opens `git blame` annotation in a scroll-synced vertical split; **Stage hunks:** `]c`/`[c` navigate between `@@` hunks, `gs`/`:Ghs`/`:Ghunk` stages the hunk under the cursor via `git apply --cached`
 
+### LSP Support (Language Server Protocol)
+- Automatic language server detection — open a file and features light up if the server is on `PATH`
+- Built-in registry: rust-analyzer, pyright-langserver, typescript-language-server, gopls, clangd
+- Custom servers configurable via `settings.json` `lsp_servers` array
+- **Diagnostics:** inline underlines (wavy in GTK, colored in TUI) + severity-colored gutter icons (dots in GTK, E/W/I/H chars in TUI)
+- **Diagnostic navigation:** `]d` / `[d` jump to next/prev diagnostic with wrap-around
+- **LSP completions:** `Ctrl-Space` in insert mode; feeds into existing completion popup
+- **Go-to-definition:** `gd` opens the definition file and jumps to the target line/column
+- **Hover:** `K` shows type/documentation popup above cursor; dismissed on any keypress
+- **Diagnostic counts:** `E:N W:N` in status bar right section
+- **Commands:** `:LspInfo`, `:LspRestart`, `:LspStop`
+- **Settings:** `lsp` boolean (default true); `:set lsp` / `:set nolsp` toggle
+- Full document sync (simple + correct; incremental sync is a future optimization)
+- Debounced `didChange` via dirty buffer tracking, flushed only during idle periods (no pending input)
+- Deterministic response routing via `pending_requests` map (request ID → method name)
+- LSP initialization guards: no `didOpen`/`didChange`/`didSave`/`didClose` until server handshake complete
+- Server-initiated requests (e.g. `window/workDoneProgress/create`) receive proper responses
+- Error responses from server generate proper events with empty data (no silent drops)
+- Diagnostic flood optimization: events capped at 50 per poll, only redraw for visible buffers
+- Path canonicalization: diagnostics keyed by absolute paths; lookups canonicalize buffer paths
+- Pure `std::thread` + `std::sync::mpsc` — no tokio/async runtime
+
 ### TUI Backend (`src/tui_main.rs`)
 - Full editor in terminal via ratatui 0.27 + crossterm
 - **Sidebar:** File explorer tree (Ctrl-B toggle, Ctrl-Shift-E focus), j/k navigation, l/Enter open, h collapse, a/A/D CRUD, R refresh; **Search panel** (Ctrl-Shift-F): query input, Enter to run, j/k results, Enter opens file
@@ -94,6 +116,8 @@
 - **Per-window viewport:** each split pane tracks its own viewport_lines/cols for correct `ensure_cursor_visible` in hsplit/vsplit
 - **Scroll sync:** `sync_scroll_binds()` called after keyboard nav and all mouse scroll/drag events (`:Gblame` pairs stay in sync)
 - **Drag event coalescing:** consecutive `MouseEventKind::Drag` events are coalesced (only the final position is rendered), eliminating render-per-pixel lag on all drag operations
+- **Idle-only background work**: `lsp_flush_changes()`, `poll_lsp()`, `poll_project_search()`, `poll_project_replace()` only run when no input is pending (prevents blocking pipe writes during typing)
+- **On-demand rendering**: `needs_redraw` flag skips rendering when nothing changed; adaptive poll timeout (1ms when redraw pending, 50ms idle)
 - Cursor shapes: bar in insert, underline in replace-r
 
 ### Settings
@@ -118,21 +142,23 @@
 ```
 vimcode/
 ├── src/
-│   ├── main.rs (~3400 lines) — GTK4/Relm4 UI, rendering, find dialog, sidebar resize, search/replace panel
-│   ├── tui_main.rs (~2780 lines) — ratatui/crossterm TUI backend, sidebar, mouse, search/replace panel
+│   ├── main.rs (~3600 lines) — GTK4/Relm4 UI, rendering, find dialog, sidebar resize, search/replace panel
+│   ├── tui_main.rs (~2900 lines) — ratatui/crossterm TUI backend, sidebar, mouse, search/replace panel
 │   ├── icons.rs (~30 lines) — Nerd Font file-type icons (shared by GTK + TUI)
-│   ├── render.rs (~360 lines) — Platform-agnostic rendering abstraction (ScreenLayout, max_col)
-│   └── core/ (~11,500 lines) — Platform-agnostic logic
-│       ├── engine.rs (~13,900 lines) — Orchestrates everything, find/replace, macros, history, project search/replace
+│   ├── render.rs (~1200 lines) — Platform-agnostic rendering abstraction (ScreenLayout, max_col)
+│   └── core/ (~20,200 lines) — Platform-agnostic logic
+│       ├── engine.rs (~14,600 lines) — Orchestrates everything, find/replace, macros, history, LSP, project search/replace
+│       ├── lsp.rs (~1,200 lines) — LSP protocol transport + single-server client (request ID tracking)
+│       ├── lsp_manager.rs (~400 lines) — Multi-server coordinator with initialization guards
 │       ├── project_search.rs (~630 lines) — Regex/case/whole-word search + replace (ignore + regex crates)
 │       ├── buffer_manager.rs (~600 lines) — Buffer lifecycle
 │       ├── buffer.rs (~120 lines) — Rope-based storage
 │       ├── session.rs (~175 lines) — Session state persistence (sidebar_width added)
-│       ├── settings.rs (~616 lines) — JSON persistence, auto-init, :set parsing
+│       ├── settings.rs (~640 lines) — JSON persistence, auto-init, :set parsing
 │       ├── window.rs, tab.rs, view.rs, cursor.rs, mode.rs, syntax.rs
 │       ├── git.rs (~635 lines) — git subprocess integration (diff/blame/hunk parsing, branch detection, stage_hunk)
-│       └── Tests: 458 passing (9 find/replace, 14 macro, 8 session, 4 reverse search, 7 replace char, 5 undo line, 8 case change, 6 marks, 5 incremental search, 12 syntax/language, 6 history search, 11 fold tests, 12 git tests, 4 sidebar-preview tests, 5 auto-indent tests, 4 completion tests, 9 quit/ctrl-s tests, 1 session-restore test, 22 set-command tests, 10 hunk-staging tests, 9 text-object tests, 24 project-search tests, 5 engine-replace tests)
-└── Total: ~17,600 lines
+│       └── Tests: 495 passing (9 find/replace, 14 macro, 8 session, 4 reverse search, 7 replace char, 5 undo line, 8 case change, 6 marks, 5 incremental search, 12 syntax/language, 6 history search, 11 fold tests, 12 git tests, 4 sidebar-preview tests, 5 auto-indent tests, 4 completion tests, 9 quit/ctrl-s tests, 1 session-restore test, 22 set-command tests, 10 hunk-staging tests, 9 text-object tests, 24 project-search tests, 5 engine-replace tests, 27 lsp-protocol tests, 10 lsp-engine tests)
+└── Total: ~20,900 lines
 ```
 
 ## Architecture
@@ -149,13 +175,14 @@ vimcode/
 | Rendering | Pango + Cairo (GTK) / ratatui cells (TUI) |
 | Text | Ropey |
 | Parsing | Tree-sitter |
+| LSP | lsp-types 0.97 |
 | Config | serde + serde_json |
 
 ## Commands
 ```bash
 cargo build
 cargo run -- <file>
-cargo test -- --test-threads=1    # 438 tests
+cargo test -- --test-threads=1    # 495 tests
 cargo clippy -- -D warnings
 cargo fmt
 ```
@@ -188,6 +215,7 @@ cargo fmt
 - [x] **Horizontal scrollbar fix: per-window visible-column calculation using real Pango char_width**
 - [x] **TUI scrollbar polish: vsplit left-pane separator-as-scrollbar, h-scrollbar row, drag support, scroll sync via mouse, per-pane viewport**
 - [x] **TUI scrollbar drag fix: immediate h-scroll (no deferred apply), drag event coalescing, unified grey scrollbar color**
+- [x] **LSP bug fixes + TUI performance optimizations** — protocol compliance, needs_redraw, idle-only background work
 
 ### Git (next)
 - [x] **Stage hunks** — `]c`/`[c` hunk navigation, `gs`/`:Ghs` stages hunk under cursor via `git apply --cached`
@@ -203,11 +231,14 @@ cargo fmt
 - [ ] **`it`/`at` tag text objects** — inner/around HTML/XML tag
 
 ### Big features
-- [ ] **LSP support** — completions, go-to-definition, hover, diagnostics
-- [ ] **`gd` / `gD`** — go-to-definition (ctags/ripgrep stub before LSP)
+- [x] **LSP support** — completions (Ctrl-Space), go-to-definition (gd), hover (K), diagnostics (]d/[d), auto-detect servers on PATH
 - [ ] **`:norm`** — execute normal command on a range of lines
 
 ## Recent Work
+**Session 48:** LSP bug fixes + TUI performance — fixed full LSP lifecycle: `notify_did_open` now returns `Result<(), String>` with descriptive errors; added `pending_requests: Arc<Mutex<HashMap<i64, String>>>` for deterministic response routing (no more guessing response type by content); added initialization guards on all notification methods (no `didOpen`/`didChange`/`didSave`/`didClose` before server handshake completes); reader thread now responds to server-initiated requests (`window/workDoneProgress/create`) and handles error responses properly. Performance fixes: diagnostic flood optimization (pre-computed visible paths set, events capped at 50/poll, only redraw for visible buffers); fixed path mismatch between LSP diagnostic keys (absolute) and buffer file_path (relative) via canonicalization at lookup points in render.rs, diagnostic_counts(), and jump_next/prev_diagnostic(). TUI: added `needs_redraw` flag for on-demand rendering (was unconditional 50 FPS); moved all background work (LSP flush/poll, search poll, replace poll) to idle-only periods (no pending input) — eliminated blocking pipe writes during typing; adaptive poll timeout (1ms when redraw pending, 50ms idle). Reverted `Stdio::inherit()` to `Stdio::null()` for child process stderr (rust-analyzer stderr was corrupting TUI display). (495 tests, no change.)
+
+**Session 47:** LSP support — full Language Server Protocol integration using lightweight custom client (`std::thread` + `mpsc`, no tokio). New files: `src/core/lsp.rs` (~750 lines, protocol transport + single-server client with 27 unit tests), `src/core/lsp_manager.rs` (~340 lines, multi-server coordinator with built-in registry for rust-analyzer/pyright/typescript-language-server/gopls/clangd). Engine gains LSP fields and lifecycle hooks (didOpen/didChange/didSave/didClose), `poll_lsp()` event processing, diagnostic navigation (`]d`/`[d`), go-to-definition (`gd`), hover popup (`K`), LSP completion (`Ctrl-Space`). Render layer: `DiagnosticMark` + `HoverPopup` types, diagnostic_gutter map, theme colors (error/warning/info/hint/hover). GTK backend: wavy underlines via Cairo curves, colored gutter dots, hover popup, LSP poll in SearchPollTick, shutdown on quit. TUI backend: colored underlines + E/W/I/H gutter chars, hover popup, LSP poll in event loop, shutdown on quit. Settings: `lsp_enabled` bool + `lsp_servers` array for custom servers; `:set lsp`/`:set nolsp`; `:LspInfo`/`:LspRestart`/`:LspStop` commands. (458→495 tests, 37 new.)
+
 **Session 46:** TUI scrollbar drag fix — removed deferred `pending_h_scroll` mechanism so h-scrollbar drag updates immediately (matching v-scrollbar behaviour); added drag event coalescing (consecutive `MouseEventKind::Drag` events are drained via `poll(Duration::ZERO)`, only the final position is rendered) benefiting all drag operations (h-scrollbar, v-scrollbar, sidebar resize); unified scrollbar thumb colour to `Rgb(128, 128, 128)` grey across vertical and horizontal scrollbars. (458 tests, no change.)
 
 **Session 45:** Replace across files — added `replace_in_project()` to `project_search.rs`: walks files via `ignore` crate, applies `regex::replace_all`, writes back only changed files; uses `NoExpand` wrapper in literal mode to prevent `$1` backreference expansion; files in `skip_paths` (dirty buffers) are skipped and reported. New `ReplaceResult` struct with counts and file lists. Extracted `build_search_regex()` helper shared by search and replace. Engine gains `project_replace_text`, `start_project_replace` (async), `poll_project_replace`, `apply_replace_result` (reloads open buffers, clears undo stacks, refreshes git diff). GTK: Replace `Entry` + "Replace All" button; 2 new `Msg` variants; replace poll piggybacked on `SearchPollTick`. TUI: `replace_input_focused` field; `Tab` switches inputs; `Enter` in replace box triggers replace; `Alt+H` shortcut; new `[Replace…]` row; all layout offsets shifted +1; mouse handling updated. (444→458 tests, 14 new: 9 replace + 5 engine.)
