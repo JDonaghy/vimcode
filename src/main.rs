@@ -1,7 +1,10 @@
 // TreeView/TreeStore are deprecated in GTK4 4.10+ but still functional
 // TODO: Migrate to ListView/ColumnView in a future phase
 #![allow(deprecated)]
+// Relm4 view! macro generates #[name = "..."] bindings that trigger this lint
+#![allow(unused_assignments)]
 
+use gio::prelude::{FileExt, FileMonitorExt};
 use gtk4::cairo::Context;
 use gtk4::gdk;
 use gtk4::pango::{self, AttrColor, AttrList, FontDescription};
@@ -14,10 +17,18 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 mod core;
-use core::buffer::Buffer;
+mod icons;
+mod render;
+mod tui_main;
+
 use core::engine::EngineAction;
+use core::lsp::DiagnosticSeverity;
 use core::settings::LineNumberMode;
-use core::{Cursor, Engine, Mode, OpenMode, WindowRect};
+use core::{Engine, GitLineStatus, OpenMode, WindowRect};
+use render::{
+    build_screen_layout, CommandLineData, CursorShape, RenderedWindow, SelectionKind,
+    SelectionRange, StyledSpan, TabInfo, Theme,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[allow(dead_code)] // Variants used in later phases
@@ -29,6 +40,8 @@ enum SidebarPanel {
     None,
 }
 
+use std::collections::HashMap;
+
 struct App {
     engine: Rc<RefCell<Engine>>,
     redraw: bool,
@@ -38,6 +51,34 @@ struct App {
     tree_has_focus: bool,
     file_tree_view: Rc<RefCell<Option<gtk4::TreeView>>>,
     drawing_area: Rc<RefCell<Option<gtk4::DrawingArea>>>,
+    sidebar_inner_box: Rc<RefCell<Option<gtk4::Box>>>,
+    // Per-window scrollbars and indicators
+    window_scrollbars: Rc<RefCell<HashMap<core::WindowId, WindowScrollbars>>>,
+    overlay: Rc<RefCell<Option<gtk4::Overlay>>>,
+    cached_line_height: f64,
+    cached_char_width: f64,
+    #[allow(dead_code)] // Kept alive to continue monitoring settings.json
+    settings_monitor: Option<gio::FileMonitor>,
+    sender: relm4::Sender<Msg>,
+    // Find/Replace dialog state
+    find_dialog_visible: bool,
+    find_text: String,
+    replace_text: String,
+    #[allow(dead_code)] // For future case-sensitive search feature
+    find_case_sensitive: bool,
+    #[allow(dead_code)] // For future whole word search feature
+    find_whole_word: bool,
+    /// Status text shown below the project search input ("N matches in M files").
+    project_search_status: String,
+    /// Ref to the search results ListBox so we can rebuild it after each search.
+    search_results_list: Rc<RefCell<Option<gtk4::ListBox>>>,
+}
+
+/// Scrollbars and indicators for a single window
+struct WindowScrollbars {
+    vertical: gtk4::Scrollbar,
+    horizontal: gtk4::Scrollbar,
+    cursor_indicator: gtk4::DrawingArea,
 }
 
 #[derive(Debug)]
@@ -63,9 +104,10 @@ enum Msg {
     ToggleSidebar,
     /// Switch to a different sidebar panel.
     SwitchPanel(SidebarPanel),
-    /// Open file from sidebar tree view (permanent).
+    /// Open file from sidebar tree view (switches to existing tab or opens new permanent tab).
+    /// Used for double-click.
     OpenFileFromSidebar(PathBuf),
-    /// Preview file from sidebar single-click (reusable preview tab).
+    /// Preview file from sidebar tree view (single-click, replaces current preview tab).
     PreviewFileFromSidebar(PathBuf),
     /// Create a new file with the given name.
     CreateFile(String),
@@ -79,6 +121,64 @@ enum Msg {
     FocusExplorer,
     /// Focus the editor (Escape from tree).
     FocusEditor,
+    /// Vertical scrollbar value changed.
+    VerticalScrollbarChanged {
+        window_id: core::WindowId,
+        value: f64,
+    },
+    /// Horizontal scrollbar value changed.
+    HorizontalScrollbarChanged {
+        window_id: core::WindowId,
+        value: f64,
+    },
+    /// Cache font metrics (line_height, char_width) from draw_editor.
+    CacheFontMetrics(f64, f64),
+    /// Open settings.json in editor.
+    OpenSettingsFile,
+    /// Settings file changed on disk.
+    SettingsFileChanged,
+    /// Toggle find dialog visibility.
+    ToggleFindDialog,
+    /// Find text input changed.
+    FindTextChanged(String),
+    /// Replace text input changed.
+    ReplaceTextChanged(String),
+    /// Find next match.
+    FindNext,
+    /// Find previous match.
+    FindPrevious,
+    /// Replace current match and find next.
+    ReplaceNext,
+    /// Replace all matches.
+    ReplaceAll,
+    /// Close find dialog.
+    CloseFindDialog,
+    /// Window size changed.
+    WindowResized { width: i32, height: i32 },
+    /// Window closing (save session state).
+    WindowClosing { width: i32, height: i32 },
+    /// Sidebar was resized via drag handle — save new width.
+    SidebarResized,
+    /// Project search input text changed (query update, no search yet).
+    ProjectSearchQueryChanged(String),
+    /// User pressed Enter in the project search box — run the search.
+    ProjectSearchSubmit,
+    /// User clicked/activated a search result by index — open the file.
+    ProjectSearchOpenResult(usize),
+    /// Periodic tick to poll for background search results.
+    SearchPollTick,
+    /// Toggle case-sensitive project search.
+    ProjectSearchToggleCase,
+    /// Toggle whole-word project search.
+    ProjectSearchToggleWholeWord,
+    /// Toggle regex project search.
+    ProjectSearchToggleRegex,
+    /// Project replace input text changed.
+    ProjectReplaceTextChanged(String),
+    /// User clicked "Replace All" button — run replace across files.
+    ProjectReplaceAll,
+    /// Mouse scroll wheel on editor drawing area.
+    MouseScroll { delta_x: f64, delta_y: f64 },
 }
 
 #[relm4::component]
@@ -91,6 +191,14 @@ impl SimpleComponent for App {
         gtk4::Window {
             set_title: Some("VimCode"),
             set_default_size: (800, 600),
+
+            // Save window geometry on close
+            connect_close_request[sender] => move |window| {
+                let width = window.default_width();
+                let height = window.default_height();
+                sender.input(Msg::WindowClosing { width, height });
+                gtk4::glib::Propagation::Proceed
+            },
 
             #[name = "main_hbox"]
             gtk4::Box {
@@ -105,7 +213,7 @@ impl SimpleComponent for App {
 
                     #[name = "explorer_button"]
                     gtk4::Button {
-                        set_label: "📁",
+                        set_label: "\u{f07c}",
                         set_tooltip_text: Some("Explorer (Ctrl+Shift+E)"),
                         set_width_request: 48,
                         set_height_request: 48,
@@ -122,17 +230,27 @@ impl SimpleComponent for App {
                         }
                     },
 
+                    #[name = "search_button"]
                     gtk4::Button {
-                        set_label: "🔍",
-                        set_tooltip_text: Some("Search (disabled)"),
+                        set_label: "\u{f002}",
+                        set_tooltip_text: Some("Search (Ctrl+Shift+F)"),
                         set_width_request: 48,
                         set_height_request: 48,
-                        set_css_classes: &["activity-button"],
-                        set_sensitive: false,
+
+                        #[watch]
+                        set_css_classes: if model.active_panel == SidebarPanel::Search && model.sidebar_visible {
+                            &["activity-button", "active"]
+                        } else {
+                            &["activity-button"]
+                        },
+
+                        connect_clicked[sender] => move |_| {
+                            sender.input(Msg::SwitchPanel(SidebarPanel::Search));
+                        }
                     },
 
                     gtk4::Button {
-                        set_label: "🌿",
+                        set_label: "\u{f418}",
                         set_tooltip_text: Some("Git (disabled)"),
                         set_width_request: 48,
                         set_height_request: 48,
@@ -145,12 +263,16 @@ impl SimpleComponent for App {
                     },
 
                     gtk4::Button {
-                        set_label: "⚙️",
-                        set_tooltip_text: Some("Settings (disabled)"),
+                        set_label: "\u{f013}",
+                        set_tooltip_text: Some("Settings"),
                         set_width_request: 48,
                         set_height_request: 48,
                         set_css_classes: &["activity-button"],
-                        set_sensitive: false,
+                        set_sensitive: true,
+
+                        connect_clicked[sender] => move |_| {
+                            sender.input(Msg::SwitchPanel(SidebarPanel::Settings));
+                        }
                     },
                 },
 
@@ -163,10 +285,19 @@ impl SimpleComponent for App {
                     #[watch]
                     set_reveal_child: model.sidebar_visible,
 
+                    // Container for both panels (Explorer and Settings)
+                    #[name = "sidebar_inner_box"]
                     gtk4::Box {
                         set_orientation: gtk4::Orientation::Vertical,
                         set_width_request: 300,
-                        set_css_classes: &["sidebar"],
+
+                        // Explorer panel
+                        gtk4::Box {
+                            set_orientation: gtk4::Orientation::Vertical,
+                            set_css_classes: &["sidebar"],
+
+                            #[watch]
+                            set_visible: model.active_panel == SidebarPanel::Explorer,
 
                         // Toolbar with file operation buttons
                         #[name = "explorer_toolbar"]
@@ -177,7 +308,7 @@ impl SimpleComponent for App {
                             set_css_classes: &["explorer-toolbar"],
 
                             gtk4::Button {
-                                set_label: "📄",
+                                set_label: "\u{f15b}",
                                 set_tooltip_text: Some("New File"),
                                 set_width_request: 32,
                                 set_height_request: 32,
@@ -198,7 +329,7 @@ impl SimpleComponent for App {
                             },
 
                             gtk4::Button {
-                                set_label: "📁",
+                                set_label: "\u{f07b}",
                                 set_tooltip_text: Some("New Folder"),
                                 set_width_request: 32,
                                 set_height_request: 32,
@@ -219,7 +350,7 @@ impl SimpleComponent for App {
                             },
 
                             gtk4::Button {
-                                set_label: "🗑️",
+                                set_label: "\u{f1f8}",
                                 set_tooltip_text: Some("Delete"),
                                 set_width_request: 32,
                                 set_height_request: 32,
@@ -238,7 +369,7 @@ impl SimpleComponent for App {
                             },
 
                             gtk4::Button {
-                                set_label: "🔄",
+                                set_label: "\u{f021}",
                                 set_tooltip_text: Some("Refresh"),
                                 set_width_request: 32,
                                 set_height_request: 32,
@@ -285,61 +416,413 @@ impl SimpleComponent for App {
                                 },
                             },
                         },
-                    }
+                        },
+
+                        // Settings panel
+                        gtk4::Box {
+                            set_orientation: gtk4::Orientation::Vertical,
+                            set_css_classes: &["sidebar"],
+
+                            #[watch]
+                            set_visible: model.active_panel == SidebarPanel::Settings,
+
+                        gtk4::Box {
+                            set_orientation: gtk4::Orientation::Vertical,
+                            set_margin_all: 12,
+                            set_spacing: 12,
+
+                            gtk4::Label {
+                                set_text: "Settings",
+                                set_halign: gtk4::Align::Start,
+                                set_css_classes: &["heading"],
+                            },
+
+                            gtk4::Button {
+                                set_label: "Open settings.json",
+
+                                connect_clicked[sender] => move |_| {
+                                    sender.input(Msg::OpenSettingsFile);
+                                }
+                            },
+
+                            gtk4::Label {
+                                set_text: "Settings file will auto-reload on save",
+                                set_halign: gtk4::Align::Start,
+                                set_css_classes: &["dim-label"],
+                            },
+                        },
+                        },
+
+                        // Search panel
+                        gtk4::Box {
+                            set_orientation: gtk4::Orientation::Vertical,
+                            set_css_classes: &["sidebar"],
+
+                            #[watch]
+                            set_visible: model.active_panel == SidebarPanel::Search,
+
+                            // Header
+                            gtk4::Box {
+                                set_orientation: gtk4::Orientation::Horizontal,
+                                set_css_classes: &["sidebar-header"],
+                                gtk4::Label {
+                                    set_text: " SEARCH",
+                                    set_halign: gtk4::Align::Start,
+                                    set_hexpand: true,
+                                    set_css_classes: &["sidebar-title"],
+                                },
+                            },
+
+                            // Search input row
+                            gtk4::Box {
+                                set_orientation: gtk4::Orientation::Horizontal,
+                                set_margin_top: 6,
+                                set_margin_bottom: 4,
+                                set_margin_start: 6,
+                                set_margin_end: 6,
+
+                                #[name = "project_search_entry"]
+                                gtk4::Entry {
+                                    set_hexpand: true,
+                                    set_placeholder_text: Some("Search files…"),
+
+                                    connect_changed[sender] => move |entry| {
+                                        sender.input(Msg::ProjectSearchQueryChanged(
+                                            entry.text().to_string(),
+                                        ));
+                                    },
+
+                                    connect_activate[sender] => move |_| {
+                                        sender.input(Msg::ProjectSearchSubmit);
+                                    },
+                                },
+                            },
+
+                            // Toggle buttons row (Aa / Ab| / .*)
+                            gtk4::Box {
+                                set_orientation: gtk4::Orientation::Horizontal,
+                                set_margin_start: 6,
+                                set_margin_end: 6,
+                                set_margin_bottom: 4,
+                                set_spacing: 4,
+
+                                gtk4::ToggleButton {
+                                    set_label: "Aa",
+                                    set_tooltip_text: Some("Match Case"),
+                                    set_css_classes: &["search-toggle-btn"],
+
+                                    #[watch]
+                                    set_active: model.engine.borrow().project_search_options.case_sensitive,
+
+                                    connect_clicked[sender] => move |_| {
+                                        sender.input(Msg::ProjectSearchToggleCase);
+                                    },
+                                },
+
+                                gtk4::ToggleButton {
+                                    set_label: "Ab|",
+                                    set_tooltip_text: Some("Match Whole Word"),
+                                    set_css_classes: &["search-toggle-btn"],
+
+                                    #[watch]
+                                    set_active: model.engine.borrow().project_search_options.whole_word,
+
+                                    connect_clicked[sender] => move |_| {
+                                        sender.input(Msg::ProjectSearchToggleWholeWord);
+                                    },
+                                },
+
+                                gtk4::ToggleButton {
+                                    set_label: ".*",
+                                    set_tooltip_text: Some("Use Regular Expression"),
+                                    set_css_classes: &["search-toggle-btn"],
+
+                                    #[watch]
+                                    set_active: model.engine.borrow().project_search_options.use_regex,
+
+                                    connect_clicked[sender] => move |_| {
+                                        sender.input(Msg::ProjectSearchToggleRegex);
+                                    },
+                                },
+                            },
+
+                            // Replace input row
+                            gtk4::Box {
+                                set_orientation: gtk4::Orientation::Horizontal,
+                                set_margin_top: 2,
+                                set_margin_bottom: 4,
+                                set_margin_start: 6,
+                                set_margin_end: 6,
+                                set_spacing: 4,
+
+                                gtk4::Entry {
+                                    set_hexpand: true,
+                                    set_placeholder_text: Some("Replace…"),
+
+                                    connect_changed[sender] => move |entry| {
+                                        sender.input(Msg::ProjectReplaceTextChanged(
+                                            entry.text().to_string(),
+                                        ));
+                                    },
+
+                                    connect_activate[sender] => move |_| {
+                                        sender.input(Msg::ProjectReplaceAll);
+                                    },
+                                },
+
+                                gtk4::Button {
+                                    set_label: "Replace All",
+                                    set_tooltip_text: Some("Replace all matches in project"),
+                                    set_css_classes: &["search-toggle-btn"],
+
+                                    connect_clicked[sender] => move |_| {
+                                        sender.input(Msg::ProjectReplaceAll);
+                                    },
+                                },
+                            },
+
+                            // Status label ("N results in M files" / empty)
+                            gtk4::Label {
+                                set_margin_start: 8,
+                                set_margin_bottom: 4,
+                                set_halign: gtk4::Align::Start,
+                                set_css_classes: &["dim-label"],
+
+                                #[watch]
+                                set_text: &model.project_search_status,
+                            },
+
+                            // Results list
+                            gtk4::ScrolledWindow {
+                                set_vexpand: true,
+                                set_hscrollbar_policy: gtk4::PolicyType::Never,
+                                set_vscrollbar_policy: gtk4::PolicyType::Automatic,
+                                set_overlay_scrolling: false,
+                                set_css_classes: &["search-results-scroll"],
+
+                                #[name = "search_results_list"]
+                                gtk4::ListBox {
+                                    set_selection_mode: gtk4::SelectionMode::Single,
+                                    set_css_classes: &["search-results-list"],
+                                },
+                            },
+                        },
+                    },
                 },
 
-                // Editor area (existing DrawingArea)
+                // Sidebar resize drag handle (6px wide, ew-resize cursor)
+                #[name = "sidebar_resize_handle"]
+                gtk4::Box {
+                    set_width_request: 6,
+                    set_css_classes: &["sidebar-resize-handle"],
+
+                    #[watch]
+                    set_visible: model.sidebar_visible,
+
+                    add_controller = gtk4::GestureDrag {
+                        connect_drag_update[sidebar_inner_box_ref] => move |_, dx, _| {
+                            if let Some(ref sb) = *sidebar_inner_box_ref.borrow() {
+                                let current = sb.width_request();
+                                let new_w = (current as f64 + dx).round() as i32;
+                                sb.set_width_request(new_w.clamp(100, 600));
+                            }
+                        },
+                        connect_drag_end[sender] => move |_, _, _| {
+                            sender.input(Msg::SidebarResized);
+                        },
+                    },
+                },
+
+                // Editor area (DrawingArea wrapped in Overlay for scrollbars)
                 gtk4::Box {
                     set_orientation: gtk4::Orientation::Vertical,
                     set_hexpand: true,
 
-                    #[name = "drawing_area"]
-                    gtk4::DrawingArea {
-                        set_hexpand: true,
-                        set_vexpand: true,
-                        set_focusable: true,
-                        grab_focus: (),
+                    #[name = "editor_overlay"]
+                    gtk4::Overlay {
+                        #[name = "drawing_area"]
+                        gtk4::DrawingArea {
+                            set_hexpand: true,
+                            set_vexpand: true,
+                            set_focusable: true,
+                            grab_focus: (),
 
-                        add_controller = gtk4::EventControllerKey {
-                            connect_key_pressed[sender] => move |_, key, _, modifier| {
-                                let key_name = key.name().map(|s| s.to_string()).unwrap_or_default();
-                                let unicode = key.to_unicode().filter(|c| !c.is_control());
-                                let ctrl = modifier.contains(gdk::ModifierType::CONTROL_MASK);
-                                let shift = modifier.contains(gdk::ModifierType::SHIFT_MASK);
+                            add_controller = gtk4::EventControllerKey {
+                                connect_key_pressed[sender] => move |_, key, _, modifier| {
+                                    let key_name = key.name().map(|s| s.to_string()).unwrap_or_default();
+                                    let unicode = key.to_unicode().filter(|c| !c.is_control());
+                                    let ctrl = modifier.contains(gdk::ModifierType::CONTROL_MASK);
+                                    let shift = modifier.contains(gdk::ModifierType::SHIFT_MASK);
 
-                                // Check for Ctrl-B to toggle sidebar
-                                if ctrl && !shift && unicode == Some('b') {
-                                    sender.input(Msg::ToggleSidebar);
-                                    return gtk4::glib::Propagation::Stop;
+                                    // Check for Ctrl-F to toggle find dialog
+                                    if ctrl && !shift && unicode == Some('f') {
+                                        sender.input(Msg::ToggleFindDialog);
+                                        return gtk4::glib::Propagation::Stop;
+                                    }
+
+                                    // Check for Ctrl-B to toggle sidebar
+                                    if ctrl && !shift && unicode == Some('b') {
+                                        sender.input(Msg::ToggleSidebar);
+                                        return gtk4::glib::Propagation::Stop;
+                                    }
+
+                                    // Check for Ctrl-Shift-E to focus explorer
+                                    if ctrl && shift && (unicode == Some('E') || unicode == Some('e')) {
+                                        sender.input(Msg::FocusExplorer);
+                                        return gtk4::glib::Propagation::Stop;
+                                    }
+
+                                    // Check for Ctrl-Shift-F to open project search
+                                    if ctrl && shift && (unicode == Some('F') || unicode == Some('f')) {
+                                        sender.input(Msg::SwitchPanel(SidebarPanel::Search));
+                                        return gtk4::glib::Propagation::Stop;
+                                    }
+
+                                    sender.input(Msg::KeyPress { key_name, unicode, ctrl });
+                                    gtk4::glib::Propagation::Stop
                                 }
+                            },
 
-                                // Check for Ctrl-Shift-E to focus explorer
-                                if ctrl && shift && (unicode == Some('E') || unicode == Some('e')) {
-                                    sender.input(Msg::FocusExplorer);
-                                    return gtk4::glib::Propagation::Stop;
+                            add_controller = gtk4::GestureClick {
+                                connect_pressed[sender, drawing_area] => move |_, _, x, y| {
+                                    // Grab focus when clicking in editor
+                                    drawing_area.grab_focus();
+
+                                    let width = drawing_area.width() as f64;
+                                    let height = drawing_area.height() as f64;
+                                    sender.input(Msg::MouseClick { x, y, width, height });
                                 }
+                            },
 
-                                sender.input(Msg::KeyPress { key_name, unicode, ctrl });
-                                gtk4::glib::Propagation::Stop
+                            add_controller = gtk4::EventControllerScroll {
+                                set_flags: gtk4::EventControllerScrollFlags::VERTICAL
+                                         | gtk4::EventControllerScrollFlags::HORIZONTAL,
+                                connect_scroll[sender] => move |_, dx, dy| {
+                                    sender.input(Msg::MouseScroll { delta_x: dx, delta_y: dy });
+                                    gtk4::glib::Propagation::Stop
+                                },
+                            },
+
+                            #[watch]
+                            set_css_classes: {
+                                drawing_area.queue_draw();
+                                if model.redraw { &["vim-code", "even"] } else { &["vim-code", "odd"] }
+                            },
+                        },
+
+                        // Find/Replace Dialog (overlay at top-right)
+                        add_overlay = &gtk4::Revealer {
+                            set_transition_type: gtk4::RevealerTransitionType::SlideDown,
+                            set_transition_duration: 200,
+                            set_halign: gtk4::Align::End,
+                            set_valign: gtk4::Align::Start,
+                            set_margin_top: 10,
+                            set_margin_end: 10,
+
+                            #[watch]
+                            set_reveal_child: model.find_dialog_visible,
+
+                            gtk4::Box {
+                                set_orientation: gtk4::Orientation::Vertical,
+                                set_spacing: 8,
+                                set_css_classes: &["find-dialog"],
+                                set_width_request: 400,
+
+                                // Find input row
+                                gtk4::Box {
+                                    set_orientation: gtk4::Orientation::Horizontal,
+                                    set_spacing: 4,
+
+                                    gtk4::Label {
+                                        set_text: "Find:",
+                                        set_width_request: 60,
+                                    },
+
+                                    #[name = "find_entry"]
+                                    gtk4::Entry {
+                                        set_placeholder_text: Some("Find in buffer"),
+                                        set_hexpand: true,
+
+                                        connect_changed[sender] => move |entry| {
+                                            let text = entry.text().to_string();
+                                            sender.input(Msg::FindTextChanged(text));
+                                        },
+
+                                        connect_activate[sender] => move |_| {
+                                            sender.input(Msg::FindNext);
+                                        },
+                                    },
+
+                                    gtk4::Button {
+                                        set_label: "↑",
+                                        set_tooltip_text: Some("Previous (Shift+Enter)"),
+                                        connect_clicked[sender] => move |_| {
+                                            sender.input(Msg::FindPrevious);
+                                        },
+                                    },
+
+                                    gtk4::Button {
+                                        set_label: "↓",
+                                        set_tooltip_text: Some("Next (Enter)"),
+                                        connect_clicked[sender] => move |_| {
+                                            sender.input(Msg::FindNext);
+                                        },
+                                    },
+
+                                    gtk4::Button {
+                                        set_label: "×",
+                                        set_tooltip_text: Some("Close (Escape)"),
+                                        connect_clicked[sender] => move |_| {
+                                            sender.input(Msg::CloseFindDialog);
+                                        },
+                                    },
+                                },
+
+                                // Replace input row
+                                gtk4::Box {
+                                    set_orientation: gtk4::Orientation::Horizontal,
+                                    set_spacing: 4,
+
+                                    gtk4::Label {
+                                        set_text: "Replace:",
+                                        set_width_request: 60,
+                                    },
+
+                                    #[name = "replace_entry"]
+                                    gtk4::Entry {
+                                        set_placeholder_text: Some("Replace with"),
+                                        set_hexpand: true,
+
+                                        connect_changed[sender] => move |entry| {
+                                            let text = entry.text().to_string();
+                                            sender.input(Msg::ReplaceTextChanged(text));
+                                        },
+                                    },
+
+                                    gtk4::Button {
+                                        set_label: "Replace",
+                                        connect_clicked[sender] => move |_| {
+                                            sender.input(Msg::ReplaceNext);
+                                        },
+                                    },
+
+                                    gtk4::Button {
+                                        set_label: "Replace All",
+                                        connect_clicked[sender] => move |_| {
+                                            sender.input(Msg::ReplaceAll);
+                                        },
+                                    },
+                                },
+
+                                // Match count label
+                                #[name = "match_count_label"]
+                                gtk4::Label {
+                                    set_text: "No matches",
+                                    set_halign: gtk4::Align::Start,
+                                    set_css_classes: &["find-match-count"],
+                                },
                             }
-                        },
-
-                        add_controller = gtk4::GestureClick {
-                            connect_pressed[sender, drawing_area] => move |_, _, x, y| {
-                                // Grab focus when clicking in editor
-                                drawing_area.grab_focus();
-
-                                let width = drawing_area.width() as f64;
-                                let height = drawing_area.height() as f64;
-                                sender.input(Msg::MouseClick { x, y, width, height });
-                            }
-                        },
-
-                        #[watch]
-                        set_css_classes: {
-                            drawing_area.queue_draw();
-                            if model.redraw { &["vim-code", "even"] } else { &["vim-code", "odd"] }
-                        },
+                        }
                     }
                 }
             }
@@ -356,7 +839,11 @@ impl SimpleComponent for App {
 
         let engine = match file_path {
             Some(ref path) => Engine::open(path),
-            None => Engine::new(),
+            None => {
+                let mut e = Engine::new();
+                e.restore_session_files();
+                e
+            }
         };
 
         // Set window title based on file
@@ -376,36 +863,108 @@ impl SimpleComponent for App {
 
         let file_tree_view_ref = Rc::new(RefCell::new(None));
         let drawing_area_ref = Rc::new(RefCell::new(None));
+        let overlay_ref = Rc::new(RefCell::new(None));
+        let window_scrollbars_ref = Rc::new(RefCell::new(HashMap::new()));
+        let sidebar_inner_box_ref: Rc<RefCell<Option<gtk4::Box>>> = Rc::new(RefCell::new(None));
+        let search_results_list_ref: Rc<RefCell<Option<gtk4::ListBox>>> =
+            Rc::new(RefCell::new(None));
+
+        // Set up file watcher for settings.json
+        let settings_path = std::env::var("HOME")
+            .map(|h| format!("{}/.config/vimcode/settings.json", h))
+            .unwrap_or_else(|_| ".config/vimcode/settings.json".to_string());
+
+        let file = gio::File::for_path(&settings_path);
+        let settings_monitor =
+            match file.monitor_file(gio::FileMonitorFlags::NONE, gio::Cancellable::NONE) {
+                Ok(monitor) => {
+                    let sender_for_monitor = sender.input_sender().clone();
+                    monitor.connect_changed(move |_, _, _, event| {
+                        // ChangesDoneHint fires once after the write completes, avoiding
+                        // multiple events during a single save. Fall back to Changed on
+                        // filesystems that don't emit ChangesDoneHint.
+                        if event == gio::FileMonitorEvent::ChangesDoneHint
+                            || event == gio::FileMonitorEvent::Changed
+                        {
+                            sender_for_monitor.send(Msg::SettingsFileChanged).ok();
+                        }
+                    });
+                    Some(monitor)
+                }
+                Err(_) => None,
+            };
+
+        // Initialize sidebar visibility from session state or settings
+        let sidebar_visible = {
+            let eng = engine.borrow();
+            eng.session.explorer_visible || eng.settings.explorer_visible_on_startup
+        };
 
         let model = App {
             engine: engine.clone(),
             redraw: false,
-            sidebar_visible: true,
+            sidebar_visible,
             active_panel: SidebarPanel::Explorer,
             tree_store: Some(tree_store.clone()),
             tree_has_focus: false,
             file_tree_view: file_tree_view_ref.clone(),
             drawing_area: drawing_area_ref.clone(),
+            window_scrollbars: window_scrollbars_ref.clone(),
+            overlay: overlay_ref.clone(),
+            cached_line_height: 24.0,
+            cached_char_width: 9.0,
+            settings_monitor,
+            sender: sender.input_sender().clone(),
+            find_dialog_visible: false,
+            find_text: String::new(),
+            replace_text: String::new(),
+            find_case_sensitive: false,
+            find_whole_word: false,
+            sidebar_inner_box: sidebar_inner_box_ref.clone(),
+            project_search_status: String::new(),
+            search_results_list: search_results_list_ref.clone(),
         };
         let widgets = view_output!();
 
         // Store widget references
         *file_tree_view_ref.borrow_mut() = Some(widgets.file_tree_view.clone());
         *drawing_area_ref.borrow_mut() = Some(widgets.drawing_area.clone());
+        *overlay_ref.borrow_mut() = Some(widgets.editor_overlay.clone());
+        *sidebar_inner_box_ref.borrow_mut() = Some(widgets.sidebar_inner_box.clone());
+        *search_results_list_ref.borrow_mut() = Some(widgets.search_results_list.clone());
+
+        // Restore saved sidebar width
+        {
+            let saved_width = engine.borrow().session.sidebar_width;
+            widgets.sidebar_inner_box.set_width_request(saved_width);
+        }
+
+        // Set ew-resize cursor on drag handle
+        widgets
+            .sidebar_resize_handle
+            .set_cursor_from_name(Some("ew-resize"));
+
+        // Apply saved window geometry from session state
+        {
+            let eng = engine.borrow();
+            let geom = &eng.session.window;
+            root.set_default_size(geom.width, geom.height);
+        }
 
         // Build tree from current working directory
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         build_file_tree(&tree_store, None, &cwd);
 
-        // Debug: print entry count
-        eprintln!("Tree entries: {}", tree_store.iter_n_children(None));
+        // Read font family for nerd font icon rendering
+        let nf_font = engine.borrow().settings.font_family.clone();
 
         // Setup TreeView columns
         // Single column with icon + filename (so they indent together)
         let col = gtk4::TreeViewColumn::new();
 
-        // Icon cell renderer (non-expanding)
+        // Icon cell renderer (non-expanding) — must use the nerd font for glyph support
         let icon_cell = gtk4::CellRendererText::new();
+        icon_cell.set_property("font", &nf_font);
         col.pack_start(&icon_cell, false);
         col.add_attribute(&icon_cell, "text", 0);
 
@@ -467,35 +1026,72 @@ impl SimpleComponent for App {
         // Set the actual title after widget creation
         root.set_title(Some(&title));
 
-        // Track resize to update viewport_lines
+        // Create initial scrollbars for the first window
+        {
+            let initial_window_id = engine.borrow().active_window_id();
+            let ws = model.create_window_scrollbars(
+                &widgets.editor_overlay,
+                initial_window_id,
+                sender.input_sender(),
+            );
+            model
+                .window_scrollbars
+                .borrow_mut()
+                .insert(initial_window_id, ws);
+        }
+
+        // Track resize to update viewport_lines and viewport_cols
         let sender_clone = sender.clone();
         let engine_for_resize = engine.clone();
-        widgets.drawing_area.connect_resize(move |_, _, height| {
-            let line_height_approx = 24.0_f64;
-            let total_lines = (height as f64 / line_height_approx).floor() as usize;
-            let viewport = total_lines.saturating_sub(2);
-            {
-                let mut e = engine_for_resize.borrow_mut();
-                e.set_viewport_lines(viewport.max(1));
-            }
-            sender_clone.input(Msg::Resize);
-        });
+        widgets
+            .drawing_area
+            .connect_resize(move |_, width, height| {
+                let line_height_approx = 24.0_f64;
+                let char_width_approx = 9.0_f64; // Approximate for monospace font
+
+                let total_lines = (height as f64 / line_height_approx).floor() as usize;
+                let viewport_lines = total_lines.saturating_sub(2);
+
+                let total_cols = (width as f64 / char_width_approx).floor() as usize;
+                let viewport_cols = total_cols.saturating_sub(5); // Account for gutter
+
+                {
+                    let mut e = engine_for_resize.borrow_mut();
+                    e.set_viewport_lines(viewport_lines.max(1));
+                    e.set_viewport_cols(viewport_cols.max(40));
+                }
+                sender_clone.input(Msg::Resize);
+            });
 
         let engine_clone = engine.clone();
+        let sender_for_draw = sender.input_sender().clone();
         widgets
             .drawing_area
             .set_draw_func(move |_, cr, width, height| {
                 let engine = engine_clone.borrow();
-                draw_editor(cr, &engine, width, height);
+                draw_editor(cr, &engine, width, height, &sender_for_draw);
             });
 
         // Ensure drawing area has focus on startup
         widgets.drawing_area.grab_focus();
 
+        // Poll for background search results every 50 ms.
+        let sender_for_poll = sender.input_sender().clone();
+        gtk4::glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            sender_for_poll.send(Msg::SearchPollTick).ok();
+            gtk4::glib::ControlFlow::Continue
+        });
+
         ComponentParts { model, widgets }
     }
 
     fn update(&mut self, msg: Self::Input, _sender: ComponentSender<Self>) {
+        // Track if this is a scrollbar change to avoid syncing feedback loop
+        let is_scrollbar_msg = matches!(
+            &msg,
+            Msg::VerticalScrollbarChanged { .. } | Msg::HorizontalScrollbarChanged { .. }
+        );
+
         match msg {
             Msg::KeyPress {
                 key_name,
@@ -509,6 +1105,27 @@ impl SimpleComponent for App {
 
                 match action {
                     EngineAction::Quit | EngineAction::SaveQuit => {
+                        // Save current file position before exiting
+                        let mut engine = self.engine.borrow_mut();
+                        let buffer_id = engine.active_buffer_id();
+                        if let Some(path) = engine
+                            .buffer_manager
+                            .get(buffer_id)
+                            .and_then(|s| s.file_path.as_deref())
+                            .map(|p| p.to_path_buf())
+                        {
+                            let view = engine.active_window().view.clone();
+                            engine.session.save_file_position(
+                                &path,
+                                view.cursor.line,
+                                view.cursor.col,
+                                view.scroll_top,
+                            );
+                        }
+                        engine.collect_session_open_files();
+                        let _ = engine.session.save();
+                        engine.lsp_shutdown();
+                        drop(engine);
                         std::process::exit(0);
                     }
                     EngineAction::OpenFile(path) => {
@@ -533,6 +1150,64 @@ impl SimpleComponent for App {
                     EngineAction::None | EngineAction::Error => {}
                 }
 
+                // Process macro playback queue if active
+                loop {
+                    let (has_more, action) = {
+                        let mut engine = self.engine.borrow_mut();
+                        engine.advance_macro_playback()
+                    };
+
+                    // Handle actions from macro playback
+                    match action {
+                        EngineAction::Quit | EngineAction::SaveQuit => {
+                            let mut engine = self.engine.borrow_mut();
+                            let buffer_id = engine.active_buffer_id();
+                            if let Some(path) = engine
+                                .buffer_manager
+                                .get(buffer_id)
+                                .and_then(|s| s.file_path.as_deref())
+                                .map(|p| p.to_path_buf())
+                            {
+                                let view = engine.active_window().view.clone();
+                                engine.session.save_file_position(
+                                    &path,
+                                    view.cursor.line,
+                                    view.cursor.col,
+                                    view.scroll_top,
+                                );
+                            }
+                            engine.collect_session_open_files();
+                            let _ = engine.session.save();
+                            engine.lsp_shutdown();
+                            drop(engine);
+                            std::process::exit(0);
+                        }
+                        EngineAction::OpenFile(path) => {
+                            let mut engine = self.engine.borrow_mut();
+                            match engine.open_file_with_mode(&path, OpenMode::Permanent) {
+                                Ok(()) => {
+                                    drop(engine);
+                                    if let Some(ref tree) = *self.file_tree_view.borrow() {
+                                        highlight_file_in_tree(tree, &path);
+                                    }
+                                    if let Some(ref drawing) = *self.drawing_area.borrow() {
+                                        drawing.grab_focus();
+                                    }
+                                    self.tree_has_focus = false;
+                                }
+                                Err(e) => {
+                                    engine.message = e;
+                                }
+                            }
+                        }
+                        EngineAction::None | EngineAction::Error => {}
+                    }
+
+                    if !has_more {
+                        break;
+                    }
+                }
+
                 self.redraw = !self.redraw;
             }
             Msg::Resize => {
@@ -551,6 +1226,11 @@ impl SimpleComponent for App {
             Msg::ToggleSidebar => {
                 self.sidebar_visible = !self.sidebar_visible;
                 self.redraw = !self.redraw;
+
+                // Save sidebar visibility to session state
+                let mut engine = self.engine.borrow_mut();
+                engine.session.explorer_visible = self.sidebar_visible;
+                let _ = engine.session.save();
             }
             Msg::SwitchPanel(panel) => {
                 if self.active_panel == panel {
@@ -565,15 +1245,8 @@ impl SimpleComponent for App {
             }
             Msg::OpenFileFromSidebar(path) => {
                 let mut engine = self.engine.borrow_mut();
-                // Double-click opens in new tab (permanent mode)
-                engine.new_tab(Some(&path));
-
-                // Promote to permanent if it was opened as preview
-                let buffer_id = engine.active_buffer_id();
-                if engine.preview_buffer_id == Some(buffer_id) {
-                    engine.promote_preview(buffer_id);
-                }
-
+                // Open in a new tab, or switch to the existing tab that shows this file.
+                engine.open_file_in_tab(&path);
                 drop(engine);
                 if let Some(ref tree) = *self.file_tree_view.borrow() {
                     highlight_file_in_tree(tree, &path);
@@ -586,21 +1259,16 @@ impl SimpleComponent for App {
             }
             Msg::PreviewFileFromSidebar(path) => {
                 let mut engine = self.engine.borrow_mut();
-                match engine.open_file_with_mode(&path, OpenMode::Preview) {
-                    Ok(()) => {
-                        drop(engine);
-                        if let Some(ref tree) = *self.file_tree_view.borrow() {
-                            highlight_file_in_tree(tree, &path);
-                        }
-                        if let Some(ref drawing) = *self.drawing_area.borrow() {
-                            drawing.grab_focus();
-                        }
-                        self.tree_has_focus = false;
-                    }
-                    Err(e) => {
-                        engine.message = e;
-                    }
+                // Single-click: open as a preview tab (replaceable by next single-click).
+                engine.open_file_preview(&path);
+                drop(engine);
+                if let Some(ref tree) = *self.file_tree_view.borrow() {
+                    highlight_file_in_tree(tree, &path);
                 }
+                if let Some(ref drawing) = *self.drawing_area.borrow() {
+                    drawing.grab_focus();
+                }
+                self.tree_has_focus = false;
                 self.redraw = !self.redraw;
             }
             Msg::CreateFile(name) => {
@@ -766,11 +1434,611 @@ impl SimpleComponent for App {
 
                 self.redraw = !self.redraw;
             }
+            Msg::VerticalScrollbarChanged { window_id, value } => {
+                // Update specific window's scroll_top based on scrollbar value
+                let mut engine = self.engine.borrow_mut();
+                // For now, only scroll if it's the active window
+                if engine.active_window_id() == window_id {
+                    engine.set_scroll_top(value.round() as usize);
+                    engine.sync_scroll_binds();
+                }
+                drop(engine);
+                self.redraw = !self.redraw;
+            }
+            Msg::HorizontalScrollbarChanged { window_id, value } => {
+                let mut engine = self.engine.borrow_mut();
+                engine.set_scroll_left_for_window(window_id, value.round() as usize);
+                drop(engine);
+                self.redraw = !self.redraw;
+            }
+            Msg::MouseScroll { delta_x, delta_y } => {
+                let mut engine = self.engine.borrow_mut();
+                if delta_y.abs() > 0.01 {
+                    let lines = engine.buffer().len_lines().saturating_sub(1);
+                    let scroll_amount = (delta_y * 3.0).round() as isize;
+                    let st = engine.view().scroll_top as isize;
+                    let new_top = (st + scroll_amount).clamp(0, lines as isize) as usize;
+                    engine.set_scroll_top(new_top);
+                    engine.ensure_cursor_visible();
+                    engine.sync_scroll_binds();
+                }
+                if delta_x.abs() > 0.01 {
+                    let win_id = engine.active_window_id();
+                    let current = engine.view().scroll_left;
+                    let scroll_amount = (delta_x * 3.0).round() as isize;
+                    let new_left = (current as isize + scroll_amount).max(0) as usize;
+                    engine.set_scroll_left_for_window(win_id, new_left);
+                }
+                drop(engine);
+                self.redraw = !self.redraw;
+            }
+            Msg::CacheFontMetrics(line_height, char_width) => {
+                self.cached_line_height = line_height;
+                self.cached_char_width = char_width;
+            }
+            Msg::OpenSettingsFile => {
+                let settings_path = std::env::var("HOME")
+                    .map(|h| format!("{}/.config/vimcode/settings.json", h))
+                    .unwrap_or_else(|_| ".config/vimcode/settings.json".to_string());
+
+                let mut engine = self.engine.borrow_mut();
+                // Open settings in a new tab
+                engine.new_tab(Some(Path::new(&settings_path)));
+                drop(engine);
+                self.redraw = !self.redraw;
+            }
+            Msg::SettingsFileChanged => {
+                // Use load_with_validation (not load) to avoid writing back to the file,
+                // which would trigger the watcher again and cause an infinite reload loop.
+                // Silently ignore errors — the file may be mid-write.
+                if let Ok(new_settings) = core::settings::Settings::load_with_validation() {
+                    let mut engine = self.engine.borrow_mut();
+                    engine.settings = new_settings;
+                    engine.message = "Settings reloaded".to_string();
+                    drop(engine);
+
+                    // Force redraw to apply new font/line number settings
+                    if let Some(drawing_area) = self.drawing_area.borrow().as_ref() {
+                        drawing_area.queue_draw();
+                    }
+                    self.redraw = !self.redraw;
+                }
+            }
+            Msg::ToggleFindDialog => {
+                self.find_dialog_visible = !self.find_dialog_visible;
+                self.redraw = !self.redraw;
+            }
+            Msg::FindTextChanged(text) => {
+                self.find_text = text.clone();
+                let mut engine = self.engine.borrow_mut();
+                engine.search_query = text;
+                engine.run_search();
+                self.redraw = !self.redraw;
+            }
+            Msg::ReplaceTextChanged(text) => {
+                self.replace_text = text;
+            }
+            Msg::FindNext => {
+                let mut engine = self.engine.borrow_mut();
+                engine.search_next();
+                self.redraw = !self.redraw;
+            }
+            Msg::FindPrevious => {
+                let mut engine = self.engine.borrow_mut();
+                engine.search_prev();
+                self.redraw = !self.redraw;
+            }
+            Msg::ReplaceNext => {
+                let mut engine = self.engine.borrow_mut();
+
+                // Replace current match and find next
+                if let Some(current_idx) = engine.search_index {
+                    if let Some(&(start, end)) = engine.search_matches.get(current_idx) {
+                        engine.start_undo_group();
+                        engine.delete_with_undo(start, end);
+                        engine.insert_with_undo(start, &self.replace_text);
+                        engine.finish_undo_group();
+
+                        // Re-run search and move to next
+                        engine.run_search();
+                        engine.search_next();
+                    }
+                }
+
+                self.redraw = !self.redraw;
+            }
+            Msg::ReplaceAll => {
+                let mut engine = self.engine.borrow_mut();
+                let pattern = engine.search_query.clone();
+                let replacement = self.replace_text.clone();
+
+                // Replace in entire buffer
+                let last_line = engine.buffer().len_lines().saturating_sub(1);
+                match engine.replace_in_range(Some((0, last_line)), &pattern, &replacement, "g") {
+                    Ok(count) => {
+                        engine.message = format!(
+                            "Replaced {} occurrence{}",
+                            count,
+                            if count == 1 { "" } else { "s" }
+                        );
+                    }
+                    Err(e) => {
+                        engine.message = e;
+                    }
+                }
+
+                // Re-run search to update highlights
+                engine.run_search();
+                self.redraw = !self.redraw;
+            }
+            Msg::CloseFindDialog => {
+                self.find_dialog_visible = false;
+
+                // Clear search highlights
+                let mut engine = self.engine.borrow_mut();
+                engine.search_matches.clear();
+                engine.search_index = None;
+
+                // Return focus to editor
+                if let Some(ref drawing_area) = *self.drawing_area.borrow() {
+                    drawing_area.grab_focus();
+                }
+
+                self.redraw = !self.redraw;
+            }
+            Msg::WindowResized { width, height } => {
+                // Update session state with new window geometry (debounced save)
+                let mut engine = self.engine.borrow_mut();
+                engine.session.window.width = width;
+                engine.session.window.height = height;
+                // Note: We don't save on every resize event (too frequent)
+                // Window geometry is saved on close instead
+            }
+            Msg::SidebarResized => {
+                if let Some(ref sb) = *self.sidebar_inner_box.borrow() {
+                    let w = sb.width_request();
+                    self.engine.borrow_mut().session.sidebar_width = w;
+                    let _ = self.engine.borrow().session.save();
+                }
+            }
+            Msg::ProjectSearchQueryChanged(q) => {
+                self.engine.borrow_mut().project_search_query = q;
+            }
+            Msg::ProjectSearchToggleCase => {
+                self.engine.borrow_mut().toggle_project_search_case();
+                self.redraw = true;
+            }
+            Msg::ProjectSearchToggleWholeWord => {
+                self.engine.borrow_mut().toggle_project_search_whole_word();
+                self.redraw = true;
+            }
+            Msg::ProjectSearchToggleRegex => {
+                self.engine.borrow_mut().toggle_project_search_regex();
+                self.redraw = true;
+            }
+            Msg::ProjectReplaceTextChanged(t) => {
+                self.engine.borrow_mut().project_replace_text = t;
+            }
+            Msg::ProjectReplaceAll => {
+                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                self.engine.borrow_mut().start_project_replace(cwd);
+                let status = self.engine.borrow().message.clone();
+                self.project_search_status = status;
+                self.redraw = true;
+            }
+            Msg::ProjectSearchSubmit => {
+                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                self.engine.borrow_mut().start_project_search(cwd);
+                let status = self.engine.borrow().message.clone();
+                self.project_search_status = status;
+                self.redraw = true;
+            }
+            Msg::SearchPollTick => {
+                if self.engine.borrow_mut().poll_project_search() {
+                    let status = self.engine.borrow().message.clone();
+                    self.project_search_status = status;
+                    let s = self.sender.clone();
+                    self.rebuild_search_results(&s);
+                    self.redraw = true;
+                }
+                if self.engine.borrow_mut().poll_project_replace() {
+                    let status = self.engine.borrow().message.clone();
+                    self.project_search_status = status;
+                    let s = self.sender.clone();
+                    self.rebuild_search_results(&s);
+                    self.redraw = true;
+                }
+                // LSP: flush debounced didChange notifications and poll for events
+                {
+                    let mut engine = self.engine.borrow_mut();
+                    engine.lsp_flush_changes();
+                    if engine.poll_lsp() {
+                        self.redraw = true;
+                    }
+                }
+            }
+            Msg::ProjectSearchOpenResult(idx) => {
+                let result = self
+                    .engine
+                    .borrow()
+                    .project_search_results
+                    .get(idx)
+                    .map(|m| (m.file.clone(), m.line));
+                if let Some((file, line)) = result {
+                    self.engine.borrow_mut().open_file_in_tab(&file);
+                    // Jump cursor to the matched line
+                    let win_id = self.engine.borrow().active_window_id();
+                    self.engine
+                        .borrow_mut()
+                        .set_cursor_for_window(win_id, line, 0);
+                    self.engine.borrow_mut().ensure_cursor_visible();
+                }
+                self.redraw = true;
+            }
+            Msg::WindowClosing { width, height } => {
+                let mut engine = self.engine.borrow_mut();
+                engine.session.window.width = width;
+                engine.session.window.height = height;
+                engine.session.explorer_visible = self.sidebar_visible;
+                // Save sidebar width on close too
+                if let Some(ref sb) = *self.sidebar_inner_box.borrow() {
+                    engine.session.sidebar_width = sb.width_request();
+                }
+
+                // Save cursor/scroll position for the active file
+                let buffer_id = engine.active_buffer_id();
+                if let Some(path) = engine
+                    .buffer_manager
+                    .get(buffer_id)
+                    .and_then(|s| s.file_path.as_deref())
+                    .map(|p| p.to_path_buf())
+                {
+                    let view = engine.active_window().view.clone();
+                    engine.session.save_file_position(
+                        &path,
+                        view.cursor.line,
+                        view.cursor.col,
+                        view.scroll_top,
+                    );
+                }
+
+                engine.collect_session_open_files();
+                let _ = engine.session.save();
+            }
+        }
+
+        // Sync scrollbar position to match engine state (except when scrollbar itself changed)
+        if !is_scrollbar_msg {
+            self.sync_scrollbar();
         }
     }
 }
 
+impl App {
+    /// Rebuild the search results ListBox from current engine state.
+    fn rebuild_search_results(&self, sender: &relm4::Sender<Msg>) {
+        let list = match self.search_results_list.borrow().as_ref() {
+            Some(l) => l.clone(),
+            None => return,
+        };
+
+        // Remove all existing rows
+        while let Some(child) = list.first_child() {
+            list.remove(&child);
+        }
+
+        let engine = self.engine.borrow();
+        let results = &engine.project_search_results;
+        if results.is_empty() {
+            return;
+        }
+
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let mut last_file: Option<PathBuf> = None;
+
+        for (idx, m) in results.iter().enumerate() {
+            // Add a file header row when the file changes
+            if last_file.as_deref() != Some(&m.file) {
+                last_file = Some(m.file.clone());
+                let rel = m.file.strip_prefix(&cwd).unwrap_or(&m.file);
+                let file_label = gtk4::Label::new(None);
+                let header_markup = format!(
+                    "<b><span foreground='#569cd6'>{}</span></b>",
+                    gtk4::glib::markup_escape_text(&rel.display().to_string())
+                );
+                file_label.set_markup(&header_markup);
+                file_label.set_halign(gtk4::Align::Start);
+                file_label.set_margin_top(4);
+                file_label.set_margin_start(4);
+                let header_row = gtk4::ListBoxRow::new();
+                header_row.set_selectable(false);
+                header_row.set_child(Some(&file_label));
+                list.append(&header_row);
+            }
+
+            // Result row
+            let snippet = format!("  {}: {}", m.line + 1, m.line_text.trim());
+            let row_label = gtk4::Label::new(None);
+            let result_markup = format!(
+                "<span foreground='#cccccc'>{}</span>",
+                gtk4::glib::markup_escape_text(&snippet)
+            );
+            row_label.set_markup(&result_markup);
+            row_label.set_halign(gtk4::Align::Start);
+            row_label.set_ellipsize(pango::EllipsizeMode::End);
+            row_label.set_margin_start(4);
+            let result_row = gtk4::ListBoxRow::new();
+            result_row.set_selectable(true);
+
+            // Tag the row with its result index via the widget name
+            result_row.set_widget_name(&idx.to_string());
+            result_row.set_child(Some(&row_label));
+            list.append(&result_row);
+        }
+
+        let sender_clone = sender.clone();
+        list.connect_row_activated(move |_, row| {
+            if let Ok(idx) = row.widget_name().parse::<usize>() {
+                sender_clone.send(Msg::ProjectSearchOpenResult(idx)).ok();
+            }
+        });
+    }
+
+    /// Rebuild and sync scrollbars for all windows
+    fn sync_scrollbar(&self) {
+        let overlay = match self.overlay.borrow().as_ref() {
+            Some(o) => o.clone(),
+            None => return,
+        };
+
+        let drawing_area = match self.drawing_area.borrow().as_ref() {
+            Some(da) => da.clone(),
+            None => return,
+        };
+
+        let engine = self.engine.borrow();
+        let mut scrollbars = self.window_scrollbars.borrow_mut();
+
+        // Calculate window rects (same logic as draw_editor)
+        let da_width = drawing_area.width() as f64;
+        let da_height = drawing_area.height() as f64;
+
+        // Skip if the drawing area hasn't been laid out yet (startup / minimised)
+        if da_width < 20.0 || da_height < 20.0 {
+            return;
+        }
+
+        let line_height = self.cached_line_height;
+        let tab_bar_height = line_height;
+        let status_bar_height = line_height * 2.0;
+
+        let content_bounds = WindowRect::new(
+            0.0,
+            tab_bar_height,
+            da_width,
+            da_height - tab_bar_height - status_bar_height - 10.0, // Reserve 10px for h-scrollbar
+        );
+
+        let window_rects = engine.calculate_window_rects(content_bounds);
+
+        // Remove scrollbars for windows that no longer exist
+        scrollbars.retain(|window_id, _| engine.windows.contains_key(window_id));
+
+        // Create/update scrollbars for each window
+        for (window_id, rect) in &window_rects {
+            let window = match engine.windows.get(window_id) {
+                Some(w) => w,
+                None => continue,
+            };
+
+            let buffer_state = match engine.buffer_manager.get(window.buffer_id) {
+                Some(s) => s,
+                None => continue,
+            };
+
+            // Create new scrollbars if needed
+            if !scrollbars.contains_key(window_id) {
+                let ws = self.create_window_scrollbars(&overlay, *window_id, &self.sender);
+                scrollbars.insert(*window_id, ws);
+            }
+
+            // Get scrollbars for this window
+            let ws = match scrollbars.get(window_id) {
+                Some(ws) => ws,
+                None => continue,
+            };
+
+            // Position and sync vertical scrollbar
+            // Use absolute positioning with Start alignment
+            ws.vertical.set_halign(gtk4::Align::Start);
+            ws.vertical.set_valign(gtk4::Align::Start);
+
+            let scrollbar_x = rect.x as i32 + (rect.width - 10.0) as i32;
+            ws.vertical.set_margin_start(scrollbar_x);
+            ws.vertical.set_margin_top(rect.y as i32);
+            ws.vertical
+                .set_height_request(((rect.height - 10.0) as i32).max(0));
+
+            let total_lines = buffer_state.buffer.content.len_lines();
+            let v_adj = ws.vertical.adjustment();
+            v_adj.set_upper(total_lines as f64);
+            v_adj.set_page_size(window.view.viewport_lines as f64);
+            v_adj.set_value(window.view.scroll_top as f64);
+
+            // Position cursor indicator (fix: ensure height stays constant at 4px)
+            let cursor_line = window.view.cursor.line;
+            if total_lines > 0 {
+                let ratio = cursor_line as f64 / total_lines as f64;
+
+                // Calculate Y position within the scrollbar's visible area
+                // Use the vertical scrollbar's actual height
+                let scrollbar_height = ws.vertical.height() as f64;
+                let indicator_y = rect.y + (ratio * scrollbar_height);
+
+                let indicator_x = rect.x as i32 + (rect.width - 10.0) as i32;
+                ws.cursor_indicator.set_margin_start(indicator_x);
+                ws.cursor_indicator.set_margin_top(indicator_y as i32);
+
+                // Ensure size stays fixed (defensive coding)
+                ws.cursor_indicator.set_width_request(10);
+                ws.cursor_indicator.set_height_request(4);
+            }
+
+            // Position and sync horizontal scrollbar in the 10px gap above status line
+            let h_scrollbar_y = da_height - status_bar_height - 10.0;
+
+            // Use absolute positioning with Start alignment
+            ws.horizontal.set_halign(gtk4::Align::Start);
+            ws.horizontal.set_valign(gtk4::Align::Start);
+
+            ws.horizontal.set_margin_start(rect.x as i32);
+            ws.horizontal.set_margin_top(h_scrollbar_y as i32);
+            ws.horizontal.set_width_request(rect.width as i32);
+            ws.horizontal.set_height_request(10);
+
+            let max_line_length = buffer_state
+                .buffer
+                .content
+                .lines()
+                .map(|line| line.chars().count())
+                .max()
+                .unwrap_or(80);
+
+            // Compute visible text columns for this specific window.
+            // We subtract the gutter (char cells × char_width) and the 10px
+            // vertical scrollbar so that the thumb correctly reflects how much
+            // of the longest line fits on screen.
+            let cw = self.cached_char_width.max(1.0);
+            let gutter_cols = render::calculate_gutter_cols(
+                engine.settings.line_numbers,
+                buffer_state.buffer.content.len_lines(),
+                cw,
+                !buffer_state.git_diff.is_empty(),
+            );
+            let gutter_px = gutter_cols as f64 * cw;
+            let v_scrollbar_px = 10.0_f64;
+            let visible_cols = ((rect.width - gutter_px - v_scrollbar_px) / cw)
+                .floor()
+                .max(1.0);
+
+            let h_adj = ws.horizontal.adjustment();
+            h_adj.set_upper(max_line_length as f64);
+            h_adj.set_page_size(visible_cols);
+            h_adj.set_value(window.view.scroll_left as f64);
+        }
+
+        // Remove overlay widgets for deleted windows
+        // (GTK will automatically remove them when we drop the references)
+    }
+
+    /// Create scrollbars and indicator for a window
+    fn create_window_scrollbars(
+        &self,
+        overlay: &gtk4::Overlay,
+        window_id: core::WindowId,
+        sender: &relm4::Sender<Msg>,
+    ) -> WindowScrollbars {
+        // Vertical scrollbar
+        let v_adj = gtk4::Adjustment::new(0.0, 0.0, 100.0, 1.0, 10.0, 20.0);
+        let vertical = gtk4::Scrollbar::new(gtk4::Orientation::Vertical, Some(&v_adj));
+        vertical.set_width_request(10);
+        vertical.set_hexpand(false);
+        vertical.set_vexpand(false);
+
+        // Horizontal scrollbar
+        let h_adj = gtk4::Adjustment::new(0.0, 0.0, 200.0, 1.0, 10.0, 80.0);
+        let horizontal = gtk4::Scrollbar::new(gtk4::Orientation::Horizontal, Some(&h_adj));
+        horizontal.set_height_request(10);
+        horizontal.set_hexpand(false);
+        horizontal.set_vexpand(false);
+
+        // Cursor indicator
+        let cursor_indicator = gtk4::DrawingArea::new();
+        cursor_indicator.set_width_request(10);
+        cursor_indicator.set_height_request(4);
+        cursor_indicator.set_can_target(false);
+        // Set alignments and prevent expansion to maintain fixed 4px height
+        cursor_indicator.set_halign(gtk4::Align::Start);
+        cursor_indicator.set_valign(gtk4::Align::Start);
+        cursor_indicator.set_hexpand(false);
+        cursor_indicator.set_vexpand(false);
+        cursor_indicator.set_draw_func(|_, cr, w, h| {
+            // Darker grey color like VSCode (darker than scrollbar handle)
+            cr.set_source_rgba(0.5, 0.5, 0.5, 0.8);
+            cr.rectangle(0.0, 0.0, w as f64, h as f64);
+            let _ = cr.fill();
+        });
+
+        // Add to overlay
+        overlay.add_overlay(&vertical);
+        overlay.add_overlay(&horizontal);
+        overlay.add_overlay(&cursor_indicator);
+
+        // Make scrollbars visible
+        vertical.show();
+        horizontal.show();
+        cursor_indicator.show();
+
+        // Connect signals (always, for all windows)
+        let sender_v = sender.clone();
+        v_adj.connect_value_changed(move |adj| {
+            sender_v
+                .send(Msg::VerticalScrollbarChanged {
+                    window_id,
+                    value: adj.value(),
+                })
+                .ok();
+        });
+
+        let sender_h = sender.clone();
+        h_adj.connect_value_changed(move |adj| {
+            sender_h
+                .send(Msg::HorizontalScrollbarChanged {
+                    window_id,
+                    value: adj.value(),
+                })
+                .ok();
+        });
+
+        WindowScrollbars {
+            vertical,
+            horizontal,
+            cursor_indicator,
+        }
+    }
+}
+
+/// Map a visible row index (0-based from scroll_top) to the corresponding
+/// buffer line index, skipping lines hidden inside closed folds.
+fn view_row_to_buf_line(
+    view: &crate::core::view::View,
+    scroll_top: usize,
+    view_row: usize,
+    total_lines: usize,
+) -> usize {
+    let mut buf_line = scroll_top;
+    let mut visible = 0usize;
+    while buf_line < total_lines {
+        if view.is_line_hidden(buf_line) {
+            buf_line += 1;
+            continue;
+        }
+        if visible == view_row {
+            return buf_line;
+        }
+        visible += 1;
+        if let Some(fold) = view.fold_at(buf_line) {
+            buf_line = fold.end + 1;
+        } else {
+            buf_line += 1;
+        }
+    }
+    // Clamp to last valid line
+    total_lines.saturating_sub(1)
+}
+
 /// Calculate gutter width in pixels based on line number mode and buffer size
+#[allow(dead_code)]
 fn calculate_gutter_width(mode: LineNumberMode, total_lines: usize, char_width: f64) -> f64 {
     match mode {
         LineNumberMode::None => 0.0,
@@ -788,155 +2056,220 @@ fn calculate_gutter_width(mode: LineNumberMode, total_lines: usize, char_width: 
     }
 }
 
-/// Format a line number based on mode, current line, and cursor position
-fn format_line_number(mode: LineNumberMode, line_idx: usize, cursor_line: usize) -> String {
-    match mode {
-        LineNumberMode::None => String::new(),
-        LineNumberMode::Absolute => format!("{}", line_idx + 1),
-        LineNumberMode::Relative => {
-            let distance = line_idx.abs_diff(cursor_line);
-            distance.to_string()
-        }
-        LineNumberMode::Hybrid => {
-            if line_idx == cursor_line {
-                format!("{}", line_idx + 1)
-            } else {
-                let distance = line_idx.abs_diff(cursor_line);
-                distance.to_string()
-            }
-        }
-    }
-}
+fn draw_editor(
+    cr: &Context,
+    engine: &Engine,
+    width: i32,
+    height: i32,
+    sender: &relm4::Sender<Msg>,
+) {
+    let theme = Theme::onedark();
 
-fn draw_editor(cr: &Context, engine: &Engine, width: i32, height: i32) {
     // 1. Background
-    cr.set_source_rgb(0.1, 0.1, 0.1);
+    let (bg_r, bg_g, bg_b) = theme.background.to_cairo();
+    cr.set_source_rgb(bg_r, bg_g, bg_b);
     cr.paint().expect("Invalid cairo surface");
 
     // 2. Setup Pango
     let pango_ctx = pangocairo::create_context(cr);
     let layout = pango::Layout::new(&pango_ctx);
-    let font_desc = FontDescription::from_string("Monospace 14");
+
+    // Use configurable font from settings
+    let font_str = format!(
+        "{} {}",
+        engine.settings.font_family, engine.settings.font_size
+    );
+    let font_desc = FontDescription::from_string(&font_str);
     layout.set_font_description(Some(&font_desc));
 
-    // Derive line height from font metrics
+    // Derive line height and char width from font metrics
     let font_metrics = pango_ctx.metrics(Some(&font_desc), None);
     let line_height = (font_metrics.ascent() + font_metrics.descent()) as f64 / pango::SCALE as f64;
+    let char_width = font_metrics.approximate_char_width() as f64 / pango::SCALE as f64;
+
+    // Cache font metrics for use in sync_scrollbar
+    sender
+        .send(Msg::CacheFontMetrics(line_height, char_width))
+        .ok();
 
     // Calculate layout regions
     let tab_bar_height = line_height; // Always show tab bar
     let status_bar_height = line_height * 2.0; // status + command line
+
+    // Reserve space for the quickfix panel when open
+    const QUICKFIX_ROWS: usize = 6; // 1 header + 5 result rows
+    let qf_px = if engine.quickfix_open && !engine.quickfix_items.is_empty() {
+        QUICKFIX_ROWS as f64 * line_height
+    } else {
+        0.0
+    };
 
     // Calculate window rects for the current tab
     let content_bounds = WindowRect::new(
         0.0,
         tab_bar_height,
         width as f64,
-        height as f64 - tab_bar_height - status_bar_height,
+        height as f64 - tab_bar_height - status_bar_height - qf_px - 10.0, // Reserve 10px for h-scrollbar
     );
     let window_rects = engine.calculate_window_rects(content_bounds);
 
+    // Build the platform-agnostic screen layout
+    let screen = build_screen_layout(engine, &theme, &window_rects, line_height, char_width);
+
     // 3. Draw tab bar (always visible)
-    draw_tab_bar(cr, &layout, engine, width as f64, line_height);
+    draw_tab_bar(
+        cr,
+        &layout,
+        &theme,
+        &screen.tab_bar,
+        width as f64,
+        line_height,
+    );
 
     // 4. Draw each window
-    for (window_id, rect) in &window_rects {
-        let is_active = *window_id == engine.active_window_id();
+    for rendered_window in &screen.windows {
         draw_window(
             cr,
             &layout,
             &font_metrics,
-            engine,
-            *window_id,
-            rect,
+            &theme,
+            rendered_window,
+            char_width,
             line_height,
-            is_active,
         );
     }
 
     // 5. Draw window separators
-    draw_window_separators(cr, &window_rects);
+    draw_window_separators(cr, &window_rects, &theme);
+
+    // 5b. Draw completion popup (on top of everything else)
+    draw_completion_popup(cr, &layout, &screen, &theme, line_height, char_width);
+
+    // 5c. Draw hover popup (on top of everything else)
+    draw_hover_popup(cr, &layout, &screen, &theme, line_height, char_width);
+
+    // 5d. Draw fuzzy file-picker modal (on top of everything else)
+    draw_fuzzy_popup(
+        cr,
+        &layout,
+        &screen,
+        &theme,
+        width as f64,
+        height as f64,
+        line_height,
+        char_width,
+    );
+
+    // 5e. Draw live grep modal (on top of everything else)
+    draw_live_grep_popup(
+        cr,
+        &layout,
+        &screen,
+        &theme,
+        width as f64,
+        height as f64,
+        line_height,
+    );
+
+    // 5f. Draw quickfix panel (persistent bottom strip above status bar)
+    if qf_px > 0.0 {
+        let qf_y = height as f64 - status_bar_height - qf_px;
+        draw_quickfix_panel(
+            cr,
+            &layout,
+            &screen,
+            &theme,
+            0.0,
+            qf_y,
+            width as f64,
+            qf_px,
+            line_height,
+        );
+    }
 
     // 6. Status Line (second-to-last line)
     let status_y = height as f64 - status_bar_height;
-    draw_status_line(cr, &layout, engine, width as f64, status_y, line_height);
+    draw_status_line(
+        cr,
+        &layout,
+        &theme,
+        &screen.status_left,
+        &screen.status_right,
+        width as f64,
+        status_y,
+        line_height,
+    );
 
     // 7. Command Line (last line)
     let cmd_y = status_y + line_height;
-    draw_command_line(cr, &layout, engine, width as f64, cmd_y, line_height);
+    draw_command_line(
+        cr,
+        &layout,
+        &theme,
+        &screen.command,
+        width as f64,
+        cmd_y,
+        line_height,
+    );
 }
 
 fn draw_tab_bar(
     cr: &Context,
     layout: &pango::Layout,
-    engine: &Engine,
+    theme: &Theme,
+    tabs: &[TabInfo],
     width: f64,
     line_height: f64,
 ) {
     // Tab bar background
-    cr.set_source_rgb(0.15, 0.15, 0.2);
+    let (r, g, b) = theme.tab_bar_bg.to_cairo();
+    cr.set_source_rgb(r, g, b);
     cr.rectangle(0.0, 0.0, width, line_height);
     cr.fill().unwrap();
 
     // Save current font description so we can restore after rendering previews
-    let normal_font = layout
-        .font_description()
-        .unwrap_or_else(|| FontDescription::from_string("Monospace 14"));
+    let normal_font = layout.font_description().unwrap_or_default();
     let mut italic_font = normal_font.clone();
     italic_font.set_style(pango::Style::Italic);
 
     let mut x = 0.0;
-    for (i, tab) in engine.tabs.iter().enumerate() {
-        let is_active = i == engine.active_tab;
-
-        // Get first buffer name and preview state in this tab
-        let window_id = tab.active_window;
-        let (name, is_preview) = if let Some(window) = engine.windows.get(&window_id) {
-            if let Some(state) = engine.buffer_manager.get(window.buffer_id) {
-                let dirty = if state.dirty { "*" } else { "" };
-                (
-                    format!(" {}: {}{} ", i + 1, state.display_name(), dirty),
-                    state.preview,
-                )
-            } else {
-                (format!(" {}: [No Name] ", i + 1), false)
-            }
-        } else {
-            (format!(" {}: [No Name] ", i + 1), false)
-        };
-
+    for tab in tabs {
         // Use italic font for preview tabs
-        if is_preview {
+        if tab.preview {
             layout.set_font_description(Some(&italic_font));
         } else {
             layout.set_font_description(Some(&normal_font));
         }
 
-        layout.set_text(&name);
+        layout.set_text(&tab.name);
         let (tab_width, _) = layout.pixel_size();
 
         // Tab background
-        if is_active {
-            cr.set_source_rgb(0.25, 0.25, 0.35);
+        let bg = if tab.active {
+            theme.tab_active_bg
         } else {
-            cr.set_source_rgb(0.15, 0.15, 0.2);
-        }
+            theme.tab_bar_bg
+        };
+        let (br, bg_g, bb) = bg.to_cairo();
+        cr.set_source_rgb(br, bg_g, bb);
         cr.rectangle(x, 0.0, tab_width as f64, line_height);
         cr.fill().unwrap();
 
-        // Tab text — dimmed colors for preview tabs
+        // Tab text — dimmed colours for preview tabs
         cr.move_to(x, 0.0);
-        if is_preview {
-            if is_active {
-                cr.set_source_rgb(0.8, 0.8, 0.8);
+        let fg = if tab.preview {
+            if tab.active {
+                theme.tab_preview_active_fg
             } else {
-                cr.set_source_rgb(0.5, 0.5, 0.5);
+                theme.tab_preview_inactive_fg
             }
-        } else if is_active {
-            cr.set_source_rgb(1.0, 1.0, 1.0);
+        } else if tab.active {
+            theme.tab_active_fg
         } else {
-            cr.set_source_rgb(0.7, 0.7, 0.7);
-        }
+            theme.tab_inactive_fg
+        };
+        let (fr, fg_g, fb) = fg.to_cairo();
+        cr.set_source_rgb(fr, fg_g, fb);
         pangocairo::show_layout(cr, layout);
 
         x += tab_width as f64 + 2.0;
@@ -951,258 +2284,281 @@ fn draw_window(
     cr: &Context,
     layout: &pango::Layout,
     font_metrics: &pango::FontMetrics,
-    engine: &Engine,
-    window_id: core::WindowId,
-    rect: &WindowRect,
+    theme: &Theme,
+    rw: &RenderedWindow,
+    char_width: f64,
     line_height: f64,
-    is_active: bool,
 ) {
-    let window = match engine.windows.get(&window_id) {
-        Some(w) => w,
-        None => return,
-    };
+    let rect = &rw.rect;
 
-    let buffer_state = match engine.buffer_manager.get(window.buffer_id) {
-        Some(s) => s,
-        None => return,
-    };
+    // Gutter pixel width
+    let gutter_width = rw.gutter_char_width as f64 * char_width;
 
-    let buffer = &buffer_state.buffer;
-    let view = &window.view;
+    // Apply horizontal scroll offset
+    let h_scroll_offset = rw.scroll_left as f64 * char_width;
+    let text_x_offset = rect.x + gutter_width - h_scroll_offset;
 
-    // Calculate visible area (leave room for per-window status bar)
-    let per_window_status = if engine.windows.len() > 1 {
-        line_height
+    // Window background
+    let bg = if rw.show_active_bg {
+        theme.active_background
     } else {
-        0.0
+        theme.background
     };
-    let text_area_height = rect.height - per_window_status;
-    let visible_lines = (text_area_height / line_height).floor() as usize;
-
-    // Calculate gutter width for line numbers
-    let total_lines = buffer.content.len_lines();
-    let char_width = font_metrics.approximate_char_width() as f64 / pango::SCALE as f64;
-    let gutter_width =
-        calculate_gutter_width(engine.settings.line_numbers, total_lines, char_width);
-    let text_x_offset = rect.x + gutter_width;
-
-    // Window background (slightly different for active)
-    if is_active && engine.windows.len() > 1 {
-        cr.set_source_rgb(0.12, 0.12, 0.12);
-    } else {
-        cr.set_source_rgb(0.1, 0.1, 0.1);
-    }
+    let (br, bg_g, bb) = bg.to_cairo();
+    cr.set_source_rgb(br, bg_g, bb);
     cr.rectangle(rect.x, rect.y, rect.width, rect.height);
     cr.fill().unwrap();
 
-    // Render visual selection highlight (if in visual mode and this is active window)
-    if is_active {
-        match engine.mode {
-            Mode::Visual | Mode::VisualLine => {
-                if let Some(anchor) = engine.visual_anchor {
-                    draw_visual_selection(
-                        cr,
-                        layout,
-                        engine,
-                        buffer,
-                        &anchor,
-                        &view.cursor,
-                        rect,
-                        line_height,
-                        view.scroll_top,
-                        visible_lines,
-                        text_x_offset,
-                    );
-                }
-            }
-            _ => {}
-        }
+    // Visual selection highlight (drawn before text so text renders on top)
+    if let Some(sel) = &rw.selection {
+        draw_visual_selection(
+            cr,
+            layout,
+            sel,
+            &rw.lines,
+            rect,
+            line_height,
+            rw.scroll_top,
+            text_x_offset,
+            theme,
+        );
     }
 
-    // Render text with highlights and line numbers
-    let scroll_top = view.scroll_top;
+    // Render gutter (git marker + fold indicators + optional line numbers)
+    if rw.gutter_char_width > 0 {
+        for (view_idx, rl) in rw.lines.iter().enumerate() {
+            let y = rect.y + view_idx as f64 * line_height;
 
-    for view_idx in 0..visible_lines {
-        let line_idx = scroll_top + view_idx;
-        if line_idx >= total_lines {
-            break;
-        }
+            if rw.has_git_diff {
+                // Render git marker (first char of gutter_text) with git color.
+                let git_ch: String = rl.gutter_text.chars().take(1).collect();
+                let git_color = match rl.git_diff {
+                    Some(GitLineStatus::Added) => theme.git_added,
+                    Some(GitLineStatus::Modified) => theme.git_modified,
+                    None => theme.line_number_fg,
+                };
+                layout.set_text(&git_ch);
+                layout.set_attributes(None);
+                let (gr, gg, gb) = git_color.to_cairo();
+                cr.set_source_rgb(gr, gg, gb);
+                cr.move_to(rect.x + 3.0, y);
+                pangocairo::show_layout(cr, layout);
 
-        let line = buffer.content.line(line_idx);
-        let y = rect.y + view_idx as f64 * line_height;
-
-        // Render line number in gutter (if enabled)
-        if engine.settings.line_numbers != LineNumberMode::None {
-            let line_num_text =
-                format_line_number(engine.settings.line_numbers, line_idx, view.cursor.line);
-
-            layout.set_text(&line_num_text);
-            layout.set_attributes(None);
-
-            // Right-align line number within gutter
-            let (num_width, _) = layout.pixel_size();
-            let num_x = rect.x + gutter_width - num_width as f64 - char_width;
-
-            // Highlight current line number
-            if is_active && line_idx == view.cursor.line {
-                cr.set_source_rgb(0.9, 0.9, 0.5); // Brighter yellow for current line
+                // Render fold+numbers (rest of gutter_text) with normal color.
+                let rest: String = rl.gutter_text.chars().skip(1).collect();
+                layout.set_text(&rest);
+                layout.set_attributes(None);
             } else {
-                cr.set_source_rgb(0.5, 0.5, 0.5); // Dimmed gray for other lines
+                layout.set_text(&rl.gutter_text);
+                layout.set_attributes(None);
             }
 
+            let (num_width, _) = layout.pixel_size();
+            let num_x = rect.x + gutter_width - num_width as f64 - char_width + 3.0;
+
+            let num_color = if rw.is_active && rl.is_current_line {
+                theme.line_number_active_fg
+            } else {
+                theme.line_number_fg
+            };
+            let (nr, ng, nb) = num_color.to_cairo();
+            cr.set_source_rgb(nr, ng, nb);
             cr.move_to(num_x, y);
             pangocairo::show_layout(cr, layout);
-        }
 
-        // Render line text with syntax highlighting
-        layout.set_text(&line.to_string());
-
-        let line_start_byte = buffer.content.line_to_byte(line_idx);
-        let line_end_byte = line_start_byte + line.len_bytes();
-
-        let attrs = AttrList::new();
-
-        for (start, end, scope) in &buffer_state.highlights {
-            if *end <= line_start_byte || *start >= line_end_byte {
-                continue;
-            }
-
-            let rel_start = if *start < line_start_byte {
-                0
-            } else {
-                *start - line_start_byte
-            };
-            let rel_end = if *end > line_end_byte {
-                line.len_bytes()
-            } else {
-                *end - line_start_byte
-            };
-
-            let color_hex = match scope.as_str() {
-                "keyword" | "operator" => "#c678dd",
-                "string" => "#98c379",
-                "comment" => "#5c6370",
-                "function" | "method" => "#61afef",
-                "type" | "class" | "struct" => "#e5c07b",
-                "variable" => "#e06c75",
-                _ => "#abb2bf",
-            };
-
-            if let Ok(pango_color) = pango::Color::parse(color_hex) {
-                let mut attr = AttrColor::new_foreground(
-                    pango_color.red(),
-                    pango_color.green(),
-                    pango_color.blue(),
-                );
-                attr.set_start_index(rel_start as u32);
-                attr.set_end_index(rel_end as u32);
-                attrs.insert(attr);
+            // Diagnostic gutter icon (colored dot overrides git marker position)
+            if let Some(severity) = rw.diagnostic_gutter.get(&rl.line_idx) {
+                let diag_color = match severity {
+                    DiagnosticSeverity::Error => theme.diagnostic_error,
+                    DiagnosticSeverity::Warning => theme.diagnostic_warning,
+                    DiagnosticSeverity::Information => theme.diagnostic_info,
+                    DiagnosticSeverity::Hint => theme.diagnostic_hint,
+                };
+                let (dr, dg, db) = diag_color.to_cairo();
+                cr.set_source_rgb(dr, dg, db);
+                let dot_r = line_height * 0.2;
+                let dot_cx = rect.x + 3.0 + dot_r;
+                let dot_cy = y + line_height * 0.5;
+                cr.arc(dot_cx, dot_cy, dot_r, 0.0, 2.0 * std::f64::consts::PI);
+                cr.fill().ok();
             }
         }
+    } // end gutter rendering block
+
+    // Clip text area (excluding gutter)
+    cr.save().unwrap();
+    cr.rectangle(
+        rect.x + gutter_width,
+        rect.y,
+        rect.width - gutter_width,
+        rect.height,
+    );
+    cr.clip();
+
+    // Render each visible line
+    for (view_idx, rl) in rw.lines.iter().enumerate() {
+        let y = rect.y + view_idx as f64 * line_height;
+
+        layout.set_text(&rl.raw_text);
+
+        let attrs = build_pango_attrs(&rl.spans);
         layout.set_attributes(Some(&attrs));
 
+        let (fr, fg_g, fb) = theme.foreground.to_cairo();
+        cr.set_source_rgb(fr, fg_g, fb);
         cr.move_to(text_x_offset, y);
-        cr.set_source_rgb(0.9, 0.9, 0.9);
         pangocairo::show_layout(cr, layout);
-    }
 
-    // Render cursor (only in active window)
-    if is_active && view.cursor.line >= scroll_top && view.cursor.line < scroll_top + visible_lines
-    {
-        if let Some(line) = buffer.content.lines().nth(view.cursor.line) {
-            let line_text = line.to_string();
-            layout.set_text(&line_text);
+        // Diagnostic underlines (wavy squiggles)
+        for dm in &rl.diagnostics {
+            let diag_color = match dm.severity {
+                DiagnosticSeverity::Error => theme.diagnostic_error,
+                DiagnosticSeverity::Warning => theme.diagnostic_warning,
+                DiagnosticSeverity::Information => theme.diagnostic_info,
+                DiagnosticSeverity::Hint => theme.diagnostic_hint,
+            };
+            let (dr, dg, db) = diag_color.to_cairo();
+            cr.set_source_rgb(dr, dg, db);
+            cr.set_line_width(1.0);
+
+            let start_byte = rl
+                .raw_text
+                .char_indices()
+                .nth(dm.start_col)
+                .map(|(i, _)| i)
+                .unwrap_or(rl.raw_text.len());
+            let end_byte = rl
+                .raw_text
+                .char_indices()
+                .nth(dm.end_col)
+                .map(|(i, _)| i)
+                .unwrap_or(rl.raw_text.len());
+
+            layout.set_text(&rl.raw_text);
             layout.set_attributes(None);
 
-            let byte_offset: usize = line_text
+            let start_pos = layout.index_to_pos(start_byte as i32);
+            let end_pos = layout.index_to_pos(end_byte as i32);
+            let x0 = text_x_offset + start_pos.x() as f64 / pango::SCALE as f64;
+            let x1 = text_x_offset + end_pos.x() as f64 / pango::SCALE as f64;
+            let underline_y = y + line_height - 2.0;
+
+            // Draw wavy underline
+            let wave_h = 1.5;
+            let wave_len = 4.0;
+            cr.move_to(x0, underline_y);
+            let mut wx = x0;
+            let mut up = true;
+            while wx < x1 {
+                let next_x = (wx + wave_len).min(x1);
+                let cy = if up {
+                    underline_y - wave_h
+                } else {
+                    underline_y + wave_h
+                };
+                cr.curve_to(
+                    wx + (next_x - wx) * 0.5,
+                    cy,
+                    wx + (next_x - wx) * 0.5,
+                    cy,
+                    next_x,
+                    underline_y,
+                );
+                wx = next_x;
+                up = !up;
+            }
+            cr.stroke().ok();
+        }
+    }
+
+    cr.restore().unwrap();
+
+    // Render cursor
+    if let Some((cursor_pos, cursor_shape)) = &rw.cursor {
+        if let Some(rl) = rw.lines.get(cursor_pos.view_line) {
+            layout.set_text(&rl.raw_text);
+            layout.set_attributes(None);
+
+            let byte_offset: usize = rl
+                .raw_text
                 .char_indices()
-                .nth(view.cursor.col)
+                .nth(cursor_pos.col)
                 .map(|(i, _)| i)
-                .unwrap_or(line_text.len());
+                .unwrap_or(rl.raw_text.len());
 
             let pos = layout.index_to_pos(byte_offset as i32);
             let cursor_x = text_x_offset + pos.x() as f64 / pango::SCALE as f64;
             let char_w = pos.width() as f64 / pango::SCALE as f64;
-            let cursor_y = rect.y + (view.cursor.line - scroll_top) as f64 * line_height;
+            let cursor_y = rect.y + cursor_pos.view_line as f64 * line_height;
 
-            match engine.mode {
-                Mode::Normal | Mode::Visual | Mode::VisualLine => {
-                    cr.set_source_rgba(1.0, 1.0, 1.0, 0.5);
-                    let w = if char_w > 0.0 {
-                        char_w
-                    } else {
-                        font_metrics.approximate_char_width() as f64 / pango::SCALE as f64
-                    };
-                    cr.rectangle(cursor_x, cursor_y, w, line_height);
+            let (cr_r, cr_g, cr_b) = theme.cursor.to_cairo();
+            let char_w = if char_w > 0.0 {
+                char_w
+            } else {
+                font_metrics.approximate_char_width() as f64 / pango::SCALE as f64
+            };
+            match cursor_shape {
+                CursorShape::Block => {
+                    cr.set_source_rgba(cr_r, cr_g, cr_b, theme.cursor_normal_alpha);
+                    cr.rectangle(cursor_x, cursor_y, char_w, line_height);
+                    cr.fill().unwrap();
                 }
-                Mode::Insert => {
-                    cr.set_source_rgb(1.0, 1.0, 1.0);
+                CursorShape::Bar => {
+                    cr.set_source_rgb(cr_r, cr_g, cr_b);
                     cr.rectangle(cursor_x, cursor_y, 2.0, line_height);
+                    cr.fill().unwrap();
                 }
-                Mode::Command | Mode::Search => {
-                    // No text cursor shown — cursor is in the command line
+                CursorShape::Underline => {
+                    cr.set_source_rgb(cr_r, cr_g, cr_b);
+                    let bar_h = (line_height * 0.12).max(2.0);
+                    cr.rectangle(cursor_x, cursor_y + line_height - bar_h, char_w, bar_h);
+                    cr.fill().unwrap();
                 }
             }
-            cr.fill().unwrap();
         }
     }
+}
 
-    // Per-window status bar (only if multiple windows)
-    if engine.windows.len() > 1 {
-        let status_y = rect.y + rect.height - line_height;
+/// Convert a slice of [`StyledSpan`]s into a Pango [`AttrList`].
+fn build_pango_attrs(spans: &[StyledSpan]) -> AttrList {
+    let attrs = AttrList::new();
+    for span in spans {
+        let (fr, fg_g, fb) = span.style.fg.to_pango_u16();
+        let mut fg_attr = AttrColor::new_foreground(fr, fg_g, fb);
+        fg_attr.set_start_index(span.start_byte as u32);
+        fg_attr.set_end_index(span.end_byte as u32);
+        attrs.insert(fg_attr);
 
-        // Status bar background (different for active)
-        if is_active {
-            cr.set_source_rgb(0.25, 0.25, 0.35);
-        } else {
-            cr.set_source_rgb(0.18, 0.18, 0.25);
+        if let Some(bg) = span.style.bg {
+            let (br, bg_g, bb) = bg.to_pango_u16();
+            let mut bg_attr = AttrColor::new_background(br, bg_g, bb);
+            bg_attr.set_start_index(span.start_byte as u32);
+            bg_attr.set_end_index(span.end_byte as u32);
+            attrs.insert(bg_attr);
         }
-        cr.rectangle(rect.x, status_y, rect.width, line_height);
-        cr.fill().unwrap();
-
-        let filename = buffer_state.display_name();
-        let dirty_indicator = if buffer_state.dirty { " [+]" } else { "" };
-
-        let status_text = format!(" {}{}", filename, dirty_indicator);
-        layout.set_text(&status_text);
-        layout.set_attributes(None);
-
-        cr.move_to(rect.x, status_y);
-        cr.set_source_rgb(0.9, 0.9, 0.9);
-        pangocairo::show_layout(cr, layout);
     }
+    attrs
 }
 
 #[allow(clippy::too_many_arguments)]
 fn draw_visual_selection(
     cr: &Context,
     layout: &pango::Layout,
-    engine: &Engine,
-    buffer: &Buffer,
-    anchor: &Cursor,
-    cursor: &Cursor,
+    sel: &SelectionRange,
+    lines: &[render::RenderedLine],
     rect: &WindowRect,
     line_height: f64,
     scroll_top: usize,
-    visible_lines: usize,
     text_x_offset: f64,
+    theme: &Theme,
 ) {
-    // Normalize selection (start <= end)
-    let (start, end) =
-        if anchor.line < cursor.line || (anchor.line == cursor.line && anchor.col <= cursor.col) {
-            (*anchor, *cursor)
-        } else {
-            (*cursor, *anchor)
-        };
+    let visible_lines = lines.len();
+    let (sr, sg, sb) = theme.selection.to_cairo();
+    cr.set_source_rgba(sr, sg, sb, theme.selection_alpha);
 
-    // Set highlight color (semi-transparent blue)
-    cr.set_source_rgba(0.3, 0.5, 0.7, 0.3);
-
-    match engine.mode {
-        Mode::VisualLine => {
-            // Line mode: highlight full lines (text area only, not gutter)
-            for line_idx in start.line..=end.line {
-                // Only draw if line is visible
+    match sel.kind {
+        SelectionKind::Line => {
+            for line_idx in sel.start_line..=sel.end_line {
                 if line_idx >= scroll_top && line_idx < scroll_top + visible_lines {
                     let view_idx = line_idx - scroll_top;
                     let y = rect.y + view_idx as f64 * line_height;
@@ -1212,108 +2568,134 @@ fn draw_visual_selection(
             }
             cr.fill().unwrap();
         }
-        Mode::Visual => {
-            // Character mode: highlight from start to end (inclusive)
-            if start.line == end.line {
+        SelectionKind::Char => {
+            if sel.start_line == sel.end_line {
                 // Single-line selection
-                if start.line >= scroll_top && start.line < scroll_top + visible_lines {
-                    let view_idx = start.line - scroll_top;
+                if sel.start_line >= scroll_top && sel.start_line < scroll_top + visible_lines {
+                    let view_idx = sel.start_line - scroll_top;
                     let y = rect.y + view_idx as f64 * line_height;
+                    let line_text = &lines[view_idx].raw_text;
 
-                    if let Some(line) = buffer.content.lines().nth(start.line) {
-                        let line_text = line.to_string();
-                        layout.set_text(&line_text);
+                    layout.set_text(line_text);
+                    layout.set_attributes(None);
+
+                    let start_byte = line_text
+                        .char_indices()
+                        .nth(sel.start_col)
+                        .map(|(i, _)| i)
+                        .unwrap_or(line_text.len());
+                    let start_pos = layout.index_to_pos(start_byte as i32);
+                    let start_x = text_x_offset + start_pos.x() as f64 / pango::SCALE as f64;
+
+                    let end_col = (sel.end_col + 1).min(line_text.chars().count());
+                    let end_byte = line_text
+                        .char_indices()
+                        .nth(end_col)
+                        .map(|(i, _)| i)
+                        .unwrap_or(line_text.len());
+                    let end_pos = layout.index_to_pos(end_byte as i32);
+                    let end_x = text_x_offset + end_pos.x() as f64 / pango::SCALE as f64;
+
+                    cr.rectangle(start_x, y, end_x - start_x, line_height);
+                    cr.fill().unwrap();
+                }
+            } else {
+                // Multi-line selection
+                for line_idx in sel.start_line..=sel.end_line {
+                    if line_idx >= scroll_top && line_idx < scroll_top + visible_lines {
+                        let view_idx = line_idx - scroll_top;
+                        let y = rect.y + view_idx as f64 * line_height;
+                        let line_text = &lines[view_idx].raw_text;
+
+                        layout.set_text(line_text);
                         layout.set_attributes(None);
 
-                        // Calculate x position for start column
-                        let start_byte: usize = line_text
+                        if line_idx == sel.start_line {
+                            let start_byte = line_text
+                                .char_indices()
+                                .nth(sel.start_col)
+                                .map(|(i, _)| i)
+                                .unwrap_or(line_text.len());
+                            let start_pos = layout.index_to_pos(start_byte as i32);
+                            let start_x =
+                                text_x_offset + start_pos.x() as f64 / pango::SCALE as f64;
+                            let (line_width, _) = layout.pixel_size();
+                            cr.rectangle(
+                                start_x,
+                                y,
+                                text_x_offset + line_width as f64 - start_x,
+                                line_height,
+                            );
+                            cr.fill().unwrap();
+                        } else if line_idx == sel.end_line {
+                            let end_col = (sel.end_col + 1).min(line_text.chars().count());
+                            let end_byte = line_text
+                                .char_indices()
+                                .nth(end_col)
+                                .map(|(i, _)| i)
+                                .unwrap_or(line_text.len());
+                            let end_pos = layout.index_to_pos(end_byte as i32);
+                            let end_x = text_x_offset + end_pos.x() as f64 / pango::SCALE as f64;
+                            cr.rectangle(text_x_offset, y, end_x - text_x_offset, line_height);
+                            cr.fill().unwrap();
+                        } else {
+                            let (line_width, _) = layout.pixel_size();
+                            cr.rectangle(text_x_offset, y, line_width as f64, line_height);
+                            cr.fill().unwrap();
+                        }
+                    }
+                }
+            }
+        }
+        SelectionKind::Block => {
+            for line_idx in sel.start_line..=sel.end_line {
+                if line_idx >= scroll_top && line_idx < scroll_top + visible_lines {
+                    let view_idx = line_idx - scroll_top;
+                    let y = rect.y + view_idx as f64 * line_height;
+                    let line_text = &lines[view_idx].raw_text;
+                    let line_len = line_text.chars().count();
+
+                    layout.set_text(line_text);
+                    layout.set_attributes(None);
+
+                    if sel.start_col < line_len {
+                        let start_byte = line_text
                             .char_indices()
-                            .nth(start.col)
+                            .nth(sel.start_col)
                             .map(|(i, _)| i)
                             .unwrap_or(line_text.len());
                         let start_pos = layout.index_to_pos(start_byte as i32);
                         let start_x = text_x_offset + start_pos.x() as f64 / pango::SCALE as f64;
 
-                        // Calculate x position for end column (inclusive, so +1)
-                        let end_col = (end.col + 1).min(line_text.chars().count());
-                        let end_byte: usize = line_text
+                        let block_end_col = (sel.end_col + 1).min(line_len);
+                        let end_byte = line_text
                             .char_indices()
-                            .nth(end_col)
+                            .nth(block_end_col)
                             .map(|(i, _)| i)
                             .unwrap_or(line_text.len());
                         let end_pos = layout.index_to_pos(end_byte as i32);
                         let end_x = text_x_offset + end_pos.x() as f64 / pango::SCALE as f64;
 
                         cr.rectangle(start_x, y, end_x - start_x, line_height);
-                        cr.fill().unwrap();
-                    }
-                }
-            } else {
-                // Multi-line selection
-                for line_idx in start.line..=end.line {
-                    if line_idx >= scroll_top && line_idx < scroll_top + visible_lines {
-                        let view_idx = line_idx - scroll_top;
-                        let y = rect.y + view_idx as f64 * line_height;
-
-                        if let Some(line) = buffer.content.lines().nth(line_idx) {
-                            let line_text = line.to_string();
-                            layout.set_text(&line_text);
-                            layout.set_attributes(None);
-
-                            if line_idx == start.line {
-                                // First line: from start.col to end of line
-                                let start_byte: usize = line_text
-                                    .char_indices()
-                                    .nth(start.col)
-                                    .map(|(i, _)| i)
-                                    .unwrap_or(line_text.len());
-                                let start_pos = layout.index_to_pos(start_byte as i32);
-                                let start_x =
-                                    text_x_offset + start_pos.x() as f64 / pango::SCALE as f64;
-
-                                let (line_width, _) = layout.pixel_size();
-                                cr.rectangle(
-                                    start_x,
-                                    y,
-                                    text_x_offset + line_width as f64 - start_x,
-                                    line_height,
-                                );
-                                cr.fill().unwrap();
-                            } else if line_idx == end.line {
-                                // Last line: from start of line to end.col (inclusive)
-                                let end_col = (end.col + 1).min(line_text.chars().count());
-                                let end_byte: usize = line_text
-                                    .char_indices()
-                                    .nth(end_col)
-                                    .map(|(i, _)| i)
-                                    .unwrap_or(line_text.len());
-                                let end_pos = layout.index_to_pos(end_byte as i32);
-                                let end_x =
-                                    text_x_offset + end_pos.x() as f64 / pango::SCALE as f64;
-
-                                cr.rectangle(text_x_offset, y, end_x - text_x_offset, line_height);
-                                cr.fill().unwrap();
-                            } else {
-                                // Middle lines: full line
-                                let (line_width, _) = layout.pixel_size();
-                                cr.rectangle(text_x_offset, y, line_width as f64, line_height);
-                                cr.fill().unwrap();
-                            }
-                        }
                     }
                 }
             }
+            cr.fill().unwrap();
         }
-        _ => {}
     }
 }
 
-fn draw_window_separators(cr: &Context, window_rects: &[(core::WindowId, WindowRect)]) {
+fn draw_window_separators(
+    cr: &Context,
+    window_rects: &[(core::WindowId, WindowRect)],
+    theme: &Theme,
+) {
     if window_rects.len() <= 1 {
         return;
     }
 
-    cr.set_source_rgb(0.3, 0.3, 0.4);
+    let (sr, sg, sb) = theme.separator.to_cairo();
+    cr.set_source_rgb(sr, sg, sb);
     cr.set_line_width(1.0);
 
     // Draw separators between adjacent windows
@@ -1347,52 +2729,457 @@ fn draw_window_separators(cr: &Context, window_rects: &[(core::WindowId, WindowR
     }
 }
 
+fn draw_completion_popup(
+    cr: &Context,
+    layout: &pango::Layout,
+    screen: &render::ScreenLayout,
+    theme: &Theme,
+    line_height: f64,
+    char_width: f64,
+) {
+    let Some(menu) = &screen.completion else {
+        return;
+    };
+    let Some(active_win) = screen
+        .windows
+        .iter()
+        .find(|w| w.window_id == screen.active_window_id)
+    else {
+        return;
+    };
+    let Some((cursor_pos, _)) = &active_win.cursor else {
+        return;
+    };
+
+    // Anchor popup below the cursor cell, to the right of the gutter.
+    let gutter_width = active_win.gutter_char_width as f64 * char_width;
+    let h_scroll_offset = active_win.scroll_left as f64 * char_width;
+    let popup_x =
+        active_win.rect.x + gutter_width + cursor_pos.col as f64 * char_width - h_scroll_offset;
+    let popup_y = active_win.rect.y + (cursor_pos.view_line + 1) as f64 * line_height;
+
+    let visible = menu.candidates.len().min(10);
+    let popup_w = ((menu.max_width + 2) as f64 * char_width).max(100.0);
+    let popup_h = visible as f64 * line_height;
+
+    // Background
+    let (r, g, b) = theme.completion_bg.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
+    cr.fill().ok();
+
+    // Border
+    let (r, g, b) = theme.completion_border.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    cr.set_line_width(1.0);
+    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
+    cr.stroke().ok();
+
+    // Items
+    for (i, candidate) in menu.candidates.iter().enumerate().take(visible) {
+        let item_y = popup_y + i as f64 * line_height;
+
+        // Selected row highlight
+        if i == menu.selected_idx {
+            let (r, g, b) = theme.completion_selected_bg.to_cairo();
+            cr.set_source_rgb(r, g, b);
+            cr.rectangle(popup_x, item_y, popup_w, line_height);
+            cr.fill().ok();
+        }
+
+        // Candidate text
+        let (r, g, b) = theme.completion_fg.to_cairo();
+        cr.set_source_rgb(r, g, b);
+        let display = format!(" {}", candidate);
+        layout.set_text(&display);
+        layout.set_attributes(None);
+        cr.move_to(popup_x, item_y);
+        pangocairo::show_layout(cr, layout);
+    }
+}
+
+fn draw_hover_popup(
+    cr: &Context,
+    layout: &pango::Layout,
+    screen: &render::ScreenLayout,
+    theme: &Theme,
+    line_height: f64,
+    char_width: f64,
+) {
+    let Some(hover) = &screen.hover else {
+        return;
+    };
+    let Some(active_win) = screen
+        .windows
+        .iter()
+        .find(|w| w.window_id == screen.active_window_id)
+    else {
+        return;
+    };
+
+    // Position above the anchor line
+    let gutter_width = active_win.gutter_char_width as f64 * char_width;
+    let h_scroll_offset = active_win.scroll_left as f64 * char_width;
+    let anchor_view_line = hover.anchor_line.saturating_sub(active_win.scroll_top);
+    let popup_x =
+        active_win.rect.x + gutter_width + hover.anchor_col as f64 * char_width - h_scroll_offset;
+
+    // Split text into lines and measure
+    let text_lines: Vec<&str> = hover.text.lines().collect();
+    let num_lines = text_lines.len().min(20) as f64;
+    let max_line_len = text_lines.iter().map(|l| l.len()).max().unwrap_or(10);
+    let popup_w = ((max_line_len + 2) as f64 * char_width).max(100.0);
+    let popup_h = num_lines * line_height + 4.0;
+
+    // Place above cursor if possible, otherwise below
+    let popup_y = if anchor_view_line as f64 * line_height > popup_h {
+        active_win.rect.y + anchor_view_line as f64 * line_height - popup_h
+    } else {
+        active_win.rect.y + (anchor_view_line as f64 + 1.0) * line_height
+    };
+
+    // Background
+    let (r, g, b) = theme.hover_bg.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
+    cr.fill().ok();
+
+    // Border
+    let (r, g, b) = theme.hover_border.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    cr.set_line_width(1.0);
+    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
+    cr.stroke().ok();
+
+    // Text
+    let (r, g, b) = theme.hover_fg.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    for (i, text_line) in text_lines.iter().enumerate().take(20) {
+        let display = format!(" {}", text_line);
+        layout.set_text(&display);
+        layout.set_attributes(None);
+        cr.move_to(popup_x, popup_y + 2.0 + i as f64 * line_height);
+        pangocairo::show_layout(cr, layout);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_fuzzy_popup(
+    cr: &Context,
+    layout: &pango::Layout,
+    screen: &render::ScreenLayout,
+    theme: &Theme,
+    editor_width: f64,
+    editor_height: f64,
+    line_height: f64,
+    _char_width: f64,
+) {
+    let Some(fuzzy) = &screen.fuzzy else {
+        return;
+    };
+
+    // Size: 60% of editor width (min 400px), 55% of editor height (min 300px)
+    let popup_w = (editor_width * 0.6).max(400.0);
+    let popup_h = (editor_height * 0.55).max(300.0);
+
+    // Centered in editor area
+    let popup_x = (editor_width - popup_w) / 2.0;
+    let popup_y = (editor_height - popup_h) / 2.0;
+
+    // Background
+    let (r, g, b) = theme.fuzzy_bg.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
+    cr.fill().ok();
+
+    // Border
+    let (r, g, b) = theme.fuzzy_border.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    cr.set_line_width(1.0);
+    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
+    cr.stroke().ok();
+
+    // Title row: "  Find Files  (N/M files)"
+    let title = format!(
+        "  Find Files  ({}/{} files)",
+        fuzzy.results.len(),
+        fuzzy.total_files
+    );
+    let (r, g, b) = theme.fuzzy_title_fg.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    layout.set_text(&title);
+    layout.set_attributes(None);
+    cr.move_to(popup_x, popup_y);
+    pangocairo::show_layout(cr, layout);
+
+    // Query row: "> " + query
+    let query_text = format!("> {}_", fuzzy.query);
+    let (r, g, b) = theme.fuzzy_query_fg.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    layout.set_text(&query_text);
+    layout.set_attributes(None);
+    cr.move_to(popup_x, popup_y + line_height);
+    pangocairo::show_layout(cr, layout);
+
+    // Horizontal separator
+    let sep_y = popup_y + 2.0 * line_height;
+    let (r, g, b) = theme.fuzzy_border.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    cr.set_line_width(1.0);
+    cr.move_to(popup_x, sep_y);
+    cr.line_to(popup_x + popup_w, sep_y);
+    cr.stroke().ok();
+
+    // Result rows
+    let rows_area_h = popup_h - 2.0 * line_height - 2.0; // minus title, query, sep
+    let visible_rows = ((rows_area_h / line_height) as usize).min(fuzzy.results.len());
+    for (i, display) in fuzzy.results.iter().enumerate().take(visible_rows) {
+        let item_y = sep_y + 1.0 + i as f64 * line_height;
+        let is_selected = i == fuzzy.selected_idx;
+
+        // Selected row highlight
+        if is_selected {
+            let (r, g, b) = theme.fuzzy_selected_bg.to_cairo();
+            cr.set_source_rgb(r, g, b);
+            cr.rectangle(popup_x, item_y, popup_w, line_height);
+            cr.fill().ok();
+        }
+
+        // Row text with ▶ prefix for selected
+        let prefix = if is_selected { "▶ " } else { "  " };
+        let row_text = format!("{}{}", prefix, display);
+        let (r, g, b) = theme.fuzzy_fg.to_cairo();
+        cr.set_source_rgb(r, g, b);
+        layout.set_text(&row_text);
+        layout.set_attributes(None);
+        cr.move_to(popup_x, item_y);
+        pangocairo::show_layout(cr, layout);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_live_grep_popup(
+    cr: &Context,
+    layout: &pango::Layout,
+    screen: &render::ScreenLayout,
+    theme: &Theme,
+    editor_width: f64,
+    editor_height: f64,
+    line_height: f64,
+) {
+    let Some(grep) = &screen.live_grep else {
+        return;
+    };
+
+    // Size: 80% of editor width (min 600px), 65% of editor height (min 400px)
+    let popup_w = (editor_width * 0.8).max(600.0);
+    let popup_h = (editor_height * 0.65).max(400.0);
+
+    // Centered in editor area
+    let popup_x = (editor_width - popup_w) / 2.0;
+    let popup_y = (editor_height - popup_h) / 2.0;
+
+    // Background
+    let (r, g, b) = theme.fuzzy_bg.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
+    cr.fill().ok();
+
+    // Border
+    let (r, g, b) = theme.fuzzy_border.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    cr.set_line_width(1.0);
+    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
+    cr.stroke().ok();
+
+    // Title row
+    let title = format!("  Live Grep  {} matches", grep.total_matches);
+    let (r, g, b) = theme.fuzzy_title_fg.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    layout.set_text(&title);
+    layout.set_attributes(None);
+    cr.move_to(popup_x, popup_y);
+    pangocairo::show_layout(cr, layout);
+
+    // Query row: "> " + query
+    let query_text = format!("> {}_", grep.query);
+    let (r, g, b) = theme.fuzzy_query_fg.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    layout.set_text(&query_text);
+    layout.set_attributes(None);
+    cr.move_to(popup_x, popup_y + line_height);
+    pangocairo::show_layout(cr, layout);
+
+    // Horizontal separator
+    let sep_y = popup_y + 2.0 * line_height;
+    let (r, g, b) = theme.fuzzy_border.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    cr.set_line_width(1.0);
+    cr.move_to(popup_x, sep_y);
+    cr.line_to(popup_x + popup_w, sep_y);
+    cr.stroke().ok();
+
+    // Two-column layout: left pane = 40% of popup width
+    let left_pane_w = popup_w * 0.4;
+    let right_pane_x = popup_x + left_pane_w + 1.0;
+    let right_pane_w = popup_w - left_pane_w - 1.0;
+
+    // Vertical separator between panes
+    cr.move_to(popup_x + left_pane_w, sep_y);
+    cr.line_to(popup_x + left_pane_w, popup_y + popup_h);
+    cr.stroke().ok();
+
+    let rows_area_h = popup_h - 2.0 * line_height - 2.0;
+    let visible_rows = (rows_area_h / line_height) as usize;
+
+    // Compute scroll offset so the selected row is always visible.
+    // Stateless: derived entirely from selected_idx each frame.
+    let scroll_top = if grep.selected_idx < visible_rows {
+        0
+    } else {
+        grep.selected_idx + 1 - visible_rows
+    };
+
+    // Left pane: result rows — clipped to left_pane_w to prevent text spill
+    cr.save().ok();
+    cr.rectangle(popup_x, sep_y, left_pane_w, rows_area_h + 2.0);
+    cr.clip();
+
+    for i in 0..visible_rows {
+        let result_idx = scroll_top + i;
+        let Some(display) = grep.results.get(result_idx) else {
+            break;
+        };
+        let item_y = sep_y + 1.0 + i as f64 * line_height;
+        let is_selected = result_idx == grep.selected_idx;
+
+        if is_selected {
+            let (r, g, b) = theme.fuzzy_selected_bg.to_cairo();
+            cr.set_source_rgb(r, g, b);
+            cr.rectangle(popup_x, item_y, left_pane_w, line_height);
+            cr.fill().ok();
+        }
+
+        let prefix = if is_selected { "▶ " } else { "  " };
+        let row_text = format!("{}{}", prefix, display);
+        let (r, g, b) = theme.fuzzy_fg.to_cairo();
+        cr.set_source_rgb(r, g, b);
+        layout.set_text(&row_text);
+        layout.set_attributes(None);
+        cr.move_to(popup_x, item_y);
+        pangocairo::show_layout(cr, layout);
+    }
+
+    cr.restore().ok();
+
+    // Right pane: preview lines — clipped to right pane bounds
+    cr.save().ok();
+    cr.rectangle(right_pane_x, sep_y, right_pane_w, rows_area_h + 2.0);
+    cr.clip();
+
+    for (i, (lineno, text, is_match)) in grep.preview_lines.iter().enumerate().take(visible_rows) {
+        let item_y = sep_y + 1.0 + i as f64 * line_height;
+        let preview_text = format!("{:4}: {}", lineno, text);
+
+        if *is_match {
+            let (r, g, b) = theme.fuzzy_title_fg.to_cairo();
+            cr.set_source_rgb(r, g, b);
+        } else {
+            let (r, g, b) = theme.fuzzy_fg.to_cairo();
+            cr.set_source_rgb(r, g, b);
+        }
+
+        layout.set_text(&preview_text);
+        layout.set_attributes(None);
+        cr.move_to(right_pane_x, item_y);
+        pangocairo::show_layout(cr, layout);
+    }
+
+    cr.restore().ok();
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_quickfix_panel(
+    cr: &Context,
+    layout: &pango::Layout,
+    screen: &render::ScreenLayout,
+    theme: &Theme,
+    editor_x: f64,
+    editor_y: f64,
+    editor_w: f64,
+    qf_px: f64,
+    line_height: f64,
+) {
+    let Some(qf) = &screen.quickfix else {
+        return;
+    };
+
+    // Header row
+    let (hr, hg, hb) = theme.status_bg.to_cairo();
+    cr.set_source_rgb(hr, hg, hb);
+    cr.rectangle(editor_x, editor_y, editor_w, line_height);
+    cr.fill().ok();
+    let focus_mark = if qf.has_focus { " [FOCUS]" } else { "" };
+    let title = format!("  QUICKFIX  ({} items){}", qf.total_items, focus_mark);
+    let (fr, fg, fb) = theme.status_fg.to_cairo();
+    cr.set_source_rgb(fr, fg, fb);
+    layout.set_attributes(None);
+    layout.set_text(&title);
+    cr.move_to(editor_x, editor_y);
+    pangocairo::show_layout(cr, layout);
+
+    // Result rows
+    let visible_rows = ((qf_px / line_height) as usize).saturating_sub(1);
+    let scroll_top = (qf.selected_idx + 1).saturating_sub(visible_rows);
+    for row_idx in 0..visible_rows {
+        let item_idx = scroll_top + row_idx;
+        if item_idx >= qf.items.len() {
+            break;
+        }
+        let ry = editor_y + line_height * (row_idx + 1) as f64;
+        let is_selected = item_idx == qf.selected_idx;
+        if is_selected {
+            let (sr, sg, sb) = theme.fuzzy_selected_bg.to_cairo();
+            cr.set_source_rgb(sr, sg, sb);
+            cr.rectangle(editor_x, ry, editor_w, line_height);
+            cr.fill().ok();
+        }
+        let prefix = if is_selected { "▶ " } else { "  " };
+        let text = format!("{}{}", prefix, qf.items[item_idx]);
+        let (ir, ig, ib) = theme.fuzzy_fg.to_cairo();
+        cr.set_source_rgb(ir, ig, ib);
+        layout.set_text(&text);
+        cr.move_to(editor_x, ry);
+        pangocairo::show_layout(cr, layout);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn draw_status_line(
     cr: &Context,
     layout: &pango::Layout,
-    engine: &Engine,
+    theme: &Theme,
+    left: &str,
+    right: &str,
     width: f64,
     y: f64,
     line_height: f64,
 ) {
-    // Status bar background
-    cr.set_source_rgb(0.2, 0.2, 0.3);
+    let (br, bg, bb) = theme.status_bg.to_cairo();
+    cr.set_source_rgb(br, bg, bb);
     cr.rectangle(0.0, y, width, line_height);
     cr.fill().unwrap();
 
-    let mode_str = match engine.mode {
-        Mode::Normal | Mode::Command | Mode::Search => "NORMAL",
-        Mode::Insert => "INSERT",
-        Mode::Visual => "VISUAL",
-        Mode::VisualLine => "VISUAL LINE",
-    };
-
-    let filename = match engine.file_path() {
-        Some(p) => p.display().to_string(),
-        None => "[No Name]".to_string(),
-    };
-
-    let dirty_indicator = if engine.dirty() { " [+]" } else { "" };
-
-    let left_status = format!(" -- {} -- {}{}", mode_str, filename, dirty_indicator);
-    let cursor = engine.cursor();
-    let right_status = format!(
-        "Ln {}, Col {}  ({} lines) ",
-        cursor.line + 1,
-        cursor.col + 1,
-        engine.buffer().len_lines()
-    );
-
     layout.set_attributes(None);
 
-    // Left side
-    layout.set_text(&left_status);
+    let (fr, fg, fb) = theme.status_fg.to_cairo();
+    cr.set_source_rgb(fr, fg, fb);
+
+    layout.set_text(left);
     cr.move_to(0.0, y);
-    cr.set_source_rgb(0.9, 0.9, 0.9);
     pangocairo::show_layout(cr, layout);
 
-    // Right side
-    layout.set_text(&right_status);
+    layout.set_text(right);
     let (right_w, _) = layout.pixel_size();
     cr.move_to(width - right_w as f64, y);
     pangocairo::show_layout(cr, layout);
@@ -1401,60 +3188,40 @@ fn draw_status_line(
 fn draw_command_line(
     cr: &Context,
     layout: &pango::Layout,
-    engine: &Engine,
+    theme: &Theme,
+    cmd: &CommandLineData,
     width: f64,
     y: f64,
     line_height: f64,
 ) {
-    // Command line background
-    cr.set_source_rgb(0.1, 0.1, 0.1);
+    let (br, bg, bb) = theme.command_bg.to_cairo();
+    cr.set_source_rgb(br, bg, bb);
     cr.rectangle(0.0, y, width, line_height);
     cr.fill().unwrap();
 
-    let cmd_text = match engine.mode {
-        Mode::Command => format!(":{}", engine.command_buffer),
-        Mode::Search => format!("/{}", engine.command_buffer),
-        Mode::Normal | Mode::Visual | Mode::VisualLine => {
-            // Display count if present, otherwise show message
-            if let Some(count) = engine.peek_count() {
-                count.to_string()
-            } else {
-                engine.message.clone()
-            }
-        }
-        _ => engine.message.clone(),
-    };
+    if !cmd.text.is_empty() {
+        layout.set_text(&cmd.text);
+        layout.set_attributes(None);
 
-    if !cmd_text.is_empty() {
-        layout.set_text(&cmd_text);
+        let (fr, fg, fb) = theme.command_fg.to_cairo();
+        cr.set_source_rgb(fr, fg, fb);
 
-        // Right-align count in Normal/Visual modes
-        if (engine.mode == Mode::Normal
-            || engine.mode == Mode::Visual
-            || engine.mode == Mode::VisualLine)
-            && engine.peek_count().is_some()
-        {
+        if cmd.right_align {
             let (text_w, _) = layout.pixel_size();
             cr.move_to(width - text_w as f64, y);
         } else {
             cr.move_to(0.0, y);
         }
-
-        cr.set_source_rgb(0.9, 0.9, 0.9);
         pangocairo::show_layout(cr, layout);
     }
 
-    // Command-line cursor in Command/Search mode
-    if engine.mode == Mode::Command || engine.mode == Mode::Search {
-        let prefix = if engine.mode == Mode::Command {
-            ":"
-        } else {
-            "/"
-        };
-        let full = format!("{}{}", prefix, engine.command_buffer);
-        layout.set_text(&full);
+    // Command-line insert cursor
+    if cmd.show_cursor {
+        layout.set_text(&cmd.cursor_anchor_text);
+        layout.set_attributes(None);
         let (text_w, _) = layout.pixel_size();
-        cr.set_source_rgb(1.0, 1.0, 1.0);
+        let (cr_r, cr_g, cr_b) = theme.cursor.to_cairo();
+        cr.set_source_rgb(cr_r, cr_g, cr_b);
         cr.rectangle(text_w as f64, y, 2.0, line_height);
         cr.fill().unwrap();
     }
@@ -1471,7 +3238,12 @@ fn handle_mouse_click(engine: &mut Engine, x: f64, y: f64, width: f64, height: f
     let cr = CairoContext::new(&surface).unwrap();
 
     let pango_ctx = pangocairo::create_context(&cr);
-    let font_desc = FontDescription::from_string("Monospace 14");
+    // Use configurable font from settings (matching draw_editor)
+    let font_str = format!(
+        "{} {}",
+        engine.settings.font_family, engine.settings.font_size
+    );
+    let font_desc = FontDescription::from_string(&font_str);
 
     // Get actual font metrics (matching draw_editor line 250-251)
     let font_metrics = pango_ctx.metrics(Some(&font_desc), None);
@@ -1570,16 +3342,17 @@ fn handle_mouse_click(engine: &mut Engine, x: f64, y: f64, width: f64, height: f
     let buffer = &buffer_state.buffer;
     let view = &window.view;
 
-    // Calculate gutter width using real char width from font metrics (matching draw_window line 391)
+    // Calculate gutter width from render module (matches the actual draw function).
     let char_width = font_metrics.approximate_char_width() as f64 / pango::SCALE as f64;
     let total_lines = buffer.content.len_lines();
-    let gutter_width =
-        calculate_gutter_width(engine.settings.line_numbers, total_lines, char_width);
-
-    // Check if click is in gutter - if so, ignore
-    if x < rect.x + gutter_width {
-        return;
-    }
+    let has_git = !buffer_state.git_diff.is_empty();
+    let gutter_char_width = render::calculate_gutter_cols(
+        engine.settings.line_numbers,
+        total_lines,
+        char_width,
+        has_git,
+    );
+    let gutter_width = gutter_char_width as f64 * char_width;
 
     // Calculate per-window status bar height
     let per_window_status = if engine.windows.len() > 1 {
@@ -1594,10 +3367,18 @@ fn handle_mouse_click(engine: &mut Engine, x: f64, y: f64, width: f64, height: f
         return;
     }
 
-    // Convert y coordinate to line number
+    // Convert y coordinate to visible row index
     let relative_y = y - rect.y;
-    let view_line = (relative_y / line_height).floor() as usize;
-    let line = view.scroll_top + view_line;
+    let view_row = (relative_y / line_height).floor() as usize;
+
+    // Map view_row → buffer line (fold-aware: skip hidden lines)
+    let line = view_row_to_buf_line(view, view.scroll_top, view_row, total_lines);
+
+    // Entire gutter is a click target for fold toggle
+    if x >= rect.x && x < rect.x + gutter_width && gutter_width > 0.0 {
+        engine.toggle_fold_at_line(line);
+        return;
+    }
 
     // Convert x coordinate to column using pixel-perfect Pango layout measurement
     let relative_x = x - (rect.x + gutter_width);
@@ -1790,6 +3571,158 @@ fn load_css() {
         treeview expander:not(:checked) {
             color: #999999;
         }
+
+        /* Thin overlay scrollbars */
+        scrollbar {
+            background: transparent;
+            transition: opacity 200ms ease-out;
+        }
+
+        scrollbar.vertical {
+            min-width: 10px;
+        }
+
+        scrollbar.horizontal {
+            min-height: 10px;
+            max-height: 10px;
+        }
+
+        scrollbar.horizontal slider {
+            min-height: 10px;
+            max-height: 10px;
+        }
+
+        scrollbar slider {
+            min-width: 10px;
+            min-height: 40px;
+            background: rgba(255, 255, 255, 0.3);
+            border-radius: 5px;
+        }
+
+        scrollbar slider:hover {
+            background: rgba(255, 255, 255, 0.5);
+        }
+
+        scrollbar slider:active {
+            background: rgba(255, 255, 255, 0.7);
+        }
+
+        /* Scrollbars — subtle but always visible */
+        scrollbar:not(:hover):not(:active) {
+            opacity: 0.4;
+        }
+
+        /* Search results ListBox — GTK4 CSS node for GtkListBox is 'list' */
+        .search-results-list {
+            background-color: #252526;
+            color: #cccccc;
+        }
+
+        .search-results-list > row {
+            background-color: #252526;
+            color: #cccccc;
+            padding: 2px 4px;
+            min-height: 20px;
+        }
+
+        .search-results-list > row:hover {
+            background-color: #2a2d2e;
+        }
+
+        .search-results-list > row:selected,
+        .search-results-list > row:selected:focus {
+            background-color: rgba(9, 71, 113, 0.5);
+            color: #cccccc;
+        }
+
+        /* Search results ScrolledWindow background */
+        .search-results-scroll {
+            background-color: #252526;
+        }
+
+        /* Labels inside search results list */
+        .search-results-list label {
+            color: #cccccc;
+            background-color: transparent;
+        }
+
+        .search-results-list > row:selected label,
+        .search-results-list > row:selected:focus label {
+            color: #cccccc;
+        }
+
+        /* File-header rows in search results */
+        .search-file-header {
+            color: #569cd6;
+            font-weight: bold;
+            font-size: 12px;
+        }
+
+        /* Search input entry inside sidebar */
+        .sidebar entry {
+            background-color: #3c3c3c;
+            color: #cccccc;
+            border: 1px solid #3e3e42;
+            border-radius: 2px;
+            padding: 4px;
+        }
+
+        .sidebar entry:focus {
+            border-color: #0e639c;
+        }
+
+        /* Search toggle buttons (Aa / Ab| / .*) */
+        .search-toggle-btn {
+            background: transparent;
+            color: #808080;
+            border: 1px solid #3e3e42;
+            border-radius: 2px;
+            padding: 2px 6px;
+            min-width: 0;
+            min-height: 0;
+            font-size: 12px;
+        }
+        .search-toggle-btn:hover {
+            background-color: #2a2d2e;
+        }
+        .search-toggle-btn:checked {
+            background-color: #0e639c;
+            color: #ffffff;
+            border-color: #0e639c;
+        }
+
+        /* Find/Replace Dialog */
+        .find-dialog {
+            background-color: #2d2d30;
+            border: 1px solid #3e3e42;
+            border-radius: 4px;
+            padding: 12px;
+        }
+
+        .find-dialog entry {
+            background-color: #3c3c3c;
+            color: #cccccc;
+            padding: 6px;
+            border: 1px solid #3e3e42;
+            border-radius: 2px;
+        }
+
+        .find-dialog button {
+            background: transparent;
+            border: 1px solid #3e3e42;
+            color: #cccccc;
+            padding: 6px 12px;
+            border-radius: 2px;
+        }
+
+        .find-dialog button:hover {
+            background-color: #2a2d2e;
+        }
+
+        .find-match-count {
+            color: #858585;
+            font-size: 11px;
+        }
         ",
     );
 
@@ -1832,7 +3765,12 @@ fn build_file_tree(store: &gtk4::TreeStore, parent: Option<&gtk4::TreeIter>, pat
         }
 
         let is_dir = path.is_dir();
-        let icon = if is_dir { "📁" } else { "📄" };
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let icon = if is_dir {
+            ""
+        } else {
+            crate::icons::file_icon(ext)
+        };
 
         let iter = store.insert_with_values(
             parent,
@@ -1952,7 +3890,19 @@ fn find_tree_path_for_file(
 fn main() {
     // Parse CLI args to get optional file path
     let args: Vec<String> = std::env::args().collect();
-    let file_path = if args.len() > 1 {
+
+    // --tui flag: launch the terminal UI instead of GTK
+    if args.iter().any(|a| a == "--tui") {
+        let file_path = args
+            .iter()
+            .skip(1)
+            .find(|a| !a.starts_with('-'))
+            .map(PathBuf::from);
+        tui_main::run(file_path);
+        return;
+    }
+
+    let file_path = if args.len() > 1 && !args[1].starts_with('-') {
         Some(PathBuf::from(&args[1]))
     } else {
         None

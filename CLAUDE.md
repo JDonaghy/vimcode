@@ -3,6 +3,20 @@
 2. Check `.opencode/specs/` for detailed feature specs before starting
 3. Prompt user to update `PROJECT_STATE.md` after significant tasks
 
+## Documentation Maintenance (MANDATORY)
+After completing any feature or significant change, update ALL of these files:
+- **`README.md`** — the primary user-facing reference; keep the feature tables, key reference, and command list accurate and complete; update the test count in the intro line
+- **`PROJECT_STATE.md`** — internal progress tracker; update session date, test counts, file sizes, recent work entry, and roadmap checkboxes
+- **`PLAN.md`** — update recently completed section at top; tick off roadmap items
+
+**README.md update rules:**
+- Add new keys/commands to the appropriate Key Reference table
+- Add new `:` commands to the Command Mode table
+- Add new git commands to the git commands table
+- Add new settings to the settings table
+- Update architecture section if new files are added or line counts change significantly
+- Do NOT add speculative/planned features — only document what is implemented
+
 ## Architecture
 
 **VimCode**: Vim-like code editor in Rust with GTK4/Relm4. Clean separation: `src/core/` (platform-agnostic logic) vs `src/main.rs` (UI).
@@ -32,6 +46,16 @@ cargo clippy -- -D warnings  # Lint (must pass)
 cargo fmt                 # Format
 ```
 
+## Quality Checks (MANDATORY Before Commits)
+**CRITICAL:** After making ANY code changes and before creating commits, ALWAYS run:
+1. `cargo fmt` - Format code
+2. `cargo clippy -- -D warnings` - Check linting (must have zero warnings)
+3. `cargo test` - Verify all tests pass
+4. `cargo build` - Ensure compilation succeeds
+
+If any check fails, fix immediately and re-run. Only commit when ALL checks pass.
+This prevents CI failures and maintains code quality.
+
 ## Code Style
 - `rustfmt` defaults (4-space indent)
 - `PascalCase` types, `snake_case` functions/vars
@@ -49,3 +73,10 @@ cargo fmt                 # Format
 **Ctrl-W Command:** `handle_pending_key()` under `'\x17'` case
 
 **Engine Facade Methods:** `buffer()`, `buffer_mut()`, `view()`, `view_mut()`, `cursor()` — all operate on active window's buffer
+
+**Add New Setting:** When adding a new user-configurable setting:
+1. Add field to `Settings` struct in `settings.rs` with `#[serde(default = "default_fn_name")]`
+2. Create default function returning sensible default value
+3. Update `Default` impl to include the field
+4. Settings are automatically merged: new fields are added to existing settings files without overwriting user values
+5. Document the setting name and purpose in comments

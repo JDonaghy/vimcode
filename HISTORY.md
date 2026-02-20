@@ -6,6 +6,34 @@ This file contains detailed session logs and development history. This is not lo
 
 ## Session History (Detailed)
 
+### Session 26: Multi-Language Syntax Highlighting (COMPLETE)
+
+**Date:** February 2026
+
+**Goal:** Add syntax highlighting for Python, JavaScript, Go, and C++ via Tree-sitter.
+
+**Implementation:**
+- Added four new crates: `tree-sitter-python`, `tree-sitter-javascript`, `tree-sitter-go`, `tree-sitter-cpp`
+- New `SyntaxLanguage` enum (Rust, Python, JavaScript, Go, Cpp) with `from_path()` for case-insensitive extension detection
+  - Python: `.py`, `.pyw`
+  - JavaScript: `.js`, `.jsx`, `.mjs`, `.cjs`
+  - Go: `.go`
+  - C++: `.cpp`, `.cc`, `.cxx`, `.c++`, `.hpp`, `.h`, `.hh`, `.hxx`
+- Each language has its own tree-sitter query for functions, types, strings, comments, and keywords
+- `Syntax::new_for_language(lang)` — explicit language constructor
+- `Syntax::new_from_path(path)` — returns `Option<Syntax>`, auto-detects language
+- `Syntax::new()` — retained for backward compatibility (Rust default)
+- `BufferState::with_file()` now calls `Syntax::new_from_path()` so every buffer gets the correct highlighter automatically; unknown extensions fall back to Rust
+
+**Tests:** 324 → 336 passing (12 new: 5 language-detection tests + 5 per-language parser tests + `test_syntax_from_path`)
+
+**Files Modified:**
+- `Cargo.toml`: +4 grammar crates
+- `src/core/syntax.rs`: Full redesign (~60 → ~395 lines)
+- `src/core/buffer_manager.rs`: `with_file()` uses `new_from_path()`
+
+---
+
 ### Session 17: Phase 3 - Integration & Polish (COMPLETE)
 
 **Date:** February 2026

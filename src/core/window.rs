@@ -118,11 +118,11 @@ impl WindowLayout {
 
                 // Recursively try to remove from children
                 if let Some(new_first) = first.remove(target) {
-                    *first = Box::new(new_first);
+                    **first = new_first;
                     return Some(self.clone());
                 }
                 if let Some(new_second) = second.remove(target) {
-                    *second = Box::new(new_second);
+                    **second = new_second;
                     return Some(self.clone());
                 }
 

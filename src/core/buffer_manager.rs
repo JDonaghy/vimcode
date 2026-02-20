@@ -55,6 +55,8 @@ pub struct BufferState {
     pub dirty: bool,
     /// Whether this is a preview buffer (single-click in file explorer).
     pub preview: bool,
+    /// For diff buffers: the source file the diff was generated from.
+    pub source_file: Option<PathBuf>,
     /// Syntax highlighter for this buffer.
     pub syntax: Syntax,
     /// Cached syntax highlights (byte ranges + scope names).
@@ -65,6 +67,15 @@ pub struct BufferState {
     pub redo_stack: Vec<UndoEntry>,
     /// Current undo group being accumulated (during Insert mode or multi-op commands).
     pub current_undo_group: Option<UndoEntry>,
+    /// Original line content for U (undo line) command: (line_number, original_content)
+    pub line_undo_state: Option<(usize, String)>,
+    /// Per-line git diff status (Added/Modified/None). Empty when not in a git repo.
+    pub git_diff: Vec<Option<crate::core::git::GitLineStatus>>,
+    /// LSP language identifier (e.g. "rust", "python") for this buffer, if applicable.
+    pub lsp_language_id: Option<String>,
+    /// Cached maximum line length (in chars) across the whole buffer.
+    /// Recomputed in `update_syntax` so renders don't need to scan every line.
+    pub max_col: usize,
 }
 
 impl std::fmt::Debug for BufferState {
@@ -87,36 +98,52 @@ impl BufferState {
             file_path: None,
             dirty: false,
             preview: false,
+            source_file: None,
             syntax: Syntax::new(),
             highlights: Vec::new(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             current_undo_group: None,
+            line_undo_state: None,
+            git_diff: Vec::new(),
+            lsp_language_id: None,
+            max_col: 0,
         };
         state.update_syntax();
         state
     }
 
     pub fn with_file(buffer: Buffer, path: PathBuf) -> Self {
+        // Try to detect language from file path, fallback to Rust
+        let syntax = Syntax::new_from_path(path.to_str()).unwrap_or_else(Syntax::new);
+        let lsp_language_id = crate::core::lsp::language_id_from_path(&path);
+
         let mut state = Self {
             buffer,
             file_path: Some(path),
             dirty: false,
             preview: false,
-            syntax: Syntax::new(),
+            source_file: None,
+            syntax,
             highlights: Vec::new(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             current_undo_group: None,
+            line_undo_state: None,
+            git_diff: Vec::new(),
+            lsp_language_id,
+            max_col: 0,
         };
         state.update_syntax();
         state
     }
 
-    /// Re-parse the buffer and update syntax highlights.
+    /// Re-parse the buffer and update syntax highlights and max_col cache.
     pub fn update_syntax(&mut self) {
         let text = self.buffer.to_string();
         self.highlights = self.syntax.parse(&text);
+        // Cache max line length while we have the text; avoids O(N) scan every render.
+        self.max_col = text.lines().map(|l| l.chars().count()).max().unwrap_or(0);
     }
 
     /// Save the buffer to its associated file path.
@@ -293,12 +320,73 @@ impl BufferState {
             || self
                 .current_undo_group
                 .as_ref()
-                .map_or(false, |g| !g.is_empty())
+                .is_some_and(|g| !g.is_empty())
     }
 
     /// Check if redo is available.
     pub fn can_redo(&self) -> bool {
         !self.redo_stack.is_empty()
+    }
+
+    /// Save the original content of a line before modifications (for U command)
+    pub fn save_line_for_undo(&mut self, line_num: usize) {
+        // Only save if we haven't already saved this line
+        if let Some((saved_line, _)) = self.line_undo_state {
+            if saved_line == line_num {
+                return; // Already saved this line
+            }
+        }
+
+        // Save the current line content
+        if line_num < self.buffer.len_lines() {
+            let line_content: String = self.buffer.content.line(line_num).chars().collect();
+            self.line_undo_state = Some((line_num, line_content));
+        }
+    }
+
+    /// Undo all changes on the current line (U command)
+    pub fn undo_line(&mut self, current_line: usize, cursor: Cursor) -> Option<Cursor> {
+        let (saved_line, original_content) = self.line_undo_state.take()?;
+
+        // Only undo if we're on the saved line
+        if saved_line != current_line {
+            return None;
+        }
+
+        // Get the current line content
+        if current_line >= self.buffer.len_lines() {
+            return None;
+        }
+
+        let line_start = self.buffer.line_to_char(current_line);
+        let line_len = self.buffer.line_len_chars(current_line);
+        let line_end = line_start + line_len;
+
+        // Start an undo group for the line restore
+        self.start_undo_group(cursor);
+
+        // Delete the current line content and insert the original
+        if line_len > 0 {
+            let deleted_text: String = self
+                .buffer
+                .content
+                .slice(line_start..line_end)
+                .chars()
+                .collect();
+            self.record_delete(line_start, &deleted_text);
+            self.buffer.delete_range(line_start, line_end);
+        }
+        self.record_insert(line_start, &original_content);
+        self.buffer.insert(line_start, &original_content);
+
+        self.finish_undo_group();
+        self.update_syntax();
+
+        // Return cursor at start of line
+        Some(Cursor {
+            line: current_line,
+            col: 0,
+        })
     }
 }
 
