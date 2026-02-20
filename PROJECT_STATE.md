@@ -1,10 +1,10 @@
 # VimCode Project State
 
-**Last updated:** Feb 20, 2026 (Session 52)
+**Last updated:** Feb 20, 2026 (Session 54)
 
 ## Status
 
-**:norm command:** `:norm[al][!] {keys}` executes normal-mode keystrokes on a line range; supports `%`, `N,M`, `'<,'>` ranges; single-undo; `<CR>`/`<BS>`/`<C-x>` key notation — 544 tests passing
+**Live grep:** Ctrl-G opens a Telescope-style two-column grep modal; live search (≥2 chars) with left pane results and right pane ±5-line preview; Ctrl-N/P/arrows navigate; Enter jumps to match; Escape closes — 563 tests passing
 
 ### Core Vim (Complete)
 - Seven modes (Normal/Insert/Visual/Visual Line/Visual Block/Command/Search)
@@ -64,6 +64,16 @@
 - GTK: Entry input + ListBox results; click row opens file at that line
 - TUI: `[query]` input box; Enter to search; j/k navigate results; Enter opens file
 - **Replace across files:** Replace input + "Replace All" button (GTK) / Enter in replace box / Alt+H (TUI); skips dirty buffers; reloads open buffers; regex capture group backreferences in regex mode; literal `$` in literal mode
+
+### Fuzzy File Finder (Complete)
+- `Ctrl-P` in Normal mode opens a centered floating modal (Telescope-style)
+- Recursively walks `cwd`, skipping hidden dirs and `target/` — file list built once on open
+- Subsequence scoring: `fuzzy_score()` with gap penalties and word-boundary bonuses (/, _, -, .)
+- `fuzzy_filter()` re-scores on every keystroke, capped at 50 results
+- Keys: Escape close; Enter open selected file; Ctrl-N/↓ next; Ctrl-P/↑ prev; Backspace edit query
+- GTK: `draw_fuzzy_popup()` — centered Cairo rectangle with title, query, separator, result rows
+- TUI: `render_fuzzy_popup()` — box-drawing chars (╭╮╰╯├┤); `fuzzy_scroll_top` local var tracks visible slice
+- Both backends: selected row highlighted (`fuzzy_selected_bg`); ▶ prefix on selected item
 
 ### File Explorer (Complete)
 - VSCode-style sidebar (Ctrl-B toggle, Ctrl-Shift-E focus)
@@ -149,12 +159,12 @@
 ```
 vimcode/
 ├── src/
-│   ├── main.rs (~3600 lines) — GTK4/Relm4 UI, rendering, find dialog, sidebar resize, search/replace panel
-│   ├── tui_main.rs (~2900 lines) — ratatui/crossterm TUI backend, sidebar, mouse, search/replace panel
+│   ├── main.rs (~3700 lines) — GTK4/Relm4 UI, rendering, find dialog, sidebar resize, search/replace panel, fuzzy popup
+│   ├── tui_main.rs (~3100 lines) — ratatui/crossterm TUI backend, sidebar, mouse, search/replace panel, fuzzy popup
 │   ├── icons.rs (~30 lines) — Nerd Font file-type icons (shared by GTK + TUI)
-│   ├── render.rs (~1200 lines) — Platform-agnostic rendering abstraction (ScreenLayout, max_col)
-│   └── core/ (~20,200 lines) — Platform-agnostic logic
-│       ├── engine.rs (~14,750 lines) — Orchestrates everything, find/replace, macros, history, LSP, project search/replace
+│   ├── render.rs (~1220 lines) — Platform-agnostic rendering abstraction (ScreenLayout, max_col)
+│   └── core/ (~16,700 lines) — Platform-agnostic logic
+│       ├── engine.rs (~16,500 lines) — Orchestrates everything, find/replace, macros, history, LSP, project search/replace, fuzzy finder
 │       ├── lsp.rs (~1,200 lines) — LSP protocol transport + single-server client (request ID tracking)
 │       ├── lsp_manager.rs (~400 lines) — Multi-server coordinator with initialization guards
 │       ├── project_search.rs (~630 lines) — Regex/case/whole-word search + replace (ignore + regex crates)
@@ -164,8 +174,8 @@ vimcode/
 │       ├── settings.rs (~640 lines) — JSON persistence, auto-init, :set parsing
 │       ├── window.rs, tab.rs, view.rs, cursor.rs, mode.rs, syntax.rs
 │       ├── git.rs (~635 lines) — git subprocess integration (diff/blame/hunk parsing, branch detection, stage_hunk)
-│       └── Tests: 544 passing (9 find/replace, 14 macro, 8 session, 4 reverse search, 7 replace char, 5 undo line, 8 case change, 6 marks, 5 incremental search, 12 syntax/language, 6 history search, 11 fold tests, 12 git tests, 4 sidebar-preview tests, 5 auto-indent tests, 4 completion tests, 9 quit/ctrl-s tests, 1 session-restore test, 22 set-command tests, 10 hunk-staging tests, 9 text-object tests, 24 project-search tests, 5 engine-replace tests, 27 lsp-protocol tests, 10 lsp-engine tests, 31 vim-features tests, 9 tag-object tests, 9 norm-command tests)
-└── Total: ~21,150 lines
+│       └── Tests: 555 passing (9 find/replace, 14 macro, 8 session, 4 reverse search, 7 replace char, 5 undo line, 8 case change, 6 marks, 5 incremental search, 12 syntax/language, 6 history search, 11 fold tests, 12 git tests, 4 sidebar-preview tests, 5 auto-indent tests, 4 completion tests, 9 quit/ctrl-s tests, 1 session-restore test, 22 set-command tests, 10 hunk-staging tests, 9 text-object tests, 24 project-search tests, 5 engine-replace tests, 27 lsp-protocol tests, 10 lsp-engine tests, 31 vim-features tests, 9 tag-object tests, 9 norm-command tests, 11 fuzzy-finder tests)
+└── Total: ~21,550 lines
 ```
 
 ## Architecture

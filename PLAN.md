@@ -1,5 +1,38 @@
 # VimCode Implementation Plan
 
+## Recently Completed (Session 54)
+
+### ✅ Live Grep (Telescope-style)
+- **`Ctrl-G`** in Normal mode opens a centered two-column floating grep modal
+- **Search engine:** reuses `project_search::search_in_project()` + `SearchOptions::default()` (case-insensitive, no regex, no whole-word); capped at 200 matches; fires when query ≥ 2 chars
+- **Preview:** `grep_load_preview()` reads ±5 context lines from disk; flags the match line with `is_match=true`
+- **Navigation:** `grep_select_next/prev()` (clamped, each calls `grep_load_preview()`); `grep_confirm()` opens file at match line + closes modal; `handle_grep_key()` routes Escape/Enter/Up/Down/Ctrl-N/Ctrl-P/Backspace/printable
+- **Key guard:** `handle_key()` checks `self.grep_open` before mode dispatch; Ctrl-G in `handle_normal_key()` calls `open_live_grep()`
+- **render.rs:** `LiveGrepPanel { query, results, selected_idx, total_matches, preview_lines }`; `live_grep: Option<LiveGrepPanel>` on `ScreenLayout`; reuses all fuzzy theme colors
+- **GTK:** `draw_live_grep_popup()` — 80% × 65% centered; title, query, horizontal separator, vertical separator at 40%; left pane results with ▶ indicator, right pane preview with match line highlighted in `fuzzy_title_fg`; Cairo `save/rectangle/clip/restore` around each pane prevents text spill; stateless `scroll_top = selected_idx + 1 - visible_rows` computed each frame keeps selection visible
+- **TUI:** `render_live_grep_popup()` — box-drawing chars with ╭╮╰╯├┤┬┴; left pane 35% width, right pane preview; `grep_scroll_top: usize` local var; sidebar suppressed (`!engine.grep_open`); `draw_frame()` gets `grep_scroll_top` param
+- File changes: `src/core/engine.rs` (5 fields, `impl Engine` block with 10 methods, Ctrl-G binding, key guard, 8 tests), `src/render.rs` (LiveGrepPanel struct, ScreenLayout field, populate in build_screen_layout; char-aware snippet truncation to avoid multi-byte UTF-8 panic), `src/main.rs` (draw_live_grep_popup + call; Cairo clipping + stateless scroll fix), `src/tui_main.rs` (render_live_grep_popup + grep_scroll_top + sidebar guard + draw_frame param)
+- Tests: 555 → 563 total
+
+---
+
+## Recently Completed (Session 53)
+
+### ✅ Fuzzy File Finder (Telescope-style)
+- **`Ctrl-P`** in Normal mode opens a centered floating modal over the editor
+- **File walking:** `walk_for_fuzzy()` recursively walks `cwd`; skips hidden dirs/files and `target/`; stores relative `PathBuf`s; sorted alphabetically; built once on open
+- **Fuzzy scoring:** `fuzzy_score(path, query)` — subsequence match with gap penalties (`score -= gap`) and word-boundary bonuses (+5 for matches after `/`, `_`, `-`, `.`); returns `None` if not all query chars match
+- **Filtering:** `fuzzy_filter()` — empty query shows first 50 files alphabetically; non-empty query scores all files, sorts by score desc, caps at 50
+- **Navigation:** `fuzzy_select_next/prev()` (clamped); `fuzzy_confirm()` opens file + closes modal; `handle_fuzzy_key()` routes Escape/Enter/Up/Down/Ctrl-N/Ctrl-P/Backspace/printable
+- **Key guard:** `handle_key()` checks `self.fuzzy_open` before mode dispatch; Ctrl-P in `handle_normal_key()` calls `open_fuzzy_finder()`
+- **render.rs:** `FuzzyPanel { query, results, selected_idx, total_files }`; `fuzzy: Option<FuzzyPanel>` on `ScreenLayout`; 6 new theme colors (`fuzzy_bg`, `fuzzy_selected_bg`, `fuzzy_fg`, `fuzzy_query_fg`, `fuzzy_border`, `fuzzy_title_fg`)
+- **GTK:** `draw_fuzzy_popup()` — 60% × 55% centered rectangle; title row, query row ("> query▌"), separator line, result rows with ▶ selection indicator
+- **TUI:** `render_fuzzy_popup()` — box-drawing chars (╭╮╰╯├┤─│); `fuzzy_scroll_top: usize` local var; scroll adjusts after each key in editor section; sidebar suppressed (`!engine.fuzzy_open`) while modal is open; `draw_frame()` gets `fuzzy_scroll_top` param
+- File changes: `src/core/engine.rs` (6 fields, `impl Engine` block with 9 methods, Ctrl-P binding, key guard, 11 tests), `src/render.rs` (FuzzyPanel struct, ScreenLayout field, 6 theme colors), `src/main.rs` (draw_fuzzy_popup + call in draw_editor), `src/tui_main.rs` (render_fuzzy_popup + fuzzy_scroll_top + sidebar guard + draw_frame param)
+- Tests: 544 → 555 total
+
+---
+
 ## Recently Completed (Session 52)
 
 ### ✅ :norm Command
@@ -279,6 +312,6 @@
 - [x] **LSP support** — completions, go-to-definition, hover, diagnostics (session 47 + 48 bug fixes)
 - [x] **`gd` / `gD`** — go-to-definition via LSP
 - [x] **`:norm`** — execute normal command on a range of lines
-- [ ] **Fuzzy finder / Telescope-style** — live fuzzy file + buffer + symbol search in a floating panel *(consider after VSCode search)*
+- [x] **Fuzzy finder / Telescope-style** — Ctrl-P opens centered file-picker modal with subsequence scoring (session 53)
 - [ ] **Multiple cursors**
 - [ ] **Themes / plugin system**

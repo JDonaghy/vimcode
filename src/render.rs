@@ -267,6 +267,38 @@ pub struct HoverPopup {
     pub anchor_col: usize,
 }
 
+// ─── FuzzyPanel ──────────────────────────────────────────────────────────────
+
+/// Data needed to render the fuzzy file-picker modal.
+#[derive(Debug, Clone)]
+pub struct FuzzyPanel {
+    /// Current query string typed by the user.
+    pub query: String,
+    /// Display paths for the filtered results (up to 50).
+    pub results: Vec<String>,
+    /// Index of the currently highlighted result.
+    pub selected_idx: usize,
+    /// Total number of files in the project (for the status line).
+    pub total_files: usize,
+}
+
+// ─── LiveGrepPanel ────────────────────────────────────────────────────────────
+
+/// Data needed to render the live grep modal.
+#[derive(Debug, Clone)]
+pub struct LiveGrepPanel {
+    /// Current query typed by the user.
+    pub query: String,
+    /// Result display strings: "basename.rs:N: snippet text"
+    pub results: Vec<String>,
+    /// Index of the currently highlighted result.
+    pub selected_idx: usize,
+    /// Total number of matched lines.
+    pub total_matches: usize,
+    /// Preview lines: (1-based line number, text, is_match_line)
+    pub preview_lines: Vec<(usize, String, bool)>,
+}
+
 // ─── ScreenLayout ─────────────────────────────────────────────────────────────
 
 /// The complete, platform-agnostic description of one editor frame.
@@ -283,6 +315,10 @@ pub struct ScreenLayout {
     pub completion: Option<CompletionMenu>,
     /// Hover information popup, or `None` when inactive.
     pub hover: Option<HoverPopup>,
+    /// Fuzzy file-picker modal, or `None` when inactive.
+    pub fuzzy: Option<FuzzyPanel>,
+    /// Live grep modal, or `None` when inactive.
+    pub live_grep: Option<LiveGrepPanel>,
 }
 
 // ─── Theme ────────────────────────────────────────────────────────────────────
@@ -363,6 +399,14 @@ pub struct Theme {
     pub hover_bg: Color,
     pub hover_fg: Color,
     pub hover_border: Color,
+
+    // Fuzzy file-picker modal
+    pub fuzzy_bg: Color,
+    pub fuzzy_selected_bg: Color,
+    pub fuzzy_fg: Color,
+    pub fuzzy_query_fg: Color,
+    pub fuzzy_border: Color,
+    pub fuzzy_title_fg: Color,
 }
 
 impl Theme {
@@ -451,6 +495,14 @@ impl Theme {
             hover_bg: Color::from_hex("#21252b"),
             hover_fg: Color::from_hex("#abb2bf"),
             hover_border: Color::from_hex("#528bff"),
+
+            // Fuzzy file-picker modal (OneDark palette)
+            fuzzy_bg: Color::from_hex("#21252b"),
+            fuzzy_selected_bg: Color::from_hex("#2c313c"),
+            fuzzy_fg: Color::from_hex("#abb2bf"),
+            fuzzy_query_fg: Color::from_hex("#61afef"),
+            fuzzy_border: Color::from_hex("#528bff"),
+            fuzzy_title_fg: Color::from_hex("#e5c07b"),
         }
     }
 
@@ -535,6 +587,37 @@ pub fn build_screen_layout(
         anchor_col: engine.view().cursor.col,
     });
 
+    let fuzzy = engine.fuzzy_open.then(|| FuzzyPanel {
+        query: engine.fuzzy_query.clone(),
+        results: engine
+            .fuzzy_results
+            .iter()
+            .map(|(_, d)| d.clone())
+            .collect(),
+        selected_idx: engine.fuzzy_selected,
+        total_files: engine.fuzzy_all_files.len(),
+    });
+
+    let live_grep = engine.grep_open.then(|| {
+        let results = engine
+            .grep_results
+            .iter()
+            .map(|m| {
+                let basename = m.file.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+                let snippet = m.line_text.trim();
+                let snippet: String = snippet.chars().take(60).collect();
+                format!("{}:{}: {}", basename, m.line + 1, snippet)
+            })
+            .collect();
+        LiveGrepPanel {
+            query: engine.grep_query.clone(),
+            results,
+            selected_idx: engine.grep_selected,
+            total_matches: engine.grep_results.len(),
+            preview_lines: engine.grep_preview_lines.clone(),
+        }
+    });
+
     ScreenLayout {
         tab_bar,
         windows,
@@ -544,6 +627,8 @@ pub fn build_screen_layout(
         active_window_id,
         completion,
         hover,
+        fuzzy,
+        live_grep,
     }
 }
 

@@ -2140,6 +2140,29 @@ fn draw_editor(
     // 5c. Draw hover popup (on top of everything else)
     draw_hover_popup(cr, &layout, &screen, &theme, line_height, char_width);
 
+    // 5d. Draw fuzzy file-picker modal (on top of everything else)
+    draw_fuzzy_popup(
+        cr,
+        &layout,
+        &screen,
+        &theme,
+        width as f64,
+        height as f64,
+        line_height,
+        char_width,
+    );
+
+    // 5e. Draw live grep modal (on top of everything else)
+    draw_live_grep_popup(
+        cr,
+        &layout,
+        &screen,
+        &theme,
+        width as f64,
+        height as f64,
+        line_height,
+    );
+
     // 6. Status Line (second-to-last line)
     let status_y = height as f64 - status_bar_height;
     draw_status_line(
@@ -2814,6 +2837,241 @@ fn draw_hover_popup(
         cr.move_to(popup_x, popup_y + 2.0 + i as f64 * line_height);
         pangocairo::show_layout(cr, layout);
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_fuzzy_popup(
+    cr: &Context,
+    layout: &pango::Layout,
+    screen: &render::ScreenLayout,
+    theme: &Theme,
+    editor_width: f64,
+    editor_height: f64,
+    line_height: f64,
+    _char_width: f64,
+) {
+    let Some(fuzzy) = &screen.fuzzy else {
+        return;
+    };
+
+    // Size: 60% of editor width (min 400px), 55% of editor height (min 300px)
+    let popup_w = (editor_width * 0.6).max(400.0);
+    let popup_h = (editor_height * 0.55).max(300.0);
+
+    // Centered in editor area
+    let popup_x = (editor_width - popup_w) / 2.0;
+    let popup_y = (editor_height - popup_h) / 2.0;
+
+    // Background
+    let (r, g, b) = theme.fuzzy_bg.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
+    cr.fill().ok();
+
+    // Border
+    let (r, g, b) = theme.fuzzy_border.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    cr.set_line_width(1.0);
+    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
+    cr.stroke().ok();
+
+    // Title row: "  Find Files  (N/M files)"
+    let title = format!(
+        "  Find Files  ({}/{} files)",
+        fuzzy.results.len(),
+        fuzzy.total_files
+    );
+    let (r, g, b) = theme.fuzzy_title_fg.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    layout.set_text(&title);
+    layout.set_attributes(None);
+    cr.move_to(popup_x, popup_y);
+    pangocairo::show_layout(cr, layout);
+
+    // Query row: "> " + query
+    let query_text = format!("> {}_", fuzzy.query);
+    let (r, g, b) = theme.fuzzy_query_fg.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    layout.set_text(&query_text);
+    layout.set_attributes(None);
+    cr.move_to(popup_x, popup_y + line_height);
+    pangocairo::show_layout(cr, layout);
+
+    // Horizontal separator
+    let sep_y = popup_y + 2.0 * line_height;
+    let (r, g, b) = theme.fuzzy_border.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    cr.set_line_width(1.0);
+    cr.move_to(popup_x, sep_y);
+    cr.line_to(popup_x + popup_w, sep_y);
+    cr.stroke().ok();
+
+    // Result rows
+    let rows_area_h = popup_h - 2.0 * line_height - 2.0; // minus title, query, sep
+    let visible_rows = ((rows_area_h / line_height) as usize).min(fuzzy.results.len());
+    for (i, display) in fuzzy.results.iter().enumerate().take(visible_rows) {
+        let item_y = sep_y + 1.0 + i as f64 * line_height;
+        let is_selected = i == fuzzy.selected_idx;
+
+        // Selected row highlight
+        if is_selected {
+            let (r, g, b) = theme.fuzzy_selected_bg.to_cairo();
+            cr.set_source_rgb(r, g, b);
+            cr.rectangle(popup_x, item_y, popup_w, line_height);
+            cr.fill().ok();
+        }
+
+        // Row text with ▶ prefix for selected
+        let prefix = if is_selected { "▶ " } else { "  " };
+        let row_text = format!("{}{}", prefix, display);
+        let (r, g, b) = theme.fuzzy_fg.to_cairo();
+        cr.set_source_rgb(r, g, b);
+        layout.set_text(&row_text);
+        layout.set_attributes(None);
+        cr.move_to(popup_x, item_y);
+        pangocairo::show_layout(cr, layout);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_live_grep_popup(
+    cr: &Context,
+    layout: &pango::Layout,
+    screen: &render::ScreenLayout,
+    theme: &Theme,
+    editor_width: f64,
+    editor_height: f64,
+    line_height: f64,
+) {
+    let Some(grep) = &screen.live_grep else {
+        return;
+    };
+
+    // Size: 80% of editor width (min 600px), 65% of editor height (min 400px)
+    let popup_w = (editor_width * 0.8).max(600.0);
+    let popup_h = (editor_height * 0.65).max(400.0);
+
+    // Centered in editor area
+    let popup_x = (editor_width - popup_w) / 2.0;
+    let popup_y = (editor_height - popup_h) / 2.0;
+
+    // Background
+    let (r, g, b) = theme.fuzzy_bg.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
+    cr.fill().ok();
+
+    // Border
+    let (r, g, b) = theme.fuzzy_border.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    cr.set_line_width(1.0);
+    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
+    cr.stroke().ok();
+
+    // Title row
+    let title = format!("  Live Grep  {} matches", grep.total_matches);
+    let (r, g, b) = theme.fuzzy_title_fg.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    layout.set_text(&title);
+    layout.set_attributes(None);
+    cr.move_to(popup_x, popup_y);
+    pangocairo::show_layout(cr, layout);
+
+    // Query row: "> " + query
+    let query_text = format!("> {}_", grep.query);
+    let (r, g, b) = theme.fuzzy_query_fg.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    layout.set_text(&query_text);
+    layout.set_attributes(None);
+    cr.move_to(popup_x, popup_y + line_height);
+    pangocairo::show_layout(cr, layout);
+
+    // Horizontal separator
+    let sep_y = popup_y + 2.0 * line_height;
+    let (r, g, b) = theme.fuzzy_border.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    cr.set_line_width(1.0);
+    cr.move_to(popup_x, sep_y);
+    cr.line_to(popup_x + popup_w, sep_y);
+    cr.stroke().ok();
+
+    // Two-column layout: left pane = 40% of popup width
+    let left_pane_w = popup_w * 0.4;
+    let right_pane_x = popup_x + left_pane_w + 1.0;
+    let right_pane_w = popup_w - left_pane_w - 1.0;
+
+    // Vertical separator between panes
+    cr.move_to(popup_x + left_pane_w, sep_y);
+    cr.line_to(popup_x + left_pane_w, popup_y + popup_h);
+    cr.stroke().ok();
+
+    let rows_area_h = popup_h - 2.0 * line_height - 2.0;
+    let visible_rows = (rows_area_h / line_height) as usize;
+
+    // Compute scroll offset so the selected row is always visible.
+    // Stateless: derived entirely from selected_idx each frame.
+    let scroll_top = if grep.selected_idx < visible_rows {
+        0
+    } else {
+        grep.selected_idx + 1 - visible_rows
+    };
+
+    // Left pane: result rows — clipped to left_pane_w to prevent text spill
+    cr.save().ok();
+    cr.rectangle(popup_x, sep_y, left_pane_w, rows_area_h + 2.0);
+    cr.clip();
+
+    for i in 0..visible_rows {
+        let result_idx = scroll_top + i;
+        let Some(display) = grep.results.get(result_idx) else {
+            break;
+        };
+        let item_y = sep_y + 1.0 + i as f64 * line_height;
+        let is_selected = result_idx == grep.selected_idx;
+
+        if is_selected {
+            let (r, g, b) = theme.fuzzy_selected_bg.to_cairo();
+            cr.set_source_rgb(r, g, b);
+            cr.rectangle(popup_x, item_y, left_pane_w, line_height);
+            cr.fill().ok();
+        }
+
+        let prefix = if is_selected { "▶ " } else { "  " };
+        let row_text = format!("{}{}", prefix, display);
+        let (r, g, b) = theme.fuzzy_fg.to_cairo();
+        cr.set_source_rgb(r, g, b);
+        layout.set_text(&row_text);
+        layout.set_attributes(None);
+        cr.move_to(popup_x, item_y);
+        pangocairo::show_layout(cr, layout);
+    }
+
+    cr.restore().ok();
+
+    // Right pane: preview lines — clipped to right pane bounds
+    cr.save().ok();
+    cr.rectangle(right_pane_x, sep_y, right_pane_w, rows_area_h + 2.0);
+    cr.clip();
+
+    for (i, (lineno, text, is_match)) in grep.preview_lines.iter().enumerate().take(visible_rows) {
+        let item_y = sep_y + 1.0 + i as f64 * line_height;
+        let preview_text = format!("{:4}: {}", lineno, text);
+
+        if *is_match {
+            let (r, g, b) = theme.fuzzy_title_fg.to_cairo();
+            cr.set_source_rgb(r, g, b);
+        } else {
+            let (r, g, b) = theme.fuzzy_fg.to_cairo();
+            cr.set_source_rgb(r, g, b);
+        }
+
+        layout.set_text(&preview_text);
+        layout.set_attributes(None);
+        cr.move_to(right_pane_x, item_y);
+        pangocairo::show_layout(cr, layout);
+    }
+
+    cr.restore().ok();
 }
 
 #[allow(clippy::too_many_arguments)]

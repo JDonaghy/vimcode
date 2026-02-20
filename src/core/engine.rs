@@ -288,6 +288,32 @@ pub struct Engine {
     // --- Search word under cursor ---
     /// Whether current search uses word boundaries (set by * and #).
     search_word_bounded: bool,
+
+    // --- Fuzzy file finder ---
+    /// Project root directory for the fuzzy finder.
+    pub cwd: PathBuf,
+    /// Whether the fuzzy finder modal is open.
+    pub fuzzy_open: bool,
+    /// Current query typed in the fuzzy finder.
+    pub fuzzy_query: String,
+    /// All files in the project (relative paths), built once when fuzzy opens.
+    pub fuzzy_all_files: Vec<PathBuf>,
+    /// Filtered + scored results: (relative_path, display_string), capped at 50.
+    pub fuzzy_results: Vec<(PathBuf, String)>,
+    /// Index of the currently highlighted result.
+    pub fuzzy_selected: usize,
+
+    // --- Live grep state ---
+    /// Whether the live grep modal is open.
+    pub grep_open: bool,
+    /// Current query typed in the live grep input.
+    pub grep_query: String,
+    /// Results from the last grep run (capped at 200).
+    pub grep_results: Vec<ProjectMatch>,
+    /// Index of the currently highlighted grep result.
+    pub grep_selected: usize,
+    /// Context lines for the preview pane: (1-based line number, text, is_match_line).
+    pub grep_preview_lines: Vec<(usize, String, bool)>,
 }
 
 impl Engine {
@@ -377,6 +403,17 @@ impl Engine {
             jump_list: Vec::new(),
             jump_list_pos: 0,
             search_word_bounded: false,
+            cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            fuzzy_open: false,
+            fuzzy_query: String::new(),
+            fuzzy_all_files: Vec::new(),
+            fuzzy_results: Vec::new(),
+            fuzzy_selected: 0,
+            grep_open: false,
+            grep_query: String::new(),
+            grep_results: Vec::new(),
+            grep_selected: 0,
+            grep_preview_lines: Vec::new(),
         }
     }
 
@@ -2062,6 +2099,16 @@ impl Engine {
             }
         }
 
+        // Fuzzy finder intercepts all keys when open.
+        if self.fuzzy_open {
+            return self.handle_fuzzy_key(key_name, unicode, ctrl);
+        }
+
+        // Live grep intercepts all keys when open.
+        if self.grep_open {
+            return self.handle_grep_key(key_name, unicode, ctrl);
+        }
+
         // Ctrl-S: save in any mode (does not change mode).
         if ctrl && key_name == "s" {
             if let Err(e) = self.save() {
@@ -2286,6 +2333,16 @@ impl Engine {
                 "i" => {
                     // Ctrl-I: Jump list forward (same as Tab in many terminals)
                     self.jump_list_forward();
+                    return EngineAction::None;
+                }
+                "p" => {
+                    // Ctrl-P: Open fuzzy file finder
+                    self.open_fuzzy_finder();
+                    return EngineAction::None;
+                }
+                "g" => {
+                    // Ctrl-G: Open live grep modal
+                    self.open_live_grep();
                     return EngineAction::None;
                 }
                 _ => {}
@@ -5391,9 +5448,10 @@ impl Engine {
             let cursor_before = new_entries[0].cursor_before;
             let merged_ops: Vec<_> = new_entries.into_iter().flat_map(|e| e.ops).collect();
             if !merged_ops.is_empty() {
-                state
-                    .undo_stack
-                    .push(UndoEntry { ops: merged_ops, cursor_before });
+                state.undo_stack.push(UndoEntry {
+                    ops: merged_ops,
+                    cursor_before,
+                });
             }
         }
 
@@ -8415,8 +8473,353 @@ impl Default for Engine {
     }
 }
 
+// ─── Fuzzy file finder ────────────────────────────────────────────────────────
+
+impl Engine {
+    /// Open the fuzzy finder modal: walk cwd, populate file list, filter, show.
+    pub fn open_fuzzy_finder(&mut self) {
+        // Walk the cwd recursively, skipping hidden dirs, target/, and non-UTF-8 names.
+        let mut all_files = Vec::new();
+        self.walk_for_fuzzy(&self.cwd.clone(), &mut all_files);
+        all_files.sort();
+        self.fuzzy_all_files = all_files;
+        self.fuzzy_query.clear();
+        self.fuzzy_selected = 0;
+        self.fuzzy_filter();
+        self.fuzzy_open = true;
+    }
+
+    /// Recursively walk a directory, collecting relative file paths.
+    fn walk_for_fuzzy(&self, dir: &Path, out: &mut Vec<PathBuf>) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n.to_owned(),
+                None => continue,
+            };
+            // Skip hidden files/dirs and the target/ build directory
+            if name.starts_with('.') || name == "target" {
+                continue;
+            }
+            if path.is_dir() {
+                self.walk_for_fuzzy(&path, out);
+            } else {
+                // Store as relative path
+                if let Ok(rel) = path.strip_prefix(&self.cwd) {
+                    out.push(rel.to_path_buf());
+                }
+            }
+        }
+    }
+
+    /// Close the fuzzy finder and clear all associated state.
+    pub fn close_fuzzy_finder(&mut self) {
+        self.fuzzy_open = false;
+        self.fuzzy_query.clear();
+        self.fuzzy_results.clear();
+        self.fuzzy_selected = 0;
+    }
+
+    /// Append a character to the query and re-filter.
+    pub fn fuzzy_handle_char(&mut self, c: char) {
+        self.fuzzy_query.push(c);
+        self.fuzzy_filter();
+        self.fuzzy_selected = 0;
+    }
+
+    /// Remove the last character from the query and re-filter.
+    pub fn fuzzy_handle_backspace(&mut self) {
+        self.fuzzy_query.pop();
+        self.fuzzy_filter();
+        self.fuzzy_selected = 0;
+    }
+
+    /// Move selection down one row (clamped).
+    pub fn fuzzy_select_next(&mut self) {
+        let max = self.fuzzy_results.len().saturating_sub(1);
+        self.fuzzy_selected = (self.fuzzy_selected + 1).min(max);
+    }
+
+    /// Move selection up one row (clamped).
+    pub fn fuzzy_select_prev(&mut self) {
+        self.fuzzy_selected = self.fuzzy_selected.saturating_sub(1);
+    }
+
+    /// Open the selected file and close the fuzzy finder.
+    pub fn fuzzy_confirm(&mut self) -> EngineAction {
+        if let Some((rel_path, _)) = self.fuzzy_results.get(self.fuzzy_selected).cloned() {
+            let abs = self.cwd.join(&rel_path);
+            self.close_fuzzy_finder();
+            self.open_file_in_tab(&abs);
+        }
+        EngineAction::None
+    }
+
+    /// Route a key press when the fuzzy finder is open.
+    pub fn handle_fuzzy_key(
+        &mut self,
+        key_name: &str,
+        unicode: Option<char>,
+        ctrl: bool,
+    ) -> EngineAction {
+        match key_name {
+            "Escape" => {
+                self.close_fuzzy_finder();
+                EngineAction::None
+            }
+            "Return" => self.fuzzy_confirm(),
+            "Down" => {
+                self.fuzzy_select_next();
+                EngineAction::None
+            }
+            "Up" => {
+                self.fuzzy_select_prev();
+                EngineAction::None
+            }
+            "n" if ctrl => {
+                self.fuzzy_select_next();
+                EngineAction::None
+            }
+            "p" if ctrl => {
+                self.fuzzy_select_prev();
+                EngineAction::None
+            }
+            "BackSpace" => {
+                self.fuzzy_handle_backspace();
+                EngineAction::None
+            }
+            _ => {
+                if !ctrl {
+                    if let Some(c) = unicode {
+                        if !c.is_control() {
+                            self.fuzzy_handle_char(c);
+                        }
+                    }
+                }
+                EngineAction::None
+            }
+        }
+    }
+
+    /// Filter `fuzzy_all_files` by the current query and populate `fuzzy_results`.
+    fn fuzzy_filter(&mut self) {
+        const CAP: usize = 50;
+        if self.fuzzy_query.is_empty() {
+            self.fuzzy_results = self
+                .fuzzy_all_files
+                .iter()
+                .take(CAP)
+                .map(|p| (p.clone(), p.to_string_lossy().into_owned()))
+                .collect();
+        } else {
+            let query = self.fuzzy_query.clone();
+            let mut scored: Vec<(i32, PathBuf, String)> = self
+                .fuzzy_all_files
+                .iter()
+                .filter_map(|p| {
+                    let display = p.to_string_lossy().into_owned();
+                    Self::fuzzy_score(&display, &query).map(|s| (s, p.clone(), display))
+                })
+                .collect();
+            scored.sort_by(|a, b| b.0.cmp(&a.0));
+            self.fuzzy_results = scored
+                .into_iter()
+                .take(CAP)
+                .map(|(_, p, d)| (p, d))
+                .collect();
+        }
+    }
+
+    /// Compute a fuzzy match score of `query` against `path`.
+    /// Returns `None` if not all query characters appear as a subsequence in `path`.
+    fn fuzzy_score(path: &str, query: &str) -> Option<i32> {
+        if query.is_empty() {
+            return Some(0);
+        }
+        let path_lc = path.to_lowercase();
+        let query_lc = query.to_lowercase();
+        let pb = path_lc.as_bytes();
+        let qb = query_lc.as_bytes();
+        let mut qi = 0usize;
+        let mut score = 100i32;
+        let mut last_pi = 0usize;
+        for pi in 0..pb.len() {
+            if qi < qb.len() && pb[pi] == qb[qi] {
+                if qi > 0 {
+                    score -= (pi - last_pi - 1) as i32; // penalize gaps
+                }
+                // bonus for word-boundary matches (/, _, -, .)
+                if pi == 0 || matches!(pb[pi - 1], b'/' | b'_' | b'-' | b'.') {
+                    score += 5;
+                }
+                last_pi = pi;
+                qi += 1;
+            }
+        }
+        if qi < qb.len() {
+            None
+        } else {
+            Some(score - pb.len() as i32 / 20)
+        }
+    }
+}
+
 fn is_word_char(ch: char) -> bool {
     ch.is_alphanumeric() || ch == '_'
+}
+
+// ─── Live grep ────────────────────────────────────────────────────────────────
+
+impl Engine {
+    /// Open the live grep modal and reset all associated state.
+    pub fn open_live_grep(&mut self) {
+        self.grep_open = true;
+        self.grep_query.clear();
+        self.grep_results.clear();
+        self.grep_selected = 0;
+        self.grep_preview_lines.clear();
+    }
+
+    /// Close the live grep modal and clear all associated state.
+    pub fn close_live_grep(&mut self) {
+        self.grep_open = false;
+        self.grep_query.clear();
+        self.grep_results.clear();
+        self.grep_selected = 0;
+        self.grep_preview_lines.clear();
+    }
+
+    /// Append a character to the query, re-run search, and update preview.
+    pub fn grep_handle_char(&mut self, c: char) {
+        self.grep_query.push(c);
+        self.grep_selected = 0;
+        self.grep_run_search();
+        self.grep_load_preview();
+    }
+
+    /// Remove the last character from the query, re-run search, and update preview.
+    pub fn grep_handle_backspace(&mut self) {
+        self.grep_query.pop();
+        self.grep_selected = 0;
+        self.grep_run_search();
+        self.grep_load_preview();
+    }
+
+    /// Move selection down one row (clamped) and update preview.
+    pub fn grep_select_next(&mut self) {
+        let max = self.grep_results.len().saturating_sub(1);
+        self.grep_selected = (self.grep_selected + 1).min(max);
+        self.grep_load_preview();
+    }
+
+    /// Move selection up one row (clamped) and update preview.
+    pub fn grep_select_prev(&mut self) {
+        self.grep_selected = self.grep_selected.saturating_sub(1);
+        self.grep_load_preview();
+    }
+
+    /// Open the selected file at the matched line and close the grep modal.
+    pub fn grep_confirm(&mut self) -> EngineAction {
+        if let Some(m) = self.grep_results.get(self.grep_selected).cloned() {
+            let line = m.line;
+            self.close_live_grep();
+            self.open_file_in_tab(&m.file.clone());
+            let win_id = self.active_window_id();
+            self.set_cursor_for_window(win_id, line, 0);
+            self.ensure_cursor_visible();
+        }
+        EngineAction::None
+    }
+
+    /// Route a key press when the live grep modal is open.
+    pub fn handle_grep_key(
+        &mut self,
+        key_name: &str,
+        unicode: Option<char>,
+        ctrl: bool,
+    ) -> EngineAction {
+        match key_name {
+            "Escape" => {
+                self.close_live_grep();
+                EngineAction::None
+            }
+            "Return" => self.grep_confirm(),
+            "Down" => {
+                self.grep_select_next();
+                EngineAction::None
+            }
+            "Up" => {
+                self.grep_select_prev();
+                EngineAction::None
+            }
+            "n" if ctrl => {
+                self.grep_select_next();
+                EngineAction::None
+            }
+            "p" if ctrl => {
+                self.grep_select_prev();
+                EngineAction::None
+            }
+            "BackSpace" => {
+                self.grep_handle_backspace();
+                EngineAction::None
+            }
+            _ => {
+                if !ctrl {
+                    if let Some(c) = unicode {
+                        if !c.is_control() {
+                            self.grep_handle_char(c);
+                        }
+                    }
+                }
+                EngineAction::None
+            }
+        }
+    }
+
+    /// Search all files under cwd for the current query (min 2 chars).
+    fn grep_run_search(&mut self) {
+        if self.grep_query.len() < 2 {
+            self.grep_results.clear();
+            return;
+        }
+        let options = SearchOptions::default();
+        let cwd = self.cwd.clone();
+        match project_search::search_in_project(&cwd, &self.grep_query, &options) {
+            Ok(mut results) => {
+                results.truncate(200);
+                self.grep_results = results;
+            }
+            Err(_) => self.grep_results.clear(),
+        }
+    }
+
+    /// Load ±5 context lines around the currently selected match into `grep_preview_lines`.
+    fn grep_load_preview(&mut self) {
+        const CONTEXT: usize = 5;
+        self.grep_preview_lines.clear();
+        let Some(m) = self.grep_results.get(self.grep_selected) else {
+            return;
+        };
+        let file = m.file.clone();
+        let match_line = m.line; // 0-indexed
+        let Ok(content) = std::fs::read_to_string(&file) else {
+            return;
+        };
+        let all_lines: Vec<&str> = content.lines().collect();
+        let start = match_line.saturating_sub(CONTEXT);
+        let end = (match_line + CONTEXT + 1).min(all_lines.len());
+        for (i, &text) in all_lines[start..end].iter().enumerate() {
+            let lineno = start + i + 1; // 1-based for display
+            let is_match = (start + i) == match_line;
+            self.grep_preview_lines
+                .push((lineno, text.to_string(), is_match));
+        }
+    }
 }
 
 /// Try to parse a `:norm[al][!] {keys}` command with an optional range prefix.
@@ -16233,5 +16636,359 @@ mod tests {
         press_char(&mut engine, 'u');
         let restored: String = engine.buffer().content.chars().collect();
         assert_eq!(restored, "aaa\nbbb");
+    }
+
+    // ── Fuzzy finder tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_fuzzy_score_empty_query() {
+        // Empty query always matches with score 0
+        assert_eq!(Engine::fuzzy_score("src/main.rs", ""), Some(0));
+        assert_eq!(Engine::fuzzy_score("anything", ""), Some(0));
+    }
+
+    #[test]
+    fn test_fuzzy_score_no_match() {
+        // Query chars not present as subsequence → None
+        assert_eq!(Engine::fuzzy_score("src/main.rs", "xyz"), None);
+        assert_eq!(Engine::fuzzy_score("foo.rs", "bar"), None);
+    }
+
+    #[test]
+    fn test_fuzzy_score_exact() {
+        // Exact prefix should score positively
+        let score = Engine::fuzzy_score("engine.rs", "engine");
+        assert!(score.is_some());
+        assert!(score.unwrap() > 0);
+    }
+
+    #[test]
+    fn test_fuzzy_score_consecutive_bonus() {
+        // Consecutive matches incur no gap penalty; widely scattered matches do.
+        // Use paths without underscores to avoid word-boundary bonus interference.
+        let consecutive = Engine::fuzzy_score("abcdef.rs", "abc").unwrap();
+        let scattered = Engine::fuzzy_score("aXXbXXc.rs", "abc").unwrap();
+        assert!(
+            consecutive >= scattered,
+            "consecutive={} scattered={}",
+            consecutive,
+            scattered
+        );
+    }
+
+    #[test]
+    fn test_fuzzy_close_clears_state() {
+        let mut engine = Engine::new();
+        engine.fuzzy_open = true;
+        engine.fuzzy_query = "hello".to_string();
+        engine.fuzzy_results = vec![(PathBuf::from("a"), "a".to_string())];
+        engine.fuzzy_selected = 1;
+
+        engine.close_fuzzy_finder();
+
+        assert!(!engine.fuzzy_open);
+        assert!(engine.fuzzy_query.is_empty());
+        assert!(engine.fuzzy_results.is_empty());
+        assert_eq!(engine.fuzzy_selected, 0);
+    }
+
+    #[test]
+    fn test_fuzzy_filter_empty_query() {
+        let mut engine = Engine::new();
+        engine.fuzzy_all_files = vec![
+            PathBuf::from("src/main.rs"),
+            PathBuf::from("src/lib.rs"),
+            PathBuf::from("README.md"),
+        ];
+        engine.fuzzy_query.clear();
+        engine.fuzzy_filter();
+
+        // All files should be shown when query is empty
+        assert_eq!(engine.fuzzy_results.len(), 3);
+    }
+
+    #[test]
+    fn test_fuzzy_filter_with_query() {
+        let mut engine = Engine::new();
+        engine.fuzzy_all_files = vec![
+            PathBuf::from("src/main.rs"),
+            PathBuf::from("src/engine.rs"),
+            PathBuf::from("README.md"),
+        ];
+        engine.fuzzy_query = "eng".to_string();
+        engine.fuzzy_filter();
+
+        // Only engine.rs should match "eng"
+        assert_eq!(engine.fuzzy_results.len(), 1);
+        assert!(engine.fuzzy_results[0].1.contains("engine"));
+    }
+
+    #[test]
+    fn test_fuzzy_select_bounds() {
+        let mut engine = Engine::new();
+        engine.fuzzy_results = vec![
+            (PathBuf::from("a"), "a".to_string()),
+            (PathBuf::from("b"), "b".to_string()),
+            (PathBuf::from("c"), "c".to_string()),
+        ];
+        engine.fuzzy_selected = 0;
+
+        // prev at 0 stays at 0
+        engine.fuzzy_select_prev();
+        assert_eq!(engine.fuzzy_selected, 0);
+
+        // next from 0 goes to 1
+        engine.fuzzy_select_next();
+        assert_eq!(engine.fuzzy_selected, 1);
+
+        // next to max (2)
+        engine.fuzzy_select_next();
+        engine.fuzzy_select_next(); // trying to go past max
+        assert_eq!(engine.fuzzy_selected, 2);
+    }
+
+    #[test]
+    fn test_fuzzy_handle_char_and_backspace() {
+        let mut engine = Engine::new();
+        engine.fuzzy_all_files = vec![PathBuf::from("src/main.rs"), PathBuf::from("src/engine.rs")];
+        engine.fuzzy_open = true;
+
+        engine.fuzzy_handle_char('m');
+        assert_eq!(engine.fuzzy_query, "m");
+        // Only main.rs matches "m"
+        assert_eq!(engine.fuzzy_results.len(), 1);
+        assert_eq!(engine.fuzzy_selected, 0);
+
+        engine.fuzzy_handle_backspace();
+        assert_eq!(engine.fuzzy_query, "");
+        // Both files shown again
+        assert_eq!(engine.fuzzy_results.len(), 2);
+    }
+
+    #[test]
+    fn test_fuzzy_escape_closes() {
+        let mut engine = Engine::new();
+        engine.fuzzy_open = true;
+        engine.fuzzy_query = "test".to_string();
+
+        engine.handle_key("Escape", None, false);
+
+        assert!(!engine.fuzzy_open);
+        assert!(engine.fuzzy_query.is_empty());
+    }
+
+    #[test]
+    fn test_ctrl_p_opens_fuzzy() {
+        let mut engine = Engine::new();
+        assert!(!engine.fuzzy_open);
+
+        press_ctrl(&mut engine, 'p');
+
+        assert!(engine.fuzzy_open);
+    }
+
+    // ── Live grep tests ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_grep_run_search_short_query() {
+        let mut engine = Engine::new();
+        engine.grep_open = true;
+        engine.grep_query = "a".to_string(); // only 1 char — below threshold
+        engine.grep_run_search();
+        assert!(
+            engine.grep_results.is_empty(),
+            "query < 2 chars should yield no results"
+        );
+    }
+
+    #[test]
+    fn test_grep_run_search_finds_match() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("vimcode_grep_test_finds");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut f = std::fs::File::create(dir.join("sample.txt")).unwrap();
+        writeln!(f, "hello grep world").unwrap();
+        drop(f);
+
+        let mut engine = Engine::new();
+        engine.cwd = dir.clone();
+        engine.grep_query = "grep".to_string();
+        engine.grep_run_search();
+        assert!(
+            !engine.grep_results.is_empty(),
+            "should find at least one match"
+        );
+        assert!(engine
+            .grep_results
+            .iter()
+            .any(|m| m.line_text.contains("grep")));
+    }
+
+    #[test]
+    fn test_grep_close_clears_state() {
+        let mut engine = Engine::new();
+        engine.grep_open = true;
+        engine.grep_query = "hello".to_string();
+        engine.grep_results = vec![super::super::project_search::ProjectMatch {
+            file: PathBuf::from("a.rs"),
+            line: 0,
+            col: 0,
+            line_text: "hello".to_string(),
+        }];
+        engine.grep_selected = 1;
+        engine.grep_preview_lines = vec![(1, "hello".to_string(), true)];
+
+        engine.close_live_grep();
+
+        assert!(!engine.grep_open);
+        assert!(engine.grep_query.is_empty());
+        assert!(engine.grep_results.is_empty());
+        assert_eq!(engine.grep_selected, 0);
+        assert!(engine.grep_preview_lines.is_empty());
+    }
+
+    #[test]
+    fn test_grep_select_bounds() {
+        let mut engine = Engine::new();
+        engine.grep_results = vec![
+            super::super::project_search::ProjectMatch {
+                file: PathBuf::from("a.rs"),
+                line: 0,
+                col: 0,
+                line_text: "a".to_string(),
+            },
+            super::super::project_search::ProjectMatch {
+                file: PathBuf::from("b.rs"),
+                line: 1,
+                col: 0,
+                line_text: "b".to_string(),
+            },
+        ];
+        engine.grep_selected = 0;
+
+        // prev at 0 stays at 0
+        engine.grep_select_prev();
+        assert_eq!(engine.grep_selected, 0);
+
+        // next from 0 → 1
+        engine.grep_select_next();
+        assert_eq!(engine.grep_selected, 1);
+
+        // next at max stays at max
+        engine.grep_select_next();
+        assert_eq!(engine.grep_selected, 1);
+    }
+
+    #[test]
+    fn test_grep_select_updates_preview() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("vimcode_grep_test_preview");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("file.txt");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "line one").unwrap();
+        writeln!(f, "line two searchterm").unwrap();
+        writeln!(f, "line three").unwrap();
+        drop(f);
+
+        let mut engine = Engine::new();
+        engine.grep_results = vec![super::super::project_search::ProjectMatch {
+            file: path.clone(),
+            line: 1, // 0-indexed → "line two searchterm"
+            col: 0,
+            line_text: "line two searchterm".to_string(),
+        }];
+        engine.grep_selected = 0;
+        engine.grep_load_preview();
+
+        assert!(
+            !engine.grep_preview_lines.is_empty(),
+            "preview should be populated"
+        );
+        // The match line should be flagged is_match = true
+        assert!(
+            engine
+                .grep_preview_lines
+                .iter()
+                .any(|(_, _, is_match)| *is_match),
+            "at least one preview line should be the match line"
+        );
+    }
+
+    #[test]
+    fn test_grep_confirm_opens_file() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("vimcode_grep_test_confirm");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("confirm.txt");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "line0").unwrap();
+        writeln!(f, "line1 target").unwrap();
+        writeln!(f, "line2").unwrap();
+        drop(f);
+
+        let mut engine = Engine::new();
+        engine.grep_open = true;
+        engine.grep_results = vec![super::super::project_search::ProjectMatch {
+            file: path.clone(),
+            line: 1,
+            col: 0,
+            line_text: "line1 target".to_string(),
+        }];
+        engine.grep_selected = 0;
+
+        engine.grep_confirm();
+
+        // Modal should be closed
+        assert!(!engine.grep_open, "grep modal should close after confirm");
+        // The active buffer should be the confirmed file
+        let active_path = engine.file_path().cloned();
+        assert_eq!(
+            active_path,
+            Some(path),
+            "active buffer should be the confirmed file"
+        );
+    }
+
+    #[test]
+    fn test_grep_handle_char_triggers_search() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("vimcode_grep_test_char");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut f = std::fs::File::create(dir.join("hi.txt")).unwrap();
+        writeln!(f, "hello world").unwrap();
+        drop(f);
+
+        let mut engine = Engine::new();
+        engine.cwd = dir.clone();
+        engine.grep_open = true;
+
+        // Single char — no search yet (below 2-char threshold)
+        engine.grep_handle_char('h');
+        assert!(
+            engine.grep_results.is_empty(),
+            "1 char should not trigger search"
+        );
+
+        // Second char — search fires
+        engine.grep_handle_char('e');
+        assert!(
+            !engine.grep_results.is_empty(),
+            "2 chars should trigger search"
+        );
+    }
+
+    #[test]
+    fn test_ctrl_g_opens_grep() {
+        let mut engine = Engine::new();
+        assert!(!engine.grep_open);
+
+        press_ctrl(&mut engine, 'g');
+
+        assert!(engine.grep_open);
     }
 }

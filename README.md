@@ -7,7 +7,7 @@ High-performance Vim+VSCode hybrid editor in Rust. Modal editing meets modern UX
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 535 tests, zero async runtime
+- **Clean architecture** — platform-agnostic core, 563 tests, zero async runtime
 
 ## Building
 
@@ -181,6 +181,29 @@ cargo fmt
   - Open buffers for modified files are automatically reloaded from disk after replace
 - **GTK:** click toggle buttons below the search input; click a result to open the file; `Tab` or click to switch between search/replace inputs
 - **TUI:** `Alt+C` (case), `Alt+W` (whole word), `Alt+R` (regex), `Alt+H` (replace all); `Tab` to switch between search/replace inputs; `j`/`k` to navigate results; `Enter` to open
+
+---
+
+### Fuzzy File Finder
+
+- `Ctrl-P` (Normal mode) — open the Telescope-style fuzzy file picker
+- A centered floating modal appears over the editor
+- Type to instantly filter all project files by fuzzy subsequence match
+- Word-boundary matches (after `/`, `_`, `-`, `.`) are scored higher
+- `Ctrl-N` / `↓` and `Ctrl-P` / `↑` — navigate results; `Enter` — open selected file; `Escape` — close
+- Results capped at 50; hidden dirs (`.git`, etc.) and `target/` are excluded
+
+---
+
+### Live Grep
+
+- `Ctrl-G` (Normal mode) — open the Telescope-style live grep modal
+- A centered floating two-column modal appears over the editor
+- Type to instantly search file *contents* across the entire project (live-as-you-type, query ≥ 2 chars)
+- Left pane shows results in `filename.rs:N: snippet` format; right pane shows ±5 context lines around the match
+- Match line is highlighted in the preview pane
+- `Ctrl-N` / `↓` and `Ctrl-P` / `↑` — navigate results; preview updates as you move; `Enter` — open file at match line; `Escape` — close
+- Results capped at 200; uses `.gitignore`-aware search (same engine as project search panel)
 
 ---
 
@@ -384,6 +407,8 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `za` / `zo` / `zc` / `zR` | Fold toggle / open / close / open all |
 | `Ctrl-W h/j/k/l` | Focus window left/down/up/right |
 | `Ctrl-W w` / `c` / `o` | Cycle / close / close-others |
+| `Ctrl-P` | Open fuzzy file finder |
+| `Ctrl-G` | Open live grep modal (search file contents) |
 
 ### Command Mode
 
@@ -418,12 +443,12 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 
 ```
 src/
-├── main.rs          (~3600 lines)  GTK4/Relm4 UI, rendering, sidebar resize, search panel
-├── tui_main.rs      (~2900 lines)  ratatui/crossterm TUI backend, search panel
-├── render.rs        (~1200 lines)  Platform-agnostic ScreenLayout bridge
+├── main.rs          (~3700 lines)  GTK4/Relm4 UI, rendering, sidebar resize, fuzzy popup
+├── tui_main.rs      (~3100 lines)  ratatui/crossterm TUI backend, fuzzy popup
+├── render.rs        (~1220 lines)  Platform-agnostic ScreenLayout bridge
 ├── icons.rs            (~30 lines)  Nerd Font file-type icons (GTK + TUI)
-└── core/            (~20200 lines)  Zero GTK/rendering deps — fully testable
-    ├── engine.rs                    Orchestrator: keys, commands, git, macros, LSP, project search/replace
+└── core/            (~16700 lines)  Zero GTK/rendering deps — fully testable
+    ├── engine.rs                    Orchestrator: keys, commands, git, macros, LSP, project search/replace, fuzzy finder
     ├── lsp.rs                       LSP protocol transport + single-server client (request ID tracking, JSON-RPC framing)
     ├── lsp_manager.rs               Multi-server coordinator with initialization guards + built-in registry
     ├── project_search.rs            Regex/case/whole-word search + replace (ignore + regex crates)

@@ -269,6 +269,10 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
 
     // Mutable sidebar width (default SIDEBAR_WIDTH, clamped 15..60)
     let mut sidebar_width: u16 = SIDEBAR_WIDTH;
+    // Scroll offset for the fuzzy finder results list
+    let mut fuzzy_scroll_top: usize = 0;
+    // Scroll offset for the live grep results list
+    let mut grep_scroll_top: usize = 0;
     // True while user is dragging the sidebar resize handle
     let mut dragging_sidebar = false;
     // Non-None while user is dragging a scrollbar thumb
@@ -344,6 +348,8 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                             engine,
                             &sidebar_prompt,
                             sidebar_width,
+                            fuzzy_scroll_top,
+                            grep_scroll_top,
                         );
                     }
                 })
@@ -440,7 +446,12 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                 }
 
                 // ── Sidebar focused ─────────────────────────────────────────
-                if sidebar.has_focus && key_event.kind != KeyEventKind::Release {
+                // Note: sidebar key handling is suppressed when fuzzy modal is open.
+                if sidebar.has_focus
+                    && !engine.fuzzy_open
+                    && !engine.grep_open
+                    && key_event.kind != KeyEventKind::Release
+                {
                     let ctrl = key_event.modifiers.contains(KeyModifiers::CONTROL);
 
                     // ── Search panel keyboard handling ──────────────────────
@@ -725,6 +736,36 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                         if !has_more {
                             break;
                         }
+                    }
+                    // Adjust fuzzy scroll to keep selected item visible
+                    if engine.fuzzy_open {
+                        if let Ok(size) = terminal.size() {
+                            let popup_h = ((size.height as usize) * 55 / 100).max(15);
+                            let visible_rows = popup_h.saturating_sub(4); // title+query+sep+border
+                            if engine.fuzzy_selected < fuzzy_scroll_top {
+                                fuzzy_scroll_top = engine.fuzzy_selected;
+                            }
+                            if engine.fuzzy_selected >= fuzzy_scroll_top + visible_rows {
+                                fuzzy_scroll_top = engine.fuzzy_selected + 1 - visible_rows;
+                            }
+                        }
+                    } else {
+                        fuzzy_scroll_top = 0;
+                    }
+                    // Adjust grep scroll to keep selected item visible
+                    if engine.grep_open {
+                        if let Ok(size) = terminal.size() {
+                            let popup_h = ((size.height as usize) * 65 / 100).max(18);
+                            let visible_rows = popup_h.saturating_sub(4); // title+query+sep+border
+                            if engine.grep_selected < grep_scroll_top {
+                                grep_scroll_top = engine.grep_selected;
+                            }
+                            if engine.grep_selected >= grep_scroll_top + visible_rows {
+                                grep_scroll_top = engine.grep_selected + 1 - visible_rows;
+                            }
+                        }
+                    } else {
+                        grep_scroll_top = 0;
                     }
                 }
             }
@@ -1198,6 +1239,8 @@ fn draw_frame(
     engine: &Engine,
     sidebar_prompt: &Option<SidebarPrompt>,
     sidebar_width: u16,
+    fuzzy_scroll_top: usize,
+    grep_scroll_top: usize,
 ) {
     let area = frame.size();
 
@@ -1303,6 +1346,16 @@ fn draw_frame(
             let popup_y = win_y + anchor_view;
             render_hover_popup(frame, hover, popup_x, popup_y, frame.size(), theme);
         }
+    }
+
+    // ── Fuzzy file-picker modal (rendered on top of everything) ───────────────
+    if let Some(ref fuzzy) = screen.fuzzy {
+        render_fuzzy_popup(frame, fuzzy, area, theme, fuzzy_scroll_top);
+    }
+
+    // ── Live grep modal (rendered on top of everything) ───────────────────────
+    if let Some(ref grep) = screen.live_grep {
+        render_live_grep_popup(frame, grep, area, theme, grep_scroll_top);
     }
 
     // ── Status / command ──────────────────────────────────────────────────────
@@ -1586,6 +1639,353 @@ fn render_hover_popup(
             if cell_x + 1 < x + width && cell_x < term_area.width && row_y < term_area.height {
                 let cell = buf.get_mut(cell_x, row_y);
                 cell.set_char(ch).set_fg(fg_color).set_bg(bg_color);
+            }
+        }
+    }
+}
+
+fn render_fuzzy_popup(
+    frame: &mut ratatui::Frame,
+    fuzzy: &render::FuzzyPanel,
+    term_area: Rect,
+    theme: &Theme,
+    scroll_top: usize,
+) {
+    let term_cols = term_area.width;
+    let term_rows = term_area.height;
+
+    // Size: 3/5 of terminal width (min 50), 55% of terminal rows (min 15)
+    let width = (term_cols * 3 / 5).max(50);
+    let height = (term_rows * 55 / 100).max(15);
+
+    // Centered
+    let x = (term_cols.saturating_sub(width)) / 2;
+    let y = (term_rows.saturating_sub(height)) / 2;
+
+    let bg_color = rc(theme.fuzzy_bg);
+    let sel_bg_color = rc(theme.fuzzy_selected_bg);
+    let fg_color = rc(theme.fuzzy_fg);
+    let query_fg = rc(theme.fuzzy_query_fg);
+    let border_fg = rc(theme.fuzzy_border);
+    let title_fg = rc(theme.fuzzy_title_fg);
+
+    let buf = frame.buffer_mut();
+
+    // Row 0: top border ╭─ Find Files ── N/M ──╮
+    let title_text = format!(
+        " Find Files  {}/{} ",
+        fuzzy.results.len(),
+        fuzzy.total_files
+    );
+    for col in 0..width {
+        let cx = x + col;
+        if cx < term_area.width && y < term_area.height {
+            let ch = if col == 0 {
+                '╭'
+            } else if col == width - 1 {
+                '╮'
+            } else {
+                '─'
+            };
+            set_cell(buf, cx, y, ch, border_fg, bg_color);
+        }
+    }
+    // Overlay title text starting at col 2
+    for (i, ch) in title_text.chars().enumerate() {
+        let cx = x + 2 + i as u16;
+        if cx + 1 < x + width && cx < term_area.width && y < term_area.height {
+            set_cell(buf, cx, y, ch, title_fg, bg_color);
+        }
+    }
+
+    // Row 1: query line │ > query_ │
+    let row1 = y + 1;
+    if row1 < term_area.height {
+        // Left border
+        set_cell(buf, x, row1, '│', border_fg, bg_color);
+        // Right border
+        if x + width - 1 < term_area.width {
+            set_cell(buf, x + width - 1, row1, '│', border_fg, bg_color);
+        }
+        // Fill background
+        for col in 1..width - 1 {
+            let cx = x + col;
+            if cx < term_area.width {
+                set_cell(buf, cx, row1, ' ', fg_color, bg_color);
+            }
+        }
+        // Query text "> query"
+        let query_display = format!("> {}", fuzzy.query);
+        for (i, ch) in query_display.chars().enumerate() {
+            let cx = x + 1 + i as u16;
+            if cx + 1 < x + width && cx < term_area.width {
+                set_cell(buf, cx, row1, ch, query_fg, bg_color);
+            }
+        }
+        // Cursor block after query
+        let cursor_col = x + 1 + query_display.chars().count() as u16;
+        if cursor_col + 1 < x + width && cursor_col < term_area.width {
+            set_cell(buf, cursor_col, row1, '▌', query_fg, bg_color);
+        }
+    }
+
+    // Row 2: separator ├───────┤
+    let row2 = y + 2;
+    if row2 < term_area.height {
+        for col in 0..width {
+            let cx = x + col;
+            if cx < term_area.width {
+                let ch = if col == 0 {
+                    '├'
+                } else if col == width - 1 {
+                    '┤'
+                } else {
+                    '─'
+                };
+                set_cell(buf, cx, row2, ch, border_fg, bg_color);
+            }
+        }
+    }
+
+    // Result rows: rows 3..height-1
+    let results_start = y + 3;
+    let results_end = y + height - 1;
+    let visible_rows = (results_end.saturating_sub(results_start)) as usize;
+
+    for row_idx in 0..visible_rows {
+        let result_idx = scroll_top + row_idx;
+        let ry = results_start + row_idx as u16;
+        if ry >= results_end || ry >= term_area.height {
+            break;
+        }
+        // Left/right border
+        set_cell(buf, x, ry, '│', border_fg, bg_color);
+        if x + width - 1 < term_area.width {
+            set_cell(buf, x + width - 1, ry, '│', border_fg, bg_color);
+        }
+        // Fill row background
+        let is_selected = result_idx == fuzzy.selected_idx;
+        let row_bg = if is_selected { sel_bg_color } else { bg_color };
+        for col in 1..width - 1 {
+            let cx = x + col;
+            if cx < term_area.width {
+                set_cell(buf, cx, ry, ' ', fg_color, row_bg);
+            }
+        }
+        // Result text
+        if let Some(display) = fuzzy.results.get(result_idx) {
+            let prefix = if is_selected { "▶ " } else { "  " };
+            let row_text = format!("{}{}", prefix, display);
+            for (j, ch) in row_text.chars().enumerate() {
+                let cx = x + 1 + j as u16;
+                if cx + 1 < x + width && cx < term_area.width {
+                    set_cell(buf, cx, ry, ch, fg_color, row_bg);
+                }
+            }
+        }
+    }
+
+    // Bottom border ╰───────╯
+    let bottom = y + height - 1;
+    if bottom < term_area.height {
+        for col in 0..width {
+            let cx = x + col;
+            if cx < term_area.width {
+                let ch = if col == 0 {
+                    '╰'
+                } else if col == width - 1 {
+                    '╯'
+                } else {
+                    '─'
+                };
+                set_cell(buf, cx, bottom, ch, border_fg, bg_color);
+            }
+        }
+    }
+}
+
+fn render_live_grep_popup(
+    frame: &mut ratatui::Frame,
+    grep: &render::LiveGrepPanel,
+    term_area: Rect,
+    theme: &Theme,
+    scroll_top: usize,
+) {
+    let term_cols = term_area.width;
+    let term_rows = term_area.height;
+
+    // Size: 4/5 of terminal width (min 60), 65% of terminal rows (min 18)
+    let width = (term_cols * 4 / 5).max(60);
+    let height = (term_rows * 65 / 100).max(18);
+
+    // Centered
+    let x = (term_cols.saturating_sub(width)) / 2;
+    let y = (term_rows.saturating_sub(height)) / 2;
+
+    let bg_color = rc(theme.fuzzy_bg);
+    let sel_bg_color = rc(theme.fuzzy_selected_bg);
+    let fg_color = rc(theme.fuzzy_fg);
+    let query_fg = rc(theme.fuzzy_query_fg);
+    let border_fg = rc(theme.fuzzy_border);
+    let title_fg = rc(theme.fuzzy_title_fg);
+
+    let buf = frame.buffer_mut();
+
+    // Row 0: top border ╭─ Live Grep ── N matches ──╮
+    let title_text = format!(" Live Grep  {} matches ", grep.total_matches);
+    for col in 0..width {
+        let cx = x + col;
+        if cx < term_area.width && y < term_area.height {
+            let ch = if col == 0 {
+                '╭'
+            } else if col == width - 1 {
+                '╮'
+            } else {
+                '─'
+            };
+            set_cell(buf, cx, y, ch, border_fg, bg_color);
+        }
+    }
+    // Overlay title text starting at col 2
+    for (i, ch) in title_text.chars().enumerate() {
+        let cx = x + 2 + i as u16;
+        if cx + 1 < x + width && cx < term_area.width && y < term_area.height {
+            set_cell(buf, cx, y, ch, title_fg, bg_color);
+        }
+    }
+
+    // Row 1: query line │ > query_ │
+    let row1 = y + 1;
+    if row1 < term_area.height {
+        set_cell(buf, x, row1, '│', border_fg, bg_color);
+        if x + width - 1 < term_area.width {
+            set_cell(buf, x + width - 1, row1, '│', border_fg, bg_color);
+        }
+        for col in 1..width - 1 {
+            let cx = x + col;
+            if cx < term_area.width {
+                set_cell(buf, cx, row1, ' ', fg_color, bg_color);
+            }
+        }
+        let query_display = format!("> {}", grep.query);
+        for (i, ch) in query_display.chars().enumerate() {
+            let cx = x + 1 + i as u16;
+            if cx + 1 < x + width && cx < term_area.width {
+                set_cell(buf, cx, row1, ch, query_fg, bg_color);
+            }
+        }
+        let cursor_col = x + 1 + query_display.chars().count() as u16;
+        if cursor_col + 1 < x + width && cursor_col < term_area.width {
+            set_cell(buf, cursor_col, row1, '▌', query_fg, bg_color);
+        }
+    }
+
+    // Row 2: separator ├───────────────┬───────────────────────────────┤
+    let row2 = y + 2;
+    // Left pane width: 35% of popup (in columns)
+    let left_w = (width as usize * 35 / 100) as u16;
+    if row2 < term_area.height {
+        for col in 0..width {
+            let cx = x + col;
+            if cx < term_area.width {
+                let ch = if col == 0 {
+                    '├'
+                } else if col == width - 1 {
+                    '┤'
+                } else if col == left_w {
+                    '┬'
+                } else {
+                    '─'
+                };
+                set_cell(buf, cx, row2, ch, border_fg, bg_color);
+            }
+        }
+    }
+
+    // Result rows: rows 3..height-1
+    let results_start = y + 3;
+    let results_end = y + height - 1;
+    let visible_rows = (results_end.saturating_sub(results_start)) as usize;
+
+    for row_idx in 0..visible_rows {
+        let result_idx = scroll_top + row_idx;
+        let ry = results_start + row_idx as u16;
+        if ry >= results_end || ry >= term_area.height {
+            break;
+        }
+
+        // Left border
+        set_cell(buf, x, ry, '│', border_fg, bg_color);
+        // Vertical separator between panes
+        if x + left_w < term_area.width {
+            set_cell(buf, x + left_w, ry, '│', border_fg, bg_color);
+        }
+        // Right border
+        if x + width - 1 < term_area.width {
+            set_cell(buf, x + width - 1, ry, '│', border_fg, bg_color);
+        }
+
+        // Fill left pane background
+        let is_selected = result_idx == grep.selected_idx;
+        let left_bg = if is_selected { sel_bg_color } else { bg_color };
+        for col in 1..left_w {
+            let cx = x + col;
+            if cx < term_area.width {
+                set_cell(buf, cx, ry, ' ', fg_color, left_bg);
+            }
+        }
+        // Fill right pane background
+        for col in (left_w + 1)..(width - 1) {
+            let cx = x + col;
+            if cx < term_area.width {
+                set_cell(buf, cx, ry, ' ', fg_color, bg_color);
+            }
+        }
+
+        // Left pane: result text
+        if let Some(display) = grep.results.get(result_idx) {
+            let prefix = if is_selected { "▶" } else { " " };
+            let row_text = format!("{}{}", prefix, display);
+            let left_inner = left_w.saturating_sub(1) as usize; // inner cols
+            for (j, ch) in row_text.chars().enumerate().take(left_inner) {
+                let cx = x + 1 + j as u16;
+                if cx < x + left_w && cx < term_area.width {
+                    set_cell(buf, cx, ry, ch, fg_color, left_bg);
+                }
+            }
+        }
+
+        // Right pane: preview line for this row_idx
+        if let Some((lineno, text, is_match)) = grep.preview_lines.get(row_idx) {
+            let preview_text = format!("{:4}: {}", lineno, text);
+            let preview_fg = if *is_match { title_fg } else { fg_color };
+            let right_start = x + left_w + 1;
+            let right_inner = (width - left_w - 2) as usize;
+            for (j, ch) in preview_text.chars().enumerate().take(right_inner) {
+                let cx = right_start + j as u16;
+                if cx + 1 < x + width && cx < term_area.width {
+                    set_cell(buf, cx, ry, ch, preview_fg, bg_color);
+                }
+            }
+        }
+    }
+
+    // Bottom border ╰───────────────┴───────────────────────────────╯
+    let bottom = y + height - 1;
+    if bottom < term_area.height {
+        for col in 0..width {
+            let cx = x + col;
+            if cx < term_area.width {
+                let ch = if col == 0 {
+                    '╰'
+                } else if col == width - 1 {
+                    '╯'
+                } else if col == left_w {
+                    '┴'
+                } else {
+                    '─'
+                };
+                set_cell(buf, cx, bottom, ch, border_fg, bg_color);
             }
         }
     }
