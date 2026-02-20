@@ -1,19 +1,25 @@
 # VimCode Project State
 
-**Last updated:** Feb 19, 2026 (Session 48)
+**Last updated:** Feb 20, 2026 (Session 50)
 
 ## Status
 
-**LSP Support STABLE:** Language server auto-detection, diagnostics (inline underlines + gutter icons), completions (Ctrl-Space), go-to-definition (gd), hover (K), diagnostic navigation (]d/[d); protocol compliance fixes + TUI performance optimizations — 495 tests passing
+**CPU Performance Fixes:** Cached `max_col` in `BufferState` (eliminates O(N) scan per render frame); 60fps frame rate cap in TUI event loop — 526 tests passing
 
 ### Core Vim (Complete)
 - Seven modes (Normal/Insert/Visual/Visual Line/Visual Block/Command/Search)
 - Navigation (hjkl, w/b/e, {}, gg/G, f/F/t/T, %, 0/$, Ctrl-D/U/F/B)
-- Operators (d/c/y with motions, x/dd/D/s/S/C, r for replace char)
+- Operators (d/c/y with motions, x/dd/D/s/S/C, r for replace char, >>/<<)
 - Text objects (iw/aw, quotes, brackets)
 - Registers (unnamed + a-z)
 - Undo/redo (u/Ctrl-R), undo line (U), repeat (.), count prefix
-- Visual modes (v/V/Ctrl-V with y/d/c/u/U, rectangular block selections, case change)
+- Visual modes (v/V/Ctrl-V with y/d/c/u/U/~/>/< , rectangular block selections, case change)
+- **Toggle case:** `~` toggles case under cursor (count + dot-repeat)
+- **Join lines:** `J` joins next line collapsing whitespace to one space (count + dot-repeat)
+- **Indent/Dedent:** `>>` / `<<` indent/dedent by `shiftwidth` (count, visual, dot-repeat)
+- **Search word under cursor:** `*` (forward) / `#` (backward) with whole-word boundaries; `n`/`N` continue
+- **Jump list:** `Ctrl-O` / `Ctrl-I` navigate back/forward through jump history (G, gg, /, ?, n, N, %, {, }, gd push entries)
+- **Scroll cursor:** `zz` (center), `zt` (top), `zb` (bottom) adjust scroll without moving cursor
 - **Search:**
   - Forward search: `/` + pattern, `n` for next, `N` for previous
   - Reverse search: `?` + pattern, `n` for previous, `N` for next
@@ -76,7 +82,7 @@
 - **Line numbers (FIXED):** Absolute/relative/hybrid modes now render correctly with proper visibility
 - Tab bar, single global status line, command line
 - Mouse click positioning (pixel-perfect) — both GTK and TUI
-- **Scrollbars:** Per-window vertical/horizontal scrollbars with cursor indicators (GTK + TUI); horizontal scrollbar driven by `max_col` field in `RenderedWindow`
+- **Scrollbars:** Per-window vertical/horizontal scrollbars with cursor indicators (GTK + TUI); horizontal scrollbar driven by `max_col` cached in `BufferState` (updated in `update_syntax()`)
 - **Font configuration:** Customizable font family and size
 - **Nerd Font icons:** File-type icons in both GTK sidebar and TUI sidebar (`src/icons.rs`)
 - **Code folding:** `+`/`-` gutter indicators; entire gutter column is clickable in both GTK and TUI
@@ -118,6 +124,7 @@
 - **Drag event coalescing:** consecutive `MouseEventKind::Drag` events are coalesced (only the final position is rendered), eliminating render-per-pixel lag on all drag operations
 - **Idle-only background work**: `lsp_flush_changes()`, `poll_lsp()`, `poll_project_search()`, `poll_project_replace()` only run when no input is pending (prevents blocking pipe writes during typing)
 - **On-demand rendering**: `needs_redraw` flag skips rendering when nothing changed; adaptive poll timeout (1ms when redraw pending, 50ms idle)
+- **60fps frame rate cap**: `min_frame = 16ms` + `last_draw: Instant` prevent uncapped rendering from rapid LSP/search events
 - Cursor shapes: bar in insert, underline in replace-r
 
 ### Settings
@@ -182,7 +189,7 @@ vimcode/
 ```bash
 cargo build
 cargo run -- <file>
-cargo test -- --test-threads=1    # 495 tests
+cargo test -- --test-threads=1    # 526 tests
 cargo clippy -- -D warnings
 cargo fmt
 ```
@@ -235,6 +242,10 @@ cargo fmt
 - [ ] **`:norm`** — execute normal command on a range of lines
 
 ## Recent Work
+**Session 50:** CPU performance fixes — two startup/runtime CPU issues resolved. (1) `max_col` (longest line length, used for h-scrollbar range) was computed by scanning all buffer lines on every render frame; now cached as `BufferState.max_col: usize`, initialized in both constructors, recomputed once inside `update_syntax()`; `render.rs` updated to read the cached value. (2) TUI event loop had no frame rate cap — rapid LSP events or search results could trigger uncapped rendering (100% CPU); added `min_frame = Duration::from_millis(16)` and `last_draw: Instant` so renders are gated to ~60fps. (526 tests, no change.)
+
+**Session 49:** 6 high-priority vim features — toggle case (`~` / visual `~`), scroll-to-cursor (`zz`/`zt`/`zb`), join lines (`J`), search word under cursor (`*`/`#` with word boundaries), jump list (`Ctrl-O`/`Ctrl-I`, cross-file, max 100, pushes on G/gg/n/N/%/{/}/gd/\*/#), indent/dedent (`>>`/`<<`, visual `>`/`<`, dot-repeatable). Plus two jump-list bug fixes: back-from-live-end saves position before going back; clearing pending_key after z/zz/zt/zb so they don't interfere with subsequent keys. (495→526 tests, 31 new.)
+
 **Session 48:** LSP bug fixes + TUI performance — fixed full LSP lifecycle: `notify_did_open` now returns `Result<(), String>` with descriptive errors; added `pending_requests: Arc<Mutex<HashMap<i64, String>>>` for deterministic response routing (no more guessing response type by content); added initialization guards on all notification methods (no `didOpen`/`didChange`/`didSave`/`didClose` before server handshake completes); reader thread now responds to server-initiated requests (`window/workDoneProgress/create`) and handles error responses properly. Performance fixes: diagnostic flood optimization (pre-computed visible paths set, events capped at 50/poll, only redraw for visible buffers); fixed path mismatch between LSP diagnostic keys (absolute) and buffer file_path (relative) via canonicalization at lookup points in render.rs, diagnostic_counts(), and jump_next/prev_diagnostic(). TUI: added `needs_redraw` flag for on-demand rendering (was unconditional 50 FPS); moved all background work (LSP flush/poll, search poll, replace poll) to idle-only periods (no pending input) — eliminated blocking pipe writes during typing; adaptive poll timeout (1ms when redraw pending, 50ms idle). Reverted `Stdio::inherit()` to `Stdio::null()` for child process stderr (rust-analyzer stderr was corrupting TUI display). (495 tests, no change.)
 
 **Session 47:** LSP support — full Language Server Protocol integration using lightweight custom client (`std::thread` + `mpsc`, no tokio). New files: `src/core/lsp.rs` (~750 lines, protocol transport + single-server client with 27 unit tests), `src/core/lsp_manager.rs` (~340 lines, multi-server coordinator with built-in registry for rust-analyzer/pyright/typescript-language-server/gopls/clangd). Engine gains LSP fields and lifecycle hooks (didOpen/didChange/didSave/didClose), `poll_lsp()` event processing, diagnostic navigation (`]d`/`[d`), go-to-definition (`gd`), hover popup (`K`), LSP completion (`Ctrl-Space`). Render layer: `DiagnosticMark` + `HoverPopup` types, diagnostic_gutter map, theme colors (error/warning/info/hint/hover). GTK backend: wavy underlines via Cairo curves, colored gutter dots, hover popup, LSP poll in SearchPollTick, shutdown on quit. TUI backend: colored underlines + E/W/I/H gutter chars, hover popup, LSP poll in event loop, shutdown on quit. Settings: `lsp_enabled` bool + `lsp_servers` array for custom servers; `:set lsp`/`:set nolsp`; `:LspInfo`/`:LspRestart`/`:LspStop` commands. (458→495 tests, 37 new.)

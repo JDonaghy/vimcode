@@ -7,7 +7,7 @@ High-performance Vim+VSCode hybrid editor in Rust. Modal editing meets modern UX
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 495 tests, zero async runtime
+- **Clean architecture** — platform-agnostic core, 526 tests, zero async runtime
 
 ## Building
 
@@ -279,7 +279,7 @@ Runtime changes are written through to `~/.config/vimcode/settings.json` immedia
 | `relativenumber` / `norelativenumber` | `rnu` | off | Relative line numbers (`number` + `relativenumber` = hybrid) |
 | `expandtab` / `noexpandtab` | `et` | on | Tab key inserts spaces |
 | `tabstop=N` | `ts` | 4 | Width of Tab key / tab display |
-| `shiftwidth=N` | `sw` | 4 | Indent width (for future `>>` / `<<`) |
+| `shiftwidth=N` | `sw` | 4 | Indent width for `>>` / `<<` |
 | `autoindent` / `noautoindent` | `ai` | on | Copy indent from current line on Enter/o/O |
 | `incsearch` / `noincsearch` | `is` | on | Incremental search as you type |
 | `lsp` / `nolsp` | | on | Enable/disable LSP language servers |
@@ -335,6 +335,7 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 - **Sidebar resize:** drag separator column; `Alt+Left` / `Alt+Right` keyboard resize (min 15, max 60 cols)
 - **Scrollbars:** `█` / `░` thumb/track in uniform grey; vsplit separator doubles as left-pane vertical scrollbar; horizontal scrollbar row when content wider than viewport; `┘` corner when both axes present
 - **Scroll sync:** `:Gblame` pairs stay in sync across keyboard nav and mouse events
+- **Frame rate cap:** renders limited to ~60fps so rapid LSP or search events don't peg the CPU
 - **Cursor shapes:** bar `|` in Insert mode, underline `_` in replace (`r`)
 
 ---
@@ -352,6 +353,8 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `0` / `$` | Line start / end |
 | `f{c}` / `t{c}` | Find / till char (`;` `,` repeat) |
 | `%` | Jump to matching bracket |
+| `zz` / `zt` / `zb` | Scroll cursor to center / top / bottom |
+| `Ctrl-O` / `Ctrl-I` | Jump list back / forward |
 | `Ctrl-D` / `Ctrl-U` | Half-page down / up |
 | `i` / `I` / `a` / `A` | Insert (cursor / line-start / append / line-end) |
 | `o` / `O` | Open line below / above |
@@ -362,6 +365,10 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `U` | Undo all changes on line |
 | `.` | Repeat last change |
 | `r{c}` | Replace character |
+| `~` | Toggle case of char under cursor (count supported) |
+| `J` | Join lines (collapse next line's whitespace to one space) |
+| `>>` / `<<` | Indent / dedent line(s) by `shiftwidth` |
+| `*` / `#` | Search forward / backward for word under cursor |
 | `v` / `V` / `Ctrl-V` | Visual / Visual Line / Visual Block |
 | `/` / `?` | Search forward / backward |
 | `n` / `N` | Next / previous match |
