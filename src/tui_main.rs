@@ -28,8 +28,9 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color as RColor, Modifier};
 use ratatui::Terminal;
 
-use crate::core::engine::EngineAction;
+use crate::core::engine::{DiffLine, EngineAction};
 use crate::core::lsp::DiagnosticSeverity;
+use crate::core::settings::ExplorerAction;
 use crate::core::{Engine, GitLineStatus, Mode, OpenMode, WindowRect};
 use crate::render::{
     self, build_screen_layout, Color, CompletionMenu, CursorShape, RenderedLine, RenderedWindow,
@@ -40,6 +41,9 @@ use crate::render::{
 
 const SIDEBAR_WIDTH: u16 = 30;
 const ACTIVITY_BAR_WIDTH: u16 = 3;
+/// Number of terminal columns the explorer toolbar occupies:
+/// 4 Nerd Font icons × 3 cols (2-col icon + 1 space) + 1 col for '?' = 13.
+const EXPLORER_TOOLBAR_LEN: u16 = 12;
 
 // ─── Activity bar panels ──────────────────────────────────────────────────────
 
@@ -76,10 +80,15 @@ struct TuiSidebar {
     replace_input_focused: bool,
     /// Scroll offset for the search results area (written back by render_search_panel).
     search_scroll_top: usize,
+    /// When true, clicks select without opening; keyboard file ops (r/M/D/a) work.
+    explorer_mode: bool,
 }
 
 impl TuiSidebar {
     fn new(root: PathBuf, visible: bool) -> Self {
+        let mut expanded = HashSet::new();
+        // Root folder starts expanded so the tree is visible
+        expanded.insert(root.clone());
         let mut sb = TuiSidebar {
             visible,
             has_focus: false,
@@ -88,10 +97,11 @@ impl TuiSidebar {
             scroll_top: 0,
             rows: Vec::new(),
             root,
-            expanded: HashSet::new(),
+            expanded,
             search_input_mode: true,
             replace_input_focused: false,
             search_scroll_top: 0,
+            explorer_mode: false,
         };
         sb.build_rows();
         sb
@@ -100,7 +110,22 @@ impl TuiSidebar {
     fn build_rows(&mut self) {
         self.rows.clear();
         let root = self.root.clone();
-        collect_rows(&root, 0, &self.expanded, &mut self.rows);
+        // Root folder entry at the top (like VSCode project name)
+        let root_name = root
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| root.to_string_lossy().to_string());
+        let root_expanded = self.expanded.contains(&root);
+        self.rows.push(ExplorerRow {
+            depth: 0,
+            name: root_name.to_uppercase(),
+            path: root.clone(),
+            is_dir: true,
+            is_expanded: root_expanded,
+        });
+        if root_expanded {
+            collect_rows(&root, 1, &self.expanded, &mut self.rows);
+        }
         if !self.rows.is_empty() && self.selected >= self.rows.len() {
             self.selected = self.rows.len() - 1;
         }
@@ -127,6 +152,25 @@ impl TuiSidebar {
             self.scroll_top = self.selected;
         } else if self.selected >= self.scroll_top + viewport_height {
             self.scroll_top = self.selected + 1 - viewport_height;
+        }
+    }
+
+    /// Expand all ancestor directories of `target`, rebuild the row list,
+    /// select the row matching `target`, and scroll it into view.
+    fn reveal_path(&mut self, target: &Path, viewport_height: usize) {
+        // Expand every ancestor directory between root and target.
+        if let Ok(rel) = target.strip_prefix(&self.root) {
+            let mut accum = self.root.clone();
+            for component in rel.parent().into_iter().flat_map(|p| p.components()) {
+                accum.push(component);
+                self.expanded.insert(accum.clone());
+            }
+        }
+        self.build_rows();
+        // Select the row whose path matches target, then scroll into view.
+        if let Some(idx) = self.rows.iter().position(|r| r.path == target) {
+            self.selected = idx;
+            self.ensure_visible(viewport_height);
         }
     }
 }
@@ -173,15 +217,22 @@ fn collect_rows(dir: &Path, depth: usize, expanded: &HashSet<PathBuf>, out: &mut
 /// ─── Prompt kind for CRUD operations ─────────────────────────────────────────
 #[derive(Clone, Debug)]
 enum PromptKind {
-    NewFile,
-    NewFolder,
+    /// New file inside the given directory.
+    NewFile(PathBuf),
+    /// New folder inside the given directory.
+    NewFolder(PathBuf),
     DeleteConfirm(PathBuf),
+    /// Rename: the path to rename; input will be the new bare name.
+    Rename(PathBuf),
+    /// Move: source path; input is destination dir (relative to project root).
+    MoveFile(PathBuf),
 }
 
 /// State for an active sidebar prompt shown in the command line area.
 struct SidebarPrompt {
     kind: PromptKind,
     input: String,
+    cursor: usize, // byte offset into input
 }
 
 // ─── Public entry point ───────────────────────────────────────────────────────
@@ -290,6 +341,8 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
     let mut last_draw = Instant::now()
         .checked_sub(min_frame)
         .unwrap_or_else(Instant::now);
+    // Auto-refresh sidebar to reflect external filesystem changes.
+    let mut last_sidebar_refresh = Instant::now();
 
     loop {
         // Sync viewport dimensions so ensure_cursor_visible uses real terminal size.
@@ -401,6 +454,12 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
             if engine.poll_project_replace() {
                 needs_redraw = true;
             }
+            // Auto-refresh explorer to reflect external filesystem changes.
+            if sidebar.visible && last_sidebar_refresh.elapsed() >= Duration::from_secs(2) {
+                sidebar.build_rows();
+                last_sidebar_refresh = Instant::now();
+                needs_redraw = true;
+            }
             continue;
         }
 
@@ -416,10 +475,54 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                             let input = prompt.input.clone();
                             let kind = prompt.kind.clone();
                             sidebar_prompt = None;
-                            handle_sidebar_prompt(engine, &mut sidebar, kind, input);
+                            let vh = terminal
+                                .size()
+                                .map(|s| s.height.saturating_sub(4) as usize)
+                                .unwrap_or(40);
+                            handle_sidebar_prompt(engine, &mut sidebar, kind, input, vh);
                         }
                         KeyCode::Backspace => {
-                            prompt.input.pop();
+                            if prompt.cursor > 0 {
+                                // Find the previous char boundary
+                                let prev = prompt.input[..prompt.cursor]
+                                    .char_indices()
+                                    .next_back()
+                                    .map(|(i, _)| i)
+                                    .unwrap_or(0);
+                                prompt.input.remove(prev);
+                                prompt.cursor = prev;
+                            }
+                        }
+                        KeyCode::Delete => {
+                            if prompt.cursor < prompt.input.len() {
+                                prompt.input.remove(prompt.cursor);
+                            }
+                        }
+                        KeyCode::Left => {
+                            if prompt.cursor > 0 {
+                                prompt.cursor = prompt.input[..prompt.cursor]
+                                    .char_indices()
+                                    .next_back()
+                                    .map(|(i, _)| i)
+                                    .unwrap_or(0);
+                            }
+                        }
+                        KeyCode::Right => {
+                            if prompt.cursor < prompt.input.len() {
+                                let rest = &prompt.input[prompt.cursor..];
+                                let next = rest
+                                    .char_indices()
+                                    .nth(1)
+                                    .map(|(i, _)| prompt.cursor + i)
+                                    .unwrap_or(prompt.input.len());
+                                prompt.cursor = next;
+                            }
+                        }
+                        KeyCode::Home => {
+                            prompt.cursor = 0;
+                        }
+                        KeyCode::End => {
+                            prompt.cursor = prompt.input.len();
                         }
                         KeyCode::Char(c)
                             if key_event.kind != KeyEventKind::Release
@@ -431,20 +534,27 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                                     let kind = prompt.kind.clone();
                                     sidebar_prompt = None;
                                     if c == 'y' {
+                                        let vh = terminal
+                                            .size()
+                                            .map(|s| s.height.saturating_sub(3) as usize)
+                                            .unwrap_or(40);
                                         handle_sidebar_prompt(
                                             engine,
                                             &mut sidebar,
                                             kind,
                                             "y".to_string(),
+                                            vh,
                                         );
                                     }
                                 }
                             } else {
-                                prompt.input.push(c);
+                                prompt.input.insert(prompt.cursor, c);
+                                prompt.cursor += c.len_utf8();
                             }
                         }
                         _ => {}
                     }
+                    needs_redraw = true;
                     continue;
                 }
 
@@ -488,7 +598,10 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                                 sidebar.has_focus = false;
                             }
                             KeyCode::Char('b') if ctrl => {
+                                sidebar.visible = false;
                                 sidebar.has_focus = false;
+                                engine.session.explorer_visible = false;
+                                let _ = engine.session.save();
                             }
                             // Input mode: typing into the search or replace box
                             _ if sidebar.search_input_mode => match key_event.code {
@@ -576,16 +689,22 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                                 }
                             }
                         }
+                        needs_redraw = true;
                         continue;
                     }
 
                     match key_event.code {
                         // Return focus to editor
                         KeyCode::Esc => {
+                            sidebar.explorer_mode = false;
                             sidebar.has_focus = false;
                         }
                         KeyCode::Char('b') if ctrl => {
+                            sidebar.explorer_mode = false;
+                            sidebar.visible = false;
                             sidebar.has_focus = false;
+                            engine.session.explorer_visible = false;
+                            let _ = engine.session.save();
                         }
                         // Navigate down
                         KeyCode::Char('j') | KeyCode::Down => {
@@ -594,7 +713,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                                     (sidebar.selected + 1).min(sidebar.rows.len() - 1);
                             }
                             if let Ok(size) = terminal.size() {
-                                let h = size.height.saturating_sub(3) as usize; // header + status + cmd
+                                let h = size.height.saturating_sub(4) as usize; // tab + header + status + cmd
                                 sidebar.ensure_visible(h);
                             }
                         }
@@ -602,7 +721,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                         KeyCode::Char('k') | KeyCode::Up => {
                             sidebar.selected = sidebar.selected.saturating_sub(1);
                             if let Ok(size) = terminal.size() {
-                                let h = size.height.saturating_sub(3) as usize;
+                                let h = size.height.saturating_sub(4) as usize;
                                 sidebar.ensure_visible(h);
                             }
                         }
@@ -640,37 +759,109 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                                 }
                             }
                         }
-                        // New file prompt
-                        KeyCode::Char('a') if !ctrl => {
-                            sidebar_prompt = Some(SidebarPrompt {
-                                kind: PromptKind::NewFile,
-                                input: String::new(),
-                            });
-                        }
-                        // New folder prompt
-                        KeyCode::Char('A') if !ctrl => {
-                            sidebar_prompt = Some(SidebarPrompt {
-                                kind: PromptKind::NewFolder,
-                                input: String::new(),
-                            });
-                        }
-                        // Delete prompt
-                        KeyCode::Char('D') if !ctrl => {
-                            let idx = sidebar.selected;
-                            if idx < sidebar.rows.len() {
-                                let path = sidebar.rows[idx].path.clone();
-                                sidebar_prompt = Some(SidebarPrompt {
-                                    kind: PromptKind::DeleteConfirm(path),
-                                    input: String::new(),
-                                });
+                        // Explorer CRUD keys — resolved from settings
+                        KeyCode::Char(c) if !ctrl => {
+                            if let Some(action) = engine.settings.explorer_keys.resolve(c) {
+                                match action {
+                                    ExplorerAction::NewFile | ExplorerAction::NewFolder => {
+                                        let target_dir = {
+                                            let idx = sidebar.selected;
+                                            if idx < sidebar.rows.len() {
+                                                let p = &sidebar.rows[idx].path;
+                                                if p.is_dir() {
+                                                    p.clone()
+                                                } else {
+                                                    p.parent()
+                                                        .unwrap_or(&sidebar.root)
+                                                        .to_path_buf()
+                                                }
+                                            } else {
+                                                sidebar.root.clone()
+                                            }
+                                        };
+                                        // Pre-fill with target dir relative to root + /
+                                        let prefill = target_dir
+                                            .strip_prefix(&sidebar.root)
+                                            .unwrap_or(&target_dir)
+                                            .to_string_lossy()
+                                            .to_string();
+                                        let prefill = if prefill.is_empty() {
+                                            String::new()
+                                        } else {
+                                            format!("{}/", prefill)
+                                        };
+                                        let kind = if action == ExplorerAction::NewFile {
+                                            PromptKind::NewFile(sidebar.root.clone())
+                                        } else {
+                                            PromptKind::NewFolder(sidebar.root.clone())
+                                        };
+                                        let cursor = prefill.len();
+                                        sidebar_prompt = Some(SidebarPrompt {
+                                            kind,
+                                            input: prefill,
+                                            cursor,
+                                        });
+                                    }
+                                    ExplorerAction::Delete => {
+                                        let idx = sidebar.selected;
+                                        if idx < sidebar.rows.len() {
+                                            let path = sidebar.rows[idx].path.clone();
+                                            sidebar_prompt = Some(SidebarPrompt {
+                                                kind: PromptKind::DeleteConfirm(path),
+                                                input: String::new(),
+                                                cursor: 0,
+                                            });
+                                        }
+                                    }
+                                    ExplorerAction::Rename => {
+                                        let idx = sidebar.selected;
+                                        if idx < sidebar.rows.len() {
+                                            let path = sidebar.rows[idx].path.clone();
+                                            let current_name = path
+                                                .file_name()
+                                                .map(|n| n.to_string_lossy().to_string())
+                                                .unwrap_or_default();
+                                            let cursor = current_name.len();
+                                            sidebar_prompt = Some(SidebarPrompt {
+                                                kind: PromptKind::Rename(path),
+                                                input: current_name,
+                                                cursor,
+                                            });
+                                        }
+                                    }
+                                    ExplorerAction::MoveFile => {
+                                        let idx = sidebar.selected;
+                                        if idx < sidebar.rows.len() {
+                                            let path = sidebar.rows[idx].path.clone();
+                                            // Pre-fill with full relative path from root
+                                            let prefill = path
+                                                .strip_prefix(&sidebar.root)
+                                                .unwrap_or(&path)
+                                                .to_string_lossy()
+                                                .to_string();
+                                            let cursor = prefill.len();
+                                            sidebar_prompt = Some(SidebarPrompt {
+                                                kind: PromptKind::MoveFile(path),
+                                                input: prefill,
+                                                cursor,
+                                            });
+                                        }
+                                    }
+                                    ExplorerAction::ToggleMode => {
+                                        sidebar.explorer_mode = !sidebar.explorer_mode;
+                                        if sidebar.explorer_mode {
+                                            engine.message = "Explorer mode ON \u{2014} a/A/r/M/D  (? to exit, :help explorer for details)".to_string();
+                                        } else {
+                                            sidebar.has_focus = false;
+                                            engine.message = "Explorer mode OFF".to_string();
+                                        }
+                                    }
+                                }
                             }
-                        }
-                        // Refresh
-                        KeyCode::Char('R') if !ctrl => {
-                            sidebar.build_rows();
                         }
                         _ => {}
                     }
+                    needs_redraw = true;
                     continue;
                 }
 
@@ -679,8 +870,13 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                     // Ctrl-B: toggle sidebar visibility
                     if ctrl && key_name == "b" {
                         sidebar.visible = !sidebar.visible;
+                        if !sidebar.visible {
+                            sidebar.has_focus = false;
+                            sidebar.explorer_mode = false;
+                        }
                         engine.session.explorer_visible = sidebar.visible;
                         let _ = engine.session.save();
+                        needs_redraw = true;
                         continue;
                     }
 
@@ -693,6 +889,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                         sidebar.visible = true;
                         sidebar.active_panel = TuiPanel::Explorer;
                         sidebar.has_focus = true;
+                        needs_redraw = true;
                         continue;
                     }
 
@@ -707,6 +904,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                         sidebar.has_focus = true;
                         sidebar.search_input_mode = true;
                         sidebar.replace_input_focused = false;
+                        needs_redraw = true;
                         continue;
                     }
 
@@ -717,16 +915,19 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                         match key_event.code {
                             KeyCode::Left => {
                                 sidebar_width = sidebar_width.saturating_sub(1).max(15);
+                                needs_redraw = true;
                                 continue;
                             }
                             KeyCode::Right => {
                                 sidebar_width = (sidebar_width + 1).min(60);
+                                needs_redraw = true;
                                 continue;
                             }
                             _ => {}
                         }
                     }
 
+                    let prev_tab = engine.active_tab;
                     let action = engine.handle_key(&key_name, unicode, ctrl);
                     if handle_action(engine, action) {
                         break;
@@ -738,6 +939,16 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                         }
                         if !has_more {
                             break;
+                        }
+                    }
+                    // Reveal the active file in the sidebar when the tab changed
+                    if engine.active_tab != prev_tab {
+                        if let Some(path) = engine.file_path().cloned() {
+                            let h = terminal
+                                .size()
+                                .map(|s| s.height.saturating_sub(4) as usize)
+                                .unwrap_or(40);
+                            sidebar.reveal_path(&path, h);
                         }
                     }
                     // Adjust fuzzy scroll to keep selected item visible
@@ -803,6 +1014,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                                 &mut dragging_scrollbar,
                                 &mut dragging_sidebar_search,
                                 last_layout.as_ref(),
+                                &mut sidebar_prompt,
                             );
                             mouse_event = next;
                             break;
@@ -821,6 +1033,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                     &mut dragging_scrollbar,
                     &mut dragging_sidebar_search,
                     last_layout.as_ref(),
+                    &mut sidebar_prompt,
                 );
             }
             Event::Resize(_, _) => {}
@@ -843,6 +1056,7 @@ fn handle_mouse(
     dragging_scrollbar: &mut Option<ScrollDragState>,
     dragging_sidebar_search: &mut Option<SidebarScrollDrag>,
     last_layout: Option<&render::ScreenLayout>,
+    sidebar_prompt: &mut Option<SidebarPrompt>,
 ) -> u16 {
     let col = ev.column;
     let row = ev.row;
@@ -992,10 +1206,14 @@ fn handle_mouse(
 
     // ── Activity bar ──────────────────────────────────────────────────────────
     if col < ACTIVITY_BAR_WIDTH {
+        // Activity bar height = term_height - 2 (status+cmd) - quickfix
+        let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
+        let bar_height = term_height.saturating_sub(2 + qf_rows);
+        let settings_row = bar_height.saturating_sub(1);
         let target_panel = match row {
             0 => Some(TuiPanel::Explorer),
             1 => Some(TuiPanel::Search),
-            2 => Some(TuiPanel::Settings),
+            r if r == settings_row && settings_row >= 2 => Some(TuiPanel::Settings),
             _ => None,
         };
         if let Some(panel) = target_panel {
@@ -1017,7 +1235,9 @@ fn handle_mouse(
 
     // ── Sidebar panel area ────────────────────────────────────────────────────
     if sidebar.visible && col < ACTIVITY_BAR_WIDTH + sidebar_width {
-        sidebar.has_focus = true;
+        if sidebar.explorer_mode {
+            sidebar.has_focus = true;
+        }
         // Rightmost column of the sidebar is the scrollbar column.
         let sb_col = ACTIVITY_BAR_WIDTH + sidebar_width - 1;
 
@@ -1036,20 +1256,87 @@ fn handle_mouse(
             }
 
             if row == 0 {
-                return sidebar_width; // header row
+                // Header row: check if a toolbar button was clicked.
+                // Toolbar is right-aligned: 5 NF icons × 3 cols = 15.
+                let toolbar_start = ACTIVITY_BAR_WIDTH + sidebar_width - EXPLORER_TOOLBAR_LEN;
+                if col >= toolbar_start {
+                    let btn = (col - toolbar_start) / 3; // 0=new-file 1=new-folder 2=delete 3=explorer-mode
+                    let idx = sidebar.selected;
+                    let selected_is_dir = idx < sidebar.rows.len() && sidebar.rows[idx].is_dir;
+                    match btn {
+                        0 | 1 if idx < sidebar.rows.len() => {
+                            let target = if selected_is_dir {
+                                &sidebar.rows[idx].path
+                            } else {
+                                sidebar.rows[idx].path.parent().unwrap_or(&sidebar.root)
+                            };
+                            let prefill = target
+                                .strip_prefix(&sidebar.root)
+                                .unwrap_or(target)
+                                .to_string_lossy()
+                                .to_string();
+                            let prefill = if prefill.is_empty() {
+                                String::new()
+                            } else {
+                                format!("{}/", prefill)
+                            };
+                            let kind = if btn == 0 {
+                                PromptKind::NewFile(sidebar.root.clone())
+                            } else {
+                                PromptKind::NewFolder(sidebar.root.clone())
+                            };
+                            let cursor = prefill.len();
+                            *sidebar_prompt = Some(SidebarPrompt {
+                                kind,
+                                input: prefill,
+                                cursor,
+                            });
+                        }
+                        2 => {
+                            if idx < sidebar.rows.len() {
+                                let path = sidebar.rows[idx].path.clone();
+                                *sidebar_prompt = Some(SidebarPrompt {
+                                    kind: PromptKind::DeleteConfirm(path),
+                                    input: String::new(),
+                                    cursor: 0,
+                                });
+                            }
+                        }
+                        3 => {
+                            // Pencil button — toggle explorer mode
+                            sidebar.explorer_mode = !sidebar.explorer_mode;
+                            if sidebar.explorer_mode {
+                                sidebar.has_focus = true;
+                                engine.message = "Explorer mode ON \u{2014} a/A/r/M/D  (? to exit, :help explorer for details)".to_string();
+                            } else {
+                                sidebar.has_focus = false;
+                                engine.message = "Explorer mode OFF".to_string();
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                return sidebar_width;
             }
             let tree_row = (row as usize).saturating_sub(1) + sidebar.scroll_top;
             if tree_row < sidebar.rows.len() {
-                if sidebar.selected == tree_row {
-                    if sidebar.rows[tree_row].is_dir {
+                if sidebar.explorer_mode {
+                    // Explorer mode: click selects; second click on dir toggles
+                    if sidebar.selected == tree_row && sidebar.rows[tree_row].is_dir {
                         sidebar.toggle_dir(tree_row);
                     } else {
-                        let path = sidebar.rows[tree_row].path.clone();
-                        engine.open_file_in_tab(&path);
-                        sidebar.has_focus = false;
+                        sidebar.selected = tree_row;
                     }
                 } else {
-                    sidebar.selected = tree_row;
+                    // Default: click opens files immediately, dirs toggle
+                    if sidebar.rows[tree_row].is_dir {
+                        sidebar.selected = tree_row;
+                        sidebar.toggle_dir(tree_row);
+                    } else {
+                        sidebar.selected = tree_row;
+                        let path = sidebar.rows[tree_row].path.clone();
+                        engine.open_file_in_tab(&path);
+                    }
                 }
             }
         } else if sidebar.active_panel == TuiPanel::Search {
@@ -1125,6 +1412,29 @@ fn handle_mouse(
     sidebar.has_focus = false;
     if col < editor_left {
         return sidebar_width; // separator column
+    }
+
+    // ── Tab bar click (row 0 of editor column) ──────────────────────────
+    if row == 0 {
+        if let Some(layout) = last_layout {
+            let rel_col = col - editor_left;
+            let mut x: u16 = 0;
+            for (i, tab) in layout.tab_bar.iter().enumerate() {
+                let tab_width = tab.name.len() as u16 + 1; // +1 for trailing separator
+                if rel_col >= x && rel_col < x + tab_width {
+                    if i < engine.tabs.len() {
+                        engine.active_tab = i;
+                        // Reveal the active file in the sidebar tree
+                        if let Some(path) = engine.file_path().cloned() {
+                            sidebar.reveal_path(&path, term_height.saturating_sub(4) as usize);
+                        }
+                    }
+                    break;
+                }
+                x += tab_width;
+            }
+        }
+        return sidebar_width;
     }
 
     let rel_col = col - editor_left;
@@ -1397,18 +1707,35 @@ fn draw_frame(
     );
 
     if let Some(prompt) = sidebar_prompt {
-        let prompt_text = match &prompt.kind {
-            PromptKind::NewFile => format!("New file: {}", prompt.input),
-            PromptKind::NewFolder => format!("New folder: {}", prompt.input),
+        let (prefix, input_cursor) = match &prompt.kind {
+            PromptKind::NewFile(_) => ("New file: ".to_string(), prompt.cursor),
+            PromptKind::NewFolder(_) => ("New folder: ".to_string(), prompt.cursor),
             PromptKind::DeleteConfirm(path) => {
                 let name = path
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_default();
-                format!("Delete '{}'? (y/n)", name)
+                (format!("Delete '{}'? (y/n)", name), 0)
             }
+            PromptKind::Rename(path) => {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                (format!("Rename '{}' to: ", name), prompt.cursor)
+            }
+            PromptKind::MoveFile(_) => ("Move to: ".to_string(), prompt.cursor),
         };
-        render_prompt_line(frame.buffer_mut(), cmd_area, &prompt_text, theme);
+        let prompt_text = format!("{}{}", prefix, prompt.input);
+        // Cursor position in rendered chars: prefix char count + cursor char count
+        let cursor_char_pos = prefix.chars().count() + prompt.input[..input_cursor].chars().count();
+        render_prompt_line(
+            frame.buffer_mut(),
+            cmd_area,
+            &prompt_text,
+            cursor_char_pos,
+            theme,
+        );
     } else {
         render_command_line(frame.buffer_mut(), cmd_area, &screen.command, theme);
     }
@@ -1421,31 +1748,31 @@ fn handle_sidebar_prompt(
     sidebar: &mut TuiSidebar,
     kind: PromptKind,
     input: String,
+    viewport_height: usize,
 ) {
-    let cwd = sidebar.root.clone();
     match kind {
-        PromptKind::NewFile => {
+        PromptKind::NewFile(target_dir) => {
             let name = input.trim();
             if !name.is_empty() {
-                let path = cwd.join(name);
+                let path = target_dir.join(name);
                 if let Err(e) = fs::write(&path, "") {
                     engine.message = format!("Error creating file: {}", e);
                 } else {
-                    sidebar.build_rows();
+                    sidebar.reveal_path(&path, viewport_height);
                     if let Err(e) = engine.open_file_with_mode(&path, OpenMode::Permanent) {
                         engine.message = e;
                     }
                 }
             }
         }
-        PromptKind::NewFolder => {
+        PromptKind::NewFolder(target_dir) => {
             let name = input.trim();
             if !name.is_empty() {
-                let path = cwd.join(name);
+                let path = target_dir.join(name);
                 if let Err(e) = fs::create_dir_all(&path) {
                     engine.message = format!("Error creating folder: {}", e);
                 } else {
-                    sidebar.build_rows();
+                    sidebar.reveal_path(&path, viewport_height);
                 }
             }
         }
@@ -1460,6 +1787,47 @@ fn handle_sidebar_prompt(
                     engine.message = format!("Error deleting: {}", e);
                 } else {
                     sidebar.build_rows();
+                }
+            }
+        }
+        PromptKind::Rename(path) => {
+            let new_name = input.trim();
+            if !new_name.is_empty() {
+                match engine.rename_file(&path, new_name) {
+                    Ok(()) => {
+                        sidebar.build_rows();
+                        engine.message = format!("Renamed to '{}'", new_name);
+                    }
+                    Err(e) => {
+                        engine.message = e;
+                    }
+                }
+            }
+        }
+        PromptKind::MoveFile(src) => {
+            let dest_str = input.trim();
+            if !dest_str.is_empty() {
+                // Resolve destination relative to project root
+                let dest = if std::path::Path::new(dest_str).is_absolute() {
+                    std::path::PathBuf::from(dest_str)
+                } else {
+                    sidebar.root.join(dest_str)
+                };
+                match engine.move_file(&src, &dest) {
+                    Ok(()) => {
+                        // engine.move_file resolves the final path; figure out
+                        // the actual destination for reveal_path.
+                        let final_dest = if dest.is_dir() {
+                            dest.join(src.file_name().unwrap_or_default())
+                        } else {
+                            dest.clone()
+                        };
+                        sidebar.reveal_path(&final_dest, viewport_height);
+                        engine.message = format!("Moved to '{}'", final_dest.display());
+                    }
+                    Err(e) => {
+                        engine.message = e;
+                    }
                 }
             }
         }
@@ -2054,6 +2422,25 @@ fn render_window(frame: &mut ratatui::Frame, area: Rect, window: &RenderedWindow
             break;
         }
 
+        // Diff background: repaint the full row when the line is part of a diff
+        let line_bg = match line.diff_status {
+            Some(DiffLine::Added) => rc(theme.diff_added_bg),
+            Some(DiffLine::Removed) => rc(theme.diff_removed_bg),
+            _ => window_bg,
+        };
+        if line_bg != window_bg {
+            for col in 0..area.width {
+                set_cell(
+                    frame.buffer_mut(),
+                    area.x + col,
+                    screen_y,
+                    ' ',
+                    default_fg,
+                    line_bg,
+                );
+            }
+        }
+
         // Gutter
         if gutter_w > 0 {
             let line_num_fg = rc(if line.is_current_line {
@@ -2075,7 +2462,7 @@ fn render_window(frame: &mut ratatui::Frame, area: Rect, window: &RenderedWindow
                 } else {
                     line_num_fg
                 };
-                set_cell(frame.buffer_mut(), gx, screen_y, ch, fg, window_bg);
+                set_cell(frame.buffer_mut(), gx, screen_y, ch, fg, line_bg);
             }
             // Diagnostic gutter icon (overwrite leftmost gutter char)
             if let Some(severity) = window.diagnostic_gutter.get(&line.line_idx) {
@@ -2091,7 +2478,7 @@ fn render_window(frame: &mut ratatui::Frame, area: Rect, window: &RenderedWindow
                     screen_y,
                     diag_ch,
                     diag_color,
-                    window_bg,
+                    line_bg,
                 );
             }
         }
@@ -2110,7 +2497,7 @@ fn render_window(frame: &mut ratatui::Frame, area: Rect, window: &RenderedWindow
             line,
             window.scroll_left,
             theme,
-            window_bg,
+            line_bg,
         );
 
         // Diagnostic underlines (UNDERLINED modifier on diagnostic spans)
@@ -2485,14 +2872,13 @@ fn render_activity_bar(
         }
     }
 
-    // Panel buttons: (row offset, panel, icon char)
-    let buttons: &[(u16, TuiPanel, char)] = &[
+    // Top buttons: Explorer and Search
+    let top_buttons: &[(u16, TuiPanel, char)] = &[
         (0, TuiPanel::Explorer, '\u{f07c}'), // nf-fa-folder_open
         (1, TuiPanel::Search, '\u{f002}'),   // nf-fa-search
-        (2, TuiPanel::Settings, '\u{f013}'), // nf-fa-cog
     ];
 
-    for &(row_off, panel, icon) in buttons {
+    for &(row_off, panel, icon) in top_buttons {
         let y = area.y + row_off;
         if y >= area.y + area.height {
             break;
@@ -2503,13 +2889,28 @@ fn render_activity_bar(
         } else {
             (inactive_fg, bar_bg)
         };
-        // Fill the full row for this button
         for x in area.x..area.x + area.width {
             set_cell(buf, x, y, ' ', fg, bg);
         }
-        // Icon centred in the 3-char width: col 1
         if area.width >= 3 {
             set_cell(buf, area.x + 1, y, icon, fg, bg);
+        }
+    }
+
+    // Settings button pinned to the bottom row (like VSCode)
+    if area.height >= 1 {
+        let y = area.y + area.height - 1;
+        let is_active = sidebar.visible && sidebar.active_panel == TuiPanel::Settings;
+        let (fg, bg) = if is_active {
+            (icon_fg, active_bg)
+        } else {
+            (inactive_fg, bar_bg)
+        };
+        for x in area.x..area.x + area.width {
+            set_cell(buf, x, y, ' ', fg, bg);
+        }
+        if area.width >= 3 {
+            set_cell(buf, area.x + 1, y, '\u{f013}', fg, bg); // nf-fa-cog
         }
     }
 }
@@ -2576,20 +2977,42 @@ fn render_sidebar(
         set_cell(buf, x, header_y, ch, header_fg, header_bg);
         x += 1;
     }
-    // Toolbar icons on the right: new file, new folder, delete, refresh
-    let toolbar: &[&str] = &["\u{f15b}", "\u{f07b}", "\u{f1f8}", "\u{f021}"];
-    let toolbar_str: String = toolbar.iter().fold(String::new(), |mut acc, s| {
-        acc.push('[');
-        acc.push_str(s);
-        acc.push(']');
-        acc
-    });
-    let toolbar_chars: Vec<char> = toolbar_str.chars().collect();
-    let toolbar_len = toolbar_chars.len() as u16;
+    // Toolbar buttons (right-aligned, Nerd Font icons):
+    //   new-file  new-folder  delete  refresh  explorer-mode
+    // Each icon occupies 2 terminal cols (Nerd Font) + 1 space = 3 cols per button.
+    // EXPLORER_TOOLBAR_LEN = 15 (5 NF icons × 3 cols).
+    // When a file (not folder) is selected, new-file/new-folder icons are dimmed.
+    let selected_is_dir = {
+        let idx = sidebar.selected;
+        idx < sidebar.rows.len() && sidebar.rows[idx].is_dir
+    };
+    let dim_fg = rc(theme.line_number_fg); // dimmed color for unavailable buttons
+    let pencil_fg = if sidebar.explorer_mode {
+        rc(theme.keyword)
+    } else {
+        header_fg
+    };
+    let icons: &[(char, bool, ratatui::style::Color)] = &[
+        (
+            '\u{f15b}',
+            selected_is_dir,
+            if selected_is_dir { header_fg } else { dim_fg },
+        ), // new file
+        (
+            '\u{f07b}',
+            selected_is_dir,
+            if selected_is_dir { header_fg } else { dim_fg },
+        ), // new folder
+        ('\u{f1f8}', true, header_fg), // delete
+        ('\u{f040}', true, pencil_fg), // pencil (explorer mode toggle)
+    ];
+    let toolbar_len = EXPLORER_TOOLBAR_LEN;
     if toolbar_len < area.width {
         let mut tx = area.x + area.width - toolbar_len;
-        for &ch in &toolbar_chars {
-            set_cell(buf, tx, header_y, ch, header_fg, header_bg);
+        for &(icon, _enabled, fg) in icons {
+            set_cell(buf, tx, header_y, icon, fg, header_bg);
+            tx += 2; // icon is 2-cols wide (Nerd Font)
+            set_cell(buf, tx, header_y, ' ', header_fg, header_bg);
             tx += 1;
         }
     }
@@ -3160,26 +3583,44 @@ fn render_search_panel(
 }
 
 /// Render a one-line prompt in the command area (used for sidebar CRUD input).
-fn render_prompt_line(buf: &mut ratatui::buffer::Buffer, area: Rect, text: &str, theme: &Theme) {
+fn render_prompt_line(
+    buf: &mut ratatui::buffer::Buffer,
+    area: Rect,
+    text: &str,
+    cursor_char_pos: usize,
+    theme: &Theme,
+) {
     let fg = rc(theme.command_fg);
     let bg = rc(theme.command_bg);
     for x in area.x..area.x + area.width {
         set_cell(buf, x, area.y, ' ', fg, bg);
     }
     let mut x = area.x;
+    let mut char_idx = 0;
+    let mut cursor_x = None;
     for ch in text.chars() {
         if x >= area.x + area.width {
             break;
         }
+        if char_idx == cursor_char_pos {
+            cursor_x = Some(x);
+        }
         set_cell(buf, x, area.y, ch, fg, bg);
         x += 1;
+        char_idx += 1;
     }
-    // Show cursor at end of text
-    if x < area.x + area.width {
-        let cell = buf.get_mut(x, area.y);
-        let old_fg = cell.fg;
-        let old_bg = cell.bg;
-        cell.set_fg(old_bg).set_bg(old_fg);
+    // If cursor is at the end (past all chars)
+    if cursor_x.is_none() && char_idx == cursor_char_pos {
+        cursor_x = Some(x);
+    }
+    // Show cursor (inverted colors)
+    if let Some(cx) = cursor_x {
+        if cx < area.x + area.width {
+            let cell = buf.get_mut(cx, area.y);
+            let old_fg = cell.fg;
+            let old_bg = cell.bg;
+            cell.set_fg(old_bg).set_bg(old_fg);
+        }
     }
 }
 

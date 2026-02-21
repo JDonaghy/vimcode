@@ -1,5 +1,51 @@
 # VimCode Implementation Plan
 
+## Recently Completed (Session 59)
+
+### ✅ Explorer Polish
+- **Prompt delay fix** — early `continue` statements in TUI event loop now set `needs_redraw = true` before continuing, so explorer mode prompts (M, a, A, etc.) appear instantly instead of waiting for the next event
+- **Cursor key editing in prompts** — `SidebarPrompt` gained `cursor: usize` field; Left/Right/Home/End/Delete keys work in all sidebar prompts (move, new file, new folder, rename); Backspace and char insert are cursor-position-aware
+- **Move path editing** — `engine.move_file()` now accepts either a directory (appends filename) or a full destination path (rename+move); prompt pre-fills with full relative path including filename; `../` paths resolve correctly
+- **Auto-refresh** — TUI sidebar rebuilds every 2s when visible and idle (`last_sidebar_refresh` timer); external filesystem changes reflected automatically
+- **Root folder entry** — project root shown at top of explorer tree (uppercase name, always expanded) in both GTK (`build_file_tree_with_root()` wrapper) and TUI (`build_rows()` inserts root at depth 0); select root + press `a` to create files at the top level
+- **Removed refresh** — `ExplorerAction::Refresh` variant, `refresh` field from `ExplorerKeys`, refresh toolbar icon (GTK + TUI), and `R` key binding all removed; auto-refresh makes manual refresh unnecessary
+- **New file/folder prompts** — pre-fill with target directory path relative to root so user can see and edit the destination
+- File changes: `tui_main.rs` (+320 lines), `main.rs` (+150 lines), `engine.rs` (move_file API, help text), `settings.rs` (removed refresh)
+- Tests: no change (593 total)
+
+---
+
+## Recently Completed (Session 58)
+
+### ✅ Configurable Explorer Keys + Help Hint
+- **`ExplorerKeys` struct** in `settings.rs` — 6 configurable fields (`new_file`, `new_folder`, `delete`, `rename`, `move_file`, `toggle_mode`) with serde per-field defaults; `ExplorerAction` enum + `resolve(char)` dispatcher
+- **TUI sidebar refactor** — replaced hardcoded `KeyCode::Char` arms with `engine.settings.explorer_keys.resolve(c)` match
+- **Explorer mode message** — now reads `Explorer mode ON — a/A/r/M/D  (? to exit, :help explorer for details)`
+- **`:help explorer`** — added configurable keys note with JSON example
+- Tests: 588 → 593 (5 new: explorer_keys_default, resolve, custom_override, serde_partial, in_settings_serde)
+
+---
+
+## Recently Completed (Session 57)
+
+### ✅ Help System + Move-File Fix
+- **`:help [topic]`** / **`:h [topic]`** — opens help text in a read-only vsplit; topics: `explorer` (sidebar keys + explorer mode), `keys` (normal mode reference), `commands` (command mode reference); unknown topic shows error message; no-arg shows topic index
+- **Move file selection:** sidebar `M` (move file) now calls `reveal_path(&dest)` instead of `build_rows()`, so the moved file is selected at its new location
+- Tests: 584 → 588 (4 new: help_command_explorer, help_command_no_args, help_alias_h, help_unknown_topic)
+
+---
+
+## Recently Completed (Session 56)
+
+### ✅ VSCode-Like Explorer + File Diff
+- **Engine:** `rename_file()` / `move_file()` with open-buffer path updates; `DiffLine` enum; `diff_window_pair` + `diff_results` fields; `cmd_diffthis/off/split`; `lcs_diff()` O(N×M) LCS with 3000-line cap; `:diffthis`/`:diffoff`/`:diffsplit` commands
+- **render.rs:** `diff_status: Option<DiffLine>` on `RenderedLine`; `diff_added_bg`/`diff_removed_bg` in Theme; populated in `build_rendered_window()`
+- **GTK:** F2 inline rename; right-click `GestureClick` → `Popover` context menu; DragSource + DropTarget for file move; diff bg rendering; `SelectForDiff`/`DiffWithSelected` flow; create-in-selected-folder
+- **TUI:** `PromptKind::Rename(PathBuf)` + `MoveFile(PathBuf)`; `r`/`M` keys; create-in-selected-folder (`NewFile(PathBuf)` / `NewFolder(PathBuf)`); diff bg via `line_bg` per-row
+- **Tests:** 571 → 584 (13 new: rename_file ×3, move_file ×2, lcs_diff ×5, diffthis/off/split ×3)
+
+---
+
 ## Recently Completed (Session 55)
 
 ### ✅ Quickfix Window
@@ -321,8 +367,8 @@
 - [x] **`is`/`as` sentence text objects** — inner/around sentence (`.`/`!`/`?`-delimited)
 - [x] **Enhanced project search** — regex/case/whole-word toggles; `.gitignore`-aware via `ignore` crate; 10k result cap; GTK toggle buttons + TUI Alt+C/W/R
 - [x] **VSCode-style replace across files** — replace all matches in project; skip dirty buffers; reload open buffers; regex capture group backreferences
-- [ ] **`:grep` / `:vimgrep`** — project-wide search, populate quickfix list *(lower priority)*
-- [ ] **Quickfix window** — `:copen`, `:cn`, `:cp` navigation *(lower priority)*
+- [x] **`:grep` / `:vimgrep`** — project-wide search, populate quickfix list
+- [x] **Quickfix window** — `:copen`, `:cn`, `:cp` navigation
 - [x] **`it`/`at` tag text objects** — inner/around HTML/XML tag
 
 ### Big Features

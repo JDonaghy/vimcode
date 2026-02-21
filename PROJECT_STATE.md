@@ -1,10 +1,10 @@
 # VimCode Project State
 
-**Last updated:** Feb 20, 2026 (Session 55)
+**Last updated:** Feb 21, 2026 (Session 59)
 
 ## Status
 
-**Quickfix window:** `:grep`/`:vimgrep` populates a persistent 6-row bottom panel; `:copen`/`:cclose`/`:cn`/`:cp`/`:cc N` commands; j/k/Enter/q navigate and jump when focused — 571 tests passing
+**Explorer polish:** Root folder entry at top of tree (GTK + TUI); auto-refresh filesystem watching (2s timer, no manual refresh needed); cursor key editing in move/create prompts (Left/Right/Home/End/Delete); full-path pre-fill for move operations; removed refresh button/key/setting — 593 tests passing
 
 ### Core Vim (Complete)
 - Seven modes (Normal/Insert/Visual/Visual Line/Visual Block/Command/Search)
@@ -78,14 +78,27 @@
 ### File Explorer (Complete)
 - VSCode-style sidebar (Ctrl-B toggle, Ctrl-Shift-E focus)
 - Tree view with icons, expand/collapse folders
-- CRUD operations (create/delete files/folders)
-- **Preview mode (NEW):**
+- CRUD operations (create/delete/rename/move files/folders)
+- **Preview mode:**
   - Single-click → preview (italic/dimmed tab, replaceable)
   - Double-click → permanent
   - Edit/save → auto-promote
   - `:ls` shows [Preview] suffix
+- **Rename:** F2 inline rename in GTK tree view; `r` key prompt in TUI
+- **Move:** Drag-and-drop in GTK; `M` key prompt in TUI
+- **Right-click context menu (GTK):** New File / New Folder / Rename / Delete / Copy Path / Select for Diff
+- **Create in selected folder:** New files/folders created inside the currently selected directory (not always root)
 - Active file highlighting, auto-expand parents
 - Error handling, name validation
+
+### File Diff (Complete)
+- `:diffthis` — mark current window as diff participant; second `:diffthis` in another window activates diff
+- `:diffoff` — clear diff mode and highlighting
+- `:diffsplit <path>` — open file in vsplit and immediately activate diff between the two windows
+- LCS (Longest Common Subsequence) diff algorithm — cap at 3000 lines per side
+- Added lines: dark green background; Removed lines: dark red background
+- Both GTK (Cairo rectangle bg) and TUI (cell bg color) backends render diff colors
+- `diff_window_pair: Option<(WindowId, WindowId)>` and `diff_results: HashMap<WindowId, Vec<DiffLine>>` on Engine
 
 ### Rendering
 - Syntax highlighting (Tree-sitter, Rust/Python/JavaScript/Go/C++, auto-detected by extension)
@@ -122,7 +135,7 @@
 
 ### TUI Backend (`src/tui_main.rs`)
 - Full editor in terminal via ratatui 0.27 + crossterm
-- **Sidebar:** File explorer tree (Ctrl-B toggle, Ctrl-Shift-E focus), j/k navigation, l/Enter open, h collapse, a/A/D CRUD, R refresh; **Search panel** (Ctrl-Shift-F): query input, Enter to run, j/k results, Enter opens file
+- **Sidebar:** File explorer tree (Ctrl-B toggle, Ctrl-Shift-E focus), j/k navigation, l/Enter open, h collapse, a/A/D/r/M CRUD+rename+move; root folder entry at top of tree; auto-refresh every 2s; cursor keys in prompts; **Search panel** (Ctrl-Shift-F): query input, Enter to run, j/k results, Enter opens file
 - **Activity bar:** 3-col strip with Explorer / Search / Settings panel icons (Nerd Font)
 - **Layout:** activity bar | sidebar | editor col (with its own tab bar); status + cmd full-width at bottom
 - **Mouse support:** click-to-position cursor, window switching, scroll wheel (targets window under cursor), scrollbar click-to-jump and drag (vertical + horizontal)
@@ -159,23 +172,23 @@
 ```
 vimcode/
 ├── src/
-│   ├── main.rs (~3870 lines) — GTK4/Relm4 UI, rendering, find dialog, sidebar resize, search/replace panel, fuzzy popup, quickfix panel
-│   ├── tui_main.rs (~3410 lines) — ratatui/crossterm TUI backend, sidebar, mouse, search/replace panel, fuzzy popup, quickfix panel
+│   ├── main.rs (~4410 lines) — GTK4/Relm4 UI, rendering, find dialog, sidebar resize, search/replace panel, fuzzy popup, quickfix panel, right-click context menu, drag-and-drop, diff rendering
+│   ├── tui_main.rs (~3860 lines) — ratatui/crossterm TUI backend, sidebar, mouse, search/replace panel, fuzzy popup, quickfix panel, rename/move prompts, diff rendering
 │   ├── icons.rs (~30 lines) — Nerd Font file-type icons (shared by GTK + TUI)
-│   ├── render.rs (~1240 lines) — Platform-agnostic rendering abstraction (ScreenLayout, max_col, QuickfixPanel)
-│   └── core/ (~17,100 lines) — Platform-agnostic logic
-│       ├── engine.rs (~17,100 lines) — Orchestrates everything, find/replace, macros, history, LSP, project search/replace, fuzzy finder, quickfix
+│   ├── render.rs (~1340 lines) — Platform-agnostic rendering abstraction (ScreenLayout, max_col, QuickfixPanel, DiffLine, diff_status)
+│   └── core/ (~23,700 lines) — Platform-agnostic logic
+│       ├── engine.rs (~17,940 lines) — Orchestrates everything, find/replace, macros, history, LSP, project search/replace, fuzzy finder, quickfix, rename/move, diff
 │       ├── lsp.rs (~1,200 lines) — LSP protocol transport + single-server client (request ID tracking)
 │       ├── lsp_manager.rs (~400 lines) — Multi-server coordinator with initialization guards
 │       ├── project_search.rs (~630 lines) — Regex/case/whole-word search + replace (ignore + regex crates)
 │       ├── buffer_manager.rs (~600 lines) — Buffer lifecycle
 │       ├── buffer.rs (~120 lines) — Rope-based storage
 │       ├── session.rs (~175 lines) — Session state persistence (sidebar_width added)
-│       ├── settings.rs (~640 lines) — JSON persistence, auto-init, :set parsing
+│       ├── settings.rs (~780 lines) — JSON persistence, auto-init, :set parsing, explorer keys
 │       ├── window.rs, tab.rs, view.rs, cursor.rs, mode.rs, syntax.rs
 │       ├── git.rs (~635 lines) — git subprocess integration (diff/blame/hunk parsing, branch detection, stage_hunk)
-│       └── Tests: 555 passing (9 find/replace, 14 macro, 8 session, 4 reverse search, 7 replace char, 5 undo line, 8 case change, 6 marks, 5 incremental search, 12 syntax/language, 6 history search, 11 fold tests, 12 git tests, 4 sidebar-preview tests, 5 auto-indent tests, 4 completion tests, 9 quit/ctrl-s tests, 1 session-restore test, 22 set-command tests, 10 hunk-staging tests, 9 text-object tests, 24 project-search tests, 5 engine-replace tests, 27 lsp-protocol tests, 10 lsp-engine tests, 31 vim-features tests, 9 tag-object tests, 9 norm-command tests, 11 fuzzy-finder tests)
-└── Total: ~21,550 lines
+│       └── Tests: 593 passing (9 find/replace, 14 macro, 8 session, 4 reverse search, 7 replace char, 5 undo line, 8 case change, 6 marks, 5 incremental search, 12 syntax/language, 6 history search, 11 fold tests, 12 git tests, 4 sidebar-preview tests, 5 auto-indent tests, 4 completion tests, 9 quit/ctrl-s tests, 1 session-restore test, 22 set-command tests, 10 hunk-staging tests, 9 text-object tests, 24 project-search tests, 5 engine-replace tests, 27 lsp-protocol tests, 10 lsp-engine tests, 31 vim-features tests, 9 tag-object tests, 9 norm-command tests, 11 fuzzy-finder tests, 8 live-grep tests, 8 quickfix tests, 13 diff+rename+move tests, 5 explorer-keys tests, 4 help-system tests)
+└── Total: ~33,400 lines
 ```
 
 ## Architecture
@@ -199,7 +212,7 @@ vimcode/
 ```bash
 cargo build
 cargo run -- <file>
-cargo test -- --test-threads=1    # 571 tests
+cargo test -- --test-threads=1    # 593 tests
 cargo clippy -- -D warnings
 cargo fmt
 ```
@@ -251,6 +264,10 @@ cargo fmt
 - [x] **`:norm`** — execute normal command on a range of lines
 
 ## Recent Work
+**Session 59:** Explorer polish — (1) Fixed prompt delay: early `continue` statements in TUI event loop now set `needs_redraw = true` so explorer mode prompts appear instantly. (2) Move path editing: `move_file()` now accepts full destination path (not just directory); prompt pre-fills with full relative path; added cursor key support (Left/Right/Home/End/Delete) in all sidebar prompts via `SidebarPrompt.cursor` field. (3) Auto-refresh: TUI sidebar rebuilds every 2s when visible and idle (`last_sidebar_refresh` timer), removing need for manual refresh. (4) Root folder entry: project root shown at top of explorer tree (uppercase name, always expanded) in both GTK (`build_file_tree_with_root()`) and TUI (`build_rows()` inserts root at depth 0). (5) Removed refresh: `ExplorerAction::Refresh` variant, `refresh` setting field, refresh toolbar icon, and refresh key binding removed from all layers. (6) New file/folder at root: prompts pre-fill with target directory path so creating at root is straightforward. File changes: `tui_main.rs` (+320 lines), `main.rs` (+150 lines), `engine.rs` (move_file API change, help text update), `settings.rs` (removed refresh).
+
+**Session 56:** VSCode-Like Explorer + File Diff — Engine: `rename_file(&mut self, old_path, new_name)` + `move_file(&mut self, src, dest_dir)` using `std::fs::rename` with open-buffer path updates; `DiffLine` enum (Same/Added/Removed); `diff_window_pair: Option<(WindowId, WindowId)>` + `diff_results: HashMap<WindowId, Vec<DiffLine>>`; `cmd_diffthis()`/`cmd_diffoff()`/`cmd_diffsplit(path)` + `compute_diff()` internal; LCS diff free fn `lcs_diff(a, b)` (O(N×M), 3000-line cap); `:diffthis`/`:diffoff`/`:diffsplit <path>` command dispatch. Render: `diff_status: Option<DiffLine>` on `RenderedLine`; `diff_added_bg`/`diff_removed_bg` in `Theme`. GTK: `RenameFile`/`MoveFile`/`CopyPath`/`SelectForDiff`/`DiffWithSelected` messages; `diff_selected_file` on `App`; F2 inline rename via CellRendererText; right-click `GestureClick` → GTK4 `Popover` with buttons; DragSource + DropTarget for drag-and-drop move; diff bg via Cairo rectangle before text paint. TUI: `PromptKind::Rename(PathBuf)` + `PromptKind::MoveFile(PathBuf)`; `NewFile`/`NewFolder` carry target `PathBuf` for create-in-selected-folder; `r` rename key, `M` move key; diff bg via per-row repaint + `line_bg` passed to gutter/text. 13 new tests (571→584): rename_file (3), move_file (2), lcs_diff (5), cmd_diffthis/off/split (3).
+
 **Session 55:** Quickfix window — `:grep`/`:vimgrep <pattern>` searches project using the existing `search_in_project()` engine and populates `engine.quickfix_items: Vec<ProjectMatch>`; `:copen`/`:cclose` toggle the panel; `:cn`/`:cp`/`:cc N` navigate and jump (file opens in current tab, cursor positioned). The quickfix panel is a **persistent 6-row bottom strip** (not a floating modal) rendered below the editor area in both backends. TUI: extra `Constraint::Length(qf_height)` slot in the vertical layout + `render_quickfix_panel()`. GTK: editor `content_bounds` height reduced by `qf_px = 6 × line_height` when open + `draw_quickfix_panel()`. When open with focus (`quickfix_has_focus = true`), all keypresses are routed through `handle_quickfix_key()` — j/k/Ctrl-N/Ctrl-P navigate, Enter jumps and returns focus to editor, q/Escape closes. 8 new tests (563→571): copen guard, open/close, cn/cp clamp, cc 1-based jump, empty pattern, no matches, grep populates, vimgrep alias.
 
 **Session 54:** Telescope-style live grep modal — `src/core/engine.rs` (`grep_*` fields + `open_live_grep`, `handle_grep_key`, `grep_run_search`, `grep_load_preview`, `grep_confirm`), `render.rs` (`LiveGrepPanel`, populate), `tui_main.rs` (`render_live_grep_popup`, extra scroll var, `grep_scroll_top`), `main.rs` (`draw_live_grep_popup`). Ctrl-G opens; two-column split (35% results, 65% preview); ±5 context lines; `grep_open` guard intercepts all keys when modal open.

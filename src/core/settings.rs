@@ -70,6 +70,10 @@ pub struct Settings {
     /// User-configured LSP server overrides/additions
     #[serde(default)]
     pub lsp_servers: Vec<crate::core::lsp::LspServerConfig>,
+
+    /// Configurable explorer mode key bindings
+    #[serde(default)]
+    pub explorer_keys: ExplorerKeys,
 }
 
 fn default_explorer_visible() -> bool {
@@ -100,6 +104,89 @@ fn default_lsp_enabled() -> bool {
     true // Default: enabled
 }
 
+// ── Explorer key defaults ──────────────────────────────────────────────────
+
+fn ek_new_file() -> String {
+    "a".to_string()
+}
+fn ek_new_folder() -> String {
+    "A".to_string()
+}
+fn ek_delete() -> String {
+    "D".to_string()
+}
+fn ek_rename() -> String {
+    "r".to_string()
+}
+fn ek_move_file() -> String {
+    "M".to_string()
+}
+fn ek_toggle_mode() -> String {
+    "?".to_string()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExplorerAction {
+    NewFile,
+    NewFolder,
+    Delete,
+    Rename,
+    MoveFile,
+    ToggleMode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExplorerKeys {
+    #[serde(default = "ek_new_file")]
+    pub new_file: String,
+    #[serde(default = "ek_new_folder")]
+    pub new_folder: String,
+    #[serde(default = "ek_delete")]
+    pub delete: String,
+    #[serde(default = "ek_rename")]
+    pub rename: String,
+    #[serde(default = "ek_move_file")]
+    pub move_file: String,
+    #[serde(default = "ek_toggle_mode")]
+    pub toggle_mode: String,
+}
+
+impl Default for ExplorerKeys {
+    fn default() -> Self {
+        ExplorerKeys {
+            new_file: ek_new_file(),
+            new_folder: ek_new_folder(),
+            delete: ek_delete(),
+            rename: ek_rename(),
+            move_file: ek_move_file(),
+            toggle_mode: ek_toggle_mode(),
+        }
+    }
+}
+
+impl ExplorerKeys {
+    /// Resolve a typed character to an explorer action.
+    /// Only single-character bindings are supported.
+    pub fn resolve(&self, ch: char) -> Option<ExplorerAction> {
+        let s = ch.to_string();
+        if s == self.new_file {
+            Some(ExplorerAction::NewFile)
+        } else if s == self.new_folder {
+            Some(ExplorerAction::NewFolder)
+        } else if s == self.delete {
+            Some(ExplorerAction::Delete)
+        } else if s == self.rename {
+            Some(ExplorerAction::Rename)
+        } else if s == self.move_file {
+            Some(ExplorerAction::MoveFile)
+        } else if s == self.toggle_mode {
+            Some(ExplorerAction::ToggleMode)
+        } else {
+            None
+        }
+    }
+}
+
 fn default_font_family() -> String {
     "Monospace".to_string()
 }
@@ -122,6 +209,7 @@ impl Default for Settings {
             shift_width: default_shift_width(),
             lsp_enabled: default_lsp_enabled(),
             lsp_servers: Vec::new(),
+            explorer_keys: ExplorerKeys::default(),
         }
     }
 }
@@ -633,5 +721,63 @@ mod tests {
         assert!(display.contains("sw=4"));
         assert!(display.contains("autoindent"));
         assert!(display.contains("incsearch"));
+    }
+
+    // ── ExplorerKeys tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_explorer_keys_default() {
+        let ek = ExplorerKeys::default();
+        assert_eq!(ek.new_file, "a");
+        assert_eq!(ek.new_folder, "A");
+        assert_eq!(ek.delete, "D");
+        assert_eq!(ek.rename, "r");
+        assert_eq!(ek.move_file, "M");
+        assert_eq!(ek.toggle_mode, "?");
+    }
+
+    #[test]
+    fn test_explorer_keys_resolve() {
+        let ek = ExplorerKeys::default();
+        assert_eq!(ek.resolve('a'), Some(ExplorerAction::NewFile));
+        assert_eq!(ek.resolve('A'), Some(ExplorerAction::NewFolder));
+        assert_eq!(ek.resolve('D'), Some(ExplorerAction::Delete));
+        assert_eq!(ek.resolve('r'), Some(ExplorerAction::Rename));
+        assert_eq!(ek.resolve('M'), Some(ExplorerAction::MoveFile));
+        assert_eq!(ek.resolve('?'), Some(ExplorerAction::ToggleMode));
+        assert_eq!(ek.resolve('z'), None);
+    }
+
+    #[test]
+    fn test_explorer_keys_custom_override() {
+        let mut ek = ExplorerKeys::default();
+        ek.delete = "x".to_string();
+        assert_eq!(ek.resolve('x'), Some(ExplorerAction::Delete));
+        assert_eq!(ek.resolve('D'), None); // old key no longer works
+                                           // Other keys still work
+        assert_eq!(ek.resolve('a'), Some(ExplorerAction::NewFile));
+    }
+
+    #[test]
+    fn test_explorer_keys_serde_partial() {
+        let json = r#"{ "delete": "x" }"#;
+        let ek: ExplorerKeys = serde_json::from_str(json).unwrap();
+        assert_eq!(ek.delete, "x");
+        // Unspecified fields keep defaults
+        assert_eq!(ek.new_file, "a");
+        assert_eq!(ek.new_folder, "A");
+        assert_eq!(ek.rename, "r");
+        assert_eq!(ek.move_file, "M");
+        assert_eq!(ek.toggle_mode, "?");
+    }
+
+    #[test]
+    fn test_explorer_keys_in_settings_serde() {
+        let json = r#"{ "explorer_keys": { "rename": "R" } }"#;
+        let s: Settings = serde_json::from_str(json).unwrap();
+        assert_eq!(s.explorer_keys.rename, "R");
+        // Defaults preserved for the rest
+        assert_eq!(s.explorer_keys.new_file, "a");
+        assert_eq!(s.explorer_keys.delete, "D");
     }
 }

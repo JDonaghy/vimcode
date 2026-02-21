@@ -72,6 +72,8 @@ struct App {
     project_search_status: String,
     /// Ref to the search results ListBox so we can rebuild it after each search.
     search_results_list: Rc<RefCell<Option<gtk4::ListBox>>>,
+    /// File selected as "left side" for a two-way diff (via context menu).
+    diff_selected_file: Option<PathBuf>,
 }
 
 /// Scrollbars and indicators for a single window
@@ -109,11 +111,13 @@ enum Msg {
     OpenFileFromSidebar(PathBuf),
     /// Preview file from sidebar tree view (single-click, replaces current preview tab).
     PreviewFileFromSidebar(PathBuf),
-    /// Create a new file with the given name.
-    CreateFile(String),
-    /// Create a new folder with the given name.
-    CreateFolder(String),
-    /// Delete a file or folder at the given path.
+    /// Create a new file: (parent_dir, name).
+    CreateFile(PathBuf, String),
+    /// Create a new folder: (parent_dir, name).
+    CreateFolder(PathBuf, String),
+    /// Show confirmation dialog before deleting.
+    ConfirmDeletePath(PathBuf),
+    /// Delete a file or folder at the given path (after confirmation).
     DeletePath(PathBuf),
     /// Refresh the file tree from current working directory.
     RefreshFileTree,
@@ -179,6 +183,16 @@ enum Msg {
     ProjectReplaceAll,
     /// Mouse scroll wheel on editor drawing area.
     MouseScroll { delta_x: f64, delta_y: f64 },
+    /// Rename a file: (old_path, new_name_without_dir)
+    RenameFile(PathBuf, String),
+    /// Move a file to a different directory: (src, dest_dir)
+    MoveFile(PathBuf, PathBuf),
+    /// Copy the file path to the clipboard.
+    CopyPath(PathBuf),
+    /// Remember this file as the "left side" for a two-way diff.
+    SelectForDiff(PathBuf),
+    /// Open a vsplit diff: current file is right side, stored path is left.
+    DiffWithSelected(PathBuf),
 }
 
 #[relm4::component]
@@ -312,19 +326,12 @@ impl SimpleComponent for App {
                                 set_tooltip_text: Some("New File"),
                                 set_width_request: 32,
                                 set_height_request: 32,
-                                connect_clicked[sender] => move |_| {
-                                    // Generate filename: newfile_1.txt, newfile_2.txt, etc.
-                                    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                                    let mut counter = 1;
-                                    let mut filename = format!("newfile_{}.txt", counter);
-
-                                    // Find next available number
-                                    while cwd.join(&filename).exists() {
-                                        counter += 1;
-                                        filename = format!("newfile_{}.txt", counter);
-                                    }
-
-                                    sender.input(Msg::CreateFile(filename));
+                                connect_clicked[sender, file_tree_view] => move |_| {
+                                    let parent_dir = selected_parent_dir(&file_tree_view);
+                                    show_name_prompt_dialog("New File", "", {
+                                        let s = sender.clone();
+                                        move |name| s.input(Msg::CreateFile(parent_dir.clone(), name))
+                                    });
                                 }
                             },
 
@@ -333,19 +340,12 @@ impl SimpleComponent for App {
                                 set_tooltip_text: Some("New Folder"),
                                 set_width_request: 32,
                                 set_height_request: 32,
-                                connect_clicked[sender] => move |_| {
-                                    // Generate folder name: newfolder_1, newfolder_2, etc.
-                                    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                                    let mut counter = 1;
-                                    let mut foldername = format!("newfolder_{}", counter);
-
-                                    // Find next available number
-                                    while cwd.join(&foldername).exists() {
-                                        counter += 1;
-                                        foldername = format!("newfolder_{}", counter);
-                                    }
-
-                                    sender.input(Msg::CreateFolder(foldername));
+                                connect_clicked[sender, file_tree_view] => move |_| {
+                                    let parent_dir = selected_parent_dir(&file_tree_view);
+                                    show_name_prompt_dialog("New Folder", "", {
+                                        let s = sender.clone();
+                                        move |name| s.input(Msg::CreateFolder(parent_dir.clone(), name))
+                                    });
                                 }
                             },
 
@@ -362,21 +362,12 @@ impl SimpleComponent for App {
                                         let path_str: String = model.get_value(&iter, 2).get().unwrap_or_default();
                                         if !path_str.is_empty() {
                                             let path = PathBuf::from(path_str);
-                                            sender.input(Msg::DeletePath(path));
+                                            sender.input(Msg::ConfirmDeletePath(path));
                                         }
                                     }
                                 }
                             },
 
-                            gtk4::Button {
-                                set_label: "\u{f021}",
-                                set_tooltip_text: Some("Refresh"),
-                                set_width_request: 32,
-                                set_height_request: 32,
-                                connect_clicked[sender] => move |_| {
-                                    sender.input(Msg::RefreshFileTree);
-                                }
-                            },
                         },
 
                         // Scrollable tree view
@@ -923,6 +914,7 @@ impl SimpleComponent for App {
             sidebar_inner_box: sidebar_inner_box_ref.clone(),
             project_search_status: String::new(),
             search_results_list: search_results_list_ref.clone(),
+            diff_selected_file: None,
         };
         let widgets = view_output!();
 
@@ -953,7 +945,7 @@ impl SimpleComponent for App {
 
         // Build tree from current working directory
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        build_file_tree(&tree_store, None, &cwd);
+        build_file_tree_with_root(&tree_store, &cwd);
 
         // Read font family for nerd font icon rendering
         let nf_font = engine.borrow().settings.font_family.clone();
@@ -977,6 +969,11 @@ impl SimpleComponent for App {
 
         // Set the model on the TreeView
         widgets.file_tree_view.set_model(Some(&tree_store));
+
+        // Expand the root node so the tree contents are visible
+        widgets
+            .file_tree_view
+            .expand_row(&gtk4::TreePath::from_indices(&[0]), false);
 
         // Connect double-click signal to open files
         let sender_for_tree = sender.clone();
@@ -1022,6 +1019,268 @@ impl SimpleComponent for App {
             }
         });
         widgets.file_tree_view.add_controller(gesture);
+
+        // Right-click context menu
+        {
+            let sender_rc = sender.clone();
+            let right_click = gtk4::GestureClick::new();
+            right_click.set_button(3); // right mouse button
+            right_click.connect_pressed(move |gesture, _n_press, x, y| {
+                let widget = gesture.widget();
+                let Some(tree_view) = widget.downcast_ref::<gtk4::TreeView>() else {
+                    return;
+                };
+                // Select the row under the cursor
+                if let Some((Some(tp), _, _, _)) = tree_view.path_at_pos(x as i32, y as i32) {
+                    tree_view.selection().select_path(&tp);
+                }
+                // Get selected path
+                let selected_path: Option<PathBuf> =
+                    tree_view.selection().selected().and_then(|(model, iter)| {
+                        let s: String = model.get_value(&iter, 2).get().ok()?;
+                        if s.is_empty() {
+                            None
+                        } else {
+                            Some(PathBuf::from(s))
+                        }
+                    });
+                let Some(target) = selected_path else { return };
+
+                // Build a simple popover with buttons
+                let menu_box = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
+                menu_box.set_margin_all(4);
+
+                let add_btn = |label: &str| -> gtk4::Button {
+                    let b = gtk4::Button::with_label(label);
+                    b.set_has_frame(false);
+                    b.set_halign(gtk4::Align::Fill);
+                    b
+                };
+
+                let btn_new_file = add_btn("New File");
+                let btn_new_folder = add_btn("New Folder");
+                let btn_rename = add_btn("Rename  F2");
+                let btn_delete = add_btn("Delete  Del");
+                let btn_copy_path = add_btn("Copy Path");
+                let btn_select_diff = add_btn("Select for Diff");
+
+                menu_box.append(&btn_new_file);
+                menu_box.append(&btn_new_folder);
+                menu_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+                menu_box.append(&btn_rename);
+                menu_box.append(&btn_delete);
+                menu_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+                menu_box.append(&btn_copy_path);
+                menu_box.append(&btn_select_diff);
+
+                let popover = gtk4::Popover::new();
+                popover.set_child(Some(&menu_box));
+                popover.set_parent(tree_view);
+                // Position near cursor
+                let rect = gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1);
+                popover.set_pointing_to(Some(&rect));
+                popover.set_autohide(true);
+                popover.popup();
+
+                // Determine parent dir for "New File" / "New Folder"
+                let parent_dir = if target.is_dir() {
+                    target.clone()
+                } else {
+                    target
+                        .parent()
+                        .unwrap_or(std::path::Path::new("."))
+                        .to_path_buf()
+                };
+
+                // Wire up buttons
+                let s = sender_rc.clone();
+                let pd = parent_dir.clone();
+                let p = popover.clone();
+                btn_new_file.connect_clicked(move |_| {
+                    p.popdown();
+                    let pd2 = pd.clone();
+                    show_name_prompt_dialog("New File", "", {
+                        let s2 = s.clone();
+                        move |name| s2.input(Msg::CreateFile(pd2.clone(), name))
+                    });
+                });
+                let s = sender_rc.clone();
+                let pd = parent_dir.clone();
+                let p = popover.clone();
+                btn_new_folder.connect_clicked(move |_| {
+                    p.popdown();
+                    let pd2 = pd.clone();
+                    show_name_prompt_dialog("New Folder", "", {
+                        let s2 = s.clone();
+                        move |name| s2.input(Msg::CreateFolder(pd2.clone(), name))
+                    });
+                });
+                let s = sender_rc.clone();
+                let tgt = target.clone();
+                let tv_clone = tree_view.clone();
+                let p = popover.clone();
+                btn_rename.connect_clicked(move |_| {
+                    // Trigger inline rename via a simple dialog
+                    let dialog = gtk4::Dialog::with_buttons(
+                        Some("Rename"),
+                        None::<&gtk4::Window>,
+                        gtk4::DialogFlags::MODAL | gtk4::DialogFlags::DESTROY_WITH_PARENT,
+                        &[
+                            ("Rename", gtk4::ResponseType::Accept),
+                            ("Cancel", gtk4::ResponseType::Cancel),
+                        ],
+                    );
+                    let entry = gtk4::Entry::new();
+                    let current = tgt
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    entry.set_text(&current);
+                    entry.select_region(0, -1);
+                    dialog.content_area().append(&entry);
+                    dialog.set_default_response(gtk4::ResponseType::Accept);
+                    entry.set_activates_default(true);
+                    let s2 = s.clone();
+                    let tgt2 = tgt.clone();
+                    let tv2 = tv_clone.clone();
+                    dialog.connect_response(move |dlg, resp| {
+                        if resp == gtk4::ResponseType::Accept {
+                            let new_name = entry.text().to_string();
+                            if !new_name.is_empty() {
+                                s2.input(Msg::RenameFile(tgt2.clone(), new_name));
+                            }
+                        }
+                        tv2.grab_focus();
+                        dlg.close();
+                    });
+                    dialog.present();
+                    p.popdown();
+                });
+                let s = sender_rc.clone();
+                let tgt = target.clone();
+                let p = popover.clone();
+                btn_delete.connect_clicked(move |_| {
+                    p.popdown();
+                    s.input(Msg::ConfirmDeletePath(tgt.clone()));
+                });
+                let s = sender_rc.clone();
+                let tgt = target.clone();
+                let p = popover.clone();
+                btn_copy_path.connect_clicked(move |_| {
+                    s.input(Msg::CopyPath(tgt.clone()));
+                    p.popdown();
+                });
+                let s = sender_rc.clone();
+                let tgt = target.clone();
+                let p = popover.clone();
+                btn_select_diff.connect_clicked(move |_| {
+                    s.input(Msg::SelectForDiff(tgt.clone()));
+                    p.popdown();
+                });
+            });
+            widgets.file_tree_view.add_controller(right_click);
+        }
+
+        // Drag-and-drop: DragSource (initiator) + DropTarget (receiver)
+        //
+        // We store the dragged path in a shared Rc so the drop handler can
+        // read it directly — avoids relying on GValue content negotiation
+        // which can crash on some GTK4 builds when types don't match.
+        {
+            let drag_path: Rc<RefCell<Option<PathBuf>>> = Rc::new(RefCell::new(None));
+
+            // DragSource
+            let drag_source = gtk4::DragSource::new();
+            drag_source.set_actions(gtk4::gdk::DragAction::MOVE);
+            let drag_path_src = drag_path.clone();
+            drag_source.connect_prepare(move |ds, x, y| {
+                let widget = ds.widget();
+                let tree_view = widget.downcast_ref::<gtk4::TreeView>()?;
+                let file_path: Option<PathBuf> = (|| {
+                    let (tp, _, _, _) = tree_view.path_at_pos(x as i32, y as i32)?;
+                    let model = tree_view.model()?;
+                    let iter = model.iter(&tp?)?;
+                    let s: String = model.get_value(&iter, 2).get().ok()?;
+                    if s.is_empty() {
+                        None
+                    } else {
+                        Some(PathBuf::from(s))
+                    }
+                })();
+                *drag_path_src.borrow_mut() = file_path.clone();
+                // Provide a dummy string content so GTK accepts the drag gesture.
+                file_path.map(|p| {
+                    let path_str: String = p.to_string_lossy().into_owned();
+                    gtk4::gdk::ContentProvider::for_value(&path_str.to_value())
+                })
+            });
+            let drag_path_icon = drag_path.clone();
+            drag_source.connect_drag_begin(move |_source, drag| {
+                // Set a custom drag icon — prevents GTK from snapshotting the
+                // TreeView row, which can cause a core dump on GTK4 >= 4.10.
+                let icon_widget = gtk4::DragIcon::for_drag(drag);
+                if let Some(drag_icon) = icon_widget.downcast_ref::<gtk4::DragIcon>() {
+                    let name = drag_path_icon
+                        .borrow()
+                        .as_ref()
+                        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+                        .unwrap_or_else(|| "File".to_string());
+                    let label = gtk4::Label::new(Some(&name));
+                    drag_icon.set_child(Some(&label));
+                }
+            });
+            let drag_path_end = drag_path.clone();
+            drag_source.connect_drag_end(move |_source, _drag, _delete_data| {
+                // Clear leftover drag state (covers cancelled/failed drags).
+                *drag_path_end.borrow_mut() = None;
+            });
+            widgets.file_tree_view.add_controller(drag_source);
+
+            // DropTarget
+            let sender_drop = sender.clone();
+            let drag_path_drop = drag_path.clone();
+            let drop_target =
+                gtk4::DropTarget::new(gtk4::glib::Type::STRING, gtk4::gdk::DragAction::MOVE);
+            drop_target.connect_drop(move |dt, _value, x, y| {
+                // Read source from the shared Rc (set by connect_prepare).
+                let src = drag_path_drop.borrow_mut().take();
+                let Some(src) = src else {
+                    return false;
+                };
+                let widget = dt.widget();
+                let Some(tree_view) = widget.downcast_ref::<gtk4::TreeView>() else {
+                    return false;
+                };
+                // Find destination directory at drop position.
+                let dest_dir: Option<PathBuf> = (|| {
+                    let (tp, _, _, _) = tree_view.path_at_pos(x as i32, y as i32)?;
+                    let model = tree_view.model()?;
+                    let iter = model.iter(&tp?)?;
+                    let s: String = model.get_value(&iter, 2).get().ok()?;
+                    if s.is_empty() {
+                        return None;
+                    }
+                    let p = PathBuf::from(s);
+                    Some(if p.is_dir() {
+                        p
+                    } else {
+                        p.parent()
+                            .unwrap_or(std::path::Path::new("."))
+                            .to_path_buf()
+                    })
+                })();
+                let Some(dest_dir) = dest_dir else {
+                    return false;
+                };
+                // Don't move to the same directory
+                if src.parent() == Some(dest_dir.as_path()) {
+                    return false;
+                }
+                sender_drop.input(Msg::MoveFile(src, dest_dir));
+                true
+            });
+            widgets.file_tree_view.add_controller(drop_target);
+        }
 
         // Set the actual title after widget creation
         root.set_title(Some(&title));
@@ -1098,9 +1357,11 @@ impl SimpleComponent for App {
                 unicode,
                 ctrl,
             } => {
-                let action = {
+                let (action, prev_tab) = {
                     let mut engine = self.engine.borrow_mut();
-                    engine.handle_key(&key_name, unicode, ctrl)
+                    let prev = engine.active_tab;
+                    let a = engine.handle_key(&key_name, unicode, ctrl);
+                    (a, prev)
                 };
 
                 match action {
@@ -1208,6 +1469,20 @@ impl SimpleComponent for App {
                     }
                 }
 
+                // Reveal the active file in the sidebar when tab changed (gt/gT/:tabn/:tabp)
+                {
+                    let engine = self.engine.borrow();
+                    if engine.active_tab != prev_tab {
+                        let file_path = engine.file_path().cloned();
+                        drop(engine);
+                        if let Some(path) = file_path {
+                            if let Some(ref tree) = *self.file_tree_view.borrow() {
+                                highlight_file_in_tree(tree, &path);
+                            }
+                        }
+                    }
+                }
+
                 self.redraw = !self.redraw;
             }
             Msg::Resize => {
@@ -1221,6 +1496,14 @@ impl SimpleComponent for App {
             } => {
                 let mut engine = self.engine.borrow_mut();
                 handle_mouse_click(&mut engine, x, y, width, height);
+                // Reveal the active file in the sidebar tree (e.g. after tab click)
+                let file_path = engine.file_path().cloned();
+                drop(engine);
+                if let Some(path) = file_path {
+                    if let Some(ref tree) = *self.file_tree_view.borrow() {
+                        highlight_file_in_tree(tree, &path);
+                    }
+                }
                 self.redraw = !self.redraw;
             }
             Msg::ToggleSidebar => {
@@ -1271,7 +1554,7 @@ impl SimpleComponent for App {
                 self.tree_has_focus = false;
                 self.redraw = !self.redraw;
             }
-            Msg::CreateFile(name) => {
+            Msg::CreateFile(parent_dir, name) => {
                 // Validate name
                 if let Err(msg) = validate_name(&name) {
                     self.engine.borrow_mut().message = msg;
@@ -1279,8 +1562,7 @@ impl SimpleComponent for App {
                     return;
                 }
 
-                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                let file_path = cwd.join(&name);
+                let file_path = parent_dir.join(&name);
 
                 // Check if already exists
                 if file_path.exists() {
@@ -1307,7 +1589,7 @@ impl SimpleComponent for App {
                 }
                 self.redraw = !self.redraw;
             }
-            Msg::CreateFolder(name) => {
+            Msg::CreateFolder(parent_dir, name) => {
                 // Validate name
                 if let Err(msg) = validate_name(&name) {
                     self.engine.borrow_mut().message = msg;
@@ -1315,8 +1597,7 @@ impl SimpleComponent for App {
                     return;
                 }
 
-                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                let folder_path = cwd.join(&name);
+                let folder_path = parent_dir.join(&name);
 
                 // Check if already exists
                 if folder_path.exists() {
@@ -1330,6 +1611,14 @@ impl SimpleComponent for App {
                     Ok(_) => {
                         self.engine.borrow_mut().message = format!("Created folder: {}", name);
                         _sender.input(Msg::RefreshFileTree);
+                        // Highlight the new folder in the tree after refresh
+                        let tree_ref = self.file_tree_view.clone();
+                        let path = folder_path.clone();
+                        gtk4::glib::idle_add_local_once(move || {
+                            if let Some(ref tree) = *tree_ref.borrow() {
+                                highlight_file_in_tree(tree, &path);
+                            }
+                        });
                     }
                     Err(e) => {
                         self.engine.borrow_mut().message =
@@ -1337,6 +1626,35 @@ impl SimpleComponent for App {
                     }
                 }
                 self.redraw = !self.redraw;
+            }
+            Msg::ConfirmDeletePath(path) => {
+                let filename = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let item_type = if path.is_dir() { "folder" } else { "file" };
+                let dialog = gtk4::Dialog::with_buttons(
+                    Some("Confirm Delete"),
+                    None::<&gtk4::Window>,
+                    gtk4::DialogFlags::MODAL | gtk4::DialogFlags::DESTROY_WITH_PARENT,
+                    &[
+                        ("Delete", gtk4::ResponseType::Accept),
+                        ("Cancel", gtk4::ResponseType::Cancel),
+                    ],
+                );
+                let label =
+                    gtk4::Label::new(Some(&format!("Delete {} '{}'?", item_type, filename)));
+                label.set_margin_all(12);
+                dialog.content_area().append(&label);
+                let s = _sender.clone();
+                dialog.connect_response(move |dlg, resp| {
+                    if resp == gtk4::ResponseType::Accept {
+                        s.input(Msg::DeletePath(path.clone()));
+                    }
+                    dlg.close();
+                });
+                dialog.present();
             }
             Msg::DeletePath(path) => {
                 // Get filename for message
@@ -1397,11 +1715,11 @@ impl SimpleComponent for App {
                 if let Some(ref store) = self.tree_store {
                     match std::env::current_dir() {
                         Ok(cwd) => {
-                            // Clear tree
                             store.clear();
-
-                            // Rebuild
-                            build_file_tree(store, None, &cwd);
+                            build_file_tree_with_root(store, &cwd);
+                            if let Some(ref tv) = *self.file_tree_view.borrow() {
+                                tv.expand_row(&gtk4::TreePath::from_indices(&[0]), false);
+                            }
                         }
                         Err(e) => {
                             self.engine.borrow_mut().message =
@@ -1674,6 +1992,82 @@ impl SimpleComponent for App {
                     self.engine.borrow_mut().ensure_cursor_visible();
                 }
                 self.redraw = true;
+            }
+            Msg::RenameFile(old_path, new_name) => {
+                let result = self.engine.borrow_mut().rename_file(&old_path, &new_name);
+                match result {
+                    Ok(()) => {
+                        self.engine.borrow_mut().message = format!("Renamed to '{}'", new_name);
+                        _sender.input(Msg::RefreshFileTree);
+                    }
+                    Err(e) => {
+                        self.engine.borrow_mut().message = e;
+                    }
+                }
+                self.redraw = !self.redraw;
+            }
+            Msg::MoveFile(src, dest_dir) => {
+                let name = src
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let result = self.engine.borrow_mut().move_file(&src, &dest_dir);
+                match result {
+                    Ok(()) => {
+                        self.engine.borrow_mut().message =
+                            format!("Moved '{}' to '{}'", name, dest_dir.display());
+                        // Refresh tree inline so we can highlight the moved file
+                        if let Some(ref store) = self.tree_store {
+                            if let Ok(cwd) = std::env::current_dir() {
+                                store.clear();
+                                build_file_tree_with_root(store, &cwd);
+                            }
+                        }
+                        let new_path = dest_dir.join(&name);
+                        if let Some(ref tree) = *self.file_tree_view.borrow() {
+                            tree.expand_row(&gtk4::TreePath::from_indices(&[0]), false);
+                            highlight_file_in_tree(tree, &new_path);
+                        }
+                    }
+                    Err(e) => {
+                        self.engine.borrow_mut().message = e;
+                    }
+                }
+                self.redraw = !self.redraw;
+            }
+            Msg::CopyPath(path) => {
+                let path_str = path.to_string_lossy().to_string();
+                if let Some(display) = gtk4::gdk::Display::default() {
+                    display.clipboard().set_text(&path_str);
+                    self.engine.borrow_mut().message = format!("Copied: {}", path_str);
+                }
+                self.redraw = !self.redraw;
+            }
+            Msg::SelectForDiff(path) => {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| path.display().to_string());
+                self.diff_selected_file = Some(path);
+                self.engine.borrow_mut().message = format!(
+                    "Selected '{}' for diff. Right-click another file → Diff with…",
+                    name
+                );
+                self.redraw = !self.redraw;
+            }
+            Msg::DiffWithSelected(right_path) => {
+                if let Some(left_path) = self.diff_selected_file.take() {
+                    // Open left file and mark it as diff left side
+                    self.engine.borrow_mut().open_file_in_tab(&left_path);
+                    self.engine.borrow_mut().cmd_diffthis();
+                    // Open right file in vsplit + activate diff
+                    self.engine.borrow_mut().cmd_diffsplit(&right_path);
+                } else {
+                    self.engine.borrow_mut().message =
+                        "No file selected for diff. Right-click a file → Select for Diff first."
+                            .to_string();
+                }
+                self.redraw = !self.redraw;
             }
             Msg::WindowClosing { width, height } => {
                 let mut engine = self.engine.borrow_mut();
@@ -2308,6 +2702,23 @@ fn draw_window(
     cr.set_source_rgb(br, bg_g, bb);
     cr.rectangle(rect.x, rect.y, rect.width, rect.height);
     cr.fill().unwrap();
+
+    // Diff background highlight (drawn before selection so selection is on top)
+    for (view_idx, rl) in rw.lines.iter().enumerate() {
+        if let Some(diff_status) = rl.diff_status {
+            use crate::core::engine::DiffLine;
+            let diff_color = match diff_status {
+                DiffLine::Added => theme.diff_added_bg,
+                DiffLine::Removed => theme.diff_removed_bg,
+                DiffLine::Same => continue,
+            };
+            let y = rect.y + view_idx as f64 * line_height;
+            let (dr, dg, db) = diff_color.to_cairo();
+            cr.set_source_rgb(dr, dg, db);
+            cr.rectangle(rect.x, y, rect.width, line_height);
+            cr.fill().unwrap();
+        }
+    }
 
     // Visual selection highlight (drawn before text so text renders on top)
     if let Some(sel) = &rw.selection {
@@ -3733,6 +4144,25 @@ fn load_css() {
     );
 }
 
+/// Build file tree with a root folder node at the top (like VSCode).
+fn build_file_tree_with_root(store: &gtk4::TreeStore, root: &Path) {
+    let root_name = root
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| root.to_string_lossy().to_string())
+        .to_uppercase();
+    let root_iter = store.insert_with_values(
+        None,
+        None,
+        &[
+            (0, &""),
+            (1, &root_name),
+            (2, &root.to_string_lossy().to_string()),
+        ],
+    );
+    build_file_tree(store, Some(&root_iter), root);
+}
+
 /// Build file tree recursively
 /// TreeStore columns: [Icon(String), Name(String), FullPath(String)]
 fn build_file_tree(store: &gtk4::TreeStore, parent: Option<&gtk4::TreeIter>, path: &Path) {
@@ -3791,6 +4221,60 @@ fn build_file_tree(store: &gtk4::TreeStore, parent: Option<&gtk4::TreeIter>, pat
             }
         }
     }
+}
+
+/// Get the parent directory for creating a new file/folder, based on the
+/// currently selected tree row. If a directory is selected, use it. If a
+/// file is selected, use its parent. Fallback: cwd.
+fn selected_parent_dir(tv: &gtk4::TreeView) -> PathBuf {
+    if let Some((model, iter)) = tv.selection().selected() {
+        if let Ok(s) = model.get_value(&iter, 2).get::<String>() {
+            if !s.is_empty() {
+                let p = PathBuf::from(s);
+                if p.is_dir() {
+                    return p;
+                }
+                if let Some(parent) = p.parent() {
+                    return parent.to_path_buf();
+                }
+            }
+        }
+    }
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+/// Show a modal dialog with a text entry prompting for a name.
+/// `title` is the dialog title, `prefill` pre-populates the entry,
+/// and `on_accept` is called with the entered text when the user confirms.
+fn show_name_prompt_dialog<F: Fn(String) + 'static>(title: &str, prefill: &str, on_accept: F) {
+    let dialog = gtk4::Dialog::with_buttons(
+        Some(title),
+        None::<&gtk4::Window>,
+        gtk4::DialogFlags::MODAL | gtk4::DialogFlags::DESTROY_WITH_PARENT,
+        &[
+            ("Create", gtk4::ResponseType::Accept),
+            ("Cancel", gtk4::ResponseType::Cancel),
+        ],
+    );
+    let entry = gtk4::Entry::new();
+    entry.set_text(prefill);
+    entry.set_placeholder_text(Some("Enter name…"));
+    if !prefill.is_empty() {
+        entry.select_region(0, -1);
+    }
+    dialog.content_area().append(&entry);
+    dialog.set_default_response(gtk4::ResponseType::Accept);
+    entry.set_activates_default(true);
+    dialog.connect_response(move |dlg, resp| {
+        if resp == gtk4::ResponseType::Accept {
+            let name = entry.text().to_string();
+            if !name.is_empty() {
+                on_accept(name);
+            }
+        }
+        dlg.close();
+    });
+    dialog.present();
 }
 
 /// Validate filename for file/folder creation

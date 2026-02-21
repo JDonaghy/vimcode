@@ -11,7 +11,7 @@ There's a touch of irony here - using a cli tool to write the editor that I've w
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 571 tests, zero async runtime
+- **Clean architecture** — platform-agnostic core, 593 tests, zero async runtime
 
 ## Building
 
@@ -229,7 +229,12 @@ cargo fmt
 - `Ctrl-B` — toggle sidebar; `Ctrl-Shift-E` — focus explorer
 - Tree view with Nerd Font file-type icons
 - `j` / `k` — navigate; `l` or `Enter` — open file/expand; `h` — collapse
-- `a` — create file; `A` — create folder; `D` — delete; `R` — refresh
+- `a` — create file; `A` — create folder; `D` — delete
+- **Root folder entry** — project root shown at top of tree (like VSCode); select it to create files at the top level
+- **Auto-refresh** — filesystem changes are detected automatically (no manual refresh needed)
+- **Rename:** `F2` (GTK inline) / `r` (TUI prompt) — rename file or folder in-place
+- **Move:** Drag-and-drop (GTK) / `M` key prompt (TUI) — move to another folder; full path pre-filled with cursor key editing (Left/Right/Home/End/Delete)
+- **Right-click context menu (GTK):** New File, New Folder, Rename, Delete, Copy Path, Select for Diff
 - **Preview mode:**
   - Single-click → preview tab (italic/dimmed, replaced by next single-click)
   - Double-click → permanent tab
@@ -328,6 +333,19 @@ Runtime changes are written through to `~/.config/vimcode/settings.json` immedia
 - `:set option?` — query current value (e.g. `:set ts?` → `tabstop=4`)
 - `:set` (no args) — show one-line summary of all settings
 - `:config reload` — reload settings file from disk
+
+**Explorer key bindings** — configurable in `settings.json` under `"explorer_keys"`:
+
+| Field | Default | Action |
+|-------|---------|--------|
+| `new_file` | `a` | New file prompt |
+| `new_folder` | `A` | New folder prompt |
+| `delete` | `D` | Delete prompt |
+| `rename` | `r` | Rename prompt |
+| `move_file` | `M` | Move file prompt |
+| `toggle_mode` | `?` | Toggle explorer mode |
+
+Only specify keys you want to change — unspecified keys keep their defaults.
 
 ---
 
@@ -449,6 +467,9 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `:Gpush` | Push |
 | `:Gblame` | Blame (scroll-synced split) |
 | `:Ghs` / `:Ghunk` | Stage hunk under cursor |
+| `:diffsplit <file>` | Open file in vsplit with diff highlighting |
+| `:diffthis` | Mark current window as diff participant (two calls activate diff) |
+| `:diffoff` | Clear diff highlighting |
 | `:grep <pat>` / `:vimgrep <pat>` | Search project, populate quickfix list |
 | `:copen` / `:ccl` | Open / close quickfix panel |
 | `:cn` / `:cp` | Next / previous quickfix item |
@@ -457,6 +478,7 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `:LspRestart` | Restart server for current language |
 | `:LspStop` | Stop server for current language |
 | `:config reload` | Reload settings from disk |
+| `:help [topic]` / `:h [topic]` | Show help (topics: explorer, keys, commands) |
 
 ---
 
@@ -464,11 +486,11 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 
 ```
 src/
-├── main.rs          (~3700 lines)  GTK4/Relm4 UI, rendering, sidebar resize, fuzzy popup
-├── tui_main.rs      (~3100 lines)  ratatui/crossterm TUI backend, fuzzy popup
-├── render.rs        (~1220 lines)  Platform-agnostic ScreenLayout bridge
+├── main.rs          (~4410 lines)  GTK4/Relm4 UI, rendering, sidebar resize, fuzzy popup, context menu, drag-and-drop
+├── tui_main.rs      (~3860 lines)  ratatui/crossterm TUI backend, fuzzy popup, rename/move prompts
+├── render.rs        (~1340 lines)  Platform-agnostic ScreenLayout bridge (DiffLine, diff_status)
 ├── icons.rs            (~30 lines)  Nerd Font file-type icons (GTK + TUI)
-└── core/            (~16700 lines)  Zero GTK/rendering deps — fully testable
+└── core/            (~23700 lines)  Zero GTK/rendering deps — fully testable
     ├── engine.rs                    Orchestrator: keys, commands, git, macros, LSP, project search/replace, fuzzy finder
     ├── lsp.rs                       LSP protocol transport + single-server client (request ID tracking, JSON-RPC framing)
     ├── lsp_manager.rs               Multi-server coordinator with initialization guards + built-in registry
@@ -498,4 +520,4 @@ src/
 
 ## License
 
-TBD
+MIT

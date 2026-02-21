@@ -14,7 +14,7 @@
 
 use crate::core::buffer::Buffer;
 use crate::core::buffer_manager::BufferState;
-use crate::core::engine::{Engine, SearchDirection};
+use crate::core::engine::{DiffLine, Engine, SearchDirection};
 use crate::core::settings::LineNumberMode;
 use crate::core::view::View;
 use crate::core::{Cursor, GitLineStatus, Mode, WindowId, WindowRect};
@@ -112,6 +112,8 @@ pub struct RenderedLine {
     pub git_diff: Option<GitLineStatus>,
     /// LSP diagnostic marks on this line (may be empty).
     pub diagnostics: Vec<DiagnosticMark>,
+    /// Two-way diff status for this line (`None` when diff mode is off).
+    pub diff_status: Option<DiffLine>,
 }
 
 /// A single diagnostic mark on a rendered line (for inline underlines/squiggles).
@@ -424,6 +426,10 @@ pub struct Theme {
     pub fuzzy_query_fg: Color,
     pub fuzzy_border: Color,
     pub fuzzy_title_fg: Color,
+
+    // Two-way diff background colours
+    pub diff_added_bg: Color,
+    pub diff_removed_bg: Color,
 }
 
 impl Theme {
@@ -520,6 +526,10 @@ impl Theme {
             fuzzy_query_fg: Color::from_hex("#61afef"),
             fuzzy_border: Color::from_hex("#528bff"),
             fuzzy_title_fg: Color::from_hex("#e5c07b"),
+
+            // Two-way diff backgrounds (dark green / dark red)
+            diff_added_bg: Color::from_hex("#1e3a1e"), // dark green
+            diff_removed_bg: Color::from_hex("#3a1e1e"), // dark red
         }
     }
 
@@ -853,6 +863,13 @@ fn build_rendered_window(
             })
             .unwrap_or_default();
 
+        // Two-way diff status for this line.
+        let diff_status = engine
+            .diff_results
+            .get(&window_id)
+            .and_then(|v| v.get(line_idx))
+            .copied();
+
         lines.push(RenderedLine {
             raw_text: line_str,
             gutter_text,
@@ -863,6 +880,7 @@ fn build_rendered_window(
             line_idx,
             git_diff: git_status,
             diagnostics: line_diagnostics,
+            diff_status,
         });
 
         // Jump past the fold body for fold headers.

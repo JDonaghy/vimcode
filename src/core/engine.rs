@@ -39,6 +39,14 @@ pub enum OpenMode {
 /// Maximum depth for macro recursion to prevent infinite loops.
 const MAX_MACRO_RECURSION: usize = 100;
 
+/// Per-line diff status used by the two-way diff feature (`:diffthis` / `:diffsplit`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiffLine {
+    Same,
+    Added,
+    Removed,
+}
+
 /// Direction of the last search operation
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SearchDirection {
@@ -324,6 +332,13 @@ pub struct Engine {
     pub quickfix_open: bool,
     /// Whether the quickfix panel has keyboard focus.
     pub quickfix_has_focus: bool,
+
+    // --- Two-way diff state ---
+    /// The pair of windows currently in diff mode, or None when diff is off.
+    pub diff_window_pair: Option<(WindowId, WindowId)>,
+    /// Per-window per-line diff status.  Keyed by WindowId, value is a Vec
+    /// with one entry per buffer line.
+    pub diff_results: HashMap<WindowId, Vec<DiffLine>>,
 }
 
 impl Engine {
@@ -428,6 +443,8 @@ impl Engine {
             quickfix_selected: 0,
             quickfix_open: false,
             quickfix_has_focus: false,
+            diff_window_pair: None,
+            diff_results: HashMap::new(),
         }
     }
 
@@ -923,6 +940,151 @@ impl Engine {
         }
     }
 
+    /// Open help text for `topic` in a new read-only vertical split.
+    fn cmd_help(&mut self, topic: &str) -> EngineAction {
+        let text = match topic {
+            "" | "topics" => concat!(
+                "VimCode Help\n",
+                "=============\n",
+                "\n",
+                "Available topics:\n",
+                "  :help explorer    File explorer sidebar keys\n",
+                "  :help keys        Normal mode key reference\n",
+                "  :help commands    Command mode reference\n",
+                "\n",
+                "Type :help <topic> for details.\n",
+            )
+            .to_string(),
+            "explorer" => concat!(
+                "Explorer Sidebar\n",
+                "================\n",
+                "\n",
+                "Toggle & Focus:\n",
+                "  Ctrl-B            Toggle sidebar visibility\n",
+                "  Ctrl-Shift-E      Focus the sidebar (or toggle)\n",
+                "\n",
+                "Navigation:\n",
+                "  j / k             Move selection down / up\n",
+                "  Enter             Open file / toggle directory\n",
+                "  Esc               Return focus to editor\n",
+                "\n",
+                "Explorer Mode (press ? to toggle):\n",
+                "  a                 New file — type name, Enter to create\n",
+                "  A                 New directory — type name, Enter to create\n",
+                "  r                 Rename — type new name, Enter to confirm\n",
+                "  M                 Move — type destination dir, Enter to confirm\n",
+                "  D                 Delete — y to confirm, n to cancel\n",
+                "\n",
+                "The activity bar (left edge) also provides clickable icons\n",
+                "for the explorer, search panel, and settings.\n",
+                "\n",
+                "Keys are configurable via settings.json under \"explorer_keys\".\n",
+                "Example: { \"explorer_keys\": { \"delete\": \"x\", \"rename\": \"R\" } }\n",
+            )
+            .to_string(),
+            "keys" => concat!(
+                "Normal Mode Keys\n",
+                "================\n",
+                "\n",
+                "Motion:\n",
+                "  h/j/k/l           Left / Down / Up / Right\n",
+                "  w/W/b/B/e/E       Word motions\n",
+                "  0/^/$              Line start / first non-blank / line end\n",
+                "  gg/G              Top / bottom of file\n",
+                "  %                 Matching bracket\n",
+                "  f/F/t/T + char    Find char on line\n",
+                "  {/}               Paragraph up / down\n",
+                "  Ctrl-D/Ctrl-U     Half-page down / up\n",
+                "  Ctrl-F/Ctrl-B     Full-page down / up\n",
+                "\n",
+                "Editing:\n",
+                "  i/a/o/O           Insert mode (before/after/below/above)\n",
+                "  d/c/y + motion    Delete / change / yank with motion\n",
+                "  dd/cc/yy          Line-wise delete / change / yank\n",
+                "  x/X               Delete char / backspace\n",
+                "  p/P               Paste after / before\n",
+                "  u / Ctrl-R        Undo / redo\n",
+                "  . (dot)           Repeat last change\n",
+                "  J                 Join lines\n",
+                "  ~ / g~            Toggle case\n",
+                "  >> / <<           Indent / dedent\n",
+                "\n",
+                "Search:\n",
+                "  / / ?             Search forward / backward\n",
+                "  n/N               Next / previous match\n",
+                "  * / #             Search word under cursor fwd / back\n",
+                "\n",
+                "Other:\n",
+                "  :                 Enter command mode\n",
+                "  v/V               Visual char / line mode\n",
+                "  Ctrl-P            Fuzzy file finder\n",
+                "  Ctrl-G            Live grep\n",
+                "  gd                Go to definition (LSP)\n",
+                "  K                 Hover info (LSP)\n",
+                "  ]d / [d           Next / prev diagnostic\n",
+                "  ]c / [c           Next / prev hunk\n",
+                "  Ctrl-O / Ctrl-I   Jump list back / forward\n",
+                "  zz / zt / zb      Scroll cursor center / top / bottom\n",
+                "  q<reg> / @<reg>   Record / play macro\n",
+            )
+            .to_string(),
+            "commands" => concat!(
+                "Command Mode\n",
+                "============\n",
+                "\n",
+                "File:\n",
+                "  :w                Save\n",
+                "  :q / :q!          Quit / force quit\n",
+                "  :wq / :x          Save and quit\n",
+                "  :e <file>         Edit file\n",
+                "  :saveas <file>    Save as\n",
+                "\n",
+                "Buffers & Windows:\n",
+                "  :ls / :buffers    List buffers\n",
+                "  :bn / :bp / :b#   Next / prev / alternate buffer\n",
+                "  :bd               Delete buffer\n",
+                "  :split / :vsplit  Horizontal / vertical split\n",
+                "  :close / :only    Close window / close others\n",
+                "  :tabnew / :tabc   New tab / close tab\n",
+                "\n",
+                "Search & Replace:\n",
+                "  :s/pat/rep/flags  Substitute (current line)\n",
+                "  :%s/pat/rep/g     Substitute (all lines)\n",
+                "  :grep <pattern>   Grep into quickfix\n",
+                "\n",
+                "Git:\n",
+                "  :Gdiff / :Gd      Git diff in vsplit\n",
+                "  :Gstatus / :Gs    Git status\n",
+                "  :Gblame / :Gb     Git blame\n",
+                "  :Gadd             Stage current file\n",
+                "\n",
+                "Other:\n",
+                "  :set              Show settings\n",
+                "  :set <opt>=<val>  Change setting\n",
+                "  :norm <keys>      Run normal keys on range\n",
+                "  :help <topic>     Show help\n",
+                "  :N                Jump to line N\n",
+            )
+            .to_string(),
+            _ => {
+                self.message = format!("No help for '{}'. Try :help topics", topic);
+                return EngineAction::None;
+            }
+        };
+        let buf_id = self.buffer_manager.create();
+        if let Some(state) = self.buffer_manager.get_mut(buf_id) {
+            state.buffer.content = ropey::Rope::from_str(&text);
+        }
+        self.split_window(SplitDirection::Vertical, None);
+        self.active_window_mut().buffer_id = buf_id;
+        self.message = if topic.is_empty() {
+            "Help".to_string()
+        } else {
+            format!("Help: {}", topic)
+        };
+        EngineAction::None
+    }
+
     /// Stage the current file (`:Gadd`) or all changes (`:Gadd!`).
     fn cmd_git_add(&mut self, all: bool) -> EngineAction {
         let dir = self.git_dir();
@@ -1024,6 +1186,163 @@ impl Engine {
                 EngineAction::Error
             }
         }
+    }
+
+    // =======================================================================
+    // File rename / move
+    // =======================================================================
+
+    /// Rename or move a single file / directory within the filesystem.
+    ///
+    /// `new_name` is the bare name (no path separators).  The new location is
+    /// built as `old_path.parent() / new_name`.
+    ///
+    /// Any open buffer whose `file_path` matches `old_path` is updated in
+    /// place so the editor does not show a stale path.
+    pub fn rename_file(&mut self, old_path: &Path, new_name: &str) -> Result<(), String> {
+        if new_name.is_empty() {
+            return Err("Name cannot be empty".to_string());
+        }
+        if new_name.contains('/') || new_name.contains('\\') {
+            return Err("Name must not contain path separators".to_string());
+        }
+        let parent = old_path
+            .parent()
+            .ok_or_else(|| "Cannot rename root".to_string())?;
+        let new_path = parent.join(new_name);
+        std::fs::rename(old_path, &new_path).map_err(|e| format!("Rename failed: {}", e))?;
+
+        // Update any open buffer that was showing the old path.
+        for id in self.buffer_manager.list() {
+            if let Some(state) = self.buffer_manager.get_mut(id) {
+                if state.file_path.as_deref() == Some(old_path) {
+                    state.file_path = Some(new_path.clone());
+                    self.refresh_git_diff(id);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Move `src` into `dest_dir` (a directory).
+    ///
+    /// The filename is preserved.  Any open buffer whose `file_path` matches
+    /// `src` is updated to point at the new location.
+    pub fn move_file(&mut self, src: &Path, dest: &Path) -> Result<(), String> {
+        // If dest is a directory, move file into it keeping the original name.
+        // Otherwise treat dest as the full destination path (allows rename+move).
+        let final_dest = if dest.is_dir() {
+            let file_name = src
+                .file_name()
+                .ok_or_else(|| "Cannot determine file name".to_string())?;
+            dest.join(file_name)
+        } else {
+            let parent = dest
+                .parent()
+                .ok_or_else(|| "Invalid destination path".to_string())?;
+            if !parent.is_dir() {
+                return Err(format!("'{}' is not a directory", parent.display()));
+            }
+            dest.to_path_buf()
+        };
+        std::fs::rename(src, &final_dest).map_err(|e| format!("Move failed: {}", e))?;
+
+        // Update any open buffer that was showing the old path.
+        for id in self.buffer_manager.list() {
+            if let Some(state) = self.buffer_manager.get_mut(id) {
+                if state.file_path.as_deref() == Some(src) {
+                    state.file_path = Some(final_dest.clone());
+                    self.refresh_git_diff(id);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // =======================================================================
+    // Two-way diff
+    // =======================================================================
+
+    /// Mark the current window as a diff participant (public for UI backends).
+    ///
+    /// - First call: remembers the window id in `diff_window_pair` (left side).
+    /// - Second call: sets both windows and runs `compute_diff()`.
+    /// - If diff is already active, resets and re-runs.
+    pub fn cmd_diffthis(&mut self) -> EngineAction {
+        let win = self.active_window_id();
+        match self.diff_window_pair {
+            None => {
+                // First window: store it as the left side.
+                self.diff_window_pair = Some((win, win)); // placeholder; right == left means "waiting"
+                self.message = "DiffThis: select second window with :diffthis".to_string();
+            }
+            Some((a, b)) if a == b && a != win => {
+                // Second window chosen: activate diff.
+                self.diff_window_pair = Some((a, win));
+                self.compute_diff();
+                self.message = "Diff active".to_string();
+            }
+            Some(_) => {
+                self.message = "Diff already active. Use :diffoff to reset.".to_string();
+            }
+        }
+        EngineAction::None
+    }
+
+    /// Disable diff mode and clear all diff state.
+    pub fn cmd_diffoff(&mut self) -> EngineAction {
+        self.diff_window_pair = None;
+        self.diff_results.clear();
+        self.message = "Diff off".to_string();
+        EngineAction::None
+    }
+
+    /// Open `path` in a new vertical split and immediately diff it against the
+    /// current window.  Public for use by UI backends.
+    pub fn cmd_diffsplit(&mut self, path: &Path) -> EngineAction {
+        let left_win = self.active_window_id();
+        self.split_window(SplitDirection::Vertical, Some(path));
+        let right_win = self.active_window_id();
+        self.diff_window_pair = Some((left_win, right_win));
+        self.compute_diff();
+        self.message = format!("Diff: {}", path.display());
+        EngineAction::None
+    }
+
+    /// Internal: compute the LCS diff between the two diff windows and store
+    /// results in `self.diff_results`.
+    fn compute_diff(&mut self) {
+        let (a_win, b_win) = match self.diff_window_pair {
+            Some(pair) => pair,
+            None => return,
+        };
+        let a_lines: Vec<String> = {
+            if let Some(w) = self.windows.get(&a_win) {
+                if let Some(s) = self.buffer_manager.get(w.buffer_id) {
+                    s.buffer.content.lines().map(|l| l.to_string()).collect()
+                } else {
+                    vec![]
+                }
+            } else {
+                vec![]
+            }
+        };
+        let b_lines: Vec<String> = {
+            if let Some(w) = self.windows.get(&b_win) {
+                if let Some(s) = self.buffer_manager.get(w.buffer_id) {
+                    s.buffer.content.lines().map(|l| l.to_string()).collect()
+                } else {
+                    vec![]
+                }
+            } else {
+                vec![]
+            }
+        };
+        let a_refs: Vec<&str> = a_lines.iter().map(String::as_str).collect();
+        let b_refs: Vec<&str> = b_lines.iter().map(String::as_str).collect();
+        let (da, db) = lcs_diff(&a_refs, &b_refs);
+        self.diff_results.insert(a_win, da);
+        self.diff_results.insert(b_win, db);
     }
 
     // =======================================================================
@@ -5055,6 +5374,22 @@ impl Engine {
             return self.cmd_git_diff();
         }
 
+        // Two-way diff commands
+        if cmd == "diffthis" {
+            return self.cmd_diffthis();
+        }
+        if cmd == "diffoff" {
+            return self.cmd_diffoff();
+        }
+        if let Some(path_str) = cmd.strip_prefix("diffsplit ") {
+            let path = Path::new(path_str.trim());
+            return self.cmd_diffsplit(path);
+        }
+        if cmd == "diffsplit" {
+            self.message = "Usage: :diffsplit <file>".to_string();
+            return EngineAction::None;
+        }
+
         // Handle :Gstatus / :Gs
         if cmd == "Gstatus" || cmd == "Gs" {
             return self.cmd_git_status();
@@ -5310,6 +5645,14 @@ impl Engine {
         if cmd == "grep" || cmd == "vimgrep" {
             self.message = "Usage: :grep <pattern>".to_string();
             return EngineAction::None;
+        }
+
+        // Handle :help / :h [topic]
+        if cmd == "help" || cmd == "h" {
+            return self.cmd_help("");
+        }
+        if let Some(topic) = cmd.strip_prefix("help ").or_else(|| cmd.strip_prefix("h ")) {
+            return self.cmd_help(topic.trim());
         }
 
         // Substitute command: :s/pattern/replacement/flags or :%s/...
@@ -9021,6 +9364,73 @@ fn norm_numeric_range_end(cmd: &str) -> Option<usize> {
         return None;
     }
     Some(i)
+}
+
+// =============================================================================
+// LCS-based two-way line diff
+// =============================================================================
+
+/// Compute per-line diff status for two sequences of lines using a standard
+/// LCS (Longest Common Subsequence) approach.
+///
+/// Returns `(status_a, status_b)` where each element corresponds to one line
+/// of the respective input sequence:
+/// - `DiffLine::Same`    — line is shared by both sides.
+/// - `DiffLine::Removed` — line exists in `a` but not `b` (deleted from a's perspective).
+/// - `DiffLine::Added`   — line exists in `b` but not `a` (added from b's perspective).
+///
+/// Files longer than 3000 lines are too slow to diff with O(N×M) LCS; in that
+/// case all lines are emitted as `Same` and the engine sets a message.
+pub fn lcs_diff(a: &[&str], b: &[&str]) -> (Vec<DiffLine>, Vec<DiffLine>) {
+    const MAX_LINES: usize = 3000;
+    if a.len() > MAX_LINES || b.len() > MAX_LINES {
+        return (vec![DiffLine::Same; a.len()], vec![DiffLine::Same; b.len()]);
+    }
+
+    let m = a.len();
+    let n = b.len();
+
+    // Build LCS table
+    let mut dp = vec![vec![0usize; n + 1]; m + 1];
+    for i in (0..m).rev() {
+        for j in (0..n).rev() {
+            dp[i][j] = if a[i] == b[j] {
+                dp[i + 1][j + 1] + 1
+            } else {
+                dp[i + 1][j].max(dp[i][j + 1])
+            };
+        }
+    }
+
+    // Backtrack to assign per-line status
+    let mut da = Vec::with_capacity(m);
+    let mut db = Vec::with_capacity(n);
+    let mut i = 0;
+    let mut j = 0;
+    while i < m && j < n {
+        if a[i] == b[j] {
+            da.push(DiffLine::Same);
+            db.push(DiffLine::Same);
+            i += 1;
+            j += 1;
+        } else if dp[i + 1][j] >= dp[i][j + 1] {
+            da.push(DiffLine::Removed);
+            i += 1;
+        } else {
+            db.push(DiffLine::Added);
+            j += 1;
+        }
+    }
+    while i < m {
+        da.push(DiffLine::Removed);
+        i += 1;
+    }
+    while j < n {
+        db.push(DiffLine::Added);
+        j += 1;
+    }
+
+    (da, db)
 }
 
 #[cfg(test)]
@@ -17293,5 +17703,241 @@ mod tests {
             "vimgrep should work same as grep"
         );
         assert!(engine.quickfix_open);
+    }
+
+    // ─── rename_file / move_file tests ────────────────────────────────────────
+
+    #[test]
+    fn test_rename_file_updates_buffer_path() {
+        let dir = std::env::temp_dir().join("vimcode_rename_upd");
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = dir.join("rename_old.txt");
+        std::fs::write(&old, "hello").unwrap();
+
+        let mut engine = Engine::new();
+        engine
+            .open_file_with_mode(&old, OpenMode::Permanent)
+            .unwrap();
+
+        engine.rename_file(&old, "rename_new.txt").unwrap();
+
+        let new = dir.join("rename_new.txt");
+        assert!(new.exists(), "new path should exist");
+        assert!(!old.exists(), "old path should be gone");
+
+        // The open buffer's file_path should have been updated
+        let updated = engine.buffer_manager.list().into_iter().any(|id| {
+            engine
+                .buffer_manager
+                .get(id)
+                .and_then(|s| s.file_path.as_ref())
+                == Some(&new)
+        });
+        assert!(updated, "open buffer should point to new path");
+    }
+
+    #[test]
+    fn test_rename_file_not_found() {
+        let mut engine = Engine::new();
+        let result = engine.rename_file(Path::new("/vimcode_nonexistent_xyz/file.txt"), "new.txt");
+        assert!(result.is_err(), "renaming missing file should fail");
+    }
+
+    #[test]
+    fn test_rename_file_empty_name() {
+        let mut engine = Engine::new();
+        let result = engine.rename_file(Path::new("/tmp/whatever.txt"), "");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("empty"));
+    }
+
+    #[test]
+    fn test_move_file_basic() {
+        let base = std::env::temp_dir().join("vimcode_move_basic");
+        let dest = base.join("subdir_mv");
+        std::fs::create_dir_all(&dest).unwrap();
+        let src = base.join("moveme.txt");
+        std::fs::write(&src, "data").unwrap();
+
+        let mut engine = Engine::new();
+        engine.move_file(&src, &dest).unwrap();
+
+        assert!(!src.exists(), "source should be gone");
+        assert!(dest.join("moveme.txt").exists(), "file should be in dest");
+    }
+
+    #[test]
+    fn test_move_file_invalid_dest() {
+        let mut engine = Engine::new();
+        let result = engine.move_file(
+            Path::new("/tmp/whatever.txt"),
+            Path::new("/tmp/not_a_real_dir_xyz_vc"),
+        );
+        assert!(result.is_err());
+    }
+
+    // ─── LCS diff tests ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_lcs_diff_same_content() {
+        let a = &["alpha", "beta", "gamma"];
+        let b = &["alpha", "beta", "gamma"];
+        let (da, db) = lcs_diff(a, b);
+        assert!(da.iter().all(|s| *s == DiffLine::Same));
+        assert!(db.iter().all(|s| *s == DiffLine::Same));
+        assert_eq!(da.len(), 3);
+        assert_eq!(db.len(), 3);
+    }
+
+    #[test]
+    fn test_lcs_diff_added_line() {
+        let a = &["alpha", "gamma"];
+        let b = &["alpha", "beta", "gamma"];
+        let (da, db) = lcs_diff(a, b);
+        assert!(da.iter().all(|s| *s == DiffLine::Same));
+        assert_eq!(db[0], DiffLine::Same);
+        assert_eq!(db[1], DiffLine::Added);
+        assert_eq!(db[2], DiffLine::Same);
+    }
+
+    #[test]
+    fn test_lcs_diff_removed_line() {
+        let a = &["alpha", "beta", "gamma"];
+        let b = &["alpha", "gamma"];
+        let (da, db) = lcs_diff(a, b);
+        assert_eq!(da[0], DiffLine::Same);
+        assert_eq!(da[1], DiffLine::Removed);
+        assert_eq!(da[2], DiffLine::Same);
+        assert!(db.iter().all(|s| *s == DiffLine::Same));
+    }
+
+    #[test]
+    fn test_lcs_diff_changed_line() {
+        let a = &["hello world"];
+        let b = &["hello rust"];
+        let (da, db) = lcs_diff(a, b);
+        assert_eq!(da[0], DiffLine::Removed);
+        assert_eq!(db[0], DiffLine::Added);
+    }
+
+    #[test]
+    fn test_lcs_diff_empty() {
+        let (da, db) = lcs_diff(&[], &[]);
+        assert!(da.is_empty());
+        assert!(db.is_empty());
+    }
+
+    // ─── cmd_diffthis / cmd_diffoff / cmd_diffsplit tests ─────────────────────
+
+    #[test]
+    fn test_diffthis_one_window_then_diffoff() {
+        let mut engine = Engine::new();
+        engine.execute_command("diffthis");
+        assert!(engine.diff_window_pair.is_some());
+        engine.execute_command("diffoff");
+        assert!(engine.diff_window_pair.is_none());
+        assert!(engine.diff_results.is_empty());
+    }
+
+    #[test]
+    fn test_diffthis_two_windows() {
+        let dir = std::env::temp_dir().join("vimcode_diffthis_two");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f1 = dir.join("file_a_dt.txt");
+        let f2 = dir.join("file_b_dt.txt");
+        std::fs::write(&f1, "line1\nline2\n").unwrap();
+        std::fs::write(&f2, "line1\nline3\n").unwrap();
+
+        let mut engine = Engine::new();
+        engine
+            .open_file_with_mode(&f1, OpenMode::Permanent)
+            .unwrap();
+
+        // Mark first window
+        engine.execute_command("diffthis");
+        let (a_stored, _) = engine.diff_window_pair.unwrap();
+
+        // Open second file in a split
+        engine.split_window(SplitDirection::Vertical, Some(&f2));
+
+        // Mark second window
+        engine.execute_command("diffthis");
+
+        assert!(engine.diff_window_pair.is_some());
+        let (a, b) = engine.diff_window_pair.unwrap();
+        assert_ne!(a, b, "pair should have two distinct windows");
+        assert_eq!(a, a_stored, "first window should be preserved");
+        assert!(!engine.diff_results.is_empty(), "diff results should exist");
+    }
+
+    #[test]
+    fn test_diffsplit_command() {
+        let dir = std::env::temp_dir().join("vimcode_diffsplit_vc");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f1 = dir.join("src_ds.txt");
+        let f2 = dir.join("cmp_ds.txt");
+        std::fs::write(&f1, "alpha\nbeta\n").unwrap();
+        std::fs::write(&f2, "alpha\ngamma\n").unwrap();
+
+        let mut engine = Engine::new();
+        engine
+            .open_file_with_mode(&f1, OpenMode::Permanent)
+            .unwrap();
+
+        let initial_win_count = engine.tabs[engine.active_tab].layout.window_ids().len();
+
+        engine.execute_command(&format!("diffsplit {}", f2.display()));
+
+        let new_win_count = engine.tabs[engine.active_tab].layout.window_ids().len();
+        assert!(
+            new_win_count > initial_win_count,
+            "diffsplit should open a new window"
+        );
+        assert!(engine.diff_window_pair.is_some());
+        assert!(!engine.diff_results.is_empty());
+    }
+
+    // ── Help command tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_help_command_explorer() {
+        let mut engine = Engine::new();
+        let initial_wins = engine.tabs[engine.active_tab].layout.window_ids().len();
+        engine.execute_command("help explorer");
+        let new_wins = engine.tabs[engine.active_tab].layout.window_ids().len();
+        assert_eq!(new_wins, initial_wins + 1, "help should open a vsplit");
+        let content: String = engine.buffer().content.chars().collect();
+        assert!(content.contains("Explorer Sidebar"));
+        assert!(content.contains("Explorer Mode"));
+    }
+
+    #[test]
+    fn test_help_command_no_args() {
+        let mut engine = Engine::new();
+        engine.execute_command("help");
+        let content: String = engine.buffer().content.chars().collect();
+        assert!(content.contains("VimCode Help"));
+        assert!(content.contains(":help explorer"));
+    }
+
+    #[test]
+    fn test_help_alias_h() {
+        let mut engine = Engine::new();
+        engine.execute_command("h keys");
+        let content: String = engine.buffer().content.chars().collect();
+        assert!(content.contains("Normal Mode Keys"));
+    }
+
+    #[test]
+    fn test_help_unknown_topic() {
+        let mut engine = Engine::new();
+        let initial_wins = engine.tabs[engine.active_tab].layout.window_ids().len();
+        engine.execute_command("help nonexistent");
+        let new_wins = engine.tabs[engine.active_tab].layout.window_ids().len();
+        assert_eq!(
+            new_wins, initial_wins,
+            "unknown topic should not open a split"
+        );
+        assert!(engine.message.contains("No help for"));
     }
 }
