@@ -17,8 +17,9 @@ use std::time::{Duration, Instant};
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::cursor::SetCursorStyle;
 use ratatui::crossterm::event::{
-    self as ct_event, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent,
-    KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    self as ct_event, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste,
+    EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton,
+    MouseEvent, MouseEventKind,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
@@ -263,6 +264,121 @@ struct SidebarScrollDrag {
     total: usize,
 }
 
+// =============================================================================
+// Clipboard setup helpers
+// =============================================================================
+
+/// Build the best clipboard context for the current platform.
+///
+/// On X11 we explicitly use `x11_bin::ClipboardContext` (xclip/xsel subprocesses)
+/// rather than letting `try_context()` pick `x11_fork` first.  The fork-based
+/// provider delegates `get_contents()` to `X11ClipboardContext::get_contents()`
+/// which can stall or return empty when another app owns the clipboard (competing
+/// X11 events).  Subprocess reads each open their own independent X11 connection
+/// and have no such conflict.
+fn build_clipboard_ctx() -> Option<Box<dyn copypasta_ext::ClipboardProviderExt>> {
+    // On Unix (Linux / BSDs) but not macOS, prefer the binary (subprocess) X11
+    // context when running under X11.
+    #[cfg(all(
+        unix,
+        not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))
+    ))]
+    {
+        if copypasta_ext::display::is_x11() {
+            if let Ok(ctx) = copypasta_ext::x11_bin::ClipboardContext::new() {
+                return Some(Box::new(ctx));
+            }
+        }
+    }
+    copypasta_ext::try_context()
+}
+
+/// Set up system clipboard callbacks on the engine.
+///
+/// Backends (first match wins):
+///   X11      → X11BinClipboardContext (xclip/xsel subprocesses — no X11 event conflict)
+///   Wayland  → WaylandBinClipboardContext (wl-paste/wl-copy)
+///   macOS    → native NSPasteboard
+///   Windows  → native Win32
+///   headless → None (message shown to user)
+fn setup_tui_clipboard(engine: &mut Engine) {
+    match build_clipboard_ctx() {
+        Some(ctx) => {
+            use std::sync::{Arc, Mutex};
+            let cb = Arc::new(Mutex::new(ctx));
+            let cb_read = cb.clone();
+            engine.clipboard_read = Some(Box::new(move || {
+                let mut g = cb_read.lock().map_err(|e| format!("clipboard: {e}"))?;
+                g.get_contents().map_err(|e| format!("{e}"))
+            }));
+            let cb_write = cb;
+            engine.clipboard_write = Some(Box::new(move |text: &str| {
+                let mut g = cb_write.lock().map_err(|e| format!("clipboard: {e}"))?;
+                g.set_contents(text.to_string()).map_err(|e| format!("{e}"))
+            }));
+        }
+        None => {
+            engine.message = "Clipboard unavailable — \"+/\"* registers unavailable".to_string();
+        }
+    }
+}
+
+/// Sync the unnamed `"` register to the system clipboard if its content changed.
+/// Must be called after every keypress that might have yanked/cut text.
+fn sync_tui_clipboard(engine: &mut Engine, last: &mut Option<String>) {
+    let current = engine
+        .registers
+        .get(&'"')
+        .filter(|(s, _)| !s.is_empty())
+        .map(|(s, _)| s.clone());
+    if current != *last {
+        if let (Some(ref text), Some(ref cb_write)) = (&current, &engine.clipboard_write) {
+            let _ = cb_write(text.as_str());
+        }
+        *last = current;
+    }
+}
+
+/// Intercept paste keys (`p`/`P`) to load the system clipboard into registers
+/// before the engine processes the keypress (clipboard=unnamedplus semantics).
+/// Returns true if the key was intercepted and processed.
+fn intercept_paste_key(engine: &mut Engine, before: bool) -> bool {
+    use crate::core::Mode;
+    // Only intercept in Normal mode with a default/clipboard register.
+    if engine.mode != Mode::Normal {
+        return false;
+    }
+    if !matches!(
+        engine.selected_register,
+        None | Some('"') | Some('+') | Some('*')
+    ) {
+        return false;
+    }
+    // Read from system clipboard synchronously.
+    // Capture any error to show after handle_key (which clears engine.message).
+    let clip_err: Option<String> = match engine.clipboard_read {
+        None => Some("Clipboard unavailable — install xclip or xsel".to_string()),
+        Some(ref cb_read) => match cb_read() {
+            Ok(text) if !text.is_empty() => {
+                engine.registers.insert('"', (text.clone(), false));
+                engine.load_clipboard_register(text);
+                None
+            }
+            Ok(_) => None, // empty clipboard — fall through to use internal register
+            Err(e) => Some(format!("Clipboard read failed: {e}")),
+        },
+    };
+    // Let engine execute the paste from the (now-updated) register.
+    // TUI uses key_name="" for regular chars; unicode carries the actual character.
+    let uni = if before { Some('P') } else { Some('p') };
+    engine.handle_key("", uni, false);
+    // Restore error message after handle_key clears it.
+    if let Some(err) = clip_err {
+        engine.message = err;
+    }
+    true
+}
+
 /// Initialise the engine, set up the terminal, run the event loop, and restore
 /// the terminal on exit.
 pub fn run(file_path: Option<PathBuf>) {
@@ -275,9 +391,17 @@ pub fn run(file_path: Option<PathBuf>) {
         engine.restore_session_files();
     }
 
+    setup_tui_clipboard(&mut engine);
+
     enable_raw_mode().expect("enable raw mode");
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture).expect("enter alternate screen");
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )
+    .expect("enter alternate screen");
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).expect("create terminal");
@@ -299,6 +423,7 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) {
     let _ = execute!(
         terminal.backend_mut(),
         DisableMouseCapture,
+        DisableBracketedPaste,
         LeaveAlternateScreen
     );
     let _ = terminal.show_cursor();
@@ -334,6 +459,16 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
     let mut dragging_sidebar_search: Option<SidebarScrollDrag> = None;
     // Cache of the last rendered layout for mouse hit-testing
     let mut last_layout: Option<render::ScreenLayout> = None;
+    // Double-click detection state
+    let mut last_click_time = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .unwrap_or_else(Instant::now);
+    let mut last_click_pos: (u16, u16) = (0, 0);
+    // Whether a mouse text drag is active (not scrollbar drag)
+    let mut mouse_text_drag = false;
+
+    // Track unnamed register content so we only write to clipboard on changes.
+    let mut last_clipboard_content: Option<String> = None;
 
     let mut needs_redraw = true;
     // Track last draw time to cap frame rate at ~60 fps and keep CPU low.
@@ -927,10 +1062,18 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                         }
                     }
 
+                    // clipboard=unnamedplus: intercept p/P to read from system clipboard.
+                    // TUI translate_key() sets key_name="" for regular chars; check unicode.
+                    let paste_intercepted = !ctrl
+                        && matches!(unicode, Some('p') | Some('P'))
+                        && intercept_paste_key(engine, unicode == Some('P'));
+
                     let prev_tab = engine.active_tab;
-                    let action = engine.handle_key(&key_name, unicode, ctrl);
-                    if handle_action(engine, action) {
-                        break;
+                    if !paste_intercepted {
+                        let action = engine.handle_key(&key_name, unicode, ctrl);
+                        if handle_action(engine, action) {
+                            break;
+                        }
                     }
                     loop {
                         let (has_more, action) = engine.advance_macro_playback();
@@ -941,6 +1084,8 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                             break;
                         }
                     }
+                    // Sync unnamed register → system clipboard (clipboard=unnamedplus).
+                    sync_tui_clipboard(engine, &mut last_clipboard_content);
                     // Reveal the active file in the sidebar when the tab changed
                     if engine.active_tab != prev_tab {
                         if let Some(path) = engine.file_path().cloned() {
@@ -1015,6 +1160,9 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                                 &mut dragging_sidebar_search,
                                 last_layout.as_ref(),
                                 &mut sidebar_prompt,
+                                &mut last_click_time,
+                                &mut last_click_pos,
+                                &mut mouse_text_drag,
                             );
                             mouse_event = next;
                             break;
@@ -1034,7 +1182,38 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                     &mut dragging_sidebar_search,
                     last_layout.as_ref(),
                     &mut sidebar_prompt,
+                    &mut last_click_time,
+                    &mut last_click_pos,
+                    &mut mouse_text_drag,
                 );
+            }
+            Event::Paste(text) => {
+                // Bracketed paste — text delivered directly from the terminal.
+                use crate::core::Mode;
+                match engine.mode {
+                    Mode::Command | Mode::Search => {
+                        engine.paste_text_to_input(&text);
+                    }
+                    Mode::Insert => {
+                        for ch in text.chars() {
+                            if ch == '\n' || ch == '\r' {
+                                engine.handle_key("Return", None, false);
+                            } else {
+                                engine.handle_key("", Some(ch), false);
+                            }
+                        }
+                    }
+                    Mode::Normal | Mode::Visual => {
+                        // Load into `"` register then paste after cursor.
+                        if !text.is_empty() {
+                            engine.registers.insert('"', (text.clone(), false));
+                            engine.load_clipboard_register(text);
+                            engine.handle_key("p", Some('p'), false);
+                            sync_tui_clipboard(engine, &mut last_clipboard_content);
+                        }
+                    }
+                    _ => {}
+                }
             }
             Event::Resize(_, _) => {}
             _ => {}
@@ -1057,6 +1236,9 @@ fn handle_mouse(
     dragging_sidebar_search: &mut Option<SidebarScrollDrag>,
     last_layout: Option<&render::ScreenLayout>,
     sidebar_prompt: &mut Option<SidebarPrompt>,
+    last_click_time: &mut Instant,
+    last_click_pos: &mut (u16, u16),
+    mouse_text_drag: &mut bool,
 ) -> u16 {
     let col = ev.column;
     let row = ev.row;
@@ -1114,11 +1296,43 @@ fn handle_mouse(
                 }
                 return sidebar_width;
             }
+            // Text drag-to-select — find window under cursor and extend visual selection
+            if col >= editor_left {
+                if let Some(layout) = last_layout {
+                    let editor_row = row;
+                    for rw in &layout.windows {
+                        let wx = rw.rect.x as u16;
+                        let wy = rw.rect.y as u16;
+                        let ww = rw.rect.width as u16;
+                        let wh = rw.rect.height as u16;
+                        let gutter = rw.gutter_char_width as u16;
+                        let rel_col = col - editor_left;
+                        if rel_col >= wx
+                            && rel_col < wx + ww
+                            && editor_row >= wy
+                            && editor_row < wy + wh
+                        {
+                            let view_row = (editor_row - wy) as usize;
+                            let buf_line = rw
+                                .lines
+                                .get(view_row)
+                                .map(|l| l.line_idx)
+                                .unwrap_or_else(|| rw.scroll_top + view_row);
+                            let col_in_text = (rel_col - wx - gutter) as usize + rw.scroll_left;
+                            engine.mouse_drag(rw.window_id, buf_line, col_in_text);
+                            *mouse_text_drag = true;
+                            return sidebar_width;
+                        }
+                    }
+                }
+            }
         }
         MouseEventKind::Up(MouseButton::Left) => {
             *dragging_sidebar = false;
             *dragging_scrollbar = None;
             *dragging_sidebar_search = None;
+            *mouse_text_drag = false;
+            engine.mouse_drag_active = false;
             return sidebar_width;
         }
         // Scroll wheel — sidebar or editor
@@ -1521,7 +1735,19 @@ fn handle_mouse(
                     .map(|l| l.line_idx)
                     .unwrap_or_else(|| rw.scroll_top + view_row);
                 let col_in_text = (rel_col - wx - gutter) as usize + rw.scroll_left;
-                engine.set_cursor_for_window(rw.window_id, buf_line, col_in_text);
+
+                // Double-click detection
+                let now = Instant::now();
+                let is_double = now.duration_since(*last_click_time) < Duration::from_millis(400)
+                    && *last_click_pos == (col, row);
+                *last_click_time = now;
+                *last_click_pos = (col, row);
+
+                if is_double {
+                    engine.mouse_double_click(rw.window_id, buf_line, col_in_text);
+                } else {
+                    engine.mouse_click(rw.window_id, buf_line, col_in_text);
+                }
                 return sidebar_width;
             }
         }

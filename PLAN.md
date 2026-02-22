@@ -1,5 +1,17 @@
 # VimCode Implementation Plan
 
+## Recently Completed (Session 61)
+
+### ✅ Replace arboard with copypasta-ext; fix TUI paste intercept
+- **Dependency swap** — removed `arboard = "3"`, added `copypasta-ext = "0.4"`
+- **GTK backend** — eliminated background thread + `ClipboardCmd` enum + `clip_tx`; replaced with synchronous `copypasta_ext::x11_bin::ClipboardContext` (xclip/xsel subprocesses, no X11 event-loop conflict); `p`/`P` now read clipboard inline before falling through to `handle_key()`; removed `Msg::ClipboardPasteReady`
+- **TUI backend** — replaced ~180 lines of platform-detection helpers (`is_wsl`, `cmd_exists`, `try_setup_*`, etc.) with `build_clipboard_ctx()` (~20 lines) using `copypasta_ext::x11_bin::ClipboardContext` on X11 and `try_context()` elsewhere; `Arc<Mutex<Box<dyn ClipboardProviderExt>>>` wraps the context for the read/write callbacks
+- **TUI paste-intercept bug** — `translate_key()` sets `key_name = ""` for regular chars (only ctrl/special keys get a name); paste intercept condition was `key_name == "p"` (always false) so `intercept_paste_key` was never called; fixed to `matches!(unicode, Some('p') | Some('P'))`; also fixed `intercept_paste_key` to pass `key_name = ""` (TUI convention) and to set error message after `handle_key()` (which clears `engine.message`)
+- **Why x11_bin explicitly** — `try_context()` picks `x11_fork` first on X11; `x11_fork::get_contents()` delegates to `X11ClipboardContext::get_contents()` (direct X11 socket) which conflicts with GTK's event loop and fails when another app owns the clipboard; `x11_bin` uses xclip/xsel subprocesses (independent X11 connections per call)
+- Tests: 606 (no change)
+
+---
+
 ## Recently Completed (Session 59)
 
 ### ✅ Explorer Polish

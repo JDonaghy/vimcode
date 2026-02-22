@@ -339,6 +339,17 @@ pub struct Engine {
     /// Per-window per-line diff status.  Keyed by WindowId, value is a Vec
     /// with one entry per buffer line.
     pub diff_results: HashMap<WindowId, Vec<DiffLine>>,
+
+    // --- Clipboard callbacks (set by UI backend) ---
+    /// Read text from the system clipboard.  Set by the GTK/TUI backend at startup.
+    /// Returns Ok(text) or Err(error_message).
+    pub clipboard_read: Option<Box<dyn Fn() -> Result<String, String>>>,
+    /// Write text to the system clipboard.  Set by the GTK/TUI backend at startup.
+    /// Returns Err(error_message) on failure.
+    #[allow(clippy::type_complexity)]
+    pub clipboard_write: Option<Box<dyn Fn(&str) -> Result<(), String>>>,
+    /// Whether a mouse drag selection is currently active.
+    pub mouse_drag_active: bool,
 }
 
 impl Engine {
@@ -445,6 +456,9 @@ impl Engine {
             quickfix_has_focus: false,
             diff_window_pair: None,
             diff_results: HashMap::new(),
+            clipboard_read: None,
+            clipboard_write: None,
+            mouse_drag_active: false,
         }
     }
 
@@ -3397,7 +3411,7 @@ impl Engine {
             '"' => {
                 // Register selection: "x sets selected_register for next operation
                 if let Some(ch) = unicode {
-                    if ch.is_ascii_lowercase() || ch == '"' {
+                    if ch.is_ascii_lowercase() || ch == '"' || ch == '+' || ch == '*' {
                         self.selected_register = Some(ch);
                     }
                 }
@@ -4889,12 +4903,7 @@ impl Engine {
         if let Some((text, is_linewise)) = self.get_visual_selection_text() {
             // Store in selected register (or unnamed register)
             let reg = self.selected_register.unwrap_or('"');
-            self.registers.insert(reg, (text.clone(), is_linewise));
-
-            // Also store in unnamed register if we used a named one
-            if reg != '"' {
-                self.registers.insert('"', (text, is_linewise));
-            }
+            self.set_register(reg, text, is_linewise);
 
             self.selected_register = None;
             self.message = format!("{} yanked", if is_linewise { "Line(s)" } else { "Text" });
@@ -4909,10 +4918,7 @@ impl Engine {
         if let Some((text, is_linewise)) = self.get_visual_selection_text() {
             // Store in register
             let reg = self.selected_register.unwrap_or('"');
-            self.registers.insert(reg, (text.clone(), is_linewise));
-            if reg != '"' {
-                self.registers.insert('"', (text, is_linewise));
-            }
+            self.set_register(reg, text, is_linewise);
             self.selected_register = None;
 
             // Delete the selection
@@ -6000,7 +6006,7 @@ impl Engine {
     }
 
     /// Perform incremental search as user types
-    fn perform_incremental_search(&mut self) {
+    pub fn perform_incremental_search(&mut self) {
         // Update search query from command buffer
         self.search_query = self.command_buffer.clone();
 
@@ -7696,17 +7702,45 @@ impl Engine {
     }
 
     /// Sets a register's content. `is_linewise` affects paste behavior.
+    /// For `+` and `*` registers, also writes to the system clipboard.
     fn set_register(&mut self, reg: char, content: String, is_linewise: bool) {
         self.registers.insert(reg, (content.clone(), is_linewise));
         // Also copy to unnamed register if using a named register
         if reg != '"' {
-            self.registers.insert('"', (content, is_linewise));
+            self.registers.insert('"', (content.clone(), is_linewise));
+        }
+        // Sync clipboard registers to system clipboard
+        if reg == '+' || reg == '*' {
+            if let Some(ref cb_write) = self.clipboard_write {
+                if let Err(e) = cb_write(&content) {
+                    self.message = format!("Clipboard write failed: {}", e);
+                }
+            }
         }
     }
 
-    /// Gets a register's content and linewise flag.
+    /// Gets a register's content and linewise flag (borrowed).
     fn get_register(&self, reg: char) -> Option<&(String, bool)> {
         self.registers.get(&reg)
+    }
+
+    /// Gets register content as owned data.
+    /// For `+` and `*` registers, reads from the system clipboard.
+    pub fn get_register_content(&mut self, reg: char) -> Option<(String, bool)> {
+        if reg == '+' || reg == '*' {
+            if let Some(ref cb_read) = self.clipboard_read {
+                match cb_read() {
+                    Ok(text) => return Some((text, false)),
+                    Err(e) => {
+                        self.message = format!("Clipboard read failed: {}", e);
+                    }
+                }
+            }
+            // Fall back to internal register if clipboard unavailable
+            self.registers.get(&reg).cloned()
+        } else {
+            self.registers.get(&reg).cloned()
+        }
     }
 
     /// Clears the selected register after an operation.
@@ -7936,8 +7970,8 @@ impl Engine {
     /// Paste after cursor (p). Linewise pastes below current line.
     fn paste_after(&mut self, changed: &mut bool) {
         let reg = self.active_register();
-        let (content, is_linewise) = match self.get_register(reg) {
-            Some((c, l)) => (c.clone(), *l),
+        let (content, is_linewise) = match self.get_register_content(reg) {
+            Some(pair) => pair,
             None => {
                 self.clear_selected_register();
                 return;
@@ -7989,8 +8023,8 @@ impl Engine {
     /// Paste before cursor (P). Linewise pastes above current line.
     fn paste_before(&mut self, changed: &mut bool) {
         let reg = self.active_register();
-        let (content, is_linewise) = match self.get_register(reg) {
-            Some((c, l)) => (c.clone(), *l),
+        let (content, is_linewise) = match self.get_register_content(reg) {
+            Some(pair) => pair,
             None => {
                 self.clear_selected_register();
                 return;
@@ -8022,6 +8056,149 @@ impl Engine {
         self.finish_undo_group();
         self.clear_selected_register();
         *changed = true;
+    }
+
+    // =======================================================================
+    // Mouse selection (called by UI backends after coordinate conversion)
+    // =======================================================================
+
+    /// Handle a single mouse click at the given buffer position.
+    /// Exits visual mode if active, positions cursor, clears drag state.
+    pub fn mouse_click(&mut self, window_id: WindowId, line: usize, col: usize) {
+        // Exit visual mode if active
+        if matches!(
+            self.mode,
+            Mode::Visual | Mode::VisualLine | Mode::VisualBlock
+        ) {
+            self.mode = Mode::Normal;
+            self.visual_anchor = None;
+        }
+        self.mouse_drag_active = false;
+        self.set_cursor_for_window(window_id, line, col);
+    }
+
+    /// Handle mouse drag to the given buffer position.
+    /// On first drag: enters Visual mode with anchor at current cursor.
+    /// On subsequent drags: extends selection by moving cursor.
+    /// If already in Visual mode (e.g. from double-click word select),
+    /// preserves the existing anchor and just extends.
+    pub fn mouse_drag(&mut self, window_id: WindowId, line: usize, col: usize) {
+        // Ensure this window is active
+        if self.windows.contains_key(&window_id) {
+            self.active_tab_mut().active_window = window_id;
+        }
+
+        if !self.mouse_drag_active {
+            // First drag event — only set anchor if not already in visual mode
+            // (double-click word select already set the anchor at word start)
+            if !matches!(
+                self.mode,
+                Mode::Visual | Mode::VisualLine | Mode::VisualBlock
+            ) {
+                self.visual_anchor = Some(self.view().cursor);
+                self.mode = Mode::Visual;
+            }
+            self.mouse_drag_active = true;
+        }
+
+        // Move cursor to drag position (extends visual selection)
+        let buffer = self.buffer();
+        let max_line = buffer.content.len_lines().saturating_sub(1);
+        let clamped_line = line.min(max_line);
+        let max_col = self.get_max_cursor_col(clamped_line);
+        let clamped_col = col.min(max_col);
+        let view = self.view_mut();
+        view.cursor.line = clamped_line;
+        view.cursor.col = clamped_col;
+    }
+
+    /// Handle mouse double-click: select the word under the cursor.
+    /// Positions cursor, finds word boundaries, enters Visual mode.
+    pub fn mouse_double_click(&mut self, window_id: WindowId, line: usize, col: usize) {
+        self.mouse_drag_active = false;
+        self.set_cursor_for_window(window_id, line, col);
+
+        // Find word boundaries at cursor
+        let cursor_line = self.view().cursor.line;
+        let cursor_col = self.view().cursor.col;
+        let line_text: Vec<char> = self.buffer().content.line(cursor_line).chars().collect();
+
+        if cursor_col >= line_text.len() || !Self::is_word_char(line_text[cursor_col]) {
+            // Clicked on non-word character — don't select
+            return;
+        }
+
+        // Find word start
+        let mut word_start = cursor_col;
+        while word_start > 0 && Self::is_word_char(line_text[word_start - 1]) {
+            word_start -= 1;
+        }
+
+        // Find word end (inclusive)
+        let mut word_end = cursor_col;
+        while word_end + 1 < line_text.len() && Self::is_word_char(line_text[word_end + 1]) {
+            word_end += 1;
+        }
+        // Exclude trailing newline from word end
+        if word_end < line_text.len() && line_text[word_end] == '\n' && word_end > word_start {
+            word_end -= 1;
+        }
+
+        // Enter visual mode with anchor at word start, cursor at word end
+        self.visual_anchor = Some(Cursor {
+            line: cursor_line,
+            col: word_start,
+        });
+        let view = self.view_mut();
+        view.cursor.col = word_end;
+        self.mode = Mode::Visual;
+    }
+
+    // =======================================================================
+    // Clipboard paste into command/search mode
+    // =======================================================================
+
+    /// Paste the first line from the system clipboard into the command buffer.
+    /// Works in Command and Search modes. For Search mode with incremental search,
+    /// also triggers a search update.
+    #[allow(dead_code)]
+    pub fn paste_clipboard_to_input(&mut self) {
+        let text = match self.clipboard_read {
+            Some(ref cb_read) => match cb_read() {
+                Ok(t) => t,
+                Err(e) => {
+                    self.message = format!("Clipboard read failed: {}", e);
+                    return;
+                }
+            },
+            None => return,
+        };
+        self.paste_text_to_input(&text);
+    }
+
+    /// Paste the given text into the command/search buffer (first line only).
+    /// Called by backends that have already fetched the clipboard text themselves.
+    pub fn paste_text_to_input(&mut self, text: &str) {
+        let first_line = text.lines().next().unwrap_or("");
+        if first_line.is_empty() {
+            return;
+        }
+        match self.mode {
+            Mode::Command | Mode::Search => {
+                self.command_buffer.push_str(first_line);
+                if self.mode == Mode::Search && self.settings.incremental_search {
+                    self.perform_incremental_search();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Pre-load clipboard text into the `+` and `*` registers.
+    /// Called by GTK backend after an async GDK clipboard read, before paste.
+    pub fn load_clipboard_register(&mut self, text: String) {
+        self.registers.insert('+', (text.clone(), false));
+        self.registers.insert('*', (text, false));
     }
 
     // =======================================================================
@@ -17939,5 +18116,226 @@ mod tests {
             "unknown topic should not open a split"
         );
         assert!(engine.message.contains("No help for"));
+    }
+
+    // ── Mouse selection tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_mouse_click_exits_visual_mode() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello world");
+        engine.update_syntax();
+
+        // Enter visual mode
+        press_char(&mut engine, 'v');
+        assert_eq!(engine.mode, Mode::Visual);
+
+        // Click should exit visual mode
+        let wid = engine.active_window_id();
+        engine.mouse_click(wid, 0, 3);
+        assert_eq!(engine.mode, Mode::Normal);
+        assert!(engine.visual_anchor.is_none());
+    }
+
+    #[test]
+    fn test_mouse_click_positions_cursor() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello world\nsecond line");
+        engine.update_syntax();
+
+        let wid = engine.active_window_id();
+        engine.mouse_click(wid, 1, 3);
+        assert_eq!(engine.view().cursor.line, 1);
+        assert_eq!(engine.view().cursor.col, 3);
+    }
+
+    #[test]
+    fn test_mouse_drag_enters_visual_mode() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello world");
+        engine.update_syntax();
+
+        // Position cursor at col 2
+        let wid = engine.active_window_id();
+        engine.mouse_click(wid, 0, 2);
+        assert_eq!(engine.view().cursor.col, 2);
+
+        // First drag should enter visual mode with anchor at current position
+        engine.mouse_drag(wid, 0, 5);
+        assert_eq!(engine.mode, Mode::Visual);
+        assert!(engine.mouse_drag_active);
+        assert_eq!(engine.visual_anchor.unwrap().col, 2); // anchor at click position
+        assert_eq!(engine.view().cursor.col, 5); // cursor moved to drag position
+    }
+
+    #[test]
+    fn test_mouse_drag_extends_selection() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello world");
+        engine.update_syntax();
+
+        let wid = engine.active_window_id();
+        engine.mouse_click(wid, 0, 2);
+
+        // First drag
+        engine.mouse_drag(wid, 0, 5);
+        let anchor = engine.visual_anchor.unwrap();
+
+        // Second drag should extend, keeping anchor
+        engine.mouse_drag(wid, 0, 8);
+        assert_eq!(engine.visual_anchor.unwrap(), anchor);
+        assert_eq!(engine.view().cursor.col, 8);
+    }
+
+    #[test]
+    fn test_mouse_drag_multiline() {
+        let mut engine = Engine::new();
+        engine
+            .buffer_mut()
+            .insert(0, "line one\nline two\nline three");
+        engine.update_syntax();
+
+        let wid = engine.active_window_id();
+        engine.mouse_click(wid, 0, 3);
+        engine.mouse_drag(wid, 2, 4);
+
+        assert_eq!(engine.mode, Mode::Visual);
+        assert_eq!(engine.visual_anchor.unwrap().line, 0);
+        assert_eq!(engine.view().cursor.line, 2);
+        assert_eq!(engine.view().cursor.col, 4);
+    }
+
+    #[test]
+    fn test_mouse_double_click_selects_word() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello world");
+        engine.update_syntax();
+
+        let wid = engine.active_window_id();
+        engine.mouse_double_click(wid, 0, 1); // in "hello"
+
+        assert_eq!(engine.mode, Mode::Visual);
+        assert_eq!(engine.visual_anchor.unwrap().col, 0); // word start
+        assert_eq!(engine.view().cursor.col, 4); // word end (inclusive)
+    }
+
+    #[test]
+    fn test_mouse_double_click_on_non_word() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello world");
+        engine.update_syntax();
+
+        let wid = engine.active_window_id();
+        engine.mouse_double_click(wid, 0, 5); // on space
+
+        // Should not enter visual mode
+        assert_eq!(engine.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn test_mouse_click_after_drag_resets() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello world");
+        engine.update_syntax();
+
+        let wid = engine.active_window_id();
+        engine.mouse_click(wid, 0, 2);
+        engine.mouse_drag(wid, 0, 5);
+        assert_eq!(engine.mode, Mode::Visual);
+
+        // Click should exit visual mode and reset drag
+        engine.mouse_click(wid, 0, 0);
+        assert_eq!(engine.mode, Mode::Normal);
+        assert!(!engine.mouse_drag_active);
+    }
+
+    #[test]
+    fn test_double_click_then_drag_preserves_word_anchor() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello world foo bar");
+        engine.update_syntax();
+
+        let wid = engine.active_window_id();
+
+        // Double-click on "world" (col 6 is inside "world")
+        engine.mouse_double_click(wid, 0, 6);
+        assert_eq!(engine.mode, Mode::Visual);
+        // Anchor should be at word start (col 6)
+        assert_eq!(engine.visual_anchor.unwrap().col, 6);
+        // Cursor should be at word end (col 10)
+        assert_eq!(engine.view().cursor.col, 10);
+
+        // Now drag to extend selection further right
+        engine.mouse_drag(wid, 0, 14);
+        assert_eq!(engine.mode, Mode::Visual);
+        // Anchor should still be at word start (col 6), NOT reset
+        assert_eq!(engine.visual_anchor.unwrap().col, 6);
+        // Cursor should follow the drag
+        assert_eq!(engine.view().cursor.col, 14);
+    }
+
+    // ── Clipboard register tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_clipboard_register_write() {
+        use std::sync::{Arc, Mutex};
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello");
+        engine.update_syntax();
+
+        let written = Arc::new(Mutex::new(String::new()));
+        let written_clone = written.clone();
+        engine.clipboard_write = Some(Box::new(move |text: &str| {
+            *written_clone.lock().unwrap() = text.to_string();
+            Ok(())
+        }));
+
+        engine.set_register('+', "test_data".to_string(), false);
+        assert_eq!(*written.lock().unwrap(), "test_data");
+    }
+
+    #[test]
+    fn test_clipboard_register_read() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello");
+        engine.update_syntax();
+
+        engine.clipboard_read = Some(Box::new(|| Ok("from_clipboard".to_string())));
+
+        let content = engine.get_register_content('+');
+        assert!(content.is_some());
+        let (text, linewise) = content.unwrap();
+        assert_eq!(text, "from_clipboard");
+        assert!(!linewise);
+    }
+
+    #[test]
+    fn test_paste_clipboard_to_command_buffer() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello");
+        engine.update_syntax();
+
+        engine.clipboard_read = Some(Box::new(|| Ok("pasted_text".to_string())));
+
+        // Enter command mode
+        press_char(&mut engine, ':');
+        assert_eq!(engine.mode, Mode::Command);
+
+        engine.paste_clipboard_to_input();
+        assert_eq!(engine.command_buffer, "pasted_text");
+    }
+
+    #[test]
+    fn test_paste_clipboard_multiline_takes_first() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello");
+        engine.update_syntax();
+
+        engine.clipboard_read = Some(Box::new(|| Ok("first line\nsecond line".to_string())));
+
+        // Enter command mode
+        press_char(&mut engine, ':');
+        engine.paste_clipboard_to_input();
+        assert_eq!(engine.command_buffer, "first line");
     }
 }

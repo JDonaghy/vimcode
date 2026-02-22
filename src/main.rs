@@ -42,6 +42,8 @@ enum SidebarPanel {
 
 use std::collections::HashMap;
 
+use copypasta_ext::ClipboardProviderExt;
+
 struct App {
     engine: Rc<RefCell<Engine>>,
     redraw: bool,
@@ -74,6 +76,12 @@ struct App {
     search_results_list: Rc<RefCell<Option<gtk4::ListBox>>>,
     /// File selected as "left side" for a two-way diff (via context menu).
     diff_selected_file: Option<PathBuf>,
+    /// Last content written to system clipboard.
+    /// Used to avoid redundant writes on every keystroke.
+    last_clipboard_content: Option<String>,
+    /// System clipboard context (copypasta-ext).  None if unavailable.
+    // Box<dyn ClipboardProviderExt> is !Send; GTK App lives on main thread only.
+    clipboard: Option<Box<dyn ClipboardProviderExt>>,
 }
 
 /// Scrollbars and indicators for a single window
@@ -183,6 +191,22 @@ enum Msg {
     ProjectReplaceAll,
     /// Mouse scroll wheel on editor drawing area.
     MouseScroll { delta_x: f64, delta_y: f64 },
+    /// Mouse double-click at (x, y) coordinates in drawing area.
+    MouseDoubleClick {
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+    },
+    /// Mouse drag to (x, y) coordinates in drawing area.
+    MouseDrag {
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+    },
+    /// Mouse button released in editor.
+    MouseUp,
     /// Rename a file: (old_path, new_name_without_dir)
     RenameFile(PathBuf, String),
     /// Move a file to a different directory: (src, dest_dir)
@@ -193,6 +217,8 @@ enum Msg {
     SelectForDiff(PathBuf),
     /// Open a vsplit diff: current file is right side, stored path is left.
     DiffWithSelected(PathBuf),
+    /// GDK clipboard text arrived for pasting into command/search/insert input.
+    ClipboardPasteToInput { text: String },
 }
 
 #[relm4::component]
@@ -669,20 +695,51 @@ impl SimpleComponent for App {
                                         return gtk4::glib::Propagation::Stop;
                                     }
 
+                                    // Ctrl-Shift-V: paste from system clipboard
+                                    if ctrl && shift && (key_name == "v" || key_name == "V") {
+                                        sender.input(Msg::KeyPress {
+                                            key_name: "PasteClipboard".to_string(),
+                                            unicode: None,
+                                            ctrl: false,
+                                        });
+                                        return gtk4::glib::Propagation::Stop;
+                                    }
+
                                     sender.input(Msg::KeyPress { key_name, unicode, ctrl });
                                     gtk4::glib::Propagation::Stop
                                 }
                             },
 
                             add_controller = gtk4::GestureClick {
-                                connect_pressed[sender, drawing_area] => move |_, _, x, y| {
+                                set_button: 1,
+                                connect_pressed[sender, drawing_area] => move |_, n_press, x, y| {
                                     // Grab focus when clicking in editor
                                     drawing_area.grab_focus();
 
                                     let width = drawing_area.width() as f64;
                                     let height = drawing_area.height() as f64;
-                                    sender.input(Msg::MouseClick { x, y, width, height });
+                                    if n_press >= 2 {
+                                        sender.input(Msg::MouseDoubleClick { x, y, width, height });
+                                    } else {
+                                        sender.input(Msg::MouseClick { x, y, width, height });
+                                    }
                                 }
+                            },
+
+                            add_controller = gtk4::GestureDrag {
+                                set_button: 1,
+                                connect_drag_update[sender, drawing_area] => move |gesture, dx, dy| {
+                                    if let Some((start_x, start_y)) = gesture.start_point() {
+                                        let x = start_x + dx;
+                                        let y = start_y + dy;
+                                        let width = drawing_area.width() as f64;
+                                        let height = drawing_area.height() as f64;
+                                        sender.input(Msg::MouseDrag { x, y, width, height });
+                                    }
+                                },
+                                connect_drag_end[sender] => move |_, _, _| {
+                                    sender.input(Msg::MouseUp);
+                                },
                             },
 
                             add_controller = gtk4::EventControllerScroll {
@@ -837,6 +894,38 @@ impl SimpleComponent for App {
             }
         };
 
+        // On X11 use x11_bin (xclip/xsel subprocesses) explicitly: try_context() picks
+        // x11_fork first, whose get_contents() uses X11ClipboardContext directly and
+        // competes with GTK's X11 event loop.  Subprocess reads open their own X11
+        // connection per call and have no such conflict.
+        let clipboard: Option<Box<dyn ClipboardProviderExt>> = {
+            #[cfg(all(
+                unix,
+                not(any(
+                    target_os = "macos",
+                    target_os = "android",
+                    target_os = "emscripten"
+                ))
+            ))]
+            if copypasta_ext::display::is_x11() {
+                copypasta_ext::x11_bin::ClipboardContext::new()
+                    .ok()
+                    .map(|c| Box::new(c) as Box<dyn ClipboardProviderExt>)
+                    .or_else(copypasta_ext::try_context)
+            } else {
+                copypasta_ext::try_context()
+            }
+            #[cfg(not(all(
+                unix,
+                not(any(
+                    target_os = "macos",
+                    target_os = "android",
+                    target_os = "emscripten"
+                ))
+            )))]
+            copypasta_ext::try_context()
+        };
+
         // Set window title based on file
         let title = match engine.file_path() {
             Some(p) => format!("VimCode - {}", p.display()),
@@ -915,6 +1004,8 @@ impl SimpleComponent for App {
             project_search_status: String::new(),
             search_results_list: search_results_list_ref.clone(),
             diff_selected_file: None,
+            last_clipboard_content: None,
+            clipboard,
         };
         let widgets = view_output!();
 
@@ -1344,7 +1435,7 @@ impl SimpleComponent for App {
         ComponentParts { model, widgets }
     }
 
-    fn update(&mut self, msg: Self::Input, _sender: ComponentSender<Self>) {
+    fn update(&mut self, msg: Self::Input, sender: ComponentSender<Self>) {
         // Track if this is a scrollbar change to avoid syncing feedback loop
         let is_scrollbar_msg = matches!(
             &msg,
@@ -1357,6 +1448,51 @@ impl SimpleComponent for App {
                 unicode,
                 ctrl,
             } => {
+                // Handle Ctrl-Shift-V paste (sent as synthetic "PasteClipboard" key):
+                // do async GDK clipboard read → ClipboardPasteToInput
+                if key_name == "PasteClipboard" {
+                    if let Some(display) = gdk::Display::default() {
+                        let sender = sender.clone();
+                        display.clipboard().read_text_async(
+                            gtk4::gio::Cancellable::NONE,
+                            move |result| {
+                                let text = result
+                                    .ok()
+                                    .flatten()
+                                    .map(|s| s.to_string())
+                                    .unwrap_or_default();
+                                sender.input(Msg::ClipboardPasteToInput { text });
+                            },
+                        );
+                    }
+                    return;
+                }
+
+                // Intercept p/P to read from the system clipboard first
+                // (clipboard=unnamedplus semantics: plain p/P and "+p/"*p all read
+                // from system clipboard).  Skip for explicit named registers like "ap.
+                if !ctrl && (key_name == "p" || key_name == "P") {
+                    let use_clipboard = {
+                        let engine = self.engine.borrow();
+                        matches!(
+                            engine.selected_register,
+                            None | Some('"') | Some('+') | Some('*')
+                        )
+                    };
+                    if use_clipboard {
+                        if let Some(ref mut ctx) = self.clipboard {
+                            let text = ctx.get_contents().unwrap_or_default();
+                            if !text.is_empty() {
+                                let mut engine = self.engine.borrow_mut();
+                                self.last_clipboard_content = Some(text.clone());
+                                engine.registers.insert('"', (text.clone(), false));
+                                engine.load_clipboard_register(text);
+                            }
+                        }
+                        // Fall through — handle_key() will execute the paste.
+                    }
+                }
+
                 let (action, prev_tab) = {
                     let mut engine = self.engine.borrow_mut();
                     let prev = engine.active_tab;
@@ -1483,6 +1619,10 @@ impl SimpleComponent for App {
                     }
                 }
 
+                // Sync the unnamed register to the system clipboard if it changed.
+                // The comparison is O(1); actual write is deferred to the background thread.
+                self.sync_plus_register_to_clipboard();
+
                 self.redraw = !self.redraw;
             }
             Msg::Resize => {
@@ -1504,6 +1644,31 @@ impl SimpleComponent for App {
                         highlight_file_in_tree(tree, &path);
                     }
                 }
+                self.redraw = !self.redraw;
+            }
+            Msg::MouseDoubleClick {
+                x,
+                y,
+                width,
+                height,
+            } => {
+                let mut engine = self.engine.borrow_mut();
+                handle_mouse_double_click(&mut engine, x, y, width, height);
+                self.redraw = !self.redraw;
+            }
+            Msg::MouseDrag {
+                x,
+                y,
+                width,
+                height,
+            } => {
+                let mut engine = self.engine.borrow_mut();
+                handle_mouse_drag(&mut engine, x, y, width, height);
+                self.redraw = !self.redraw;
+            }
+            Msg::MouseUp => {
+                let mut engine = self.engine.borrow_mut();
+                engine.mouse_drag_active = false;
                 self.redraw = !self.redraw;
             }
             Msg::ToggleSidebar => {
@@ -1577,10 +1742,10 @@ impl SimpleComponent for App {
                         self.engine.borrow_mut().message = format!("Created: {}", name);
 
                         // Trigger tree refresh
-                        _sender.input(Msg::RefreshFileTree);
+                        sender.input(Msg::RefreshFileTree);
 
                         // Open the new file
-                        _sender.input(Msg::OpenFileFromSidebar(file_path));
+                        sender.input(Msg::OpenFileFromSidebar(file_path));
                     }
                     Err(e) => {
                         self.engine.borrow_mut().message =
@@ -1610,7 +1775,7 @@ impl SimpleComponent for App {
                 match std::fs::create_dir(&folder_path) {
                     Ok(_) => {
                         self.engine.borrow_mut().message = format!("Created folder: {}", name);
-                        _sender.input(Msg::RefreshFileTree);
+                        sender.input(Msg::RefreshFileTree);
                         // Highlight the new folder in the tree after refresh
                         let tree_ref = self.file_tree_view.clone();
                         let path = folder_path.clone();
@@ -1647,7 +1812,7 @@ impl SimpleComponent for App {
                     gtk4::Label::new(Some(&format!("Delete {} '{}'?", item_type, filename)));
                 label.set_margin_all(12);
                 dialog.content_area().append(&label);
-                let s = _sender.clone();
+                let s = sender.clone();
                 dialog.connect_response(move |dlg, resp| {
                     if resp == gtk4::ResponseType::Accept {
                         s.input(Msg::DeletePath(path.clone()));
@@ -1696,7 +1861,7 @@ impl SimpleComponent for App {
                             }
                         }
 
-                        _sender.input(Msg::RefreshFileTree);
+                        sender.input(Msg::RefreshFileTree);
                     }
                     Err(e) => {
                         let msg = match e.kind() {
@@ -1998,7 +2163,7 @@ impl SimpleComponent for App {
                 match result {
                     Ok(()) => {
                         self.engine.borrow_mut().message = format!("Renamed to '{}'", new_name);
-                        _sender.input(Msg::RefreshFileTree);
+                        sender.input(Msg::RefreshFileTree);
                     }
                     Err(e) => {
                         self.engine.borrow_mut().message = e;
@@ -2069,6 +2234,27 @@ impl SimpleComponent for App {
                 }
                 self.redraw = !self.redraw;
             }
+            Msg::ClipboardPasteToInput { text } => {
+                // GDK clipboard text arrived for Ctrl-Shift-V paste into command/search/insert.
+                use core::Mode;
+                let mut engine = self.engine.borrow_mut();
+                match engine.mode {
+                    Mode::Command | Mode::Search => {
+                        engine.paste_text_to_input(&text);
+                    }
+                    Mode::Insert => {
+                        for ch in text.chars() {
+                            if ch == '\n' || ch == '\r' {
+                                engine.handle_key("Return", None, false);
+                            } else {
+                                engine.handle_key("", Some(ch), false);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                self.redraw = !self.redraw;
+            }
             Msg::WindowClosing { width, height } => {
                 let mut engine = self.engine.borrow_mut();
                 engine.session.window.width = width;
@@ -2109,6 +2295,26 @@ impl SimpleComponent for App {
 }
 
 impl App {
+    /// Sync the unnamed `"` register to the system clipboard whenever its content changes
+    /// (clipboard=unnamedplus semantics: every yank/cut is auto-copied).
+    /// Uses the background arboard thread to avoid blocking GTK's X11 connection.
+    fn sync_plus_register_to_clipboard(&mut self) {
+        let new_content = self
+            .engine
+            .borrow()
+            .registers
+            .get(&'"')
+            .filter(|(s, _)| !s.is_empty())
+            .map(|(s, _)| s.clone());
+
+        if new_content != self.last_clipboard_content {
+            if let (Some(ref content), Some(ref mut ctx)) = (&new_content, &mut self.clipboard) {
+                let _ = ctx.set_contents(content.clone());
+            }
+            self.last_clipboard_content = new_content;
+        }
+    }
+
     /// Rebuild the search results ListBox from current engine state.
     fn rebuild_search_results(&self, sender: &relm4::Sender<Msg>) {
         let list = match self.search_results_list.borrow().as_ref() {
@@ -3638,33 +3844,45 @@ fn draw_command_line(
     }
 }
 
-/// Handle mouse click by converting coordinates to buffer position.
-/// This determines which window was clicked and moves the cursor there.
-fn handle_mouse_click(engine: &mut Engine, x: f64, y: f64, width: f64, height: f64) {
-    // Create Pango context to measure font metrics (matching draw_editor)
+/// Result of converting pixel coordinates to buffer position.
+enum ClickTarget {
+    /// Click was in the tab bar, tab already switched.
+    TabBar,
+    /// Click was in gutter — fold already toggled.
+    Gutter,
+    /// Click resolved to a buffer position in a specific window.
+    BufferPos(core::WindowId, usize, usize),
+    /// Click was outside any actionable area.
+    None,
+}
+
+/// Convert pixel (x, y) to a buffer position (window_id, line, col).
+/// Also handles tab-bar clicks and gutter fold toggles.
+fn pixel_to_click_target(
+    engine: &mut Engine,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+) -> ClickTarget {
     use gtk4::cairo::{Context as CairoContext, Format, ImageSurface};
 
-    // Create a temporary surface for Pango measurements
     let surface = ImageSurface::create(Format::Rgb24, 1, 1).unwrap();
     let cr = CairoContext::new(&surface).unwrap();
 
     let pango_ctx = pangocairo::create_context(&cr);
-    // Use configurable font from settings (matching draw_editor)
     let font_str = format!(
         "{} {}",
         engine.settings.font_family, engine.settings.font_size
     );
     let font_desc = FontDescription::from_string(&font_str);
-
-    // Get actual font metrics (matching draw_editor line 250-251)
     let font_metrics = pango_ctx.metrics(Some(&font_desc), None);
     let line_height = (font_metrics.ascent() + font_metrics.descent()) as f64 / pango::SCALE as f64;
 
-    let tab_bar_height = line_height; // Always show tab bar
+    let tab_bar_height = line_height;
 
     // Check if click is in tab bar
     if y < tab_bar_height {
-        // Calculate which tab was clicked
         let layout = pangocairo::create_layout(&cr);
         layout.set_font_description(Some(&font_desc));
 
@@ -3674,7 +3892,6 @@ fn handle_mouse_click(engine: &mut Engine, x: f64, y: f64, width: f64, height: f
 
         let mut tab_x = 0.0;
         for (i, tab) in engine.tabs.iter().enumerate() {
-            // Get buffer name and preview state (same logic as draw_tab_bar)
             let window_id = tab.active_window;
             let (name, is_preview) = if let Some(window) = engine.windows.get(&window_id) {
                 if let Some(state) = engine.buffer_manager.get(window.buffer_id) {
@@ -3690,7 +3907,6 @@ fn handle_mouse_click(engine: &mut Engine, x: f64, y: f64, width: f64, height: f
                 (format!(" {}: [No Name] ", i + 1), false)
             };
 
-            // Use correct font for measuring
             if is_preview {
                 layout.set_font_description(Some(&italic_font));
             } else {
@@ -3700,19 +3916,17 @@ fn handle_mouse_click(engine: &mut Engine, x: f64, y: f64, width: f64, height: f
             layout.set_text(&name);
             let (tab_width, _) = layout.pixel_size();
 
-            // Check if click is in this tab's bounds
             if x >= tab_x && x < tab_x + tab_width as f64 {
                 engine.goto_tab(i);
-                return;
+                return ClickTarget::TabBar;
             }
 
             tab_x += tab_width as f64 + 2.0;
         }
-        return;
+        return ClickTarget::TabBar;
     }
 
     let status_bar_height = line_height * 2.0;
-
     let content_bounds = WindowRect::new(
         0.0,
         tab_bar_height,
@@ -3720,40 +3934,33 @@ fn handle_mouse_click(engine: &mut Engine, x: f64, y: f64, width: f64, height: f
         height - tab_bar_height - status_bar_height,
     );
 
-    // Check if click is in status/command area
     if y >= content_bounds.y + content_bounds.height {
-        // Click in status bar or command line - ignore for now
-        return;
+        return ClickTarget::None;
     }
 
-    // Get window rects
     let window_rects = engine.calculate_window_rects(content_bounds);
-
-    // Find which window was clicked
     let clicked_window = window_rects.iter().find(|(_, rect)| {
         x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
     });
 
     let (window_id, rect) = match clicked_window {
         Some((id, r)) => (*id, r),
-        None => return, // Click outside any window
+        None => return ClickTarget::None,
     };
 
-    // Get window and buffer info
     let window = match engine.windows.get(&window_id) {
         Some(w) => w,
-        None => return,
+        None => return ClickTarget::None,
     };
 
     let buffer_state = match engine.buffer_manager.get(window.buffer_id) {
         Some(s) => s,
-        None => return,
+        None => return ClickTarget::None,
     };
 
     let buffer = &buffer_state.buffer;
     let view = &window.view;
 
-    // Calculate gutter width from render module (matches the actual draw function).
     let char_width = font_metrics.approximate_char_width() as f64 / pango::SCALE as f64;
     let total_lines = buffer.content.len_lines();
     let has_git = !buffer_state.git_diff.is_empty();
@@ -3765,7 +3972,6 @@ fn handle_mouse_click(engine: &mut Engine, x: f64, y: f64, width: f64, height: f
     );
     let gutter_width = gutter_char_width as f64 * char_width;
 
-    // Calculate per-window status bar height
     let per_window_status = if engine.windows.len() > 1 {
         line_height
     } else {
@@ -3773,53 +3979,41 @@ fn handle_mouse_click(engine: &mut Engine, x: f64, y: f64, width: f64, height: f
     };
     let text_area_height = rect.height - per_window_status;
 
-    // Check if click is in per-window status bar
     if y >= rect.y + text_area_height {
-        return;
+        return ClickTarget::None;
     }
 
-    // Convert y coordinate to visible row index
     let relative_y = y - rect.y;
     let view_row = (relative_y / line_height).floor() as usize;
-
-    // Map view_row → buffer line (fold-aware: skip hidden lines)
     let line = view_row_to_buf_line(view, view.scroll_top, view_row, total_lines);
 
-    // Entire gutter is a click target for fold toggle
+    // Gutter click → fold toggle
     if x >= rect.x && x < rect.x + gutter_width && gutter_width > 0.0 {
         engine.toggle_fold_at_line(line);
-        return;
+        return ClickTarget::Gutter;
     }
 
-    // Convert x coordinate to column using pixel-perfect Pango layout measurement
     let relative_x = x - (rect.x + gutter_width);
-
-    // Get the actual line text (clamp line to valid range)
     let line = line.min(buffer.content.len_lines().saturating_sub(1));
     let line_text = buffer.content.line(line).to_string();
 
-    // Create Pango layout with the line text
     let layout = pango::Layout::new(&pango_ctx);
     layout.set_font_description(Some(&font_desc));
 
-    // Find column by measuring text width character by character
     let mut col = 0;
 
     if !line_text.is_empty() {
-        // Handle tabs by expanding them to spaces (4 spaces per tab)
         let expanded_text = line_text.replace('\t', "    ");
         layout.set_text(&expanded_text);
 
         let mut best_col = 0;
         let mut prev_width = 0.0;
 
-        // Find which character the click falls within
         let char_indices: Vec<(usize, char)> = expanded_text.char_indices().collect();
 
         for i in 0..char_indices.len() {
             let (byte_idx, _) = char_indices[i];
 
-            // Measure width up to and including this character
             let next_byte_idx = if i + 1 < char_indices.len() {
                 char_indices[i + 1].0
             } else {
@@ -3830,28 +4024,22 @@ fn handle_mouse_click(engine: &mut Engine, x: f64, y: f64, width: f64, height: f
             let (curr_width, _) = layout.pixel_size();
             let curr_width_f64 = curr_width as f64;
 
-            // Check if click falls between prev_width and curr_width
             if relative_x >= prev_width && relative_x < curr_width_f64 {
-                // Click is within this character, use its starting position
                 best_col = byte_idx;
                 break;
             }
 
             prev_width = curr_width_f64;
 
-            // If we're at the last character and click is past it
             if i == char_indices.len() - 1 && relative_x >= curr_width_f64 {
                 best_col = next_byte_idx;
             }
         }
 
-        // If line is empty or click is before first character
         if relative_x < 0.0 {
             best_col = 0;
         }
 
-        // Convert byte position in expanded text to column in original text
-        // Account for tabs (each tab in original becomes 4 spaces in expanded)
         let mut original_col = 0;
         let mut expanded_pos = 0;
         for ch in line_text.chars() {
@@ -3859,7 +4047,7 @@ fn handle_mouse_click(engine: &mut Engine, x: f64, y: f64, width: f64, height: f
                 break;
             }
             if ch == '\t' {
-                expanded_pos += 4; // Tab expands to 4 spaces
+                expanded_pos += 4;
             } else {
                 expanded_pos += ch.len_utf8();
             }
@@ -3868,8 +4056,34 @@ fn handle_mouse_click(engine: &mut Engine, x: f64, y: f64, width: f64, height: f
         col = original_col;
     }
 
-    // Set cursor position for this window
-    engine.set_cursor_for_window(window_id, line, col);
+    ClickTarget::BufferPos(window_id, line, col)
+}
+
+/// Handle mouse click by converting coordinates to buffer position.
+fn handle_mouse_click(engine: &mut Engine, x: f64, y: f64, width: f64, height: f64) {
+    if let ClickTarget::BufferPos(wid, line, col) =
+        pixel_to_click_target(engine, x, y, width, height)
+    {
+        engine.mouse_click(wid, line, col);
+    }
+}
+
+/// Handle mouse double-click — select word at position.
+fn handle_mouse_double_click(engine: &mut Engine, x: f64, y: f64, width: f64, height: f64) {
+    if let ClickTarget::BufferPos(wid, line, col) =
+        pixel_to_click_target(engine, x, y, width, height)
+    {
+        engine.mouse_double_click(wid, line, col);
+    }
+}
+
+/// Handle mouse drag — extend visual selection.
+fn handle_mouse_drag(engine: &mut Engine, x: f64, y: f64, width: f64, height: f64) {
+    if let ClickTarget::BufferPos(wid, line, col) =
+        pixel_to_click_target(engine, x, y, width, height)
+    {
+        engine.mouse_drag(wid, line, col);
+    }
 }
 
 fn load_css() {

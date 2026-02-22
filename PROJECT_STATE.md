@@ -1,17 +1,17 @@
 # VimCode Project State
 
-**Last updated:** Feb 21, 2026 (Session 59)
+**Last updated:** Feb 21, 2026 (Session 61)
 
 ## Status
 
-**Explorer polish:** Root folder entry at top of tree (GTK + TUI); auto-refresh filesystem watching (2s timer, no manual refresh needed); cursor key editing in move/create prompts (Left/Right/Home/End/Delete); full-path pre-fill for move operations; removed refresh button/key/setting — 593 tests passing
+**Mouse selection + clipboard:** Double-click word select, click-and-drag visual selection, system clipboard registers (`"+`/`"*`) via copypasta-ext (xclip/xsel on X11, wl-copy/wl-paste on Wayland), Ctrl-Shift-V paste in Command/Search/Insert mode (GTK), bracketed paste support (TUI) — 606 tests passing
 
 ### Core Vim (Complete)
 - Seven modes (Normal/Insert/Visual/Visual Line/Visual Block/Command/Search)
 - Navigation (hjkl, w/b/e, {}, gg/G, f/F/t/T, %, 0/$, Ctrl-D/U/F/B)
 - Operators (d/c/y with motions, x/dd/D/s/S/C, r for replace char, >>/<<)
 - Text objects (iw/aw, quotes, brackets, ip/ap paragraph, is/as sentence, it/at tag)
-- Registers (unnamed + a-z)
+- Registers (unnamed + a-z + system clipboard `+`/`*`)
 - Undo/redo (u/Ctrl-R), undo line (U), repeat (.), count prefix
 - Visual modes (v/V/Ctrl-V with y/d/c/u/U/~/>/< , rectangular block selections, case change)
 - **Toggle case:** `~` toggles case under cursor (count + dot-repeat)
@@ -212,7 +212,7 @@ vimcode/
 ```bash
 cargo build
 cargo run -- <file>
-cargo test -- --test-threads=1    # 593 tests
+cargo test -- --test-threads=1    # 606 tests
 cargo clippy -- -D warnings
 cargo fmt
 ```
@@ -264,6 +264,8 @@ cargo fmt
 - [x] **`:norm`** — execute normal command on a range of lines
 
 ## Recent Work
+**Session 61:** Replaced `arboard` with `copypasta-ext 0.4`. GTK backend: removed background clipboard thread + `ClipboardCmd` + `clip_tx`; synchronous reads/writes via `x11_bin::ClipboardContext` (xclip subprocess, no X11 event-loop conflict). TUI backend: replaced ~180 lines of platform-detection helpers with ~20-line `build_clipboard_ctx()`. Fixed TUI paste-intercept bug: `translate_key()` sets `key_name=""` for regular chars, so `key_name == "p"` was always false — paste intercept never fired; fixed to check `unicode` instead. Also fixed error message timing (set it after `handle_key()` which clears `engine.message`). Root cause of `try_context()` being insufficient: copypasta-ext picks `x11_fork` first on X11, but `x11_fork::get_contents()` uses `X11ClipboardContext` directly (same X11 connection conflict as arboard); we explicitly use `x11_bin` on X11. 606 tests, no change.
+
 **Session 59:** Explorer polish — (1) Fixed prompt delay: early `continue` statements in TUI event loop now set `needs_redraw = true` so explorer mode prompts appear instantly. (2) Move path editing: `move_file()` now accepts full destination path (not just directory); prompt pre-fills with full relative path; added cursor key support (Left/Right/Home/End/Delete) in all sidebar prompts via `SidebarPrompt.cursor` field. (3) Auto-refresh: TUI sidebar rebuilds every 2s when visible and idle (`last_sidebar_refresh` timer), removing need for manual refresh. (4) Root folder entry: project root shown at top of explorer tree (uppercase name, always expanded) in both GTK (`build_file_tree_with_root()`) and TUI (`build_rows()` inserts root at depth 0). (5) Removed refresh: `ExplorerAction::Refresh` variant, `refresh` setting field, refresh toolbar icon, and refresh key binding removed from all layers. (6) New file/folder at root: prompts pre-fill with target directory path so creating at root is straightforward. File changes: `tui_main.rs` (+320 lines), `main.rs` (+150 lines), `engine.rs` (move_file API change, help text update), `settings.rs` (removed refresh).
 
 **Session 56:** VSCode-Like Explorer + File Diff — Engine: `rename_file(&mut self, old_path, new_name)` + `move_file(&mut self, src, dest_dir)` using `std::fs::rename` with open-buffer path updates; `DiffLine` enum (Same/Added/Removed); `diff_window_pair: Option<(WindowId, WindowId)>` + `diff_results: HashMap<WindowId, Vec<DiffLine>>`; `cmd_diffthis()`/`cmd_diffoff()`/`cmd_diffsplit(path)` + `compute_diff()` internal; LCS diff free fn `lcs_diff(a, b)` (O(N×M), 3000-line cap); `:diffthis`/`:diffoff`/`:diffsplit <path>` command dispatch. Render: `diff_status: Option<DiffLine>` on `RenderedLine`; `diff_added_bg`/`diff_removed_bg` in `Theme`. GTK: `RenameFile`/`MoveFile`/`CopyPath`/`SelectForDiff`/`DiffWithSelected` messages; `diff_selected_file` on `App`; F2 inline rename via CellRendererText; right-click `GestureClick` → GTK4 `Popover` with buttons; DragSource + DropTarget for drag-and-drop move; diff bg via Cairo rectangle before text paint. TUI: `PromptKind::Rename(PathBuf)` + `PromptKind::MoveFile(PathBuf)`; `NewFile`/`NewFolder` carry target `PathBuf` for create-in-selected-folder; `r` rename key, `M` move key; diff bg via per-row repaint + `line_bg` passed to gutter/text. 13 new tests (571→584): rename_file (3), move_file (2), lcs_diff (5), cmd_diffthis/off/split (3).

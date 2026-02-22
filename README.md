@@ -11,7 +11,7 @@ There's a touch of irony here - using a cli tool to write the editor that I've w
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 593 tests, zero async runtime
+- **Clean architecture** — platform-agnostic core, 606 tests, zero async runtime
 
 ## Building
 
@@ -116,10 +116,12 @@ cargo fmt
 - `@{a-z}` — play back; `@@` — repeat last; `{N}@{a}` — play N times
 - Records all keys: navigation, Ctrl combos, special keys, Insert mode content, search
 
-**Registers**
+**Registers & Clipboard**
 - `"` — unnamed (default)
 - `"{a-z}` — named registers (`"ay` yank into `a`, `"ap` paste from `a`)
+- `"+` / `"*` — system clipboard registers (`"+y` yank to clipboard, `"+p` paste from clipboard)
 - Registers preserve linewise/characterwise type
+- `Ctrl-Shift-V` — paste clipboard in Command/Search/Insert mode (GTK); bracketed paste in TUI
 
 **Find/Replace**
 - `:s/pattern/replacement/[flags]` — substitute on current line
@@ -390,7 +392,7 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 
 - **Layout:** activity bar (3 cols) | sidebar | editor area; status line + command line full-width at bottom
 - **Sidebar:** same file explorer as GTK with Nerd Font icons
-- **Mouse support:** click-to-position, window switching, scroll wheel (targets pane under cursor), scrollbar click-to-jump and drag; drag event coalescing for smooth scrollbar tracking
+- **Mouse support:** click-to-position, double-click word select, click-and-drag visual selection, window switching, scroll wheel (targets pane under cursor), scrollbar click-to-jump and drag; drag event coalescing for smooth scrollbar tracking; bracketed paste support
 - **Sidebar resize:** drag separator column; `Alt+Left` / `Alt+Right` keyboard resize (min 15, max 60 cols)
 - **Scrollbars:** `█` / `░` thumb/track in uniform grey; vsplit separator doubles as left-pane vertical scrollbar; horizontal scrollbar row when content wider than viewport; `┘` corner when both axes present
 - **Scroll sync:** `:Gblame` pairs stay in sync across keyboard nav and mouse events
