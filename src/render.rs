@@ -1251,13 +1251,7 @@ pub fn calculate_gutter_cols(
 }
 
 fn build_status_line(engine: &Engine) -> (String, String) {
-    let mode_str = match engine.mode {
-        Mode::Normal | Mode::Command | Mode::Search => "NORMAL",
-        Mode::Insert => "INSERT",
-        Mode::Visual => "VISUAL",
-        Mode::VisualLine => "VISUAL LINE",
-        Mode::VisualBlock => "VISUAL BLOCK",
-    };
+    let mode_str = engine.mode_str();
 
     let filename = match engine.file_path() {
         Some(p) => p.display().to_string(),

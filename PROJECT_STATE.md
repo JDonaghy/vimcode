@@ -1,10 +1,10 @@
 # VimCode Project State
 
-**Last updated:** Feb 22, 2026 (Session 65)
+**Last updated:** Feb 22, 2026 (Session 67)
 
 ## Status
 
-**Completion popup polish:** Down/Up arrow keys now cycle popup candidates (same as Ctrl-N/P) without moving cursor; Ctrl-Space re-trigger fixed in TUI (was silently broken — `translate_key` emitted `" "` but engine checked `"space"`); `parse_key_binding` now handles named keys like `"Space"` so `<C-Space>` parses correctly — 620 tests passing
+**VSCode mode F1 command access:** F1 opens command bar from EDIT mode; status bar shows `EDIT  F1:cmd  Alt-M:vim`; returns to Insert after command executes; `Settings::load()` returns defaults in `#[cfg(test)]` (tests hermetic regardless of settings.json) — 638 tests passing
 
 ### Core Vim (Complete)
 - Seven modes (Normal/Insert/Visual/Visual Line/Visual Block/Command/Search)
@@ -163,8 +163,10 @@
   - `tabstop=N` (alias `ts`) — spaces per Tab key press / tab display width
   - `shiftwidth=N` (alias `sw`) — indent width for future `>>` / `<<`
   - `autoindent`/`noautoindent` (alias `ai`), `incsearch`/`noincsearch` (alias `is`)
+  - `mode=vim` / `mode=vscode` — editor mode (aliases: `editor_mode`)
   - `:set option?` — query current value without changing it
   - `:set` (no args) — show all settings summary
+- **VSCode Mode** — `Alt-M` toggles Vim↔VSCode; always-insert editing with Ctrl-C/X/V/Z/Y/A shortcuts, Shift+Arrow selection, Ctrl+Arrow word navigation, smart Home, Ctrl+/ line comment toggle
 - `:config reload` runtime refresh
 - File watcher for automatic reload
 
@@ -187,7 +189,7 @@ vimcode/
 │       ├── settings.rs (~925 lines) — JSON persistence, auto-init, :set parsing, explorer keys, panel_keys, parse_key_binding
 │       ├── window.rs, tab.rs, view.rs, cursor.rs, mode.rs, syntax.rs
 │       ├── git.rs (~635 lines) — git subprocess integration (diff/blame/hunk parsing, branch detection, stage_hunk)
-│       └── Tests: 620 passing (9 find/replace, 14 macro, 8 session, 4 reverse search, 7 replace char, 5 undo line, 8 case change, 6 marks, 5 incremental search, 12 syntax/language, 6 history search, 11 fold tests, 12 git tests, 4 sidebar-preview tests, 5 auto-indent tests, 6 completion tests, 9 quit/ctrl-s tests, 1 session-restore test, 23 set-command tests, 10 hunk-staging tests, 9 text-object tests, 24 project-search tests, 5 engine-replace tests, 27 lsp-protocol tests, 10 lsp-engine tests, 31 vim-features tests, 9 tag-object tests, 9 norm-command tests, 11 fuzzy-finder tests, 8 live-grep tests, 8 quickfix tests, 13 diff+rename+move tests, 4 explorer-keys tests, 4 help-system tests, 7 panel-keys tests)
+│       └── Tests: 638 passing (9 find/replace, 14 macro, 8 session, 4 reverse search, 7 replace char, 5 undo line, 8 case change, 6 marks, 5 incremental search, 12 syntax/language, 6 history search, 11 fold tests, 12 git tests, 4 sidebar-preview tests, 5 auto-indent tests, 6 completion tests, 9 quit/ctrl-s tests, 1 session-restore test, 23 set-command tests, 10 hunk-staging tests, 9 text-object tests, 24 project-search tests, 5 engine-replace tests, 27 lsp-protocol tests, 10 lsp-engine tests, 31 vim-features tests, 9 tag-object tests, 9 norm-command tests, 11 fuzzy-finder tests, 8 live-grep tests, 8 quickfix tests, 13 diff+rename+move tests, 4 explorer-keys tests, 4 help-system tests, 7 panel-keys tests, 18 vscode-mode tests)
 └── Total: ~33,400 lines
 ```
 
@@ -259,12 +261,18 @@ cargo fmt
 - [x] **VSCode-style project search** — Ctrl-Shift-F panel; regex/case/whole-word toggles; `.gitignore`-aware (ignore crate); grouped results, click to open
 - [x] **:grep / :vimgrep + Quickfix window** — `:grep`/`:vimgrep` populate the quickfix list; `:copen`/`:cclose`/`:cn`/`:cp`/`:cc N`; persistent 6-row bottom panel (GTK + TUI); j/k/Enter/q when focused
 - [x] **`it`/`at` tag text objects** — inner/around HTML/XML tag
+- [x] **Edit mode toggle** — `editor_mode` setting (`vim`/`vscode`); `:set mode=vscode`; `Alt-M` runtime toggle; always-insert with Ctrl-C/X/V/Z/Y/A shortcuts, Shift+Arrow selection, Ctrl+Arrow word nav, smart Home, Ctrl+/ comment toggle
+- [x] **VSCode mode F1 command access** — F1 opens command bar; status shows `EDIT  F1:cmd  Alt-M:vim`; returns to Insert after execution
 
 ### Big features
 - [x] **LSP support** — completions (Ctrl-Space), go-to-definition (gd), hover (K), diagnostics (]d/[d), auto-detect servers on PATH
 - [x] **`:norm`** — execute normal command on a range of lines
 
 ## Recent Work
+**Session 67:** VSCode mode F1 command access — F1 in `handle_vscode_key()` sets `mode = Command`; routing: top of `handle_vscode_key()` delegates to `handle_command_key()` when `mode == Command`; Escape returns to Insert (not Normal); after `execute_command()`, `is_vscode_mode()` guard returns to Insert (stays Normal if `:set mode=vim` was run); `mode_str()` shows `EDIT  F1:cmd  Alt-M:vim` and `COMMAND` during command bar; `Settings::load()` returns `Self::default()` under `#[cfg(test)]` so tests are hermetic regardless of user's `settings.json`. 3 new tests: `test_vscode_mode_f1_opens_command`, `test_vscode_mode_command_returns_to_insert`, `test_vscode_mode_f1_escape_returns_to_insert`. 635 → 638 tests.
+
+**Session 66:** VSCode edit mode toggle — `EditorMode` enum (`Vim`/`Vscode`) in `settings.rs` with serde serialization + `:set mode=vim`/`:set mode=vscode` command; full `handle_vscode_key()` dispatcher in `engine.rs` with Shift+Arrow selection (exclusive-end semantics), Ctrl-C/X/V/Z/Y/A/S shortcuts, Ctrl+Arrow word navigation, Ctrl+Shift+Arrow word select, smart Home (first non-ws toggle), Ctrl+/ line comment toggle, Escape clears selection, typing replaces selection; `toggle_editor_mode()` (Alt-M) persists mode to settings.json; `mode_str()` returns "EDIT"/"SELECT" in vscode mode; GTK: Shift+Arrow key name transform, Ctrl-V clipboard pre-load, mouse click clears selection, Alt-M toggle; TUI: `translate_key()` Shift+Arrow and Ctrl+Shift+Arrow, Alt-M arm, Ctrl-V pre-load, click clear; `render.rs` calls `engine.mode_str()` for status bar. Undo model: each keypress is one undo group (start_undo_group/finish_undo_group in handle_vscode_key); vscode_delete_selection uses exclusive end. 620 → 635 tests (+15 vscode-mode tests).
+
 **Session 65:** Completion popup arrow key navigation + Ctrl-Space re-trigger fix — `Down`/`Up` in Insert mode now cycle through completion candidates when the popup is visible (same semantics as `Ctrl-N`/`Ctrl-P`); intercepted before the clear block so the popup is not dismissed. Ctrl-Space re-trigger was silently broken in TUI: `translate_key()` emitted `key_name=" "` (literal space char) but the engine checks `key_name == "space"` (GDK convention) — they never matched; fixed by normalizing space to `"space"` in the ctrl path. Also fixed `parse_key_binding` to accept named keys (`"Space"`) so `<C-Space>` in settings.json now parses correctly to `Some((true, false, false, ' '))` instead of failing. 2 new tests: `test_auto_popup_arrow_cycles` + `test_parse_key_binding_named_space`. 618 → 620 tests.
 
 **Session 63:** Inline ghost text autosuggestions — dimmed suffix shown after cursor in Insert mode as you type; two sources: synchronous buffer-word scan + async LSP `textDocument/completion`. Engine: 3 new fields (`ghost_text`, `lsp_pending_ghost_completion`, `ghost_prefix`); `update_ghost_text()` called after each BackSpace or char insert; `lsp_request_ghost()` fires a separate LSP completion request; `poll_lsp()` routes `CompletionResponse` by `request_id` (ghost vs popup); Tab acceptance handled before the general-clear block so ghost text survives to the Tab arm; ghost text cleared by any non-text-changing key (arrows, Escape, Return, etc.) and hidden when Ctrl-N/P popup is active. Render: `RenderedLine.ghost_suffix` populated in `build_rendered_window()` (active window + cursor line + Insert mode + no popup); `Theme.ghost_text_fg` color (#636363 dimmed grey). GTK: `pangocairo::show_layout` after cursor x computed via `layout.index_to_pos()`. TUI: `set_cell()` for each ghost char after cursor column. 613 → 619 tests (6 new ghost-text tests).

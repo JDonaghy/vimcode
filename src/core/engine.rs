@@ -8,7 +8,7 @@ use super::lsp::{self, Diagnostic, DiagnosticSeverity, LspEvent};
 use super::lsp_manager::LspManager;
 use super::project_search::{self, ProjectMatch, ReplaceResult, SearchError, SearchOptions};
 use super::session::SessionState;
-use super::settings::Settings;
+use super::settings::{EditorMode, Settings};
 use super::tab::{Tab, TabId};
 use super::view::View;
 use super::window::{SplitDirection, Window, WindowId, WindowLayout, WindowRect};
@@ -367,7 +367,7 @@ impl Engine {
 
         let tab = Tab::new(TabId(1), window_id);
 
-        Self {
+        let mut engine = Self {
             buffer_manager,
             windows,
             tabs: vec![tab],
@@ -463,7 +463,12 @@ impl Engine {
             clipboard_read: None,
             clipboard_write: None,
             mouse_drag_active: false,
+        };
+        // If vscode mode is configured, start in Insert mode (no Normal mode)
+        if engine.is_vscode_mode() {
+            engine.mode = Mode::Insert;
         }
+        engine
     }
 
     /// Create an engine with a file loaded (or empty buffer for new file).
@@ -2473,6 +2478,13 @@ impl Engine {
             return EngineAction::None;
         }
 
+        // VSCode mode: all keys go through the vscode handler, which internally
+        // delegates to handle_command_key() / handle_search_key() when those overlays
+        // are open (e.g. after F1 opens the command bar).
+        if self.is_vscode_mode() {
+            return self.handle_vscode_key(key_name, unicode, ctrl);
+        }
+
         let mut changed = false;
         let mut action = EngineAction::None;
 
@@ -4166,7 +4178,11 @@ impl Engine {
                     self.command_buffer = self.command_typing_buffer.clone();
                     self.command_typing_buffer.clear();
                 } else {
-                    self.mode = Mode::Normal;
+                    self.mode = if self.is_vscode_mode() {
+                        Mode::Insert
+                    } else {
+                        Mode::Normal
+                    };
                     self.command_buffer.clear();
                     self.command_history_index = None;
                     self.command_typing_buffer.clear();
@@ -4186,7 +4202,14 @@ impl Engine {
                 self.command_history_index = None;
                 self.command_typing_buffer.clear();
                 let _ = self.session.save();
-                self.execute_command(&cmd)
+                let result = self.execute_command(&cmd);
+                // If still in VSCode mode after the command, return to Insert (EDIT) mode.
+                // (If the command switched to Vim mode, is_vscode_mode() will be false,
+                //  so mode stays Normal — which is correct.)
+                if self.is_vscode_mode() {
+                    self.mode = Mode::Insert;
+                }
+                result
             }
             "Up" => {
                 // Exit history search first
@@ -9705,6 +9728,681 @@ pub fn lcs_diff(a: &[&str], b: &[&str]) -> (Vec<DiffLine>, Vec<DiffLine>) {
     }
 
     (da, db)
+}
+
+// =============================================================================
+// VSCode-compatible editing mode
+// =============================================================================
+
+impl Engine {
+    /// True when the editor is configured in VSCode editing mode.
+    pub fn is_vscode_mode(&self) -> bool {
+        self.settings.editor_mode == EditorMode::Vscode
+    }
+
+    /// Human-readable mode string for the status bar.
+    pub fn mode_str(&self) -> &'static str {
+        if self.is_vscode_mode() {
+            return match self.mode {
+                Mode::Visual | Mode::VisualLine | Mode::VisualBlock => "SELECT",
+                Mode::Command => "COMMAND",
+                _ => "EDIT  F1:cmd  Alt-M:vim",
+            };
+        }
+        match self.mode {
+            Mode::Normal | Mode::Command | Mode::Search => "NORMAL",
+            Mode::Insert => "INSERT",
+            Mode::Visual => "VISUAL",
+            Mode::VisualLine => "VISUAL LINE",
+            Mode::VisualBlock => "VISUAL BLOCK",
+        }
+    }
+
+    /// Toggle between Vim and VSCode editing modes, saving the setting.
+    pub fn toggle_editor_mode(&mut self) {
+        self.settings.editor_mode = match self.settings.editor_mode {
+            EditorMode::Vim => EditorMode::Vscode,
+            EditorMode::Vscode => EditorMode::Vim,
+        };
+        // Clear any selection
+        self.visual_anchor = None;
+        // Set appropriate base mode
+        self.mode = if self.is_vscode_mode() {
+            Mode::Insert
+        } else {
+            Mode::Normal
+        };
+        let _ = self.settings.save();
+    }
+
+    // ── Selection helpers ────────────────────────────────────────────────────
+
+    /// Clear selection and ensure Insert mode (used in vscode mode).
+    pub fn vscode_clear_selection(&mut self) {
+        self.visual_anchor = None;
+        self.mode = Mode::Insert;
+    }
+
+    /// Apply a named movement operation (used by selection extension).
+    fn vscode_do_move(&mut self, op: &str) {
+        match op {
+            "Right" => self.move_right_insert(),
+            "Left" => self.move_left(),
+            "Up" => {
+                if self.view().cursor.line > 0 {
+                    self.view_mut().cursor.line -= 1;
+                    self.clamp_cursor_col_insert();
+                }
+            }
+            "Down" => {
+                let max_line = self.buffer().len_lines().saturating_sub(1);
+                if self.view().cursor.line < max_line {
+                    self.view_mut().cursor.line += 1;
+                    self.clamp_cursor_col_insert();
+                }
+            }
+            "WordForward" => self.move_word_forward(),
+            "WordBackward" => self.move_word_backward(),
+            "LineEnd" => {
+                let line = self.view().cursor.line;
+                let max = self.get_line_len_for_insert(line);
+                self.view_mut().cursor.col = max;
+            }
+            "SmartHome" => self.vscode_smart_home(),
+            "DocStart" => {
+                self.view_mut().cursor = Cursor { line: 0, col: 0 };
+            }
+            "DocEnd" => {
+                let last = self.buffer().len_lines().saturating_sub(1);
+                let last_col = self.get_line_len_for_insert(last);
+                self.view_mut().cursor = Cursor {
+                    line: last,
+                    col: last_col,
+                };
+            }
+            _ => {}
+        }
+    }
+
+    /// Extend (or start) the visual selection by applying a move, then collapse
+    /// if anchor == cursor.
+    fn vscode_extend_selection(&mut self, op: &str) {
+        if self.visual_anchor.is_none() {
+            self.visual_anchor = Some(self.view().cursor);
+            self.mode = Mode::Visual;
+        }
+        self.vscode_do_move(op);
+        if self.visual_anchor == Some(self.view().cursor) {
+            self.visual_anchor = None;
+            self.mode = Mode::Insert;
+        }
+    }
+
+    /// Delete the current visual selection and restore Insert mode.
+    /// Uses exclusive-end semantics: selection is [anchor, cursor) (cursor not included).
+    /// Relies on the caller to manage the undo group.
+    fn vscode_delete_selection(&mut self, changed: &mut bool) {
+        let Some(anchor) = self.visual_anchor else {
+            return;
+        };
+        let cursor = self.view().cursor;
+
+        // Normalize so start <= end.
+        let (start, end) = if anchor.line < cursor.line
+            || (anchor.line == cursor.line && anchor.col <= cursor.col)
+        {
+            (anchor, cursor)
+        } else {
+            (cursor, anchor)
+        };
+
+        let start_char = self.buffer().line_to_char(start.line) + start.col;
+        let end_char = self.buffer().line_to_char(end.line) + end.col; // exclusive
+
+        if end_char > start_char {
+            self.delete_with_undo(start_char, end_char);
+            self.view_mut().cursor = start;
+            *changed = true;
+        }
+
+        self.visual_anchor = None;
+        self.mode = Mode::Insert;
+    }
+
+    // ── Movement helpers ─────────────────────────────────────────────────────
+
+    /// Smart Home: move to first non-whitespace; if already there, move to col 0.
+    fn vscode_smart_home(&mut self) {
+        let line = self.view().cursor.line;
+        let first_non_ws = self
+            .buffer()
+            .content
+            .line(line)
+            .chars()
+            .take_while(|&c| c == ' ' || c == '\t')
+            .count();
+        let cur_col = self.view().cursor.col;
+        self.view_mut().cursor.col = if cur_col == first_non_ws {
+            0
+        } else {
+            first_non_ws
+        };
+    }
+
+    // ── Clipboard operations ─────────────────────────────────────────────────
+
+    /// Ctrl-C: copy selection (or current line if no selection).
+    fn vscode_copy(&mut self) {
+        if self.visual_anchor.is_some() {
+            if let Some((text, is_linewise)) = self.get_visual_selection_text() {
+                self.set_register('+', text.clone(), is_linewise);
+                self.set_register('"', text, is_linewise);
+            }
+            // Keep selection visible after copy.
+        } else {
+            // No selection: copy current line (including trailing newline).
+            let line = self.view().cursor.line;
+            let start = self.buffer().line_to_char(line);
+            let end = if line + 1 < self.buffer().len_lines() {
+                self.buffer().line_to_char(line + 1)
+            } else {
+                self.buffer().len_chars()
+            };
+            let text: String = self.buffer().content.slice(start..end).chars().collect();
+            let text = if text.ends_with('\n') {
+                text
+            } else {
+                format!("{}\n", text)
+            };
+            self.set_register('+', text.clone(), true);
+            self.set_register('"', text, true);
+        }
+    }
+
+    /// Ctrl-X: cut selection (or current line if no selection).
+    fn vscode_cut(&mut self, changed: &mut bool) {
+        if self.visual_anchor.is_some() {
+            if let Some((text, is_linewise)) = self.get_visual_selection_text() {
+                self.set_register('+', text.clone(), is_linewise);
+                self.set_register('"', text, is_linewise);
+            }
+            self.vscode_delete_selection(changed);
+        } else {
+            // No selection: cut current line.
+            let line = self.view().cursor.line;
+            let num_lines = self.buffer().len_lines();
+            let start = self.buffer().line_to_char(line);
+            let end = if line + 1 < num_lines {
+                self.buffer().line_to_char(line + 1)
+            } else {
+                self.buffer().len_chars()
+            };
+            let text: String = self.buffer().content.slice(start..end).chars().collect();
+            let text = if text.ends_with('\n') {
+                text
+            } else {
+                format!("{}\n", text)
+            };
+            self.set_register('+', text.clone(), true);
+            self.set_register('"', text, true);
+
+            self.delete_with_undo(start, end);
+
+            let new_line = line.min(self.buffer().len_lines().saturating_sub(1));
+            self.view_mut().cursor.line = new_line;
+            self.view_mut().cursor.col = 0;
+            *changed = true;
+        }
+    }
+
+    /// Ctrl-V: paste from `+` register at cursor (replaces selection if any).
+    fn vscode_paste(&mut self, changed: &mut bool) {
+        if self.visual_anchor.is_some() {
+            self.vscode_delete_selection(changed);
+        }
+        if let Some((text, is_linewise)) = self.get_register_content('+') {
+            if is_linewise {
+                // Linewise: insert before current line.
+                let line = self.view().cursor.line;
+                let line_start = self.buffer().line_to_char(line);
+                self.insert_with_undo(line_start, &text);
+                // Cursor stays at beginning of pasted text.
+                self.view_mut().cursor.line = line;
+                self.view_mut().cursor.col = 0;
+            } else {
+                // Character paste: insert at cursor.
+                let line = self.view().cursor.line;
+                let col = self.view().cursor.col;
+                let char_idx = self.buffer().line_to_char(line) + col;
+                self.insert_with_undo(char_idx, &text);
+                // Advance cursor past pasted text.
+                let lines: Vec<&str> = text.split('\n').collect();
+                if lines.len() == 1 {
+                    self.view_mut().cursor.col += text.chars().count();
+                } else {
+                    self.view_mut().cursor.line += lines.len() - 1;
+                    self.view_mut().cursor.col = lines.last().unwrap().chars().count();
+                }
+            }
+            *changed = true;
+        }
+    }
+
+    /// Ctrl-A: select all text.
+    fn vscode_select_all(&mut self) {
+        self.visual_anchor = Some(Cursor { line: 0, col: 0 });
+        self.mode = Mode::Visual;
+        let last = self.buffer().len_lines().saturating_sub(1);
+        let last_col = self.get_line_len_for_insert(last);
+        self.view_mut().cursor = Cursor {
+            line: last,
+            col: last_col,
+        };
+    }
+
+    // ── Word-level delete ────────────────────────────────────────────────────
+
+    /// Ctrl-Delete: delete word forward from cursor.
+    fn vscode_delete_word_forward(&mut self, changed: &mut bool) {
+        let line = self.view().cursor.line;
+        let col = self.view().cursor.col;
+        let line_chars: Vec<char> = self.buffer().content.line(line).chars().collect();
+        let line_len = self.get_line_len_for_insert(line);
+
+        if col >= line_len {
+            // At EOL: delete newline to join with next line.
+            let char_idx = self.buffer().line_to_char(line) + col;
+            if char_idx < self.buffer().len_chars() {
+                self.delete_with_undo(char_idx, char_idx + 1);
+                *changed = true;
+            }
+            return;
+        }
+
+        let is_ws = |c: char| c == ' ' || c == '\t';
+        let is_word = |c: char| c.is_alphanumeric() || c == '_';
+
+        let mut end_col = col;
+        if is_ws(line_chars[col]) {
+            while end_col < line_len && line_chars.get(end_col).is_some_and(|&c| is_ws(c)) {
+                end_col += 1;
+            }
+        } else if is_word(line_chars[col]) {
+            while end_col < line_len && line_chars.get(end_col).is_some_and(|&c| is_word(c)) {
+                end_col += 1;
+            }
+        } else {
+            end_col += 1;
+        }
+
+        let start_char = self.buffer().line_to_char(line) + col;
+        let end_char = self.buffer().line_to_char(line) + end_col;
+        if start_char < end_char {
+            self.delete_with_undo(start_char, end_char);
+            *changed = true;
+        }
+    }
+
+    /// Ctrl-Backspace: delete word backward from cursor.
+    fn vscode_delete_word_backward(&mut self, changed: &mut bool) {
+        let line = self.view().cursor.line;
+        let col = self.view().cursor.col;
+
+        if col == 0 {
+            if line > 0 {
+                // Join with previous line.
+                let char_idx = self.buffer().line_to_char(line);
+                if char_idx > 0 {
+                    self.delete_with_undo(char_idx - 1, char_idx);
+                    let new_col = self.get_line_len_for_insert(line - 1);
+                    self.view_mut().cursor.line -= 1;
+                    self.view_mut().cursor.col = new_col;
+                    *changed = true;
+                }
+            }
+            return;
+        }
+
+        let line_chars: Vec<char> = self.buffer().content.line(line).chars().collect();
+        let is_ws = |c: char| c == ' ' || c == '\t';
+        let is_word = |c: char| c.is_alphanumeric() || c == '_';
+
+        let mut start_col = col;
+        // Skip leading whitespace.
+        while start_col > 0 && line_chars.get(start_col - 1).is_some_and(|&c| is_ws(c)) {
+            start_col -= 1;
+        }
+        if start_col > 0 {
+            if line_chars.get(start_col - 1).is_some_and(|&c| is_word(c)) {
+                while start_col > 0 && line_chars.get(start_col - 1).is_some_and(|&c| is_word(c)) {
+                    start_col -= 1;
+                }
+            } else {
+                start_col -= 1;
+            }
+        }
+
+        let start_char = self.buffer().line_to_char(line) + start_col;
+        let end_char = self.buffer().line_to_char(line) + col;
+        if start_char < end_char {
+            self.delete_with_undo(start_char, end_char);
+            self.view_mut().cursor.col = start_col;
+            *changed = true;
+        }
+    }
+
+    // ── Comment toggle ───────────────────────────────────────────────────────
+
+    /// Ctrl-/: toggle `// ` line comment on the current line (or visual range).
+    fn vscode_toggle_line_comment(&mut self, changed: &mut bool) {
+        let (start_line, end_line) = if self.visual_anchor.is_some() {
+            match self.get_visual_selection_range() {
+                Some((start, end)) => (start.line, end.line),
+                None => {
+                    let l = self.view().cursor.line;
+                    (l, l)
+                }
+            }
+        } else {
+            let l = self.view().cursor.line;
+            (l, l)
+        };
+
+        // Check if every line in the range already starts with `// ` (after whitespace).
+        let all_commented = (start_line..=end_line).all(|ln| {
+            let line_str = self.buffer().content.line(ln).to_string();
+            let trimmed = line_str.trim_start_matches([' ', '\t']);
+            trimmed.starts_with("// ")
+        });
+
+        if all_commented {
+            // Remove `// ` from each line (reverse to keep indices valid).
+            for ln in (start_line..=end_line).rev() {
+                let line_str = self.buffer().content.line(ln).to_string();
+                let ws_len: usize = line_str
+                    .chars()
+                    .take_while(|&c| c == ' ' || c == '\t')
+                    .count();
+                let rest = &line_str[ws_len..];
+                if rest.starts_with("// ") {
+                    let start_char = self.buffer().line_to_char(ln) + ws_len;
+                    self.delete_with_undo(start_char, start_char + 3);
+                }
+            }
+        } else {
+            // Prepend `// ` after leading whitespace (reverse to keep indices valid).
+            for ln in (start_line..=end_line).rev() {
+                let line_str = self.buffer().content.line(ln).to_string();
+                let ws_len: usize = line_str
+                    .chars()
+                    .take_while(|&c| c == ' ' || c == '\t')
+                    .count();
+                // Don't comment empty / whitespace-only lines.
+                if ws_len < line_str.trim_end_matches('\n').len() {
+                    let insert_char = self.buffer().line_to_char(ln) + ws_len;
+                    self.insert_with_undo(insert_char, "// ");
+                }
+            }
+        }
+
+        *changed = true;
+    }
+
+    // ── Main VSCode key dispatcher ───────────────────────────────────────────
+
+    fn handle_vscode_key(
+        &mut self,
+        key_name: &str,
+        unicode: Option<char>,
+        ctrl: bool,
+    ) -> EngineAction {
+        // If the command bar is open (e.g. user pressed F1), delegate directly
+        // to the command handler — no undo group needed.
+        if self.mode == Mode::Command {
+            return self.handle_command_key(key_name, unicode, ctrl);
+        }
+
+        let mut changed = false;
+
+        // Start an undo group for this keystroke.  Each sub-helper that
+        // manages its own undo group (vscode_cut line-cut, vscode_paste,
+        // vscode_toggle_line_comment) relies on this outer group; helpers
+        // that used to have inner calls have had them removed.
+        self.start_undo_group();
+
+        if ctrl {
+            match key_name {
+                "z" => {
+                    self.vscode_clear_selection();
+                    self.undo();
+                }
+                "y" => {
+                    self.vscode_clear_selection();
+                    self.redo();
+                }
+                "a" => {
+                    self.vscode_select_all();
+                }
+                "c" => {
+                    self.vscode_copy();
+                }
+                "x" => {
+                    self.vscode_cut(&mut changed);
+                }
+                "v" => {
+                    self.vscode_paste(&mut changed);
+                }
+                "Right" => {
+                    self.vscode_clear_selection();
+                    self.move_word_forward();
+                }
+                "Left" => {
+                    self.vscode_clear_selection();
+                    self.move_word_backward();
+                }
+                "Home" => {
+                    self.vscode_clear_selection();
+                    self.view_mut().cursor = Cursor { line: 0, col: 0 };
+                }
+                "End" => {
+                    self.vscode_clear_selection();
+                    self.vscode_do_move("DocEnd");
+                }
+                "Shift_Right" => {
+                    self.vscode_extend_selection("WordForward");
+                }
+                "Shift_Left" => {
+                    self.vscode_extend_selection("WordBackward");
+                }
+                "Shift_Home" => {
+                    self.vscode_extend_selection("DocStart");
+                }
+                "Shift_End" => {
+                    self.vscode_extend_selection("DocEnd");
+                }
+                "Delete" => {
+                    self.vscode_delete_word_forward(&mut changed);
+                }
+                "BackSpace" => {
+                    self.vscode_delete_word_backward(&mut changed);
+                }
+                "/" => {
+                    self.vscode_toggle_line_comment(&mut changed);
+                }
+                _ => {}
+            }
+        } else if key_name.starts_with("Shift_") {
+            // Shift+Arrow selection extension (no ctrl).
+            match key_name {
+                "Shift_Right" => self.vscode_extend_selection("Right"),
+                "Shift_Left" => self.vscode_extend_selection("Left"),
+                "Shift_Up" => self.vscode_extend_selection("Up"),
+                "Shift_Down" => self.vscode_extend_selection("Down"),
+                "Shift_Home" => self.vscode_extend_selection("SmartHome"),
+                "Shift_End" => self.vscode_extend_selection("LineEnd"),
+                _ => {}
+            }
+        } else {
+            // Regular (non-ctrl, non-shift) key.
+            match key_name {
+                "Escape" => {
+                    self.vscode_clear_selection();
+                }
+                "Right" => {
+                    self.vscode_clear_selection();
+                    self.move_right_insert();
+                }
+                "Left" => {
+                    self.vscode_clear_selection();
+                    self.move_left();
+                }
+                "Up" => {
+                    self.vscode_clear_selection();
+                    self.vscode_do_move("Up");
+                }
+                "Down" => {
+                    self.vscode_clear_selection();
+                    self.vscode_do_move("Down");
+                }
+                "Home" => {
+                    self.vscode_clear_selection();
+                    self.vscode_smart_home();
+                }
+                "End" => {
+                    self.vscode_clear_selection();
+                    let line = self.view().cursor.line;
+                    let max = self.get_line_len_for_insert(line);
+                    self.view_mut().cursor.col = max;
+                }
+                "Page_Up" => {
+                    self.vscode_clear_selection();
+                    let amount = self.viewport_lines();
+                    self.view_mut().cursor.line = self.view().cursor.line.saturating_sub(amount);
+                    self.clamp_cursor_col_insert();
+                }
+                "Page_Down" => {
+                    self.vscode_clear_selection();
+                    let amount = self.viewport_lines();
+                    let max_line = self.buffer().len_lines().saturating_sub(1);
+                    self.view_mut().cursor.line = (self.view().cursor.line + amount).min(max_line);
+                    self.clamp_cursor_col_insert();
+                }
+                "F1" => {
+                    // Open the command bar (analogous to VSCode's command palette / Vim's ':').
+                    // handle_command_key() will return to Insert mode when done.
+                    self.mode = Mode::Command;
+                    self.command_buffer.clear();
+                    self.message.clear();
+                }
+                "BackSpace" => {
+                    if self.visual_anchor.is_some() {
+                        self.vscode_delete_selection(&mut changed);
+                    } else {
+                        let line = self.view().cursor.line;
+                        let col = self.view().cursor.col;
+                        let char_idx = self.buffer().line_to_char(line) + col;
+                        if col > 0 {
+                            self.delete_with_undo(char_idx - 1, char_idx);
+                            self.view_mut().cursor.col -= 1;
+                            changed = true;
+                        } else if line > 0 {
+                            let prev_len = self.buffer().line_len_chars(line - 1);
+                            let new_col = if prev_len > 0 { prev_len - 1 } else { 0 };
+                            self.delete_with_undo(char_idx - 1, char_idx);
+                            self.view_mut().cursor.line -= 1;
+                            self.view_mut().cursor.col = new_col;
+                            changed = true;
+                        }
+                        if changed {
+                            self.trigger_auto_completion();
+                        }
+                    }
+                }
+                "Delete" => {
+                    if self.visual_anchor.is_some() {
+                        self.vscode_delete_selection(&mut changed);
+                    } else {
+                        let line = self.view().cursor.line;
+                        let col = self.view().cursor.col;
+                        let char_idx = self.buffer().line_to_char(line) + col;
+                        if char_idx < self.buffer().len_chars() {
+                            self.delete_with_undo(char_idx, char_idx + 1);
+                            changed = true;
+                        }
+                    }
+                }
+                "Return" => {
+                    if self.visual_anchor.is_some() {
+                        self.vscode_delete_selection(&mut changed);
+                    }
+                    let line = self.view().cursor.line;
+                    let col = self.view().cursor.col;
+                    let char_idx = self.buffer().line_to_char(line) + col;
+                    let indent = if self.settings.auto_indent {
+                        self.get_line_indent_str(line)
+                    } else {
+                        String::new()
+                    };
+                    let indent_len = indent.len();
+                    let text = format!("\n{}", indent);
+                    self.insert_with_undo(char_idx, &text);
+                    self.view_mut().cursor.line += 1;
+                    self.view_mut().cursor.col = indent_len;
+                    changed = true;
+                }
+                "Tab" => {
+                    if self.visual_anchor.is_some() {
+                        self.vscode_delete_selection(&mut changed);
+                    }
+                    let line = self.view().cursor.line;
+                    let col = self.view().cursor.col;
+                    let char_idx = self.buffer().line_to_char(line) + col;
+                    if self.settings.expand_tab {
+                        let n = self.settings.tabstop as usize;
+                        let spaces = " ".repeat(n);
+                        self.insert_with_undo(char_idx, &spaces);
+                        self.view_mut().cursor.col += n;
+                    } else {
+                        self.insert_with_undo(char_idx, "\t");
+                        self.view_mut().cursor.col += 1;
+                    }
+                    changed = true;
+                }
+                _ => {
+                    // Printable character.
+                    if let Some(ch) = unicode {
+                        if self.visual_anchor.is_some() {
+                            self.vscode_delete_selection(&mut changed);
+                        }
+                        let line = self.view().cursor.line;
+                        let col = self.view().cursor.col;
+                        let char_idx = self.buffer().line_to_char(line) + col;
+                        let mut buf = [0u8; 4];
+                        let s = ch.encode_utf8(&mut buf);
+                        self.insert_with_undo(char_idx, s);
+                        self.view_mut().cursor.col += 1;
+                        changed = true;
+                        self.trigger_auto_completion();
+                    }
+                }
+            }
+        }
+
+        if changed {
+            self.finish_undo_group();
+            self.set_dirty(true);
+            self.update_syntax();
+            let active_id = self.active_buffer_id();
+            if self.preview_buffer_id == Some(active_id) {
+                self.promote_preview(active_id);
+            }
+            self.lsp_dirty_buffers.insert(active_id, true);
+        }
+
+        self.ensure_cursor_visible();
+        self.sync_scroll_binds();
+        EngineAction::None
+    }
 }
 
 #[cfg(test)]
@@ -18620,5 +19318,269 @@ mod tests {
         press_char(&mut engine, ':');
         engine.paste_clipboard_to_input();
         assert_eq!(engine.command_buffer, "first line");
+    }
+
+    // ── VSCode editing mode tests ────────────────────────────────────────────
+
+    fn make_vscode_engine(text: &str) -> Engine {
+        let mut engine = Engine::new();
+        engine.settings.editor_mode = crate::core::settings::EditorMode::Vscode;
+        engine.mode = Mode::Insert;
+        engine.buffer_mut().insert(0, text);
+        engine.update_syntax();
+        engine
+    }
+
+    fn vscode_key(engine: &mut Engine, key_name: &str, unicode: Option<char>, ctrl: bool) {
+        engine.handle_key(key_name, unicode, ctrl);
+    }
+
+    #[test]
+    fn test_vscode_mode_setting() {
+        let mut s = crate::core::settings::Settings::default();
+        // Default is Vim
+        assert_eq!(s.editor_mode, crate::core::settings::EditorMode::Vim);
+        s.parse_set_option("mode=vscode").unwrap();
+        assert_eq!(s.editor_mode, crate::core::settings::EditorMode::Vscode);
+        s.parse_set_option("mode=vim").unwrap();
+        assert_eq!(s.editor_mode, crate::core::settings::EditorMode::Vim);
+        // Query
+        let msg = s.parse_set_option("mode?").unwrap();
+        assert_eq!(msg, "mode=vim");
+        s.parse_set_option("mode=vscode").unwrap();
+        let msg2 = s.parse_set_option("mode?").unwrap();
+        assert_eq!(msg2, "mode=vscode");
+    }
+
+    #[test]
+    fn test_vscode_mode_typing() {
+        let mut engine = make_vscode_engine("hello");
+        // Colon should insert a literal ':' not enter command mode
+        vscode_key(&mut engine, "", Some(':'), false);
+        assert_eq!(engine.mode, Mode::Insert);
+        assert!(engine.buffer().to_string().contains(':'));
+    }
+
+    #[test]
+    fn test_vscode_mode_ctrl_z_undo() {
+        let mut engine = make_vscode_engine("hello");
+        // Type 'x'
+        vscode_key(&mut engine, "", Some('x'), false);
+        let text_after = engine.buffer().to_string();
+        // Ctrl-Z undo
+        vscode_key(&mut engine, "z", Some('z'), true);
+        // Should restore to "hello"
+        assert_ne!(engine.buffer().to_string(), text_after);
+    }
+
+    #[test]
+    fn test_vscode_mode_ctrl_y_redo() {
+        let mut engine = make_vscode_engine("hello");
+        // Type 'x'
+        vscode_key(&mut engine, "", Some('x'), false);
+        let after_type = engine.buffer().to_string();
+        // Undo
+        vscode_key(&mut engine, "z", Some('z'), true);
+        // Redo
+        vscode_key(&mut engine, "y", Some('y'), true);
+        assert_eq!(engine.buffer().to_string(), after_type);
+    }
+
+    #[test]
+    fn test_vscode_mode_shift_arrow_selection() {
+        let mut engine = make_vscode_engine("hello");
+        // Shift+Right: start selection
+        vscode_key(&mut engine, "Shift_Right", None, false);
+        assert!(engine.visual_anchor.is_some());
+        assert_eq!(engine.mode, Mode::Visual);
+        assert_eq!(engine.visual_anchor.unwrap().col, 0);
+        assert_eq!(engine.view().cursor.col, 1);
+    }
+
+    #[test]
+    fn test_vscode_mode_ctrl_shift_arrow_word_select() {
+        let mut engine = make_vscode_engine("hello world");
+        // Ctrl+Shift+Right: select word
+        vscode_key(&mut engine, "Shift_Right", None, true);
+        assert!(engine.visual_anchor.is_some());
+        assert_eq!(engine.mode, Mode::Visual);
+        // Cursor should be past the word "hello"
+        assert!(engine.view().cursor.col > 0);
+    }
+
+    #[test]
+    fn test_vscode_mode_type_replaces_selection() {
+        let mut engine = make_vscode_engine("hello");
+        // Shift+Right+Right to select "he"
+        vscode_key(&mut engine, "Shift_Right", None, false);
+        vscode_key(&mut engine, "Shift_Right", None, false);
+        assert!(engine.visual_anchor.is_some());
+        // Type 'X' — should replace selection
+        vscode_key(&mut engine, "", Some('X'), false);
+        assert!(engine.visual_anchor.is_none());
+        assert_eq!(engine.mode, Mode::Insert);
+        let text = engine.buffer().to_string();
+        assert!(text.starts_with('X'));
+        assert!(text.contains("llo"));
+    }
+
+    #[test]
+    fn test_vscode_mode_backspace_clears_selection() {
+        let mut engine = make_vscode_engine("hello");
+        // Shift+Right+Right to select "he"
+        vscode_key(&mut engine, "Shift_Right", None, false);
+        vscode_key(&mut engine, "Shift_Right", None, false);
+        assert!(engine.visual_anchor.is_some());
+        // Backspace — should delete selection
+        vscode_key(&mut engine, "BackSpace", None, false);
+        assert!(engine.visual_anchor.is_none());
+        let text = engine.buffer().to_string();
+        assert!(text.starts_with("llo"));
+    }
+
+    #[test]
+    fn test_vscode_mode_ctrl_a_select_all() {
+        let mut engine = make_vscode_engine("hello\nworld");
+        engine.update_syntax();
+        vscode_key(&mut engine, "a", Some('a'), true);
+        assert!(engine.visual_anchor.is_some());
+        assert_eq!(engine.visual_anchor.unwrap().line, 0);
+        assert_eq!(engine.visual_anchor.unwrap().col, 0);
+        assert_eq!(engine.mode, Mode::Visual);
+        // Cursor at end of last line
+        assert_eq!(engine.view().cursor.line, 1);
+    }
+
+    #[test]
+    fn test_vscode_mode_escape_clears_selection() {
+        let mut engine = make_vscode_engine("hello");
+        vscode_key(&mut engine, "Shift_Right", None, false);
+        assert!(engine.visual_anchor.is_some());
+        vscode_key(&mut engine, "Escape", None, false);
+        assert!(engine.visual_anchor.is_none());
+        assert_eq!(engine.mode, Mode::Insert);
+    }
+
+    #[test]
+    fn test_vscode_mode_ctrl_x_no_selection_cuts_line() {
+        let mut engine = make_vscode_engine("hello\nworld");
+        engine.update_syntax();
+        // Cursor on first line, no selection
+        assert!(engine.visual_anchor.is_none());
+        vscode_key(&mut engine, "x", Some('x'), true);
+        // First line should be deleted
+        let text = engine.buffer().to_string();
+        assert!(
+            !text.contains("hello"),
+            "Line should be cut: got {:?}",
+            text
+        );
+        // Register '+' should contain the cut line
+        let (reg_content, _) = engine.registers.get(&'+').cloned().unwrap_or_default();
+        assert!(reg_content.contains("hello"));
+    }
+
+    #[test]
+    fn test_vscode_mode_ctrl_c_no_selection_copies_line() {
+        let mut engine = make_vscode_engine("hello\nworld");
+        engine.update_syntax();
+        // Ctrl-C with no selection: copy current line
+        vscode_key(&mut engine, "c", Some('c'), true);
+        // Buffer unchanged
+        assert!(engine.buffer().to_string().contains("hello"));
+        // Register '+' should contain the line
+        let (reg_content, is_linewise) = engine.registers.get(&'+').cloned().unwrap_or_default();
+        assert!(reg_content.contains("hello"));
+        assert!(is_linewise);
+    }
+
+    #[test]
+    fn test_vscode_mode_toggle() {
+        let mut engine = Engine::new();
+        assert_eq!(
+            engine.settings.editor_mode,
+            crate::core::settings::EditorMode::Vim
+        );
+        assert_eq!(engine.mode, Mode::Normal);
+        engine.toggle_editor_mode();
+        assert_eq!(
+            engine.settings.editor_mode,
+            crate::core::settings::EditorMode::Vscode
+        );
+        assert_eq!(engine.mode, Mode::Insert);
+        engine.toggle_editor_mode();
+        assert_eq!(
+            engine.settings.editor_mode,
+            crate::core::settings::EditorMode::Vim
+        );
+        assert_eq!(engine.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn test_vscode_mode_smart_home() {
+        let mut engine = make_vscode_engine("  hello");
+        // Cursor at col 0 initially — Home moves to first non-ws
+        vscode_key(&mut engine, "Home", None, false);
+        assert_eq!(engine.view().cursor.col, 2); // first non-ws is col 2
+                                                 // Home again — moves to col 0
+        vscode_key(&mut engine, "Home", None, false);
+        assert_eq!(engine.view().cursor.col, 0);
+    }
+
+    #[test]
+    fn test_vscode_mode_comment_toggle() {
+        let mut engine = make_vscode_engine("hello");
+        // Ctrl+/ should add "// " prefix
+        vscode_key(&mut engine, "/", Some('/'), true);
+        let text = engine.buffer().to_string();
+        assert!(
+            text.starts_with("// hello"),
+            "Expected '// hello', got {:?}",
+            text
+        );
+        // Ctrl+/ again should remove "// "
+        vscode_key(&mut engine, "/", Some('/'), true);
+        let text2 = engine.buffer().to_string();
+        assert!(
+            text2.starts_with("hello"),
+            "Expected 'hello', got {:?}",
+            text2
+        );
+    }
+
+    #[test]
+    fn test_vscode_mode_f1_opens_command() {
+        let mut engine = make_vscode_engine("hello");
+        // F1 should switch to Command mode so the user can type a ':' command.
+        vscode_key(&mut engine, "F1", None, false);
+        assert_eq!(engine.mode, Mode::Command);
+        assert!(engine.command_buffer.is_empty());
+    }
+
+    #[test]
+    fn test_vscode_mode_command_returns_to_insert() {
+        let mut engine = make_vscode_engine("hello");
+        // F1 → Command mode
+        vscode_key(&mut engine, "F1", None, false);
+        assert_eq!(engine.mode, Mode::Command);
+        // Type `:set number` and press Enter
+        for ch in "set number".chars() {
+            engine.handle_key(&ch.to_string(), Some(ch), false);
+        }
+        engine.handle_key("Return", None, false);
+        // Should return to Insert (EDIT) mode, not Normal mode.
+        assert_eq!(engine.mode, Mode::Insert);
+        assert!(engine.is_vscode_mode());
+    }
+
+    #[test]
+    fn test_vscode_mode_f1_escape_returns_to_insert() {
+        let mut engine = make_vscode_engine("hello");
+        // F1 → Command mode, then Escape → back to EDIT (Insert) mode.
+        vscode_key(&mut engine, "F1", None, false);
+        assert_eq!(engine.mode, Mode::Command);
+        engine.handle_key("Escape", None, false);
+        assert_eq!(engine.mode, Mode::Insert);
+        assert!(engine.is_vscode_mode());
     }
 }

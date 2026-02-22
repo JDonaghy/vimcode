@@ -1,5 +1,42 @@
 # VimCode Implementation Plan
 
+## Recently Completed (Session 67)
+
+### ✅ VSCode Mode: F1 Command Access + Status Bar Hint
+
+- **F1 opens command bar** — `"F1"` arm in `handle_vscode_key()` sets `mode = Command`, clears `command_buffer` and `message`
+- **Routing** — top of `handle_vscode_key()` delegates to `handle_command_key()` when `mode == Command` (before undo group start, no undo side-effect)
+- **Escape returns to Insert** — `handle_command_key()` Escape arm: `mode = if is_vscode_mode() { Insert } else { Normal }`
+- **Return returns to Insert** — after `execute_command()`, if `is_vscode_mode()` → `mode = Insert`; if `:set mode=vim` ran, `is_vscode_mode()` is false so mode stays Normal (correct)
+- **Status bar hint** — `mode_str()`: when `is_vscode_mode()`, Insert/Normal → `"EDIT  F1:cmd  Alt-M:vim"`, Command → `"COMMAND"`, Visual → `"SELECT"`
+- **Test hermetic fix** — `Settings::load()` returns `Self::default()` under `#[cfg(test)]`; prevents user's `settings.json` from breaking tests
+- **3 new tests**: `test_vscode_mode_f1_opens_command`, `test_vscode_mode_command_returns_to_insert`, `test_vscode_mode_f1_escape_returns_to_insert`
+- Tests: 635 → 638 (+3)
+
+---
+
+## Recently Completed (Session 66)
+
+### ✅ Edit Mode Toggle (Vim ↔ VSCode)
+
+- **`EditorMode` enum** (`Vim`/`Vscode`) in `settings.rs` with serde `#[serde(rename_all = "lowercase")]`; `editor_mode` field on `Settings`; backward-compat (existing settings.json without field defaults to `Vim`)
+- **`:set mode=vim` / `:set mode=vscode`** — `set_value_option()` arm; `query_option()` arm; `display_all()` includes `mode=vim/vscode`
+- **`handle_vscode_key(key_name, unicode, ctrl)`** — replaces normal mode dispatch when `is_vscode_mode()`; three branches: ctrl combos, Shift+Arrow selection, regular keys
+- **Ctrl combos**: Ctrl-Z undo, Ctrl-Y redo, Ctrl-A select-all, Ctrl-C copy, Ctrl-X cut (line if no selection), Ctrl-V paste, Ctrl+Arrow word jump, Ctrl+Shift+Arrow word select, Ctrl-Delete/Backspace word delete, Ctrl-/ line comment toggle
+- **Shift+Arrow**: `vscode_extend_selection()` starts/extends visual selection; exclusive-end semantics (cursor = exclusive end)
+- **Regular keys**: Escape clears selection, arrows clear selection + move, BackSpace/Delete/Tab/Return/printable replace selection if active
+- **Undo model**: `start_undo_group()` at start of `handle_vscode_key`; `finish_undo_group()` if `changed`; helpers don't manage their own undo groups
+- **`vscode_delete_selection()`**: exclusive end (delete `[anchor, cursor)`, not including cursor char); no inner undo group
+- **`mode_str()`**: returns "EDIT"/"SELECT"/"NORMAL"/"INSERT"/"COMMAND"/"SEARCH"/"VISUAL"/"VLINE"/"VBLOCK"
+- **`toggle_editor_mode()`** — `Alt-M` in both GTK and TUI; saves to settings.json; clears selection; sets mode Insert or Normal
+- **GTK**: Shift+Arrow key name transform in vscode mode; Ctrl-V clipboard pre-load; mouse click clears selection
+- **TUI**: `translate_key()` Shift+Arrow (ctrl=false), Ctrl+Shift+Arrow (ctrl=true); Alt-M in alt-key block; Ctrl-V clipboard pre-load; mouse click clears
+- **render.rs**: `engine.mode_str()` replaces inline mode-string match in status bar
+- **15 new tests**: setting, typing (`:` inserts literal colon), undo, redo, shift-arrow selection, ctrl+shift-arrow word select, type-replaces-selection, backspace-clears-selection, ctrl-a, escape, ctrl-x cuts line, ctrl-c copies line, toggle, smart-home, comment-toggle
+- Tests: 620 → 635 (+15)
+
+---
+
 ## Recently Completed (Session 65)
 
 ### ✅ Arrow Key Navigation for Completion Popup + Ctrl-Space Re-trigger Fix
@@ -434,7 +471,7 @@
 
 ### Enhanced Editor
 - [x] **Autosuggestions (inline ghost text)** — as-you-type completions shown as dimmed ghost text inline after the cursor; sources: buffer word scan (sync) + LSP `textDocument/completion` (async); Tab accepts, any other key dismisses; coexists with Ctrl-N/Ctrl-P popup (ghost hidden when popup active)
-- [ ] **Edit mode toggle** — `editor_mode` setting (`"vim"` default | `"vscode"`) switchable at runtime via `:set mode=vscode`; VSCode mode: no modal editing, standard Ctrl-C/X/V/Z/Y/A/S/F, click-to-insert, selection-replace-on-type, Home/End/PgUp/PgDn behave like a normal editor; Vim mode unchanged
+- [x] **Edit mode toggle** — `editor_mode` setting (`"vim"` default | `"vscode"`); `:set mode=vscode`; `Alt-M` runtime toggle; Shift+Arrow selection, Ctrl+Arrow word nav, Ctrl-C/X/V/Z/Y/A shortcuts, Ctrl+/ comment toggle, smart Home; status bar shows EDIT/SELECT; session 66
 
 ### Terminal & Debugger
 - [ ] **Integrated terminal** — VSCode-style bottom panel terminal; spawns a shell (`$SHELL`) in the project `cwd`; `:terminal` / `Ctrl-\`` to open/toggle; multiple terminal tabs; input routed to PTY; scrollback buffer; GTK uses `vte` crate or similar; TUI renders PTY output via crossterm raw mode subregion

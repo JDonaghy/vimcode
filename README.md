@@ -11,7 +11,7 @@ There's a touch of irony here - using a cli tool to write the editor that I've w
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 618 tests, zero async runtime
+- **Clean architecture** — platform-agnostic core, 638 tests, zero async runtime
 
 ## Building
 
@@ -333,6 +333,7 @@ Runtime changes are written through to `~/.config/vimcode/settings.json` immedia
 | `autoindent` / `noautoindent` | `ai` | on | Copy indent from current line on Enter/o/O |
 | `incsearch` / `noincsearch` | `is` | on | Incremental search as you type |
 | `lsp` / `nolsp` | | on | Enable/disable LSP language servers |
+| `mode=vim` / `mode=vscode` | | vim | Editor mode (see **VSCode Mode** below) |
 
 - `:set option?` — query current value (e.g. `:set ts?` → `tabstop=4`)
 - `:set` (no args) — show one-line summary of all settings
@@ -368,6 +369,36 @@ Key notation: `<C-x>` = Ctrl+x, `<A-x>` = Alt+x, `<C-S-x>` = Ctrl+Shift+x.
 | `accept` | `Tab` | Accept the highlighted completion item |
 
 Only specify keys you want to change — unspecified keys keep their defaults.
+
+---
+
+### VSCode Mode
+
+Switch the editor into a **non-modal editing** mode that works like a standard text editor:
+
+- `:set mode=vscode` — activate VSCode mode (from Vim normal mode)
+- `Alt-M` — toggle between Vim mode and VSCode mode at any time
+- `:set mode=vim` — return to Vim mode
+
+**In VSCode mode:**
+- Always in "insert" state — no mode switching
+- `Ctrl-C` / `Ctrl-X` — copy / cut (no selection → copies/cuts whole current line)
+- `Ctrl-V` — paste
+- `Ctrl-Z` / `Ctrl-Y` — undo / redo
+- `Ctrl-A` — select all
+- `Ctrl-S` — save
+- `Ctrl-/` — toggle line comment (`// `)
+- `Shift+Arrow` — extend selection one character/line at a time
+- `Ctrl+Arrow` — move by word
+- `Ctrl+Shift+Arrow` — extend selection by word
+- `Home` — smart home (first non-whitespace; again → col 0)
+- `Shift+Home` / `Shift+End` — extend selection to line start/end
+- `Escape` — clear selection (stays in insert)
+- `F1` — open the command bar (run any `:` command, then returns to EDIT mode)
+- Typing while a selection is active **replaces** the selection
+- Status bar shows `EDIT  F1:cmd  Alt-M:vim` (or `SELECT` when text is selected, `COMMAND` in command bar)
+
+The `editor_mode` setting is persisted in `settings.json`.
 
 ---
 

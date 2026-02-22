@@ -708,6 +708,14 @@ impl SimpleComponent for App {
                                     let unicode = key.to_unicode().filter(|c| !c.is_control());
                                     let ctrl = modifier.contains(gdk::ModifierType::CONTROL_MASK);
                                     let shift = modifier.contains(gdk::ModifierType::SHIFT_MASK);
+                                    let alt = modifier.contains(gdk::ModifierType::ALT_MASK);
+
+                                    // Alt-M: toggle Vim ↔ VSCode editing mode
+                                    if alt && !ctrl && !shift && unicode == Some('m') {
+                                        engine.borrow_mut().toggle_editor_mode();
+                                        sender.input(Msg::Resize);
+                                        return gtk4::glib::Propagation::Stop;
+                                    }
 
                                     // Check for Ctrl-F to toggle find dialog
                                     if ctrl && !shift && unicode == Some('f') {
@@ -757,7 +765,23 @@ impl SimpleComponent for App {
                                         return gtk4::glib::Propagation::Stop;
                                     }
 
-                                    sender.input(Msg::KeyPress { key_name, unicode, ctrl });
+                                    // In VSCode mode, transform Shift+Arrow to "Shift_" prefixed
+                                    // key names so the engine's vscode handler can distinguish them.
+                                    let effective_key = if engine.borrow().is_vscode_mode() && shift {
+                                        match key_name.as_str() {
+                                            "Right" => "Shift_Right".to_string(),
+                                            "Left"  => "Shift_Left".to_string(),
+                                            "Up"    => "Shift_Up".to_string(),
+                                            "Down"  => "Shift_Down".to_string(),
+                                            "Home"  => "Shift_Home".to_string(),
+                                            "End"   => "Shift_End".to_string(),
+                                            _       => key_name,
+                                        }
+                                    } else {
+                                        key_name
+                                    };
+
+                                    sender.input(Msg::KeyPress { key_name: effective_key, unicode, ctrl });
                                     gtk4::glib::Propagation::Stop
                                 }
                             },
@@ -1512,6 +1536,18 @@ impl SimpleComponent for App {
                     return;
                 }
 
+                // In VSCode mode, Ctrl-V reads clipboard into register '+' before
+                // calling handle_key (which will read it via get_register_content).
+                if ctrl && key_name == "v" && self.engine.borrow().is_vscode_mode() {
+                    if let Some(ref mut ctx) = self.clipboard {
+                        let text = ctx.get_contents().unwrap_or_default();
+                        let mut engine = self.engine.borrow_mut();
+                        engine.registers.insert('+', (text.clone(), false));
+                        engine.registers.insert('"', (text, false));
+                    }
+                    // Fall through to handle_key which calls vscode_paste().
+                }
+
                 // Intercept p/P to read from the system clipboard first
                 // (clipboard=unnamedplus semantics: plain p/P and "+p/"*p all read
                 // from system clipboard).  Skip for explicit named registers like "ap.
@@ -1679,6 +1715,10 @@ impl SimpleComponent for App {
                 height,
             } => {
                 let mut engine = self.engine.borrow_mut();
+                // Clear selection on click in VSCode mode.
+                if engine.is_vscode_mode() {
+                    engine.vscode_clear_selection();
+                }
                 handle_mouse_click(&mut engine, x, y, width, height);
                 // Reveal the active file in the sidebar tree (e.g. after tab click)
                 let file_path = engine.file_path().cloned();

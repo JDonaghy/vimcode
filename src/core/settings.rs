@@ -2,6 +2,17 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+/// Which editing paradigm the editor uses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum EditorMode {
+    /// Classic modal Vim key-bindings (default).
+    #[default]
+    Vim,
+    /// VSCode-style always-insert editing (Shift+Arrow select, Ctrl-C/X/V/Z/Y/A).
+    Vscode,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum LineNumberMode {
     #[default]
@@ -82,6 +93,10 @@ pub struct Settings {
     /// Completion popup key bindings
     #[serde(default)]
     pub completion_keys: CompletionKeys,
+
+    /// Editing mode: `vim` (modal) or `vscode` (always-insert).
+    #[serde(default)]
+    pub editor_mode: EditorMode,
 }
 
 fn default_explorer_visible() -> bool {
@@ -331,6 +346,7 @@ impl Default for Settings {
             explorer_keys: ExplorerKeys::default(),
             panel_keys: PanelKeys::default(),
             completion_keys: CompletionKeys::default(),
+            editor_mode: EditorMode::Vim,
         }
     }
 }
@@ -344,6 +360,11 @@ impl Settings {
     /// This ensures that when new settings are added to VimCode, they appear in the user's
     /// settings.json file with sensible defaults without requiring manual editing.
     pub fn load() -> Self {
+        // Tests must be hermetic — never read the user's settings.json.
+        #[cfg(test)]
+        return Self::default();
+
+        #[cfg_attr(test, allow(unreachable_code))]
         match Self::load_with_validation() {
             Ok(settings) => {
                 // Automatically update settings file to include any new fields with defaults
@@ -438,9 +459,13 @@ impl Settings {
             "noincsearch"
         };
         let lsp = if self.lsp_enabled { "lsp" } else { "nolsp" };
+        let mode = match self.editor_mode {
+            EditorMode::Vim => "mode=vim",
+            EditorMode::Vscode => "mode=vscode",
+        };
         format!(
-            "{}  {}  ts={}  sw={}  {}  {}  {}",
-            num, et, self.tabstop, self.shift_width, ai, is, lsp
+            "{}  {}  ts={}  sw={}  {}  {}  {}  {}",
+            num, et, self.tabstop, self.shift_width, ai, is, lsp, mode
         )
     }
 
@@ -498,6 +523,11 @@ impl Settings {
                     .map_err(|_| format!("Invalid value for {name}: '{value}'"))?;
                 self.shift_width = n;
             }
+            "mode" | "editor_mode" => match value {
+                "vim" => self.editor_mode = EditorMode::Vim,
+                "vscode" => self.editor_mode = EditorMode::Vscode,
+                _ => return Err(format!("Unknown mode '{}' (vim|vscode)", value)),
+            },
             _ => return Err(format!("Unknown option: {name}")),
         }
         Ok(())
@@ -549,6 +579,13 @@ impl Settings {
             } else {
                 "nolsp".to_string()
             }),
+            "mode" | "editor_mode" => Ok(format!(
+                "mode={}",
+                match self.editor_mode {
+                    EditorMode::Vim => "vim",
+                    EditorMode::Vscode => "vscode",
+                }
+            )),
             _ => Err(format!("Unknown option: {opt}")),
         }
     }

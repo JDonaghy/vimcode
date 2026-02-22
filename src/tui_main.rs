@@ -1120,8 +1120,26 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                                 needs_redraw = true;
                                 continue;
                             }
+                            // Alt-M: toggle Vim ↔ VSCode editing mode
+                            KeyCode::Char('m') | KeyCode::Char('M') => {
+                                engine.toggle_editor_mode();
+                                needs_redraw = true;
+                                continue;
+                            }
                             _ => {}
                         }
+                    }
+
+                    // In VSCode mode, Ctrl-V pre-loads clipboard into register '+' before
+                    // calling handle_key (which dispatches to vscode_paste()).
+                    if ctrl && key_name == "v" && engine.is_vscode_mode() {
+                        if let Some(ref cb_read) = engine.clipboard_read {
+                            if let Ok(text) = cb_read() {
+                                engine.registers.insert('+', (text.clone(), false));
+                                engine.registers.insert('"', (text, false));
+                            }
+                        }
+                        // Fall through to handle_key which calls vscode_paste().
                     }
 
                     // clipboard=unnamedplus: intercept p/P to read from system clipboard.
@@ -1784,6 +1802,10 @@ fn handle_mouse(
                 if is_double {
                     engine.mouse_double_click(rw.window_id, buf_line, col_in_text);
                 } else {
+                    // Clear selection on click in VSCode mode.
+                    if engine.is_vscode_mode() {
+                        engine.vscode_clear_selection();
+                    }
                     engine.mouse_click(rw.window_id, buf_line, col_in_text);
                 }
                 return sidebar_width;
@@ -3979,6 +4001,7 @@ fn translate_key(event: KeyEvent) -> Option<(String, Option<char>, bool)> {
         return None;
     }
     let ctrl = event.modifiers.contains(KeyModifiers::CONTROL);
+    let shift = event.modifiers.contains(KeyModifiers::SHIFT);
     match event.code {
         KeyCode::Char(c) => {
             let lower = c.to_ascii_lowercase();
@@ -4002,12 +4025,22 @@ fn translate_key(event: KeyEvent) -> Option<(String, Option<char>, bool)> {
         KeyCode::Delete => Some(("Delete".to_string(), None, false)),
         KeyCode::Tab => Some(("Tab".to_string(), None, false)),
         KeyCode::BackTab => Some(("ISO_Left_Tab".to_string(), None, false)),
+        // Shift+Arrow (no ctrl): emit as "Shift_X" for VSCode selection extension.
+        KeyCode::Up if shift && !ctrl => Some(("Shift_Up".to_string(), None, false)),
+        KeyCode::Down if shift && !ctrl => Some(("Shift_Down".to_string(), None, false)),
+        KeyCode::Left if shift && !ctrl => Some(("Shift_Left".to_string(), None, false)),
+        KeyCode::Right if shift && !ctrl => Some(("Shift_Right".to_string(), None, false)),
+        KeyCode::Home if shift => Some(("Shift_Home".to_string(), None, false)),
+        KeyCode::End if shift => Some(("Shift_End".to_string(), None, false)),
+        // Ctrl+Shift+Arrow: emit as "Shift_X" with ctrl=true for word-level selection.
+        KeyCode::Left if shift && ctrl => Some(("Shift_Left".to_string(), None, true)),
+        KeyCode::Right if shift && ctrl => Some(("Shift_Right".to_string(), None, true)),
         KeyCode::Up => Some(("Up".to_string(), None, false)),
         KeyCode::Down => Some(("Down".to_string(), None, false)),
-        KeyCode::Left => Some(("Left".to_string(), None, false)),
-        KeyCode::Right => Some(("Right".to_string(), None, false)),
-        KeyCode::Home => Some(("Home".to_string(), None, false)),
-        KeyCode::End => Some(("End".to_string(), None, false)),
+        KeyCode::Left => Some(("Left".to_string(), None, ctrl)),
+        KeyCode::Right => Some(("Right".to_string(), None, ctrl)),
+        KeyCode::Home => Some(("Home".to_string(), None, ctrl)),
+        KeyCode::End => Some(("End".to_string(), None, ctrl)),
         KeyCode::PageUp => Some(("Page_Up".to_string(), None, false)),
         KeyCode::PageDown => Some(("Page_Down".to_string(), None, false)),
         KeyCode::F(n) => Some((format!("F{}", n), None, false)),
