@@ -3983,8 +3983,14 @@ fn translate_key(event: KeyEvent) -> Option<(String, Option<char>, bool)> {
         KeyCode::Char(c) => {
             let lower = c.to_ascii_lowercase();
             let (key_name, unicode) = if ctrl {
-                // Engine dispatches Ctrl combos via key_name (e.g. "d" for Ctrl-D)
-                (lower.to_string(), Some(lower))
+                // Engine dispatches Ctrl combos via key_name (e.g. "d" for Ctrl-D).
+                // Space is a named key; use "space" to match GTK and the engine's convention.
+                let name = if lower == ' ' {
+                    "space".to_string()
+                } else {
+                    lower.to_string()
+                };
+                (name, Some(lower))
             } else {
                 ("".to_string(), Some(c))
             };

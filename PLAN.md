@@ -1,5 +1,32 @@
 # VimCode Implementation Plan
 
+## Recently Completed (Session 65)
+
+### ✅ Arrow Key Navigation for Completion Popup + Ctrl-Space Re-trigger Fix
+
+- **`Down`/`Up` in Insert mode navigate popup** — when the completion popup is visible (`completion_display_only && completion_idx.is_some()`), `Down` and `Up` cycle through candidates (same as `Ctrl-N`/`Ctrl-P`) without moving the cursor; intercepted before the clear block so the popup is not dismissed
+- **Ctrl-Space re-trigger bug fixed in TUI** — `translate_key()` was emitting `key_name=" "` (literal space) for Ctrl-Space; engine checks `key_name == "space"`; they never matched, so Ctrl-Space had no effect in the TUI backend; fixed to emit `"space"` for ctrl+space (matching GTK/GDK convention)
+- **`parse_key_binding` named key support** — `"Space"` (5 chars) failed the single-char guard; added named-key table so `<C-Space>` now parses to `Some((true, false, false, ' '))`; trigger setting round-trips correctly
+- File changes: `src/core/engine.rs` (intercept block, updated `test_auto_popup_dismissed_on_navigation`, new `test_auto_popup_arrow_cycles`), `src/core/settings.rs` (named-key table in `parse_key_binding`, new `test_parse_key_binding_named_space`), `src/tui_main.rs` (`translate_key` space fix)
+- Tests: 618 → 620 (+2)
+
+---
+
+## Recently Completed (Session 64)
+
+### ✅ VSCode-Style Auto-Popup Completion (replaces ghost text)
+
+- **Removed ghost text** — `ghost_text`, `lsp_pending_ghost_completion`, `ghost_prefix` fields, `update_ghost_text()`, `lsp_request_ghost()`, `ghost_suffix` on `RenderedLine`, `ghost_text_fg` on `Theme`, GTK + TUI ghost rendering blocks; 6 ghost tests removed
+- **`completion_display_only: bool`** — new field; `true` when popup triggered by typing or Ctrl-Space (Tab accepts, Ctrl-N/P cycle without inserting); `false` when triggered by explicit Ctrl-N/P (old behavior: inserts immediately)
+- **`trigger_auto_completion()`** — new method; called after char insert and BackSpace; uses `word_completions_for_prefix()` sync + `lsp_request_completion()` async; sets `completion_display_only = true`
+- **`handle_insert_key()` changes** — configured trigger check (parses `settings.completion_keys.trigger`); Ctrl-N/P: if display-only, just cycles index (no text change); Tab: if display-only, calls `apply_completion_candidate()`; clear block now also resets `completion_display_only`
+- **`poll_lsp()` CompletionResponse** — ghost branch removed; popup branch now filters by prefix and sets `completion_display_only = true` (no immediate insert)
+- **`CompletionKeys` struct** in `settings.rs` — `trigger` (default `<C-Space>`) + `accept` (default `Tab`); follows `PanelKeys` pattern with serde per-field defaults; added to `Settings` struct
+- File changes: `src/core/settings.rs` (+CompletionKeys), `src/core/engine.rs` (−ghost, +display_only, +trigger_auto_completion, rewritten insert_key/poll_lsp, 5 new tests), `src/render.rs` (−ghost_suffix, −ghost_text_fg), `src/main.rs` (−ghost rendering), `src/tui_main.rs` (−ghost rendering)
+- Tests: 619 → 618 (−6 ghost tests, +5 auto-popup tests)
+
+---
+
 ## Recently Completed (Session 62)
 
 ### ✅ Configurable Panel Navigation Keys (`panel_keys`)
@@ -402,5 +429,24 @@
 - [x] **`gd` / `gD`** — go-to-definition via LSP
 - [x] **`:norm`** — execute normal command on a range of lines
 - [x] **Fuzzy finder / Telescope-style** — Ctrl-P opens centered file-picker modal with subsequence scoring (session 53)
-- [ ] **Multiple cursors**
-- [ ] **Themes / plugin system**
+- [ ] **Multiple cursors** — `Ctrl-D` adds cursor at next match of word under cursor; all cursors receive identical keystrokes; Escape collapses to one
+- [ ] **Themes / plugin system** — named color themes selectable via `:colorscheme`; theme file format TBD
+
+### Enhanced Editor
+- [x] **Autosuggestions (inline ghost text)** — as-you-type completions shown as dimmed ghost text inline after the cursor; sources: buffer word scan (sync) + LSP `textDocument/completion` (async); Tab accepts, any other key dismisses; coexists with Ctrl-N/Ctrl-P popup (ghost hidden when popup active)
+- [ ] **Edit mode toggle** — `editor_mode` setting (`"vim"` default | `"vscode"`) switchable at runtime via `:set mode=vscode`; VSCode mode: no modal editing, standard Ctrl-C/X/V/Z/Y/A/S/F, click-to-insert, selection-replace-on-type, Home/End/PgUp/PgDn behave like a normal editor; Vim mode unchanged
+
+### Terminal & Debugger
+- [ ] **Integrated terminal** — VSCode-style bottom panel terminal; spawns a shell (`$SHELL`) in the project `cwd`; `:terminal` / `Ctrl-\`` to open/toggle; multiple terminal tabs; input routed to PTY; scrollback buffer; GTK uses `vte` crate or similar; TUI renders PTY output via crossterm raw mode subregion
+- [ ] **Debugger (DAP)** — Debug Adapter Protocol client (analogous to LSP but for debugging); auto-detect `codelldb`, `debugpy`, `js-debug`; breakpoints set with `<F9>` or `:Breakpoint`; step over/in/out (`<F10>`/`<F11>`/`<F12>`); call stack + variables panel in sidebar; inline variable values shown as virtual text; status bar shows current debug state
+
+### UI & Menus
+- [ ] **VSCode-style menus** — application menu bar (File / Edit / View / Go / Run / Terminal / Help) in GTK; command palette (`Ctrl-Shift-P`) lists all commands + key bindings; fuzzy-searchable; both GTK native menus and TUI pop-up menu overlay
+- [ ] **Command palette** — `Ctrl-Shift-P` floating modal (like Telescope but for commands); lists named commands with descriptions and current keybindings; typing filters; Enter executes; shared between GTK and TUI
+
+### Extension System
+- [ ] **Extension mechanism** — WASM or Lua plugin sandbox (TBD); plugins can: register commands (`:MyCmd`), add key bindings, hook into editor events (on-save, on-open, on-key), read/write buffer text, show messages; `~/.config/vimcode/extensions/` directory auto-loaded; `:ExtInstall <url>`, `:ExtList`, `:ExtDisable`
+
+### AI Integration
+- [ ] **AI assistant panel** — VSCode Copilot-style sidebar chat panel; configurable provider (Anthropic Claude API, OpenAI, Ollama local); `api_key` in settings; `Alt-A` opens panel; multi-turn conversation with editor context (current file, selection, diagnostics); "Insert at cursor" / "Replace selection" actions on responses
+- [ ] **AI inline completions** — ghost-text completions from AI provider interleaved with LSP ghost text; separate `ai_completions` setting (default false to avoid unexpected API costs); debounced after 500ms idle in insert mode; Tab accepts whole suggestion, `Alt-]`/`Alt-[` cycle through alternatives

@@ -11,7 +11,7 @@ There's a touch of irony here - using a cli tool to write the editor that I've w
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 613 tests, zero async runtime
+- **Clean architecture** — platform-agnostic core, 618 tests, zero async runtime
 
 ## Building
 
@@ -88,9 +88,11 @@ cargo fmt
 - `i` / `I` — insert at cursor / line start
 - `a` / `A` — append at cursor / line end
 - `o` / `O` — open line below/above
-- `Ctrl-N` / `Ctrl-P` — word completion (cycles through buffer words)
+- **Auto-popup completion** — suggestion popup appears automatically as you type; `Tab` accepts highlighted item; `Ctrl-N`/`Ctrl-P` or `Down`/`Up` cycle candidates without inserting; `Left`/`Escape` or any non-completion key dismisses; sources: buffer word scan (sync) + LSP (async)
+- `Ctrl-Space` — manually trigger (or re-trigger) completion popup; configurable via `completion_keys.trigger`
+- `Ctrl-N` / `Ctrl-P` / `Down` / `Up` — cycle completion candidates (display-only when auto-popup active; Ctrl-N/P inserts immediately when triggered manually)
 - `Backspace` — delete left; joins lines at start of line
-- Tab key — inserts spaces (width = `tabstop`) or literal `\t` (when `noexpandtab`)
+- Tab key — accepts auto-popup completion if active; otherwise inserts spaces (width = `tabstop`) or literal `\t` (when `noexpandtab`)
 - **Auto-indent** — Enter/`o`/`O` copy leading whitespace from current line
 
 **Visual mode**
@@ -291,7 +293,7 @@ Automatic language server integration — open a file and diagnostics, completio
 **Features:**
 - **Inline diagnostics** — wavy underlines (GTK) / colored underlines (TUI) with severity-colored gutter icons
 - **Diagnostic navigation** — `]d` / `[d` jump to next/previous diagnostic
-- **LSP completions** — `Ctrl-Space` in insert mode triggers server completions (merges with existing buffer word completion)
+- **LSP completions** — async source for the auto-popup (appears as you type); `Ctrl-Space` manually triggers
 - **Go-to-definition** — `gd` jumps to the definition of the symbol under the cursor
 - **Hover info** — `K` shows type/documentation popup above the cursor
 - **Diagnostic counts** — `E:N W:N` shown in status bar
@@ -357,6 +359,13 @@ Key notation: `<C-x>` = Ctrl+x, `<A-x>` = Alt+x, `<C-S-x>` = Ctrl+Shift+x.
 | `delete` | `D` | Delete prompt |
 | `rename` | `r` | Rename prompt |
 | `move_file` | `M` | Move file prompt |
+
+**Completion key bindings** — configurable in `settings.json` under `"completion_keys"`:
+
+| Field | Default | Action |
+|-------|---------|--------|
+| `trigger` | `<C-Space>` | Manually trigger the completion popup |
+| `accept` | `Tab` | Accept the highlighted completion item |
 
 Only specify keys you want to change — unspecified keys keep their defaults.
 

@@ -1,10 +1,10 @@
 # VimCode Project State
 
-**Last updated:** Feb 21, 2026 (Session 62)
+**Last updated:** Feb 22, 2026 (Session 65)
 
 ## Status
 
-**Panel navigation keys + mouse selection:** Configurable `panel_keys` for sidebar navigation (`Alt+E` explorer, `Alt+F` search, `Ctrl-B` toggle, etc.) with bidirectional toggle support in both GTK and TUI; double-click word select, click-and-drag visual selection, system clipboard registers (`"+`/`"*`) via copypasta-ext — 613 tests passing
+**Completion popup polish:** Down/Up arrow keys now cycle popup candidates (same as Ctrl-N/P) without moving cursor; Ctrl-Space re-trigger fixed in TUI (was silently broken — `translate_key` emitted `" "` but engine checked `"space"`); `parse_key_binding` now handles named keys like `"Space"` so `<C-Space>` parses correctly — 620 tests passing
 
 ### Core Vim (Complete)
 - Seven modes (Normal/Insert/Visual/Visual Line/Visual Block/Command/Search)
@@ -187,7 +187,7 @@ vimcode/
 │       ├── settings.rs (~925 lines) — JSON persistence, auto-init, :set parsing, explorer keys, panel_keys, parse_key_binding
 │       ├── window.rs, tab.rs, view.rs, cursor.rs, mode.rs, syntax.rs
 │       ├── git.rs (~635 lines) — git subprocess integration (diff/blame/hunk parsing, branch detection, stage_hunk)
-│       └── Tests: 613 passing (9 find/replace, 14 macro, 8 session, 4 reverse search, 7 replace char, 5 undo line, 8 case change, 6 marks, 5 incremental search, 12 syntax/language, 6 history search, 11 fold tests, 12 git tests, 4 sidebar-preview tests, 5 auto-indent tests, 4 completion tests, 9 quit/ctrl-s tests, 1 session-restore test, 22 set-command tests, 10 hunk-staging tests, 9 text-object tests, 24 project-search tests, 5 engine-replace tests, 27 lsp-protocol tests, 10 lsp-engine tests, 31 vim-features tests, 9 tag-object tests, 9 norm-command tests, 11 fuzzy-finder tests, 8 live-grep tests, 8 quickfix tests, 13 diff+rename+move tests, 4 explorer-keys tests, 4 help-system tests, 7 panel-keys tests)
+│       └── Tests: 620 passing (9 find/replace, 14 macro, 8 session, 4 reverse search, 7 replace char, 5 undo line, 8 case change, 6 marks, 5 incremental search, 12 syntax/language, 6 history search, 11 fold tests, 12 git tests, 4 sidebar-preview tests, 5 auto-indent tests, 6 completion tests, 9 quit/ctrl-s tests, 1 session-restore test, 23 set-command tests, 10 hunk-staging tests, 9 text-object tests, 24 project-search tests, 5 engine-replace tests, 27 lsp-protocol tests, 10 lsp-engine tests, 31 vim-features tests, 9 tag-object tests, 9 norm-command tests, 11 fuzzy-finder tests, 8 live-grep tests, 8 quickfix tests, 13 diff+rename+move tests, 4 explorer-keys tests, 4 help-system tests, 7 panel-keys tests)
 └── Total: ~33,400 lines
 ```
 
@@ -253,6 +253,7 @@ cargo fmt
 ### Editor features
 - [x] **Auto-indent** — copies current line's leading whitespace on Enter/o/O; `auto_indent` setting (default: true)
 - [x] **Completion menu** — Ctrl-N/Ctrl-P word completion from buffer in insert mode; floating popup in GTK + TUI
+- [x] **Ghost text (inline autosuggestions)** — dimmed suffix after cursor in Insert mode; buffer word + LSP sources; Tab accepts
 - [x] **:set command** — runtime setting changes; write-through to settings.json; number/rnu/expandtab/tabstop/shiftwidth/autoindent/incsearch; query with `?`
 - [x] **`ip`/`ap` + `is`/`as` text objects** — paragraph and sentence text objects for all operators and visual mode
 - [x] **VSCode-style project search** — Ctrl-Shift-F panel; regex/case/whole-word toggles; `.gitignore`-aware (ignore crate); grouped results, click to open
@@ -264,6 +265,10 @@ cargo fmt
 - [x] **`:norm`** — execute normal command on a range of lines
 
 ## Recent Work
+**Session 65:** Completion popup arrow key navigation + Ctrl-Space re-trigger fix — `Down`/`Up` in Insert mode now cycle through completion candidates when the popup is visible (same semantics as `Ctrl-N`/`Ctrl-P`); intercepted before the clear block so the popup is not dismissed. Ctrl-Space re-trigger was silently broken in TUI: `translate_key()` emitted `key_name=" "` (literal space char) but the engine checks `key_name == "space"` (GDK convention) — they never matched; fixed by normalizing space to `"space"` in the ctrl path. Also fixed `parse_key_binding` to accept named keys (`"Space"`) so `<C-Space>` in settings.json now parses correctly to `Some((true, false, false, ' '))` instead of failing. 2 new tests: `test_auto_popup_arrow_cycles` + `test_parse_key_binding_named_space`. 618 → 620 tests.
+
+**Session 63:** Inline ghost text autosuggestions — dimmed suffix shown after cursor in Insert mode as you type; two sources: synchronous buffer-word scan + async LSP `textDocument/completion`. Engine: 3 new fields (`ghost_text`, `lsp_pending_ghost_completion`, `ghost_prefix`); `update_ghost_text()` called after each BackSpace or char insert; `lsp_request_ghost()` fires a separate LSP completion request; `poll_lsp()` routes `CompletionResponse` by `request_id` (ghost vs popup); Tab acceptance handled before the general-clear block so ghost text survives to the Tab arm; ghost text cleared by any non-text-changing key (arrows, Escape, Return, etc.) and hidden when Ctrl-N/P popup is active. Render: `RenderedLine.ghost_suffix` populated in `build_rendered_window()` (active window + cursor line + Insert mode + no popup); `Theme.ghost_text_fg` color (#636363 dimmed grey). GTK: `pangocairo::show_layout` after cursor x computed via `layout.index_to_pos()`. TUI: `set_cell()` for each ghost char after cursor column. 613 → 619 tests (6 new ghost-text tests).
+
 **Session 62:** Configurable panel navigation keys (`panel_keys`) — new `PanelKeys` struct in `settings.rs` with 5 fields (`toggle_sidebar`, `focus_explorer`, `focus_search`, `fuzzy_finder`, `live_grep`) and defaults `<C-b>`, `<A-e>`, `<A-f>`, `<C-p>`, `<C-g>`; `parse_key_binding()` parses Vim-style key notation. Removed `ExplorerAction::ToggleMode` / `toggle_mode` from `ExplorerKeys` (keyboard focus on explorer makes a separate mode gate unnecessary). TUI: `matches_tui_key()` helper; panel_keys dispatch added in both editor-focused and sidebar-focused sections so `Alt+E`/`Alt+F` work bidirectionally (from editor OR from within the sidebar). GTK: `matches_gtk_key()` helper; `Msg::ToggleFocusExplorer` (existing) + new `Msg::ToggleFocusSearch`; tree view `EventControllerKey` now checks panel_keys before `Stop` catchall so shortcuts work when tree has focus; `ToggleFocusSearch` returns keyboard focus to drawing area without hiding sidebar (avoids Revealer animation white-area artifact). 613 tests (7 net new).
 
 **Session 61:** Replaced `arboard` with `copypasta-ext 0.4`. GTK backend: removed background clipboard thread + `ClipboardCmd` + `clip_tx`; synchronous reads/writes via `x11_bin::ClipboardContext` (xclip subprocess, no X11 event-loop conflict). TUI backend: replaced ~180 lines of platform-detection helpers with ~20-line `build_clipboard_ctx()`. Fixed TUI paste-intercept bug: `translate_key()` sets `key_name=""` for regular chars, so `key_name == "p"` was always false — paste intercept never fired; fixed to check `unicode` instead. Also fixed error message timing (set it after `handle_key()` which clears `engine.message`). Root cause of `try_context()` being insufficient: copypasta-ext picks `x11_fork` first on X11, but `x11_fork::get_contents()` uses `X11ClipboardContext` directly (same X11 connection conflict as arboard); we explicitly use `x11_bin` on X11. 606 tests, no change.

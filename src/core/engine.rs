@@ -237,12 +237,15 @@ pub struct Engine {
     scroll_bind_pairs: Vec<(WindowId, WindowId)>,
 
     // --- Completion state ---
-    /// Current completion candidates (populated on first Ctrl-N/P).
+    /// Current completion candidates (populated on first Ctrl-N/P or auto-trigger).
     pub completion_candidates: Vec<String>,
     /// Index of the currently selected candidate, or None when inactive.
     pub completion_idx: Option<usize>,
     /// Buffer column where the prefix that triggered completion starts.
     pub completion_start_col: usize,
+    /// True when the popup was triggered automatically (typing/Ctrl-Space):
+    /// Tab accepts the highlighted item. False for Ctrl-N/P (inserts immediately as before).
+    pub completion_display_only: bool,
 
     // --- Project search state ---
     /// Current text typed in the project search input box.
@@ -419,6 +422,7 @@ impl Engine {
             completion_candidates: Vec::new(),
             completion_idx: None,
             completion_start_col: 0,
+            completion_display_only: false,
             project_search_query: String::new(),
             project_search_results: Vec::new(),
             project_search_selected: 0,
@@ -3896,15 +3900,39 @@ impl Engine {
         ctrl: bool,
         changed: &mut bool,
     ) {
-        // ── Ctrl-Space: trigger LSP completion ────────────────────────────────
-        if ctrl && key_name == "space" {
-            self.lsp_request_completion();
-            return;
+        // ── Configured completion trigger (e.g. Ctrl-Space) ──────────────────
+        {
+            let trigger = self.settings.completion_keys.trigger.clone();
+            if let Some((t_ctrl, _t_shift, _t_alt, t_ch)) =
+                crate::core::settings::parse_key_binding(&trigger)
+            {
+                let key_char = key_name.chars().next().unwrap_or('\0');
+                if ctrl == t_ctrl && (key_char == t_ch || (key_name == "space" && t_ch == ' ')) {
+                    self.trigger_auto_completion();
+                    return;
+                }
+            } else if ctrl && key_name == "space" {
+                // Fallback for default <C-Space> trigger
+                self.trigger_auto_completion();
+                return;
+            }
         }
 
         // ── Ctrl-N / Ctrl-P: word completion ─────────────────────────────────
         if ctrl && (key_name == "n" || key_name == "p") {
             let next = key_name == "n";
+            if self.completion_display_only && self.completion_idx.is_some() {
+                // Auto-popup is active: just cycle the index (don't insert)
+                let len = self.completion_candidates.len();
+                let cur = self.completion_idx.unwrap();
+                let new_idx = if next {
+                    (cur + 1) % len
+                } else {
+                    (cur + len - 1) % len
+                };
+                self.completion_idx = Some(new_idx);
+                return;
+            }
             if self.completion_idx.is_none() {
                 let (prefix, start_col) = self.completion_prefix_at_cursor();
                 let candidates = self.word_completions_for_prefix(&prefix);
@@ -3936,10 +3964,42 @@ impl Engine {
             return;
         }
 
+        // ── Tab: accept display-only popup OR fall through ────────────────────
+        if !ctrl && key_name == "Tab" && self.completion_display_only {
+            if let Some(idx) = self.completion_idx {
+                self.apply_completion_candidate(idx);
+                self.completion_candidates.clear();
+                self.completion_idx = None;
+                self.completion_display_only = false;
+                *changed = true;
+                return;
+            }
+        }
+        // No display-only popup — fall through to regular Tab handling in match below.
+
+        // ── Down/Up: navigate completion popup if active ──────────────────────
+        if !ctrl
+            && (key_name == "Down" || key_name == "Up")
+            && self.completion_display_only
+            && self.completion_idx.is_some()
+        {
+            let next = key_name == "Down";
+            let len = self.completion_candidates.len();
+            let cur = self.completion_idx.unwrap();
+            let new_idx = if next {
+                (cur + 1) % len
+            } else {
+                (cur + len - 1) % len
+            };
+            self.completion_idx = Some(new_idx);
+            return;
+        }
+
         // Clear completion state on any non-completion key.
         if self.completion_idx.is_some() {
             self.completion_candidates.clear();
             self.completion_idx = None;
+            self.completion_display_only = false;
         }
 
         match key_name {
@@ -3976,6 +4036,9 @@ impl Engine {
                     self.view_mut().cursor.line -= 1;
                     self.view_mut().cursor.col = new_col;
                     *changed = true;
+                }
+                if *changed {
+                    self.trigger_auto_completion();
                 }
             }
             "Delete" => {
@@ -4052,6 +4115,9 @@ impl Engine {
                     self.insert_text_buffer.push(ch);
                     self.view_mut().cursor.col += 1;
                     *changed = true;
+                }
+                if *changed {
+                    self.trigger_auto_completion();
                 }
             }
         }
@@ -7565,6 +7631,32 @@ impl Engine {
         self.view_mut().cursor.col = start + candidate.len();
     }
 
+    /// Trigger auto-popup completion based on current cursor prefix.
+    /// Called after each text change in Insert mode.
+    fn trigger_auto_completion(&mut self) {
+        let (prefix, _) = self.completion_prefix_at_cursor();
+        if prefix.is_empty() {
+            self.completion_candidates.clear();
+            self.completion_idx = None;
+            self.completion_display_only = false;
+            return;
+        }
+        let candidates = self.word_completions_for_prefix(&prefix);
+        if !candidates.is_empty() {
+            self.completion_start_col = self.view().cursor.col - prefix.chars().count();
+            self.completion_candidates = candidates;
+            self.completion_idx = Some(0);
+            self.completion_display_only = true;
+        } else {
+            // No buffer-word hits yet; still fire LSP (may populate asynchronously)
+            self.completion_candidates.clear();
+            self.completion_idx = None;
+            self.completion_display_only = false;
+        }
+        // Async LSP source — response will update candidates if popup is still active
+        self.lsp_request_completion();
+    }
+
     // ── Fold helpers ──────────────────────────────────────────────────────────
 
     /// Count leading whitespace characters (spaces = 1, tabs = tab_width).
@@ -8367,27 +8459,32 @@ impl Engine {
                     }
                     self.lsp_diagnostics.insert(path, diagnostics);
                 }
-                LspEvent::CompletionResponse { items, .. } => {
-                    self.lsp_pending_completion = None;
-                    if !items.is_empty() {
-                        self.lsp_completion_active = true;
-                        let (_, start_col) = self.completion_prefix_at_cursor();
-                        self.completion_start_col = start_col;
-                        self.completion_candidates = items
-                            .iter()
-                            .map(|item| {
-                                item.insert_text
-                                    .as_deref()
-                                    .unwrap_or(&item.label)
-                                    .to_string()
-                            })
-                            .collect();
-                        self.completion_idx = Some(0);
-                        self.apply_completion_candidate(0);
-                        redraw = true;
-                    } else {
-                        self.message = "No completions".to_string();
+                LspEvent::CompletionResponse {
+                    request_id, items, ..
+                } => {
+                    if self.lsp_pending_completion == Some(request_id) {
+                        // Popup completion response — populate display-only popup
+                        self.lsp_pending_completion = None;
+                        if !items.is_empty() {
+                            let (cur_prefix, _) = self.completion_prefix_at_cursor();
+                            let lsp_cands: Vec<String> = items
+                                .iter()
+                                .filter_map(|item| {
+                                    let text = item.insert_text.as_deref().unwrap_or(&item.label);
+                                    text.starts_with(&cur_prefix).then(|| text.to_string())
+                                })
+                                .collect();
+                            if !lsp_cands.is_empty() {
+                                self.completion_start_col =
+                                    self.view().cursor.col - cur_prefix.chars().count();
+                                self.completion_candidates = lsp_cands;
+                                self.completion_idx = Some(0);
+                                self.completion_display_only = true;
+                                redraw = true;
+                            }
+                        }
                     }
+                    // else: stale response (request already superseded) — ignore
                 }
                 LspEvent::DefinitionResponse { locations, .. } => {
                     self.lsp_pending_definition = None;
@@ -16033,6 +16130,192 @@ mod tests {
         press_char(&mut engine, 'x');
         assert!(engine.completion_idx.is_none());
         assert!(engine.completion_candidates.is_empty());
+    }
+
+    // ── Auto-popup completion tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_auto_popup_appears_on_type() {
+        let mut engine = Engine::new();
+        // Buffer has "foobar" on line 0; enter insert mode on line 1 and type "fo"
+        engine.buffer_mut().insert(0, "foobar\n");
+        press_char(&mut engine, 'G');
+        press_char(&mut engine, 'o'); // open new line in insert mode
+        press_char(&mut engine, 'f');
+        press_char(&mut engine, 'o');
+        assert!(
+            engine.completion_idx.is_some(),
+            "completion popup should appear after typing prefix"
+        );
+        assert!(
+            !engine.completion_candidates.is_empty(),
+            "candidates should be populated"
+        );
+        assert!(
+            engine.completion_display_only,
+            "popup should be in display-only mode"
+        );
+    }
+
+    #[test]
+    fn test_auto_popup_tab_accepts() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "foobar\n");
+        press_char(&mut engine, 'G');
+        press_char(&mut engine, 'o'); // insert mode, new line
+        press_char(&mut engine, 'f');
+        press_char(&mut engine, 'o');
+        // Popup should be active with display_only=true
+        assert!(
+            engine.completion_display_only,
+            "popup should be display-only"
+        );
+        assert!(engine.completion_idx.is_some(), "popup should be active");
+        // Tab should accept the highlighted candidate
+        press_special(&mut engine, "Tab");
+        assert!(
+            engine.completion_idx.is_none(),
+            "popup should be cleared after Tab"
+        );
+        assert!(
+            !engine.completion_display_only,
+            "display_only should be false after accept"
+        );
+        let line1: String = engine.buffer().content.line(1).chars().collect();
+        assert!(
+            line1.starts_with("foobar"),
+            "buffer should contain accepted completion, got: {}",
+            line1
+        );
+    }
+
+    #[test]
+    fn test_auto_popup_dismissed_on_navigation() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "foobar\n");
+        press_char(&mut engine, 'G');
+        press_char(&mut engine, 'o');
+        press_char(&mut engine, 'f');
+        press_char(&mut engine, 'o');
+        assert!(engine.completion_idx.is_some(), "popup should be active");
+        // Left arrow should clear the popup
+        press_special(&mut engine, "Left");
+        assert!(
+            engine.completion_idx.is_none(),
+            "popup should be dismissed after Left"
+        );
+
+        // Down arrow cycles popup, does NOT dismiss it
+        engine.buffer_mut().insert(0, "foobar\n");
+        press_char(&mut engine, 'G');
+        press_char(&mut engine, 'o');
+        press_char(&mut engine, 'f');
+        press_char(&mut engine, 'o');
+        assert!(engine.completion_idx.is_some(), "popup should be active");
+        press_special(&mut engine, "Down");
+        assert!(
+            engine.completion_idx.is_some(),
+            "Down should NOT dismiss popup"
+        );
+    }
+
+    #[test]
+    fn test_auto_popup_ctrl_n_cycles() {
+        let mut engine = Engine::new();
+        // Two candidates: "foobar" and "foobaz"
+        engine.buffer_mut().insert(0, "foobar foobaz\n");
+        press_char(&mut engine, 'G');
+        press_char(&mut engine, 'o');
+        press_char(&mut engine, 'f');
+        press_char(&mut engine, 'o');
+        assert!(
+            engine.completion_display_only,
+            "popup should be display-only"
+        );
+        assert!(
+            engine.completion_candidates.len() >= 2,
+            "need at least 2 candidates"
+        );
+        let initial_idx = engine.completion_idx.unwrap();
+        let col_before = engine.view().cursor.col;
+        // Ctrl-N should advance the index without modifying text
+        press_ctrl(&mut engine, 'n');
+        let new_idx = engine.completion_idx.unwrap();
+        assert_ne!(new_idx, initial_idx, "index should advance on Ctrl-N");
+        assert_eq!(
+            engine.view().cursor.col,
+            col_before,
+            "cursor col should NOT change (display-only mode)"
+        );
+    }
+
+    #[test]
+    fn test_auto_popup_arrow_cycles() {
+        let mut engine = Engine::new();
+        // Two candidates: "foobar" and "foobaz"
+        engine.buffer_mut().insert(0, "foobar foobaz\n");
+        press_char(&mut engine, 'G');
+        press_char(&mut engine, 'o');
+        press_char(&mut engine, 'f');
+        press_char(&mut engine, 'o');
+        assert!(
+            engine.completion_display_only,
+            "popup should be display-only"
+        );
+        assert!(
+            engine.completion_candidates.len() >= 2,
+            "need at least 2 candidates"
+        );
+        let initial_idx = engine.completion_idx.unwrap();
+        let col_before = engine.view().cursor.col;
+
+        // Down should advance index, not move cursor
+        press_special(&mut engine, "Down");
+        let after_down = engine.completion_idx.unwrap();
+        assert_ne!(after_down, initial_idx, "Down advances index");
+        assert_eq!(
+            engine.view().cursor.col,
+            col_before,
+            "cursor col unchanged after Down"
+        );
+        assert_eq!(
+            engine.view().cursor.line,
+            1,
+            "cursor line unchanged after Down"
+        );
+
+        // Up should go back
+        press_special(&mut engine, "Up");
+        assert_eq!(
+            engine.completion_idx.unwrap(),
+            initial_idx,
+            "Up goes back to initial index"
+        );
+    }
+
+    #[test]
+    fn test_auto_popup_backspace_retriggers() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "foobar\n");
+        press_char(&mut engine, 'G');
+        press_char(&mut engine, 'o');
+        press_char(&mut engine, 'f');
+        press_char(&mut engine, 'o');
+        press_char(&mut engine, 'o'); // prefix "foo" → popup for "foobar"
+        assert!(
+            engine.completion_idx.is_some(),
+            "popup should be active after 'foo'"
+        );
+        // Backspace → prefix "fo" → popup should retrigger
+        press_special(&mut engine, "BackSpace");
+        assert!(
+            engine.completion_idx.is_some(),
+            "popup should be re-triggered after BackSpace"
+        );
+        assert!(
+            engine.completion_display_only,
+            "popup should remain display-only after BackSpace"
+        );
     }
 
     // ── :set command (engine-level) ───────────────────────────────────────────

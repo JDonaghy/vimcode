@@ -78,6 +78,10 @@ pub struct Settings {
     /// Global panel navigation key bindings
     #[serde(default)]
     pub panel_keys: PanelKeys,
+
+    /// Completion popup key bindings
+    #[serde(default)]
+    pub completion_keys: CompletionKeys,
 }
 
 fn default_explorer_visible() -> bool {
@@ -236,6 +240,33 @@ impl Default for PanelKeys {
     }
 }
 
+fn default_completion_trigger() -> String {
+    "<C-Space>".to_string()
+}
+fn default_completion_accept() -> String {
+    "Tab".to_string()
+}
+
+/// Key bindings for the auto-popup completion menu.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompletionKeys {
+    /// Key to manually trigger completion popup. Default: `<C-Space>`
+    #[serde(default = "default_completion_trigger")]
+    pub trigger: String,
+    /// Key to accept the highlighted completion item. Default: `Tab`
+    #[serde(default = "default_completion_accept")]
+    pub accept: String,
+}
+
+impl Default for CompletionKeys {
+    fn default() -> Self {
+        Self {
+            trigger: default_completion_trigger(),
+            accept: default_completion_accept(),
+        }
+    }
+}
+
 /// Parse a Vim-style key binding string into `(ctrl, shift, alt, lowercase_char)`.
 ///
 /// Supported formats: `<C-b>`, `<C-S-e>`, `<A-x>`, `<C-A-x>`.
@@ -262,10 +293,16 @@ pub fn parse_key_binding(s: &str) -> Option<(bool, bool, bool, char)> {
         }
     }
     let key_str = parts[parts.len() - 1];
-    if key_str.chars().count() != 1 {
-        return None;
-    }
-    let ch = key_str.chars().next()?;
+    // Accept named keys (e.g. "Space") in addition to single characters.
+    let ch = match key_str {
+        "Space" | "space" => ' ',
+        _ => {
+            if key_str.chars().count() != 1 {
+                return None;
+            }
+            key_str.chars().next()?
+        }
+    };
     Some((ctrl, shift, alt, ch.to_ascii_lowercase()))
 }
 
@@ -293,6 +330,7 @@ impl Default for Settings {
             lsp_servers: Vec::new(),
             explorer_keys: ExplorerKeys::default(),
             panel_keys: PanelKeys::default(),
+            completion_keys: CompletionKeys::default(),
         }
     }
 }
@@ -882,6 +920,18 @@ mod tests {
     #[test]
     fn test_parse_key_binding_alt() {
         assert_eq!(parse_key_binding("<A-x>"), Some((false, false, true, 'x')));
+    }
+
+    #[test]
+    fn test_parse_key_binding_named_space() {
+        assert_eq!(
+            parse_key_binding("<C-Space>"),
+            Some((true, false, false, ' '))
+        );
+        assert_eq!(
+            parse_key_binding("<C-space>"),
+            Some((true, false, false, ' '))
+        );
     }
 
     #[test]
