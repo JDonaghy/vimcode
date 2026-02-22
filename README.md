@@ -11,7 +11,7 @@ There's a touch of irony here - using a cli tool to write the editor that I've w
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 606 tests, zero async runtime
+- **Clean architecture** — platform-agnostic core, 613 tests, zero async runtime
 
 ## Building
 
@@ -171,7 +171,7 @@ cargo fmt
 
 ### Project Search
 
-- `Ctrl-Shift-F` — open search panel (or click the search icon in the activity bar)
+- `Alt+F` — focus search panel (or click the search icon in the activity bar)
 - Type a query and press `Enter` to search all text files under the project root
 - Respects `.gitignore` rules (powered by the `ignore` crate — same walker as ripgrep)
 - Hidden files/directories and binary files are skipped; results capped at 10,000
@@ -228,7 +228,7 @@ cargo fmt
 
 ### File Explorer
 
-- `Ctrl-B` — toggle sidebar; `Ctrl-Shift-E` — focus explorer
+- `Ctrl-B` — toggle sidebar; `Alt+E` — focus explorer; `Alt+F` — focus search panel
 - Tree view with Nerd Font file-type icons
 - `j` / `k` — navigate; `l` or `Enter` — open file/expand; `h` — collapse
 - `a` — create file; `A` — create folder; `D` — delete
@@ -336,6 +336,18 @@ Runtime changes are written through to `~/.config/vimcode/settings.json` immedia
 - `:set` (no args) — show one-line summary of all settings
 - `:config reload` — reload settings file from disk
 
+**Panel navigation key bindings** — configurable in `settings.json` under `"panel_keys"`:
+
+| Field | Default | Action |
+|-------|---------|--------|
+| `toggle_sidebar` | `<C-b>` | Toggle sidebar visibility |
+| `focus_explorer` | `<A-e>` | Focus explorer (press again to return to editor) |
+| `focus_search` | `<A-f>` | Focus search panel (press again to return to editor) |
+| `fuzzy_finder` | `<C-p>` | Open fuzzy file finder |
+| `live_grep` | `<C-g>` | Open live grep modal |
+
+Key notation: `<C-x>` = Ctrl+x, `<A-x>` = Alt+x, `<C-S-x>` = Ctrl+Shift+x.
+
 **Explorer key bindings** — configurable in `settings.json` under `"explorer_keys"`:
 
 | Field | Default | Action |
@@ -345,7 +357,6 @@ Runtime changes are written through to `~/.config/vimcode/settings.json` immedia
 | `delete` | `D` | Delete prompt |
 | `rename` | `r` | Rename prompt |
 | `move_file` | `M` | Move file prompt |
-| `toggle_mode` | `?` | Toggle explorer mode |
 
 Only specify keys you want to change — unspecified keys keep their defaults.
 
@@ -446,6 +457,8 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `Ctrl-W w` / `c` / `o` | Cycle / close / close-others |
 | `Ctrl-P` | Open fuzzy file finder |
 | `Ctrl-G` | Open live grep modal (search file contents) |
+| `Alt+E` | Focus / unfocus file explorer |
+| `Alt+F` | Focus / unfocus search panel |
 
 ### Command Mode
 

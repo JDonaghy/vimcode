@@ -71,9 +71,13 @@ pub struct Settings {
     #[serde(default)]
     pub lsp_servers: Vec<crate::core::lsp::LspServerConfig>,
 
-    /// Configurable explorer mode key bindings
+    /// Configurable explorer key bindings (in-tree CRUD operations)
     #[serde(default)]
     pub explorer_keys: ExplorerKeys,
+
+    /// Global panel navigation key bindings
+    #[serde(default)]
+    pub panel_keys: PanelKeys,
 }
 
 fn default_explorer_visible() -> bool {
@@ -121,10 +125,6 @@ fn ek_rename() -> String {
 fn ek_move_file() -> String {
     "M".to_string()
 }
-fn ek_toggle_mode() -> String {
-    "?".to_string()
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExplorerAction {
     NewFile,
@@ -132,7 +132,6 @@ pub enum ExplorerAction {
     Delete,
     Rename,
     MoveFile,
-    ToggleMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -147,8 +146,6 @@ pub struct ExplorerKeys {
     pub rename: String,
     #[serde(default = "ek_move_file")]
     pub move_file: String,
-    #[serde(default = "ek_toggle_mode")]
-    pub toggle_mode: String,
 }
 
 impl Default for ExplorerKeys {
@@ -159,7 +156,6 @@ impl Default for ExplorerKeys {
             delete: ek_delete(),
             rename: ek_rename(),
             move_file: ek_move_file(),
-            toggle_mode: ek_toggle_mode(),
         }
     }
 }
@@ -179,12 +175,98 @@ impl ExplorerKeys {
             Some(ExplorerAction::Rename)
         } else if s == self.move_file {
             Some(ExplorerAction::MoveFile)
-        } else if s == self.toggle_mode {
-            Some(ExplorerAction::ToggleMode)
         } else {
             None
         }
     }
+}
+
+// ── Panel / global key defaults ────────────────────────────────────────────
+
+fn pk_toggle_sidebar() -> String {
+    "<C-b>".to_string()
+}
+fn pk_focus_explorer() -> String {
+    "<A-e>".to_string()
+}
+fn pk_focus_search() -> String {
+    "<A-f>".to_string()
+}
+fn pk_fuzzy_finder() -> String {
+    "<C-p>".to_string()
+}
+fn pk_live_grep() -> String {
+    "<C-g>".to_string()
+}
+
+/// Global keyboard shortcuts for panel navigation.
+///
+/// Keys are specified in Vim-style notation:
+/// - `<C-x>` — Ctrl+x
+/// - `<C-S-x>` — Ctrl+Shift+x
+/// - `<A-x>` — Alt+x
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PanelKeys {
+    /// Toggle sidebar visibility. Default: `<C-b>`
+    #[serde(default = "pk_toggle_sidebar")]
+    pub toggle_sidebar: String,
+    /// Focus explorer (or return to editor if already focused). Default: `<A-e>`
+    #[serde(default = "pk_focus_explorer")]
+    pub focus_explorer: String,
+    /// Open search panel in sidebar. Default: `<A-f>`
+    #[serde(default = "pk_focus_search")]
+    pub focus_search: String,
+    /// Open fuzzy file finder. Default: `<C-p>`
+    #[serde(default = "pk_fuzzy_finder")]
+    pub fuzzy_finder: String,
+    /// Open live grep modal. Default: `<C-g>`
+    #[serde(default = "pk_live_grep")]
+    pub live_grep: String,
+}
+
+impl Default for PanelKeys {
+    fn default() -> Self {
+        PanelKeys {
+            toggle_sidebar: pk_toggle_sidebar(),
+            focus_explorer: pk_focus_explorer(),
+            focus_search: pk_focus_search(),
+            fuzzy_finder: pk_fuzzy_finder(),
+            live_grep: pk_live_grep(),
+        }
+    }
+}
+
+/// Parse a Vim-style key binding string into `(ctrl, shift, alt, lowercase_char)`.
+///
+/// Supported formats: `<C-b>`, `<C-S-e>`, `<A-x>`, `<C-A-x>`.
+/// Returns `None` if the format is not recognised.
+pub fn parse_key_binding(s: &str) -> Option<(bool, bool, bool, char)> {
+    let s = s.trim();
+    if !s.starts_with('<') || !s.ends_with('>') {
+        return None;
+    }
+    let inner = &s[1..s.len() - 1];
+    let parts: Vec<&str> = inner.split('-').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let mut ctrl = false;
+    let mut shift = false;
+    let mut alt = false;
+    for part in &parts[..parts.len() - 1] {
+        match *part {
+            "C" => ctrl = true,
+            "S" => shift = true,
+            "A" => alt = true,
+            _ => return None,
+        }
+    }
+    let key_str = parts[parts.len() - 1];
+    if key_str.chars().count() != 1 {
+        return None;
+    }
+    let ch = key_str.chars().next()?;
+    Some((ctrl, shift, alt, ch.to_ascii_lowercase()))
 }
 
 fn default_font_family() -> String {
@@ -210,6 +292,7 @@ impl Default for Settings {
             lsp_enabled: default_lsp_enabled(),
             lsp_servers: Vec::new(),
             explorer_keys: ExplorerKeys::default(),
+            panel_keys: PanelKeys::default(),
         }
     }
 }
@@ -733,7 +816,6 @@ mod tests {
         assert_eq!(ek.delete, "D");
         assert_eq!(ek.rename, "r");
         assert_eq!(ek.move_file, "M");
-        assert_eq!(ek.toggle_mode, "?");
     }
 
     #[test]
@@ -744,7 +826,7 @@ mod tests {
         assert_eq!(ek.resolve('D'), Some(ExplorerAction::Delete));
         assert_eq!(ek.resolve('r'), Some(ExplorerAction::Rename));
         assert_eq!(ek.resolve('M'), Some(ExplorerAction::MoveFile));
-        assert_eq!(ek.resolve('?'), Some(ExplorerAction::ToggleMode));
+        assert_eq!(ek.resolve('?'), None);
         assert_eq!(ek.resolve('z'), None);
     }
 
@@ -768,7 +850,6 @@ mod tests {
         assert_eq!(ek.new_folder, "A");
         assert_eq!(ek.rename, "r");
         assert_eq!(ek.move_file, "M");
-        assert_eq!(ek.toggle_mode, "?");
     }
 
     #[test]
@@ -779,5 +860,65 @@ mod tests {
         // Defaults preserved for the rest
         assert_eq!(s.explorer_keys.new_file, "a");
         assert_eq!(s.explorer_keys.delete, "D");
+    }
+
+    // ── parse_key_binding tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_key_binding_ctrl() {
+        assert_eq!(parse_key_binding("<C-b>"), Some((true, false, false, 'b')));
+        assert_eq!(parse_key_binding("<C-p>"), Some((true, false, false, 'p')));
+        assert_eq!(parse_key_binding("<C-g>"), Some((true, false, false, 'g')));
+    }
+
+    #[test]
+    fn test_parse_key_binding_ctrl_shift() {
+        assert_eq!(parse_key_binding("<C-S-e>"), Some((true, true, false, 'e')));
+        assert_eq!(parse_key_binding("<C-S-f>"), Some((true, true, false, 'f')));
+        // Uppercase key char is lowercased
+        assert_eq!(parse_key_binding("<C-S-E>"), Some((true, true, false, 'e')));
+    }
+
+    #[test]
+    fn test_parse_key_binding_alt() {
+        assert_eq!(parse_key_binding("<A-x>"), Some((false, false, true, 'x')));
+    }
+
+    #[test]
+    fn test_parse_key_binding_invalid() {
+        assert_eq!(parse_key_binding("ctrl+b"), None);
+        assert_eq!(parse_key_binding("<C>"), None); // no key char
+        assert_eq!(parse_key_binding("<X-b>"), None); // unknown modifier
+        assert_eq!(parse_key_binding(""), None);
+    }
+
+    // ── PanelKeys tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_panel_keys_defaults() {
+        let pk = PanelKeys::default();
+        assert_eq!(pk.toggle_sidebar, "<C-b>");
+        assert_eq!(pk.focus_explorer, "<A-e>");
+        assert_eq!(pk.focus_search, "<A-f>");
+        assert_eq!(pk.fuzzy_finder, "<C-p>");
+        assert_eq!(pk.live_grep, "<C-g>");
+    }
+
+    #[test]
+    fn test_panel_keys_serde_partial() {
+        let json = r#"{ "fuzzy_finder": "<C-A-p>" }"#;
+        let pk: PanelKeys = serde_json::from_str(json).unwrap();
+        assert_eq!(pk.fuzzy_finder, "<C-A-p>");
+        // Unspecified keep defaults
+        assert_eq!(pk.toggle_sidebar, "<C-b>");
+        assert_eq!(pk.focus_explorer, "<A-e>");
+    }
+
+    #[test]
+    fn test_panel_keys_in_settings_serde() {
+        let json = r#"{ "panel_keys": { "live_grep": "<C-A-g>" } }"#;
+        let s: Settings = serde_json::from_str(json).unwrap();
+        assert_eq!(s.panel_keys.live_grep, "<C-A-g>");
+        assert_eq!(s.panel_keys.toggle_sidebar, "<C-b>");
     }
 }

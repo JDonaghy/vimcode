@@ -1,10 +1,10 @@
 # VimCode Project State
 
-**Last updated:** Feb 21, 2026 (Session 61)
+**Last updated:** Feb 21, 2026 (Session 62)
 
 ## Status
 
-**Mouse selection + clipboard:** Double-click word select, click-and-drag visual selection, system clipboard registers (`"+`/`"*`) via copypasta-ext (xclip/xsel on X11, wl-copy/wl-paste on Wayland), Ctrl-Shift-V paste in Command/Search/Insert mode (GTK), bracketed paste support (TUI) — 606 tests passing
+**Panel navigation keys + mouse selection:** Configurable `panel_keys` for sidebar navigation (`Alt+E` explorer, `Alt+F` search, `Ctrl-B` toggle, etc.) with bidirectional toggle support in both GTK and TUI; double-click word select, click-and-drag visual selection, system clipboard registers (`"+`/`"*`) via copypasta-ext — 613 tests passing
 
 ### Core Vim (Complete)
 - Seven modes (Normal/Insert/Visual/Visual Line/Visual Block/Command/Search)
@@ -58,7 +58,7 @@
 - **Quit / save commands:** `:q` closes current tab (quits if last); `:q!` force-closes; `:qa` / `:qa!` close all; `Ctrl-S` saves in any mode
 
 ### Project Search + Replace (Complete)
-- VSCode-style search panel accessed via Search icon in activity bar or Ctrl-Shift-F
+- VSCode-style search panel accessed via Search icon in activity bar or Alt+F
 - Case-insensitive literal search across all text files under the project root
 - Grouped results list (file headers + `line: text` rows)
 - GTK: Entry input + ListBox results; click row opens file at that line
@@ -76,7 +76,7 @@
 - Both backends: selected row highlighted (`fuzzy_selected_bg`); ▶ prefix on selected item
 
 ### File Explorer (Complete)
-- VSCode-style sidebar (Ctrl-B toggle, Ctrl-Shift-E focus)
+- VSCode-style sidebar (Ctrl-B toggle, Alt+E focus explorer, Alt+F focus search)
 - Tree view with icons, expand/collapse folders
 - CRUD operations (create/delete/rename/move files/folders)
 - **Preview mode:**
@@ -135,7 +135,7 @@
 
 ### TUI Backend (`src/tui_main.rs`)
 - Full editor in terminal via ratatui 0.27 + crossterm
-- **Sidebar:** File explorer tree (Ctrl-B toggle, Ctrl-Shift-E focus), j/k navigation, l/Enter open, h collapse, a/A/D/r/M CRUD+rename+move; root folder entry at top of tree; auto-refresh every 2s; cursor keys in prompts; **Search panel** (Ctrl-Shift-F): query input, Enter to run, j/k results, Enter opens file
+- **Sidebar:** File explorer tree (Ctrl-B toggle, Alt+E focus), j/k navigation, l/Enter open, h collapse, a/A/D/r/M CRUD+rename+move; root folder entry at top of tree; auto-refresh every 2s; cursor keys in prompts; **Search panel** (Alt+F): query input, Enter to run, j/k results, Enter opens file
 - **Activity bar:** 3-col strip with Explorer / Search / Settings panel icons (Nerd Font)
 - **Layout:** activity bar | sidebar | editor col (with its own tab bar); status + cmd full-width at bottom
 - **Mouse support:** click-to-position cursor, window switching, scroll wheel (targets window under cursor), scrollbar click-to-jump and drag (vertical + horizontal)
@@ -184,10 +184,10 @@ vimcode/
 │       ├── buffer_manager.rs (~600 lines) — Buffer lifecycle
 │       ├── buffer.rs (~120 lines) — Rope-based storage
 │       ├── session.rs (~175 lines) — Session state persistence (sidebar_width added)
-│       ├── settings.rs (~780 lines) — JSON persistence, auto-init, :set parsing, explorer keys
+│       ├── settings.rs (~925 lines) — JSON persistence, auto-init, :set parsing, explorer keys, panel_keys, parse_key_binding
 │       ├── window.rs, tab.rs, view.rs, cursor.rs, mode.rs, syntax.rs
 │       ├── git.rs (~635 lines) — git subprocess integration (diff/blame/hunk parsing, branch detection, stage_hunk)
-│       └── Tests: 593 passing (9 find/replace, 14 macro, 8 session, 4 reverse search, 7 replace char, 5 undo line, 8 case change, 6 marks, 5 incremental search, 12 syntax/language, 6 history search, 11 fold tests, 12 git tests, 4 sidebar-preview tests, 5 auto-indent tests, 4 completion tests, 9 quit/ctrl-s tests, 1 session-restore test, 22 set-command tests, 10 hunk-staging tests, 9 text-object tests, 24 project-search tests, 5 engine-replace tests, 27 lsp-protocol tests, 10 lsp-engine tests, 31 vim-features tests, 9 tag-object tests, 9 norm-command tests, 11 fuzzy-finder tests, 8 live-grep tests, 8 quickfix tests, 13 diff+rename+move tests, 5 explorer-keys tests, 4 help-system tests)
+│       └── Tests: 613 passing (9 find/replace, 14 macro, 8 session, 4 reverse search, 7 replace char, 5 undo line, 8 case change, 6 marks, 5 incremental search, 12 syntax/language, 6 history search, 11 fold tests, 12 git tests, 4 sidebar-preview tests, 5 auto-indent tests, 4 completion tests, 9 quit/ctrl-s tests, 1 session-restore test, 22 set-command tests, 10 hunk-staging tests, 9 text-object tests, 24 project-search tests, 5 engine-replace tests, 27 lsp-protocol tests, 10 lsp-engine tests, 31 vim-features tests, 9 tag-object tests, 9 norm-command tests, 11 fuzzy-finder tests, 8 live-grep tests, 8 quickfix tests, 13 diff+rename+move tests, 4 explorer-keys tests, 4 help-system tests, 7 panel-keys tests)
 └── Total: ~33,400 lines
 ```
 
@@ -212,7 +212,7 @@ vimcode/
 ```bash
 cargo build
 cargo run -- <file>
-cargo test -- --test-threads=1    # 606 tests
+cargo test -- --test-threads=1    # 613 tests
 cargo clippy -- -D warnings
 cargo fmt
 ```
@@ -264,6 +264,8 @@ cargo fmt
 - [x] **`:norm`** — execute normal command on a range of lines
 
 ## Recent Work
+**Session 62:** Configurable panel navigation keys (`panel_keys`) — new `PanelKeys` struct in `settings.rs` with 5 fields (`toggle_sidebar`, `focus_explorer`, `focus_search`, `fuzzy_finder`, `live_grep`) and defaults `<C-b>`, `<A-e>`, `<A-f>`, `<C-p>`, `<C-g>`; `parse_key_binding()` parses Vim-style key notation. Removed `ExplorerAction::ToggleMode` / `toggle_mode` from `ExplorerKeys` (keyboard focus on explorer makes a separate mode gate unnecessary). TUI: `matches_tui_key()` helper; panel_keys dispatch added in both editor-focused and sidebar-focused sections so `Alt+E`/`Alt+F` work bidirectionally (from editor OR from within the sidebar). GTK: `matches_gtk_key()` helper; `Msg::ToggleFocusExplorer` (existing) + new `Msg::ToggleFocusSearch`; tree view `EventControllerKey` now checks panel_keys before `Stop` catchall so shortcuts work when tree has focus; `ToggleFocusSearch` returns keyboard focus to drawing area without hiding sidebar (avoids Revealer animation white-area artifact). 613 tests (7 net new).
+
 **Session 61:** Replaced `arboard` with `copypasta-ext 0.4`. GTK backend: removed background clipboard thread + `ClipboardCmd` + `clip_tx`; synchronous reads/writes via `x11_bin::ClipboardContext` (xclip subprocess, no X11 event-loop conflict). TUI backend: replaced ~180 lines of platform-detection helpers with ~20-line `build_clipboard_ctx()`. Fixed TUI paste-intercept bug: `translate_key()` sets `key_name=""` for regular chars, so `key_name == "p"` was always false — paste intercept never fired; fixed to check `unicode` instead. Also fixed error message timing (set it after `handle_key()` which clears `engine.message`). Root cause of `try_context()` being insufficient: copypasta-ext picks `x11_fork` first on X11, but `x11_fork::get_contents()` uses `X11ClipboardContext` directly (same X11 connection conflict as arboard); we explicitly use `x11_bin` on X11. 606 tests, no change.
 
 **Session 59:** Explorer polish — (1) Fixed prompt delay: early `continue` statements in TUI event loop now set `needs_redraw = true` so explorer mode prompts appear instantly. (2) Move path editing: `move_file()` now accepts full destination path (not just directory); prompt pre-fills with full relative path; added cursor key support (Left/Right/Home/End/Delete) in all sidebar prompts via `SidebarPrompt.cursor` field. (3) Auto-refresh: TUI sidebar rebuilds every 2s when visible and idle (`last_sidebar_refresh` timer), removing need for manual refresh. (4) Root folder entry: project root shown at top of explorer tree (uppercase name, always expanded) in both GTK (`build_file_tree_with_root()`) and TUI (`build_rows()` inserts root at depth 0). (5) Removed refresh: `ExplorerAction::Refresh` variant, `refresh` setting field, refresh toolbar icon, and refresh key binding removed from all layers. (6) New file/folder at root: prompts pre-fill with target directory path so creating at root is straightforward. File changes: `tui_main.rs` (+320 lines), `main.rs` (+150 lines), `engine.rs` (move_file API change, help text update), `settings.rs` (removed refresh).

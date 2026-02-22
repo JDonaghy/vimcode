@@ -23,7 +23,7 @@ mod tui_main;
 
 use core::engine::EngineAction;
 use core::lsp::DiagnosticSeverity;
-use core::settings::LineNumberMode;
+use core::settings::{parse_key_binding, LineNumberMode};
 use core::{Engine, GitLineStatus, OpenMode, WindowRect};
 use render::{
     build_screen_layout, CommandLineData, CursorShape, RenderedWindow, SelectionKind,
@@ -43,6 +43,25 @@ enum SidebarPanel {
 use std::collections::HashMap;
 
 use copypasta_ext::ClipboardProviderExt;
+
+/// Returns true if `key` + `state` match a panel_keys binding string like `<C-b>`, `<C-S-e>`.
+fn matches_gtk_key(binding: &str, key: gdk::Key, state: gdk::ModifierType) -> bool {
+    let Some((ctrl, shift, alt, key_char)) = parse_key_binding(binding) else {
+        return false;
+    };
+    if ctrl != state.contains(gdk::ModifierType::CONTROL_MASK) {
+        return false;
+    }
+    if shift != state.contains(gdk::ModifierType::SHIFT_MASK) {
+        return false;
+    }
+    if alt != state.contains(gdk::ModifierType::ALT_MASK) {
+        return false;
+    }
+    key.to_unicode()
+        .map(|c| c.to_ascii_lowercase() == key_char)
+        .unwrap_or(false)
+}
 
 struct App {
     engine: Rc<RefCell<Engine>>,
@@ -131,6 +150,10 @@ enum Msg {
     RefreshFileTree,
     /// Focus the explorer panel (Ctrl-Shift-E).
     FocusExplorer,
+    /// Toggle focus between explorer and editor.
+    ToggleFocusExplorer,
+    /// Toggle focus between search panel and editor.
+    ToggleFocusSearch,
     /// Focus the editor (Escape from tree).
     FocusEditor,
     /// Vertical scrollbar value changed.
@@ -413,12 +436,27 @@ impl SimpleComponent for App {
                                 set_enable_search: false,
 
                                 add_controller = gtk4::EventControllerKey {
-                                    connect_key_pressed[sender] => move |_, key, _, _| {
+                                    connect_key_pressed[sender, engine] => move |_, key, _, modifier| {
                                         let key_name = key.name().map(|s| s.to_string()).unwrap_or_default();
 
                                         // Escape returns focus to editor
                                         if key_name == "Escape" {
                                             sender.input(Msg::FocusEditor);
+                                            return gtk4::glib::Propagation::Stop;
+                                        }
+
+                                        // Panel navigation — same shortcuts work from within tree view
+                                        let pk = engine.borrow().settings.panel_keys.clone();
+                                        if matches_gtk_key(&pk.toggle_sidebar, key, modifier) {
+                                            sender.input(Msg::ToggleSidebar);
+                                            return gtk4::glib::Propagation::Stop;
+                                        }
+                                        if matches_gtk_key(&pk.focus_explorer, key, modifier) {
+                                            sender.input(Msg::ToggleFocusExplorer);
+                                            return gtk4::glib::Propagation::Stop;
+                                        }
+                                        if matches_gtk_key(&pk.focus_search, key, modifier) {
+                                            sender.input(Msg::ToggleFocusSearch);
                                             return gtk4::glib::Propagation::Stop;
                                         }
 
@@ -665,7 +703,7 @@ impl SimpleComponent for App {
                             grab_focus: (),
 
                             add_controller = gtk4::EventControllerKey {
-                                connect_key_pressed[sender] => move |_, key, _, modifier| {
+                                connect_key_pressed[sender, engine] => move |_, key, _, modifier| {
                                     let key_name = key.name().map(|s| s.to_string()).unwrap_or_default();
                                     let unicode = key.to_unicode().filter(|c| !c.is_control());
                                     let ctrl = modifier.contains(gdk::ModifierType::CONTROL_MASK);
@@ -677,30 +715,44 @@ impl SimpleComponent for App {
                                         return gtk4::glib::Propagation::Stop;
                                     }
 
-                                    // Check for Ctrl-B to toggle sidebar
-                                    if ctrl && !shift && unicode == Some('b') {
-                                        sender.input(Msg::ToggleSidebar);
-                                        return gtk4::glib::Propagation::Stop;
-                                    }
-
-                                    // Check for Ctrl-Shift-E to focus explorer
-                                    if ctrl && shift && (unicode == Some('E') || unicode == Some('e')) {
-                                        sender.input(Msg::FocusExplorer);
-                                        return gtk4::glib::Propagation::Stop;
-                                    }
-
-                                    // Check for Ctrl-Shift-F to open project search
-                                    if ctrl && shift && (unicode == Some('F') || unicode == Some('f')) {
-                                        sender.input(Msg::SwitchPanel(SidebarPanel::Search));
-                                        return gtk4::glib::Propagation::Stop;
-                                    }
-
                                     // Ctrl-Shift-V: paste from system clipboard
                                     if ctrl && shift && (key_name == "v" || key_name == "V") {
                                         sender.input(Msg::KeyPress {
                                             key_name: "PasteClipboard".to_string(),
                                             unicode: None,
                                             ctrl: false,
+                                        });
+                                        return gtk4::glib::Propagation::Stop;
+                                    }
+
+                                    // Panel navigation — driven by panel_keys settings
+                                    let pk = engine.borrow().settings.panel_keys.clone();
+                                    if matches_gtk_key(&pk.toggle_sidebar, key, modifier) {
+                                        sender.input(Msg::ToggleSidebar);
+                                        return gtk4::glib::Propagation::Stop;
+                                    }
+                                    if matches_gtk_key(&pk.focus_explorer, key, modifier) {
+                                        // Toggle: if tree already focused, go back to editor
+                                        sender.input(Msg::ToggleFocusExplorer);
+                                        return gtk4::glib::Propagation::Stop;
+                                    }
+                                    if matches_gtk_key(&pk.focus_search, key, modifier) {
+                                        sender.input(Msg::ToggleFocusSearch);
+                                        return gtk4::glib::Propagation::Stop;
+                                    }
+                                    if matches_gtk_key(&pk.fuzzy_finder, key, modifier) {
+                                        sender.input(Msg::KeyPress {
+                                            key_name: "p".to_string(),
+                                            unicode: Some('p'),
+                                            ctrl: true,
+                                        });
+                                        return gtk4::glib::Propagation::Stop;
+                                    }
+                                    if matches_gtk_key(&pk.live_grep, key, modifier) {
+                                        sender.input(Msg::KeyPress {
+                                            key_name: "g".to_string(),
+                                            unicode: Some('g'),
+                                            ctrl: true,
                                         });
                                         return gtk4::glib::Propagation::Stop;
                                     }
@@ -901,11 +953,7 @@ impl SimpleComponent for App {
         let clipboard: Option<Box<dyn ClipboardProviderExt>> = {
             #[cfg(all(
                 unix,
-                not(any(
-                    target_os = "macos",
-                    target_os = "android",
-                    target_os = "emscripten"
-                ))
+                not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))
             ))]
             if copypasta_ext::display::is_x11() {
                 copypasta_ext::x11_bin::ClipboardContext::new()
@@ -917,11 +965,7 @@ impl SimpleComponent for App {
             }
             #[cfg(not(all(
                 unix,
-                not(any(
-                    target_os = "macos",
-                    target_os = "android",
-                    target_os = "emscripten"
-                ))
+                not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))
             )))]
             copypasta_ext::try_context()
         };
@@ -1905,6 +1949,44 @@ impl SimpleComponent for App {
                     tree.grab_focus();
                 }
 
+                self.redraw = !self.redraw;
+            }
+            Msg::ToggleFocusExplorer => {
+                if self.tree_has_focus {
+                    // Already focused — return to editor
+                    self.tree_has_focus = false;
+                    if let Some(ref drawing) = *self.drawing_area.borrow() {
+                        drawing.grab_focus();
+                    }
+                } else {
+                    self.sidebar_visible = true;
+                    self.active_panel = SidebarPanel::Explorer;
+                    self.tree_has_focus = true;
+                    if let Some(ref tree) = *self.file_tree_view.borrow() {
+                        tree.grab_focus();
+                    }
+                }
+                self.redraw = !self.redraw;
+            }
+            Msg::ToggleFocusSearch => {
+                // Same pattern as ToggleFocusExplorer: toggle between showing the search
+                // panel and returning to the editor.  When "exiting" we keep the sidebar
+                // visible (don't touch sidebar_visible) to avoid a white-area artifact
+                // from the Revealer animation — Ctrl+B closes the sidebar entirely.
+                self.tree_has_focus = false;
+                if self.active_panel == SidebarPanel::Search && self.sidebar_visible {
+                    // Already showing search — return keyboard focus to editor, keep panel open.
+                    if let Some(ref drawing) = *self.drawing_area.borrow() {
+                        drawing.grab_focus();
+                    }
+                } else {
+                    // Show search panel and return focus to editor (Entry widgets are mouse-driven).
+                    self.active_panel = SidebarPanel::Search;
+                    self.sidebar_visible = true;
+                    if let Some(ref drawing) = *self.drawing_area.borrow() {
+                        drawing.grab_focus();
+                    }
+                }
                 self.redraw = !self.redraw;
             }
             Msg::FocusEditor => {

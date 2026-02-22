@@ -31,20 +31,43 @@ use ratatui::Terminal;
 
 use crate::core::engine::{DiffLine, EngineAction};
 use crate::core::lsp::DiagnosticSeverity;
-use crate::core::settings::ExplorerAction;
+use crate::core::settings::{parse_key_binding, ExplorerAction};
 use crate::core::{Engine, GitLineStatus, Mode, OpenMode, WindowRect};
 use crate::render::{
     self, build_screen_layout, Color, CompletionMenu, CursorShape, RenderedLine, RenderedWindow,
     SelectionKind, Theme,
 };
 
+// ─── Key binding helpers ──────────────────────────────────────────────────────
+
+/// Returns true if the given crossterm key event matches a panel_keys binding string.
+/// Binding strings use Vim notation: `<C-b>`, `<C-S-e>`, `<A-x>`.
+fn matches_tui_key(binding: &str, code: KeyCode, mods: KeyModifiers) -> bool {
+    let Some((ctrl, shift, alt, key_char)) = parse_key_binding(binding) else {
+        return false;
+    };
+    if ctrl != mods.contains(KeyModifiers::CONTROL) {
+        return false;
+    }
+    if shift != mods.contains(KeyModifiers::SHIFT) {
+        return false;
+    }
+    if alt != mods.contains(KeyModifiers::ALT) {
+        return false;
+    }
+    match code {
+        KeyCode::Char(c) => c.to_ascii_lowercase() == key_char,
+        _ => false,
+    }
+}
+
 // ─── Sidebar constants ────────────────────────────────────────────────────────
 
 const SIDEBAR_WIDTH: u16 = 30;
 const ACTIVITY_BAR_WIDTH: u16 = 3;
 /// Number of terminal columns the explorer toolbar occupies:
-/// 4 Nerd Font icons × 3 cols (2-col icon + 1 space) + 1 col for '?' = 13.
-const EXPLORER_TOOLBAR_LEN: u16 = 12;
+/// 3 Nerd Font icons × 3 cols each (2-col icon + 1 space) = 9.
+const EXPLORER_TOOLBAR_LEN: u16 = 9;
 
 // ─── Activity bar panels ──────────────────────────────────────────────────────
 
@@ -81,8 +104,6 @@ struct TuiSidebar {
     replace_input_focused: bool,
     /// Scroll offset for the search results area (written back by render_search_panel).
     search_scroll_top: usize,
-    /// When true, clicks select without opening; keyboard file ops (r/M/D/a) work.
-    explorer_mode: bool,
 }
 
 impl TuiSidebar {
@@ -102,7 +123,6 @@ impl TuiSidebar {
             search_input_mode: true,
             replace_input_focused: false,
             search_scroll_top: 0,
-            explorer_mode: false,
         };
         sb.build_rows();
         sb
@@ -702,6 +722,43 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                 {
                     let ctrl = key_event.modifiers.contains(KeyModifiers::CONTROL);
 
+                    // ── Panel navigation shortcuts work from within sidebar too ─
+                    {
+                        let pk = &engine.settings.panel_keys;
+                        let mods = key_event.modifiers;
+                        let code = key_event.code;
+                        if matches_tui_key(&pk.toggle_sidebar, code, mods) {
+                            sidebar.visible = false;
+                            sidebar.has_focus = false;
+                            engine.session.explorer_visible = false;
+                            let _ = engine.session.save();
+                            needs_redraw = true;
+                            continue;
+                        }
+                        if matches_tui_key(&pk.focus_explorer, code, mods) {
+                            if sidebar.active_panel == TuiPanel::Explorer {
+                                // Already in explorer — return focus to editor
+                                sidebar.has_focus = false;
+                            } else {
+                                sidebar.active_panel = TuiPanel::Explorer;
+                            }
+                            needs_redraw = true;
+                            continue;
+                        }
+                        if matches_tui_key(&pk.focus_search, code, mods) {
+                            if sidebar.active_panel == TuiPanel::Search {
+                                // Already in search — return focus to editor
+                                sidebar.has_focus = false;
+                            } else {
+                                sidebar.active_panel = TuiPanel::Search;
+                                sidebar.search_input_mode = true;
+                                sidebar.replace_input_focused = false;
+                            }
+                            needs_redraw = true;
+                            continue;
+                        }
+                    }
+
                     // ── Search panel keyboard handling ──────────────────────
                     if sidebar.active_panel == TuiPanel::Search {
                         let alt = key_event.modifiers.contains(KeyModifiers::ALT);
@@ -831,11 +888,9 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                     match key_event.code {
                         // Return focus to editor
                         KeyCode::Esc => {
-                            sidebar.explorer_mode = false;
                             sidebar.has_focus = false;
                         }
                         KeyCode::Char('b') if ctrl => {
-                            sidebar.explorer_mode = false;
                             sidebar.visible = false;
                             sidebar.has_focus = false;
                             engine.session.explorer_visible = false;
@@ -982,15 +1037,6 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                                             });
                                         }
                                     }
-                                    ExplorerAction::ToggleMode => {
-                                        sidebar.explorer_mode = !sidebar.explorer_mode;
-                                        if sidebar.explorer_mode {
-                                            engine.message = "Explorer mode ON \u{2014} a/A/r/M/D  (? to exit, :help explorer for details)".to_string();
-                                        } else {
-                                            sidebar.has_focus = false;
-                                            engine.message = "Explorer mode OFF".to_string();
-                                        }
-                                    }
                                 }
                             }
                         }
@@ -1002,45 +1048,61 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
 
                 // ── Editor focused ──────────────────────────────────────────
                 if let Some((key_name, unicode, ctrl)) = translate_key(key_event) {
-                    // Ctrl-B: toggle sidebar visibility
-                    if ctrl && key_name == "b" {
-                        sidebar.visible = !sidebar.visible;
-                        if !sidebar.visible {
-                            sidebar.has_focus = false;
-                            sidebar.explorer_mode = false;
+                    // Panel navigation — all driven by panel_keys settings
+                    if key_event.kind != KeyEventKind::Release {
+                        let pk = &engine.settings.panel_keys;
+                        let mods = key_event.modifiers;
+                        let code = key_event.code;
+
+                        if matches_tui_key(&pk.toggle_sidebar, code, mods) {
+                            sidebar.visible = !sidebar.visible;
+                            if !sidebar.visible {
+                                sidebar.has_focus = false;
+                            }
+                            engine.session.explorer_visible = sidebar.visible;
+                            let _ = engine.session.save();
+                            needs_redraw = true;
+                            continue;
                         }
-                        engine.session.explorer_visible = sidebar.visible;
-                        let _ = engine.session.save();
-                        needs_redraw = true;
-                        continue;
-                    }
 
-                    // Ctrl-Shift-E: show sidebar and focus it (explorer)
-                    if key_event.kind != KeyEventKind::Release
-                        && key_event.modifiers.contains(KeyModifiers::CONTROL)
-                        && key_event.modifiers.contains(KeyModifiers::SHIFT)
-                        && key_event.code == KeyCode::Char('e')
-                    {
-                        sidebar.visible = true;
-                        sidebar.active_panel = TuiPanel::Explorer;
-                        sidebar.has_focus = true;
-                        needs_redraw = true;
-                        continue;
-                    }
+                        if matches_tui_key(&pk.focus_explorer, code, mods) {
+                            if sidebar.has_focus && sidebar.active_panel == TuiPanel::Explorer {
+                                // Already in explorer — return focus to editor
+                                sidebar.has_focus = false;
+                            } else {
+                                sidebar.visible = true;
+                                sidebar.active_panel = TuiPanel::Explorer;
+                                sidebar.has_focus = true;
+                            }
+                            needs_redraw = true;
+                            continue;
+                        }
 
-                    // Ctrl-Shift-F: show sidebar in search mode and focus it
-                    if key_event.kind != KeyEventKind::Release
-                        && key_event.modifiers.contains(KeyModifiers::CONTROL)
-                        && key_event.modifiers.contains(KeyModifiers::SHIFT)
-                        && key_event.code == KeyCode::Char('f')
-                    {
-                        sidebar.visible = true;
-                        sidebar.active_panel = TuiPanel::Search;
-                        sidebar.has_focus = true;
-                        sidebar.search_input_mode = true;
-                        sidebar.replace_input_focused = false;
-                        needs_redraw = true;
-                        continue;
+                        if matches_tui_key(&pk.focus_search, code, mods) {
+                            if sidebar.has_focus && sidebar.active_panel == TuiPanel::Search {
+                                sidebar.has_focus = false;
+                            } else {
+                                sidebar.visible = true;
+                                sidebar.active_panel = TuiPanel::Search;
+                                sidebar.has_focus = true;
+                                sidebar.search_input_mode = true;
+                                sidebar.replace_input_focused = false;
+                            }
+                            needs_redraw = true;
+                            continue;
+                        }
+
+                        if matches_tui_key(&pk.fuzzy_finder, code, mods) {
+                            engine.open_fuzzy_finder();
+                            needs_redraw = true;
+                            continue;
+                        }
+
+                        if matches_tui_key(&pk.live_grep, code, mods) {
+                            engine.open_live_grep();
+                            needs_redraw = true;
+                            continue;
+                        }
                     }
 
                     // Alt+Left/Right: resize sidebar
@@ -1449,9 +1511,6 @@ fn handle_mouse(
 
     // ── Sidebar panel area ────────────────────────────────────────────────────
     if sidebar.visible && col < ACTIVITY_BAR_WIDTH + sidebar_width {
-        if sidebar.explorer_mode {
-            sidebar.has_focus = true;
-        }
         // Rightmost column of the sidebar is the scrollbar column.
         let sb_col = ACTIVITY_BAR_WIDTH + sidebar_width - 1;
 
@@ -1474,7 +1533,7 @@ fn handle_mouse(
                 // Toolbar is right-aligned: 5 NF icons × 3 cols = 15.
                 let toolbar_start = ACTIVITY_BAR_WIDTH + sidebar_width - EXPLORER_TOOLBAR_LEN;
                 if col >= toolbar_start {
-                    let btn = (col - toolbar_start) / 3; // 0=new-file 1=new-folder 2=delete 3=explorer-mode
+                    let btn = (col - toolbar_start) / 3; // 0=new-file 1=new-folder 2=delete
                     let idx = sidebar.selected;
                     let selected_is_dir = idx < sidebar.rows.len() && sidebar.rows[idx].is_dir;
                     match btn {
@@ -1516,17 +1575,6 @@ fn handle_mouse(
                                 });
                             }
                         }
-                        3 => {
-                            // Pencil button — toggle explorer mode
-                            sidebar.explorer_mode = !sidebar.explorer_mode;
-                            if sidebar.explorer_mode {
-                                sidebar.has_focus = true;
-                                engine.message = "Explorer mode ON \u{2014} a/A/r/M/D  (? to exit, :help explorer for details)".to_string();
-                            } else {
-                                sidebar.has_focus = false;
-                                engine.message = "Explorer mode OFF".to_string();
-                            }
-                        }
                         _ => {}
                     }
                 }
@@ -1534,23 +1582,13 @@ fn handle_mouse(
             }
             let tree_row = (row as usize).saturating_sub(1) + sidebar.scroll_top;
             if tree_row < sidebar.rows.len() {
-                if sidebar.explorer_mode {
-                    // Explorer mode: click selects; second click on dir toggles
-                    if sidebar.selected == tree_row && sidebar.rows[tree_row].is_dir {
-                        sidebar.toggle_dir(tree_row);
-                    } else {
-                        sidebar.selected = tree_row;
-                    }
+                if sidebar.rows[tree_row].is_dir {
+                    sidebar.selected = tree_row;
+                    sidebar.toggle_dir(tree_row);
                 } else {
-                    // Default: click opens files immediately, dirs toggle
-                    if sidebar.rows[tree_row].is_dir {
-                        sidebar.selected = tree_row;
-                        sidebar.toggle_dir(tree_row);
-                    } else {
-                        sidebar.selected = tree_row;
-                        let path = sidebar.rows[tree_row].path.clone();
-                        engine.open_file_in_tab(&path);
-                    }
+                    sidebar.selected = tree_row;
+                    let path = sidebar.rows[tree_row].path.clone();
+                    engine.open_file_in_tab(&path);
                 }
             }
         } else if sidebar.active_panel == TuiPanel::Search {
@@ -3206,18 +3244,13 @@ fn render_sidebar(
     // Toolbar buttons (right-aligned, Nerd Font icons):
     //   new-file  new-folder  delete  refresh  explorer-mode
     // Each icon occupies 2 terminal cols (Nerd Font) + 1 space = 3 cols per button.
-    // EXPLORER_TOOLBAR_LEN = 15 (5 NF icons × 3 cols).
+    // EXPLORER_TOOLBAR_LEN = 9 (3 NF icons × 3 cols each).
     // When a file (not folder) is selected, new-file/new-folder icons are dimmed.
     let selected_is_dir = {
         let idx = sidebar.selected;
         idx < sidebar.rows.len() && sidebar.rows[idx].is_dir
     };
     let dim_fg = rc(theme.line_number_fg); // dimmed color for unavailable buttons
-    let pencil_fg = if sidebar.explorer_mode {
-        rc(theme.keyword)
-    } else {
-        header_fg
-    };
     let icons: &[(char, bool, ratatui::style::Color)] = &[
         (
             '\u{f15b}',
@@ -3230,7 +3263,6 @@ fn render_sidebar(
             if selected_is_dir { header_fg } else { dim_fg },
         ), // new folder
         ('\u{f1f8}', true, header_fg), // delete
-        ('\u{f040}', true, pencil_fg), // pencil (explorer mode toggle)
     ];
     let toolbar_len = EXPLORER_TOOLBAR_LEN;
     if toolbar_len < area.width {

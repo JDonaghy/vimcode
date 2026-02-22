@@ -1,5 +1,19 @@
 # VimCode Implementation Plan
 
+## Recently Completed (Session 62)
+
+### ✅ Configurable Panel Navigation Keys (`panel_keys`)
+- **`PanelKeys` struct** in `settings.rs` — 5 fields (`toggle_sidebar`, `focus_explorer`, `focus_search`, `fuzzy_finder`, `live_grep`) with serde per-field defaults; `parse_key_binding(s) -> Option<(ctrl, shift, alt, char)>` free function parses `<C-b>`, `<A-e>`, `<C-S-x>` notation
+- **Defaults** — `toggle_sidebar: <C-b>`, `focus_explorer: <A-e>`, `focus_search: <A-f>`, `fuzzy_finder: <C-p>`, `live_grep: <C-g>`
+- **Removed `ExplorerAction::ToggleMode`** — keyboard focus on explorer makes a separate "explorer mode" gate unnecessary; `toggle_mode` field + default fn + test removed from `ExplorerKeys`
+- **TUI** — `matches_tui_key(binding, code, mods)` helper; panel_keys dispatch block added in both the editor-focused section (to activate panels) AND the sidebar-focused section (to toggle back to editor or switch panels); all five shortcuts work bidirectionally regardless of where focus is
+- **GTK** — `matches_gtk_key(binding, key, state)` helper; `Msg::ToggleFocusExplorer` (toggle between editor and tree view) + new `Msg::ToggleFocusSearch` (show search panel / return to editor without hiding sidebar); tree view `EventControllerKey` now captures `engine` and dispatches panel_keys before the `Stop` catchall — so `Alt+E`, `Alt+F`, `Ctrl+B` all work when the tree has focus
+- **Return to editor** — `Escape` works from both explorer and search panels; pressing the same panel shortcut again also returns focus to the editor (toggle); search panel stays visible (no sidebar-hide animation artifact)
+- File changes: `src/core/settings.rs` (+55 lines, PanelKeys struct, parse_key_binding, 8 new tests), `src/tui_main.rs` (matches_tui_key helper, panel_keys dispatch ×2, removed explorer_mode), `src/main.rs` (matches_gtk_key helper, ToggleFocusExplorer + ToggleFocusSearch msgs, tree-view key handler update)
+- Tests: 606 → 613 (7 net new: +8 PanelKeys, −1 toggle_mode)
+
+---
+
 ## Recently Completed (Session 61)
 
 ### ✅ Replace arboard with copypasta-ext; fix TUI paste intercept
