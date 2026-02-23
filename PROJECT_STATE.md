@@ -1,8 +1,10 @@
 # VimCode Project State
 
-**Last updated:** Feb 22, 2026 (Session 70)
+**Last updated:** Feb 22, 2026 (Session 71)
 
 ## Status
+
+**Terminal panel resize (Session 71):** Drag the terminal header row to resize the panel height. `session.terminal_panel_rows: u16` (default 12) persists across sessions. GTK: `terminal_resize_dragging: bool` flag; header-row click starts drag; `Msg::MouseDrag` updates rows live; `Msg::MouseUp` calls `terminal_resize()` + `session.save()`. TUI: `dragging_terminal_resize: bool` local var + new param in `handle_mouse()`; Up handler saves + resizes PTY. All hardcoded `13`/`12` row constants replaced dynamically. Clamped [5, 30] content rows. 638 tests (no change).
 
 **Terminal polish (Session 70):** Scrollbar draggable in both GTK + TUI (correct direction, slides back to live view); copy (Ctrl+Y) and paste (Ctrl+Shift+V / bracketed paste) wired up in both backends; TUI scrollbar colored to match editor; GTK full-width terminal; GTK editor scrollbar no longer overlaps terminal — 638 tests passing
 
@@ -135,7 +137,7 @@
 
 ### Integrated Terminal
 - `Ctrl-T` (Normal mode) or `:term`/`:terminal` command — toggle integrated terminal panel
-- Persistent 13-row bottom strip (1 toolbar + 12 content rows); panel closes but shell session stays alive; reopen restores same session
+- Resizable bottom strip (default 1 header + 12 content rows); drag header row to resize; height persisted via `session.terminal_panel_rows`; panel closes but shell session stays alive; reopen restores same session
 - Real PTY via `portable-pty`; VT100/ANSI parsing via `vt100`; full 256-color xterm palette (system colors 0–15, 6×6×6 cube 16–231, grayscale 232–255)
 - Background mpsc reader thread forwards shell output; `poll()` drains and feeds `vt100::Parser`
 - All keypresses forwarded to PTY when terminal has focus; Ctrl-C, Ctrl-D, Ctrl-L, Ctrl-Z, arrow keys, Tab all work
@@ -187,8 +189,8 @@
 ```
 vimcode/
 ├── src/
-│   ├── main.rs (~4560 lines) — GTK4/Relm4 UI, rendering, find dialog, sidebar resize, search/replace panel, fuzzy popup, quickfix panel, terminal panel, right-click context menu, drag-and-drop, diff rendering
-│   ├── tui_main.rs (~4000 lines) — ratatui/crossterm TUI backend, sidebar, mouse, search/replace panel, fuzzy popup, quickfix panel, terminal panel, rename/move prompts, diff rendering
+│   ├── main.rs (~5260 lines) — GTK4/Relm4 UI, rendering, find dialog, sidebar resize, search/replace panel, fuzzy popup, quickfix panel, terminal panel, right-click context menu, drag-and-drop, diff rendering
+│   ├── tui_main.rs (~4600 lines) — ratatui/crossterm TUI backend, sidebar, mouse, search/replace panel, fuzzy popup, quickfix panel, terminal panel, rename/move prompts, diff rendering
 │   ├── icons.rs (~30 lines) — Nerd Font file-type icons (shared by GTK + TUI)
 │   ├── render.rs (~1410 lines) — Platform-agnostic rendering abstraction (ScreenLayout, max_col, QuickfixPanel, TerminalPanel, DiffLine, diff_status)
 │   └── core/ (~23,870 lines) — Platform-agnostic logic
@@ -199,7 +201,7 @@ vimcode/
 │       ├── project_search.rs (~630 lines) — Regex/case/whole-word search + replace (ignore + regex crates)
 │       ├── buffer_manager.rs (~600 lines) — Buffer lifecycle
 │       ├── buffer.rs (~120 lines) — Rope-based storage
-│       ├── session.rs (~175 lines) — Session state persistence (sidebar_width added)
+│       ├── session.rs (~180 lines) — Session state persistence (sidebar_width, terminal_panel_rows)
 │       ├── settings.rs (~940 lines) — JSON persistence, auto-init, :set parsing, explorer keys, panel_keys (incl. open_terminal), parse_key_binding
 │       ├── window.rs, tab.rs, view.rs, cursor.rs, mode.rs, syntax.rs
 │       ├── git.rs (~635 lines) — git subprocess integration (diff/blame/hunk parsing, branch detection, stage_hunk)
@@ -284,6 +286,8 @@ cargo fmt
 - [x] **`:norm`** — execute normal command on a range of lines
 
 ## Recent Work
+**Session 71:** Terminal panel draggable resize — `session.terminal_panel_rows: u16` (serde default 12) added to `SessionState`. GTK: `terminal_resize_dragging: bool` on `App`; header-row click starts resize drag; `Msg::MouseDrag` recalculates rows from y-position (clamped [5, 30]); `Msg::MouseUp` calls `terminal_resize(cols, rows)` + `session.save()`. TUI: `dragging_terminal_resize: bool` local var added alongside `dragging_terminal_sb`; new parameter added to `handle_mouse()` signature + both call sites; Drag handler updates rows live; Up handler resizes PTY and saves session. All hardcoded `13`/`12` terminal-row constants across both backends replaced with `engine.session.terminal_panel_rows + 1` / `engine.session.terminal_panel_rows`. 638 tests (no change — pure UI change, no core logic).
+
 **Session 70:** Terminal bug fixes — scrollbar thumb shrinks as content accumulates (`lines_written: usize` counter on `TerminalPane`, incremented in `poll()` as `max(scrollback + rows)`; `render.rs` uses it for `scrollback_rows`); `:term` after Ctrl-D now drops the dead pane (`exited = true` check at top of `open_terminal()`) and spawns a fresh shell. 638 tests (no change).
 
 **Session 69:** Terminal panel bug fixes + scrollbar — fixed TUI crash (clicking on terminal output caused panic: `build_screen_for_tui` didn't subtract quickfix/terminal rows from `content_rows`, so engine window rects extended into the terminal area; mouse clicks matched a window and called `engine.mouse_click()` with an OOB line number). Fixed TUI not-full-width (PTY was opened with editor-column width; changed to `terminal.size().ok().map(|s| s.width)`). Added scrollback tracking: `scroll_offset: usize` + `scroll_up/down/reset()` on `TerminalPane`; PageUp/PageDown in terminal focus changes offset (visual scrollback deferred — vt100 0.15 has no per-cell scrollback API). Added scrollbar: `scrollback_rows: usize` on `TerminalPanel`; TUI uses rightmost column (`░`/`█`); GTK draws a 6px Cairo strip. Fixed mouse click-to-focus: clicking outside the terminal panel clears `terminal_has_focus` in both backends. Fixed TUI mouse selection (click starts, drag extends). Auto-close on shell exit: `poll_terminal()` calls `close_terminal()` when `term.exited` is detected. 638 tests (no change).

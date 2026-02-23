@@ -232,7 +232,7 @@ cargo fmt
 
 - `Ctrl-T` (Normal mode) — toggle the integrated terminal panel
 - `:term` / `:terminal` — open the terminal from command mode
-- The terminal is a **persistent bottom strip** (13 rows: 1 toolbar + 12 content rows) above the status bar
+- The terminal is a **resizable bottom strip** (default 1 toolbar + 12 content rows) above the status bar; drag the header row up/down to resize; height persists across sessions
 - Shell is determined by the `$SHELL` environment variable, falling back to `/bin/bash`
 - Full **ANSI/VT100 color support** — 256-color xterm palette rendered cell-by-cell
 - **Mouse selection** — click and drag to select text in the terminal content area
@@ -562,8 +562,8 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 
 ```
 src/
-├── main.rs          (~4410 lines)  GTK4/Relm4 UI, rendering, sidebar resize, fuzzy popup, context menu, drag-and-drop
-├── tui_main.rs      (~3860 lines)  ratatui/crossterm TUI backend, fuzzy popup, rename/move prompts
+├── main.rs          (~5260 lines)  GTK4/Relm4 UI, rendering, sidebar resize, fuzzy popup, context menu, drag-and-drop
+├── tui_main.rs      (~4600 lines)  ratatui/crossterm TUI backend, fuzzy popup, rename/move prompts
 ├── render.rs        (~1340 lines)  Platform-agnostic ScreenLayout bridge (DiffLine, diff_status)
 ├── icons.rs            (~30 lines)  Nerd Font file-type icons (GTK + TUI)
 └── core/            (~23700 lines)  Zero GTK/rendering deps — fully testable

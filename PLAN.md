@@ -1,5 +1,17 @@
 # VimCode Implementation Plan
 
+## Recently Completed (Session 71)
+
+### ✅ Terminal Panel Draggable Resize
+
+- **`session.terminal_panel_rows: u16`** — new field (serde default 12) in `SessionState`; saved on drag end in both backends
+- **GTK drag** — `terminal_resize_dragging: bool` on `App`; header-row click starts drag; `Msg::MouseDrag` recalculates rows from y-position clamped [5, 30]; `Msg::MouseUp` calls `terminal_resize(cols, rows)` + `session.save()`; all hardcoded `13.0 *` / `12` terminal row constants replaced with session-dynamic values
+- **TUI drag** — `dragging_terminal_resize: bool` local var; `handle_mouse()` gains new parameter + both call sites updated; Drag handler computes `available = term_height - row - 2 - qf_h` then new rows; Up handler resizes PTY and saves session; all `strip_rows` calculations replaced with dynamic values
+- **No core changes** — `render.rs` and `engine.rs` unchanged; `open_terminal(cols, rows)` already parameterized
+- Tests: 638 → 638 (no change — pure UI drag handling)
+
+---
+
 ## Recently Completed (Session 70)
 
 ### ✅ Terminal Scrollback, Copy/Paste, and Scrollbar Polish

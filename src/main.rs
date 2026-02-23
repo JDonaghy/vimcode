@@ -103,6 +103,8 @@ struct App {
     clipboard: Option<Box<dyn ClipboardProviderExt>>,
     /// True while the user is dragging the terminal panel's scrollbar thumb.
     terminal_sb_dragging: bool,
+    /// True while the user drags the terminal header row to resize the panel.
+    terminal_resize_dragging: bool,
 }
 
 /// Scrollbars and indicators for a single window
@@ -1114,6 +1116,7 @@ impl SimpleComponent for App {
             last_clipboard_content: None,
             clipboard,
             terminal_sb_dragging: false,
+            terminal_resize_dragging: false,
         };
         let widgets = view_output!();
 
@@ -1765,7 +1768,8 @@ impl SimpleComponent for App {
                 let in_terminal = if self.cached_line_height > 0.0 {
                     let engine = self.engine.borrow();
                     if engine.terminal_open {
-                        let term_px = 13.0 * self.cached_line_height;
+                        let term_px = (engine.session.terminal_panel_rows as f64 + 1.0)
+                            * self.cached_line_height;
                         let status_h = 2.0 * self.cached_line_height;
                         let term_y = height - status_h - term_px;
                         if y >= term_y {
@@ -1788,6 +1792,7 @@ impl SimpleComponent for App {
                             self.terminal_sb_dragging = true;
                         } else {
                             self.terminal_sb_dragging = false;
+                            self.terminal_resize_dragging = false;
                             let row = ((y - term_y - self.cached_line_height)
                                 / self.cached_line_height)
                                 as u16;
@@ -1802,6 +1807,9 @@ impl SimpleComponent for App {
                                 });
                             }
                         }
+                    } else {
+                        // Header row click — start panel resize drag.
+                        self.terminal_resize_dragging = true;
                     }
                     self.redraw = true;
                 } else {
@@ -1840,11 +1848,22 @@ impl SimpleComponent for App {
                 width,
                 height,
             } => {
-                // Terminal scrollbar drag takes priority.
-                if self.terminal_sb_dragging {
+                // Terminal panel resize drag takes priority.
+                if self.terminal_resize_dragging {
+                    if self.cached_line_height > 0.0 {
+                        let status_h = 2.0 * self.cached_line_height;
+                        let available = (height - y - status_h).max(0.0);
+                        let new_rows = ((available / self.cached_line_height) as u16)
+                            .saturating_sub(1)
+                            .clamp(5, 30);
+                        self.engine.borrow_mut().session.terminal_panel_rows = new_rows;
+                        self.redraw = true;
+                    }
+                } else if self.terminal_sb_dragging {
                     let engine = self.engine.borrow();
                     if let Some(term) = engine.terminal.as_ref() {
-                        let term_px = 13.0 * self.cached_line_height;
+                        let term_px = (engine.session.terminal_panel_rows as f64 + 1.0)
+                            * self.cached_line_height;
                         let status_h = 2.0 * self.cached_line_height;
                         let term_y = height - status_h - term_px;
                         let content_y = term_y + self.cached_line_height;
@@ -1867,7 +1886,8 @@ impl SimpleComponent for App {
                     let in_terminal = if self.cached_line_height > 0.0 {
                         let engine = self.engine.borrow();
                         if engine.terminal_open {
-                            let term_px = 13.0 * self.cached_line_height;
+                            let term_px = (engine.session.terminal_panel_rows as f64 + 1.0)
+                                * self.cached_line_height;
                             let status_h = 2.0 * self.cached_line_height;
                             let term_y = height - status_h - term_px;
                             if y >= term_y + self.cached_line_height {
@@ -1901,6 +1921,22 @@ impl SimpleComponent for App {
             }
             Msg::MouseUp => {
                 self.terminal_sb_dragging = false;
+                if self.terminal_resize_dragging {
+                    self.terminal_resize_dragging = false;
+                    let rows = self.engine.borrow().session.terminal_panel_rows;
+                    let cols = if let Some(da) = self.drawing_area.borrow().as_ref() {
+                        if self.cached_char_width > 0.0 {
+                            (da.width() as f64 / self.cached_char_width) as u16
+                        } else {
+                            80
+                        }
+                    } else {
+                        80
+                    }
+                    .max(40);
+                    self.engine.borrow_mut().terminal_resize(cols, rows);
+                    let _ = self.engine.borrow().session.save();
+                }
                 let mut engine = self.engine.borrow_mut();
                 engine.mouse_drag_active = false;
                 self.redraw = !self.redraw;
@@ -2578,7 +2614,8 @@ impl SimpleComponent for App {
                         80
                     }
                     .max(40);
-                    self.engine.borrow_mut().open_terminal(cols, 12);
+                    let rows = self.engine.borrow().session.terminal_panel_rows;
+                    self.engine.borrow_mut().open_terminal(cols, rows);
                 } else {
                     self.engine.borrow_mut().toggle_terminal();
                 }
@@ -2764,7 +2801,7 @@ impl App {
             0.0
         };
         let term_px = if engine.terminal_open {
-            13.0 * line_height
+            (engine.session.terminal_panel_rows as f64 + 1.0) * line_height
         } else {
             0.0
         };
@@ -3061,12 +3098,9 @@ fn draw_editor(
         0.0
     };
 
-    // Reserve space for the terminal panel when open (13 rows: 1 header + 12 content)
-    const TERMINAL_CONTENT_ROWS: usize = 12;
-    const TERMINAL_HEADER_ROWS: usize = 1;
-    const TERMINAL_TOTAL_ROWS: usize = TERMINAL_CONTENT_ROWS + TERMINAL_HEADER_ROWS;
+    // Reserve space for the terminal panel when open (1 header + session-configured content rows)
     let term_px = if engine.terminal_open {
-        TERMINAL_TOTAL_ROWS as f64 * line_height
+        (engine.session.terminal_panel_rows as usize + 1) as f64 * line_height
     } else {
         0.0
     };

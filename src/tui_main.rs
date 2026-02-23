@@ -480,6 +480,8 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
     // Non-None while user is dragging the terminal panel's scrollbar thumb.
     // Stores (track_start_row, track_len, total_scrollback_rows).
     let mut dragging_terminal_sb: Option<(u16, u16, usize)> = None;
+    // True while user drags the terminal header row to resize the panel.
+    let mut dragging_terminal_resize: bool = false;
     // Cache of the last rendered layout for mouse hit-testing
     let mut last_layout: Option<render::ScreenLayout> = None;
     // Double-click detection state
@@ -508,7 +510,11 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
         // editor_col: [tab(1)] / [editor] then global [status(1)] [cmd(1)]
         if let Ok(size) = terminal.size() {
             let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
-            let trm_rows: u16 = if engine.terminal_open { 13 } else { 0 };
+            let trm_rows: u16 = if engine.terminal_open {
+                engine.session.terminal_panel_rows + 1
+            } else {
+                0
+            };
             let content_rows = size.height.saturating_sub(3 + qf_rows + trm_rows); // tab + status + cmd + panels
             let gutter_approx = 4u16;
             let sidebar_cols = if sidebar.visible {
@@ -1072,7 +1078,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                             } else {
                                 // Open terminal at full terminal width
                                 let cols = terminal.size().ok().map(|s| s.width).unwrap_or(80);
-                                engine.open_terminal(cols, 12);
+                                engine.open_terminal(cols, engine.session.terminal_panel_rows);
                             }
                             needs_redraw = true;
                             continue;
@@ -1224,7 +1230,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                         if action == EngineAction::OpenTerminal {
                             if !engine.terminal_open {
                                 let cols = terminal.size().ok().map(|s| s.width).unwrap_or(80);
-                                engine.open_terminal(cols, 12);
+                                engine.open_terminal(cols, engine.session.terminal_panel_rows);
                             }
                             needs_redraw = true;
                         } else if handle_action(engine, action) {
@@ -1315,6 +1321,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                                 &mut dragging_scrollbar,
                                 &mut dragging_sidebar_search,
                                 &mut dragging_terminal_sb,
+                                &mut dragging_terminal_resize,
                                 last_layout.as_ref(),
                                 &mut sidebar_prompt,
                                 &mut last_click_time,
@@ -1338,6 +1345,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                     &mut dragging_scrollbar,
                     &mut dragging_sidebar_search,
                     &mut dragging_terminal_sb,
+                    &mut dragging_terminal_resize,
                     last_layout.as_ref(),
                     &mut sidebar_prompt,
                     &mut last_click_time,
@@ -1402,6 +1410,7 @@ fn handle_mouse(
     dragging_scrollbar: &mut Option<ScrollDragState>,
     dragging_sidebar_search: &mut Option<SidebarScrollDrag>,
     dragging_terminal_sb: &mut Option<(u16, u16, usize)>,
+    dragging_terminal_resize: &mut bool,
     last_layout: Option<&render::ScreenLayout>,
     sidebar_prompt: &mut Option<SidebarPrompt>,
     last_click_time: &mut Instant,
@@ -1441,6 +1450,14 @@ fn handle_mouse(
                     sidebar.search_scroll_top =
                         new_scroll.min(drag.total.saturating_sub(drag.track_len as usize));
                 }
+                return sidebar_width;
+            }
+            // Terminal panel resize drag
+            if *dragging_terminal_resize {
+                let qf_h: u16 = if engine.quickfix_open { 6 } else { 0 };
+                let available = term_height.saturating_sub(row + 2 + qf_h);
+                let new_rows = available.saturating_sub(1).clamp(5, 30);
+                engine.session.terminal_panel_rows = new_rows;
                 return sidebar_width;
             }
             // Terminal scrollbar drag
@@ -1512,7 +1529,11 @@ fn handle_mouse(
             // Terminal drag-to-select in content rows.
             {
                 let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
-                let strip_rows: u16 = if engine.terminal_open { 13 } else { 0 };
+                let strip_rows: u16 = if engine.terminal_open {
+                    engine.session.terminal_panel_rows + 1
+                } else {
+                    0
+                };
                 let term_strip_top = term_height.saturating_sub(2 + qf_rows + strip_rows);
                 if engine.terminal_open
                     && strip_rows > 0
@@ -1535,6 +1556,13 @@ fn handle_mouse(
             *dragging_scrollbar = None;
             *dragging_sidebar_search = None;
             *dragging_terminal_sb = None;
+            if *dragging_terminal_resize {
+                *dragging_terminal_resize = false;
+                let rows = engine.session.terminal_panel_rows;
+                let cols = terminal_size.map(|s| s.width).unwrap_or(80);
+                engine.terminal_resize(cols, rows);
+                let _ = engine.session.save();
+            }
             *mouse_text_drag = false;
             engine.mouse_drag_active = false;
             // Auto-copy terminal selection to clipboard on mouse-release.
@@ -1579,7 +1607,11 @@ fn handle_mouse(
             // Terminal panel scroll (must check before editor scroll).
             {
                 let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
-                let strip_rows: u16 = if engine.terminal_open { 13 } else { 0 };
+                let strip_rows: u16 = if engine.terminal_open {
+                    engine.session.terminal_panel_rows + 1
+                } else {
+                    0
+                };
                 let term_strip_top = term_height.saturating_sub(2 + qf_rows + strip_rows);
                 if engine.terminal_open
                     && strip_rows > 0
@@ -1653,7 +1685,11 @@ fn handle_mouse(
     // ── Terminal panel click ───────────────────────────────────────────────────
     {
         let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
-        let strip_rows: u16 = if engine.terminal_open { 13 } else { 0 };
+        let strip_rows: u16 = if engine.terminal_open {
+            engine.session.terminal_panel_rows + 1
+        } else {
+            0
+        };
         let term_strip_top = term_height.saturating_sub(2 + qf_rows + strip_rows);
         if engine.terminal_open
             && strip_rows > 0
@@ -1661,8 +1697,9 @@ fn handle_mouse(
             && row < term_strip_top + strip_rows
         {
             if row == term_strip_top {
-                // Header row — just focus the terminal.
+                // Header row — focus terminal and start panel resize drag.
                 engine.terminal_has_focus = true;
+                *dragging_terminal_resize = true;
             } else {
                 // Content row — check for scrollbar click first.
                 let term_width = terminal_size.map(|s| s.width).unwrap_or(80);
@@ -1708,7 +1745,11 @@ fn handle_mouse(
     if col < ACTIVITY_BAR_WIDTH {
         // Activity bar height = term_height - 2 (status+cmd) - quickfix
         let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
-        let strip_rows: u16 = if engine.terminal_open { 13 } else { 0 };
+        let strip_rows: u16 = if engine.terminal_open {
+            engine.session.terminal_panel_rows + 1
+        } else {
+            0
+        };
         let bar_height = term_height.saturating_sub(2 + qf_rows + strip_rows);
         let settings_row = bar_height.saturating_sub(1);
         let target_panel = match row {
@@ -2035,7 +2076,11 @@ fn build_screen_for_tui(
     // Global bottom rows: status(1) + cmd(1); editor column top: tab(1)
     // Also subtract quickfix and terminal panels so window rects don't extend into them.
     let qf_height: u16 = if engine.quickfix_open { 6 } else { 0 };
-    let term_height: u16 = if engine.terminal_open { 13 } else { 0 };
+    let term_height: u16 = if engine.terminal_open {
+        engine.session.terminal_panel_rows + 1
+    } else {
+        0
+    };
     let content_rows = area.height.saturating_sub(3 + qf_height + term_height); // tab + status + cmd + panels
     let sidebar_cols = if sidebar.visible {
         sidebar_width + 1
@@ -2067,7 +2112,11 @@ fn draw_frame(
 
     // ── Global vertical split: [main_area] / [quickfix?] / [terminal?] / [status(1)] / [cmd(1)] ──
     let qf_height: u16 = if screen.quickfix.is_some() { 6 } else { 0 };
-    let terminal_height: u16 = if screen.terminal.is_some() { 13 } else { 0 }; // 1 header + 12 content
+    let terminal_height: u16 = if screen.terminal.is_some() {
+        engine.session.terminal_panel_rows + 1
+    } else {
+        0
+    };
     let v_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([

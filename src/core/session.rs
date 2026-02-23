@@ -47,6 +47,10 @@ pub struct SessionState {
     /// The active (focused) file when the session was last saved
     #[serde(default)]
     pub active_file: Option<PathBuf>,
+
+    /// Terminal panel content rows (default 12; does not include the header row)
+    #[serde(default = "default_terminal_rows")]
+    pub terminal_panel_rows: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,6 +67,10 @@ pub struct WindowGeometry {
 
 fn default_sidebar_width() -> i32 {
     300
+}
+
+fn default_terminal_rows() -> u16 {
+    12
 }
 
 impl Default for SessionState {
@@ -83,6 +91,7 @@ impl Default for SessionState {
             file_positions: HashMap::new(),
             open_files: Vec::new(),
             active_file: None,
+            terminal_panel_rows: default_terminal_rows(),
         }
     }
 }
