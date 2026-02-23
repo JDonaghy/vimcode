@@ -1,8 +1,12 @@
 # VimCode Project State
 
-**Last updated:** Feb 23, 2026 (Session 72)
+**Last updated:** Feb 23, 2026 (Session 74)
 
 ## Status
+
+**Terminal find bug fixes (Session 74):** Two bugs fixed. (1) Find now scans scrollback history: `terminal_find_matches` changed from `Vec<(u16, u16)>` to `Vec<(usize, u16, u16)>` (required_scroll_offset, row, col); `terminal_find_update_matches()` scans at `max_offset` (oldest) AND `0` (live), deduplicating by absolute line number; `terminal_find_next/prev()` now also calls `term.set_scroll_offset(req_offset)` to scroll to the match; `build_terminal_panel()` maps matches to visible rows using `visible_row = mr + current_offset - moffset`. (2) GTK terminal content area: added full-width background fill `(30,30,30)` before drawing cells; added `CacheFontMetrics` auto-resize that calls `terminal_resize()` when char_width changes by >0.5px. 638 tests.
+
+**Terminal find bar (Session 73):** Ctrl+F while the terminal panel is focused opens an inline find bar that replaces the tab strip in the toolbar row. Typing updates the query live; case-insensitive char-by-char scan of all visible vt100 screen rows. Active match: orange background / black text. Other matches: dark amber background. Enter = next match; Shift+Enter = previous match; Escape = close; Ctrl+F toggles open/close. Engine: 4 new fields (`terminal_find_active`, `terminal_find_query`, `terminal_find_selected`, `terminal_find_matches`) + 7 methods (`terminal_find_open/close/char/backspace/next/prev/update_matches`); `poll_terminal()` refreshes matches when screen changes. render.rs: `TerminalCell` gains `is_find_match` + `is_find_active`; `TerminalPanel` gains `find_active/query/match_count/selected_idx`; `build_terminal_panel()` applies highlights. GTK: 6 new `Msg` variants + key routing + toolbar + cell rendering. TUI: same pattern. 638 tests (no change — PTY/vt100 scan not unit-testable in isolation).
 
 **Terminal multiple tabs + auto-close fix (Session 72):** `terminal_panes: Vec<TerminalPane>` + `terminal_active: usize` replace the single `terminal: Option<TerminalPane>` field. `terminal_new_tab()` always spawns a fresh shell; `terminal_close_active_tab()` removes current pane (closes panel if last); `terminal_switch_tab(idx)` switches active pane. `:term` always creates a new tab (via `EngineAction::OpenTerminal → NewTerminalTab`). Ctrl-T toggles panel (creates first tab if none). Alt-1–9 switches tabs (both GTK and TUI). Click on `[N]` tab label in toolbar switches tab; click on close icon closes active tab. `poll_terminal()` auto-removes exited panes immediately (all tabs, not just single-pane); panel closes when last pane exits. `terminal_resize()` resizes ALL panes. 638 tests (no change — PTY features are UI-only).
 
@@ -139,6 +143,7 @@
 
 ### Integrated Terminal
 - `Ctrl-T` (Normal mode) or `:term`/`:terminal` command — toggle integrated terminal panel
+- **Find in terminal:** `Ctrl-F` while terminal has focus opens inline find bar in toolbar; live match highlights; Enter/Shift+Enter navigate; Escape closes
 - Resizable bottom strip (default 1 header + 12 content rows); drag header row to resize; height persisted via `session.terminal_panel_rows`; panel closes but shell session stays alive; reopen restores same session
 - Real PTY via `portable-pty`; VT100/ANSI parsing via `vt100`; full 256-color xterm palette (system colors 0–15, 6×6×6 cube 16–231, grayscale 232–255)
 - Background mpsc reader thread forwards shell output; `poll()` drains and feeds `vt100::Parser`
@@ -191,12 +196,12 @@
 ```
 vimcode/
 ├── src/
-│   ├── main.rs (~5260 lines) — GTK4/Relm4 UI, rendering, find dialog, sidebar resize, search/replace panel, fuzzy popup, quickfix panel, terminal panel, right-click context menu, drag-and-drop, diff rendering
-│   ├── tui_main.rs (~4600 lines) — ratatui/crossterm TUI backend, sidebar, mouse, search/replace panel, fuzzy popup, quickfix panel, terminal panel, rename/move prompts, diff rendering
+│   ├── main.rs (~5440 lines) — GTK4/Relm4 UI, rendering, find dialog, sidebar resize, search/replace panel, fuzzy popup, quickfix panel, terminal panel, right-click context menu, drag-and-drop, diff rendering
+│   ├── tui_main.rs (~4705 lines) — ratatui/crossterm TUI backend, sidebar, mouse, search/replace panel, fuzzy popup, quickfix panel, terminal panel, rename/move prompts, diff rendering
 │   ├── icons.rs (~30 lines) — Nerd Font file-type icons (shared by GTK + TUI)
-│   ├── render.rs (~1410 lines) — Platform-agnostic rendering abstraction (ScreenLayout, max_col, QuickfixPanel, TerminalPanel, DiffLine, diff_status)
-│   └── core/ (~23,870 lines) — Platform-agnostic logic
-│       ├── engine.rs (~17,980 lines) — Orchestrates everything, find/replace, macros, history, LSP, project search/replace, fuzzy finder, quickfix, rename/move, diff, terminal
+│   ├── render.rs (~1590 lines) — Platform-agnostic rendering abstraction (ScreenLayout, max_col, QuickfixPanel, TerminalPanel, DiffLine, diff_status)
+│   └── core/ (~23,980 lines) — Platform-agnostic logic
+│       ├── engine.rs (~19,870 lines) — Orchestrates everything, find/replace, macros, history, LSP, project search/replace, fuzzy finder, quickfix, rename/move, diff, terminal, terminal-find
 │       ├── terminal.rs (~165 lines) — PTY-backed terminal pane (portable-pty + vt100 parser, mpsc reader thread)
 │       ├── lsp.rs (~1,200 lines) — LSP protocol transport + single-server client (request ID tracking)
 │       ├── lsp_manager.rs (~400 lines) — Multi-server coordinator with initialization guards
@@ -288,6 +293,8 @@ cargo fmt
 - [x] **`:norm`** — execute normal command on a range of lines
 
 ## Recent Work
+**Session 73:** Terminal find bar + PLAN.md housekeeping — Ctrl+F while terminal has focus opens an inline find bar. The tab strip is replaced by `FIND: <query>█ (N/M)` in the toolbar row. Typing updates the query live; vt100 screen rows are scanned case-insensitively char-by-char (`terminal_find_update_matches()`). Active match highlighted orange (black text); other matches dark amber. Enter = next; Shift+Enter = prev; Escape = close; Ctrl+F toggles. Engine: 4 new fields + 7 methods; `poll_terminal()` refreshes matches after new terminal output. render.rs: `TerminalCell` +2 booleans; `TerminalPanel` +4 find fields; `build_terminal_panel()` mutates cell grid for highlights. GTK: 6 new `Msg` variants + Ctrl+F routing reordered (terminal gets priority). TUI: same routing + cell colors. PLAN.md: ticked off terminal tabs/resize/scrollback; added terminal button bar + horizontal split roadmap items. 638 tests (no change).
+
 **Session 71:** Terminal panel draggable resize — `session.terminal_panel_rows: u16` (serde default 12) added to `SessionState`. GTK: `terminal_resize_dragging: bool` on `App`; header-row click starts resize drag; `Msg::MouseDrag` recalculates rows from y-position (clamped [5, 30]); `Msg::MouseUp` calls `terminal_resize(cols, rows)` + `session.save()`. TUI: `dragging_terminal_resize: bool` local var added alongside `dragging_terminal_sb`; new parameter added to `handle_mouse()` signature + both call sites; Drag handler updates rows live; Up handler resizes PTY and saves session. All hardcoded `13`/`12` terminal-row constants across both backends replaced with `engine.session.terminal_panel_rows + 1` / `engine.session.terminal_panel_rows`. 638 tests (no change — pure UI change, no core logic).
 
 **Session 70:** Terminal bug fixes — scrollbar thumb shrinks as content accumulates (`lines_written: usize` counter on `TerminalPane`, incremented in `poll()` as `max(scrollback + rows)`; `render.rs` uses it for `scrollback_rows`); `:term` after Ctrl-D now drops the dead pane (`exited = true` check at top of `open_terminal()`) and spawns a fresh shell. 638 tests (no change).

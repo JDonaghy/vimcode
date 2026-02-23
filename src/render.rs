@@ -332,6 +332,10 @@ pub struct TerminalCell {
     pub selected: bool,
     /// Whether this cell is the VT100 cursor position.
     pub is_cursor: bool,
+    /// Whether this cell is part of a non-active find match (dim highlight).
+    pub is_find_match: bool,
+    /// Whether this cell is part of the currently selected find match (bright highlight).
+    pub is_find_active: bool,
 }
 
 /// A text selection range within the terminal content area.
@@ -362,6 +366,14 @@ pub struct TerminalPanel {
     pub tab_count: usize,
     /// Index of the currently active tab.
     pub active_tab: usize,
+    /// Whether the inline find bar is open.
+    pub find_active: bool,
+    /// Current find query string.
+    pub find_query: String,
+    /// Total number of matches found.
+    pub find_match_count: usize,
+    /// Index (0-based) of the currently highlighted match.
+    pub find_selected_idx: usize,
 }
 
 // ─── ScreenLayout ─────────────────────────────────────────────────────────────
@@ -814,7 +826,7 @@ fn build_terminal_panel(engine: &Engine) -> Option<TerminalPanel> {
         None
     };
 
-    let rows: Vec<Vec<TerminalCell>> = (0..rows_count)
+    let mut rows: Vec<Vec<TerminalCell>> = (0..rows_count)
         .map(|r| {
             (0..cols_count)
                 .map(|c| {
@@ -862,11 +874,49 @@ fn build_terminal_panel(engine: &Engine) -> Option<TerminalPanel> {
                         underline,
                         selected,
                         is_cursor,
+                        is_find_match: false,
+                        is_find_active: false,
                     }
                 })
                 .collect()
         })
         .collect();
+
+    // Apply find match highlights.
+    // Each match stores (required_scroll_offset, row, col). A match is visible at the
+    // current scroll_offset when: visible_row = mr + current_offset - moffset ∈ [0, rows).
+    let match_count = engine.terminal_find_matches.len();
+    if engine.terminal_find_active && match_count > 0 {
+        let qlen = engine.terminal_find_query.chars().count();
+        let active_idx = engine.terminal_find_selected % match_count;
+        let current_offset = term.scroll_offset as isize;
+        let term_rows = term.rows as isize;
+        for (mi, &(moffset, mr, mc)) in engine.terminal_find_matches.iter().enumerate() {
+            let visible_row = mr as isize + current_offset - moffset as isize;
+            if visible_row < 0 || visible_row >= term_rows {
+                continue; // Match is in a part of history not currently on screen.
+            }
+            let row_idx = visible_row as usize;
+            if row_idx < rows.len() {
+                for char_off in 0..qlen {
+                    let col_idx = mc as usize + char_off;
+                    if col_idx < rows[row_idx].len() {
+                        if mi == active_idx {
+                            rows[row_idx][col_idx].is_find_active = true;
+                        } else {
+                            rows[row_idx][col_idx].is_find_match = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let find_selected_idx = if match_count > 0 {
+        engine.terminal_find_selected % match_count
+    } else {
+        0
+    };
 
     Some(TerminalPanel {
         rows,
@@ -881,6 +931,10 @@ fn build_terminal_panel(engine: &Engine) -> Option<TerminalPanel> {
             .min(term.rows as usize),
         tab_count: engine.terminal_panes.len(),
         active_tab: engine.terminal_active,
+        find_active: engine.terminal_find_active,
+        find_query: engine.terminal_find_query.clone(),
+        find_match_count: match_count,
+        find_selected_idx,
     })
 }
 

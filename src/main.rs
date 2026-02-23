@@ -266,6 +266,18 @@ enum Msg {
     TerminalMouseDrag { row: u16, col: u16 },
     /// Mouse released over terminal.
     TerminalMouseUp,
+    /// Open the terminal inline find bar.
+    TerminalFindOpen,
+    /// Close the terminal inline find bar.
+    TerminalFindClose,
+    /// Type a character into the terminal find bar.
+    TerminalFindChar(char),
+    /// Delete the last character from the terminal find bar.
+    TerminalFindBackspace,
+    /// Navigate to the next find match.
+    TerminalFindNext,
+    /// Navigate to the previous find match.
+    TerminalFindPrev,
 }
 
 #[relm4::component]
@@ -741,9 +753,17 @@ impl SimpleComponent for App {
                                         return gtk4::glib::Propagation::Stop;
                                     }
 
-                                    // Check for Ctrl-F to toggle find dialog
+                                    // Ctrl-F: terminal find when terminal focused, else editor find dialog
                                     if ctrl && !shift && unicode == Some('f') {
-                                        sender.input(Msg::ToggleFindDialog);
+                                        if engine.borrow().terminal_has_focus {
+                                            if engine.borrow().terminal_find_active {
+                                                sender.input(Msg::TerminalFindClose);
+                                            } else {
+                                                sender.input(Msg::TerminalFindOpen);
+                                            }
+                                        } else {
+                                            sender.input(Msg::ToggleFindDialog);
+                                        }
                                         return gtk4::glib::Propagation::Stop;
                                     }
 
@@ -784,6 +804,23 @@ impl SimpleComponent for App {
                                         // Ctrl+Y: copy terminal selection to clipboard.
                                         if ctrl && !shift && (key_name == "y" || key_name == "Y") {
                                             sender.input(Msg::TerminalCopySelection);
+                                            return gtk4::glib::Propagation::Stop;
+                                        }
+                                        // Terminal find bar key routing.
+                                        if engine.borrow().terminal_find_active {
+                                            match key_name.as_str() {
+                                                "Escape" => sender.input(Msg::TerminalFindClose),
+                                                "Return" if !shift => sender.input(Msg::TerminalFindNext),
+                                                "Return" => sender.input(Msg::TerminalFindPrev),
+                                                "BackSpace" => sender.input(Msg::TerminalFindBackspace),
+                                                _ => {
+                                                    if !ctrl && !alt {
+                                                        if let Some(ch) = unicode {
+                                                            sender.input(Msg::TerminalFindChar(ch));
+                                                        }
+                                                    }
+                                                }
+                                            }
                                             return gtk4::glib::Propagation::Stop;
                                         }
                                         let data = gtk_key_to_pty_bytes(&key_name, unicode, ctrl);
@@ -2301,8 +2338,21 @@ impl SimpleComponent for App {
                 self.redraw = !self.redraw;
             }
             Msg::CacheFontMetrics(line_height, char_width) => {
+                let old_char_width = self.cached_char_width;
                 self.cached_line_height = line_height;
                 self.cached_char_width = char_width;
+                // If cached_char_width changed significantly (e.g. on first draw after startup
+                // when the initial default of 9.0 differed from the actual font metric),
+                // resize any open terminal panes so their PTY col count matches the display.
+                if (old_char_width - char_width).abs() > 0.5
+                    && !self.engine.borrow().terminal_panes.is_empty()
+                {
+                    if let Some(da) = self.drawing_area.borrow().as_ref() {
+                        let cols = ((da.width() as f64 / char_width) as u16).max(40);
+                        let rows = self.engine.borrow().session.terminal_panel_rows;
+                        self.engine.borrow_mut().terminal_resize(cols, rows);
+                    }
+                }
             }
             Msg::OpenSettingsFile => {
                 let settings_path = std::env::var("HOME")
@@ -2726,6 +2776,30 @@ impl SimpleComponent for App {
             }
             Msg::TerminalMouseUp => {
                 // Selection stays in place; user can now copy
+                self.redraw = true;
+            }
+            Msg::TerminalFindOpen => {
+                self.engine.borrow_mut().terminal_find_open();
+                self.redraw = true;
+            }
+            Msg::TerminalFindClose => {
+                self.engine.borrow_mut().terminal_find_close();
+                self.redraw = true;
+            }
+            Msg::TerminalFindChar(ch) => {
+                self.engine.borrow_mut().terminal_find_char(ch);
+                self.redraw = true;
+            }
+            Msg::TerminalFindBackspace => {
+                self.engine.borrow_mut().terminal_find_backspace();
+                self.redraw = true;
+            }
+            Msg::TerminalFindNext => {
+                self.engine.borrow_mut().terminal_find_next();
+                self.redraw = true;
+            }
+            Msg::TerminalFindPrev => {
+                self.engine.borrow_mut().terminal_find_prev();
                 self.redraw = true;
             }
         }
@@ -4279,43 +4353,70 @@ fn draw_terminal_panel(
     let (fr, fg2, fb) = theme.status_fg.to_cairo();
     layout.set_attributes(None);
 
-    // Tab strip — each tab is 4 chars: "[N] "
-    const TERMINAL_TAB_COLS: usize = 4;
-    let mut tab_x = x;
-    for i in 0..panel.tab_count {
-        let label = format!("[{}] ", i + 1);
-        if i == panel.active_tab {
-            // Active tab: inverted colors (cursor background)
-            let (ar, ag, ab) = theme.cursor.to_cairo();
-            cr.set_source_rgb(ar, ag, ab);
-            cr.rectangle(tab_x, y, char_width * TERMINAL_TAB_COLS as f64, line_height);
-            cr.fill().ok();
-            let (br, bg_, bb) = theme.background.to_cairo();
-            cr.set_source_rgb(br, bg_, bb);
+    if panel.find_active {
+        // Find bar mode: replace tab strip with query + match count
+        let match_info = if panel.find_match_count == 0 {
+            if panel.find_query.is_empty() {
+                String::new()
+            } else {
+                "  (no matches)".to_string()
+            }
         } else {
-            cr.set_source_rgb(fr, fg2, fb);
-        }
-        layout.set_text(&label);
-        cr.move_to(tab_x, y);
-        pangocairo::show_layout(cr, layout);
-        tab_x += char_width * TERMINAL_TAB_COLS as f64;
-    }
-
-    // If no tabs yet (panel open but spawning), show a minimal title
-    if panel.tab_count == 0 {
+            format!(
+                "  ({}/{})",
+                panel.find_selected_idx + 1,
+                panel.find_match_count
+            )
+        };
+        let find_text = format!(" FIND: {}█{}", panel.find_query, match_info);
         cr.set_source_rgb(fr, fg2, fb);
-        layout.set_text("  TERMINAL");
+        layout.set_text(&find_text);
         cr.move_to(x, y);
         pangocairo::show_layout(cr, layout);
-    }
+        // Close icon right-aligned
+        layout.set_text(NF_CLOSE);
+        let (cw, _) = layout.pixel_size();
+        cr.move_to(x + w - cw as f64 - 4.0, y);
+        pangocairo::show_layout(cr, layout);
+    } else {
+        // Tab strip — each tab is 4 chars: "[N] "
+        const TERMINAL_TAB_COLS: usize = 4;
+        let mut tab_x = x;
+        for i in 0..panel.tab_count {
+            let label = format!("[{}] ", i + 1);
+            if i == panel.active_tab {
+                // Active tab: inverted colors (cursor background)
+                let (ar, ag, ab) = theme.cursor.to_cairo();
+                cr.set_source_rgb(ar, ag, ab);
+                cr.rectangle(tab_x, y, char_width * TERMINAL_TAB_COLS as f64, line_height);
+                cr.fill().ok();
+                let (br, bg_, bb) = theme.background.to_cairo();
+                cr.set_source_rgb(br, bg_, bb);
+            } else {
+                cr.set_source_rgb(fr, fg2, fb);
+            }
+            layout.set_text(&label);
+            cr.move_to(tab_x, y);
+            pangocairo::show_layout(cr, layout);
+            tab_x += char_width * TERMINAL_TAB_COLS as f64;
+        }
 
-    // Right-aligned toolbar buttons
-    cr.set_source_rgb(fr, fg2, fb);
-    let btn_text = format!("{}  {}", NF_SPLIT, NF_CLOSE);
-    layout.set_text(&btn_text);
-    let (btn_w, _) = layout.pixel_size();
-    cr.move_to(x + w - btn_w as f64 - 4.0, y);
-    pangocairo::show_layout(cr, layout);
+        // If no tabs yet (panel open but spawning), show a minimal title
+        if panel.tab_count == 0 {
+            cr.set_source_rgb(fr, fg2, fb);
+            layout.set_text("  TERMINAL");
+            cr.move_to(x, y);
+            pangocairo::show_layout(cr, layout);
+        }
+
+        // Right-aligned toolbar buttons
+        cr.set_source_rgb(fr, fg2, fb);
+        let btn_text = format!("{}  {}", NF_SPLIT, NF_CLOSE);
+        layout.set_text(&btn_text);
+        let (btn_w, _) = layout.pixel_size();
+        cr.move_to(x + w - btn_w as f64 - 4.0, y);
+        pangocairo::show_layout(cr, layout);
+    }
 
     // close_x used by click detection in MouseClick handler
     let close_x = x + w - char_width * 2.0;
@@ -4360,6 +4461,14 @@ fn draw_terminal_panel(
 
     // Content rows (terminal cells)
     let cell_area_w = w - SB_W;
+
+    // Fill the entire content area with the default terminal background first.
+    // This prevents the editor background from showing through where cells are absent
+    // (e.g. when PTY cols were computed with a slightly different char_width).
+    cr.set_source_rgb(30.0 / 255.0, 30.0 / 255.0, 30.0 / 255.0);
+    cr.rectangle(x, content_y, cell_area_w, content_h);
+    cr.fill().ok();
+
     for row_idx in 0..rows_to_draw {
         if row_idx >= panel.rows.len() {
             break;
@@ -4378,6 +4487,12 @@ fn draw_terminal_panel(
             let (draw_br, draw_bg, draw_bb) = if cell.is_cursor {
                 // Cursor: inverted colors (white on normal bg)
                 (fr, fg2, fb)
+            } else if cell.is_find_active {
+                // Active find match: orange background
+                (255u8, 165u8, 0u8)
+            } else if cell.is_find_match {
+                // Other find matches: dark amber background
+                (100u8, 80u8, 20u8)
             } else if cell.selected {
                 // Selection highlight (use theme selection color)
                 let (sr, sg, sb) = theme.selection.to_cairo();
@@ -4398,6 +4513,8 @@ fn draw_terminal_panel(
             if cell.ch != ' ' {
                 let (draw_fr, draw_fg, draw_fb) = if cell.is_cursor {
                     (br, bg, bb) // inverted for cursor
+                } else if cell.is_find_active {
+                    (0u8, 0u8, 0u8) // black text on orange
                 } else {
                     (fr, fg2, fb)
                 };

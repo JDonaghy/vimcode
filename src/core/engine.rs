@@ -366,6 +366,15 @@ pub struct Engine {
     pub terminal_open: bool,
     /// Whether the terminal panel has keyboard focus.
     pub terminal_has_focus: bool,
+    /// Whether the inline find bar is active in the terminal panel.
+    pub terminal_find_active: bool,
+    /// Current search query in the terminal find bar.
+    pub terminal_find_query: String,
+    /// Index of the currently highlighted match (wraps via modulo in render).
+    pub terminal_find_selected: usize,
+    /// (required_scroll_offset, row, col) of each match across all accessible history.
+    /// Sorted oldest-to-newest (highest offset first, then top-to-bottom).
+    pub terminal_find_matches: Vec<(usize, u16, u16)>,
 }
 
 impl Engine {
@@ -480,6 +489,10 @@ impl Engine {
             terminal_active: 0,
             terminal_open: false,
             terminal_has_focus: false,
+            terminal_find_active: false,
+            terminal_find_query: String::new(),
+            terminal_find_selected: 0,
+            terminal_find_matches: Vec::new(),
         };
         // If vscode mode is configured, start in Insert mode (no Normal mode)
         if engine.is_vscode_mode() {
@@ -9745,6 +9758,10 @@ impl Engine {
         } else {
             self.terminal_active = self.terminal_active.min(self.terminal_panes.len() - 1);
         }
+        // Keep find matches fresh if new terminal output arrived while find is active.
+        if got_data && self.terminal_find_active {
+            self.terminal_find_update_matches();
+        }
         got_data
     }
 
@@ -9785,6 +9802,164 @@ impl Engine {
     pub fn terminal_scroll_reset(&mut self) {
         if let Some(term) = self.active_terminal_mut() {
             term.scroll_reset();
+        }
+    }
+
+    // ── Terminal inline find bar ───────────────────────────────────────────
+
+    /// Open the terminal find bar and reset the query.
+    pub fn terminal_find_open(&mut self) {
+        self.terminal_find_active = true;
+        self.terminal_find_query.clear();
+        self.terminal_find_selected = 0;
+        self.terminal_find_matches.clear();
+    }
+
+    /// Close the terminal find bar and clear all match state.
+    pub fn terminal_find_close(&mut self) {
+        self.terminal_find_active = false;
+        self.terminal_find_query.clear();
+        self.terminal_find_selected = 0;
+        self.terminal_find_matches.clear();
+    }
+
+    /// Append a character to the find query and refresh matches.
+    pub fn terminal_find_char(&mut self, ch: char) {
+        self.terminal_find_query.push(ch);
+        self.terminal_find_selected = 0;
+        self.terminal_find_update_matches();
+    }
+
+    /// Delete the last character from the find query and refresh matches.
+    pub fn terminal_find_backspace(&mut self) {
+        self.terminal_find_query.pop();
+        self.terminal_find_selected = 0;
+        self.terminal_find_update_matches();
+    }
+
+    /// Advance to the next match (wraps around) and scroll to it.
+    pub fn terminal_find_next(&mut self) {
+        let n = self.terminal_find_matches.len();
+        if n > 0 {
+            self.terminal_find_selected = (self.terminal_find_selected + 1) % n;
+            let (req_offset, _, _) = self.terminal_find_matches[self.terminal_find_selected];
+            if let Some(term) = self.terminal_panes.get_mut(self.terminal_active) {
+                term.set_scroll_offset(req_offset);
+            }
+        }
+    }
+
+    /// Go back to the previous match (wraps around) and scroll to it.
+    pub fn terminal_find_prev(&mut self) {
+        let n = self.terminal_find_matches.len();
+        if n > 0 {
+            self.terminal_find_selected = (self.terminal_find_selected + n - 1) % n;
+            let (req_offset, _, _) = self.terminal_find_matches[self.terminal_find_selected];
+            if let Some(term) = self.terminal_panes.get_mut(self.terminal_active) {
+                term.set_scroll_offset(req_offset);
+            }
+        }
+    }
+
+    /// Scan the active pane's vt100 screen (and its accessible scrollback) and rebuild
+    /// `terminal_find_matches`. Case-insensitive.
+    ///
+    /// vt100 0.15 exposes at most one screenful of scrollback: calling
+    /// `parser.set_scrollback(N)` (where N ≤ rows) moves the viewport N lines back into
+    /// history so that `screen.cell(r, c)` returns historical content. We therefore scan
+    /// at `scroll_offset = max_offset` (oldest accessible) AND `scroll_offset = 0`
+    /// (newest / live), deduplicating by absolute line number to avoid double-counting
+    /// overlapping rows when `max_offset < rows`.
+    ///
+    /// Matches are stored as `(required_scroll_offset, row, col)` so that navigation
+    /// can scroll the pane to show the match.
+    fn terminal_find_update_matches(&mut self) {
+        self.terminal_find_matches.clear();
+        if !self.terminal_find_active || self.terminal_find_query.is_empty() {
+            return;
+        }
+        let q_lower: Vec<char> = self.terminal_find_query.to_lowercase().chars().collect();
+        let qlen = q_lower.len();
+        let active_idx = self.terminal_active;
+        let term = match self.terminal_panes.get_mut(active_idx) {
+            Some(t) => t,
+            None => return,
+        };
+
+        let saved_offset = term.scroll_offset;
+        let rows = term.rows;
+        let cols = term.cols;
+        let history = term.lines_written.saturating_sub(rows as usize);
+        let max_offset = (rows as usize).min(history);
+
+        let mut matches: Vec<(usize, u16, u16)> = Vec::new();
+        // Track which absolute lines (0 = bottom live row) we have already scanned.
+        let mut seen_abs: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+        // Scan oldest-accessible content first, then the live view.
+        let scan_offsets: &[usize] = if max_offset == 0 {
+            &[0]
+        } else {
+            &[max_offset, 0]
+        };
+
+        for &offset in scan_offsets {
+            term.parser.set_scrollback(offset);
+            // Collect all row text at this scrollback position (drop `screen` borrow before
+            // we call set_scrollback again in the next iteration).
+            let row_data: Vec<Vec<char>> = {
+                let screen = term.parser.screen();
+                (0..rows)
+                    .map(|r| {
+                        (0..cols)
+                            .map(|c| {
+                                let ch = screen
+                                    .cell(r, c)
+                                    .map(|cell| {
+                                        let s = cell.contents();
+                                        if s.is_empty() {
+                                            ' '
+                                        } else {
+                                            s.chars().next().unwrap_or(' ')
+                                        }
+                                    })
+                                    .unwrap_or(' ');
+                                ch.to_lowercase().next().unwrap_or(ch)
+                            })
+                            .collect()
+                    })
+                    .collect()
+            };
+
+            for (r_idx, row_lower) in row_data.iter().enumerate() {
+                // Absolute line from the bottom of the live view (0 = bottom).
+                let abs_line = offset + (rows as usize - 1 - r_idx);
+                if !seen_abs.insert(abs_line) {
+                    continue; // Already processed this physical line in an earlier pass.
+                }
+                if qlen <= row_lower.len() {
+                    for c in 0..=(row_lower.len() - qlen) {
+                        if row_lower[c..c + qlen] == q_lower[..] {
+                            matches.push((offset, r_idx as u16, c as u16));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Restore the user's original scroll position.
+        term.parser.set_scrollback(saved_offset);
+
+        // Sort: oldest first (highest offset), then top-to-bottom within same offset.
+        matches.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+
+        self.terminal_find_matches = matches;
+        if !self.terminal_find_matches.is_empty() {
+            self.terminal_find_selected = self
+                .terminal_find_selected
+                .min(self.terminal_find_matches.len() - 1);
+        } else {
+            self.terminal_find_selected = 0;
         }
     }
 }
