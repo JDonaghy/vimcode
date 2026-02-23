@@ -101,6 +101,8 @@ struct App {
     /// System clipboard context (copypasta-ext).  None if unavailable.
     // Box<dyn ClipboardProviderExt> is !Send; GTK App lives on main thread only.
     clipboard: Option<Box<dyn ClipboardProviderExt>>,
+    /// True while the user is dragging the terminal panel's scrollbar thumb.
+    terminal_sb_dragging: bool,
 }
 
 /// Scrollbars and indicators for a single window
@@ -248,6 +250,8 @@ enum Msg {
     TerminalKill,
     /// Copy terminal selection to clipboard.
     TerminalCopySelection,
+    /// Paste from system clipboard into the terminal PTY.
+    TerminalPasteClipboard,
     /// Mouse pressed at terminal cell (row, col).
     TerminalMouseDown { row: u16, col: u16 },
     /// Mouse dragged to terminal cell (row, col).
@@ -735,13 +739,17 @@ impl SimpleComponent for App {
                                         return gtk4::glib::Propagation::Stop;
                                     }
 
-                                    // Ctrl-Shift-V: paste from system clipboard
+                                    // Ctrl-Shift-V: paste from system clipboard (editor or terminal)
                                     if ctrl && shift && (key_name == "v" || key_name == "V") {
-                                        sender.input(Msg::KeyPress {
-                                            key_name: "PasteClipboard".to_string(),
-                                            unicode: None,
-                                            ctrl: false,
-                                        });
+                                        if engine.borrow().terminal_has_focus {
+                                            sender.input(Msg::TerminalPasteClipboard);
+                                        } else {
+                                            sender.input(Msg::KeyPress {
+                                                key_name: "PasteClipboard".to_string(),
+                                                unicode: None,
+                                                ctrl: false,
+                                            });
+                                        }
                                         return gtk4::glib::Propagation::Stop;
                                     }
 
@@ -755,6 +763,11 @@ impl SimpleComponent for App {
                                     // Terminal key routing: when terminal has focus, all keys
                                     // are forwarded as PTY bytes without going to the engine.
                                     if engine.borrow().terminal_has_focus {
+                                        // Ctrl+Y: copy terminal selection to clipboard.
+                                        if ctrl && !shift && (key_name == "y" || key_name == "Y") {
+                                            sender.input(Msg::TerminalCopySelection);
+                                            return gtk4::glib::Propagation::Stop;
+                                        }
                                         let data = gtk_key_to_pty_bytes(&key_name, unicode, ctrl);
                                         if !data.is_empty() {
                                             engine.borrow_mut().terminal_write(&data);
@@ -1100,6 +1113,7 @@ impl SimpleComponent for App {
             diff_selected_file: None,
             last_clipboard_content: None,
             clipboard,
+            terminal_sb_dragging: false,
         };
         let widgets = view_output!();
 
@@ -1747,17 +1761,13 @@ impl SimpleComponent for App {
                 height,
             } => {
                 // Check if click lands in the terminal panel before general handling.
+                // term_y: terminal sits directly above the status bar (NOT above quickfix).
                 let in_terminal = if self.cached_line_height > 0.0 {
                     let engine = self.engine.borrow();
                     if engine.terminal_open {
-                        let qf_px = if engine.quickfix_open {
-                            6.0 * self.cached_line_height
-                        } else {
-                            0.0
-                        };
                         let term_px = 13.0 * self.cached_line_height;
                         let status_h = 2.0 * self.cached_line_height;
-                        let term_y = height - status_h - qf_px - term_px;
+                        let term_y = height - status_h - term_px;
                         if y >= term_y {
                             Some((term_y, y >= term_y + self.cached_line_height))
                         } else {
@@ -1772,17 +1782,25 @@ impl SimpleComponent for App {
                 if let Some((term_y, in_content)) = in_terminal {
                     self.engine.borrow_mut().terminal_has_focus = true;
                     if in_content {
-                        let row = ((y - term_y - self.cached_line_height) / self.cached_line_height)
-                            as u16;
-                        let col = (x / self.cached_char_width.max(1.0)) as u16;
-                        self.engine.borrow_mut().terminal_scroll_reset();
-                        if let Some(term) = self.engine.borrow_mut().terminal.as_mut() {
-                            term.selection = Some(crate::core::terminal::TermSelection {
-                                start_row: row,
-                                start_col: col,
-                                end_row: row,
-                                end_col: col,
-                            });
+                        // 6px scrollbar strip on the right edge — start a scrollbar drag.
+                        const SB_W: f64 = 6.0;
+                        if x >= width - SB_W {
+                            self.terminal_sb_dragging = true;
+                        } else {
+                            self.terminal_sb_dragging = false;
+                            let row = ((y - term_y - self.cached_line_height)
+                                / self.cached_line_height)
+                                as u16;
+                            let col = (x / self.cached_char_width.max(1.0)) as u16;
+                            self.engine.borrow_mut().terminal_scroll_reset();
+                            if let Some(term) = self.engine.borrow_mut().terminal.as_mut() {
+                                term.selection = Some(crate::core::terminal::TermSelection {
+                                    start_row: row,
+                                    start_col: col,
+                                    end_row: row,
+                                    end_col: col,
+                                });
+                            }
                         }
                     }
                     self.redraw = true;
@@ -1822,47 +1840,67 @@ impl SimpleComponent for App {
                 width,
                 height,
             } => {
-                // Check if drag is in the terminal panel area.
-                let in_terminal = if self.cached_line_height > 0.0 {
+                // Terminal scrollbar drag takes priority.
+                if self.terminal_sb_dragging {
                     let engine = self.engine.borrow();
-                    if engine.terminal_open {
-                        let qf_px = if engine.quickfix_open {
-                            6.0 * self.cached_line_height
-                        } else {
-                            0.0
-                        };
+                    if let Some(term) = engine.terminal.as_ref() {
                         let term_px = 13.0 * self.cached_line_height;
                         let status_h = 2.0 * self.cached_line_height;
-                        let term_y = height - status_h - qf_px - term_px;
-                        if y >= term_y + self.cached_line_height {
-                            Some(term_y)
+                        let term_y = height - status_h - term_px;
+                        let content_y = term_y + self.cached_line_height;
+                        let content_h = term_px - self.cached_line_height;
+                        let scrollback_rows = term.lines_written.saturating_sub(term.rows as usize);
+                        if scrollback_rows > 0 && content_h > 0.0 {
+                            let y_rel = (y - content_y).clamp(0.0, content_h);
+                            let frac = y_rel / content_h;
+                            // frac=0 (top) → max scroll; frac=1 (bottom) → live view
+                            let new_offset = ((1.0 - frac) * scrollback_rows as f64) as usize;
+                            drop(engine);
+                            if let Some(term) = self.engine.borrow_mut().terminal.as_mut() {
+                                term.set_scroll_offset(new_offset.min(scrollback_rows));
+                            }
+                        }
+                    }
+                    self.redraw = true;
+                } else {
+                    // Check if drag is in the terminal content area (text selection).
+                    let in_terminal = if self.cached_line_height > 0.0 {
+                        let engine = self.engine.borrow();
+                        if engine.terminal_open {
+                            let term_px = 13.0 * self.cached_line_height;
+                            let status_h = 2.0 * self.cached_line_height;
+                            let term_y = height - status_h - term_px;
+                            if y >= term_y + self.cached_line_height {
+                                Some(term_y)
+                            } else {
+                                None
+                            }
                         } else {
                             None
                         }
                     } else {
                         None
-                    }
-                } else {
-                    None
-                };
-                if let Some(term_y) = in_terminal {
-                    let row =
-                        ((y - term_y - self.cached_line_height) / self.cached_line_height) as u16;
-                    let col = (x / self.cached_char_width.max(1.0)) as u16;
-                    if let Some(term) = self.engine.borrow_mut().terminal.as_mut() {
-                        if let Some(ref mut sel) = term.selection {
-                            sel.end_row = row;
-                            sel.end_col = col;
+                    };
+                    if let Some(term_y) = in_terminal {
+                        let row = ((y - term_y - self.cached_line_height) / self.cached_line_height)
+                            as u16;
+                        let col = (x / self.cached_char_width.max(1.0)) as u16;
+                        if let Some(term) = self.engine.borrow_mut().terminal.as_mut() {
+                            if let Some(ref mut sel) = term.selection {
+                                sel.end_row = row;
+                                sel.end_col = col;
+                            }
                         }
+                        self.redraw = true;
+                    } else {
+                        let mut engine = self.engine.borrow_mut();
+                        handle_mouse_drag(&mut engine, x, y, width, height);
+                        self.redraw = !self.redraw;
                     }
-                    self.redraw = true;
-                } else {
-                    let mut engine = self.engine.borrow_mut();
-                    handle_mouse_drag(&mut engine, x, y, width, height);
-                    self.redraw = !self.redraw;
                 }
             }
             Msg::MouseUp => {
+                self.terminal_sb_dragging = false;
                 let mut engine = self.engine.borrow_mut();
                 engine.mouse_drag_active = false;
                 self.redraw = !self.redraw;
@@ -2529,12 +2567,17 @@ impl SimpleComponent for App {
                     !engine.terminal_open || !engine.terminal_has_focus
                 };
                 if needs_open && self.engine.borrow().terminal.is_none() {
-                    // Open with computed dimensions (12 content rows, width from char_width)
-                    let cols = if self.cached_char_width > 0.0 {
-                        80u16.max((200.0 / self.cached_char_width) as u16)
+                    // Use the actual drawing area width so the PTY matches the visible panel.
+                    let cols = if let Some(da) = self.drawing_area.borrow().as_ref() {
+                        if self.cached_char_width > 0.0 {
+                            (da.width() as f64 / self.cached_char_width) as u16
+                        } else {
+                            80
+                        }
                     } else {
                         80
-                    };
+                    }
+                    .max(40);
                     self.engine.borrow_mut().open_terminal(cols, 12);
                 } else {
                     self.engine.borrow_mut().toggle_terminal();
@@ -2553,6 +2596,17 @@ impl SimpleComponent for App {
                         let _ = ctx.set_contents(text);
                     }
                 }
+            }
+            Msg::TerminalPasteClipboard => {
+                let text = if let Some(ref mut ctx) = self.clipboard {
+                    ctx.get_contents().ok()
+                } else {
+                    None
+                };
+                if let Some(text) = text {
+                    self.engine.borrow_mut().terminal_write(text.as_bytes());
+                }
+                self.redraw = true;
             }
             Msg::TerminalMouseDown { row, col } => {
                 if let Some(term) = self.engine.borrow_mut().terminal.as_mut() {
@@ -2704,12 +2758,22 @@ impl App {
         let line_height = self.cached_line_height;
         let tab_bar_height = line_height;
         let status_bar_height = line_height * 2.0;
+        let qf_px = if engine.quickfix_open && !engine.quickfix_items.is_empty() {
+            6.0 * line_height
+        } else {
+            0.0
+        };
+        let term_px = if engine.terminal_open {
+            13.0 * line_height
+        } else {
+            0.0
+        };
 
         let content_bounds = WindowRect::new(
             0.0,
             tab_bar_height,
             da_width,
-            da_height - tab_bar_height - status_bar_height - 10.0, // Reserve 10px for h-scrollbar
+            da_height - tab_bar_height - status_bar_height - qf_px - term_px - 10.0,
         );
 
         let window_rects = engine.calculate_window_rects(content_bounds);

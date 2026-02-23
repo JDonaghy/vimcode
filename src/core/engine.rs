@@ -9640,6 +9640,10 @@ impl Engine {
     /// Open the integrated terminal panel with the given dimensions.
     /// If already open, just focuses the terminal.
     pub fn open_terminal(&mut self, cols: u16, rows: u16) {
+        // Drop an exited pane so `:term` after Ctrl-D spawns a fresh shell.
+        if self.terminal.as_ref().map(|t| t.exited).unwrap_or(false) {
+            self.terminal = None;
+        }
         if self.terminal.is_none() {
             let shell = default_shell();
             match TerminalPane::new(cols, rows, &shell) {

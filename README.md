@@ -235,11 +235,15 @@ cargo fmt
 - The terminal is a **persistent bottom strip** (13 rows: 1 toolbar + 12 content rows) above the status bar
 - Shell is determined by the `$SHELL` environment variable, falling back to `/bin/bash`
 - Full **ANSI/VT100 color support** — 256-color xterm palette rendered cell-by-cell
-- **Mouse selection** — click and drag to select text; selection copied to clipboard
+- **Mouse selection** — click and drag to select text in the terminal content area
+- **Copy / Paste:**
+  - `Ctrl-Y` — copy the current mouse selection to the system clipboard
+  - `Ctrl-Shift-V` — paste from system clipboard into the running shell (GTK: intercepted by vimcode; TUI: Alacritty/kitty bracketed-paste is forwarded to the PTY automatically)
+  - Mouse-release auto-copies the selection to the clipboard (requires `xclip` or `xsel` on Linux/X11)
+- **Scrollback** — PageUp / PageDown scroll up to one screenful into the shell history; the scrollbar is draggable; `:term` after Ctrl-D spawns a fresh shell
 - **Nerd Font toolbar** — title bar with close (`󰅖`) button
 - **All keys forwarded to shell PTY** — Ctrl-C, Ctrl-D, Ctrl-L, Ctrl-Z, arrow keys, Tab, etc. work as expected
 - `Ctrl-T` while the terminal has focus **closes the panel** while keeping the shell session alive; reopening restores the same session
-- **Scrollbar** — right edge of the content area shows a live scrollbar; PageUp/PageDown scroll the offset (content display requires future scrollback ring buffer)
 - When the shell **exits** (Ctrl-D, `exit`, etc.) the panel closes automatically; clicking outside the terminal returns focus to the editor
 
 ---

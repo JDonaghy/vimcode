@@ -804,11 +804,8 @@ fn build_terminal_panel(engine: &Engine) -> Option<TerminalPanel> {
     let cols_count = term.cols as usize;
     let scroll_offset = term.scroll_offset;
     // Selection only valid when viewing the live screen (not scrolled).
-    // NOTE: vt100 0.15 exposes scrollback count via screen.scrollback() but does not
-    // expose individual scrollback cells. Proper scrollback display requires a custom
-    // ring buffer (planned for a future session). For now scroll_offset is tracked
-    // (so the header shows [SCROLLBACK]) but the visible content always shows the
-    // live screen rows.
+    // vt100::Parser::set_scrollback() is called whenever scroll_offset changes, so
+    // screen.cell() already reads the correct scrollback rows via visible_cell().
     let sel_bounds = if scroll_offset == 0 {
         term.selection.as_ref().map(normalize_term_selection)
     } else {
@@ -876,7 +873,11 @@ fn build_terminal_panel(engine: &Engine) -> Option<TerminalPanel> {
         has_focus: engine.terminal_has_focus,
         exited: term.exited,
         scroll_offset,
-        scrollback_rows: screen.scrollback(),
+        // Cap to one screenful: vt100 visible_rows() requires offset <= rows_len.
+        scrollback_rows: term
+            .lines_written
+            .saturating_sub(term.rows as usize)
+            .min(term.rows as usize),
     })
 }
 

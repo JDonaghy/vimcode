@@ -1,10 +1,10 @@
 # VimCode Project State
 
-**Last updated:** Feb 22, 2026 (Session 69)
+**Last updated:** Feb 22, 2026 (Session 70)
 
 ## Status
 
-**Integrated terminal panel:** VSCode-style bottom strip terminal backed by a real PTY; full VT100/256-color rendering; Ctrl-T toggle; `:term` command; auto-close on shell exit; scrollbar; click-to-refocus editor — 638 tests passing
+**Terminal polish (Session 70):** Scrollbar draggable in both GTK + TUI (correct direction, slides back to live view); copy (Ctrl+Y) and paste (Ctrl+Shift+V / bracketed paste) wired up in both backends; TUI scrollbar colored to match editor; GTK full-width terminal; GTK editor scrollbar no longer overlaps terminal — 638 tests passing
 
 ### Core Vim (Complete)
 - Seven modes (Normal/Insert/Visual/Visual Line/Visual Block/Command/Search)
@@ -284,6 +284,8 @@ cargo fmt
 - [x] **`:norm`** — execute normal command on a range of lines
 
 ## Recent Work
+**Session 70:** Terminal bug fixes — scrollbar thumb shrinks as content accumulates (`lines_written: usize` counter on `TerminalPane`, incremented in `poll()` as `max(scrollback + rows)`; `render.rs` uses it for `scrollback_rows`); `:term` after Ctrl-D now drops the dead pane (`exited = true` check at top of `open_terminal()`) and spawns a fresh shell. 638 tests (no change).
+
 **Session 69:** Terminal panel bug fixes + scrollbar — fixed TUI crash (clicking on terminal output caused panic: `build_screen_for_tui` didn't subtract quickfix/terminal rows from `content_rows`, so engine window rects extended into the terminal area; mouse clicks matched a window and called `engine.mouse_click()` with an OOB line number). Fixed TUI not-full-width (PTY was opened with editor-column width; changed to `terminal.size().ok().map(|s| s.width)`). Added scrollback tracking: `scroll_offset: usize` + `scroll_up/down/reset()` on `TerminalPane`; PageUp/PageDown in terminal focus changes offset (visual scrollback deferred — vt100 0.15 has no per-cell scrollback API). Added scrollbar: `scrollback_rows: usize` on `TerminalPanel`; TUI uses rightmost column (`░`/`█`); GTK draws a 6px Cairo strip. Fixed mouse click-to-focus: clicking outside the terminal panel clears `terminal_has_focus` in both backends. Fixed TUI mouse selection (click starts, drag extends). Auto-close on shell exit: `poll_terminal()` calls `close_terminal()` when `term.exited` is detected. 638 tests (no change).
 
 **Session 68:** Integrated terminal panel — new `src/core/terminal.rs` (`TerminalPane` backed by `portable-pty` + `vt100`; background mpsc reader thread; `poll()`, `write_input()`, `resize()`, `selected_text()`). Engine: `terminal: Option<TerminalPane>`, `terminal_open`, `terminal_has_focus`; `open_terminal()`, `close_terminal()`, `toggle_terminal()`, `poll_terminal()`, `terminal_write()`, `terminal_resize()`, `terminal_copy_selection()`; `EngineAction::OpenTerminal`; `:term`/`:terminal` command. Settings: `PanelKeys.open_terminal` (default `<C-t>`). Render: `TerminalCell`, `TermSelection`, `TerminalPanel`, `build_terminal_panel()`, `map_vt100_color()`, `xterm_256_color()`; `terminal: Option<TerminalPanel>` on `ScreenLayout`. GTK: `draw_terminal_panel()`, `gtk_key_to_pty_bytes()`, terminal Msg variants, key routing (panel key checked first; PTY byte routing when `terminal_has_focus`), `term_px` editor height reduction, SearchPollTick polling. TUI: `render_terminal_panel()`, `translate_key_to_pty()`, extra `Constraint::Length(terminal_height)` layout slot, key routing, `EngineAction::OpenTerminal` handling, idle poll, resize handler. 638 tests (no change — PTY requires subprocess, no unit tests in v1).

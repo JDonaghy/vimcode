@@ -31,6 +31,9 @@ pub struct TerminalPane {
     pub exited: bool,
     /// Rows scrolled up into the scrollback buffer (0 = at the live bottom).
     pub scroll_offset: usize,
+    /// Monotonically-increasing total line count: max(scrollback + rows) ever seen.
+    /// Used to compute a meaningful scrollbar thumb size even before the user scrolls.
+    pub lines_written: usize,
 }
 
 impl TerminalPane {
@@ -85,6 +88,7 @@ impl TerminalPane {
             selection: None,
             exited: false,
             scroll_offset: 0,
+            lines_written: rows as usize,
         })
     }
 
@@ -94,7 +98,19 @@ impl TerminalPane {
     pub fn poll(&mut self) -> bool {
         let mut got_data = false;
         while let Ok(data) = self.rx.try_recv() {
+            // Count raw newlines BEFORE processing so we have the byte slice available.
+            let newlines = data.iter().filter(|&&b| b == b'\n').count();
             self.parser.process(&data);
+            self.lines_written = self.lines_written.saturating_add(newlines);
+            // vt100 auto-increments scrollback_offset as new lines scroll in while the
+            // user is scrolled up (keeping the viewed content stable). Sync our field,
+            // but re-clamp: vt100's visible_rows() subtracts scrollback_offset from
+            // rows_len with plain usize arithmetic, so offset > rows causes a panic.
+            let raw = self.parser.screen().scrollback();
+            self.scroll_offset = raw.min(self.rows as usize);
+            if raw > self.rows as usize {
+                self.parser.set_scrollback(self.scroll_offset);
+            }
             got_data = true;
         }
         if !self.exited {
@@ -123,21 +139,36 @@ impl TerminalPane {
         // their own or we can add TIOCSWINSZ via nix if needed in the future.
     }
 
+    /// Set scroll offset and sync the vt100 parser so `screen.cell()` shows the
+    /// correct scrollback content.
+    ///
+    /// **vt100 limitation**: `visible_rows()` computes `rows_len - scrollback_offset`
+    /// with plain usize subtraction; exceeding `rows` (the PTY height) panics in
+    /// debug builds and wraps in release builds. We therefore cap the offset at
+    /// `rows` — the maximum is one screenful of history.
+    pub fn set_scroll_offset(&mut self, offset: usize) {
+        // Cap to one screenful (vt100 API limit) and to available history.
+        let history = self.lines_written.saturating_sub(self.rows as usize);
+        let max = (self.rows as usize).min(history);
+        self.scroll_offset = offset.min(max);
+        self.parser.set_scrollback(self.scroll_offset);
+    }
+
     /// Scroll up into scrollback by `rows` lines.
-    /// vt100::Screen::scrollback() returns the number of stored scrollback rows.
     pub fn scroll_up(&mut self, rows: usize) {
-        let max = self.parser.screen().scrollback();
-        self.scroll_offset = (self.scroll_offset + rows).min(max.max(1).saturating_sub(1));
+        let new_offset = self.scroll_offset.saturating_add(rows);
+        self.set_scroll_offset(new_offset);
     }
 
     /// Scroll down toward the live view by `rows` lines.
     pub fn scroll_down(&mut self, rows: usize) {
-        self.scroll_offset = self.scroll_offset.saturating_sub(rows);
+        let new_offset = self.scroll_offset.saturating_sub(rows);
+        self.set_scroll_offset(new_offset);
     }
 
     /// Return to the live view (scroll_offset = 0).
     pub fn scroll_reset(&mut self) {
-        self.scroll_offset = 0;
+        self.set_scroll_offset(0);
     }
 
     /// Extract selected text from the current VT100 screen.

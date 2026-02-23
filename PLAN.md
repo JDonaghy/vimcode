@@ -1,27 +1,20 @@
 # VimCode Implementation Plan
 
-## 🔴 Fix Next (Highest Priority — Session 70)
+## Recently Completed (Session 70)
 
-### Terminal: Scrollbar always full height
-The scrollbar thumb always fills the full height instead of shrinking as content accumulates.
-Root cause: `panel.scrollback_rows` comes from `screen.scrollback()` which returns 0 until lines
-actually scroll off the top of the 12-row vt100 screen. When output fits on-screen, no scrollback
-is recorded and the fallback `(0, content_rows)` always draws a full bar.
-Fix: track the total lines ever written (not just scrollback buffer count) — either maintain a
-`lines_written: usize` counter on `TerminalPane` incremented in `poll()` based on cursor row
-advancement, or derive a `total_rows = scroll_offset + content_rows` approximation from
-`scroll_offset` when scrollback count is zero. The thumb should shrink to
-`content_rows / total_rows` once output exceeds the panel height.
+### ✅ Terminal Scrollback, Copy/Paste, and Scrollbar Polish
 
-### Terminal: `:term` reopens zombie after Ctrl-D exit
-When the shell exits (Ctrl-D), `poll_terminal()` correctly sets `exited = true` and calls
-`close_terminal()` (sets `terminal_open = false`). However the `TerminalPane` with
-`exited = true` is left in `self.terminal`. When the user then types `:term`, `open_terminal()`
-sees `terminal_open == false` and `self.terminal.is_some()`, so it reopens the dead pane instead
-of spawning a fresh shell.
-Fix: in `open_terminal()`, check `self.terminal.as_ref().map(|t| t.exited).unwrap_or(false)`;
-if true, drop the old pane (`self.terminal = None`) before creating a new one. Alternatively,
-drop the pane inside `close_terminal()` when `exited` is true (since there's nothing to restore).
+- **Scrollback works** — `parser.set_scrollback(offset)` wired up in `set_scroll_offset()`; `scroll_up/down/reset` all sync the vt100 parser so `screen.cell()` returns history rows; `poll()` re-clamps after vt100 auto-increments; capped to one screenful (`rows`) per vt100 API constraint (`visible_rows()` panics if offset > rows_len)
+- **TUI scrollbar drag fixed** — `total` in drag state capped to `rows as usize`; ratio formula uses `row.saturating_sub(track_start).min(track_len)` so dragging to the bottom reaches `ratio = 1.0` → `offset = 0` (live view)
+- **TUI scrollbar color** — now matches editor scrollbar: thumb `Rgb(128,128,128)` / track `theme.separator` / bg `theme.background` (was using light status-bar fg for both)
+- **Copy (Ctrl+Y)** — copies terminal mouse-selection to system clipboard in both GTK and TUI; mouse-release auto-copies in TUI (via `clipboard_write` callback)
+- **Paste (Ctrl+Shift+V / bracketed paste)** — GTK: new `Msg::TerminalPasteClipboard` reads clipboard and writes to PTY; Ctrl+Shift+V intercepted before PTY routing; TUI: `Event::Paste(text)` (Alacritty/kitty bracketed paste) now routed to PTY when terminal has focus
+- **TUI terminal scrollbar drag** — `dragging_terminal_sb: Option<(track_start, track_len, total)>`; click on rightmost column starts drag; drag computes `scroll_offset = (1-ratio) * total`; MouseUp clears state
+- **GTK terminal scrollbar drag** — `terminal_sb_dragging: bool` on App; click in 6px right strip starts drag; MouseUp clears state
+- **GTK terminal full-width** — `ToggleTerminal` uses actual DA width / `cached_char_width` (not hardcoded `200.0`)
+- **GTK editor scrollbar overlapping terminal** — `sync_scrollbar()` subtracts `qf_px + term_px` from `content_bounds`
+- **`:term` spawns fresh shell after Ctrl-D** — `open_terminal()` drops dead (exited) pane before `is_none()` guard
+- Tests: 638 → 638 (no change — PTY requires subprocess)
 
 ---
 

@@ -477,6 +477,9 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
     let mut dragging_scrollbar: Option<ScrollDragState> = None;
     // Non-None while user is dragging the search-results scrollbar thumb
     let mut dragging_sidebar_search: Option<SidebarScrollDrag> = None;
+    // Non-None while user is dragging the terminal panel's scrollbar thumb.
+    // Stores (track_start_row, track_len, total_scrollback_rows).
+    let mut dragging_terminal_sb: Option<(u16, u16, usize)> = None;
     // Cache of the last rendered layout for mouse hit-testing
     let mut last_layout: Option<render::ScreenLayout> = None;
     // Double-click detection state
@@ -1088,6 +1091,28 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                                 needs_redraw = true;
                                 continue;
                             }
+                            // Ctrl+Y: copy terminal selection to clipboard.
+                            if ctrl && matches!(code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+                                let text = engine.terminal.as_ref().and_then(|t| t.selected_text());
+                                if let Some(ref text) = text {
+                                    if let Some(ref cb) = engine.clipboard_write {
+                                        let _ = cb(text);
+                                    }
+                                    engine.message = "Copied".to_string();
+                                }
+                                needs_redraw = true;
+                                continue;
+                            }
+                            // Ctrl+Shift+V (crossterm: Ctrl+uppercase-V): paste clipboard to PTY.
+                            if ctrl && matches!(code, KeyCode::Char('V')) {
+                                if let Some(ref cb) = engine.clipboard_read {
+                                    if let Ok(text) = cb() {
+                                        engine.terminal_write(text.as_bytes());
+                                    }
+                                }
+                                needs_redraw = true;
+                                continue;
+                            }
                             // Any other key resets scroll (returns to live view) and forwards.
                             engine.terminal_scroll_reset();
                             let data = translate_key_to_pty(key_event);
@@ -1289,6 +1314,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                                 &mut dragging_sidebar,
                                 &mut dragging_scrollbar,
                                 &mut dragging_sidebar_search,
+                                &mut dragging_terminal_sb,
                                 last_layout.as_ref(),
                                 &mut sidebar_prompt,
                                 &mut last_click_time,
@@ -1311,6 +1337,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                     &mut dragging_sidebar,
                     &mut dragging_scrollbar,
                     &mut dragging_sidebar_search,
+                    &mut dragging_terminal_sb,
                     last_layout.as_ref(),
                     &mut sidebar_prompt,
                     &mut last_click_time,
@@ -1319,7 +1346,13 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                 );
             }
             Event::Paste(text) => {
-                // Bracketed paste — text delivered directly from the terminal.
+                // Bracketed paste — text delivered directly from the terminal emulator.
+                // When the embedded terminal panel has focus, forward directly to the PTY.
+                if engine.terminal_has_focus {
+                    engine.terminal_write(text.as_bytes());
+                    needs_redraw = true;
+                    continue;
+                }
                 use crate::core::Mode;
                 match engine.mode {
                     Mode::Command | Mode::Search => {
@@ -1368,6 +1401,7 @@ fn handle_mouse(
     dragging_sidebar: &mut bool,
     dragging_scrollbar: &mut Option<ScrollDragState>,
     dragging_sidebar_search: &mut Option<SidebarScrollDrag>,
+    dragging_terminal_sb: &mut Option<(u16, u16, usize)>,
     last_layout: Option<&render::ScreenLayout>,
     sidebar_prompt: &mut Option<SidebarPrompt>,
     last_click_time: &mut Instant,
@@ -1406,6 +1440,21 @@ fn handle_mouse(
                     let new_scroll = (ratio * drag.total as f64) as usize;
                     sidebar.search_scroll_top =
                         new_scroll.min(drag.total.saturating_sub(drag.track_len as usize));
+                }
+                return sidebar_width;
+            }
+            // Terminal scrollbar drag
+            if let Some((track_start, track_len, total)) = *dragging_terminal_sb {
+                if track_len > 0 && total > 0 {
+                    // Use saturating_sub + min(track_len) so ratio reaches exactly 1.0
+                    // at the bottom of the track (allowing scroll_offset to reach 0).
+                    let offset_in_track = row.saturating_sub(track_start).min(track_len) as f64;
+                    let ratio = offset_in_track / track_len as f64;
+                    // top (ratio=0) → max offset; bottom (ratio=1) → 0 (live view)
+                    let new_offset = ((1.0 - ratio) * total as f64) as usize;
+                    if let Some(term) = engine.terminal.as_mut() {
+                        term.set_scroll_offset(new_offset);
+                    }
                 }
                 return sidebar_width;
             }
@@ -1485,8 +1534,18 @@ fn handle_mouse(
             *dragging_sidebar = false;
             *dragging_scrollbar = None;
             *dragging_sidebar_search = None;
+            *dragging_terminal_sb = None;
             *mouse_text_drag = false;
             engine.mouse_drag_active = false;
+            // Auto-copy terminal selection to clipboard on mouse-release.
+            if engine.terminal_has_focus {
+                let text = engine.terminal.as_ref().and_then(|t| t.selected_text());
+                if let Some(ref text) = text {
+                    if let Some(ref cb) = engine.clipboard_write {
+                        let _ = cb(text);
+                    }
+                }
+            }
             return sidebar_width;
         }
         // Scroll wheel — sidebar or editor
@@ -1605,17 +1664,38 @@ fn handle_mouse(
                 // Header row — just focus the terminal.
                 engine.terminal_has_focus = true;
             } else {
-                // Content row — start a selection.
-                let term_row = row - term_strip_top - 1;
+                // Content row — check for scrollbar click first.
+                let term_width = terminal_size.map(|s| s.width).unwrap_or(80);
+                let sb_col = term_width.saturating_sub(1);
                 engine.terminal_has_focus = true;
-                engine.terminal_scroll_reset();
-                if let Some(term) = engine.terminal.as_mut() {
-                    term.selection = Some(crate::core::terminal::TermSelection {
-                        start_row: term_row,
-                        start_col: col,
-                        end_row: term_row,
-                        end_col: col,
-                    });
+                if col == sb_col {
+                    // Scrollbar column — start drag.
+                    let track_start = term_strip_top + 1;
+                    let track_len = strip_rows.saturating_sub(1); // content rows
+                                                                  // Cap total to one screenful (vt100 API limit) so the drag range
+                                                                  // [0, total] exactly matches what set_scroll_offset can deliver.
+                    let total = engine
+                        .terminal
+                        .as_ref()
+                        .map(|t| {
+                            t.lines_written
+                                .saturating_sub(t.rows as usize)
+                                .min(t.rows as usize)
+                        })
+                        .unwrap_or(0);
+                    *dragging_terminal_sb = Some((track_start, track_len, total));
+                } else {
+                    // Content area — start a selection.
+                    let term_row = row - term_strip_top - 1;
+                    engine.terminal_scroll_reset();
+                    if let Some(term) = engine.terminal.as_mut() {
+                        term.selection = Some(crate::core::terminal::TermSelection {
+                            start_row: term_row,
+                            start_col: col,
+                            end_row: term_row,
+                            end_col: col,
+                        });
+                    }
                 }
             }
             return sidebar_width;
@@ -4376,11 +4456,11 @@ fn render_terminal_panel(
     } else {
         let thumb_h = ((content_rows * content_rows) / total).max(1);
         let max_off = panel.scrollback_rows;
-        let thumb_top = if panel.scroll_offset == 0 {
-            content_rows.saturating_sub(thumb_h)
-        } else {
-            let frac = panel.scroll_offset.min(max_off);
-            (frac * content_rows.saturating_sub(thumb_h)) / max_off
+        // scroll_offset=0 → thumb at bottom (live view); max_off → thumb at top.
+        let max_top = content_rows.saturating_sub(thumb_h);
+        let thumb_top = {
+            let frac = 1.0 - (panel.scroll_offset as f64 / max_off as f64).min(1.0);
+            (frac * max_top as f64) as usize
         };
         (thumb_top, (thumb_top + thumb_h).min(content_rows))
     };
@@ -4436,13 +4516,20 @@ fn render_terminal_panel(
             }
         }
 
-        // Scrollbar column
-        let sb_char = if row_idx >= thumb_start && row_idx < thumb_end {
-            '█'
+        // Scrollbar column — same colors as the editor scrollbar.
+        let (sb_char, sb_fg) = if row_idx >= thumb_start && row_idx < thumb_end {
+            ('█', RColor::Rgb(128, 128, 128))
         } else {
-            '░'
+            ('░', rc(theme.separator))
         };
-        set_cell(buf, sb_col, screen_row, sb_char, hdr_fg, hdr_bg);
+        set_cell(
+            buf,
+            sb_col,
+            screen_row,
+            sb_char,
+            sb_fg,
+            rc(theme.background),
+        );
     }
 }
 
