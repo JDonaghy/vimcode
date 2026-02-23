@@ -9678,7 +9678,8 @@ impl Engine {
     pub fn terminal_new_tab(&mut self, cols: u16, rows: u16) {
         let shell = default_shell();
         let cwd = self.cwd.clone();
-        match TerminalPane::new(cols, rows, &shell, &cwd) {
+        let history_cap = self.settings.terminal_scrollback_lines;
+        match TerminalPane::new(cols, rows, &shell, &cwd, history_cap) {
             Ok(pane) => {
                 self.terminal_panes.push(pane);
                 self.terminal_active = self.terminal_panes.len() - 1;

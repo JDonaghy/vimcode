@@ -4,9 +4,6 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver};
 
-/// Maximum number of historical rows stored per pane.
-const HISTORY_CAPACITY: usize = 5_000;
-
 /// A single captured terminal cell stored in the history ring buffer.
 /// Uses vt100::Color to avoid duplicating the 256-colour palette lookup.
 #[derive(Clone, Copy)]
@@ -69,6 +66,8 @@ pub struct TerminalPane {
     /// Ring buffer of captured historical rows (oldest at index 0).
     /// Populated by `poll()` as lines scroll off the vt100 live screen.
     pub history: VecDeque<Vec<HistCell>>,
+    /// Maximum number of rows kept in `history` (from settings).
+    history_capacity: usize,
 }
 
 impl TerminalPane {
@@ -81,6 +80,7 @@ impl TerminalPane {
         rows: u16,
         shell: &str,
         cwd: &Path,
+        history_capacity: usize,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
@@ -135,6 +135,7 @@ impl TerminalPane {
             exited: false,
             scroll_offset: 0,
             history: VecDeque::new(),
+            history_capacity,
         })
     }
 
@@ -220,7 +221,7 @@ impl TerminalPane {
                         None => HistCell::default(),
                     })
                     .collect();
-                if self.history.len() >= HISTORY_CAPACITY {
+                if self.history_capacity > 0 && self.history.len() >= self.history_capacity {
                     self.history.pop_front();
                 }
                 self.history.push_back(row);

@@ -78,6 +78,11 @@ pub struct Settings {
     #[serde(default = "default_lsp_enabled")]
     pub lsp_enabled: bool,
 
+    /// Number of lines kept in the integrated terminal's scrollback history.
+    /// Increase for commands that produce very long output. Default: 5000.
+    #[serde(default = "default_terminal_scrollback_lines")]
+    pub terminal_scrollback_lines: usize,
+
     /// User-configured LSP server overrides/additions
     #[serde(default)]
     pub lsp_servers: Vec<crate::core::lsp::LspServerConfig>,
@@ -125,6 +130,10 @@ fn default_shift_width() -> u8 {
 
 fn default_lsp_enabled() -> bool {
     true // Default: enabled
+}
+
+fn default_terminal_scrollback_lines() -> usize {
+    5000
 }
 
 // ── Explorer key defaults ──────────────────────────────────────────────────
@@ -350,6 +359,7 @@ impl Default for Settings {
             shift_width: default_shift_width(),
             lsp_enabled: default_lsp_enabled(),
             lsp_servers: Vec::new(),
+            terminal_scrollback_lines: default_terminal_scrollback_lines(),
             explorer_keys: ExplorerKeys::default(),
             panel_keys: PanelKeys::default(),
             completion_keys: CompletionKeys::default(),
