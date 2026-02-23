@@ -1134,6 +1134,31 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                                 needs_redraw = true;
                                 continue;
                             }
+                            // Ctrl+F: toggle terminal inline find bar.
+                            if ctrl && matches!(code, KeyCode::Char('f') | KeyCode::Char('F')) {
+                                if engine.terminal_find_active {
+                                    engine.terminal_find_close();
+                                } else {
+                                    engine.terminal_find_open();
+                                }
+                                needs_redraw = true;
+                                continue;
+                            }
+                            // Terminal find bar key routing (all other keys go here when active).
+                            if engine.terminal_find_active {
+                                match code {
+                                    KeyCode::Esc => engine.terminal_find_close(),
+                                    KeyCode::Enter if mods.contains(KeyModifiers::SHIFT) => {
+                                        engine.terminal_find_prev()
+                                    }
+                                    KeyCode::Enter => engine.terminal_find_next(),
+                                    KeyCode::Backspace => engine.terminal_find_backspace(),
+                                    KeyCode::Char(ch) if !ctrl => engine.terminal_find_char(ch),
+                                    _ => {}
+                                }
+                                needs_redraw = true;
+                                continue;
+                            }
                             // Any other key resets scroll (returns to live view) and forwards.
                             engine.terminal_scroll_reset();
                             let data = translate_key_to_pty(key_event);
@@ -1402,7 +1427,8 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
             }
             Event::Resize(new_w, _new_h) => {
                 // Resize the terminal PTY to match the full new terminal width.
-                engine.terminal_resize(new_w, 12);
+                let term_rows = engine.session.terminal_panel_rows;
+                engine.terminal_resize(new_w, term_rows);
             }
             _ => {}
         }
@@ -1737,11 +1763,7 @@ fn handle_mouse(
                                                                   // [0, total] exactly matches what set_scroll_offset can deliver.
                     let total = engine
                         .active_terminal()
-                        .map(|t| {
-                            t.lines_written
-                                .saturating_sub(t.rows as usize)
-                                .min(t.rows as usize)
-                        })
+                        .map(|t| t.history.len())
                         .unwrap_or(0);
                     *dragging_terminal_sb = Some((track_start, track_len, total));
                 } else {
@@ -4500,49 +4522,76 @@ fn render_terminal_panel(
         set_cell(buf, x, area.y, ' ', hdr_fg, hdr_bg);
     }
 
-    // Tab strip — each tab is exactly 4 chars: "[N] "
-    const TERMINAL_TAB_COLS: u16 = 4;
-    let mut cursor_x = area.x;
-    for i in 0..panel.tab_count {
-        let label: Vec<char> = format!("[{}] ", i + 1).chars().collect();
-        let (tab_fg, tab_bg) = if i == panel.active_tab {
-            (hdr_bg, hdr_fg) // inverted for active tab
-        } else {
-            (hdr_fg, hdr_bg)
-        };
-        for (j, &ch) in label.iter().enumerate().take(TERMINAL_TAB_COLS as usize) {
-            let x = cursor_x + j as u16;
-            if x >= area.x + area.width {
-                break;
+    if panel.find_active {
+        // Find bar mode: show query and match count in toolbar
+        let match_info = if panel.find_match_count == 0 {
+            if panel.find_query.is_empty() {
+                String::new()
+            } else {
+                " (no matches)".to_string()
             }
-            set_cell(buf, x, area.y, ch, tab_fg, tab_bg);
-        }
-        cursor_x += TERMINAL_TAB_COLS;
-        if cursor_x >= area.x + area.width {
-            break;
-        }
-    }
-
-    // If no tabs yet, show minimal title
-    if panel.tab_count == 0 {
-        for (i, ch) in " TERMINAL".chars().enumerate().take(area.width as usize) {
+        } else {
+            format!(
+                " ({}/{})",
+                panel.find_selected_idx + 1,
+                panel.find_match_count
+            )
+        };
+        let find_str = format!(" FIND: {}█{}", panel.find_query, match_info);
+        let max_chars = area.width.saturating_sub(3) as usize;
+        for (i, ch) in find_str.chars().enumerate().take(max_chars) {
             set_cell(buf, area.x + i as u16, area.y, ch, hdr_fg, hdr_bg);
         }
-    }
+        // Close icon right-aligned
+        for (i, ch) in NF_TERMINAL_CLOSE.chars().enumerate() {
+            let x = area.x + area.width.saturating_sub(1 + i as u16);
+            set_cell(buf, x, area.y, ch, hdr_fg, hdr_bg);
+        }
+    } else {
+        // Tab strip — each tab is exactly 4 chars: "[N] "
+        const TERMINAL_TAB_COLS: u16 = 4;
+        let mut cursor_x = area.x;
+        for i in 0..panel.tab_count {
+            let label: Vec<char> = format!("[{}] ", i + 1).chars().collect();
+            let (tab_fg, tab_bg) = if i == panel.active_tab {
+                (hdr_bg, hdr_fg) // inverted for active tab
+            } else {
+                (hdr_fg, hdr_bg)
+            };
+            for (j, &ch) in label.iter().enumerate().take(TERMINAL_TAB_COLS as usize) {
+                let x = cursor_x + j as u16;
+                if x >= area.x + area.width {
+                    break;
+                }
+                set_cell(buf, x, area.y, ch, tab_fg, tab_bg);
+            }
+            cursor_x += TERMINAL_TAB_COLS;
+            if cursor_x >= area.x + area.width {
+                break;
+            }
+        }
 
-    // Right-aligned icons
-    let icons = format!("{}  {}", NF_TERMINAL_SPLIT, NF_TERMINAL_CLOSE);
-    let icon_chars: Vec<char> = icons.chars().collect();
-    let icon_start = area.width.saturating_sub(icon_chars.len() as u16 + 1);
-    for (i, &ch) in icon_chars.iter().enumerate() {
-        set_cell(
-            buf,
-            area.x + icon_start + i as u16,
-            area.y,
-            ch,
-            hdr_fg,
-            hdr_bg,
-        );
+        // If no tabs yet, show minimal title
+        if panel.tab_count == 0 {
+            for (i, ch) in " TERMINAL".chars().enumerate().take(area.width as usize) {
+                set_cell(buf, area.x + i as u16, area.y, ch, hdr_fg, hdr_bg);
+            }
+        }
+
+        // Right-aligned icons
+        let icons = format!("{}  {}", NF_TERMINAL_SPLIT, NF_TERMINAL_CLOSE);
+        let icon_chars: Vec<char> = icons.chars().collect();
+        let icon_start = area.width.saturating_sub(icon_chars.len() as u16 + 1);
+        for (i, &ch) in icon_chars.iter().enumerate() {
+            set_cell(
+                buf,
+                area.x + icon_start + i as u16,
+                area.y,
+                ch,
+                hdr_fg,
+                hdr_bg,
+            );
+        }
     }
 
     // ── Scrollbar geometry ────────────────────────────────────────────────────
@@ -4590,6 +4639,12 @@ fn render_terminal_panel(
 
                 let (draw_fg, draw_bg) = if cell.is_cursor || cell.selected {
                     (bg, fg) // Reverse video for cursor / selection
+                } else if cell.is_find_active {
+                    // Active find match: black text on orange
+                    (RColor::Rgb(0, 0, 0), RColor::Rgb(255, 165, 0))
+                } else if cell.is_find_match {
+                    // Other find matches: yellow text on dark amber
+                    (RColor::Rgb(255, 220, 0), RColor::Rgb(80, 65, 0))
                 } else {
                     (fg, bg)
                 };

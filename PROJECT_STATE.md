@@ -1,8 +1,10 @@
 # VimCode Project State
 
-**Last updated:** Feb 23, 2026 (Session 74)
+**Last updated:** Feb 23, 2026 (Session 75)
 
 ## Status
+
+**Terminal history, resize, and CWD (Session 75):** Three bugs fixed. (1) Deep history: `TerminalPane` now has a `history: VecDeque<Vec<HistCell>>` ring buffer (capacity 5000) that captures rows as they scroll off the vt100 live screen. `process_with_capture()` splits PTY output into chunks of ≤rows newlines; `capture_scrolled_rows()` safely calls `set_scrollback(N ≤ rows)`, reads the just-scrolled-off rows into `history`, then restores `set_scrollback(0)`. `build_terminal_panel()` merges history rows (at scroll_offset N: rows 0..N from `history[hist_len-N+i]`) and live vt100 rows (rows N..=rows from `screen.cell(i-N, c)`). `terminal_find_update_matches()` now searches `history` VecDeque directly (no more `set_scrollback` abuse). (2) Real PTY resize: `TerminalPane` keeps `master: Box<dyn MasterPty + Send>` and `resize()` now calls `self.master.resize(PtySize{…})` to send SIGWINCH to the shell. GTK `Msg::Resize` now calls `terminal_resize(cols, rows)` on open panes. TUI `Event::Resize` now uses `engine.session.terminal_panel_rows` instead of hardcoded `12`. (3) CWD fix: `terminal_new_tab()` passes `self.cwd.clone()` to `TerminalPane::new()` which calls `cmd.cwd(cwd)`. 638 tests.
 
 **Terminal find bug fixes (Session 74):** Two bugs fixed. (1) Find now scans scrollback history: `terminal_find_matches` changed from `Vec<(u16, u16)>` to `Vec<(usize, u16, u16)>` (required_scroll_offset, row, col); `terminal_find_update_matches()` scans at `max_offset` (oldest) AND `0` (live), deduplicating by absolute line number; `terminal_find_next/prev()` now also calls `term.set_scroll_offset(req_offset)` to scroll to the match; `build_terminal_panel()` maps matches to visible rows using `visible_row = mr + current_offset - moffset`. (2) GTK terminal content area: added full-width background fill `(30,30,30)` before drawing cells; added `CacheFontMetrics` auto-resize that calls `terminal_resize()` when char_width changes by >0.5px. 638 tests.
 

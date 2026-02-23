@@ -1,5 +1,29 @@
 # VimCode Implementation Plan
 
+## Recently Completed (Session 75)
+
+### ✅ Terminal History, Resize, and CWD
+
+- **`terminal.rs`** — `HistCell { ch, fg: vt100::Color, bg: vt100::Color, bold, italic, underline }` + `history: VecDeque<Vec<HistCell>>` (5000-row ring buffer) added to `TerminalPane`; `lines_written` removed; `new()` gains `cwd: &Path` param + `cmd.cwd(cwd)`; `master: Box<dyn MasterPty + Send>` stored for resize; `poll()` calls `process_with_capture()` which splits data into ≤rows-newline chunks and calls `capture_scrolled_rows()` between chunks; `capture_scrolled_rows()` safely reads scrolled-off rows via `set_scrollback(N ≤ rows)` → copies into `history` → restores `set_scrollback(0)`; `resize()` now calls `self.master.resize(PtySize{…})` for real SIGWINCH; `set_scroll_offset()` caps at `history.len()`
+- **`engine.rs`** — `terminal_new_tab()` passes `self.cwd.clone()` to `TerminalPane::new()`; `terminal_find_update_matches()` rewritten to search `history` VecDeque directly (no `set_scrollback` abuse): history matches get `required_offset = hist_len - hist_idx`, live matches get `required_offset = 0`
+- **`render.rs`** — `build_terminal_panel()` rewritten: at `scroll_offset = N`, rows 0..N come from `history[hist_len-N+i]` (HistCell → TerminalCell via `map_vt100_color`), rows N..rows come from `screen.cell(i-N, c)` at scrollback=0; `scrollback_rows = hist_len` (accurate deep history count)
+- **`main.rs` (GTK)** — `Msg::Resize` now calls `terminal_resize(cols, rows)` on open panes; `terminal_sb_dragging` code updated from `lines_written` to `history.len()`
+- **`tui_main.rs`** — `Event::Resize` uses `engine.session.terminal_panel_rows` instead of hardcoded `12`; scrollbar drag `total` updated from `lines_written` formula to `history.len()`
+- Tests: 638 → 638 (no change — PTY features not unit-testable in isolation)
+
+---
+
+## Recently Completed (Session 73)
+
+### ✅ Terminal Find (Ctrl+F in terminal panel)
+
+- **`engine.rs`** — 4 new fields: `terminal_find_active`, `terminal_find_query`, `terminal_find_selected`, `terminal_find_matches: Vec<(u16, u16)>`; 7 new methods: `terminal_find_open()`, `terminal_find_close()`, `terminal_find_char(ch)`, `terminal_find_backspace()`, `terminal_find_next()`, `terminal_find_prev()`, `terminal_find_update_matches()` (private); `poll_terminal()` re-runs `terminal_find_update_matches()` when find is active so matches stay fresh as new output arrives
+- **`render.rs`** — `TerminalCell` gains `is_find_match: bool` + `is_find_active: bool`; `TerminalPanel` gains `find_active`, `find_query`, `find_match_count`, `find_selected_idx`; `build_terminal_panel()` applies find highlighting after building cell grid (case-insensitive char-by-char scan of each screen row)
+- **`main.rs` (GTK)** — 6 new `Msg` variants (`TerminalFindOpen/Close/Char/Backspace/Next/Prev`); Ctrl+F check reordered so terminal gets priority over editor find dialog when `terminal_has_focus`; find-active key routing in `terminal_has_focus` block; `draw_terminal_panel()` renders inline find bar (query + match count) in toolbar when `find_active`; active-match cells orange bg/black fg; other-match cells dark-amber bg
+- **`tui_main.rs`** — find key routing in `terminal_has_focus` block; `render_terminal_panel()` renders find bar when `find_active`; cell highlights match GTK
+
+---
+
 ## Recently Completed (Session 72)
 
 ### ✅ Terminal Multiple Tabs
@@ -545,10 +569,12 @@
 
 ### Terminal & Debugger
 - [x] **Integrated terminal** — VSCode-style 13-row bottom panel; `portable-pty` + `vt100`; Ctrl-T toggle + `:term` command; full 256-color cell rendering; mouse selection; Nerd Font toolbar; shell session persists on close (session 68)
-- [ ] **Terminal: multiple tabs** — tab strip in toolbar; `Vec<TerminalPane>`; Ctrl-T N to switch
-- [ ] **Terminal: draggable panel height** — same GestureDrag pattern as sidebar resize
-- [ ] **Terminal: scrollback navigation** — ring buffer of completed rows + scroll_offset; PgUp/PgDn while focused
-- [ ] **Terminal: TUI Ctrl+F find** — general-purpose find dialog in TUI (currently GTK-only)
+- [x] **Terminal: multiple tabs** — tab strip in toolbar; `Vec<TerminalPane>`; Alt-1–9 / click `[N]` to switch; auto-close on shell exit (session 72)
+- [x] **Terminal: draggable panel height** — drag header row to resize; `session.terminal_panel_rows` persisted; clamped [5, 30] (session 71)
+- [x] **Terminal: scrollback navigation** — `scroll_offset` + vt100 `set_scrollback()`; PgUp/PgDn while focused; scrollbar thumb tracks position (session 70)
+- [x] **Terminal: find in panel** — Ctrl+F while terminal focused opens an inline find bar in the toolbar row; live match highlighting (orange active, amber others); Enter/Shift+Enter navigate matches; Escape closes
+- [ ] **Terminal: button bar (Add / Split / Trash)** — make the inert Nerd Font toolbar buttons functional: `+`/`󰐕` creates a new tab (same as `:term`); `⊞`/`󰤼` opens a horizontal split showing two panes side-by-side; `✕`/`󰅖` closes the active tab; click detection for both GTK and TUI backends
+- [ ] **Terminal: horizontal split view** — two terminal panes side-by-side within the panel strip; independent PTY sessions; mouse click or Ctrl+W to switch active pane; draggable divider between panes
 - [ ] **Debugger (DAP)** — Debug Adapter Protocol client (analogous to LSP but for debugging); auto-detect `codelldb`, `debugpy`, `js-debug`; breakpoints set with `<F9>` or `:Breakpoint`; step over/in/out (`<F10>`/`<F11>`/`<F12>`); call stack + variables panel in sidebar; inline variable values shown as virtual text; status bar shows current debug state
 
 ### UI & Menus

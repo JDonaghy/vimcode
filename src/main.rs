@@ -1808,6 +1808,14 @@ impl SimpleComponent for App {
                 self.redraw = !self.redraw;
             }
             Msg::Resize => {
+                // Propagate window resize to open terminal panes.
+                if !self.engine.borrow().terminal_panes.is_empty() {
+                    if let Some(da) = self.drawing_area.borrow().as_ref() {
+                        let cols = ((da.width() as f64 / self.cached_char_width) as u16).max(40);
+                        let rows = self.engine.borrow().session.terminal_panel_rows;
+                        self.engine.borrow_mut().terminal_resize(cols, rows);
+                    }
+                }
                 self.redraw = !self.redraw;
             }
             Msg::MouseClick {
@@ -1927,10 +1935,10 @@ impl SimpleComponent for App {
                         self.redraw = true;
                     }
                 } else if self.terminal_sb_dragging {
-                    let (term_rows, lines_written) = {
+                    let (term_rows, scrollback_rows) = {
                         let engine = self.engine.borrow();
                         if let Some(term) = engine.active_terminal() {
-                            (term.rows, term.lines_written)
+                            (term.rows, term.history.len())
                         } else {
                             (0, 0)
                         }
@@ -1943,7 +1951,6 @@ impl SimpleComponent for App {
                         let term_y = height - status_h - term_px;
                         let content_y = term_y + self.cached_line_height;
                         let content_h = term_px - self.cached_line_height;
-                        let scrollback_rows = lines_written.saturating_sub(term_rows as usize);
                         if scrollback_rows > 0 && content_h > 0.0 {
                             let y_rel = (y - content_y).clamp(0.0, content_h);
                             let frac = y_rel / content_h;

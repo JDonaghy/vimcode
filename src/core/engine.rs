@@ -9674,10 +9674,11 @@ impl Engine {
         }
     }
 
-    /// Create a new terminal tab (always spawns a fresh shell).
+    /// Create a new terminal tab (always spawns a fresh shell in the editor's CWD).
     pub fn terminal_new_tab(&mut self, cols: u16, rows: u16) {
         let shell = default_shell();
-        match TerminalPane::new(cols, rows, &shell) {
+        let cwd = self.cwd.clone();
+        match TerminalPane::new(cols, rows, &shell, &cwd) {
             Ok(pane) => {
                 self.terminal_panes.push(pane);
                 self.terminal_active = self.terminal_panes.len() - 1;
@@ -9861,18 +9862,15 @@ impl Engine {
         }
     }
 
-    /// Scan the active pane's vt100 screen (and its accessible scrollback) and rebuild
-    /// `terminal_find_matches`. Case-insensitive.
+    /// Scan the entire history buffer and the live vt100 screen, rebuilding
+    /// `terminal_find_matches`.  Case-insensitive.
     ///
-    /// vt100 0.15 exposes at most one screenful of scrollback: calling
-    /// `parser.set_scrollback(N)` (where N ≤ rows) moves the viewport N lines back into
-    /// history so that `screen.cell(r, c)` returns historical content. We therefore scan
-    /// at `scroll_offset = max_offset` (oldest accessible) AND `scroll_offset = 0`
-    /// (newest / live), deduplicating by absolute line number to avoid double-counting
-    /// overlapping rows when `max_offset < rows`.
+    /// Matches are `(required_scroll_offset, row, col)` where:
+    /// - History match at `history[H]`: required_offset = `history.len() - H`, row = 0.
+    ///   Formula: visible_row = row + current_offset − required_offset.
+    /// - Live match at vt100 row R:    required_offset = 0, row = R.
     ///
-    /// Matches are stored as `(required_scroll_offset, row, col)` so that navigation
-    /// can scroll the pane to show the match.
+    /// Sorted oldest-first (highest required_offset first, then top-to-bottom).
     fn terminal_find_update_matches(&mut self) {
         self.terminal_find_matches.clear();
         if !self.terminal_find_active || self.terminal_find_query.is_empty() {
@@ -9881,76 +9879,64 @@ impl Engine {
         let q_lower: Vec<char> = self.terminal_find_query.to_lowercase().chars().collect();
         let qlen = q_lower.len();
         let active_idx = self.terminal_active;
-        let term = match self.terminal_panes.get_mut(active_idx) {
+        let term = match self.terminal_panes.get(active_idx) {
             Some(t) => t,
             None => return,
         };
 
-        let saved_offset = term.scroll_offset;
-        let rows = term.rows;
-        let cols = term.cols;
-        let history = term.lines_written.saturating_sub(rows as usize);
-        let max_offset = (rows as usize).min(history);
-
         let mut matches: Vec<(usize, u16, u16)> = Vec::new();
-        // Track which absolute lines (0 = bottom live row) we have already scanned.
-        let mut seen_abs: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let hist_len = term.history.len();
 
-        // Scan oldest-accessible content first, then the live view.
-        let scan_offsets: &[usize] = if max_offset == 0 {
-            &[0]
-        } else {
-            &[max_offset, 0]
-        };
-
-        for &offset in scan_offsets {
-            term.parser.set_scrollback(offset);
-            // Collect all row text at this scrollback position (drop `screen` borrow before
-            // we call set_scrollback again in the next iteration).
-            let row_data: Vec<Vec<char>> = {
-                let screen = term.parser.screen();
-                (0..rows)
-                    .map(|r| {
-                        (0..cols)
-                            .map(|c| {
-                                let ch = screen
-                                    .cell(r, c)
-                                    .map(|cell| {
-                                        let s = cell.contents();
-                                        if s.is_empty() {
-                                            ' '
-                                        } else {
-                                            s.chars().next().unwrap_or(' ')
-                                        }
-                                    })
-                                    .unwrap_or(' ');
-                                ch.to_lowercase().next().unwrap_or(ch)
-                            })
-                            .collect()
-                    })
-                    .collect()
-            };
-
-            for (r_idx, row_lower) in row_data.iter().enumerate() {
-                // Absolute line from the bottom of the live view (0 = bottom).
-                let abs_line = offset + (rows as usize - 1 - r_idx);
-                if !seen_abs.insert(abs_line) {
-                    continue; // Already processed this physical line in an earlier pass.
-                }
-                if qlen <= row_lower.len() {
-                    for c in 0..=(row_lower.len() - qlen) {
-                        if row_lower[c..c + qlen] == q_lower[..] {
-                            matches.push((offset, r_idx as u16, c as u16));
-                        }
+        // ── History rows (oldest → newest) ──────────────────────────────────
+        for (hist_idx, hist_row) in term.history.iter().enumerate() {
+            let required_offset = hist_len - hist_idx;
+            let row_lower: Vec<char> = hist_row
+                .iter()
+                .map(|cell| {
+                    let ch = cell.ch;
+                    ch.to_lowercase().next().unwrap_or(ch)
+                })
+                .collect();
+            if qlen <= row_lower.len() {
+                for c in 0..=(row_lower.len() - qlen) {
+                    if row_lower[c..c + qlen] == q_lower[..] {
+                        matches.push((required_offset, 0, c as u16));
                     }
                 }
             }
         }
 
-        // Restore the user's original scroll position.
-        term.parser.set_scrollback(saved_offset);
+        // ── Live vt100 rows (always at scrollback_offset = 0) ───────────────
+        let cols = term.cols;
+        let rows = term.rows;
+        let screen = term.parser.screen();
+        for r in 0..rows {
+            let row_lower: Vec<char> = (0..cols)
+                .map(|c| {
+                    let ch = screen
+                        .cell(r, c)
+                        .map(|cell| {
+                            let s = cell.contents();
+                            if s.is_empty() {
+                                ' '
+                            } else {
+                                s.chars().next().unwrap_or(' ')
+                            }
+                        })
+                        .unwrap_or(' ');
+                    ch.to_lowercase().next().unwrap_or(ch)
+                })
+                .collect();
+            if qlen <= row_lower.len() {
+                for c in 0..=(row_lower.len() - qlen) {
+                    if row_lower[c..c + qlen] == q_lower[..] {
+                        matches.push((0, r, c as u16));
+                    }
+                }
+            }
+        }
 
-        // Sort: oldest first (highest offset), then top-to-bottom within same offset.
+        // Sort: oldest first (highest required_offset), then top-to-bottom.
         matches.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
 
         self.terminal_find_matches = matches;

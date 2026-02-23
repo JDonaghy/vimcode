@@ -246,6 +246,10 @@ cargo fmt
   - `Ctrl-Shift-V` — paste from system clipboard into the running shell (GTK: intercepted by vimcode; TUI: Alacritty/kitty bracketed-paste is forwarded to the PTY automatically)
   - Mouse-release auto-copies the selection to the clipboard (requires `xclip` or `xsel` on Linux/X11)
 - **Scrollback** — PageUp / PageDown scroll up to one screenful into the shell history; the scrollbar is draggable
+- **Find in terminal** — `Ctrl-F` (while terminal has focus) opens an inline find bar in the toolbar row:
+  - Type to set the query; matching text highlights live (orange = active match, amber = other matches)
+  - `Enter` — next match; `Shift+Enter` — previous match; `Escape` or `Ctrl-F` — close find bar
+  - Search is case-insensitive; covers all visible rows in the current terminal view
 - **Nerd Font toolbar** — tab strip + split (`󰤼`) and close (`󰅖`) icons
 - **All keys forwarded to shell PTY** — Ctrl-C, Ctrl-D, Ctrl-L, Ctrl-Z, arrow keys, Tab, etc. work as expected
 - `Ctrl-T` while the terminal has focus **closes the panel** while keeping all shell sessions alive; reopening restores the same sessions

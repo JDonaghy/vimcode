@@ -812,58 +812,111 @@ fn build_terminal_panel(engine: &Engine) -> Option<TerminalPanel> {
         return None;
     }
     let term = engine.active_terminal()?;
+    // The vt100 parser is always kept at scrollback_offset = 0 (live view).
+    // Historical content is served from `term.history`.
     let screen = term.parser.screen();
     let (cursor_row, cursor_col) = screen.cursor_position();
     let rows_count = term.rows as usize;
     let cols_count = term.cols as usize;
     let scroll_offset = term.scroll_offset;
-    // Selection only valid when viewing the live screen (not scrolled).
-    // vt100::Parser::set_scrollback() is called whenever scroll_offset changes, so
-    // screen.cell() already reads the correct scrollback rows via visible_cell().
+    let hist_len = term.history.len();
+
+    // Selection only applies to the live view.
     let sel_bounds = if scroll_offset == 0 {
         term.selection.as_ref().map(normalize_term_selection)
     } else {
         None
     };
 
+    // Build the display grid.
+    //
+    // At scroll_offset = N, display row i (0 = top) maps to:
+    //   • history[hist_len - N + i]  when i < N  (history rows, oldest-first)
+    //   • vt100 live row  (i - N)    when i >= N  (live rows)
     let mut rows: Vec<Vec<TerminalCell>> = (0..rows_count)
-        .map(|r| {
+        .map(|display_r| {
             (0..cols_count)
                 .map(|c| {
                     let cu = c as u16;
-                    let ru = r as u16;
-                    let cell_opt = screen.cell(ru, cu);
-
-                    let (ch, fg, bg, bold, italic, underline) = if let Some(cell) = cell_opt {
-                        let contents = cell.contents();
-                        let ch = contents.chars().next().unwrap_or(' ');
-                        let fg = map_vt100_color(cell.fgcolor(), false);
-                        let bg = map_vt100_color(cell.bgcolor(), true);
-                        let bold = cell.bold();
-                        let italic = cell.italic();
-                        let underline = cell.underline();
-                        (ch, fg, bg, bold, italic, underline)
-                    } else {
-                        (' ', (229, 229, 229), (30, 30, 30), false, false, false)
-                    };
-
-                    // Show cursor only on the live view.
-                    let is_cursor = scroll_offset == 0
-                        && engine.terminal_has_focus
-                        && ru == cursor_row
-                        && cu == cursor_col;
-
-                    let selected = sel_bounds.is_some_and(|(r0, c0, r1, c1)| {
-                        if r0 == r1 {
-                            ru == r0 && cu >= c0 && cu <= c1
-                        } else if ru == r0 {
-                            cu >= c0
-                        } else if ru == r1 {
-                            cu <= c1
+                    let (ch, fg, bg, bold, italic, underline, is_cursor, selected) = if display_r
+                        < scroll_offset
+                    {
+                        // ── History row ──────────────────────────────────
+                        let hist_idx_signed =
+                            hist_len as isize - scroll_offset as isize + display_r as isize;
+                        if hist_idx_signed >= 0 {
+                            let hist_idx = hist_idx_signed as usize;
+                            if let Some(hist_row) = term.history.get(hist_idx) {
+                                let hc = hist_row.get(c).copied().unwrap_or_default();
+                                (
+                                    hc.ch,
+                                    map_vt100_color(hc.fg, false),
+                                    map_vt100_color(hc.bg, true),
+                                    hc.bold,
+                                    hc.italic,
+                                    hc.underline,
+                                    false,
+                                    false,
+                                )
+                            } else {
+                                (
+                                    ' ',
+                                    (229, 229, 229),
+                                    (30, 30, 30),
+                                    false,
+                                    false,
+                                    false,
+                                    false,
+                                    false,
+                                )
+                            }
                         } else {
-                            ru > r0 && ru < r1
+                            (
+                                ' ',
+                                (229, 229, 229),
+                                (30, 30, 30),
+                                false,
+                                false,
+                                false,
+                                false,
+                                false,
+                            )
                         }
-                    });
+                    } else {
+                        // ── Live vt100 row ───────────────────────────────
+                        let live_r = (display_r - scroll_offset) as u16;
+                        let cell_opt = screen.cell(live_r, cu);
+                        let (ch, fg, bg, bold, italic, underline) = if let Some(cell) = cell_opt {
+                            let contents = cell.contents();
+                            let ch = contents.chars().next().unwrap_or(' ');
+                            (
+                                ch,
+                                map_vt100_color(cell.fgcolor(), false),
+                                map_vt100_color(cell.bgcolor(), true),
+                                cell.bold(),
+                                cell.italic(),
+                                cell.underline(),
+                            )
+                        } else {
+                            (' ', (229, 229, 229), (30, 30, 30), false, false, false)
+                        };
+                        let is_cursor = scroll_offset == 0
+                            && engine.terminal_has_focus
+                            && live_r == cursor_row
+                            && cu == cursor_col;
+                        let selected = sel_bounds.is_some_and(|(r0, c0, r1, c1)| {
+                            if r0 == r1 {
+                                live_r == r0 && cu >= c0 && cu <= c1
+                            } else if live_r == r0 {
+                                cu >= c0
+                            } else if live_r == r1 {
+                                cu <= c1
+                            } else {
+                                live_r > r0 && live_r < r1
+                            }
+                        });
+                        (ch, fg, bg, bold, italic, underline, is_cursor, selected)
+                    };
 
                     TerminalCell {
                         ch,
@@ -883,18 +936,18 @@ fn build_terminal_panel(engine: &Engine) -> Option<TerminalPanel> {
         .collect();
 
     // Apply find match highlights.
-    // Each match stores (required_scroll_offset, row, col). A match is visible at the
-    // current scroll_offset when: visible_row = mr + current_offset - moffset ∈ [0, rows).
+    // Each match stores (required_scroll_offset, row, col).
+    // visible_row = row + current_offset − required_offset; valid when ∈ [0, rows_count).
     let match_count = engine.terminal_find_matches.len();
     if engine.terminal_find_active && match_count > 0 {
         let qlen = engine.terminal_find_query.chars().count();
         let active_idx = engine.terminal_find_selected % match_count;
-        let current_offset = term.scroll_offset as isize;
-        let term_rows = term.rows as isize;
+        let current_offset = scroll_offset as isize;
+        let term_rows = rows_count as isize;
         for (mi, &(moffset, mr, mc)) in engine.terminal_find_matches.iter().enumerate() {
             let visible_row = mr as isize + current_offset - moffset as isize;
             if visible_row < 0 || visible_row >= term_rows {
-                continue; // Match is in a part of history not currently on screen.
+                continue;
             }
             let row_idx = visible_row as usize;
             if row_idx < rows.len() {
@@ -924,11 +977,8 @@ fn build_terminal_panel(engine: &Engine) -> Option<TerminalPanel> {
         content_cols: term.cols,
         has_focus: engine.terminal_has_focus,
         scroll_offset,
-        // Cap to one screenful: vt100 visible_rows() requires offset <= rows_len.
-        scrollback_rows: term
-            .lines_written
-            .saturating_sub(term.rows as usize)
-            .min(term.rows as usize),
+        // Scrollback depth = number of lines in our custom history ring buffer.
+        scrollback_rows: hist_len,
         tab_count: engine.terminal_panes.len(),
         active_tab: engine.terminal_active,
         find_active: engine.terminal_find_active,

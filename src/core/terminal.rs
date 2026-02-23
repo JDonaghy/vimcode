@@ -1,6 +1,36 @@
-use portable_pty::{native_pty_system, Child, CommandBuilder, PtySize};
+use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use std::collections::VecDeque;
 use std::io::Write;
+use std::path::Path;
 use std::sync::mpsc::{self, Receiver};
+
+/// Maximum number of historical rows stored per pane.
+const HISTORY_CAPACITY: usize = 5_000;
+
+/// A single captured terminal cell stored in the history ring buffer.
+/// Uses vt100::Color to avoid duplicating the 256-colour palette lookup.
+#[derive(Clone, Copy)]
+pub struct HistCell {
+    pub ch: char,
+    pub fg: vt100::Color,
+    pub bg: vt100::Color,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+}
+
+impl Default for HistCell {
+    fn default() -> Self {
+        HistCell {
+            ch: ' ',
+            fg: vt100::Color::Default,
+            bg: vt100::Color::Default,
+            bold: false,
+            italic: false,
+            underline: false,
+        }
+    }
+}
 
 /// Terminal text selection (row/col are 0-based into content area)
 #[derive(Debug, Clone)]
@@ -14,9 +44,13 @@ pub struct TermSelection {
 /// A single integrated terminal pane backed by a real PTY.
 pub struct TerminalPane {
     /// VT100 screen parser — holds current cell grid with colors/attrs.
+    /// The parser is **always** kept at `scrollback_offset = 0` (live view).
+    /// Historical content is captured into `history` instead.
     pub parser: vt100::Parser,
     /// Write side of the PTY master — sends keyboard input to the shell.
     writer: Box<dyn Write + Send>,
+    /// PTY master — kept alive so we can call `resize()` on it.
+    master: Box<dyn MasterPty + Send>,
     /// Shell child process.
     child: Box<dyn Child + Send + Sync>,
     /// Bytes coming from the shell (sent by background reader thread).
@@ -29,18 +63,25 @@ pub struct TerminalPane {
     pub selection: Option<TermSelection>,
     /// True once the child shell process has exited.
     pub exited: bool,
-    /// Rows scrolled up into the scrollback buffer (0 = at the live bottom).
+    /// How many rows above the live bottom the user has scrolled.
+    /// 0 = live view; max = `history.len()`.
     pub scroll_offset: usize,
-    /// Monotonically-increasing total line count: max(scrollback + rows) ever seen.
-    /// Used to compute a meaningful scrollbar thumb size even before the user scrolls.
-    pub lines_written: usize,
+    /// Ring buffer of captured historical rows (oldest at index 0).
+    /// Populated by `poll()` as lines scroll off the vt100 live screen.
+    pub history: VecDeque<Vec<HistCell>>,
 }
 
 impl TerminalPane {
-    /// Spawn a new terminal pane.
+    /// Spawn a new terminal pane in the given working directory.
     ///
     /// `shell` defaults to `$SHELL` or `/bin/bash`.
-    pub fn new(cols: u16, rows: u16, shell: &str) -> Result<Self, Box<dyn std::error::Error>> {
+    /// `cwd` is the initial working directory (use process CWD if the path is invalid).
+    pub fn new(
+        cols: u16,
+        rows: u16,
+        shell: &str,
+        cwd: &Path,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
             rows,
@@ -50,12 +91,14 @@ impl TerminalPane {
         })?;
 
         let mut cmd = CommandBuilder::new(shell);
-        // Ensure TERM is set so programs know they have a real terminal.
         cmd.env("TERM", "xterm-256color");
+        // Start the shell in the editor's working directory.
+        cmd.cwd(cwd);
         let child = pair.slave.spawn_command(cmd)?;
 
         let writer = pair.master.take_writer()?;
         let reader = pair.master.try_clone_reader()?;
+        let master = pair.master;
 
         // Spawn background thread that reads PTY output and forwards via channel.
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
@@ -76,11 +119,14 @@ impl TerminalPane {
             }
         });
 
+        // 1 000-line vt100 scrollback is kept for internal rendering of the live
+        // screen; we never use its set_scrollback() API for user scrolling.
         let parser = vt100::Parser::new(rows, cols, 1000);
 
         Ok(TerminalPane {
             parser,
             writer,
+            master,
             child,
             rx,
             cols,
@@ -88,30 +134,21 @@ impl TerminalPane {
             selection: None,
             exited: false,
             scroll_offset: 0,
-            lines_written: rows as usize,
+            history: VecDeque::new(),
         })
     }
 
     /// Drain pending output from the PTY reader thread and feed it to the VT100 parser.
+    /// Lines that scroll off the visible area are captured into `self.history`.
     /// Also checks if the child process has exited.
     /// Returns `true` if any new data was processed.
     pub fn poll(&mut self) -> bool {
         let mut got_data = false;
         while let Ok(data) = self.rx.try_recv() {
-            // Count raw newlines BEFORE processing so we have the byte slice available.
-            let newlines = data.iter().filter(|&&b| b == b'\n').count();
-            self.parser.process(&data);
-            self.lines_written = self.lines_written.saturating_add(newlines);
-            // vt100 auto-increments scrollback_offset as new lines scroll in while the
-            // user is scrolled up (keeping the viewed content stable). Sync our field,
-            // but re-clamp: vt100's visible_rows() subtracts scrollback_offset from
-            // rows_len with plain usize arithmetic, so offset > rows causes a panic.
-            let raw = self.parser.screen().scrollback();
-            self.scroll_offset = raw.min(self.rows as usize);
-            if raw > self.rows as usize {
-                self.parser.set_scrollback(self.scroll_offset);
-            }
             got_data = true;
+            // Process in chunks of at most `rows` newlines so we can capture
+            // every row that scrolls off the vt100 live screen between chunks.
+            self.process_with_capture(&data);
         }
         if !self.exited {
             if let Ok(Some(_)) = self.child.try_wait() {
@@ -120,6 +157,77 @@ impl TerminalPane {
             }
         }
         got_data
+    }
+
+    /// Process a data chunk, splitting at `rows`-newline boundaries so that each
+    /// sub-chunk causes at most `rows` lines to scroll off — the maximum we can
+    /// safely read back from vt100's scrollback API (set_scrollback(N ≤ rows)).
+    fn process_with_capture(&mut self, data: &[u8]) {
+        let max_nl = self.rows as usize;
+        let mut start = 0;
+        let mut nl_count = 0;
+
+        for (i, &b) in data.iter().enumerate() {
+            if b == b'\n' {
+                nl_count += 1;
+                if nl_count >= max_nl {
+                    let chunk = &data[start..=i];
+                    self.parser.process(chunk);
+                    self.capture_scrolled_rows(nl_count);
+                    start = i + 1;
+                    nl_count = 0;
+                }
+            }
+        }
+        // Remaining data (may or may not contain newlines).
+        if start < data.len() {
+            let chunk = &data[start..];
+            let remaining_nl = chunk.iter().filter(|&&b| b == b'\n').count();
+            self.parser.process(chunk);
+            if remaining_nl > 0 {
+                self.capture_scrolled_rows(remaining_nl);
+            }
+        }
+    }
+
+    /// Read the rows that *just* scrolled off the top of the vt100 live screen
+    /// and append them to `self.history`.
+    ///
+    /// After processing `n_newlines` of new output, the vt100 scrollback deque
+    /// contains those rows at its tail. We call `set_scrollback(n_to_capture)`
+    /// (capped at `rows`, which is the safe vt100 maximum) to bring them into
+    /// the visible window, read them, then restore the live view.
+    fn capture_scrolled_rows(&mut self, n_newlines: usize) {
+        let to_capture = n_newlines.min(self.rows as usize);
+        // Temporarily shift the vt100 viewport to see the rows that just scrolled off.
+        self.parser.set_scrollback(to_capture);
+        {
+            let screen = self.parser.screen();
+            for r in 0..to_capture as u16 {
+                let row: Vec<HistCell> = (0..self.cols)
+                    .map(|c| match screen.cell(r, c) {
+                        Some(cell) => {
+                            let raw = cell.contents();
+                            HistCell {
+                                ch: raw.chars().next().unwrap_or(' '),
+                                fg: cell.fgcolor(),
+                                bg: cell.bgcolor(),
+                                bold: cell.bold(),
+                                italic: cell.italic(),
+                                underline: cell.underline(),
+                            }
+                        }
+                        None => HistCell::default(),
+                    })
+                    .collect();
+                if self.history.len() >= HISTORY_CAPACITY {
+                    self.history.pop_front();
+                }
+                self.history.push_back(row);
+            }
+        }
+        // Restore live view — always safe since we're back to offset 0.
+        self.parser.set_scrollback(0);
     }
 
     /// Send raw bytes as keyboard input to the shell.
@@ -133,36 +241,31 @@ impl TerminalPane {
         self.cols = cols;
         self.rows = rows;
         self.parser.set_size(rows, cols);
-        // Best-effort resize signal to the PTY master; ignore errors (e.g. after child exits).
-        // portable-pty doesn't expose resize on PtyMaster directly, so we re-open via the
-        // system-level ioctl. For now we just update parser size; most shells will resize on
-        // their own or we can add TIOCSWINSZ via nix if needed in the future.
+        // Notify the PTY master so the shell (and running programs) see SIGWINCH.
+        let _ = self.master.resize(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        });
     }
 
-    /// Set scroll offset and sync the vt100 parser so `screen.cell()` shows the
-    /// correct scrollback content.
-    ///
-    /// **vt100 limitation**: `visible_rows()` computes `rows_len - scrollback_offset`
-    /// with plain usize subtraction; exceeding `rows` (the PTY height) panics in
-    /// debug builds and wraps in release builds. We therefore cap the offset at
-    /// `rows` — the maximum is one screenful of history.
+    /// Set the scroll offset (0 = live view, max = `history.len()`).
     pub fn set_scroll_offset(&mut self, offset: usize) {
-        // Cap to one screenful (vt100 API limit) and to available history.
-        let history = self.lines_written.saturating_sub(self.rows as usize);
-        let max = (self.rows as usize).min(history);
-        self.scroll_offset = offset.min(max);
-        self.parser.set_scrollback(self.scroll_offset);
+        self.scroll_offset = offset.min(self.history.len());
+        // Keep the vt100 parser at the live view — history is served from our buffer.
+        self.parser.set_scrollback(0);
     }
 
-    /// Scroll up into scrollback by `rows` lines.
-    pub fn scroll_up(&mut self, rows: usize) {
-        let new_offset = self.scroll_offset.saturating_add(rows);
+    /// Scroll up into history by `n` rows.
+    pub fn scroll_up(&mut self, n: usize) {
+        let new_offset = self.scroll_offset.saturating_add(n);
         self.set_scroll_offset(new_offset);
     }
 
-    /// Scroll down toward the live view by `rows` lines.
-    pub fn scroll_down(&mut self, rows: usize) {
-        let new_offset = self.scroll_offset.saturating_sub(rows);
+    /// Scroll down toward the live view by `n` rows.
+    pub fn scroll_down(&mut self, n: usize) {
+        let new_offset = self.scroll_offset.saturating_sub(n);
         self.set_scroll_offset(new_offset);
     }
 
