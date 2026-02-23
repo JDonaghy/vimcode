@@ -228,6 +228,22 @@ cargo fmt
 
 ---
 
+### Integrated Terminal
+
+- `Ctrl-T` (Normal mode) — toggle the integrated terminal panel
+- `:term` / `:terminal` — open the terminal from command mode
+- The terminal is a **persistent bottom strip** (13 rows: 1 toolbar + 12 content rows) above the status bar
+- Shell is determined by the `$SHELL` environment variable, falling back to `/bin/bash`
+- Full **ANSI/VT100 color support** — 256-color xterm palette rendered cell-by-cell
+- **Mouse selection** — click and drag to select text; selection copied to clipboard
+- **Nerd Font toolbar** — title bar with close (`󰅖`) button
+- **All keys forwarded to shell PTY** — Ctrl-C, Ctrl-D, Ctrl-L, Ctrl-Z, arrow keys, Tab, etc. work as expected
+- `Ctrl-T` while the terminal has focus **closes the panel** while keeping the shell session alive; reopening restores the same session
+- **Scrollbar** — right edge of the content area shows a live scrollbar; PageUp/PageDown scroll the offset (content display requires future scrollback ring buffer)
+- When the shell **exits** (Ctrl-D, `exit`, etc.) the panel closes automatically; clicking outside the terminal returns focus to the editor
+
+---
+
 ### File Explorer
 
 - `Ctrl-B` — toggle sidebar; `Alt+E` — focus explorer; `Alt+F` — focus search panel
@@ -348,6 +364,7 @@ Runtime changes are written through to `~/.config/vimcode/settings.json` immedia
 | `focus_search` | `<A-f>` | Focus search panel (press again to return to editor) |
 | `fuzzy_finder` | `<C-p>` | Open fuzzy file finder |
 | `live_grep` | `<C-g>` | Open live grep modal |
+| `open_terminal` | `<C-t>` | Toggle integrated terminal panel |
 
 Key notation: `<C-x>` = Ctrl+x, `<A-x>` = Alt+x, `<C-S-x>` = Ctrl+Shift+x.
 

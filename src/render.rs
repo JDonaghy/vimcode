@@ -16,6 +16,7 @@ use crate::core::buffer::Buffer;
 use crate::core::buffer_manager::BufferState;
 use crate::core::engine::{DiffLine, Engine, SearchDirection};
 use crate::core::settings::LineNumberMode;
+use crate::core::terminal::TermSelection as CoreTermSelection;
 use crate::core::view::View;
 use crate::core::{Cursor, GitLineStatus, Mode, WindowId, WindowRect};
 
@@ -316,6 +317,51 @@ pub struct QuickfixPanel {
     pub has_focus: bool,
 }
 
+// ─── TerminalPanel ────────────────────────────────────────────────────────────
+
+/// A single rendered cell in the terminal grid.
+#[derive(Debug, Clone)]
+pub struct TerminalCell {
+    pub ch: char,
+    pub fg: (u8, u8, u8),
+    pub bg: (u8, u8, u8),
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    /// Whether this cell is within the mouse selection.
+    pub selected: bool,
+    /// Whether this cell is the VT100 cursor position.
+    pub is_cursor: bool,
+}
+
+/// A text selection range within the terminal content area.
+#[derive(Debug, Clone)]
+pub struct TermSelection {
+    pub start_row: u16,
+    pub start_col: u16,
+    pub end_row: u16,
+    pub end_col: u16,
+}
+
+/// Data needed to render the integrated terminal bottom panel.
+#[derive(Debug)]
+pub struct TerminalPanel {
+    /// Rendered cell grid: `rows[content_row][col]`
+    pub rows: Vec<Vec<TerminalCell>>,
+    /// Number of content rows (excluding toolbar).
+    pub content_rows: u16,
+    /// Number of columns.
+    pub content_cols: u16,
+    /// Whether the terminal panel has keyboard focus.
+    pub has_focus: bool,
+    /// Whether the shell process has exited.
+    pub exited: bool,
+    /// Rows scrolled up into scrollback (0 = live view).
+    pub scroll_offset: usize,
+    /// Number of scrollback rows stored in the VT100 parser buffer.
+    pub scrollback_rows: usize,
+}
+
 // ─── ScreenLayout ─────────────────────────────────────────────────────────────
 
 /// The complete, platform-agnostic description of one editor frame.
@@ -338,6 +384,8 @@ pub struct ScreenLayout {
     pub live_grep: Option<LiveGrepPanel>,
     /// Quickfix bottom panel, or `None` when closed.
     pub quickfix: Option<QuickfixPanel>,
+    /// Integrated terminal panel, or `None` when closed.
+    pub terminal: Option<TerminalPanel>,
 }
 
 // ─── Theme ────────────────────────────────────────────────────────────────────
@@ -663,6 +711,8 @@ pub fn build_screen_layout(
         }
     });
 
+    let terminal = build_terminal_panel(engine);
+
     ScreenLayout {
         tab_bar,
         windows,
@@ -675,7 +725,159 @@ pub fn build_screen_layout(
         fuzzy,
         live_grep,
         quickfix,
+        terminal,
     }
+}
+
+/// Map a vt100 color to an RGB triple.
+/// Falls back to reasonable defaults for the OneDark theme.
+fn map_vt100_color(color: vt100::Color, is_bg: bool) -> (u8, u8, u8) {
+    match color {
+        vt100::Color::Default => {
+            if is_bg {
+                (30, 30, 30) // terminal background (~#1e1e1e)
+            } else {
+                (229, 229, 229) // terminal foreground (~#e5e5e5)
+            }
+        }
+        vt100::Color::Rgb(r, g, b) => (r, g, b),
+        vt100::Color::Idx(n) => xterm_256_color(n),
+    }
+}
+
+/// Standard xterm 256-color palette lookup.
+fn xterm_256_color(n: u8) -> (u8, u8, u8) {
+    // Colors 0-15: system colors (approximate)
+    const SYSTEM: [(u8, u8, u8); 16] = [
+        (0, 0, 0),       // 0: Black
+        (128, 0, 0),     // 1: Maroon
+        (0, 128, 0),     // 2: Green
+        (128, 128, 0),   // 3: Olive
+        (0, 0, 128),     // 4: Navy
+        (128, 0, 128),   // 5: Purple
+        (0, 128, 128),   // 6: Teal
+        (192, 192, 192), // 7: Silver
+        (128, 128, 128), // 8: Grey
+        (255, 0, 0),     // 9: Red
+        (0, 255, 0),     // 10: Lime
+        (255, 255, 0),   // 11: Yellow
+        (0, 0, 255),     // 12: Blue
+        (255, 0, 255),   // 13: Fuchsia
+        (0, 255, 255),   // 14: Aqua
+        (255, 255, 255), // 15: White
+    ];
+    if n < 16 {
+        return SYSTEM[n as usize];
+    }
+    // Colors 16-231: 6×6×6 color cube
+    if n < 232 {
+        let idx = n - 16;
+        let b = idx % 6;
+        let g = (idx / 6) % 6;
+        let r = idx / 36;
+        let to_byte = |v: u8| if v == 0 { 0 } else { 55 + v * 40 };
+        return (to_byte(r), to_byte(g), to_byte(b));
+    }
+    // Colors 232-255: grayscale
+    let gray = 8 + (n - 232) * 10;
+    (gray, gray, gray)
+}
+
+/// Normalize a terminal selection so start ≤ end in reading order.
+fn normalize_term_selection(sel: &CoreTermSelection) -> (u16, u16, u16, u16) {
+    if (sel.start_row, sel.start_col) <= (sel.end_row, sel.end_col) {
+        (sel.start_row, sel.start_col, sel.end_row, sel.end_col)
+    } else {
+        (sel.end_row, sel.end_col, sel.start_row, sel.start_col)
+    }
+}
+
+/// Build the TerminalPanel from engine state (when terminal is open).
+fn build_terminal_panel(engine: &Engine) -> Option<TerminalPanel> {
+    if !engine.terminal_open {
+        return None;
+    }
+    let term = engine.terminal.as_ref()?;
+    let screen = term.parser.screen();
+    let (cursor_row, cursor_col) = screen.cursor_position();
+    let rows_count = term.rows as usize;
+    let cols_count = term.cols as usize;
+    let scroll_offset = term.scroll_offset;
+    // Selection only valid when viewing the live screen (not scrolled).
+    // NOTE: vt100 0.15 exposes scrollback count via screen.scrollback() but does not
+    // expose individual scrollback cells. Proper scrollback display requires a custom
+    // ring buffer (planned for a future session). For now scroll_offset is tracked
+    // (so the header shows [SCROLLBACK]) but the visible content always shows the
+    // live screen rows.
+    let sel_bounds = if scroll_offset == 0 {
+        term.selection.as_ref().map(normalize_term_selection)
+    } else {
+        None
+    };
+
+    let rows: Vec<Vec<TerminalCell>> = (0..rows_count)
+        .map(|r| {
+            (0..cols_count)
+                .map(|c| {
+                    let cu = c as u16;
+                    let ru = r as u16;
+                    let cell_opt = screen.cell(ru, cu);
+
+                    let (ch, fg, bg, bold, italic, underline) = if let Some(cell) = cell_opt {
+                        let contents = cell.contents();
+                        let ch = contents.chars().next().unwrap_or(' ');
+                        let fg = map_vt100_color(cell.fgcolor(), false);
+                        let bg = map_vt100_color(cell.bgcolor(), true);
+                        let bold = cell.bold();
+                        let italic = cell.italic();
+                        let underline = cell.underline();
+                        (ch, fg, bg, bold, italic, underline)
+                    } else {
+                        (' ', (229, 229, 229), (30, 30, 30), false, false, false)
+                    };
+
+                    // Show cursor only on the live view.
+                    let is_cursor = scroll_offset == 0
+                        && engine.terminal_has_focus
+                        && ru == cursor_row
+                        && cu == cursor_col;
+
+                    let selected = sel_bounds.is_some_and(|(r0, c0, r1, c1)| {
+                        if r0 == r1 {
+                            ru == r0 && cu >= c0 && cu <= c1
+                        } else if ru == r0 {
+                            cu >= c0
+                        } else if ru == r1 {
+                            cu <= c1
+                        } else {
+                            ru > r0 && ru < r1
+                        }
+                    });
+
+                    TerminalCell {
+                        ch,
+                        fg,
+                        bg,
+                        bold,
+                        italic,
+                        underline,
+                        selected,
+                        is_cursor,
+                    }
+                })
+                .collect()
+        })
+        .collect();
+
+    Some(TerminalPanel {
+        rows,
+        content_rows: term.rows,
+        content_cols: term.cols,
+        has_focus: engine.terminal_has_focus,
+        exited: term.exited,
+        scroll_offset,
+        scrollback_rows: screen.scrollback(),
+    })
 }
 
 // ─── Private builder helpers ──────────────────────────────────────────────────

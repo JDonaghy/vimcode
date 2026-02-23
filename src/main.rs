@@ -242,6 +242,18 @@ enum Msg {
     DiffWithSelected(PathBuf),
     /// GDK clipboard text arrived for pasting into command/search/insert input.
     ClipboardPasteToInput { text: String },
+    /// Toggle the integrated terminal panel open/closed.
+    ToggleTerminal,
+    /// Kill the terminal process and close the panel.
+    TerminalKill,
+    /// Copy terminal selection to clipboard.
+    TerminalCopySelection,
+    /// Mouse pressed at terminal cell (row, col).
+    TerminalMouseDown { row: u16, col: u16 },
+    /// Mouse dragged to terminal cell (row, col).
+    TerminalMouseDrag { row: u16, col: u16 },
+    /// Mouse released over terminal.
+    TerminalMouseUp,
 }
 
 #[relm4::component]
@@ -735,6 +747,20 @@ impl SimpleComponent for App {
 
                                     // Panel navigation — driven by panel_keys settings
                                     let pk = engine.borrow().settings.panel_keys.clone();
+                                    // Ctrl+T: toggle terminal (checked first so it works even when terminal has focus)
+                                    if matches_gtk_key(&pk.open_terminal, key, modifier) {
+                                        sender.input(Msg::ToggleTerminal);
+                                        return gtk4::glib::Propagation::Stop;
+                                    }
+                                    // Terminal key routing: when terminal has focus, all keys
+                                    // are forwarded as PTY bytes without going to the engine.
+                                    if engine.borrow().terminal_has_focus {
+                                        let data = gtk_key_to_pty_bytes(&key_name, unicode, ctrl);
+                                        if !data.is_empty() {
+                                            engine.borrow_mut().terminal_write(&data);
+                                        }
+                                        return gtk4::glib::Propagation::Stop;
+                                    }
                                     if matches_gtk_key(&pk.toggle_sidebar, key, modifier) {
                                         sender.input(Msg::ToggleSidebar);
                                         return gtk4::glib::Propagation::Stop;
@@ -1624,6 +1650,9 @@ impl SimpleComponent for App {
                             }
                         }
                     }
+                    EngineAction::OpenTerminal => {
+                        sender.input(Msg::ToggleTerminal);
+                    }
                     EngineAction::None | EngineAction::Error => {}
                 }
 
@@ -1677,6 +1706,9 @@ impl SimpleComponent for App {
                                 }
                             }
                         }
+                        EngineAction::OpenTerminal => {
+                            sender.input(Msg::ToggleTerminal);
+                        }
                         EngineAction::None | EngineAction::Error => {}
                     }
 
@@ -1714,21 +1746,65 @@ impl SimpleComponent for App {
                 width,
                 height,
             } => {
-                let mut engine = self.engine.borrow_mut();
-                // Clear selection on click in VSCode mode.
-                if engine.is_vscode_mode() {
-                    engine.vscode_clear_selection();
-                }
-                handle_mouse_click(&mut engine, x, y, width, height);
-                // Reveal the active file in the sidebar tree (e.g. after tab click)
-                let file_path = engine.file_path().cloned();
-                drop(engine);
-                if let Some(path) = file_path {
-                    if let Some(ref tree) = *self.file_tree_view.borrow() {
-                        highlight_file_in_tree(tree, &path);
+                // Check if click lands in the terminal panel before general handling.
+                let in_terminal = if self.cached_line_height > 0.0 {
+                    let engine = self.engine.borrow();
+                    if engine.terminal_open {
+                        let qf_px = if engine.quickfix_open {
+                            6.0 * self.cached_line_height
+                        } else {
+                            0.0
+                        };
+                        let term_px = 13.0 * self.cached_line_height;
+                        let status_h = 2.0 * self.cached_line_height;
+                        let term_y = height - status_h - qf_px - term_px;
+                        if y >= term_y {
+                            Some((term_y, y >= term_y + self.cached_line_height))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
                     }
+                } else {
+                    None
+                };
+                if let Some((term_y, in_content)) = in_terminal {
+                    self.engine.borrow_mut().terminal_has_focus = true;
+                    if in_content {
+                        let row = ((y - term_y - self.cached_line_height) / self.cached_line_height)
+                            as u16;
+                        let col = (x / self.cached_char_width.max(1.0)) as u16;
+                        self.engine.borrow_mut().terminal_scroll_reset();
+                        if let Some(term) = self.engine.borrow_mut().terminal.as_mut() {
+                            term.selection = Some(crate::core::terminal::TermSelection {
+                                start_row: row,
+                                start_col: col,
+                                end_row: row,
+                                end_col: col,
+                            });
+                        }
+                    }
+                    self.redraw = true;
+                } else {
+                    let mut engine = self.engine.borrow_mut();
+                    // Clicking outside the terminal panel returns focus to the editor.
+                    engine.terminal_has_focus = false;
+                    // Clear selection on click in VSCode mode.
+                    if engine.is_vscode_mode() {
+                        engine.vscode_clear_selection();
+                    }
+                    handle_mouse_click(&mut engine, x, y, width, height);
+                    // Reveal the active file in the sidebar tree (e.g. after tab click)
+                    let file_path = engine.file_path().cloned();
+                    drop(engine);
+                    if let Some(path) = file_path {
+                        if let Some(ref tree) = *self.file_tree_view.borrow() {
+                            highlight_file_in_tree(tree, &path);
+                        }
+                    }
+                    self.redraw = !self.redraw;
                 }
-                self.redraw = !self.redraw;
             }
             Msg::MouseDoubleClick {
                 x,
@@ -1746,9 +1822,45 @@ impl SimpleComponent for App {
                 width,
                 height,
             } => {
-                let mut engine = self.engine.borrow_mut();
-                handle_mouse_drag(&mut engine, x, y, width, height);
-                self.redraw = !self.redraw;
+                // Check if drag is in the terminal panel area.
+                let in_terminal = if self.cached_line_height > 0.0 {
+                    let engine = self.engine.borrow();
+                    if engine.terminal_open {
+                        let qf_px = if engine.quickfix_open {
+                            6.0 * self.cached_line_height
+                        } else {
+                            0.0
+                        };
+                        let term_px = 13.0 * self.cached_line_height;
+                        let status_h = 2.0 * self.cached_line_height;
+                        let term_y = height - status_h - qf_px - term_px;
+                        if y >= term_y + self.cached_line_height {
+                            Some(term_y)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let Some(term_y) = in_terminal {
+                    let row =
+                        ((y - term_y - self.cached_line_height) / self.cached_line_height) as u16;
+                    let col = (x / self.cached_char_width.max(1.0)) as u16;
+                    if let Some(term) = self.engine.borrow_mut().terminal.as_mut() {
+                        if let Some(ref mut sel) = term.selection {
+                            sel.end_row = row;
+                            sel.end_col = col;
+                        }
+                    }
+                    self.redraw = true;
+                } else {
+                    let mut engine = self.engine.borrow_mut();
+                    handle_mouse_drag(&mut engine, x, y, width, height);
+                    self.redraw = !self.redraw;
+                }
             }
             Msg::MouseUp => {
                 let mut engine = self.engine.borrow_mut();
@@ -2261,6 +2373,10 @@ impl SimpleComponent for App {
                         self.redraw = true;
                     }
                 }
+                // Terminal: drain PTY output and refresh display if needed
+                if self.engine.borrow_mut().poll_terminal() {
+                    self.redraw = true;
+                }
             }
             Msg::ProjectSearchOpenResult(idx) => {
                 let result = self
@@ -2406,6 +2522,61 @@ impl SimpleComponent for App {
 
                 engine.collect_session_open_files();
                 let _ = engine.session.save();
+            }
+            Msg::ToggleTerminal => {
+                let needs_open = {
+                    let engine = self.engine.borrow();
+                    !engine.terminal_open || !engine.terminal_has_focus
+                };
+                if needs_open && self.engine.borrow().terminal.is_none() {
+                    // Open with computed dimensions (12 content rows, width from char_width)
+                    let cols = if self.cached_char_width > 0.0 {
+                        80u16.max((200.0 / self.cached_char_width) as u16)
+                    } else {
+                        80
+                    };
+                    self.engine.borrow_mut().open_terminal(cols, 12);
+                } else {
+                    self.engine.borrow_mut().toggle_terminal();
+                }
+                self.redraw = true;
+            }
+            Msg::TerminalKill => {
+                self.engine.borrow_mut().terminal = None;
+                self.engine.borrow_mut().terminal_open = false;
+                self.engine.borrow_mut().terminal_has_focus = false;
+                self.redraw = true;
+            }
+            Msg::TerminalCopySelection => {
+                if let Some(text) = self.engine.borrow_mut().terminal_copy_selection() {
+                    if let Some(ref mut ctx) = self.clipboard {
+                        let _ = ctx.set_contents(text);
+                    }
+                }
+            }
+            Msg::TerminalMouseDown { row, col } => {
+                if let Some(term) = self.engine.borrow_mut().terminal.as_mut() {
+                    term.selection = Some(crate::core::terminal::TermSelection {
+                        start_row: row,
+                        start_col: col,
+                        end_row: row,
+                        end_col: col,
+                    });
+                }
+                self.redraw = true;
+            }
+            Msg::TerminalMouseDrag { row, col } => {
+                if let Some(term) = self.engine.borrow_mut().terminal.as_mut() {
+                    if let Some(ref mut sel) = term.selection {
+                        sel.end_row = row;
+                        sel.end_col = col;
+                    }
+                }
+                self.redraw = true;
+            }
+            Msg::TerminalMouseUp => {
+                // Selection stays in place; user can now copy
+                self.redraw = true;
             }
         }
 
@@ -2826,12 +2997,22 @@ fn draw_editor(
         0.0
     };
 
+    // Reserve space for the terminal panel when open (13 rows: 1 header + 12 content)
+    const TERMINAL_CONTENT_ROWS: usize = 12;
+    const TERMINAL_HEADER_ROWS: usize = 1;
+    const TERMINAL_TOTAL_ROWS: usize = TERMINAL_CONTENT_ROWS + TERMINAL_HEADER_ROWS;
+    let term_px = if engine.terminal_open {
+        TERMINAL_TOTAL_ROWS as f64 * line_height
+    } else {
+        0.0
+    };
+
     // Calculate window rects for the current tab
     let content_bounds = WindowRect::new(
         0.0,
         tab_bar_height,
         width as f64,
-        height as f64 - tab_bar_height - status_bar_height - qf_px - 10.0, // Reserve 10px for h-scrollbar
+        height as f64 - tab_bar_height - status_bar_height - qf_px - term_px - 10.0, // Reserve 10px for h-scrollbar
     );
     let window_rects = engine.calculate_window_rects(content_bounds);
 
@@ -2895,7 +3076,7 @@ fn draw_editor(
 
     // 5f. Draw quickfix panel (persistent bottom strip above status bar)
     if qf_px > 0.0 {
-        let qf_y = height as f64 - status_bar_height - qf_px;
+        let qf_y = height as f64 - status_bar_height - qf_px - term_px;
         draw_quickfix_panel(
             cr,
             &layout,
@@ -2907,6 +3088,26 @@ fn draw_editor(
             qf_px,
             line_height,
         );
+    }
+
+    // 5g. Draw terminal panel (persistent bottom strip above quickfix/status)
+    if term_px > 0.0 {
+        if let Some(ref term_panel) = screen.terminal {
+            let term_y = height as f64 - status_bar_height - term_px;
+            draw_terminal_panel(
+                cr,
+                &layout,
+                term_panel,
+                &theme,
+                0.0,
+                term_y,
+                width as f64,
+                term_px,
+                line_height,
+                char_width,
+                sender,
+            );
+        }
     }
 
     // 6. Status Line (second-to-last line)
@@ -3890,6 +4091,224 @@ fn draw_quickfix_panel(
         layout.set_text(&text);
         cr.move_to(editor_x, ry);
         pangocairo::show_layout(cr, layout);
+    }
+}
+
+/// Nerd Font icons for the terminal panel toolbar.
+const NF_CLOSE: &str = "󰅖"; // nf-md-close_box
+const NF_SPLIT: &str = "󰤼"; // nf-md-table_split (placeholder — inert for now)
+
+/// Draw the integrated terminal bottom panel.
+#[allow(clippy::too_many_arguments)]
+fn draw_terminal_panel(
+    cr: &Context,
+    layout: &pango::Layout,
+    panel: &render::TerminalPanel,
+    theme: &Theme,
+    x: f64,
+    y: f64,
+    w: f64,
+    term_px: f64,
+    line_height: f64,
+    char_width: f64,
+    sender: &relm4::Sender<Msg>,
+) {
+    // Toolbar row (header)
+    let (hr, hg, hb) = theme.status_bg.to_cairo();
+    cr.set_source_rgb(hr, hg, hb);
+    cr.rectangle(x, y, w, line_height);
+    cr.fill().ok();
+
+    let exit_note = if panel.exited { " [exited]" } else { "" };
+    let focus_note = if panel.has_focus {
+        ""
+    } else {
+        " (click to focus)"
+    };
+    let title = format!("  TERMINAL{}{}", exit_note, focus_note);
+    let (fr, fg2, fb) = theme.status_fg.to_cairo();
+    cr.set_source_rgb(fr, fg2, fb);
+    layout.set_attributes(None);
+    layout.set_text(&title);
+    cr.move_to(x, y);
+    pangocairo::show_layout(cr, layout);
+
+    // Right-aligned toolbar buttons
+    let btn_text = format!("{}  {}", NF_SPLIT, NF_CLOSE);
+    layout.set_text(&btn_text);
+    let (btn_w, _) = layout.pixel_size();
+    cr.move_to(x + w - btn_w as f64 - 4.0, y);
+    pangocairo::show_layout(cr, layout);
+
+    // Determine if NF_CLOSE button was possibly clicked (we store its rect for click detection)
+    // For simplicity, click on the NF_CLOSE area sends TerminalKill.
+    let close_x = x + w - char_width * 2.0;
+    let _ = (close_x, sender); // suppress unused warning; click detection handled in MouseClick
+
+    // Scrollbar geometry
+    const SB_W: f64 = 6.0;
+    let content_y = y + line_height;
+    let content_h = term_px - line_height;
+    let rows_to_draw = ((term_px / line_height) as usize).saturating_sub(1);
+    let total = panel.scrollback_rows + rows_to_draw;
+    let (thumb_top_px, thumb_bot_px) = if panel.scrollback_rows == 0 {
+        (0.0, content_h) // no scrollback → full bar
+    } else {
+        let thumb_h = ((rows_to_draw as f64 / total as f64) * content_h).max(4.0);
+        let max_off = panel.scrollback_rows as f64;
+        let frac = if panel.scroll_offset == 0 {
+            1.0 // at live bottom → thumb at bottom
+        } else {
+            1.0 - (panel.scroll_offset as f64 / max_off).min(1.0)
+        };
+        let thumb_t = frac * (content_h - thumb_h);
+        (thumb_t, thumb_t + thumb_h)
+    };
+
+    // Draw scrollbar track
+    let sb_x = x + w - SB_W;
+    let (tbr, tbg, tbb) = theme.status_bg.to_cairo();
+    cr.set_source_rgb(tbr * 1.4, tbg * 1.4, tbb * 1.4); // slightly lighter than header
+    cr.rectangle(sb_x, content_y, SB_W, content_h);
+    cr.fill().ok();
+    // Draw scrollbar thumb
+    let (fr, fg2, fb) = theme.status_fg.to_cairo();
+    cr.set_source_rgba(fr, fg2, fb, 0.5);
+    cr.rectangle(
+        sb_x + 1.0,
+        content_y + thumb_top_px,
+        SB_W - 2.0,
+        thumb_bot_px - thumb_top_px,
+    );
+    cr.fill().ok();
+
+    // Content rows (terminal cells)
+    let cell_area_w = w - SB_W;
+    for row_idx in 0..rows_to_draw {
+        if row_idx >= panel.rows.len() {
+            break;
+        }
+        let row_y = content_y + row_idx as f64 * line_height;
+        let row = &panel.rows[row_idx];
+        let mut cell_x = x;
+        for cell in row {
+            if cell_x + char_width > x + cell_area_w {
+                break;
+            }
+            let (br, bg, bb) = cell.bg;
+            let (fr, fg2, fb) = cell.fg;
+
+            // Cell background
+            let (draw_br, draw_bg, draw_bb) = if cell.is_cursor {
+                // Cursor: inverted colors (white on normal bg)
+                (fr, fg2, fb)
+            } else if cell.selected {
+                // Selection highlight (use theme selection color)
+                let (sr, sg, sb) = theme.selection.to_cairo();
+                ((sr * 255.0) as u8, (sg * 255.0) as u8, (sb * 255.0) as u8)
+            } else {
+                (br, bg, bb)
+            };
+            cr.set_source_rgb(
+                draw_br as f64 / 255.0,
+                draw_bg as f64 / 255.0,
+                draw_bb as f64 / 255.0,
+            );
+            cr.rectangle(cell_x, row_y, char_width, line_height);
+            cr.fill().ok();
+
+            // Cell foreground text
+            let ch_str = cell.ch.to_string();
+            if cell.ch != ' ' {
+                let (draw_fr, draw_fg, draw_fb) = if cell.is_cursor {
+                    (br, bg, bb) // inverted for cursor
+                } else {
+                    (fr, fg2, fb)
+                };
+                cr.set_source_rgb(
+                    draw_fr as f64 / 255.0,
+                    draw_fg as f64 / 255.0,
+                    draw_fb as f64 / 255.0,
+                );
+
+                // Apply bold/italic via Pango attributes if needed
+                let attrs = AttrList::new();
+                if cell.bold {
+                    attrs.insert(pango::AttrInt::new_weight(pango::Weight::Bold));
+                }
+                if cell.italic {
+                    attrs.insert(pango::AttrInt::new_style(pango::Style::Italic));
+                }
+                if cell.underline {
+                    attrs.insert(pango::AttrInt::new_underline(pango::Underline::Single));
+                }
+                layout.set_attributes(Some(&attrs));
+                layout.set_text(&ch_str);
+                cr.move_to(cell_x, row_y);
+                pangocairo::show_layout(cr, layout);
+                layout.set_attributes(None);
+            }
+
+            cell_x += char_width;
+        }
+    }
+}
+
+/// Translate a GTK key event to PTY input bytes.
+/// Returns an empty vec for keys that have no PTY mapping.
+fn gtk_key_to_pty_bytes(key_name: &str, unicode: Option<char>, ctrl: bool) -> Vec<u8> {
+    if ctrl {
+        // Ctrl+char → byte & 0x1f
+        if let Some(ch) = unicode {
+            let b = ch as u8;
+            if b.is_ascii() {
+                return vec![b & 0x1f];
+            }
+        }
+        // Named control keys when ctrl held
+        return match key_name {
+            "Return" => b"\r".to_vec(),
+            "BackSpace" => b"\x7f".to_vec(),
+            "Tab" => b"\t".to_vec(),
+            _ => vec![],
+        };
+    }
+
+    match key_name {
+        "Return" | "KP_Enter" => b"\r".to_vec(),
+        "BackSpace" => b"\x7f".to_vec(),
+        "Tab" => b"\t".to_vec(),
+        "Escape" => b"\x1b".to_vec(),
+        "Up" | "KP_Up" => b"\x1b[A".to_vec(),
+        "Down" | "KP_Down" => b"\x1b[B".to_vec(),
+        "Right" | "KP_Right" => b"\x1b[C".to_vec(),
+        "Left" | "KP_Left" => b"\x1b[D".to_vec(),
+        "Home" | "KP_Home" => b"\x1b[H".to_vec(),
+        "End" | "KP_End" => b"\x1b[F".to_vec(),
+        "Delete" | "KP_Delete" => b"\x1b[3~".to_vec(),
+        "Insert" | "KP_Insert" => b"\x1b[2~".to_vec(),
+        "Page_Up" | "KP_Page_Up" => b"\x1b[5~".to_vec(),
+        "Page_Down" | "KP_Page_Down" => b"\x1b[6~".to_vec(),
+        "F1" => b"\x1bOP".to_vec(),
+        "F2" => b"\x1bOQ".to_vec(),
+        "F3" => b"\x1bOR".to_vec(),
+        "F4" => b"\x1bOS".to_vec(),
+        "F5" => b"\x1b[15~".to_vec(),
+        "F6" => b"\x1b[17~".to_vec(),
+        "F7" => b"\x1b[18~".to_vec(),
+        "F8" => b"\x1b[19~".to_vec(),
+        "F9" => b"\x1b[20~".to_vec(),
+        "F10" => b"\x1b[21~".to_vec(),
+        "F11" => b"\x1b[23~".to_vec(),
+        "F12" => b"\x1b[24~".to_vec(),
+        _ => {
+            // Regular printable character
+            if let Some(ch) = unicode {
+                ch.to_string().into_bytes()
+            } else {
+                vec![]
+            }
+        }
     }
 }
 

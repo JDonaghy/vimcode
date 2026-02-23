@@ -11,6 +11,7 @@ pub mod session;
 pub mod settings;
 pub mod syntax;
 pub mod tab;
+pub mod terminal;
 pub mod view;
 pub mod window;
 

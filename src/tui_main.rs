@@ -504,7 +504,9 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
         // Layout: [activity_bar(3)] [sidebar(sw+1sep, if visible)] [editor_col]
         // editor_col: [tab(1)] / [editor] then global [status(1)] [cmd(1)]
         if let Ok(size) = terminal.size() {
-            let content_rows = size.height.saturating_sub(3); // tab + status + cmd
+            let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
+            let trm_rows: u16 = if engine.terminal_open { 13 } else { 0 };
+            let content_rows = size.height.saturating_sub(3 + qf_rows + trm_rows); // tab + status + cmd + panels
             let gutter_approx = 4u16;
             let sidebar_cols = if sidebar.visible {
                 sidebar_width + 1
@@ -613,6 +615,10 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
             if sidebar.visible && last_sidebar_refresh.elapsed() >= Duration::from_secs(2) {
                 sidebar.build_rows();
                 last_sidebar_refresh = Instant::now();
+                needs_redraw = true;
+            }
+            // Terminal: drain PTY output and refresh display if new data arrived.
+            if engine.poll_terminal() {
                 needs_redraw = true;
             }
             continue;
@@ -1054,6 +1060,44 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                         let mods = key_event.modifiers;
                         let code = key_event.code;
 
+                        // Ctrl+T: toggle terminal (checked first, works even when terminal focused)
+                        if matches_tui_key(&pk.open_terminal, code, mods) {
+                            if engine.terminal_open && engine.terminal_has_focus {
+                                engine.close_terminal();
+                            } else if engine.terminal_open {
+                                engine.terminal_has_focus = true;
+                            } else {
+                                // Open terminal at full terminal width
+                                let cols = terminal.size().ok().map(|s| s.width).unwrap_or(80);
+                                engine.open_terminal(cols, 12);
+                            }
+                            needs_redraw = true;
+                            continue;
+                        }
+
+                        // When terminal has focus, route all keys to PTY
+                        if engine.terminal_has_focus {
+                            // PageUp/PageDown scroll through scrollback instead of going to PTY.
+                            if matches!(code, KeyCode::PageUp) {
+                                engine.terminal_scroll_up(12);
+                                needs_redraw = true;
+                                continue;
+                            }
+                            if matches!(code, KeyCode::PageDown) {
+                                engine.terminal_scroll_down(12);
+                                needs_redraw = true;
+                                continue;
+                            }
+                            // Any other key resets scroll (returns to live view) and forwards.
+                            engine.terminal_scroll_reset();
+                            let data = translate_key_to_pty(key_event);
+                            if !data.is_empty() {
+                                engine.terminal_write(&data);
+                                needs_redraw = true;
+                            }
+                            continue;
+                        }
+
                         if matches_tui_key(&pk.toggle_sidebar, code, mods) {
                             sidebar.visible = !sidebar.visible;
                             if !sidebar.visible {
@@ -1151,7 +1195,14 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                     let prev_tab = engine.active_tab;
                     if !paste_intercepted {
                         let action = engine.handle_key(&key_name, unicode, ctrl);
-                        if handle_action(engine, action) {
+                        // Handle OpenTerminal specially (needs terminal size info)
+                        if action == EngineAction::OpenTerminal {
+                            if !engine.terminal_open {
+                                let cols = terminal.size().ok().map(|s| s.width).unwrap_or(80);
+                                engine.open_terminal(cols, 12);
+                            }
+                            needs_redraw = true;
+                        } else if handle_action(engine, action) {
                             break;
                         }
                     }
@@ -1295,7 +1346,10 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                     _ => {}
                 }
             }
-            Event::Resize(_, _) => {}
+            Event::Resize(new_w, _new_h) => {
+                // Resize the terminal PTY to match the full new terminal width.
+                engine.terminal_resize(new_w, 12);
+            }
             _ => {}
         }
         needs_redraw = true;
@@ -1406,6 +1460,26 @@ fn handle_mouse(
                     }
                 }
             }
+            // Terminal drag-to-select in content rows.
+            {
+                let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
+                let strip_rows: u16 = if engine.terminal_open { 13 } else { 0 };
+                let term_strip_top = term_height.saturating_sub(2 + qf_rows + strip_rows);
+                if engine.terminal_open
+                    && strip_rows > 0
+                    && row > term_strip_top
+                    && row < term_strip_top + strip_rows
+                {
+                    let term_row = row - term_strip_top - 1;
+                    if let Some(term) = engine.terminal.as_mut() {
+                        if let Some(ref mut sel) = term.selection {
+                            sel.end_row = term_row;
+                            sel.end_col = col;
+                        }
+                    }
+                    return sidebar_width;
+                }
+            }
         }
         MouseEventKind::Up(MouseButton::Left) => {
             *dragging_sidebar = false;
@@ -1443,6 +1517,25 @@ fn handle_mouse(
                 }
                 return sidebar_width;
             }
+            // Terminal panel scroll (must check before editor scroll).
+            {
+                let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
+                let strip_rows: u16 = if engine.terminal_open { 13 } else { 0 };
+                let term_strip_top = term_height.saturating_sub(2 + qf_rows + strip_rows);
+                if engine.terminal_open
+                    && strip_rows > 0
+                    && row >= term_strip_top
+                    && row < term_strip_top + strip_rows
+                {
+                    if matches!(ev.kind, MouseEventKind::ScrollUp) {
+                        engine.terminal_scroll_up(3);
+                    } else {
+                        engine.terminal_scroll_down(3);
+                    }
+                    return sidebar_width;
+                }
+            }
+
             if col >= editor_left && row + 2 < term_height {
                 let rel_col = col - editor_left;
                 let editor_row = row.saturating_sub(1);
@@ -1498,11 +1591,45 @@ fn handle_mouse(
         return sidebar_width;
     }
 
+    // ── Terminal panel click ───────────────────────────────────────────────────
+    {
+        let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
+        let strip_rows: u16 = if engine.terminal_open { 13 } else { 0 };
+        let term_strip_top = term_height.saturating_sub(2 + qf_rows + strip_rows);
+        if engine.terminal_open
+            && strip_rows > 0
+            && row >= term_strip_top
+            && row < term_strip_top + strip_rows
+        {
+            if row == term_strip_top {
+                // Header row — just focus the terminal.
+                engine.terminal_has_focus = true;
+            } else {
+                // Content row — start a selection.
+                let term_row = row - term_strip_top - 1;
+                engine.terminal_has_focus = true;
+                engine.terminal_scroll_reset();
+                if let Some(term) = engine.terminal.as_mut() {
+                    term.selection = Some(crate::core::terminal::TermSelection {
+                        start_row: term_row,
+                        start_col: col,
+                        end_row: term_row,
+                        end_col: col,
+                    });
+                }
+            }
+            return sidebar_width;
+        }
+    }
+    // Click landed outside the terminal panel — return focus to the editor.
+    engine.terminal_has_focus = false;
+
     // ── Activity bar ──────────────────────────────────────────────────────────
     if col < ACTIVITY_BAR_WIDTH {
         // Activity bar height = term_height - 2 (status+cmd) - quickfix
         let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
-        let bar_height = term_height.saturating_sub(2 + qf_rows);
+        let strip_rows: u16 = if engine.terminal_open { 13 } else { 0 };
+        let bar_height = term_height.saturating_sub(2 + qf_rows + strip_rows);
         let settings_row = bar_height.saturating_sub(1);
         let target_panel = match row {
             0 => Some(TuiPanel::Explorer),
@@ -1826,7 +1953,10 @@ fn build_screen_for_tui(
     sidebar_width: u16,
 ) -> render::ScreenLayout {
     // Global bottom rows: status(1) + cmd(1); editor column top: tab(1)
-    let content_rows = area.height.saturating_sub(3); // tab + status + cmd
+    // Also subtract quickfix and terminal panels so window rects don't extend into them.
+    let qf_height: u16 = if engine.quickfix_open { 6 } else { 0 };
+    let term_height: u16 = if engine.terminal_open { 13 } else { 0 };
+    let content_rows = area.height.saturating_sub(3 + qf_height + term_height); // tab + status + cmd + panels
     let sidebar_cols = if sidebar.visible {
         sidebar_width + 1
     } else {
@@ -1855,21 +1985,24 @@ fn draw_frame(
 ) {
     let area = frame.size();
 
-    // ── Global vertical split: [main_area] / [quickfix?] / [status(1)] / [cmd(1)] ──
+    // ── Global vertical split: [main_area] / [quickfix?] / [terminal?] / [status(1)] / [cmd(1)] ──
     let qf_height: u16 = if screen.quickfix.is_some() { 6 } else { 0 };
+    let terminal_height: u16 = if screen.terminal.is_some() { 13 } else { 0 }; // 1 header + 12 content
     let v_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(0),
             Constraint::Length(qf_height),
+            Constraint::Length(terminal_height),
             Constraint::Length(1),
             Constraint::Length(1),
         ])
         .split(area);
     let main_area = v_chunks[0];
     let quickfix_area = v_chunks[1];
-    let status_area = v_chunks[2];
-    let cmd_area = v_chunks[3];
+    let terminal_area = v_chunks[2];
+    let status_area = v_chunks[3];
+    let cmd_area = v_chunks[4];
 
     // ── Horizontal split of main_area: [activity_bar] [sidebar?] [editor_col] ─
     let sidebar_constraint = if sidebar.visible {
@@ -1981,6 +2114,11 @@ fn draw_frame(
             quickfix_scroll_top,
             theme,
         );
+    }
+
+    // ── Terminal panel (persistent bottom strip below quickfix) ──────────────
+    if let Some(ref term) = screen.terminal {
+        render_terminal_panel(frame.buffer_mut(), terminal_area, term, theme);
     }
 
     // ── Status / command ──────────────────────────────────────────────────────
@@ -4048,6 +4186,52 @@ fn translate_key(event: KeyEvent) -> Option<(String, Option<char>, bool)> {
     }
 }
 
+// ─── Terminal PTY key translation ────────────────────────────────────────────
+
+/// Translate a crossterm key event to PTY input bytes.
+/// Returns an empty vec for keys with no PTY mapping.
+fn translate_key_to_pty(event: KeyEvent) -> Vec<u8> {
+    let ctrl = event.modifiers.contains(KeyModifiers::CONTROL);
+    match event.code {
+        KeyCode::Char(c) if ctrl => {
+            let b = c.to_ascii_lowercase() as u8;
+            if b.is_ascii() {
+                vec![b & 0x1f]
+            } else {
+                vec![]
+            }
+        }
+        KeyCode::Char(c) => c.to_string().into_bytes(),
+        KeyCode::Enter => b"\r".to_vec(),
+        KeyCode::Backspace => b"\x7f".to_vec(),
+        KeyCode::Tab => b"\t".to_vec(),
+        KeyCode::Esc => b"\x1b".to_vec(),
+        KeyCode::Up => b"\x1b[A".to_vec(),
+        KeyCode::Down => b"\x1b[B".to_vec(),
+        KeyCode::Right => b"\x1b[C".to_vec(),
+        KeyCode::Left => b"\x1b[D".to_vec(),
+        KeyCode::Home => b"\x1b[H".to_vec(),
+        KeyCode::End => b"\x1b[F".to_vec(),
+        KeyCode::Delete => b"\x1b[3~".to_vec(),
+        KeyCode::Insert => b"\x1b[2~".to_vec(),
+        KeyCode::PageUp => b"\x1b[5~".to_vec(),
+        KeyCode::PageDown => b"\x1b[6~".to_vec(),
+        KeyCode::F(1) => b"\x1bOP".to_vec(),
+        KeyCode::F(2) => b"\x1bOQ".to_vec(),
+        KeyCode::F(3) => b"\x1bOR".to_vec(),
+        KeyCode::F(4) => b"\x1bOS".to_vec(),
+        KeyCode::F(5) => b"\x1b[15~".to_vec(),
+        KeyCode::F(6) => b"\x1b[17~".to_vec(),
+        KeyCode::F(7) => b"\x1b[18~".to_vec(),
+        KeyCode::F(8) => b"\x1b[19~".to_vec(),
+        KeyCode::F(9) => b"\x1b[20~".to_vec(),
+        KeyCode::F(10) => b"\x1b[21~".to_vec(),
+        KeyCode::F(11) => b"\x1b[23~".to_vec(),
+        KeyCode::F(12) => b"\x1b[24~".to_vec(),
+        _ => vec![],
+    }
+}
+
 // ─── Engine action handling ───────────────────────────────────────────────────
 
 fn handle_action(engine: &mut Engine, action: EngineAction) -> bool {
@@ -4063,6 +4247,7 @@ fn handle_action(engine: &mut Engine, action: EngineAction) -> bool {
             }
             false
         }
+        EngineAction::OpenTerminal => false, // TUI handles terminal open in main event loop
         EngineAction::None | EngineAction::Error => false,
     }
 }
@@ -4136,6 +4321,128 @@ fn render_quickfix_panel(
                 set_cell(buf, area.x + i as u16, ry, ch, item_fg, bg);
             }
         }
+    }
+}
+
+// ─── Terminal panel ───────────────────────────────────────────────────────────
+
+/// Nerd Font icons for the terminal toolbar.
+const NF_TERMINAL_CLOSE: &str = "󰅖"; // nf-md-close_box (inert; click detection not implemented in TUI yet)
+const NF_TERMINAL_SPLIT: &str = "󰤼"; // nf-md-table_split (placeholder)
+
+fn render_terminal_panel(
+    buf: &mut ratatui::buffer::Buffer,
+    area: Rect,
+    panel: &render::TerminalPanel,
+    theme: &Theme,
+) {
+    if area.height == 0 {
+        return;
+    }
+    let hdr_fg = RColor::Rgb(theme.status_fg.r, theme.status_fg.g, theme.status_fg.b);
+    let hdr_bg = RColor::Rgb(theme.status_bg.r, theme.status_bg.g, theme.status_bg.b);
+
+    // ── Toolbar row ──────────────────────────────────────────────────────────
+    for x in area.x..area.x + area.width {
+        set_cell(buf, x, area.y, ' ', hdr_fg, hdr_bg);
+    }
+    let exit_note = if panel.exited { " [exited]" } else { "" };
+    let title = format!(" TERMINAL{}", exit_note);
+    for (i, ch) in title.chars().enumerate().take(area.width as usize) {
+        set_cell(buf, area.x + i as u16, area.y, ch, hdr_fg, hdr_bg);
+    }
+    // Right-aligned icons
+    let icons = format!("{}  {}", NF_TERMINAL_SPLIT, NF_TERMINAL_CLOSE);
+    let icon_chars: Vec<char> = icons.chars().collect();
+    let icon_start = area.width.saturating_sub(icon_chars.len() as u16 + 1);
+    for (i, &ch) in icon_chars.iter().enumerate() {
+        set_cell(
+            buf,
+            area.x + icon_start + i as u16,
+            area.y,
+            ch,
+            hdr_fg,
+            hdr_bg,
+        );
+    }
+
+    // ── Scrollbar geometry ────────────────────────────────────────────────────
+    let content_rows = area.height.saturating_sub(1) as usize;
+    let sb_col = area.x + area.width.saturating_sub(1);
+    // Compute thumb range (row indices into the content area).
+    let total = panel.scrollback_rows + content_rows;
+    let (thumb_start, thumb_end) = if panel.scrollback_rows == 0 || area.width < 2 {
+        (0, content_rows) // no scrollback → full bar
+    } else {
+        let thumb_h = ((content_rows * content_rows) / total).max(1);
+        let max_off = panel.scrollback_rows;
+        let thumb_top = if panel.scroll_offset == 0 {
+            content_rows.saturating_sub(thumb_h)
+        } else {
+            let frac = panel.scroll_offset.min(max_off);
+            (frac * content_rows.saturating_sub(thumb_h)) / max_off
+        };
+        (thumb_top, (thumb_top + thumb_h).min(content_rows))
+    };
+
+    // ── Content rows ─────────────────────────────────────────────────────────
+    let cell_width = area.width.saturating_sub(1); // leave last col for scrollbar
+    for row_idx in 0..content_rows {
+        let screen_row = area.y + 1 + row_idx as u16;
+        if screen_row >= area.y + area.height {
+            break;
+        }
+        let term_bg_default = RColor::Rgb(30, 30, 30);
+        // Clear row with terminal default background (excluding scrollbar col).
+        for x in area.x..area.x + cell_width {
+            set_cell(buf, x, screen_row, ' ', hdr_fg, term_bg_default);
+        }
+
+        if row_idx < panel.rows.len() {
+            let row = &panel.rows[row_idx];
+            for (col_idx, cell) in row.iter().enumerate() {
+                let x = area.x + col_idx as u16;
+                if x >= area.x + cell_width {
+                    break;
+                }
+
+                let fg = RColor::Rgb(cell.fg.0, cell.fg.1, cell.fg.2);
+                let bg = RColor::Rgb(cell.bg.0, cell.bg.1, cell.bg.2);
+
+                let (draw_fg, draw_bg) = if cell.is_cursor || cell.selected {
+                    (bg, fg) // Reverse video for cursor / selection
+                } else {
+                    (fg, bg)
+                };
+
+                let ch = if cell.ch == '\0' { ' ' } else { cell.ch };
+
+                let mut modifier = Modifier::empty();
+                if cell.bold {
+                    modifier |= Modifier::BOLD;
+                }
+                if cell.italic {
+                    modifier |= Modifier::ITALIC;
+                }
+                if cell.underline {
+                    modifier |= Modifier::UNDERLINED;
+                }
+
+                if modifier.is_empty() {
+                    set_cell(buf, x, screen_row, ch, draw_fg, draw_bg);
+                } else {
+                    set_cell_styled(buf, x, screen_row, ch, draw_fg, draw_bg, modifier);
+                }
+            }
+        }
+
+        // Scrollbar column
+        let sb_char = if row_idx >= thumb_start && row_idx < thumb_end {
+            '█'
+        } else {
+            '░'
+        };
+        set_cell(buf, sb_col, screen_row, sb_char, hdr_fg, hdr_bg);
     }
 }
 

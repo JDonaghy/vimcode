@@ -1,5 +1,34 @@
 # VimCode Implementation Plan
 
+## Recently Completed (Session 69)
+
+### ✅ Terminal Panel Bug Fixes + Scrollbar
+
+- **TUI crash fix** — `build_screen_for_tui` now subtracts `qf_height + term_height` from `content_rows`; same fix in the viewport-sync loop at event-loop top
+- **TUI full-width fix** — PTY opens at `terminal.size().ok().map(|s| s.width)`, not editor-column width; `Event::Resize` now passes full `new_w` to `terminal_resize()`
+- **Scrollbar** — `TerminalPanel.scrollback_rows: usize` (from `screen.scrollback()`); TUI: rightmost column uses `░`/`█`; GTK: 6px Cairo strip with alpha thumb; thumb tracks `scroll_offset / scrollback_rows`
+- **Auto-close on exit** — `poll_terminal()` calls `close_terminal()` when `term.exited` is true; no zombie pane after Ctrl-D / `exit`
+- **Click-to-refocus editor** — `Msg::MouseClick` else-branch sets `terminal_has_focus = false` (GTK); `handle_mouse()` sets it false when click lands outside terminal block (TUI)
+- **TUI mouse selection** — Down click starts `TermSelection`; Drag arm updates `end_row/end_col`; Scroll arms detect terminal area before editor scroll
+- Tests: 638 → 638 (no change)
+
+---
+
+## Recently Completed (Session 68)
+
+### ✅ Integrated Terminal Panel
+
+- **`src/core/terminal.rs`** (new, ~165 lines) — `TerminalPane` backed by `portable-pty` (native PTY creation) + `vt100` (VT100 parser / cell grid); background mpsc reader thread drains PTY output asynchronously; `poll()` feeds parser + checks child exit; `write_input()` sends bytes to shell; `resize()` updates parser dimensions; `selected_text()` extracts selection from vt100 screen; `default_shell()` reads `$SHELL`
+- **Engine** — 3 new fields (`terminal`, `terminal_open`, `terminal_has_focus`); 7 new methods (`open_terminal`, `close_terminal`, `toggle_terminal`, `poll_terminal`, `terminal_write`, `terminal_resize`, `terminal_copy_selection`); `EngineAction::OpenTerminal` new variant; `:term`/`:terminal` command dispatch
+- **Settings** — `PanelKeys.open_terminal: String` (default `<C-t>`); `pk_open_terminal()` default fn; `Default` impl updated
+- **Render** — `TerminalCell`, `TermSelection`, `TerminalPanel` types; `ScreenLayout.terminal: Option<TerminalPanel>`; `build_terminal_panel(engine)` maps vt100 screen cells; `map_vt100_color(color, is_bg)` handles Default/Rgb/Idx(256) variants; `xterm_256_color(n)` 256-color palette; `normalize_term_selection()` helper
+- **GTK** — `draw_terminal_panel()` renders toolbar (Nerd Font `󰅖` close / `󰤼` split icons) + cell grid (per-cell bg fill + pango char + cursor rect + selection overlay); `gtk_key_to_pty_bytes()` translates GDK key names to PTY bytes; 6 new Msg variants; key routing checks `open_terminal` panel key first, then PTY routing when `terminal_has_focus`; `term_px` reduces editor content bounds; SearchPollTick polls terminal
+- **TUI** — `render_terminal_panel()` toolbar + content rows via ratatui buffer; `translate_key_to_pty()` maps crossterm keycodes; extra `Constraint::Length(terminal_height)` layout slot; key routing; `EngineAction::OpenTerminal` handling; idle polling; resize event calls `terminal_resize()`
+- **Future items** — Multiple tabs (tab strip in toolbar, `Vec<TerminalPane>`); draggable panel height; scrollback navigation (ring buffer + scroll_offset); TUI Ctrl+F find dialog; split terminal panes
+- Tests: 638 → 638 (PTY requires subprocess; no unit tests in v1)
+
+---
+
 ## Recently Completed (Session 67)
 
 ### ✅ VSCode Mode: F1 Command Access + Status Bar Hint
@@ -474,7 +503,11 @@
 - [x] **Edit mode toggle** — `editor_mode` setting (`"vim"` default | `"vscode"`); `:set mode=vscode`; `Alt-M` runtime toggle; Shift+Arrow selection, Ctrl+Arrow word nav, Ctrl-C/X/V/Z/Y/A shortcuts, Ctrl+/ comment toggle, smart Home; status bar shows EDIT/SELECT; session 66
 
 ### Terminal & Debugger
-- [ ] **Integrated terminal** — VSCode-style bottom panel terminal; spawns a shell (`$SHELL`) in the project `cwd`; `:terminal` / `Ctrl-\`` to open/toggle; multiple terminal tabs; input routed to PTY; scrollback buffer; GTK uses `vte` crate or similar; TUI renders PTY output via crossterm raw mode subregion
+- [x] **Integrated terminal** — VSCode-style 13-row bottom panel; `portable-pty` + `vt100`; Ctrl-T toggle + `:term` command; full 256-color cell rendering; mouse selection; Nerd Font toolbar; shell session persists on close (session 68)
+- [ ] **Terminal: multiple tabs** — tab strip in toolbar; `Vec<TerminalPane>`; Ctrl-T N to switch
+- [ ] **Terminal: draggable panel height** — same GestureDrag pattern as sidebar resize
+- [ ] **Terminal: scrollback navigation** — ring buffer of completed rows + scroll_offset; PgUp/PgDn while focused
+- [ ] **Terminal: TUI Ctrl+F find** — general-purpose find dialog in TUI (currently GTK-only)
 - [ ] **Debugger (DAP)** — Debug Adapter Protocol client (analogous to LSP but for debugging); auto-detect `codelldb`, `debugpy`, `js-debug`; breakpoints set with `<F9>` or `:Breakpoint`; step over/in/out (`<F10>`/`<F11>`/`<F12>`); call stack + variables panel in sidebar; inline variable values shown as virtual text; status bar shows current debug state
 
 ### UI & Menus

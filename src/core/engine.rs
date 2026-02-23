@@ -10,6 +10,7 @@ use super::project_search::{self, ProjectMatch, ReplaceResult, SearchError, Sear
 use super::session::SessionState;
 use super::settings::{EditorMode, Settings};
 use super::tab::{Tab, TabId};
+use super::terminal::{default_shell, TerminalPane};
 use super::view::View;
 use super::window::{SplitDirection, Window, WindowId, WindowLayout, WindowRect};
 use super::{Cursor, Mode};
@@ -24,6 +25,8 @@ pub enum EngineAction {
     OpenFile(PathBuf),
     /// Display an error to the user (engine already set self.message)
     Error,
+    /// Open the integrated terminal panel (UI layer provides correct cols/rows)
+    OpenTerminal,
 }
 
 /// How a file should be opened: as a temporary preview or permanent buffer.
@@ -353,6 +356,14 @@ pub struct Engine {
     pub clipboard_write: Option<Box<dyn Fn(&str) -> Result<(), String>>>,
     /// Whether a mouse drag selection is currently active.
     pub mouse_drag_active: bool,
+
+    // --- Integrated terminal ---
+    /// The terminal pane (PTY + VT100 parser). None until first open.
+    pub terminal: Option<TerminalPane>,
+    /// Whether the terminal panel is visible.
+    pub terminal_open: bool,
+    /// Whether the terminal panel has keyboard focus.
+    pub terminal_has_focus: bool,
 }
 
 impl Engine {
@@ -463,6 +474,9 @@ impl Engine {
             clipboard_read: None,
             clipboard_write: None,
             mouse_drag_active: false,
+            terminal: None,
+            terminal_open: false,
+            terminal_has_focus: false,
         };
         // If vscode mode is configured, start in Insert mode (no Normal mode)
         if engine.is_vscode_mode() {
@@ -5420,6 +5434,11 @@ impl Engine {
 
         let cmd = cmd.trim();
 
+        // Handle :term / :terminal — open integrated terminal
+        if cmd == "term" || cmd == "terminal" {
+            return EngineAction::OpenTerminal;
+        }
+
         // Handle :LspInfo — show running LSP servers
         if cmd == "LspInfo" {
             if let Some(mgr) = &self.lsp_manager {
@@ -9613,6 +9632,103 @@ impl Engine {
                 EngineAction::None
             }
             _ => EngineAction::None,
+        }
+    }
+
+    // ── Integrated Terminal ────────────────────────────────────────────────
+
+    /// Open the integrated terminal panel with the given dimensions.
+    /// If already open, just focuses the terminal.
+    pub fn open_terminal(&mut self, cols: u16, rows: u16) {
+        if self.terminal.is_none() {
+            let shell = default_shell();
+            match TerminalPane::new(cols, rows, &shell) {
+                Ok(pane) => {
+                    self.terminal = Some(pane);
+                }
+                Err(e) => {
+                    self.message = format!("terminal: failed to open PTY: {}", e);
+                    return;
+                }
+            }
+        }
+        self.terminal_open = true;
+        self.terminal_has_focus = true;
+    }
+
+    /// Hide the terminal panel but keep the PTY running.
+    pub fn close_terminal(&mut self) {
+        self.terminal_open = false;
+        self.terminal_has_focus = false;
+    }
+
+    /// Toggle the integrated terminal:
+    /// - If open and focused → close (hide)
+    /// - If open but unfocused → give focus
+    /// - If not open → open with current dimensions (UI must call open_terminal directly)
+    pub fn toggle_terminal(&mut self) {
+        if self.terminal_open && self.terminal_has_focus {
+            self.close_terminal();
+        } else if self.terminal_open {
+            self.terminal_has_focus = true;
+        } else {
+            // Signal UI to call open_terminal with correct dimensions
+            self.terminal_open = true;
+            self.terminal_has_focus = true;
+        }
+    }
+
+    /// Drain PTY output and update the VT100 screen. Returns true if redrawn needed.
+    /// Automatically closes the panel when the shell process has exited.
+    pub fn poll_terminal(&mut self) -> bool {
+        let got_data = if let Some(term) = self.terminal.as_mut() {
+            term.poll()
+        } else {
+            false
+        };
+        if got_data && self.terminal.as_ref().map(|t| t.exited).unwrap_or(false) {
+            self.close_terminal();
+        }
+        got_data
+    }
+
+    /// Send raw bytes to the shell's PTY stdin.
+    pub fn terminal_write(&mut self, data: &[u8]) {
+        if let Some(term) = self.terminal.as_mut() {
+            term.write_input(data);
+        }
+    }
+
+    /// Resize the terminal PTY and VT100 parser.
+    pub fn terminal_resize(&mut self, cols: u16, rows: u16) {
+        if let Some(term) = self.terminal.as_mut() {
+            term.resize(cols, rows);
+        }
+    }
+
+    /// Return selected terminal text for clipboard copy.
+    pub fn terminal_copy_selection(&mut self) -> Option<String> {
+        self.terminal.as_ref()?.selected_text()
+    }
+
+    /// Scroll the terminal scrollback view up (away from live output).
+    pub fn terminal_scroll_up(&mut self, rows: usize) {
+        if let Some(term) = self.terminal.as_mut() {
+            term.scroll_up(rows);
+        }
+    }
+
+    /// Scroll the terminal scrollback view down (toward live output).
+    pub fn terminal_scroll_down(&mut self, rows: usize) {
+        if let Some(term) = self.terminal.as_mut() {
+            term.scroll_down(rows);
+        }
+    }
+
+    /// Return to the live view (cancel any scrollback offset).
+    pub fn terminal_scroll_reset(&mut self) {
+        if let Some(term) = self.terminal.as_mut() {
+            term.scroll_reset();
         }
     }
 }

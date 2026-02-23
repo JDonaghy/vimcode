@@ -1,10 +1,10 @@
 # VimCode Project State
 
-**Last updated:** Feb 22, 2026 (Session 67)
+**Last updated:** Feb 22, 2026 (Session 69)
 
 ## Status
 
-**VSCode mode F1 command access:** F1 opens command bar from EDIT mode; status bar shows `EDIT  F1:cmd  Alt-M:vim`; returns to Insert after command executes; `Settings::load()` returns defaults in `#[cfg(test)]` (tests hermetic regardless of settings.json) — 638 tests passing
+**Integrated terminal panel:** VSCode-style bottom strip terminal backed by a real PTY; full VT100/256-color rendering; Ctrl-T toggle; `:term` command; auto-close on shell exit; scrollbar; click-to-refocus editor — 638 tests passing
 
 ### Core Vim (Complete)
 - Seven modes (Normal/Insert/Visual/Visual Line/Visual Block/Command/Search)
@@ -133,6 +133,19 @@
 - Path canonicalization: diagnostics keyed by absolute paths; lookups canonicalize buffer paths
 - Pure `std::thread` + `std::sync::mpsc` — no tokio/async runtime
 
+### Integrated Terminal
+- `Ctrl-T` (Normal mode) or `:term`/`:terminal` command — toggle integrated terminal panel
+- Persistent 13-row bottom strip (1 toolbar + 12 content rows); panel closes but shell session stays alive; reopen restores same session
+- Real PTY via `portable-pty`; VT100/ANSI parsing via `vt100`; full 256-color xterm palette (system colors 0–15, 6×6×6 cube 16–231, grayscale 232–255)
+- Background mpsc reader thread forwards shell output; `poll()` drains and feeds `vt100::Parser`
+- All keypresses forwarded to PTY when terminal has focus; Ctrl-C, Ctrl-D, Ctrl-L, Ctrl-Z, arrow keys, Tab all work
+- Mouse selection (click+drag sets `TermSelection`; `selected_text()` extracts from vt100 screen)
+- Nerd Font toolbar row with `󰅖` close / `󰤼` split icons
+- GTK: Cairo/Pango per-cell rendering; TUI: ratatui buffer cell rendering with `Modifier::BOLD/ITALIC/UNDERLINED`
+- **Scrollbar** in rightmost column (TUI `░`/`█`) or 6px Cairo strip (GTK); thumb position tracks `scroll_offset` vs `scrollback_rows`
+- **Auto-close:** `poll_terminal()` calls `close_terminal()` when `exited` is detected; no zombie panes
+- **Focus handoff:** clicking outside terminal panel clears `terminal_has_focus` in both backends
+
 ### TUI Backend (`src/tui_main.rs`)
 - Full editor in terminal via ratatui 0.27 + crossterm
 - **Sidebar:** File explorer tree (Ctrl-B toggle, Alt+E focus), j/k navigation, l/Enter open, h collapse, a/A/D/r/M CRUD+rename+move; root folder entry at top of tree; auto-refresh every 2s; cursor keys in prompts; **Search panel** (Alt+F): query input, Enter to run, j/k results, Enter opens file
@@ -174,23 +187,24 @@
 ```
 vimcode/
 ├── src/
-│   ├── main.rs (~4410 lines) — GTK4/Relm4 UI, rendering, find dialog, sidebar resize, search/replace panel, fuzzy popup, quickfix panel, right-click context menu, drag-and-drop, diff rendering
-│   ├── tui_main.rs (~3860 lines) — ratatui/crossterm TUI backend, sidebar, mouse, search/replace panel, fuzzy popup, quickfix panel, rename/move prompts, diff rendering
+│   ├── main.rs (~4560 lines) — GTK4/Relm4 UI, rendering, find dialog, sidebar resize, search/replace panel, fuzzy popup, quickfix panel, terminal panel, right-click context menu, drag-and-drop, diff rendering
+│   ├── tui_main.rs (~4000 lines) — ratatui/crossterm TUI backend, sidebar, mouse, search/replace panel, fuzzy popup, quickfix panel, terminal panel, rename/move prompts, diff rendering
 │   ├── icons.rs (~30 lines) — Nerd Font file-type icons (shared by GTK + TUI)
-│   ├── render.rs (~1340 lines) — Platform-agnostic rendering abstraction (ScreenLayout, max_col, QuickfixPanel, DiffLine, diff_status)
-│   └── core/ (~23,700 lines) — Platform-agnostic logic
-│       ├── engine.rs (~17,940 lines) — Orchestrates everything, find/replace, macros, history, LSP, project search/replace, fuzzy finder, quickfix, rename/move, diff
+│   ├── render.rs (~1410 lines) — Platform-agnostic rendering abstraction (ScreenLayout, max_col, QuickfixPanel, TerminalPanel, DiffLine, diff_status)
+│   └── core/ (~23,870 lines) — Platform-agnostic logic
+│       ├── engine.rs (~17,980 lines) — Orchestrates everything, find/replace, macros, history, LSP, project search/replace, fuzzy finder, quickfix, rename/move, diff, terminal
+│       ├── terminal.rs (~165 lines) — PTY-backed terminal pane (portable-pty + vt100 parser, mpsc reader thread)
 │       ├── lsp.rs (~1,200 lines) — LSP protocol transport + single-server client (request ID tracking)
 │       ├── lsp_manager.rs (~400 lines) — Multi-server coordinator with initialization guards
 │       ├── project_search.rs (~630 lines) — Regex/case/whole-word search + replace (ignore + regex crates)
 │       ├── buffer_manager.rs (~600 lines) — Buffer lifecycle
 │       ├── buffer.rs (~120 lines) — Rope-based storage
 │       ├── session.rs (~175 lines) — Session state persistence (sidebar_width added)
-│       ├── settings.rs (~925 lines) — JSON persistence, auto-init, :set parsing, explorer keys, panel_keys, parse_key_binding
+│       ├── settings.rs (~940 lines) — JSON persistence, auto-init, :set parsing, explorer keys, panel_keys (incl. open_terminal), parse_key_binding
 │       ├── window.rs, tab.rs, view.rs, cursor.rs, mode.rs, syntax.rs
 │       ├── git.rs (~635 lines) — git subprocess integration (diff/blame/hunk parsing, branch detection, stage_hunk)
 │       └── Tests: 638 passing (9 find/replace, 14 macro, 8 session, 4 reverse search, 7 replace char, 5 undo line, 8 case change, 6 marks, 5 incremental search, 12 syntax/language, 6 history search, 11 fold tests, 12 git tests, 4 sidebar-preview tests, 5 auto-indent tests, 6 completion tests, 9 quit/ctrl-s tests, 1 session-restore test, 23 set-command tests, 10 hunk-staging tests, 9 text-object tests, 24 project-search tests, 5 engine-replace tests, 27 lsp-protocol tests, 10 lsp-engine tests, 31 vim-features tests, 9 tag-object tests, 9 norm-command tests, 11 fuzzy-finder tests, 8 live-grep tests, 8 quickfix tests, 13 diff+rename+move tests, 4 explorer-keys tests, 4 help-system tests, 7 panel-keys tests, 18 vscode-mode tests)
-└── Total: ~33,400 lines
+└── Total: ~34,000 lines
 ```
 
 ## Architecture
@@ -263,12 +277,17 @@ cargo fmt
 - [x] **`it`/`at` tag text objects** — inner/around HTML/XML tag
 - [x] **Edit mode toggle** — `editor_mode` setting (`vim`/`vscode`); `:set mode=vscode`; `Alt-M` runtime toggle; always-insert with Ctrl-C/X/V/Z/Y/A shortcuts, Shift+Arrow selection, Ctrl+Arrow word nav, smart Home, Ctrl+/ comment toggle
 - [x] **VSCode mode F1 command access** — F1 opens command bar; status shows `EDIT  F1:cmd  Alt-M:vim`; returns to Insert after execution
+- [x] **Integrated terminal panel** — Ctrl-T toggle; `:term` command; PTY-backed real shell; VT100/256-color; mouse selection; Nerd Font toolbar; session persists on close
 
 ### Big features
 - [x] **LSP support** — completions (Ctrl-Space), go-to-definition (gd), hover (K), diagnostics (]d/[d), auto-detect servers on PATH
 - [x] **`:norm`** — execute normal command on a range of lines
 
 ## Recent Work
+**Session 69:** Terminal panel bug fixes + scrollbar — fixed TUI crash (clicking on terminal output caused panic: `build_screen_for_tui` didn't subtract quickfix/terminal rows from `content_rows`, so engine window rects extended into the terminal area; mouse clicks matched a window and called `engine.mouse_click()` with an OOB line number). Fixed TUI not-full-width (PTY was opened with editor-column width; changed to `terminal.size().ok().map(|s| s.width)`). Added scrollback tracking: `scroll_offset: usize` + `scroll_up/down/reset()` on `TerminalPane`; PageUp/PageDown in terminal focus changes offset (visual scrollback deferred — vt100 0.15 has no per-cell scrollback API). Added scrollbar: `scrollback_rows: usize` on `TerminalPanel`; TUI uses rightmost column (`░`/`█`); GTK draws a 6px Cairo strip. Fixed mouse click-to-focus: clicking outside the terminal panel clears `terminal_has_focus` in both backends. Fixed TUI mouse selection (click starts, drag extends). Auto-close on shell exit: `poll_terminal()` calls `close_terminal()` when `term.exited` is detected. 638 tests (no change).
+
+**Session 68:** Integrated terminal panel — new `src/core/terminal.rs` (`TerminalPane` backed by `portable-pty` + `vt100`; background mpsc reader thread; `poll()`, `write_input()`, `resize()`, `selected_text()`). Engine: `terminal: Option<TerminalPane>`, `terminal_open`, `terminal_has_focus`; `open_terminal()`, `close_terminal()`, `toggle_terminal()`, `poll_terminal()`, `terminal_write()`, `terminal_resize()`, `terminal_copy_selection()`; `EngineAction::OpenTerminal`; `:term`/`:terminal` command. Settings: `PanelKeys.open_terminal` (default `<C-t>`). Render: `TerminalCell`, `TermSelection`, `TerminalPanel`, `build_terminal_panel()`, `map_vt100_color()`, `xterm_256_color()`; `terminal: Option<TerminalPanel>` on `ScreenLayout`. GTK: `draw_terminal_panel()`, `gtk_key_to_pty_bytes()`, terminal Msg variants, key routing (panel key checked first; PTY byte routing when `terminal_has_focus`), `term_px` editor height reduction, SearchPollTick polling. TUI: `render_terminal_panel()`, `translate_key_to_pty()`, extra `Constraint::Length(terminal_height)` layout slot, key routing, `EngineAction::OpenTerminal` handling, idle poll, resize handler. 638 tests (no change — PTY requires subprocess, no unit tests in v1).
+
 **Session 67:** VSCode mode F1 command access — F1 in `handle_vscode_key()` sets `mode = Command`; routing: top of `handle_vscode_key()` delegates to `handle_command_key()` when `mode == Command`; Escape returns to Insert (not Normal); after `execute_command()`, `is_vscode_mode()` guard returns to Insert (stays Normal if `:set mode=vim` was run); `mode_str()` shows `EDIT  F1:cmd  Alt-M:vim` and `COMMAND` during command bar; `Settings::load()` returns `Self::default()` under `#[cfg(test)]` so tests are hermetic regardless of user's `settings.json`. 3 new tests: `test_vscode_mode_f1_opens_command`, `test_vscode_mode_command_returns_to_insert`, `test_vscode_mode_f1_escape_returns_to_insert`. 635 → 638 tests.
 
 **Session 66:** VSCode edit mode toggle — `EditorMode` enum (`Vim`/`Vscode`) in `settings.rs` with serde serialization + `:set mode=vim`/`:set mode=vscode` command; full `handle_vscode_key()` dispatcher in `engine.rs` with Shift+Arrow selection (exclusive-end semantics), Ctrl-C/X/V/Z/Y/A/S shortcuts, Ctrl+Arrow word navigation, Ctrl+Shift+Arrow word select, smart Home (first non-ws toggle), Ctrl+/ line comment toggle, Escape clears selection, typing replaces selection; `toggle_editor_mode()` (Alt-M) persists mode to settings.json; `mode_str()` returns "EDIT"/"SELECT" in vscode mode; GTK: Shift+Arrow key name transform, Ctrl-V clipboard pre-load, mouse click clears selection, Alt-M toggle; TUI: `translate_key()` Shift+Arrow and Ctrl+Shift+Arrow, Alt-M arm, Ctrl-V pre-load, click clear; `render.rs` calls `engine.mode_str()` for status bar. Undo model: each keypress is one undo group (start_undo_group/finish_undo_group in handle_vscode_key); vscode_delete_selection uses exclusive end. 620 → 635 tests (+15 vscode-mode tests).

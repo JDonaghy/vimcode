@@ -217,6 +217,9 @@ fn pk_fuzzy_finder() -> String {
 fn pk_live_grep() -> String {
     "<C-g>".to_string()
 }
+fn pk_open_terminal() -> String {
+    "<C-t>".to_string()
+}
 
 /// Global keyboard shortcuts for panel navigation.
 ///
@@ -241,6 +244,9 @@ pub struct PanelKeys {
     /// Open live grep modal. Default: `<C-g>`
     #[serde(default = "pk_live_grep")]
     pub live_grep: String,
+    /// Toggle integrated terminal panel. Default: `<C-t>`
+    #[serde(default = "pk_open_terminal")]
+    pub open_terminal: String,
 }
 
 impl Default for PanelKeys {
@@ -251,6 +257,7 @@ impl Default for PanelKeys {
             focus_search: pk_focus_search(),
             fuzzy_finder: pk_fuzzy_finder(),
             live_grep: pk_live_grep(),
+            open_terminal: pk_open_terminal(),
         }
     }
 }
