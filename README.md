@@ -11,7 +11,7 @@ There's a touch of irony here - using a cli tool to write the editor that I've w
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 638 tests, zero async runtime
+- **Clean architecture** — platform-agnostic core, 638 tests, zero async runtime dependency
 
 ## Building
 
@@ -233,7 +233,7 @@ cargo fmt
 - `Ctrl-T` (Normal mode) — toggle the integrated terminal panel
 - `:term` / `:terminal` — open a **new terminal tab** (always spawns a fresh shell, even if the panel is already open)
 - The terminal is a **resizable bottom strip** (default 1 toolbar + 12 content rows) above the status bar; drag the header row up/down to resize; height persists across sessions
-- Shell is determined by the `$SHELL` environment variable, falling back to `/bin/bash`
+- Shell is determined by the `$SHELL` environment variable, falling back to `/bin/bash`; starts in the editor's working directory
 - Full **ANSI/VT100 color support** — 256-color xterm palette rendered cell-by-cell
 - **Multiple terminal tabs** — each tab runs an independent PTY; the toolbar shows `[1] [2] …` labels:
   - `Alt-1` through `Alt-9` (when terminal has focus) — switch to tab N
@@ -249,7 +249,7 @@ cargo fmt
 - **Find in terminal** — `Ctrl-F` (while terminal has focus) opens an inline find bar in the toolbar row:
   - Type to set the query; matching text highlights live (orange = active match, amber = other matches)
   - `Enter` — next match; `Shift+Enter` — previous match; `Escape` or `Ctrl-F` — close find bar
-  - Search is case-insensitive; covers all visible rows in the current terminal view
+  - Search is case-insensitive; covers all visible rows and the full scrollback history
 - **Nerd Font toolbar** — tab strip + split (`󰤼`) and close (`󰅖`) icons
 - **All keys forwarded to shell PTY** — Ctrl-C, Ctrl-D, Ctrl-L, Ctrl-Z, arrow keys, Tab, etc. work as expected
 - `Ctrl-T` while the terminal has focus **closes the panel** while keeping all shell sessions alive; reopening restores the same sessions
@@ -363,6 +363,12 @@ Runtime changes are written through to `~/.config/vimcode/settings.json` immedia
 | `incsearch` / `noincsearch` | `is` | on | Incremental search as you type |
 | `lsp` / `nolsp` | | on | Enable/disable LSP language servers |
 | `mode=vim` / `mode=vscode` | | vim | Editor mode (see **VSCode Mode** below) |
+
+Additional options (set directly in `settings.json`):
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `terminal_scrollback_lines` | `5000` | Rows kept in terminal scrollback history (0 = unlimited) |
 
 - `:set option?` — query current value (e.g. `:set ts?` → `tabstop=4`)
 - `:set` (no args) — show one-line summary of all settings
@@ -571,20 +577,21 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 
 ```
 src/
-├── main.rs          (~5260 lines)  GTK4/Relm4 UI, rendering, sidebar resize, fuzzy popup, context menu, drag-and-drop
-├── tui_main.rs      (~4600 lines)  ratatui/crossterm TUI backend, fuzzy popup, rename/move prompts
-├── render.rs        (~1340 lines)  Platform-agnostic ScreenLayout bridge (DiffLine, diff_status)
+├── main.rs          (~5470 lines)  GTK4/Relm4 UI, rendering, sidebar resize, fuzzy popup, context menu, drag-and-drop
+├── tui_main.rs      (~4705 lines)  ratatui/crossterm TUI backend, fuzzy popup, rename/move prompts
+├── render.rs        (~1650 lines)  Platform-agnostic ScreenLayout bridge (DiffLine, diff_status)
 ├── icons.rs            (~30 lines)  Nerd Font file-type icons (GTK + TUI)
-└── core/            (~23700 lines)  Zero GTK/rendering deps — fully testable
-    ├── engine.rs                    Orchestrator: keys, commands, git, macros, LSP, project search/replace, fuzzy finder
-    ├── lsp.rs                       LSP protocol transport + single-server client (request ID tracking, JSON-RPC framing)
-    ├── lsp_manager.rs               Multi-server coordinator with initialization guards + built-in registry
-    ├── project_search.rs            Regex/case/whole-word search + replace (ignore + regex crates)
-    ├── buffer_manager.rs            Buffer lifecycle, undo/redo stacks
-    ├── buffer.rs                    Rope-based text storage (ropey)
-    ├── settings.rs                  JSON config, :set parsing
-    ├── session.rs                   Session state persistence
-    ├── git.rs                       Git subprocesses: diff, blame, stage_hunk
+└── core/            (~24,100 lines)  Zero GTK/rendering deps — fully testable
+    ├── engine.rs    (~19,920 lines)  Orchestrator: keys, commands, git, macros, LSP, project search/replace, fuzzy finder
+    ├── terminal.rs     (~320 lines)  PTY-backed terminal pane (portable-pty + vt100, history ring buffer)
+    ├── lsp.rs        (~1,200 lines)  LSP protocol transport + single-server client (request ID tracking, JSON-RPC framing)
+    ├── lsp_manager.rs  (~400 lines)  Multi-server coordinator with initialization guards + built-in registry
+    ├── project_search.rs (~630 lines)  Regex/case/whole-word search + replace (ignore + regex crates)
+    ├── buffer_manager.rs (~600 lines)  Buffer lifecycle, undo/redo stacks
+    ├── buffer.rs       (~120 lines)  Rope-based text storage (ropey)
+    ├── settings.rs   (~1,030 lines)  JSON config, :set parsing, key binding notation
+    ├── session.rs      (~180 lines)  Session state persistence
+    ├── git.rs          (~635 lines)  Git subprocesses: diff, blame, stage_hunk
     └── window.rs, tab.rs, view.rs, cursor.rs, mode.rs, syntax.rs
 ```
 
