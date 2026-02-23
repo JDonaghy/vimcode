@@ -105,6 +105,8 @@ struct App {
     terminal_sb_dragging: bool,
     /// True while the user drags the terminal header row to resize the panel.
     terminal_resize_dragging: bool,
+    /// True while the user drags the terminal split divider left/right.
+    terminal_split_dragging: bool,
 }
 
 /// Scrollbars and indicators for a single window
@@ -256,6 +258,10 @@ enum Msg {
     TerminalCloseActiveTab,
     /// Kill the terminal process and close the panel.
     TerminalKill,
+    /// Toggle horizontal split view (two panes side-by-side).
+    TerminalToggleSplit,
+    /// Set keyboard focus to a specific split pane (0=left, 1=right).
+    TerminalSplitFocus(usize),
     /// Copy terminal selection to clipboard.
     TerminalCopySelection,
     /// Paste from system clipboard into the terminal PTY.
@@ -823,6 +829,14 @@ impl SimpleComponent for App {
                                             }
                                             return gtk4::glib::Propagation::Stop;
                                         }
+                                        // Ctrl-W in split mode: switch focus between panes.
+                                        if ctrl && !shift && !alt
+                                            && (key_name == "w" || key_name == "W")
+                                            && engine.borrow().terminal_split
+                                        {
+                                            engine.borrow_mut().terminal_split_switch_focus();
+                                            return gtk4::glib::Propagation::Stop;
+                                        }
                                         let data = gtk_key_to_pty_bytes(&key_name, unicode, ctrl);
                                         if !data.is_empty() {
                                             engine.borrow_mut().terminal_write(&data);
@@ -1170,6 +1184,7 @@ impl SimpleComponent for App {
             clipboard,
             terminal_sb_dragging: false,
             terminal_resize_dragging: false,
+            terminal_split_dragging: false,
         };
         let widgets = view_output!();
 
@@ -1847,41 +1862,74 @@ impl SimpleComponent for App {
                 if let Some((term_y, in_content)) = in_terminal {
                     self.engine.borrow_mut().terminal_has_focus = true;
                     if in_content {
-                        // 6px scrollbar strip on the right edge — start a scrollbar drag.
                         const SB_W: f64 = 6.0;
-                        if x >= width - SB_W {
-                            self.terminal_sb_dragging = true;
+                        // In split mode: detect a click on the divider (start drag)
+                        // or set keyboard focus to the appropriate pane.
+                        let on_divider = if self.engine.borrow().terminal_split
+                            && self.engine.borrow().terminal_panes.len() >= 2
+                        {
+                            let left_cols = {
+                                let engine = self.engine.borrow();
+                                if engine.terminal_split_left_cols > 0 {
+                                    engine.terminal_split_left_cols
+                                } else {
+                                    engine.terminal_panes[0].cols
+                                }
+                            };
+                            let div_x = left_cols as f64 * self.cached_char_width;
+                            if x < width - SB_W && (x - div_x).abs() < 4.0 {
+                                self.terminal_split_dragging = true;
+                                true
+                            } else {
+                                let mut engine = self.engine.borrow_mut();
+                                engine.terminal_active = if x < div_x { 0 } else { 1 };
+                                false
+                            }
                         } else {
-                            self.terminal_sb_dragging = false;
-                            self.terminal_resize_dragging = false;
-                            let row = ((y - term_y - self.cached_line_height)
-                                / self.cached_line_height)
-                                as u16;
-                            let col = (x / self.cached_char_width.max(1.0)) as u16;
-                            self.engine.borrow_mut().terminal_scroll_reset();
-                            if let Some(term) = self.engine.borrow_mut().active_terminal_mut() {
-                                term.selection = Some(crate::core::terminal::TermSelection {
-                                    start_row: row,
-                                    start_col: col,
-                                    end_row: row,
-                                    end_col: col,
-                                });
+                            false
+                        };
+                        if !on_divider {
+                            // 6px scrollbar strip on the right edge — start a scrollbar drag.
+                            if x >= width - SB_W {
+                                self.terminal_sb_dragging = true;
+                            } else {
+                                self.terminal_sb_dragging = false;
+                                self.terminal_resize_dragging = false;
+                                let row = ((y - term_y - self.cached_line_height)
+                                    / self.cached_line_height)
+                                    as u16;
+                                let col = (x / self.cached_char_width.max(1.0)) as u16;
+                                self.engine.borrow_mut().terminal_scroll_reset();
+                                if let Some(term) = self.engine.borrow_mut().active_terminal_mut() {
+                                    term.selection = Some(crate::core::terminal::TermSelection {
+                                        start_row: row,
+                                        start_col: col,
+                                        end_row: row,
+                                        end_col: col,
+                                    });
+                                }
                             }
                         }
                     } else {
-                        // Header row click — tab switch, close icon, or resize drag.
+                        // Header row click — tab switch, toolbar buttons, or resize drag.
                         const TERMINAL_TAB_COLS: usize = 4;
                         let tab_count = self.engine.borrow().terminal_panes.len();
                         let tab_area_px =
                             tab_count as f64 * TERMINAL_TAB_COLS as f64 * self.cached_char_width;
-                        // Right-aligned close icon occupies ~2 chars from the right edge.
+                        // Right-aligned buttons (3 chars each): + ⊞ ×
                         let close_x = width - self.cached_char_width * 2.0;
+                        let split_x = width - self.cached_char_width * 4.0;
+                        let add_x = width - self.cached_char_width * 6.0;
                         if x < tab_area_px && self.cached_char_width > 0.0 {
                             let idx =
                                 (x / (TERMINAL_TAB_COLS as f64 * self.cached_char_width)) as usize;
                             sender.input(Msg::TerminalSwitchTab(idx));
                         } else if x >= close_x {
                             sender.input(Msg::TerminalCloseActiveTab);
+                        } else if x >= split_x {
+                            sender.input(Msg::TerminalToggleSplit);
+                        } else if x >= add_x {
+                            sender.input(Msg::NewTerminalTab);
                         } else {
                             self.terminal_resize_dragging = true;
                         }
@@ -1923,8 +1971,21 @@ impl SimpleComponent for App {
                 width,
                 height,
             } => {
-                // Terminal panel resize drag takes priority.
-                if self.terminal_resize_dragging {
+                // Terminal split divider drag — update visual position (no PTY resize yet).
+                if self.terminal_split_dragging {
+                    if self.cached_char_width > 0.0 {
+                        const SB_W: f64 = 6.0;
+                        let min_x = self.cached_char_width * 5.0;
+                        let max_x = (width - SB_W - self.cached_char_width * 5.0).max(min_x);
+                        let clamped_x = x.clamp(min_x, max_x);
+                        let left_cols = (clamped_x / self.cached_char_width) as u16;
+                        self.engine
+                            .borrow_mut()
+                            .terminal_split_set_drag_cols(left_cols);
+                        self.redraw = true;
+                    }
+                // Terminal panel resize drag.
+                } else if self.terminal_resize_dragging {
                     if self.cached_line_height > 0.0 {
                         let status_h = 2.0 * self.cached_line_height;
                         let available = (height - y - status_h).max(0.0);
@@ -2001,6 +2062,34 @@ impl SimpleComponent for App {
                 }
             }
             Msg::MouseUp => {
+                if self.terminal_split_dragging {
+                    self.terminal_split_dragging = false;
+                    if self.cached_char_width > 0.0 {
+                        let engine = self.engine.borrow();
+                        let left_cols = if engine.terminal_split_left_cols > 0 {
+                            engine.terminal_split_left_cols
+                        } else if !engine.terminal_panes.is_empty() {
+                            engine.terminal_panes[0].cols
+                        } else {
+                            0
+                        };
+                        let rows = engine.session.terminal_panel_rows;
+                        drop(engine);
+                        if left_cols > 0 {
+                            let da_w = if let Some(da) = self.drawing_area.borrow().as_ref() {
+                                da.width() as f64
+                            } else {
+                                800.0
+                            };
+                            const SB_W: f64 = 6.0;
+                            let total_cols = ((da_w - SB_W) / self.cached_char_width) as u16;
+                            let right_cols = total_cols.saturating_sub(left_cols);
+                            self.engine
+                                .borrow_mut()
+                                .terminal_split_finalize_drag(left_cols, right_cols, rows);
+                        }
+                    }
+                }
                 self.terminal_sb_dragging = false;
                 if self.terminal_resize_dragging {
                     self.terminal_resize_dragging = false;
@@ -2741,6 +2830,33 @@ impl SimpleComponent for App {
             }
             Msg::TerminalKill => {
                 self.engine.borrow_mut().terminal_close_active_tab();
+                self.redraw = true;
+            }
+            Msg::TerminalToggleSplit => {
+                let (full_cols, rows) = {
+                    let da_w = if let Some(da) = self.drawing_area.borrow().as_ref() {
+                        da.width() as f64
+                    } else {
+                        0.0
+                    };
+                    let cols = if self.cached_char_width > 0.0 {
+                        (da_w / self.cached_char_width) as u16
+                    } else {
+                        80
+                    };
+                    let rows = self.engine.borrow().session.terminal_panel_rows;
+                    (cols, rows)
+                };
+                self.engine
+                    .borrow_mut()
+                    .terminal_toggle_split(full_cols, rows);
+                self.redraw = true;
+            }
+            Msg::TerminalSplitFocus(idx) => {
+                let mut engine = self.engine.borrow_mut();
+                if engine.terminal_split && idx < engine.terminal_panes.len() {
+                    engine.terminal_active = idx;
+                }
                 self.redraw = true;
             }
             Msg::TerminalCopySelection => {
@@ -4334,7 +4450,7 @@ fn draw_quickfix_panel(
 
 /// Nerd Font icons for the terminal panel toolbar.
 const NF_CLOSE: &str = "󰅖"; // nf-md-close_box
-const NF_SPLIT: &str = "󰤼"; // nf-md-table_split (placeholder — inert for now)
+const NF_SPLIT: &str = "󰤼"; // nf-md-view_split_vertical
 
 /// Draw the integrated terminal bottom panel.
 #[allow(clippy::too_many_arguments)]
@@ -4416,18 +4532,17 @@ fn draw_terminal_panel(
             pangocairo::show_layout(cr, layout);
         }
 
-        // Right-aligned toolbar buttons
+        // Right-aligned toolbar buttons: + ⊞ ×  (each ~2 chars wide)
         cr.set_source_rgb(fr, fg2, fb);
-        let btn_text = format!("{}  {}", NF_SPLIT, NF_CLOSE);
+        let btn_text = format!("+ {} {}", NF_SPLIT, NF_CLOSE);
         layout.set_text(&btn_text);
         let (btn_w, _) = layout.pixel_size();
         cr.move_to(x + w - btn_w as f64 - 4.0, y);
         pangocairo::show_layout(cr, layout);
     }
 
-    // close_x used by click detection in MouseClick handler
-    let close_x = x + w - char_width * 2.0;
-    let _ = (close_x, sender); // suppress unused warning; click detection handled in MouseClick
+    // close_x / split_x used by click detection in MouseClick handler
+    let _ = sender; // click detection handled in MouseClick
 
     // Scrollbar geometry
     const SB_W: f64 = 6.0;
@@ -4449,7 +4564,7 @@ fn draw_terminal_panel(
         (thumb_t, thumb_t + thumb_h)
     };
 
-    // Draw scrollbar track
+    // Draw scrollbar track (right edge of whole panel)
     let sb_x = x + w - SB_W;
     let (tbr, tbg, tbb) = theme.status_bg.to_cairo();
     cr.set_source_rgb(tbr * 1.4, tbg * 1.4, tbb * 1.4); // slightly lighter than header
@@ -4466,22 +4581,87 @@ fn draw_terminal_panel(
     );
     cr.fill().ok();
 
+    // ── Split view: draw left pane + divider + right pane ─────────────────────
+    if let Some(ref left_rows) = panel.split_left_rows {
+        let half_w = panel.split_left_cols as f64 * char_width;
+        let div_x = x + half_w;
+
+        // Fill both halves with terminal default bg.
+        cr.set_source_rgb(30.0 / 255.0, 30.0 / 255.0, 30.0 / 255.0);
+        cr.rectangle(x, content_y, w - SB_W, content_h);
+        cr.fill().ok();
+
+        // Draw left pane cells.
+        draw_terminal_cells(
+            cr,
+            layout,
+            left_rows,
+            x,
+            content_y,
+            half_w,
+            line_height,
+            char_width,
+            theme,
+        );
+
+        // Draw divider (1px vertical line).
+        let (dr, dg, db) = theme.separator.to_cairo();
+        cr.set_source_rgb(dr, dg, db);
+        cr.rectangle(div_x, content_y, 1.0, content_h);
+        cr.fill().ok();
+
+        // Draw right pane cells.
+        draw_terminal_cells(
+            cr,
+            layout,
+            &panel.rows,
+            div_x + 1.0,
+            content_y,
+            half_w - 1.0,
+            line_height,
+            char_width,
+            theme,
+        );
+        return;
+    }
+
+    // ── Normal single-pane view ────────────────────────────────────────────────
     // Content rows (terminal cells)
     let cell_area_w = w - SB_W;
 
     // Fill the entire content area with the default terminal background first.
-    // This prevents the editor background from showing through where cells are absent
-    // (e.g. when PTY cols were computed with a slightly different char_width).
     cr.set_source_rgb(30.0 / 255.0, 30.0 / 255.0, 30.0 / 255.0);
     cr.rectangle(x, content_y, cell_area_w, content_h);
     cr.fill().ok();
 
-    for row_idx in 0..rows_to_draw {
-        if row_idx >= panel.rows.len() {
-            break;
-        }
+    draw_terminal_cells(
+        cr,
+        layout,
+        &panel.rows,
+        x,
+        content_y,
+        cell_area_w,
+        line_height,
+        char_width,
+        theme,
+    );
+}
+
+/// Draw a grid of terminal cells into a rectangular region.
+#[allow(clippy::too_many_arguments)]
+fn draw_terminal_cells(
+    cr: &Context,
+    layout: &pango::Layout,
+    rows: &[Vec<render::TerminalCell>],
+    x: f64,
+    content_y: f64,
+    cell_area_w: f64,
+    line_height: f64,
+    char_width: f64,
+    theme: &Theme,
+) {
+    for (row_idx, row) in rows.iter().enumerate() {
         let row_y = content_y + row_idx as f64 * line_height;
-        let row = &panel.rows[row_idx];
         let mut cell_x = x;
         for cell in row {
             if cell_x + char_width > x + cell_area_w {

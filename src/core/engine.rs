@@ -375,6 +375,13 @@ pub struct Engine {
     /// (required_scroll_offset, row, col) of each match across all accessible history.
     /// Sorted oldest-to-newest (highest offset first, then top-to-bottom).
     pub terminal_find_matches: Vec<(usize, u16, u16)>,
+    /// Whether the terminal panel is in horizontal split view (two panes side-by-side).
+    /// When true, pane[0] is left and pane[1] is right; `terminal_active` is 0 or 1.
+    pub terminal_split: bool,
+    /// Visual column width of the left pane during a split-divider drag resize.
+    /// Zero means "use the pane's actual PTY column count".
+    /// Set by `terminal_split_set_drag_cols`; cleared by `terminal_split_finalize_drag`.
+    pub terminal_split_left_cols: u16,
 }
 
 impl Engine {
@@ -493,6 +500,8 @@ impl Engine {
             terminal_find_query: String::new(),
             terminal_find_selected: 0,
             terminal_find_matches: Vec::new(),
+            terminal_split: false,
+            terminal_split_left_cols: 0,
         };
         // If vscode mode is configured, start in Insert mode (no Normal mode)
         if engine.is_vscode_mode() {
@@ -9691,10 +9700,13 @@ impl Engine {
     }
 
     /// Close the active terminal tab. If it was the last tab, close the panel.
+    /// Closing either pane while in split mode also exits split view.
     pub fn terminal_close_active_tab(&mut self) {
         if self.terminal_panes.is_empty() {
             return;
         }
+        // Exiting split mode before removing the pane keeps tab indices sane.
+        self.terminal_split = false;
         self.terminal_panes.remove(self.terminal_active);
         if self.terminal_panes.is_empty() {
             self.terminal_open = false;
@@ -9702,6 +9714,92 @@ impl Engine {
             self.terminal_active = 0;
         } else {
             self.terminal_active = self.terminal_active.min(self.terminal_panes.len() - 1);
+        }
+    }
+
+    /// Enable horizontal split view.
+    /// Ensures at least two panes exist (creates a second if needed), resizes both to
+    /// `half_cols`, then sets focus to the right pane (index 1).
+    pub fn terminal_open_split(&mut self, half_cols: u16, rows: u16) {
+        let history_cap = self.settings.terminal_scrollback_lines;
+        if self.terminal_panes.is_empty() {
+            // Create two fresh panes.
+            let shell = default_shell();
+            let cwd = self.cwd.clone();
+            for _ in 0..2 {
+                match TerminalPane::new(half_cols, rows, &shell, &cwd, history_cap) {
+                    Ok(pane) => self.terminal_panes.push(pane),
+                    Err(e) => {
+                        self.message = format!("terminal: failed to open PTY: {e}");
+                        return;
+                    }
+                }
+            }
+            self.terminal_open = true;
+            self.terminal_has_focus = true;
+        } else if self.terminal_panes.len() == 1 {
+            // Resize existing pane to half-width, then spawn a second.
+            self.terminal_panes[0].resize(half_cols, rows);
+            let shell = default_shell();
+            let cwd = self.cwd.clone();
+            match TerminalPane::new(half_cols, rows, &shell, &cwd, history_cap) {
+                Ok(pane) => self.terminal_panes.push(pane),
+                Err(e) => {
+                    self.message = format!("terminal: failed to open PTY: {e}");
+                    return;
+                }
+            }
+        } else {
+            // Two or more panes exist — resize the first two to half-width.
+            self.terminal_panes[0].resize(half_cols, rows);
+            self.terminal_panes[1].resize(half_cols, rows);
+        }
+        self.terminal_split = true;
+        self.terminal_active = 1; // right pane gets focus
+    }
+
+    /// Disable horizontal split view and return to single-pane / tab view.
+    /// Panes are kept alive as regular tabs; `full_cols` is used to resize the
+    /// active pane back to the full panel width.
+    pub fn terminal_close_split(&mut self, full_cols: u16, rows: u16) {
+        self.terminal_split = false;
+        self.terminal_split_left_cols = 0;
+        // Resize whatever is now the active pane to full width.
+        if let Some(pane) = self.terminal_panes.get_mut(self.terminal_active) {
+            pane.resize(full_cols, rows);
+        }
+    }
+
+    /// Toggle split mode on/off. `full_cols` = total panel width (each pane gets half).
+    pub fn terminal_toggle_split(&mut self, full_cols: u16, rows: u16) {
+        if self.terminal_split {
+            self.terminal_close_split(full_cols, rows);
+        } else {
+            self.terminal_open_split(full_cols / 2, rows);
+        }
+    }
+
+    /// Switch keyboard focus between the two split panes (left ↔ right).
+    /// No-op when not in split mode.
+    pub fn terminal_split_switch_focus(&mut self) {
+        if self.terminal_split && self.terminal_panes.len() >= 2 {
+            self.terminal_active = 1 - self.terminal_active;
+        }
+    }
+
+    /// Update the visual divider position during a drag (no PTY resize yet).
+    /// Backends call this on every drag event; finalize with `terminal_split_finalize_drag`.
+    pub fn terminal_split_set_drag_cols(&mut self, left_cols: u16) {
+        self.terminal_split_left_cols = left_cols;
+    }
+
+    /// Commit a drag resize: resize both PTY panes to the new sizes.
+    /// Clears `terminal_split_left_cols` so PTY cols become authoritative again.
+    pub fn terminal_split_finalize_drag(&mut self, left_cols: u16, right_cols: u16, rows: u16) {
+        self.terminal_split_left_cols = 0;
+        if self.terminal_panes.len() >= 2 {
+            self.terminal_panes[0].resize(left_cols, rows);
+            self.terminal_panes[1].resize(right_cols, rows);
         }
     }
 
@@ -9757,8 +9855,13 @@ impl Engine {
             self.terminal_open = false;
             self.terminal_has_focus = false;
             self.terminal_active = 0;
+            self.terminal_split = false;
         } else {
             self.terminal_active = self.terminal_active.min(self.terminal_panes.len() - 1);
+            // If a pane exited while in split and we're down to one, exit split.
+            if self.terminal_split && self.terminal_panes.len() < 2 {
+                self.terminal_split = false;
+            }
         }
         // Keep find matches fresh if new terminal output arrived while find is active.
         if got_data && self.terminal_find_active {

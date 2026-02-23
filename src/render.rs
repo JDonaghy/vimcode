@@ -374,6 +374,14 @@ pub struct TerminalPanel {
     pub find_match_count: usize,
     /// Index (0-based) of the currently highlighted match.
     pub find_selected_idx: usize,
+    /// In split view: cell grid for the LEFT pane (pane[0]).
+    /// When `Some`, the main `rows` field represents the RIGHT pane (pane[1]).
+    /// `None` in normal (non-split) mode.
+    pub split_left_rows: Option<Vec<Vec<TerminalCell>>>,
+    /// Column count of the left pane in split view.
+    pub split_left_cols: u16,
+    /// Which pane has keyboard focus in split view: 0 = left, 1 = right.
+    pub split_focus: u8,
 }
 
 // ─── ScreenLayout ─────────────────────────────────────────────────────────────
@@ -806,14 +814,16 @@ fn normalize_term_selection(sel: &CoreTermSelection) -> (u16, u16, u16, u16) {
     }
 }
 
-/// Build the TerminalPanel from engine state (when terminal is open).
-fn build_terminal_panel(engine: &Engine) -> Option<TerminalPanel> {
-    if !engine.terminal_open {
-        return None;
-    }
-    let term = engine.active_terminal()?;
-    // The vt100 parser is always kept at scrollback_offset = 0 (live view).
-    // Historical content is served from `term.history`.
+/// Build the cell grid for a single terminal pane.
+///
+/// `cursor_active` controls whether the VT100 cursor position is highlighted.
+/// `find` carries per-match highlighting data; pass `None` for the inactive pane.
+#[allow(clippy::type_complexity)]
+fn build_pane_rows(
+    term: &crate::core::terminal::TerminalPane,
+    cursor_active: bool,
+    find: Option<(&[(usize, u16, u16)], usize, usize)>, // (matches, qlen, active_idx)
+) -> Vec<Vec<TerminalCell>> {
     let screen = term.parser.screen();
     let (cursor_row, cursor_col) = screen.cursor_position();
     let rows_count = term.rows as usize;
@@ -821,18 +831,12 @@ fn build_terminal_panel(engine: &Engine) -> Option<TerminalPanel> {
     let scroll_offset = term.scroll_offset;
     let hist_len = term.history.len();
 
-    // Selection only applies to the live view.
     let sel_bounds = if scroll_offset == 0 {
         term.selection.as_ref().map(normalize_term_selection)
     } else {
         None
     };
 
-    // Build the display grid.
-    //
-    // At scroll_offset = N, display row i (0 = top) maps to:
-    //   • history[hist_len - N + i]  when i < N  (history rows, oldest-first)
-    //   • vt100 live row  (i - N)    when i >= N  (live rows)
     let mut rows: Vec<Vec<TerminalCell>> = (0..rows_count)
         .map(|display_r| {
             (0..cols_count)
@@ -841,7 +845,6 @@ fn build_terminal_panel(engine: &Engine) -> Option<TerminalPanel> {
                     let (ch, fg, bg, bold, italic, underline, is_cursor, selected) = if display_r
                         < scroll_offset
                     {
-                        // ── History row ──────────────────────────────────
                         let hist_idx_signed =
                             hist_len as isize - scroll_offset as isize + display_r as isize;
                         if hist_idx_signed >= 0 {
@@ -883,7 +886,6 @@ fn build_terminal_panel(engine: &Engine) -> Option<TerminalPanel> {
                             )
                         }
                     } else {
-                        // ── Live vt100 row ───────────────────────────────
                         let live_r = (display_r - scroll_offset) as u16;
                         let cell_opt = screen.cell(live_r, cu);
                         let (ch, fg, bg, bold, italic, underline) = if let Some(cell) = cell_opt {
@@ -901,7 +903,7 @@ fn build_terminal_panel(engine: &Engine) -> Option<TerminalPanel> {
                             (' ', (229, 229, 229), (30, 30, 30), false, false, false)
                         };
                         let is_cursor = scroll_offset == 0
-                            && engine.terminal_has_focus
+                            && cursor_active
                             && live_r == cursor_row
                             && cu == cursor_col;
                         let selected = sel_bounds.is_some_and(|(r0, c0, r1, c1)| {
@@ -935,16 +937,11 @@ fn build_terminal_panel(engine: &Engine) -> Option<TerminalPanel> {
         })
         .collect();
 
-    // Apply find match highlights.
-    // Each match stores (required_scroll_offset, row, col).
-    // visible_row = row + current_offset − required_offset; valid when ∈ [0, rows_count).
-    let match_count = engine.terminal_find_matches.len();
-    if engine.terminal_find_active && match_count > 0 {
-        let qlen = engine.terminal_find_query.chars().count();
-        let active_idx = engine.terminal_find_selected % match_count;
+    // Apply find match highlights when provided.
+    if let Some((matches, qlen, active_idx)) = find {
         let current_offset = scroll_offset as isize;
         let term_rows = rows_count as isize;
-        for (mi, &(moffset, mr, mc)) in engine.terminal_find_matches.iter().enumerate() {
+        for (mi, &(moffset, mr, mc)) in matches.iter().enumerate() {
             let visible_row = mr as isize + current_offset - moffset as isize;
             if visible_row < 0 || visible_row >= term_rows {
                 continue;
@@ -965,11 +962,92 @@ fn build_terminal_panel(engine: &Engine) -> Option<TerminalPanel> {
         }
     }
 
+    rows
+}
+
+/// Build the TerminalPanel from engine state (when terminal is open).
+fn build_terminal_panel(engine: &Engine) -> Option<TerminalPanel> {
+    if !engine.terminal_open {
+        return None;
+    }
+
+    // Prepare find-highlight data (applies only to the focused/active pane).
+    let match_count = engine.terminal_find_matches.len();
     let find_selected_idx = if match_count > 0 {
         engine.terminal_find_selected % match_count
     } else {
         0
     };
+    #[allow(clippy::type_complexity)]
+    let find_data: Option<(&[(usize, u16, u16)], usize, usize)> =
+        if engine.terminal_find_active && match_count > 0 {
+            Some((
+                &engine.terminal_find_matches,
+                engine.terminal_find_query.chars().count(),
+                find_selected_idx,
+            ))
+        } else {
+            None
+        };
+
+    // ── Split view: two panes side-by-side ────────────────────────────────────
+    if engine.terminal_split && engine.terminal_panes.len() >= 2 {
+        let left_pane = &engine.terminal_panes[0];
+        let right_pane = &engine.terminal_panes[1];
+        let left_cursor_active = engine.terminal_has_focus && engine.terminal_active == 0;
+        let right_cursor_active = engine.terminal_has_focus && engine.terminal_active == 1;
+
+        // Find highlights only shown in the focused pane.
+        let left_find = if engine.terminal_active == 0 {
+            find_data
+        } else {
+            None
+        };
+        let right_find = if engine.terminal_active == 1 {
+            find_data
+        } else {
+            None
+        };
+
+        let split_left_rows = build_pane_rows(left_pane, left_cursor_active, left_find);
+        let rows = build_pane_rows(right_pane, right_cursor_active, right_find);
+
+        // Active pane supplies scroll / scrollback for the scrollbar.
+        let active_pane = if engine.terminal_active == 1 {
+            right_pane
+        } else {
+            left_pane
+        };
+
+        return Some(TerminalPanel {
+            rows,
+            content_rows: right_pane.rows,
+            content_cols: right_pane.cols,
+            has_focus: engine.terminal_has_focus,
+            scroll_offset: active_pane.scroll_offset,
+            scrollback_rows: active_pane.history.len(),
+            tab_count: engine.terminal_panes.len(),
+            active_tab: engine.terminal_active,
+            find_active: engine.terminal_find_active,
+            find_query: engine.terminal_find_query.clone(),
+            find_match_count: match_count,
+            find_selected_idx,
+            split_left_rows: Some(split_left_rows),
+            split_left_cols: if engine.terminal_split_left_cols > 0 {
+                engine.terminal_split_left_cols
+            } else {
+                left_pane.cols
+            },
+            split_focus: engine.terminal_active as u8,
+        });
+    }
+
+    // ── Single-pane (normal) view ──────────────────────────────────────────────
+    let term = engine.active_terminal()?;
+    let hist_len = term.history.len();
+    let scroll_offset = term.scroll_offset;
+    let cursor_active = engine.terminal_has_focus;
+    let rows = build_pane_rows(term, cursor_active, find_data);
 
     Some(TerminalPanel {
         rows,
@@ -977,7 +1055,6 @@ fn build_terminal_panel(engine: &Engine) -> Option<TerminalPanel> {
         content_cols: term.cols,
         has_focus: engine.terminal_has_focus,
         scroll_offset,
-        // Scrollback depth = number of lines in our custom history ring buffer.
         scrollback_rows: hist_len,
         tab_count: engine.terminal_panes.len(),
         active_tab: engine.terminal_active,
@@ -985,6 +1062,9 @@ fn build_terminal_panel(engine: &Engine) -> Option<TerminalPanel> {
         find_query: engine.terminal_find_query.clone(),
         find_match_count: match_count,
         find_selected_idx,
+        split_left_rows: None,
+        split_left_cols: 0,
+        split_focus: 0,
     })
 }
 

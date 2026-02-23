@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Feb 23, 2026 (Session 75) | **Tests:** 638
+**Last updated:** Feb 23, 2026 (Session 77) | **Tests:** 638
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 72 are in **SESSION_HISTORY.md**.
@@ -8,6 +8,10 @@
 ---
 
 ## Recent Work
+
+**Session 77:** Terminal split drag-to-resize — dragging the `│` divider between the two panes resizes them. Engine: `terminal_split_left_cols: u16` field (0 = use PTY cols); `terminal_split_set_drag_cols(left_cols)` updates visual position during drag; `terminal_split_finalize_drag(left_cols, right_cols, rows)` commits and resizes both PTY panes; `terminal_close_split` resets field. render.rs: `split_left_cols` uses `engine.terminal_split_left_cols` if > 0, else `left_pane.cols`. GTK: `terminal_split_dragging: bool` on App; click within 4px of divider starts drag; `MouseDrag` calls `terminal_split_set_drag_cols`; `MouseUp` finalizes. TUI: `dragging_terminal_split: bool` param + var; same pattern; split rendering now uses `panel.split_left_cols` (not hardcoded half). 638 tests.
+
+**Session 76:** Terminal horizontal split view — `⊞`/`󰤼` toolbar button toggles two PTY panes side-by-side. Engine: `terminal_split: bool` field; `terminal_open_split(half_cols, rows)` (creates 2nd pane if needed, resizes both to half-width), `terminal_close_split(full_cols, rows)`, `terminal_toggle_split(full_cols, rows)`, `terminal_split_switch_focus()` (Ctrl-W swaps focus); `terminal_close_active_tab` exits split before removing. `render.rs`: `build_pane_rows()` helper extracts cell-grid build logic; `TerminalPanel` gains `split_left_rows: Option<Vec<Vec<TerminalCell>>>`, `split_left_cols: u16`, `split_focus: u8`; `build_terminal_panel()` builds both panes when split. GTK: `draw_terminal_cells()` extracted helper; split view renders left/divider/right; toolbar shows `+ ⊞ ×`; header-row click detects ⊞ → toggle split; content-area click sets focus by left/right half; Ctrl-W intercepts before PTY when split. TUI: `render_terminal_pane_cells()` helper; same split rendering with `│` divider; same click and Ctrl-W handling. 638 tests.
 
 **Session 75:** Terminal deep history, real PTY resize, and CWD fix — `TerminalPane` gains `history: VecDeque<Vec<HistCell>>` ring buffer (capacity configurable via `terminal_scrollback_lines` setting, default 5000). `process_with_capture()` splits PTY output into ≤rows-newline chunks; `capture_scrolled_rows()` safely reads just-scrolled-off rows via `set_scrollback(N ≤ rows_len)`, stores as `HistCell` rows, then restores `set_scrollback(0)`. `build_terminal_panel()` merges: at scroll_offset N, rows 0..N from `history[hist_len-N+i]`, rows N..rows from `screen.cell(i-N)`. `terminal_find_update_matches()` now searches `history` VecDeque directly. `TerminalPane` stores `master: Box<dyn MasterPty+Send>`; `resize()` calls `self.master.resize(PtySize{…})` for real SIGWINCH. GTK `Msg::Resize` propagates to terminal. TUI `Event::Resize` uses `session.terminal_panel_rows` (was hardcoded 12). `terminal_new_tab()` passes `self.cwd.clone()` → `cmd.cwd(cwd)`. 638 tests.
 
@@ -73,9 +77,11 @@ Total: ~35,000 lines
 - [x] :norm command (range execution, undo merge)
 - [x] LSP support (completions, go-to-definition, hover, diagnostics, auto-detect)
 - [x] Integrated terminal (PTY, VT100/256-color, multiple tabs, scrollback, find, resize)
+- [x] Terminal toolbar buttons: `+` new-tab and `×` close functional (click detection GTK + TUI)
+- [x] Terminal horizontal split view (`⊞` toolbar toggle, two panes side-by-side, `│` divider, click or Ctrl-W to switch focus)
+- [x] Terminal split drag-to-resize (drag `│` divider to rebalance pane widths; PTY resized on release)
 
 ### Planned / Ideas
-- [ ] Terminal button bar (add/split/trash icons, horizontal split-view)
 - [ ] More Tree-sitter grammars (TypeScript, HTML, CSS, JSON, YAML, Lua)
 - [ ] Vim `%` (matchit-style tag jumping)
 - [ ] `:set wrap` / line-wrap rendering

@@ -1,5 +1,29 @@
 # VimCode Implementation Plan
 
+## Recently Completed (Session 77)
+
+### ✅ Terminal Split Drag-to-Resize
+
+- **`engine.rs`** — `terminal_split_left_cols: u16` field (0 = use PTY cols); `terminal_split_set_drag_cols(left_cols)` updates visual column during drag without resizing PTY; `terminal_split_finalize_drag(left_cols, right_cols, rows)` commits the new sizes and resizes both PTY panes; `terminal_close_split` resets `terminal_split_left_cols = 0`
+- **`render.rs`** — split branch in `build_terminal_panel` now sets `split_left_cols = engine.terminal_split_left_cols` when > 0 (drag in progress), else `left_pane.cols` (PTY authoritative)
+- **`main.rs` (GTK)** — `terminal_split_dragging: bool` on App struct; content-area click within 4px of divider (`left_cols * char_width`) starts drag; `Msg::MouseDrag` calls `terminal_split_set_drag_cols(col)` clamped ≥5/≤total-5; `Msg::MouseUp` finalizes via `terminal_split_finalize_drag`; split rendering now uses `panel.split_left_cols as f64 * char_width` instead of hardcoded `(w-SB_W)/2`
+- **`tui_main.rs`** — `dragging_terminal_split: &mut bool` added to `handle_mouse` params and both call sites; content click on divider column starts drag; `Drag` event calls `terminal_split_set_drag_cols`; `Up` event finalizes; split rendering uses `panel.split_left_cols` instead of `area.width/2`
+- Tests: 638 → 638
+
+---
+
+## Recently Completed (Session 76)
+
+### ✅ Terminal Horizontal Split View
+
+- **`engine.rs`** — `terminal_split: bool` field (default false); `terminal_open_split(half_cols, rows)` creates 2nd pane if needed, resizes both to half-width, sets `terminal_active = 1`; `terminal_close_split(full_cols, rows)` clears flag + resizes active pane; `terminal_toggle_split(full_cols, rows)` delegates; `terminal_split_switch_focus()` toggles `terminal_active` between 0 and 1; `terminal_close_active_tab` resets `terminal_split = false` before removing; `poll_terminal` resets split when panes drop below 2
+- **`render.rs`** — `build_pane_rows(term, cursor_active, find)` helper (with `#[allow(clippy::type_complexity)]` on the `find` tuple); `TerminalPanel` gains `split_left_rows: Option<Vec<Vec<TerminalCell>>>`, `split_left_cols: u16`, `split_focus: u8`; `build_terminal_panel` has early-return split branch that builds both pane[0] and pane[1] grids
+- **`main.rs` (GTK)** — `NF_SPLIT = "󰤼"` constant; `draw_terminal_cells()` helper extracted; toolbar now shows `"+ ⊞ ×"`; split rendering: fill + left cells + 1px divider + right cells; header click: `split_x = width - 4×char_width` triggers `TerminalToggleSplit`; content click in split mode sets `terminal_active = 0/1` based on `x < width/2`; Ctrl-W intercepted before PTY when `terminal_split`; `Msg::TerminalToggleSplit` + `Msg::TerminalSplitFocus(usize)` handlers
+- **`tui_main.rs`** — `NF_TERMINAL_SPLIT = "󰤼"`; `render_terminal_pane_cells()` helper; toolbar shows `"+ ⊞ ×"`; split rendering with `│` divider; header click detects split button at `term_width - 4`; content click sets focus pane; Ctrl-W intercepted when `terminal_split`
+- Tests: 638 → 638 (PTY features not unit-testable in isolation)
+
+---
+
 ## Recently Completed (Session 75)
 
 ### ✅ Terminal History, Resize, and CWD
@@ -573,8 +597,8 @@
 - [x] **Terminal: draggable panel height** — drag header row to resize; `session.terminal_panel_rows` persisted; clamped [5, 30] (session 71)
 - [x] **Terminal: scrollback navigation** — `scroll_offset` + vt100 `set_scrollback()`; PgUp/PgDn while focused; scrollbar thumb tracks position (session 70)
 - [x] **Terminal: find in panel** — Ctrl+F while terminal focused opens an inline find bar in the toolbar row; live match highlighting (orange active, amber others); Enter/Shift+Enter navigate matches; Escape closes
-- [ ] **Terminal: button bar (Add / Split / Trash)** — make the inert Nerd Font toolbar buttons functional: `+`/`󰐕` creates a new tab (same as `:term`); `⊞`/`󰤼` opens a horizontal split showing two panes side-by-side; `✕`/`󰅖` closes the active tab; click detection for both GTK and TUI backends
-- [ ] **Terminal: horizontal split view** — two terminal panes side-by-side within the panel strip; independent PTY sessions; mouse click or Ctrl+W to switch active pane; draggable divider between panes
+- [x] **Terminal: button bar (Add / Close)** — `+` creates a new tab; `×`/`󰅖` closes the active tab; click detection in both GTK and TUI backends
+- [x] **Terminal: horizontal split view** — `⊞`/`󰤼` toolbar button toggles two panes side-by-side; independent PTY sessions; mouse click or Ctrl-W switches active pane; `│` divider
 - [ ] **Debugger (DAP)** — Debug Adapter Protocol client (analogous to LSP but for debugging); auto-detect `codelldb`, `debugpy`, `js-debug`; breakpoints set with `<F9>` or `:Breakpoint`; step over/in/out (`<F10>`/`<F11>`/`<F12>`); call stack + variables panel in sidebar; inline variable values shown as virtual text; status bar shows current debug state
 
 ### UI & Menus

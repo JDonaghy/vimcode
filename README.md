@@ -250,6 +250,9 @@ cargo fmt
   - Type to set the query; matching text highlights live (orange = active match, amber = other matches)
   - `Enter` — next match; `Shift+Enter` — previous match; `Escape` or `Ctrl-F` — close find bar
   - Search is case-insensitive; covers all visible rows and the full scrollback history
+- **Horizontal split** — click `󰤼` in the toolbar (or `Ctrl-W` when split is active) to toggle a side-by-side two-pane view:
+  - Click either pane or press `Ctrl-W` to switch keyboard focus between panes
+  - Drag the `│` divider left/right to resize the panes; both PTYs are resized on mouse release
 - **Nerd Font toolbar** — tab strip + split (`󰤼`) and close (`󰅖`) icons
 - **All keys forwarded to shell PTY** — Ctrl-C, Ctrl-D, Ctrl-L, Ctrl-Z, arrow keys, Tab, etc. work as expected
 - `Ctrl-T` while the terminal has focus **closes the panel** while keeping all shell sessions alive; reopening restores the same sessions

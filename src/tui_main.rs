@@ -482,6 +482,8 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
     let mut dragging_terminal_sb: Option<(u16, u16, usize)> = None;
     // True while user drags the terminal header row to resize the panel.
     let mut dragging_terminal_resize: bool = false;
+    // True while user drags the terminal split divider left/right.
+    let mut dragging_terminal_split: bool = false;
     // Cache of the last rendered layout for mouse hit-testing
     let mut last_layout: Option<render::ScreenLayout> = None;
     // Double-click detection state
@@ -1159,6 +1161,15 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                                 needs_redraw = true;
                                 continue;
                             }
+                            // Ctrl-W in split mode: switch focus between panes.
+                            if ctrl
+                                && engine.terminal_split
+                                && matches!(code, KeyCode::Char('w') | KeyCode::Char('W'))
+                            {
+                                engine.terminal_split_switch_focus();
+                                needs_redraw = true;
+                                continue;
+                            }
                             // Any other key resets scroll (returns to live view) and forwards.
                             engine.terminal_scroll_reset();
                             let data = translate_key_to_pty(key_event);
@@ -1360,6 +1371,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                                 &mut dragging_sidebar_search,
                                 &mut dragging_terminal_sb,
                                 &mut dragging_terminal_resize,
+                                &mut dragging_terminal_split,
                                 last_layout.as_ref(),
                                 &mut sidebar_prompt,
                                 &mut last_click_time,
@@ -1384,6 +1396,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                     &mut dragging_sidebar_search,
                     &mut dragging_terminal_sb,
                     &mut dragging_terminal_resize,
+                    &mut dragging_terminal_split,
                     last_layout.as_ref(),
                     &mut sidebar_prompt,
                     &mut last_click_time,
@@ -1450,6 +1463,7 @@ fn handle_mouse(
     dragging_sidebar_search: &mut Option<SidebarScrollDrag>,
     dragging_terminal_sb: &mut Option<(u16, u16, usize)>,
     dragging_terminal_resize: &mut bool,
+    dragging_terminal_split: &mut bool,
     last_layout: Option<&render::ScreenLayout>,
     sidebar_prompt: &mut Option<SidebarPrompt>,
     last_click_time: &mut Instant,
@@ -1497,6 +1511,14 @@ fn handle_mouse(
                 let available = term_height.saturating_sub(row + 2 + qf_h);
                 let new_rows = available.saturating_sub(1).clamp(5, 30);
                 engine.session.terminal_panel_rows = new_rows;
+                return sidebar_width;
+            }
+            // Terminal split divider drag — update visual column position (no PTY resize yet).
+            if *dragging_terminal_split {
+                let term_width = terminal_size.map(|s| s.width).unwrap_or(80);
+                let sb_col = term_width.saturating_sub(1);
+                let left_cols = col.clamp(5, sb_col.saturating_sub(5));
+                engine.terminal_split_set_drag_cols(left_cols);
                 return sidebar_width;
             }
             // Terminal scrollbar drag
@@ -1601,6 +1623,17 @@ fn handle_mouse(
                 let cols = terminal_size.map(|s| s.width).unwrap_or(80);
                 engine.terminal_resize(cols, rows);
                 let _ = engine.session.save();
+            }
+            if *dragging_terminal_split {
+                *dragging_terminal_split = false;
+                let left_cols = engine.terminal_split_left_cols;
+                if left_cols > 0 {
+                    let term_width = terminal_size.map(|s| s.width).unwrap_or(80);
+                    let sb_col = term_width.saturating_sub(1);
+                    let right_cols = sb_col.saturating_sub(left_cols).saturating_sub(1);
+                    let rows = engine.session.terminal_panel_rows;
+                    engine.terminal_split_finalize_drag(left_cols, right_cols, rows);
+                }
             }
             *mouse_text_drag = false;
             engine.mouse_drag_active = false;
@@ -1736,22 +1769,48 @@ fn handle_mouse(
             && row < term_strip_top + strip_rows
         {
             if row == term_strip_top {
-                // Header row — tab switch, close icon, or resize drag.
+                // Header row — tab switch, toolbar buttons, or resize drag.
                 engine.terminal_has_focus = true;
                 const TERMINAL_TAB_COLS: u16 = 4;
                 let tab_count = engine.terminal_panes.len() as u16;
                 let term_width = terminal_size.map(|s| s.width).unwrap_or(80);
-                // Right-aligned icons: 2 icon chars + 2 spaces = ~4 chars
-                let icon_len: u16 = 4;
                 if tab_count > 0 && col < tab_count * TERMINAL_TAB_COLS {
                     engine.terminal_switch_tab((col / TERMINAL_TAB_COLS) as usize);
-                } else if col >= term_width.saturating_sub(icon_len) {
+                } else if col >= term_width.saturating_sub(2) {
+                    // Close icon (rightmost 2 cols)
                     engine.terminal_close_active_tab();
+                } else if col >= term_width.saturating_sub(4) {
+                    // Split button (2 cols left of close)
+                    let full_cols = terminal_size.map(|s| s.width).unwrap_or(80);
+                    let rows = engine.session.terminal_panel_rows;
+                    engine.terminal_toggle_split(full_cols, rows);
+                } else if col >= term_width.saturating_sub(6) {
+                    // Add button (2 cols left of split)
+                    let cols = terminal_size.map(|s| s.width).unwrap_or(80);
+                    let rows = engine.session.terminal_panel_rows;
+                    engine.terminal_new_tab(cols, rows);
                 } else {
                     *dragging_terminal_resize = true;
                 }
             } else {
-                // Content row — check for scrollbar click first.
+                // Content row — focus split pane or start divider drag.
+                if engine.terminal_split && engine.terminal_panes.len() >= 2 {
+                    // Mirror render.rs: use drag-override if set, else actual PTY cols.
+                    let div_col = if engine.terminal_split_left_cols > 0 {
+                        engine.terminal_split_left_cols
+                    } else {
+                        engine.terminal_panes[0].cols
+                    };
+                    // Allow clicking within ±1 column of the divider to start a resize drag.
+                    if col.abs_diff(div_col) <= 1 {
+                        engine.terminal_has_focus = true;
+                        *dragging_terminal_split = true;
+                        return sidebar_width; // skip selection start
+                    } else {
+                        engine.terminal_active = if col < div_col { 0 } else { 1 };
+                    }
+                }
+                // Check for scrollbar click first.
                 let term_width = terminal_size.map(|s| s.width).unwrap_or(80);
                 let sb_col = term_width.saturating_sub(1);
                 engine.terminal_has_focus = true;
@@ -4501,8 +4560,8 @@ fn render_quickfix_panel(
 // ─── Terminal panel ───────────────────────────────────────────────────────────
 
 /// Nerd Font icons for the terminal toolbar.
-const NF_TERMINAL_CLOSE: &str = "󰅖"; // nf-md-close_box (inert; click detection not implemented in TUI yet)
-const NF_TERMINAL_SPLIT: &str = "󰤼"; // nf-md-table_split (placeholder)
+const NF_TERMINAL_CLOSE: &str = "󰅖"; // nf-md-close_box
+const NF_TERMINAL_SPLIT: &str = "󰤼"; // nf-md-view_split_vertical
 
 fn render_terminal_panel(
     buf: &mut ratatui::buffer::Buffer,
@@ -4578,8 +4637,8 @@ fn render_terminal_panel(
             }
         }
 
-        // Right-aligned icons
-        let icons = format!("{}  {}", NF_TERMINAL_SPLIT, NF_TERMINAL_CLOSE);
+        // Right-aligned icons: + ⊞ ×
+        let icons = format!("+ {} {}", NF_TERMINAL_SPLIT, NF_TERMINAL_CLOSE);
         let icon_chars: Vec<char> = icons.chars().collect();
         let icon_start = area.width.saturating_sub(icon_chars.len() as u16 + 1);
         for (i, &ch) in icon_chars.iter().enumerate() {
@@ -4613,7 +4672,53 @@ fn render_terminal_panel(
         (thumb_top, (thumb_top + thumb_h).min(content_rows))
     };
 
-    // ── Content rows ─────────────────────────────────────────────────────────
+    // ── Split view: left pane | divider | right pane ─────────────────────────
+    if let Some(ref left_rows) = panel.split_left_rows {
+        let half_w = panel.split_left_cols; // left-pane column count (may reflect drag state)
+        let div_col = area.x + half_w;
+
+        for row_idx in 0..content_rows {
+            let screen_row = area.y + 1 + row_idx as u16;
+            if screen_row >= area.y + area.height {
+                break;
+            }
+            let term_bg = RColor::Rgb(30, 30, 30);
+
+            // Clear both halves.
+            for x in area.x..area.x + area.width.saturating_sub(1) {
+                set_cell(buf, x, screen_row, ' ', hdr_fg, term_bg);
+            }
+
+            // Left pane cells.
+            render_terminal_pane_cells(buf, left_rows, area.x, screen_row, half_w, row_idx);
+
+            // Divider column.
+            let div_fg = rc(theme.separator);
+            set_cell(buf, div_col, screen_row, '│', div_fg, term_bg);
+
+            // Right pane cells.
+            render_terminal_pane_cells(buf, &panel.rows, div_col + 1, screen_row, half_w, row_idx);
+
+            // Scrollbar in the last column.
+            let (sb_char, sb_fg) = if row_idx >= thumb_start && row_idx < thumb_end {
+                ('█', RColor::Rgb(128, 128, 128))
+            } else {
+                ('░', rc(theme.separator))
+            };
+            set_cell(
+                buf,
+                sb_col,
+                screen_row,
+                sb_char,
+                sb_fg,
+                rc(theme.background),
+            );
+        }
+
+        return;
+    }
+
+    // ── Normal single-pane content rows ──────────────────────────────────────
     let cell_width = area.width.saturating_sub(1); // leave last col for scrollbar
     for row_idx in 0..content_rows {
         let screen_row = area.y + 1 + row_idx as u16;
@@ -4626,49 +4731,7 @@ fn render_terminal_panel(
             set_cell(buf, x, screen_row, ' ', hdr_fg, term_bg_default);
         }
 
-        if row_idx < panel.rows.len() {
-            let row = &panel.rows[row_idx];
-            for (col_idx, cell) in row.iter().enumerate() {
-                let x = area.x + col_idx as u16;
-                if x >= area.x + cell_width {
-                    break;
-                }
-
-                let fg = RColor::Rgb(cell.fg.0, cell.fg.1, cell.fg.2);
-                let bg = RColor::Rgb(cell.bg.0, cell.bg.1, cell.bg.2);
-
-                let (draw_fg, draw_bg) = if cell.is_cursor || cell.selected {
-                    (bg, fg) // Reverse video for cursor / selection
-                } else if cell.is_find_active {
-                    // Active find match: black text on orange
-                    (RColor::Rgb(0, 0, 0), RColor::Rgb(255, 165, 0))
-                } else if cell.is_find_match {
-                    // Other find matches: yellow text on dark amber
-                    (RColor::Rgb(255, 220, 0), RColor::Rgb(80, 65, 0))
-                } else {
-                    (fg, bg)
-                };
-
-                let ch = if cell.ch == '\0' { ' ' } else { cell.ch };
-
-                let mut modifier = Modifier::empty();
-                if cell.bold {
-                    modifier |= Modifier::BOLD;
-                }
-                if cell.italic {
-                    modifier |= Modifier::ITALIC;
-                }
-                if cell.underline {
-                    modifier |= Modifier::UNDERLINED;
-                }
-
-                if modifier.is_empty() {
-                    set_cell(buf, x, screen_row, ch, draw_fg, draw_bg);
-                } else {
-                    set_cell_styled(buf, x, screen_row, ch, draw_fg, draw_bg, modifier);
-                }
-            }
-        }
+        render_terminal_pane_cells(buf, &panel.rows, area.x, screen_row, cell_width, row_idx);
 
         // Scrollbar column — same colors as the editor scrollbar.
         let (sb_char, sb_fg) = if row_idx >= thumb_start && row_idx < thumb_end {
@@ -4684,6 +4747,54 @@ fn render_terminal_panel(
             sb_fg,
             rc(theme.background),
         );
+    }
+}
+
+/// Render one row of terminal pane cells into a ratatui buffer.
+fn render_terminal_pane_cells(
+    buf: &mut ratatui::buffer::Buffer,
+    rows: &[Vec<render::TerminalCell>],
+    start_x: u16,
+    screen_row: u16,
+    max_cols: u16,
+    row_idx: usize,
+) {
+    if row_idx >= rows.len() {
+        return;
+    }
+    let row = &rows[row_idx];
+    for (col_idx, cell) in row.iter().enumerate() {
+        let x = start_x + col_idx as u16;
+        if x >= start_x + max_cols {
+            break;
+        }
+        let fg = RColor::Rgb(cell.fg.0, cell.fg.1, cell.fg.2);
+        let bg = RColor::Rgb(cell.bg.0, cell.bg.1, cell.bg.2);
+        let (draw_fg, draw_bg) = if cell.is_cursor || cell.selected {
+            (bg, fg)
+        } else if cell.is_find_active {
+            (RColor::Rgb(0, 0, 0), RColor::Rgb(255, 165, 0))
+        } else if cell.is_find_match {
+            (RColor::Rgb(255, 220, 0), RColor::Rgb(80, 65, 0))
+        } else {
+            (fg, bg)
+        };
+        let ch = if cell.ch == '\0' { ' ' } else { cell.ch };
+        let mut modifier = Modifier::empty();
+        if cell.bold {
+            modifier |= Modifier::BOLD;
+        }
+        if cell.italic {
+            modifier |= Modifier::ITALIC;
+        }
+        if cell.underline {
+            modifier |= Modifier::UNDERLINED;
+        }
+        if modifier.is_empty() {
+            set_cell(buf, x, screen_row, ch, draw_fg, draw_bg);
+        } else {
+            set_cell_styled(buf, x, screen_row, ch, draw_fg, draw_bg, modifier);
+        }
     }
 }
 
