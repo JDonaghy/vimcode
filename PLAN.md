@@ -1,5 +1,30 @@
 # VimCode Implementation Plan
 
+## 🔴 Fix Next (Highest Priority — Session 70)
+
+### Terminal: Scrollbar always full height
+The scrollbar thumb always fills the full height instead of shrinking as content accumulates.
+Root cause: `panel.scrollback_rows` comes from `screen.scrollback()` which returns 0 until lines
+actually scroll off the top of the 12-row vt100 screen. When output fits on-screen, no scrollback
+is recorded and the fallback `(0, content_rows)` always draws a full bar.
+Fix: track the total lines ever written (not just scrollback buffer count) — either maintain a
+`lines_written: usize` counter on `TerminalPane` incremented in `poll()` based on cursor row
+advancement, or derive a `total_rows = scroll_offset + content_rows` approximation from
+`scroll_offset` when scrollback count is zero. The thumb should shrink to
+`content_rows / total_rows` once output exceeds the panel height.
+
+### Terminal: `:term` reopens zombie after Ctrl-D exit
+When the shell exits (Ctrl-D), `poll_terminal()` correctly sets `exited = true` and calls
+`close_terminal()` (sets `terminal_open = false`). However the `TerminalPane` with
+`exited = true` is left in `self.terminal`. When the user then types `:term`, `open_terminal()`
+sees `terminal_open == false` and `self.terminal.is_some()`, so it reopens the dead pane instead
+of spawning a fresh shell.
+Fix: in `open_terminal()`, check `self.terminal.as_ref().map(|t| t.exited).unwrap_or(false)`;
+if true, drop the old pane (`self.terminal = None`) before creating a new one. Alternatively,
+drop the pane inside `close_terminal()` when `exited` is true (since there's nothing to restore).
+
+---
+
 ## Recently Completed (Session 69)
 
 ### ✅ Terminal Panel Bug Fixes + Scrollbar
