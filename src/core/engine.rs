@@ -358,8 +358,10 @@ pub struct Engine {
     pub mouse_drag_active: bool,
 
     // --- Integrated terminal ---
-    /// The terminal pane (PTY + VT100 parser). None until first open.
-    pub terminal: Option<TerminalPane>,
+    /// All open terminal panes (PTY + VT100 parser). Empty until first open.
+    pub terminal_panes: Vec<TerminalPane>,
+    /// Index of the currently active terminal pane.
+    pub terminal_active: usize,
     /// Whether the terminal panel is visible.
     pub terminal_open: bool,
     /// Whether the terminal panel has keyboard focus.
@@ -474,7 +476,8 @@ impl Engine {
             clipboard_read: None,
             clipboard_write: None,
             mouse_drag_active: false,
-            terminal: None,
+            terminal_panes: Vec::new(),
+            terminal_active: 0,
             terminal_open: false,
             terminal_has_focus: false,
         };
@@ -9637,30 +9640,64 @@ impl Engine {
 
     // ── Integrated Terminal ────────────────────────────────────────────────
 
-    /// Open the integrated terminal panel with the given dimensions.
-    /// If already open, just focuses the terminal.
-    pub fn open_terminal(&mut self, cols: u16, rows: u16) {
-        // Drop an exited pane so `:term` after Ctrl-D spawns a fresh shell.
-        if self.terminal.as_ref().map(|t| t.exited).unwrap_or(false) {
-            self.terminal = None;
-        }
-        if self.terminal.is_none() {
-            let shell = default_shell();
-            match TerminalPane::new(cols, rows, &shell) {
-                Ok(pane) => {
-                    self.terminal = Some(pane);
-                }
-                Err(e) => {
-                    self.message = format!("terminal: failed to open PTY: {}", e);
-                    return;
-                }
-            }
-        }
-        self.terminal_open = true;
-        self.terminal_has_focus = true;
+    /// Get a reference to the active terminal pane, if any.
+    pub fn active_terminal(&self) -> Option<&TerminalPane> {
+        self.terminal_panes.get(self.terminal_active)
     }
 
-    /// Hide the terminal panel but keep the PTY running.
+    /// Get a mutable reference to the active terminal pane, if any.
+    pub fn active_terminal_mut(&mut self) -> Option<&mut TerminalPane> {
+        self.terminal_panes.get_mut(self.terminal_active)
+    }
+
+    /// Open the terminal panel. If no panes exist, create the first one.
+    /// If panes already exist, just show/focus the panel.
+    pub fn open_terminal(&mut self, cols: u16, rows: u16) {
+        if self.terminal_panes.is_empty() {
+            self.terminal_new_tab(cols, rows);
+        } else {
+            self.terminal_open = true;
+            self.terminal_has_focus = true;
+        }
+    }
+
+    /// Create a new terminal tab (always spawns a fresh shell).
+    pub fn terminal_new_tab(&mut self, cols: u16, rows: u16) {
+        let shell = default_shell();
+        match TerminalPane::new(cols, rows, &shell) {
+            Ok(pane) => {
+                self.terminal_panes.push(pane);
+                self.terminal_active = self.terminal_panes.len() - 1;
+                self.terminal_open = true;
+                self.terminal_has_focus = true;
+            }
+            Err(e) => self.message = format!("terminal: failed to open PTY: {e}"),
+        }
+    }
+
+    /// Close the active terminal tab. If it was the last tab, close the panel.
+    pub fn terminal_close_active_tab(&mut self) {
+        if self.terminal_panes.is_empty() {
+            return;
+        }
+        self.terminal_panes.remove(self.terminal_active);
+        if self.terminal_panes.is_empty() {
+            self.terminal_open = false;
+            self.terminal_has_focus = false;
+            self.terminal_active = 0;
+        } else {
+            self.terminal_active = self.terminal_active.min(self.terminal_panes.len() - 1);
+        }
+    }
+
+    /// Switch to the terminal tab at the given index (clamped to valid range).
+    pub fn terminal_switch_tab(&mut self, idx: usize) {
+        if !self.terminal_panes.is_empty() {
+            self.terminal_active = idx.min(self.terminal_panes.len() - 1);
+        }
+    }
+
+    /// Hide the terminal panel but keep all PTY panes running.
     pub fn close_terminal(&mut self) {
         self.terminal_open = false;
         self.terminal_has_focus = false;
@@ -9669,69 +9706,84 @@ impl Engine {
     /// Toggle the integrated terminal:
     /// - If open and focused → close (hide)
     /// - If open but unfocused → give focus
-    /// - If not open → open with current dimensions (UI must call open_terminal directly)
+    /// - If not open → signal UI to open (UI calls terminal_new_tab with correct dimensions)
     pub fn toggle_terminal(&mut self) {
         if self.terminal_open && self.terminal_has_focus {
             self.close_terminal();
         } else if self.terminal_open {
             self.terminal_has_focus = true;
         } else {
-            // Signal UI to call open_terminal with correct dimensions
+            // Signal UI to call terminal_new_tab with correct dimensions
             self.terminal_open = true;
             self.terminal_has_focus = true;
         }
     }
 
-    /// Drain PTY output and update the VT100 screen. Returns true if redrawn needed.
-    /// Automatically closes the panel when the shell process has exited.
+    /// Drain PTY output from all panes and update VT100 screens.
+    /// Returns true if a redraw is needed.
+    /// Exited panes are automatically removed; closes the panel when the last pane exits.
     pub fn poll_terminal(&mut self) -> bool {
-        let got_data = if let Some(term) = self.terminal.as_mut() {
-            term.poll()
+        let mut got_data = false;
+        for pane in &mut self.terminal_panes {
+            got_data |= pane.poll();
+        }
+        // Remove exited panes in reverse order (preserves earlier indices during removal).
+        let mut i = self.terminal_panes.len();
+        while i > 0 {
+            i -= 1;
+            if self.terminal_panes[i].exited {
+                self.terminal_panes.remove(i);
+                if self.terminal_active > i {
+                    self.terminal_active = self.terminal_active.saturating_sub(1);
+                }
+            }
+        }
+        if self.terminal_panes.is_empty() {
+            self.terminal_open = false;
+            self.terminal_has_focus = false;
+            self.terminal_active = 0;
         } else {
-            false
-        };
-        if got_data && self.terminal.as_ref().map(|t| t.exited).unwrap_or(false) {
-            self.close_terminal();
+            self.terminal_active = self.terminal_active.min(self.terminal_panes.len() - 1);
         }
         got_data
     }
 
-    /// Send raw bytes to the shell's PTY stdin.
+    /// Send raw bytes to the active pane's PTY stdin.
     pub fn terminal_write(&mut self, data: &[u8]) {
-        if let Some(term) = self.terminal.as_mut() {
+        if let Some(term) = self.active_terminal_mut() {
             term.write_input(data);
         }
     }
 
-    /// Resize the terminal PTY and VT100 parser.
+    /// Resize all terminal panes (shared panel height).
     pub fn terminal_resize(&mut self, cols: u16, rows: u16) {
-        if let Some(term) = self.terminal.as_mut() {
-            term.resize(cols, rows);
+        for pane in &mut self.terminal_panes {
+            pane.resize(cols, rows);
         }
     }
 
-    /// Return selected terminal text for clipboard copy.
+    /// Return selected terminal text from the active pane for clipboard copy.
     pub fn terminal_copy_selection(&mut self) -> Option<String> {
-        self.terminal.as_ref()?.selected_text()
+        self.active_terminal()?.selected_text()
     }
 
-    /// Scroll the terminal scrollback view up (away from live output).
+    /// Scroll the active pane's scrollback view up (away from live output).
     pub fn terminal_scroll_up(&mut self, rows: usize) {
-        if let Some(term) = self.terminal.as_mut() {
+        if let Some(term) = self.active_terminal_mut() {
             term.scroll_up(rows);
         }
     }
 
-    /// Scroll the terminal scrollback view down (toward live output).
+    /// Scroll the active pane's scrollback view down (toward live output).
     pub fn terminal_scroll_down(&mut self, rows: usize) {
-        if let Some(term) = self.terminal.as_mut() {
+        if let Some(term) = self.active_terminal_mut() {
             term.scroll_down(rows);
         }
     }
 
-    /// Return to the live view (cancel any scrollback offset).
+    /// Return the active pane to the live view (cancel any scrollback offset).
     pub fn terminal_scroll_reset(&mut self) {
-        if let Some(term) = self.terminal.as_mut() {
+        if let Some(term) = self.active_terminal_mut() {
             term.scroll_reset();
         }
     }

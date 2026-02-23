@@ -354,12 +354,14 @@ pub struct TerminalPanel {
     pub content_cols: u16,
     /// Whether the terminal panel has keyboard focus.
     pub has_focus: bool,
-    /// Whether the shell process has exited.
-    pub exited: bool,
     /// Rows scrolled up into scrollback (0 = live view).
     pub scroll_offset: usize,
     /// Number of scrollback rows stored in the VT100 parser buffer.
     pub scrollback_rows: usize,
+    /// Total number of terminal tabs.
+    pub tab_count: usize,
+    /// Index of the currently active tab.
+    pub active_tab: usize,
 }
 
 // ─── ScreenLayout ─────────────────────────────────────────────────────────────
@@ -797,7 +799,7 @@ fn build_terminal_panel(engine: &Engine) -> Option<TerminalPanel> {
     if !engine.terminal_open {
         return None;
     }
-    let term = engine.terminal.as_ref()?;
+    let term = engine.active_terminal()?;
     let screen = term.parser.screen();
     let (cursor_row, cursor_col) = screen.cursor_position();
     let rows_count = term.rows as usize;
@@ -871,13 +873,14 @@ fn build_terminal_panel(engine: &Engine) -> Option<TerminalPanel> {
         content_rows: term.rows,
         content_cols: term.cols,
         has_focus: engine.terminal_has_focus,
-        exited: term.exited,
         scroll_offset,
         // Cap to one screenful: vt100 visible_rows() requires offset <= rows_len.
         scrollback_rows: term
             .lines_written
             .saturating_sub(term.rows as usize)
             .min(term.rows as usize),
+        tab_count: engine.terminal_panes.len(),
+        active_tab: engine.terminal_active,
     })
 }
 

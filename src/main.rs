@@ -248,6 +248,12 @@ enum Msg {
     ClipboardPasteToInput { text: String },
     /// Toggle the integrated terminal panel open/closed.
     ToggleTerminal,
+    /// Open a new terminal tab.
+    NewTerminalTab,
+    /// Switch to a specific terminal tab by index.
+    TerminalSwitchTab(usize),
+    /// Close the active terminal tab (closes panel if last tab).
+    TerminalCloseActiveTab,
     /// Kill the terminal process and close the panel.
     TerminalKill,
     /// Copy terminal selection to clipboard.
@@ -765,6 +771,16 @@ impl SimpleComponent for App {
                                     // Terminal key routing: when terminal has focus, all keys
                                     // are forwarded as PTY bytes without going to the engine.
                                     if engine.borrow().terminal_has_focus {
+                                        // Alt+1–9: switch terminal tab.
+                                        if alt && !ctrl && !shift {
+                                            if let Some(ch) = unicode {
+                                                if ch.is_ascii_digit() && ch != '0' {
+                                                    let idx = (ch as u8 - b'1') as usize;
+                                                    sender.input(Msg::TerminalSwitchTab(idx));
+                                                    return gtk4::glib::Propagation::Stop;
+                                                }
+                                            }
+                                        }
                                         // Ctrl+Y: copy terminal selection to clipboard.
                                         if ctrl && !shift && (key_name == "y" || key_name == "Y") {
                                             sender.input(Msg::TerminalCopySelection);
@@ -1668,7 +1684,7 @@ impl SimpleComponent for App {
                         }
                     }
                     EngineAction::OpenTerminal => {
-                        sender.input(Msg::ToggleTerminal);
+                        sender.input(Msg::NewTerminalTab);
                     }
                     EngineAction::None | EngineAction::Error => {}
                 }
@@ -1798,7 +1814,7 @@ impl SimpleComponent for App {
                                 as u16;
                             let col = (x / self.cached_char_width.max(1.0)) as u16;
                             self.engine.borrow_mut().terminal_scroll_reset();
-                            if let Some(term) = self.engine.borrow_mut().terminal.as_mut() {
+                            if let Some(term) = self.engine.borrow_mut().active_terminal_mut() {
                                 term.selection = Some(crate::core::terminal::TermSelection {
                                     start_row: row,
                                     start_col: col,
@@ -1808,8 +1824,22 @@ impl SimpleComponent for App {
                             }
                         }
                     } else {
-                        // Header row click — start panel resize drag.
-                        self.terminal_resize_dragging = true;
+                        // Header row click — tab switch, close icon, or resize drag.
+                        const TERMINAL_TAB_COLS: usize = 4;
+                        let tab_count = self.engine.borrow().terminal_panes.len();
+                        let tab_area_px =
+                            tab_count as f64 * TERMINAL_TAB_COLS as f64 * self.cached_char_width;
+                        // Right-aligned close icon occupies ~2 chars from the right edge.
+                        let close_x = width - self.cached_char_width * 2.0;
+                        if x < tab_area_px && self.cached_char_width > 0.0 {
+                            let idx =
+                                (x / (TERMINAL_TAB_COLS as f64 * self.cached_char_width)) as usize;
+                            sender.input(Msg::TerminalSwitchTab(idx));
+                        } else if x >= close_x {
+                            sender.input(Msg::TerminalCloseActiveTab);
+                        } else {
+                            self.terminal_resize_dragging = true;
+                        }
                     }
                     self.redraw = true;
                 } else {
@@ -1860,22 +1890,29 @@ impl SimpleComponent for App {
                         self.redraw = true;
                     }
                 } else if self.terminal_sb_dragging {
-                    let engine = self.engine.borrow();
-                    if let Some(term) = engine.terminal.as_ref() {
-                        let term_px = (engine.session.terminal_panel_rows as f64 + 1.0)
+                    let (term_rows, lines_written) = {
+                        let engine = self.engine.borrow();
+                        if let Some(term) = engine.active_terminal() {
+                            (term.rows, term.lines_written)
+                        } else {
+                            (0, 0)
+                        }
+                    };
+                    if term_rows > 0 {
+                        let term_px = (self.engine.borrow().session.terminal_panel_rows as f64
+                            + 1.0)
                             * self.cached_line_height;
                         let status_h = 2.0 * self.cached_line_height;
                         let term_y = height - status_h - term_px;
                         let content_y = term_y + self.cached_line_height;
                         let content_h = term_px - self.cached_line_height;
-                        let scrollback_rows = term.lines_written.saturating_sub(term.rows as usize);
+                        let scrollback_rows = lines_written.saturating_sub(term_rows as usize);
                         if scrollback_rows > 0 && content_h > 0.0 {
                             let y_rel = (y - content_y).clamp(0.0, content_h);
                             let frac = y_rel / content_h;
                             // frac=0 (top) → max scroll; frac=1 (bottom) → live view
                             let new_offset = ((1.0 - frac) * scrollback_rows as f64) as usize;
-                            drop(engine);
-                            if let Some(term) = self.engine.borrow_mut().terminal.as_mut() {
+                            if let Some(term) = self.engine.borrow_mut().active_terminal_mut() {
                                 term.set_scroll_offset(new_offset.min(scrollback_rows));
                             }
                         }
@@ -1905,7 +1942,7 @@ impl SimpleComponent for App {
                         let row = ((y - term_y - self.cached_line_height) / self.cached_line_height)
                             as u16;
                         let col = (x / self.cached_char_width.max(1.0)) as u16;
-                        if let Some(term) = self.engine.borrow_mut().terminal.as_mut() {
+                        if let Some(term) = self.engine.borrow_mut().active_terminal_mut() {
                             if let Some(ref mut sel) = term.selection {
                                 sel.end_row = row;
                                 sel.end_col = col;
@@ -2598,11 +2635,12 @@ impl SimpleComponent for App {
                 let _ = engine.session.save();
             }
             Msg::ToggleTerminal => {
-                let needs_open = {
+                let needs_new_tab = {
                     let engine = self.engine.borrow();
-                    !engine.terminal_open || !engine.terminal_has_focus
+                    (!engine.terminal_open || !engine.terminal_has_focus)
+                        && engine.terminal_panes.is_empty()
                 };
-                if needs_open && self.engine.borrow().terminal.is_none() {
+                if needs_new_tab {
                     // Use the actual drawing area width so the PTY matches the visible panel.
                     let cols = if let Some(da) = self.drawing_area.borrow().as_ref() {
                         if self.cached_char_width > 0.0 {
@@ -2615,16 +2653,37 @@ impl SimpleComponent for App {
                     }
                     .max(40);
                     let rows = self.engine.borrow().session.terminal_panel_rows;
-                    self.engine.borrow_mut().open_terminal(cols, rows);
+                    self.engine.borrow_mut().terminal_new_tab(cols, rows);
                 } else {
                     self.engine.borrow_mut().toggle_terminal();
                 }
                 self.redraw = true;
             }
+            Msg::NewTerminalTab => {
+                let cols = if let Some(da) = self.drawing_area.borrow().as_ref() {
+                    if self.cached_char_width > 0.0 {
+                        (da.width() as f64 / self.cached_char_width) as u16
+                    } else {
+                        80
+                    }
+                } else {
+                    80
+                }
+                .max(40);
+                let rows = self.engine.borrow().session.terminal_panel_rows;
+                self.engine.borrow_mut().terminal_new_tab(cols, rows);
+                self.redraw = true;
+            }
+            Msg::TerminalSwitchTab(idx) => {
+                self.engine.borrow_mut().terminal_switch_tab(idx);
+                self.redraw = true;
+            }
+            Msg::TerminalCloseActiveTab => {
+                self.engine.borrow_mut().terminal_close_active_tab();
+                self.redraw = true;
+            }
             Msg::TerminalKill => {
-                self.engine.borrow_mut().terminal = None;
-                self.engine.borrow_mut().terminal_open = false;
-                self.engine.borrow_mut().terminal_has_focus = false;
+                self.engine.borrow_mut().terminal_close_active_tab();
                 self.redraw = true;
             }
             Msg::TerminalCopySelection => {
@@ -2646,7 +2705,7 @@ impl SimpleComponent for App {
                 self.redraw = true;
             }
             Msg::TerminalMouseDown { row, col } => {
-                if let Some(term) = self.engine.borrow_mut().terminal.as_mut() {
+                if let Some(term) = self.engine.borrow_mut().active_terminal_mut() {
                     term.selection = Some(crate::core::terminal::TermSelection {
                         start_row: row,
                         start_col: col,
@@ -2657,7 +2716,7 @@ impl SimpleComponent for App {
                 self.redraw = true;
             }
             Msg::TerminalMouseDrag { row, col } => {
-                if let Some(term) = self.engine.borrow_mut().terminal.as_mut() {
+                if let Some(term) = self.engine.borrow_mut().active_terminal_mut() {
                     if let Some(ref mut sel) = term.selection {
                         sel.end_row = row;
                         sel.end_col = col;
@@ -4217,29 +4276,48 @@ fn draw_terminal_panel(
     cr.rectangle(x, y, w, line_height);
     cr.fill().ok();
 
-    let exit_note = if panel.exited { " [exited]" } else { "" };
-    let focus_note = if panel.has_focus {
-        ""
-    } else {
-        " (click to focus)"
-    };
-    let title = format!("  TERMINAL{}{}", exit_note, focus_note);
     let (fr, fg2, fb) = theme.status_fg.to_cairo();
-    cr.set_source_rgb(fr, fg2, fb);
     layout.set_attributes(None);
-    layout.set_text(&title);
-    cr.move_to(x, y);
-    pangocairo::show_layout(cr, layout);
+
+    // Tab strip — each tab is 4 chars: "[N] "
+    const TERMINAL_TAB_COLS: usize = 4;
+    let mut tab_x = x;
+    for i in 0..panel.tab_count {
+        let label = format!("[{}] ", i + 1);
+        if i == panel.active_tab {
+            // Active tab: inverted colors (cursor background)
+            let (ar, ag, ab) = theme.cursor.to_cairo();
+            cr.set_source_rgb(ar, ag, ab);
+            cr.rectangle(tab_x, y, char_width * TERMINAL_TAB_COLS as f64, line_height);
+            cr.fill().ok();
+            let (br, bg_, bb) = theme.background.to_cairo();
+            cr.set_source_rgb(br, bg_, bb);
+        } else {
+            cr.set_source_rgb(fr, fg2, fb);
+        }
+        layout.set_text(&label);
+        cr.move_to(tab_x, y);
+        pangocairo::show_layout(cr, layout);
+        tab_x += char_width * TERMINAL_TAB_COLS as f64;
+    }
+
+    // If no tabs yet (panel open but spawning), show a minimal title
+    if panel.tab_count == 0 {
+        cr.set_source_rgb(fr, fg2, fb);
+        layout.set_text("  TERMINAL");
+        cr.move_to(x, y);
+        pangocairo::show_layout(cr, layout);
+    }
 
     // Right-aligned toolbar buttons
+    cr.set_source_rgb(fr, fg2, fb);
     let btn_text = format!("{}  {}", NF_SPLIT, NF_CLOSE);
     layout.set_text(&btn_text);
     let (btn_w, _) = layout.pixel_size();
     cr.move_to(x + w - btn_w as f64 - 4.0, y);
     pangocairo::show_layout(cr, layout);
 
-    // Determine if NF_CLOSE button was possibly clicked (we store its rect for click detection)
-    // For simplicity, click on the NF_CLOSE area sends TerminalKill.
+    // close_x used by click detection in MouseClick handler
     let close_x = x + w - char_width * 2.0;
     let _ = (close_x, sender); // suppress unused warning; click detection handled in MouseClick
 

@@ -1076,9 +1076,14 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                             } else if engine.terminal_open {
                                 engine.terminal_has_focus = true;
                             } else {
-                                // Open terminal at full terminal width
+                                // Open terminal at full terminal width; create first tab if needed
                                 let cols = terminal.size().ok().map(|s| s.width).unwrap_or(80);
-                                engine.open_terminal(cols, engine.session.terminal_panel_rows);
+                                if engine.terminal_panes.is_empty() {
+                                    engine
+                                        .terminal_new_tab(cols, engine.session.terminal_panel_rows);
+                                } else {
+                                    engine.open_terminal(cols, engine.session.terminal_panel_rows);
+                                }
                             }
                             needs_redraw = true;
                             continue;
@@ -1086,6 +1091,16 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
 
                         // When terminal has focus, route all keys to PTY
                         if engine.terminal_has_focus {
+                            // Alt+1–9: switch terminal tab.
+                            if mods.contains(KeyModifiers::ALT) && !ctrl {
+                                if let KeyCode::Char(ch) = code {
+                                    if ch.is_ascii_digit() && ch != '0' {
+                                        engine.terminal_switch_tab((ch as u8 - b'1') as usize);
+                                        needs_redraw = true;
+                                        continue;
+                                    }
+                                }
+                            }
                             // PageUp/PageDown scroll through scrollback instead of going to PTY.
                             if matches!(code, KeyCode::PageUp) {
                                 engine.terminal_scroll_up(12);
@@ -1099,7 +1114,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                             }
                             // Ctrl+Y: copy terminal selection to clipboard.
                             if ctrl && matches!(code, KeyCode::Char('y') | KeyCode::Char('Y')) {
-                                let text = engine.terminal.as_ref().and_then(|t| t.selected_text());
+                                let text = engine.active_terminal().and_then(|t| t.selected_text());
                                 if let Some(ref text) = text {
                                     if let Some(ref cb) = engine.clipboard_write {
                                         let _ = cb(text);
@@ -1228,10 +1243,8 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                         let action = engine.handle_key(&key_name, unicode, ctrl);
                         // Handle OpenTerminal specially (needs terminal size info)
                         if action == EngineAction::OpenTerminal {
-                            if !engine.terminal_open {
-                                let cols = terminal.size().ok().map(|s| s.width).unwrap_or(80);
-                                engine.open_terminal(cols, engine.session.terminal_panel_rows);
-                            }
+                            let cols = terminal.size().ok().map(|s| s.width).unwrap_or(80);
+                            engine.terminal_new_tab(cols, engine.session.terminal_panel_rows);
                             needs_redraw = true;
                         } else if handle_action(engine, action) {
                             break;
@@ -1469,7 +1482,7 @@ fn handle_mouse(
                     let ratio = offset_in_track / track_len as f64;
                     // top (ratio=0) → max offset; bottom (ratio=1) → 0 (live view)
                     let new_offset = ((1.0 - ratio) * total as f64) as usize;
-                    if let Some(term) = engine.terminal.as_mut() {
+                    if let Some(term) = engine.active_terminal_mut() {
                         term.set_scroll_offset(new_offset);
                     }
                 }
@@ -1541,7 +1554,7 @@ fn handle_mouse(
                     && row < term_strip_top + strip_rows
                 {
                     let term_row = row - term_strip_top - 1;
-                    if let Some(term) = engine.terminal.as_mut() {
+                    if let Some(term) = engine.active_terminal_mut() {
                         if let Some(ref mut sel) = term.selection {
                             sel.end_row = term_row;
                             sel.end_col = col;
@@ -1567,7 +1580,7 @@ fn handle_mouse(
             engine.mouse_drag_active = false;
             // Auto-copy terminal selection to clipboard on mouse-release.
             if engine.terminal_has_focus {
-                let text = engine.terminal.as_ref().and_then(|t| t.selected_text());
+                let text = engine.active_terminal().and_then(|t| t.selected_text());
                 if let Some(ref text) = text {
                     if let Some(ref cb) = engine.clipboard_write {
                         let _ = cb(text);
@@ -1697,9 +1710,20 @@ fn handle_mouse(
             && row < term_strip_top + strip_rows
         {
             if row == term_strip_top {
-                // Header row — focus terminal and start panel resize drag.
+                // Header row — tab switch, close icon, or resize drag.
                 engine.terminal_has_focus = true;
-                *dragging_terminal_resize = true;
+                const TERMINAL_TAB_COLS: u16 = 4;
+                let tab_count = engine.terminal_panes.len() as u16;
+                let term_width = terminal_size.map(|s| s.width).unwrap_or(80);
+                // Right-aligned icons: 2 icon chars + 2 spaces = ~4 chars
+                let icon_len: u16 = 4;
+                if tab_count > 0 && col < tab_count * TERMINAL_TAB_COLS {
+                    engine.terminal_switch_tab((col / TERMINAL_TAB_COLS) as usize);
+                } else if col >= term_width.saturating_sub(icon_len) {
+                    engine.terminal_close_active_tab();
+                } else {
+                    *dragging_terminal_resize = true;
+                }
             } else {
                 // Content row — check for scrollbar click first.
                 let term_width = terminal_size.map(|s| s.width).unwrap_or(80);
@@ -1712,8 +1736,7 @@ fn handle_mouse(
                                                                   // Cap total to one screenful (vt100 API limit) so the drag range
                                                                   // [0, total] exactly matches what set_scroll_offset can deliver.
                     let total = engine
-                        .terminal
-                        .as_ref()
+                        .active_terminal()
                         .map(|t| {
                             t.lines_written
                                 .saturating_sub(t.rows as usize)
@@ -1725,7 +1748,7 @@ fn handle_mouse(
                     // Content area — start a selection.
                     let term_row = row - term_strip_top - 1;
                     engine.terminal_scroll_reset();
-                    if let Some(term) = engine.terminal.as_mut() {
+                    if let Some(term) = engine.active_terminal_mut() {
                         term.selection = Some(crate::core::terminal::TermSelection {
                             start_row: term_row,
                             start_col: col,
@@ -4472,14 +4495,41 @@ fn render_terminal_panel(
     let hdr_bg = RColor::Rgb(theme.status_bg.r, theme.status_bg.g, theme.status_bg.b);
 
     // ── Toolbar row ──────────────────────────────────────────────────────────
+    // Clear toolbar background
     for x in area.x..area.x + area.width {
         set_cell(buf, x, area.y, ' ', hdr_fg, hdr_bg);
     }
-    let exit_note = if panel.exited { " [exited]" } else { "" };
-    let title = format!(" TERMINAL{}", exit_note);
-    for (i, ch) in title.chars().enumerate().take(area.width as usize) {
-        set_cell(buf, area.x + i as u16, area.y, ch, hdr_fg, hdr_bg);
+
+    // Tab strip — each tab is exactly 4 chars: "[N] "
+    const TERMINAL_TAB_COLS: u16 = 4;
+    let mut cursor_x = area.x;
+    for i in 0..panel.tab_count {
+        let label: Vec<char> = format!("[{}] ", i + 1).chars().collect();
+        let (tab_fg, tab_bg) = if i == panel.active_tab {
+            (hdr_bg, hdr_fg) // inverted for active tab
+        } else {
+            (hdr_fg, hdr_bg)
+        };
+        for (j, &ch) in label.iter().enumerate().take(TERMINAL_TAB_COLS as usize) {
+            let x = cursor_x + j as u16;
+            if x >= area.x + area.width {
+                break;
+            }
+            set_cell(buf, x, area.y, ch, tab_fg, tab_bg);
+        }
+        cursor_x += TERMINAL_TAB_COLS;
+        if cursor_x >= area.x + area.width {
+            break;
+        }
     }
+
+    // If no tabs yet, show minimal title
+    if panel.tab_count == 0 {
+        for (i, ch) in " TERMINAL".chars().enumerate().take(area.width as usize) {
+            set_cell(buf, area.x + i as u16, area.y, ch, hdr_fg, hdr_bg);
+        }
+    }
+
     // Right-aligned icons
     let icons = format!("{}  {}", NF_TERMINAL_SPLIT, NF_TERMINAL_CLOSE);
     let icon_chars: Vec<char> = icons.chars().collect();

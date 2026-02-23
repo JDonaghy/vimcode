@@ -231,20 +231,25 @@ cargo fmt
 ### Integrated Terminal
 
 - `Ctrl-T` (Normal mode) — toggle the integrated terminal panel
-- `:term` / `:terminal` — open the terminal from command mode
+- `:term` / `:terminal` — open a **new terminal tab** (always spawns a fresh shell, even if the panel is already open)
 - The terminal is a **resizable bottom strip** (default 1 toolbar + 12 content rows) above the status bar; drag the header row up/down to resize; height persists across sessions
 - Shell is determined by the `$SHELL` environment variable, falling back to `/bin/bash`
 - Full **ANSI/VT100 color support** — 256-color xterm palette rendered cell-by-cell
+- **Multiple terminal tabs** — each tab runs an independent PTY; the toolbar shows `[1] [2] …` labels:
+  - `Alt-1` through `Alt-9` (when terminal has focus) — switch to tab N
+  - Click a `[N]` tab label in the toolbar — switch to that tab
+  - Click the close icon (`󰅖`) — close the active tab; closes the panel if it was the last tab
+  - When a shell exits (Ctrl-D, `exit`), its tab closes automatically
 - **Mouse selection** — click and drag to select text in the terminal content area
 - **Copy / Paste:**
   - `Ctrl-Y` — copy the current mouse selection to the system clipboard
   - `Ctrl-Shift-V` — paste from system clipboard into the running shell (GTK: intercepted by vimcode; TUI: Alacritty/kitty bracketed-paste is forwarded to the PTY automatically)
   - Mouse-release auto-copies the selection to the clipboard (requires `xclip` or `xsel` on Linux/X11)
-- **Scrollback** — PageUp / PageDown scroll up to one screenful into the shell history; the scrollbar is draggable; `:term` after Ctrl-D spawns a fresh shell
-- **Nerd Font toolbar** — title bar with close (`󰅖`) button
+- **Scrollback** — PageUp / PageDown scroll up to one screenful into the shell history; the scrollbar is draggable
+- **Nerd Font toolbar** — tab strip + split (`󰤼`) and close (`󰅖`) icons
 - **All keys forwarded to shell PTY** — Ctrl-C, Ctrl-D, Ctrl-L, Ctrl-Z, arrow keys, Tab, etc. work as expected
-- `Ctrl-T` while the terminal has focus **closes the panel** while keeping the shell session alive; reopening restores the same session
-- When the shell **exits** (Ctrl-D, `exit`, etc.) the panel closes automatically; clicking outside the terminal returns focus to the editor
+- `Ctrl-T` while the terminal has focus **closes the panel** while keeping all shell sessions alive; reopening restores the same sessions
+- When a shell exits (Ctrl-D, `exit`, etc.) its tab closes immediately; the panel closes automatically when the last tab exits; clicking outside the terminal returns focus to the editor
 
 ---
 

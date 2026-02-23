@@ -1,5 +1,16 @@
 # VimCode Implementation Plan
 
+## Recently Completed (Session 72)
+
+### ✅ Terminal Multiple Tabs
+
+- **`engine.rs`** — `terminal: Option<TerminalPane>` → `terminal_panes: Vec<TerminalPane>` + `terminal_active: usize`; helpers `active_terminal()` / `active_terminal_mut()`; new methods `terminal_new_tab()`, `terminal_close_active_tab()`, `terminal_switch_tab()`; `open_terminal()` creates first tab if empty; `poll_terminal()` polls all panes and auto-removes exited ones (panel closes when last pane exits); `terminal_resize()` resizes all panes
+- **`render.rs`** — `TerminalPanel` gains `tab_count`, `active_tab`; `build_terminal_panel()` uses `active_terminal()` and populates new fields; `exited`/`tabs_exited` removed (panes never linger in exited state)
+- **`main.rs` (GTK)** — new `Msg` variants: `NewTerminalTab`, `TerminalSwitchTab(usize)`, `TerminalCloseActiveTab`; `EngineAction::OpenTerminal` → `NewTerminalTab`; Ctrl-T creates first tab when panel empty; Alt-1–9 in terminal-focus block; header-row click: tab zone → switch, close icon → close, else → resize drag; tab strip `[N] ` in toolbar (active tab inverted); all `terminal.as_mut()/as_ref()` → `active_terminal_mut()/active_terminal()`
+- **`tui_main.rs`** — same `EngineAction::OpenTerminal` → `terminal_new_tab()`; Ctrl-T creates first tab if empty; Alt-1–9 in terminal-focus block; header-row click: tab zone → switch, close icon → close; tab strip `[N] ` with `TERMINAL_TAB_COLS = 4`; all `engine.terminal` → `active_terminal()`/`active_terminal_mut()`
+
+---
+
 ## Recently Completed (Session 71)
 
 ### ✅ Terminal Panel Draggable Resize

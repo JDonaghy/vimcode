@@ -1,8 +1,10 @@
 # VimCode Project State
 
-**Last updated:** Feb 22, 2026 (Session 71)
+**Last updated:** Feb 23, 2026 (Session 72)
 
 ## Status
+
+**Terminal multiple tabs + auto-close fix (Session 72):** `terminal_panes: Vec<TerminalPane>` + `terminal_active: usize` replace the single `terminal: Option<TerminalPane>` field. `terminal_new_tab()` always spawns a fresh shell; `terminal_close_active_tab()` removes current pane (closes panel if last); `terminal_switch_tab(idx)` switches active pane. `:term` always creates a new tab (via `EngineAction::OpenTerminal → NewTerminalTab`). Ctrl-T toggles panel (creates first tab if none). Alt-1–9 switches tabs (both GTK and TUI). Click on `[N]` tab label in toolbar switches tab; click on close icon closes active tab. `poll_terminal()` auto-removes exited panes immediately (all tabs, not just single-pane); panel closes when last pane exits. `terminal_resize()` resizes ALL panes. 638 tests (no change — PTY features are UI-only).
 
 **Terminal panel resize (Session 71):** Drag the terminal header row to resize the panel height. `session.terminal_panel_rows: u16` (default 12) persists across sessions. GTK: `terminal_resize_dragging: bool` flag; header-row click starts drag; `Msg::MouseDrag` updates rows live; `Msg::MouseUp` calls `terminal_resize()` + `session.save()`. TUI: `dragging_terminal_resize: bool` local var + new param in `handle_mouse()`; Up handler saves + resizes PTY. All hardcoded `13`/`12` row constants replaced dynamically. Clamped [5, 30] content rows. 638 tests (no change).
 
