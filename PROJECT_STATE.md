@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Feb 23, 2026 (Session 79) | **Tests:** 673
+**Last updated:** Feb 24, 2026 (Session 80) | **Tests:** 673
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 72 are in **SESSION_HISTORY.md**.
@@ -8,6 +8,8 @@
 ---
 
 ## Recent Work
+
+**Session 80:** Bug fix — LSP not starting for files opened via sidebar, fuzzy finder, live grep, `:split`, or `:tabnew`. Root cause: `lsp_did_open()` was only called from `Engine::open()` and `open_file_with_mode()`, leaving 4 other file-opening paths without LSP initialization. Fixed by adding `self.lsp_did_open(buffer_id)` at the appropriate point in `open_file_in_tab()` (3 return paths), `open_file_preview()` (2 paths), `new_tab()` (when file_path is Some), and `split_window()` (when file_path is Some). `lsp_did_open` is idempotent so duplicate calls are safe. `engine.rs` only — no other files changed. 673 tests, all passing.
 
 **Session 79:** Leader key + extended syntax highlighting + LSP feature expansion. `settings.rs`: `leader: char` field (default `' '`). `syntax.rs`: 10 new `SyntaxLanguage` variants (C, TypeScript, TypeScriptReact, Css, Json, Bash, Ruby, CSharp, Java, Toml); full `from_path()`, `language()`, `query_source()` for each; 19 new tests. `Cargo.toml`: 9 new tree-sitter grammar crates at 0.20 (html skipped — depends on tree-sitter 0.22). `lsp_manager.rs`: Python server fallback chain (basedpyright-langserver → pylsp → jedi-language-server); `server_and_uri()` helper; 6 new request methods (references, implementation, type_definition, signature_help, formatting, rename). `lsp.rs`: 6 new `LspEvent` variants; `FormattingEdit`, `FileEdit`, `WorkspaceEdit`, `SignatureHelpData` types; 7 new `LspServer` request methods; 5 new response parsers; new reader_thread routing arms. `render.rs`: `SignatureHelp` struct + `signature_help: Option<SignatureHelp>` on `ScreenLayout`. `engine.rs`: `leader_partial` field; `handle_leader_key()`; leader detection in normal+visual (only when no pending_key); `gr`/`gi`/`gy` bindings; `<leader>gf` / `<leader>rn`; 8 new LSP pending fields; `apply_lsp_edits()` + `apply_workspace_edit()`; `:Lformat` / `:Rename` commands; signature help trigger on `(` and `,` in insert mode; 6 new poll_lsp arms. `main.rs`: `draw_signature_popup()`. `tui_main.rs`: `render_signature_popup()`. 673 tests (+19 new).
 
@@ -36,7 +38,7 @@ src/
 ├── render.rs        (~1759 lines)  Platform-agnostic ScreenLayout bridge
 ├── icons.rs            (~30 lines)  Nerd Font file-type icons
 └── core/            (~25,700 lines)  Zero GTK/rendering deps — fully testable
-    ├── engine.rs    (~20,751 lines)  Orchestrator: keys, commands, all features
+    ├── engine.rs    (~20,793 lines)  Orchestrator: keys, commands, all features
     ├── terminal.rs     (~320 lines)  PTY-backed terminal pane (portable-pty + vt100)
     ├── lsp.rs        (~1,894 lines)  LSP protocol transport + single-server client
     ├── lsp_manager.rs  (~671 lines)  Multi-server coordinator + built-in registry

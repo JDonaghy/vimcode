@@ -1,5 +1,19 @@
 # VimCode Implementation Plan
 
+## Recently Completed (Session 80)
+
+### ✅ Fix LSP Not Starting for Files Opened via Sidebar / Fuzzy / Split
+
+- **Root cause** — `lsp_did_open(buffer_id)` was only called in `Engine::open()` (CLI startup) and `open_file_with_mode()` (`:e`, quickfix, grep confirm). Four other file-opening functions never triggered LSP initialization, so `:LspInfo` reported `manager=not started` for any file opened via the sidebar, Ctrl-P fuzzy finder, live grep confirm, `:split`/`:vsplit`, or `:tabnew`.
+- **`open_file_in_tab()`** — added `self.lsp_did_open(buffer_id)` on all 3 exit paths: preview-promotion early return, existing-tab switch early return, and fall-through (new tab created). Used by sidebar double-click, fuzzy finder, and project search confirm.
+- **`open_file_preview()`** — added `self.lsp_did_open(buffer_id)` on both paths: existing-tab switch early return and at the end of the preview-slot if/else block. Used by sidebar single-click.
+- **`new_tab()`** — added `self.lsp_did_open(buffer_id)` after `self.active_tab` is set, guarded by `if file_path.is_some()` (no-op for scratch buffers). Used by `:tabnew <file>`.
+- **`split_window()`** — added `self.lsp_did_open(new_buffer_id)` before `self.message`, guarded by `if file_path.is_some()` (no-op for same-buffer splits). Used by `:split <file>` and `:vsplit <file>`.
+- **`engine.rs` only** — no changes to `render.rs`, `main.rs`, `tui_main.rs`, or any other file.
+- Tests: 673 → 673 (no new tests; behavior verified manually)
+
+---
+
 ## Recently Completed (Session 79)
 
 ### ✅ Leader Key + Extended Syntax Highlighting + Full LSP Feature Set

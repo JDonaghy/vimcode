@@ -1577,6 +1577,9 @@ impl Engine {
             .split_at(current_window_id, direction, new_window_id, false);
         tab.active_window = new_window_id;
 
+        if file_path.is_some() {
+            self.lsp_did_open(new_buffer_id);
+        }
         self.message = String::new();
     }
 
@@ -1715,6 +1718,9 @@ impl Engine {
         self.tabs.push(tab);
         self.active_tab = self.tabs.len() - 1;
 
+        if file_path.is_some() {
+            self.lsp_did_open(buffer_id);
+        }
         self.message = String::new();
     }
 
@@ -1785,6 +1791,7 @@ impl Engine {
         if self.preview_buffer_id == Some(buffer_id) {
             self.promote_preview(buffer_id);
             self.refresh_git_diff(buffer_id);
+            self.lsp_did_open(buffer_id);
             self.message = format!("\"{}\"", path.display());
             return;
         }
@@ -1795,6 +1802,7 @@ impl Engine {
                 if win.buffer_id == buffer_id {
                     self.active_tab = tab_idx;
                     self.refresh_git_diff(buffer_id);
+                    self.lsp_did_open(buffer_id);
                     self.message = format!("\"{}\"", path.display());
                     return;
                 }
@@ -1818,6 +1826,7 @@ impl Engine {
         }
 
         self.refresh_git_diff(buffer_id);
+        self.lsp_did_open(buffer_id);
         self.message = format!("\"{}\"", path.display());
     }
 
@@ -1846,6 +1855,7 @@ impl Engine {
                 if win.buffer_id == buffer_id {
                     self.active_tab = tab_idx;
                     self.refresh_git_diff(buffer_id);
+                    self.lsp_did_open(buffer_id);
                     self.message = format!("\"{}\"", path.display());
                     return;
                 }
@@ -1901,6 +1911,7 @@ impl Engine {
         }
 
         self.refresh_git_diff(buffer_id);
+        self.lsp_did_open(buffer_id);
         self.message = format!("\"{}\"", path.display());
     }
 
@@ -9115,8 +9126,7 @@ impl Engine {
                         } else if let Some(err) = error_message {
                             self.message = format!("Rename failed: {err}");
                         } else {
-                            self.message =
-                                "Rename: no changes returned by server".to_string();
+                            self.message = "Rename: no changes returned by server".to_string();
                         }
                         redraw = true;
                     }

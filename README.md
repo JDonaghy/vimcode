@@ -310,7 +310,7 @@ cargo fmt
 
 ### LSP Support (Language Server Protocol)
 
-Automatic language server integration — open a file and diagnostics, completions, go-to-definition, and hover just work if the appropriate server is on `PATH`.
+Automatic language server integration — open a file and diagnostics, completions, go-to-definition, and hover just work if the appropriate server is on `PATH`. LSP initializes on every file-opening path: `:e`, sidebar click, fuzzy finder (Ctrl-P), live grep confirm, `:split`/`:vsplit`, and `:tabnew`.
 
 **Built-in server registry** (auto-detected on `PATH`):
 
@@ -602,7 +602,7 @@ src/
 ├── render.rs        (~1759 lines)  Platform-agnostic ScreenLayout bridge (DiffLine, diff_status)
 ├── icons.rs            (~30 lines)  Nerd Font file-type icons (GTK + TUI)
 └── core/            (~25,700 lines)  Zero GTK/rendering deps — fully testable
-    ├── engine.rs    (~20,751 lines)  Orchestrator: keys, commands, git, macros, LSP, project search/replace, fuzzy finder
+    ├── engine.rs    (~20,793 lines)  Orchestrator: keys, commands, git, macros, LSP, project search/replace, fuzzy finder
     ├── terminal.rs     (~320 lines)  PTY-backed terminal pane (portable-pty + vt100, history ring buffer)
     ├── lsp.rs        (~1,894 lines)  LSP protocol transport + single-server client (request ID tracking, JSON-RPC framing)
     ├── lsp_manager.rs  (~671 lines)  Multi-server coordinator with initialization guards + built-in registry
