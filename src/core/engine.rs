@@ -9079,7 +9079,7 @@ impl Engine {
                 LspEvent::RenameResponse {
                     request_id,
                     workspace_edit,
-                    debug_info,
+                    error_message,
                     ..
                 } => {
                     if self.lsp_pending_rename == Some(request_id) {
@@ -9088,9 +9088,11 @@ impl Engine {
                         if n > 0 {
                             self.apply_workspace_edit(workspace_edit);
                             self.message = format!("Renamed in {n} file(s)");
+                        } else if let Some(err) = error_message {
+                            self.message = format!("Rename failed: {err}");
                         } else {
                             self.message =
-                                format!("Rename: no changes [{debug_info}]");
+                                "Rename: no changes returned by server".to_string();
                         }
                         redraw = true;
                     }

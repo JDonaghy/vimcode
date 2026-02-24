@@ -89,8 +89,8 @@ pub enum LspEvent {
         server_id: LspServerId,
         request_id: i64,
         workspace_edit: WorkspaceEdit,
-        /// Debug string capturing raw result structure (empty in normal flow).
-        debug_info: String,
+        /// Error message from the server, if the response contained an error.
+        error_message: Option<String>,
     },
 }
 
@@ -1010,28 +1010,20 @@ fn reader_thread(
                 Some("textDocument/rename") => {
                     let null = serde_json::Value::Null;
                     let r = result.unwrap_or(&null);
-                    let debug_info = if result.is_none() {
-                        let err_msg = json
-                            .get("error")
+                    let error_message = if result.is_none() {
+                        json.get("error")
                             .and_then(|e| e.get("message"))
                             .and_then(|m| m.as_str())
-                            .unwrap_or("no error field");
-                        format!("error: {err_msg}")
+                            .map(|s| s.to_string())
                     } else {
-                        let has_c = r.get("changes").is_some();
-                        let has_dc = r.get("documentChanges").is_some();
-                        let top_keys: Vec<String> = r
-                            .as_object()
-                            .map(|m| m.keys().cloned().collect())
-                            .unwrap_or_default();
-                        format!("changes={has_c} docChanges={has_dc} keys={top_keys:?}")
+                        None
                     };
                     let workspace_edit = try_parse_workspace_edit(r);
                     let _ = tx.send(LspEvent::RenameResponse {
                         server_id,
                         request_id: id,
                         workspace_edit,
-                        debug_info,
+                        error_message,
                     });
                 }
                 _ => {
