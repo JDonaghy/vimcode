@@ -251,11 +251,13 @@ impl LspManager {
         }
 
         // Find a matching config where the binary is available (try all configs — first one wins).
-        let (config, _resolved) = self
+        // Use the resolved full path so the spawn works regardless of the process's PATH.
+        let (mut config, resolved) = self
             .registry
             .iter()
             .filter(|c| c.languages.iter().any(|l| l == language_id))
             .find_map(|c| resolve_command(&c.command).map(|p| (c.clone(), p)))?;
+        config.command = resolved.to_string_lossy().into_owned();
 
         // Start the server
         let id = self.servers.len();
@@ -604,13 +606,14 @@ impl LspManager {
             self.initialized.remove(&id);
         }
 
-        // Find config and restart
-        let config = self
+        // Find config and restart, using the resolved full binary path.
+        let mut config = self
             .registry
             .iter()
             .find(|c| c.languages.iter().any(|l| l == language_id))?
             .clone();
-        resolve_command(&config.command)?;
+        let resolved = resolve_command(&config.command)?;
+        config.command = resolved.to_string_lossy().into_owned();
         let new_id = self.servers.len();
         match LspServer::start(new_id, &config, &self.root_path, self.event_tx.clone()) {
             Ok(server) => {
