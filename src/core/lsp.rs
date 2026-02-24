@@ -88,7 +88,7 @@ pub enum LspEvent {
     RenameResponse {
         server_id: LspServerId,
         request_id: i64,
-        workspace_edit: Option<WorkspaceEdit>,
+        workspace_edit: WorkspaceEdit,
     },
 }
 
@@ -542,6 +542,13 @@ impl LspServer {
             "processId": std::process::id(),
             "rootUri": root_uri,
             "capabilities": {
+                "workspace": {
+                    "workspaceEdit": {
+                        "documentChanges": true,
+                        "normalizationMode": "None"
+                    },
+                    "applyEdit": true
+                },
                 "textDocument": {
                     "completion": {
                         "completionItem": {
@@ -556,6 +563,11 @@ impl LspServer {
                         "relatedInformation": false
                     },
                     "definition": {},
+                    "rename": {
+                        "dynamicRegistration": false,
+                        "prepareSupport": false,
+                        "honorsChangeAnnotations": false
+                    },
                     "synchronization": {
                         "didSave": true,
                         "willSave": false,
@@ -994,7 +1006,8 @@ fn reader_thread(
                     });
                 }
                 Some("textDocument/rename") => {
-                    let workspace_edit = result.and_then(try_parse_workspace_edit);
+                    let null = serde_json::Value::Null;
+                    let workspace_edit = try_parse_workspace_edit(result.unwrap_or(&null));
                     let _ = tx.send(LspEvent::RenameResponse {
                         server_id,
                         request_id: id,
@@ -1245,7 +1258,7 @@ fn parse_text_edits(result: &serde_json::Value) -> Option<Vec<FormattingEdit>> {
 }
 
 /// Parse a WorkspaceEdit from a rename response.
-fn try_parse_workspace_edit(result: &serde_json::Value) -> Option<WorkspaceEdit> {
+fn try_parse_workspace_edit(result: &serde_json::Value) -> WorkspaceEdit {
     let mut file_edits: Vec<FileEdit> = Vec::new();
 
     // Format 1: result.changes = { uri: [TextEdit] }
@@ -1281,9 +1294,9 @@ fn try_parse_workspace_edit(result: &serde_json::Value) -> Option<WorkspaceEdit>
         }
     }
 
-    Some(WorkspaceEdit {
+    WorkspaceEdit {
         changes: file_edits,
-    })
+    }
 }
 
 fn extract_markup_content(value: &serde_json::Value) -> Option<String> {

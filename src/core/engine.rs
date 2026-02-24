@@ -9083,12 +9083,12 @@ impl Engine {
                 } => {
                     if self.lsp_pending_rename == Some(request_id) {
                         self.lsp_pending_rename = None;
-                        if let Some(we) = workspace_edit {
-                            let n = we.changes.len();
-                            self.apply_workspace_edit(we);
+                        let n = workspace_edit.changes.len();
+                        if n > 0 {
+                            self.apply_workspace_edit(workspace_edit);
                             self.message = format!("Renamed in {n} file(s)");
                         } else {
-                            self.message = "Rename not supported by server".to_string();
+                            self.message = "Rename: no changes returned by server".to_string();
                         }
                         redraw = true;
                     }
