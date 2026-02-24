@@ -87,6 +87,13 @@ pub struct Settings {
     #[serde(default)]
     pub lsp_servers: Vec<crate::core::lsp::LspServerConfig>,
 
+    /// User-configured file extension → LSP language ID overrides.
+    /// Keys are extensions without the dot (e.g. "cs", "h").
+    /// Values are LSP language IDs (e.g. "csharp", "cpp").
+    /// Example: { "h": "cpp", "mjs": "javascript" }
+    #[serde(default)]
+    pub language_map: std::collections::HashMap<String, String>,
+
     /// Configurable explorer key bindings (in-tree CRUD operations)
     #[serde(default)]
     pub explorer_keys: ExplorerKeys,
@@ -102,6 +109,11 @@ pub struct Settings {
     /// Editing mode: `vim` (modal) or `vscode` (always-insert).
     #[serde(default)]
     pub editor_mode: EditorMode,
+
+    /// Single character used as the leader key prefix in normal mode.
+    /// Default is Space (' '). Override in settings.json: { "leader": "\\" }
+    #[serde(default = "default_leader")]
+    pub leader: char,
 }
 
 fn default_explorer_visible() -> bool {
@@ -134,6 +146,10 @@ fn default_lsp_enabled() -> bool {
 
 fn default_terminal_scrollback_lines() -> usize {
     5000
+}
+
+fn default_leader() -> char {
+    ' '
 }
 
 // ── Explorer key defaults ──────────────────────────────────────────────────
@@ -359,11 +375,13 @@ impl Default for Settings {
             shift_width: default_shift_width(),
             lsp_enabled: default_lsp_enabled(),
             lsp_servers: Vec::new(),
+            language_map: std::collections::HashMap::new(),
             terminal_scrollback_lines: default_terminal_scrollback_lines(),
             explorer_keys: ExplorerKeys::default(),
             panel_keys: PanelKeys::default(),
             completion_keys: CompletionKeys::default(),
             editor_mode: EditorMode::Vim,
+            leader: default_leader(),
         }
     }
 }

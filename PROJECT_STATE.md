@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Feb 23, 2026 (Session 77) | **Tests:** 638
+**Last updated:** Feb 23, 2026 (Session 79) | **Tests:** 673
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 72 are in **SESSION_HISTORY.md**.
@@ -8,6 +8,10 @@
 ---
 
 ## Recent Work
+
+**Session 79:** Leader key + extended syntax highlighting + LSP feature expansion. `settings.rs`: `leader: char` field (default `' '`). `syntax.rs`: 10 new `SyntaxLanguage` variants (C, TypeScript, TypeScriptReact, Css, Json, Bash, Ruby, CSharp, Java, Toml); full `from_path()`, `language()`, `query_source()` for each; 19 new tests. `Cargo.toml`: 9 new tree-sitter grammar crates at 0.20 (html skipped — depends on tree-sitter 0.22). `lsp_manager.rs`: Python server fallback chain (basedpyright-langserver → pylsp → jedi-language-server); `server_and_uri()` helper; 6 new request methods (references, implementation, type_definition, signature_help, formatting, rename). `lsp.rs`: 6 new `LspEvent` variants; `FormattingEdit`, `FileEdit`, `WorkspaceEdit`, `SignatureHelpData` types; 7 new `LspServer` request methods; 5 new response parsers; new reader_thread routing arms. `render.rs`: `SignatureHelp` struct + `signature_help: Option<SignatureHelp>` on `ScreenLayout`. `engine.rs`: `leader_partial` field; `handle_leader_key()`; leader detection in normal+visual (only when no pending_key); `gr`/`gi`/`gy` bindings; `<leader>gf` / `<leader>rn`; 8 new LSP pending fields; `apply_lsp_edits()` + `apply_workspace_edit()`; `:Lformat` / `:Rename` commands; signature help trigger on `(` and `,` in insert mode; 6 new poll_lsp arms. `main.rs`: `draw_signature_popup()`. `tui_main.rs`: `render_signature_popup()`. 673 tests (+19 new).
+
+**Session 78:** LSP expansion — live Mason registry, auto-detect, `:LspInstall`. `language_id_from_path()` gains 12 new extensions (cs→csharp, kt/kts→kotlin, php, hs/lhs→haskell, ml/mli→ocaml, nix, tf/tfvars→terraform, scala/sc, graphql/gql, sql, sol→solidity, swift, Dockerfile filename match). `lsp.rs`: `MasonPackageInfo { binaries, install_cmd }` struct; `mason_package_for_language()` 25-entry static map; `parse_purl_install_cmd()` converts PURL to shell command; `parse_mason_package_yaml()` hand-written YAML parser; 2 new `LspEvent` variants (`RegistryLookup`, `InstallComplete`). `lsp_manager.rs`: `mason_bin_dir()` detects `~/.local/share/nvim/mason/bin`; `resolve_command()` checks Mason bin first then PATH; `ensure_server_for_language()` uses fallback multi-config logic; `registry_cache: HashMap<String, MasonPackageInfo>` field; `fetch_mason_registry_for_language()` and `run_install_command()` spawn background threads. `engine.rs`: `lsp_installing` and `lsp_lookup_in_flight` fields; `lsp_did_open()` triggers registry lookup on failure; `trigger_lsp_registry_lookup()` helper; `lsp_reopen_buffers_for_language()` re-sends didOpen after new server starts; `poll_lsp()` handles `RegistryLookup` and `InstallComplete`; `:LspInstall <lang>` command. 654 tests (+16 new).
 
 **Session 77:** Terminal split drag-to-resize — dragging the `│` divider between the two panes resizes them. Engine: `terminal_split_left_cols: u16` field (0 = use PTY cols); `terminal_split_set_drag_cols(left_cols)` updates visual position during drag; `terminal_split_finalize_drag(left_cols, right_cols, rows)` commits and resizes both PTY panes; `terminal_close_split` resets field. render.rs: `split_left_cols` uses `engine.terminal_split_left_cols` if > 0, else `left_pane.cols`. GTK: `terminal_split_dragging: bool` on App; click within 4px of divider starts drag; `MouseDrag` calls `terminal_split_set_drag_cols`; `MouseUp` finalizes. TUI: `dragging_terminal_split: bool` param + var; same pattern; split rendering now uses `panel.split_left_cols` (not hardcoded half). 638 tests.
 
@@ -27,24 +31,24 @@
 
 ```
 src/
-├── main.rs          (~5470 lines)  GTK4/Relm4 UI, rendering, all panels
-├── tui_main.rs      (~4705 lines)  ratatui/crossterm TUI backend
-├── render.rs        (~1650 lines)  Platform-agnostic ScreenLayout bridge
+├── main.rs          (~5725 lines)  GTK4/Relm4 UI, rendering, all panels
+├── tui_main.rs      (~4898 lines)  ratatui/crossterm TUI backend
+├── render.rs        (~1759 lines)  Platform-agnostic ScreenLayout bridge
 ├── icons.rs            (~30 lines)  Nerd Font file-type icons
-└── core/            (~24,100 lines)  Zero GTK/rendering deps — fully testable
-    ├── engine.rs    (~19,920 lines)  Orchestrator: keys, commands, all features
+└── core/            (~25,700 lines)  Zero GTK/rendering deps — fully testable
+    ├── engine.rs    (~20,751 lines)  Orchestrator: keys, commands, all features
     ├── terminal.rs     (~320 lines)  PTY-backed terminal pane (portable-pty + vt100)
-    ├── lsp.rs        (~1,200 lines)  LSP protocol transport + single-server client
-    ├── lsp_manager.rs  (~400 lines)  Multi-server coordinator + built-in registry
+    ├── lsp.rs        (~1,894 lines)  LSP protocol transport + single-server client
+    ├── lsp_manager.rs  (~671 lines)  Multi-server coordinator + built-in registry
     ├── project_search.rs (~630 lines)  Regex/case/word search + replace
     ├── buffer_manager.rs (~600 lines)  Buffer lifecycle, undo/redo
     ├── buffer.rs       (~120 lines)  Rope-based text storage (ropey)
     ├── session.rs      (~180 lines)  Session state persistence
     ├── settings.rs   (~1,030 lines)  JSON config, :set parsing, key bindings
     ├── git.rs          (~635 lines)  git subprocess integration
-    └── window.rs, tab.rs, view.rs, cursor.rs, mode.rs, syntax.rs
-Tests: 638 passing
-Total: ~35,000 lines
+    └── window.rs, tab.rs, view.rs, cursor.rs, mode.rs, syntax.rs (~893 lines)
+Tests: 673 passing
+Total: ~38,000 lines
 ```
 
 ---
@@ -55,7 +59,7 @@ Total: ~35,000 lines
 - [x] Core Vim (7 modes, navigation, operators, text objects, macros, marks, registers, undo, visual, search, folding)
 - [x] Find/Replace (:s + Ctrl-F dialog with replace-all)
 - [x] Session persistence (files, cursor/scroll, history, geometry)
-- [x] Multi-language syntax highlighting (Tree-sitter: Rust/Python/JS/Go/C++)
+- [x] Multi-language syntax highlighting (Tree-sitter: Rust/Python/JS/TS/TSX/Go/C/C++/C#/Java/Ruby/Bash/JSON/TOML/CSS)
 - [x] TUI backend (ratatui + crossterm, feature-parity with GTK)
 - [x] Nerd Font icons (GTK + TUI)
 - [x] Sidebar: file explorer with CRUD, rename, move, drag-and-drop, preview mode, auto-refresh
@@ -75,14 +79,15 @@ Total: ~35,000 lines
 - [x] Live grep (Ctrl-G, two-column modal, ±5 context)
 - [x] Quickfix window (:grep/:copen/:cn/:cp/:cc)
 - [x] :norm command (range execution, undo merge)
-- [x] LSP support (completions, go-to-definition, hover, diagnostics, auto-detect)
+- [x] LSP support (completions, go-to-def, hover, diagnostics, references, implementation, type-def, signature help, formatting, rename)
+- [x] Leader key (`<leader>gf` = LSP format, `<leader>rn` = rename; configurable in settings.json)
 - [x] Integrated terminal (PTY, VT100/256-color, multiple tabs, scrollback, find, resize)
 - [x] Terminal toolbar buttons: `+` new-tab and `×` close functional (click detection GTK + TUI)
 - [x] Terminal horizontal split view (`⊞` toolbar toggle, two panes side-by-side, `│` divider, click or Ctrl-W to switch focus)
 - [x] Terminal split drag-to-resize (drag `│` divider to rebalance pane widths; PTY resized on release)
 
 ### Planned / Ideas
-- [ ] More Tree-sitter grammars (TypeScript, HTML, CSS, JSON, YAML, Lua)
+- [ ] More Tree-sitter grammars (HTML, YAML, Lua — await tree-sitter 0.22 migration)
 - [ ] Vim `%` (matchit-style tag jumping)
 - [ ] `:set wrap` / line-wrap rendering
 - [ ] Remote editing (SSH/SFTP)

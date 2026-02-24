@@ -7,6 +7,19 @@ pub enum SyntaxLanguage {
     JavaScript,
     Go,
     Cpp,
+    C,
+    TypeScript,
+    TypeScriptReact,
+    // TODO: Html — tree-sitter-html 0.20.4 depends on tree-sitter 0.22, incompatible
+    Css,
+    Json,
+    Bash,
+    Ruby,
+    CSharp,
+    Java,
+    Toml,
+    // TODO: Lua (tree-sitter-lua has no 0.20.x release on crates.io)
+    // TODO: Kotlin (tree-sitter-kotlin has no 0.20.x release on crates.io)
 }
 
 impl SyntaxLanguage {
@@ -18,6 +31,10 @@ impl SyntaxLanguage {
             Some(Self::Rust)
         } else if path_lower.ends_with(".py") || path_lower.ends_with(".pyw") {
             Some(Self::Python)
+        } else if path_lower.ends_with(".tsx") {
+            Some(Self::TypeScriptReact)
+        } else if path_lower.ends_with(".ts") {
+            Some(Self::TypeScript)
         } else if path_lower.ends_with(".js")
             || path_lower.ends_with(".jsx")
             || path_lower.ends_with(".mjs")
@@ -31,11 +48,29 @@ impl SyntaxLanguage {
             || path_lower.ends_with(".cxx")
             || path_lower.ends_with(".c++")
             || path_lower.ends_with(".hpp")
-            || path_lower.ends_with(".h")
             || path_lower.ends_with(".hh")
             || path_lower.ends_with(".hxx")
         {
             Some(Self::Cpp)
+        } else if path_lower.ends_with(".c") || path_lower.ends_with(".h") {
+            Some(Self::C)
+        } else if path_lower.ends_with(".css") {
+            Some(Self::Css)
+        } else if path_lower.ends_with(".json") || path_lower.ends_with(".jsonc") {
+            Some(Self::Json)
+        } else if path_lower.ends_with(".sh")
+            || path_lower.ends_with(".bash")
+            || path_lower.ends_with(".zsh")
+        {
+            Some(Self::Bash)
+        } else if path_lower.ends_with(".rb") {
+            Some(Self::Ruby)
+        } else if path_lower.ends_with(".cs") {
+            Some(Self::CSharp)
+        } else if path_lower.ends_with(".java") {
+            Some(Self::Java)
+        } else if path_lower.ends_with(".toml") {
+            Some(Self::Toml)
         } else {
             None
         }
@@ -48,6 +83,16 @@ impl SyntaxLanguage {
             Self::JavaScript => tree_sitter_javascript::language(),
             Self::Go => tree_sitter_go::language(),
             Self::Cpp => tree_sitter_cpp::language(),
+            Self::C => tree_sitter_c::language(),
+            Self::TypeScript => tree_sitter_typescript::language_typescript(),
+            Self::TypeScriptReact => tree_sitter_typescript::language_tsx(),
+            Self::Css => tree_sitter_css::language(),
+            Self::Json => tree_sitter_json::language(),
+            Self::Bash => tree_sitter_bash::language(),
+            Self::Ruby => tree_sitter_ruby::language(),
+            Self::CSharp => tree_sitter_c_sharp::language(),
+            Self::Java => tree_sitter_java::language(),
+            Self::Toml => tree_sitter_toml::language(),
         }
     }
 
@@ -218,6 +263,211 @@ impl SyntaxLanguage {
                 (type_identifier) @type
                 (primitive_type) @type
             ",
+            Self::C => "
+                (function_definition declarator: (function_declarator declarator: (identifier) @function))
+                (declaration declarator: (function_declarator declarator: (identifier) @function))
+                (struct_specifier name: (type_identifier) @type)
+                (enum_specifier name: (type_identifier) @type)
+                (string_literal) @string
+                (comment) @comment
+                [
+                  \"if\"
+                  \"else\"
+                  \"for\"
+                  \"while\"
+                  \"do\"
+                  \"return\"
+                  \"break\"
+                  \"continue\"
+                  \"switch\"
+                  \"case\"
+                  \"default\"
+                  \"struct\"
+                  \"enum\"
+                  \"typedef\"
+                  \"static\"
+                  \"const\"
+                  \"sizeof\"
+                ] @keyword
+                (type_identifier) @type
+                (primitive_type) @type
+            ",
+            Self::TypeScript | Self::TypeScriptReact => "
+                (function_declaration name: (identifier) @function)
+                (method_definition name: (property_identifier) @function)
+                (class_declaration name: (type_identifier) @type)
+                (interface_declaration name: (type_identifier) @type)
+                (type_alias_declaration name: (type_identifier) @type)
+                (string) @string
+                (template_string) @string
+                (comment) @comment
+                [
+                  \"function\"
+                  \"class\"
+                  \"interface\"
+                  \"type\"
+                  \"const\"
+                  \"let\"
+                  \"var\"
+                  \"if\"
+                  \"else\"
+                  \"for\"
+                  \"while\"
+                  \"do\"
+                  \"return\"
+                  \"import\"
+                  \"export\"
+                  \"from\"
+                  \"default\"
+                  \"try\"
+                  \"catch\"
+                  \"finally\"
+                  \"throw\"
+                  \"new\"
+                  \"async\"
+                  \"await\"
+                  \"break\"
+                  \"continue\"
+                  \"switch\"
+                  \"case\"
+                  \"as\"
+                  \"extends\"
+                  \"implements\"
+                ] @keyword
+                (type_identifier) @type
+            ",
+            Self::Css => "
+                (tag_name) @function
+                (class_selector) @type
+                (id_selector) @type
+                (property_name) @keyword
+                (string_value) @string
+                (comment) @comment
+            ",
+            Self::Json => "
+                (pair key: (string) @type)
+                (string) @string
+                (number) @number
+                (true) @keyword
+                (false) @keyword
+                (null) @keyword
+            ",
+            Self::Bash => "
+                (function_definition name: (word) @function)
+                (string) @string
+                (comment) @comment
+                (variable_name) @type
+                [
+                  \"if\"
+                  \"then\"
+                  \"else\"
+                  \"elif\"
+                  \"fi\"
+                  \"for\"
+                  \"while\"
+                  \"do\"
+                  \"done\"
+                  \"case\"
+                  \"esac\"
+                  \"function\"
+                  \"in\"
+                ] @keyword
+            ",
+            Self::Ruby => "
+                (method name: (identifier) @function)
+                (class name: (constant) @type)
+                (constant) @type
+                (string) @string
+                (comment) @comment
+                [
+                  \"def\"
+                  \"end\"
+                  \"class\"
+                  \"module\"
+                  \"if\"
+                  \"else\"
+                  \"elsif\"
+                  \"unless\"
+                  \"while\"
+                  \"until\"
+                  \"for\"
+                  \"do\"
+                  \"return\"
+                ] @keyword
+                (nil) @keyword
+                (true) @keyword
+                (false) @keyword
+                (self) @keyword
+            ",
+            Self::CSharp => "
+                (method_declaration name: (identifier) @function)
+                (constructor_declaration name: (identifier) @function)
+                (class_declaration name: (identifier) @type)
+                (interface_declaration name: (identifier) @type)
+                (struct_declaration name: (identifier) @type)
+                (string_literal) @string
+                (comment) @comment
+                [
+                  \"class\"
+                  \"interface\"
+                  \"struct\"
+                  \"namespace\"
+                  \"using\"
+                  \"public\"
+                  \"private\"
+                  \"protected\"
+                  \"static\"
+                  \"if\"
+                  \"else\"
+                  \"for\"
+                  \"foreach\"
+                  \"while\"
+                  \"return\"
+                  \"new\"
+                ] @keyword
+                (boolean_literal) @keyword
+                (null_literal) @keyword
+                (predefined_type) @type
+            ",
+            Self::Java => "
+                (method_declaration name: (identifier) @function)
+                (class_declaration name: (identifier) @type)
+                (interface_declaration name: (identifier) @type)
+                (string_literal) @string
+                (line_comment) @comment
+                (block_comment) @comment
+                [
+                  \"class\"
+                  \"interface\"
+                  \"extends\"
+                  \"implements\"
+                  \"public\"
+                  \"private\"
+                  \"protected\"
+                  \"static\"
+                  \"if\"
+                  \"else\"
+                  \"for\"
+                  \"while\"
+                  \"return\"
+                  \"new\"
+                  \"import\"
+                  \"package\"
+                ] @keyword
+                (true) @keyword
+                (false) @keyword
+                (null_literal) @keyword
+                (type_identifier) @type
+            ",
+            Self::Toml => "
+                (bare_key) @type
+                (quoted_key) @type
+                (string) @string
+                (integer) @number
+                (float) @number
+                (boolean) @keyword
+                (comment) @comment
+            ",
         }
     }
 }
@@ -371,16 +621,136 @@ mod tests {
             Some(SyntaxLanguage::Cpp)
         );
         assert_eq!(
-            SyntaxLanguage::from_path("header.h"),
-            Some(SyntaxLanguage::Cpp)
-        );
-        assert_eq!(
             SyntaxLanguage::from_path("header.hh"),
             Some(SyntaxLanguage::Cpp)
         );
         assert_eq!(
             SyntaxLanguage::from_path("header.hxx"),
             Some(SyntaxLanguage::Cpp)
+        );
+    }
+
+    #[test]
+    fn test_language_detection_c() {
+        assert_eq!(SyntaxLanguage::from_path("main.c"), Some(SyntaxLanguage::C));
+        assert_eq!(
+            SyntaxLanguage::from_path("header.h"),
+            Some(SyntaxLanguage::C)
+        );
+        assert_eq!(
+            SyntaxLanguage::from_path("/path/to/FILE.C"),
+            Some(SyntaxLanguage::C)
+        );
+    }
+
+    #[test]
+    fn test_language_detection_typescript() {
+        assert_eq!(
+            SyntaxLanguage::from_path("app.ts"),
+            Some(SyntaxLanguage::TypeScript)
+        );
+        assert_eq!(
+            SyntaxLanguage::from_path("component.tsx"),
+            Some(SyntaxLanguage::TypeScriptReact)
+        );
+        assert_eq!(
+            SyntaxLanguage::from_path("/path/to/file.TS"),
+            Some(SyntaxLanguage::TypeScript)
+        );
+    }
+
+    #[test]
+    fn test_language_detection_html() {
+        // HTML is not yet supported (tree-sitter-html 0.20.x depends on tree-sitter 0.22)
+        assert_eq!(SyntaxLanguage::from_path("index.html"), None);
+        assert_eq!(SyntaxLanguage::from_path("page.htm"), None);
+    }
+
+    #[test]
+    fn test_language_detection_css() {
+        assert_eq!(
+            SyntaxLanguage::from_path("style.css"),
+            Some(SyntaxLanguage::Css)
+        );
+        assert_eq!(
+            SyntaxLanguage::from_path("STYLE.CSS"),
+            Some(SyntaxLanguage::Css)
+        );
+    }
+
+    #[test]
+    fn test_language_detection_json() {
+        assert_eq!(
+            SyntaxLanguage::from_path("config.json"),
+            Some(SyntaxLanguage::Json)
+        );
+        assert_eq!(
+            SyntaxLanguage::from_path("tsconfig.jsonc"),
+            Some(SyntaxLanguage::Json)
+        );
+    }
+
+    #[test]
+    fn test_language_detection_bash() {
+        assert_eq!(
+            SyntaxLanguage::from_path("build.sh"),
+            Some(SyntaxLanguage::Bash)
+        );
+        assert_eq!(
+            SyntaxLanguage::from_path("script.bash"),
+            Some(SyntaxLanguage::Bash)
+        );
+        assert_eq!(
+            SyntaxLanguage::from_path("config.zsh"),
+            Some(SyntaxLanguage::Bash)
+        );
+    }
+
+    #[test]
+    fn test_language_detection_ruby() {
+        assert_eq!(
+            SyntaxLanguage::from_path("app.rb"),
+            Some(SyntaxLanguage::Ruby)
+        );
+        assert_eq!(
+            SyntaxLanguage::from_path("APP.RB"),
+            Some(SyntaxLanguage::Ruby)
+        );
+    }
+
+    #[test]
+    fn test_language_detection_csharp() {
+        assert_eq!(
+            SyntaxLanguage::from_path("Program.cs"),
+            Some(SyntaxLanguage::CSharp)
+        );
+        assert_eq!(
+            SyntaxLanguage::from_path("PROGRAM.CS"),
+            Some(SyntaxLanguage::CSharp)
+        );
+    }
+
+    #[test]
+    fn test_language_detection_java() {
+        assert_eq!(
+            SyntaxLanguage::from_path("Main.java"),
+            Some(SyntaxLanguage::Java)
+        );
+        assert_eq!(
+            SyntaxLanguage::from_path("MAIN.JAVA"),
+            Some(SyntaxLanguage::Java)
+        );
+    }
+
+    #[test]
+    fn test_language_detection_toml() {
+        assert_eq!(
+            SyntaxLanguage::from_path("Cargo.toml"),
+            Some(SyntaxLanguage::Toml)
+        );
+        assert_eq!(
+            SyntaxLanguage::from_path("CARGO.TOML"),
+            Some(SyntaxLanguage::Toml)
         );
     }
 
@@ -432,6 +802,78 @@ mod tests {
     }
 
     #[test]
+    fn test_syntax_c_basic() {
+        let mut syntax = Syntax::new_for_language(SyntaxLanguage::C);
+        let code = "int main() { return 0; }";
+        let highlights = syntax.parse(code);
+        assert!(!highlights.is_empty());
+    }
+
+    #[test]
+    fn test_syntax_typescript_basic() {
+        let mut syntax = Syntax::new_for_language(SyntaxLanguage::TypeScript);
+        let code = "interface Foo { bar: string; }\nconst x: Foo = { bar: 'hello' };";
+        let highlights = syntax.parse(code);
+        assert!(!highlights.is_empty());
+    }
+
+    #[test]
+    fn test_syntax_css_basic() {
+        let mut syntax = Syntax::new_for_language(SyntaxLanguage::Css);
+        let code = "body { color: red; }\n.foo { background: blue; }";
+        let highlights = syntax.parse(code);
+        assert!(!highlights.is_empty());
+    }
+
+    #[test]
+    fn test_syntax_json_basic() {
+        let mut syntax = Syntax::new_for_language(SyntaxLanguage::Json);
+        let code = r#"{"name": "test", "value": 42, "enabled": true}"#;
+        let highlights = syntax.parse(code);
+        assert!(!highlights.is_empty());
+    }
+
+    #[test]
+    fn test_syntax_bash_basic() {
+        let mut syntax = Syntax::new_for_language(SyntaxLanguage::Bash);
+        let code = "#!/bin/bash\n# comment\nif [ -f file ]; then\n  echo hello\nfi";
+        let highlights = syntax.parse(code);
+        assert!(!highlights.is_empty());
+    }
+
+    #[test]
+    fn test_syntax_ruby_basic() {
+        let mut syntax = Syntax::new_for_language(SyntaxLanguage::Ruby);
+        let code = "def hello\n  puts 'world'\nend";
+        let highlights = syntax.parse(code);
+        assert!(!highlights.is_empty());
+    }
+
+    #[test]
+    fn test_syntax_csharp_basic() {
+        let mut syntax = Syntax::new_for_language(SyntaxLanguage::CSharp);
+        let code = "class Foo { public void Bar() { return; } }";
+        let highlights = syntax.parse(code);
+        assert!(!highlights.is_empty());
+    }
+
+    #[test]
+    fn test_syntax_java_basic() {
+        let mut syntax = Syntax::new_for_language(SyntaxLanguage::Java);
+        let code = "public class Main { public static void main(String[] args) {} }";
+        let highlights = syntax.parse(code);
+        assert!(!highlights.is_empty());
+    }
+
+    #[test]
+    fn test_syntax_toml_basic() {
+        let mut syntax = Syntax::new_for_language(SyntaxLanguage::Toml);
+        let code = "[package]\nname = \"vimcode\"\nversion = \"0.1.0\"";
+        let highlights = syntax.parse(code);
+        assert!(!highlights.is_empty());
+    }
+
+    #[test]
     fn test_syntax_from_path() {
         let syntax_py = Syntax::new_from_path(Some("test.py"));
         assert!(syntax_py.is_some());
@@ -440,6 +882,10 @@ mod tests {
         let syntax_js = Syntax::new_from_path(Some("app.js"));
         assert!(syntax_js.is_some());
         assert_eq!(syntax_js.unwrap().language(), SyntaxLanguage::JavaScript);
+
+        let syntax_ts = Syntax::new_from_path(Some("app.ts"));
+        assert!(syntax_ts.is_some());
+        assert_eq!(syntax_ts.unwrap().language(), SyntaxLanguage::TypeScript);
 
         let syntax_unknown = Syntax::new_from_path(Some("file.txt"));
         assert!(syntax_unknown.is_none());

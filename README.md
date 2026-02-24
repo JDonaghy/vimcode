@@ -314,10 +314,10 @@ Automatic language server integration — open a file and diagnostics, completio
 
 **Built-in server registry** (auto-detected on `PATH`):
 
-| Language | Server |
-|----------|--------|
+| Language | Server(s) tried in order |
+|----------|--------------------------|
 | Rust | `rust-analyzer` |
-| Python | `pyright-langserver` |
+| Python | `pyright-langserver` → `basedpyright-langserver` → `pylsp` → `jedi-language-server` |
 | JavaScript / TypeScript | `typescript-language-server` |
 | Go | `gopls` |
 | C / C++ | `clangd` |
@@ -327,7 +327,13 @@ Automatic language server integration — open a file and diagnostics, completio
 - **Diagnostic navigation** — `]d` / `[d` jump to next/previous diagnostic
 - **LSP completions** — async source for the auto-popup (appears as you type); `Ctrl-Space` manually triggers
 - **Go-to-definition** — `gd` jumps to the definition of the symbol under the cursor
+- **Find references** — `gr` populates quickfix list with all usage sites; single result jumps directly
+- **Go-to-implementation** — `gi` jumps to the implementation of the symbol
+- **Go-to-type-definition** — `gy` jumps to the type definition
 - **Hover info** — `K` shows type/documentation popup above the cursor
+- **Signature help** — popup appears above cursor when typing `(` or `,` in a function call; active parameter highlighted
+- **LSP formatting** — `<leader>gf` (or `:Lformat`) formats the whole buffer; single undo step reverts
+- **LSP rename** — `<leader>rn` pre-fills `:Rename <word>` in command bar; `:Rename <newname>` renames across all files
 - **Diagnostic counts** — `E:N W:N` shown in status bar
 
 **Commands:**
@@ -337,6 +343,8 @@ Automatic language server integration — open a file and diagnostics, completio
 | `:LspInfo` | Show running servers and their status |
 | `:LspRestart` | Restart server for current file type |
 | `:LspStop` | Stop server for current file type |
+| `:Lformat` | Format current buffer via LSP |
+| `:Rename <name>` | Rename symbol under cursor across all files |
 
 **Settings:**
 - `:set lsp` / `:set nolsp` — enable/disable LSP (default: enabled)
@@ -372,6 +380,7 @@ Additional options (set directly in `settings.json`):
 | Key | Default | Description |
 |-----|---------|-------------|
 | `terminal_scrollback_lines` | `5000` | Rows kept in terminal scrollback history (0 = unlimited) |
+| `leader` | `" "` (Space) | Leader key character for `<leader>gf` / `<leader>rn` sequences |
 
 - `:set option?` — query current value (e.g. `:set ts?` → `tabstop=4`)
 - `:set` (no args) — show one-line summary of all settings
@@ -463,7 +472,7 @@ All state lives in `~/.config/vimcode/`:
 ### Rendering
 
 **Syntax highlighting** (Tree-sitter, auto-detected by extension)
-- Rust (`.rs`), Python (`.py`), JavaScript (`.js`/`.ts`), Go (`.go`), C++ (`.cpp`/`.hpp`/`.h`)
+- Rust, Python, JavaScript, TypeScript/TSX, Go, C, C++, C#, Java, Ruby, Bash, JSON, TOML, CSS
 
 **Line numbers** — absolute / relative / hybrid (both on = hybrid)
 
@@ -527,10 +536,15 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `q{a-z}` / `@{a-z}` | Record macro / play macro |
 | `gt` / `gT` | Next / previous tab |
 | `gd` | Go to definition (LSP) |
+| `gr` | Find references (LSP) — multiple results open quickfix |
+| `gi` | Go to implementation (LSP) |
+| `gy` | Go to type definition (LSP) |
 | `gs` | Stage hunk (in `:Gdiff` buffer) |
 | `K` | Show hover info (LSP) |
 | `]c` / `[c` | Next / previous hunk |
 | `]d` / `[d` | Next / previous diagnostic (LSP) |
+| `<leader>gf` | LSP format current buffer (Space=leader by default) |
+| `<leader>rn` | LSP rename symbol — pre-fills `:Rename <word>` |
 | `za` / `zo` / `zc` / `zR` | Fold toggle / open / close / open all |
 | `Ctrl-W h/j/k/l` | Focus window left/down/up/right |
 | `Ctrl-W w` / `c` / `o` | Cycle / close / close-others |
@@ -571,6 +585,9 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `:LspInfo` | Show running LSP servers |
 | `:LspRestart` | Restart server for current language |
 | `:LspStop` | Stop server for current language |
+| `:LspInstall <lang>` | Install LSP server for language via Mason |
+| `:Lformat` | Format buffer via LSP |
+| `:Rename <newname>` | Rename symbol under cursor across workspace |
 | `:config reload` | Reload settings from disk |
 | `:help [topic]` / `:h [topic]` | Show help (topics: explorer, keys, commands) |
 
@@ -580,22 +597,22 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 
 ```
 src/
-├── main.rs          (~5470 lines)  GTK4/Relm4 UI, rendering, sidebar resize, fuzzy popup, context menu, drag-and-drop
-├── tui_main.rs      (~4705 lines)  ratatui/crossterm TUI backend, fuzzy popup, rename/move prompts
-├── render.rs        (~1650 lines)  Platform-agnostic ScreenLayout bridge (DiffLine, diff_status)
+├── main.rs          (~5725 lines)  GTK4/Relm4 UI, rendering, sidebar resize, fuzzy popup, context menu, drag-and-drop
+├── tui_main.rs      (~4898 lines)  ratatui/crossterm TUI backend, fuzzy popup, rename/move prompts
+├── render.rs        (~1759 lines)  Platform-agnostic ScreenLayout bridge (DiffLine, diff_status)
 ├── icons.rs            (~30 lines)  Nerd Font file-type icons (GTK + TUI)
-└── core/            (~24,100 lines)  Zero GTK/rendering deps — fully testable
-    ├── engine.rs    (~19,920 lines)  Orchestrator: keys, commands, git, macros, LSP, project search/replace, fuzzy finder
+└── core/            (~25,700 lines)  Zero GTK/rendering deps — fully testable
+    ├── engine.rs    (~20,751 lines)  Orchestrator: keys, commands, git, macros, LSP, project search/replace, fuzzy finder
     ├── terminal.rs     (~320 lines)  PTY-backed terminal pane (portable-pty + vt100, history ring buffer)
-    ├── lsp.rs        (~1,200 lines)  LSP protocol transport + single-server client (request ID tracking, JSON-RPC framing)
-    ├── lsp_manager.rs  (~400 lines)  Multi-server coordinator with initialization guards + built-in registry
+    ├── lsp.rs        (~1,894 lines)  LSP protocol transport + single-server client (request ID tracking, JSON-RPC framing)
+    ├── lsp_manager.rs  (~671 lines)  Multi-server coordinator with initialization guards + built-in registry
     ├── project_search.rs (~630 lines)  Regex/case/whole-word search + replace (ignore + regex crates)
     ├── buffer_manager.rs (~600 lines)  Buffer lifecycle, undo/redo stacks
     ├── buffer.rs       (~120 lines)  Rope-based text storage (ropey)
     ├── settings.rs   (~1,030 lines)  JSON config, :set parsing, key binding notation
     ├── session.rs      (~180 lines)  Session state persistence
     ├── git.rs          (~635 lines)  Git subprocesses: diff, blame, stage_hunk
-    └── window.rs, tab.rs, view.rs, cursor.rs, mode.rs, syntax.rs
+    └── window.rs, tab.rs, view.rs, cursor.rs, mode.rs, syntax.rs (~893 lines)
 ```
 
 **Design rule:** `src/core/` has zero GTK/rendering dependencies and is testable in isolation.

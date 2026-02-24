@@ -1,5 +1,22 @@
 # VimCode Implementation Plan
 
+## Recently Completed (Session 79)
+
+### ✅ Leader Key + Extended Syntax Highlighting + Full LSP Feature Set
+
+- **`settings.rs`** — `leader: char` field (default `' '`); `default_leader()` fn; `Default` impl updated
+- **`syntax.rs`** — 10 new `SyntaxLanguage` variants (C, TypeScript, TypeScriptReact, Css, Json, Bash, Ruby, CSharp, Java, Toml); full `from_path()`, `language()`, `query_source()` for each; 19 new tests; HTML skipped (tree-sitter-html 0.20.4 depends on tree-sitter 0.22, incompatible with our 0.20.x stack)
+- **`Cargo.toml`** — 9 new tree-sitter grammar crates at 0.20 (`tree-sitter-c`, `-typescript`, `-css`, `-json`, `-bash`, `-ruby`, `-c-sharp`, `-java`, `-toml`)
+- **`lsp_manager.rs`** — Python fallback chain (pyright → basedpyright → pylsp → jedi); `server_and_uri()` helper; 6 new request methods (references, implementation, type_definition, signature_help, formatting, rename)
+- **`lsp.rs`** — 6 new `LspEvent` variants; `FormattingEdit`, `FileEdit`, `WorkspaceEdit`, `SignatureHelpData` types; 7 new `LspServer` request methods; `parse_locations_response`, `try_parse_signature_help_response`, `parse_text_edits`, `try_parse_workspace_edit` parsers; reader_thread routing for all new methods
+- **`render.rs`** — `SignatureHelp` struct; `signature_help: Option<SignatureHelp>` on `ScreenLayout`; populated from `engine.lsp_signature_help` in `build_screen_layout`
+- **`engine.rs`** — `leader_partial: Option<String>` field; `handle_leader_key()`; leader detection (only when `pending_key.is_none()`); `gr`/`gi`/`gy` bindings in `handle_pending_key`; 8 new LSP pending fields; `lsp_request_references/implementation/type_definition/signature_help`; `lsp_format_current()`; `lsp_request_rename()`; `apply_lsp_edits()`; `apply_workspace_edit()`; `:Lformat`/`:Rename` commands; signature help trigger after `(` or `,` in insert mode; 6 new `poll_lsp` arms
+- **`main.rs` (GTK)** — `draw_signature_popup()` — positioned above cursor, active parameter in `theme.keyword` color via Pango AttrList
+- **`tui_main.rs`** — `render_signature_popup()` — same layout; active parameter in `theme.keyword` color cell-by-cell
+- Tests: 654 → 673 (+19 new syntax tests)
+
+---
+
 ## Recently Completed (Session 77)
 
 ### ✅ Terminal Split Drag-to-Resize

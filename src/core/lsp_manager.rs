@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use super::lsp::{
-    language_id_from_path, path_to_uri, LspEvent, LspServer, LspServerConfig, LspServerId,
+    language_id_from_path, mason_package_for_language, parse_mason_package_yaml, path_to_uri,
+    LspEvent, LspServer, LspServerConfig, LspServerId, MasonPackageInfo,
 };
 
 // ---------------------------------------------------------------------------
@@ -19,9 +20,25 @@ pub fn default_server_registry() -> Vec<LspServerConfig> {
             args: vec![],
             languages: vec!["rust".to_string()],
         },
+        // Python — ordered fallbacks (first binary found on PATH/Mason wins)
         LspServerConfig {
             command: "pyright-langserver".to_string(),
             args: vec!["--stdio".to_string()],
+            languages: vec!["python".to_string()],
+        },
+        LspServerConfig {
+            command: "basedpyright-langserver".to_string(),
+            args: vec!["--stdio".to_string()],
+            languages: vec!["python".to_string()],
+        },
+        LspServerConfig {
+            command: "pylsp".to_string(),
+            args: vec![],
+            languages: vec!["python".to_string()],
+        },
+        LspServerConfig {
+            command: "jedi-language-server".to_string(),
+            args: vec![],
             languages: vec!["python".to_string()],
         },
         LspServerConfig {
@@ -44,20 +61,133 @@ pub fn default_server_registry() -> Vec<LspServerConfig> {
             args: vec![],
             languages: vec!["c".to_string(), "cpp".to_string()],
         },
+        LspServerConfig {
+            command: "csharp-ls".to_string(),
+            args: vec![],
+            languages: vec!["csharp".to_string()],
+        },
+        LspServerConfig {
+            command: "lua-language-server".to_string(),
+            args: vec![],
+            languages: vec!["lua".to_string()],
+        },
+        LspServerConfig {
+            command: "bash-language-server".to_string(),
+            args: vec!["start".to_string()],
+            languages: vec!["shellscript".to_string()],
+        },
+        LspServerConfig {
+            command: "yaml-language-server".to_string(),
+            args: vec!["--stdio".to_string()],
+            languages: vec!["yaml".to_string()],
+        },
+        LspServerConfig {
+            command: "kotlin-language-server".to_string(),
+            args: vec![],
+            languages: vec!["kotlin".to_string()],
+        },
+        LspServerConfig {
+            command: "zls".to_string(),
+            args: vec![],
+            languages: vec!["zig".to_string()],
+        },
+        LspServerConfig {
+            command: "elixir-ls".to_string(),
+            args: vec![],
+            languages: vec!["elixir".to_string()],
+        },
+        LspServerConfig {
+            command: "ruby-lsp".to_string(),
+            args: vec![],
+            languages: vec!["ruby".to_string()],
+        },
+        LspServerConfig {
+            command: "terraform-ls".to_string(),
+            args: vec!["serve".to_string()],
+            languages: vec!["terraform".to_string()],
+        },
+        LspServerConfig {
+            command: "marksman".to_string(),
+            args: vec!["server".to_string()],
+            languages: vec!["markdown".to_string()],
+        },
+        LspServerConfig {
+            command: "taplo".to_string(),
+            args: vec!["lsp".to_string(), "stdio".to_string()],
+            languages: vec!["toml".to_string()],
+        },
+        LspServerConfig {
+            command: "sourcekit-lsp".to_string(),
+            args: vec![],
+            languages: vec!["swift".to_string()],
+        },
+        LspServerConfig {
+            command: "metals".to_string(),
+            args: vec![],
+            languages: vec!["scala".to_string()],
+        },
     ]
 }
 
-/// Check whether a command exists on PATH.
-fn command_exists(cmd: &str) -> bool {
+/// Return the Mason LSP binary directory if it exists.
+/// On Linux/macOS: `$HOME/.local/share/nvim/mason/bin`
+/// On Windows: `%APPDATA%\nvim-data\mason\bin`
+fn mason_bin_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    let base = std::env::var_os("APPDATA").map(PathBuf::from)?;
+    #[cfg(not(target_os = "windows"))]
+    let base = std::env::var_os("HOME").map(PathBuf::from)?;
+
+    #[cfg(target_os = "windows")]
+    let dir = base.join("nvim-data").join("mason").join("bin");
+    #[cfg(not(target_os = "windows"))]
+    let dir = base
+        .join(".local")
+        .join("share")
+        .join("nvim")
+        .join("mason")
+        .join("bin");
+
+    if dir.is_dir() {
+        Some(dir)
+    } else {
+        None
+    }
+}
+
+/// Resolve a command to an absolute path.
+/// Checks Mason bin directory first (if it exists), then falls back to PATH.
+fn resolve_command(cmd: &str) -> Option<PathBuf> {
     // Split on whitespace to get just the binary name
     let binary = cmd.split_whitespace().next().unwrap_or(cmd);
-    std::process::Command::new("which")
+
+    // Check Mason bin directory first
+    if let Some(mason_bin) = mason_bin_dir() {
+        let candidate = mason_bin.join(binary);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+
+    // Fall back to PATH lookup via `which`/`where`
+    #[cfg(target_os = "windows")]
+    let which_cmd = "where";
+    #[cfg(not(target_os = "windows"))]
+    let which_cmd = "which";
+
+    let output = std::process::Command::new(which_cmd)
         .arg(binary)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .output()
+        .ok()?;
+    if output.status.success() {
+        let path_str = String::from_utf8_lossy(&output.stdout);
+        // `where` on Windows may return multiple lines — take the first
+        let first_line = path_str.lines().next()?.trim();
+        if !first_line.is_empty() {
+            return Some(PathBuf::from(first_line));
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -77,6 +207,8 @@ pub struct LspManager {
     event_rx: Receiver<LspEvent>,
     /// Track which servers have completed initialization
     initialized: HashMap<LspServerId, bool>,
+    /// In-memory cache of Mason registry lookups (keyed by language ID).
+    pub registry_cache: HashMap<String, MasonPackageInfo>,
 }
 
 impl LspManager {
@@ -105,29 +237,25 @@ impl LspManager {
             event_tx,
             event_rx,
             initialized: HashMap::new(),
+            registry_cache: HashMap::new(),
         }
     }
 
     /// Ensure a server is running for the given language. Returns the server ID
     /// if a server is available (or was just started), None if no config exists
-    /// or the binary is not on PATH.
+    /// or the binary is not on PATH/Mason bin.
     pub fn ensure_server_for_language(&mut self, language_id: &str) -> Option<LspServerId> {
         // Already running?
         if let Some(&id) = self.language_to_server.get(language_id) {
             return Some(id);
         }
 
-        // Find a matching config
-        let config = self
+        // Find a matching config where the binary is available (try all configs — first one wins).
+        let (config, _resolved) = self
             .registry
             .iter()
-            .find(|c| c.languages.iter().any(|l| l == language_id))?
-            .clone();
-
-        // Check if the binary exists on PATH
-        if !command_exists(&config.command) {
-            return None;
-        }
+            .filter(|c| c.languages.iter().any(|l| l == language_id))
+            .find_map(|c| resolve_command(&c.command).map(|p| (c.clone(), p)))?;
 
         // Start the server
         let id = self.servers.len();
@@ -146,6 +274,97 @@ impl LspManager {
                 None
             }
         }
+    }
+
+    /// Add a server config to the in-memory registry (does not persist to disk).
+    pub fn add_registry_entry(&mut self, config: LspServerConfig) {
+        self.registry.push(config);
+    }
+
+    /// Spawn a background thread to fetch Mason registry metadata for a language.
+    /// The result is sent as `LspEvent::RegistryLookup` on the shared channel.
+    pub fn fetch_mason_registry_for_language(&self, lang_id: &str) {
+        let pkg_name = match mason_package_for_language(lang_id) {
+            Some(p) => p,
+            None => {
+                // No Mason mapping — send None immediately
+                let _ = self.event_tx.send(LspEvent::RegistryLookup {
+                    lang_id: lang_id.to_string(),
+                    info: None,
+                });
+                return;
+            }
+        };
+        let tx = self.event_tx.clone();
+        let lang_id = lang_id.to_string();
+        let pkg_name = pkg_name.to_string();
+        std::thread::spawn(move || {
+            let url = format!(
+                "https://raw.githubusercontent.com/mason-org/mason-registry/main/packages/{pkg_name}/package.yaml"
+            );
+            let output = std::process::Command::new("curl")
+                .args(["-sf", "--max-time", "10", &url])
+                .output();
+            match output {
+                Ok(out) if out.status.success() => {
+                    let yaml = String::from_utf8_lossy(&out.stdout);
+                    let info = parse_mason_package_yaml(&yaml);
+                    let _ = tx.send(LspEvent::RegistryLookup {
+                        lang_id,
+                        info: Some(info),
+                    });
+                }
+                _ => {
+                    let _ = tx.send(LspEvent::RegistryLookup {
+                        lang_id,
+                        info: None,
+                    });
+                }
+            }
+        });
+    }
+
+    /// Spawn a background thread to run an install command.
+    /// The result is sent as `LspEvent::InstallComplete` on the shared channel.
+    pub fn run_install_command(&self, lang_id: &str, install_cmd: &str) {
+        let tx = self.event_tx.clone();
+        let lang_id = lang_id.to_string();
+        let install_cmd = install_cmd.to_string();
+        std::thread::spawn(move || {
+            // Run via shell so npm/pip/dotnet etc. resolve from user PATH
+            #[cfg(target_os = "windows")]
+            let result = std::process::Command::new("cmd")
+                .args(["/C", &install_cmd])
+                .output();
+            #[cfg(not(target_os = "windows"))]
+            let result = std::process::Command::new("sh")
+                .args(["-c", &install_cmd])
+                .output();
+
+            match result {
+                Ok(out) => {
+                    let success = out.status.success();
+                    let output = if success {
+                        String::from_utf8_lossy(&out.stdout).into_owned()
+                    } else {
+                        String::from_utf8_lossy(&out.stderr).into_owned()
+                    };
+                    let output = output.trim().to_string();
+                    let _ = tx.send(LspEvent::InstallComplete {
+                        lang_id,
+                        success,
+                        output,
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(LspEvent::InstallComplete {
+                        lang_id,
+                        success: false,
+                        output: e.to_string(),
+                    });
+                }
+            }
+        });
     }
 
     /// Non-blocking poll for events from all running servers.
@@ -192,25 +411,13 @@ impl LspManager {
             return Ok(());
         }
 
-        // Find a matching config
-        let config = match self
-            .registry
-            .iter()
-            .find(|c| c.languages.iter().any(|l| l == &language_id))
-        {
-            Some(c) => c.clone(),
-            None => return Ok(()), // no config for this language
-        };
-
-        // Check if the binary exists on PATH
-        if !command_exists(&config.command) {
-            return Err(format!("{} not found on PATH", config.command));
-        }
-
-        // Start the server (don't send didOpen yet — wait for Initialized)
+        // Try to start any configured server for this language
         match self.ensure_server_for_language(&language_id) {
             Some(_) => Ok(()),
-            None => Err(format!("Failed to start {}", config.command)),
+            None => {
+                // No server available — let the engine handle the registry lookup
+                Err(format!("No LSP server found for {language_id}"))
+            }
         }
     }
 
@@ -270,6 +477,16 @@ impl LspManager {
         Some(self.servers[server_id].request_completion(&uri, line, character))
     }
 
+    /// Helper: look up server for a path; returns (server_id, uri) if ready.
+    fn server_and_uri(&mut self, path: &Path) -> Option<(usize, String)> {
+        let language_id = language_id_from_path(path)?;
+        let server_id = *self.language_to_server.get(&language_id)?;
+        if !self.initialized.get(&server_id).copied().unwrap_or(false) {
+            return None;
+        }
+        Some((server_id, path_to_uri(path)))
+    }
+
     /// Check whether a server exists for the given path but is still initializing.
     pub fn is_server_initializing(&self, path: &Path) -> bool {
         let language_id = match language_id_from_path(path) {
@@ -305,6 +522,68 @@ impl LspManager {
         Some(self.servers[server_id].request_hover(&uri, line, character))
     }
 
+    /// Request all references from the appropriate server.
+    pub fn request_references(&mut self, path: &Path, line: u32, character: u32) -> Option<i64> {
+        let (sid, uri) = self.server_and_uri(path)?;
+        Some(self.servers[sid].request_references(&uri, line, character))
+    }
+
+    /// Request go-to-implementation from the appropriate server.
+    pub fn request_implementation(
+        &mut self,
+        path: &Path,
+        line: u32,
+        character: u32,
+    ) -> Option<i64> {
+        let (sid, uri) = self.server_and_uri(path)?;
+        Some(self.servers[sid].request_implementation(&uri, line, character))
+    }
+
+    /// Request go-to-type-definition from the appropriate server.
+    pub fn request_type_definition(
+        &mut self,
+        path: &Path,
+        line: u32,
+        character: u32,
+    ) -> Option<i64> {
+        let (sid, uri) = self.server_and_uri(path)?;
+        Some(self.servers[sid].request_type_definition(&uri, line, character))
+    }
+
+    /// Request signature help from the appropriate server.
+    pub fn request_signature_help(
+        &mut self,
+        path: &Path,
+        line: u32,
+        character: u32,
+    ) -> Option<i64> {
+        let (sid, uri) = self.server_and_uri(path)?;
+        Some(self.servers[sid].request_signature_help(&uri, line, character))
+    }
+
+    /// Request whole-file formatting from the appropriate server.
+    pub fn request_formatting(
+        &mut self,
+        path: &Path,
+        tab_size: u32,
+        insert_spaces: bool,
+    ) -> Option<i64> {
+        let (sid, uri) = self.server_and_uri(path)?;
+        Some(self.servers[sid].request_formatting(&uri, tab_size, insert_spaces))
+    }
+
+    /// Request rename from the appropriate server.
+    pub fn request_rename(
+        &mut self,
+        path: &Path,
+        line: u32,
+        character: u32,
+        new_name: &str,
+    ) -> Option<i64> {
+        let (sid, uri) = self.server_and_uri(path)?;
+        Some(self.servers[sid].request_rename(&uri, line, character, new_name))
+    }
+
     /// Shutdown all running servers.
     pub fn shutdown_all(&mut self) {
         for server in &mut self.servers {
@@ -331,9 +610,7 @@ impl LspManager {
             .iter()
             .find(|c| c.languages.iter().any(|l| l == language_id))?
             .clone();
-        if !command_exists(&config.command) {
-            return None;
-        }
+        resolve_command(&config.command)?;
         let new_id = self.servers.len();
         match LspServer::start(new_id, &config, &self.root_path, self.event_tx.clone()) {
             Ok(server) => {

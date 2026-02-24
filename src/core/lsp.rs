@@ -38,6 +38,86 @@ pub enum LspEvent {
         contents: Option<String>,
     },
     ServerExited(LspServerId),
+    /// Background registry lookup result (from Mason registry fetch).
+    RegistryLookup {
+        lang_id: String,
+        info: Option<MasonPackageInfo>,
+    },
+    /// Background install command completed.
+    InstallComplete {
+        lang_id: String,
+        success: bool,
+        output: String,
+    },
+    /// References response (textDocument/references).
+    ReferencesResponse {
+        server_id: LspServerId,
+        request_id: i64,
+        locations: Vec<Location>,
+    },
+    /// Go-to-implementation response (textDocument/implementation).
+    ImplementationResponse {
+        server_id: LspServerId,
+        request_id: i64,
+        locations: Vec<Location>,
+    },
+    /// Go-to-type-definition response (textDocument/typeDefinition).
+    TypeDefinitionResponse {
+        server_id: LspServerId,
+        request_id: i64,
+        locations: Vec<Location>,
+    },
+    /// Signature help response (textDocument/signatureHelp).
+    SignatureHelpResponse {
+        server_id: LspServerId,
+        request_id: i64,
+        /// Full label of the first/active signature, e.g. "fn foo(a: i32, b: &str) -> bool"
+        label: String,
+        /// Byte-offset ranges of each parameter within `label`.
+        params: Vec<(usize, usize)>,
+        /// Index of the currently active parameter (0-based).
+        active_param: Option<usize>,
+    },
+    /// Formatting edits response (textDocument/formatting or rangeFormatting).
+    FormattingResponse {
+        server_id: LspServerId,
+        request_id: i64,
+        edits: Vec<FormattingEdit>,
+    },
+    /// Rename response (textDocument/rename).
+    RenameResponse {
+        server_id: LspServerId,
+        request_id: i64,
+        workspace_edit: Option<WorkspaceEdit>,
+    },
+}
+
+/// Cached signature help data stored in engine state.
+#[derive(Debug, Clone)]
+pub struct SignatureHelpData {
+    pub label: String,
+    pub params: Vec<(usize, usize)>,
+    pub active_param: Option<usize>,
+}
+
+/// A single text edit produced by formatting or rename operations.
+#[derive(Debug, Clone)]
+pub struct FormattingEdit {
+    pub range: LspRange,
+    pub new_text: String,
+}
+
+/// A set of edits for a single file.
+#[derive(Debug, Clone)]
+pub struct FileEdit {
+    pub path: PathBuf,
+    pub edits: Vec<FormattingEdit>,
+}
+
+/// A workspace-wide set of edits (rename result).
+#[derive(Debug, Clone)]
+pub struct WorkspaceEdit {
+    pub changes: Vec<FileEdit>,
 }
 
 #[derive(Debug, Clone)]
@@ -146,8 +226,31 @@ pub fn uri_to_path(uri: &str) -> Option<PathBuf> {
     uri.strip_prefix("file://").map(PathBuf::from)
 }
 
-/// Map a file extension to an LSP language identifier.
+/// Map a file extension (or filename) to an LSP language identifier.
+/// `user_map` (from `settings.language_map`) is checked first, allowing overrides
+/// like `{ "h": "cpp", "mjs": "javascript" }`.
+pub fn language_id_from_path_with_map(
+    path: &Path,
+    user_map: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    // User overrides by extension take priority
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        if let Some(lang) = user_map.get(ext) {
+            return Some(lang.clone());
+        }
+    }
+    language_id_from_path(path)
+}
+
+/// Map a file extension (or filename) to an LSP language identifier.
 pub fn language_id_from_path(path: &Path) -> Option<String> {
+    // Filename-only matches (no extension)
+    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+        if name == "Dockerfile" || name.starts_with("Dockerfile.") {
+            return Some("dockerfile".to_string());
+        }
+    }
+
     let ext = path.extension()?.to_str()?;
     let lang = match ext {
         "rs" => "rust",
@@ -160,6 +263,7 @@ pub fn language_id_from_path(path: &Path) -> Option<String> {
         "c" | "h" => "c",
         "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh" => "cpp",
         "java" => "java",
+        "cs" => "csharp",
         "rb" => "ruby",
         "lua" => "lua",
         "sh" | "bash" | "zsh" => "shellscript",
@@ -171,6 +275,17 @@ pub fn language_id_from_path(path: &Path) -> Option<String> {
         "md" | "markdown" => "markdown",
         "zig" => "zig",
         "ex" | "exs" => "elixir",
+        "kt" | "kts" => "kotlin",
+        "php" => "php",
+        "hs" | "lhs" => "haskell",
+        "ml" | "mli" => "ocaml",
+        "nix" => "nix",
+        "tf" | "tfvars" => "terraform",
+        "scala" | "sc" => "scala",
+        "graphql" | "gql" => "graphql",
+        "sql" => "sql",
+        "sol" => "solidity",
+        "swift" => "swift",
         _ => return None,
     };
     Some(lang.to_string())
@@ -228,6 +343,129 @@ pub fn completion_kind_label(kind: u32) -> &'static str {
         24 => "Operator",
         25 => "TypeParameter",
         _ => "Unknown",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Mason registry helpers
+// ---------------------------------------------------------------------------
+
+/// Information parsed from a Mason package.yaml.
+#[derive(Debug, Clone)]
+pub struct MasonPackageInfo {
+    /// Binary names that the package installs (from the `bin:` section).
+    pub binaries: Vec<String>,
+    /// Shell command to install this package (derived from PURL `source.id`).
+    pub install_cmd: Option<String>,
+}
+
+/// Static mapping: LSP language ID → Mason registry package name.
+/// Used to look up package metadata when no server is configured.
+pub fn mason_package_for_language(lang_id: &str) -> Option<&'static str> {
+    match lang_id {
+        "csharp" => Some("csharp-language-server"),
+        "lua" => Some("lua-language-server"),
+        "shellscript" => Some("bash-language-server"),
+        "yaml" => Some("yaml-language-server"),
+        "html" => Some("html-lsp"),
+        "css" => Some("css-lsp"),
+        "json" => Some("json-lsp"),
+        "ruby" => Some("ruby-lsp"),
+        "kotlin" => Some("kotlin-language-server"),
+        "php" => Some("intelephense"),
+        "elixir" => Some("elixir-ls"),
+        "zig" => Some("zls"),
+        "haskell" => Some("haskell-language-server"),
+        "ocaml" => Some("ocaml-lsp"),
+        "nix" => Some("nil"),
+        "terraform" => Some("terraform-ls"),
+        "java" => Some("jdtls"),
+        "markdown" => Some("marksman"),
+        "toml" => Some("taplo"),
+        "dockerfile" => Some("dockerfile-language-server"),
+        "graphql" => Some("graphql-language-service-cli"),
+        "sql" => Some("sqls"),
+        "solidity" => Some("nomicfoundation-solidity-language-server"),
+        // scala and swift are not in Mason — PATH detection only
+        _ => None,
+    }
+}
+
+/// Convert a PURL string (e.g. `pkg:npm/bash-language-server`) to a shell install command.
+pub fn parse_purl_install_cmd(purl: &str) -> Option<String> {
+    let purl = purl.trim();
+    if let Some(rest) = purl.strip_prefix("pkg:npm/") {
+        let name = rest.split('@').next()?.trim();
+        return Some(format!("npm install -g {name}"));
+    }
+    if let Some(rest) = purl.strip_prefix("pkg:nuget/") {
+        let name = rest.split('@').next()?.trim();
+        return Some(format!("dotnet tool install -g {name}"));
+    }
+    if let Some(rest) = purl.strip_prefix("pkg:golang/") {
+        let module = rest.trim();
+        // Mason golang PURLs often end with a version like @v0.x.y — strip it for @latest
+        let module = module.split('@').next()?.trim();
+        return Some(format!("go install {module}@latest"));
+    }
+    if let Some(rest) = purl.strip_prefix("pkg:pypi/") {
+        let name = rest.split('@').next()?.trim();
+        return Some(format!("pip install {name}"));
+    }
+    if let Some(rest) = purl.strip_prefix("pkg:cargo/") {
+        let name = rest.split('@').next()?.trim();
+        return Some(format!("cargo install {name}"));
+    }
+    // pkg:github/..., pkg:generic/... — no automated install
+    None
+}
+
+/// Parse the relevant parts of a Mason `package.yaml` file.
+/// This is a minimal hand-written parser — no YAML crate needed.
+///
+/// We extract:
+/// - Binary names from the `bin:` section (indented key lines).
+/// - Install command from the first `id: pkg:` line under `source:`.
+pub fn parse_mason_package_yaml(yaml: &str) -> MasonPackageInfo {
+    let mut binaries = Vec::new();
+    let mut install_cmd = None;
+
+    let mut in_bin_section = false;
+    let mut in_source_section = false;
+
+    for line in yaml.lines() {
+        let trimmed = line.trim();
+
+        // Track which top-level section we are in
+        if !line.starts_with(' ') && !line.starts_with('\t') {
+            in_bin_section = trimmed == "bin:";
+            in_source_section = trimmed == "source:";
+            continue;
+        }
+
+        if in_bin_section {
+            // Lines like `  binary-name: path/to/binary` or `  binary-name:`
+            // We only want the key (binary name).
+            if let Some(key) = trimmed.split(':').next() {
+                let key = key.trim().trim_matches('"').trim_matches('\'');
+                if !key.is_empty() && !key.starts_with('#') {
+                    binaries.push(key.to_string());
+                }
+            }
+        }
+
+        if in_source_section && install_cmd.is_none() {
+            // Lines like `  id: pkg:npm/bash-language-server`
+            if let Some(rest) = trimmed.strip_prefix("id:") {
+                let purl = rest.trim();
+                install_cmd = parse_purl_install_cmd(purl);
+            }
+        }
+    }
+
+    MasonPackageInfo {
+        binaries,
+        install_cmd,
     }
 }
 
@@ -451,6 +689,102 @@ impl LspServer {
         )
     }
 
+    /// Request all references at a position.
+    pub fn request_references(&mut self, uri: &str, line: u32, character: u32) -> i64 {
+        self.send_request(
+            "textDocument/references",
+            serde_json::json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": line, "character": character },
+                "context": { "includeDeclaration": true }
+            }),
+        )
+    }
+
+    /// Request go-to-implementation at a position.
+    pub fn request_implementation(&mut self, uri: &str, line: u32, character: u32) -> i64 {
+        self.send_request(
+            "textDocument/implementation",
+            serde_json::json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": line, "character": character }
+            }),
+        )
+    }
+
+    /// Request go-to-type-definition at a position.
+    pub fn request_type_definition(&mut self, uri: &str, line: u32, character: u32) -> i64 {
+        self.send_request(
+            "textDocument/typeDefinition",
+            serde_json::json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": line, "character": character }
+            }),
+        )
+    }
+
+    /// Request signature help at a position.
+    pub fn request_signature_help(&mut self, uri: &str, line: u32, character: u32) -> i64 {
+        self.send_request(
+            "textDocument/signatureHelp",
+            serde_json::json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": line, "character": character }
+            }),
+        )
+    }
+
+    /// Request whole-file formatting.
+    pub fn request_formatting(&mut self, uri: &str, tab_size: u32, insert_spaces: bool) -> i64 {
+        self.send_request(
+            "textDocument/formatting",
+            serde_json::json!({
+                "textDocument": { "uri": uri },
+                "options": {
+                    "tabSize": tab_size,
+                    "insertSpaces": insert_spaces
+                }
+            }),
+        )
+    }
+
+    /// Request range formatting (available for visual-selection formatting).
+    #[allow(dead_code)]
+    pub fn request_range_formatting(
+        &mut self,
+        uri: &str,
+        range: &LspRange,
+        tab_size: u32,
+        insert_spaces: bool,
+    ) -> i64 {
+        self.send_request(
+            "textDocument/rangeFormatting",
+            serde_json::json!({
+                "textDocument": { "uri": uri },
+                "range": {
+                    "start": { "line": range.start.line, "character": range.start.character },
+                    "end":   { "line": range.end.line,   "character": range.end.character }
+                },
+                "options": {
+                    "tabSize": tab_size,
+                    "insertSpaces": insert_spaces
+                }
+            }),
+        )
+    }
+
+    /// Request rename of the symbol at a position.
+    pub fn request_rename(&mut self, uri: &str, line: u32, character: u32, new_name: &str) -> i64 {
+        self.send_request(
+            "textDocument/rename",
+            serde_json::json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": line, "character": character },
+                "newName": new_name
+            }),
+        )
+    }
+
     /// Send shutdown request and exit notification.
     pub fn shutdown(&mut self) {
         self.send_request("shutdown", serde_json::json!(null));
@@ -614,6 +948,59 @@ fn reader_thread(
                         });
                     }
                 }
+                Some("textDocument/references") => {
+                    let locations = result
+                        .and_then(parse_locations_response)
+                        .unwrap_or_default();
+                    let _ = tx.send(LspEvent::ReferencesResponse {
+                        server_id,
+                        request_id: id,
+                        locations,
+                    });
+                }
+                Some("textDocument/implementation") => {
+                    let locations = result
+                        .and_then(parse_locations_response)
+                        .unwrap_or_default();
+                    let _ = tx.send(LspEvent::ImplementationResponse {
+                        server_id,
+                        request_id: id,
+                        locations,
+                    });
+                }
+                Some("textDocument/typeDefinition") => {
+                    let locations = result
+                        .and_then(parse_locations_response)
+                        .unwrap_or_default();
+                    let _ = tx.send(LspEvent::TypeDefinitionResponse {
+                        server_id,
+                        request_id: id,
+                        locations,
+                    });
+                }
+                Some("textDocument/signatureHelp") => {
+                    if let Some(r) = result {
+                        if let Some(event) = try_parse_signature_help_response(server_id, id, r) {
+                            let _ = tx.send(event);
+                        }
+                    }
+                }
+                Some("textDocument/formatting") | Some("textDocument/rangeFormatting") => {
+                    let edits = result.and_then(parse_text_edits).unwrap_or_default();
+                    let _ = tx.send(LspEvent::FormattingResponse {
+                        server_id,
+                        request_id: id,
+                        edits,
+                    });
+                }
+                Some("textDocument/rename") => {
+                    let workspace_edit = result.and_then(try_parse_workspace_edit);
+                    let _ = tx.send(LspEvent::RenameResponse {
+                        server_id,
+                        request_id: id,
+                        workspace_edit,
+                    });
+                }
                 _ => {
                     // Unknown or shutdown response — ignore
                 }
@@ -762,6 +1149,135 @@ fn try_parse_hover_response(
         server_id,
         request_id,
         contents: text,
+    })
+}
+
+/// Parse a response that is a flat array of Locations (references, implementation, typeDefinition).
+fn parse_locations_response(result: &serde_json::Value) -> Option<Vec<Location>> {
+    let mut locations = Vec::new();
+    if result.is_null() {
+        return Some(locations);
+    }
+    if let Some(arr) = result.as_array() {
+        for loc in arr {
+            if let Some(l) = parse_location(loc) {
+                locations.push(l);
+            } else if let Some(l) = parse_location_link(loc) {
+                locations.push(l);
+            }
+        }
+    } else if result.is_object() {
+        if let Some(l) = parse_location(result) {
+            locations.push(l);
+        } else if let Some(l) = parse_location_link(result) {
+            locations.push(l);
+        }
+    }
+    Some(locations)
+}
+
+fn try_parse_signature_help_response(
+    server_id: LspServerId,
+    request_id: i64,
+    result: &serde_json::Value,
+) -> Option<LspEvent> {
+    if result.is_null() {
+        return None;
+    }
+    let signatures = result.get("signatures")?.as_array()?;
+    let sig = signatures.first()?;
+    let label = sig.get("label")?.as_str()?.to_string();
+
+    // Parse parameter ranges — each can be [start, end] (UTF-16 offsets) or { label: str }
+    let params: Vec<(usize, usize)> = sig
+        .get("parameters")
+        .and_then(|p| p.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|p| {
+                    let param_label = p.get("label")?;
+                    if let Some(arr) = param_label.as_array() {
+                        // [startOffset, endOffset] in bytes within label
+                        let s = arr.first()?.as_u64()? as usize;
+                        let e = arr.get(1)?.as_u64()? as usize;
+                        Some((s, e))
+                    } else if let Some(s) = param_label.as_str() {
+                        // Find this substring in label
+                        label.find(s).map(|start| (start, start + s.len()))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let active_param = result
+        .get("activeParameter")
+        .or_else(|| sig.get("activeParameter"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize);
+
+    Some(LspEvent::SignatureHelpResponse {
+        server_id,
+        request_id,
+        label,
+        params,
+        active_param,
+    })
+}
+
+/// Parse an array of TextEdit objects from a formatting response.
+fn parse_text_edits(result: &serde_json::Value) -> Option<Vec<FormattingEdit>> {
+    if result.is_null() {
+        return Some(Vec::new());
+    }
+    let arr = result.as_array()?;
+    let edits = arr
+        .iter()
+        .filter_map(|e| {
+            let range = parse_range(e.get("range")?)?;
+            let new_text = e.get("newText")?.as_str()?.to_string();
+            Some(FormattingEdit { range, new_text })
+        })
+        .collect();
+    Some(edits)
+}
+
+/// Parse a WorkspaceEdit from a rename response.
+fn try_parse_workspace_edit(result: &serde_json::Value) -> Option<WorkspaceEdit> {
+    let mut file_edits: Vec<FileEdit> = Vec::new();
+
+    // Format 1: result.changes = { uri: [TextEdit] }
+    if let Some(changes) = result.get("changes").and_then(|c| c.as_object()) {
+        for (uri, edits_val) in changes {
+            if let Some(path) = uri_to_path(uri) {
+                if let Some(edits) = parse_text_edits(edits_val) {
+                    file_edits.push(FileEdit { path, edits });
+                }
+            }
+        }
+    }
+
+    // Format 2: result.documentChanges = [{ textDocument: { uri }, edits: [...] }]
+    if let Some(doc_changes) = result.get("documentChanges").and_then(|d| d.as_array()) {
+        for change in doc_changes {
+            let uri = change
+                .get("textDocument")
+                .and_then(|td| td.get("uri"))
+                .and_then(|u| u.as_str())?;
+            if let Some(path) = uri_to_path(uri) {
+                if let Some(edits_val) = change.get("edits") {
+                    if let Some(edits) = parse_text_edits(edits_val) {
+                        file_edits.push(FileEdit { path, edits });
+                    }
+                }
+            }
+        }
+    }
+
+    Some(WorkspaceEdit {
+        changes: file_edits,
     })
 }
 
@@ -1182,5 +1698,197 @@ mod tests {
         let result = extract_markup_content(&v).unwrap();
         assert!(result.contains("first"));
         assert!(result.contains("fn main()"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Mason PURL parser tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_purl_npm() {
+        assert_eq!(
+            parse_purl_install_cmd("pkg:npm/bash-language-server"),
+            Some("npm install -g bash-language-server".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_purl_npm_versioned() {
+        // Version suffix should be stripped
+        assert_eq!(
+            parse_purl_install_cmd("pkg:npm/typescript-language-server@4.3.3"),
+            Some("npm install -g typescript-language-server".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_purl_nuget() {
+        assert_eq!(
+            parse_purl_install_cmd("pkg:nuget/csharp-ls"),
+            Some("dotnet tool install -g csharp-ls".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_purl_golang() {
+        assert_eq!(
+            parse_purl_install_cmd("pkg:golang/golang.org/x/tools/gopls"),
+            Some("go install golang.org/x/tools/gopls@latest".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_purl_pypi() {
+        assert_eq!(
+            parse_purl_install_cmd("pkg:pypi/python-lsp-server"),
+            Some("pip install python-lsp-server".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_purl_cargo() {
+        assert_eq!(
+            parse_purl_install_cmd("pkg:cargo/taplo-cli"),
+            Some("cargo install taplo-cli".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_purl_github_none() {
+        // pkg:github has no automated install
+        assert_eq!(
+            parse_purl_install_cmd("pkg:github/sumneko/lua-language-server"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_parse_purl_generic_none() {
+        assert_eq!(parse_purl_install_cmd("pkg:generic/omnisharp"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Mason package.yaml parser tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_mason_yaml_npm() {
+        let yaml = r#"
+name: bash-language-server
+description: A language server for Bash
+homepage: https://github.com/bash-lsp/bash-language-server
+licenses:
+  - MIT
+languages:
+  - Bash
+categories:
+  - LSP
+source:
+  id: pkg:npm/bash-language-server@5.4.0
+bin:
+  bash-language-server: node_modules/.bin/bash-language-server
+"#;
+        let info = parse_mason_package_yaml(yaml);
+        assert_eq!(info.binaries, vec!["bash-language-server"]);
+        assert_eq!(
+            info.install_cmd,
+            Some("npm install -g bash-language-server".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_mason_yaml_no_bin() {
+        // Package without a bin section (e.g. jdtls uses a wrapper script)
+        let yaml = r#"
+name: jdtls
+source:
+  id: pkg:generic/eclipse-jdt-ls
+"#;
+        let info = parse_mason_package_yaml(yaml);
+        assert!(info.binaries.is_empty());
+        assert_eq!(info.install_cmd, None); // pkg:generic has no install cmd
+    }
+
+    #[test]
+    fn test_parse_mason_yaml_multiple_bins() {
+        let yaml = r#"
+name: typescript-language-server
+source:
+  id: pkg:npm/typescript-language-server@4.3.3
+bin:
+  typescript-language-server: node_modules/.bin/typescript-language-server
+  tsserver: node_modules/.bin/tsserver
+"#;
+        let info = parse_mason_package_yaml(yaml);
+        assert!(info
+            .binaries
+            .contains(&"typescript-language-server".to_string()));
+        assert!(info.binaries.contains(&"tsserver".to_string()));
+        assert_eq!(
+            info.install_cmd,
+            Some("npm install -g typescript-language-server".to_string())
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // language_id_from_path new extensions
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_language_id_csharp() {
+        use std::path::Path;
+        assert_eq!(
+            language_id_from_path(Path::new("Foo.cs")),
+            Some("csharp".to_string())
+        );
+    }
+
+    #[test]
+    fn test_language_id_kotlin() {
+        use std::path::Path;
+        assert_eq!(
+            language_id_from_path(Path::new("Main.kt")),
+            Some("kotlin".to_string())
+        );
+        assert_eq!(
+            language_id_from_path(Path::new("build.gradle.kts")),
+            Some("kotlin".to_string())
+        );
+    }
+
+    #[test]
+    fn test_language_id_dockerfile() {
+        use std::path::Path;
+        assert_eq!(
+            language_id_from_path(Path::new("Dockerfile")),
+            Some("dockerfile".to_string())
+        );
+        assert_eq!(
+            language_id_from_path(Path::new("Dockerfile.prod")),
+            Some("dockerfile".to_string())
+        );
+    }
+
+    #[test]
+    fn test_language_id_terraform() {
+        use std::path::Path;
+        assert_eq!(
+            language_id_from_path(Path::new("main.tf")),
+            Some("terraform".to_string())
+        );
+    }
+
+    #[test]
+    fn test_mason_package_for_language() {
+        assert_eq!(
+            mason_package_for_language("csharp"),
+            Some("csharp-language-server")
+        );
+        assert_eq!(
+            mason_package_for_language("lua"),
+            Some("lua-language-server")
+        );
+        assert_eq!(mason_package_for_language("rust"), None); // handled by built-in registry
+        assert_eq!(mason_package_for_language("scala"), None); // PATH-only
     }
 }

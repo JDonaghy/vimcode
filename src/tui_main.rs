@@ -2328,6 +2328,24 @@ fn draw_frame(
         }
     }
 
+    // ── Signature-help popup (shown in insert mode when cursor is inside a call) ─
+    if let Some(ref sig) = screen.signature_help {
+        if let Some(active_win) = screen
+            .windows
+            .iter()
+            .find(|w| w.window_id == screen.active_window_id)
+        {
+            let gutter_w = active_win.gutter_char_width as u16;
+            let win_x = editor_area.x + active_win.rect.x as u16;
+            let win_y = editor_area.y + active_win.rect.y as u16;
+            let anchor_view = sig.anchor_line.saturating_sub(active_win.scroll_top) as u16;
+            let vis_col = sig.anchor_col.saturating_sub(active_win.scroll_left) as u16;
+            let popup_x = win_x + gutter_w + vis_col;
+            let popup_y = win_y + anchor_view;
+            render_signature_popup(frame, sig, popup_x, popup_y, frame.size(), theme);
+        }
+    }
+
     // ── Fuzzy file-picker modal (rendered on top of everything) ───────────────
     if let Some(ref fuzzy) = screen.fuzzy {
         render_fuzzy_popup(frame, fuzzy, area, theme, fuzzy_scroll_top);
@@ -2694,6 +2712,73 @@ fn render_hover_popup(
                 let cell = buf.get_mut(cell_x, row_y);
                 cell.set_char(ch).set_fg(fg_color).set_bg(bg_color);
             }
+        }
+    }
+}
+
+fn render_signature_popup(
+    frame: &mut ratatui::Frame,
+    sig: &render::SignatureHelp,
+    popup_x: u16,
+    popup_y: u16,
+    term_area: Rect,
+    theme: &Theme,
+) {
+    let label = &sig.label;
+    if label.is_empty() {
+        return;
+    }
+    let display = format!(" {} ", label);
+    let width = (display.len() as u16 + 2).max(12);
+
+    // Place above the cursor line if possible, otherwise below.
+    let y = if popup_y > 1 {
+        popup_y - 1
+    } else {
+        popup_y + 1
+    };
+    let x = popup_x.min(term_area.width.saturating_sub(width));
+    let y = y.min(term_area.height.saturating_sub(1));
+
+    let bg_color = rc(theme.hover_bg);
+    let fg_color = rc(theme.hover_fg);
+    let kw_color = rc(theme.keyword);
+    let border_color = rc(theme.hover_border);
+
+    // Compute which char indices are in the active parameter (byte → char mapping).
+    let active_char_range: Option<(usize, usize)> = sig.active_param.and_then(|idx| {
+        sig.params.get(idx).map(|&(start_byte, end_byte)| {
+            let char_start = label[..start_byte].chars().count() + 1; // +1 for leading space
+            let char_end = label[..end_byte].chars().count() + 1;
+            (char_start, char_end)
+        })
+    });
+
+    let buf = frame.buffer_mut();
+    // Draw background row
+    for col in 0..width {
+        let cell_x = x + col;
+        if cell_x < term_area.width && y < term_area.height {
+            let cell = buf.get_mut(cell_x, y);
+            cell.set_bg(bg_color);
+            let ch = if col == 0 || col == width - 1 {
+                '│'
+            } else {
+                ' '
+            };
+            cell.set_char(ch).set_fg(border_color);
+        }
+    }
+    // Draw each character of the display string with appropriate color.
+    for (j, ch) in display.chars().enumerate() {
+        let cell_x = x + 1 + j as u16;
+        if cell_x + 1 < x + width && cell_x < term_area.width && y < term_area.height {
+            let in_active = active_char_range
+                .map(|(s, e)| j >= s && j < e)
+                .unwrap_or(false);
+            let color = if in_active { kw_color } else { fg_color };
+            let cell = buf.get_mut(cell_x, y);
+            cell.set_char(ch).set_fg(color).set_bg(bg_color);
         }
     }
 }

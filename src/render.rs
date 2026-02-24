@@ -15,6 +15,7 @@
 use crate::core::buffer::Buffer;
 use crate::core::buffer_manager::BufferState;
 use crate::core::engine::{DiffLine, Engine, SearchDirection};
+use crate::core::lsp::SignatureHelpData;
 use crate::core::settings::LineNumberMode;
 use crate::core::terminal::TermSelection as CoreTermSelection;
 use crate::core::view::View;
@@ -270,6 +271,23 @@ pub struct HoverPopup {
     pub anchor_col: usize,
 }
 
+// ─── SignatureHelp ────────────────────────────────────────────────────────────
+
+/// Data needed to render the signature help popup (shown above cursor in insert mode).
+#[derive(Debug, Clone)]
+pub struct SignatureHelp {
+    /// The full signature label, e.g. `fn foo(a: i32, b: &str) -> bool`
+    pub label: String,
+    /// Byte-offset ranges of each parameter within `label`.
+    pub params: Vec<(usize, usize)>,
+    /// Index of the currently active parameter (0-based), if known.
+    pub active_param: Option<usize>,
+    /// Buffer line where the call was started (for positioning above cursor).
+    pub anchor_line: usize,
+    /// Buffer column of the opening `(`.
+    pub anchor_col: usize,
+}
+
 // ─── FuzzyPanel ──────────────────────────────────────────────────────────────
 
 /// Data needed to render the fuzzy file-picker modal.
@@ -408,6 +426,8 @@ pub struct ScreenLayout {
     pub quickfix: Option<QuickfixPanel>,
     /// Integrated terminal panel, or `None` when closed.
     pub terminal: Option<TerminalPanel>,
+    /// Signature help popup (shown in insert mode after `(` or `,`), or `None`.
+    pub signature_help: Option<SignatureHelp>,
 }
 
 // ─── Theme ────────────────────────────────────────────────────────────────────
@@ -735,6 +755,17 @@ pub fn build_screen_layout(
 
     let terminal = build_terminal_panel(engine);
 
+    let signature_help = engine
+        .lsp_signature_help
+        .as_ref()
+        .map(|sh: &SignatureHelpData| SignatureHelp {
+            label: sh.label.clone(),
+            params: sh.params.clone(),
+            active_param: sh.active_param,
+            anchor_line: engine.view().cursor.line,
+            anchor_col: engine.view().cursor.col,
+        });
+
     ScreenLayout {
         tab_bar,
         windows,
@@ -748,6 +779,7 @@ pub fn build_screen_layout(
         live_grep,
         quickfix,
         terminal,
+        signature_help,
     }
 }
 

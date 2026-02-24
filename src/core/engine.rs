@@ -4,7 +4,10 @@ use std::path::{Path, PathBuf};
 use super::buffer::{Buffer, BufferId};
 use super::buffer_manager::{BufferManager, BufferState, UndoEntry};
 use super::git;
-use super::lsp::{self, Diagnostic, DiagnosticSeverity, LspEvent};
+use super::lsp::{
+    self, Diagnostic, DiagnosticSeverity, FormattingEdit, LspEvent, SignatureHelpData,
+    WorkspaceEdit,
+};
 use super::lsp_manager::LspManager;
 use super::project_search::{self, ProjectMatch, ReplaceResult, SearchError, SearchOptions};
 use super::session::SessionState;
@@ -290,8 +293,30 @@ pub struct Engine {
     pub lsp_pending_hover: Option<i64>,
     /// Request ID of the pending definition request.
     pub lsp_pending_definition: Option<i64>,
+    /// Request ID of the pending references request.
+    pub lsp_pending_references: Option<i64>,
+    /// Request ID of the pending implementation request.
+    pub lsp_pending_implementation: Option<i64>,
+    /// Request ID of the pending type-definition request.
+    pub lsp_pending_type_definition: Option<i64>,
+    /// Request ID of the pending signature-help request.
+    pub lsp_pending_signature: Option<i64>,
+    /// Request ID of the pending formatting request.
+    pub lsp_pending_formatting: Option<i64>,
+    /// Request ID of the pending rename request.
+    pub lsp_pending_rename: Option<i64>,
+    /// Currently visible signature help data (set in insert mode after `(` or `,`).
+    pub lsp_signature_help: Option<SignatureHelpData>,
     /// Tracks whether we need to send didChange on next poll (debounce).
     lsp_dirty_buffers: HashMap<BufferId, bool>,
+    /// Language IDs for which a background install is in progress.
+    lsp_installing: std::collections::HashSet<String>,
+    /// Language IDs for which a Mason registry lookup is already in flight.
+    lsp_lookup_in_flight: std::collections::HashSet<String>,
+
+    // --- Leader key ---
+    /// Accumulated keys after leader was pressed; `None` when not in leader mode.
+    leader_partial: Option<String>,
 
     // --- Jump list ---
     /// List of (file_path, line, col) jump positions. Max 100 entries.
@@ -468,7 +493,17 @@ impl Engine {
             lsp_pending_completion: None,
             lsp_pending_hover: None,
             lsp_pending_definition: None,
+            lsp_pending_references: None,
+            lsp_pending_implementation: None,
+            lsp_pending_type_definition: None,
+            lsp_pending_signature: None,
+            lsp_pending_formatting: None,
+            lsp_pending_rename: None,
+            lsp_signature_help: None,
             lsp_dirty_buffers: HashMap::new(),
+            lsp_installing: std::collections::HashSet::new(),
+            lsp_lookup_in_flight: std::collections::HashSet::new(),
+            leader_partial: None,
             jump_list: Vec::new(),
             jump_list_pos: 0,
             search_word_bounded: false,
@@ -2671,6 +2706,17 @@ impl Engine {
         ctrl: bool,
         changed: &mut bool,
     ) -> EngineAction {
+        // If leader mode is active, route all keypresses there first.
+        if self.leader_partial.is_some() {
+            return self.handle_leader_key(unicode);
+        }
+
+        // Detect leader keypress (non-ctrl, no pending key sequence, matches configured leader char).
+        if !ctrl && self.pending_key.is_none() && unicode == Some(self.settings.leader) {
+            self.leader_partial = Some(String::new());
+            return EngineAction::None;
+        }
+
         // Handle Ctrl combinations first
         if ctrl {
             match key_name {
@@ -3429,6 +3475,18 @@ impl Engine {
                     self.push_jump_location();
                     self.lsp_request_definition();
                 }
+                Some('r') => {
+                    self.push_jump_location();
+                    self.lsp_request_references();
+                }
+                Some('i') => {
+                    self.push_jump_location();
+                    self.lsp_request_implementation();
+                }
+                Some('y') => {
+                    self.push_jump_location();
+                    self.lsp_request_type_definition();
+                }
                 _ => {}
             },
             ']' => match unicode {
@@ -3786,6 +3844,44 @@ impl Engine {
         EngineAction::None
     }
 
+    /// Handle a key press while leader mode is active (after pressing the leader key).
+    fn handle_leader_key(&mut self, unicode: Option<char>) -> EngineAction {
+        let ch = match unicode {
+            Some(c) => c,
+            None => {
+                // Non-unicode key (e.g. arrow) — cancel leader
+                self.leader_partial = None;
+                return EngineAction::None;
+            }
+        };
+        let mut partial = self.leader_partial.take().unwrap_or_default();
+        partial.push(ch);
+
+        // All known leader sequences
+        const SEQUENCES: &[&str] = &["rn", "gf", "gF"];
+
+        match partial.as_str() {
+            "rn" => {
+                // LSP rename — enter command mode pre-filled with :Rename <word>
+                let word = self.word_under_cursor().unwrap_or_default();
+                self.mode = crate::core::Mode::Command;
+                self.command_buffer = format!(":Rename {word}");
+            }
+            "gf" | "gF" => {
+                // LSP format whole file
+                self.lsp_format_current();
+            }
+            // Partial match — keep accumulating if the partial is a prefix of some sequence
+            s if SEQUENCES.iter().any(|seq| seq.starts_with(s)) => {
+                self.leader_partial = Some(partial);
+            }
+            _ => {
+                self.message = format!("Unknown leader sequence: <leader>{partial}");
+            }
+        }
+        EngineAction::None
+    }
+
     fn apply_operator_with_motion(
         &mut self,
         operator: char,
@@ -4067,6 +4163,8 @@ impl Engine {
                 }
                 self.mode = Mode::Normal;
                 self.clamp_cursor_col();
+                // Dismiss signature help when leaving insert mode
+                self.lsp_signature_help = None;
             }
             "BackSpace" => {
                 let line = self.view().cursor.line;
@@ -4166,6 +4264,11 @@ impl Engine {
                     self.insert_text_buffer.push(ch);
                     self.view_mut().cursor.col += 1;
                     *changed = true;
+                    // Trigger signature help after '(' or ','
+                    if ch == '(' || ch == ',' {
+                        self.ensure_lsp_manager();
+                        self.lsp_request_signature_help();
+                    }
                 }
                 if *changed {
                     self.trigger_auto_completion();
@@ -4542,6 +4645,15 @@ impl Engine {
             self.mode = Mode::Normal;
             self.visual_anchor = None;
             self.count = None; // Clear count on mode exit
+            return EngineAction::None;
+        }
+
+        // Leader key in visual mode
+        if self.leader_partial.is_some() {
+            return self.handle_leader_key(unicode);
+        }
+        if !ctrl && self.pending_key.is_none() && unicode == Some(self.settings.leader) {
+            self.leader_partial = Some(String::new());
             return EngineAction::None;
         }
 
@@ -5504,6 +5616,77 @@ impl Engine {
                 }
             } else {
                 self.message = "No LSP language for current buffer".to_string();
+            }
+            return EngineAction::None;
+        }
+
+        // Handle :LspInstall <language> — install LSP server via package manager
+        if let Some(lang_id) = cmd.strip_prefix("LspInstall").map(|s| s.trim()) {
+            if lang_id.is_empty() {
+                self.message =
+                    "Usage: :LspInstall <language>  (e.g. :LspInstall csharp)".to_string();
+                return EngineAction::None;
+            }
+            self.ensure_lsp_manager();
+            // Check if already installing
+            if self.lsp_installing.contains(lang_id) {
+                self.message = format!("Install already running for {lang_id}");
+                return EngineAction::None;
+            }
+            // Get install command from cache
+            let install_cmd = self
+                .lsp_manager
+                .as_ref()
+                .and_then(|m| m.registry_cache.get(lang_id))
+                .and_then(|info| info.install_cmd.clone());
+            match install_cmd {
+                Some(cmd_str) => {
+                    self.lsp_installing.insert(lang_id.to_string());
+                    self.message = format!("Installing LSP for {lang_id}...");
+                    if let Some(mgr) = &self.lsp_manager {
+                        mgr.run_install_command(lang_id, &cmd_str);
+                    }
+                }
+                None => {
+                    // Not cached — may need a registry fetch first, or no installable package
+                    let has_cache = self
+                        .lsp_manager
+                        .as_ref()
+                        .map(|m| m.registry_cache.contains_key(lang_id))
+                        .unwrap_or(false);
+                    if has_cache {
+                        self.message = format!(
+                            "No automated installer for {lang_id} (pkg:github or pkg:generic — see Mason docs)"
+                        );
+                    } else {
+                        // Trigger a lookup first so the user can retry
+                        self.trigger_lsp_registry_lookup(lang_id);
+                        if self.message.starts_with("Looking up") {
+                            self.message = format!(
+                                "Fetching LSP info for {lang_id}... run :LspInstall {lang_id} again after"
+                            );
+                        }
+                    }
+                }
+            }
+            return EngineAction::None;
+        }
+
+        // Handle :Lformat — LSP format current buffer
+        if cmd == "Lformat" {
+            self.lsp_format_current();
+            return EngineAction::None;
+        }
+
+        // Handle :Rename <newname> — LSP rename symbol at cursor
+        if let Some(new_name) = cmd.strip_prefix("Rename").map(|s| s.trim()) {
+            if new_name.is_empty() {
+                // Pre-fill with word under cursor for interactive editing
+                let word = self.word_under_cursor().unwrap_or_default();
+                self.mode = crate::core::Mode::Command;
+                self.command_buffer = format!(":Rename {word}");
+            } else {
+                self.lsp_request_rename(new_name);
             }
             return EngineAction::None;
         }
@@ -8378,7 +8561,7 @@ impl Engine {
         if !self.settings.lsp_enabled {
             return;
         }
-        let (path, text) = {
+        let (path, text, lang_id) = {
             let state = match self.buffer_manager.get(buffer_id) {
                 Some(s) => s,
                 None => return,
@@ -8387,15 +8570,76 @@ impl Engine {
                 Some(p) => p.clone(),
                 None => return,
             };
-            if state.lsp_language_id.is_none() {
-                return;
-            }
-            (path, state.buffer.to_string())
+            // User language_map takes priority; fall back to built-in extension table
+            let lang_id = lsp::language_id_from_path_with_map(&path, &self.settings.language_map)
+                .or_else(|| state.lsp_language_id.clone());
+            let lang_id = match lang_id {
+                Some(l) => l,
+                None => return,
+            };
+            (path, state.buffer.to_string(), lang_id)
         };
         self.ensure_lsp_manager();
+        let no_server = if let Some(mgr) = &mut self.lsp_manager {
+            mgr.notify_did_open(&path, &text).err()
+        } else {
+            None
+        };
+        if no_server.is_some() {
+            self.trigger_lsp_registry_lookup(&lang_id);
+        }
+    }
+
+    /// Trigger a Mason registry lookup for a language if not already in flight or cached.
+    fn trigger_lsp_registry_lookup(&mut self, lang_id: &str) {
+        if self.lsp_lookup_in_flight.contains(lang_id) {
+            return; // already fetching
+        }
+
+        // If we already fetched and found no binary, show the install hint immediately
+        let cached_info = self
+            .lsp_manager
+            .as_ref()
+            .and_then(|m| m.registry_cache.get(lang_id))
+            .cloned();
+        if let Some(info) = cached_info {
+            let hint = if let Some(cmd) = &info.install_cmd {
+                format!("No LSP for {lang_id} — run :LspInstall {lang_id}  (installs via: {cmd})")
+            } else {
+                format!("No LSP for {lang_id} — run :LspInstall {lang_id}")
+            };
+            self.message = hint;
+            return;
+        }
+
+        // Trigger background fetch
+        self.lsp_lookup_in_flight.insert(lang_id.to_string());
+        self.message = format!("Looking up LSP for {lang_id}...");
+        if let Some(mgr) = &self.lsp_manager {
+            mgr.fetch_mason_registry_for_language(lang_id);
+        }
+    }
+
+    /// Re-send didOpen for all open buffers that match a given language ID.
+    /// Called after a new server is detected/started mid-session.
+    fn lsp_reopen_buffers_for_language(&mut self, lang_id: &str) {
+        let buffers: Vec<(PathBuf, String)> = self
+            .buffer_manager
+            .list()
+            .iter()
+            .filter_map(|&bid| {
+                let s = self.buffer_manager.get(bid)?;
+                if s.lsp_language_id.as_deref() == Some(lang_id) {
+                    let path = s.file_path.as_ref()?.clone();
+                    Some((path, s.buffer.to_string()))
+                } else {
+                    None
+                }
+            })
+            .collect();
         if let Some(mgr) = &mut self.lsp_manager {
-            if let Err(msg) = mgr.notify_did_open(&path, &text) {
-                self.message = format!("LSP: {}", msg);
+            for (path, text) in buffers {
+                let _ = mgr.notify_did_open(&path, &text);
             }
         }
     }
@@ -8592,6 +8836,263 @@ impl Engine {
                     self.message = format!("LSP server {} exited", id);
                     redraw = true;
                 }
+                LspEvent::RegistryLookup { lang_id, info } => {
+                    self.lsp_lookup_in_flight.remove(&lang_id);
+                    match info {
+                        None => {
+                            self.message = format!(
+                                "No LSP for {lang_id} — unknown language (add to lsp_servers in settings.json)"
+                            );
+                        }
+                        Some(pkg_info) => {
+                            // Try to find one of the advertised binaries on PATH/Mason
+                            let found_binary = pkg_info.binaries.iter().find_map(|bin| {
+                                // Use a shell check: `which <bin>` or check Mason bin dir
+                                let mason_found = std::env::var_os("HOME")
+                                    .map(std::path::PathBuf::from)
+                                    .map(|h| {
+                                        h.join(".local")
+                                            .join("share")
+                                            .join("nvim")
+                                            .join("mason")
+                                            .join("bin")
+                                            .join(bin)
+                                    })
+                                    .filter(|p| p.exists())
+                                    .is_some();
+                                if mason_found {
+                                    return Some(bin.clone());
+                                }
+                                let on_path = std::process::Command::new("which")
+                                    .arg(bin)
+                                    .stdout(std::process::Stdio::null())
+                                    .stderr(std::process::Stdio::null())
+                                    .status()
+                                    .map(|s| s.success())
+                                    .unwrap_or(false);
+                                if on_path {
+                                    Some(bin.clone())
+                                } else {
+                                    None
+                                }
+                            });
+
+                            if let Some(binary) = found_binary {
+                                // Binary found — add config to manager and retry
+                                let config = lsp::LspServerConfig {
+                                    command: binary.clone(),
+                                    args: vec![],
+                                    languages: vec![lang_id.clone()],
+                                };
+                                if let Some(mgr) = &mut self.lsp_manager {
+                                    mgr.add_registry_entry(config);
+                                    mgr.registry_cache.insert(lang_id.clone(), pkg_info);
+                                    mgr.ensure_server_for_language(&lang_id);
+                                }
+                                // Re-open any buffers of this language
+                                self.lsp_reopen_buffers_for_language(&lang_id);
+                                self.message =
+                                    format!("LSP server started for {lang_id} ({binary})");
+                                redraw = true;
+                            } else {
+                                // Binary not found — cache and show install hint
+                                let hint = if let Some(cmd) = &pkg_info.install_cmd {
+                                    format!("No LSP for {lang_id} — run :LspInstall {lang_id}  (installs via: {cmd})")
+                                } else {
+                                    format!("No LSP for {lang_id} — run :LspInstall {lang_id}")
+                                };
+                                if let Some(mgr) = &mut self.lsp_manager {
+                                    mgr.registry_cache.insert(lang_id, pkg_info);
+                                }
+                                self.message = hint;
+                            }
+                        }
+                    }
+                }
+                LspEvent::InstallComplete {
+                    lang_id,
+                    success,
+                    output,
+                } => {
+                    self.lsp_installing.remove(&lang_id);
+                    if success {
+                        // Retry: add config and start server
+                        let cached_info = self
+                            .lsp_manager
+                            .as_ref()
+                            .and_then(|m| m.registry_cache.get(&lang_id))
+                            .cloned();
+                        if let Some(info) = cached_info {
+                            let binary = info.binaries.first().cloned().unwrap_or_default();
+                            if !binary.is_empty() {
+                                let config = lsp::LspServerConfig {
+                                    command: binary.clone(),
+                                    args: vec![],
+                                    languages: vec![lang_id.clone()],
+                                };
+                                if let Some(mgr) = &mut self.lsp_manager {
+                                    mgr.add_registry_entry(config);
+                                    mgr.ensure_server_for_language(&lang_id);
+                                }
+                                self.lsp_reopen_buffers_for_language(&lang_id);
+                                self.message = format!(
+                                    "LSP server for {lang_id} installed and started ({binary})"
+                                );
+                                redraw = true;
+                            } else {
+                                self.message = format!(
+                                    "LSP for {lang_id} installed — reopen a file to activate"
+                                );
+                            }
+                        } else {
+                            self.message =
+                                format!("LSP for {lang_id} installed — reopen a file to activate");
+                        }
+                    } else {
+                        let short = output.lines().next().unwrap_or("unknown error").to_string();
+                        self.message = format!("LSP install failed: {short}");
+                    }
+                }
+                LspEvent::ReferencesResponse { locations, .. } => {
+                    self.lsp_pending_references = None;
+                    if locations.is_empty() {
+                        self.message = "No references found".to_string();
+                    } else if locations.len() == 1 {
+                        // Single result — jump directly like gd
+                        let loc = &locations[0];
+                        let path = loc.path.clone();
+                        let line = loc.range.start.line as usize;
+                        if path
+                            != self
+                                .buffer_manager
+                                .get(self.active_buffer_id())
+                                .and_then(|s| s.file_path.clone())
+                                .unwrap_or_default()
+                        {
+                            let _ = self.open_file_with_mode(&path, OpenMode::Permanent);
+                        }
+                        self.view_mut().cursor.line = line;
+                        let line_text: String = self.buffer().content.line(line).chars().collect();
+                        let col = lsp::utf16_offset_to_char(&line_text, loc.range.start.character);
+                        self.view_mut().cursor.col = col;
+                        self.ensure_cursor_visible();
+                    } else {
+                        // Multiple results — populate quickfix window
+                        self.quickfix_items = locations
+                            .into_iter()
+                            .map(|l| ProjectMatch {
+                                file: l.path,
+                                line: l.range.start.line as usize,
+                                col: l.range.start.character as usize,
+                                line_text: String::new(),
+                            })
+                            .collect();
+                        self.quickfix_selected = 0;
+                        self.quickfix_open = true;
+                        self.quickfix_has_focus = false;
+                        self.message = format!("{} references found", self.quickfix_items.len());
+                    }
+                    redraw = true;
+                }
+                LspEvent::ImplementationResponse { locations, .. } => {
+                    self.lsp_pending_implementation = None;
+                    if let Some(loc) = locations.first() {
+                        let path = loc.path.clone();
+                        let line = loc.range.start.line as usize;
+                        if path
+                            != self
+                                .buffer_manager
+                                .get(self.active_buffer_id())
+                                .and_then(|s| s.file_path.clone())
+                                .unwrap_or_default()
+                        {
+                            let _ = self.open_file_with_mode(&path, OpenMode::Permanent);
+                        }
+                        self.view_mut().cursor.line = line;
+                        let line_text: String = self.buffer().content.line(line).chars().collect();
+                        let col = lsp::utf16_offset_to_char(&line_text, loc.range.start.character);
+                        self.view_mut().cursor.col = col;
+                        self.ensure_cursor_visible();
+                        redraw = true;
+                    } else {
+                        self.message = "No implementation found".to_string();
+                    }
+                }
+                LspEvent::TypeDefinitionResponse { locations, .. } => {
+                    self.lsp_pending_type_definition = None;
+                    if let Some(loc) = locations.first() {
+                        let path = loc.path.clone();
+                        let line = loc.range.start.line as usize;
+                        if path
+                            != self
+                                .buffer_manager
+                                .get(self.active_buffer_id())
+                                .and_then(|s| s.file_path.clone())
+                                .unwrap_or_default()
+                        {
+                            let _ = self.open_file_with_mode(&path, OpenMode::Permanent);
+                        }
+                        self.view_mut().cursor.line = line;
+                        let line_text: String = self.buffer().content.line(line).chars().collect();
+                        let col = lsp::utf16_offset_to_char(&line_text, loc.range.start.character);
+                        self.view_mut().cursor.col = col;
+                        self.ensure_cursor_visible();
+                        redraw = true;
+                    } else {
+                        self.message = "No type definition found".to_string();
+                    }
+                }
+                LspEvent::SignatureHelpResponse {
+                    request_id,
+                    label,
+                    params,
+                    active_param,
+                    ..
+                } => {
+                    if self.lsp_pending_signature == Some(request_id) {
+                        self.lsp_pending_signature = None;
+                        if !label.is_empty() {
+                            self.lsp_signature_help = Some(SignatureHelpData {
+                                label,
+                                params,
+                                active_param,
+                            });
+                        }
+                        redraw = true;
+                    }
+                }
+                LspEvent::FormattingResponse {
+                    request_id, edits, ..
+                } => {
+                    if self.lsp_pending_formatting == Some(request_id) {
+                        self.lsp_pending_formatting = None;
+                        let buffer_id = self.active_buffer_id();
+                        if !edits.is_empty() {
+                            self.apply_lsp_edits(buffer_id, edits);
+                            self.message = "Buffer formatted".to_string();
+                        } else {
+                            self.message = "No formatting changes".to_string();
+                        }
+                        redraw = true;
+                    }
+                }
+                LspEvent::RenameResponse {
+                    request_id,
+                    workspace_edit,
+                    ..
+                } => {
+                    if self.lsp_pending_rename == Some(request_id) {
+                        self.lsp_pending_rename = None;
+                        if let Some(we) = workspace_edit {
+                            let n = we.changes.len();
+                            self.apply_workspace_edit(we);
+                            self.message = format!("Renamed in {n} file(s)");
+                        } else {
+                            self.message = "Rename not supported by server".to_string();
+                        }
+                        redraw = true;
+                    }
+                }
             }
         }
         redraw
@@ -8653,6 +9154,233 @@ impl Engine {
                 self.message = "LSP server initializing...".to_string();
             } else {
                 self.message = "No LSP server for this file".to_string();
+            }
+        }
+    }
+
+    /// Request LSP find-references at cursor position.
+    fn lsp_request_references(&mut self) {
+        if !self.settings.lsp_enabled {
+            return;
+        }
+        self.ensure_lsp_manager();
+        let (path, line, col_utf16) = match self.lsp_cursor_position() {
+            Some(v) => v,
+            None => return,
+        };
+        if let Some(mgr) = &mut self.lsp_manager {
+            if let Some(id) = mgr.request_references(&path, line, col_utf16) {
+                self.lsp_pending_references = Some(id);
+                self.message = "Finding references...".to_string();
+            } else if mgr.is_server_initializing(&path) {
+                self.message = "LSP server initializing...".to_string();
+            } else {
+                self.message = "No LSP server for this file".to_string();
+            }
+        }
+    }
+
+    /// Request LSP go-to-implementation at cursor position.
+    fn lsp_request_implementation(&mut self) {
+        if !self.settings.lsp_enabled {
+            return;
+        }
+        self.ensure_lsp_manager();
+        let (path, line, col_utf16) = match self.lsp_cursor_position() {
+            Some(v) => v,
+            None => return,
+        };
+        if let Some(mgr) = &mut self.lsp_manager {
+            if let Some(id) = mgr.request_implementation(&path, line, col_utf16) {
+                self.lsp_pending_implementation = Some(id);
+                self.message = "Finding implementation...".to_string();
+            } else if mgr.is_server_initializing(&path) {
+                self.message = "LSP server initializing...".to_string();
+            } else {
+                self.message = "No LSP server for this file".to_string();
+            }
+        }
+    }
+
+    /// Request LSP go-to-type-definition at cursor position.
+    fn lsp_request_type_definition(&mut self) {
+        if !self.settings.lsp_enabled {
+            return;
+        }
+        self.ensure_lsp_manager();
+        let (path, line, col_utf16) = match self.lsp_cursor_position() {
+            Some(v) => v,
+            None => return,
+        };
+        if let Some(mgr) = &mut self.lsp_manager {
+            if let Some(id) = mgr.request_type_definition(&path, line, col_utf16) {
+                self.lsp_pending_type_definition = Some(id);
+                self.message = "Finding type definition...".to_string();
+            } else if mgr.is_server_initializing(&path) {
+                self.message = "LSP server initializing...".to_string();
+            } else {
+                self.message = "No LSP server for this file".to_string();
+            }
+        }
+    }
+
+    /// Request LSP signature help at cursor position (triggered in insert mode).
+    fn lsp_request_signature_help(&mut self) {
+        if !self.settings.lsp_enabled {
+            return;
+        }
+        let (path, line, col_utf16) = match self.lsp_cursor_position() {
+            Some(v) => v,
+            None => return,
+        };
+        if let Some(mgr) = &mut self.lsp_manager {
+            if let Some(id) = mgr.request_signature_help(&path, line, col_utf16) {
+                self.lsp_pending_signature = Some(id);
+            }
+        }
+    }
+
+    /// Request LSP formatting for the current buffer.
+    fn lsp_format_current(&mut self) {
+        if !self.settings.lsp_enabled {
+            return;
+        }
+        self.ensure_lsp_manager();
+        let (path, _line, _col) = match self.lsp_cursor_position() {
+            Some(v) => v,
+            None => return,
+        };
+        let tab_size = self.settings.tabstop as u32;
+        let insert_spaces = self.settings.expand_tab;
+        if let Some(mgr) = &mut self.lsp_manager {
+            if let Some(id) = mgr.request_formatting(&path, tab_size, insert_spaces) {
+                self.lsp_pending_formatting = Some(id);
+                self.message = "Formatting...".to_string();
+            } else if mgr.is_server_initializing(&path) {
+                self.message = "LSP server initializing...".to_string();
+            } else {
+                self.message = "No LSP server for this file".to_string();
+            }
+        }
+    }
+
+    /// Request LSP rename of the symbol at cursor.
+    fn lsp_request_rename(&mut self, new_name: &str) {
+        if !self.settings.lsp_enabled {
+            return;
+        }
+        self.ensure_lsp_manager();
+        let (path, line, col_utf16) = match self.lsp_cursor_position() {
+            Some(v) => v,
+            None => return,
+        };
+        let new_name = new_name.to_string();
+        if let Some(mgr) = &mut self.lsp_manager {
+            if let Some(id) = mgr.request_rename(&path, line, col_utf16, &new_name) {
+                self.lsp_pending_rename = Some(id);
+                self.message = format!("Renaming to '{new_name}'...");
+            } else if mgr.is_server_initializing(&path) {
+                self.message = "LSP server initializing...".to_string();
+            } else {
+                self.message = "No LSP server for this file".to_string();
+            }
+        }
+    }
+
+    /// Apply a list of LSP text edits to a buffer as a single undo group.
+    /// Edits must be applied in reverse order (last first) to preserve offsets.
+    fn apply_lsp_edits(&mut self, buffer_id: BufferId, mut edits: Vec<FormattingEdit>) {
+        if edits.is_empty() {
+            return;
+        }
+        // Sort in reverse start order so applying one edit doesn't shift others
+        edits.sort_by(|a, b| {
+            b.range
+                .start
+                .line
+                .cmp(&a.range.start.line)
+                .then(b.range.start.character.cmp(&a.range.start.character))
+        });
+        self.start_undo_group();
+        for edit in &edits {
+            let state = match self.buffer_manager.get(buffer_id) {
+                Some(s) => s,
+                None => break,
+            };
+            let content = state.buffer.content.clone();
+            let total_lines = content.len_lines();
+            let start_line = (edit.range.start.line as usize).min(total_lines.saturating_sub(1));
+            let end_line = (edit.range.end.line as usize).min(total_lines.saturating_sub(1));
+
+            let start_line_text: String = content.line(start_line).chars().collect();
+            let end_line_text: String = content.line(end_line).chars().collect();
+
+            let start_char =
+                lsp::utf16_offset_to_char(&start_line_text, edit.range.start.character);
+            let end_char = lsp::utf16_offset_to_char(&end_line_text, edit.range.end.character);
+
+            let start_offset = content.line_to_char(start_line) + start_char;
+            let end_offset = content.line_to_char(end_line) + end_char;
+
+            if let Some(state) = self.buffer_manager.get_mut(buffer_id) {
+                if end_offset > start_offset {
+                    state.buffer.content.remove(start_offset..end_offset);
+                }
+                state.buffer.content.insert(start_offset, &edit.new_text);
+                state.dirty = true;
+            }
+        }
+        self.finish_undo_group();
+    }
+
+    /// Apply a workspace-wide rename edit.
+    fn apply_workspace_edit(&mut self, we: WorkspaceEdit) {
+        for file_edit in we.changes {
+            // Try to find an already-open buffer for this path
+            let buffer_id = self.buffer_manager.list().into_iter().find(|&bid| {
+                self.buffer_manager
+                    .get(bid)
+                    .and_then(|s| s.file_path.as_deref())
+                    .map(|p| p == file_edit.path)
+                    .unwrap_or(false)
+            });
+
+            if let Some(bid) = buffer_id {
+                self.apply_lsp_edits(bid, file_edit.edits);
+            } else {
+                // File not open — read, edit, and write back to disk
+                if let Ok(text) = std::fs::read_to_string(&file_edit.path) {
+                    let mut edits = file_edit.edits;
+                    // Sort in reverse order
+                    edits.sort_by(|a, b| {
+                        b.range
+                            .start
+                            .line
+                            .cmp(&a.range.start.line)
+                            .then(b.range.start.character.cmp(&a.range.start.character))
+                    });
+                    let mut rope = ropey::Rope::from_str(&text);
+                    for edit in &edits {
+                        let total_lines = rope.len_lines();
+                        let start_line =
+                            (edit.range.start.line as usize).min(total_lines.saturating_sub(1));
+                        let end_line =
+                            (edit.range.end.line as usize).min(total_lines.saturating_sub(1));
+                        let start_line_text: String = rope.line(start_line).chars().collect();
+                        let end_line_text: String = rope.line(end_line).chars().collect();
+                        let start_char =
+                            lsp::utf16_offset_to_char(&start_line_text, edit.range.start.character);
+                        let end_char =
+                            lsp::utf16_offset_to_char(&end_line_text, edit.range.end.character);
+                        let start_offset = rope.line_to_char(start_line) + start_char;
+                        let end_offset = rope.line_to_char(end_line) + end_char;
+                        if end_offset > start_offset {
+                            rope.remove(start_offset..end_offset);
+                        }
+                        rope.insert(start_offset, &edit.new_text);
+                    }
+                    let _ = std::fs::write(&file_edit.path, rope.to_string());
+                }
             }
         }
     }

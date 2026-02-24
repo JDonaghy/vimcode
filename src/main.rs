@@ -3405,6 +3405,9 @@ fn draw_editor(
     // 5c. Draw hover popup (on top of everything else)
     draw_hover_popup(cr, &layout, &screen, &theme, line_height, char_width);
 
+    // 5c2. Draw signature-help popup (on top of everything else, shown in insert mode)
+    draw_signature_popup(cr, &layout, &screen, &theme, line_height, char_width);
+
     // 5d. Draw fuzzy file-picker modal (on top of everything else)
     draw_fuzzy_popup(
         cr,
@@ -4155,6 +4158,82 @@ fn draw_hover_popup(
         cr.move_to(popup_x, popup_y + 2.0 + i as f64 * line_height);
         pangocairo::show_layout(cr, layout);
     }
+}
+
+fn draw_signature_popup(
+    cr: &Context,
+    layout: &pango::Layout,
+    screen: &render::ScreenLayout,
+    theme: &Theme,
+    line_height: f64,
+    char_width: f64,
+) {
+    let Some(sig) = &screen.signature_help else {
+        return;
+    };
+    let Some(active_win) = screen
+        .windows
+        .iter()
+        .find(|w| w.window_id == screen.active_window_id)
+    else {
+        return;
+    };
+
+    let gutter_width = active_win.gutter_char_width as f64 * char_width;
+    let h_scroll_offset = active_win.scroll_left as f64 * char_width;
+    let anchor_view_line = sig.anchor_line.saturating_sub(active_win.scroll_top);
+    let popup_x =
+        active_win.rect.x + gutter_width + sig.anchor_col as f64 * char_width - h_scroll_offset;
+
+    let popup_w = ((sig.label.len() + 4) as f64 * char_width).max(120.0);
+    let popup_h = line_height + 4.0;
+
+    // Place above the cursor if space allows, otherwise below.
+    let popup_y = if anchor_view_line as f64 * line_height > popup_h {
+        active_win.rect.y + anchor_view_line as f64 * line_height - popup_h
+    } else {
+        active_win.rect.y + (anchor_view_line as f64 + 1.0) * line_height
+    };
+
+    // Background
+    let (r, g, b) = theme.hover_bg.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
+    cr.fill().ok();
+
+    // Border
+    let (r, g, b) = theme.hover_border.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    cr.set_line_width(1.0);
+    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
+    cr.stroke().ok();
+
+    // Build Pango attr list: active parameter in keyword color, rest in hover_fg.
+    let display = format!(" {}", sig.label);
+    let offset = 1usize; // accounts for the leading space
+
+    let attrs = AttrList::new();
+    let (fr, fg_g, fb) = theme.hover_fg.to_pango_u16();
+    let mut base_attr = AttrColor::new_foreground(fr, fg_g, fb);
+    base_attr.set_start_index(0);
+    base_attr.set_end_index(display.len() as u32);
+    attrs.insert(base_attr);
+
+    if let Some(idx) = sig.active_param {
+        if let Some(&(start, end)) = sig.params.get(idx) {
+            let (kr, kg, kb) = theme.keyword.to_pango_u16();
+            let mut kw_attr = AttrColor::new_foreground(kr, kg, kb);
+            kw_attr.set_start_index((offset + start) as u32);
+            kw_attr.set_end_index((offset + end) as u32);
+            attrs.insert(kw_attr);
+        }
+    }
+
+    layout.set_text(&display);
+    layout.set_attributes(Some(&attrs));
+    cr.move_to(popup_x, popup_y + 2.0);
+    pangocairo::show_layout(cr, layout);
+    layout.set_attributes(None);
 }
 
 #[allow(clippy::too_many_arguments)]
