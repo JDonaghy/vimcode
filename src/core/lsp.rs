@@ -1260,12 +1260,17 @@ fn try_parse_workspace_edit(result: &serde_json::Value) -> Option<WorkspaceEdit>
     }
 
     // Format 2: result.documentChanges = [{ textDocument: { uri }, edits: [...] }]
+    // Some entries may be file-level operations (kind: "create"/"rename"/"delete") with no
+    // textDocument field — skip those rather than bailing out of the whole function.
     if let Some(doc_changes) = result.get("documentChanges").and_then(|d| d.as_array()) {
         for change in doc_changes {
-            let uri = change
+            let Some(uri) = change
                 .get("textDocument")
                 .and_then(|td| td.get("uri"))
-                .and_then(|u| u.as_str())?;
+                .and_then(|u| u.as_str())
+            else {
+                continue;
+            };
             if let Some(path) = uri_to_path(uri) {
                 if let Some(edits_val) = change.get("edits") {
                     if let Some(edits) = parse_text_edits(edits_val) {
