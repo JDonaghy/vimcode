@@ -3865,7 +3865,7 @@ impl Engine {
                 // LSP rename — enter command mode pre-filled with :Rename <word>
                 let word = self.word_under_cursor().unwrap_or_default();
                 self.mode = crate::core::Mode::Command;
-                self.command_buffer = format!(":Rename {word}");
+                self.command_buffer = format!("Rename {word}");
             }
             "gf" | "gF" => {
                 // LSP format whole file
@@ -5684,7 +5684,7 @@ impl Engine {
                 // Pre-fill with word under cursor for interactive editing
                 let word = self.word_under_cursor().unwrap_or_default();
                 self.mode = crate::core::Mode::Command;
-                self.command_buffer = format!(":Rename {word}");
+                self.command_buffer = format!("Rename {word}");
             } else {
                 self.lsp_request_rename(new_name);
             }
