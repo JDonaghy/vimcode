@@ -667,6 +667,27 @@ impl LspManager {
     }
 }
 
+/// Diagnostic helper: try to resolve binaries for all servers matching `lang_id`
+/// from the default registry, and report which were found or not found.
+pub fn debug_resolve(lang_id: &str) -> String {
+    let registry = default_server_registry();
+    let candidates: Vec<_> = registry
+        .iter()
+        .filter(|c| c.languages.iter().any(|l| l == lang_id))
+        .collect();
+    if candidates.is_empty() {
+        return format!("LspDebug: no registry entries for '{lang_id}'");
+    }
+    let results: Vec<String> = candidates
+        .iter()
+        .map(|c| match resolve_command(&c.command) {
+            Some(p) => format!("{} -> {}", c.command, p.display()),
+            None => format!("{} -> NOT FOUND", c.command),
+        })
+        .collect();
+    format!("LspDebug[{lang_id}]: {}", results.join("; "))
+}
+
 impl Drop for LspManager {
     fn drop(&mut self) {
         self.shutdown_all();

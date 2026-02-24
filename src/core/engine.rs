@@ -5578,10 +5578,34 @@ impl Engine {
 
         // Handle :LspInfo — show running LSP servers
         if cmd == "LspInfo" {
+            let buf_lang = self
+                .buffer_manager
+                .get(self.active_buffer_id())
+                .and_then(|s| s.lsp_language_id.clone())
+                .unwrap_or_else(|| "none".to_string());
+            let mut parts = vec![format!("buf_lang={buf_lang}")];
             if let Some(mgr) = &self.lsp_manager {
-                self.message = mgr.server_info().join("; ");
+                parts.extend(mgr.server_info());
             } else {
-                self.message = "No LSP servers running".to_string();
+                parts.push("manager=not started".to_string());
+            }
+            self.message = parts.join("; ");
+            return EngineAction::None;
+        }
+
+        // Handle :LspDebug — show binary resolution result for current language
+        if cmd == "LspDebug" {
+            let buf_lang = self
+                .buffer_manager
+                .get(self.active_buffer_id())
+                .and_then(|s| s.lsp_language_id.clone());
+            match buf_lang {
+                None => {
+                    self.message = "LspDebug: buffer has no language ID".to_string();
+                }
+                Some(lang) => {
+                    self.message = super::lsp_manager::debug_resolve(&lang);
+                }
             }
             return EngineAction::None;
         }
@@ -18831,7 +18855,11 @@ mod tests {
         let mut engine = Engine::new();
         // :LspInfo with no servers running
         engine.execute_command("LspInfo");
-        assert_eq!(engine.message, "No LSP servers running");
+        assert!(
+            engine.message.contains("manager=not started"),
+            "unexpected LspInfo: {}",
+            engine.message
+        );
     }
 
     #[test]
