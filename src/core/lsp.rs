@@ -1011,7 +1011,12 @@ fn reader_thread(
                     let null = serde_json::Value::Null;
                     let r = result.unwrap_or(&null);
                     let debug_info = if result.is_none() {
-                        "result=null/error".to_string()
+                        let err_msg = json
+                            .get("error")
+                            .and_then(|e| e.get("message"))
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("no error field");
+                        format!("error: {err_msg}")
                     } else {
                         let has_c = r.get("changes").is_some();
                         let has_dc = r.get("documentChanges").is_some();
