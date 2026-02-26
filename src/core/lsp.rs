@@ -359,6 +359,24 @@ pub struct MasonPackageInfo {
     pub binaries: Vec<String>,
     /// Shell command to install this package (derived from PURL `source.id`).
     pub install_cmd: Option<String>,
+    /// Package categories from the `categories:` YAML section, e.g. ["LSP"], ["DAP"], ["Linter"].
+    pub categories: Vec<String>,
+}
+
+#[allow(dead_code)]
+impl MasonPackageInfo {
+    pub fn is_lsp(&self) -> bool {
+        self.categories.iter().any(|c| c == "LSP")
+    }
+    pub fn is_dap(&self) -> bool {
+        self.categories.iter().any(|c| c == "DAP")
+    }
+    pub fn is_linter(&self) -> bool {
+        self.categories.iter().any(|c| c == "Linter")
+    }
+    pub fn is_formatter(&self) -> bool {
+        self.categories.iter().any(|c| c == "Formatter")
+    }
 }
 
 /// Static mapping: LSP language ID → Mason registry package name.
@@ -428,12 +446,15 @@ pub fn parse_purl_install_cmd(purl: &str) -> Option<String> {
 /// We extract:
 /// - Binary names from the `bin:` section (indented key lines).
 /// - Install command from the first `id: pkg:` line under `source:`.
+/// - Package categories from the `categories:` section (e.g. LSP, DAP, Linter).
 pub fn parse_mason_package_yaml(yaml: &str) -> MasonPackageInfo {
     let mut binaries = Vec::new();
     let mut install_cmd = None;
+    let mut categories = Vec::new();
 
     let mut in_bin_section = false;
     let mut in_source_section = false;
+    let mut in_categories_section = false;
 
     for line in yaml.lines() {
         let trimmed = line.trim();
@@ -442,7 +463,18 @@ pub fn parse_mason_package_yaml(yaml: &str) -> MasonPackageInfo {
         if !line.starts_with(' ') && !line.starts_with('\t') {
             in_bin_section = trimmed == "bin:";
             in_source_section = trimmed == "source:";
+            in_categories_section = trimmed == "categories:";
             continue;
+        }
+
+        if in_categories_section {
+            // Lines like `  - LSP` or `  - DAP`
+            if let Some(rest) = trimmed.strip_prefix("- ") {
+                let cat = rest.trim().trim_matches('"').trim_matches('\'');
+                if !cat.is_empty() {
+                    categories.push(cat.to_string());
+                }
+            }
         }
 
         if in_bin_section {
@@ -468,6 +500,7 @@ pub fn parse_mason_package_yaml(yaml: &str) -> MasonPackageInfo {
     MasonPackageInfo {
         binaries,
         install_cmd,
+        categories,
     }
 }
 
@@ -1824,6 +1857,7 @@ bin:
             info.install_cmd,
             Some("npm install -g bash-language-server".to_string())
         );
+        assert_eq!(info.categories, vec!["LSP"]);
     }
 
     #[test]
@@ -1920,5 +1954,92 @@ bin:
         );
         assert_eq!(mason_package_for_language("rust"), None); // handled by built-in registry
         assert_eq!(mason_package_for_language("scala"), None); // PATH-only
+    }
+
+    // -----------------------------------------------------------------------
+    // Mason category parsing tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_mason_yaml_dap_category() {
+        let yaml = r#"
+name: codelldb
+description: LLDB-based debug adapter
+categories:
+  - DAP
+source:
+  id: pkg:github/vadimcn/codelldb
+bin:
+  codelldb: extension/adapter/codelldb
+"#;
+        let info = parse_mason_package_yaml(yaml);
+        assert_eq!(info.categories, vec!["DAP"]);
+        assert!(info.is_dap());
+        assert!(!info.is_lsp());
+        assert!(!info.is_linter());
+    }
+
+    #[test]
+    fn test_parse_mason_yaml_linter_category() {
+        let yaml = r#"
+name: pylint
+description: Python linter
+categories:
+  - Linter
+source:
+  id: pkg:pypi/pylint
+bin:
+  pylint: venv/bin/pylint
+"#;
+        let info = parse_mason_package_yaml(yaml);
+        assert_eq!(info.categories, vec!["Linter"]);
+        assert!(info.is_linter());
+        assert!(!info.is_dap());
+        assert!(!info.is_formatter());
+    }
+
+    #[test]
+    fn test_parse_mason_yaml_multi_category() {
+        let yaml = r#"
+name: black
+description: Python code formatter and linter
+categories:
+  - Linter
+  - Formatter
+source:
+  id: pkg:pypi/black
+bin:
+  black: venv/bin/black
+"#;
+        let info = parse_mason_package_yaml(yaml);
+        assert_eq!(info.categories, vec!["Linter", "Formatter"]);
+        assert!(info.is_linter());
+        assert!(info.is_formatter());
+        assert!(!info.is_dap());
+        assert!(!info.is_lsp());
+    }
+
+    #[test]
+    fn test_parse_mason_yaml_lsp_still_works() {
+        // Regression: adding categories field must not break existing LSP yaml parsing
+        let yaml = r#"
+name: rust-analyzer
+description: Rust language server
+categories:
+  - LSP
+source:
+  id: pkg:cargo/rust-analyzer
+bin:
+  rust-analyzer: rust-analyzer
+"#;
+        let info = parse_mason_package_yaml(yaml);
+        assert_eq!(info.binaries, vec!["rust-analyzer"]);
+        assert_eq!(
+            info.install_cmd,
+            Some("cargo install rust-analyzer".to_string())
+        );
+        assert_eq!(info.categories, vec!["LSP"]);
+        assert!(info.is_lsp());
+        assert!(!info.is_dap());
     }
 }

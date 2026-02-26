@@ -114,6 +114,12 @@ pub struct Settings {
     /// Default is Space (' '). Override in settings.json: { "leader": "\\" }
     #[serde(default = "default_leader")]
     pub leader: char,
+
+    /// Wrap long lines at the viewport width instead of scrolling horizontally.
+    /// When true, lines longer than the window width are wrapped to the next
+    /// visual row. Corresponds to Vim's `:set wrap` / `:set nowrap`.
+    #[serde(default)]
+    pub wrap: bool,
 }
 
 fn default_explorer_visible() -> bool {
@@ -382,6 +388,7 @@ impl Default for Settings {
             completion_keys: CompletionKeys::default(),
             editor_mode: EditorMode::Vim,
             leader: default_leader(),
+            wrap: false,
         }
     }
 }
@@ -498,9 +505,10 @@ impl Settings {
             EditorMode::Vim => "mode=vim",
             EditorMode::Vscode => "mode=vscode",
         };
+        let wrap = if self.wrap { "wrap" } else { "nowrap" };
         format!(
-            "{}  {}  ts={}  sw={}  {}  {}  {}  {}",
-            num, et, self.tabstop, self.shift_width, ai, is, lsp, mode
+            "{}  {}  ts={}  sw={}  {}  {}  {}  {}  {}",
+            num, et, self.tabstop, self.shift_width, ai, is, lsp, mode, wrap
         )
     }
 
@@ -536,6 +544,7 @@ impl Settings {
             "autoindent" | "ai" => self.auto_indent = enable,
             "incsearch" | "is" => self.incremental_search = enable,
             "lsp" => self.lsp_enabled = enable,
+            "wrap" => self.wrap = enable,
             _ => return Err(format!("Unknown option: {opt}")),
         }
         Ok(())
@@ -621,6 +630,11 @@ impl Settings {
                     EditorMode::Vscode => "vscode",
                 }
             )),
+            "wrap" => Ok(if self.wrap {
+                "wrap".to_string()
+            } else {
+                "nowrap".to_string()
+            }),
             _ => Err(format!("Unknown option: {opt}")),
         }
     }
@@ -914,6 +928,41 @@ mod tests {
         assert!(display.contains("sw=4"));
         assert!(display.contains("autoindent"));
         assert!(display.contains("incsearch"));
+    }
+
+    #[test]
+    fn test_settings_wrap_default_is_false() {
+        let s = Settings::default();
+        assert!(!s.wrap);
+    }
+
+    #[test]
+    fn test_settings_set_wrap() {
+        let mut s = Settings::default();
+        let msg = s.parse_set_option("wrap").unwrap();
+        assert_eq!(msg, "wrap");
+        assert!(s.wrap);
+        let msg = s.parse_set_option("nowrap").unwrap();
+        assert_eq!(msg, "nowrap");
+        assert!(!s.wrap);
+    }
+
+    #[test]
+    fn test_settings_query_wrap() {
+        let mut s = Settings::default();
+        let msg = s.parse_set_option("wrap?").unwrap();
+        assert_eq!(msg, "nowrap");
+        s.wrap = true;
+        let msg = s.parse_set_option("wrap?").unwrap();
+        assert_eq!(msg, "wrap");
+    }
+
+    #[test]
+    fn test_display_all_includes_wrap() {
+        let mut s = Settings::default();
+        assert!(s.display_all().contains("nowrap"));
+        s.wrap = true;
+        assert!(s.display_all().contains("wrap"));
     }
 
     // ── ExplorerKeys tests ──────────────────────────────────────────────────

@@ -76,6 +76,7 @@ enum TuiPanel {
     Explorer,
     Search,
     Settings,
+    Debug,
 }
 
 // ─── Sidebar data structures ──────────────────────────────────────────────────
@@ -517,7 +518,11 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
             } else {
                 0
             };
-            let content_rows = size.height.saturating_sub(3 + qf_rows + trm_rows); // tab + status + cmd + panels
+            let menu_row: u16 = if engine.menu_bar_visible { 1 } else { 0 };
+            let dbg_row: u16 = if engine.debug_toolbar_visible { 1 } else { 0 };
+            let content_rows = size
+                .height
+                .saturating_sub(3 + qf_rows + trm_rows + menu_row + dbg_row); // tab + status + cmd + panels
             let gutter_approx = 4u16;
             let sidebar_cols = if sidebar.visible {
                 sidebar_width + 1
@@ -630,6 +635,17 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
             }
             // Terminal: drain PTY output and refresh display if new data arrived.
             if engine.poll_terminal() {
+                needs_redraw = true;
+            }
+            // DAP: drain adapter events (breakpoint hits, stops, output)
+            if engine.poll_dap() {
+                needs_redraw = true;
+            }
+            // Auto-switch to Debug sidebar when a session starts.
+            if engine.dap_wants_sidebar {
+                engine.dap_wants_sidebar = false;
+                sidebar.active_panel = TuiPanel::Debug;
+                sidebar.visible = true;
                 needs_redraw = true;
             }
             continue;
@@ -1231,6 +1247,117 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                         }
                     }
 
+                    // Escape when menu dropdown is open: close it
+                    if matches!(key_event.code, KeyCode::Esc)
+                        && key_event.kind != KeyEventKind::Release
+                        && engine.menu_open_idx.is_some()
+                    {
+                        engine.close_menu();
+                        needs_redraw = true;
+                        continue;
+                    }
+
+                    // When menu dropdown is open: Left/Right/Up/Down/Enter navigate menus
+                    if engine.menu_open_idx.is_some() && key_event.kind != KeyEventKind::Release {
+                        match key_event.code {
+                            KeyCode::Left => {
+                                if let Some(idx) = engine.menu_open_idx {
+                                    if idx > 0 {
+                                        engine.open_menu(idx - 1);
+                                    } else {
+                                        engine.open_menu(render::MENU_STRUCTURE.len() - 1);
+                                    }
+                                }
+                                needs_redraw = true;
+                                continue;
+                            }
+                            KeyCode::Right => {
+                                if let Some(idx) = engine.menu_open_idx {
+                                    engine.open_menu((idx + 1) % render::MENU_STRUCTURE.len());
+                                }
+                                needs_redraw = true;
+                                continue;
+                            }
+                            KeyCode::Down => {
+                                if let Some(open_idx) = engine.menu_open_idx {
+                                    if let Some((_, _, items)) =
+                                        render::MENU_STRUCTURE.get(open_idx)
+                                    {
+                                        let seps: Vec<bool> =
+                                            items.iter().map(|i| i.separator).collect();
+                                        engine.menu_move_selection(1, &seps);
+                                    }
+                                }
+                                needs_redraw = true;
+                                continue;
+                            }
+                            KeyCode::Up => {
+                                if let Some(open_idx) = engine.menu_open_idx {
+                                    if let Some((_, _, items)) =
+                                        render::MENU_STRUCTURE.get(open_idx)
+                                    {
+                                        let seps: Vec<bool> =
+                                            items.iter().map(|i| i.separator).collect();
+                                        engine.menu_move_selection(-1, &seps);
+                                    }
+                                }
+                                needs_redraw = true;
+                                continue;
+                            }
+                            KeyCode::Enter => {
+                                if let Some((menu_idx, item_idx)) =
+                                    engine.menu_activate_highlighted()
+                                {
+                                    if let Some((_, _, items)) =
+                                        render::MENU_STRUCTURE.get(menu_idx)
+                                    {
+                                        if let Some(item) = items.get(item_idx) {
+                                            let action = item.action.to_string();
+                                            let act = engine
+                                                .menu_activate_item(menu_idx, item_idx, &action);
+                                            if act == EngineAction::OpenTerminal {
+                                                let cols = terminal
+                                                    .size()
+                                                    .ok()
+                                                    .map(|s| s.width)
+                                                    .unwrap_or(80);
+                                                engine.terminal_new_tab(
+                                                    cols,
+                                                    engine.session.terminal_panel_rows,
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                needs_redraw = true;
+                                continue;
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    // Alt+letter: open menu (only when menu bar visible)
+                    if key_event.modifiers.contains(KeyModifiers::ALT)
+                        && key_event.kind != KeyEventKind::Release
+                        && engine.menu_bar_visible
+                    {
+                        if let KeyCode::Char(ch) = key_event.code {
+                            let ch_lower = ch.to_ascii_lowercase();
+                            let menu_idx = render::MENU_STRUCTURE
+                                .iter()
+                                .position(|(_, alt_key, _)| *alt_key == ch_lower);
+                            if let Some(idx) = menu_idx {
+                                if engine.menu_open_idx == Some(idx) {
+                                    engine.close_menu();
+                                } else {
+                                    engine.open_menu(idx);
+                                }
+                                needs_redraw = true;
+                                continue;
+                            }
+                        }
+                    }
+
                     // Alt+Left/Right: resize sidebar
                     if key_event.modifiers.contains(KeyModifiers::ALT)
                         && key_event.kind != KeyEventKind::Release
@@ -1266,6 +1393,25 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                             }
                         }
                         // Fall through to handle_key which calls vscode_paste().
+                    }
+
+                    // Shift+F5 → stop, Shift+F11 → stepout (debug shortcuts)
+                    if key_event.modifiers.contains(KeyModifiers::SHIFT)
+                        && key_event.kind != KeyEventKind::Release
+                    {
+                        match key_event.code {
+                            KeyCode::F(5) => {
+                                let _ = engine.execute_command("stop");
+                                needs_redraw = true;
+                                continue;
+                            }
+                            KeyCode::F(11) => {
+                                let _ = engine.execute_command("stepout");
+                                needs_redraw = true;
+                                continue;
+                            }
+                            _ => {}
+                        }
                     }
 
                     // clipboard=unnamedplus: intercept p/P to read from system clipboard.
@@ -1701,7 +1847,8 @@ fn handle_mouse(
 
             if col >= editor_left && row + 2 < term_height {
                 let rel_col = col - editor_left;
-                let editor_row = row.saturating_sub(1);
+                let scroll_menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
+                let editor_row = row.saturating_sub(1 + scroll_menu_rows);
                 // Find which window the mouse is over; scroll that window
                 let scrolled = last_layout.and_then(|layout| {
                     layout.windows.iter().find(|rw| {
@@ -1752,6 +1899,85 @@ fn handle_mouse(
     // Bottom 2 rows are status + cmd — ignore
     if row + 2 >= term_height {
         return sidebar_width;
+    }
+
+    // ── Menu bar row click ─────────────────────────────────────────────────────
+    if engine.menu_bar_visible && row == 0 {
+        let mut col_pos: u16 = 1; // 1-cell left pad
+        for (idx, (name, _, _)) in render::MENU_STRUCTURE.iter().enumerate() {
+            let item_w = name.chars().count() as u16 + 2; // space + name + space
+            if col >= col_pos && col < col_pos + item_w {
+                if engine.menu_open_idx == Some(idx) {
+                    engine.close_menu();
+                } else {
+                    engine.open_menu(idx);
+                }
+                return sidebar_width;
+            }
+            col_pos += item_w;
+        }
+        engine.close_menu(); // click in empty area of menu bar
+        return sidebar_width;
+    }
+
+    // ── Menu dropdown item click ───────────────────────────────────────────────
+    if let Some(open_idx) = engine.menu_open_idx {
+        if let Some((_, _, items)) = render::MENU_STRUCTURE.get(open_idx) {
+            // Determine the dropdown anchor column (same formula as render_menu_dropdown)
+            let mut popup_col: u16 = 1;
+            for i in 0..open_idx {
+                if let Some((name, _, _)) = render::MENU_STRUCTURE.get(i) {
+                    popup_col += name.chars().count() as u16 + 2;
+                }
+            }
+            let max_label = items.iter().map(|i| i.label.len()).max().unwrap_or(4);
+            let max_shortcut = items.iter().map(|i| i.shortcut.len()).max().unwrap_or(0);
+            let popup_width = (max_label + max_shortcut + 6).clamp(20, 50) as u16;
+            let popup_x = popup_col.min(term_height.saturating_sub(popup_width));
+            // Dropdown rows: border(1) + items
+            let menu_bar_row: u16 = if engine.menu_bar_visible { 1 } else { 0 };
+            let popup_y = menu_bar_row; // dropdown starts below menu bar
+            if row > popup_y && col >= popup_x && col < popup_x + popup_width {
+                let item_idx = (row - popup_y - 1) as usize;
+                if item_idx < items.len() && !items[item_idx].separator && items[item_idx].enabled {
+                    let action = items[item_idx].action.to_string();
+                    let act = engine.menu_activate_item(open_idx, item_idx, &action);
+                    if act == EngineAction::OpenTerminal {
+                        let cols = terminal_size.map(|s| s.width).unwrap_or(80);
+                        engine.terminal_new_tab(cols, engine.session.terminal_panel_rows);
+                    }
+                }
+                return sidebar_width;
+            }
+            // Click outside dropdown — close it
+            engine.close_menu();
+        }
+    }
+
+    // ── Debug toolbar row click ────────────────────────────────────────────────
+    if engine.debug_toolbar_visible {
+        let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
+        let strip_rows: u16 = if engine.terminal_open {
+            engine.session.terminal_panel_rows + 1
+        } else {
+            0
+        };
+        let toolbar_row = term_height.saturating_sub(3 + qf_rows + strip_rows);
+        if row == toolbar_row {
+            let mut col_pos: u16 = 1;
+            for (idx, btn) in render::DEBUG_BUTTONS.iter().enumerate() {
+                if idx == 4 {
+                    col_pos += 2; // separator gap
+                }
+                let btn_w = (btn.icon.chars().count() + btn.key_hint.chars().count() + 4) as u16;
+                if col >= col_pos && col < col_pos + btn_w {
+                    let _ = engine.execute_command(btn.action);
+                    return sidebar_width;
+                }
+                col_pos += btn_w;
+            }
+            return sidebar_width; // click in toolbar row, consume event
+        }
     }
 
     // ── Terminal panel click ───────────────────────────────────────────────────
@@ -1847,19 +2073,34 @@ fn handle_mouse(
 
     // ── Activity bar ──────────────────────────────────────────────────────────
     if col < ACTIVITY_BAR_WIDTH {
-        // Activity bar height = term_height - 2 (status+cmd) - quickfix
+        // Activity bar is in the main content area, below the menu bar row (if visible)
+        // and above the debug toolbar row (if visible).
         let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
         let strip_rows: u16 = if engine.terminal_open {
             engine.session.terminal_panel_rows + 1
         } else {
             0
         };
-        let bar_height = term_height.saturating_sub(2 + qf_rows + strip_rows);
+        let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
+        let dbg_rows: u16 = if engine.debug_toolbar_visible { 1 } else { 0 };
+        // Activity bar starts at row `menu_rows` in absolute terminal coordinates.
+        if row < menu_rows {
+            return sidebar_width; // click in menu bar area, ignore
+        }
+        let bar_row = row - menu_rows; // row relative to activity bar start
+        let bar_height =
+            term_height.saturating_sub(2 + qf_rows + strip_rows + menu_rows + dbg_rows);
         let settings_row = bar_height.saturating_sub(1);
-        let target_panel = match row {
-            0 => Some(TuiPanel::Explorer),
-            1 => Some(TuiPanel::Search),
-            r if r == settings_row && settings_row >= 2 => Some(TuiPanel::Settings),
+        // Row 0: hamburger (menu bar toggle)
+        if bar_row == 0 {
+            engine.toggle_menu_bar();
+            return sidebar_width;
+        }
+        let target_panel = match bar_row {
+            1 => Some(TuiPanel::Explorer),
+            2 => Some(TuiPanel::Search),
+            3 => Some(TuiPanel::Debug),
+            r if r == settings_row && settings_row >= 4 => Some(TuiPanel::Settings),
             _ => None,
         };
         if let Some(panel) = target_panel {
@@ -1883,6 +2124,10 @@ fn handle_mouse(
     if sidebar.visible && col < ACTIVITY_BAR_WIDTH + sidebar_width {
         // Rightmost column of the sidebar is the scrollbar column.
         let sb_col = ACTIVITY_BAR_WIDTH + sidebar_width - 1;
+        // Account for menu bar: when visible it occupies absolute row 0, so the
+        // sidebar's logical row 0 is at absolute terminal row `menu_rows`.
+        let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
+        let sidebar_row = row.saturating_sub(menu_rows);
 
         if sidebar.active_panel == TuiPanel::Explorer {
             // tree_height = (total height - 2 status rows) - 1 header row
@@ -1890,15 +2135,15 @@ fn handle_mouse(
             let total_rows = sidebar.rows.len();
 
             // Click on the scrollbar column → jump-scroll
-            if col == sb_col && total_rows > tree_height && row >= 1 {
-                let rel_row = row.saturating_sub(1) as usize;
+            if col == sb_col && total_rows > tree_height && sidebar_row >= 1 {
+                let rel_row = sidebar_row.saturating_sub(1) as usize;
                 let ratio = rel_row as f64 / tree_height as f64;
                 let new_top = (ratio * total_rows as f64) as usize;
                 sidebar.scroll_top = new_top.min(total_rows.saturating_sub(tree_height));
                 return sidebar_width;
             }
 
-            if row == 0 {
+            if sidebar_row == 0 {
                 // Header row: check if a toolbar button was clicked.
                 // Toolbar is right-aligned: 5 NF icons × 3 cols = 15.
                 let toolbar_start = ACTIVITY_BAR_WIDTH + sidebar_width - EXPLORER_TOOLBAR_LEN;
@@ -1950,7 +2195,7 @@ fn handle_mouse(
                 }
                 return sidebar_width;
             }
-            let tree_row = (row as usize).saturating_sub(1) + sidebar.scroll_top;
+            let tree_row = (sidebar_row as usize).saturating_sub(1) + sidebar.scroll_top;
             if tree_row < sidebar.rows.len() {
                 if sidebar.rows[tree_row].is_dir {
                     sidebar.selected = tree_row;
@@ -1961,13 +2206,25 @@ fn handle_mouse(
                     engine.open_file_in_tab(&path);
                 }
             }
+        } else if sidebar.active_panel == TuiPanel::Debug {
+            // sidebar_row 1 is the Run/Stop button.
+            if sidebar_row == 1 {
+                if engine.dap_session_active && engine.dap_stopped_thread.is_some() {
+                    engine.dap_continue();
+                } else if engine.dap_session_active {
+                    engine.execute_command("stop");
+                } else {
+                    engine.execute_command("debug");
+                }
+            }
+            return sidebar_width;
         } else if sidebar.active_panel == TuiPanel::Search {
             // results_height = (total height - 2 status rows) - 5 panel header rows
             let results_height = term_height.saturating_sub(7) as usize;
             let results = &engine.project_search_results;
 
             // Click on the scrollbar column in the results area → jump-scroll
-            if col == sb_col && !results.is_empty() && row >= 5 {
+            if col == sb_col && !results.is_empty() && sidebar_row >= 5 {
                 // Count total display rows (result rows + file header rows)
                 let total_display = {
                     let mut count = 0usize;
@@ -1982,14 +2239,15 @@ fn handle_mouse(
                     count
                 };
                 if total_display > results_height {
-                    let rel_row = row.saturating_sub(5) as usize;
+                    let rel_row = sidebar_row.saturating_sub(5) as usize;
                     let ratio = rel_row as f64 / results_height as f64;
                     let new_scroll = (ratio * total_display as f64) as usize;
                     sidebar.search_scroll_top =
                         new_scroll.min(total_display.saturating_sub(results_height));
-                    // Arm drag state so subsequent Drag events continue scrolling
+                    // Arm drag state so subsequent Drag events continue scrolling.
+                    // track_abs_start is the absolute terminal row of the track top.
                     *dragging_sidebar_search = Some(SidebarScrollDrag {
-                        track_abs_start: 5,
+                        track_abs_start: 5 + menu_rows,
                         track_len: results_height as u16,
                         total: total_display,
                     });
@@ -1997,16 +2255,17 @@ fn handle_mouse(
                 return sidebar_width;
             }
 
-            // Rows 0-2: header + search + replace inputs — clicking enters input mode
-            if row <= 2 {
+            // sidebar_rows 0-2: header + search + replace inputs — clicking enters input mode
+            if sidebar_row <= 2 {
                 sidebar.search_input_mode = true;
-                sidebar.replace_input_focused = row == 2;
+                sidebar.replace_input_focused = sidebar_row == 2;
             } else {
                 sidebar.search_input_mode = false;
                 sidebar.replace_input_focused = false;
-                // row 3 = toggles, row 4 = status line; rows 5+ = results area
+                // sidebar_row 3 = toggles, 4 = status line; 5+ = results area
                 // Add scroll offset so clicks map to the correct result.
-                let content_row = (row as usize).saturating_sub(5) + sidebar.search_scroll_top;
+                let content_row =
+                    (sidebar_row as usize).saturating_sub(5) + sidebar.search_scroll_top;
                 if !results.is_empty() {
                     let selected = visual_row_to_result_idx(results, content_row);
                     if let Some(idx) = selected {
@@ -2036,8 +2295,12 @@ fn handle_mouse(
         return sidebar_width; // separator column
     }
 
-    // ── Tab bar click (row 0 of editor column) ──────────────────────────
-    if row == 0 {
+    // The menu bar (if visible) occupies absolute row 0, pushing the tab bar
+    // and editor content down by `menu_rows`.
+    let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
+
+    // ── Tab bar click (first row of editor column, below menu bar) ──────────
+    if row == menu_rows {
         if let Some(layout) = last_layout {
             let rel_col = col - editor_left;
             let mut x: u16 = 0;
@@ -2060,7 +2323,9 @@ fn handle_mouse(
     }
 
     let rel_col = col - editor_left;
-    let editor_row = row.saturating_sub(1); // subtract tab bar row
+    // Subtract tab bar row (1) and menu bar rows so editor_row is 0-indexed
+    // relative to the editor content area (matching window rect y coords).
+    let editor_row = row.saturating_sub(1 + menu_rows);
 
     if let Some(layout) = last_layout {
         for rw in &layout.windows {
@@ -2079,8 +2344,8 @@ fn handle_mouse(
 
                 // Vertical scrollbar click/drag-start (rightmost column)
                 if has_v_scrollbar && rel_col == wx + ww - 1 {
-                    // row 1 = tab bar offset; wy = window top in editor area
-                    let track_abs_start = 1 + wy;
+                    // 1 = tab bar row, menu_rows = menu bar offset; wy = window top in editor area
+                    let track_abs_start = 1 + menu_rows + wy;
                     // If there's also a h-scrollbar, v-track is 1 row shorter
                     let track_len = if has_h_scrollbar {
                         wh.saturating_sub(1)
@@ -2126,12 +2391,26 @@ fn handle_mouse(
                 // Check gutter area
                 let view_row = (editor_row - wy) as usize;
                 if gutter > 0 && rel_col >= wx && rel_col < wx + gutter {
-                    // Any click in gutter toggles fold if there's a fold indicator
                     if let Some(rl) = rw.lines.get(view_row) {
-                        let has_fold_indicator =
-                            rl.gutter_text.chars().any(|c| c == '+' || c == '-');
-                        if has_fold_indicator {
-                            engine.toggle_fold_at_line(rl.line_idx);
+                        // If the breakpoint column is visible and the click
+                        // landed in its cell (always the leftmost gutter col),
+                        // toggle the breakpoint instead of the fold.
+                        if rw.has_breakpoints && rel_col == wx {
+                            let file = engine
+                                .windows
+                                .get(&rw.window_id)
+                                .and_then(|w| engine.buffer_manager.get(w.buffer_id))
+                                .and_then(|bs| bs.file_path.as_ref())
+                                .map(|p| p.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            let bp_line = rl.line_idx as u64 + 1;
+                            engine.dap_toggle_breakpoint(&file, bp_line);
+                        } else {
+                            let has_fold_indicator =
+                                rl.gutter_text.chars().any(|c| c == '+' || c == '-');
+                            if has_fold_indicator {
+                                engine.toggle_fold_at_line(rl.line_idx);
+                            }
                         }
                     }
                     return sidebar_width;
@@ -2180,12 +2459,16 @@ fn build_screen_for_tui(
     // Global bottom rows: status(1) + cmd(1); editor column top: tab(1)
     // Also subtract quickfix and terminal panels so window rects don't extend into them.
     let qf_height: u16 = if engine.quickfix_open { 6 } else { 0 };
-    let term_height: u16 = if engine.terminal_open {
+    let term_height: u16 = if engine.terminal_open || engine.bottom_panel_open {
         engine.session.terminal_panel_rows + 1
     } else {
         0
     };
-    let content_rows = area.height.saturating_sub(3 + qf_height + term_height); // tab + status + cmd + panels
+    let menu_height: u16 = if engine.menu_bar_visible { 1 } else { 0 };
+    let dbg_height: u16 = if engine.debug_toolbar_visible { 1 } else { 0 };
+    let content_rows = area
+        .height
+        .saturating_sub(3 + qf_height + term_height + menu_height + dbg_height); // tab + status + cmd + panels
     let sidebar_cols = if sidebar.visible {
         sidebar_width + 1
     } else {
@@ -2214,28 +2497,41 @@ fn draw_frame(
 ) {
     let area = frame.size();
 
-    // ── Global vertical split: [main_area] / [quickfix?] / [terminal?] / [status(1)] / [cmd(1)] ──
+    // ── Global vertical split: [menu] / [main] / [qf?] / [tabs?] / [term?] / [dbg?] / [status] / [cmd] ──
     let qf_height: u16 = if screen.quickfix.is_some() { 6 } else { 0 };
-    let terminal_height: u16 = if screen.terminal.is_some() {
-        engine.session.terminal_panel_rows + 1
+    let terminal_open = screen.bottom_tabs.terminal.is_some();
+    // Show the bottom panel when terminal is open OR when Debug Output tab is
+    // active and there are lines to display (DAP diagnostic output).
+    let debug_output_open = engine.bottom_panel_kind == render::BottomPanelKind::DebugOutput
+        && !screen.bottom_tabs.output_lines.is_empty();
+    let bottom_panel_open = terminal_open || debug_output_open;
+    // 1 tab bar row + 1 header row + content rows
+    let bottom_panel_height: u16 = if bottom_panel_open {
+        engine.session.terminal_panel_rows + 2
     } else {
         0
     };
+    let menu_bar_height: u16 = if screen.menu_bar.is_some() { 1 } else { 0 };
+    let debug_toolbar_height: u16 = if screen.debug_toolbar.is_some() { 1 } else { 0 };
     let v_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(menu_bar_height),
             Constraint::Min(0),
             Constraint::Length(qf_height),
-            Constraint::Length(terminal_height),
+            Constraint::Length(bottom_panel_height),
+            Constraint::Length(debug_toolbar_height),
             Constraint::Length(1),
             Constraint::Length(1),
         ])
         .split(area);
-    let main_area = v_chunks[0];
-    let quickfix_area = v_chunks[1];
-    let terminal_area = v_chunks[2];
-    let status_area = v_chunks[3];
-    let cmd_area = v_chunks[4];
+    let menu_bar_area = v_chunks[0];
+    let main_area = v_chunks[1];
+    let quickfix_area = v_chunks[2];
+    let bottom_panel_area = v_chunks[3];
+    let debug_toolbar_area = v_chunks[4];
+    let status_area = v_chunks[5];
+    let cmd_area = v_chunks[6];
 
     // ── Horizontal split of main_area: [activity_bar] [sidebar?] [editor_col] ─
     let sidebar_constraint = if sidebar.visible {
@@ -2263,8 +2559,20 @@ fn draw_frame(
     let tab_area = ec_chunks[0];
     let editor_area = ec_chunks[1];
 
+    // ── Render menu bar strip (if visible) ───────────────────────────────────
+    if let Some(ref menu_data) = screen.menu_bar {
+        render_menu_bar(frame.buffer_mut(), menu_bar_area, menu_data, theme);
+        // Note: dropdown is rendered LAST (after all content) so it draws on top.
+    }
+
     // ── Render activity bar ───────────────────────────────────────────────────
-    render_activity_bar(frame.buffer_mut(), activity_area, sidebar, theme);
+    render_activity_bar(
+        frame.buffer_mut(),
+        activity_area,
+        sidebar,
+        theme,
+        engine.menu_bar_visible,
+    );
 
     // ── Render sidebar + separator ────────────────────────────────────────────
     if sidebar.visible && sidebar_sep_area.width > 1 {
@@ -2367,9 +2675,47 @@ fn draw_frame(
         );
     }
 
-    // ── Terminal panel (persistent bottom strip below quickfix) ──────────────
-    if let Some(ref term) = screen.terminal {
-        render_terminal_panel(frame.buffer_mut(), terminal_area, term, theme);
+    // ── Bottom panel (tab bar + terminal or debug output) ────────────────────
+    if bottom_panel_area.height > 0 {
+        // Tab bar (first row)
+        let tab_bar_area = Rect {
+            x: bottom_panel_area.x,
+            y: bottom_panel_area.y,
+            width: bottom_panel_area.width,
+            height: 1,
+        };
+        let content_area = Rect {
+            x: bottom_panel_area.x,
+            y: bottom_panel_area.y + 1,
+            width: bottom_panel_area.width,
+            height: bottom_panel_area.height.saturating_sub(1),
+        };
+        render_bottom_panel_tabs(
+            frame.buffer_mut(),
+            tab_bar_area,
+            engine.bottom_panel_kind.clone(),
+            theme,
+        );
+        match engine.bottom_panel_kind {
+            render::BottomPanelKind::Terminal => {
+                if let Some(ref term) = screen.bottom_tabs.terminal {
+                    render_terminal_panel(frame.buffer_mut(), content_area, term, theme);
+                }
+            }
+            render::BottomPanelKind::DebugOutput => {
+                render_debug_output(
+                    frame.buffer_mut(),
+                    content_area,
+                    &screen.bottom_tabs.output_lines,
+                    theme,
+                );
+            }
+        }
+    }
+
+    // ── Debug toolbar strip (if visible) ────────────────────────────────────
+    if let Some(ref toolbar) = screen.debug_toolbar {
+        render_debug_toolbar(frame.buffer_mut(), debug_toolbar_area, toolbar, theme);
     }
 
     // ── Status / command ──────────────────────────────────────────────────────
@@ -2413,6 +2759,13 @@ fn draw_frame(
         );
     } else {
         render_command_line(frame.buffer_mut(), cmd_area, &screen.command, theme);
+    }
+
+    // ── Menu dropdown — rendered last so it draws on top of everything ────────
+    if let Some(ref menu_data) = screen.menu_bar {
+        if menu_data.open_menu_idx.is_some() {
+            render_menu_dropdown(frame.buffer_mut(), area, menu_data, theme);
+        }
     }
 }
 
@@ -3164,11 +3517,15 @@ fn render_window(frame: &mut ratatui::Frame, area: Rect, window: &RenderedWindow
             break;
         }
 
-        // Diff background: repaint the full row when the line is part of a diff
-        let line_bg = match line.diff_status {
-            Some(DiffLine::Added) => rc(theme.diff_added_bg),
-            Some(DiffLine::Removed) => rc(theme.diff_removed_bg),
-            _ => window_bg,
+        // Diff / DAP stopped-line background.
+        let line_bg = if line.is_dap_current {
+            rc(theme.dap_stopped_bg)
+        } else {
+            match line.diff_status {
+                Some(DiffLine::Added) => rc(theme.diff_added_bg),
+                Some(DiffLine::Removed) => rc(theme.diff_removed_bg),
+                _ => window_bg,
+            }
         };
         if line_bg != window_bg {
             for col in 0..area.width {
@@ -3190,18 +3547,35 @@ fn render_window(frame: &mut ratatui::Frame, area: Rect, window: &RenderedWindow
             } else {
                 theme.line_number_fg
             });
+            // The bp column offset: 1 when has_breakpoints, else 0.
+            // The git column offset: bp_offset + 1 when has_git_diff, else bp_offset.
+            let bp_offset = if window.has_breakpoints { 1 } else { 0 };
+            let git_offset = if window.has_git_diff {
+                bp_offset + 1
+            } else {
+                bp_offset
+            };
             for (i, ch) in line.gutter_text.chars().enumerate() {
                 let gx = area.x + i as u16;
                 if gx >= area.x + gutter_w {
                     break;
                 }
-                let fg = if window.has_git_diff && i == 0 {
+                let fg = if window.has_breakpoints && i == 0 {
+                    // Breakpoint column: red when active, dimmed otherwise.
+                    if line.is_dap_current || line.is_breakpoint {
+                        rc(theme.diagnostic_error)
+                    } else {
+                        line_num_fg
+                    }
+                } else if window.has_git_diff && i == bp_offset {
+                    // Git column.
                     rc(match line.git_diff {
                         Some(GitLineStatus::Added) => theme.git_added,
                         Some(GitLineStatus::Modified) => theme.git_modified,
                         None => theme.line_number_fg,
                     })
                 } else {
+                    let _ = git_offset; // suppress unused-variable warning
                     line_num_fg
                 };
                 set_cell(frame.buffer_mut(), gx, screen_y, ch, fg, line_bg);
@@ -3596,11 +3970,262 @@ fn render_separators(
 
 // ─── Activity bar ─────────────────────────────────────────────────────────────
 
+// ─── Menu bar rendering ───────────────────────────────────────────────────────────────────
+
+fn render_menu_bar(
+    buf: &mut ratatui::buffer::Buffer,
+    area: Rect,
+    data: &render::MenuBarData,
+    theme: &Theme,
+) {
+    if area.height == 0 {
+        return;
+    }
+    let bar_bg = rc(theme.status_bg);
+    let bar_fg = rc(theme.status_fg);
+    let y = area.y;
+
+    // Fill background
+    for x in area.x..area.x + area.width {
+        set_cell(buf, x, y, ' ', bar_fg, bar_bg);
+    }
+
+    // Menu labels (no hamburger here — it lives in the activity bar below)
+    let mut col = area.x + 1; // one-cell left pad
+
+    for (idx, (name, _, _)) in render::MENU_STRUCTURE.iter().enumerate() {
+        let is_open = data.open_menu_idx == Some(idx);
+        let (fg, bg) = if is_open {
+            (bar_bg, bar_fg) // reversed for open
+        } else {
+            (bar_fg, bar_bg)
+        };
+        // Space before name
+        if col < area.x + area.width {
+            set_cell(buf, col, y, ' ', bar_fg, bar_bg);
+            col += 1;
+        }
+        // Name chars
+        for ch in name.chars() {
+            if col >= area.x + area.width {
+                break;
+            }
+            set_cell(buf, col, y, ch, fg, bg);
+            col += 1;
+        }
+        // Space after name
+        if col < area.x + area.width {
+            set_cell(buf, col, y, ' ', fg, bar_bg);
+            col += 1;
+        }
+    }
+}
+
+fn render_menu_dropdown(
+    buf: &mut ratatui::buffer::Buffer,
+    full_area: Rect,
+    data: &render::MenuBarData,
+    theme: &Theme,
+) {
+    let Some(midx) = data.open_menu_idx else {
+        return;
+    };
+    if data.open_items.is_empty() {
+        return;
+    }
+
+    let popup_bg = rc(theme.tab_bar_bg);
+    let popup_fg = rc(theme.foreground);
+    let sep_fg = rc(theme.line_number_fg);
+    let shortcut_fg = rc(theme.line_number_fg);
+
+    let total_rows = data.open_items.len() as u16 + 2; // border top/bottom
+    let max_label = data
+        .open_items
+        .iter()
+        .map(|i| i.label.len())
+        .max()
+        .unwrap_or(4);
+    let max_shortcut = data
+        .open_items
+        .iter()
+        .map(|i| i.shortcut.len())
+        .max()
+        .unwrap_or(0);
+    let popup_width = (max_label + max_shortcut + 6).clamp(20, 50) as u16;
+    let anchor_col = data.open_menu_col + full_area.x;
+    let popup_x = anchor_col.min(full_area.x + full_area.width.saturating_sub(popup_width));
+    // Dropdown appears just below the menu bar row (y=1)
+    let popup_y = full_area.y + 1;
+    let popup_height = total_rows.min(full_area.height.saturating_sub(popup_y));
+
+    // Draw border + background
+    for dy in 0..popup_height {
+        for dx in 0..popup_width {
+            let x = popup_x + dx;
+            let y = popup_y + dy;
+            if x >= full_area.x + full_area.width || y >= full_area.y + full_area.height {
+                continue;
+            }
+            let ch = if dy == 0 {
+                if dx == 0 {
+                    '\u{250c}'
+                } else if dx == popup_width - 1 {
+                    '\u{2510}'
+                } else {
+                    '\u{2500}'
+                }
+            } else if dy == popup_height - 1 {
+                if dx == 0 {
+                    '\u{2514}'
+                } else if dx == popup_width - 1 {
+                    '\u{2518}'
+                } else {
+                    '\u{2500}'
+                }
+            } else if dx == 0 || dx == popup_width - 1 {
+                '\u{2502}'
+            } else {
+                ' '
+            };
+            set_cell(buf, x, y, ch, popup_fg, popup_bg);
+        }
+    }
+
+    // Draw items
+    let mut row: u16 = popup_y + 1;
+    for (item_idx, item) in data.open_items.iter().enumerate() {
+        if row >= popup_y + popup_height - 1 {
+            break;
+        }
+        let is_highlighted = data.highlighted_item_idx == Some(item_idx);
+        let (item_fg, item_bg) = if is_highlighted {
+            (popup_bg, popup_fg) // invert for highlighted row
+        } else {
+            (popup_fg, popup_bg)
+        };
+        if item.separator {
+            // Separator line (never highlighted)
+            for dx in 1..popup_width - 1 {
+                let x = popup_x + dx;
+                if x < full_area.x + full_area.width {
+                    set_cell(buf, x, row, '\u{2500}', sep_fg, popup_bg);
+                }
+            }
+        } else {
+            // Fill highlighted row background
+            if is_highlighted {
+                for dx in 1..popup_width - 1 {
+                    let x = popup_x + dx;
+                    if x < full_area.x + full_area.width {
+                        set_cell(buf, x, row, ' ', item_fg, item_bg);
+                    }
+                }
+            }
+            // Label
+            let label_x = popup_x + 2;
+            for (i, ch) in item.label.chars().enumerate() {
+                let x = label_x + i as u16;
+                if x >= popup_x + popup_width - 1 {
+                    break;
+                }
+                set_cell(buf, x, row, ch, item_fg, item_bg);
+            }
+            // Right-aligned shortcut
+            if !item.shortcut.is_empty() {
+                let sc_fg = if is_highlighted { item_fg } else { shortcut_fg };
+                let sc_len = item.shortcut.len() as u16;
+                let sc_x = popup_x + popup_width - 1 - sc_len - 1;
+                for (i, ch) in item.shortcut.chars().enumerate() {
+                    let x = sc_x + i as u16;
+                    if x < full_area.x + full_area.width {
+                        set_cell(buf, x, row, ch, sc_fg, item_bg);
+                    }
+                }
+            }
+        }
+        row += 1;
+    }
+    let _ = midx; // suppress unused warning
+}
+
+// ─── Debug toolbar rendering ────────────────────────────────────────────────────────────
+
+fn render_debug_toolbar(
+    buf: &mut ratatui::buffer::Buffer,
+    area: Rect,
+    toolbar: &render::DebugToolbarData,
+    theme: &Theme,
+) {
+    if area.height == 0 {
+        return;
+    }
+    let bar_bg = rc(theme.status_bg);
+    let bar_fg = rc(theme.status_fg);
+    let dim_fg = rc(theme.line_number_fg);
+    let y = area.y;
+
+    // Fill background
+    for x in area.x..area.x + area.width {
+        set_cell(buf, x, y, ' ', bar_fg, bar_bg);
+    }
+
+    let mut col = area.x + 1;
+    for (idx, btn) in toolbar.buttons.iter().enumerate() {
+        // Separator between index 3 and 4
+        if idx == 4 {
+            if col < area.x + area.width {
+                set_cell(buf, col, y, '\u{2502}', dim_fg, bar_bg);
+                col += 1;
+            }
+            if col < area.x + area.width {
+                set_cell(buf, col, y, ' ', bar_fg, bar_bg);
+                col += 1;
+            }
+        }
+        let fg = if toolbar.session_active {
+            bar_fg
+        } else {
+            dim_fg
+        };
+        // Icon
+        for ch in btn.icon.chars() {
+            if col >= area.x + area.width {
+                break;
+            }
+            set_cell(buf, col, y, ch, fg, bar_bg);
+            col += 1;
+        }
+        // Key hint in parens
+        if col < area.x + area.width {
+            set_cell(buf, col, y, '(', dim_fg, bar_bg);
+            col += 1;
+        }
+        for ch in btn.key_hint.chars() {
+            if col >= area.x + area.width {
+                break;
+            }
+            set_cell(buf, col, y, ch, dim_fg, bar_bg);
+            col += 1;
+        }
+        if col < area.x + area.width {
+            set_cell(buf, col, y, ')', dim_fg, bar_bg);
+            col += 1;
+        }
+        // Space separator
+        if col < area.x + area.width {
+            set_cell(buf, col, y, ' ', bar_fg, bar_bg);
+            col += 1;
+        }
+    }
+}
+
 fn render_activity_bar(
     buf: &mut ratatui::buffer::Buffer,
     area: Rect,
     sidebar: &TuiSidebar,
     theme: &Theme,
+    menu_bar_visible: bool,
 ) {
     let bar_bg = rc(theme.tab_bar_bg);
     let active_bg = rc(theme.status_bg);
@@ -3614,10 +4239,27 @@ fn render_activity_bar(
         }
     }
 
-    // Top buttons: Explorer and Search
+    // Row 0: Hamburger icon (menu bar toggle)
+    if area.height >= 1 {
+        let y = area.y;
+        let (fg, bg) = if menu_bar_visible {
+            (icon_fg, active_bg)
+        } else {
+            (inactive_fg, bar_bg)
+        };
+        for x in area.x..area.x + area.width {
+            set_cell(buf, x, y, ' ', fg, bg);
+        }
+        if area.width >= 3 {
+            set_cell(buf, area.x + 1, y, '\u{f035c}', fg, bg); // hamburger
+        }
+    }
+
+    // Top buttons: Explorer (row 1), Search (row 2), Debug (row 3)
     let top_buttons: &[(u16, TuiPanel, char)] = &[
-        (0, TuiPanel::Explorer, '\u{f07c}'), // nf-fa-folder_open
-        (1, TuiPanel::Search, '\u{f002}'),   // nf-fa-search
+        (1, TuiPanel::Explorer, '\u{f07c}'), // nf-fa-folder_open
+        (2, TuiPanel::Search, '\u{f002}'),   // nf-fa-search
+        (3, TuiPanel::Debug, '\u{f188}'),    // nf-fa-bug
     ];
 
     for &(row_off, panel, icon) in top_buttons {
@@ -3683,6 +4325,12 @@ fn render_sidebar(
     // Search panel
     if sidebar.active_panel == TuiPanel::Search {
         render_search_panel(buf, area, sidebar, engine, theme);
+        return;
+    }
+
+    // Debug panel
+    if sidebar.active_panel == TuiPanel::Debug {
+        render_debug_sidebar(buf, area, engine, theme);
         return;
     }
 
@@ -4588,6 +5236,230 @@ fn save_session(engine: &mut Engine) {
     }
     engine.collect_session_open_files();
     let _ = engine.session.save();
+}
+
+// ─── Debug sidebar panel ──────────────────────────────────────────────────────
+
+/// Render the debug sidebar: header + run button + 4 sections (Variables, Watch, Call Stack, Breakpoints).
+fn render_debug_sidebar(
+    buf: &mut ratatui::buffer::Buffer,
+    area: Rect,
+    engine: &Engine,
+    theme: &Theme,
+) {
+    use render::DebugSidebarSection;
+    if area.height == 0 {
+        return;
+    }
+    let hdr_fg = rc(theme.status_fg);
+    let hdr_bg = rc(theme.status_bg);
+    let item_fg = rc(theme.line_number_fg);
+    let sel_bg = rc(theme.fuzzy_selected_bg);
+    let act_fg = rc(theme.tab_active_fg);
+    let row_bg = rc(theme.tab_bar_bg);
+
+    // ── Row 0: header strip ──────────────────────────────────────────────────
+    let cfg_name = engine
+        .dap_launch_configs
+        .get(engine.dap_selected_launch_config)
+        .map(|c| c.name.as_str())
+        .unwrap_or("no config");
+    let header_text = format!("  \u{f188} DEBUG  |  {cfg_name}");
+    for x in area.x..area.x + area.width {
+        set_cell(buf, x, area.y, ' ', hdr_fg, hdr_bg);
+    }
+    for (i, ch) in header_text.chars().enumerate().take(area.width as usize) {
+        set_cell(buf, area.x + i as u16, area.y, ch, hdr_fg, hdr_bg);
+    }
+
+    if area.height < 2 {
+        return;
+    }
+
+    // ── Row 1: Run / Stop button ─────────────────────────────────────────────
+    let btn_y = area.y + 1;
+    let (btn_label, btn_fg) = if engine.dap_session_active && engine.dap_stopped_thread.is_some() {
+        ("\u{f04b}  Continue", rc(Color::from_rgb(97, 186, 115)))
+    } else if engine.dap_session_active {
+        ("\u{f04d}  Stop", rc(Color::from_rgb(220, 70, 56)))
+    } else {
+        (
+            "\u{f04b}  Start Debugging",
+            rc(Color::from_rgb(97, 186, 115)),
+        )
+    };
+    for x in area.x..area.x + area.width {
+        set_cell(buf, x, btn_y, ' ', btn_fg, hdr_bg);
+    }
+    for (i, ch) in btn_label.chars().enumerate().take(area.width as usize) {
+        set_cell(buf, area.x + i as u16, btn_y, ch, btn_fg, hdr_bg);
+    }
+
+    // ── Sections ─────────────────────────────────────────────────────────────
+    // Build minimal screen layout to get debug_sidebar data
+    let screen = render::build_screen_layout(engine, theme, &[], 1.0, 1.0);
+    let sidebar = &screen.debug_sidebar;
+
+    let sections: &[(&str, &[render::DebugSidebarItem], DebugSidebarSection)] = &[
+        (
+            "\u{f6a9} VARIABLES",
+            &sidebar.variables,
+            DebugSidebarSection::Variables,
+        ),
+        ("\u{f06e} WATCH", &sidebar.watch, DebugSidebarSection::Watch),
+        (
+            "\u{f020e} CALL STACK",
+            &sidebar.frames,
+            DebugSidebarSection::CallStack,
+        ),
+        (
+            "\u{f111} BREAKPOINTS",
+            &sidebar.breakpoints,
+            DebugSidebarSection::Breakpoints,
+        ),
+    ];
+
+    let mut row_y = area.y + 2;
+    let max_y = area.y + area.height;
+
+    for (section_label, items, section_kind) in sections {
+        if row_y >= max_y {
+            break;
+        }
+        // Section header
+        let is_active = sidebar.active_section == *section_kind;
+        let sect_fg = if is_active { act_fg } else { hdr_fg };
+        for x in area.x..area.x + area.width {
+            set_cell(buf, x, row_y, ' ', sect_fg, hdr_bg);
+        }
+        for (i, ch) in section_label.chars().enumerate().take(area.width as usize) {
+            set_cell(buf, area.x + i as u16, row_y, ch, sect_fg, hdr_bg);
+        }
+        row_y += 1;
+
+        // Items
+        for item in *items {
+            if row_y >= max_y {
+                break;
+            }
+            let (fg, bg) = if item.is_selected {
+                (hdr_fg, sel_bg)
+            } else {
+                (item_fg, row_bg)
+            };
+            for x in area.x..area.x + area.width {
+                set_cell(buf, x, row_y, ' ', fg, bg);
+            }
+            let indent = item.indent as usize * 2;
+            let text = format!("{:indent$}{}", "", item.text, indent = indent);
+            for (i, ch) in text.chars().enumerate().take(area.width as usize) {
+                set_cell(buf, area.x + i as u16, row_y, ch, fg, bg);
+            }
+            row_y += 1;
+        }
+
+        // Empty hint
+        if items.is_empty() && row_y < max_y {
+            let hint = if engine.dap_session_active {
+                "  (empty)"
+            } else {
+                "  (not running)"
+            };
+            for x in area.x..area.x + area.width {
+                set_cell(buf, x, row_y, ' ', item_fg, row_bg);
+            }
+            for (i, ch) in hint.chars().enumerate().take(area.width as usize) {
+                set_cell(buf, area.x + i as u16, row_y, ch, item_fg, row_bg);
+            }
+            row_y += 1;
+        }
+    }
+}
+
+/// Render the bottom panel tab bar (Terminal | Debug Output).
+fn render_bottom_panel_tabs(
+    buf: &mut ratatui::buffer::Buffer,
+    area: Rect,
+    active: render::BottomPanelKind,
+    theme: &Theme,
+) {
+    if area.height == 0 {
+        return;
+    }
+    let tab_bg = rc(theme.tab_bar_bg);
+    let active_fg = rc(theme.tab_active_fg);
+    let inactive_fg = rc(theme.tab_inactive_fg);
+
+    // Fill background
+    for x in area.x..area.x + area.width {
+        set_cell(buf, x, area.y, ' ', inactive_fg, tab_bg);
+    }
+
+    let tabs = [
+        ("  Terminal  ", render::BottomPanelKind::Terminal),
+        ("  Debug Output  ", render::BottomPanelKind::DebugOutput),
+    ];
+    let mut cur_x = area.x;
+    for (label, kind) in &tabs {
+        let fg = if *kind == active {
+            active_fg
+        } else {
+            inactive_fg
+        };
+        for (i, ch) in label.chars().enumerate() {
+            let x = cur_x + i as u16;
+            if x >= area.x + area.width {
+                break;
+            }
+            set_cell(buf, x, area.y, ch, fg, tab_bg);
+        }
+        cur_x += label.len() as u16;
+        if cur_x >= area.x + area.width {
+            break;
+        }
+    }
+}
+
+/// Render the debug output tab content (scrolling log).
+fn render_debug_output(
+    buf: &mut ratatui::buffer::Buffer,
+    area: Rect,
+    output_lines: &[String],
+    theme: &Theme,
+) {
+    if area.height == 0 {
+        return;
+    }
+    let hdr_fg = rc(theme.status_fg);
+    let hdr_bg = rc(theme.status_bg);
+    let item_fg = rc(theme.foreground);
+    let row_bg = rc(theme.tab_bar_bg);
+
+    // Header row
+    for x in area.x..area.x + area.width {
+        set_cell(buf, x, area.y, ' ', hdr_fg, hdr_bg);
+    }
+    let hdr_text = " DEBUG OUTPUT";
+    for (i, ch) in hdr_text.chars().enumerate().take(area.width as usize) {
+        set_cell(buf, area.x + i as u16, area.y, ch, hdr_fg, hdr_bg);
+    }
+
+    // Content rows: most-recent lines at bottom
+    let content_rows = area.height.saturating_sub(1) as usize;
+    let recent: Vec<&String> = output_lines.iter().rev().take(content_rows).collect();
+    for (row, line_text) in recent.iter().rev().enumerate() {
+        let ry = area.y + 1 + row as u16;
+        if ry >= area.y + area.height {
+            break;
+        }
+        for x in area.x..area.x + area.width {
+            set_cell(buf, x, ry, ' ', item_fg, row_bg);
+        }
+        let text = format!("  {line_text}");
+        for (i, ch) in text.chars().enumerate().take(area.width as usize) {
+            set_cell(buf, area.x + i as u16, ry, ch, item_fg, row_bg);
+        }
+    }
 }
 
 // ─── Quickfix panel ───────────────────────────────────────────────────────────

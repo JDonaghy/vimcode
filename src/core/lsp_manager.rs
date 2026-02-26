@@ -349,7 +349,17 @@ impl LspManager {
                     let output = if success {
                         String::from_utf8_lossy(&out.stdout).into_owned()
                     } else {
-                        String::from_utf8_lossy(&out.stderr).into_owned()
+                        // Combine stderr + stdout: some tools (e.g. unzip) write
+                        // errors to stdout rather than stderr.
+                        let stderr = String::from_utf8_lossy(&out.stderr);
+                        let stdout = String::from_utf8_lossy(&out.stdout);
+                        let combined = format!("{}\n{}", stderr.trim(), stdout.trim());
+                        let combined = combined.trim().to_string();
+                        if combined.is_empty() {
+                            format!("process exited with {}", out.status)
+                        } else {
+                            combined
+                        }
                     };
                     let output = output.trim().to_string();
                     let _ = tx.send(LspEvent::InstallComplete {

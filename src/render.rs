@@ -14,6 +14,7 @@
 
 use crate::core::buffer::Buffer;
 use crate::core::buffer_manager::BufferState;
+pub use crate::core::engine::{BottomPanelKind, DebugSidebarSection};
 use crate::core::engine::{DiffLine, Engine, SearchDirection};
 use crate::core::lsp::SignatureHelpData;
 use crate::core::settings::LineNumberMode;
@@ -116,6 +117,17 @@ pub struct RenderedLine {
     pub diagnostics: Vec<DiagnosticMark>,
     /// Two-way diff status for this line (`None` when diff mode is off).
     pub diff_status: Option<DiffLine>,
+    /// True when there is a DAP breakpoint set on this line.
+    pub is_breakpoint: bool,
+    /// True when the DAP adapter is currently stopped at this line.
+    pub is_dap_current: bool,
+    /// True when this is a soft-wrap continuation row (the 2nd+ visual row of a
+    /// long buffer line). When true, `gutter_text` is blank and the line number
+    /// belongs to the preceding non-continuation row.
+    pub is_wrap_continuation: bool,
+    /// Character offset within the buffer line where this visual segment begins.
+    /// 0 for non-wrapped lines and the first visual segment of a wrapped line.
+    pub segment_col_offset: usize,
 }
 
 /// A single diagnostic mark on a rendered line (for inline underlines/squiggles).
@@ -222,6 +234,9 @@ pub struct RenderedWindow {
     pub show_active_bg: bool,
     /// Whether the buffer has git diff data (controls git column in gutter).
     pub has_git_diff: bool,
+    /// Whether to show the breakpoint gutter column (any breakpoint set for
+    /// this file, or a DAP session is active).
+    pub has_breakpoints: bool,
     /// Maximum line length across the whole buffer (character cells, excluding
     /// trailing newline).  Used by backends to size the horizontal scrollbar.
     pub max_col: usize,
@@ -335,6 +350,58 @@ pub struct QuickfixPanel {
     pub has_focus: bool,
 }
 
+/// A single item rendered in the debug sidebar.
+#[derive(Debug, Clone)]
+pub struct DebugSidebarItem {
+    /// Pre-formatted display text.
+    pub text: String,
+    /// Indentation level (0 = top-level, 1 = one indent, …).
+    pub indent: u8,
+    /// Whether this item is currently selected (cursor highlight).
+    pub is_selected: bool,
+}
+
+/// Data for the VSCode-style debug sidebar (Variables / Watch / Call Stack / Breakpoints).
+/// Always present in `ScreenLayout`; each section may be empty.
+#[derive(Debug, Clone)]
+pub struct DebugSidebarData {
+    /// True when a DAP session is active.
+    pub session_active: bool,
+    /// True when the debuggee is paused (breakpoint hit, step completed, etc.).
+    pub stopped: bool,
+    /// Variables section items (flat tree with ▶/▼ prefixes).
+    pub variables: Vec<DebugSidebarItem>,
+    /// Watch section items (expression = value).
+    pub watch: Vec<DebugSidebarItem>,
+    /// Call Stack section items.
+    pub frames: Vec<DebugSidebarItem>,
+    /// Breakpoints section items (always populated from dap_breakpoints).
+    pub breakpoints: Vec<DebugSidebarItem>,
+    /// Which section is currently focused.
+    pub active_section: DebugSidebarSection,
+    /// Selected item index within the active section.
+    pub sidebar_selected: usize,
+    /// Whether the debug sidebar panel has keyboard focus.
+    pub has_focus: bool,
+    /// Name of the selected launch configuration, or `None` if no configs loaded.
+    pub launch_config_name: Option<String>,
+    /// Debug output lines for the Debug Output bottom tab.
+    pub debug_output_lines: Vec<String>,
+    /// Most-recent expression evaluation result, or `None`.
+    pub eval_result: Option<String>,
+}
+
+/// The two bottom panel tabs: Terminal and Debug Output.
+#[derive(Debug)]
+pub struct BottomPanelTabs {
+    /// Which tab is currently active.
+    pub active: BottomPanelKind,
+    /// Terminal panel data (always built if terminal is open, regardless of active tab).
+    pub terminal: Option<TerminalPanel>,
+    /// Debug output lines for the Debug Output tab.
+    pub output_lines: Vec<String>,
+}
+
 // ─── TerminalPanel ────────────────────────────────────────────────────────────
 
 /// A single rendered cell in the terminal grid.
@@ -402,6 +469,473 @@ pub struct TerminalPanel {
     pub split_focus: u8,
 }
 
+// ─── Menu bar / debug toolbar ─────────────────────────────────────────────────
+
+/// One item in a menu dropdown.
+#[derive(Debug, Clone)]
+pub struct MenuItemData {
+    /// Display label shown in the dropdown (e.g. "Save").
+    pub label: &'static str,
+    /// Right-aligned keyboard shortcut hint (e.g. "Ctrl+S").
+    pub shortcut: &'static str,
+    /// Command string dispatched to the engine when activated (e.g. "w").
+    /// Empty string means no action (for separators).
+    pub action: &'static str,
+    /// Whether this item is currently enabled.
+    pub enabled: bool,
+    /// If true, render as a horizontal divider line instead of a regular item.
+    pub separator: bool,
+}
+
+/// Data for the visible menu bar strip and optional open dropdown.
+#[derive(Debug)]
+pub struct MenuBarData {
+    /// Index (into `MENU_STRUCTURE`) of the currently open dropdown, or `None`.
+    pub open_menu_idx: Option<usize>,
+    /// Items in the currently open submenu (empty when no dropdown open).
+    pub open_items: Vec<MenuItemData>,
+    /// Approximate terminal column where the open menu header starts (for TUI anchor).
+    pub open_menu_col: u16,
+    /// Index into `open_items` of the keyboard-highlighted row, or `None`.
+    pub highlighted_item_idx: Option<usize>,
+}
+
+/// One button in the debug toolbar strip.
+#[derive(Debug, Clone)]
+pub struct DebugButton {
+    /// Nerd Font glyph string.
+    pub icon: &'static str,
+    /// Short label shown next to the icon.
+    pub label: &'static str,
+    /// Key hint shown in the button (e.g. "F5").
+    pub key_hint: &'static str,
+    /// Command string passed to `engine.execute_command()` when the button is clicked.
+    pub action: &'static str,
+    /// Whether this button is currently clickable.
+    pub enabled: bool,
+}
+
+/// Data for the debug toolbar strip.
+#[derive(Debug)]
+pub struct DebugToolbarData {
+    /// Buttons to render (in order, with a `│` separator after index 3).
+    pub buttons: Vec<DebugButton>,
+    /// True when a DAP session is active; drives future enabled/greyed-out state.
+    pub session_active: bool,
+}
+
+// ─── Static menu structure ────────────────────────────────────────────────────
+
+/// Static description of every top-level menu and its items.
+/// Layout: (menu_name, alt_key_char, items).
+/// Used by both backends to render the menu bar and by the engine to dispatch actions.
+pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
+    (
+        "File",
+        'f',
+        &[
+            MenuItemData {
+                label: "New Tab",
+                shortcut: "Ctrl+T",
+                action: "tabnew",
+                enabled: true,
+                separator: false,
+            },
+            MenuItemData {
+                label: "Open…",
+                shortcut: "",
+                action: "e ",
+                enabled: true,
+                separator: false,
+            },
+            MenuItemData {
+                label: "Save",
+                shortcut: "Ctrl+S",
+                action: "w",
+                enabled: true,
+                separator: false,
+            },
+            MenuItemData {
+                label: "Save As",
+                shortcut: "",
+                action: "saveas",
+                enabled: true,
+                separator: false,
+            },
+            MenuItemData {
+                label: "Close Tab",
+                shortcut: "",
+                action: "bd",
+                enabled: true,
+                separator: false,
+            },
+            MenuItemData {
+                label: "",
+                shortcut: "",
+                action: "",
+                enabled: false,
+                separator: true,
+            },
+            MenuItemData {
+                label: "Quit",
+                shortcut: "",
+                action: "qa",
+                enabled: true,
+                separator: false,
+            },
+        ],
+    ),
+    (
+        "Edit",
+        'e',
+        &[
+            MenuItemData {
+                label: "Undo",
+                shortcut: "u",
+                action: "u",
+                enabled: true,
+                separator: false,
+            },
+            MenuItemData {
+                label: "Redo",
+                shortcut: "Ctrl+R",
+                action: "redo",
+                enabled: true,
+                separator: false,
+            },
+            MenuItemData {
+                label: "",
+                shortcut: "",
+                action: "",
+                enabled: false,
+                separator: true,
+            },
+            MenuItemData {
+                label: "Cut",
+                shortcut: "",
+                action: "cut",
+                enabled: true,
+                separator: false,
+            },
+            MenuItemData {
+                label: "Copy",
+                shortcut: "",
+                action: "copy",
+                enabled: true,
+                separator: false,
+            },
+            MenuItemData {
+                label: "Paste",
+                shortcut: "",
+                action: "paste",
+                enabled: true,
+                separator: false,
+            },
+            MenuItemData {
+                label: "",
+                shortcut: "",
+                action: "",
+                enabled: false,
+                separator: true,
+            },
+            MenuItemData {
+                label: "Find",
+                shortcut: "Ctrl+F",
+                action: "find",
+                enabled: true,
+                separator: false,
+            },
+            MenuItemData {
+                label: "Replace",
+                shortcut: "",
+                action: "replace",
+                enabled: true,
+                separator: false,
+            },
+        ],
+    ),
+    (
+        "View",
+        'v',
+        &[
+            MenuItemData {
+                label: "Toggle Sidebar",
+                shortcut: "Ctrl+B",
+                action: "sidebar",
+                enabled: true,
+                separator: false,
+            },
+            MenuItemData {
+                label: "Toggle Terminal",
+                shortcut: "Ctrl+T",
+                action: "term",
+                enabled: true,
+                separator: false,
+            },
+            MenuItemData {
+                label: "",
+                shortcut: "",
+                action: "",
+                enabled: false,
+                separator: true,
+            },
+            MenuItemData {
+                label: "Zoom In",
+                shortcut: "Ctrl++",
+                action: "zoomin",
+                enabled: true,
+                separator: false,
+            },
+            MenuItemData {
+                label: "Zoom Out",
+                shortcut: "Ctrl+-",
+                action: "zoomout",
+                enabled: true,
+                separator: false,
+            },
+        ],
+    ),
+    (
+        "Go",
+        'g',
+        &[
+            MenuItemData {
+                label: "Go to File",
+                shortcut: "Ctrl+P",
+                action: "fuzzy",
+                enabled: true,
+                separator: false,
+            },
+            MenuItemData {
+                label: "Go to Line",
+                shortcut: "",
+                action: "goto",
+                enabled: true,
+                separator: false,
+            },
+            MenuItemData {
+                label: "",
+                shortcut: "",
+                action: "",
+                enabled: false,
+                separator: true,
+            },
+            MenuItemData {
+                label: "Go to Definition",
+                shortcut: "gd",
+                action: "def",
+                enabled: true,
+                separator: false,
+            },
+            MenuItemData {
+                label: "Find References",
+                shortcut: "gr",
+                action: "refs",
+                enabled: true,
+                separator: false,
+            },
+            MenuItemData {
+                label: "",
+                shortcut: "",
+                action: "",
+                enabled: false,
+                separator: true,
+            },
+            MenuItemData {
+                label: "Back",
+                shortcut: "Ctrl+O",
+                action: "back",
+                enabled: true,
+                separator: false,
+            },
+            MenuItemData {
+                label: "Forward",
+                shortcut: "Ctrl+I",
+                action: "fwd",
+                enabled: true,
+                separator: false,
+            },
+        ],
+    ),
+    (
+        "Run",
+        'r',
+        &[
+            MenuItemData {
+                label: "Start Debugging",
+                shortcut: "F5",
+                action: "debug",
+                enabled: true,
+                separator: false,
+            },
+            MenuItemData {
+                label: "",
+                shortcut: "",
+                action: "",
+                enabled: false,
+                separator: true,
+            },
+            MenuItemData {
+                label: "Continue",
+                shortcut: "F5",
+                action: "continue",
+                enabled: true,
+                separator: false,
+            },
+            MenuItemData {
+                label: "Pause",
+                shortcut: "F6",
+                action: "pause",
+                enabled: true,
+                separator: false,
+            },
+            MenuItemData {
+                label: "Stop",
+                shortcut: "Shift+F5",
+                action: "stop",
+                enabled: true,
+                separator: false,
+            },
+            MenuItemData {
+                label: "",
+                shortcut: "",
+                action: "",
+                enabled: false,
+                separator: true,
+            },
+            MenuItemData {
+                label: "Step Over",
+                shortcut: "F10",
+                action: "stepover",
+                enabled: true,
+                separator: false,
+            },
+            MenuItemData {
+                label: "Step Into",
+                shortcut: "F11",
+                action: "stepin",
+                enabled: true,
+                separator: false,
+            },
+            MenuItemData {
+                label: "Step Out",
+                shortcut: "Shift+F11",
+                action: "stepout",
+                enabled: true,
+                separator: false,
+            },
+            MenuItemData {
+                label: "",
+                shortcut: "",
+                action: "",
+                enabled: false,
+                separator: true,
+            },
+            MenuItemData {
+                label: "Toggle Breakpoint",
+                shortcut: "F9",
+                action: "brkpt",
+                enabled: true,
+                separator: false,
+            },
+        ],
+    ),
+    (
+        "Terminal",
+        't',
+        &[
+            MenuItemData {
+                label: "New Terminal",
+                shortcut: "",
+                action: "term",
+                enabled: true,
+                separator: false,
+            },
+            MenuItemData {
+                label: "Close Terminal",
+                shortcut: "",
+                action: "termkill",
+                enabled: true,
+                separator: false,
+            },
+        ],
+    ),
+    (
+        "Help",
+        'h',
+        &[
+            MenuItemData {
+                label: "Key Bindings",
+                shortcut: "",
+                action: "keys",
+                enabled: true,
+                separator: false,
+            },
+            MenuItemData {
+                label: "About",
+                shortcut: "",
+                action: "about",
+                enabled: true,
+                separator: false,
+            },
+        ],
+    ),
+];
+
+/// Static debug toolbar button definitions.
+pub static DEBUG_BUTTONS: &[DebugButton] = &[
+    DebugButton {
+        icon: "\u{f040a}",
+        label: "Continue",
+        key_hint: "F5",
+        action: "continue",
+        enabled: true,
+    },
+    DebugButton {
+        icon: "\u{f03e4}",
+        label: "Pause",
+        key_hint: "F6",
+        action: "pause",
+        enabled: true,
+    },
+    DebugButton {
+        icon: "\u{f04db}",
+        label: "Stop",
+        key_hint: "Shift+F5",
+        action: "stop",
+        enabled: true,
+    },
+    DebugButton {
+        icon: "\u{f0459}",
+        label: "Restart",
+        key_hint: "Ctrl+Shift+F5",
+        action: "restart",
+        enabled: true,
+    },
+    // separator goes here (rendered between index 3 and 4)
+    DebugButton {
+        icon: "\u{f0457}",
+        label: "Step Over",
+        key_hint: "F10",
+        action: "stepover",
+        enabled: true,
+    },
+    DebugButton {
+        icon: "\u{f0459}",
+        label: "Step Into",
+        key_hint: "F11",
+        action: "stepin",
+        enabled: true,
+    },
+    DebugButton {
+        icon: "\u{f0458}",
+        label: "Step Out",
+        key_hint: "Shift+F11",
+        action: "stepout",
+        enabled: true,
+    },
+];
+
 // ─── ScreenLayout ─────────────────────────────────────────────────────────────
 
 /// The complete, platform-agnostic description of one editor frame.
@@ -424,10 +958,16 @@ pub struct ScreenLayout {
     pub live_grep: Option<LiveGrepPanel>,
     /// Quickfix bottom panel, or `None` when closed.
     pub quickfix: Option<QuickfixPanel>,
-    /// Integrated terminal panel, or `None` when closed.
-    pub terminal: Option<TerminalPanel>,
+    /// Bottom panel tabs (Terminal / Debug Output) — always present.
+    pub bottom_tabs: BottomPanelTabs,
     /// Signature help popup (shown in insert mode after `(` or `,`), or `None`.
     pub signature_help: Option<SignatureHelp>,
+    /// Menu bar strip data, or `None` when the bar is hidden.
+    pub menu_bar: Option<MenuBarData>,
+    /// Debug toolbar strip data, or `None` when hidden and no active session.
+    pub debug_toolbar: Option<DebugToolbarData>,
+    /// Debug sidebar data — always present (sections may be empty).
+    pub debug_sidebar: DebugSidebarData,
 }
 
 // ─── Theme ────────────────────────────────────────────────────────────────────
@@ -520,6 +1060,9 @@ pub struct Theme {
     // Two-way diff background colours
     pub diff_added_bg: Color,
     pub diff_removed_bg: Color,
+
+    // DAP stopped-line highlight
+    pub dap_stopped_bg: Color,
 }
 
 impl Theme {
@@ -620,6 +1163,9 @@ impl Theme {
             // Two-way diff backgrounds (dark green / dark red)
             diff_added_bg: Color::from_hex("#1e3a1e"), // dark green
             diff_removed_bg: Color::from_hex("#3a1e1e"), // dark red
+
+            // DAP stopped-line (dark amber)
+            dap_stopped_bg: Color::from_hex("#3a3000"),
         }
     }
 
@@ -753,8 +1299,6 @@ pub fn build_screen_layout(
         }
     });
 
-    let terminal = build_terminal_panel(engine);
-
     let signature_help = engine
         .lsp_signature_help
         .as_ref()
@@ -765,6 +1309,185 @@ pub fn build_screen_layout(
             anchor_line: engine.view().cursor.line,
             anchor_col: engine.view().cursor.col,
         });
+
+    let menu_bar = engine.menu_bar_visible.then(|| {
+        let open_items = if let Some(midx) = engine.menu_open_idx {
+            if let Some((_, _, items)) = MENU_STRUCTURE.get(midx) {
+                items.to_vec()
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+        // Compute approximate column position of the active menu header for dropdown anchor.
+        let open_menu_col: u16 = if let Some(midx) = engine.menu_open_idx {
+            // Hamburger (3) + spaces between labels: each label ~5-8 chars
+            let mut col: u16 = 3; // hamburger icon width
+            for i in 0..midx {
+                if let Some((name, _, _)) = MENU_STRUCTURE.get(i) {
+                    col += name.len() as u16 + 2; // label + 2 spaces
+                }
+            }
+            col
+        } else {
+            0
+        };
+        MenuBarData {
+            open_menu_idx: engine.menu_open_idx,
+            open_items,
+            open_menu_col,
+            highlighted_item_idx: engine.menu_highlighted_item,
+        }
+    });
+
+    let debug_toolbar = engine.debug_toolbar_visible.then(|| DebugToolbarData {
+        buttons: DEBUG_BUTTONS.to_vec(),
+        session_active: engine.dap_session_active,
+    });
+
+    // Build the debug sidebar data (always present).
+    let debug_sidebar = {
+        let selected = engine.dap_sidebar_selected;
+        let active_section = engine.dap_sidebar_section.clone();
+
+        // Variables section: flat tree with ▶/▼ prefixes.
+        let mut var_items: Vec<DebugSidebarItem> = Vec::new();
+        for (i, v) in engine.dap_variables.iter().enumerate() {
+            let prefix = if v.var_ref > 0 {
+                if engine.dap_expanded_vars.contains(&v.var_ref) {
+                    "\u{f0d7} " // ▼
+                } else {
+                    "\u{f0da} " // ▶
+                }
+            } else {
+                "  "
+            };
+            var_items.push(DebugSidebarItem {
+                text: format!("{}{} = {}", prefix, v.name, v.value),
+                indent: 0,
+                is_selected: active_section == DebugSidebarSection::Variables && i == selected,
+            });
+            if v.var_ref > 0 && engine.dap_expanded_vars.contains(&v.var_ref) {
+                if let Some(children) = engine.dap_child_variables.get(&v.var_ref) {
+                    for child in children {
+                        let child_prefix = if child.var_ref > 0 { "\u{f0da} " } else { "  " };
+                        var_items.push(DebugSidebarItem {
+                            text: format!("{}{} = {}", child_prefix, child.name, child.value),
+                            indent: 1,
+                            is_selected: false,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Watch section: expressions with their evaluated values.
+        let watch_items: Vec<DebugSidebarItem> = engine
+            .dap_watch_expressions
+            .iter()
+            .zip(engine.dap_watch_values.iter())
+            .enumerate()
+            .map(|(i, (expr, val))| {
+                let val_str = val.as_deref().unwrap_or(if engine.dap_session_active {
+                    "…"
+                } else {
+                    "(not running)"
+                });
+                DebugSidebarItem {
+                    text: format!("{expr} = {val_str}"),
+                    indent: 0,
+                    is_selected: active_section == DebugSidebarSection::Watch && i == selected,
+                }
+            })
+            .collect();
+
+        // Call Stack section.
+        let frame_items: Vec<DebugSidebarItem> = engine
+            .dap_stack_frames
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let src = f
+                    .source
+                    .as_deref()
+                    .and_then(|p| std::path::Path::new(p).file_name())
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("?");
+                let prefix = if i == engine.dap_active_frame {
+                    "\u{f0da} " // ▶
+                } else {
+                    "  "
+                };
+                DebugSidebarItem {
+                    text: format!("{}{} ({}:{})", prefix, f.name, src, f.line),
+                    indent: 0,
+                    is_selected: active_section == DebugSidebarSection::CallStack && i == selected,
+                }
+            })
+            .collect();
+
+        // Breakpoints section: all breakpoints across all files.
+        let mut bp_items: Vec<DebugSidebarItem> = Vec::new();
+        let mut sorted_bp: Vec<(&String, &Vec<u64>)> = engine.dap_breakpoints.iter().collect();
+        sorted_bp.sort_by_key(|(path, _)| path.as_str());
+        let mut bp_global_idx = 0usize;
+        for (path, lines) in &sorted_bp {
+            let file_name = std::path::Path::new(path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(path);
+            for &line in *lines {
+                bp_items.push(DebugSidebarItem {
+                    text: format!("\u{f111} {}:{}", file_name, line), // ● file:line
+                    indent: 0,
+                    is_selected: active_section == DebugSidebarSection::Breakpoints
+                        && bp_global_idx == selected,
+                });
+                bp_global_idx += 1;
+            }
+        }
+
+        // Output lines for the Debug Output tab (up to 200, oldest-first).
+        let debug_output_lines: Vec<String> = engine
+            .dap_output_lines
+            .iter()
+            .rev()
+            .take(200)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+
+        let launch_config_name = engine
+            .dap_launch_configs
+            .get(engine.dap_selected_launch_config)
+            .map(|c| c.name.clone());
+
+        DebugSidebarData {
+            session_active: engine.dap_session_active,
+            stopped: engine.dap_stopped_thread.is_some(),
+            variables: var_items,
+            watch: watch_items,
+            frames: frame_items,
+            breakpoints: bp_items,
+            active_section,
+            sidebar_selected: selected,
+            has_focus: false, // focus is tracked by the UI backends
+            launch_config_name,
+            debug_output_lines,
+            eval_result: engine.dap_eval_result.clone(),
+        }
+    };
+
+    // Build bottom panel tabs.
+    let terminal = build_terminal_panel(engine);
+    let bottom_tabs = BottomPanelTabs {
+        active: engine.bottom_panel_kind.clone(),
+        output_lines: debug_sidebar.debug_output_lines.clone(),
+        terminal,
+    };
 
     ScreenLayout {
         tab_bar,
@@ -778,8 +1501,11 @@ pub fn build_screen_layout(
         fuzzy,
         live_grep,
         quickfix,
-        terminal,
+        bottom_tabs,
         signature_help,
+        menu_bar,
+        debug_toolbar,
+        debug_sidebar,
     }
 }
 
@@ -1134,6 +1860,48 @@ fn build_tab_bar(engine: &Engine) -> Vec<TabInfo> {
         .collect()
 }
 
+/// Return the number of visual rows a buffer line of `line_char_len` characters
+/// occupies when the viewport is `viewport_cols` columns wide.
+/// Always returns at least 1 (even for empty lines).
+pub fn visual_rows_for_line(line_char_len: usize, viewport_cols: usize) -> usize {
+    if viewport_cols == 0 {
+        return 1;
+    }
+    line_char_len.div_ceil(viewport_cols).max(1)
+}
+
+/// Slice `spans` to cover only the byte range `[seg_start_byte, seg_end_byte)`,
+/// adjusting `start_byte`/`end_byte` to be relative to `seg_start_byte`.
+/// Used when splitting a wrapped line into per-segment `RenderedLine` entries.
+fn slice_spans_for_segment(
+    spans: &[StyledSpan],
+    seg_start_byte: usize,
+    seg_end_byte: usize,
+) -> Vec<StyledSpan> {
+    let mut result = Vec::new();
+    for span in spans {
+        let overlap_start = span.start_byte.max(seg_start_byte);
+        let overlap_end = span.end_byte.min(seg_end_byte);
+        if overlap_start < overlap_end {
+            result.push(StyledSpan {
+                start_byte: overlap_start - seg_start_byte,
+                end_byte: overlap_end - seg_start_byte,
+                style: span.style,
+            });
+        }
+    }
+    result
+}
+
+/// Convert a character index within a UTF-8 string to its byte offset.
+/// Returns `s.len()` if `char_idx` is beyond the string length.
+fn char_to_byte_offset(s: &str, char_idx: usize) -> usize {
+    s.char_indices()
+        .nth(char_idx)
+        .map(|(b, _)| b)
+        .unwrap_or(s.len())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_rendered_window(
     engine: &Engine,
@@ -1158,6 +1926,7 @@ fn build_rendered_window(
         is_active,
         show_active_bg: false,
         has_git_diff: false,
+        has_breakpoints: false,
         max_col: 0,
         diagnostic_gutter: std::collections::HashMap::new(),
     };
@@ -1191,12 +1960,32 @@ fn build_rendered_window(
         .as_ref()
         .and_then(|p| engine.lsp_diagnostics.get(p));
 
+    // DAP breakpoints for this buffer.
+    // Use the raw buffer path as key (matches how dap_toggle_breakpoint stores them).
+    let bp_file_key = buffer_state
+        .file_path
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let bp_lines: Vec<u64> = engine
+        .dap_breakpoints
+        .get(&bp_file_key)
+        .cloned()
+        .unwrap_or_default();
+    // Show the breakpoint column when any BP is set for this file, or a DAP
+    // session is active (so the column width stays stable during a session).
+    let has_bp = !bp_lines.is_empty() || engine.dap_session_active;
+
+    // Stopped-line path for per-line comparison (try canonical, then raw).
+    let dap_stop_path = engine.dap_current_line.as_ref().map(|(p, _)| p.as_str());
+
     // Gutter width in character columns (always includes fold indicator column).
     let gutter_char_width = calculate_gutter_cols(
         engine.settings.line_numbers,
         total_lines,
         char_width,
         has_git,
+        has_bp,
     );
 
     // Build rendered lines (fold-aware: skip hidden lines, jump over fold bodies)
@@ -1235,23 +2024,57 @@ fn build_rendered_window(
             None
         };
 
+        // DAP: is there a breakpoint on this line? Is the adapter stopped here?
+        let line_1based = line_idx as u64 + 1;
+        let is_breakpoint = has_bp && bp_lines.binary_search(&line_1based).is_ok();
+        let is_dap_current = engine
+            .dap_current_line
+            .as_ref()
+            .map(|(path, l)| {
+                *l == line_1based
+                    && (dap_stop_path == Some(path.as_str())
+                        || canonical_path
+                            .as_ref()
+                            .map(|cp| cp.to_string_lossy().as_ref() == path.as_str())
+                            .unwrap_or(false))
+            })
+            .unwrap_or(false);
+
         let fold_char = fold_indicator_char(buffer, view, line_idx);
+        // Number of leading marker columns (bp + git) subtracted from the
+        // numeric portion so line numbers fill their allotted width correctly.
+        let marker_cols = if has_bp { 1 } else { 0 } + if has_git { 1 } else { 0 };
         let base_gutter = format_gutter_with_fold(
             engine.settings.line_numbers,
             line_idx,
             cursor_line,
-            // Pass gutter_char_width minus the git column so numbers fill correctly.
-            gutter_char_width.saturating_sub(if has_git { 1 } else { 0 }),
+            gutter_char_width.saturating_sub(marker_cols),
             fold_char,
         );
-        let gutter_text = if has_git {
-            let git_char = match git_status {
-                Some(GitLineStatus::Added) | Some(GitLineStatus::Modified) => '▌',
-                None => ' ',
+        // Build gutter_text: [bp_char][git_char][fold+nums]
+        let gutter_text = {
+            let bp_part = if has_bp {
+                if is_dap_current && is_breakpoint {
+                    "◉" // breakpoint + current line
+                } else if is_dap_current {
+                    "▶" // current execution line (no breakpoint)
+                } else if is_breakpoint {
+                    "●" // breakpoint
+                } else {
+                    " "
+                }
+            } else {
+                ""
             };
-            format!("{}{}", git_char, base_gutter)
-        } else {
-            base_gutter
+            let git_part = if has_git {
+                match git_status {
+                    Some(GitLineStatus::Added) | Some(GitLineStatus::Modified) => "▌",
+                    None => " ",
+                }
+            } else {
+                ""
+            };
+            format!("{}{}{}", bp_part, git_part, base_gutter)
         };
 
         // LSP diagnostics for this line.
@@ -1292,18 +2115,74 @@ fn build_rendered_window(
             .and_then(|v| v.get(line_idx))
             .copied();
 
-        lines.push(RenderedLine {
-            raw_text: line_str,
-            gutter_text,
-            is_current_line: line_idx == cursor_line,
-            spans,
-            is_fold_header,
-            folded_line_count,
-            line_idx,
-            git_diff: git_status,
-            diagnostics: line_diagnostics,
-            diff_status,
-        });
+        let wrap_on = engine.settings.wrap && view.viewport_cols > 0 && !is_fold_header;
+        let line_char_len = line_str.chars().count();
+
+        if wrap_on && line_char_len > view.viewport_cols {
+            // Split long line into viewport-width segments.
+            let vp = view.viewport_cols;
+            let num_segments = visual_rows_for_line(line_char_len, vp);
+            let cursor_seg = if line_idx == cursor_line {
+                view.cursor.col / vp
+            } else {
+                usize::MAX // won't match any segment
+            };
+            // Blank gutter for continuation rows (same width as normal gutter).
+            let blank_gutter = " ".repeat(gutter_char_width);
+            for seg in 0..num_segments {
+                if lines.len() >= visible_lines {
+                    break;
+                }
+                let seg_start_char = seg * vp;
+                let seg_end_char = ((seg + 1) * vp).min(line_char_len);
+                let seg_start_byte = char_to_byte_offset(&line_str, seg_start_char);
+                let seg_end_byte = char_to_byte_offset(&line_str, seg_end_char);
+                let seg_text = line_str[seg_start_byte..seg_end_byte].to_string();
+                let seg_spans = slice_spans_for_segment(&spans, seg_start_byte, seg_end_byte);
+                let is_cont = seg > 0;
+                lines.push(RenderedLine {
+                    raw_text: seg_text,
+                    gutter_text: if is_cont {
+                        blank_gutter.clone()
+                    } else {
+                        gutter_text.clone()
+                    },
+                    is_current_line: line_idx == cursor_line && seg == cursor_seg,
+                    spans: seg_spans,
+                    is_fold_header: false,
+                    folded_line_count: 0,
+                    line_idx,
+                    git_diff: if is_cont { None } else { git_status },
+                    diagnostics: if is_cont {
+                        Vec::new()
+                    } else {
+                        line_diagnostics.clone()
+                    },
+                    diff_status: if is_cont { None } else { diff_status },
+                    is_breakpoint: !is_cont && is_breakpoint,
+                    is_dap_current,
+                    is_wrap_continuation: is_cont,
+                    segment_col_offset: seg_start_char,
+                });
+            }
+        } else {
+            lines.push(RenderedLine {
+                raw_text: line_str,
+                gutter_text,
+                is_current_line: line_idx == cursor_line,
+                spans,
+                is_fold_header,
+                folded_line_count,
+                line_idx,
+                git_diff: git_status,
+                diagnostics: line_diagnostics,
+                diff_status,
+                is_breakpoint,
+                is_dap_current,
+                is_wrap_continuation: false,
+                segment_col_offset: 0,
+            });
+        }
 
         // Jump past the fold body for fold headers.
         if let Some(fold) = view.fold_at(line_idx) {
@@ -1317,8 +2196,9 @@ fn build_rendered_window(
     let cursor = if is_active {
         lines
             .iter()
-            .position(|l| l.is_current_line)
-            .map(|view_line| {
+            .enumerate()
+            .find(|(_, l)| l.is_current_line)
+            .map(|(view_line, l)| {
                 let shape = if engine.pending_key == Some('r') {
                     CursorShape::Underline
                 } else {
@@ -1327,13 +2207,9 @@ fn build_rendered_window(
                         _ => CursorShape::Block,
                     }
                 };
-                (
-                    CursorPos {
-                        view_line,
-                        col: view.cursor.col,
-                    },
-                    shape,
-                )
+                // When wrapping, the cursor col is relative to the segment start.
+                let col = view.cursor.col.saturating_sub(l.segment_col_offset);
+                (CursorPos { view_line, col }, shape)
             })
     } else {
         None
@@ -1346,9 +2222,13 @@ fn build_rendered_window(
         None
     };
 
-    // Maximum line length across the whole buffer.  Pre-computed in update_syntax()
-    // so we don't pay an O(N_lines) scan here on every render frame.
-    let max_col = buffer_state.max_col;
+    // Maximum line length across the whole buffer. When wrap is on, there is no
+    // horizontal scrolling, so we report 0 to suppress the horizontal scrollbar.
+    let max_col = if engine.settings.wrap {
+        0
+    } else {
+        buffer_state.max_col
+    };
 
     // Build diagnostic gutter map (line → worst severity).
     let mut diagnostic_gutter = std::collections::HashMap::new();
@@ -1376,6 +2256,7 @@ fn build_rendered_window(
         is_active,
         show_active_bg: is_active && multi_window,
         has_git_diff: has_git,
+        has_breakpoints: has_bp,
         max_col,
         diagnostic_gutter,
     }
@@ -1655,19 +2536,21 @@ pub fn calculate_gutter_cols(
     total_lines: usize,
     _char_width: f64,
     has_git_diff: bool,
+    has_breakpoints: bool,
 ) -> usize {
     let git = if has_git_diff { 1 } else { 0 };
+    let bp = if has_breakpoints { 1 } else { 0 };
     match mode {
         // No line numbers: show only the 1-column fold indicator.
-        LineNumberMode::None => 1 + git,
+        LineNumberMode::None => 1 + git + bp,
         LineNumberMode::Absolute => {
             let digits = total_lines.to_string().len().max(1);
-            digits + 2 + 1 + git // digits + padding + fold indicator + git
+            digits + 2 + 1 + git + bp // digits + padding + fold indicator + git + bp
         }
         LineNumberMode::Relative | LineNumberMode::Hybrid => {
             let max_relative = total_lines.saturating_sub(1);
             let digits = max_relative.to_string().len().max(3);
-            digits + 2 + 1 + git
+            digits + 2 + 1 + git + bp
         }
     }
 }

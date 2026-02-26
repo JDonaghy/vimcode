@@ -109,13 +109,19 @@ impl SessionState {
     }
 
     /// Save session state to ~/.config/vimcode/session.json
+    ///
+    /// Uses an atomic write: serialise → write to `.tmp` → rename.
+    /// A rename is atomic on Linux/macOS (same filesystem), so a crash
+    /// mid-write cannot corrupt the existing session file.
     pub fn save(&self) -> std::io::Result<()> {
         let path = Self::session_path();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(&path, json)?;
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, &json)?;
+        std::fs::rename(&tmp, &path)?;
         Ok(())
     }
 

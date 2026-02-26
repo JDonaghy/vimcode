@@ -11,7 +11,7 @@ There's a touch of irony here - using a cli tool to write the editor that I've w
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 638 tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 746 tests, zero async runtime dependency
 
 ## Building
 
@@ -257,6 +257,59 @@ cargo fmt
 - **All keys forwarded to shell PTY** — Ctrl-C, Ctrl-D, Ctrl-L, Ctrl-Z, arrow keys, Tab, etc. work as expected
 - `Ctrl-T` while the terminal has focus **closes the panel** while keeping all shell sessions alive; reopening restores the same sessions
 - When a shell exits (Ctrl-D, `exit`, etc.) its tab closes immediately; the panel closes automatically when the last tab exits; clicking outside the terminal returns focus to the editor
+
+---
+
+### Debugger (DAP)
+
+Built-in Debug Adapter Protocol support with a VSCode-like UI. Open the debug sidebar (click the bug icon in the activity bar), set breakpoints with `F9`, and press `F5` to start debugging.
+
+**Supported adapters** (installed via `:DapInstall <lang>`):
+
+| Language | Adapter | Type |
+|----------|---------|------|
+| Rust / C / C++ | codelldb | lldb |
+| Python | debugpy | debugpy |
+| Go | delve | go |
+| JavaScript / TypeScript | js-debug | node |
+| Java | java-debug | java |
+
+**Debug sidebar** — four collapsible sections:
+- **Variables** — local/scope variables from the current stack frame
+- **Watch** — user-defined watch expressions (`:DapWatch <expr>`)
+- **Call Stack** — all stack frames; active frame marked with `▶`
+- **Breakpoints** — all set breakpoints listed as `file.rs:N`
+
+**Bottom panel tabs** — `Terminal` and `Debug Output` tabs; debug output shows adapter diagnostics and program output.
+
+**launch.json** — generated automatically in `.vimcode/launch.json` on first debug run; supports `${workspaceFolder}` substitution; existing `.vscode/launch.json` files are auto-migrated.
+
+**Gutter indicators:**
+- `●` — breakpoint set
+- `▶` — current execution line (stopped)
+- `◉` — breakpoint + current line
+
+**Keys:**
+
+| Key | Action |
+|-----|--------|
+| `F5` | Start debugging / continue |
+| `Shift+F5` | Stop debugging |
+| `F9` | Toggle breakpoint on current line |
+| `F10` | Step over |
+| `F11` | Step into |
+| `Shift+F11` | Step out |
+| `F6` | Pause |
+
+**Commands:**
+
+| Command | Action |
+|---------|--------|
+| `:DapInstall <lang>` | Install debug adapter for language |
+| `:DapInfo` | Show detected DAP adapters |
+| `:DapEval <expr>` | Evaluate expression in current frame |
+| `:DapWatch <expr>` | Add watch expression |
+| `:DapBottomPanel terminal\|output` | Switch bottom panel tab |
 
 ---
 
@@ -550,6 +603,13 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `Ctrl-W w` / `c` / `o` | Cycle / close / close-others |
 | `Ctrl-P` | Open fuzzy file finder |
 | `Ctrl-G` | Open live grep modal (search file contents) |
+| `F5` | Start debugging / continue |
+| `Shift+F5` | Stop debugging |
+| `F6` | Pause debugger |
+| `F9` | Toggle breakpoint |
+| `F10` | Step over |
+| `F11` | Step into |
+| `Shift+F11` | Step out |
 | `Alt+E` | Focus / unfocus file explorer |
 | `Alt+F` | Focus / unfocus search panel |
 
@@ -588,6 +648,10 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `:LspInstall <lang>` | Install LSP server for language via Mason |
 | `:Lformat` | Format buffer via LSP |
 | `:Rename <newname>` | Rename symbol under cursor across workspace |
+| `:DapInstall <lang>` | Install debug adapter for language |
+| `:DapInfo` | Show detected DAP adapters |
+| `:DapEval <expr>` | Evaluate expression in current debug frame |
+| `:DapWatch <expr>` | Add watch expression to debug sidebar |
 | `:config reload` | Reload settings from disk |
 | `:help [topic]` / `:h [topic]` | Show help (topics: explorer, keys, commands) |
 
@@ -597,19 +661,21 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 
 ```
 src/
-├── main.rs          (~5725 lines)  GTK4/Relm4 UI, rendering, sidebar resize, fuzzy popup, context menu, drag-and-drop
-├── tui_main.rs      (~4898 lines)  ratatui/crossterm TUI backend, fuzzy popup, rename/move prompts
-├── render.rs        (~1759 lines)  Platform-agnostic ScreenLayout bridge (DiffLine, diff_status)
+├── main.rs          (~6690 lines)  GTK4/Relm4 UI, rendering, sidebar resize, fuzzy popup, context menu, drag-and-drop
+├── tui_main.rs      (~5770 lines)  ratatui/crossterm TUI backend, fuzzy popup, rename/move prompts
+├── render.rs        (~2642 lines)  Platform-agnostic ScreenLayout bridge (DiffLine, diff_status, DebugSidebarData, BottomPanelTabs)
 ├── icons.rs            (~30 lines)  Nerd Font file-type icons (GTK + TUI)
-└── core/            (~25,700 lines)  Zero GTK/rendering deps — fully testable
-    ├── engine.rs    (~20,793 lines)  Orchestrator: keys, commands, git, macros, LSP, project search/replace, fuzzy finder
+└── core/            (~27,600 lines)  Zero GTK/rendering deps — fully testable
+    ├── engine.rs    (~22,902 lines)  Orchestrator: keys, commands, git, macros, LSP, DAP, project search/replace, fuzzy finder
     ├── terminal.rs     (~320 lines)  PTY-backed terminal pane (portable-pty + vt100, history ring buffer)
-    ├── lsp.rs        (~1,894 lines)  LSP protocol transport + single-server client (request ID tracking, JSON-RPC framing)
+    ├── lsp.rs        (~2,045 lines)  LSP protocol transport + single-server client (request ID tracking, JSON-RPC framing)
     ├── lsp_manager.rs  (~671 lines)  Multi-server coordinator with initialization guards + built-in registry
+    ├── dap.rs          (~631 lines)  DAP protocol transport + event routing + seq→command tracking
+    ├── dap_manager.rs  (~779 lines)  DAP multi-adapter coordinator + launch.json support + install scripts
     ├── project_search.rs (~630 lines)  Regex/case/whole-word search + replace (ignore + regex crates)
     ├── buffer_manager.rs (~600 lines)  Buffer lifecycle, undo/redo stacks
     ├── buffer.rs       (~120 lines)  Rope-based text storage (ropey)
-    ├── settings.rs   (~1,030 lines)  JSON config, :set parsing, key binding notation
+    ├── settings.rs   (~1,095 lines)  JSON config, :set parsing, key binding notation
     ├── session.rs      (~180 lines)  Session state persistence
     ├── git.rs          (~635 lines)  Git subprocesses: diff, blame, stage_hunk
     └── window.rs, tab.rs, view.rs, cursor.rs, mode.rs, syntax.rs (~893 lines)

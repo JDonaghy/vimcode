@@ -35,6 +35,7 @@ use render::{
 enum SidebarPanel {
     Explorer,
     Search,
+    Debug,
     Git,
     Settings,
     None,
@@ -72,6 +73,8 @@ struct App {
     tree_has_focus: bool,
     file_tree_view: Rc<RefCell<Option<gtk4::TreeView>>>,
     drawing_area: Rc<RefCell<Option<gtk4::DrawingArea>>>,
+    menu_bar_da: Rc<RefCell<Option<gtk4::DrawingArea>>>,
+    debug_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>>,
     sidebar_inner_box: Rc<RefCell<Option<gtk4::Box>>>,
     // Per-window scrollbars and indicators
     window_scrollbars: Rc<RefCell<HashMap<core::WindowId, WindowScrollbars>>>,
@@ -284,6 +287,16 @@ enum Msg {
     TerminalFindNext,
     /// Navigate to the previous find match.
     TerminalFindPrev,
+    /// Toggle the VSCode-style menu bar on/off.
+    ToggleMenuBar,
+    /// Open a specific top-level menu dropdown by index.
+    OpenMenu(usize),
+    /// Close the open menu dropdown.
+    CloseMenu,
+    /// Activate a menu item: (menu_idx, item_idx, action_str).
+    MenuActivateItem(usize, usize, String),
+    /// Click in the debug sidebar DrawingArea (y coordinate in pixels).
+    DebugSidebarClick(f64),
 }
 
 #[relm4::component]
@@ -305,9 +318,20 @@ impl SimpleComponent for App {
                 gtk4::glib::Propagation::Proceed
             },
 
-            #[name = "main_hbox"]
             gtk4::Box {
-                set_orientation: gtk4::Orientation::Horizontal,
+                set_orientation: gtk4::Orientation::Vertical,
+
+                // Full-width menu bar (sits above the activity bar + sidebar + editor)
+                #[name = "menu_bar_da"]
+                gtk4::DrawingArea {
+                    set_hexpand: true,
+                    set_height_request: 0,
+                },
+
+                #[name = "main_hbox"]
+                gtk4::Box {
+                    set_orientation: gtk4::Orientation::Horizontal,
+                    set_vexpand: true,
 
                 // Activity Bar (48px, always visible)
                 #[name = "activity_bar"]
@@ -315,6 +339,18 @@ impl SimpleComponent for App {
                     set_orientation: gtk4::Orientation::Vertical,
                     set_width_request: 48,
                     set_css_classes: &["activity-bar"],
+
+                    gtk4::Button {
+                        set_label: "\u{f035c}",  // hamburger 󰍜
+                        set_tooltip_text: Some("Menu Bar"),
+                        set_width_request: 48,
+                        set_height_request: 48,
+                        set_css_classes: &["activity-button"],
+
+                        connect_clicked[sender] => move |_| {
+                            sender.input(Msg::ToggleMenuBar);
+                        }
+                    },
 
                     #[name = "explorer_button"]
                     gtk4::Button {
@@ -351,6 +387,25 @@ impl SimpleComponent for App {
 
                         connect_clicked[sender] => move |_| {
                             sender.input(Msg::SwitchPanel(SidebarPanel::Search));
+                        }
+                    },
+
+                    #[name = "debug_button"]
+                    gtk4::Button {
+                        set_label: "\u{f188}",  // nf-fa-bug
+                        set_tooltip_text: Some("Debug"),
+                        set_width_request: 48,
+                        set_height_request: 48,
+
+                        #[watch]
+                        set_css_classes: if model.active_panel == SidebarPanel::Debug && model.sidebar_visible {
+                            &["activity-button", "active"]
+                        } else {
+                            &["activity-button"]
+                        },
+
+                        connect_clicked[sender] => move |_| {
+                            sender.input(Msg::SwitchPanel(SidebarPanel::Debug));
                         }
                     },
 
@@ -705,6 +760,26 @@ impl SimpleComponent for App {
                             },
                         },
                     },
+
+                    // Debug sidebar panel
+                    gtk4::Box {
+                        set_orientation: gtk4::Orientation::Vertical,
+                        set_css_classes: &["sidebar"],
+
+                        #[watch]
+                        set_visible: {
+                            if model.active_panel == SidebarPanel::Debug {
+                                debug_sidebar_da.queue_draw();
+                            }
+                            model.active_panel == SidebarPanel::Debug
+                        },
+
+                        #[name = "debug_sidebar_da"]
+                        gtk4::DrawingArea {
+                            set_vexpand: true,
+                            set_hexpand: true,
+                        },
+                    },
                 },
 
                 // Sidebar resize drag handle (6px wide, ew-resize cursor)
@@ -751,6 +826,27 @@ impl SimpleComponent for App {
                                     let ctrl = modifier.contains(gdk::ModifierType::CONTROL_MASK);
                                     let shift = modifier.contains(gdk::ModifierType::SHIFT_MASK);
                                     let alt = modifier.contains(gdk::ModifierType::ALT_MASK);
+
+                                    // Alt+letter: open menu (when menu bar visible)
+                                    if alt && !ctrl && !shift {
+                                        if let Some(ch) = unicode {
+                                            let ch_lower = ch.to_ascii_lowercase();
+                                            use crate::render::MENU_STRUCTURE;
+                                            let menu_idx = MENU_STRUCTURE
+                                                .iter()
+                                                .position(|(_, alt_key, _)| *alt_key == ch_lower);
+                                            if let Some(idx) = menu_idx {
+                                                if engine.borrow().menu_bar_visible {
+                                                    if engine.borrow().menu_open_idx == Some(idx) {
+                                                        sender.input(Msg::CloseMenu);
+                                                    } else {
+                                                        sender.input(Msg::OpenMenu(idx));
+                                                    }
+                                                    return gtk4::glib::Propagation::Stop;
+                                                }
+                                            }
+                                        }
+                                    }
 
                                     // Alt-M: toggle Vim ↔ VSCode editing mode
                                     if alt && !ctrl && !shift && unicode == Some('m') {
@@ -871,6 +967,21 @@ impl SimpleComponent for App {
                                             ctrl: true,
                                         });
                                         return gtk4::glib::Propagation::Stop;
+                                    }
+
+                                    // Shift+F5 → stop, Shift+F11 → stepout (debug shortcuts)
+                                    if shift && !ctrl && !alt {
+                                        match key_name.as_str() {
+                                            "F5" => {
+                                                engine.borrow_mut().execute_command("stop");
+                                                return gtk4::glib::Propagation::Stop;
+                                            }
+                                            "F11" => {
+                                                engine.borrow_mut().execute_command("stepout");
+                                                return gtk4::glib::Propagation::Stop;
+                                            }
+                                            _ => {}
+                                        }
                                     }
 
                                     // In VSCode mode, transform Shift+Arrow to "Shift_" prefixed
@@ -1057,7 +1168,8 @@ impl SimpleComponent for App {
                         }
                     }
                 }
-            }
+                }  // close main_hbox
+            }  // close outer gtk4::Box
         }
     }
 
@@ -1119,6 +1231,9 @@ impl SimpleComponent for App {
 
         let file_tree_view_ref = Rc::new(RefCell::new(None));
         let drawing_area_ref = Rc::new(RefCell::new(None));
+        let menu_bar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> = Rc::new(RefCell::new(None));
+        let debug_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> =
+            Rc::new(RefCell::new(None));
         let overlay_ref = Rc::new(RefCell::new(None));
         let window_scrollbars_ref = Rc::new(RefCell::new(HashMap::new()));
         let sidebar_inner_box_ref: Rc<RefCell<Option<gtk4::Box>>> = Rc::new(RefCell::new(None));
@@ -1165,6 +1280,8 @@ impl SimpleComponent for App {
             tree_has_focus: false,
             file_tree_view: file_tree_view_ref.clone(),
             drawing_area: drawing_area_ref.clone(),
+            menu_bar_da: menu_bar_da_ref.clone(),
+            debug_sidebar_da_ref: debug_sidebar_da_ref.clone(),
             window_scrollbars: window_scrollbars_ref.clone(),
             overlay: overlay_ref.clone(),
             cached_line_height: 24.0,
@@ -1191,10 +1308,120 @@ impl SimpleComponent for App {
         // Store widget references
         *file_tree_view_ref.borrow_mut() = Some(widgets.file_tree_view.clone());
         *drawing_area_ref.borrow_mut() = Some(widgets.drawing_area.clone());
+        *menu_bar_da_ref.borrow_mut() = Some(widgets.menu_bar_da.clone());
         *overlay_ref.borrow_mut() = Some(widgets.editor_overlay.clone());
         *sidebar_inner_box_ref.borrow_mut() = Some(widgets.sidebar_inner_box.clone());
         *search_results_list_ref.borrow_mut() = Some(widgets.search_results_list.clone());
 
+        // ── Menu bar DrawingArea setup ─────────────────────────────────────────
+        // Draw function: renders menu labels using the same Cairo helper.
+        {
+            let engine = engine.clone();
+            widgets.menu_bar_da.set_draw_func(move |da, cr, _w, _h| {
+                let engine = engine.borrow();
+                if !engine.menu_bar_visible {
+                    return;
+                }
+                let theme = Theme::onedark();
+                let open_items: Vec<render::MenuItemData> = if let Some(midx) = engine.menu_open_idx
+                {
+                    render::MENU_STRUCTURE
+                        .get(midx)
+                        .map(|(_, _, items)| items.to_vec())
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                let open_menu_col: u16 = if let Some(midx) = engine.menu_open_idx {
+                    let mut col: u16 = 0;
+                    for i in 0..midx {
+                        if let Some((name, _, _)) = render::MENU_STRUCTURE.get(i) {
+                            col += name.len() as u16 + 2;
+                        }
+                    }
+                    col
+                } else {
+                    0
+                };
+                let data = render::MenuBarData {
+                    open_menu_idx: engine.menu_open_idx,
+                    open_items,
+                    open_menu_col,
+                    highlighted_item_idx: engine.menu_highlighted_item,
+                };
+                let w = da.width() as f64;
+                let h = da.height() as f64;
+                draw_menu_bar(cr, &data, &theme, 0.0, 0.0, w, h);
+            });
+        }
+        // Click gesture: open/close individual menus (no hamburger zone here).
+        {
+            let sender_menu = sender.input_sender().clone();
+            let engine_menu = engine.clone();
+            let gesture = gtk4::GestureClick::new();
+            gesture.set_button(1);
+            gesture.connect_pressed(move |_, _, x, _y| {
+                let engine = engine_menu.borrow();
+                // Scan menu labels from left edge (no hamburger on this widget)
+                let mut cursor_x = 8.0_f64;
+                for (idx, (name, _, _)) in render::MENU_STRUCTURE.iter().enumerate() {
+                    let item_w = name.len() as f64 * 7.0 + 8.0;
+                    if x >= cursor_x && x < cursor_x + item_w {
+                        if engine.menu_open_idx == Some(idx) {
+                            sender_menu.send(Msg::CloseMenu).ok();
+                        } else {
+                            sender_menu.send(Msg::OpenMenu(idx)).ok();
+                        }
+                        return;
+                    }
+                    cursor_x += item_w;
+                }
+                // Click in empty part of bar → close any open dropdown
+                if engine.menu_open_idx.is_some() {
+                    sender_menu.send(Msg::CloseMenu).ok();
+                }
+            });
+            widgets.menu_bar_da.add_controller(gesture);
+        }
+        // ── Debug sidebar DrawingArea setup ───────────────────────────────────
+        {
+            let engine = engine.clone();
+            widgets
+                .debug_sidebar_da
+                .set_draw_func(move |da, cr, _w, _h| {
+                    let engine = engine.borrow();
+                    let theme = Theme::onedark();
+                    let font_str = format!(
+                        "{} {}",
+                        engine.settings.font_family, engine.settings.font_size
+                    );
+                    let font_desc = FontDescription::from_string(&font_str);
+                    let pango_ctx = pangocairo::create_context(cr);
+                    let layout = pango::Layout::new(&pango_ctx);
+                    layout.set_font_description(Some(&font_desc));
+                    let font_metrics = pango_ctx.metrics(Some(&font_desc), None);
+                    let line_height = (font_metrics.ascent() + font_metrics.descent()) as f64
+                        / pango::SCALE as f64;
+                    let char_width =
+                        font_metrics.approximate_char_width() as f64 / pango::SCALE as f64;
+                    let screen = build_screen_layout(&engine, &theme, &[], line_height, char_width);
+                    let w = da.width() as f64;
+                    let h = da.height() as f64;
+                    draw_debug_sidebar(cr, &layout, &screen, &theme, 0.0, 0.0, w, h, line_height);
+                });
+        }
+        // ── Debug sidebar click handler ────────────────────────────────────────
+        {
+            let sender_dbg = sender.input_sender().clone();
+            let gesture = gtk4::GestureClick::new();
+            gesture.set_button(1);
+            gesture.connect_pressed(move |_, _, _x, y| {
+                sender_dbg.send(Msg::DebugSidebarClick(y)).ok();
+            });
+            widgets.debug_sidebar_da.add_controller(gesture);
+        }
+        // Store a reference so update() can explicitly queue_draw when DAP events arrive.
+        *debug_sidebar_da_ref.borrow_mut() = Some(widgets.debug_sidebar_da.clone());
         // Restore saved sidebar width
         {
             let saved_width = engine.borrow().session.sidebar_width;
@@ -1840,14 +2067,19 @@ impl SimpleComponent for App {
                 height,
             } => {
                 // Check if click lands in the terminal panel before general handling.
-                // term_y: terminal sits directly above the status bar (NOT above quickfix).
+                // Layout (bottom to top): status | toolbar | terminal | quickfix | DAP | editor
                 let in_terminal = if self.cached_line_height > 0.0 {
                     let engine = self.engine.borrow();
-                    if engine.terminal_open {
+                    if engine.terminal_open || engine.bottom_panel_open {
                         let term_px = (engine.session.terminal_panel_rows as f64 + 1.0)
                             * self.cached_line_height;
                         let status_h = 2.0 * self.cached_line_height;
-                        let term_y = height - status_h - term_px;
+                        let toolbar_px = if engine.debug_toolbar_visible {
+                            self.cached_line_height
+                        } else {
+                            0.0
+                        };
+                        let term_y = height - status_h - toolbar_px - term_px;
                         if y >= term_y {
                             Some((term_y, y >= term_y + self.cached_line_height))
                         } else {
@@ -1860,6 +2092,28 @@ impl SimpleComponent for App {
                     None
                 };
                 if let Some((term_y, in_content)) = in_terminal {
+                    // Click on the tab bar row: switch active bottom panel tab.
+                    if !in_content {
+                        // Determine which tab was clicked by measuring label widths.
+                        // Labels mirror draw_bottom_panel_tabs: Terminal then Debug Output.
+                        // Use a simple fixed-width estimate (label char count × char_width).
+                        let cw = self.cached_char_width.max(1.0);
+                        let terminal_label = "  \u{f489}  Terminal  ";
+                        let debug_label = "  \u{f188}  Debug Output  ";
+                        let terminal_w = terminal_label.chars().count() as f64 * cw;
+                        let tab_x = x - 4.0; // offset matches draw_bottom_panel_tabs cursor_x start
+                        let new_kind = if tab_x < terminal_w {
+                            render::BottomPanelKind::Terminal
+                        } else if tab_x < terminal_w + 8.0 + debug_label.chars().count() as f64 * cw
+                        {
+                            render::BottomPanelKind::DebugOutput
+                        } else {
+                            self.engine.borrow().bottom_panel_kind.clone()
+                        };
+                        self.engine.borrow_mut().bottom_panel_kind = new_kind;
+                        sender.input(Msg::Resize); // triggers redraw
+                        return;
+                    }
                     self.engine.borrow_mut().terminal_has_focus = true;
                     if in_content {
                         const SB_W: f64 = 6.0;
@@ -1939,11 +2193,90 @@ impl SimpleComponent for App {
                     let mut engine = self.engine.borrow_mut();
                     // Clicking outside the terminal panel returns focus to the editor.
                     engine.terminal_has_focus = false;
-                    // Clear selection on click in VSCode mode.
-                    if engine.is_vscode_mode() {
-                        engine.vscode_clear_selection();
+
+                    // ── Dropdown click detection ──────────────────────────────
+                    // Menu bar strip clicks are handled by menu_bar_da's GestureClick.
+                    // Here we only check for dropdown item clicks.
+                    let line_height = self.cached_line_height;
+                    let mut menu_handled = false;
+                    if let Some(open_idx) = engine.menu_open_idx {
+                        if let Some((_, _, items)) = render::MENU_STRUCTURE.get(open_idx) {
+                            // Dropdown is drawn at y=0 of the drawing_area
+                            // (which starts just below the full-width menu_bar_da widget).
+                            let popup_y = 0.0_f64;
+                            let popup_h = (items.len() as f64 + 1.0) * line_height;
+                            // Compute popup_x to match draw_menu_dropdown.
+                            let mut col_pos: u16 = 0;
+                            for i in 0..open_idx {
+                                if let Some((name, _, _)) = render::MENU_STRUCTURE.get(i) {
+                                    col_pos += name.len() as u16 + 2;
+                                }
+                            }
+                            let popup_x = col_pos as f64 * 7.0;
+                            let popup_w = 200.0_f64;
+                            if y >= popup_y
+                                && y < popup_y + popup_h
+                                && x >= popup_x
+                                && x < popup_x + popup_w
+                            {
+                                // Click inside the dropdown.
+                                if y >= popup_y + line_height * 0.5 {
+                                    let item_idx = ((y - popup_y) / line_height) as usize;
+                                    let actual = item_idx.saturating_sub(1);
+                                    if actual < items.len() && !items[actual].separator {
+                                        let action = items[actual].action.to_string();
+                                        engine.menu_activate_item(open_idx, actual, &action);
+                                    }
+                                }
+                                menu_handled = true;
+                            } else {
+                                // Click outside dropdown → close it.
+                                engine.close_menu();
+                            }
+                        }
                     }
-                    handle_mouse_click(&mut engine, x, y, width, height);
+
+                    // ── Debug toolbar hit-test ────────────────────────────────
+                    let mut toolbar_handled = false;
+                    if !menu_handled
+                        && engine.debug_toolbar_visible
+                        && self.cached_line_height > 0.0
+                    {
+                        // Toolbar is the single row above status(1)+cmd(1).
+                        // It is always at a fixed position; terminal/quickfix/DAP
+                        // panels stack above it, not below it.
+                        let toolbar_y =
+                            height - 2.0 * self.cached_line_height - self.cached_line_height;
+                        if y >= toolbar_y && y < toolbar_y + self.cached_line_height {
+                            let mut cursor_x = 8.0_f64;
+                            for (idx, btn) in render::DEBUG_BUTTONS.iter().enumerate() {
+                                if idx == 4 {
+                                    cursor_x += 16.0; // visual separator gap
+                                }
+                                let text_len =
+                                    btn.icon.chars().count() + btn.key_hint.chars().count() + 4; // " (hint) "
+                                let btn_w = text_len as f64 * self.cached_char_width;
+                                if x >= cursor_x && x < cursor_x + btn_w {
+                                    let _ = engine.execute_command(btn.action);
+                                    toolbar_handled = true;
+                                    break;
+                                }
+                                cursor_x += btn_w;
+                            }
+                            if !toolbar_handled {
+                                toolbar_handled = true; // click in toolbar row, consume event
+                            }
+                        }
+                    }
+
+                    if !menu_handled && !toolbar_handled {
+                        // Clear selection on click in VSCode mode.
+                        if engine.is_vscode_mode() {
+                            engine.vscode_clear_selection();
+                        }
+                        handle_mouse_click(&mut engine, x, y, width, height);
+                    }
+
                     // Reveal the active file in the sidebar tree (e.g. after tab click)
                     let file_path = engine.file_path().cloned();
                     drop(engine);
@@ -2009,7 +2342,12 @@ impl SimpleComponent for App {
                             + 1.0)
                             * self.cached_line_height;
                         let status_h = 2.0 * self.cached_line_height;
-                        let term_y = height - status_h - term_px;
+                        let toolbar_px = if self.engine.borrow().debug_toolbar_visible {
+                            self.cached_line_height
+                        } else {
+                            0.0
+                        };
+                        let term_y = height - status_h - toolbar_px - term_px;
                         let content_y = term_y + self.cached_line_height;
                         let content_h = term_px - self.cached_line_height;
                         if scrollback_rows > 0 && content_h > 0.0 {
@@ -2027,11 +2365,16 @@ impl SimpleComponent for App {
                     // Check if drag is in the terminal content area (text selection).
                     let in_terminal = if self.cached_line_height > 0.0 {
                         let engine = self.engine.borrow();
-                        if engine.terminal_open {
+                        if engine.terminal_open || engine.bottom_panel_open {
                             let term_px = (engine.session.terminal_panel_rows as f64 + 1.0)
                                 * self.cached_line_height;
                             let status_h = 2.0 * self.cached_line_height;
-                            let term_y = height - status_h - term_px;
+                            let toolbar_px = if engine.debug_toolbar_visible {
+                                self.cached_line_height
+                            } else {
+                                0.0
+                            };
+                            let term_y = height - status_h - toolbar_px - term_px;
                             if y >= term_y + self.cached_line_height {
                                 Some(term_y)
                             } else {
@@ -2437,6 +2780,12 @@ impl SimpleComponent for App {
                 let old_char_width = self.cached_char_width;
                 self.cached_line_height = line_height;
                 self.cached_char_width = char_width;
+                // Sync menu bar height to font metrics
+                if let Some(ref da) = *self.menu_bar_da.borrow() {
+                    if self.engine.borrow().menu_bar_visible {
+                        da.set_height_request(line_height as i32);
+                    }
+                }
                 // If cached_char_width changed significantly (e.g. on first draw after startup
                 // when the initial default of 9.0 differed from the actual font metric),
                 // resize any open terminal panes so their PTY col count matches the display.
@@ -2633,6 +2982,27 @@ impl SimpleComponent for App {
                 // Terminal: drain PTY output and refresh display if needed
                 if self.engine.borrow_mut().poll_terminal() {
                     self.redraw = true;
+                }
+                // DAP: drain adapter events (breakpoint hits, stops, output)
+                {
+                    let mut engine = self.engine.borrow_mut();
+                    if engine.poll_dap() {
+                        self.redraw = true;
+                    }
+                    // Auto-switch to Debug sidebar when a session starts.
+                    if engine.dap_wants_sidebar {
+                        engine.dap_wants_sidebar = false;
+                        self.active_panel = SidebarPanel::Debug;
+                        self.sidebar_visible = true;
+                        self.redraw = true;
+                    }
+                }
+                // Explicitly redraw the debug sidebar if it's active so the
+                // Run/Stop button text and section data stay in sync.
+                if self.active_panel == SidebarPanel::Debug {
+                    if let Some(ref da) = *self.debug_sidebar_da_ref.borrow() {
+                        da.queue_draw();
+                    }
                 }
             }
             Msg::ProjectSearchOpenResult(idx) => {
@@ -2925,6 +3295,63 @@ impl SimpleComponent for App {
                 self.engine.borrow_mut().terminal_find_prev();
                 self.redraw = true;
             }
+            Msg::ToggleMenuBar => {
+                self.engine.borrow_mut().toggle_menu_bar();
+                if let Some(ref da) = *self.menu_bar_da.borrow() {
+                    let visible = self.engine.borrow().menu_bar_visible;
+                    da.set_height_request(if visible {
+                        self.cached_line_height as i32
+                    } else {
+                        0
+                    });
+                    da.set_visible(visible);
+                    da.queue_draw();
+                }
+                self.redraw = true;
+            }
+            Msg::OpenMenu(idx) => {
+                self.engine.borrow_mut().open_menu(idx);
+                if let Some(ref da) = *self.menu_bar_da.borrow() {
+                    da.queue_draw();
+                }
+                self.redraw = true;
+            }
+            Msg::CloseMenu => {
+                self.engine.borrow_mut().close_menu();
+                if let Some(ref da) = *self.menu_bar_da.borrow() {
+                    da.queue_draw();
+                }
+                self.redraw = true;
+            }
+            Msg::MenuActivateItem(menu_idx, item_idx, action) => {
+                self.engine
+                    .borrow_mut()
+                    .menu_activate_item(menu_idx, item_idx, &action);
+                if let Some(ref da) = *self.menu_bar_da.borrow() {
+                    da.queue_draw();
+                }
+                self.redraw = true;
+            }
+            Msg::DebugSidebarClick(y) => {
+                // Row 1 (the Run/Stop button) is between line_height and 2×line_height.
+                let lh = self.cached_line_height;
+                if y >= lh && y < 2.0 * lh {
+                    let mut engine = self.engine.borrow_mut();
+                    if engine.dap_session_active && engine.dap_stopped_thread.is_some() {
+                        engine.dap_continue();
+                    } else if engine.dap_session_active {
+                        engine.execute_command("stop");
+                    } else {
+                        engine.execute_command("debug");
+                    }
+                }
+                // Always queue a redraw of the debug sidebar so the button text
+                // reflects the updated engine state immediately.
+                if let Some(ref da) = *self.debug_sidebar_da_ref.borrow() {
+                    da.queue_draw();
+                }
+                self.redraw = !self.redraw;
+            }
         }
 
         // Sync scrollbar position to match engine state (except when scrollbar itself changed)
@@ -3051,12 +3478,17 @@ impl App {
         let line_height = self.cached_line_height;
         let tab_bar_height = line_height;
         let status_bar_height = line_height * 2.0;
+        let debug_toolbar_px = if engine.debug_toolbar_visible {
+            line_height
+        } else {
+            0.0
+        };
         let qf_px = if engine.quickfix_open && !engine.quickfix_items.is_empty() {
             6.0 * line_height
         } else {
             0.0
         };
-        let term_px = if engine.terminal_open {
+        let term_px = if engine.terminal_open || engine.bottom_panel_open {
             (engine.session.terminal_panel_rows as f64 + 1.0) * line_height
         } else {
             0.0
@@ -3066,7 +3498,13 @@ impl App {
             0.0,
             tab_bar_height,
             da_width,
-            da_height - tab_bar_height - status_bar_height - qf_px - term_px - 10.0,
+            da_height
+                - tab_bar_height
+                - status_bar_height
+                - debug_toolbar_px
+                - qf_px
+                - term_px
+                - 10.0,
         );
 
         let window_rects = engine.calculate_window_rects(content_bounds);
@@ -3159,11 +3597,24 @@ impl App {
             // vertical scrollbar so that the thumb correctly reflects how much
             // of the longest line fits on screen.
             let cw = self.cached_char_width.max(1.0);
+            let has_bp_sb = {
+                let key = buffer_state
+                    .file_path
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                !engine
+                    .dap_breakpoints
+                    .get(&key)
+                    .is_none_or(|v| v.is_empty())
+                    || engine.dap_session_active
+            };
             let gutter_cols = render::calculate_gutter_cols(
                 engine.settings.line_numbers,
                 buffer_state.buffer.content.len_lines(),
                 cw,
                 !buffer_state.git_diff.is_empty(),
+                has_bp_sb,
             );
             let gutter_px = gutter_cols as f64 * cw;
             let v_scrollbar_px = 10.0_f64;
@@ -3354,26 +3805,57 @@ fn draw_editor(
         0.0
     };
 
-    // Reserve space for the terminal panel when open (1 header + session-configured content rows)
-    let term_px = if engine.terminal_open {
+    // Reserve space for the bottom panel when open (1 tab-bar row + content rows).
+    // Triggered by either a live terminal OR the debug output panel being shown.
+    let term_px = if engine.terminal_open || engine.bottom_panel_open {
         (engine.session.terminal_panel_rows as usize + 1) as f64 * line_height
     } else {
         0.0
     };
 
+    let debug_toolbar_px = if engine.debug_toolbar_visible {
+        line_height
+    } else {
+        0.0
+    };
+
     // Calculate window rects for the current tab
+    // Note: menu bar is now a separate full-width GTK widget above the drawing area,
+    // so we do NOT subtract menu_bar_px from the content bounds here.
     let content_bounds = WindowRect::new(
         0.0,
         tab_bar_height,
         width as f64,
-        height as f64 - tab_bar_height - status_bar_height - qf_px - term_px - 10.0, // Reserve 10px for h-scrollbar
+        height as f64
+            - tab_bar_height
+            - status_bar_height
+            - debug_toolbar_px
+            - qf_px
+            - term_px
+            - 10.0, // Reserve 10px for h-scrollbar
     );
     let window_rects = engine.calculate_window_rects(content_bounds);
 
     // Build the platform-agnostic screen layout
     let screen = build_screen_layout(engine, &theme, &window_rects, line_height, char_width);
 
-    // 3. Draw tab bar (always visible)
+    // 3. Draw menu dropdown overlay if a menu is open (bar itself is in menu_bar_da widget)
+    if let Some(ref menu_data) = screen.menu_bar {
+        if menu_data.open_menu_idx.is_some() {
+            draw_menu_dropdown(
+                cr,
+                menu_data,
+                &theme,
+                0.0,
+                0.0, // drawing_area starts just below the menu bar widget
+                width as f64,
+                height as f64,
+                line_height,
+            );
+        }
+    }
+
+    // 3b. Draw tab bar (at y=0; the menu bar widget is above the drawing_area)
     draw_tab_bar(
         cr,
         &layout,
@@ -3381,6 +3863,7 @@ fn draw_editor(
         &screen.tab_bar,
         width as f64,
         line_height,
+        0.0,
     );
 
     // 4. Draw each window
@@ -3431,9 +3914,9 @@ fn draw_editor(
         line_height,
     );
 
-    // 5f. Draw quickfix panel (persistent bottom strip above status bar)
+    // 5f2. Draw quickfix panel (persistent bottom strip above status bar)
     if qf_px > 0.0 {
-        let qf_y = height as f64 - status_bar_height - qf_px - term_px;
+        let qf_y = height as f64 - status_bar_height - debug_toolbar_px - qf_px - term_px;
         draw_quickfix_panel(
             cr,
             &layout,
@@ -3447,24 +3930,66 @@ fn draw_editor(
         );
     }
 
-    // 5g. Draw terminal panel (persistent bottom strip above quickfix/status)
+    // 5g. Draw bottom panel (Terminal or Debug Output) with a tab bar.
     if term_px > 0.0 {
-        if let Some(ref term_panel) = screen.terminal {
-            let term_y = height as f64 - status_bar_height - term_px;
-            draw_terminal_panel(
-                cr,
-                &layout,
-                term_panel,
-                &theme,
-                0.0,
-                term_y,
-                width as f64,
-                term_px,
-                line_height,
-                char_width,
-                sender,
-            );
+        let term_y = height as f64 - status_bar_height - debug_toolbar_px - term_px;
+        // Tab bar row (1 line high) at the top of the bottom panel area.
+        draw_bottom_panel_tabs(
+            cr,
+            &layout,
+            &screen,
+            &theme,
+            0.0,
+            term_y,
+            width as f64,
+            line_height,
+        );
+        match screen.bottom_tabs.active {
+            render::BottomPanelKind::Terminal => {
+                if let Some(ref term_panel) = screen.bottom_tabs.terminal {
+                    draw_terminal_panel(
+                        cr,
+                        &layout,
+                        term_panel,
+                        &theme,
+                        0.0,
+                        term_y + line_height, // skip tab bar row
+                        width as f64,
+                        term_px - line_height,
+                        line_height,
+                        char_width,
+                        sender,
+                    );
+                }
+            }
+            render::BottomPanelKind::DebugOutput => {
+                draw_debug_output(
+                    cr,
+                    &layout,
+                    &screen.bottom_tabs.output_lines,
+                    &theme,
+                    0.0,
+                    term_y + line_height,
+                    width as f64,
+                    term_px - line_height,
+                    line_height,
+                );
+            }
         }
+    }
+
+    // 5h. Draw debug toolbar strip if visible (above status bar)
+    if let Some(ref toolbar) = screen.debug_toolbar {
+        let toolbar_y = height as f64 - status_bar_height - debug_toolbar_px;
+        draw_debug_toolbar(
+            cr,
+            toolbar,
+            &theme,
+            0.0,
+            toolbar_y,
+            width as f64,
+            line_height,
+        );
     }
 
     // 6. Status Line (second-to-last line)
@@ -3500,11 +4025,12 @@ fn draw_tab_bar(
     tabs: &[TabInfo],
     width: f64,
     line_height: f64,
+    y_offset: f64,
 ) {
     // Tab bar background
     let (r, g, b) = theme.tab_bar_bg.to_cairo();
     cr.set_source_rgb(r, g, b);
-    cr.rectangle(0.0, 0.0, width, line_height);
+    cr.rectangle(0.0, y_offset, width, line_height);
     cr.fill().unwrap();
 
     // Save current font description so we can restore after rendering previews
@@ -3532,11 +4058,11 @@ fn draw_tab_bar(
         };
         let (br, bg_g, bb) = bg.to_cairo();
         cr.set_source_rgb(br, bg_g, bb);
-        cr.rectangle(x, 0.0, tab_width as f64, line_height);
+        cr.rectangle(x, y_offset, tab_width as f64, line_height);
         cr.fill().unwrap();
 
         // Tab text — dimmed colours for preview tabs
-        cr.move_to(x, 0.0);
+        cr.move_to(x, y_offset);
         let fg = if tab.preview {
             if tab.active {
                 theme.tab_preview_active_fg
@@ -3589,17 +4115,23 @@ fn draw_window(
     cr.rectangle(rect.x, rect.y, rect.width, rect.height);
     cr.fill().unwrap();
 
-    // Diff background highlight (drawn before selection so selection is on top)
+    // Diff / DAP stopped-line background (drawn before selection so selection is on top)
     for (view_idx, rl) in rw.lines.iter().enumerate() {
-        if let Some(diff_status) = rl.diff_status {
+        let y = rect.y + view_idx as f64 * line_height;
+        let bg_color = if rl.is_dap_current {
+            Some(theme.dap_stopped_bg)
+        } else if let Some(diff_status) = rl.diff_status {
             use crate::core::engine::DiffLine;
-            let diff_color = match diff_status {
-                DiffLine::Added => theme.diff_added_bg,
-                DiffLine::Removed => theme.diff_removed_bg,
-                DiffLine::Same => continue,
-            };
-            let y = rect.y + view_idx as f64 * line_height;
-            let (dr, dg, db) = diff_color.to_cairo();
+            match diff_status {
+                DiffLine::Added => Some(theme.diff_added_bg),
+                DiffLine::Removed => Some(theme.diff_removed_bg),
+                DiffLine::Same => None,
+            }
+        } else {
+            None
+        };
+        if let Some(color) = bg_color {
+            let (dr, dg, db) = color.to_cairo();
             cr.set_source_rgb(dr, dg, db);
             cr.rectangle(rect.x, y, rect.width, line_height);
             cr.fill().unwrap();
@@ -3621,14 +4153,34 @@ fn draw_window(
         );
     }
 
-    // Render gutter (git marker + fold indicators + optional line numbers)
+    // Render gutter (bp marker + git marker + fold indicators + optional line numbers)
     if rw.gutter_char_width > 0 {
         for (view_idx, rl) in rw.lines.iter().enumerate() {
             let y = rect.y + view_idx as f64 * line_height;
 
+            // Track how many left-aligned marker chars have been rendered.
+            let mut char_offset = 0usize;
+
+            // Breakpoint column — leftmost when any breakpoints/session active.
+            if rw.has_breakpoints {
+                let bp_ch: String = rl.gutter_text.chars().take(1).collect();
+                let bp_color = if rl.is_dap_current || rl.is_breakpoint {
+                    theme.diagnostic_error
+                } else {
+                    theme.line_number_fg
+                };
+                layout.set_text(&bp_ch);
+                layout.set_attributes(None);
+                let (br, bg_c, bb) = bp_color.to_cairo();
+                cr.set_source_rgb(br, bg_c, bb);
+                cr.move_to(rect.x + 3.0, y);
+                pangocairo::show_layout(cr, layout);
+                char_offset += 1;
+            }
+
+            // Git marker column.
             if rw.has_git_diff {
-                // Render git marker (first char of gutter_text) with git color.
-                let git_ch: String = rl.gutter_text.chars().take(1).collect();
+                let git_ch: String = rl.gutter_text.chars().skip(char_offset).take(1).collect();
                 let git_color = match rl.git_diff {
                     Some(GitLineStatus::Added) => theme.git_added,
                     Some(GitLineStatus::Modified) => theme.git_modified,
@@ -3638,14 +4190,21 @@ fn draw_window(
                 layout.set_attributes(None);
                 let (gr, gg, gb) = git_color.to_cairo();
                 cr.set_source_rgb(gr, gg, gb);
-                cr.move_to(rect.x + 3.0, y);
+                cr.move_to(rect.x + char_offset as f64 * char_width + 3.0, y);
                 pangocairo::show_layout(cr, layout);
+                char_offset += 1;
 
-                // Render fold+numbers (rest of gutter_text) with normal color.
-                let rest: String = rl.gutter_text.chars().skip(1).collect();
+                // Fold+numbers portion right-aligned.
+                let rest: String = rl.gutter_text.chars().skip(char_offset).collect();
+                layout.set_text(&rest);
+                layout.set_attributes(None);
+            } else if char_offset > 0 {
+                // bp column only — rest is fold+numbers.
+                let rest: String = rl.gutter_text.chars().skip(char_offset).collect();
                 layout.set_text(&rest);
                 layout.set_attributes(None);
             } else {
+                // No marker columns.
                 layout.set_text(&rl.gutter_text);
                 layout.set_attributes(None);
             }
@@ -3663,7 +4222,7 @@ fn draw_window(
             cr.move_to(num_x, y);
             pangocairo::show_layout(cr, layout);
 
-            // Diagnostic gutter icon (colored dot overrides git marker position)
+            // Diagnostic gutter icon (colored dot at leftmost gutter position)
             if let Some(severity) = rw.diagnostic_gutter.get(&rl.line_idx) {
                 let diag_color = match severity {
                     DiagnosticSeverity::Error => theme.diagnostic_error,
@@ -4471,6 +5030,252 @@ fn draw_live_grep_popup(
     cr.restore().ok();
 }
 
+/// Draw the tab bar for the bottom panel (Terminal / Debug Output).
+/// One row high at `(x, y)`, full width `w`.
+#[allow(clippy::too_many_arguments)]
+fn draw_bottom_panel_tabs(
+    cr: &Context,
+    layout: &pango::Layout,
+    screen: &render::ScreenLayout,
+    theme: &Theme,
+    x: f64,
+    y: f64,
+    w: f64,
+    line_height: f64,
+) {
+    let (hr, hg, hb) = theme.status_bg.to_cairo();
+    let (fr, fg, fb) = theme.status_fg.to_cairo();
+    let (ar, ag, ab) = theme.tab_active_fg.to_cairo();
+
+    // Background.
+    cr.set_source_rgb(hr, hg, hb);
+    cr.rectangle(x, y, w, line_height);
+    cr.fill().ok();
+
+    layout.set_attributes(None);
+
+    let tabs = [
+        ("  \u{f489}  Terminal  ", render::BottomPanelKind::Terminal), // nf-md-console
+        (
+            "  \u{f188}  Debug Output  ",
+            render::BottomPanelKind::DebugOutput,
+        ), // nf-fa-bug
+    ];
+
+    let mut cursor_x = x + 4.0;
+    for (label, kind) in &tabs {
+        let is_active = screen.bottom_tabs.active == *kind;
+        let (lr, lg, lb) = if is_active {
+            (ar, ag, ab)
+        } else {
+            (fr, fg, fb)
+        };
+        cr.set_source_rgb(lr, lg, lb);
+        layout.set_text(label);
+        cr.move_to(cursor_x, y);
+        pangocairo::show_layout(cr, layout);
+        // Underline the active tab.
+        if is_active {
+            let extents = layout.pixel_extents().1;
+            let tab_w = extents.width() as f64;
+            cr.set_source_rgb(ar, ag, ab);
+            cr.rectangle(cursor_x, y + line_height - 2.0, tab_w, 2.0);
+            cr.fill().ok();
+        }
+        let extents = layout.pixel_extents().1;
+        cursor_x += extents.width() as f64 + 8.0;
+    }
+}
+
+/// Draw debug output lines (read-only scrolling log).
+#[allow(clippy::too_many_arguments)]
+fn draw_debug_output(
+    cr: &Context,
+    layout: &pango::Layout,
+    output_lines: &[String],
+    theme: &Theme,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    line_height: f64,
+) {
+    let (br, bg_g, bb) = theme.completion_bg.to_cairo();
+    cr.set_source_rgb(br, bg_g, bb);
+    cr.rectangle(x, y, w, h);
+    cr.fill().ok();
+
+    let (fr, fg, fb) = theme.fuzzy_fg.to_cairo();
+    cr.set_source_rgb(fr, fg, fb);
+    layout.set_attributes(None);
+
+    let visible_rows = (h / line_height) as usize;
+    let start = output_lines.len().saturating_sub(visible_rows);
+    for (row, line_text) in output_lines.iter().skip(start).enumerate() {
+        let ry = y + row as f64 * line_height;
+        let text = format!("  {line_text}");
+        layout.set_text(&text);
+        cr.move_to(x, ry);
+        pangocairo::show_layout(cr, layout);
+    }
+}
+
+/// Draw the VSCode-style debug sidebar content.
+///
+/// Shows four sections stacked vertically:
+///   • VARIABLES (with ▶/▼ expansion)
+///   • WATCH (expressions + values)
+///   • CALL STACK (frames, active highlighted)
+///   • BREAKPOINTS (file:line list)
+///
+/// A 2-row header at the top shows the session status and a Run/Stop button.
+#[allow(clippy::too_many_arguments)]
+fn draw_debug_sidebar(
+    cr: &Context,
+    layout: &pango::Layout,
+    screen: &render::ScreenLayout,
+    theme: &Theme,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    line_height: f64,
+) {
+    let sidebar = &screen.debug_sidebar;
+
+    let (bg_r, bg_g, bg_b) = theme.completion_bg.to_cairo();
+    let (hdr_r, hdr_g, hdr_b) = theme.status_bg.to_cairo();
+    let (fg_r, fg_g, fg_b) = theme.status_fg.to_cairo();
+    let (dim_r, dim_g, dim_b) = theme.line_number_fg.to_cairo();
+    let (sel_r, sel_g, sel_b) = theme.fuzzy_selected_bg.to_cairo();
+    let (act_r, act_g, act_b) = theme.tab_active_fg.to_cairo();
+
+    // Paint sidebar background.
+    cr.set_source_rgb(bg_r, bg_g, bg_b);
+    cr.rectangle(x, y, w, h);
+    cr.fill().ok();
+
+    layout.set_attributes(None);
+
+    // ── Row 0: header strip ─────────────────────────────────────────────────
+    cr.set_source_rgb(hdr_r, hdr_g, hdr_b);
+    cr.rectangle(x, y, w, line_height);
+    cr.fill().ok();
+
+    let cfg_name = sidebar.launch_config_name.as_deref().unwrap_or("no config");
+    let header_text = format!("  \u{f188} DEBUG  |  {cfg_name}");
+    cr.set_source_rgb(fg_r, fg_g, fg_b);
+    layout.set_text(&header_text);
+    cr.move_to(x + 4.0, y);
+    pangocairo::show_layout(cr, layout);
+
+    // ── Row 1: Run/Stop button ───────────────────────────────────────────────
+    let btn_y = y + line_height;
+    cr.set_source_rgb(hdr_r, hdr_g, hdr_b);
+    cr.rectangle(x, btn_y, w, line_height);
+    cr.fill().ok();
+
+    let (btn_label, btn_color) = if sidebar.session_active && sidebar.stopped {
+        ("\u{f04b}  Continue", (0.38_f64, 0.73_f64, 0.45_f64)) // green play
+    } else if sidebar.session_active {
+        ("\u{f04d}  Stop", (0.86_f64, 0.27_f64, 0.22_f64)) // red stop
+    } else {
+        ("\u{f04b}  Start Debugging", (0.38_f64, 0.73_f64, 0.45_f64)) // green play
+    };
+    cr.set_source_rgb(btn_color.0, btn_color.1, btn_color.2);
+    layout.set_text(btn_label);
+    cr.move_to(x + 8.0, btn_y);
+    pangocairo::show_layout(cr, layout);
+
+    // ── Sections ─────────────────────────────────────────────────────────────
+    let sections: &[(
+        &str,
+        &[render::DebugSidebarItem],
+        render::DebugSidebarSection,
+    )] = &[
+        (
+            "\u{f6a9} VARIABLES",
+            &sidebar.variables,
+            render::DebugSidebarSection::Variables,
+        ),
+        (
+            "\u{f06e} WATCH",
+            &sidebar.watch,
+            render::DebugSidebarSection::Watch,
+        ),
+        (
+            "\u{f020e} CALL STACK",
+            &sidebar.frames,
+            render::DebugSidebarSection::CallStack,
+        ),
+        (
+            "\u{f111} BREAKPOINTS",
+            &sidebar.breakpoints,
+            render::DebugSidebarSection::Breakpoints,
+        ),
+    ];
+
+    let mut cursor_y = btn_y + line_height;
+    let max_y = y + h;
+
+    for (section_label, items, section_kind) in sections {
+        if cursor_y >= max_y {
+            break;
+        }
+
+        // Section header row.
+        let is_active_section = sidebar.active_section == *section_kind;
+        let (shr, shg, shb) = if is_active_section {
+            (act_r, act_g, act_b)
+        } else {
+            (fg_r, fg_g, fg_b)
+        };
+        cr.set_source_rgb(hdr_r, hdr_g, hdr_b);
+        cr.rectangle(x, cursor_y, w, line_height);
+        cr.fill().ok();
+        cr.set_source_rgb(shr, shg, shb);
+        layout.set_text(section_label);
+        cr.move_to(x + 4.0, cursor_y);
+        pangocairo::show_layout(cr, layout);
+        cursor_y += line_height;
+
+        // Items.
+        for item in *items {
+            if cursor_y >= max_y {
+                break;
+            }
+            let (ir, ig, ib) = if item.is_selected {
+                cr.set_source_rgb(sel_r, sel_g, sel_b);
+                cr.rectangle(x, cursor_y, w, line_height);
+                cr.fill().ok();
+                (fg_r, fg_g, fg_b)
+            } else {
+                (dim_r, dim_g, dim_b)
+            };
+            let indent_px = item.indent as f64 * 12.0;
+            cr.set_source_rgb(ir, ig, ib);
+            layout.set_text(&item.text);
+            cr.move_to(x + 4.0 + indent_px, cursor_y);
+            pangocairo::show_layout(cr, layout);
+            cursor_y += line_height;
+        }
+
+        // "empty" hint when section has no items and a session is not active.
+        if items.is_empty() && cursor_y < max_y {
+            cr.set_source_rgb(dim_r, dim_g, dim_b);
+            let hint = if sidebar.session_active {
+                "  (empty)"
+            } else {
+                "  (not running)"
+            };
+            layout.set_text(hint);
+            cr.move_to(x + 4.0, cursor_y);
+            pangocairo::show_layout(cr, layout);
+            cursor_y += line_height;
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_quickfix_panel(
     cr: &Context,
@@ -4944,6 +5749,141 @@ fn draw_command_line(
     }
 }
 
+fn draw_menu_bar(
+    cr: &Context,
+    data: &render::MenuBarData,
+    theme: &Theme,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+) {
+    let (r, g, b) = theme.status_bg.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    cr.rectangle(x, y, width, height);
+    let _ = cr.fill();
+
+    let (fr, fg, fb) = theme.status_fg.to_cairo();
+    cr.set_source_rgb(fr, fg, fb);
+
+    // Menu labels only — hamburger lives in the activity bar widget
+    let mut cursor_x = x + 8.0;
+
+    for (idx, (name, _, _)) in render::MENU_STRUCTURE.iter().enumerate() {
+        let is_open = data.open_menu_idx == Some(idx);
+        if is_open {
+            let (ar, ag, ab) = theme.keyword.to_cairo();
+            cr.set_source_rgb(ar, ag, ab);
+        } else {
+            cr.set_source_rgb(fr, fg, fb);
+        }
+        cr.move_to(cursor_x, y + height * 0.7);
+        let _ = cr.show_text(name);
+        cursor_x += (name.len() as f64 * 7.0) + 8.0;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_menu_dropdown(
+    cr: &Context,
+    data: &render::MenuBarData,
+    theme: &Theme,
+    x: f64,
+    anchor_y: f64,
+    _width: f64,
+    _height: f64,
+    line_height: f64,
+) {
+    if data.open_items.is_empty() {
+        return;
+    }
+    let item_count = data.open_items.len() as f64;
+    let popup_width = 200.0_f64;
+    let popup_height = (item_count + 1.0) * line_height;
+    let popup_x = x + data.open_menu_col as f64 * 7.0;
+    let popup_y = anchor_y;
+
+    // Background
+    let (r, g, b) = theme.tab_bar_bg.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    cr.rectangle(popup_x, popup_y, popup_width, popup_height);
+    let _ = cr.fill();
+
+    // Border
+    let (br, bg_c, bb) = theme.separator.to_cairo();
+    cr.set_source_rgb(br, bg_c, bb);
+    cr.rectangle(popup_x, popup_y, popup_width, popup_height);
+    let _ = cr.stroke();
+
+    // Items
+    let (fr, fg_c, fb) = theme.foreground.to_cairo();
+    let (sr, sg, sb) = theme.line_number_fg.to_cairo();
+    cr.set_source_rgb(fr, fg_c, fb);
+    let mut item_y = popup_y + line_height * 0.8;
+    for item in &data.open_items {
+        item_y += line_height;
+        if item.separator {
+            cr.set_source_rgb(sr, sg, sb);
+            cr.move_to(popup_x + 4.0, item_y - line_height * 0.5);
+            cr.line_to(popup_x + popup_width - 4.0, item_y - line_height * 0.5);
+            let _ = cr.stroke();
+            cr.set_source_rgb(fr, fg_c, fb);
+        } else {
+            cr.move_to(popup_x + 8.0, item_y);
+            let _ = cr.show_text(item.label);
+            if !item.shortcut.is_empty() {
+                cr.set_source_rgb(sr, sg, sb);
+                cr.move_to(
+                    popup_x + popup_width - (item.shortcut.len() as f64 * 7.0) - 8.0,
+                    item_y,
+                );
+                let _ = cr.show_text(item.shortcut);
+                cr.set_source_rgb(fr, fg_c, fb);
+            }
+        }
+    }
+}
+
+fn draw_debug_toolbar(
+    cr: &Context,
+    toolbar: &render::DebugToolbarData,
+    theme: &Theme,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+) {
+    let (r, g, b) = theme.status_bg.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    cr.rectangle(x, y, width, height);
+    let _ = cr.fill();
+
+    let (fr, fg_c, fb) = if toolbar.session_active {
+        theme.status_fg.to_cairo()
+    } else {
+        theme.line_number_fg.to_cairo()
+    };
+    cr.set_source_rgb(fr, fg_c, fb);
+
+    let mut cursor_x = x + 8.0;
+    for (idx, btn) in toolbar.buttons.iter().enumerate() {
+        if idx == 4 {
+            // Separator
+            let (dr, dg, db) = theme.line_number_fg.to_cairo();
+            cr.set_source_rgb(dr, dg, db);
+            cr.move_to(cursor_x, y + 2.0);
+            cr.line_to(cursor_x, y + height - 2.0);
+            let _ = cr.stroke();
+            cr.set_source_rgb(fr, fg_c, fb);
+            cursor_x += 8.0;
+        }
+        cr.move_to(cursor_x, y + height * 0.7);
+        let text = format!("{} ({}) ", btn.icon, btn.key_hint);
+        let _ = cr.show_text(&text);
+        cursor_x += text.len() as f64 * 7.0;
+    }
+}
+
 /// Result of converting pixel coordinates to buffer position.
 enum ClickTarget {
     /// Click was in the tab bar, tab already switched.
@@ -4981,7 +5921,7 @@ fn pixel_to_click_target(
 
     let tab_bar_height = line_height;
 
-    // Check if click is in tab bar
+    // Check if click is in tab bar (menu bar is a separate widget above, not in drawing_area)
     if y < tab_bar_height {
         let layout = pangocairo::create_layout(&cr);
         layout.set_font_description(Some(&font_desc));
@@ -5064,11 +6004,24 @@ fn pixel_to_click_target(
     let char_width = font_metrics.approximate_char_width() as f64 / pango::SCALE as f64;
     let total_lines = buffer.content.len_lines();
     let has_git = !buffer_state.git_diff.is_empty();
+    let has_bp_click = {
+        let key = buffer_state
+            .file_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        !engine
+            .dap_breakpoints
+            .get(&key)
+            .is_none_or(|v| v.is_empty())
+            || engine.dap_session_active
+    };
     let gutter_char_width = render::calculate_gutter_cols(
         engine.settings.line_numbers,
         total_lines,
         char_width,
         has_git,
+        has_bp_click,
     );
     let gutter_width = gutter_char_width as f64 * char_width;
 
@@ -5087,9 +6040,21 @@ fn pixel_to_click_target(
     let view_row = (relative_y / line_height).floor() as usize;
     let line = view_row_to_buf_line(view, view.scroll_top, view_row, total_lines);
 
-    // Gutter click → fold toggle
+    // Gutter click
     if x >= rect.x && x < rect.x + gutter_width && gutter_width > 0.0 {
-        engine.toggle_fold_at_line(line);
+        // If the breakpoint column is visible and the click landed in its cell
+        // (always the leftmost gutter character), toggle the breakpoint instead
+        // of the fold.
+        if has_bp_click && x < rect.x + char_width {
+            let file = buffer_state
+                .file_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            engine.dap_toggle_breakpoint(&file, line as u64 + 1);
+        } else {
+            engine.toggle_fold_at_line(line);
+        }
         return ClickTarget::Gutter;
     }
 

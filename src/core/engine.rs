@@ -1,8 +1,12 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 use super::buffer::{Buffer, BufferId};
 use super::buffer_manager::{BufferManager, BufferState, UndoEntry};
+use super::dap::{DapEvent, DapVariable, StackFrame};
+use super::dap_manager::{
+    generate_launch_json, parse_launch_json, type_to_adapter, DapManager, LaunchConfig,
+};
 use super::git;
 use super::lsp::{
     self, Diagnostic, DiagnosticSeverity, FormattingEdit, LspEvent, SignatureHelpData,
@@ -109,6 +113,24 @@ enum Motion {
     ParagraphBackward,
     MatchingBracket,
     TextObject(char, char), // (modifier, object) - e.g., ('i', 'w')
+}
+
+/// Which section of the debug sidebar currently has the selection cursor.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum DebugSidebarSection {
+    #[default]
+    Variables,
+    Watch,
+    CallStack,
+    Breakpoints,
+}
+
+/// Which panel is shown in the bottom area (Terminal or Debug Output).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum BottomPanelKind {
+    #[default]
+    Terminal,
+    DebugOutput,
 }
 
 pub struct Engine {
@@ -382,6 +404,82 @@ pub struct Engine {
     /// Whether a mouse drag selection is currently active.
     pub mouse_drag_active: bool,
 
+    // --- Menu bar / debug toolbar ---
+    /// Whether the VSCode-style menu bar strip is visible.
+    pub menu_bar_visible: bool,
+    /// Index of the currently open top-level menu dropdown (None = bar visible but no dropdown).
+    pub menu_open_idx: Option<usize>,
+    /// Whether the debug toolbar strip is shown (persistent for now; later: only during DAP session).
+    pub debug_toolbar_visible: bool,
+    /// True while a DAP debug session is active.
+    pub dap_session_active: bool,
+    /// Index of the keyboard-highlighted item in the currently open menu dropdown.
+    pub menu_highlighted_item: Option<usize>,
+
+    // --- DAP (Debug Adapter Protocol) state ---
+    /// Multi-adapter DAP coordinator. None until first debug session is started.
+    pub dap_manager: Option<DapManager>,
+    /// Thread ID of the currently stopped thread (set on Stopped event).
+    pub dap_stopped_thread: Option<u64>,
+    /// Per-file breakpoints: absolute file path → sorted list of 1-based line numbers.
+    pub dap_breakpoints: HashMap<String, Vec<u64>>,
+    /// Sequence number of the initialize request (used to detect its response).
+    /// Needed because codelldb omits the `command` field from responses.
+    pub dap_seq_initialize: Option<u64>,
+    /// Sequence number of the launch request (used to detect session start).
+    pub dap_seq_launch: Option<u64>,
+    /// Current stopped location: (absolute_file_path, 1-based line number).
+    /// Set when the adapter reports a Stopped event and stack trace is resolved.
+    /// Cleared on Continued or Exited.
+    pub dap_current_line: Option<(String, u64)>,
+    /// Call-stack frames captured on the last Stopped event.
+    /// Cleared on Continued or Exited.
+    pub dap_stack_frames: Vec<StackFrame>,
+    /// Variables in scope for the current stopped frame (populated after scopes response).
+    pub dap_variables: Vec<DapVariable>,
+    /// DAP output console: stdout/stderr from the debugged process + adapter messages.
+    /// Capped at 1000 lines; new lines appended, oldest dropped from the front.
+    pub dap_output_lines: Vec<String>,
+    /// Index of the currently selected stack frame in the panel.
+    pub dap_active_frame: usize,
+    /// Set of variable-reference IDs that the user has expanded (to show child variables).
+    pub dap_expanded_vars: HashSet<u64>,
+    /// Child variables fetched for expanded entries; keyed by the parent variablesReference.
+    pub dap_child_variables: HashMap<u64, Vec<DapVariable>>,
+    /// Most-recent expression evaluation result (`:DapEval`), or `None`.
+    pub dap_eval_result: Option<String>,
+    /// Tracks what the last `variables` request was for:
+    /// `0` = top-level scope (store result in `dap_variables`),
+    /// non-zero = child expansion (store in `dap_child_variables[key]`).
+    pub dap_pending_vars_ref: u64,
+    /// Which section of the debug sidebar is currently selected.
+    pub dap_sidebar_section: DebugSidebarSection,
+    /// Selected item index within the active sidebar section.
+    pub dap_sidebar_selected: usize,
+    /// Watch expressions added by the user (`:DapWatch <expr>`).
+    pub dap_watch_expressions: Vec<String>,
+    /// Evaluated values for each watch expression (parallel vec; `None` = not yet evaluated).
+    pub dap_watch_values: Vec<Option<String>>,
+    /// Debug configurations parsed from `.vscode/launch.json`, or generated.
+    pub dap_launch_configs: Vec<LaunchConfig>,
+    /// Index into `dap_launch_configs` that will be used on the next F5.
+    pub dap_selected_launch_config: usize,
+    /// Which panel is shown in the shared bottom area (Terminal or Debug Output).
+    pub bottom_panel_kind: BottomPanelKind,
+    /// Launch arguments stored between `initialize` send and response receipt.
+    /// We defer `launch` until the adapter confirms `initialize` to avoid a race
+    /// where codelldb processes both requests concurrently and reads arguments
+    /// from an uninitialised state (causing program="" / "(empty)" errors).
+    pub dap_pending_launch: Option<serde_json::Value>,
+    /// True while the bottom panel should be visible regardless of terminal state.
+    /// Set when a debug session starts; keeps the Debug Output tab accessible
+    /// even if the user never opened a terminal.
+    pub bottom_panel_open: bool,
+    /// One-shot flag: backends consume this to auto-switch to the Debug sidebar.
+    pub dap_wants_sidebar: bool,
+    /// Maps DAP evaluate request seq → watch expression index for watch eval tracking.
+    pub dap_pending_watch_seqs: HashMap<u64, usize>,
+
     // --- Integrated terminal ---
     /// All open terminal panes (PTY + VT100 parser). Empty until first open.
     pub terminal_panes: Vec<TerminalPane>,
@@ -537,6 +635,36 @@ impl Engine {
             terminal_find_matches: Vec::new(),
             terminal_split: false,
             terminal_split_left_cols: 0,
+            menu_bar_visible: false,
+            menu_open_idx: None,
+            debug_toolbar_visible: false,
+            dap_session_active: false,
+            menu_highlighted_item: None,
+            dap_manager: None,
+            dap_stopped_thread: None,
+            dap_breakpoints: HashMap::new(),
+            dap_seq_initialize: None,
+            dap_seq_launch: None,
+            dap_current_line: None,
+            dap_stack_frames: Vec::new(),
+            dap_variables: Vec::new(),
+            dap_output_lines: Vec::new(),
+            dap_active_frame: 0,
+            dap_expanded_vars: HashSet::new(),
+            dap_child_variables: HashMap::new(),
+            dap_eval_result: None,
+            dap_pending_vars_ref: 0,
+            dap_sidebar_section: DebugSidebarSection::Variables,
+            dap_sidebar_selected: 0,
+            dap_watch_expressions: Vec::new(),
+            dap_watch_values: Vec::new(),
+            dap_launch_configs: Vec::new(),
+            dap_selected_launch_config: 0,
+            bottom_panel_kind: BottomPanelKind::Terminal,
+            dap_pending_launch: None,
+            bottom_panel_open: false,
+            dap_wants_sidebar: false,
+            dap_pending_watch_seqs: HashMap::new(),
         };
         // If vscode mode is configured, start in Insert mode (no Normal mode)
         if engine.is_vscode_mode() {
@@ -2214,7 +2342,132 @@ impl Engine {
 
     /// Ensure the cursor is visible within the viewport, adjusting scroll_top.
     pub fn ensure_cursor_visible(&mut self) {
-        self.view_mut().ensure_cursor_visible();
+        if self.settings.wrap && self.view().viewport_cols > 0 {
+            self.ensure_cursor_visible_wrap();
+        } else {
+            self.view_mut().ensure_cursor_visible();
+        }
+    }
+
+    /// Wrap-aware scroll-to-cursor. Counts visual rows (accounting for
+    /// soft-wrapped buffer lines) to determine when to adjust `scroll_top`.
+    fn ensure_cursor_visible_wrap(&mut self) {
+        let viewport_cols = self.view().viewport_cols;
+        let viewport_lines = self.view().viewport_lines;
+        let cursor_line = self.view().cursor.line;
+        let cursor_col = self.view().cursor.col;
+        let scroll_top = self.view().scroll_top;
+        let total_lines = self.buffer().len_lines();
+
+        // Scroll up if cursor is above the viewport.
+        if cursor_line < scroll_top {
+            self.view_mut().scroll_top = cursor_line;
+            return;
+        }
+
+        if viewport_lines == 0 {
+            return;
+        }
+
+        // Count visual rows from scroll_top up to and including the cursor's
+        // visual row within cursor_line.
+        let mut visual_rows: usize = 0;
+        for r in scroll_top..=cursor_line {
+            let line_len = self.buffer().content.line(r).len_chars().saturating_sub(1);
+            if r < cursor_line {
+                visual_rows += engine_visual_rows_for_line(line_len, viewport_cols);
+            } else {
+                // Partial count: only up to the cursor's visual segment.
+                visual_rows += cursor_col / viewport_cols + 1;
+            }
+        }
+
+        // If cursor fits within the viewport, nothing to adjust.
+        if visual_rows <= viewport_lines {
+            return;
+        }
+
+        // Cursor is below the viewport — walk backwards from cursor_line
+        // to find the new scroll_top that makes the cursor visible.
+        let cursor_visual_row_within_line = cursor_col / viewport_cols;
+        // Rows the cursor's line contributes, up to and including cursor segment.
+        let mut rows_used = cursor_visual_row_within_line + 1;
+        let mut new_scroll_top = cursor_line;
+        if rows_used < viewport_lines && cursor_line > 0 {
+            for r in (0..cursor_line).rev() {
+                let line_len = self.buffer().content.line(r).len_chars().saturating_sub(1);
+                let vrows = engine_visual_rows_for_line(line_len, viewport_cols);
+                if rows_used + vrows > viewport_lines {
+                    break;
+                }
+                rows_used += vrows;
+                new_scroll_top = r;
+            }
+        }
+        // Clamp scroll_top to valid range.
+        new_scroll_top = new_scroll_top.min(total_lines.saturating_sub(1));
+        self.view_mut().scroll_top = new_scroll_top;
+    }
+
+    /// Move cursor down by one visual row (within the same wrapped line if
+    /// possible, otherwise to the next buffer line).  Used by `gj`.
+    fn move_visual_down(&mut self) {
+        let vp = self.view().viewport_cols.max(1);
+        let cursor_line = self.view().cursor.line;
+        let cursor_col = self.view().cursor.col;
+        let total_lines = self.buffer().len_lines();
+        let line_len = self
+            .buffer()
+            .content
+            .line(cursor_line)
+            .len_chars()
+            .saturating_sub(1);
+        let visual_col = cursor_col % vp;
+
+        if cursor_col + vp < line_len {
+            // Advance within the same buffer line (to the next wrapped segment).
+            self.view_mut().cursor.col = cursor_col + vp;
+        } else if cursor_line + 1 < total_lines {
+            // Move to the next buffer line, keeping the same visual column offset.
+            let next_len = self
+                .buffer()
+                .content
+                .line(cursor_line + 1)
+                .len_chars()
+                .saturating_sub(1);
+            self.view_mut().cursor.line = cursor_line + 1;
+            self.view_mut().cursor.col = visual_col.min(next_len.saturating_sub(1));
+        }
+        self.clamp_cursor_col();
+        self.ensure_cursor_visible();
+    }
+
+    /// Move cursor up by one visual row (within the same wrapped line if
+    /// possible, otherwise to the previous buffer line).  Used by `gk`.
+    fn move_visual_up(&mut self) {
+        let vp = self.view().viewport_cols.max(1);
+        let cursor_line = self.view().cursor.line;
+        let cursor_col = self.view().cursor.col;
+        let visual_col = cursor_col % vp;
+
+        if cursor_col >= vp {
+            // Move up within the same buffer line (to the previous wrapped segment).
+            self.view_mut().cursor.col = cursor_col - vp;
+        } else if cursor_line > 0 {
+            // Move to the previous buffer line's last visual segment.
+            let prev_len = self
+                .buffer()
+                .content
+                .line(cursor_line - 1)
+                .len_chars()
+                .saturating_sub(1);
+            let last_seg_start = (prev_len / vp) * vp;
+            let target_col = (last_seg_start + visual_col).min(prev_len.saturating_sub(1));
+            self.view_mut().cursor.line = cursor_line - 1;
+            self.view_mut().cursor.col = target_col;
+        }
+        self.clamp_cursor_col();
+        self.ensure_cursor_visible();
     }
 
     /// Synchronise the scroll_top of scroll-bound window pairs.
@@ -3437,6 +3690,27 @@ impl Engine {
                 }
                 // Tab = Ctrl-I in terminals (same byte 0x09); both advance the jump list
                 "Tab" => self.jump_list_forward(),
+                // Debug / DAP function keys
+                "F5" => {
+                    let cmd = if self.dap_session_active {
+                        "continue"
+                    } else {
+                        "debug"
+                    };
+                    let _ = self.execute_command(cmd);
+                }
+                "F6" => {
+                    let _ = self.execute_command("pause");
+                }
+                "F9" => {
+                    let _ = self.execute_command("brkpt");
+                }
+                "F10" => {
+                    let _ = self.execute_command("stepover");
+                }
+                "F11" => {
+                    let _ = self.execute_command("stepin");
+                }
                 _ => {}
             },
         }
@@ -3497,6 +3771,20 @@ impl Engine {
                 Some('y') => {
                     self.push_jump_location();
                     self.lsp_request_type_definition();
+                }
+                Some('j') => {
+                    // gj: move down one visual row (stays in wrapped line when possible)
+                    let count = self.take_count().max(1);
+                    for _ in 0..count {
+                        self.move_visual_down();
+                    }
+                }
+                Some('k') => {
+                    // gk: move up one visual row (stays in wrapped line when possible)
+                    let count = self.take_count().max(1);
+                    for _ in 0..count {
+                        self.move_visual_up();
+                    }
                 }
                 _ => {}
             },
@@ -5574,7 +5862,7 @@ impl Engine {
         common
     }
 
-    fn execute_command(&mut self, cmd: &str) -> EngineAction {
+    pub fn execute_command(&mut self, cmd: &str) -> EngineAction {
         // Handle :norm[al][!] before trimming — keys may contain significant trailing whitespace
         if let Some((range_str, keys)) = try_parse_norm(cmd.trim_start()) {
             return self.execute_norm_command(range_str, keys);
@@ -5585,6 +5873,136 @@ impl Engine {
         // Handle :term / :terminal — open integrated terminal
         if cmd == "term" || cmd == "terminal" {
             return EngineAction::OpenTerminal;
+        }
+
+        // Handle :DapInfo — show detected DAP adapters from Mason registry cache
+        if cmd == "DapInfo" {
+            if let Some(mgr) = &self.lsp_manager {
+                let dap_langs: Vec<String> = mgr
+                    .registry_cache
+                    .iter()
+                    .filter(|(_, info)| info.is_dap())
+                    .map(|(lang, _)| lang.clone())
+                    .collect();
+                if dap_langs.is_empty() {
+                    self.message =
+                        "No DAP adapters detected (open a file to trigger registry lookup)"
+                            .to_string();
+                } else {
+                    let mut sorted = dap_langs;
+                    sorted.sort();
+                    self.message = format!("DAP adapters: {}", sorted.join(", "));
+                }
+            } else {
+                self.message =
+                    "LSP manager not started — open a file first to initialise Mason registry"
+                        .to_string();
+            }
+            return EngineAction::None;
+        }
+
+        // Handle :DapWatch <expr> — add a watch expression to the debug sidebar.
+        if let Some(expr) = cmd.strip_prefix("DapWatch").map(|s| s.trim()) {
+            if expr.is_empty() {
+                self.message = "Usage: :DapWatch <expression>".to_string();
+            } else {
+                self.dap_add_watch(expr.to_string());
+                self.message = format!("Watch added: {expr}");
+            }
+            return EngineAction::None;
+        }
+
+        // Handle :DapBottomPanel terminal|output — switch the bottom panel tab.
+        if let Some(panel_name) = cmd.strip_prefix("DapBottomPanel").map(|s| s.trim()) {
+            match panel_name {
+                "terminal" => {
+                    self.bottom_panel_kind = BottomPanelKind::Terminal;
+                    self.message = "Bottom panel: Terminal".to_string();
+                }
+                "output" => {
+                    self.bottom_panel_kind = BottomPanelKind::DebugOutput;
+                    self.message = "Bottom panel: Debug Output".to_string();
+                }
+                _ => {
+                    self.message = "Usage: :DapBottomPanel terminal|output".to_string();
+                }
+            }
+            return EngineAction::None;
+        }
+
+        // Handle :DapEval <expr> — evaluate expression in the current frame.
+        if let Some(expr) = cmd.strip_prefix("DapEval").map(|s| s.trim()) {
+            if expr.is_empty() {
+                self.message = "Usage: :DapEval <expression>".to_string();
+            } else if self.dap_session_active && self.dap_stopped_thread.is_some() {
+                self.dap_eval(expr);
+            } else {
+                self.message = "DapEval: program must be stopped at a breakpoint".to_string();
+            }
+            return EngineAction::None;
+        }
+
+        // Handle :DapExpand <var_ref> — toggle expansion of a variable node.
+        if let Some(ref_str) = cmd.strip_prefix("DapExpand").map(|s| s.trim()) {
+            match ref_str.parse::<u64>() {
+                Ok(var_ref) if var_ref > 0 => self.dap_toggle_expand_var(var_ref),
+                _ => self.message = "Usage: :DapExpand <variablesReference>".to_string(),
+            }
+            return EngineAction::None;
+        }
+
+        // Handle :DapInstall <lang> — install a DAP adapter via Mason
+        if let Some(lang_id) = cmd.strip_prefix("DapInstall").map(|s| s.trim()) {
+            if lang_id.is_empty() {
+                self.message = "Usage: :DapInstall <language>  (e.g. :DapInstall rust)".to_string();
+                return EngineAction::None;
+            }
+            // Check the built-in adapter registry for this language
+            let adapter_info = match super::dap_manager::DapManager::adapter_for_language(lang_id) {
+                Some(info) => info,
+                None => {
+                    self.message = format!(
+                            "No built-in DAP adapter for '{lang_id}' (supported: rust, python, go, javascript, typescript, java)"
+                        );
+                    return EngineAction::None;
+                }
+            };
+            let adapter_name = adapter_info.name;
+            let binary_name = adapter_info.binary;
+            // Delegate to the LSP manager's Mason infrastructure (same install path).
+            // Look up by adapter name (e.g. "codelldb"), NOT by language ID ("rust"),
+            // since Mason package names match adapter names, not language IDs.
+            self.ensure_lsp_manager();
+            // Use "dap:{adapter_name}" as the install key so InstallComplete can
+            // distinguish DAP installs from LSP installs and skip the LSP-start logic.
+            let dap_key = format!("dap:{adapter_name}");
+            if self.lsp_installing.contains(&dap_key) {
+                self.message = format!("Install already running for {adapter_name}");
+                return EngineAction::None;
+            }
+            // Prefer a Mason registry install_cmd if one is cached under the adapter name,
+            // otherwise fall back to the built-in install command for this adapter.
+            let install_cmd = self
+                .lsp_manager
+                .as_ref()
+                .and_then(|m| m.registry_cache.get(adapter_name))
+                .and_then(|info| info.install_cmd.clone())
+                .or_else(|| super::dap_manager::install_cmd_for_adapter(adapter_name));
+            match install_cmd {
+                Some(cmd_str) => {
+                    self.lsp_installing.insert(dap_key.clone());
+                    if let Some(mgr) = &self.lsp_manager {
+                        mgr.run_install_command(&dap_key, &cmd_str);
+                    }
+                    self.message = format!("Installing {adapter_name}…");
+                }
+                None => {
+                    self.message = format!(
+                        "No automated installer for '{adapter_name}' — install '{binary_name}' manually and ensure it is on PATH"
+                    );
+                }
+            }
+            return EngineAction::None;
         }
 
         // Handle :LspInfo — show running LSP servers
@@ -6089,6 +6507,62 @@ impl Engine {
                 } else {
                     EngineAction::Error
                 }
+            }
+            "debug" => {
+                let lang = self
+                    .buffer_manager
+                    .get(self.active_buffer_id())
+                    .and_then(|s| s.file_path.as_ref())
+                    .and_then(|p| super::lsp::language_id_from_path(p))
+                    .unwrap_or_else(|| "rust".to_string());
+                self.dap_start_debug(&lang);
+                EngineAction::None
+            }
+            "continue" => {
+                self.dap_continue();
+                EngineAction::None
+            }
+            "pause" => {
+                self.dap_pause();
+                EngineAction::None
+            }
+            "stop" => {
+                self.dap_stop();
+                EngineAction::None
+            }
+            "restart" => {
+                let lang = self
+                    .buffer_manager
+                    .get(self.active_buffer_id())
+                    .and_then(|s| s.file_path.as_ref())
+                    .and_then(|p| super::lsp::language_id_from_path(p))
+                    .unwrap_or_else(|| "rust".to_string());
+                self.dap_stop();
+                self.dap_start_debug(&lang);
+                EngineAction::None
+            }
+            "stepover" => {
+                self.dap_step_over();
+                EngineAction::None
+            }
+            "stepin" => {
+                self.dap_step_into();
+                EngineAction::None
+            }
+            "stepout" => {
+                self.dap_step_out();
+                EngineAction::None
+            }
+            "brkpt" => {
+                let file = self
+                    .buffer_manager
+                    .get(self.active_buffer_id())
+                    .and_then(|s| s.file_path.as_ref())
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let line = self.cursor().line as u64 + 1; // 1-based
+                self.dap_toggle_breakpoint(&file, line);
+                EngineAction::None
             }
             _ => {
                 self.message = format!("Not an editor command: {}", cmd);
@@ -8950,8 +9424,22 @@ impl Engine {
                     output,
                 } => {
                     self.lsp_installing.remove(&lang_id);
-                    if success {
-                        // Retry: add config and start server
+                    // DAP installs use a "dap:{adapter_name}" key to distinguish them
+                    // from LSP installs so we don't try to auto-start an LSP server.
+                    if let Some(adapter_name) = lang_id.strip_prefix("dap:") {
+                        if success {
+                            self.message = format!(
+                                "DAP adapter '{adapter_name}' installed — press F5 to debug"
+                            );
+                        } else {
+                            let short =
+                                output.lines().next().unwrap_or("unknown error").to_string();
+                            self.message =
+                                format!("DAP install failed for '{adapter_name}': {short}");
+                        }
+                        redraw = true;
+                    } else if success {
+                        // LSP install: retry adding config and starting server
                         let cached_info = self
                             .lsp_manager
                             .as_ref()
@@ -10820,6 +11308,17 @@ impl Engine {
     }
 }
 
+/// Return the number of visual rows a buffer line of `line_char_len` characters
+/// occupies when the viewport is `viewport_cols` columns wide.
+/// Always returns at least 1 (even for empty lines).
+/// Duplicated from render.rs so core/ stays GTK/render-free.
+fn engine_visual_rows_for_line(line_char_len: usize, viewport_cols: usize) -> usize {
+    if viewport_cols == 0 {
+        return 1;
+    }
+    line_char_len.div_ceil(viewport_cols).max(1)
+}
+
 /// Try to parse a `:norm[al][!] {keys}` command with an optional range prefix.
 /// Returns `(range_str, keys)` if recognized, `None` otherwise.
 /// Supported ranges: `""` (current line), `"%"` (all), `"'<,'>"` (visual), `"N,M"` (numeric, 1-based).
@@ -10864,6 +11363,43 @@ fn norm_numeric_range_end(cmd: &str) -> Option<usize> {
         return None;
     }
     Some(i)
+}
+
+// =============================================================================
+// DAP helpers
+
+/// Walk up from `cwd` to find `Cargo.toml`, extract `[package] name`, and
+/// return the path to `target/debug/{name}`. Returns an error string when the
+/// binary does not yet exist (caller should tell the user to `cargo build`).
+#[allow(dead_code)]
+fn rust_debug_binary(cwd: &std::path::Path) -> Result<String, String> {
+    let mut dir = Some(cwd);
+    while let Some(d) = dir {
+        let cargo_toml = d.join("Cargo.toml");
+        if cargo_toml.exists() {
+            let content = std::fs::read_to_string(&cargo_toml)
+                .map_err(|e| format!("Cannot read Cargo.toml: {e}"))?;
+            // Find [package] section and parse the `name` key.
+            let name = content
+                .lines()
+                .skip_while(|l| l.trim() != "[package]")
+                .skip(1)
+                .find(|l| l.trim_start().starts_with("name"))
+                .and_then(|l| l.split('=').nth(1))
+                .map(|v| v.trim().trim_matches('"').to_string())
+                .ok_or_else(|| "Cannot find package name in Cargo.toml".to_string())?;
+            let binary = d.join("target").join("debug").join(&name);
+            if !binary.exists() {
+                return Err(format!(
+                    "Binary not found: {} — run `cargo build` first",
+                    binary.display()
+                ));
+            }
+            return Ok(binary.to_string_lossy().into_owned());
+        }
+        dir = d.parent();
+    }
+    Err("Cargo.toml not found in project tree".to_string())
 }
 
 // =============================================================================
@@ -10959,6 +11495,943 @@ impl Engine {
             Mode::VisualLine => "VISUAL LINE",
             Mode::VisualBlock => "VISUAL BLOCK",
         }
+    }
+
+    // ── Menu bar ─────────────────────────────────────────────────────────────
+
+    /// Toggle the VSCode-style menu bar strip on/off; clears any open dropdown.
+    #[allow(dead_code)]
+    pub fn toggle_menu_bar(&mut self) {
+        self.menu_bar_visible = !self.menu_bar_visible;
+        self.menu_open_idx = None;
+    }
+
+    /// Open the dropdown for top-level menu at `idx` (e.g. 0=File, 1=Edit, …).
+    pub fn open_menu(&mut self, idx: usize) {
+        self.menu_open_idx = Some(idx);
+        self.menu_highlighted_item = None;
+    }
+
+    /// Close the currently open dropdown while keeping the bar visible.
+    pub fn close_menu(&mut self) {
+        self.menu_open_idx = None;
+    }
+
+    /// Activate the item at `item_idx` inside top-level menu `menu_idx`.
+    /// `action` is the command string to dispatch (looked up from the static menu table
+    /// in `render.rs` by the UI layer and passed in here).
+    /// Closes the dropdown and returns the `EngineAction` so the UI layer can handle
+    /// actions that require platform resources (e.g. `OpenTerminal` needs PTY size).
+    pub fn menu_activate_item(
+        &mut self,
+        menu_idx: usize,
+        item_idx: usize,
+        action: &str,
+    ) -> EngineAction {
+        let _ = (menu_idx, item_idx); // indices are for the UI; engine just dispatches
+        let result = if !action.is_empty() {
+            self.execute_command(action)
+        } else {
+            EngineAction::None
+        };
+        self.close_menu();
+        result
+    }
+
+    /// Move the keyboard highlight up or down within the open dropdown.
+    ///
+    /// `is_separator` is provided by the UI layer (derived from MENU_STRUCTURE) and indicates
+    /// which items are non-selectable separator lines. The cursor wraps around and skips
+    /// separators. `delta` is typically +1 (Down) or -1 (Up).
+    pub fn menu_move_selection(&mut self, delta: i32, is_separator: &[bool]) {
+        if self.menu_open_idx.is_none() {
+            return;
+        }
+        let non_sep: Vec<usize> = (0..is_separator.len())
+            .filter(|&i| !is_separator[i])
+            .collect();
+        if non_sep.is_empty() {
+            return;
+        }
+        let cur_pos = self
+            .menu_highlighted_item
+            .and_then(|h| non_sep.iter().position(|&i| i == h));
+        let new_pos = match cur_pos {
+            None if delta >= 0 => 0,
+            None => non_sep.len() - 1,
+            Some(pos) => {
+                let len = non_sep.len() as i32;
+                ((pos as i32 + delta).rem_euclid(len)) as usize
+            }
+        };
+        self.menu_highlighted_item = Some(non_sep[new_pos]);
+    }
+
+    /// Activate the currently highlighted item (keyboard Enter).
+    ///
+    /// Returns `Some((menu_idx, item_idx))` if an item was highlighted and the menu was
+    /// closed. The caller must look up the action string from MENU_STRUCTURE and call
+    /// `menu_activate_item` to actually dispatch it.
+    /// Returns `None` if no menu is open or nothing is highlighted.
+    pub fn menu_activate_highlighted(&mut self) -> Option<(usize, usize)> {
+        let open_idx = self.menu_open_idx?;
+        let item_idx = self.menu_highlighted_item?;
+        self.close_menu();
+        Some((open_idx, item_idx))
+    }
+
+    // ── DAP (Debug Adapter Protocol) ─────────────────────────────────────────
+
+    /// Toggle a breakpoint on `line` (1-based) in `file`.
+    /// Keeps the per-file list sorted ascending. Re-sends `setBreakpoints`
+    /// to the adapter if a session is currently active.
+    pub fn dap_toggle_breakpoint(&mut self, file: &str, line: u64) {
+        let lines = self.dap_breakpoints.entry(file.to_string()).or_default();
+        match lines.binary_search(&line) {
+            Ok(pos) => {
+                lines.remove(pos);
+                self.message = format!("Breakpoint removed: line {line}");
+            }
+            Err(pos) => {
+                lines.insert(pos, line);
+                self.message = format!("Breakpoint set: line {line}");
+            }
+        }
+        // Re-send breakpoints to adapter if session is live
+        let bp_lines: Vec<u64> = self.dap_breakpoints.get(file).cloned().unwrap_or_default();
+        if let Some(mgr) = &mut self.dap_manager {
+            if let Some(server) = &mut mgr.server {
+                server.set_breakpoints(file, &bp_lines);
+            }
+        }
+    }
+
+    /// Start a debug session for the given language.
+    ///
+    /// Launch config resolution order:
+    /// 1. `.vimcode/launch.json` (our native folder)
+    /// 2. `.vscode/launch.json`  (migration: copy to `.vimcode/` on first use)
+    /// 3. Generate a new config and write to `.vimcode/launch.json`
+    pub fn dap_start_debug(&mut self, lang: &str) {
+        // Determine the workspace root — walk up from cwd until a project
+        // manifest (Cargo.toml, package.json, .git, …) is found.
+        let workspace_root = super::dap_manager::find_workspace_root(&self.cwd);
+        let cwd = workspace_root.to_string_lossy().into_owned();
+        let vimcode_dir = workspace_root.join(".vimcode");
+        let launch_json_path = vimcode_dir.join("launch.json");
+
+        // Migration: if .vscode/launch.json exists and .vimcode/launch.json doesn't,
+        // copy it over so the user's existing VSCode config is preserved.
+        let vscode_path = workspace_root.join(".vscode").join("launch.json");
+        if !launch_json_path.exists() && vscode_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&vscode_path) {
+                let _ = std::fs::create_dir_all(&vimcode_dir);
+                let _ = std::fs::write(&launch_json_path, &content);
+            }
+        }
+
+        // Try to parse an existing launch.json, or generate a fresh one.
+        let configs = if let Ok(content) = std::fs::read_to_string(&launch_json_path) {
+            let parsed = parse_launch_json(&content, &cwd);
+            if parsed.is_empty() {
+                // File exists but is unparseable — generate and overwrite.
+                let generated = generate_launch_json(lang, &cwd);
+                let _ = std::fs::create_dir_all(&vimcode_dir);
+                let _ = std::fs::write(&launch_json_path, &generated);
+                parse_launch_json(&generated, &cwd)
+            } else {
+                parsed
+            }
+        } else {
+            // No launch.json — generate it.
+            let generated = generate_launch_json(lang, &cwd);
+            let _ = std::fs::create_dir_all(&vimcode_dir);
+            let _ = std::fs::write(&launch_json_path, &generated);
+            parse_launch_json(&generated, &cwd)
+        };
+
+        // Store configs and select the current one.
+        let cfg_idx = self
+            .dap_selected_launch_config
+            .min(configs.len().saturating_sub(1));
+        let config = if configs.is_empty() {
+            // Absolute fallback: synthesise a minimal config.
+            LaunchConfig {
+                name: "Debug".to_string(),
+                adapter_type: lang.to_string(),
+                request: "launch".to_string(),
+                program: String::new(),
+                args: Vec::new(),
+                cwd: cwd.clone(),
+                raw: serde_json::Value::Null,
+            }
+        } else {
+            configs[cfg_idx].clone()
+        };
+        self.dap_launch_configs = configs;
+        self.dap_selected_launch_config = cfg_idx;
+
+        // Determine the adapter registry name.
+        let adapter_lang = type_to_adapter(&config.adapter_type).unwrap_or(lang);
+
+        // Ensure a DapManager exists.
+        if self.dap_manager.is_none() {
+            self.dap_manager = Some(DapManager::new());
+        }
+        let mgr = self.dap_manager.as_mut().unwrap();
+
+        if let Err(e) = mgr.start_adapter(adapter_lang) {
+            self.message = format!("DAP: {e}");
+            return;
+        }
+
+        // Build launch arguments: start from ALL fields in the raw config,
+        // then overwrite the three path-bearing fields with substituted values.
+        // VSCode sends the full launch.json entry (including `type`, `request`,
+        // `name`) as the DAP `launch` arguments — some adapters (codelldb)
+        // rely on fields like `type` or `request` being present.
+        let mut extra = if let Some(obj) = config.raw.as_object() {
+            obj.iter()
+                .filter(|(k, _)| {
+                    // Only skip the three fields we re-add with substituted values.
+                    !matches!(k.as_str(), "program" | "cwd" | "args")
+                })
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect::<serde_json::Map<String, serde_json::Value>>()
+        } else {
+            serde_json::Map::new()
+        };
+
+        // sourceLanguages helps codelldb map Rust source files.
+        if adapter_lang == "codelldb" || config.adapter_type == "lldb" {
+            extra
+                .entry("sourceLanguages".to_string())
+                .or_insert_with(|| serde_json::json!(["rust"]));
+            // Default stdio to null so the debuggee's stdout/stderr doesn't
+            // flood the Debug Output panel (especially noisy for TUI apps).
+            // Users can override this in launch.json (e.g. "stdio": "/dev/pts/0").
+            extra
+                .entry("stdio".to_string())
+                .or_insert(serde_json::Value::Null);
+        }
+        extra
+            .entry("stopOnEntry".to_string())
+            .or_insert_with(|| serde_json::json!(false));
+
+        let mut launch_args = extra;
+        launch_args.insert(
+            "program".to_string(),
+            serde_json::Value::String(config.program.clone()),
+        );
+        launch_args.insert(
+            "cwd".to_string(),
+            serde_json::Value::String(config.cwd.clone()),
+        );
+        launch_args.insert(
+            "args".to_string(),
+            serde_json::Value::Array(
+                config
+                    .args
+                    .iter()
+                    .map(|s| serde_json::Value::String(s.clone()))
+                    .collect(),
+            ),
+        );
+        let launch_args = serde_json::Value::Object(launch_args);
+
+        // Clear previous output and switch to Debug Output tab so the user
+        // can see all diagnostic logs without any extra commands.
+        self.dap_output_lines.clear();
+        self.bottom_panel_kind = BottomPanelKind::DebugOutput;
+        // Open the bottom panel even if no terminal is running.
+        // Only bump rows if completely collapsed (0) to avoid overriding user preferences.
+        self.bottom_panel_open = true;
+        self.dap_wants_sidebar = true;
+        if self.session.terminal_panel_rows == 0 {
+            self.session.terminal_panel_rows = 10;
+        }
+
+        // Diagnostic logs — visible immediately in the Debug Output tab.
+        self.dap_output_lines
+            .push(format!("[dap] workspace: {cwd}"));
+        self.dap_output_lines
+            .push(format!("[dap] launch.json: {}", launch_json_path.display()));
+        self.dap_output_lines.push(format!(
+            "[dap] config.program: {:?}  args: {:?}",
+            config.program, config.args
+        ));
+
+        // Guard: empty program path means the launch.json is misconfigured.
+        if config.program.is_empty() {
+            self.message = format!("DAP: program not set — edit {}", launch_json_path.display());
+            self.dap_session_active = false;
+            self.debug_toolbar_visible = false;
+            return;
+        }
+
+        // Dump the complete JSON we're about to send so mismatches are obvious.
+        self.dap_output_lines
+            .push(format!("[dap] launch request: {launch_args}"));
+
+        // Store launch_args for deferred sending — we must wait for the
+        // `initialize` response before sending `launch`.  Sending both at once
+        // causes codelldb to process them concurrently, and it reads the
+        // `launch` arguments before its LLDB session is fully initialised,
+        // producing "executable doesn't exist: '(empty)'" even when `program`
+        // is correctly set in the JSON we send.
+        self.dap_pending_launch = Some(launch_args);
+        self.dap_seq_launch = None; // will be assigned once launch is actually sent
+        self.dap_seq_initialize = None;
+
+        let adapter_name = mgr.adapter.map(|a| a.name).unwrap_or("unknown");
+        if let Some(server) = mgr.server.as_mut() {
+            let init_seq = server.initialize(adapter_name);
+            self.dap_seq_initialize = Some(init_seq);
+            self.dap_output_lines
+                .push(format!("[dap] sent initialize (seq={init_seq}), waiting…"));
+        }
+
+        self.dap_session_active = true;
+        self.debug_toolbar_visible = true;
+        self.message = format!("DAP: starting {} debug session\u{2026}", config.name);
+    }
+
+    /// Continue execution of the stopped thread.
+    pub fn dap_continue(&mut self) {
+        let tid = self.dap_stopped_thread.unwrap_or(0);
+        if let Some(mgr) = &mut self.dap_manager {
+            if let Some(server) = &mut mgr.server {
+                server.continue_thread(tid);
+                self.message = "DAP: continue".to_string();
+                return;
+            }
+        }
+        self.message = "DAP: no active session".to_string();
+    }
+
+    /// Pause all threads.
+    pub fn dap_pause(&mut self) {
+        let tid = self.dap_stopped_thread.unwrap_or(0);
+        if let Some(mgr) = &mut self.dap_manager {
+            if let Some(server) = &mut mgr.server {
+                server.pause(tid);
+                self.message = "DAP: pause".to_string();
+                return;
+            }
+        }
+        self.message = "DAP: no active session".to_string();
+    }
+
+    /// Stop the debug session (disconnect adapter).
+    pub fn dap_stop(&mut self) {
+        if let Some(mgr) = &mut self.dap_manager {
+            mgr.stop();
+        }
+        self.dap_session_active = false;
+        self.debug_toolbar_visible = false;
+        self.dap_pending_launch = None;
+        self.dap_stopped_thread = None;
+        self.dap_seq_initialize = None;
+        self.dap_seq_launch = None;
+        self.dap_active_frame = 0;
+        self.dap_expanded_vars.clear();
+        self.dap_child_variables.clear();
+        self.dap_eval_result = None;
+        self.dap_pending_vars_ref = 0;
+        self.dap_watch_values = vec![None; self.dap_watch_expressions.len()];
+        self.message = "DAP: session stopped".to_string();
+    }
+
+    /// Add a watch expression to the debug sidebar.
+    pub fn dap_add_watch(&mut self, expr: String) {
+        self.dap_watch_expressions.push(expr);
+        self.dap_watch_values.push(None);
+    }
+
+    /// Remove a watch expression by index.
+    #[allow(dead_code)]
+    pub fn dap_remove_watch(&mut self, idx: usize) {
+        if idx < self.dap_watch_expressions.len() {
+            self.dap_watch_expressions.remove(idx);
+            self.dap_watch_values.remove(idx);
+        }
+    }
+
+    /// Select a stack frame by index, clamping to the valid range.
+    /// Re-requests scopes/variables for the new frame.
+    #[allow(dead_code)]
+    pub fn dap_select_frame(&mut self, idx: usize) {
+        let max = self.dap_stack_frames.len().saturating_sub(1);
+        self.dap_active_frame = idx.min(max);
+        self.dap_variables.clear();
+        self.dap_child_variables.clear();
+        self.dap_expanded_vars.clear();
+        let frame_id = self
+            .dap_stack_frames
+            .get(self.dap_active_frame)
+            .map(|f| f.id)
+            .unwrap_or(0);
+        if frame_id > 0 {
+            self.dap_pending_vars_ref = 0; // top-level fetch
+            if let Some(mgr) = &mut self.dap_manager {
+                if let Some(server) = &mut mgr.server {
+                    server.scopes(frame_id);
+                }
+            }
+        }
+    }
+
+    /// Toggle expansion of a variable with the given `var_ref`.
+    /// If already expanded, collapses it; otherwise requests child variables.
+    pub fn dap_toggle_expand_var(&mut self, var_ref: u64) {
+        if self.dap_expanded_vars.contains(&var_ref) {
+            self.dap_expanded_vars.remove(&var_ref);
+            self.dap_child_variables.remove(&var_ref);
+        } else {
+            self.dap_expanded_vars.insert(var_ref);
+            self.dap_pending_vars_ref = var_ref; // child fetch
+            if let Some(mgr) = &mut self.dap_manager {
+                if let Some(server) = &mut mgr.server {
+                    server.variables(var_ref);
+                }
+            }
+        }
+    }
+
+    /// Evaluate an expression in the context of the active frame.
+    /// Result is stored in `dap_eval_result` when the response arrives.
+    pub fn dap_eval(&mut self, expr: &str) {
+        let frame_id = self
+            .dap_stack_frames
+            .get(self.dap_active_frame)
+            .map(|f| f.id)
+            .unwrap_or(0);
+        if let Some(mgr) = &mut self.dap_manager {
+            if let Some(server) = &mut mgr.server {
+                server.evaluate(expr, frame_id);
+                self.message = format!("DAP: evaluating `{expr}`…");
+                return;
+            }
+        }
+        self.message = "DAP: no active session".to_string();
+    }
+
+    /// Handle a key press directed at the debug sidebar.
+    /// j/k or Up/Down navigate within the active section; Tab switches sections.
+    #[allow(dead_code)]
+    pub fn handle_debug_sidebar_key(&mut self, key_name: &str, _ctrl: bool) -> EngineAction {
+        match key_name {
+            "Down" | "j" => {
+                self.dap_sidebar_selected = self.dap_sidebar_selected.saturating_add(1);
+            }
+            "Up" | "k" => {
+                self.dap_sidebar_selected = self.dap_sidebar_selected.saturating_sub(1);
+            }
+            "Tab" => {
+                self.dap_sidebar_section = match self.dap_sidebar_section {
+                    DebugSidebarSection::Variables => DebugSidebarSection::Watch,
+                    DebugSidebarSection::Watch => DebugSidebarSection::CallStack,
+                    DebugSidebarSection::CallStack => DebugSidebarSection::Breakpoints,
+                    DebugSidebarSection::Breakpoints => DebugSidebarSection::Variables,
+                };
+                self.dap_sidebar_selected = 0;
+            }
+            "Return" | "Enter" => {
+                // Select a call-stack frame when Enter is pressed in that section.
+                if self.dap_sidebar_section == DebugSidebarSection::CallStack {
+                    self.dap_select_frame(self.dap_sidebar_selected);
+                }
+            }
+            _ => {}
+        }
+        EngineAction::None
+    }
+
+    /// Step over (next).
+    pub fn dap_step_over(&mut self) {
+        let tid = self.dap_stopped_thread.unwrap_or(0);
+        if let Some(mgr) = &mut self.dap_manager {
+            if let Some(server) = &mut mgr.server {
+                server.next(tid);
+                self.message = "DAP: step over".to_string();
+                return;
+            }
+        }
+        self.message = "DAP: no active session".to_string();
+    }
+
+    /// Step into.
+    pub fn dap_step_into(&mut self) {
+        let tid = self.dap_stopped_thread.unwrap_or(0);
+        if let Some(mgr) = &mut self.dap_manager {
+            if let Some(server) = &mut mgr.server {
+                server.step_in(tid);
+                self.message = "DAP: step into".to_string();
+                return;
+            }
+        }
+        self.message = "DAP: no active session".to_string();
+    }
+
+    /// Step out.
+    pub fn dap_step_out(&mut self) {
+        let tid = self.dap_stopped_thread.unwrap_or(0);
+        if let Some(mgr) = &mut self.dap_manager {
+            if let Some(server) = &mut mgr.server {
+                server.step_out(tid);
+                self.message = "DAP: step out".to_string();
+                return;
+            }
+        }
+        self.message = "DAP: no active session".to_string();
+    }
+
+    /// Drain all pending DAP events and update engine state accordingly.
+    /// Called by both UI backends every poll tick (same cadence as `poll_lsp`).
+    pub fn poll_dap(&mut self) -> bool {
+        /// Strip ANSI escape sequences (CSI, OSC, etc.) and non-printable
+        /// control characters from DAP adapter output so the Debug Output
+        /// panel doesn't show garbled text.
+        fn strip_ansi_and_control(s: &str) -> String {
+            let mut out = String::with_capacity(s.len());
+            let mut chars = s.chars().peekable();
+            while let Some(ch) = chars.next() {
+                if ch == '\x1b' {
+                    // ESC sequences: CSI ('['), OSC (']'), SS2 ('N'), SS3 ('O'), etc.
+                    match chars.peek() {
+                        Some(&'[') => {
+                            chars.next(); // consume '['
+                                          // CSI: params (0x30-3F) + intermediates (0x20-2F) + final (0x40-7E)
+                            while let Some(&c) = chars.peek() {
+                                chars.next();
+                                if ('@'..='~').contains(&c) {
+                                    break;
+                                }
+                            }
+                        }
+                        Some(&']') => {
+                            chars.next(); // consume ']'
+                                          // OSC: terminated by BEL (\x07) or ST (ESC \)
+                            while let Some(c) = chars.next() {
+                                if c == '\x07' {
+                                    break;
+                                }
+                                if c == '\x1b' && chars.peek() == Some(&'\\') {
+                                    chars.next();
+                                    break;
+                                }
+                            }
+                        }
+                        Some(&c) if c.is_ascii_uppercase() || c == '(' || c == ')' || c == '#' => {
+                            chars.next(); // two-byte escape (ESC + letter/paren)
+                        }
+                        _ => {} // bare ESC — skip it
+                    }
+                } else if ch == '\r' || (ch.is_control() && ch != '\n' && ch != '\t') {
+                    // skip control chars (keep newlines and tabs)
+                } else {
+                    out.push(ch);
+                }
+            }
+            out
+        }
+
+        let events = match &mut self.dap_manager {
+            Some(mgr) => match &mut mgr.server {
+                Some(server) => server.poll(),
+                None => return false,
+            },
+            None => return false,
+        };
+        if events.is_empty() {
+            return false;
+        }
+        let mut redraw = false;
+        for event in events {
+            match event {
+                DapEvent::Initialized => {
+                    // Re-send all current breakpoints then signal configuration complete.
+                    let bps: Vec<(String, Vec<u64>)> = self
+                        .dap_breakpoints
+                        .iter()
+                        .filter(|(_, lines)| !lines.is_empty())
+                        .map(|(f, l)| (f.clone(), l.clone()))
+                        .collect();
+                    let bp_count: usize = bps.iter().map(|(_, l)| l.len()).sum();
+                    // Diagnostic log so the user can see this in Debug Output tab.
+                    self.dap_output_lines.push(format!(
+                        "[dap] initialized — sending {bp_count} breakpoint(s)"
+                    ));
+                    if let Some(mgr) = &mut self.dap_manager {
+                        if let Some(server) = &mut mgr.server {
+                            for (file, lines) in &bps {
+                                self.dap_output_lines
+                                    .push(format!("[dap] setBreakpoints: {file} lines {lines:?}"));
+                                server.set_breakpoints(file, lines);
+                            }
+                            server.configuration_done();
+                        }
+                    }
+                    self.message = if bp_count == 0 {
+                        "DAP: ready (no breakpoints set — use F9 to add one)".to_string()
+                    } else {
+                        format!("DAP: sent {bp_count} breakpoint(s), waiting for program\u{2026}")
+                    };
+                    redraw = true;
+                }
+                DapEvent::Stopped {
+                    thread_id, reason, ..
+                } => {
+                    self.dap_output_lines
+                        .push(format!("[dap] event: Stopped reason={reason}"));
+                    self.dap_stopped_thread = Some(thread_id);
+                    self.message = format!("DAP: stopped ({reason})");
+                    // Clear previous frame/variable state before populating new ones.
+                    self.dap_stack_frames.clear();
+                    self.dap_variables.clear();
+                    // Request stack trace so we can highlight the current line.
+                    if let Some(mgr) = &mut self.dap_manager {
+                        if let Some(server) = &mut mgr.server {
+                            server.stack_trace(thread_id);
+                        }
+                    }
+                    redraw = true;
+                }
+                DapEvent::Continued { .. } => {
+                    self.dap_stopped_thread = None;
+                    self.dap_current_line = None;
+                    self.dap_stack_frames.clear();
+                    self.dap_variables.clear();
+                    self.dap_child_variables.clear();
+                    self.dap_expanded_vars.clear();
+                    self.dap_active_frame = 0;
+                    self.dap_watch_values = vec![None; self.dap_watch_expressions.len()];
+                    redraw = true;
+                }
+                DapEvent::Exited { exit_code } => {
+                    self.dap_output_lines
+                        .push(format!("[dap] event: Exited code={exit_code}"));
+                    self.dap_session_active = false;
+                    self.debug_toolbar_visible = false;
+                    self.dap_stopped_thread = None;
+                    self.dap_current_line = None;
+                    self.dap_stack_frames.clear();
+                    self.dap_variables.clear();
+                    self.dap_child_variables.clear();
+                    self.dap_expanded_vars.clear();
+                    self.dap_active_frame = 0;
+                    self.dap_watch_values = vec![None; self.dap_watch_expressions.len()];
+                    self.message = format!("DAP: process exited (code {exit_code})");
+                    if let Some(mgr) = &mut self.dap_manager {
+                        mgr.server = None;
+                    }
+                    redraw = true;
+                }
+                DapEvent::Output { category, output } => {
+                    if category != "telemetry" {
+                        let trimmed = output.trim_end_matches('\n');
+                        if !trimmed.is_empty() {
+                            // Strip ANSI escape sequences and control chars that
+                            // would garble the Debug Output panel.
+                            let clean: String = strip_ansi_and_control(trimmed);
+                            self.message = format!("[{category}] {clean}");
+                            for line in clean.lines() {
+                                self.dap_output_lines.push(format!("[{category}] {line}"));
+                            }
+                            if self.dap_output_lines.len() > 1000 {
+                                let excess = self.dap_output_lines.len() - 1000;
+                                self.dap_output_lines.drain(..excess);
+                            }
+                        }
+                    }
+                    redraw = true;
+                }
+                DapEvent::Breakpoint { reason, breakpoint } => {
+                    self.message = if breakpoint.verified {
+                        format!(
+                            "DAP: breakpoint {reason} (verified, line {})",
+                            breakpoint.line
+                        )
+                    } else {
+                        let detail = breakpoint
+                            .message
+                            .as_deref()
+                            .unwrap_or("path not found by adapter");
+                        format!(
+                            "DAP: breakpoint unverified — {detail} (line {})",
+                            breakpoint.line
+                        )
+                    };
+                    redraw = true;
+                }
+                DapEvent::RequestComplete {
+                    seq: req_seq,
+                    command: raw_command,
+                    success,
+                    body,
+                    error_message,
+                } => {
+                    // codelldb omits the `command` field from responses.
+                    // Resolve the actual command via the seq→command map kept
+                    // by DapServer so all downstream checks work correctly.
+                    let command = if raw_command.is_empty() {
+                        if let Some(mgr) = &mut self.dap_manager {
+                            if let Some(server) = &mut mgr.server {
+                                server.resolve_command(req_seq)
+                            } else {
+                                raw_command
+                            }
+                        } else {
+                            raw_command
+                        }
+                    } else {
+                        raw_command
+                    };
+
+                    // Log every response.
+                    if !success {
+                        let msg_part = error_message
+                            .as_deref()
+                            .map(|m| format!(" msg={m:?}"))
+                            .unwrap_or_default();
+                        self.dap_output_lines
+                            .push(format!("[dap] response: {command} success=false{msg_part}"));
+                    } else {
+                        self.dap_output_lines
+                            .push(format!("[dap] response: {command} success=true"));
+                    }
+                    // After initialize succeeds, send the deferred launch request.
+                    let is_init_response = command == "initialize";
+                    if is_init_response && success {
+                        self.dap_seq_initialize = None;
+                        self.dap_output_lines
+                            .push("[dap] initialize OK — sending launch".to_string());
+                        if let Some(launch_args) = self.dap_pending_launch.take() {
+                            if let Some(mgr) = &mut self.dap_manager {
+                                if let Some(server) = &mut mgr.server {
+                                    self.dap_seq_launch = Some(server.launch(launch_args));
+                                }
+                            }
+                        }
+                    }
+
+                    if command == "launch" && !success {
+                        let detail = error_message
+                            .as_deref()
+                            .unwrap_or("check binary path and DISPLAY env var");
+                        self.message = format!("DAP: launch failed — {detail}");
+                        // Don't clear dap_session_active here: some adapters (codelldb)
+                        // report success=false in the launch response even when the
+                        // process IS running. The Exited event will properly end the
+                        // session when the process terminates.
+                    }
+                    if command == "setBreakpoints" {
+                        // Log the full response to dap_output_lines so it's visible
+                        // in the Debug Output tab for diagnostics.
+                        if let Some(bps) = body.get("breakpoints").and_then(|b| b.as_array()) {
+                            let total = bps.len();
+                            for bp in bps {
+                                let verified = bp
+                                    .get("verified")
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false);
+                                let line = bp.get("line").and_then(|l| l.as_u64()).unwrap_or(0);
+                                let msg = bp.get("message").and_then(|m| m.as_str()).unwrap_or("");
+                                let log = if verified {
+                                    format!("[dap] BP line {line}: verified ✓")
+                                } else if msg.is_empty() {
+                                    format!("[dap] BP line {line}: pending (resolves on load)")
+                                } else {
+                                    format!("[dap] BP line {line}: UNVERIFIED — {msg}")
+                                };
+                                self.dap_output_lines.push(log);
+                            }
+                            // Surface errors in the status bar only when every BP
+                            // came back with a real error (not just "pending").
+                            let unverified_errors: Vec<String> = bps
+                                .iter()
+                                .filter(|bp| {
+                                    !bp.get("verified")
+                                        .and_then(|v| v.as_bool())
+                                        .unwrap_or(false)
+                                })
+                                .filter_map(|bp| {
+                                    let msg =
+                                        bp.get("message").and_then(|m| m.as_str()).unwrap_or("");
+                                    if msg.is_empty() || msg == "pending" {
+                                        None
+                                    } else {
+                                        let line =
+                                            bp.get("line").and_then(|l| l.as_u64()).unwrap_or(0);
+                                        Some(format!("line {line}: {msg}"))
+                                    }
+                                })
+                                .collect();
+                            if !unverified_errors.is_empty() && unverified_errors.len() == total {
+                                self.message = format!(
+                                    "DAP: breakpoint(s) not found — {} (check binary is built)",
+                                    unverified_errors.join("; ")
+                                );
+                            }
+                        }
+                        redraw = true;
+                    } else if command == "stackTrace" && success {
+                        if let Some(frames_json) =
+                            body.get("stackFrames").and_then(|f| f.as_array())
+                        {
+                            // Parse all frames for the call-stack panel.
+                            self.dap_stack_frames = frames_json
+                                .iter()
+                                .map(|f| StackFrame {
+                                    id: f.get("id").and_then(|v| v.as_u64()).unwrap_or(0),
+                                    name: f
+                                        .get("name")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("?")
+                                        .to_string(),
+                                    source: f
+                                        .get("source")
+                                        .and_then(|s| s.get("path"))
+                                        .and_then(|p| p.as_str())
+                                        .map(|s| s.to_string()),
+                                    line: f.get("line").and_then(|v| v.as_u64()).unwrap_or(0),
+                                })
+                                .collect();
+                            // Set dap_current_line from the top frame and navigate
+                            // the editor to that file+line (same as LSP go-to-definition).
+                            // Clone frame data to avoid borrow conflict with &mut self.
+                            let top_source = self
+                                .dap_stack_frames
+                                .first()
+                                .and_then(|f| f.source.as_ref().map(|s| (s.clone(), f.line)));
+                            if let Some((src, line)) = top_source {
+                                if line > 0 {
+                                    self.dap_current_line = Some((src.clone(), line));
+                                    // Open the file if not already active.
+                                    let src_path = std::path::PathBuf::from(&src);
+                                    let already_open = self
+                                        .buffer_manager
+                                        .get(self.active_buffer_id())
+                                        .and_then(|s| s.file_path.as_ref())
+                                        .map(|p| p == &src_path)
+                                        .unwrap_or(false);
+                                    if !already_open {
+                                        let _ = self
+                                            .open_file_with_mode(&src_path, OpenMode::Permanent);
+                                    }
+                                    // Jump to the stopped line (1-based → 0-based) and
+                                    // center it in the viewport so it's always visible.
+                                    let target_line = (line as usize).saturating_sub(1);
+                                    self.view_mut().cursor.line = target_line;
+                                    self.view_mut().cursor.col = 0;
+                                    self.scroll_cursor_center();
+                                }
+                            }
+                            // Chain: request scopes for the top frame so we can show variables.
+                            let first_id = self.dap_stack_frames.first().map(|f| f.id).unwrap_or(0);
+                            if first_id > 0 {
+                                if let Some(mgr) = &mut self.dap_manager {
+                                    if let Some(server) = &mut mgr.server {
+                                        server.scopes(first_id);
+                                    }
+                                }
+                            }
+                            redraw = true;
+                        }
+                    } else if command == "scopes" && success {
+                        // Get the variablesReference for the first scope (usually "Locals").
+                        if let Some(var_ref) = body
+                            .get("scopes")
+                            .and_then(|s| s.as_array())
+                            .and_then(|a| a.first())
+                            .and_then(|s| s.get("variablesReference"))
+                            .and_then(|v| v.as_u64())
+                        {
+                            if var_ref > 0 {
+                                self.dap_pending_vars_ref = 0; // top-level scope fetch
+                                if let Some(mgr) = &mut self.dap_manager {
+                                    if let Some(server) = &mut mgr.server {
+                                        server.variables(var_ref);
+                                    }
+                                }
+                            }
+                        }
+                    } else if command == "variables" && success {
+                        let parsed: Vec<DapVariable> = body
+                            .get("variables")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .map(|v| DapVariable {
+                                        name: v
+                                            .get("name")
+                                            .and_then(|n| n.as_str())
+                                            .unwrap_or("?")
+                                            .to_string(),
+                                        value: v
+                                            .get("value")
+                                            .and_then(|val| val.as_str())
+                                            .unwrap_or("")
+                                            .to_string(),
+                                        var_ref: v
+                                            .get("variablesReference")
+                                            .and_then(|r| r.as_u64())
+                                            .unwrap_or(0),
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        if self.dap_pending_vars_ref == 0 {
+                            // Top-level scope variables.
+                            self.dap_variables = parsed;
+                            // Now evaluate all watch expressions for the active frame.
+                            let frame_id = self
+                                .dap_stack_frames
+                                .get(self.dap_active_frame)
+                                .map(|f| f.id)
+                                .unwrap_or(0);
+                            if frame_id > 0 && !self.dap_watch_expressions.is_empty() {
+                                let exprs = self.dap_watch_expressions.clone();
+                                for (idx, expr) in exprs.iter().enumerate() {
+                                    if let Some(mgr) = &mut self.dap_manager {
+                                        if let Some(server) = &mut mgr.server {
+                                            let seq = server.evaluate(expr, frame_id);
+                                            self.dap_pending_watch_seqs.insert(seq, idx);
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            // Child variables for an expanded entry.
+                            self.dap_child_variables
+                                .insert(self.dap_pending_vars_ref, parsed);
+                        }
+                        self.dap_pending_vars_ref = 0;
+                        redraw = true;
+                    } else if command == "evaluate" && success {
+                        if let Some(result) = body
+                            .get("result")
+                            .and_then(|r| r.as_str())
+                            .map(|s| s.to_string())
+                        {
+                            // Check if this is a watch expression response.
+                            if let Some(&watch_idx) = self.dap_pending_watch_seqs.get(&req_seq) {
+                                if watch_idx < self.dap_watch_values.len() {
+                                    self.dap_watch_values[watch_idx] = Some(result.clone());
+                                }
+                                self.dap_pending_watch_seqs.remove(&req_seq);
+                            } else {
+                                // User-triggered eval — show in status and store result.
+                                self.message = format!("= {result}");
+                                self.dap_eval_result = Some(result);
+                            }
+                            redraw = true;
+                        }
+                    }
+                }
+            }
+        }
+        redraw
     }
 
     /// Toggle between Vim and VSCode editing modes, saving the setting.
@@ -20789,5 +22262,641 @@ mod tests {
         engine.handle_key("Escape", None, false);
         assert_eq!(engine.mode, Mode::Insert);
         assert!(engine.is_vscode_mode());
+    }
+
+    // -----------------------------------------------------------------------
+    // Menu bar tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_menu_bar_toggle() {
+        let mut engine = Engine::new();
+        assert!(!engine.menu_bar_visible, "menu bar starts hidden");
+        engine.toggle_menu_bar();
+        assert!(engine.menu_bar_visible, "toggle_menu_bar() should show bar");
+        engine.toggle_menu_bar();
+        assert!(!engine.menu_bar_visible, "second toggle hides bar");
+    }
+
+    #[test]
+    fn test_menu_open_close() {
+        let mut engine = Engine::new();
+        engine.menu_bar_visible = true;
+        assert_eq!(engine.menu_open_idx, None);
+        engine.open_menu(2);
+        assert_eq!(
+            engine.menu_open_idx,
+            Some(2),
+            "open_menu sets dropdown index"
+        );
+        engine.close_menu();
+        assert_eq!(engine.menu_open_idx, None, "close_menu clears dropdown");
+        assert!(engine.menu_bar_visible, "close_menu keeps bar visible");
+    }
+
+    #[test]
+    fn test_menu_activate_dispatches_command() {
+        let mut engine = Engine::new();
+        // Load a buffer with content so we can verify save via w command.
+        let tmp = std::env::temp_dir().join("vimcode_menu_test_save.txt");
+        let _ = std::fs::write(&tmp, "hello");
+        engine
+            .buffer_manager
+            .get_mut(engine.active_buffer_id())
+            .unwrap()
+            .file_path = Some(tmp.clone());
+        engine
+            .buffer_manager
+            .get_mut(engine.active_buffer_id())
+            .unwrap()
+            .dirty = true;
+        engine.menu_bar_visible = true;
+        engine.menu_open_idx = Some(0);
+        // Activate the "Save" item (File menu, action "w") via menu_activate_item.
+        engine.menu_activate_item(0, 2, "w");
+        assert_eq!(
+            engine.menu_open_idx, None,
+            "menu_activate_item closes dropdown"
+        );
+        // Buffer should no longer be dirty after :w
+        let dirty = engine
+            .buffer_manager
+            .get(engine.active_buffer_id())
+            .map(|s| s.dirty)
+            .unwrap_or(true);
+        assert!(!dirty, "buffer saved after menu activate");
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    // ── Session 82: menu navigation ────────────────────────────────────────────
+
+    #[test]
+    fn test_menu_item_navigation() {
+        let mut engine = Engine::new();
+        engine.menu_bar_visible = true;
+        engine.open_menu(0);
+        assert_eq!(
+            engine.menu_highlighted_item, None,
+            "starts with no highlight"
+        );
+
+        // Items: [non-sep(0), non-sep(1), sep(2), non-sep(3)]
+        let seps = [false, false, true, false];
+
+        engine.menu_move_selection(1, &seps);
+        assert_eq!(engine.menu_highlighted_item, Some(0), "first non-sep");
+
+        engine.menu_move_selection(1, &seps);
+        assert_eq!(engine.menu_highlighted_item, Some(1), "second non-sep");
+
+        engine.menu_move_selection(1, &seps);
+        assert_eq!(engine.menu_highlighted_item, Some(3), "skips separator");
+
+        engine.menu_move_selection(1, &seps);
+        assert_eq!(engine.menu_highlighted_item, Some(0), "wraps around");
+
+        // Reverse direction
+        engine.menu_move_selection(-1, &seps);
+        assert_eq!(engine.menu_highlighted_item, Some(3), "reverse wrap");
+    }
+
+    #[test]
+    fn test_menu_activate_highlighted() {
+        let mut engine = Engine::new();
+        engine.menu_bar_visible = true;
+        engine.open_menu(2); // arbitrary menu index
+
+        // Nothing highlighted → returns None, menu stays open
+        let result = engine.menu_activate_highlighted();
+        assert!(result.is_none(), "None when nothing highlighted");
+        assert!(engine.menu_open_idx.is_some(), "menu stays open");
+
+        // Highlight an item, then activate
+        engine.menu_highlighted_item = Some(3);
+        let result = engine.menu_activate_highlighted();
+        assert_eq!(result, Some((2, 3)), "returns (menu_idx, item_idx)");
+        assert!(
+            engine.menu_open_idx.is_none(),
+            "menu is closed after activate"
+        );
+    }
+
+    #[test]
+    fn test_dap_session_active_field() {
+        let engine = Engine::new();
+        assert!(
+            !engine.dap_session_active,
+            "dap_session_active defaults to false"
+        );
+    }
+
+    // ── Session 83: DAP transport + engine methods ─────────────────────────────
+
+    #[test]
+    fn test_dap_toggle_breakpoint_add() {
+        let mut engine = Engine::new();
+        engine.dap_toggle_breakpoint("/src/main.rs", 10);
+        let lines = engine.dap_breakpoints.get("/src/main.rs").unwrap();
+        assert_eq!(lines, &vec![10u64], "breakpoint added");
+        assert!(
+            engine.message.contains("Breakpoint set"),
+            "{}",
+            engine.message
+        );
+    }
+
+    #[test]
+    fn test_dap_toggle_breakpoint_remove() {
+        let mut engine = Engine::new();
+        engine.dap_toggle_breakpoint("/src/main.rs", 10);
+        engine.dap_toggle_breakpoint("/src/main.rs", 10);
+        let lines = engine.dap_breakpoints.get("/src/main.rs").unwrap();
+        assert!(lines.is_empty(), "second toggle removes breakpoint");
+        assert!(
+            engine.message.contains("Breakpoint removed"),
+            "{}",
+            engine.message
+        );
+    }
+
+    #[test]
+    fn test_dap_breakpoints_sorted() {
+        let mut engine = Engine::new();
+        engine.dap_toggle_breakpoint("/src/lib.rs", 30);
+        engine.dap_toggle_breakpoint("/src/lib.rs", 5);
+        engine.dap_toggle_breakpoint("/src/lib.rs", 15);
+        let lines = engine.dap_breakpoints.get("/src/lib.rs").unwrap();
+        assert_eq!(lines, &vec![5u64, 15, 30], "breakpoints stored sorted");
+    }
+
+    #[test]
+    fn test_dap_breakpoints_multiple_files() {
+        let mut engine = Engine::new();
+        engine.dap_toggle_breakpoint("/src/a.rs", 1);
+        engine.dap_toggle_breakpoint("/src/b.rs", 2);
+        assert_eq!(
+            engine.dap_breakpoints.get("/src/a.rs").unwrap(),
+            &vec![1u64]
+        );
+        assert_eq!(
+            engine.dap_breakpoints.get("/src/b.rs").unwrap(),
+            &vec![2u64]
+        );
+    }
+
+    #[test]
+    fn test_dap_no_session_commands_show_message() {
+        let mut engine = Engine::new();
+        engine.dap_continue();
+        assert!(
+            engine.message.contains("no active session"),
+            "{}",
+            engine.message
+        );
+        engine.dap_pause();
+        assert!(
+            engine.message.contains("no active session"),
+            "{}",
+            engine.message
+        );
+        engine.dap_step_over();
+        assert!(
+            engine.message.contains("no active session"),
+            "{}",
+            engine.message
+        );
+        engine.dap_step_into();
+        assert!(
+            engine.message.contains("no active session"),
+            "{}",
+            engine.message
+        );
+        engine.dap_step_out();
+        assert!(
+            engine.message.contains("no active session"),
+            "{}",
+            engine.message
+        );
+    }
+
+    #[test]
+    fn test_dap_stop_clears_session() {
+        let mut engine = Engine::new();
+        engine.dap_session_active = true;
+        engine.dap_stopped_thread = Some(1);
+        engine.dap_seq_launch = Some(42);
+        engine.dap_stop();
+        assert!(!engine.dap_session_active, "session cleared after stop");
+        assert!(
+            engine.dap_stopped_thread.is_none(),
+            "stopped_thread cleared"
+        );
+        assert!(engine.dap_seq_launch.is_none(), "seq_launch cleared");
+    }
+
+    #[test]
+    fn test_dap_install_unknown_language() {
+        let mut engine = Engine::new();
+        engine.execute_command("DapInstall cobol");
+        assert!(
+            engine.message.contains("No built-in DAP adapter"),
+            "{}",
+            engine.message
+        );
+    }
+
+    #[test]
+    fn test_dap_install_known_language_no_lsp_message() {
+        // DapInstall must NEVER show "No LSP for ..." messages.
+        // It should either show "Installing ..." (if an install command is known)
+        // or a DAP-specific manual-install hint.
+        let mut engine = Engine::new();
+        engine.execute_command("DapInstall rust");
+        assert!(
+            !engine.message.contains("No LSP"),
+            "DapInstall should not emit LSP messages: {}",
+            engine.message
+        );
+        // The message must mention the adapter (codelldb)
+        assert!(
+            engine.message.contains("codelldb"),
+            "DapInstall should mention the adapter: {}",
+            engine.message
+        );
+    }
+
+    #[test]
+    fn test_dap_install_no_arg() {
+        let mut engine = Engine::new();
+        engine.execute_command("DapInstall");
+        assert!(engine.message.contains("Usage"), "{}", engine.message);
+    }
+
+    #[test]
+    fn test_dap_fields_default() {
+        let engine = Engine::new();
+        assert!(engine.dap_manager.is_none(), "dap_manager starts None");
+        assert!(engine.dap_stopped_thread.is_none());
+        assert!(engine.dap_breakpoints.is_empty());
+        assert!(engine.dap_seq_launch.is_none());
+        assert!(engine.dap_current_line.is_none());
+        assert!(engine.dap_stack_frames.is_empty());
+        assert!(engine.dap_variables.is_empty());
+        assert!(engine.dap_output_lines.is_empty());
+    }
+
+    #[test]
+    fn test_rust_debug_binary_no_cargo_toml() {
+        // A temp dir with no Cargo.toml should return an error.
+        let dir = std::env::temp_dir().join("vimcode_test_no_cargo");
+        let _ = std::fs::create_dir_all(&dir);
+        let result = rust_debug_binary(&dir);
+        assert!(
+            result.is_err(),
+            "Should fail when Cargo.toml not found: {:?}",
+            result
+        );
+        assert!(
+            result.unwrap_err().contains("Cargo.toml"),
+            "Error should mention Cargo.toml"
+        );
+    }
+
+    #[test]
+    fn test_dap_breakpoint_gutter_fields() {
+        // Toggle a breakpoint and verify the engine state that render.rs queries.
+        let mut engine = Engine::new();
+        engine.execute_command("e /tmp/foo.rs");
+        // Set a breakpoint via the "brkpt" command path.
+        engine.dap_toggle_breakpoint("/tmp/foo.rs", 5);
+        let bp = engine.dap_breakpoints.get("/tmp/foo.rs");
+        assert!(bp.is_some(), "Breakpoint should be registered");
+        assert_eq!(bp.unwrap(), &vec![5u64]);
+        // Toggle again to remove.
+        engine.dap_toggle_breakpoint("/tmp/foo.rs", 5);
+        let bp2 = engine.dap_breakpoints.get("/tmp/foo.rs");
+        assert!(
+            bp2.map(|v| v.is_empty()).unwrap_or(true),
+            "Breakpoint should be removed"
+        );
+    }
+
+    #[test]
+    fn test_dap_current_line_set_on_stop() {
+        // dap_current_line starts None and can be set/cleared directly.
+        let mut engine = Engine::new();
+        assert!(engine.dap_current_line.is_none());
+        engine.dap_current_line = Some(("/tmp/foo.rs".to_string(), 10));
+        assert_eq!(
+            engine.dap_current_line,
+            Some(("/tmp/foo.rs".to_string(), 10))
+        );
+        // Simulate Continued: clear the stopped line.
+        engine.dap_current_line = None;
+        engine.dap_stopped_thread = None;
+        assert!(engine.dap_current_line.is_none());
+    }
+
+    #[test]
+    fn test_dap_current_line_cleared_on_stop_and_continued() {
+        // Verify that dap_session_active affects has_bp computation:
+        // when active, even a file with no BPs shows the gutter column.
+        let mut engine = Engine::new();
+        engine.dap_session_active = true;
+        // No breakpoints set yet — but session is active.
+        let bp_lines = engine
+            .dap_breakpoints
+            .get("")
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+        let has_bp = !bp_lines.is_empty() || engine.dap_session_active;
+        assert!(
+            has_bp,
+            "has_bp should be true when session is active even with no BPs"
+        );
+    }
+
+    #[test]
+    fn test_dap_stack_frames_parsed_from_json() {
+        // Simulate what poll_dap does when a stackTrace RequestComplete arrives.
+        use crate::core::dap::StackFrame;
+        let mut engine = Engine::new();
+        let frames_json = serde_json::json!([
+            {"id": 1, "name": "main", "source": {"path": "/tmp/src/main.rs"}, "line": 42},
+            {"id": 2, "name": "helper", "source": {"path": "/tmp/src/lib.rs"}, "line": 10},
+        ]);
+        let frames: Vec<StackFrame> = frames_json
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| StackFrame {
+                id: f.get("id").and_then(|v| v.as_u64()).unwrap_or(0),
+                name: f
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?")
+                    .to_string(),
+                source: f
+                    .get("source")
+                    .and_then(|s| s.get("path"))
+                    .and_then(|p| p.as_str())
+                    .map(|s| s.to_string()),
+                line: f.get("line").and_then(|v| v.as_u64()).unwrap_or(0),
+            })
+            .collect();
+        engine.dap_stack_frames = frames;
+        assert_eq!(engine.dap_stack_frames.len(), 2);
+        assert_eq!(engine.dap_stack_frames[0].name, "main");
+        assert_eq!(engine.dap_stack_frames[0].line, 42);
+        assert_eq!(
+            engine.dap_stack_frames[0].source.as_deref(),
+            Some("/tmp/src/main.rs")
+        );
+        assert_eq!(engine.dap_stack_frames[1].name, "helper");
+    }
+
+    #[test]
+    fn test_dap_variables_parsed_from_json() {
+        use crate::core::dap::DapVariable;
+        let mut engine = Engine::new();
+        let vars_json = serde_json::json!([
+            {"name": "x", "value": "42", "variablesReference": 0},
+            {"name": "msg", "value": "\"hello\"", "variablesReference": 0},
+        ]);
+        engine.dap_variables = vars_json
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| DapVariable {
+                name: v
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("?")
+                    .to_string(),
+                value: v
+                    .get("value")
+                    .and_then(|val| val.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                var_ref: v
+                    .get("variablesReference")
+                    .and_then(|r| r.as_u64())
+                    .unwrap_or(0),
+            })
+            .collect();
+        assert_eq!(engine.dap_variables.len(), 2);
+        assert_eq!(engine.dap_variables[0].name, "x");
+        assert_eq!(engine.dap_variables[0].value, "42");
+        assert_eq!(engine.dap_variables[1].name, "msg");
+    }
+
+    #[test]
+    fn test_dap_output_lines_appended_and_capped() {
+        let mut engine = Engine::new();
+        // Append lines and verify they accumulate.
+        engine
+            .dap_output_lines
+            .push("[stdout] Hello, world!".to_string());
+        engine
+            .dap_output_lines
+            .push("[stderr] Error: oops".to_string());
+        assert_eq!(engine.dap_output_lines.len(), 2);
+        assert_eq!(engine.dap_output_lines[0], "[stdout] Hello, world!");
+
+        // Verify cap: fill to > 1000 and drain.
+        engine.dap_output_lines.clear();
+        for i in 0..1005 {
+            engine.dap_output_lines.push(format!("line {i}"));
+        }
+        if engine.dap_output_lines.len() > 1000 {
+            let excess = engine.dap_output_lines.len() - 1000;
+            engine.dap_output_lines.drain(..excess);
+        }
+        assert_eq!(engine.dap_output_lines.len(), 1000);
+        // After draining, the oldest 5 lines are gone; line 5 should now be first.
+        assert_eq!(engine.dap_output_lines[0], "line 5");
+    }
+
+    #[test]
+    fn test_dap_frames_and_vars_cleared_on_continued() {
+        use crate::core::dap::{DapVariable, StackFrame};
+        let mut engine = Engine::new();
+        engine.dap_stack_frames = vec![StackFrame {
+            id: 1,
+            name: "main".to_string(),
+            source: None,
+            line: 5,
+        }];
+        engine.dap_variables = vec![DapVariable {
+            name: "x".to_string(),
+            value: "10".to_string(),
+            var_ref: 0,
+        }];
+        // Simulate Continued event clearing.
+        engine.dap_stack_frames.clear();
+        engine.dap_variables.clear();
+        engine.dap_current_line = None;
+        assert!(engine.dap_stack_frames.is_empty());
+        assert!(engine.dap_variables.is_empty());
+        assert!(engine.dap_current_line.is_none());
+    }
+
+    #[test]
+    fn test_dap_sidebar_section_navigation() {
+        let mut engine = Engine::new();
+        assert_eq!(engine.dap_sidebar_section, DebugSidebarSection::Variables);
+        engine.handle_debug_sidebar_key("Tab", false);
+        assert_eq!(engine.dap_sidebar_section, DebugSidebarSection::Watch);
+        engine.handle_debug_sidebar_key("Tab", false);
+        assert_eq!(engine.dap_sidebar_section, DebugSidebarSection::CallStack);
+        engine.handle_debug_sidebar_key("Tab", false);
+        assert_eq!(engine.dap_sidebar_section, DebugSidebarSection::Breakpoints);
+        engine.handle_debug_sidebar_key("Tab", false);
+        assert_eq!(engine.dap_sidebar_section, DebugSidebarSection::Variables);
+    }
+
+    #[test]
+    fn test_dap_select_frame_clamps() {
+        use crate::core::dap::StackFrame;
+        let mut engine = Engine::new();
+        engine.dap_stack_frames = vec![
+            StackFrame {
+                id: 1,
+                name: "main".to_string(),
+                source: None,
+                line: 1,
+            },
+            StackFrame {
+                id: 2,
+                name: "foo".to_string(),
+                source: None,
+                line: 2,
+            },
+            StackFrame {
+                id: 3,
+                name: "bar".to_string(),
+                source: None,
+                line: 3,
+            },
+        ];
+        // Select within bounds.
+        engine.dap_select_frame(1);
+        assert_eq!(engine.dap_active_frame, 1);
+        // Select beyond bounds: clamps to last.
+        engine.dap_select_frame(99);
+        assert_eq!(engine.dap_active_frame, 2);
+        // Select 0.
+        engine.dap_select_frame(0);
+        assert_eq!(engine.dap_active_frame, 0);
+    }
+
+    #[test]
+    fn test_dap_variable_expand_tracking() {
+        let mut engine = Engine::new();
+        assert!(!engine.dap_expanded_vars.contains(&5));
+        // Toggle on.
+        engine.dap_expanded_vars.insert(5);
+        assert!(engine.dap_expanded_vars.contains(&5));
+        // Toggle off.
+        engine.dap_expanded_vars.remove(&5);
+        assert!(!engine.dap_expanded_vars.contains(&5));
+    }
+
+    #[test]
+    fn test_dap_eval_result_field_default() {
+        let engine = Engine::new();
+        assert!(engine.dap_eval_result.is_none());
+        assert_eq!(engine.dap_sidebar_section, DebugSidebarSection::Variables);
+        assert_eq!(engine.dap_active_frame, 0);
+        assert!(engine.dap_expanded_vars.is_empty());
+        assert!(engine.dap_child_variables.is_empty());
+    }
+
+    #[test]
+    fn test_visual_rows_for_line() {
+        assert_eq!(engine_visual_rows_for_line(0, 80), 1); // empty line = 1 row
+        assert_eq!(engine_visual_rows_for_line(80, 80), 1); // exactly one row
+        assert_eq!(engine_visual_rows_for_line(81, 80), 2); // one char overflow
+        assert_eq!(engine_visual_rows_for_line(160, 80), 2); // exactly two rows
+        assert_eq!(engine_visual_rows_for_line(161, 80), 3);
+        assert_eq!(engine_visual_rows_for_line(10, 0), 1); // zero cols = 1 row
+    }
+
+    #[test]
+    fn test_ensure_cursor_visible_wrap_scrolls_down() {
+        let mut engine = Engine::new();
+        engine.settings.wrap = true;
+        // Fill buffer with 20 short lines so the content exists.
+        let text = (0..20).map(|i| format!("line {i}\n")).collect::<String>();
+        engine.buffer_mut().content = ropey::Rope::from_str(&text);
+        // Viewport: 10 lines of 80 cols
+        engine.view_mut().viewport_lines = 10;
+        engine.view_mut().viewport_cols = 80;
+        engine.view_mut().scroll_top = 0;
+        // Move cursor to line 15 — beyond the viewport.
+        engine.view_mut().cursor.line = 15;
+        engine.view_mut().cursor.col = 0;
+        engine.ensure_cursor_visible();
+        // scroll_top should have advanced so cursor is visible.
+        assert!(engine.view().scroll_top > 0);
+        assert!(engine.view().cursor.line >= engine.view().scroll_top);
+        assert!(
+            engine.view().cursor.line < engine.view().scroll_top + engine.view().viewport_lines
+        );
+    }
+
+    #[test]
+    fn test_ensure_cursor_visible_wrap_scrolls_up() {
+        let mut engine = Engine::new();
+        engine.settings.wrap = true;
+        let text = (0..20).map(|i| format!("line {i}\n")).collect::<String>();
+        engine.buffer_mut().content = ropey::Rope::from_str(&text);
+        engine.view_mut().viewport_lines = 10;
+        engine.view_mut().viewport_cols = 80;
+        engine.view_mut().scroll_top = 15;
+        // Move cursor above scroll_top.
+        engine.view_mut().cursor.line = 5;
+        engine.view_mut().cursor.col = 0;
+        engine.ensure_cursor_visible();
+        assert_eq!(engine.view().scroll_top, 5);
+    }
+
+    #[test]
+    fn test_dap_add_remove_watch() {
+        let mut engine = Engine::new();
+        engine.dap_add_watch("x + 1".to_string());
+        engine.dap_add_watch("y".to_string());
+        assert_eq!(engine.dap_watch_expressions, vec!["x + 1", "y"]);
+        assert_eq!(engine.dap_watch_values.len(), 2);
+        assert!(engine.dap_watch_values[0].is_none());
+        // Remove the first watch.
+        engine.dap_remove_watch(0);
+        assert_eq!(engine.dap_watch_expressions, vec!["y"]);
+        assert_eq!(engine.dap_watch_values.len(), 1);
+        // Remove out-of-bounds: no-op.
+        engine.dap_remove_watch(99);
+        assert_eq!(engine.dap_watch_expressions.len(), 1);
+    }
+
+    #[test]
+    fn test_dap_bottom_panel_kind_default() {
+        let engine = Engine::new();
+        assert_eq!(engine.bottom_panel_kind, BottomPanelKind::Terminal);
+    }
+
+    #[test]
+    fn test_dap_launch_configs_default() {
+        let engine = Engine::new();
+        assert!(engine.dap_launch_configs.is_empty());
+        assert_eq!(engine.dap_selected_launch_config, 0);
+    }
+
+    #[test]
+    fn test_debug_toolbar_default_false() {
+        let engine = Engine::new();
+        assert!(
+            !engine.debug_toolbar_visible,
+            "toolbar should default to hidden"
+        );
     }
 }

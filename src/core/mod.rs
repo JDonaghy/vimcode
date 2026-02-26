@@ -1,6 +1,8 @@
 pub mod buffer;
 pub mod buffer_manager;
 pub mod cursor;
+pub mod dap;
+pub mod dap_manager;
 pub mod engine;
 pub mod git;
 pub mod lsp;
