@@ -120,6 +120,14 @@ pub struct Settings {
     /// visual row. Corresponds to Vim's `:set wrap` / `:set nowrap`.
     #[serde(default)]
     pub wrap: bool,
+
+    /// Whether the Lua plugin system is enabled (default true).
+    #[serde(default = "default_plugins_enabled")]
+    pub plugins_enabled: bool,
+
+    /// Names of plugins that have been explicitly disabled via `:Plugin disable`.
+    #[serde(default)]
+    pub disabled_plugins: Vec<String>,
 }
 
 fn default_explorer_visible() -> bool {
@@ -148,6 +156,10 @@ fn default_shift_width() -> u8 {
 
 fn default_lsp_enabled() -> bool {
     true // Default: enabled
+}
+
+fn default_plugins_enabled() -> bool {
+    true
 }
 
 fn default_terminal_scrollback_lines() -> usize {
@@ -389,6 +401,8 @@ impl Default for Settings {
             editor_mode: EditorMode::Vim,
             leader: default_leader(),
             wrap: false,
+            plugins_enabled: default_plugins_enabled(),
+            disabled_plugins: Vec::new(),
         }
     }
 }

@@ -364,7 +364,49 @@ pub struct DebugSidebarItem {
     pub is_selected: bool,
 }
 
-/// Data for the VSCode-style debug sidebar (Variables / Watch / Call Stack / Breakpoints).
+// ─── SourceControlData ────────────────────────────────────────────────────────
+
+/// A single file-change item in the Source Control panel.
+#[derive(Debug, Clone)]
+pub struct ScFileItem {
+    pub path: String,
+    /// Single-char status label: A / M / D / R / ?
+    pub status_char: char,
+    pub is_staged: bool,
+}
+
+/// A single worktree item in the Source Control panel.
+#[derive(Debug, Clone)]
+pub struct ScWorktreeItem {
+    pub path: String,
+    pub branch: String,
+    pub is_current: bool,
+    pub is_main: bool,
+}
+
+/// Rendering data for the Source Control panel sidebar.
+#[derive(Debug, Clone)]
+pub struct SourceControlData {
+    /// Current git branch name (e.g. "main").
+    pub branch: String,
+    /// Number of commits ahead of the upstream.
+    pub ahead: u32,
+    /// Number of commits behind the upstream.
+    pub behind: u32,
+    /// Staged files (index changes).
+    pub staged: Vec<ScFileItem>,
+    /// Unstaged / untracked files (working-tree changes).
+    pub unstaged: Vec<ScFileItem>,
+    /// Git worktrees.
+    pub worktrees: Vec<ScWorktreeItem>,
+    /// Which sections are expanded: [staged, unstaged, worktrees].
+    pub sections_expanded: [bool; 3],
+    /// Flat selection index.
+    pub selected: usize,
+    /// Whether the panel currently has keyboard focus.
+    pub has_focus: bool,
+}
+
 /// Always present in `ScreenLayout`; each section may be empty.
 #[derive(Debug, Clone)]
 pub struct DebugSidebarData {
@@ -505,6 +547,11 @@ pub struct MenuBarData {
     pub open_menu_col: u16,
     /// Index into `open_items` of the keyboard-highlighted row, or `None`.
     pub highlighted_item_idx: Option<usize>,
+    /// Title string shown to the right of menu labels (e.g. "VimCode — engine.rs").
+    pub title: String,
+    /// When true the backend should render its own window control buttons (─ ☐ ✕).
+    /// Set to true by the GTK backend which uses `set_decorated(false)`.
+    pub show_window_controls: bool,
 }
 
 /// One button in the debug toolbar strip.
@@ -549,11 +596,46 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
                 separator: false,
             },
             MenuItemData {
-                label: "Open…",
+                label: "Open File…",
                 shortcut: "",
-                action: "e ",
+                action: "open_file_dialog",
                 enabled: true,
                 separator: false,
+            },
+            MenuItemData {
+                label: "Open Folder…",
+                shortcut: "",
+                action: "open_folder_dialog",
+                enabled: true,
+                separator: false,
+            },
+            MenuItemData {
+                label: "",
+                shortcut: "",
+                action: "",
+                enabled: false,
+                separator: true,
+            },
+            MenuItemData {
+                label: "Open Workspace…",
+                shortcut: "",
+                action: "open_workspace_dialog",
+                enabled: true,
+                separator: false,
+            },
+            MenuItemData {
+                label: "Save Workspace As…",
+                shortcut: "",
+                action: "save_workspace_as_dialog",
+                enabled: true,
+                separator: false,
+            },
+            MenuItemData {
+                label: "",
+                shortcut: "",
+                action: "",
+                enabled: false,
+                separator: true,
             },
             MenuItemData {
                 label: "Save",
@@ -975,6 +1057,8 @@ pub struct ScreenLayout {
     pub debug_toolbar: Option<DebugToolbarData>,
     /// Debug sidebar data — always present (sections may be empty).
     pub debug_sidebar: DebugSidebarData,
+    /// Source Control panel data — `Some` when the SC panel is the active sidebar panel.
+    pub source_control: Option<SourceControlData>,
 }
 
 // ─── Theme ────────────────────────────────────────────────────────────────────
@@ -1340,11 +1424,17 @@ pub fn build_screen_layout(
         } else {
             0
         };
+        let title = engine
+            .active_buffer_name()
+            .map(|n| format!("VimCode \u{2014} {}", n))
+            .unwrap_or_else(|| "VimCode".to_string());
         MenuBarData {
             open_menu_idx: engine.menu_open_idx,
             open_items,
             open_menu_col,
             highlighted_item_idx: engine.menu_highlighted_item,
+            title,
+            show_window_controls: false, // GTK backend overrides this
         }
     });
 
@@ -1606,6 +1696,9 @@ pub fn build_screen_layout(
         terminal,
     };
 
+    // Build Source Control panel data (populated when the panel is visible).
+    let source_control = build_source_control_data(engine);
+
     ScreenLayout {
         tab_bar,
         windows,
@@ -1623,7 +1716,64 @@ pub fn build_screen_layout(
         menu_bar,
         debug_toolbar,
         debug_sidebar,
+        source_control,
     }
+}
+
+fn build_source_control_data(engine: &Engine) -> Option<SourceControlData> {
+    // Only populate when the engine has been sc_refresh()ed at least once.
+    // We always build it so both GTK and TUI backends can check sc_has_focus.
+    let branch = engine
+        .git_branch
+        .clone()
+        .unwrap_or_else(|| "HEAD".to_string());
+
+    let staged: Vec<ScFileItem> = engine
+        .sc_file_statuses
+        .iter()
+        .filter_map(|f| {
+            f.staged.map(|s| ScFileItem {
+                path: f.path.clone(),
+                status_char: s.label(),
+                is_staged: true,
+            })
+        })
+        .collect();
+
+    let unstaged: Vec<ScFileItem> = engine
+        .sc_file_statuses
+        .iter()
+        .filter_map(|f| {
+            f.unstaged.map(|s| ScFileItem {
+                path: f.path.clone(),
+                status_char: s.label(),
+                is_staged: false,
+            })
+        })
+        .collect();
+
+    let worktrees: Vec<ScWorktreeItem> = engine
+        .sc_worktrees
+        .iter()
+        .map(|wt| ScWorktreeItem {
+            path: wt.path.display().to_string(),
+            branch: wt.branch.clone().unwrap_or_else(|| "HEAD".to_string()),
+            is_current: wt.is_current,
+            is_main: wt.is_main,
+        })
+        .collect();
+
+    Some(SourceControlData {
+        branch,
+        ahead: engine.sc_ahead,
+        behind: engine.sc_behind,
+        staged,
+        unstaged,
+        worktrees,
+        sections_expanded: engine.sc_sections_expanded,
+        selected: engine.sc_selected,
+        has_focus: engine.sc_has_focus,
+    })
 }
 
 /// Map a vt100 color to an RGB triple.

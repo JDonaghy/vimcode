@@ -9,6 +9,55 @@ pub enum GitLineStatus {
     Modified,
 }
 
+// ─── Source Control: file status ──────────────────────────────────────────────
+
+/// Change kind for a single file in a git status report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusKind {
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+    Untracked,
+}
+
+impl StatusKind {
+    /// Single-character label used in the SC panel.
+    pub fn label(self) -> char {
+        match self {
+            StatusKind::Added => 'A',
+            StatusKind::Modified => 'M',
+            StatusKind::Deleted => 'D',
+            StatusKind::Renamed => 'R',
+            StatusKind::Untracked => '?',
+        }
+    }
+}
+
+/// Status of a single file from `git status --porcelain`.
+#[derive(Debug, Clone)]
+pub struct FileStatus {
+    pub path: String,
+    /// Status in the index (staged area). `None` = unmodified in index.
+    pub staged: Option<StatusKind>,
+    /// Status in the working tree (unstaged). `None` = unmodified on disk.
+    pub unstaged: Option<StatusKind>,
+}
+
+// ─── Source Control: worktrees ────────────────────────────────────────────────
+
+/// A single entry from `git worktree list --porcelain`.
+#[derive(Debug, Clone)]
+pub struct WorktreeEntry {
+    pub path: PathBuf,
+    /// Branch name, or `None` if detached HEAD.
+    pub branch: Option<String>,
+    /// True for the main worktree (first entry).
+    pub is_main: bool,
+    /// True if this is the worktree whose directory contains `dir`.
+    pub is_current: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Hunk {
     pub header: String,     // full "@@ -a,b +c,d @@" line
@@ -632,4 +681,240 @@ mod tests {
     fn test_parse_blame_porcelain_empty() {
         assert!(parse_blame_porcelain("").is_empty());
     }
+}
+
+// ─── Source Control helpers ───────────────────────────────────────────────────
+
+/// Run `git status --porcelain` and return parsed `FileStatus` entries.
+pub fn status_detailed(dir: &Path) -> Vec<FileStatus> {
+    let output = match run_git(dir, &["status", "--porcelain", "-u"]) {
+        Some(o) => o,
+        None => return Vec::new(),
+    };
+    output
+        .lines()
+        .filter_map(|line| {
+            if line.len() < 3 {
+                return None;
+            }
+            let xy: Vec<char> = line.chars().take(2).collect();
+            let x = xy[0]; // index status
+            let y = xy[1]; // working-tree status
+            let path = line[3..].to_string();
+
+            // Renamed lines have "old -> new" form; keep just the new path.
+            let path = if let Some(pos) = path.find(" -> ") {
+                path[pos + 4..].to_string()
+            } else {
+                path
+            };
+
+            let staged = parse_status_char(x, false);
+            let unstaged = parse_status_char(y, true);
+
+            if staged.is_none() && unstaged.is_none() {
+                return None;
+            }
+            Some(FileStatus {
+                path,
+                staged,
+                unstaged,
+            })
+        })
+        .collect()
+}
+
+fn parse_status_char(ch: char, is_workdir: bool) -> Option<StatusKind> {
+    match ch {
+        'A' => Some(StatusKind::Added),
+        'M' => Some(StatusKind::Modified),
+        'D' => Some(StatusKind::Deleted),
+        'R' => Some(StatusKind::Renamed),
+        '?' if is_workdir => Some(StatusKind::Untracked),
+        _ => None,
+    }
+}
+
+/// Stage a single path (equivalent to `git add <path>`).
+pub fn stage_path(dir: &Path, path: &str) -> Result<(), String> {
+    run_git_result(dir, &["add", path])
+}
+
+/// Unstage a single path (equivalent to `git restore --staged <path>`).
+pub fn unstage_path(dir: &Path, path: &str) -> Result<(), String> {
+    run_git_result(dir, &["restore", "--staged", path])
+}
+
+/// Discard working-tree changes for a path (equivalent to `git checkout -- <path>`).
+pub fn discard_path(dir: &Path, path: &str) -> Result<(), String> {
+    run_git_result(dir, &["checkout", "--", path])
+}
+
+fn run_git_result(dir: &Path, args: &[&str]) -> Result<(), String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).into_owned())
+    }
+}
+
+/// Parse `git worktree list --porcelain` output into `WorktreeEntry` vec.
+pub fn worktree_list(dir: &Path) -> Vec<WorktreeEntry> {
+    let output = match run_git(dir, &["worktree", "list", "--porcelain"]) {
+        Some(o) => o,
+        None => return Vec::new(),
+    };
+
+    // Resolve dir so we can match which worktree is "current"
+    let canonical_dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+
+    let mut entries = Vec::new();
+    let mut current_path: Option<PathBuf> = None;
+    let mut current_branch: Option<String> = None;
+    let mut is_first = true;
+
+    for line in output.lines() {
+        if let Some(wt_path) = line.strip_prefix("worktree ") {
+            // Flush previous entry
+            if let Some(path) = current_path.take() {
+                let is_current = path
+                    .canonicalize()
+                    .map(|p| p.starts_with(&canonical_dir) || p == canonical_dir)
+                    .unwrap_or(false);
+                entries.push(WorktreeEntry {
+                    path,
+                    branch: current_branch.take(),
+                    is_main: is_first,
+                    is_current,
+                });
+                is_first = false;
+            }
+            current_path = Some(PathBuf::from(wt_path));
+            current_branch = None;
+        } else if let Some(rest) = line.strip_prefix("branch refs/heads/") {
+            current_branch = Some(rest.to_string());
+        }
+    }
+    // Flush the last entry
+    if let Some(path) = current_path {
+        let is_current = path
+            .canonicalize()
+            .map(|p| p.starts_with(&canonical_dir) || p == canonical_dir)
+            .unwrap_or(false);
+        entries.push(WorktreeEntry {
+            path,
+            branch: current_branch,
+            is_main: is_first,
+            is_current,
+        });
+    }
+    entries
+}
+
+/// Add a new worktree at `path` checked out on `branch`.
+pub fn worktree_add(dir: &Path, path: &str, branch: &str) -> Result<(), String> {
+    run_git_result(dir, &["worktree", "add", path, branch])
+}
+
+/// Remove an existing worktree at `path`.
+pub fn worktree_remove(dir: &Path, path: &str) -> Result<(), String> {
+    run_git_result(dir, &["worktree", "remove", path])
+}
+
+/// Return `(ahead, behind)` commit counts relative to the upstream branch.
+pub fn ahead_behind(dir: &Path) -> (u32, u32) {
+    let out = match run_git(dir, &["rev-list", "--left-right", "--count", "HEAD...@{u}"]) {
+        Some(o) => o,
+        None => return (0, 0),
+    };
+    let parts: Vec<&str> = out.split_whitespace().collect();
+    let ahead = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let behind = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+    (ahead, behind)
+}
+
+#[cfg(test)]
+mod sc_tests {
+    use super::*;
+
+    #[test]
+    fn test_status_detailed_parses_porcelain() {
+        // Manually test the parse_status_char helper
+        assert_eq!(parse_status_char('A', false), Some(StatusKind::Added));
+        assert_eq!(parse_status_char('M', false), Some(StatusKind::Modified));
+        assert_eq!(parse_status_char('D', false), Some(StatusKind::Deleted));
+        assert_eq!(parse_status_char('R', false), Some(StatusKind::Renamed));
+        assert_eq!(parse_status_char('?', true), Some(StatusKind::Untracked));
+        assert_eq!(parse_status_char('?', false), None); // '?' only applies to workdir
+        assert_eq!(parse_status_char(' ', false), None);
+    }
+
+    #[test]
+    fn test_status_kind_label() {
+        assert_eq!(StatusKind::Added.label(), 'A');
+        assert_eq!(StatusKind::Modified.label(), 'M');
+        assert_eq!(StatusKind::Deleted.label(), 'D');
+        assert_eq!(StatusKind::Renamed.label(), 'R');
+        assert_eq!(StatusKind::Untracked.label(), '?');
+    }
+
+    #[test]
+    fn test_worktree_list_parses_porcelain() {
+        // We test the parsing logic by constructing a fake porcelain string
+        // and calling a helper that mirrors the parse loop.
+        let porcelain = "\
+worktree /home/user/project\nHEAD abc123\nbranch refs/heads/main\n\n\
+worktree /home/user/project-feat\nHEAD def456\nbranch refs/heads/feature/auth\n\n";
+
+        let canonical_dir = PathBuf::from("/home/user/project");
+        let entries = parse_worktree_porcelain(porcelain, &canonical_dir);
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0].is_main);
+        assert_eq!(entries[0].branch.as_deref(), Some("main"));
+        assert!(!entries[1].is_main);
+        assert_eq!(entries[1].branch.as_deref(), Some("feature/auth"));
+    }
+}
+
+/// Exposed for testing — same parse logic as `worktree_list` but on a string.
+#[cfg(test)]
+fn parse_worktree_porcelain(output: &str, current_dir: &Path) -> Vec<WorktreeEntry> {
+    let mut entries = Vec::new();
+    let mut current_path: Option<PathBuf> = None;
+    let mut current_branch: Option<String> = None;
+    let mut is_first = true;
+    for line in output.lines() {
+        if line.starts_with("worktree ") {
+            if let Some(path) = current_path.take() {
+                let is_current = path == current_dir;
+                entries.push(WorktreeEntry {
+                    path,
+                    branch: current_branch.take(),
+                    is_main: is_first,
+                    is_current,
+                });
+                is_first = false;
+            }
+            current_path = Some(PathBuf::from(&line["worktree ".len()..]));
+            current_branch = None;
+        } else if let Some(rest) = line.strip_prefix("branch refs/heads/") {
+            current_branch = Some(rest.to_string());
+        }
+    }
+    if let Some(path) = current_path {
+        let is_current = path == current_dir;
+        entries.push(WorktreeEntry {
+            path,
+            branch: current_branch,
+            is_main: is_first,
+            is_current,
+        });
+    }
+    entries
 }

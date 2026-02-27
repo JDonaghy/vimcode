@@ -11,7 +11,7 @@ There's a touch of irony here - using a cli tool to write the editor that I've w
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 784 tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 801 tests, zero async runtime dependency
 
 ## Building
 
@@ -375,6 +375,113 @@ Built-in Debug Adapter Protocol support with a VSCode-like UI. Open the debug si
 
 ---
 
+### Source Control Panel
+
+Click the git branch icon in the activity bar (or press `Alt+G` once implemented) to open the Source Control panel — a VSCode-style panel showing the full working tree status.
+
+**Three expandable sections** (Tab to collapse/expand):
+- **Staged Changes** — files indexed for the next commit (`A` added, `M` modified, `D` deleted, `R` renamed)
+- **Changes** — unstaged modifications and untracked files
+- **Worktrees** — all git worktrees with ✓ marking the current one
+
+**Navigation:**
+- `j` / `k` — move selection up/down
+- `s` — stage (if unstaged) or unstage (if staged) the selected file
+- `d` — discard unstaged changes (`git checkout -- <path>`)
+- `r` — refresh the panel
+- `Enter` — open the selected file in the editor / switch to the selected worktree
+- `Tab` — collapse/expand the current section
+- `q` / `Escape` — return focus to the editor
+
+**Worktree commands:**
+
+| Command | Action |
+|---------|--------|
+| `:GWorktreeAdd <branch> <path>` | Add a new git worktree at `<path>` for `<branch>` |
+| `:GWorktreeRemove <path>` | Remove the worktree at `<path>` |
+
+---
+
+### Workspaces
+
+A `.vimcode-workspace` file at the project root captures folder settings and enables per-project session restoration.
+
+**Opening a folder or workspace:**
+- **GTK:** File → "Open Folder…" / "Open Workspace…" → native file dialog
+- **TUI:** same menu actions open a fuzzy directory picker modal
+- **Commands:** `:OpenFolder <path>`, `:OpenWorkspace <path>`, `:SaveWorkspaceAs <path>`, `:cd <path>`
+
+**Workspace file format** (`.vimcode-workspace`):
+```json
+{
+  "version": 1,
+  "folders": [{"path": "."}],
+  "settings": { "tabstop": 2, "expandtab": true }
+}
+```
+Settings in the workspace file overlay your global `settings.json`.
+
+**Per-project sessions** — when a workspace or folder is open, the session (open files, cursor/scroll positions) is stored separately from the global session using a stable hash of the workspace root path (`~/.config/vimcode/sessions/<hash>.json`).
+
+---
+
+### Lua Plugin Extensions
+
+VimCode embeds Lua 5.4 (via `mlua`, fully vendored — no system Lua required). Plugins live in `~/.config/vimcode/plugins/` as `.lua` files or directories with `init.lua`.
+
+**API surface** (`vimcode.*` global):
+
+```lua
+-- Event hooks
+vimcode.on("save",  function(path) end)   -- fired after :w
+vimcode.on("open",  function(path) end)   -- fired on file open
+vimcode.on("close", function(path) end)   -- (reserved for future use)
+
+-- Custom commands
+vimcode.command("MyCmd", function(args) end)
+
+-- Custom key mappings
+vimcode.keymap("n", "<leader>x", function() end)   -- normal mode
+vimcode.keymap("i", "<C-Space>", function() end)   -- insert mode (non-printable keys)
+
+-- Editor API
+vimcode.message(text)         -- show in status bar
+vimcode.cwd()                 -- current working directory string
+vimcode.command_run(cmd)      -- execute a VimCode : command
+
+-- Buffer API (current active buffer)
+vimcode.buf.lines()           -- returns table of all lines (strings)
+vimcode.buf.line(n)           -- returns line n (1-indexed) or nil
+vimcode.buf.set_line(n, text) -- replace line n (applied after callback returns)
+vimcode.buf.path()            -- returns file path string or nil
+vimcode.buf.line_count()      -- returns integer
+```
+
+**Example plugin** (`~/.config/vimcode/plugins/hello.lua`):
+```lua
+vimcode.command("Hello", function(args)
+  vimcode.message("Hello from Lua! " .. args)
+end)
+
+vimcode.on("save", function(path)
+  vimcode.message("Saved: " .. path)
+end)
+```
+Then `:Hello world` shows "Hello from Lua! world" in the status bar.
+
+**Plugin management commands:**
+
+| Command | Action |
+|---------|--------|
+| `:Plugin list` | Show all loaded plugins and their status |
+| `:Plugin reload` | Reload all plugins from disk |
+| `:Plugin enable <name>` | Enable a previously disabled plugin |
+| `:Plugin disable <name>` | Disable a plugin (persisted in settings) |
+
+Plugins are loaded in alphabetical order on startup. Security: plugins have unrestricted file and process access (same trust model as Neovim).
+
+---
+
 ### LSP Support (Language Server Protocol)
 
 Automatic language server integration — open a file and diagnostics, completions, go-to-definition, and hover just work if the appropriate server is on `PATH`. LSP initializes on every file-opening path: `:e`, sidebar click, fuzzy finder (Ctrl-P), live grep confirm, `:split`/`:vsplit`, and `:tabnew`.
@@ -649,6 +756,12 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `:Gpush` | Push |
 | `:Gblame` | Blame (scroll-synced split) |
 | `:Ghs` / `:Ghunk` | Stage hunk under cursor |
+| `:GWorktreeAdd <branch> <path>` | Add git worktree |
+| `:GWorktreeRemove <path>` | Remove git worktree |
+| `:OpenFolder <path>` | Open folder (clears buffers, loads per-project session) |
+| `:OpenWorkspace <path>` | Open `.vimcode-workspace` file |
+| `:SaveWorkspaceAs <path>` | Save current folder as workspace file |
+| `:cd <path>` | Change working directory |
 | `:diffsplit <file>` | Open file in vsplit with diff highlighting |
 | `:diffthis` | Mark current window as diff participant (two calls activate diff) |
 | `:diffoff` | Clear diff highlighting |
@@ -666,6 +779,16 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `:DapInfo` | Show detected DAP adapters |
 | `:DapEval <expr>` | Evaluate expression in current debug frame |
 | `:DapWatch <expr>` | Add watch expression to debug sidebar |
+| `:GWorktreeAdd <branch> <path>` | Add git worktree |
+| `:GWorktreeRemove <path>` | Remove git worktree |
+| `:OpenFolder <path>` | Open folder as workspace root |
+| `:OpenWorkspace <path>` | Open `.vimcode-workspace` file |
+| `:SaveWorkspaceAs <path>` | Save workspace file |
+| `:cd <path>` | Change working directory |
+| `:Plugin list` | List loaded plugins |
+| `:Plugin reload` | Reload plugins from disk |
+| `:Plugin enable <name>` | Enable a plugin |
+| `:Plugin disable <name>` | Disable a plugin |
 | `:config reload` | Reload settings from disk |
 | `:help [topic]` / `:h [topic]` | Show help (topics: explorer, keys, commands) |
 
@@ -675,12 +798,13 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 
 ```
 src/
-├── main.rs          (~6934 lines)  GTK4/Relm4 UI, rendering, sidebar resize, fuzzy popup, context menu, drag-and-drop
-├── tui_main.rs      (~6187 lines)  ratatui/crossterm TUI backend, fuzzy popup, rename/move prompts
-├── render.rs        (~2768 lines)  Platform-agnostic ScreenLayout bridge (DiffLine, diff_status, DebugSidebarData, BottomPanelTabs)
+├── main.rs          (~7100 lines)  GTK4/Relm4 UI, rendering, sidebar resize, fuzzy popup, context menu, drag-and-drop
+├── tui_main.rs      (~6450 lines)  ratatui/crossterm TUI backend, fuzzy popup, rename/move prompts
+├── render.rs        (~2820 lines)  Platform-agnostic ScreenLayout bridge (DebugSidebarData, SourceControlData, BottomPanelTabs)
 ├── icons.rs            (~30 lines)  Nerd Font file-type icons (GTK + TUI)
-└── core/            (~27,900 lines)  Zero GTK/rendering deps — fully testable
-    ├── engine.rs    (~24,089 lines)  Orchestrator: keys, commands, git, macros, LSP, DAP, project search/replace, fuzzy finder
+└── core/            (~29,000 lines)  Zero GTK/rendering deps — fully testable
+    ├── engine.rs    (~24,900 lines)  Orchestrator: keys, commands, git, macros, LSP, DAP, plugins, workspaces
+    ├── plugin.rs       (~430 lines)  Lua 5.4 plugin manager (mlua vendored; vimcode.* API)
     ├── terminal.rs     (~320 lines)  PTY-backed terminal pane (portable-pty + vt100, history ring buffer)
     ├── lsp.rs        (~2,045 lines)  LSP protocol transport + single-server client (request ID tracking, JSON-RPC framing)
     ├── lsp_manager.rs  (~671 lines)  Multi-server coordinator with initialization guards + built-in registry
@@ -690,8 +814,8 @@ src/
     ├── buffer_manager.rs (~600 lines)  Buffer lifecycle, undo/redo stacks
     ├── buffer.rs       (~120 lines)  Rope-based text storage (ropey)
     ├── settings.rs   (~1,095 lines)  JSON config, :set parsing, key binding notation
-    ├── session.rs      (~180 lines)  Session state persistence
-    ├── git.rs          (~635 lines)  Git subprocesses: diff, blame, stage_hunk
+    ├── session.rs      (~235 lines)  Session state persistence + per-workspace paths
+    ├── git.rs          (~900 lines)  Git subprocesses: diff, blame, stage_hunk, SC panel, worktrees
     └── window.rs, tab.rs, view.rs, cursor.rs, mode.rs, syntax.rs (~893 lines)
 ```
 
@@ -709,6 +833,7 @@ src/
 | Parsing | Tree-sitter |
 | LSP | lsp-types (protocol definitions) |
 | Config | serde + serde_json |
+| Plugins | mlua 0.9 (Lua 5.4, vendored) |
 
 ## License
 

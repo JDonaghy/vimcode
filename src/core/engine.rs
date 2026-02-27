@@ -14,6 +14,7 @@ use super::lsp::{
     WorkspaceEdit,
 };
 use super::lsp_manager::LspManager;
+use super::plugin;
 use super::project_search::{self, ProjectMatch, ReplaceResult, SearchError, SearchOptions};
 use super::session::SessionState;
 use super::settings::{EditorMode, Settings};
@@ -39,6 +40,12 @@ pub enum EngineAction {
     Error,
     /// Open the integrated terminal panel (UI layer provides correct cols/rows)
     OpenTerminal,
+    /// Open Folder dialog requested (UI layer shows the native picker)
+    OpenFolderDialog,
+    /// Open Workspace dialog requested (UI layer shows the native picker)
+    OpenWorkspaceDialog,
+    /// Save Workspace As dialog requested (UI layer shows the native picker)
+    SaveWorkspaceAsDialog,
 }
 
 /// How a file should be opened: as a temporary preview or permanent buffer.
@@ -355,6 +362,31 @@ pub struct Engine {
     /// Whether current search uses word boundaries (set by * and #).
     search_word_bounded: bool,
 
+    // --- Workspace ---
+    /// Path to the loaded `.vimcode-workspace` file, if any.
+    pub workspace_file: Option<PathBuf>,
+    /// Resolved workspace root directory (derived from `workspace_file`), if any.
+    pub workspace_root: Option<PathBuf>,
+
+    // --- Source Control panel ---
+    /// Cached file statuses from the last `sc_refresh()` call.
+    pub sc_file_statuses: Vec<git::FileStatus>,
+    /// Cached worktree list from the last `sc_refresh()` call.
+    pub sc_worktrees: Vec<git::WorktreeEntry>,
+    /// Flat selection index across all SC sections (staged/unstaged/worktrees).
+    pub sc_selected: usize,
+    /// Which of the three sections are expanded: [staged, unstaged, worktrees].
+    pub sc_sections_expanded: [bool; 3],
+    /// Whether the Source Control panel currently has keyboard focus.
+    pub sc_has_focus: bool,
+    /// Ahead/behind counts relative to upstream (cached alongside `sc_refresh`).
+    pub sc_ahead: u32,
+    pub sc_behind: u32,
+
+    // --- Plugin system ---
+    /// Manages loaded Lua plugins. `None` if no plugins dir or plugins disabled.
+    pub plugin_manager: Option<plugin::PluginManager>,
+
     // --- Fuzzy file finder ---
     /// Project root directory for the fuzzy finder.
     pub cwd: PathBuf,
@@ -632,6 +664,16 @@ impl Engine {
             jump_list: Vec::new(),
             jump_list_pos: 0,
             search_word_bounded: false,
+            workspace_file: None,
+            workspace_root: None,
+            sc_file_statuses: Vec::new(),
+            sc_worktrees: Vec::new(),
+            sc_selected: 0,
+            sc_sections_expanded: [true, true, true],
+            sc_has_focus: false,
+            sc_ahead: 0,
+            sc_behind: 0,
+            plugin_manager: None,
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             fuzzy_open: false,
             fuzzy_query: String::new(),
@@ -743,6 +785,7 @@ impl Engine {
             }
         }
 
+        engine.plugin_init();
         engine
     }
 
@@ -812,6 +855,13 @@ impl Engine {
     /// Get the file path for the active buffer.
     pub fn file_path(&self) -> Option<&PathBuf> {
         self.active_buffer_state().file_path.as_ref()
+    }
+
+    /// Get just the filename (without directory) of the active buffer, if any.
+    pub fn active_buffer_name(&self) -> Option<String> {
+        self.file_path()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
     }
 
     /// Check if the active buffer has unsaved changes.
@@ -1020,6 +1070,8 @@ impl Engine {
                     let id = self.active_buffer_id();
                     self.refresh_git_diff(id);
                     self.lsp_did_save(id);
+                    let path_str = path.to_string_lossy().into_owned();
+                    self.plugin_event("save", &path_str);
                     Ok(())
                 }
                 Err(e) => {
@@ -2848,6 +2900,12 @@ impl Engine {
             return self.handle_debug_sidebar_key(key_name, ctrl);
         }
 
+        // Source Control panel intercepts all keys when it has focus.
+        if self.sc_has_focus {
+            self.handle_sc_key(key_name);
+            return EngineAction::None;
+        }
+
         // Ctrl-S: save in any mode (does not change mode).
         if ctrl && key_name == "s" {
             if let Err(e) = self.save() {
@@ -4028,6 +4086,8 @@ impl Engine {
             }
             _ => {}
         }
+        // Try plugin normal-mode keymaps as a fallback
+        self.plugin_run_keymap("n", key_name);
         EngineAction::None
     }
 
@@ -4593,7 +4653,10 @@ impl Engine {
                 self.view_mut().cursor.col = self.get_line_len_for_insert(line);
             }
             _ => {
-                if let Some(ch) = unicode {
+                // Try plugin insert-mode keymaps first (for non-printable or special keys)
+                if unicode.is_none() && self.plugin_run_keymap("i", key_name) {
+                    // keymap handled it — skip default character insertion
+                } else if let Some(ch) = unicode {
                     let line = self.view().cursor.line;
                     let col = self.view().cursor.col;
                     let char_idx = self.buffer().line_to_char(line) + col;
@@ -5902,6 +5965,515 @@ impl Engine {
         common
     }
 
+    // ─── Workspace / Open Folder ──────────────────────────────────────────────
+
+    /// Open a folder as the new working directory.  Clears all buffers/tabs,
+    /// resets the explorer root, and loads any per-project session state.
+    pub fn open_folder(&mut self, path: &Path) {
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+
+        // Save current per-workspace session before switching
+        if let Some(ref root) = self.workspace_root.clone() {
+            self.save_session_for_workspace(root);
+        }
+
+        // Clear all existing buffers and tabs, reset to single empty window
+        self.buffer_manager = super::buffer_manager::BufferManager::new();
+        let buffer_id = self.buffer_manager.create();
+        let window_id = super::window::WindowId(self.next_window_id);
+        self.next_window_id += 1;
+        let window = super::window::Window::new(window_id, buffer_id);
+        self.windows.clear();
+        self.windows.insert(window_id, window);
+        let tab = super::tab::Tab::new(super::tab::TabId(self.next_tab_id), window_id);
+        self.next_tab_id += 1;
+        self.tabs = vec![tab];
+        self.active_tab = 0;
+        self.mode = Mode::Normal;
+
+        // Update cwd + workspace root
+        self.cwd = canonical.clone();
+        self.workspace_root = Some(canonical.clone());
+
+        // Update git branch
+        self.git_branch = git::current_branch(&canonical);
+
+        // Load per-project session (restores open files + positions)
+        let ws_session = SessionState::load_for_workspace(&canonical);
+        // Restore open files from session
+        let open_files: Vec<PathBuf> = ws_session.open_files.clone();
+        let active_file = ws_session.active_file.clone();
+        // Merge relevant session fields
+        self.session.file_positions = ws_session.file_positions;
+        // Add to recent workspaces in global session
+        self.session.add_recent_workspace(&canonical);
+
+        // Re-open session files
+        for fp in &open_files {
+            self.open_file_in_tab(fp);
+        }
+        // Focus the previously active file
+        if let Some(ref af) = active_file {
+            self.open_file_in_tab(af);
+        }
+
+        self.message = format!("Opened folder: {}", canonical.display());
+    }
+
+    /// Parse and load a `.vimcode-workspace` JSON file.
+    pub fn open_workspace(&mut self, ws_path: &Path) {
+        let content = match std::fs::read_to_string(ws_path) {
+            Ok(c) => c,
+            Err(e) => {
+                self.message = format!("Cannot read workspace: {}", e);
+                return;
+            }
+        };
+        let json: serde_json::Value = match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(e) => {
+                self.message = format!("Invalid workspace JSON: {}", e);
+                return;
+            }
+        };
+
+        // Resolve folder path relative to workspace file
+        let ws_dir = ws_path.parent().unwrap_or(Path::new("."));
+        let folder_rel = json
+            .get("folders")
+            .and_then(|f| f.as_array())
+            .and_then(|a| a.first())
+            .and_then(|e| e.get("path"))
+            .and_then(|p| p.as_str())
+            .unwrap_or(".");
+        let folder_path = ws_dir.join(folder_rel);
+        self.workspace_file = Some(ws_path.to_path_buf());
+
+        // Apply any settings overrides from workspace
+        if let Some(settings_obj) = json.get("settings").and_then(|s| s.as_object()) {
+            for (key, value) in settings_obj {
+                let arg = match value {
+                    serde_json::Value::Bool(b) => {
+                        if *b {
+                            key.clone()
+                        } else {
+                            format!("no{}", key)
+                        }
+                    }
+                    serde_json::Value::Number(n) => format!("{}={}", key, n),
+                    serde_json::Value::String(s) => format!("{}={}", key, s),
+                    _ => continue,
+                };
+                self.settings.parse_set_option(&arg).ok();
+            }
+        }
+
+        self.open_folder(&folder_path);
+        self.message = format!("Workspace loaded: {}", ws_path.display());
+    }
+
+    /// Write a `.vimcode-workspace` file at the given path with the current folder.
+    pub fn save_workspace_as(&mut self, ws_path: &Path) {
+        let folder_path = if let Some(parent) = ws_path.parent() {
+            // Make folder path relative to workspace file location
+            let canonical_cwd = self.cwd.canonicalize().unwrap_or_else(|_| self.cwd.clone());
+            let canonical_parent = parent
+                .canonicalize()
+                .unwrap_or_else(|_| parent.to_path_buf());
+            if canonical_cwd == canonical_parent {
+                ".".to_string()
+            } else {
+                canonical_cwd.to_string_lossy().into_owned()
+            }
+        } else {
+            ".".to_string()
+        };
+
+        let ws = serde_json::json!({
+            "version": 1,
+            "folders": [{"path": folder_path}],
+            "settings": {}
+        });
+        match std::fs::write(
+            ws_path,
+            serde_json::to_string_pretty(&ws).unwrap_or_default(),
+        ) {
+            Ok(()) => {
+                self.workspace_file = Some(ws_path.to_path_buf());
+                self.message = format!("Workspace saved: {}", ws_path.display());
+            }
+            Err(e) => {
+                self.message = format!("Cannot save workspace: {}", e);
+            }
+        }
+    }
+
+    /// Save per-workspace session state (open files, cursor positions).
+    fn save_session_for_workspace(&self, root: &Path) {
+        let mut ws_session = SessionState::default();
+        // Collect all unique open file paths across windows
+        let mut open_files: Vec<PathBuf> = Vec::new();
+        for window in self.windows.values() {
+            if let Some(bs) = self.buffer_manager.get(window.buffer_id) {
+                if let Some(ref fp) = bs.file_path {
+                    if !open_files.contains(fp) {
+                        open_files.push(fp.clone());
+                    }
+                }
+            }
+        }
+        ws_session.open_files = open_files;
+        ws_session.active_file = self.file_path().cloned();
+        ws_session.file_positions = self.session.file_positions.clone();
+        ws_session.save_for_workspace(root).ok();
+    }
+
+    // ─── Source Control ────────────────────────────────────────────────────────
+
+    /// Refresh SC panel: re-run `git status` and `git worktree list`.
+    pub fn sc_refresh(&mut self) {
+        let dir = self.cwd.clone();
+        self.sc_file_statuses = git::status_detailed(&dir);
+        self.sc_worktrees = git::worktree_list(&dir);
+        let (ahead, behind) = git::ahead_behind(&dir);
+        self.sc_ahead = ahead;
+        self.sc_behind = behind;
+    }
+
+    /// Stage or unstage the currently selected SC item.
+    pub fn sc_stage_selected(&mut self) {
+        let (section, idx) = self.sc_flat_to_section_idx(self.sc_selected);
+        let dir = self.cwd.clone();
+        if section == 0 {
+            // Staged section: unstage it
+            let staged: Vec<git::FileStatus> = self
+                .sc_file_statuses
+                .iter()
+                .filter(|f| f.staged.is_some())
+                .cloned()
+                .collect();
+            if let Some(f) = staged.get(idx) {
+                let path = f.path.clone();
+                let _ = git::unstage_path(&dir, &path);
+            }
+        } else if section == 1 {
+            // Unstaged/untracked section: stage it
+            let unstaged: Vec<git::FileStatus> = self
+                .sc_file_statuses
+                .iter()
+                .filter(|f| f.unstaged.is_some() || f.staged.is_none())
+                .cloned()
+                .collect();
+            if let Some(f) = unstaged.get(idx) {
+                let path = f.path.clone();
+                let _ = git::stage_path(&dir, &path);
+            }
+        }
+        self.sc_refresh();
+    }
+
+    /// Discard working-tree changes for the selected unstaged file.
+    pub fn sc_discard_selected(&mut self) {
+        let (section, idx) = self.sc_flat_to_section_idx(self.sc_selected);
+        if section != 1 {
+            return;
+        }
+        let dir = self.cwd.clone();
+        let unstaged: Vec<git::FileStatus> = self
+            .sc_file_statuses
+            .iter()
+            .filter(|f| f.unstaged.is_some())
+            .cloned()
+            .collect();
+        if let Some(f) = unstaged.get(idx) {
+            let path = f.path.clone();
+            let _ = git::discard_path(&dir, &path);
+        }
+        self.sc_refresh();
+    }
+
+    /// Switch to the selected worktree's directory.
+    pub fn sc_switch_worktree(&mut self, idx: usize) {
+        if let Some(wt) = self.sc_worktrees.get(idx) {
+            let path = wt.path.clone();
+            self.open_folder(&path);
+        }
+    }
+
+    /// Handle a key press when the Source Control panel has focus.
+    /// Returns true if the key was consumed.
+    pub fn handle_sc_key(&mut self, key: &str) -> bool {
+        let flat_len = self.sc_flat_len();
+        match key {
+            "j" | "Down" => {
+                if flat_len > 0 {
+                    self.sc_selected = (self.sc_selected + 1).min(flat_len - 1);
+                }
+                true
+            }
+            "k" | "Up" => {
+                self.sc_selected = self.sc_selected.saturating_sub(1);
+                true
+            }
+            "s" => {
+                self.sc_stage_selected();
+                true
+            }
+            "d" => {
+                self.sc_discard_selected();
+                true
+            }
+            "Tab" => {
+                // Toggle the expansion of the current section
+                let (section, _) = self.sc_flat_to_section_idx(self.sc_selected);
+                if section < 3 {
+                    self.sc_sections_expanded[section] = !self.sc_sections_expanded[section];
+                }
+                true
+            }
+            "Return" | "Enter" => {
+                let (section, idx) = self.sc_flat_to_section_idx(self.sc_selected);
+                if section == 2 {
+                    self.sc_switch_worktree(idx);
+                } else {
+                    // Open the file in the editor
+                    let statuses = self.sc_file_statuses.clone();
+                    let all_files: Vec<&git::FileStatus> = if section == 0 {
+                        statuses.iter().filter(|f| f.staged.is_some()).collect()
+                    } else {
+                        statuses.iter().filter(|f| f.unstaged.is_some()).collect()
+                    };
+                    if let Some(f) = all_files.get(idx) {
+                        let path = self.cwd.join(&f.path);
+                        let _ = self.open_file_with_mode(&path, crate::core::OpenMode::Permanent);
+                        self.sc_has_focus = false;
+                    }
+                }
+                true
+            }
+            "q" | "Escape" => {
+                self.sc_has_focus = false;
+                true
+            }
+            "r" => {
+                self.sc_refresh();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Number of visible flat rows across all sections.
+    pub fn sc_flat_len(&self) -> usize {
+        let staged_count = self
+            .sc_file_statuses
+            .iter()
+            .filter(|f| f.staged.is_some())
+            .count();
+        let unstaged_count = self
+            .sc_file_statuses
+            .iter()
+            .filter(|f| f.unstaged.is_some())
+            .count();
+        let wt_count = self.sc_worktrees.len();
+        // 3 section headers + contents (when expanded)
+        3 + if self.sc_sections_expanded[0] {
+            staged_count
+        } else {
+            0
+        } + if self.sc_sections_expanded[1] {
+            unstaged_count
+        } else {
+            0
+        } + if self.sc_sections_expanded[2] {
+            wt_count
+        } else {
+            0
+        }
+    }
+
+    /// Map a flat index to (section_idx, item_idx_within_section).
+    /// Sections: 0=staged, 1=unstaged, 2=worktrees.
+    /// Header rows are represented as item_idx = usize::MAX.
+    pub fn sc_flat_to_section_idx(&self, flat: usize) -> (usize, usize) {
+        let staged_count = self
+            .sc_file_statuses
+            .iter()
+            .filter(|f| f.staged.is_some())
+            .count();
+        let unstaged_count = self
+            .sc_file_statuses
+            .iter()
+            .filter(|f| f.unstaged.is_some())
+            .count();
+        let wt_count = self.sc_worktrees.len();
+
+        let mut pos = 0usize;
+        // Staged section header
+        if flat == pos {
+            return (0, usize::MAX);
+        }
+        pos += 1;
+        if self.sc_sections_expanded[0] {
+            if flat < pos + staged_count {
+                return (0, flat - pos);
+            }
+            pos += staged_count;
+        }
+        // Unstaged section header
+        if flat == pos {
+            return (1, usize::MAX);
+        }
+        pos += 1;
+        if self.sc_sections_expanded[1] {
+            if flat < pos + unstaged_count {
+                return (1, flat - pos);
+            }
+            pos += unstaged_count;
+        }
+        // Worktrees section header
+        if flat == pos {
+            return (2, usize::MAX);
+        }
+        pos += 1;
+        if self.sc_sections_expanded[2] && flat < pos + wt_count {
+            return (2, flat - pos);
+        }
+        (2, usize::MAX) // fallback
+    }
+
+    // =========================================================================
+    // Plugin system
+    // =========================================================================
+
+    /// Initialize the plugin manager: load all `.lua` files / `init.lua` dirs
+    /// from `~/.config/vimcode/plugins/`.
+    pub fn plugin_init(&mut self) {
+        let home = match std::env::var("HOME") {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+        let plugins_dir = PathBuf::from(home).join(".config/vimcode/plugins");
+        if !plugins_dir.exists() {
+            return;
+        }
+        match plugin::PluginManager::new() {
+            Ok(mut mgr) => {
+                mgr.load_plugins_dir(&plugins_dir, &self.settings.disabled_plugins);
+                self.plugin_manager = Some(mgr);
+            }
+            Err(e) => {
+                self.message = format!("Plugin init error: {e}");
+            }
+        }
+    }
+
+    /// Build a `PluginCallContext` from the current active buffer state.
+    fn make_plugin_ctx(&self) -> plugin::PluginCallContext {
+        let cwd = self.cwd.to_string_lossy().into_owned();
+        let buf_path = self
+            .buffer_manager
+            .get(self.active_buffer_id())
+            .and_then(|s| s.file_path.as_ref())
+            .map(|p| p.to_string_lossy().into_owned());
+        let buf_lines = self
+            .buffer_manager
+            .get(self.active_buffer_id())
+            .map(|s| {
+                (0..s.buffer.len_lines())
+                    .map(|i| s.buffer.content.line(i).to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        plugin::PluginCallContext {
+            cwd,
+            buf_path,
+            buf_lines,
+            ..Default::default()
+        }
+    }
+
+    /// Apply the output side of a `PluginCallContext` back to the engine.
+    fn apply_plugin_ctx(&mut self, ctx: plugin::PluginCallContext) {
+        if let Some(msg) = ctx.message {
+            self.message = msg;
+        }
+        if !ctx.set_lines.is_empty() {
+            let buf_id = self.active_buffer_id();
+            for (line_idx, text) in ctx.set_lines {
+                if let Some(state) = self.buffer_manager.get_mut(buf_id) {
+                    let line_count = state.buffer.len_lines();
+                    if line_idx < line_count {
+                        let start = state.buffer.line_to_char(line_idx);
+                        let end = if line_idx + 1 < line_count {
+                            state.buffer.line_to_char(line_idx + 1)
+                        } else {
+                            state.buffer.len_chars()
+                        };
+                        let new_text = if text.ends_with('\n') {
+                            text
+                        } else {
+                            format!("{text}\n")
+                        };
+                        state.buffer.delete_range(start, end);
+                        state.buffer.insert(start, &new_text);
+                        state.dirty = true;
+                    }
+                }
+            }
+        }
+        for cmd in ctx.run_commands {
+            let _ = self.execute_command(&cmd);
+        }
+    }
+
+    /// Fire an event hook (e.g. "save", "open") for all registered listeners.
+    pub fn plugin_event(&mut self, event: &str, arg: &str) {
+        if !self.settings.plugins_enabled {
+            return;
+        }
+        let pm = match self.plugin_manager.take() {
+            Some(p) => p,
+            None => return,
+        };
+        let ctx = self.make_plugin_ctx();
+        let ctx = pm.call_event(event, arg, ctx);
+        self.plugin_manager = Some(pm);
+        self.apply_plugin_ctx(ctx);
+    }
+
+    /// Try to run a named plugin command. Returns `true` if the command was found.
+    pub fn plugin_run_command(&mut self, name: &str, args: &str) -> bool {
+        if !self.settings.plugins_enabled {
+            return false;
+        }
+        let pm = match self.plugin_manager.take() {
+            Some(p) => p,
+            None => return false,
+        };
+        let ctx = self.make_plugin_ctx();
+        let (found, ctx) = pm.call_command(name, args, ctx);
+        self.plugin_manager = Some(pm);
+        self.apply_plugin_ctx(ctx);
+        found
+    }
+
+    /// Try to run a plugin keymap. Returns `true` if a mapping was found and executed.
+    pub fn plugin_run_keymap(&mut self, mode: &str, key: &str) -> bool {
+        if !self.settings.plugins_enabled {
+            return false;
+        }
+        let pm = match self.plugin_manager.take() {
+            Some(p) => p,
+            None => return false,
+        };
+        let ctx = self.make_plugin_ctx();
+        let (found, ctx) = pm.call_keymap(mode, key, ctx);
+        self.plugin_manager = Some(pm);
+        self.apply_plugin_ctx(ctx);
+        found
+    }
+
     pub fn execute_command(&mut self, cmd: &str) -> EngineAction {
         // Handle :norm[al][!] before trimming — keys may contain significant trailing whitespace
         if let Some((range_str, keys)) = try_parse_norm(cmd.trim_start()) {
@@ -5913,6 +6485,27 @@ impl Engine {
         // Handle :term / :terminal — open integrated terminal
         if cmd == "term" || cmd == "terminal" {
             return EngineAction::OpenTerminal;
+        }
+
+        // Handle workspace / folder commands
+        if cmd == "OpenFolder" {
+            return EngineAction::OpenFolderDialog;
+        }
+        if cmd == "OpenWorkspace" {
+            return EngineAction::OpenWorkspaceDialog;
+        }
+        if cmd == "SaveWorkspaceAs" {
+            return EngineAction::SaveWorkspaceAsDialog;
+        }
+        if let Some(path_str) = cmd.strip_prefix("cd ").map(|s| s.trim()) {
+            let path = Path::new(path_str);
+            let target = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                self.cwd.join(path)
+            };
+            self.open_folder(&target);
+            return EngineAction::None;
         }
 
         // Handle :DapInfo — show detected DAP adapters from Mason registry cache
@@ -6305,6 +6898,96 @@ impl Engine {
             return self.cmd_git_stage_hunk();
         }
 
+        // Handle :GWorktreeAdd <branch> <path>
+        if let Some(rest) = cmd.strip_prefix("GWorktreeAdd ") {
+            let parts: Vec<&str> = rest.splitn(2, ' ').collect();
+            if parts.len() == 2 {
+                let dir = self.cwd.clone();
+                match git::worktree_add(&dir, parts[1].trim(), parts[0].trim()) {
+                    Ok(()) => {
+                        self.message = format!("Created worktree at {}", parts[1].trim());
+                        self.sc_refresh();
+                    }
+                    Err(e) => self.message = format!("GWorktreeAdd: {}", e),
+                }
+            } else {
+                self.message = "Usage: GWorktreeAdd <branch> <path>".to_string();
+            }
+            return EngineAction::None;
+        }
+
+        // Handle :GWorktreeRemove <path>
+        if let Some(rest) = cmd.strip_prefix("GWorktreeRemove ") {
+            let dir = self.cwd.clone();
+            match git::worktree_remove(&dir, rest.trim()) {
+                Ok(()) => {
+                    self.message = format!("Removed worktree at {}", rest.trim());
+                    self.sc_refresh();
+                }
+                Err(e) => self.message = format!("GWorktreeRemove: {}", e),
+            }
+            return EngineAction::None;
+        }
+
+        // Handle :Plugin list|reload|enable|disable
+        if let Some(subcmd) = cmd.strip_prefix("Plugin").map(|s| s.trim()) {
+            match subcmd {
+                "list" => {
+                    if let Some(ref pm) = self.plugin_manager {
+                        if pm.plugins.is_empty() {
+                            self.message = "No plugins loaded".to_string();
+                        } else {
+                            let summary: Vec<String> = pm
+                                .plugins
+                                .iter()
+                                .map(|p| {
+                                    let status = if !p.enabled {
+                                        "disabled"
+                                    } else if p.error.is_some() {
+                                        "error"
+                                    } else {
+                                        "ok"
+                                    };
+                                    format!("{} [{}]", p.name, status)
+                                })
+                                .collect();
+                            self.message = summary.join(", ");
+                        }
+                    } else {
+                        self.message = "Plugin system not initialized".to_string();
+                    }
+                }
+                "reload" => {
+                    self.plugin_manager = None;
+                    self.plugin_init();
+                    self.message = "Plugins reloaded".to_string();
+                }
+                s if s.starts_with("enable ") => {
+                    let name = s.trim_start_matches("enable ").trim().to_string();
+                    self.settings.disabled_plugins.retain(|n| n != &name);
+                    let _ = self.settings.save();
+                    self.plugin_manager = None;
+                    self.plugin_init();
+                    self.message = format!("Plugin enabled: {name}");
+                }
+                s if s.starts_with("disable ") => {
+                    let name = s.trim_start_matches("disable ").trim().to_string();
+                    if !self.settings.disabled_plugins.contains(&name) {
+                        self.settings.disabled_plugins.push(name.clone());
+                        let _ = self.settings.save();
+                    }
+                    self.plugin_manager = None;
+                    self.plugin_init();
+                    self.message = format!("Plugin disabled: {name}");
+                }
+                _ => {
+                    self.message =
+                        "Usage: :Plugin list|reload|enable <name>|disable <name>".to_string();
+                }
+            }
+            return EngineAction::None;
+        }
+
         // Handle :e <filename>
         if let Some(filename) = cmd.strip_prefix("e ") {
             let filename = filename.trim();
@@ -6665,6 +7348,11 @@ impl Engine {
                 EngineAction::None
             }
             _ => {
+                // Try plugin commands before giving up
+                let (cmd_name, cmd_args) = cmd.split_once(' ').unwrap_or((cmd, ""));
+                if self.plugin_run_command(cmd_name, cmd_args) {
+                    return EngineAction::None;
+                }
                 self.message = format!("Not an editor command: {}", cmd);
                 EngineAction::Error
             }
@@ -9167,6 +9855,13 @@ impl Engine {
 
     /// Notify LSP that a file was opened.
     fn lsp_did_open(&mut self, buffer_id: BufferId) {
+        // Fire plugin "open" hook regardless of LSP enabled state
+        if let Some(state) = self.buffer_manager.get(buffer_id) {
+            if let Some(path) = state.file_path.clone() {
+                let path_str = path.to_string_lossy().into_owned();
+                self.plugin_event("open", &path_str);
+            }
+        }
         if !self.settings.lsp_enabled {
             return;
         }
@@ -24085,5 +24780,126 @@ mod tests {
         assert_eq!(engine.dap_var_ref_at_flat_index(1), Some(100)); // Statics header
         assert_eq!(engine.dap_var_ref_at_flat_index(2), Some(0)); // s1
         assert_eq!(engine.dap_var_ref_at_flat_index(3), None);
+    }
+
+    // ── Workspace / open-folder tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_open_folder_resets_cwd() {
+        let dir = std::env::temp_dir().join("vimcode_test_open_folder");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut engine = Engine::new();
+        let original_cwd = engine.cwd.clone();
+
+        engine.open_folder(&dir);
+
+        // cwd should have changed
+        let expected = dir.canonicalize().unwrap_or(dir.clone());
+        assert_eq!(engine.cwd, expected);
+        assert_ne!(engine.cwd, original_cwd);
+        // workspace_root should be set
+        assert_eq!(engine.workspace_root, Some(expected));
+        // Should have exactly one tab with one empty buffer
+        assert_eq!(engine.tabs.len(), 1);
+    }
+
+    #[test]
+    fn test_open_workspace_parses_json() {
+        let dir = std::env::temp_dir().join("vimcode_test_workspace_json");
+        std::fs::create_dir_all(&dir).unwrap();
+        let ws_path = dir.join(".vimcode-workspace");
+        let json =
+            r#"{"version":1,"folders":[{"path":"."}],"settings":{"tabstop":4,"expandtab":true}}"#;
+        std::fs::write(&ws_path, json).unwrap();
+
+        let mut engine = Engine::new();
+        engine.open_workspace(&ws_path);
+
+        // Should have changed cwd to dir
+        let expected = dir.canonicalize().unwrap_or(dir.clone());
+        assert_eq!(engine.cwd, expected);
+        // workspace_file should be recorded
+        assert_eq!(engine.workspace_file, Some(ws_path));
+        // Settings overlay: tabstop = 4
+        assert_eq!(engine.settings.tabstop, 4);
+        // expandtab = true
+        assert!(engine.settings.expand_tab);
+    }
+
+    // =========================================================================
+    // Plugin system engine-integration tests
+    // =========================================================================
+
+    fn write_plugin_lua(name: &str, code: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("vimcode_plugins_{name}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{name}.lua"));
+        std::fs::write(&path, code).unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_plugin_loads_and_command_runs() {
+        let dir = write_plugin_lua(
+            "test_cmd",
+            r#"vimcode.command("TestHello", function(args) vimcode.message("hi:" .. args) end)"#,
+        );
+        let mut engine = Engine::new();
+        match plugin::PluginManager::new() {
+            Ok(mut mgr) => {
+                mgr.load_plugins_dir(&dir, &[]);
+                engine.plugin_manager = Some(mgr);
+            }
+            Err(_) => return,
+        }
+        let action = engine.execute_command("TestHello world");
+        assert_eq!(action, EngineAction::None);
+        assert_eq!(engine.message, "hi:world");
+    }
+
+    #[test]
+    fn test_plugin_on_save_fires() {
+        let dir = write_plugin_lua(
+            "test_save",
+            r#"vimcode.on("save", function(path) vimcode.message("saved:" .. path) end)"#,
+        );
+        let mut engine = Engine::new();
+        match plugin::PluginManager::new() {
+            Ok(mut mgr) => {
+                mgr.load_plugins_dir(&dir, &[]);
+                engine.plugin_manager = Some(mgr);
+            }
+            Err(_) => return,
+        }
+        let tmp_file = std::env::temp_dir().join("vimcode_save_hook_test.txt");
+        std::fs::write(&tmp_file, "hello\n").unwrap();
+        engine.open_file_in_tab(&tmp_file);
+        let _ = engine.save();
+        assert!(
+            engine.message.starts_with("saved:"),
+            "expected save hook to fire, got: {}",
+            engine.message
+        );
+        let _ = std::fs::remove_file(&tmp_file);
+    }
+
+    #[test]
+    fn test_plugin_disabled_not_registered() {
+        let dir = write_plugin_lua(
+            "test_disabled",
+            r#"vimcode.command("DisabledCmd", function() vimcode.message("should not run") end)"#,
+        );
+        let mut engine = Engine::new();
+        match plugin::PluginManager::new() {
+            Ok(mut mgr) => {
+                mgr.load_plugins_dir(&dir, &["test_disabled".to_string()]);
+                engine.plugin_manager = Some(mgr);
+            }
+            Err(_) => return,
+        }
+        let action = engine.execute_command("DisabledCmd");
+        assert_eq!(action, EngineAction::Error);
+        assert!(engine.message.contains("Not an editor command"));
     }
 }

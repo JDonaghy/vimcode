@@ -36,3 +36,4 @@ lsp-types = "0.97"
 copypasta-ext = "0.4"
 portable-pty = "0.8"
 vt100 = "0.15"
+mlua = { version = "0.9", features = ["lua54", "vendored"] }

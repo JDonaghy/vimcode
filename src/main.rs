@@ -75,6 +75,7 @@ struct App {
     drawing_area: Rc<RefCell<Option<gtk4::DrawingArea>>>,
     menu_bar_da: Rc<RefCell<Option<gtk4::DrawingArea>>>,
     debug_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>>,
+    git_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>>,
     sidebar_inner_box: Rc<RefCell<Option<gtk4::Box>>>,
     // Per-window scrollbars and indicators
     window_scrollbars: Rc<RefCell<HashMap<core::WindowId, WindowScrollbars>>>,
@@ -110,6 +111,8 @@ struct App {
     terminal_resize_dragging: bool,
     /// True while the user drags the terminal split divider left/right.
     terminal_split_dragging: bool,
+    /// Reference to the root GTK window used for minimize / maximize / close actions.
+    window: gtk4::Window,
 }
 
 /// Scrollbars and indicators for a single window
@@ -301,6 +304,20 @@ enum Msg {
     DebugSidebarKey(String, bool),
     /// Scroll in the debug sidebar DrawingArea (dy value from EventControllerScroll).
     DebugSidebarScroll(f64),
+    /// Key press in the Source Control sidebar DrawingArea.
+    ScKey(String, bool),
+    /// Minimize the application window.
+    WindowMinimize,
+    /// Maximize or restore the application window.
+    WindowMaximize,
+    /// Close the application window.
+    WindowClose,
+    /// Show a native "Open Folder" dialog.
+    OpenFolderDialog,
+    /// Show a native "Open Workspace" dialog.
+    OpenWorkspaceDialog,
+    /// Show a native "Save Workspace As" dialog.
+    SaveWorkspaceAsDialog,
 }
 
 #[relm4::component]
@@ -313,6 +330,8 @@ impl SimpleComponent for App {
         gtk4::Window {
             set_title: Some("VimCode"),
             set_default_size: (800, 600),
+            // Remove OS titlebar — our menu bar row acts as the title bar.
+            set_decorated: false,
 
             // Save window geometry on close
             connect_close_request[sender] => move |window| {
@@ -325,11 +344,46 @@ impl SimpleComponent for App {
             gtk4::Box {
                 set_orientation: gtk4::Orientation::Vertical,
 
-                // Full-width menu bar (sits above the activity bar + sidebar + editor)
-                #[name = "menu_bar_da"]
-                gtk4::DrawingArea {
-                    set_hexpand: true,
-                    set_height_request: 0,
+                // Menu bar row — always visible, acts as the title bar.
+                // A WindowHandle wraps the DrawingArea so dragging it moves the window.
+                gtk4::Box {
+                    set_orientation: gtk4::Orientation::Horizontal,
+
+                    gtk4::WindowHandle {
+                        set_hexpand: true,
+
+                        #[name = "menu_bar_da"]
+                        gtk4::DrawingArea {
+                            set_hexpand: true,
+                            set_height_request: 24,
+                        },
+                    },
+
+                    // Window control buttons (─ ☐ ✕)
+                    gtk4::Button {
+                        set_label: "─",
+                        set_tooltip_text: Some("Minimize"),
+                        set_css_classes: &["window-control"],
+                        connect_clicked[sender] => move |_| {
+                            sender.input(Msg::WindowMinimize);
+                        }
+                    },
+                    gtk4::Button {
+                        set_label: "☐",
+                        set_tooltip_text: Some("Maximize"),
+                        set_css_classes: &["window-control"],
+                        connect_clicked[sender] => move |_| {
+                            sender.input(Msg::WindowMaximize);
+                        }
+                    },
+                    gtk4::Button {
+                        set_label: "✕",
+                        set_tooltip_text: Some("Close"),
+                        set_css_classes: &["window-control"],
+                        connect_clicked[sender] => move |_| {
+                            sender.input(Msg::WindowClose);
+                        }
+                    },
                 },
 
                 #[name = "main_hbox"]
@@ -343,18 +397,6 @@ impl SimpleComponent for App {
                     set_orientation: gtk4::Orientation::Vertical,
                     set_width_request: 48,
                     set_css_classes: &["activity-bar"],
-
-                    gtk4::Button {
-                        set_label: "\u{f035c}",  // hamburger 󰍜
-                        set_tooltip_text: Some("Menu Bar"),
-                        set_width_request: 48,
-                        set_height_request: 48,
-                        set_css_classes: &["activity-button"],
-
-                        connect_clicked[sender] => move |_| {
-                            sender.input(Msg::ToggleMenuBar);
-                        }
-                    },
 
                     #[name = "explorer_button"]
                     gtk4::Button {
@@ -414,12 +456,16 @@ impl SimpleComponent for App {
                     },
 
                     gtk4::Button {
-                        set_label: "\u{f418}",
-                        set_tooltip_text: Some("Git (disabled)"),
+                        set_label: "\u{e702}",
+                        set_tooltip_text: Some("Source Control"),
                         set_width_request: 48,
                         set_height_request: 48,
                         set_css_classes: &["activity-button"],
-                        set_sensitive: false,
+                        set_sensitive: true,
+
+                        connect_clicked[sender] => move |_| {
+                            sender.input(Msg::SwitchPanel(SidebarPanel::Git));
+                        }
                     },
 
                     gtk4::Separator {
@@ -779,6 +825,26 @@ impl SimpleComponent for App {
                         },
 
                         #[name = "debug_sidebar_da"]
+                        gtk4::DrawingArea {
+                            set_vexpand: true,
+                            set_hexpand: true,
+                        },
+                    },
+
+                    // Source Control (Git) sidebar panel
+                    gtk4::Box {
+                        set_orientation: gtk4::Orientation::Vertical,
+                        set_css_classes: &["sidebar"],
+
+                        #[watch]
+                        set_visible: {
+                            if model.active_panel == SidebarPanel::Git {
+                                git_sidebar_da.queue_draw();
+                            }
+                            model.active_panel == SidebarPanel::Git
+                        },
+
+                        #[name = "git_sidebar_da"]
                         gtk4::DrawingArea {
                             set_vexpand: true,
                             set_hexpand: true,
@@ -1238,6 +1304,8 @@ impl SimpleComponent for App {
         let menu_bar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> = Rc::new(RefCell::new(None));
         let debug_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> =
             Rc::new(RefCell::new(None));
+        let git_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> =
+            Rc::new(RefCell::new(None));
         let overlay_ref = Rc::new(RefCell::new(None));
         let window_scrollbars_ref = Rc::new(RefCell::new(HashMap::new()));
         let sidebar_inner_box_ref: Rc<RefCell<Option<gtk4::Box>>> = Rc::new(RefCell::new(None));
@@ -1279,6 +1347,7 @@ impl SimpleComponent for App {
             engine: engine.clone(),
             redraw: false,
             sidebar_visible,
+            window: root.clone(),
             active_panel: SidebarPanel::Explorer,
             tree_store: Some(tree_store.clone()),
             tree_has_focus: false,
@@ -1286,6 +1355,7 @@ impl SimpleComponent for App {
             drawing_area: drawing_area_ref.clone(),
             menu_bar_da: menu_bar_da_ref.clone(),
             debug_sidebar_da_ref: debug_sidebar_da_ref.clone(),
+            git_sidebar_da_ref: git_sidebar_da_ref.clone(),
             window_scrollbars: window_scrollbars_ref.clone(),
             overlay: overlay_ref.clone(),
             cached_line_height: 24.0,
@@ -1323,9 +1393,7 @@ impl SimpleComponent for App {
             let engine = engine.clone();
             widgets.menu_bar_da.set_draw_func(move |da, cr, _w, _h| {
                 let engine = engine.borrow();
-                if !engine.menu_bar_visible {
-                    return;
-                }
+                // Menu bar is always visible in GTK (acts as the window title bar).
                 let theme = Theme::onedark();
                 let open_items: Vec<render::MenuItemData> = if let Some(midx) = engine.menu_open_idx
                 {
@@ -1347,11 +1415,17 @@ impl SimpleComponent for App {
                 } else {
                     0
                 };
+                let title = engine
+                    .active_buffer_name()
+                    .map(|n| format!("VimCode \u{2014} {}", n))
+                    .unwrap_or_else(|| "VimCode".to_string());
                 let data = render::MenuBarData {
                     open_menu_idx: engine.menu_open_idx,
                     open_items,
                     open_menu_col,
                     highlighted_item_idx: engine.menu_highlighted_item,
+                    title,
+                    show_window_controls: true,
                 };
                 let w = da.width() as f64;
                 let h = da.height() as f64;
@@ -1452,6 +1526,55 @@ impl SimpleComponent for App {
         }
         // Store a reference so update() can explicitly queue_draw when DAP events arrive.
         *debug_sidebar_da_ref.borrow_mut() = Some(widgets.debug_sidebar_da.clone());
+
+        // ── Source Control sidebar draw + key setup ────────────────────────────
+        {
+            let engine = engine.clone();
+            widgets.git_sidebar_da.set_draw_func(move |da, cr, _w, _h| {
+                let engine = engine.borrow();
+                let theme = Theme::onedark();
+                let font_str = format!(
+                    "{} {}",
+                    engine.settings.font_family, engine.settings.font_size
+                );
+                let font_desc = FontDescription::from_string(&font_str);
+                let pango_ctx = pangocairo::create_context(cr);
+                let layout = pango::Layout::new(&pango_ctx);
+                layout.set_font_description(Some(&font_desc));
+                let font_metrics = pango_ctx.metrics(Some(&font_desc), None);
+                let line_height =
+                    (font_metrics.ascent() + font_metrics.descent()) as f64 / pango::SCALE as f64;
+                let char_width = font_metrics.approximate_char_width() as f64 / pango::SCALE as f64;
+                let screen = build_screen_layout(&engine, &theme, &[], line_height, char_width);
+                let w = da.width() as f64;
+                let h = da.height() as f64;
+                draw_source_control_panel(
+                    cr,
+                    &layout,
+                    &screen,
+                    &theme,
+                    0.0,
+                    0.0,
+                    w,
+                    h,
+                    line_height,
+                );
+            });
+        }
+        {
+            let sender_sc = sender.input_sender().clone();
+            let key_ctrl = gtk4::EventControllerKey::new();
+            key_ctrl.connect_key_pressed(move |_, key, _, modifier| {
+                let key_name = key.name().map(|s| s.to_string()).unwrap_or_default();
+                let ctrl = modifier.contains(gdk::ModifierType::CONTROL_MASK);
+                sender_sc.send(Msg::ScKey(key_name, ctrl)).ok();
+                gtk4::glib::Propagation::Stop
+            });
+            widgets.git_sidebar_da.set_focusable(true);
+            widgets.git_sidebar_da.add_controller(key_ctrl);
+        }
+        *git_sidebar_da_ref.borrow_mut() = Some(widgets.git_sidebar_da.clone());
+
         // Restore saved sidebar width
         {
             let saved_width = engine.borrow().session.sidebar_width;
@@ -1812,6 +1935,9 @@ impl SimpleComponent for App {
         // Set the actual title after widget creation
         root.set_title(Some(&title));
 
+        // Menu bar is always visible in GTK (it acts as the title bar).
+        engine.borrow_mut().menu_bar_visible = true;
+
         // Create initial scrollbars for the first window
         {
             let initial_window_id = engine.borrow().active_window_id();
@@ -1995,6 +2121,15 @@ impl SimpleComponent for App {
                     EngineAction::OpenTerminal => {
                         sender.input(Msg::NewTerminalTab);
                     }
+                    EngineAction::OpenFolderDialog => {
+                        sender.input(Msg::OpenFolderDialog);
+                    }
+                    EngineAction::OpenWorkspaceDialog => {
+                        sender.input(Msg::OpenWorkspaceDialog);
+                    }
+                    EngineAction::SaveWorkspaceAsDialog => {
+                        sender.input(Msg::SaveWorkspaceAsDialog);
+                    }
                     EngineAction::None | EngineAction::Error => {}
                 }
 
@@ -2050,6 +2185,11 @@ impl SimpleComponent for App {
                         }
                         EngineAction::OpenTerminal => {
                             sender.input(Msg::ToggleTerminal);
+                        }
+                        EngineAction::OpenFolderDialog
+                        | EngineAction::OpenWorkspaceDialog
+                        | EngineAction::SaveWorkspaceAsDialog => {
+                            // Dialog actions don't fire during macro playback
                         }
                         EngineAction::None | EngineAction::Error => {}
                     }
@@ -2503,6 +2643,13 @@ impl SimpleComponent for App {
                     // Different panel - switch and ensure visible
                     self.active_panel = panel;
                     self.sidebar_visible = true;
+                    // Refresh SC data when switching to the Git panel
+                    if self.active_panel == SidebarPanel::Git {
+                        self.engine.borrow_mut().sc_refresh();
+                        if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
+                            da.grab_focus();
+                        }
+                    }
                 }
                 self.redraw = !self.redraw;
             }
@@ -3037,6 +3184,14 @@ impl SimpleComponent for App {
                         da.queue_draw();
                     }
                 }
+                // Sync the OS window title with the active buffer name (taskbar/pager).
+                let win_title = self
+                    .engine
+                    .borrow()
+                    .active_buffer_name()
+                    .map(|n| format!("VimCode \u{2014} {}", n))
+                    .unwrap_or_else(|| "VimCode".to_string());
+                self.window.set_title(Some(&win_title));
             }
             Msg::ProjectSearchOpenResult(idx) => {
                 let result = self
@@ -3329,15 +3484,9 @@ impl SimpleComponent for App {
                 self.redraw = true;
             }
             Msg::ToggleMenuBar => {
-                self.engine.borrow_mut().toggle_menu_bar();
+                // In GTK the menu bar is always on (it's our title bar).
+                // Just queue a redraw so the menu labels re-render.
                 if let Some(ref da) = *self.menu_bar_da.borrow() {
-                    let visible = self.engine.borrow().menu_bar_visible;
-                    da.set_height_request(if visible {
-                        self.cached_line_height as i32
-                    } else {
-                        0
-                    });
-                    da.set_visible(visible);
                     da.queue_draw();
                 }
                 self.redraw = true;
@@ -3357,9 +3506,23 @@ impl SimpleComponent for App {
                 self.redraw = true;
             }
             Msg::MenuActivateItem(menu_idx, item_idx, action) => {
-                self.engine
-                    .borrow_mut()
-                    .menu_activate_item(menu_idx, item_idx, &action);
+                // Intercept dialog actions that need GTK-side handling
+                match action.as_str() {
+                    "open_folder_dialog" => {
+                        sender.input(Msg::OpenFolderDialog);
+                    }
+                    "open_workspace_dialog" => {
+                        sender.input(Msg::OpenWorkspaceDialog);
+                    }
+                    "save_workspace_as_dialog" => {
+                        sender.input(Msg::SaveWorkspaceAsDialog);
+                    }
+                    _ => {
+                        self.engine
+                            .borrow_mut()
+                            .menu_activate_item(menu_idx, item_idx, &action);
+                    }
+                }
                 if let Some(ref da) = *self.menu_bar_da.borrow() {
                     da.queue_draw();
                 }
@@ -3538,6 +3701,100 @@ impl SimpleComponent for App {
                     da.queue_draw();
                 }
                 self.redraw = !self.redraw;
+            }
+            Msg::ScKey(key_name, _ctrl) => {
+                // Map GTK key names to engine key names
+                let mapped = match key_name.as_str() {
+                    "Return" | "KP_Enter" => "Return",
+                    "Escape" => "Escape",
+                    "Tab" => "Tab",
+                    "Down" => "Down",
+                    "Up" => "Up",
+                    "j" => "j",
+                    "k" => "k",
+                    "s" => "s",
+                    "d" => "d",
+                    "r" => "r",
+                    "q" => "q",
+                    _ => "",
+                };
+                let mut engine = self.engine.borrow_mut();
+                if !mapped.is_empty() {
+                    engine.handle_sc_key(mapped);
+                }
+                let still_focused = engine.sc_has_focus;
+                drop(engine);
+                if !still_focused {
+                    if let Some(ref drawing) = *self.drawing_area.borrow() {
+                        drawing.grab_focus();
+                    }
+                }
+                if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
+                    da.queue_draw();
+                }
+                self.redraw = !self.redraw;
+            }
+            Msg::WindowMinimize => {
+                self.window.minimize();
+            }
+            Msg::WindowMaximize => {
+                if self.window.is_maximized() {
+                    self.window.unmaximize();
+                } else {
+                    self.window.maximize();
+                }
+            }
+            Msg::WindowClose => {
+                self.window.close();
+            }
+            Msg::OpenFolderDialog => {
+                let engine = self.engine.clone();
+                let sender2 = sender.input_sender().clone();
+                let dialog = gtk4::FileDialog::new();
+                dialog.set_title("Open Folder");
+                dialog.set_accept_label(Some("Open Folder"));
+                let win = self.window.clone();
+                dialog.select_folder(Some(&win), gtk4::gio::Cancellable::NONE, move |result| {
+                    if let Ok(file) = result {
+                        // Use UFCS to call gtk4's FileExt::path (avoids gio version conflict)
+                        if let Some(path) = gtk4::prelude::FileExt::path(&file) {
+                            engine.borrow_mut().open_folder(&path);
+                            sender2.send(Msg::RefreshFileTree).ok();
+                        }
+                    }
+                });
+                self.redraw = true;
+            }
+            Msg::OpenWorkspaceDialog => {
+                let engine = self.engine.clone();
+                let sender2 = sender.input_sender().clone();
+                let dialog = gtk4::FileDialog::new();
+                dialog.set_title("Open Workspace");
+                let win = self.window.clone();
+                dialog.open(Some(&win), gtk4::gio::Cancellable::NONE, move |result| {
+                    if let Ok(file) = result {
+                        if let Some(path) = gtk4::prelude::FileExt::path(&file) {
+                            engine.borrow_mut().open_workspace(&path);
+                            sender2.send(Msg::RefreshFileTree).ok();
+                        }
+                    }
+                });
+                self.redraw = true;
+            }
+            Msg::SaveWorkspaceAsDialog => {
+                let engine = self.engine.clone();
+                let dialog = gtk4::FileDialog::new();
+                dialog.set_title("Save Workspace As");
+                dialog.set_initial_name(Some(".vimcode-workspace"));
+                let win = self.window.clone();
+                dialog.save(Some(&win), gtk4::gio::Cancellable::NONE, move |result| {
+                    if let Ok(file) = result {
+                        if let Some(path) = gtk4::prelude::FileExt::path(&file) {
+                            engine.borrow_mut().save_workspace_as(&path);
+                        }
+                    }
+                });
+                self.redraw = true;
             }
         }
 
@@ -6010,7 +6267,7 @@ fn draw_menu_bar(
     let (fr, fg, fb) = theme.status_fg.to_cairo();
     cr.set_source_rgb(fr, fg, fb);
 
-    // Menu labels only — hamburger lives in the activity bar widget
+    // Menu labels
     let mut cursor_x = x + 8.0;
 
     for (idx, (name, _, _)) in render::MENU_STRUCTURE.iter().enumerate() {
@@ -6024,6 +6281,16 @@ fn draw_menu_bar(
         cr.move_to(cursor_x, y + height * 0.7);
         let _ = cr.show_text(name);
         cursor_x += (name.len() as f64 * 7.0) + 8.0;
+    }
+
+    // Title centered in remaining space (dimmed)
+    if !data.title.is_empty() {
+        let (dr, dg, db) = theme.line_number_fg.to_cairo();
+        cr.set_source_rgb(dr, dg, db);
+        let title_w = data.title.len() as f64 * 7.0;
+        let title_x = (x + width - title_w) / 2.0 + x / 2.0;
+        cr.move_to(title_x.max(cursor_x + 8.0), y + height * 0.7);
+        let _ = cr.show_text(&data.title);
     }
 }
 
@@ -6085,6 +6352,192 @@ fn draw_menu_dropdown(
                 cr.set_source_rgb(fr, fg_c, fb);
             }
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_source_control_panel(
+    cr: &Context,
+    layout: &pango::Layout,
+    screen: &render::ScreenLayout,
+    theme: &Theme,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    line_height: f64,
+) {
+    let Some(ref sc) = screen.source_control else {
+        return;
+    };
+
+    let (bg_r, bg_g, bg_b) = theme.completion_bg.to_cairo();
+    let (hdr_r, hdr_g, hdr_b) = theme.status_bg.to_cairo();
+    let (fg_r, fg_g, fg_b) = theme.status_fg.to_cairo();
+    let (dim_r, dim_g, dim_b) = theme.line_number_fg.to_cairo();
+    let (sel_r, sel_g, sel_b) = theme.fuzzy_selected_bg.to_cairo();
+    let (add_r, add_g, add_b) = theme.diff_added_bg.to_cairo();
+    let (del_r, del_g, del_b) = theme.diff_removed_bg.to_cairo();
+
+    // Background
+    cr.set_source_rgb(bg_r, bg_g, bg_b);
+    cr.rectangle(x, y, w, h);
+    cr.fill().ok();
+
+    layout.set_attributes(None);
+
+    let mut row: usize = 0;
+
+    // ── Row 0: header "SOURCE CONTROL" ──────────────────────────────────────
+    cr.set_source_rgb(hdr_r, hdr_g, hdr_b);
+    cr.rectangle(x, y + row as f64 * line_height, w, line_height);
+    cr.fill().ok();
+
+    let branch_str = format!(
+        "  \u{e702} SOURCE CONTROL   {}  ↑{}↓{}",
+        sc.branch, sc.ahead, sc.behind
+    );
+    cr.set_source_rgb(fg_r, fg_g, fg_b);
+    layout.set_text(&branch_str);
+    let (lw, lh) = layout.pixel_size();
+    cr.move_to(
+        x + 2.0,
+        y + row as f64 * line_height + (line_height - lh as f64) / 2.0,
+    );
+    pangocairo::show_layout(cr, layout);
+    let _ = (lw, lh);
+    row += 1;
+
+    // Helper to draw a section
+    let draw_section = |cr: &Context,
+                        layout: &pango::Layout,
+                        title: &str,
+                        items: &[String],
+                        expanded: bool,
+                        base_row: &mut usize,
+                        flat_start: usize,
+                        selected: usize| {
+        let arrow = if expanded { "▼" } else { "▶" };
+        let header_text = format!("  {} {} ({})", arrow, title, items.len());
+        cr.set_source_rgb(hdr_r, hdr_g, hdr_b);
+        cr.rectangle(x, y + *base_row as f64 * line_height, w, line_height);
+        cr.fill().ok();
+        cr.set_source_rgb(fg_r, fg_g, fg_b);
+        layout.set_text(&header_text);
+        let (_, lh) = layout.pixel_size();
+        cr.move_to(
+            x + 2.0,
+            y + *base_row as f64 * line_height + (line_height - lh as f64) / 2.0,
+        );
+        pangocairo::show_layout(cr, layout);
+        *base_row += 1;
+
+        if expanded {
+            for (i, item) in items.iter().enumerate() {
+                let flat_idx = flat_start + 1 + i; // +1 for section header
+                let is_sel = flat_idx == selected;
+                if is_sel {
+                    cr.set_source_rgb(sel_r, sel_g, sel_b);
+                    cr.rectangle(x, y + *base_row as f64 * line_height, w, line_height);
+                    cr.fill().ok();
+                }
+                cr.set_source_rgb(
+                    if is_sel { fg_r } else { dim_r },
+                    if is_sel { fg_g } else { dim_g },
+                    if is_sel { fg_b } else { dim_b },
+                );
+                layout.set_text(&format!("    {}", item));
+                let (_, lh) = layout.pixel_size();
+                cr.move_to(
+                    x + 2.0,
+                    y + *base_row as f64 * line_height + (line_height - lh as f64) / 2.0,
+                );
+                pangocairo::show_layout(cr, layout);
+                *base_row += 1;
+                if y + *base_row as f64 * line_height > y + h {
+                    break;
+                }
+            }
+        }
+    };
+
+    // Compute flat start offsets
+    let staged_items: Vec<String> = sc
+        .staged
+        .iter()
+        .map(|f| format!("{} {}", f.status_char, f.path))
+        .collect();
+    let unstaged_items: Vec<String> = sc
+        .unstaged
+        .iter()
+        .map(|f| format!("{} {}", f.status_char, f.path))
+        .collect();
+    let wt_items: Vec<String> = sc
+        .worktrees
+        .iter()
+        .map(|wt| {
+            let marker = if wt.is_current { "\u{2714} " } else { "  " };
+            format!("{}{} {}", marker, wt.branch, wt.path)
+        })
+        .collect();
+
+    let staged_flat_start = 0usize;
+    let unstaged_flat_start = 1 + if sc.sections_expanded[0] {
+        sc.staged.len()
+    } else {
+        0
+    };
+    let wt_flat_start = unstaged_flat_start
+        + 1
+        + if sc.sections_expanded[1] {
+            sc.unstaged.len()
+        } else {
+            0
+        };
+
+    // Draw staged section
+    if row as f64 * line_height < h {
+        draw_section(
+            cr,
+            layout,
+            "STAGED CHANGES",
+            &staged_items,
+            sc.sections_expanded[0],
+            &mut row,
+            staged_flat_start,
+            sc.selected,
+        );
+    }
+
+    // Color hint for diff-add
+    let _ = (add_r, add_g, add_b, del_r, del_g, del_b);
+
+    // Draw unstaged section
+    if row as f64 * line_height < h {
+        draw_section(
+            cr,
+            layout,
+            "CHANGES",
+            &unstaged_items,
+            sc.sections_expanded[1],
+            &mut row,
+            unstaged_flat_start,
+            sc.selected,
+        );
+    }
+
+    // Draw worktrees section
+    if row as f64 * line_height < h {
+        draw_section(
+            cr,
+            layout,
+            "WORKTREES",
+            &wt_items,
+            sc.sections_expanded[2],
+            &mut row,
+            wt_flat_start,
+            sc.selected,
+        );
     }
 }
 
@@ -6399,12 +6852,31 @@ fn load_css() {
     let provider = gtk4::CssProvider::new();
     provider.load_from_data(
         "
+        /* Window control buttons (─ ☐ ✕) in the menu bar */
+        .window-control {
+            background-color: #252526;
+            border: none;
+            border-radius: 0;
+            color: #cccccc;
+            font-size: 14px;
+            padding: 0 10px;
+            min-width: 40px;
+            min-height: 24px;
+        }
+        .window-control:hover {
+            background-color: #3e3e42;
+        }
+        .window-control:last-child:hover {
+            background-color: #c42b1c;
+            color: #ffffff;
+        }
+
         /* Activity Bar */
         .activity-bar {
             background-color: #252526;
             border-right: 1px solid #3e3e42;
         }
-        
+
         .activity-button {
             background: transparent;
             border: none;

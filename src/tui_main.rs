@@ -23,7 +23,7 @@ use ratatui::crossterm::event::{
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, SetTitle,
 };
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color as RColor, Modifier};
@@ -77,6 +77,7 @@ enum TuiPanel {
     Search,
     Settings,
     Debug,
+    Git,
 }
 
 // ─── Sidebar data structures ──────────────────────────────────────────────────
@@ -297,6 +298,177 @@ struct DebugSidebarScrollDrag {
     total: usize,
 }
 
+/// What the folder picker should do when the user confirms a selection.
+#[derive(Clone, PartialEq)]
+enum FolderPickerMode {
+    /// Open as a workspace folder (`engine.open_folder()`).
+    OpenFolder,
+    /// Open as a workspace file (`engine.open_workspace()`).
+    OpenWorkspace,
+}
+
+/// TUI folder/workspace directory picker modal.
+struct FolderPickerState {
+    mode: FolderPickerMode,
+    query: String,
+    /// All candidate directories (and .vimcode-workspace files) relative to cwd.
+    all_entries: Vec<PathBuf>,
+    /// Currently filtered + sorted entries.
+    filtered: Vec<PathBuf>,
+    selected: usize,
+    scroll_top: usize,
+}
+
+impl FolderPickerState {
+    fn new(cwd: &Path, mode: FolderPickerMode) -> Self {
+        let all_entries = collect_dir_entries(cwd);
+        let filtered = all_entries.iter().take(50).cloned().collect();
+        Self {
+            mode,
+            query: String::new(),
+            all_entries,
+            filtered,
+            selected: 0,
+            scroll_top: 0,
+        }
+    }
+
+    fn push_char(&mut self, c: char) {
+        self.query.push(c);
+        self.refilter();
+    }
+
+    fn pop_char(&mut self) {
+        self.query.pop();
+        self.refilter();
+    }
+
+    fn refilter(&mut self) {
+        self.filtered = filter_dir_entries(&self.all_entries, &self.query);
+        self.selected = 0;
+        self.scroll_top = 0;
+    }
+
+    fn move_up(&mut self) {
+        self.selected = self.selected.saturating_sub(1);
+    }
+
+    fn move_down(&mut self) {
+        if !self.filtered.is_empty() {
+            self.selected = (self.selected + 1).min(self.filtered.len() - 1);
+        }
+    }
+
+    fn selected_path(&self, cwd: &Path) -> Option<PathBuf> {
+        let rel = self.filtered.get(self.selected)?;
+        Some(cwd.join(rel))
+    }
+
+    /// Clamp `scroll_top` so `selected` is always in the visible window.
+    fn sync_scroll(&mut self, visible_rows: usize) {
+        if self.selected < self.scroll_top {
+            self.scroll_top = self.selected;
+        }
+        if self.selected >= self.scroll_top + visible_rows {
+            self.scroll_top = self.selected + 1 - visible_rows;
+        }
+    }
+}
+
+/// Walk `root` collecting relative subdirectory paths (depth ≤ 5) plus any
+/// `.vimcode-workspace` files. Skips hidden dirs, `target/`, `node_modules/`.
+/// The entry `"."` (current directory) is prepended so the user can open root.
+fn collect_dir_entries(root: &Path) -> Vec<PathBuf> {
+    let mut out = vec![PathBuf::from(".")];
+    walk_dir_entries_recursive(root, root, &mut out, 0);
+    out
+}
+
+fn walk_dir_entries_recursive(root: &Path, dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
+    if depth > 5 {
+        return;
+    }
+    let mut entries: Vec<_> = match std::fs::read_dir(dir) {
+        Ok(e) => e.flatten().collect(),
+        Err(_) => return,
+    };
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        let path = entry.path();
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n.to_owned(),
+            None => continue,
+        };
+        // Skip hidden entries (except .vimcode-workspace file specifically)
+        if name.starts_with('.') {
+            if path.is_file() && name == ".vimcode-workspace" {
+                if let Ok(rel) = path.strip_prefix(root) {
+                    out.push(rel.to_path_buf());
+                }
+            }
+            continue;
+        }
+        // Skip heavy build/dep directories
+        if name == "target" || name == "node_modules" || name == "__pycache__" {
+            continue;
+        }
+        if path.is_dir() {
+            if let Ok(rel) = path.strip_prefix(root) {
+                out.push(rel.to_path_buf());
+            }
+            walk_dir_entries_recursive(root, &path, out, depth + 1);
+        }
+    }
+}
+
+/// Filter `all` by `query` using subsequence matching (no score needed here).
+fn filter_dir_entries(all: &[PathBuf], query: &str) -> Vec<PathBuf> {
+    const CAP: usize = 50;
+    if query.is_empty() {
+        return all.iter().take(CAP).cloned().collect();
+    }
+    let q = query.to_lowercase();
+    let mut scored: Vec<(i32, &PathBuf)> = all
+        .iter()
+        .filter_map(|p| {
+            let display = p.to_string_lossy().to_lowercase();
+            dir_fuzzy_score(&display, &q).map(|s| (s, p))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    scored
+        .into_iter()
+        .take(CAP)
+        .map(|(_, p)| p.clone())
+        .collect()
+}
+
+/// Simple subsequence fuzzy match returning a score, or `None` if no match.
+fn dir_fuzzy_score(path: &str, query: &str) -> Option<i32> {
+    let pb = path.as_bytes();
+    let qb = query.as_bytes();
+    let mut qi = 0usize;
+    let mut score = 100i32;
+    let mut last_pi = 0usize;
+    for (pi, &byte) in pb.iter().enumerate() {
+        if qi < qb.len() && byte == qb[qi] {
+            if qi > 0 {
+                score -= (pi - last_pi - 1) as i32;
+            }
+            if pi == 0 || matches!(pb[pi - 1], b'/' | b'_' | b'-' | b'.') {
+                score += 5;
+            }
+            last_pi = pi;
+            qi += 1;
+        }
+    }
+    if qi == qb.len() {
+        Some(score)
+    } else {
+        None
+    }
+}
+
 // =============================================================================
 // Clipboard setup helpers
 // =============================================================================
@@ -478,6 +650,8 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
 
     // Mutable sidebar width (default SIDEBAR_WIDTH, clamped 15..60)
     let mut sidebar_width: u16 = SIDEBAR_WIDTH;
+    // Folder picker modal state (None = closed)
+    let mut folder_picker: Option<FolderPickerState> = None;
     // Scroll offset for the fuzzy finder results list
     let mut fuzzy_scroll_top: usize = 0;
     // Scroll offset for the live grep results list
@@ -632,6 +806,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                             grep_scroll_top,
                             quickfix_scroll_top,
                             debug_output_scroll,
+                            folder_picker.as_ref(),
                         );
                     }
                 })
@@ -649,6 +824,13 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                 SetCursorStyle::SteadyBlock
             };
             let _ = execute!(terminal.backend_mut(), cursor_style);
+
+            // Sync terminal emulator title bar with the active file name.
+            let tui_title = engine
+                .active_buffer_name()
+                .map(|n| format!("VimCode \u{2014} {}", n))
+                .unwrap_or_else(|| "VimCode".to_string());
+            let _ = execute!(terminal.backend_mut(), SetTitle(tui_title.as_str()));
 
             last_draw = Instant::now();
             needs_redraw = false;
@@ -794,6 +976,60 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                             }
                         }
                         _ => {}
+                    }
+                    needs_redraw = true;
+                    continue;
+                }
+
+                // ── Folder picker modal ─────────────────────────────────────
+                if folder_picker.is_some() && key_event.kind != KeyEventKind::Release {
+                    let ctrl = key_event.modifiers.contains(KeyModifiers::CONTROL);
+                    let picker = folder_picker.as_mut().unwrap();
+                    match key_event.code {
+                        KeyCode::Esc => {
+                            folder_picker = None;
+                        }
+                        KeyCode::Enter => {
+                            let cwd = engine.cwd.clone();
+                            if let Some(path) = picker.selected_path(&cwd) {
+                                let mode = picker.mode.clone();
+                                folder_picker = None;
+                                match mode {
+                                    FolderPickerMode::OpenFolder => {
+                                        engine.open_folder(&path);
+                                        // Rebuild sidebar at new root
+                                        sidebar =
+                                            TuiSidebar::new(engine.cwd.clone(), sidebar.visible);
+                                    }
+                                    FolderPickerMode::OpenWorkspace => {
+                                        engine.open_workspace(&path);
+                                        sidebar =
+                                            TuiSidebar::new(engine.cwd.clone(), sidebar.visible);
+                                    }
+                                }
+                            }
+                        }
+                        KeyCode::Up | KeyCode::Char('k') if !ctrl => {
+                            picker.move_up();
+                        }
+                        KeyCode::Down | KeyCode::Char('j') if !ctrl => {
+                            picker.move_down();
+                        }
+                        KeyCode::Backspace => {
+                            picker.pop_char();
+                        }
+                        KeyCode::Char(c) if !ctrl => {
+                            picker.push_char(c);
+                        }
+                        _ => {}
+                    }
+                    // Keep scroll in sync with selection
+                    if let Some(ref mut picker) = folder_picker {
+                        if let Ok(size) = terminal.size() {
+                            let popup_h = ((size.height as usize) * 55 / 100).max(15);
+                            let visible_rows = popup_h.saturating_sub(4);
+                            picker.sync_scroll(visible_rows);
+                        }
                     }
                     needs_redraw = true;
                     continue;
@@ -1028,6 +1264,36 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                         if let Some(name) = key_name {
                             engine.handle_debug_sidebar_key(name, ctrl);
                             if !engine.dap_sidebar_has_focus {
+                                sidebar.has_focus = false;
+                            }
+                        }
+                        needs_redraw = true;
+                        continue;
+                    }
+
+                    // ── Source Control panel keyboard handling ──────────────
+                    if sidebar.active_panel == TuiPanel::Git {
+                        let key_name: Option<&str> = match key_event.code {
+                            KeyCode::Char('j') | KeyCode::Down => Some("j"),
+                            KeyCode::Char('k') | KeyCode::Up => Some("k"),
+                            KeyCode::Char('s') => Some("s"),
+                            KeyCode::Char('d') => Some("d"),
+                            KeyCode::Tab => Some("Tab"),
+                            KeyCode::Enter => Some("Return"),
+                            KeyCode::Char('q') | KeyCode::Esc => Some("Escape"),
+                            KeyCode::Char('b') if ctrl => {
+                                sidebar.visible = false;
+                                sidebar.has_focus = false;
+                                engine.session.explorer_visible = false;
+                                engine.sc_has_focus = false;
+                                let _ = engine.session.save();
+                                None
+                            }
+                            _ => None,
+                        };
+                        if let Some(name) = key_name {
+                            engine.handle_sc_key(name);
+                            if !engine.sc_has_focus {
                                 sidebar.has_focus = false;
                             }
                         }
@@ -1545,6 +1811,23 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                             let cols = terminal.size().ok().map(|s| s.width).unwrap_or(80);
                             engine.terminal_new_tab(cols, engine.session.terminal_panel_rows);
                             needs_redraw = true;
+                        } else if action == EngineAction::OpenFolderDialog {
+                            folder_picker = Some(FolderPickerState::new(
+                                &engine.cwd.clone(),
+                                FolderPickerMode::OpenFolder,
+                            ));
+                            needs_redraw = true;
+                        } else if action == EngineAction::OpenWorkspaceDialog {
+                            folder_picker = Some(FolderPickerState::new(
+                                &engine.cwd.clone(),
+                                FolderPickerMode::OpenWorkspace,
+                            ));
+                            needs_redraw = true;
+                        } else if action == EngineAction::SaveWorkspaceAsDialog {
+                            // For TUI, save workspace to current directory immediately
+                            let ws_path = engine.cwd.join(".vimcode-workspace");
+                            engine.save_workspace_as(&ws_path);
+                            needs_redraw = true;
                         } else if handle_action(engine, action) {
                             break;
                         }
@@ -1970,6 +2253,15 @@ fn handle_mouse(
                     } else {
                         sidebar.search_scroll_top += 3; // clamped in render_search_panel
                     }
+                } else if sidebar.active_panel == TuiPanel::Git {
+                    // SC panel: scroll selection
+                    if matches!(ev.kind, MouseEventKind::ScrollUp) {
+                        engine.sc_selected = engine.sc_selected.saturating_sub(3);
+                    } else {
+                        let flat_len = engine.sc_flat_len();
+                        engine.sc_selected =
+                            (engine.sc_selected + 3).min(flat_len.saturating_sub(1));
+                    }
                 } else if sidebar.active_panel == TuiPanel::Debug {
                     use crate::core::engine::DebugSidebarSection;
                     // Determine which section the mouse is over.
@@ -2332,7 +2624,8 @@ fn handle_mouse(
             1 => Some(TuiPanel::Explorer),
             2 => Some(TuiPanel::Search),
             3 => Some(TuiPanel::Debug),
-            r if r == settings_row && settings_row >= 4 => Some(TuiPanel::Settings),
+            4 => Some(TuiPanel::Git),
+            r if r == settings_row && settings_row >= 5 => Some(TuiPanel::Settings),
             _ => None,
         };
         if let Some(panel) = target_panel {
@@ -2344,6 +2637,9 @@ fn handle_mouse(
                 if panel == TuiPanel::Search {
                     sidebar.has_focus = true;
                     sidebar.search_input_mode = true;
+                }
+                if panel == TuiPanel::Git {
+                    engine.sc_refresh();
                 }
             }
             engine.session.explorer_visible = sidebar.visible;
@@ -2786,6 +3082,7 @@ fn draw_frame(
     grep_scroll_top: usize,
     quickfix_scroll_top: usize,
     debug_output_scroll: usize,
+    folder_picker: Option<&FolderPickerState>,
 ) {
     let area = frame.size();
 
@@ -2949,6 +3246,11 @@ fn draw_frame(
     // ── Fuzzy file-picker modal (rendered on top of everything) ───────────────
     if let Some(ref fuzzy) = screen.fuzzy {
         render_fuzzy_popup(frame, fuzzy, area, theme, fuzzy_scroll_top);
+    }
+
+    // ── Folder / workspace picker modal ──────────────────────────────────────
+    if let Some(picker) = folder_picker {
+        render_folder_picker(frame, picker, area, theme);
     }
 
     // ── Live grep modal (rendered on top of everything) ───────────────────────
@@ -3561,6 +3863,171 @@ fn render_fuzzy_popup(
         if let Some(display) = fuzzy.results.get(result_idx) {
             let prefix = if is_selected { "▶ " } else { "  " };
             let row_text = format!("{}{}", prefix, display);
+            for (j, ch) in row_text.chars().enumerate() {
+                let cx = x + 1 + j as u16;
+                if cx + 1 < x + width && cx < term_area.width {
+                    set_cell(buf, cx, ry, ch, fg_color, row_bg);
+                }
+            }
+        }
+    }
+
+    // Bottom border ╰───────╯
+    let bottom = y + height - 1;
+    if bottom < term_area.height {
+        for col in 0..width {
+            let cx = x + col;
+            if cx < term_area.width {
+                let ch = if col == 0 {
+                    '╰'
+                } else if col == width - 1 {
+                    '╯'
+                } else {
+                    '─'
+                };
+                set_cell(buf, cx, bottom, ch, border_fg, bg_color);
+            }
+        }
+    }
+}
+
+fn render_folder_picker(
+    frame: &mut ratatui::Frame,
+    picker: &FolderPickerState,
+    term_area: Rect,
+    theme: &Theme,
+) {
+    let term_cols = term_area.width;
+    let term_rows = term_area.height;
+
+    // Same proportions as the fuzzy popup
+    let width = (term_cols * 3 / 5).max(50);
+    let height = (term_rows * 55 / 100).max(15);
+    let x = (term_cols.saturating_sub(width)) / 2;
+    let y = (term_rows.saturating_sub(height)) / 2;
+
+    let bg_color = rc(theme.fuzzy_bg);
+    let sel_bg_color = rc(theme.fuzzy_selected_bg);
+    let fg_color = rc(theme.fuzzy_fg);
+    let query_fg = rc(theme.fuzzy_query_fg);
+    let border_fg = rc(theme.fuzzy_border);
+    let title_fg = rc(theme.fuzzy_title_fg);
+
+    let buf = frame.buffer_mut();
+
+    // Title varies by mode
+    let title_text = match picker.mode {
+        FolderPickerMode::OpenFolder => format!(
+            " Open Folder  {}/{} ",
+            picker.filtered.len(),
+            picker.all_entries.len()
+        ),
+        FolderPickerMode::OpenWorkspace => format!(
+            " Open Workspace  {}/{} ",
+            picker.filtered.len(),
+            picker.all_entries.len()
+        ),
+    };
+
+    // Row 0: top border ╭─ Title ── N/M ──╮
+    for col in 0..width {
+        let cx = x + col;
+        if cx < term_area.width && y < term_area.height {
+            let ch = if col == 0 {
+                '╭'
+            } else if col == width - 1 {
+                '╮'
+            } else {
+                '─'
+            };
+            set_cell(buf, cx, y, ch, border_fg, bg_color);
+        }
+    }
+    for (i, ch) in title_text.chars().enumerate() {
+        let cx = x + 2 + i as u16;
+        if cx + 1 < x + width && cx < term_area.width && y < term_area.height {
+            set_cell(buf, cx, y, ch, title_fg, bg_color);
+        }
+    }
+
+    // Row 1: query line │ > query_ │
+    let row1 = y + 1;
+    if row1 < term_area.height {
+        set_cell(buf, x, row1, '│', border_fg, bg_color);
+        if x + width - 1 < term_area.width {
+            set_cell(buf, x + width - 1, row1, '│', border_fg, bg_color);
+        }
+        for col in 1..width - 1 {
+            let cx = x + col;
+            if cx < term_area.width {
+                set_cell(buf, cx, row1, ' ', fg_color, bg_color);
+            }
+        }
+        let query_display = format!("> {}", picker.query);
+        for (i, ch) in query_display.chars().enumerate() {
+            let cx = x + 1 + i as u16;
+            if cx + 1 < x + width && cx < term_area.width {
+                set_cell(buf, cx, row1, ch, query_fg, bg_color);
+            }
+        }
+        let cursor_col = x + 1 + query_display.chars().count() as u16;
+        if cursor_col + 1 < x + width && cursor_col < term_area.width {
+            set_cell(buf, cursor_col, row1, '▌', query_fg, bg_color);
+        }
+    }
+
+    // Row 2: separator ├───────┤
+    let row2 = y + 2;
+    if row2 < term_area.height {
+        for col in 0..width {
+            let cx = x + col;
+            if cx < term_area.width {
+                let ch = if col == 0 {
+                    '├'
+                } else if col == width - 1 {
+                    '┤'
+                } else {
+                    '─'
+                };
+                set_cell(buf, cx, row2, ch, border_fg, bg_color);
+            }
+        }
+    }
+
+    // Result rows
+    let results_start = y + 3;
+    let results_end = y + height - 1;
+    let visible_rows = (results_end.saturating_sub(results_start)) as usize;
+
+    for row_idx in 0..visible_rows {
+        let result_idx = picker.scroll_top + row_idx;
+        let ry = results_start + row_idx as u16;
+        if ry >= results_end || ry >= term_area.height {
+            break;
+        }
+        set_cell(buf, x, ry, '│', border_fg, bg_color);
+        if x + width - 1 < term_area.width {
+            set_cell(buf, x + width - 1, ry, '│', border_fg, bg_color);
+        }
+        let is_selected = result_idx == picker.selected;
+        let row_bg = if is_selected { sel_bg_color } else { bg_color };
+        for col in 1..width - 1 {
+            let cx = x + col;
+            if cx < term_area.width {
+                set_cell(buf, cx, ry, ' ', fg_color, row_bg);
+            }
+        }
+        if let Some(entry) = picker.filtered.get(result_idx) {
+            // Show workspace files differently with a marker
+            let display = entry.to_string_lossy();
+            let is_workspace = entry
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n == ".vimcode-workspace")
+                .unwrap_or(false);
+            let prefix = if is_selected { "▶ " } else { "  " };
+            let marker = if is_workspace { "⚙ " } else { "📁 " };
+            let row_text = format!("{}{}{}", prefix, marker, display);
             for (j, ch) in row_text.chars().enumerate() {
                 let cx = x + 1 + j as u16;
                 if cx + 1 < x + width && cx < term_area.width {
@@ -4312,6 +4779,25 @@ fn render_menu_bar(
             col += 1;
         }
     }
+
+    // Title text drawn right-aligned (dimmed)
+    if !data.title.is_empty() {
+        let title_chars: Vec<char> = data.title.chars().collect();
+        let title_len = title_chars.len() as u16;
+        let right_margin = 1u16;
+        if area.width > title_len + right_margin {
+            let title_start = area.x + area.width - title_len - right_margin;
+            if title_start > col {
+                let dim_fg = rc(theme.line_number_fg);
+                for (i, ch) in title_chars.iter().enumerate() {
+                    let tx = title_start + i as u16;
+                    if tx < area.x + area.width {
+                        set_cell(buf, tx, y, *ch, dim_fg, bar_bg);
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn render_menu_dropdown(
@@ -4548,11 +5034,12 @@ fn render_activity_bar(
         }
     }
 
-    // Top buttons: Explorer (row 1), Search (row 2), Debug (row 3)
+    // Top buttons: Explorer (row 1), Search (row 2), Debug (row 3), Git (row 4)
     let top_buttons: &[(u16, TuiPanel, char)] = &[
         (1, TuiPanel::Explorer, '\u{f07c}'), // nf-fa-folder_open
         (2, TuiPanel::Search, '\u{f002}'),   // nf-fa-search
         (3, TuiPanel::Debug, '\u{f188}'),    // nf-fa-bug
+        (4, TuiPanel::Git, '\u{e702}'),      // nf-dev-git_branch
     ];
 
     for &(row_off, panel, icon) in top_buttons {
@@ -4624,6 +5111,12 @@ fn render_sidebar(
     // Debug panel
     if sidebar.active_panel == TuiPanel::Debug {
         render_debug_sidebar(buf, area, engine, theme);
+        return;
+    }
+
+    // Source Control panel
+    if sidebar.active_panel == TuiPanel::Git {
+        render_source_control(buf, area, engine, theme);
         return;
     }
 
@@ -5507,6 +6000,9 @@ fn handle_action(engine: &mut Engine, action: EngineAction) -> bool {
             false
         }
         EngineAction::OpenTerminal => false, // TUI handles terminal open in main event loop
+        EngineAction::OpenFolderDialog
+        | EngineAction::OpenWorkspaceDialog
+        | EngineAction::SaveWorkspaceAsDialog => false, // handled by caller via tui_show_folder_picker
         EngineAction::None | EngineAction::Error => false,
     }
 }
@@ -5529,6 +6025,211 @@ fn save_session(engine: &mut Engine) {
     }
     engine.collect_session_open_files();
     let _ = engine.session.save();
+}
+
+// ─── Source Control sidebar panel ────────────────────────────────────────────
+
+/// Render the Source Control sidebar: header strip, Staged Changes, Changes, Worktrees.
+fn render_source_control(
+    buf: &mut ratatui::buffer::Buffer,
+    area: Rect,
+    engine: &Engine,
+    theme: &Theme,
+) {
+    if area.height == 0 {
+        return;
+    }
+    let hdr_fg = rc(theme.status_fg);
+    let hdr_bg = rc(theme.status_bg);
+    let item_fg = rc(theme.foreground);
+    let dim_fg = rc(theme.line_number_fg);
+    let sel_bg = rc(theme.fuzzy_selected_bg);
+    let row_bg = rc(theme.tab_bar_bg);
+    let add_fg = RColor::Rgb(90, 180, 90);
+    let del_fg = RColor::Rgb(220, 70, 60);
+    let mod_fg = RColor::Rgb(220, 180, 80);
+
+    // Build SC data from engine state via the render abstraction.
+    let screen = render::build_screen_layout(engine, theme, &[], 1.0, 1.0);
+    let Some(ref sc) = screen.source_control else {
+        return;
+    };
+
+    // ── Row 0: header "SOURCE CONTROL" ──────────────────────────────────────
+    let branch_info = if sc.ahead > 0 || sc.behind > 0 {
+        format!(
+            "  \u{e702} SOURCE CONTROL  {}  \u{2191}{} \u{2193}{}",
+            sc.branch, sc.ahead, sc.behind
+        )
+    } else {
+        format!("  \u{e702} SOURCE CONTROL  {}", sc.branch)
+    };
+    for x in area.x..area.x + area.width {
+        set_cell(buf, x, area.y, ' ', hdr_fg, hdr_bg);
+    }
+    for (i, ch) in branch_info.chars().enumerate().take(area.width as usize) {
+        set_cell(buf, area.x + i as u16, area.y, ch, hdr_fg, hdr_bg);
+    }
+
+    if area.height < 2 {
+        return;
+    }
+
+    // Sections: [staged, unstaged, worktrees]
+    #[allow(clippy::type_complexity)]
+    let sections: [(
+        &str,
+        &[render::ScFileItem],
+        Option<&[render::ScWorktreeItem]>,
+        usize,
+    ); 3] = [
+        ("\u{f055} STAGED CHANGES", &sc.staged, None, 0),
+        ("\u{f02b} CHANGES", &sc.unstaged, None, 1),
+        ("\u{e702} WORKTREES", &[], Some(&sc.worktrees), 2),
+    ];
+
+    let mut row_y = area.y + 1; // start after header
+    let max_y = area.y + area.height;
+    let mut flat_row: usize = 0; // tracks position in flat selection space
+
+    for (section_label, file_items, wt_items, sec_idx) in &sections {
+        if row_y >= max_y {
+            break;
+        }
+        let is_expanded = sc.sections_expanded[*sec_idx];
+        let expand_icon = if is_expanded { '\u{25bc}' } else { '\u{25b6}' }; // ▼ / ▶
+
+        // Section header row
+        let is_hdr_selected = sc.has_focus && sc.selected == flat_row;
+        let (hdr_r_fg, hdr_r_bg) = if is_hdr_selected {
+            (hdr_fg, sel_bg)
+        } else {
+            (hdr_fg, hdr_bg)
+        };
+        for x in area.x..area.x + area.width {
+            set_cell(buf, x, row_y, ' ', hdr_r_fg, hdr_r_bg);
+        }
+        // Expand icon + label
+        let hdr_text = format!(" {} {}", expand_icon, section_label);
+        // Item count badge
+        let badge_text = {
+            let count = if *sec_idx == 2 {
+                wt_items.map(|v| v.len()).unwrap_or(0)
+            } else {
+                file_items.len()
+            };
+            if count > 0 {
+                format!(" ({})", count)
+            } else {
+                String::new()
+            }
+        };
+        let full_hdr = format!("{}{}", hdr_text, badge_text);
+        for (i, ch) in full_hdr.chars().enumerate().take(area.width as usize) {
+            set_cell(buf, area.x + i as u16, row_y, ch, hdr_r_fg, hdr_r_bg);
+        }
+        row_y += 1;
+        flat_row += 1;
+
+        if !is_expanded {
+            continue;
+        }
+
+        // Items
+        let item_count = if *sec_idx == 2 {
+            wt_items.map(|v| v.len()).unwrap_or(0)
+        } else {
+            file_items.len()
+        };
+
+        // Determine if we need a scrollbar.
+        // For simplicity we don't scroll SC sections (they're usually small).
+        // Reserve rightmost col for scrollbar if needed.
+        let need_sb = item_count > (max_y.saturating_sub(row_y)) as usize;
+        let text_w = if need_sb {
+            (area.width as usize).saturating_sub(1)
+        } else {
+            area.width as usize
+        };
+
+        if item_count == 0 {
+            // "(no changes)" hint
+            if row_y < max_y {
+                let hint = "  (no changes)";
+                for x in area.x..area.x + area.width {
+                    set_cell(buf, x, row_y, ' ', dim_fg, row_bg);
+                }
+                for (i, ch) in hint.chars().enumerate().take(area.width as usize) {
+                    set_cell(buf, area.x + i as u16, row_y, ch, dim_fg, row_bg);
+                }
+                row_y += 1;
+            }
+        } else if *sec_idx == 2 {
+            // Worktrees section
+            if let Some(wts) = wt_items {
+                for wt in *wts {
+                    if row_y >= max_y {
+                        break;
+                    }
+                    let is_selected = sc.has_focus && sc.selected == flat_row;
+                    let (row_fg, r_bg) = if is_selected {
+                        (item_fg, sel_bg)
+                    } else {
+                        (item_fg, row_bg)
+                    };
+                    for x in area.x..area.x + area.width {
+                        set_cell(buf, x, row_y, ' ', row_fg, r_bg);
+                    }
+                    let check = if wt.is_current { '\u{2713}' } else { ' ' }; // ✓
+                    let main_marker = if wt.is_main { " [main]" } else { "" };
+                    let text = format!("  {} {} {}{}", check, wt.branch, wt.path, main_marker);
+                    for (i, ch) in text.chars().enumerate().take(text_w) {
+                        set_cell(buf, area.x + i as u16, row_y, ch, row_fg, r_bg);
+                    }
+                    row_y += 1;
+                    flat_row += 1;
+                }
+            }
+        } else {
+            // File items (staged or unstaged)
+            for fi in *file_items {
+                if row_y >= max_y {
+                    break;
+                }
+                let is_selected = sc.has_focus && sc.selected == flat_row;
+                let r_bg = if is_selected { sel_bg } else { row_bg };
+                let status_color = match fi.status_char {
+                    'A' => add_fg,
+                    'D' => del_fg,
+                    _ => mod_fg,
+                };
+                for x in area.x..area.x + area.width {
+                    set_cell(buf, x, row_y, ' ', dim_fg, r_bg);
+                }
+                // Status char colored, then path dimmed
+                let prefix = format!("  {} ", fi.status_char);
+                for (i, ch) in prefix.chars().enumerate().take(text_w) {
+                    let ch_fg = if ch == fi.status_char {
+                        status_color
+                    } else {
+                        dim_fg
+                    };
+                    set_cell(buf, area.x + i as u16, row_y, ch, ch_fg, r_bg);
+                }
+                let path_start = prefix.chars().count();
+                let path_color = if is_selected { item_fg } else { dim_fg };
+                for (i, ch) in fi.path.chars().enumerate() {
+                    let col = path_start + i;
+                    if col >= text_w {
+                        break;
+                    }
+                    set_cell(buf, area.x + col as u16, row_y, ch, path_color, r_bg);
+                }
+                row_y += 1;
+                flat_row += 1;
+            }
+        }
+    }
 }
 
 // ─── Debug sidebar panel ──────────────────────────────────────────────────────

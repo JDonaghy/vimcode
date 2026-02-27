@@ -8,6 +8,7 @@ pub mod git;
 pub mod lsp;
 pub mod lsp_manager;
 pub mod mode;
+pub mod plugin;
 pub mod project_search;
 pub mod session;
 pub mod settings;

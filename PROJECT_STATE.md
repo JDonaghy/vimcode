@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Feb 26, 2026 (Session 95) | **Tests:** 784
+**Last updated:** Feb 26, 2026 (Session 98) | **Tests:** 801
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 72 are in **SESSION_HISTORY.md**.
@@ -8,6 +8,15 @@
 ---
 
 ## Recent Work
+
+**Session 98 — Lua Extension Mechanism (Phase D):**
+`mlua = { version = "0.9", features = ["lua54", "vendored"] }` added to Cargo.toml (bundles Lua 5.4 — no system dep). `src/core/mod.rs`: `pub mod plugin;`. `src/core/settings.rs`: `plugins_enabled: bool` (default true) + `disabled_plugins: Vec<String>` (default empty) fields with `#[serde(default)]`. `src/core/plugin.rs` (new, ~430 lines): `PluginManager` struct with `lua: Lua`, `plugins: Vec<LoadedPlugin>`, `commands/keymaps/hooks` registry maps; `LoadedPlugin` struct (name/path/enabled/error); `PluginCallContext` `#[derive(Default)]` struct (cwd/buf_path/buf_lines inputs + message/set_lines/run_commands outputs); `PluginRegistrations` internal accumulator; `setup_vimcode_api()` installs full `vimcode.*` Lua API: `vimcode.on(event, fn)`, `vimcode.command(name, fn)`, `vimcode.keymap(mode, key, fn)`, `vimcode.message(text)`, `vimcode.cwd()`, `vimcode.command_run(cmd)`, `vimcode.buf.lines()`, `vimcode.buf.line(n)`, `vimcode.buf.set_line(n, text)`, `vimcode.buf.path()`, `vimcode.buf.line_count()`; `load_plugins_dir(dir, disabled)` / `load_one_plugin()` methods; `call_command/call_event/call_keymap` dispatch using take/put-back app_data pattern; 6 unit tests. `src/core/engine.rs`: `use super::plugin;` import; `plugin_manager: Option<plugin::PluginManager>` field; `plugin_init()` (loads `~/.config/vimcode/plugins/`); `make_plugin_ctx()` / `apply_plugin_ctx()` helpers; `plugin_event()`, `plugin_run_command()`, `plugin_run_keymap()` public methods (take/put-back PluginManager to avoid borrow conflict); hook points: `save()` fires "save" event, `lsp_did_open()` fires "open" event (before LSP check), `execute_command()` `_ =>` arm tries `plugin_run_command` before "Not an editor command", `handle_normal_key()` tries `plugin_run_keymap("n", key_name)` before final return, `handle_insert_key()` `_ =>` arm tries `plugin_run_keymap("i", key_name)` for non-printable keys; `:Plugin list/reload/enable <name>/disable <name>` commands; 3 new engine-integration tests. 801 tests (+9).
+
+**Session 97 — Source Control Panel (C1–C5):**
+Phase C complete. `core/git.rs`: `StatusKind` enum (Added/Modified/Deleted/Renamed/Untracked), `FileStatus` struct, `WorktreeEntry` struct, `status_detailed(dir)` (parses `git status --porcelain`), `stage_path`/`unstage_path`/`discard_path`/`run_git_result` helpers, `worktree_list(dir)` (parses `git worktree list --porcelain`), `worktree_add`/`worktree_remove`, `ahead_behind(dir)` (parses rev-list --left-right --count); 3 new tests. `engine.rs`: 7 new SC fields (`sc_file_statuses`, `sc_worktrees`, `sc_selected`, `sc_sections_expanded: [bool;3]`, `sc_has_focus`, `sc_ahead`, `sc_behind`); `sc_refresh()`, `sc_stage_selected()`, `sc_discard_selected()`, `sc_switch_worktree(idx)`, `handle_sc_key(key) -> bool`, `sc_flat_len()`, `sc_flat_to_section_idx(flat) -> (usize,usize)`; key interception in `handle_key()` when `sc_has_focus`; `:GWorktreeAdd`/`:GWorktreeRemove` commands. `render.rs`: `ScFileItem`, `ScWorktreeItem`, `SourceControlData` structs; `source_control: Option<SourceControlData>` on `ScreenLayout`; `build_source_control_data(engine)` builder. `main.rs`: `git_sidebar_da_ref` App field; Git icon (`\u{e702}`) enabled in activity bar; `git_sidebar_da` DrawingArea with draw func + `EventControllerKey`; `Msg::ScKey(String,bool)`; `SwitchPanel(Git)` calls `sc_refresh()`; `draw_source_control_panel()` (header with branch+↑↓ counts, Staged Changes section, Changes section, Worktrees section with ✓ current marker, per-item status-color highlighting). `tui_main.rs`: `TuiPanel::Git` variant; git icon at activity bar row 4; activity bar click handler updated (row 4 → Git, settings_row now `>= 5`); `sc_refresh()` on Git panel open; Git panel keyboard block (j/k/s/d/Tab/Enter/Escape); mouse scroll for SC panel; `render_source_control()` function (3-section layout: Staged Changes / Changes / Worktrees; ▼/▶ expand icons; status-char color coding; selection highlighting; ✓ for current worktree); `render_source_control` called from `render_sidebar`. 792 tests (+3).
+
+**Session 96 — UI Polish (A1–A4) + Workspaces / Open Folder (B1–B5):**
+Phase A (UI Polish): `engine.rs`: `active_buffer_name() -> Option<String>` helper (file name of active buffer). `render.rs`: `MenuBarData` gains `title: String` (e.g. "VimCode — engine.rs") and `show_window_controls: bool`; `build_screen_layout` populates both; `MENU_STRUCTURE` File menu updated: "Open…" → "Open File…", added "Open Folder…", "Open Workspace…", "Save Workspace As…" items. `tui_main.rs`: imports `SetTitle`; after each draw emits `execute!(… SetTitle(…))` so terminal emulator's title bar tracks the active file; `render_menu_bar` shows title right-aligned. `main.rs`: `App` struct gets `window: gtk4::Window`; `set_decorated: false` removes OS titlebar; menu bar always visible in GTK (`menu_bar_visible` forced true, hamburger removed); menu bar box wraps DrawingArea in `gtk4::WindowHandle` for drag-to-move; three `gtk4::Button` window controls (─ ☐ ✕) appended to menu bar box; `Msg::WindowMinimize/Maximize/Close`; CSS `.window-control` style (red hover on close); `draw_menu_bar` renders title text; `SearchPollTick` syncs OS window title (`window.set_title`). Phase B (Workspaces): `session.rs`: `recent_workspaces: Vec<PathBuf>` field; `session_path_for_workspace(root)` (FNV-1a 64-bit hash → `~/.config/vimcode/sessions/<hex>.json`); `load_for_workspace` / `save_for_workspace` / `add_recent_workspace`; 3 new tests. `engine.rs`: `workspace_file: Option<PathBuf>` + `workspace_root: Option<PathBuf>` fields; `EngineAction::OpenFolderDialog/OpenWorkspaceDialog/SaveWorkspaceAsDialog` variants; `open_folder(&Path)` (clears buffers/tabs/cwd, loads per-project session), `open_workspace(&Path)` (parses `.vimcode-workspace` JSON, applies settings overlay, calls `open_folder`), `save_workspace_as(&Path)` (writes `.vimcode-workspace`), `save_session_for_workspace`; `:OpenFolder`/`:OpenWorkspace`/`:SaveWorkspaceAs`/`:cd` commands; 2 new tests. `main.rs`: `Msg::OpenFolderDialog/OpenWorkspaceDialog/SaveWorkspaceAsDialog`; `MenuActivateItem` intercepts dialog actions; GTK `FileDialog` handlers using UFCS `gtk4::prelude::FileExt::path()` for gio version compat. `tui_main.rs`: `FolderPickerState` struct + `FolderPickerMode` enum; `collect_dir_entries` / `walk_dir_entries_recursive` / `filter_dir_entries` / `dir_fuzzy_score` helpers; folder picker key handling (j/k/Enter/Esc); action handling for `OpenFolderDialog/OpenWorkspaceDialog/SaveWorkspaceAsDialog`; `render_folder_picker` modal (same style as fuzzy picker). 789 tests (+5).
 
 **Session 95 — C# Non-Public Members grouping + Debug Output scrollbar + scrollbar height fix:** `dap.rs`: `is_nonpublic: bool` field on `DapVariable` struct. `engine.rs`: `SYNTHETIC_NON_PUBLIC_MASK: u64 = 0x8000_0000_0000_0000` constant; variables response handler uses name-based heuristic to detect C# private fields (`_name` prefix or `<Name>k__BackingField`); when non-public vars are found they are partitioned out and a synthetic "Non-Public Members" `DapVariable` placeholder (with `var_ref = parent | SYNTHETIC_NON_PUBLIC_MASK`) is inserted after the public vars; clicking this placeholder expands/collapses the non-public group; `dap_toggle_expand_var` handles synthetic refs (no server fetch on expand, keeps data for re-expansion, cleans up synthetic child cache on real-var collapse). `render.rs`: `build_var_tree` omits ` = ` separator when `value` is empty (for group headers). `tui_main.rs`: `debug_output_scroll: usize` + `dragging_debug_output_sb: Option<(u16, u16, usize)>` state vars; `handle_mouse` gains these two params; drag handler for debug output scrollbar; scroll-wheel handler for debug output panel area; click handler for debug output scrollbar; `render_debug_output` accepts `scroll: usize` and renders `█`/`░` scrollbar in rightmost column; fixed height-computation bug in both pre-draw and pre-keyboard sites — `bp_h` now includes `debug_out_open` (not just `terminal_open`) so `ensure_visible` uses the correct sidebar height when the debug output panel is active. 784 tests (no change).
 
@@ -67,12 +76,13 @@
 
 ```
 src/
-├── main.rs          (~6934 lines)  GTK4/Relm4 UI, rendering, all panels
-├── tui_main.rs      (~6187 lines)  ratatui/crossterm TUI backend
-├── render.rs        (~2768 lines)  Platform-agnostic ScreenLayout bridge
+├── main.rs          (~7100 lines)  GTK4/Relm4 UI, rendering, all panels
+├── tui_main.rs      (~6450 lines)  ratatui/crossterm TUI backend
+├── render.rs        (~2820 lines)  Platform-agnostic ScreenLayout bridge
 ├── icons.rs            (~30 lines)  Nerd Font file-type icons
-└── core/            (~27,900 lines)  Zero GTK/rendering deps — fully testable
-    ├── engine.rs    (~24,089 lines)  Orchestrator: keys, commands, all features
+└── core/            (~29,000 lines)  Zero GTK/rendering deps — fully testable
+    ├── engine.rs    (~24,900 lines)  Orchestrator: keys, commands, all features
+    ├── plugin.rs       (~430 lines)  Lua 5.4 plugin manager (mlua vendored)
     ├── terminal.rs     (~320 lines)  PTY-backed terminal pane (portable-pty + vt100)
     ├── lsp.rs        (~2,045 lines)  LSP protocol transport + single-server client
     ├── lsp_manager.rs  (~671 lines)  Multi-server coordinator + built-in registry
@@ -82,11 +92,11 @@ src/
     ├── project_search.rs (~630 lines)  Regex/case/word search + replace
     ├── buffer_manager.rs (~600 lines)  Buffer lifecycle, undo/redo
     ├── buffer.rs       (~120 lines)  Rope-based text storage (ropey)
-    ├── session.rs      (~180 lines)  Session state persistence
-    ├── git.rs          (~635 lines)  git subprocess integration
+    ├── session.rs      (~235 lines)  Session state persistence + per-workspace paths
+    ├── git.rs          (~900 lines)  git subprocess integration + SC panel data
     └── window.rs, tab.rs, view.rs, cursor.rs, mode.rs, syntax.rs (~893 lines)
-Tests: 784 passing
-Total: ~43,900 lines
+Tests: 801 passing
+Total: ~46,500 lines
 ```
 
 ---
@@ -131,6 +141,10 @@ Total: ~43,900 lines
 ### Completed (continued)
 - [x] Interactive debug sidebar — expand/collapse variables (recursive); call stack frame navigation with source jump; conditional breakpoints (`:DapCondition`, `:DapHitCondition`, `:DapLogMessage`); `◆` gutter symbol; watch/breakpoint deletion from sidebar
 - [x] Debug sidebar mouse + keyboard interactivity — j/k/Tab/Enter/x/d/q navigation in both GTK and TUI; click-to-select sections and items; section header click switches active section; item click triggers action (expand var, jump to frame, jump to breakpoint)
+- [x] GTK titlebar removal + window controls — `set_decorated(false)`; `WindowHandle` drag-to-move menu bar; [─][☐][✕] buttons embedded in menu bar; menu bar always-on in GTK (hamburger removed); TUI hamburger toggle unchanged; terminal title sync (`SetTitle` in TUI; `window.set_title()` in GTK)
+- [x] Workspaces + Open Folder — `.vimcode-workspace` JSON; `open_folder`/`open_workspace`/`save_workspace_as`; per-project session (FNV-1a hashed path); GTK `FileDialog` for Open File/Folder/Workspace; TUI fuzzy directory picker modal; `:cd`/`:OpenFolder`/`:OpenWorkspace`/`:SaveWorkspaceAs` commands
+- [x] Source Control Panel — git icon in activity bar; Staged Changes / Changes / Worktrees sections (expandable); `j`/`k` navigation; `s` stage/unstage; `d` discard; `r` refresh; `Enter` open file / switch worktree; `Tab` collapse/expand; `:GWorktreeAdd`/`:GWorktreeRemove` commands; GTK Cairo panel + TUI panel (both backends)
+- [x] Lua Extension Mechanism — mlua 5.4 vendored; `~/.config/vimcode/plugins/` auto-loaded; `vimcode.*` API (on/command/keymap/message/cwd/command_run/buf.*); `:Plugin list/reload/enable/disable`; hook points on save/open/normal-key/insert-key/command
 
 ### Planned / Ideas
 - [ ] More Tree-sitter grammars (HTML, YAML, Lua — await tree-sitter 0.22 migration)

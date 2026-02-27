@@ -51,6 +51,10 @@ pub struct SessionState {
     /// Terminal panel content rows (default 12; does not include the header row)
     #[serde(default = "default_terminal_rows")]
     pub terminal_panel_rows: u16,
+
+    /// Recently opened workspace root paths (last 10, stored in global session only).
+    #[serde(default)]
+    pub recent_workspaces: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,6 +96,7 @@ impl Default for SessionState {
             open_files: Vec::new(),
             active_file: None,
             terminal_panel_rows: default_terminal_rows(),
+            recent_workspaces: Vec::new(),
         }
     }
 }
@@ -128,6 +133,59 @@ impl SessionState {
     fn session_path() -> PathBuf {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
         PathBuf::from(home).join(".config/vimcode/session.json")
+    }
+
+    /// Compute a stable per-workspace session path based on the workspace root.
+    /// Uses a simple FNV-1a 64-bit hash of the canonical path string.
+    pub fn session_path_for_workspace(root: &Path) -> PathBuf {
+        let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let path_str = canonical.to_string_lossy();
+        // FNV-1a 64-bit hash (deterministic, no external crates needed)
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for byte in path_str.bytes() {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x00000100000001b3);
+        }
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        PathBuf::from(home)
+            .join(".config/vimcode/sessions")
+            .join(format!("{:016x}.json", hash))
+    }
+
+    /// Load per-workspace session state (open files, positions, etc.).
+    /// Falls back to an empty session if the file does not exist.
+    pub fn load_for_workspace(root: &Path) -> Self {
+        let path = Self::session_path_for_workspace(root);
+        if let Ok(contents) = std::fs::read_to_string(&path) {
+            if let Ok(state) = serde_json::from_str(&contents) {
+                return state;
+            }
+        }
+        Self::default()
+    }
+
+    /// Save per-workspace session state to the per-project file.
+    pub fn save_for_workspace(&self, root: &Path) -> std::io::Result<()> {
+        let path = Self::session_path_for_workspace(root);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_string_pretty(self)?;
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, &json)?;
+        std::fs::rename(&tmp, &path)?;
+        Ok(())
+    }
+
+    /// Add a workspace root to `recent_workspaces` (max 10, removes duplicates).
+    pub fn add_recent_workspace(&mut self, root: &Path) {
+        let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        self.recent_workspaces.retain(|p| p != &canonical);
+        self.recent_workspaces.push(canonical);
+        // Keep last 10
+        while self.recent_workspaces.len() > 10 {
+            self.recent_workspaces.remove(0);
+        }
     }
 
     /// Add command to history (max 100 entries, removes duplicates)
@@ -280,5 +338,46 @@ mod tests {
         let pos = restored.file_positions.get(&canonical).unwrap();
         assert_eq!(pos.line, 5);
         assert_eq!(pos.col, 2);
+    }
+
+    #[test]
+    fn test_workspace_session_path_is_stable() {
+        let root = Path::new("/tmp");
+        let path1 = SessionState::session_path_for_workspace(root);
+        let path2 = SessionState::session_path_for_workspace(root);
+        // Same input must always produce the same path
+        assert_eq!(path1, path2);
+        // Path must live under ~/.config/vimcode/sessions/
+        let path_str = path1.to_string_lossy();
+        assert!(path_str.contains("vimcode/sessions/"));
+        assert!(path_str.ends_with(".json"));
+    }
+
+    #[test]
+    fn test_workspace_session_path_differs_per_root() {
+        let root_a = Path::new("/tmp/proj_a");
+        let root_b = Path::new("/tmp/proj_b");
+        let path_a = SessionState::session_path_for_workspace(root_a);
+        let path_b = SessionState::session_path_for_workspace(root_b);
+        // Different roots must hash to different files
+        assert_ne!(path_a, path_b);
+    }
+
+    #[test]
+    fn test_add_recent_workspace() {
+        let mut session = SessionState::default();
+        let root = Path::new("/tmp/my_project");
+        session.add_recent_workspace(root);
+        assert_eq!(session.recent_workspaces.len(), 1);
+
+        // Adding same path twice should not duplicate
+        session.add_recent_workspace(root);
+        assert_eq!(session.recent_workspaces.len(), 1);
+
+        // Adding more than 10 paths keeps only the last 10
+        for i in 0..12 {
+            session.add_recent_workspace(&PathBuf::from(format!("/tmp/proj_{}", i)));
+        }
+        assert_eq!(session.recent_workspaces.len(), 10);
     }
 }
