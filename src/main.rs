@@ -295,8 +295,12 @@ enum Msg {
     CloseMenu,
     /// Activate a menu item: (menu_idx, item_idx, action_str).
     MenuActivateItem(usize, usize, String),
-    /// Click in the debug sidebar DrawingArea (y coordinate in pixels).
-    DebugSidebarClick(f64),
+    /// Click in the debug sidebar DrawingArea (x, y coordinates in pixels).
+    DebugSidebarClick(f64, f64),
+    /// Key press in the debug sidebar DrawingArea.
+    DebugSidebarKey(String, bool),
+    /// Scroll in the debug sidebar DrawingArea (dy value from EventControllerScroll).
+    DebugSidebarScroll(f64),
 }
 
 #[relm4::component]
@@ -1415,10 +1419,36 @@ impl SimpleComponent for App {
             let sender_dbg = sender.input_sender().clone();
             let gesture = gtk4::GestureClick::new();
             gesture.set_button(1);
-            gesture.connect_pressed(move |_, _, _x, y| {
-                sender_dbg.send(Msg::DebugSidebarClick(y)).ok();
+            gesture.connect_pressed(move |_, _, x, y| {
+                sender_dbg.send(Msg::DebugSidebarClick(x, y)).ok();
             });
             widgets.debug_sidebar_da.add_controller(gesture);
+        }
+        // ── Debug sidebar keyboard handler ───────────────────────────────────
+        {
+            let sender_dbg_key = sender.input_sender().clone();
+            let key_ctrl = gtk4::EventControllerKey::new();
+            key_ctrl.connect_key_pressed(move |_, key, _, modifier| {
+                let key_name = key.name().map(|s| s.to_string()).unwrap_or_default();
+                let ctrl = modifier.contains(gdk::ModifierType::CONTROL_MASK);
+                sender_dbg_key
+                    .send(Msg::DebugSidebarKey(key_name, ctrl))
+                    .ok();
+                gtk4::glib::Propagation::Stop
+            });
+            widgets.debug_sidebar_da.set_focusable(true);
+            widgets.debug_sidebar_da.add_controller(key_ctrl);
+        }
+        // ── Debug sidebar scroll handler ──────────────────────────────────────
+        {
+            let sender_dbg_scroll = sender.input_sender().clone();
+            let scroll_ctrl =
+                gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
+            scroll_ctrl.connect_scroll(move |_, _dx, dy| {
+                sender_dbg_scroll.send(Msg::DebugSidebarScroll(dy)).ok();
+                gtk4::glib::Propagation::Stop
+            });
+            widgets.debug_sidebar_da.add_controller(scroll_ctrl);
         }
         // Store a reference so update() can explicitly queue_draw when DAP events arrive.
         *debug_sidebar_da_ref.borrow_mut() = Some(widgets.debug_sidebar_da.clone());
@@ -2066,6 +2096,8 @@ impl SimpleComponent for App {
                 width,
                 height,
             } => {
+                // Clicking in the editor clears debug sidebar focus.
+                self.engine.borrow_mut().dap_sidebar_has_focus = false;
                 // Check if click lands in the terminal panel before general handling.
                 // Layout (bottom to top): status | toolbar | terminal | quickfix | DAP | editor
                 let in_terminal = if self.cached_line_height > 0.0 {
@@ -2730,6 +2762,7 @@ impl SimpleComponent for App {
             }
             Msg::FocusEditor => {
                 self.tree_has_focus = false;
+                self.engine.borrow_mut().dap_sidebar_has_focus = false;
 
                 // Grab focus on drawing area
                 if let Some(ref drawing) = *self.drawing_area.borrow() {
@@ -3332,11 +3365,30 @@ impl SimpleComponent for App {
                 }
                 self.redraw = true;
             }
-            Msg::DebugSidebarClick(y) => {
-                // Row 1 (the Run/Stop button) is between line_height and 2×line_height.
+            Msg::DebugSidebarClick(click_x, y) => {
+                use crate::core::engine::DebugSidebarSection;
                 let lh = self.cached_line_height;
-                if y >= lh && y < 2.0 * lh {
-                    let mut engine = self.engine.borrow_mut();
+                let row_idx = (y / lh) as u16;
+                let mut engine = self.engine.borrow_mut();
+
+                // Compute section heights for click mapping.
+                if let Some(ref da) = *self.debug_sidebar_da_ref.borrow() {
+                    if lh > 0.0 {
+                        let da_h = da.height() as f64;
+                        let content_px = (da_h - 6.0 * lh).max(0.0);
+                        let per_sec = (content_px / 4.0 / lh).floor() as u16;
+                        engine.dap_sidebar_section_heights = [per_sec; 4];
+                    }
+                }
+
+                // Give focus to the debug sidebar
+                engine.dap_sidebar_has_focus = true;
+                self.tree_has_focus = false;
+
+                if row_idx == 0 {
+                    // Header — no-op
+                } else if row_idx == 1 {
+                    // Run/Stop button
                     if engine.dap_session_active && engine.dap_stopped_thread.is_some() {
                         engine.dap_continue();
                     } else if engine.dap_session_active {
@@ -3344,9 +3396,144 @@ impl SimpleComponent for App {
                     } else {
                         engine.execute_command("debug");
                     }
+                } else {
+                    // Walk sections using fixed-allocation layout:
+                    // row 2+ = [section_header(1) + content(height)]×4
+                    let sections = [
+                        (DebugSidebarSection::Variables, 0usize),
+                        (DebugSidebarSection::Watch, 1),
+                        (DebugSidebarSection::CallStack, 2),
+                        (DebugSidebarSection::Breakpoints, 3),
+                    ];
+                    let mut cur_row: u16 = 2;
+                    for (section, sec_idx) in &sections {
+                        let sec_height = engine.dap_sidebar_section_heights[*sec_idx];
+                        let section_header_row = cur_row;
+                        let items_start = cur_row + 1;
+                        let items_end = items_start + sec_height;
+
+                        if row_idx == section_header_row {
+                            engine.dap_sidebar_section = *section;
+                            engine.dap_sidebar_selected = 0;
+                            break;
+                        } else if row_idx >= items_start && row_idx < items_end {
+                            let item_count = engine.dap_sidebar_section_item_count(*section);
+                            let height = sec_height as usize;
+                            // Scrollbar click: rightmost 6px when items overflow.
+                            let da_w = self
+                                .debug_sidebar_da_ref
+                                .borrow()
+                                .as_ref()
+                                .map(|da| da.width() as f64)
+                                .unwrap_or(200.0);
+                            if click_x >= da_w - 6.0 && item_count > height && height > 0 {
+                                let rel_row = (row_idx - items_start) as usize;
+                                let ratio = rel_row as f64 / height as f64;
+                                let max_scroll = item_count.saturating_sub(height);
+                                engine.dap_sidebar_scroll[*sec_idx] =
+                                    (ratio * max_scroll as f64) as usize;
+                                engine.dap_sidebar_section = *section;
+                            } else {
+                                let scroll_off = engine.dap_sidebar_scroll[*sec_idx];
+                                let row_offset = (row_idx - items_start) as usize;
+                                let item_idx = scroll_off + row_offset;
+                                if item_count > 0 && item_idx < item_count {
+                                    engine.dap_sidebar_section = *section;
+                                    engine.dap_sidebar_selected = item_idx;
+                                    engine.handle_debug_sidebar_key("Return", false);
+                                }
+                            }
+                            break;
+                        }
+                        cur_row = items_end;
+                    }
                 }
-                // Always queue a redraw of the debug sidebar so the button text
-                // reflects the updated engine state immediately.
+                drop(engine);
+
+                // Grab focus on the debug sidebar DA
+                if let Some(ref da) = *self.debug_sidebar_da_ref.borrow() {
+                    da.grab_focus();
+                    da.queue_draw();
+                }
+                self.redraw = !self.redraw;
+            }
+            Msg::DebugSidebarKey(key_name, ctrl) => {
+                let mut engine = self.engine.borrow_mut();
+                // Compute section heights for ensure_visible.
+                if let Some(ref da) = *self.debug_sidebar_da_ref.borrow() {
+                    let lh = self.cached_line_height;
+                    if lh > 0.0 {
+                        let da_h = da.height() as f64;
+                        let content_px = (da_h - 6.0 * lh).max(0.0);
+                        let per_sec = (content_px / 4.0 / lh).floor() as u16;
+                        engine.dap_sidebar_section_heights = [per_sec; 4];
+                    }
+                }
+                // Map GTK key names to engine key names
+                let mapped = match key_name.as_str() {
+                    "Return" | "KP_Enter" => "Return",
+                    "Escape" => "Escape",
+                    "Tab" | "ISO_Left_Tab" => "Tab",
+                    "Down" => "Down",
+                    "Up" => "Up",
+                    "Home" => "Home",
+                    "End" => "End",
+                    "Page_Down" | "KP_Page_Down" => "PageDown",
+                    "Page_Up" | "KP_Page_Up" => "PageUp",
+                    "space" => " ",
+                    "j" => "j",
+                    "k" => "k",
+                    "g" => "g",
+                    "G" => "G",
+                    "x" => "x",
+                    "d" => "d",
+                    "q" => "q",
+                    _ => "",
+                };
+                if !mapped.is_empty() {
+                    engine.handle_debug_sidebar_key(mapped, ctrl);
+                }
+                let still_focused = engine.dap_sidebar_has_focus;
+                drop(engine);
+
+                if !still_focused {
+                    // Return focus to the editor
+                    if let Some(ref drawing) = *self.drawing_area.borrow() {
+                        drawing.grab_focus();
+                    }
+                }
+                if let Some(ref da) = *self.debug_sidebar_da_ref.borrow() {
+                    da.queue_draw();
+                }
+                self.redraw = !self.redraw;
+            }
+            Msg::DebugSidebarScroll(dy) => {
+                let mut engine = self.engine.borrow_mut();
+                // Compute section heights.
+                let lh = self.cached_line_height;
+                if let Some(ref da) = *self.debug_sidebar_da_ref.borrow() {
+                    if lh > 0.0 {
+                        let da_h = da.height() as f64;
+                        let content_px = (da_h - 6.0 * lh).max(0.0);
+                        let per_sec = (content_px / 4.0 / lh).floor() as u16;
+                        engine.dap_sidebar_section_heights = [per_sec; 4];
+                    }
+                }
+                // Scroll the active section.
+                let scroll_amount = (dy.abs() * 3.0).ceil() as usize;
+                let sec = engine.dap_sidebar_section;
+                let idx = Engine::dap_sidebar_section_index(sec);
+                let item_count = engine.dap_sidebar_section_item_count(sec);
+                let height = engine.dap_sidebar_section_heights[idx] as usize;
+                let max_scroll = item_count.saturating_sub(height);
+                if dy > 0.0 {
+                    engine.dap_sidebar_scroll[idx] =
+                        (engine.dap_sidebar_scroll[idx] + scroll_amount).min(max_scroll);
+                } else {
+                    engine.dap_sidebar_scroll[idx] =
+                        engine.dap_sidebar_scroll[idx].saturating_sub(scroll_amount);
+                }
+                drop(engine);
                 if let Some(ref da) = *self.debug_sidebar_da_ref.borrow() {
                     da.queue_draw();
                 }
@@ -5187,38 +5374,51 @@ fn draw_debug_sidebar(
     cr.move_to(x + 8.0, btn_y);
     pangocairo::show_layout(cr, layout);
 
-    // ── Sections ─────────────────────────────────────────────────────────────
-    let sections: &[(
+    // ── Sections with fixed-height allocation + per-section scrolling ──────
+    let sections: [(
         &str,
         &[render::DebugSidebarItem],
         render::DebugSidebarSection,
-    )] = &[
+        usize,
+    ); 4] = [
         (
             "\u{f6a9} VARIABLES",
             &sidebar.variables,
             render::DebugSidebarSection::Variables,
+            0,
         ),
         (
             "\u{f06e} WATCH",
             &sidebar.watch,
             render::DebugSidebarSection::Watch,
+            1,
         ),
         (
             "\u{f020e} CALL STACK",
             &sidebar.frames,
             render::DebugSidebarSection::CallStack,
+            2,
         ),
         (
             "\u{f111} BREAKPOINTS",
             &sidebar.breakpoints,
             render::DebugSidebarSection::Breakpoints,
+            3,
         ),
     ];
+
+    // Compute per-section content heights (equal share of remaining space).
+    // Available px after header(1) + button(1) = 2 line_heights.
+    // Each section has 1 header row (4 total), so content px = h - 6*line_height.
+    let content_px = (h - 6.0 * line_height).max(0.0);
+    let sec_content_h = (content_px / 4.0).floor();
 
     let mut cursor_y = btn_y + line_height;
     let max_y = y + h;
 
-    for (section_label, items, section_kind) in sections {
+    let (sb_r, sb_g, sb_b) = (0.5_f64, 0.5_f64, 0.5_f64); // scrollbar thumb color
+
+    for (section_label, items, section_kind, sec_idx) in &sections {
         if cursor_y >= max_y {
             break;
         }
@@ -5239,40 +5439,84 @@ fn draw_debug_sidebar(
         pangocairo::show_layout(cr, layout);
         cursor_y += line_height;
 
-        // Items.
-        for item in *items {
-            if cursor_y >= max_y {
+        let scroll_off = sidebar.scroll_offsets[*sec_idx];
+        let sec_height = sidebar.section_heights[*sec_idx] as usize;
+        let visible_rows = if sec_height > 0 {
+            sec_height
+        } else {
+            (sec_content_h / line_height).floor() as usize
+        };
+
+        // Clip to section content area.
+        let section_start_y = cursor_y;
+        let section_end_y = (cursor_y + visible_rows as f64 * line_height).min(max_y);
+
+        cr.save().ok();
+        cr.rectangle(x, section_start_y, w, section_end_y - section_start_y);
+        cr.clip();
+
+        // Render items within the allocated height.
+        for row_offset in 0..visible_rows {
+            let item_y = section_start_y + row_offset as f64 * line_height;
+            if item_y >= section_end_y {
                 break;
             }
-            let (ir, ig, ib) = if item.is_selected {
-                cr.set_source_rgb(sel_r, sel_g, sel_b);
-                cr.rectangle(x, cursor_y, w, line_height);
-                cr.fill().ok();
-                (fg_r, fg_g, fg_b)
-            } else {
-                (dim_r, dim_g, dim_b)
-            };
-            let indent_px = item.indent as f64 * 12.0;
-            cr.set_source_rgb(ir, ig, ib);
-            layout.set_text(&item.text);
-            cr.move_to(x + 4.0 + indent_px, cursor_y);
-            pangocairo::show_layout(cr, layout);
-            cursor_y += line_height;
+            let item_idx = scroll_off + row_offset;
+            if items.is_empty() && row_offset == 0 {
+                // Empty hint.
+                cr.set_source_rgb(dim_r, dim_g, dim_b);
+                let hint = if sidebar.session_active {
+                    "  (empty)"
+                } else {
+                    "  (not running)"
+                };
+                layout.set_text(hint);
+                cr.move_to(x + 4.0, item_y);
+                pangocairo::show_layout(cr, layout);
+            } else if item_idx < items.len() {
+                let item = &items[item_idx];
+                if item.is_selected {
+                    cr.set_source_rgb(sel_r, sel_g, sel_b);
+                    cr.rectangle(x, item_y, w, line_height);
+                    cr.fill().ok();
+                    cr.set_source_rgb(fg_r, fg_g, fg_b);
+                } else {
+                    cr.set_source_rgb(dim_r, dim_g, dim_b);
+                }
+                let indent_px = item.indent as f64 * 12.0;
+                layout.set_text(&item.text);
+                cr.move_to(x + 4.0 + indent_px, item_y);
+                pangocairo::show_layout(cr, layout);
+            }
         }
 
-        // "empty" hint when section has no items and a session is not active.
-        if items.is_empty() && cursor_y < max_y {
-            cr.set_source_rgb(dim_r, dim_g, dim_b);
-            let hint = if sidebar.session_active {
-                "  (empty)"
+        // Draw scrollbar if items exceed visible height.
+        if items.len() > visible_rows && visible_rows > 0 {
+            let sb_w = 4.0_f64;
+            let sb_x = x + w - sb_w;
+            let track_h = visible_rows as f64 * line_height;
+            let total_items = items.len();
+            let thumb_h = ((visible_rows as f64 / total_items as f64) * track_h)
+                .ceil()
+                .max(line_height * 0.5);
+            let max_scroll = total_items - visible_rows;
+            let thumb_top = if max_scroll > 0 {
+                (scroll_off as f64 / max_scroll as f64) * (track_h - thumb_h)
             } else {
-                "  (not running)"
+                0.0
             };
-            layout.set_text(hint);
-            cr.move_to(x + 4.0, cursor_y);
-            pangocairo::show_layout(cr, layout);
-            cursor_y += line_height;
+            // Track background.
+            cr.set_source_rgba(0.3, 0.3, 0.3, 0.3);
+            cr.rectangle(sb_x, section_start_y, sb_w, track_h);
+            cr.fill().ok();
+            // Thumb.
+            cr.set_source_rgb(sb_r, sb_g, sb_b);
+            cr.rectangle(sb_x, section_start_y + thumb_top, sb_w, thumb_h);
+            cr.fill().ok();
         }
+
+        cr.restore().ok();
+        cursor_y = section_start_y + visible_rows as f64 * line_height;
     }
 }
 

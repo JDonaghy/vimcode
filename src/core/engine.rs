@@ -3,9 +3,10 @@ use std::path::{Path, PathBuf};
 
 use super::buffer::{Buffer, BufferId};
 use super::buffer_manager::{BufferManager, BufferState, UndoEntry};
-use super::dap::{DapEvent, DapVariable, StackFrame};
+use super::dap::{BreakpointInfo, DapEvent, DapVariable, StackFrame};
 use super::dap_manager::{
-    generate_launch_json, parse_launch_json, type_to_adapter, DapManager, LaunchConfig,
+    generate_launch_json, parse_launch_json, parse_tasks_json, task_to_shell_command,
+    type_to_adapter, DapManager, LaunchConfig,
 };
 use super::git;
 use super::lsp::{
@@ -21,6 +22,10 @@ use super::terminal::{default_shell, TerminalPane};
 use super::view::View;
 use super::window::{SplitDirection, Window, WindowId, WindowLayout, WindowRect};
 use super::{Cursor, Mode};
+
+/// High bit marker for synthetic "Non-Public Members" group var_refs.
+/// Real DAP adapters use sequential integers that never set this bit.
+const SYNTHETIC_NON_PUBLIC_MASK: u64 = 0x8000_0000_0000_0000;
 
 /// Actions returned from `handle_key` that the UI layer must act on.
 /// This keeps GTK/platform concerns out of the core engine.
@@ -116,7 +121,7 @@ enum Motion {
 }
 
 /// Which section of the debug sidebar currently has the selection cursor.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DebugSidebarSection {
     #[default]
     Variables,
@@ -385,6 +390,8 @@ pub struct Engine {
     pub quickfix_open: bool,
     /// Whether the quickfix panel has keyboard focus.
     pub quickfix_has_focus: bool,
+    /// Whether the debug sidebar has keyboard focus.
+    pub dap_sidebar_has_focus: bool,
 
     // --- Two-way diff state ---
     /// The pair of windows currently in diff mode, or None when diff is off.
@@ -422,7 +429,8 @@ pub struct Engine {
     /// Thread ID of the currently stopped thread (set on Stopped event).
     pub dap_stopped_thread: Option<u64>,
     /// Per-file breakpoints: absolute file path → sorted list of 1-based line numbers.
-    pub dap_breakpoints: HashMap<String, Vec<u64>>,
+    /// Per-file breakpoints: absolute file path → sorted list of breakpoint info.
+    pub dap_breakpoints: HashMap<String, Vec<BreakpointInfo>>,
     /// Sequence number of the initialize request (used to detect its response).
     /// Needed because codelldb omits the `command` field from responses.
     pub dap_seq_initialize: Option<u64>,
@@ -452,10 +460,24 @@ pub struct Engine {
     /// `0` = top-level scope (store result in `dap_variables`),
     /// non-zero = child expansion (store in `dap_child_variables[key]`).
     pub dap_pending_vars_ref: u64,
+    /// Name of the primary scope (e.g. "Locals"). Empty when no scopes received yet.
+    pub dap_primary_scope_name: String,
+    /// variablesReference for the primary scope. 0 when no scopes received yet.
+    /// Used to render the scope header and to skip re-fetch on toggle.
+    pub dap_primary_scope_ref: u64,
+    /// Additional scope groups beyond the primary "Locals" scope.
+    /// Each entry is (scope_name, variablesReference). Shown as expandable
+    /// groups at the bottom of the Variables section.
+    pub dap_scope_groups: Vec<(String, u64)>,
     /// Which section of the debug sidebar is currently selected.
     pub dap_sidebar_section: DebugSidebarSection,
     /// Selected item index within the active sidebar section.
     pub dap_sidebar_selected: usize,
+    /// Per-section scroll offset (top visible item index) for [Variables, Watch, CallStack, Breakpoints].
+    pub dap_sidebar_scroll: [usize; 4],
+    /// Per-section allocated heights in content rows (excluding header).
+    /// Computed by backends and stored for ensure_visible calculations.
+    pub dap_sidebar_section_heights: [u16; 4],
     /// Watch expressions added by the user (`:DapWatch <expr>`).
     pub dap_watch_expressions: Vec<String>,
     /// Evaluated values for each watch expression (parallel vec; `None` = not yet evaluated).
@@ -467,10 +489,11 @@ pub struct Engine {
     /// Which panel is shown in the shared bottom area (Terminal or Debug Output).
     pub bottom_panel_kind: BottomPanelKind,
     /// Launch arguments stored between `initialize` send and response receipt.
-    /// We defer `launch` until the adapter confirms `initialize` to avoid a race
+    /// We defer `launch`/`attach` until the adapter confirms `initialize` to avoid a race
     /// where codelldb processes both requests concurrently and reads arguments
     /// from an uninitialised state (causing program="" / "(empty)" errors).
-    pub dap_pending_launch: Option<serde_json::Value>,
+    /// Tuple: (request_type, args) where request_type is "launch" or "attach".
+    pub dap_pending_launch: Option<(String, serde_json::Value)>,
     /// True while the bottom panel should be visible regardless of terminal state.
     /// Set when a debug session starts; keeps the Debug Output tab accessible
     /// even if the user never opened a terminal.
@@ -479,6 +502,10 @@ pub struct Engine {
     pub dap_wants_sidebar: bool,
     /// Maps DAP evaluate request seq → watch expression index for watch eval tracking.
     pub dap_pending_watch_seqs: HashMap<u64, usize>,
+    /// True after the preLaunchTask has completed successfully; prevents re-running on retry.
+    pub dap_pre_launch_done: bool,
+    /// Language to resume `dap_start_debug()` with after preLaunchTask completes.
+    pub dap_deferred_lang: Option<String>,
 
     // --- Integrated terminal ---
     /// All open terminal panes (PTY + VT100 parser). Empty until first open.
@@ -620,6 +647,7 @@ impl Engine {
             quickfix_selected: 0,
             quickfix_open: false,
             quickfix_has_focus: false,
+            dap_sidebar_has_focus: false,
             diff_window_pair: None,
             diff_results: HashMap::new(),
             clipboard_read: None,
@@ -654,8 +682,13 @@ impl Engine {
             dap_child_variables: HashMap::new(),
             dap_eval_result: None,
             dap_pending_vars_ref: 0,
+            dap_primary_scope_name: String::new(),
+            dap_primary_scope_ref: 0,
+            dap_scope_groups: Vec::new(),
             dap_sidebar_section: DebugSidebarSection::Variables,
             dap_sidebar_selected: 0,
+            dap_sidebar_scroll: [0; 4],
+            dap_sidebar_section_heights: [0; 4],
             dap_watch_expressions: Vec::new(),
             dap_watch_values: Vec::new(),
             dap_launch_configs: Vec::new(),
@@ -665,6 +698,8 @@ impl Engine {
             bottom_panel_open: false,
             dap_wants_sidebar: false,
             dap_pending_watch_seqs: HashMap::new(),
+            dap_pre_launch_done: false,
+            dap_deferred_lang: None,
         };
         // If vscode mode is configured, start in Insert mode (no Normal mode)
         if engine.is_vscode_mode() {
@@ -2806,6 +2841,11 @@ impl Engine {
         // Quickfix panel intercepts all keys when it has focus.
         if self.quickfix_has_focus {
             return self.handle_quickfix_key(key_name, ctrl);
+        }
+
+        // Debug sidebar intercepts all keys when it has focus.
+        if self.dap_sidebar_has_focus {
+            return self.handle_debug_sidebar_key(key_name, ctrl);
         }
 
         // Ctrl-S: save in any mode (does not change mode).
@@ -5947,6 +5987,66 @@ impl Engine {
             match ref_str.parse::<u64>() {
                 Ok(var_ref) if var_ref > 0 => self.dap_toggle_expand_var(var_ref),
                 _ => self.message = "Usage: :DapExpand <variablesReference>".to_string(),
+            }
+            return EngineAction::None;
+        }
+
+        // Handle :DapCondition [expr] — set/clear condition on breakpoint at current line.
+        if cmd == "DapCondition" || cmd.starts_with("DapCondition ") {
+            let condition = cmd
+                .strip_prefix("DapCondition")
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let file = self
+                .active_buffer_state()
+                .file_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned());
+            let line = (self.view().cursor.line + 1) as u64;
+            if let Some(file) = file {
+                self.dap_set_breakpoint_condition(&file, line, condition);
+            } else {
+                self.message = "No file associated with this buffer".to_string();
+            }
+            return EngineAction::None;
+        }
+
+        // Handle :DapHitCondition [expr] — set/clear hit-count condition on breakpoint.
+        if cmd == "DapHitCondition" || cmd.starts_with("DapHitCondition ") {
+            let hit_cond = cmd
+                .strip_prefix("DapHitCondition")
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let file = self
+                .active_buffer_state()
+                .file_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned());
+            let line = (self.view().cursor.line + 1) as u64;
+            if let Some(file) = file {
+                self.dap_set_breakpoint_hit_condition(&file, line, hit_cond);
+            } else {
+                self.message = "No file associated with this buffer".to_string();
+            }
+            return EngineAction::None;
+        }
+
+        // Handle :DapLogMessage [msg] — set/clear a logpoint on the current line.
+        if cmd == "DapLogMessage" || cmd.starts_with("DapLogMessage ") {
+            let log_msg = cmd
+                .strip_prefix("DapLogMessage")
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let file = self
+                .active_buffer_state()
+                .file_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned());
+            let line = (self.view().cursor.line + 1) as u64;
+            if let Some(file) = file {
+                self.dap_set_breakpoint_log_message(&file, line, log_msg);
+            } else {
+                self.message = "No file associated with this buffer".to_string();
             }
             return EngineAction::None;
         }
@@ -9424,9 +9524,32 @@ impl Engine {
                     output,
                 } => {
                     self.lsp_installing.remove(&lang_id);
-                    // DAP installs use a "dap:{adapter_name}" key to distinguish them
-                    // from LSP installs so we don't try to auto-start an LSP server.
-                    if let Some(adapter_name) = lang_id.strip_prefix("dap:") {
+                    // preLaunchTask completion: resume debug session after build task.
+                    if let Some(task_label) = lang_id.strip_prefix("dap_task:") {
+                        // Append task output to Debug Output panel.
+                        for line in output.lines() {
+                            self.dap_output_lines.push(line.to_string());
+                        }
+                        if success {
+                            self.dap_output_lines.push(format!(
+                                "[dap] Pre-launch task '{task_label}' completed successfully"
+                            ));
+                            self.dap_pre_launch_done = true;
+                            // Resume the debug session with the stored language.
+                            if let Some(lang) = self.dap_deferred_lang.take() {
+                                self.dap_start_debug(&lang);
+                            }
+                        } else {
+                            self.dap_output_lines
+                                .push(format!("[dap] Pre-launch task '{task_label}' FAILED"));
+                            self.message =
+                                format!("Pre-launch task '{task_label}' failed — debug aborted");
+                            self.dap_session_active = false;
+                            self.debug_toolbar_visible = false;
+                            self.dap_deferred_lang = None;
+                        }
+                        redraw = true;
+                    } else if let Some(adapter_name) = lang_id.strip_prefix("dap:") {
                         if success {
                             self.message = format!(
                                 "DAP adapter '{adapter_name}' installed — press F5 to debug"
@@ -11586,22 +11709,95 @@ impl Engine {
     /// Keeps the per-file list sorted ascending. Re-sends `setBreakpoints`
     /// to the adapter if a session is currently active.
     pub fn dap_toggle_breakpoint(&mut self, file: &str, line: u64) {
-        let lines = self.dap_breakpoints.entry(file.to_string()).or_default();
-        match lines.binary_search(&line) {
-            Ok(pos) => {
-                lines.remove(pos);
-                self.message = format!("Breakpoint removed: line {line}");
-            }
-            Err(pos) => {
-                lines.insert(pos, line);
-                self.message = format!("Breakpoint set: line {line}");
-            }
+        let bps = self.dap_breakpoints.entry(file.to_string()).or_default();
+        if let Some(pos) = bps.iter().position(|bp| bp.line == line) {
+            bps.remove(pos);
+            self.message = format!("Breakpoint removed: line {line}");
+        } else {
+            let insert_pos = bps.partition_point(|bp| bp.line < line);
+            bps.insert(insert_pos, BreakpointInfo::new(line));
+            self.message = format!("Breakpoint set: line {line}");
         }
-        // Re-send breakpoints to adapter if session is live
-        let bp_lines: Vec<u64> = self.dap_breakpoints.get(file).cloned().unwrap_or_default();
+        self.dap_send_breakpoints_for_file(file);
+    }
+
+    /// Set a condition on an existing breakpoint, or create a conditional breakpoint.
+    #[allow(dead_code)]
+    pub fn dap_set_breakpoint_condition(
+        &mut self,
+        file: &str,
+        line: u64,
+        condition: Option<String>,
+    ) {
+        let bps = self.dap_breakpoints.entry(file.to_string()).or_default();
+        if let Some(bp) = bps.iter_mut().find(|bp| bp.line == line) {
+            bp.condition = condition.clone();
+            self.message = if condition.is_some() {
+                format!("Breakpoint condition set: line {line}")
+            } else {
+                format!("Breakpoint condition cleared: line {line}")
+            };
+        } else {
+            // Create a new breakpoint with the condition.
+            let insert_pos = bps.partition_point(|bp| bp.line < line);
+            let mut bp = BreakpointInfo::new(line);
+            bp.condition = condition;
+            bps.insert(insert_pos, bp);
+            self.message = format!("Conditional breakpoint set: line {line}");
+        }
+        self.dap_send_breakpoints_for_file(file);
+    }
+
+    /// Set a hit-count condition on a breakpoint.
+    #[allow(dead_code)]
+    pub fn dap_set_breakpoint_hit_condition(
+        &mut self,
+        file: &str,
+        line: u64,
+        hit_condition: Option<String>,
+    ) {
+        let bps = self.dap_breakpoints.entry(file.to_string()).or_default();
+        if let Some(bp) = bps.iter_mut().find(|bp| bp.line == line) {
+            bp.hit_condition = hit_condition;
+            self.message = format!("Hit condition set: line {line}");
+        } else {
+            let insert_pos = bps.partition_point(|bp| bp.line < line);
+            let mut bp = BreakpointInfo::new(line);
+            bp.hit_condition = hit_condition;
+            bps.insert(insert_pos, bp);
+            self.message = format!("Conditional breakpoint set: line {line}");
+        }
+        self.dap_send_breakpoints_for_file(file);
+    }
+
+    /// Set a log message on a breakpoint (logpoint).
+    #[allow(dead_code)]
+    pub fn dap_set_breakpoint_log_message(
+        &mut self,
+        file: &str,
+        line: u64,
+        log_message: Option<String>,
+    ) {
+        let bps = self.dap_breakpoints.entry(file.to_string()).or_default();
+        if let Some(bp) = bps.iter_mut().find(|bp| bp.line == line) {
+            bp.log_message = log_message;
+            self.message = format!("Log message set: line {line}");
+        } else {
+            let insert_pos = bps.partition_point(|bp| bp.line < line);
+            let mut bp = BreakpointInfo::new(line);
+            bp.log_message = log_message;
+            bps.insert(insert_pos, bp);
+            self.message = format!("Logpoint set: line {line}");
+        }
+        self.dap_send_breakpoints_for_file(file);
+    }
+
+    /// Re-send breakpoints for a given file to the adapter (if session is live).
+    fn dap_send_breakpoints_for_file(&mut self, file: &str) {
+        let bps: Vec<BreakpointInfo> = self.dap_breakpoints.get(file).cloned().unwrap_or_default();
         if let Some(mgr) = &mut self.dap_manager {
             if let Some(server) = &mut mgr.server {
-                server.set_breakpoints(file, &bp_lines);
+                server.set_breakpoints(file, &bps);
             }
         }
     }
@@ -11627,6 +11823,16 @@ impl Engine {
             if let Ok(content) = std::fs::read_to_string(&vscode_path) {
                 let _ = std::fs::create_dir_all(&vimcode_dir);
                 let _ = std::fs::write(&launch_json_path, &content);
+            }
+        }
+
+        // Migration: same for tasks.json.
+        let tasks_json_path = vimcode_dir.join("tasks.json");
+        let vscode_tasks_path = workspace_root.join(".vscode").join("tasks.json");
+        if !tasks_json_path.exists() && vscode_tasks_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&vscode_tasks_path) {
+                let _ = std::fs::create_dir_all(&vimcode_dir);
+                let _ = std::fs::write(&tasks_json_path, &content);
             }
         }
 
@@ -11670,6 +11876,61 @@ impl Engine {
         };
         self.dap_launch_configs = configs;
         self.dap_selected_launch_config = cfg_idx;
+
+        // --- preLaunchTask support ---
+        // If the config references a preLaunchTask and we haven't run it yet,
+        // execute it via the LSP install infrastructure and return early.
+        // Once the task completes, `poll_lsp` will call `dap_start_debug` again.
+        let pre_launch_task = config
+            .raw
+            .get("preLaunchTask")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        if let Some(ref task_label) = pre_launch_task {
+            if !self.dap_pre_launch_done {
+                // Load and parse tasks.json
+                let tasks_json_path = vimcode_dir.join("tasks.json");
+                let tasks = if let Ok(content) = std::fs::read_to_string(&tasks_json_path) {
+                    parse_tasks_json(&content, &cwd)
+                } else {
+                    Vec::new()
+                };
+
+                if let Some(task) = tasks.iter().find(|t| t.label == *task_label) {
+                    let cmd = if task.cwd != cwd {
+                        format!("cd '{}' && {}", task.cwd, task_to_shell_command(task))
+                    } else {
+                        task_to_shell_command(task)
+                    };
+                    self.dap_deferred_lang = Some(lang.to_string());
+                    self.ensure_lsp_manager();
+                    let install_key = format!("dap_task:{task_label}");
+                    self.lsp_installing.insert(install_key.clone());
+                    if let Some(mgr) = &self.lsp_manager {
+                        mgr.run_install_command(&install_key, &cmd);
+                    }
+
+                    // Set up UI state so the user sees progress.
+                    self.dap_output_lines.clear();
+                    self.bottom_panel_kind = BottomPanelKind::DebugOutput;
+                    self.bottom_panel_open = true;
+                    self.dap_wants_sidebar = true;
+                    if self.session.terminal_panel_rows == 0 {
+                        self.session.terminal_panel_rows = 10;
+                    }
+                    self.dap_session_active = true;
+                    self.dap_output_lines
+                        .push(format!("[dap] Running pre-launch task: {task_label}"));
+                    self.dap_output_lines.push(format!("[dap] command: {cmd}"));
+                    self.message = format!("Running pre-launch task: {task_label}\u{2026}");
+                    return;
+                } else {
+                    self.dap_output_lines.push(format!(
+                        "[dap] warning: preLaunchTask '{task_label}' not found in tasks.json"
+                    ));
+                }
+            }
+        }
 
         // Determine the adapter registry name.
         let adapter_lang = type_to_adapter(&config.adapter_type).unwrap_or(lang);
@@ -11762,7 +12023,8 @@ impl Engine {
         ));
 
         // Guard: empty program path means the launch.json is misconfigured.
-        if config.program.is_empty() {
+        // (Attach configs don't need a program path.)
+        if config.program.is_empty() && config.request != "attach" {
             self.message = format!("DAP: program not set — edit {}", launch_json_path.display());
             self.dap_session_active = false;
             self.debug_toolbar_visible = false;
@@ -11771,15 +12033,15 @@ impl Engine {
 
         // Dump the complete JSON we're about to send so mismatches are obvious.
         self.dap_output_lines
-            .push(format!("[dap] launch request: {launch_args}"));
+            .push(format!("[dap] {} request: {launch_args}", config.request));
 
         // Store launch_args for deferred sending — we must wait for the
-        // `initialize` response before sending `launch`.  Sending both at once
-        // causes codelldb to process them concurrently, and it reads the
+        // `initialize` response before sending `launch`/`attach`.  Sending both
+        // at once causes codelldb to process them concurrently, and it reads the
         // `launch` arguments before its LLDB session is fully initialised,
         // producing "executable doesn't exist: '(empty)'" even when `program`
         // is correctly set in the JSON we send.
-        self.dap_pending_launch = Some(launch_args);
+        self.dap_pending_launch = Some((config.request.clone(), launch_args));
         self.dap_seq_launch = None; // will be assigned once launch is actually sent
         self.dap_seq_initialize = None;
 
@@ -11838,7 +12100,13 @@ impl Engine {
         self.dap_child_variables.clear();
         self.dap_eval_result = None;
         self.dap_pending_vars_ref = 0;
+        self.dap_primary_scope_name.clear();
+        self.dap_primary_scope_ref = 0;
+        self.dap_scope_groups.clear();
         self.dap_watch_values = vec![None; self.dap_watch_expressions.len()];
+        self.dap_pre_launch_done = false;
+        self.dap_deferred_lang = None;
+        self.dap_sidebar_scroll = [0; 4];
         self.message = "DAP: session stopped".to_string();
     }
 
@@ -11866,6 +12134,9 @@ impl Engine {
         self.dap_variables.clear();
         self.dap_child_variables.clear();
         self.dap_expanded_vars.clear();
+        self.dap_primary_scope_name.clear();
+        self.dap_primary_scope_ref = 0;
+        self.dap_scope_groups.clear();
         let frame_id = self
             .dap_stack_frames
             .get(self.dap_active_frame)
@@ -11883,16 +12154,33 @@ impl Engine {
 
     /// Toggle expansion of a variable with the given `var_ref`.
     /// If already expanded, collapses it; otherwise requests child variables.
+    /// Synthetic refs (high bit set) represent the client-side "Non-Public Members"
+    /// group — data is already stored locally, no server fetch needed.
     pub fn dap_toggle_expand_var(&mut self, var_ref: u64) {
+        let is_synthetic = var_ref & SYNTHETIC_NON_PUBLIC_MASK != 0;
         if self.dap_expanded_vars.contains(&var_ref) {
             self.dap_expanded_vars.remove(&var_ref);
-            self.dap_child_variables.remove(&var_ref);
+            if var_ref == self.dap_primary_scope_ref {
+                // Primary scope: data lives in dap_variables, keep it.
+            } else if is_synthetic {
+                // Synthetic group: keep the data for re-expansion without re-fetch.
+            } else {
+                self.dap_child_variables.remove(&var_ref);
+                // Also clean up any synthetic Non-Public Members group for this var.
+                let synthetic = var_ref | SYNTHETIC_NON_PUBLIC_MASK;
+                self.dap_expanded_vars.remove(&synthetic);
+                self.dap_child_variables.remove(&synthetic);
+            }
         } else {
             self.dap_expanded_vars.insert(var_ref);
-            self.dap_pending_vars_ref = var_ref; // child fetch
-            if let Some(mgr) = &mut self.dap_manager {
-                if let Some(server) = &mut mgr.server {
-                    server.variables(var_ref);
+            // Primary scope: data already in dap_variables — no re-fetch needed.
+            // Synthetic ref: data already in dap_child_variables — no fetch needed.
+            if var_ref != self.dap_primary_scope_ref && !is_synthetic {
+                self.dap_pending_vars_ref = var_ref; // child fetch
+                if let Some(mgr) = &mut self.dap_manager {
+                    if let Some(server) = &mut mgr.server {
+                        server.variables(var_ref);
+                    }
                 }
             }
         }
@@ -11916,16 +12204,267 @@ impl Engine {
         self.message = "DAP: no active session".to_string();
     }
 
-    /// Handle a key press directed at the debug sidebar.
-    /// j/k or Up/Down navigate within the active section; Tab switches sections.
+    /// Compute the number of visible items in the currently active debug sidebar section.
+    pub fn dap_sidebar_section_len(&self) -> usize {
+        self.dap_sidebar_section_item_count(self.dap_sidebar_section)
+    }
+
+    /// Compute the number of items in a specific debug sidebar section.
+    pub fn dap_sidebar_section_item_count(&self, section: DebugSidebarSection) -> usize {
+        match section {
+            DebugSidebarSection::Variables => self.dap_var_flat_count(),
+            DebugSidebarSection::Watch => self.dap_watch_expressions.len(),
+            DebugSidebarSection::CallStack => self.dap_stack_frames.len(),
+            DebugSidebarSection::Breakpoints => {
+                self.dap_breakpoints.values().map(|v| v.len()).sum()
+            }
+        }
+    }
+
+    /// Map a `DebugSidebarSection` variant to its index (0–3).
+    pub fn dap_sidebar_section_index(section: DebugSidebarSection) -> usize {
+        match section {
+            DebugSidebarSection::Variables => 0,
+            DebugSidebarSection::Watch => 1,
+            DebugSidebarSection::CallStack => 2,
+            DebugSidebarSection::Breakpoints => 3,
+        }
+    }
+
+    /// Adjust the scroll offset for the active section so that the selected item is visible.
+    pub fn dap_sidebar_ensure_visible(&mut self) {
+        let idx = Self::dap_sidebar_section_index(self.dap_sidebar_section);
+        let height = self.dap_sidebar_section_heights[idx] as usize;
+        if height == 0 {
+            return; // not yet laid out
+        }
+        let scroll = &mut self.dap_sidebar_scroll[idx];
+        let sel = self.dap_sidebar_selected;
+        if sel < *scroll {
+            *scroll = sel;
+        }
+        if sel >= *scroll + height {
+            *scroll = sel - height + 1;
+        }
+    }
+
+    /// Resize adjacent debug sidebar sections by `delta` rows.
+    /// Shrinks `section_idx` and grows `section_idx + 1` (or vice versa for negative delta).
+    /// Clamps each section to a minimum of 1 row and keeps the total constant.
     #[allow(dead_code)]
+    pub fn dap_sidebar_resize_section(&mut self, section_idx: usize, delta: i16) {
+        if section_idx >= 3 {
+            return; // no next section to trade rows with
+        }
+        let a = self.dap_sidebar_section_heights[section_idx] as i16;
+        let b = self.dap_sidebar_section_heights[section_idx + 1] as i16;
+        let new_a = (a + delta).max(1).min(a + b - 1);
+        let new_b = a + b - new_a;
+        self.dap_sidebar_section_heights[section_idx] = new_a as u16;
+        self.dap_sidebar_section_heights[section_idx + 1] = new_b as u16;
+    }
+
+    /// Count total items in the flat variable tree (including scope headers,
+    /// expanded children, and additional scope groups).
+    fn dap_var_flat_count(&self) -> usize {
+        let mut count = 0;
+        // Primary scope header (e.g. "Locals") if we have scope info.
+        if self.dap_primary_scope_ref > 0 {
+            count += 1; // header row
+            if self.dap_expanded_vars.contains(&self.dap_primary_scope_ref) {
+                for v in &self.dap_variables {
+                    count += 1;
+                    if v.var_ref > 0 && self.dap_expanded_vars.contains(&v.var_ref) {
+                        count += self.dap_var_subtree_count(v.var_ref);
+                    }
+                }
+            }
+        } else {
+            // No scope info (e.g. tests): show variables at root level.
+            for v in &self.dap_variables {
+                count += 1;
+                if v.var_ref > 0 && self.dap_expanded_vars.contains(&v.var_ref) {
+                    count += self.dap_var_subtree_count(v.var_ref);
+                }
+            }
+        }
+        // Additional scope groups (e.g. "Statics", "Registers").
+        for &(_, var_ref) in &self.dap_scope_groups {
+            count += 1; // group header row
+            if self.dap_expanded_vars.contains(&var_ref) {
+                count += self.dap_var_subtree_count(var_ref);
+            }
+        }
+        count
+    }
+
+    /// Recursively count children in an expanded variable subtree.
+    fn dap_var_subtree_count(&self, var_ref: u64) -> usize {
+        let children = match self.dap_child_variables.get(&var_ref) {
+            Some(c) => c,
+            None => return 0,
+        };
+        let mut count = children.len();
+        for child in children {
+            if child.var_ref > 0 && self.dap_expanded_vars.contains(&child.var_ref) {
+                count += self.dap_var_subtree_count(child.var_ref);
+            }
+        }
+        count
+    }
+
+    /// Find the DapVariable at the given flat index in the Variables section.
+    /// Returns the variable reference ID (0 if non-expandable).
+    fn dap_var_ref_at_flat_index(&self, target: usize) -> Option<u64> {
+        let mut flat = 0;
+        if self.dap_primary_scope_ref > 0 {
+            // Primary scope header.
+            if flat == target {
+                return Some(self.dap_primary_scope_ref);
+            }
+            flat += 1;
+            if self.dap_expanded_vars.contains(&self.dap_primary_scope_ref) {
+                for v in &self.dap_variables {
+                    if flat == target {
+                        return Some(v.var_ref);
+                    }
+                    flat += 1;
+                    if v.var_ref > 0 && self.dap_expanded_vars.contains(&v.var_ref) {
+                        if let Some(result) =
+                            self.dap_var_ref_in_children(v.var_ref, target, &mut flat)
+                        {
+                            return Some(result);
+                        }
+                    }
+                }
+            }
+        } else {
+            // No scope info (e.g. tests): variables at root level.
+            for v in &self.dap_variables {
+                if flat == target {
+                    return Some(v.var_ref);
+                }
+                flat += 1;
+                if v.var_ref > 0 && self.dap_expanded_vars.contains(&v.var_ref) {
+                    if let Some(result) = self.dap_var_ref_in_children(v.var_ref, target, &mut flat)
+                    {
+                        return Some(result);
+                    }
+                }
+            }
+        }
+        // Additional scope groups.
+        for &(_, var_ref) in &self.dap_scope_groups {
+            if flat == target {
+                return Some(var_ref);
+            }
+            flat += 1;
+            if self.dap_expanded_vars.contains(&var_ref) {
+                if let Some(result) = self.dap_var_ref_in_children(var_ref, target, &mut flat) {
+                    return Some(result);
+                }
+            }
+        }
+        None
+    }
+
+    /// Recursively search expanded children for a flat index.
+    fn dap_var_ref_in_children(
+        &self,
+        parent_ref: u64,
+        target: usize,
+        flat: &mut usize,
+    ) -> Option<u64> {
+        let children = self.dap_child_variables.get(&parent_ref)?;
+        for child in children {
+            if *flat == target {
+                return Some(child.var_ref);
+            }
+            *flat += 1;
+            if child.var_ref > 0 && self.dap_expanded_vars.contains(&child.var_ref) {
+                if let Some(result) = self.dap_var_ref_in_children(child.var_ref, target, flat) {
+                    return Some(result);
+                }
+            }
+        }
+        None
+    }
+
+    /// Resolve a flat breakpoint sidebar index into (file_path, BreakpointInfo index).
+    fn dap_bp_at_flat_index(&self, target: usize) -> Option<(String, usize)> {
+        let mut sorted: Vec<_> = self.dap_breakpoints.iter().collect();
+        sorted.sort_by_key(|(path, _)| path.as_str());
+        let mut flat = 0;
+        for (path, bps) in &sorted {
+            for (i, _bp) in bps.iter().enumerate() {
+                if flat == target {
+                    return Some(((*path).clone(), i));
+                }
+                flat += 1;
+            }
+        }
+        None
+    }
+
+    /// Handle a key press directed at the debug sidebar.
+    /// j/k or Up/Down navigate within the active section; Tab switches sections;
+    /// Enter/Space expand/collapse variables, navigate call stack, jump to breakpoint;
+    /// x/d delete watch expressions or breakpoints; q/Escape unfocus.
     pub fn handle_debug_sidebar_key(&mut self, key_name: &str, _ctrl: bool) -> EngineAction {
+        let section_len = self.dap_sidebar_section_len();
         match key_name {
+            "Escape" | "q" => {
+                self.dap_sidebar_has_focus = false;
+            }
             "Down" | "j" => {
-                self.dap_sidebar_selected = self.dap_sidebar_selected.saturating_add(1);
+                if section_len > 0 {
+                    self.dap_sidebar_selected =
+                        (self.dap_sidebar_selected + 1).min(section_len - 1);
+                }
+                self.dap_sidebar_ensure_visible();
             }
             "Up" | "k" => {
                 self.dap_sidebar_selected = self.dap_sidebar_selected.saturating_sub(1);
+                self.dap_sidebar_ensure_visible();
+            }
+            "Home" | "g" => {
+                // Go to top of section (gg in vim).
+                self.dap_sidebar_selected = 0;
+                self.dap_sidebar_ensure_visible();
+            }
+            "End" | "G" => {
+                // Go to bottom of section.
+                if section_len > 0 {
+                    self.dap_sidebar_selected = section_len - 1;
+                }
+                self.dap_sidebar_ensure_visible();
+            }
+            "PageDown" => {
+                let idx = Self::dap_sidebar_section_index(self.dap_sidebar_section);
+                let page = (self.dap_sidebar_section_heights[idx] as usize).max(1);
+                if section_len > 0 {
+                    self.dap_sidebar_selected =
+                        (self.dap_sidebar_selected + page).min(section_len - 1);
+                }
+                self.dap_sidebar_ensure_visible();
+            }
+            "PageUp" => {
+                let idx = Self::dap_sidebar_section_index(self.dap_sidebar_section);
+                let page = (self.dap_sidebar_section_heights[idx] as usize).max(1);
+                self.dap_sidebar_selected = self.dap_sidebar_selected.saturating_sub(page);
+                self.dap_sidebar_ensure_visible();
+            }
+            "ScrollDown" => {
+                // Scroll the active section down by 3 lines (mouse wheel).
+                let idx = Self::dap_sidebar_section_index(self.dap_sidebar_section);
+                let height = self.dap_sidebar_section_heights[idx] as usize;
+                let max_scroll = section_len.saturating_sub(height);
+                self.dap_sidebar_scroll[idx] = (self.dap_sidebar_scroll[idx] + 3).min(max_scroll);
+            }
+            "ScrollUp" => {
+                // Scroll the active section up by 3 lines (mouse wheel).
+                let idx = Self::dap_sidebar_section_index(self.dap_sidebar_section);
+                self.dap_sidebar_scroll[idx] = self.dap_sidebar_scroll[idx].saturating_sub(3);
             }
             "Tab" => {
                 self.dap_sidebar_section = match self.dap_sidebar_section {
@@ -11936,11 +12475,86 @@ impl Engine {
                 };
                 self.dap_sidebar_selected = 0;
             }
-            "Return" | "Enter" => {
-                // Select a call-stack frame when Enter is pressed in that section.
-                if self.dap_sidebar_section == DebugSidebarSection::CallStack {
-                    self.dap_select_frame(self.dap_sidebar_selected);
+            "Return" | "Enter" | " " => {
+                let sel = self.dap_sidebar_selected;
+                match self.dap_sidebar_section {
+                    DebugSidebarSection::Variables => {
+                        // Expand/collapse the variable at the selected flat index.
+                        if let Some(var_ref) = self.dap_var_ref_at_flat_index(sel) {
+                            if var_ref > 0 {
+                                self.dap_toggle_expand_var(var_ref);
+                            }
+                        }
+                    }
+                    DebugSidebarSection::CallStack => {
+                        // Select a call-stack frame and navigate to its source.
+                        self.dap_select_frame(sel);
+                        // Open the source file at the frame's line.
+                        if let Some(frame) = self.dap_stack_frames.get(sel).cloned() {
+                            if let Some(src) = &frame.source {
+                                let src_path = PathBuf::from(src);
+                                self.open_file_in_tab(&src_path);
+                                let target_line = (frame.line as usize).saturating_sub(1);
+                                self.view_mut().cursor.line = target_line;
+                                self.view_mut().cursor.col = 0;
+                                self.scroll_cursor_center();
+                            }
+                        }
+                    }
+                    DebugSidebarSection::Breakpoints => {
+                        // Jump to the breakpoint's file and line.
+                        if let Some((path, bp_idx)) = self.dap_bp_at_flat_index(sel) {
+                            let line = self
+                                .dap_breakpoints
+                                .get(&path)
+                                .and_then(|bps| bps.get(bp_idx))
+                                .map(|bp| bp.line);
+                            if let Some(line) = line {
+                                let bp_path = PathBuf::from(&path);
+                                self.open_file_in_tab(&bp_path);
+                                let target_line = (line as usize).saturating_sub(1);
+                                self.view_mut().cursor.line = target_line;
+                                self.view_mut().cursor.col = 0;
+                                self.scroll_cursor_center();
+                            }
+                        }
+                    }
+                    DebugSidebarSection::Watch => {}
                 }
+            }
+            "x" | "d" => {
+                let sel = self.dap_sidebar_selected;
+                match self.dap_sidebar_section {
+                    DebugSidebarSection::Watch => {
+                        // Remove the selected watch expression.
+                        if sel < self.dap_watch_expressions.len() {
+                            self.dap_remove_watch(sel);
+                            let new_len = self.dap_watch_expressions.len();
+                            if self.dap_sidebar_selected >= new_len && new_len > 0 {
+                                self.dap_sidebar_selected = new_len - 1;
+                            }
+                        }
+                    }
+                    DebugSidebarSection::Breakpoints => {
+                        // Remove the selected breakpoint.
+                        if let Some((path, bp_idx)) = self.dap_bp_at_flat_index(sel) {
+                            if let Some(bps) = self.dap_breakpoints.get_mut(&path) {
+                                if bp_idx < bps.len() {
+                                    let line = bps[bp_idx].line;
+                                    bps.remove(bp_idx);
+                                    self.message = format!("Breakpoint removed: line {line}");
+                                    self.dap_send_breakpoints_for_file(&path);
+                                    let new_len = self.dap_sidebar_section_len();
+                                    if self.dap_sidebar_selected >= new_len && new_len > 0 {
+                                        self.dap_sidebar_selected = new_len - 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                self.dap_sidebar_ensure_visible();
             }
             _ => {}
         }
@@ -12051,23 +12665,24 @@ impl Engine {
             match event {
                 DapEvent::Initialized => {
                     // Re-send all current breakpoints then signal configuration complete.
-                    let bps: Vec<(String, Vec<u64>)> = self
+                    let bps: Vec<(String, Vec<BreakpointInfo>)> = self
                         .dap_breakpoints
                         .iter()
-                        .filter(|(_, lines)| !lines.is_empty())
-                        .map(|(f, l)| (f.clone(), l.clone()))
+                        .filter(|(_, bps)| !bps.is_empty())
+                        .map(|(f, b)| (f.clone(), b.clone()))
                         .collect();
-                    let bp_count: usize = bps.iter().map(|(_, l)| l.len()).sum();
+                    let bp_count: usize = bps.iter().map(|(_, b)| b.len()).sum();
                     // Diagnostic log so the user can see this in Debug Output tab.
                     self.dap_output_lines.push(format!(
                         "[dap] initialized — sending {bp_count} breakpoint(s)"
                     ));
                     if let Some(mgr) = &mut self.dap_manager {
                         if let Some(server) = &mut mgr.server {
-                            for (file, lines) in &bps {
+                            for (file, file_bps) in &bps {
+                                let lines: Vec<u64> = file_bps.iter().map(|bp| bp.line).collect();
                                 self.dap_output_lines
                                     .push(format!("[dap] setBreakpoints: {file} lines {lines:?}"));
-                                server.set_breakpoints(file, lines);
+                                server.set_breakpoints(file, file_bps);
                             }
                             server.configuration_done();
                         }
@@ -12089,6 +12704,8 @@ impl Engine {
                     // Clear previous frame/variable state before populating new ones.
                     self.dap_stack_frames.clear();
                     self.dap_variables.clear();
+                    self.dap_primary_scope_name.clear();
+                    self.dap_primary_scope_ref = 0;
                     // Request stack trace so we can highlight the current line.
                     if let Some(mgr) = &mut self.dap_manager {
                         if let Some(server) = &mut mgr.server {
@@ -12102,6 +12719,8 @@ impl Engine {
                     self.dap_current_line = None;
                     self.dap_stack_frames.clear();
                     self.dap_variables.clear();
+                    self.dap_primary_scope_name.clear();
+                    self.dap_primary_scope_ref = 0;
                     self.dap_child_variables.clear();
                     self.dap_expanded_vars.clear();
                     self.dap_active_frame = 0;
@@ -12117,6 +12736,8 @@ impl Engine {
                     self.dap_current_line = None;
                     self.dap_stack_frames.clear();
                     self.dap_variables.clear();
+                    self.dap_primary_scope_name.clear();
+                    self.dap_primary_scope_ref = 0;
                     self.dap_child_variables.clear();
                     self.dap_expanded_vars.clear();
                     self.dap_active_frame = 0;
@@ -12204,12 +12825,17 @@ impl Engine {
                     let is_init_response = command == "initialize";
                     if is_init_response && success {
                         self.dap_seq_initialize = None;
-                        self.dap_output_lines
-                            .push("[dap] initialize OK — sending launch".to_string());
-                        if let Some(launch_args) = self.dap_pending_launch.take() {
+                        if let Some((req_type, launch_args)) = self.dap_pending_launch.take() {
+                            self.dap_output_lines
+                                .push(format!("[dap] initialize OK — sending {req_type}"));
                             if let Some(mgr) = &mut self.dap_manager {
                                 if let Some(server) = &mut mgr.server {
-                                    self.dap_seq_launch = Some(server.launch(launch_args));
+                                    let seq = if req_type == "attach" {
+                                        server.attach(launch_args)
+                                    } else {
+                                        server.launch(launch_args)
+                                    };
+                                    self.dap_seq_launch = Some(seq);
                                 }
                             }
                         }
@@ -12339,21 +12965,49 @@ impl Engine {
                             redraw = true;
                         }
                     } else if command == "scopes" && success {
-                        // Get the variablesReference for the first scope (usually "Locals").
-                        if let Some(var_ref) = body
+                        // Parse all scopes from the response.
+                        let scopes = body
                             .get("scopes")
                             .and_then(|s| s.as_array())
-                            .and_then(|a| a.first())
-                            .and_then(|s| s.get("variablesReference"))
-                            .and_then(|v| v.as_u64())
-                        {
-                            if var_ref > 0 {
-                                self.dap_pending_vars_ref = 0; // top-level scope fetch
+                            .cloned()
+                            .unwrap_or_default();
+                        self.dap_scope_groups.clear();
+                        for (i, scope) in scopes.iter().enumerate() {
+                            let var_ref = scope
+                                .get("variablesReference")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
+                            if var_ref == 0 {
+                                continue;
+                            }
+                            // Skip expensive scopes (e.g. Registers).
+                            let expensive = scope
+                                .get("expensive")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+                            if expensive {
+                                continue;
+                            }
+                            let name = scope
+                                .get("name")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or("Scope")
+                                .to_string();
+                            if i == 0 {
+                                // First scope (usually "Locals"): store name/ref and
+                                // auto-expand so variables are visible by default.
+                                self.dap_primary_scope_name = name;
+                                self.dap_primary_scope_ref = var_ref;
+                                self.dap_expanded_vars.insert(var_ref);
+                                self.dap_pending_vars_ref = 0;
                                 if let Some(mgr) = &mut self.dap_manager {
                                     if let Some(server) = &mut mgr.server {
                                         server.variables(var_ref);
                                     }
                                 }
+                            } else {
+                                // Additional scopes: store as expandable groups.
+                                self.dap_scope_groups.push((name, var_ref));
                             }
                         }
                     } else if command == "variables" && success {
@@ -12362,21 +13016,30 @@ impl Engine {
                             .and_then(|v| v.as_array())
                             .map(|arr| {
                                 arr.iter()
-                                    .map(|v| DapVariable {
-                                        name: v
-                                            .get("name")
-                                            .and_then(|n| n.as_str())
-                                            .unwrap_or("?")
-                                            .to_string(),
-                                        value: v
-                                            .get("value")
-                                            .and_then(|val| val.as_str())
-                                            .unwrap_or("")
-                                            .to_string(),
-                                        var_ref: v
-                                            .get("variablesReference")
-                                            .and_then(|r| r.as_u64())
-                                            .unwrap_or(0),
+                                    .map(|v| {
+                                        let name =
+                                            v.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+                                        DapVariable {
+                                            name: name.to_string(),
+                                            value: v
+                                                .get("value")
+                                                .and_then(|val| val.as_str())
+                                                .unwrap_or("")
+                                                .to_string(),
+                                            var_ref: v
+                                                .get("variablesReference")
+                                                .and_then(|r| r.as_u64())
+                                                .unwrap_or(0),
+                                            // Heuristic: netcoredbg doesn't send
+                                            // presentationHint.visibility, so detect
+                                            // non-public members by naming convention:
+                                            // `_field` (underscore prefix) and
+                                            // `<Name>k__BackingField` (compiler-generated
+                                            // auto-property backing fields).
+                                            is_nonpublic: name.starts_with('_')
+                                                || (name.starts_with('<')
+                                                    && name.contains(">k__BackingField")),
+                                        }
                                     })
                                     .collect()
                             })
@@ -12403,8 +13066,27 @@ impl Engine {
                             }
                         } else {
                             // Child variables for an expanded entry.
-                            self.dap_child_variables
-                                .insert(self.dap_pending_vars_ref, parsed);
+                            // Partition into public and non-public (private/protected/internal).
+                            let pending_ref = self.dap_pending_vars_ref;
+                            let (public_vars, nonpublic_vars): (
+                                Vec<DapVariable>,
+                                Vec<DapVariable>,
+                            ) = parsed.into_iter().partition(|v| !v.is_nonpublic);
+                            if nonpublic_vars.is_empty() {
+                                self.dap_child_variables.insert(pending_ref, public_vars);
+                            } else {
+                                let synthetic_ref = pending_ref | SYNTHETIC_NON_PUBLIC_MASK;
+                                let mut children = public_vars;
+                                children.push(DapVariable {
+                                    name: "Non-Public Members".to_string(),
+                                    value: String::new(),
+                                    var_ref: synthetic_ref,
+                                    is_nonpublic: false,
+                                });
+                                self.dap_child_variables.insert(pending_ref, children);
+                                self.dap_child_variables
+                                    .insert(synthetic_ref, nonpublic_vars);
+                            }
                         }
                         self.dap_pending_vars_ref = 0;
                         redraw = true;
@@ -22394,10 +23076,11 @@ mod tests {
 
     #[test]
     fn test_dap_toggle_breakpoint_add() {
+        use crate::core::dap::BreakpointInfo;
         let mut engine = Engine::new();
         engine.dap_toggle_breakpoint("/src/main.rs", 10);
-        let lines = engine.dap_breakpoints.get("/src/main.rs").unwrap();
-        assert_eq!(lines, &vec![10u64], "breakpoint added");
+        let bps = engine.dap_breakpoints.get("/src/main.rs").unwrap();
+        assert_eq!(bps, &vec![BreakpointInfo::new(10)], "breakpoint added");
         assert!(
             engine.message.contains("Breakpoint set"),
             "{}",
@@ -22410,8 +23093,8 @@ mod tests {
         let mut engine = Engine::new();
         engine.dap_toggle_breakpoint("/src/main.rs", 10);
         engine.dap_toggle_breakpoint("/src/main.rs", 10);
-        let lines = engine.dap_breakpoints.get("/src/main.rs").unwrap();
-        assert!(lines.is_empty(), "second toggle removes breakpoint");
+        let bps = engine.dap_breakpoints.get("/src/main.rs").unwrap();
+        assert!(bps.is_empty(), "second toggle removes breakpoint");
         assert!(
             engine.message.contains("Breakpoint removed"),
             "{}",
@@ -22425,22 +23108,24 @@ mod tests {
         engine.dap_toggle_breakpoint("/src/lib.rs", 30);
         engine.dap_toggle_breakpoint("/src/lib.rs", 5);
         engine.dap_toggle_breakpoint("/src/lib.rs", 15);
-        let lines = engine.dap_breakpoints.get("/src/lib.rs").unwrap();
-        assert_eq!(lines, &vec![5u64, 15, 30], "breakpoints stored sorted");
+        let bps = engine.dap_breakpoints.get("/src/lib.rs").unwrap();
+        let lines: Vec<u64> = bps.iter().map(|b| b.line).collect();
+        assert_eq!(lines, vec![5, 15, 30], "breakpoints stored sorted");
     }
 
     #[test]
     fn test_dap_breakpoints_multiple_files() {
+        use crate::core::dap::BreakpointInfo;
         let mut engine = Engine::new();
         engine.dap_toggle_breakpoint("/src/a.rs", 1);
         engine.dap_toggle_breakpoint("/src/b.rs", 2);
         assert_eq!(
             engine.dap_breakpoints.get("/src/a.rs").unwrap(),
-            &vec![1u64]
+            &vec![BreakpointInfo::new(1)]
         );
         assert_eq!(
             engine.dap_breakpoints.get("/src/b.rs").unwrap(),
-            &vec![2u64]
+            &vec![BreakpointInfo::new(2)]
         );
     }
 
@@ -22571,7 +23256,8 @@ mod tests {
         engine.dap_toggle_breakpoint("/tmp/foo.rs", 5);
         let bp = engine.dap_breakpoints.get("/tmp/foo.rs");
         assert!(bp.is_some(), "Breakpoint should be registered");
-        assert_eq!(bp.unwrap(), &vec![5u64]);
+        assert_eq!(bp.unwrap().len(), 1);
+        assert_eq!(bp.unwrap()[0].line, 5);
         // Toggle again to remove.
         engine.dap_toggle_breakpoint("/tmp/foo.rs", 5);
         let bp2 = engine.dap_breakpoints.get("/tmp/foo.rs");
@@ -22682,6 +23368,7 @@ mod tests {
                     .get("variablesReference")
                     .and_then(|r| r.as_u64())
                     .unwrap_or(0),
+                is_nonpublic: false,
             })
             .collect();
         assert_eq!(engine.dap_variables.len(), 2);
@@ -22731,6 +23418,7 @@ mod tests {
             name: "x".to_string(),
             value: "10".to_string(),
             var_ref: 0,
+            is_nonpublic: false,
         }];
         // Simulate Continued event clearing.
         engine.dap_stack_frames.clear();
@@ -22753,6 +23441,144 @@ mod tests {
         assert_eq!(engine.dap_sidebar_section, DebugSidebarSection::Breakpoints);
         engine.handle_debug_sidebar_key("Tab", false);
         assert_eq!(engine.dap_sidebar_section, DebugSidebarSection::Variables);
+    }
+
+    #[test]
+    fn test_dap_sidebar_section_index() {
+        assert_eq!(
+            Engine::dap_sidebar_section_index(DebugSidebarSection::Variables),
+            0
+        );
+        assert_eq!(
+            Engine::dap_sidebar_section_index(DebugSidebarSection::Watch),
+            1
+        );
+        assert_eq!(
+            Engine::dap_sidebar_section_index(DebugSidebarSection::CallStack),
+            2
+        );
+        assert_eq!(
+            Engine::dap_sidebar_section_index(DebugSidebarSection::Breakpoints),
+            3
+        );
+    }
+
+    #[test]
+    fn test_dap_sidebar_ensure_visible_scrolls_down() {
+        let mut engine = Engine::new();
+        engine.dap_sidebar_section = DebugSidebarSection::Variables;
+        engine.dap_sidebar_section_heights = [5, 5, 5, 5];
+        engine.dap_sidebar_scroll = [0; 4];
+        // Simulate selecting item 7 (beyond the 5-row viewport).
+        engine.dap_sidebar_selected = 7;
+        engine.dap_sidebar_ensure_visible();
+        // scroll should adjust so item 7 is the last visible: scroll = 7 - 5 + 1 = 3
+        assert_eq!(engine.dap_sidebar_scroll[0], 3);
+    }
+
+    #[test]
+    fn test_dap_sidebar_ensure_visible_scrolls_up() {
+        let mut engine = Engine::new();
+        engine.dap_sidebar_section = DebugSidebarSection::Watch;
+        engine.dap_sidebar_section_heights = [5, 5, 5, 5];
+        engine.dap_sidebar_scroll = [0, 10, 0, 0]; // Watch scroll at 10
+                                                   // Select item 3 which is before the scroll window.
+        engine.dap_sidebar_selected = 3;
+        engine.dap_sidebar_ensure_visible();
+        // scroll should jump to 3
+        assert_eq!(engine.dap_sidebar_scroll[1], 3);
+    }
+
+    #[test]
+    fn test_dap_sidebar_ensure_visible_no_change_when_visible() {
+        let mut engine = Engine::new();
+        engine.dap_sidebar_section = DebugSidebarSection::CallStack;
+        engine.dap_sidebar_section_heights = [5, 5, 5, 5];
+        engine.dap_sidebar_scroll = [0, 0, 2, 0]; // CallStack scroll at 2
+        engine.dap_sidebar_selected = 4; // visible: items 2,3,4,5,6
+        engine.dap_sidebar_ensure_visible();
+        assert_eq!(engine.dap_sidebar_scroll[2], 2); // unchanged
+    }
+
+    #[test]
+    fn test_dap_sidebar_ensure_visible_zero_height_noop() {
+        let mut engine = Engine::new();
+        engine.dap_sidebar_section = DebugSidebarSection::Variables;
+        engine.dap_sidebar_section_heights = [0, 0, 0, 0]; // not yet laid out
+        engine.dap_sidebar_selected = 10;
+        engine.dap_sidebar_ensure_visible();
+        assert_eq!(engine.dap_sidebar_scroll[0], 0); // unchanged
+    }
+
+    #[test]
+    fn test_dap_sidebar_resize_section() {
+        let mut engine = Engine::new();
+        engine.dap_sidebar_section_heights = [10, 10, 10, 10];
+        // Grow section 0 by 3, shrink section 1 by 3.
+        engine.dap_sidebar_resize_section(0, 3);
+        assert_eq!(engine.dap_sidebar_section_heights[0], 13);
+        assert_eq!(engine.dap_sidebar_section_heights[1], 7);
+        // Total preserved.
+        assert_eq!(engine.dap_sidebar_section_heights.iter().sum::<u16>(), 40);
+    }
+
+    #[test]
+    fn test_dap_sidebar_resize_section_clamps_min() {
+        let mut engine = Engine::new();
+        engine.dap_sidebar_section_heights = [3, 3, 10, 10];
+        // Try to shrink section 0 by 10 — should clamp to 1.
+        engine.dap_sidebar_resize_section(0, -10);
+        assert_eq!(engine.dap_sidebar_section_heights[0], 1);
+        assert_eq!(engine.dap_sidebar_section_heights[1], 5); // 3 + 3 - 1 = 5
+                                                              // Total preserved.
+        assert_eq!(
+            engine.dap_sidebar_section_heights[0] + engine.dap_sidebar_section_heights[1],
+            6
+        );
+    }
+
+    #[test]
+    fn test_dap_sidebar_resize_section_last_noop() {
+        let mut engine = Engine::new();
+        engine.dap_sidebar_section_heights = [10, 10, 10, 10];
+        // section_idx=3 has no next section — should be a no-op.
+        engine.dap_sidebar_resize_section(3, 5);
+        assert_eq!(engine.dap_sidebar_section_heights, [10, 10, 10, 10]);
+    }
+
+    #[test]
+    fn test_dap_sidebar_scroll_reset_on_stop() {
+        let mut engine = Engine::new();
+        engine.dap_sidebar_scroll = [5, 10, 3, 7];
+        engine.dap_session_active = true;
+        engine.dap_stop();
+        assert_eq!(engine.dap_sidebar_scroll, [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_dap_sidebar_jk_triggers_ensure_visible() {
+        use crate::core::dap::DapVariable;
+        let mut engine = Engine::new();
+        engine.dap_sidebar_has_focus = true;
+        engine.dap_sidebar_section = DebugSidebarSection::Variables;
+        engine.dap_sidebar_section_heights = [3, 3, 3, 3];
+        // Create 10 variables so we can scroll.
+        engine.dap_variables = (0..10)
+            .map(|i| DapVariable {
+                name: format!("v{i}"),
+                value: format!("{i}"),
+                var_ref: 0,
+                is_nonpublic: false,
+            })
+            .collect();
+        engine.dap_sidebar_selected = 0;
+        // Press j 5 times to go to item 5.
+        for _ in 0..5 {
+            engine.handle_debug_sidebar_key("j", false);
+        }
+        assert_eq!(engine.dap_sidebar_selected, 5);
+        // Scroll should have adjusted: 5 >= 0 + 3 → scroll = 5 - 3 + 1 = 3
+        assert_eq!(engine.dap_sidebar_scroll[0], 3);
     }
 
     #[test]
@@ -22898,5 +23724,366 @@ mod tests {
             !engine.debug_toolbar_visible,
             "toolbar should default to hidden"
         );
+    }
+
+    // ── Session 90: Interactive debug sidebar + conditional breakpoints ──────
+
+    #[test]
+    fn test_sidebar_var_expand_via_enter() {
+        use crate::core::dap::DapVariable;
+        let mut engine = Engine::new();
+        engine.dap_variables = vec![
+            DapVariable {
+                name: "x".to_string(),
+                value: "42".to_string(),
+                var_ref: 10,
+                is_nonpublic: false,
+            },
+            DapVariable {
+                name: "y".to_string(),
+                value: "7".to_string(),
+                var_ref: 0,
+                is_nonpublic: false,
+            },
+        ];
+        engine.dap_sidebar_section = DebugSidebarSection::Variables;
+        engine.dap_sidebar_selected = 0;
+        // Enter on expandable var should toggle expand.
+        engine.handle_debug_sidebar_key("Return", false);
+        assert!(
+            engine.dap_expanded_vars.contains(&10),
+            "var_ref 10 should be expanded"
+        );
+        // Enter again should collapse.
+        engine.dap_sidebar_selected = 0;
+        engine.handle_debug_sidebar_key("Return", false);
+        assert!(
+            !engine.dap_expanded_vars.contains(&10),
+            "var_ref 10 should be collapsed"
+        );
+    }
+
+    #[test]
+    fn test_sidebar_var_enter_on_non_expandable() {
+        use crate::core::dap::DapVariable;
+        let mut engine = Engine::new();
+        engine.dap_variables = vec![DapVariable {
+            name: "x".to_string(),
+            value: "42".to_string(),
+            var_ref: 0,
+            is_nonpublic: false,
+        }];
+        engine.dap_sidebar_section = DebugSidebarSection::Variables;
+        engine.dap_sidebar_selected = 0;
+        engine.handle_debug_sidebar_key("Return", false);
+        // No expansion should happen for var_ref=0.
+        assert!(engine.dap_expanded_vars.is_empty());
+    }
+
+    #[test]
+    fn test_sidebar_callstack_enter_selects_frame() {
+        use crate::core::dap::StackFrame;
+        let mut engine = Engine::new();
+        engine.dap_stack_frames = vec![
+            StackFrame {
+                id: 1,
+                name: "main".to_string(),
+                source: None,
+                line: 10,
+            },
+            StackFrame {
+                id: 2,
+                name: "foo".to_string(),
+                source: None,
+                line: 20,
+            },
+        ];
+        engine.dap_sidebar_section = DebugSidebarSection::CallStack;
+        engine.dap_sidebar_selected = 1;
+        engine.handle_debug_sidebar_key("Return", false);
+        assert_eq!(engine.dap_active_frame, 1, "should select frame 1");
+    }
+
+    #[test]
+    fn test_sidebar_section_len_variables() {
+        use crate::core::dap::DapVariable;
+        let mut engine = Engine::new();
+        engine.dap_variables = vec![
+            DapVariable {
+                name: "a".to_string(),
+                value: "1".to_string(),
+                var_ref: 5,
+                is_nonpublic: false,
+            },
+            DapVariable {
+                name: "b".to_string(),
+                value: "2".to_string(),
+                var_ref: 0,
+                is_nonpublic: false,
+            },
+        ];
+        engine.dap_sidebar_section = DebugSidebarSection::Variables;
+        // 2 top-level vars, none expanded.
+        assert_eq!(engine.dap_sidebar_section_len(), 2);
+        // Expand var_ref=5 with 3 children.
+        engine.dap_expanded_vars.insert(5);
+        engine.dap_child_variables.insert(
+            5,
+            vec![
+                DapVariable {
+                    name: "c1".to_string(),
+                    value: "x".to_string(),
+                    var_ref: 0,
+                    is_nonpublic: false,
+                },
+                DapVariable {
+                    name: "c2".to_string(),
+                    value: "y".to_string(),
+                    var_ref: 0,
+                    is_nonpublic: false,
+                },
+                DapVariable {
+                    name: "c3".to_string(),
+                    value: "z".to_string(),
+                    var_ref: 0,
+                    is_nonpublic: false,
+                },
+            ],
+        );
+        assert_eq!(engine.dap_sidebar_section_len(), 5);
+    }
+
+    #[test]
+    fn test_sidebar_j_k_clamped() {
+        use crate::core::dap::DapVariable;
+        let mut engine = Engine::new();
+        engine.dap_variables = vec![DapVariable {
+            name: "x".to_string(),
+            value: "1".to_string(),
+            var_ref: 0,
+            is_nonpublic: false,
+        }];
+        engine.dap_sidebar_section = DebugSidebarSection::Variables;
+        engine.dap_sidebar_selected = 0;
+        // j should not go past last item.
+        engine.handle_debug_sidebar_key("j", false);
+        assert_eq!(engine.dap_sidebar_selected, 0, "clamped at end");
+        // k should not go below 0.
+        engine.handle_debug_sidebar_key("k", false);
+        assert_eq!(engine.dap_sidebar_selected, 0, "clamped at start");
+    }
+
+    #[test]
+    fn test_sidebar_delete_watch() {
+        let mut engine = Engine::new();
+        engine.dap_add_watch("expr1".to_string());
+        engine.dap_add_watch("expr2".to_string());
+        engine.dap_sidebar_section = DebugSidebarSection::Watch;
+        engine.dap_sidebar_selected = 0;
+        engine.handle_debug_sidebar_key("x", false);
+        assert_eq!(engine.dap_watch_expressions.len(), 1);
+        assert_eq!(engine.dap_watch_expressions[0], "expr2");
+    }
+
+    #[test]
+    fn test_sidebar_delete_breakpoint() {
+        let mut engine = Engine::new();
+        engine.dap_toggle_breakpoint("/tmp/a.rs", 5);
+        engine.dap_toggle_breakpoint("/tmp/a.rs", 10);
+        engine.dap_sidebar_section = DebugSidebarSection::Breakpoints;
+        engine.dap_sidebar_selected = 0;
+        engine.handle_debug_sidebar_key("d", false);
+        let bps = engine.dap_breakpoints.get("/tmp/a.rs").unwrap();
+        assert_eq!(bps.len(), 1);
+        assert_eq!(bps[0].line, 10);
+    }
+
+    #[test]
+    fn test_conditional_breakpoint() {
+        let mut engine = Engine::new();
+        engine.dap_toggle_breakpoint("/tmp/a.rs", 5);
+        engine.dap_set_breakpoint_condition("/tmp/a.rs", 5, Some("x > 10".to_string()));
+        let bps = engine.dap_breakpoints.get("/tmp/a.rs").unwrap();
+        assert_eq!(bps[0].condition.as_deref(), Some("x > 10"));
+        // Clear condition.
+        engine.dap_set_breakpoint_condition("/tmp/a.rs", 5, None);
+        let bps = engine.dap_breakpoints.get("/tmp/a.rs").unwrap();
+        assert!(bps[0].condition.is_none());
+    }
+
+    #[test]
+    fn test_conditional_breakpoint_creates_bp() {
+        let mut engine = Engine::new();
+        // Setting a condition on a non-existent breakpoint should create one.
+        engine.dap_set_breakpoint_condition("/tmp/b.rs", 10, Some("i == 3".to_string()));
+        let bps = engine.dap_breakpoints.get("/tmp/b.rs").unwrap();
+        assert_eq!(bps.len(), 1);
+        assert_eq!(bps[0].line, 10);
+        assert_eq!(bps[0].condition.as_deref(), Some("i == 3"));
+    }
+
+    #[test]
+    fn test_hit_condition_breakpoint() {
+        let mut engine = Engine::new();
+        engine.dap_toggle_breakpoint("/tmp/c.rs", 7);
+        engine.dap_set_breakpoint_hit_condition("/tmp/c.rs", 7, Some(">= 5".to_string()));
+        let bps = engine.dap_breakpoints.get("/tmp/c.rs").unwrap();
+        assert_eq!(bps[0].hit_condition.as_deref(), Some(">= 5"));
+    }
+
+    #[test]
+    fn test_dap_condition_command() {
+        let mut engine = Engine::new();
+        // Set the buffer file_path directly so the command resolves it.
+        engine.active_buffer_state_mut().file_path =
+            Some(std::path::PathBuf::from("/tmp/test_cond.rs"));
+        // Set a regular breakpoint first.
+        engine.dap_toggle_breakpoint("/tmp/test_cond.rs", 1);
+        // Cursor is at line 0 (0-based), so DapCondition targets line 1 (1-based).
+        engine.execute_command("DapCondition x > 5");
+        let bps = engine.dap_breakpoints.get("/tmp/test_cond.rs").unwrap();
+        assert_eq!(bps[0].condition.as_deref(), Some("x > 5"));
+    }
+
+    #[test]
+    fn test_var_ref_at_flat_index_with_children() {
+        use crate::core::dap::DapVariable;
+        let mut engine = Engine::new();
+        engine.dap_variables = vec![
+            DapVariable {
+                name: "a".to_string(),
+                value: "1".to_string(),
+                var_ref: 5,
+                is_nonpublic: false,
+            },
+            DapVariable {
+                name: "b".to_string(),
+                value: "2".to_string(),
+                var_ref: 0,
+                is_nonpublic: false,
+            },
+        ];
+        // Not expanded: flat [a(idx=0), b(idx=1)].
+        assert_eq!(engine.dap_var_ref_at_flat_index(0), Some(5));
+        assert_eq!(engine.dap_var_ref_at_flat_index(1), Some(0));
+        assert_eq!(engine.dap_var_ref_at_flat_index(2), None);
+        // Expand a → children c1, c2.
+        engine.dap_expanded_vars.insert(5);
+        engine.dap_child_variables.insert(
+            5,
+            vec![
+                DapVariable {
+                    name: "c1".to_string(),
+                    value: "x".to_string(),
+                    var_ref: 0,
+                    is_nonpublic: false,
+                },
+                DapVariable {
+                    name: "c2".to_string(),
+                    value: "y".to_string(),
+                    var_ref: 0,
+                    is_nonpublic: false,
+                },
+            ],
+        );
+        // Now flat: [a(0), c1(1), c2(2), b(3)].
+        assert_eq!(engine.dap_var_ref_at_flat_index(0), Some(5));
+        assert_eq!(engine.dap_var_ref_at_flat_index(1), Some(0)); // c1
+        assert_eq!(engine.dap_var_ref_at_flat_index(2), Some(0)); // c2
+        assert_eq!(engine.dap_var_ref_at_flat_index(3), Some(0)); // b
+    }
+
+    #[test]
+    fn test_dap_scope_groups_default_empty() {
+        let engine = Engine::new();
+        assert!(engine.dap_scope_groups.is_empty());
+    }
+
+    #[test]
+    fn test_dap_scope_groups_cleared_on_stop() {
+        let mut engine = Engine::new();
+        engine.dap_scope_groups.push(("Statics".to_string(), 42));
+        engine.dap_stop();
+        assert!(engine.dap_scope_groups.is_empty());
+    }
+
+    #[test]
+    fn test_dap_scope_groups_cleared_on_select_frame() {
+        let mut engine = Engine::new();
+        engine.dap_scope_groups.push(("Statics".to_string(), 42));
+        engine.dap_select_frame(0);
+        assert!(engine.dap_scope_groups.is_empty());
+    }
+
+    #[test]
+    fn test_dap_var_flat_count_with_scope_groups() {
+        use crate::core::dap::DapVariable;
+        let mut engine = Engine::new();
+        engine.dap_variables = vec![DapVariable {
+            name: "x".to_string(),
+            value: "1".to_string(),
+            var_ref: 0,
+            is_nonpublic: false,
+        }];
+        // 1 variable, no scope groups.
+        assert_eq!(engine.dap_var_flat_count(), 1);
+        // Add two scope groups.
+        engine.dap_scope_groups =
+            vec![("Statics".to_string(), 100), ("Registers".to_string(), 200)];
+        // 1 var + 2 group headers = 3.
+        assert_eq!(engine.dap_var_flat_count(), 3);
+        // Expand "Statics" with 2 children.
+        engine.dap_expanded_vars.insert(100);
+        engine.dap_child_variables.insert(
+            100,
+            vec![
+                DapVariable {
+                    name: "s1".to_string(),
+                    value: "a".to_string(),
+                    var_ref: 0,
+                    is_nonpublic: false,
+                },
+                DapVariable {
+                    name: "s2".to_string(),
+                    value: "b".to_string(),
+                    var_ref: 0,
+                    is_nonpublic: false,
+                },
+            ],
+        );
+        // 1 var + (1 header + 2 children) + 1 header = 5.
+        assert_eq!(engine.dap_var_flat_count(), 5);
+    }
+
+    #[test]
+    fn test_dap_var_ref_at_flat_index_with_scope_groups() {
+        use crate::core::dap::DapVariable;
+        let mut engine = Engine::new();
+        engine.dap_variables = vec![DapVariable {
+            name: "x".to_string(),
+            value: "1".to_string(),
+            var_ref: 0,
+            is_nonpublic: false,
+        }];
+        engine.dap_scope_groups = vec![("Statics".to_string(), 100)];
+        // Flat: [x(0), Statics-header(1)].
+        assert_eq!(engine.dap_var_ref_at_flat_index(0), Some(0)); // x
+        assert_eq!(engine.dap_var_ref_at_flat_index(1), Some(100)); // Statics header
+        assert_eq!(engine.dap_var_ref_at_flat_index(2), None);
+        // Expand Statics with children.
+        engine.dap_expanded_vars.insert(100);
+        engine.dap_child_variables.insert(
+            100,
+            vec![DapVariable {
+                name: "s1".to_string(),
+                value: "a".to_string(),
+                var_ref: 0,
+                is_nonpublic: false,
+            }],
+        );
+        // Flat: [x(0), Statics-header(1), s1(2)].
+        assert_eq!(engine.dap_var_ref_at_flat_index(1), Some(100)); // Statics header
+        assert_eq!(engine.dap_var_ref_at_flat_index(2), Some(0)); // s1
+        assert_eq!(engine.dap_var_ref_at_flat_index(3), None);
     }
 }

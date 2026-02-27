@@ -14,6 +14,7 @@
 
 use crate::core::buffer::Buffer;
 use crate::core::buffer_manager::BufferState;
+use crate::core::dap::DapVariable;
 pub use crate::core::engine::{BottomPanelKind, DebugSidebarSection};
 use crate::core::engine::{DiffLine, Engine, SearchDirection};
 use crate::core::lsp::SignatureHelpData;
@@ -119,6 +120,8 @@ pub struct RenderedLine {
     pub diff_status: Option<DiffLine>,
     /// True when there is a DAP breakpoint set on this line.
     pub is_breakpoint: bool,
+    /// True when the breakpoint on this line has a condition or hit count.
+    pub is_conditional_bp: bool,
     /// True when the DAP adapter is currently stopped at this line.
     pub is_dap_current: bool,
     /// True when this is a soft-wrap continuation row (the 2nd+ visual row of a
@@ -389,6 +392,10 @@ pub struct DebugSidebarData {
     pub debug_output_lines: Vec<String>,
     /// Most-recent expression evaluation result, or `None`.
     pub eval_result: Option<String>,
+    /// Per-section scroll offset (items to skip from top) for [Variables, Watch, CallStack, Breakpoints].
+    pub scroll_offsets: [usize; 4],
+    /// Per-section allocated content heights in rows (excluding section header).
+    pub section_heights: [u16; 4],
 }
 
 /// The two bottom panel tabs: Terminal and Debug Output.
@@ -1349,35 +1356,129 @@ pub fn build_screen_layout(
     // Build the debug sidebar data (always present).
     let debug_sidebar = {
         let selected = engine.dap_sidebar_selected;
-        let active_section = engine.dap_sidebar_section.clone();
+        let active_section = engine.dap_sidebar_section;
 
-        // Variables section: flat tree with ▶/▼ prefixes.
+        // Variables section: flat tree with ▶/▼ prefixes, recursive expansion.
         let mut var_items: Vec<DebugSidebarItem> = Vec::new();
-        for (i, v) in engine.dap_variables.iter().enumerate() {
-            let prefix = if v.var_ref > 0 {
-                if engine.dap_expanded_vars.contains(&v.var_ref) {
-                    "\u{f0d7} " // ▼
+        let mut flat_idx = 0usize;
+        #[allow(clippy::too_many_arguments)]
+        fn build_var_tree(
+            items: &mut Vec<DebugSidebarItem>,
+            vars: &[DapVariable],
+            depth: u8,
+            flat_idx: &mut usize,
+            expanded: &std::collections::HashSet<u64>,
+            children_map: &std::collections::HashMap<u64, Vec<DapVariable>>,
+            active_section: &DebugSidebarSection,
+            selected: usize,
+        ) {
+            for v in vars {
+                let prefix = if v.var_ref > 0 {
+                    if expanded.contains(&v.var_ref) {
+                        "\u{f0d7} " // ▼
+                    } else {
+                        "\u{f0da} " // ▶
+                    }
                 } else {
-                    "\u{f0da} " // ▶
+                    "  "
+                };
+                items.push(DebugSidebarItem {
+                    text: if v.value.is_empty() {
+                        format!("{}{}", prefix, v.name)
+                    } else {
+                        format!("{}{} = {}", prefix, v.name, v.value)
+                    },
+                    indent: depth,
+                    is_selected: *active_section == DebugSidebarSection::Variables
+                        && *flat_idx == selected,
+                });
+                *flat_idx += 1;
+                if v.var_ref > 0 && expanded.contains(&v.var_ref) {
+                    if let Some(child_vars) = children_map.get(&v.var_ref) {
+                        build_var_tree(
+                            items,
+                            child_vars,
+                            depth + 1,
+                            flat_idx,
+                            expanded,
+                            children_map,
+                            active_section,
+                            selected,
+                        );
+                    }
                 }
+            }
+        }
+        if engine.dap_primary_scope_ref > 0 {
+            // Primary scope header (e.g. "▼ Locals").
+            let expanded = engine
+                .dap_expanded_vars
+                .contains(&engine.dap_primary_scope_ref);
+            let prefix = if expanded {
+                "\u{f0d7} " // ▼
             } else {
-                "  "
+                "\u{f0da} " // ▶
             };
             var_items.push(DebugSidebarItem {
-                text: format!("{}{} = {}", prefix, v.name, v.value),
+                text: format!("{prefix}{}", engine.dap_primary_scope_name),
                 indent: 0,
-                is_selected: active_section == DebugSidebarSection::Variables && i == selected,
+                is_selected: active_section == DebugSidebarSection::Variables
+                    && flat_idx == selected,
             });
-            if v.var_ref > 0 && engine.dap_expanded_vars.contains(&v.var_ref) {
-                if let Some(children) = engine.dap_child_variables.get(&v.var_ref) {
-                    for child in children {
-                        let child_prefix = if child.var_ref > 0 { "\u{f0da} " } else { "  " };
-                        var_items.push(DebugSidebarItem {
-                            text: format!("{}{} = {}", child_prefix, child.name, child.value),
-                            indent: 1,
-                            is_selected: false,
-                        });
-                    }
+            flat_idx += 1;
+            if expanded {
+                build_var_tree(
+                    &mut var_items,
+                    &engine.dap_variables,
+                    1,
+                    &mut flat_idx,
+                    &engine.dap_expanded_vars,
+                    &engine.dap_child_variables,
+                    &active_section,
+                    selected,
+                );
+            }
+        } else {
+            // No scope info (e.g. tests): show variables at root level.
+            build_var_tree(
+                &mut var_items,
+                &engine.dap_variables,
+                0,
+                &mut flat_idx,
+                &engine.dap_expanded_vars,
+                &engine.dap_child_variables,
+                &active_section,
+                selected,
+            );
+        }
+
+        // Additional scope groups (e.g. "Statics", "Registers") as expandable headers.
+        for (scope_name, var_ref) in &engine.dap_scope_groups {
+            let expanded = engine.dap_expanded_vars.contains(var_ref);
+            let prefix = if expanded {
+                "\u{f0d7} " // ▼
+            } else {
+                "\u{f0da} " // ▶
+            };
+            var_items.push(DebugSidebarItem {
+                text: format!("{prefix}{scope_name}"),
+                indent: 0,
+                is_selected: active_section == DebugSidebarSection::Variables
+                    && flat_idx == selected,
+            });
+            flat_idx += 1;
+            if expanded {
+                if let Some(child_vars) = engine.dap_child_variables.get(var_ref) {
+                    build_var_tree(
+                        &mut var_items,
+                        child_vars,
+                        1,
+                        &mut flat_idx,
+                        &engine.dap_expanded_vars,
+                        &engine.dap_child_variables,
+                        &active_section,
+                        selected,
+                    );
                 }
             }
         }
@@ -1429,17 +1530,31 @@ pub fn build_screen_layout(
 
         // Breakpoints section: all breakpoints across all files.
         let mut bp_items: Vec<DebugSidebarItem> = Vec::new();
-        let mut sorted_bp: Vec<(&String, &Vec<u64>)> = engine.dap_breakpoints.iter().collect();
+        let mut sorted_bp: Vec<_> = engine.dap_breakpoints.iter().collect();
         sorted_bp.sort_by_key(|(path, _)| path.as_str());
         let mut bp_global_idx = 0usize;
-        for (path, lines) in &sorted_bp {
+        for (path, bps) in &sorted_bp {
             let file_name = std::path::Path::new(path)
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or(path);
-            for &line in *lines {
+            for bp in *bps {
+                let suffix = if let Some(cond) = &bp.condition {
+                    format!(" [if {cond}]")
+                } else if let Some(hc) = &bp.hit_condition {
+                    format!(" [hits {hc}]")
+                } else if let Some(msg) = &bp.log_message {
+                    format!(" [log: {msg}]")
+                } else {
+                    String::new()
+                };
+                let symbol = if bp.condition.is_some() || bp.hit_condition.is_some() {
+                    "\u{25c6}" // ◆ conditional
+                } else {
+                    "\u{f111}" // ●
+                };
                 bp_items.push(DebugSidebarItem {
-                    text: format!("\u{f111} {}:{}", file_name, line), // ● file:line
+                    text: format!("{} {}:{}{}", symbol, file_name, bp.line, suffix),
                     indent: 0,
                     is_selected: active_section == DebugSidebarSection::Breakpoints
                         && bp_global_idx == selected,
@@ -1474,10 +1589,12 @@ pub fn build_screen_layout(
             breakpoints: bp_items,
             active_section,
             sidebar_selected: selected,
-            has_focus: false, // focus is tracked by the UI backends
+            has_focus: engine.dap_sidebar_has_focus,
             launch_config_name,
             debug_output_lines,
             eval_result: engine.dap_eval_result.clone(),
+            scroll_offsets: engine.dap_sidebar_scroll,
+            section_heights: engine.dap_sidebar_section_heights,
         }
     };
 
@@ -1967,11 +2084,12 @@ fn build_rendered_window(
         .as_ref()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let bp_lines: Vec<u64> = engine
+    let bp_infos: &[crate::core::dap::BreakpointInfo] = engine
         .dap_breakpoints
         .get(&bp_file_key)
-        .cloned()
-        .unwrap_or_default();
+        .map(|v| v.as_slice())
+        .unwrap_or(&[]);
+    let bp_lines: Vec<u64> = bp_infos.iter().map(|bp| bp.line).collect();
     // Show the breakpoint column when any BP is set for this file, or a DAP
     // session is active (so the column width stays stable during a session).
     let has_bp = !bp_lines.is_empty() || engine.dap_session_active;
@@ -2027,6 +2145,10 @@ fn build_rendered_window(
         // DAP: is there a breakpoint on this line? Is the adapter stopped here?
         let line_1based = line_idx as u64 + 1;
         let is_breakpoint = has_bp && bp_lines.binary_search(&line_1based).is_ok();
+        let is_conditional_bp = is_breakpoint
+            && bp_infos.iter().any(|bp| {
+                bp.line == line_1based && (bp.condition.is_some() || bp.hit_condition.is_some())
+            });
         let is_dap_current = engine
             .dap_current_line
             .as_ref()
@@ -2058,6 +2180,8 @@ fn build_rendered_window(
                     "◉" // breakpoint + current line
                 } else if is_dap_current {
                     "▶" // current execution line (no breakpoint)
+                } else if is_conditional_bp {
+                    "◆" // conditional breakpoint
                 } else if is_breakpoint {
                     "●" // breakpoint
                 } else {
@@ -2160,6 +2284,7 @@ fn build_rendered_window(
                     },
                     diff_status: if is_cont { None } else { diff_status },
                     is_breakpoint: !is_cont && is_breakpoint,
+                    is_conditional_bp: !is_cont && is_conditional_bp,
                     is_dap_current,
                     is_wrap_continuation: is_cont,
                     segment_col_offset: seg_start_char,
@@ -2178,6 +2303,7 @@ fn build_rendered_window(
                 diagnostics: line_diagnostics,
                 diff_status,
                 is_breakpoint,
+                is_conditional_bp,
                 is_dap_current,
                 is_wrap_continuation: false,
                 segment_col_offset: 0,

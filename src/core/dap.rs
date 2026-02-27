@@ -63,12 +63,37 @@ pub struct StackFrame {
     pub line: u64,
 }
 
+/// A user-defined breakpoint with optional condition and hit count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BreakpointInfo {
+    pub line: u64,
+    /// Expression condition — adapter evaluates and only stops when truthy.
+    pub condition: Option<String>,
+    /// Hit-count condition — e.g. `">= 5"`, `"% 3"` (adapter-specific syntax).
+    pub hit_condition: Option<String>,
+    /// Log message — adapter prints this instead of stopping (logpoint).
+    pub log_message: Option<String>,
+}
+
+impl BreakpointInfo {
+    pub fn new(line: u64) -> Self {
+        Self {
+            line,
+            condition: None,
+            hit_condition: None,
+            log_message: None,
+        }
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct DapVariable {
     pub name: String,
     pub value: String,
     pub var_ref: u64,
+    /// True when `presentationHint.visibility` is "private", "protected", or "internal".
+    pub is_nonpublic: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -244,6 +269,9 @@ impl DapServer {
                 "columnsStartAt1": true,
                 "pathFormat": "path",
                 "supportsVariableType": true,
+                // Enables virtual variable groups in netcoredbg (e.g. "Non-Public Members")
+                // and paged variable responses in other adapters.
+                "supportsVariablePaging": true,
                 "supportsRunInTerminalRequest": false,
             }),
         )
@@ -258,10 +286,22 @@ impl DapServer {
         self.send_request("attach", config)
     }
 
-    pub fn set_breakpoints(&mut self, source: &str, lines: &[u64]) -> u64 {
-        let bp_list: Vec<serde_json::Value> = lines
+    pub fn set_breakpoints(&mut self, source: &str, bps: &[BreakpointInfo]) -> u64 {
+        let bp_list: Vec<serde_json::Value> = bps
             .iter()
-            .map(|l| serde_json::json!({ "line": l }))
+            .map(|bp| {
+                let mut obj = serde_json::json!({ "line": bp.line });
+                if let Some(cond) = &bp.condition {
+                    obj["condition"] = serde_json::json!(cond);
+                }
+                if let Some(hc) = &bp.hit_condition {
+                    obj["hitCondition"] = serde_json::json!(hc);
+                }
+                if let Some(msg) = &bp.log_message {
+                    obj["logMessage"] = serde_json::json!(msg);
+                }
+                obj
+            })
             .collect();
         // Include `name` (just the filename) alongside the full `path` so
         // adapters that use the short name for source lookup also work.

@@ -11,7 +11,7 @@ There's a touch of irony here - using a cli tool to write the editor that I've w
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 746 tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 784 tests, zero async runtime dependency
 
 ## Building
 
@@ -273,19 +273,30 @@ Built-in Debug Adapter Protocol support with a VSCode-like UI. Open the debug si
 | Go | delve | go |
 | JavaScript / TypeScript | js-debug | node |
 | Java | java-debug | java |
+| C# | netcoredbg | coreclr |
 
-**Debug sidebar** — four collapsible sections:
-- **Variables** — local/scope variables from the current stack frame
-- **Watch** — user-defined watch expressions (`:DapWatch <expr>`)
-- **Call Stack** — all stack frames; active frame marked with `▶`
-- **Breakpoints** — all set breakpoints listed as `file.rs:N`
+**Debug sidebar** — four interactive sections (Tab to switch, j/k to navigate, Enter to act, q/Escape to unfocus):
+- **Variables** — local/scope variables with additional scope groups (e.g. Statics, Registers) as expandable headers; Enter expands/collapses nested children (recursive); C# private fields (`_name`, backing fields) automatically grouped under a collapsible **Non-Public Members** node
+- **Watch** — user-defined watch expressions (`:DapWatch <expr>`); `x`/`d` removes selected
+- **Call Stack** — all stack frames; Enter selects frame and navigates to source; active frame marked with `▶`
+- **Breakpoints** — all set breakpoints with conditions shown; Enter jumps to location; `x`/`d` removes selected
+- **Mouse** — click a section header to switch; click an item to select and activate it
 
-**Bottom panel tabs** — `Terminal` and `Debug Output` tabs; debug output shows adapter diagnostics and program output.
+**Conditional breakpoints** — breakpoints can have expression conditions, hit counts, or log messages:
+- `:DapCondition <expr>` — stop only when `<expr>` is truthy (e.g. `:DapCondition x > 10`)
+- `:DapHitCondition <count>` — stop after N hits (e.g. `:DapHitCondition >= 5`)
+- `:DapLogMessage <msg>` — print message instead of stopping (logpoint)
+- Run any command without arguments to clear the condition on the current line's breakpoint
+
+**Bottom panel tabs** — `Terminal` and `Debug Output` tabs; debug output shows adapter diagnostics and program output with a scrollable history (mouse wheel + drag scrollbar; newest output shown at bottom by default).
 
 **launch.json** — generated automatically in `.vimcode/launch.json` on first debug run; supports `${workspaceFolder}` substitution; existing `.vscode/launch.json` files are auto-migrated.
 
+**tasks.json + preLaunchTask** — if a launch configuration has `"preLaunchTask": "build"`, VimCode loads `.vimcode/tasks.json` (auto-migrated from `.vscode/tasks.json`) and runs the matching task before starting the debug adapter. Task output appears in the Debug Output panel; if the task fails the debug session is aborted.
+
 **Gutter indicators:**
 - `●` — breakpoint set
+- `◆` — conditional breakpoint (has condition or hit count)
 - `▶` — current execution line (stopped)
 - `◉` — breakpoint + current line
 
@@ -309,6 +320,9 @@ Built-in Debug Adapter Protocol support with a VSCode-like UI. Open the debug si
 | `:DapInfo` | Show detected DAP adapters |
 | `:DapEval <expr>` | Evaluate expression in current frame |
 | `:DapWatch <expr>` | Add watch expression |
+| `:DapCondition [expr]` | Set/clear condition on breakpoint at cursor |
+| `:DapHitCondition [count]` | Set/clear hit-count condition on breakpoint |
+| `:DapLogMessage [msg]` | Set/clear logpoint on breakpoint at cursor |
 | `:DapBottomPanel terminal\|output` | Switch bottom panel tab |
 
 ---
@@ -661,17 +675,17 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 
 ```
 src/
-├── main.rs          (~6690 lines)  GTK4/Relm4 UI, rendering, sidebar resize, fuzzy popup, context menu, drag-and-drop
-├── tui_main.rs      (~5770 lines)  ratatui/crossterm TUI backend, fuzzy popup, rename/move prompts
-├── render.rs        (~2642 lines)  Platform-agnostic ScreenLayout bridge (DiffLine, diff_status, DebugSidebarData, BottomPanelTabs)
+├── main.rs          (~6934 lines)  GTK4/Relm4 UI, rendering, sidebar resize, fuzzy popup, context menu, drag-and-drop
+├── tui_main.rs      (~6187 lines)  ratatui/crossterm TUI backend, fuzzy popup, rename/move prompts
+├── render.rs        (~2768 lines)  Platform-agnostic ScreenLayout bridge (DiffLine, diff_status, DebugSidebarData, BottomPanelTabs)
 ├── icons.rs            (~30 lines)  Nerd Font file-type icons (GTK + TUI)
-└── core/            (~27,600 lines)  Zero GTK/rendering deps — fully testable
-    ├── engine.rs    (~22,902 lines)  Orchestrator: keys, commands, git, macros, LSP, DAP, project search/replace, fuzzy finder
+└── core/            (~27,900 lines)  Zero GTK/rendering deps — fully testable
+    ├── engine.rs    (~24,089 lines)  Orchestrator: keys, commands, git, macros, LSP, DAP, project search/replace, fuzzy finder
     ├── terminal.rs     (~320 lines)  PTY-backed terminal pane (portable-pty + vt100, history ring buffer)
     ├── lsp.rs        (~2,045 lines)  LSP protocol transport + single-server client (request ID tracking, JSON-RPC framing)
     ├── lsp_manager.rs  (~671 lines)  Multi-server coordinator with initialization guards + built-in registry
-    ├── dap.rs          (~631 lines)  DAP protocol transport + event routing + seq→command tracking
-    ├── dap_manager.rs  (~779 lines)  DAP multi-adapter coordinator + launch.json support + install scripts
+    ├── dap.rs          (~671 lines)  DAP protocol transport + event routing + seq→command tracking + BreakpointInfo
+    ├── dap_manager.rs  (~1,089 lines)  DAP multi-adapter coordinator + launch.json + tasks.json support + install scripts
     ├── project_search.rs (~630 lines)  Regex/case/whole-word search + replace (ignore + regex crates)
     ├── buffer_manager.rs (~600 lines)  Buffer lifecycle, undo/redo stacks
     ├── buffer.rs       (~120 lines)  Rope-based text storage (ropey)

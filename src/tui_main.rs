@@ -285,6 +285,18 @@ struct SidebarScrollDrag {
     total: usize,
 }
 
+/// State for an active drag on a debug sidebar section scrollbar.
+struct DebugSidebarScrollDrag {
+    /// Section index (0–3).
+    sec_idx: usize,
+    /// Absolute terminal row of the first content row in this section.
+    track_abs_start: u16,
+    /// Number of content rows in this section.
+    track_len: u16,
+    /// Total number of items in this section.
+    total: usize,
+}
+
 // =============================================================================
 // Clipboard setup helpers
 // =============================================================================
@@ -478,9 +490,16 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
     let mut dragging_scrollbar: Option<ScrollDragState> = None;
     // Non-None while user is dragging the search-results scrollbar thumb
     let mut dragging_sidebar_search: Option<SidebarScrollDrag> = None;
+    // Non-None while user is dragging a debug sidebar section scrollbar
+    let mut dragging_debug_sb: Option<DebugSidebarScrollDrag> = None;
     // Non-None while user is dragging the terminal panel's scrollbar thumb.
     // Stores (track_start_row, track_len, total_scrollback_rows).
     let mut dragging_terminal_sb: Option<(u16, u16, usize)> = None;
+    // Scroll offset for the debug output panel (0 = newest/bottom, n = n lines up from bottom).
+    let mut debug_output_scroll: usize = 0;
+    // Non-None while user is dragging the debug output panel's scrollbar thumb.
+    // Stores (track_start_row, track_len, total_lines).
+    let mut dragging_debug_output_sb: Option<(u16, u16, usize)> = None;
     // True while user drags the terminal header row to resize the panel.
     let mut dragging_terminal_resize: bool = false;
     // True while user drags the terminal split divider left/right.
@@ -565,6 +584,39 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                 }
             }
 
+            // Compute debug sidebar section heights so ensure_visible and click
+            // hit-testing use the same dimensions as the render function.
+            if sidebar.visible && sidebar.active_panel == TuiPanel::Debug {
+                if let Ok(size) = terminal.size() {
+                    // Mirror the draw_frame v_chunks layout to get the exact
+                    // sidebar area height: subtract all rows that appear above or
+                    // below main_area (menu, quickfix, bottom-panel, debug-toolbar,
+                    // status bar, command bar).
+                    let menu_h: u16 = if engine.menu_bar_visible { 1 } else { 0 };
+                    let qf_h: u16 = if engine.quickfix_open { 6 } else { 0 };
+                    let debug_out_open = engine.bottom_panel_kind
+                        == render::BottomPanelKind::DebugOutput
+                        && !engine.dap_output_lines.is_empty();
+                    let bp_h: u16 = if engine.terminal_open || debug_out_open {
+                        engine.session.terminal_panel_rows + 2
+                    } else {
+                        0
+                    };
+                    let dt_h: u16 = if engine.debug_toolbar_visible { 1 } else { 0 };
+                    // 2 fixed rows: status bar + command bar
+                    let overhead = menu_h + qf_h + bp_h + dt_h + 2;
+                    let sidebar_h = size.height.saturating_sub(overhead) as usize;
+                    // 2 overhead rows in sidebar (header + button) + 4 section headers
+                    let content_rows = sidebar_h.saturating_sub(6);
+                    let base = content_rows / 4;
+                    let remainder = content_rows % 4;
+                    for i in 0..4 {
+                        engine.dap_sidebar_section_heights[i] =
+                            (base + if i < remainder { 1 } else { 0 }) as u16;
+                    }
+                }
+            }
+
             terminal
                 .draw(|frame| {
                     if let Some(s) = &screen {
@@ -579,6 +631,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                             fuzzy_scroll_top,
                             grep_scroll_top,
                             quickfix_scroll_top,
+                            debug_output_scroll,
                         );
                     }
                 })
@@ -912,6 +965,70 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                                     }
                                     _ => {}
                                 }
+                            }
+                        }
+                        needs_redraw = true;
+                        continue;
+                    }
+
+                    // ── Debug panel keyboard handling ──────────────────────
+                    if sidebar.active_panel == TuiPanel::Debug {
+                        // Compute section heights before key handling so
+                        // ensure_visible has valid dimensions.
+                        if let Ok(size) = terminal.size() {
+                            let menu_h: u16 = if engine.menu_bar_visible { 1 } else { 0 };
+                            let qf_h: u16 = if engine.quickfix_open { 6 } else { 0 };
+                            let debug_out_open = engine.bottom_panel_kind
+                                == render::BottomPanelKind::DebugOutput
+                                && !engine.dap_output_lines.is_empty();
+                            let bp_h: u16 = if engine.terminal_open || debug_out_open {
+                                engine.session.terminal_panel_rows + 2
+                            } else {
+                                0
+                            };
+                            let dt_h: u16 = if engine.debug_toolbar_visible { 1 } else { 0 };
+                            let overhead = menu_h + qf_h + bp_h + dt_h + 2;
+                            let sidebar_h = size.height.saturating_sub(overhead) as usize;
+                            let content_rows = sidebar_h.saturating_sub(6);
+                            let base = content_rows / 4;
+                            let remainder = content_rows % 4;
+                            for i in 0..4 {
+                                engine.dap_sidebar_section_heights[i] =
+                                    (base + if i < remainder { 1 } else { 0 }) as u16;
+                            }
+                        }
+                        let key_name = match key_event.code {
+                            KeyCode::Down => Some("Down"),
+                            KeyCode::Up => Some("Up"),
+                            KeyCode::Char('j') => Some("j"),
+                            KeyCode::Char('k') => Some("k"),
+                            KeyCode::Char('g') => Some("g"),
+                            KeyCode::Char('G') => Some("G"),
+                            KeyCode::Home => Some("Home"),
+                            KeyCode::End => Some("End"),
+                            KeyCode::PageDown => Some("PageDown"),
+                            KeyCode::PageUp => Some("PageUp"),
+                            KeyCode::Tab => Some("Tab"),
+                            KeyCode::Enter => Some("Return"),
+                            KeyCode::Char(' ') => Some(" "),
+                            KeyCode::Char('x') => Some("x"),
+                            KeyCode::Char('d') => Some("d"),
+                            KeyCode::Char('q') => Some("q"),
+                            KeyCode::Esc => Some("Escape"),
+                            KeyCode::Char('b') if ctrl => {
+                                sidebar.visible = false;
+                                sidebar.has_focus = false;
+                                engine.session.explorer_visible = false;
+                                engine.dap_sidebar_has_focus = false;
+                                let _ = engine.session.save();
+                                None
+                            }
+                            _ => None,
+                        };
+                        if let Some(name) = key_name {
+                            engine.handle_debug_sidebar_key(name, ctrl);
+                            if !engine.dap_sidebar_has_focus {
+                                sidebar.has_focus = false;
                             }
                         }
                         needs_redraw = true;
@@ -1515,7 +1632,10 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                                 &mut dragging_sidebar,
                                 &mut dragging_scrollbar,
                                 &mut dragging_sidebar_search,
+                                &mut dragging_debug_sb,
                                 &mut dragging_terminal_sb,
+                                &mut debug_output_scroll,
+                                &mut dragging_debug_output_sb,
                                 &mut dragging_terminal_resize,
                                 &mut dragging_terminal_split,
                                 last_layout.as_ref(),
@@ -1540,7 +1660,10 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                     &mut dragging_sidebar,
                     &mut dragging_scrollbar,
                     &mut dragging_sidebar_search,
+                    &mut dragging_debug_sb,
                     &mut dragging_terminal_sb,
+                    &mut debug_output_scroll,
+                    &mut dragging_debug_output_sb,
                     &mut dragging_terminal_resize,
                     &mut dragging_terminal_split,
                     last_layout.as_ref(),
@@ -1607,7 +1730,10 @@ fn handle_mouse(
     dragging_sidebar: &mut bool,
     dragging_scrollbar: &mut Option<ScrollDragState>,
     dragging_sidebar_search: &mut Option<SidebarScrollDrag>,
+    dragging_debug_sb: &mut Option<DebugSidebarScrollDrag>,
     dragging_terminal_sb: &mut Option<(u16, u16, usize)>,
+    debug_output_scroll: &mut usize,
+    dragging_debug_output_sb: &mut Option<(u16, u16, usize)>,
     dragging_terminal_resize: &mut bool,
     dragging_terminal_split: &mut bool,
     last_layout: Option<&render::ScreenLayout>,
@@ -1639,6 +1765,18 @@ fn handle_mouse(
             return new_w.clamp(15, 60);
         }
         MouseEventKind::Drag(MouseButton::Left) => {
+            // Debug sidebar section scrollbar drag
+            if let Some(ref drag) = *dragging_debug_sb {
+                if drag.track_len > 0 && drag.total > 0 {
+                    let end = drag.track_abs_start + drag.track_len - 1;
+                    let clamped = row.clamp(drag.track_abs_start, end);
+                    let ratio = (clamped - drag.track_abs_start) as f64 / drag.track_len as f64;
+                    let max_scroll = drag.total.saturating_sub(drag.track_len as usize);
+                    engine.dap_sidebar_scroll[drag.sec_idx] =
+                        (ratio * max_scroll as f64).round() as usize;
+                }
+                return sidebar_width;
+            }
             // Sidebar search-results scrollbar drag
             if let Some(ref drag) = *dragging_sidebar_search {
                 if drag.track_len > 0 && drag.total > 0 {
@@ -1665,6 +1803,17 @@ fn handle_mouse(
                 let sb_col = term_width.saturating_sub(1);
                 let left_cols = col.clamp(5, sb_col.saturating_sub(5));
                 engine.terminal_split_set_drag_cols(left_cols);
+                return sidebar_width;
+            }
+            // Debug output panel scrollbar drag
+            if let Some((track_start, track_len, total)) = *dragging_debug_output_sb {
+                if track_len > 0 && total > 0 {
+                    let offset_in_track = row.saturating_sub(track_start).min(track_len) as f64;
+                    let ratio = offset_in_track / track_len as f64;
+                    // ratio=0 (top) → max scroll (oldest); ratio=1 (bottom) → 0 (newest)
+                    let max_scroll = total.saturating_sub(track_len as usize);
+                    *debug_output_scroll = ((1.0 - ratio) * max_scroll as f64).round() as usize;
+                }
                 return sidebar_width;
             }
             // Terminal scrollbar drag
@@ -1762,7 +1911,9 @@ fn handle_mouse(
             *dragging_sidebar = false;
             *dragging_scrollbar = None;
             *dragging_sidebar_search = None;
+            *dragging_debug_sb = None;
             *dragging_terminal_sb = None;
+            *dragging_debug_output_sb = None;
             if *dragging_terminal_resize {
                 *dragging_terminal_resize = false;
                 let rows = engine.session.terminal_panel_rows;
@@ -1819,6 +1970,40 @@ fn handle_mouse(
                     } else {
                         sidebar.search_scroll_top += 3; // clamped in render_search_panel
                     }
+                } else if sidebar.active_panel == TuiPanel::Debug {
+                    use crate::core::engine::DebugSidebarSection;
+                    // Determine which section the mouse is over.
+                    let menu_offset = if engine.menu_bar_visible { 1u16 } else { 0 };
+                    let sidebar_row = row.saturating_sub(menu_offset);
+                    let sections = [
+                        (DebugSidebarSection::Variables, 0usize),
+                        (DebugSidebarSection::Watch, 1),
+                        (DebugSidebarSection::CallStack, 2),
+                        (DebugSidebarSection::Breakpoints, 3),
+                    ];
+                    let mut cur_row: u16 = 2;
+                    let mut target_idx: Option<usize> = None;
+                    for (_section, sec_idx) in &sections {
+                        let sec_height = engine.dap_sidebar_section_heights[*sec_idx];
+                        let section_end = cur_row + 1 + sec_height; // header + content
+                        if sidebar_row >= cur_row && sidebar_row < section_end {
+                            target_idx = Some(*sec_idx);
+                            break;
+                        }
+                        cur_row = section_end;
+                    }
+                    if let Some(sec_idx) = target_idx {
+                        let item_count = engine.dap_sidebar_section_item_count(sections[sec_idx].0);
+                        let height = engine.dap_sidebar_section_heights[sec_idx] as usize;
+                        let max_scroll = item_count.saturating_sub(height);
+                        if matches!(ev.kind, MouseEventKind::ScrollUp) {
+                            engine.dap_sidebar_scroll[sec_idx] =
+                                engine.dap_sidebar_scroll[sec_idx].saturating_sub(3);
+                        } else {
+                            engine.dap_sidebar_scroll[sec_idx] =
+                                (engine.dap_sidebar_scroll[sec_idx] + 3).min(max_scroll);
+                        }
+                    }
                 }
                 return sidebar_width;
             }
@@ -1842,6 +2027,29 @@ fn handle_mouse(
                         engine.terminal_scroll_down(3);
                     }
                     return sidebar_width;
+                }
+            }
+            // Debug output panel scroll wheel.
+            {
+                let debug_output_open = engine.bottom_panel_kind
+                    == render::BottomPanelKind::DebugOutput
+                    && !engine.dap_output_lines.is_empty();
+                if debug_output_open {
+                    let dt_rows: u16 = if engine.debug_toolbar_visible { 1 } else { 0 };
+                    let panel_height = engine.session.terminal_panel_rows + 2;
+                    let panel_y = term_height.saturating_sub(2 + dt_rows + panel_height);
+                    let panel_end = term_height.saturating_sub(2 + dt_rows);
+                    if row >= panel_y && row < panel_end {
+                        let content_rows = engine.session.terminal_panel_rows as usize;
+                        let total = engine.dap_output_lines.len();
+                        let max_scroll = total.saturating_sub(content_rows);
+                        if matches!(ev.kind, MouseEventKind::ScrollUp) {
+                            *debug_output_scroll = (*debug_output_scroll + 3).min(max_scroll);
+                        } else {
+                            *debug_output_scroll = debug_output_scroll.saturating_sub(3);
+                        }
+                        return sidebar_width;
+                    }
                 }
             }
 
@@ -1980,6 +2188,30 @@ fn handle_mouse(
         }
     }
 
+    // ── Debug output panel click (scrollbar) ──────────────────────────────────
+    {
+        let debug_output_open = engine.bottom_panel_kind == render::BottomPanelKind::DebugOutput
+            && !engine.dap_output_lines.is_empty();
+        if debug_output_open {
+            let dt_rows: u16 = if engine.debug_toolbar_visible { 1 } else { 0 };
+            let panel_height = engine.session.terminal_panel_rows + 2;
+            let panel_y = term_height.saturating_sub(2 + dt_rows + panel_height);
+            let panel_end = term_height.saturating_sub(2 + dt_rows);
+            if row >= panel_y && row < panel_end {
+                let term_width = terminal_size.map(|s| s.width).unwrap_or(80);
+                let sb_col = term_width.saturating_sub(1);
+                let total = engine.dap_output_lines.len();
+                let content_rows = engine.session.terminal_panel_rows as usize;
+                if total > content_rows && col == sb_col && row >= panel_y + 2 {
+                    // Click on scrollbar track — start drag.
+                    let track_start = panel_y + 2; // after tab-bar row + header row
+                    let track_len = engine.session.terminal_panel_rows;
+                    *dragging_debug_output_sb = Some((track_start, track_len, total));
+                }
+                return sidebar_width;
+            }
+        }
+    }
     // ── Terminal panel click ───────────────────────────────────────────────────
     {
         let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
@@ -2207,14 +2439,73 @@ fn handle_mouse(
                 }
             }
         } else if sidebar.active_panel == TuiPanel::Debug {
-            // sidebar_row 1 is the Run/Stop button.
-            if sidebar_row == 1 {
+            use crate::core::engine::DebugSidebarSection;
+            sidebar.has_focus = true;
+            engine.dap_sidebar_has_focus = true;
+
+            if sidebar_row == 0 {
+                // Header row — no-op
+            } else if sidebar_row == 1 {
+                // Run/Stop button
                 if engine.dap_session_active && engine.dap_stopped_thread.is_some() {
                     engine.dap_continue();
                 } else if engine.dap_session_active {
                     engine.execute_command("stop");
                 } else {
                     engine.execute_command("debug");
+                }
+            } else {
+                // Walk sections using fixed-allocation layout:
+                // row 2+ = [section_header(1) + content(height)]×4
+                let sections = [
+                    (DebugSidebarSection::Variables, 0usize),
+                    (DebugSidebarSection::Watch, 1),
+                    (DebugSidebarSection::CallStack, 2),
+                    (DebugSidebarSection::Breakpoints, 3),
+                ];
+                let mut cur_row: u16 = 2;
+                for (section, sec_idx) in &sections {
+                    let sec_height = engine.dap_sidebar_section_heights[*sec_idx];
+                    let section_header_row = cur_row;
+                    let items_start = cur_row + 1;
+                    let items_end = items_start + sec_height;
+
+                    if sidebar_row == section_header_row {
+                        engine.dap_sidebar_section = *section;
+                        engine.dap_sidebar_selected = 0;
+                        break;
+                    } else if sidebar_row >= items_start && sidebar_row < items_end {
+                        let item_count = engine.dap_sidebar_section_item_count(*section);
+                        let height = sec_height as usize;
+                        let sb_col = ACTIVITY_BAR_WIDTH + sidebar_width - 1;
+                        // Scrollbar click: rightmost column when items overflow.
+                        if col == sb_col && item_count > height && height > 0 {
+                            let rel_row = (sidebar_row - items_start) as usize;
+                            let ratio = rel_row as f64 / height as f64;
+                            let max_scroll = item_count.saturating_sub(height);
+                            engine.dap_sidebar_scroll[*sec_idx] =
+                                (ratio * max_scroll as f64) as usize;
+                            engine.dap_sidebar_section = *section;
+                            // Arm drag state for subsequent Drag events.
+                            *dragging_debug_sb = Some(DebugSidebarScrollDrag {
+                                sec_idx: *sec_idx,
+                                track_abs_start: items_start + menu_rows,
+                                track_len: sec_height,
+                                total: item_count,
+                            });
+                        } else {
+                            let scroll_off = engine.dap_sidebar_scroll[*sec_idx];
+                            let row_offset = (sidebar_row - items_start) as usize;
+                            let item_idx = scroll_off + row_offset;
+                            if item_count > 0 && item_idx < item_count {
+                                engine.dap_sidebar_section = *section;
+                                engine.dap_sidebar_selected = item_idx;
+                                engine.handle_debug_sidebar_key("Return", false);
+                            }
+                        }
+                        break;
+                    }
+                    cur_row = items_end;
                 }
             }
             return sidebar_width;
@@ -2494,6 +2785,7 @@ fn draw_frame(
     fuzzy_scroll_top: usize,
     grep_scroll_top: usize,
     quickfix_scroll_top: usize,
+    debug_output_scroll: usize,
 ) {
     let area = frame.size();
 
@@ -2707,6 +2999,7 @@ fn draw_frame(
                     frame.buffer_mut(),
                     content_area,
                     &screen.bottom_tabs.output_lines,
+                    debug_output_scroll,
                     theme,
                 );
             }
@@ -5295,34 +5588,71 @@ fn render_debug_sidebar(
         set_cell(buf, area.x + i as u16, btn_y, ch, btn_fg, hdr_bg);
     }
 
-    // ── Sections ─────────────────────────────────────────────────────────────
+    // ── Sections with fixed-height allocation + per-section scrolling ──────
     // Build minimal screen layout to get debug_sidebar data
     let screen = render::build_screen_layout(engine, theme, &[], 1.0, 1.0);
     let sidebar = &screen.debug_sidebar;
 
-    let sections: &[(&str, &[render::DebugSidebarItem], DebugSidebarSection)] = &[
+    let sections: [(
+        &str,
+        &[render::DebugSidebarItem],
+        DebugSidebarSection,
+        usize,
+    ); 4] = [
         (
             "\u{f6a9} VARIABLES",
             &sidebar.variables,
             DebugSidebarSection::Variables,
+            0,
         ),
-        ("\u{f06e} WATCH", &sidebar.watch, DebugSidebarSection::Watch),
+        (
+            "\u{f06e} WATCH",
+            &sidebar.watch,
+            DebugSidebarSection::Watch,
+            1,
+        ),
         (
             "\u{f020e} CALL STACK",
             &sidebar.frames,
             DebugSidebarSection::CallStack,
+            2,
         ),
         (
             "\u{f111} BREAKPOINTS",
             &sidebar.breakpoints,
             DebugSidebarSection::Breakpoints,
+            3,
         ),
     ];
+
+    // Available rows after header(1) + button(1) = 2 overhead rows.
+    // Each section has 1 header row, so 4 section headers = 4 rows.
+    // Content rows = available - 4 section headers.
+    let available = (area.height as usize).saturating_sub(2);
+    let section_header_rows = 4;
+    let content_rows = available.saturating_sub(section_header_rows);
+
+    // Compute per-section content heights (equal share; remainder to first).
+    let mut heights = [0u16; 4];
+    if content_rows > 0 {
+        let base = content_rows / 4;
+        let remainder = content_rows % 4;
+        for (i, h) in heights.iter_mut().enumerate() {
+            *h = (base + if i < remainder { 1 } else { 0 }) as u16;
+        }
+    }
+    // Store back into engine for ensure_visible calculations.
+    // (We can't mutate engine directly here since it's borrowed, but the heights
+    // are also stored on the sidebar data for reference.)
+
+    let track_fg = rc(theme.separator);
+    let thumb_fg = RColor::Rgb(128, 128, 128);
+    let sb_bg = rc(theme.background);
 
     let mut row_y = area.y + 2;
     let max_y = area.y + area.height;
 
-    for (section_label, items, section_kind) in sections {
+    for (section_label, items, section_kind, sec_idx) in &sections {
         if row_y >= max_y {
             break;
         }
@@ -5337,41 +5667,79 @@ fn render_debug_sidebar(
         }
         row_y += 1;
 
-        // Items
-        for item in *items {
+        let sec_height = heights[*sec_idx] as usize;
+        let scroll_off = sidebar.scroll_offsets[*sec_idx];
+        let total_items = items.len().max(1); // at least 1 for "(empty)" hint
+
+        // Render items within the allocated height
+        for row_offset in 0..sec_height {
             if row_y >= max_y {
                 break;
             }
-            let (fg, bg) = if item.is_selected {
-                (hdr_fg, sel_bg)
+            let item_idx = scroll_off + row_offset;
+            if items.is_empty() && row_offset == 0 {
+                // Empty hint
+                let hint = if engine.dap_session_active {
+                    "  (empty)"
+                } else {
+                    "  (not running)"
+                };
+                for x in area.x..area.x + area.width {
+                    set_cell(buf, x, row_y, ' ', item_fg, row_bg);
+                }
+                for (i, ch) in hint.chars().enumerate().take(area.width as usize) {
+                    set_cell(buf, area.x + i as u16, row_y, ch, item_fg, row_bg);
+                }
+            } else if item_idx < items.len() {
+                let item = &items[item_idx];
+                let (fg, bg) = if item.is_selected {
+                    (hdr_fg, sel_bg)
+                } else {
+                    (item_fg, row_bg)
+                };
+                for x in area.x..area.x + area.width {
+                    set_cell(buf, x, row_y, ' ', fg, bg);
+                }
+                let indent = item.indent as usize * 2;
+                let text = format!("{:indent$}{}", "", item.text, indent = indent);
+                // Leave rightmost column for scrollbar if needed
+                let max_text_w = if items.len() > sec_height {
+                    (area.width as usize).saturating_sub(1)
+                } else {
+                    area.width as usize
+                };
+                for (i, ch) in text.chars().enumerate().take(max_text_w) {
+                    set_cell(buf, area.x + i as u16, row_y, ch, fg, bg);
+                }
             } else {
-                (item_fg, row_bg)
-            };
-            for x in area.x..area.x + area.width {
-                set_cell(buf, x, row_y, ' ', fg, bg);
-            }
-            let indent = item.indent as usize * 2;
-            let text = format!("{:indent$}{}", "", item.text, indent = indent);
-            for (i, ch) in text.chars().enumerate().take(area.width as usize) {
-                set_cell(buf, area.x + i as u16, row_y, ch, fg, bg);
+                // Past end of items — blank row
+                for x in area.x..area.x + area.width {
+                    set_cell(buf, x, row_y, ' ', item_fg, row_bg);
+                }
             }
             row_y += 1;
         }
 
-        // Empty hint
-        if items.is_empty() && row_y < max_y {
-            let hint = if engine.dap_session_active {
-                "  (empty)"
+        // Draw scrollbar in the rightmost column if items exceed visible height
+        if items.len() > sec_height && sec_height > 0 && area.width > 1 {
+            let sb_x = area.x + area.width - 1;
+            let sb_start_y = row_y - sec_height as u16;
+            let thumb_size = ((sec_height * sec_height) / total_items).max(1);
+            let thumb_pos = if total_items <= sec_height {
+                0
             } else {
-                "  (not running)"
+                (scroll_off * sec_height) / (total_items - sec_height)
             };
-            for x in area.x..area.x + area.width {
-                set_cell(buf, x, row_y, ' ', item_fg, row_bg);
+            let thumb_pos = thumb_pos.min(sec_height.saturating_sub(thumb_size));
+            for r in 0..sec_height {
+                let in_thumb = r >= thumb_pos && r < thumb_pos + thumb_size;
+                let ch = if in_thumb { '█' } else { '░' };
+                let fg = if in_thumb { thumb_fg } else { track_fg };
+                let sy = sb_start_y + r as u16;
+                if sy < max_y {
+                    set_cell(buf, sb_x, sy, ch, fg, sb_bg);
+                }
             }
-            for (i, ch) in hint.chars().enumerate().take(area.width as usize) {
-                set_cell(buf, area.x + i as u16, row_y, ch, item_fg, row_bg);
-            }
-            row_y += 1;
         }
     }
 }
@@ -5420,11 +5788,14 @@ fn render_bottom_panel_tabs(
     }
 }
 
-/// Render the debug output tab content (scrolling log).
+/// Render the debug output tab content with a scrollbar.
+/// `scroll` = 0 shows the newest lines (bottom); larger values scroll toward older lines.
+#[allow(clippy::too_many_arguments)]
 fn render_debug_output(
     buf: &mut ratatui::buffer::Buffer,
     area: Rect,
     output_lines: &[String],
+    scroll: usize,
     theme: &Theme,
 ) {
     if area.height == 0 {
@@ -5434,6 +5805,8 @@ fn render_debug_output(
     let hdr_bg = rc(theme.status_bg);
     let item_fg = rc(theme.foreground);
     let row_bg = rc(theme.tab_bar_bg);
+    let sb_active = RColor::Rgb(128, 128, 128);
+    let sb_track = rc(theme.separator);
 
     // Header row
     for x in area.x..area.x + area.width {
@@ -5444,20 +5817,64 @@ fn render_debug_output(
         set_cell(buf, area.x + i as u16, area.y, ch, hdr_fg, hdr_bg);
     }
 
-    // Content rows: most-recent lines at bottom
     let content_rows = area.height.saturating_sub(1) as usize;
-    let recent: Vec<&String> = output_lines.iter().rev().take(content_rows).collect();
-    for (row, line_text) in recent.iter().rev().enumerate() {
+    let total = output_lines.len();
+    let max_scroll = total.saturating_sub(content_rows);
+    let scroll = scroll.min(max_scroll);
+    let show_sb = total > content_rows;
+    // Index of the first visible line (0 = oldest).
+    // scroll=0 → show lines [max_scroll..total]; scroll=max_scroll → show [0..content_rows].
+    let start_idx = max_scroll.saturating_sub(scroll);
+    let text_width = if show_sb {
+        area.width.saturating_sub(1) as usize
+    } else {
+        area.width as usize
+    };
+    let sb_x = area.x + area.width - 1;
+
+    // Content rows
+    for row in 0..content_rows {
         let ry = area.y + 1 + row as u16;
         if ry >= area.y + area.height {
             break;
         }
-        for x in area.x..area.x + area.width {
+        for x in area.x..area.x + text_width as u16 {
             set_cell(buf, x, ry, ' ', item_fg, row_bg);
         }
-        let text = format!("  {line_text}");
-        for (i, ch) in text.chars().enumerate().take(area.width as usize) {
-            set_cell(buf, area.x + i as u16, ry, ch, item_fg, row_bg);
+        if let Some(line_text) = output_lines.get(start_idx + row) {
+            let text = format!("  {line_text}");
+            for (i, ch) in text.chars().enumerate().take(text_width) {
+                set_cell(buf, area.x + i as u16, ry, ch, item_fg, row_bg);
+            }
+        }
+    }
+
+    // Scrollbar
+    if show_sb {
+        let thumb_size = (content_rows * content_rows)
+            .div_ceil(total)
+            .max(1)
+            .min(content_rows);
+        let available = content_rows.saturating_sub(thumb_size);
+        // scroll=0 → thumb at bottom; scroll=max_scroll → thumb at top
+        let thumb_top = if max_scroll > 0 {
+            (available as f64 * (max_scroll - scroll) as f64 / max_scroll as f64).round() as usize
+        } else {
+            0
+        };
+        for i in 0..content_rows {
+            let sy = area.y + 1 + i as u16;
+            let ch = if i >= thumb_top && i < thumb_top + thumb_size {
+                '█'
+            } else {
+                '░'
+            };
+            let fg = if i >= thumb_top && i < thumb_top + thumb_size {
+                sb_active
+            } else {
+                sb_track
+            };
+            set_cell(buf, sb_x, sy, ch, fg, row_bg);
         }
     }
 }

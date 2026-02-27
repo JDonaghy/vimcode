@@ -60,6 +60,13 @@ static ADAPTER_REGISTRY: &[AdapterInfo] = &[
         languages: &["java"],
         use_tcp: false,
     },
+    AdapterInfo {
+        name: "netcoredbg",
+        binary: "netcoredbg",
+        args: &["--interpreter=vscode"],
+        languages: &["csharp"],
+        use_tcp: false,
+    },
 ];
 
 /// Return the Mason DAP binary directory (same path as LSP: `~/.local/share/nvim/mason/bin`).
@@ -134,6 +141,7 @@ pub fn install_cmd_for_adapter(adapter_name: &str) -> Option<String> {
             Some("pip3 install debugpy".to_string())
         }
         "delve" => Some("go install github.com/go-delve/delve/cmd/dlv@latest".to_string()),
+        "netcoredbg" => Some(netcoredbg_install_cmd()),
         // js-debug and java-debug require complex multi-step builds — no automated install
         _ => None,
     }
@@ -207,9 +215,127 @@ fn codelldb_install_cmd() -> String {
     )
 }
 
+fn netcoredbg_install_cmd() -> String {
+    // netcoredbg releases: https://github.com/Samsung/netcoredbg/releases
+    let arch = if std::env::consts::ARCH == "aarch64" {
+        "arm64"
+    } else {
+        "amd64"
+    };
+    let os = if std::env::consts::OS == "macos" {
+        "osx"
+    } else {
+        "linux"
+    };
+    format!(
+        "curl -fSL 'https://github.com/Samsung/netcoredbg/releases/latest/download/\
+         netcoredbg-{os}-{arch}.tar.gz' -o /tmp/vimcode-netcoredbg.tar.gz && \
+         mkdir -p /tmp/vimcode-netcoredbg && \
+         tar -xzf /tmp/vimcode-netcoredbg.tar.gz -C /tmp/vimcode-netcoredbg && \
+         mkdir -p \"$HOME/.local/bin\" && \
+         cp /tmp/vimcode-netcoredbg/netcoredbg/netcoredbg \"$HOME/.local/bin/netcoredbg\" && \
+         chmod +x \"$HOME/.local/bin/netcoredbg\""
+    )
+}
+
 // ---------------------------------------------------------------------------
 // LaunchConfig — VSCode-compatible launch.json support
 // ---------------------------------------------------------------------------
+
+/// A single task definition parsed from `.vimcode/tasks.json` (VSCode-compatible).
+#[derive(Debug, Clone)]
+pub struct TaskDefinition {
+    /// Human-readable label used to reference the task (e.g. from `preLaunchTask`).
+    pub label: String,
+    /// Task type: `"process"` or `"shell"`.
+    pub task_type: String,
+    /// The command to run.
+    pub command: String,
+    /// Arguments passed to the command.
+    pub args: Vec<String>,
+    /// Working directory for the task.
+    pub cwd: String,
+}
+
+/// Parse the contents of a `tasks.json` file.
+///
+/// Returns an empty `Vec` on any parse failure so callers can gracefully degrade.
+pub fn parse_tasks_json(content: &str, workspace_folder: &str) -> Vec<TaskDefinition> {
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(content) else {
+        return Vec::new();
+    };
+    let Some(tasks) = json.get("tasks").and_then(|t| t.as_array()) else {
+        return Vec::new();
+    };
+
+    let mut result = Vec::new();
+    for task in tasks {
+        let label = task
+            .get("label")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let task_type = task
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("shell")
+            .to_string();
+        let command = task
+            .get("command")
+            .and_then(|v| v.as_str())
+            .map(|s| substitute_vars(s, workspace_folder))
+            .unwrap_or_default();
+        let args = task
+            .get("args")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(|s| substitute_vars(s, workspace_folder))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let cwd = task
+            .get("options")
+            .and_then(|o| o.get("cwd"))
+            .and_then(|v| v.as_str())
+            .map(|s| substitute_vars(s, workspace_folder))
+            .unwrap_or_else(|| workspace_folder.to_string());
+
+        if !label.is_empty() && !command.is_empty() {
+            result.push(TaskDefinition {
+                label,
+                task_type,
+                command,
+                args,
+                cwd,
+            });
+        }
+    }
+    result
+}
+
+/// Convert a `TaskDefinition` into a shell command string suitable for `sh -c`.
+pub fn task_to_shell_command(task: &TaskDefinition) -> String {
+    if task.args.is_empty() {
+        task.command.clone()
+    } else {
+        // For both "shell" and "process" types, join command + args.
+        // Shell-quote args that contain spaces or special characters.
+        let quoted_args: Vec<String> = task
+            .args
+            .iter()
+            .map(|a| {
+                if a.contains(' ') || a.contains('\'') || a.contains('"') || a.contains('\\') {
+                    format!("'{}'", a.replace('\'', "'\\''"))
+                } else {
+                    a.clone()
+                }
+            })
+            .collect();
+        format!("{} {}", task.command, quoted_args.join(" "))
+    }
+}
 
 /// A single debug configuration parsed from `.vscode/launch.json`.
 #[derive(Debug, Clone)]
@@ -230,9 +356,14 @@ pub struct LaunchConfig {
     pub raw: serde_json::Value,
 }
 
-/// Substitute `${workspaceFolder}` with `workspace_folder` in a string value.
+/// Substitute `${workspaceFolder}` and `${workspaceFolderBasename}` in a string value.
 fn substitute_vars(s: &str, workspace_folder: &str) -> String {
+    let basename = std::path::Path::new(workspace_folder)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
     s.replace("${workspaceFolder}", workspace_folder)
+        .replace("${workspaceFolderBasename}", &basename)
 }
 
 /// Parse the contents of a `.vscode/launch.json` file.
@@ -308,6 +439,7 @@ pub fn type_to_adapter(adapter_type: &str) -> Option<&'static str> {
         "go" | "delve" => Some("delve"),
         "node" | "chrome" | "pwa-node" | "pwa-chrome" => Some("js-debug"),
         "java" => Some("java-debug"),
+        "coreclr" | "netcoredbg" | "csharp" => Some("netcoredbg"),
         _ => None,
     }
 }
@@ -382,6 +514,21 @@ pub fn generate_launch_json(lang: &str, workspace_folder: &str) -> String {
 }
 "#
         .to_string(),
+        "csharp" => r#"{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "coreclr",
+      "request": "launch",
+      "name": "Debug",
+      "program": "${workspaceFolder}/bin/Debug/net8.0/${workspaceFolderBasename}.dll",
+      "args": [],
+      "cwd": "${workspaceFolder}"
+    }
+  ]
+}
+"#
+        .to_string(),
         "javascript" | "typescript" => r#"{
   "version": "0.2.0",
   "configurations": [
@@ -437,11 +584,24 @@ pub fn find_workspace_root(start_dir: &std::path::Path) -> std::path::PathBuf {
         "setup.py",
         ".git",
     ];
+    // Glob-style markers checked via directory scan (e.g. *.sln for C#).
+    const GLOB_EXTS: &[&str] = &["sln", "csproj"];
     let mut dir = start_dir.to_path_buf();
     loop {
         for marker in MARKERS {
             if dir.join(marker).exists() {
                 return dir;
+            }
+        }
+        // Check for glob-style markers (any file matching the extension).
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                if let Some(ext) = entry.path().extension() {
+                    let ext_s = ext.to_string_lossy();
+                    if GLOB_EXTS.iter().any(|g| *g == ext_s.as_ref()) {
+                        return dir;
+                    }
+                }
             }
         }
         match dir.parent() {
@@ -630,6 +790,14 @@ mod tests {
     }
 
     #[test]
+    fn test_install_cmd_netcoredbg() {
+        let cmd = install_cmd_for_adapter("netcoredbg");
+        assert!(cmd.is_some());
+        let cmd = cmd.unwrap();
+        assert!(cmd.contains("netcoredbg") && cmd.contains("curl"), "{cmd}");
+    }
+
+    #[test]
     fn test_install_cmd_unknown_returns_none() {
         assert!(install_cmd_for_adapter("java-debug").is_none());
         assert!(install_cmd_for_adapter("js-debug").is_none());
@@ -723,6 +891,9 @@ mod tests {
         assert_eq!(type_to_adapter("chrome"), Some("js-debug"));
         assert_eq!(type_to_adapter("pwa-node"), Some("js-debug"));
         assert_eq!(type_to_adapter("java"), Some("java-debug"));
+        assert_eq!(type_to_adapter("coreclr"), Some("netcoredbg"));
+        assert_eq!(type_to_adapter("netcoredbg"), Some("netcoredbg"));
+        assert_eq!(type_to_adapter("csharp"), Some("netcoredbg"));
     }
 
     #[test]
@@ -750,6 +921,23 @@ mod tests {
         assert!(json.contains("debugpy"));
     }
 
+    #[test]
+    fn test_generate_launch_json_csharp_contains_coreclr() {
+        let json = generate_launch_json("csharp", "/proj");
+        assert!(
+            json.contains("coreclr"),
+            "C# launch.json should use coreclr type"
+        );
+        assert!(json.contains("0.2.0"));
+    }
+
+    #[test]
+    fn test_adapter_for_language_csharp() {
+        let adapter = DapManager::adapter_for_language("csharp");
+        assert!(adapter.is_some());
+        assert_eq!(adapter.unwrap().name, "netcoredbg");
+    }
+
     // ── find_workspace_root ───────────────────────────────────────────────────
 
     #[test]
@@ -775,5 +963,127 @@ mod tests {
         let start = std::path::Path::new("/tmp");
         let root = find_workspace_root(start);
         assert_eq!(root, start, "no markers → fall back to start dir");
+    }
+
+    // ── parse_tasks_json ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_tasks_json_basic() {
+        let json = r#"{
+            "version": "2.0.0",
+            "tasks": [
+                {
+                    "label": "build",
+                    "type": "shell",
+                    "command": "cargo",
+                    "args": ["build"]
+                }
+            ]
+        }"#;
+        let tasks = parse_tasks_json(json, "/home/user/project");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].label, "build");
+        assert_eq!(tasks[0].task_type, "shell");
+        assert_eq!(tasks[0].command, "cargo");
+        assert_eq!(tasks[0].args, vec!["build"]);
+        assert_eq!(tasks[0].cwd, "/home/user/project");
+    }
+
+    #[test]
+    fn test_parse_tasks_json_with_workspace_vars() {
+        let json = r#"{
+            "version": "2.0.0",
+            "tasks": [
+                {
+                    "label": "build",
+                    "type": "process",
+                    "command": "${workspaceFolder}/build.sh",
+                    "args": ["--output", "${workspaceFolder}/dist"],
+                    "options": {
+                        "cwd": "${workspaceFolder}/src"
+                    }
+                }
+            ]
+        }"#;
+        let tasks = parse_tasks_json(json, "/proj");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].command, "/proj/build.sh");
+        assert_eq!(tasks[0].args, vec!["--output", "/proj/dist"]);
+        assert_eq!(tasks[0].cwd, "/proj/src");
+    }
+
+    #[test]
+    fn test_parse_tasks_json_multiple_tasks() {
+        let json = r#"{
+            "version": "2.0.0",
+            "tasks": [
+                {"label": "build", "command": "cargo", "args": ["build"]},
+                {"label": "test", "command": "cargo", "args": ["test"]}
+            ]
+        }"#;
+        let tasks = parse_tasks_json(json, "/");
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].label, "build");
+        assert_eq!(tasks[1].label, "test");
+    }
+
+    #[test]
+    fn test_parse_tasks_json_skips_incomplete() {
+        let json = r#"{
+            "version": "2.0.0",
+            "tasks": [
+                {"label": "no-command"},
+                {"command": "no-label"},
+                {"label": "good", "command": "cargo"}
+            ]
+        }"#;
+        let tasks = parse_tasks_json(json, "/");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].label, "good");
+    }
+
+    #[test]
+    fn test_parse_tasks_json_invalid_returns_empty() {
+        assert!(parse_tasks_json("not json", "/").is_empty());
+        assert!(parse_tasks_json("{}", "/").is_empty());
+        assert!(parse_tasks_json(r#"{"tasks": "bad"}"#, "/").is_empty());
+    }
+
+    // ── task_to_shell_command ────────────────────────────────────────────────
+
+    #[test]
+    fn test_task_to_shell_command_no_args() {
+        let task = TaskDefinition {
+            label: "build".into(),
+            task_type: "shell".into(),
+            command: "make".into(),
+            args: vec![],
+            cwd: "/".into(),
+        };
+        assert_eq!(task_to_shell_command(&task), "make");
+    }
+
+    #[test]
+    fn test_task_to_shell_command_with_args() {
+        let task = TaskDefinition {
+            label: "build".into(),
+            task_type: "shell".into(),
+            command: "cargo".into(),
+            args: vec!["build".into(), "--release".into()],
+            cwd: "/".into(),
+        };
+        assert_eq!(task_to_shell_command(&task), "cargo build --release");
+    }
+
+    #[test]
+    fn test_task_to_shell_command_quotes_spaces() {
+        let task = TaskDefinition {
+            label: "build".into(),
+            task_type: "process".into(),
+            command: "gcc".into(),
+            args: vec!["-o".into(), "my program".into()],
+            cwd: "/".into(),
+        };
+        assert_eq!(task_to_shell_command(&task), "gcc -o 'my program'");
     }
 }

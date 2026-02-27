@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Feb 26, 2026 (Session 89) | **Tests:** 746
+**Last updated:** Feb 26, 2026 (Session 95) | **Tests:** 784
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 72 are in **SESSION_HISTORY.md**.
@@ -8,6 +8,18 @@
 ---
 
 ## Recent Work
+
+**Session 95 — C# Non-Public Members grouping + Debug Output scrollbar + scrollbar height fix:** `dap.rs`: `is_nonpublic: bool` field on `DapVariable` struct. `engine.rs`: `SYNTHETIC_NON_PUBLIC_MASK: u64 = 0x8000_0000_0000_0000` constant; variables response handler uses name-based heuristic to detect C# private fields (`_name` prefix or `<Name>k__BackingField`); when non-public vars are found they are partitioned out and a synthetic "Non-Public Members" `DapVariable` placeholder (with `var_ref = parent | SYNTHETIC_NON_PUBLIC_MASK`) is inserted after the public vars; clicking this placeholder expands/collapses the non-public group; `dap_toggle_expand_var` handles synthetic refs (no server fetch on expand, keeps data for re-expansion, cleans up synthetic child cache on real-var collapse). `render.rs`: `build_var_tree` omits ` = ` separator when `value` is empty (for group headers). `tui_main.rs`: `debug_output_scroll: usize` + `dragging_debug_output_sb: Option<(u16, u16, usize)>` state vars; `handle_mouse` gains these two params; drag handler for debug output scrollbar; scroll-wheel handler for debug output panel area; click handler for debug output scrollbar; `render_debug_output` accepts `scroll: usize` and renders `█`/`░` scrollbar in rightmost column; fixed height-computation bug in both pre-draw and pre-keyboard sites — `bp_h` now includes `debug_out_open` (not just `terminal_open`) so `ensure_visible` uses the correct sidebar height when the debug output panel is active. 784 tests (no change).
+
+**Session 94 — Per-section scrollbars in debug sidebar:** `engine.rs`: 2 new fields `dap_sidebar_scroll: [usize; 4]` (per-section scroll offset) and `dap_sidebar_section_heights: [u16; 4]` (per-section allocated content rows); `dap_sidebar_section_index(section) -> usize` maps enum to 0–3; `dap_sidebar_ensure_visible()` adjusts scroll so selected item stays on-screen (called after j/k/x/d); `dap_sidebar_resize_section(idx, delta)` trades rows between adjacent sections with min-1 clamping; `dap_stop()` resets scroll offsets. `render.rs`: `DebugSidebarData` gains `scroll_offsets: [usize; 4]` and `section_heights: [u16; 4]`. `tui_main.rs`: `render_debug_sidebar` rewritten with fixed-height section allocation (equal share of `height - 6` content rows across 4 sections); each section renders items starting from `scroll_offset`; scrollbar (`█`/`░`) drawn in rightmost column when items exceed visible height; section heights computed in main loop before draw and stored on engine; click handler uses fixed layout + scroll offset for accurate item mapping. `main.rs`: `draw_debug_sidebar` rewritten with same fixed-allocation layout using pixel coordinates; Cairo `cr.clip()` confines each section; scrollbar thumb drawn as 4px-wide rectangle; section heights computed in both `DebugSidebarClick` and `DebugSidebarKey` handlers; click handler uses fixed layout + scroll offset. 10 new tests. 784 tests (+10).
+
+**Session 93 — Scope-grouped variables in debug sidebar:** `engine.rs`: new `dap_scope_groups: Vec<(String, u64)>` field stores additional DAP scopes beyond the primary "Locals" scope; `poll_dap` scopes handler now parses ALL non-expensive scopes (first → `dap_variables`, rest → `dap_scope_groups` with name + variablesReference); `dap_var_flat_count()` and `dap_var_ref_at_flat_index()` updated to include scope group headers and their expanded children; `dap_stop()` and `dap_select_frame()` clear `dap_scope_groups`; 5 new tests. `render.rs`: after building variable tree items, appends scope group entries as expandable `▶`/`▼` headers at indent 0 with children rendered via `build_var_tree()` at indent 1 when expanded. 774 tests (+5).
+
+**Session 92 — VSCode tasks.json + preLaunchTask execution:** `dap_manager.rs`: `TaskDefinition` struct (label/task_type/command/args/cwd); `parse_tasks_json(content, workspace_folder)` parses `{"version":"2.0.0","tasks":[...]}` with `${workspaceFolder}` substitution; `task_to_shell_command(task)` converts to shell string with quoting; 8 new tests. `engine.rs`: 2 new fields (`dap_pre_launch_done: bool`, `dap_deferred_lang: Option<String>`); `dap_start_debug()` now migrates `.vscode/tasks.json` → `.vimcode/tasks.json`; if config has `preLaunchTask`, loads tasks.json, finds matching task by label, runs via `lsp_manager.run_install_command()` with `"dap_task:"` prefix, returns early; `poll_lsp` `InstallComplete` handler detects `"dap_task:"` prefix — on success resumes `dap_start_debug()`, on failure aborts session; `dap_stop()` resets both fields. 769 tests (+8).
+
+**Session 91 — Debug sidebar mouse + keyboard interactivity + C# DAP adapter:** Wired debug sidebar keyboard and mouse input in both GTK and TUI backends. `engine.rs`: added `dap_sidebar_has_focus: bool` field; key guard in `handle_key()` routes to `handle_debug_sidebar_key()` when focused; added `q`/`Escape` handling to unfocus sidebar; added `dap_sidebar_section_item_count(section)` public method for per-section item counts; `DebugSidebarSection` gains `Copy` derive; removed `#[allow(dead_code)]` from sidebar helper methods. `tui_main.rs`: added `TuiPanel::Debug` keyboard block (j/k/Tab/Enter/Space/x/d/q/Escape dispatched to engine); expanded mouse click handler — walks 4 sections starting at row 2 to map click row to section header (switches section) or item (sets selection + triggers Enter action); sets `sidebar.has_focus` + `engine.dap_sidebar_has_focus` on click. `main.rs`: added `Msg::DebugSidebarKey` variant; added `EventControllerKey` to `debug_sidebar_da` with `set_focusable(true)` + key dispatch; expanded `Msg::DebugSidebarClick` handler — same row-to-section walk as TUI; click gives focus to DA via `grab_focus()`; `FocusEditor` and `MouseClick` clear `dap_sidebar_has_focus`; `DebugSidebarKey` handler maps GTK key names to engine key names, returns focus to editor on unfocus. `render.rs`: `has_focus` now populated from `engine.dap_sidebar_has_focus` (was hardcoded false). `dap_manager.rs`: added `netcoredbg` adapter for C# (language `"csharp"`, binary `netcoredbg --interpreter=vscode`, stdio); `type_to_adapter` maps `"coreclr"`/`"netcoredbg"`/`"csharp"` → `"netcoredbg"`; `install_cmd_for_adapter("netcoredbg")` downloads from Samsung/netcoredbg GitHub releases; `generate_launch_json("csharp")` generates `coreclr` type config; `substitute_vars` now handles `${workspaceFolderBasename}`; `find_workspace_root` checks for `.sln`/`.csproj` files; 3 new tests. 761 tests.
+
+**Session 90 — Interactive debug sidebar + conditional breakpoints:** `dap.rs`: `BreakpointInfo` struct with `line`, `condition`, `hit_condition`, `log_message` fields; `set_breakpoints()` now sends condition/hitCondition/logMessage to adapter; `BreakpointInfo::new(line)` constructor. `engine.rs`: changed `dap_breakpoints: HashMap<String, Vec<u64>>` → `HashMap<String, Vec<BreakpointInfo>>`; `dap_toggle_breakpoint` updated for `BreakpointInfo`; `dap_set_breakpoint_condition()`/`dap_set_breakpoint_hit_condition()`/`dap_set_breakpoint_log_message()` methods; `dap_send_breakpoints_for_file()` helper; `dap_sidebar_section_len()`, `dap_var_flat_count()`, `dap_var_subtree_count()`, `dap_var_ref_at_flat_index()`, `dap_var_ref_in_children()`, `dap_bp_at_flat_index()` sidebar helpers; `handle_debug_sidebar_key()` fully wired: Variables section Enter/Space expands/collapses (recursive via `dap_toggle_expand_var`), CallStack Enter selects frame + navigates to source file/line, Breakpoints Enter jumps to file/line, Watch/Breakpoints `x`/`d` deletes selected item; j/k clamped to section length; `:DapCondition`/`:DapHitCondition`/`:DapLogMessage` commands (set/clear on breakpoint at current cursor line). `render.rs`: `DapVariable` import; recursive `build_var_tree()` replaces flat loop for Variables section (supports arbitrary nesting depth with `indent` levels); Breakpoints section shows `◆` symbol + `[if expr]`/`[hits N]`/`[log: msg]` suffixes for conditional breakpoints; `RenderedLine` gains `is_conditional_bp: bool`; gutter shows `◆` for conditional breakpoints. 758 tests (+12).
 
 **Session 89 — DAP debugger polish + codelldb compatibility:** Fixed codelldb adapter launching (missing `lldb-server` binary in install script; `extension/lldb/bin/*` now extracted). Fixed all DAP response handling: codelldb omits `command` field from responses — added `pending_commands: HashMap<u64, String>` to `DapServer` in `dap.rs` with `resolve_command(req_seq)` method; applied at top of `poll_dap` `RequestComplete` handler so all downstream checks work. Deferred launch via `dap_seq_initialize` seq-based matching. Three-state debug sidebar button: Start Debugging (green, no session) → Stop (red, running) → Continue (green, stopped at breakpoint); updated both GTK and TUI backends. Breakpoint gutter symbol fix: `▶` for current execution line (no breakpoint), `◉` for current+breakpoint, `●` for breakpoint only. Navigate to stopped file/line: after stackTrace response, opens source file and centers cursor on stopped line via `scroll_cursor_center()`. ANSI/control character stripping for DAP output (CSI, OSC, two-byte escapes). Default `"stdio": null` for codelldb launch args to prevent debuggee stdout flooding Debug Output panel (especially noisy for TUI apps). Auto-switch to Debug sidebar panel when debug session starts (`dap_wants_sidebar` one-shot flag consumed by both backends). `render.rs`: `DebugSidebarData` gains `stopped: bool` field. 746 tests.
 
@@ -55,26 +67,26 @@
 
 ```
 src/
-├── main.rs          (~6690 lines)  GTK4/Relm4 UI, rendering, all panels
-├── tui_main.rs      (~5770 lines)  ratatui/crossterm TUI backend
-├── render.rs        (~2642 lines)  Platform-agnostic ScreenLayout bridge
+├── main.rs          (~6934 lines)  GTK4/Relm4 UI, rendering, all panels
+├── tui_main.rs      (~6187 lines)  ratatui/crossterm TUI backend
+├── render.rs        (~2768 lines)  Platform-agnostic ScreenLayout bridge
 ├── icons.rs            (~30 lines)  Nerd Font file-type icons
-└── core/            (~27,600 lines)  Zero GTK/rendering deps — fully testable
-    ├── engine.rs    (~22,902 lines)  Orchestrator: keys, commands, all features
+└── core/            (~27,900 lines)  Zero GTK/rendering deps — fully testable
+    ├── engine.rs    (~24,089 lines)  Orchestrator: keys, commands, all features
     ├── terminal.rs     (~320 lines)  PTY-backed terminal pane (portable-pty + vt100)
     ├── lsp.rs        (~2,045 lines)  LSP protocol transport + single-server client
     ├── lsp_manager.rs  (~671 lines)  Multi-server coordinator + built-in registry
     ├── settings.rs   (~1,095 lines)  JSON config, :set parsing, key bindings
-    ├── dap.rs          (~631 lines)  DAP protocol transport + event routing
-    ├── dap_manager.rs  (~779 lines)  DAP multi-adapter coordinator + launch.json support
+    ├── dap.rs          (~671 lines)  DAP protocol transport + event routing
+    ├── dap_manager.rs  (~1,089 lines)  DAP multi-adapter coordinator + launch.json + tasks.json support
     ├── project_search.rs (~630 lines)  Regex/case/word search + replace
     ├── buffer_manager.rs (~600 lines)  Buffer lifecycle, undo/redo
     ├── buffer.rs       (~120 lines)  Rope-based text storage (ropey)
     ├── session.rs      (~180 lines)  Session state persistence
     ├── git.rs          (~635 lines)  git subprocess integration
     └── window.rs, tab.rs, view.rs, cursor.rs, mode.rs, syntax.rs (~893 lines)
-Tests: 746 passing
-Total: ~42,700 lines
+Tests: 784 passing
+Total: ~43,900 lines
 ```
 
 ---
@@ -112,12 +124,13 @@ Total: ~42,700 lines
 - [x] Terminal horizontal split view (`⊞` toolbar toggle, two panes side-by-side, `│` divider, click or Ctrl-W to switch focus)
 - [x] Terminal split drag-to-resize (drag `│` divider to rebalance pane widths; PTY resized on release)
 - [x] Menu bar + debug toolbar (hamburger, 7 menus, F5/F6/F9-F11 shortcuts)
-- [x] DAP debugger (codelldb/debugpy/delve/js-debug/java-debug; breakpoint gutter; stopped-line highlight; variables panel + call stack + output console; panel focus + frame navigation; expression evaluation via `:DapEval`)
+- [x] DAP debugger (codelldb/debugpy/delve/js-debug/java-debug/netcoredbg; breakpoint gutter; stopped-line highlight; variables panel + call stack + output console; panel focus + frame navigation; expression evaluation via `:DapEval`)
 - [x] VSCode-like debugger UI (debug sidebar panel with Variables/Watch/Call Stack/Breakpoints; bottom panel tabs for Terminal/Debug Output; launch.json support; auto-open sidebar on debug start; navigate-to-line on step; codelldb compatibility)
 - [x] `:set wrap` / soft line-wrap rendering (`gj`/`gk` for visual-line movement; cursor tracks correct segment; no h-scroll when wrap on)
 
-### In Progress
-- [ ] **Interactive debug sidebar** — expand/collapse variables in sidebar; navigate call stack frames (click to switch); conditional breakpoints (hit count, expression conditions)
+### Completed (continued)
+- [x] Interactive debug sidebar — expand/collapse variables (recursive); call stack frame navigation with source jump; conditional breakpoints (`:DapCondition`, `:DapHitCondition`, `:DapLogMessage`); `◆` gutter symbol; watch/breakpoint deletion from sidebar
+- [x] Debug sidebar mouse + keyboard interactivity — j/k/Tab/Enter/x/d/q navigation in both GTK and TUI; click-to-select sections and items; section header click switches active section; item click triggers action (expand var, jump to frame, jump to breakpoint)
 
 ### Planned / Ideas
 - [ ] More Tree-sitter grammars (HTML, YAML, Lua — await tree-sitter 0.22 migration)
