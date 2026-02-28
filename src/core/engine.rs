@@ -15272,6 +15272,8 @@ mod tests {
         std::fs::write(&p3, "ccc").unwrap();
 
         let mut engine = Engine::new();
+        // Use temp dir as cwd so no per-workspace session interferes.
+        engine.cwd = std::env::temp_dir();
         engine.session.open_files = vec![p1.clone(), p2.clone(), p3.clone()];
         engine.session.active_file = Some(p2.clone());
         engine.restore_session_files();

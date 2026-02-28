@@ -11,7 +11,7 @@ use gtk4::pango::{self, AttrColor, AttrList, FontDescription};
 use gtk4::prelude::*;
 use pangocairo::functions as pangocairo;
 use relm4::prelude::*;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -115,6 +115,11 @@ struct App {
     window: gtk4::Window,
     /// Last time sc_refresh() was called for the Git sidebar auto-refresh.
     last_sc_refresh: std::time::Instant,
+    /// Full-window overlay DrawingArea that draws the menu dropdown.
+    /// Can-target toggles true/false with menu open/close.
+    menu_dropdown_da: Rc<RefCell<Option<gtk4::DrawingArea>>>,
+    /// Cached line height shared with menu_dropdown_da draw/click closures.
+    menu_dd_line_height: Rc<Cell<f64>>,
 }
 
 /// Scrollbars and indicators for a single window
@@ -349,6 +354,8 @@ impl SimpleComponent for App {
                 gtk4::glib::Propagation::Proceed
             },
 
+            #[name = "window_overlay"]
+            gtk4::Overlay {
             gtk4::Box {
                 set_orientation: gtk4::Orientation::Vertical,
 
@@ -1248,6 +1255,7 @@ impl SimpleComponent for App {
                 }
                 }  // close main_hbox
             }  // close outer gtk4::Box
+            }  // close window_overlay
         }
     }
 
@@ -1310,6 +1318,9 @@ impl SimpleComponent for App {
         let file_tree_view_ref = Rc::new(RefCell::new(None));
         let drawing_area_ref = Rc::new(RefCell::new(None));
         let menu_bar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> = Rc::new(RefCell::new(None));
+        let menu_dropdown_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> =
+            Rc::new(RefCell::new(None));
+        let menu_dd_lh: Rc<Cell<f64>> = Rc::new(Cell::new(24.0));
         let debug_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> =
             Rc::new(RefCell::new(None));
         let git_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> =
@@ -1385,6 +1396,8 @@ impl SimpleComponent for App {
             terminal_resize_dragging: false,
             terminal_split_dragging: false,
             last_sc_refresh: std::time::Instant::now(),
+            menu_dropdown_da: menu_dropdown_da_ref.clone(),
+            menu_dd_line_height: menu_dd_lh.clone(),
         };
         let widgets = view_output!();
 
@@ -1395,6 +1408,137 @@ impl SimpleComponent for App {
         *overlay_ref.borrow_mut() = Some(widgets.editor_overlay.clone());
         *sidebar_inner_box_ref.borrow_mut() = Some(widgets.sidebar_inner_box.clone());
         *search_results_list_ref.borrow_mut() = Some(widgets.search_results_list.clone());
+
+        // ── Menu dropdown overlay DrawingArea ─────────────────────────────────
+        // A full-window transparent overlay that draws the dropdown in window
+        // coordinates (x=0 at window left edge).  can_target is toggled on/off
+        // with menu open/close so that normal editor clicks pass through.
+        {
+            let menu_dd_da = gtk4::DrawingArea::new();
+            menu_dd_da.set_hexpand(true);
+            menu_dd_da.set_vexpand(true);
+            menu_dd_da.set_can_target(false); // pass-through until menu opens
+
+            // Draw function — only renders when a menu is open.
+            {
+                let engine = engine.clone();
+                let lh = menu_dd_lh.clone();
+                menu_dd_da.set_draw_func(move |_, cr, _, _| {
+                    let engine = engine.borrow();
+                    let Some(midx) = engine.menu_open_idx else {
+                        return;
+                    };
+                    let theme = Theme::onedark();
+                    let open_items: Vec<render::MenuItemData> = render::MENU_STRUCTURE
+                        .get(midx)
+                        .map(|(_, _, items)| items.to_vec())
+                        .unwrap_or_default();
+                    let mut open_menu_col: u16 = 0;
+                    for i in 0..midx {
+                        if let Some((name, _, _)) = render::MENU_STRUCTURE.get(i) {
+                            open_menu_col += name.len() as u16 + 2;
+                        }
+                    }
+                    let title = engine
+                        .active_buffer_name()
+                        .map(|n| format!("VimCode \u{2014} {}", n))
+                        .unwrap_or_else(|| "VimCode".to_string());
+                    let data = render::MenuBarData {
+                        open_menu_idx: engine.menu_open_idx,
+                        open_items,
+                        open_menu_col,
+                        highlighted_item_idx: engine.menu_highlighted_item,
+                        title,
+                        show_window_controls: true,
+                    };
+                    let line_height = lh.get();
+                    // Draw the dropdown at window-level coordinates.
+                    // anchor_y = line_height (below the menu bar row).
+                    draw_menu_dropdown(cr, &data, &theme, 0.0, line_height, 0.0, 0.0, line_height);
+                });
+            }
+
+            // Click handler — routes clicks to menu items or closes the menu.
+            {
+                let sender_dd = sender.input_sender().clone();
+                let engine_dd = engine.clone();
+                let lh_dd = menu_dd_lh.clone();
+                let gesture = gtk4::GestureClick::new();
+                gesture.set_button(1);
+                gesture.connect_pressed(move |_, _, x, y| {
+                    let engine = engine_dd.borrow();
+                    let line_height = lh_dd.get();
+                    let Some(open_idx) = engine.menu_open_idx else {
+                        return;
+                    };
+                    if y < line_height {
+                        // Click in the menu-bar row — check if another label was clicked.
+                        let mut cursor_x = 8.0_f64;
+                        let mut clicked_menu: Option<usize> = None;
+                        for (idx, (name, _, _)) in render::MENU_STRUCTURE.iter().enumerate() {
+                            let item_w = name.len() as f64 * 7.0 + 8.0;
+                            if x >= cursor_x && x < cursor_x + item_w {
+                                clicked_menu = Some(idx);
+                                break;
+                            }
+                            cursor_x += item_w;
+                        }
+                        drop(engine);
+                        match clicked_menu {
+                            Some(idx) if idx != open_idx => {
+                                sender_dd.send(Msg::OpenMenu(idx)).ok();
+                            }
+                            _ => {
+                                sender_dd.send(Msg::CloseMenu).ok();
+                            }
+                        }
+                    } else if let Some((_, _, items)) = render::MENU_STRUCTURE.get(open_idx) {
+                        // Click in the dropdown area.
+                        let mut popup_x = 8.0_f64;
+                        for i in 0..open_idx {
+                            if let Some((name, _, _)) = render::MENU_STRUCTURE.get(i) {
+                                popup_x += name.len() as f64 * 7.0 + 8.0;
+                            }
+                        }
+                        let popup_w = 200.0_f64;
+                        let popup_y = line_height;
+                        let popup_h = (items.len() as f64 + 1.0) * line_height;
+                        if y >= popup_y
+                            && y < popup_y + popup_h
+                            && x >= popup_x
+                            && x < popup_x + popup_w
+                        {
+                            let raw_idx = ((y - popup_y) / line_height) as usize;
+                            let item_real = raw_idx.saturating_sub(1);
+                            if raw_idx >= 1
+                                && item_real < items.len()
+                                && !items[item_real].separator
+                            {
+                                let action = items[item_real].action.to_string();
+                                drop(engine);
+                                sender_dd
+                                    .send(Msg::MenuActivateItem(open_idx, item_real, action))
+                                    .ok();
+                            } else {
+                                drop(engine);
+                                sender_dd.send(Msg::CloseMenu).ok();
+                            }
+                        } else {
+                            // Click outside the dropdown → close it.
+                            drop(engine);
+                            sender_dd.send(Msg::CloseMenu).ok();
+                        }
+                    } else {
+                        drop(engine);
+                        sender_dd.send(Msg::CloseMenu).ok();
+                    }
+                });
+                menu_dd_da.add_controller(gesture);
+            }
+
+            widgets.window_overlay.add_overlay(&menu_dd_da);
+            *menu_dropdown_da_ref.borrow_mut() = Some(menu_dd_da);
+        }
 
         // ── Menu bar DrawingArea setup ─────────────────────────────────────────
         // Draw function: renders menu labels using the same Cairo helper.
@@ -2396,69 +2540,15 @@ impl SimpleComponent for App {
                         engine.terminal_has_focus = false;
                     }
 
-                    // ── Dropdown click detection ──────────────────────────────
-                    // Menu bar strip clicks are handled by menu_bar_da's GestureClick.
-                    // Here we only check for dropdown item clicks.
-                    // We collect the pending action first so we can drop engine before
-                    // calling sender.input() (needed so MenuActivateItem handler can
-                    // re-borrow engine to intercept dialog actions like OpenFolderDialog).
-                    let line_height = self.cached_line_height;
-                    let mut menu_handled = false;
-                    let mut pending_menu_action: Option<(usize, usize, String)> = None;
+                    // Dropdown clicks are fully handled by the menu_dropdown_da overlay
+                    // widget (which has can_target=true while a menu is open).
+                    // If we reach here, no menu is open and we proceed with normal handling.
                     {
-                        let mut engine = self.engine.borrow_mut();
-                        if let Some(open_idx) = engine.menu_open_idx {
-                            if let Some((_, _, items)) = render::MENU_STRUCTURE.get(open_idx) {
-                                // Dropdown is drawn at y=0 of the drawing_area
-                                // (which starts just below the full-width menu_bar_da widget).
-                                let popup_y = 0.0_f64;
-                                let popup_h = (items.len() as f64 + 1.0) * line_height;
-                                // Compute popup_x using same layout as draw_menu_bar/draw_menu_dropdown.
-                                let mut popup_x = 8.0_f64;
-                                for i in 0..open_idx {
-                                    if let Some((name, _, _)) = render::MENU_STRUCTURE.get(i) {
-                                        popup_x += name.len() as f64 * 7.0 + 8.0;
-                                    }
-                                }
-                                let popup_w = 200.0_f64;
-                                if y >= popup_y
-                                    && y < popup_y + popup_h
-                                    && x >= popup_x
-                                    && x < popup_x + popup_w
-                                {
-                                    // Click inside the dropdown.
-                                    if y >= popup_y + line_height * 0.5 {
-                                        let item_idx = ((y - popup_y) / line_height) as usize;
-                                        let actual = item_idx.saturating_sub(1);
-                                        if actual < items.len() && !items[actual].separator {
-                                            let action = items[actual].action.to_string();
-                                            // Store action; engine borrow released at end of
-                                            // this block so MenuActivateItem handler can reborrow.
-                                            pending_menu_action = Some((open_idx, actual, action));
-                                        }
-                                    }
-                                    menu_handled = true;
-                                } else {
-                                    // Click outside dropdown → close it.
-                                    engine.close_menu();
-                                }
-                            }
-                        }
-                    } // engine borrow dropped here
-                    if let Some((menu_idx, item_idx, action)) = pending_menu_action {
-                        sender.input(Msg::MenuActivateItem(menu_idx, item_idx, action));
-                        self.redraw = true;
-                        // Don't fall through to other hit-tests; menu handled it.
-                        // Return to avoid re-borrowing engine unnecessarily.
-                    } else {
                         let mut engine = self.engine.borrow_mut();
 
                         // ── Debug toolbar hit-test ────────────────────────────────
                         let mut toolbar_handled = false;
-                        if !menu_handled
-                            && engine.debug_toolbar_visible
-                            && self.cached_line_height > 0.0
-                        {
+                        if engine.debug_toolbar_visible && self.cached_line_height > 0.0 {
                             // Toolbar is the single row above status(1)+cmd(1).
                             // It is always at a fixed position; terminal/quickfix/DAP
                             // panels stack above it, not below it.
@@ -2486,7 +2576,7 @@ impl SimpleComponent for App {
                             }
                         }
 
-                        if !menu_handled && !toolbar_handled {
+                        if !toolbar_handled {
                             // Clear selection on click in VSCode mode.
                             if engine.is_vscode_mode() {
                                 engine.vscode_clear_selection();
@@ -2503,7 +2593,7 @@ impl SimpleComponent for App {
                             }
                         }
                         self.redraw = !self.redraw;
-                    } // close the `else` branch for pending_menu_action
+                    }
                 }
             }
             Msg::MouseDoubleClick {
@@ -3009,6 +3099,8 @@ impl SimpleComponent for App {
                 let old_char_width = self.cached_char_width;
                 self.cached_line_height = line_height;
                 self.cached_char_width = char_width;
+                // Keep menu dropdown overlay in sync with current line height.
+                self.menu_dd_line_height.set(line_height);
                 // Sync menu bar height to font metrics
                 if let Some(ref da) = *self.menu_bar_da.borrow() {
                     if self.engine.borrow().menu_bar_visible {
@@ -3557,11 +3649,21 @@ impl SimpleComponent for App {
                 if let Some(ref da) = *self.menu_bar_da.borrow() {
                     da.queue_draw();
                 }
+                // Enable the full-window overlay so it captures dropdown clicks.
+                if let Some(ref da) = *self.menu_dropdown_da.borrow() {
+                    da.set_can_target(true);
+                    da.queue_draw();
+                }
                 self.redraw = true;
             }
             Msg::CloseMenu => {
                 self.engine.borrow_mut().close_menu();
                 if let Some(ref da) = *self.menu_bar_da.borrow() {
+                    da.queue_draw();
+                }
+                // Disable overlay so normal clicks pass through again.
+                if let Some(ref da) = *self.menu_dropdown_da.borrow() {
+                    da.set_can_target(false);
                     da.queue_draw();
                 }
                 self.redraw = true;
@@ -3589,6 +3691,11 @@ impl SimpleComponent for App {
                             .borrow_mut()
                             .menu_activate_item(menu_idx, item_idx, &action);
                     }
+                }
+                // Disable overlay so clicks pass through again after item selection.
+                if let Some(ref da) = *self.menu_dropdown_da.borrow() {
+                    da.set_can_target(false);
+                    da.queue_draw();
                 }
                 if let Some(ref da) = *self.menu_bar_da.borrow() {
                     da.queue_draw();
@@ -4674,23 +4781,10 @@ fn draw_editor(
         cmd_y,
         line_height,
     );
-
-    // 8. Draw menu dropdown overlay last so it floats above all other content
-    if let Some(ref menu_data) = screen.menu_bar {
-        if menu_data.open_menu_idx.is_some() {
-            draw_menu_dropdown(
-                cr,
-                menu_data,
-                &theme,
-                0.0,
-                0.0, // drawing_area starts just below the menu bar widget
-                width as f64,
-                height as f64,
-                line_height,
-            );
-        }
-    }
 }
+// Note: menu dropdown is drawn by the full-window `menu_dropdown_da` overlay,
+// not here — this drawing_area's x=0 is offset from the window left by the
+// activity bar, so popup_x values would appear at the wrong horizontal position.
 
 fn draw_tab_bar(
     cr: &Context,
