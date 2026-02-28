@@ -386,10 +386,11 @@ Click the git branch icon in the activity bar to open the Source Control panel �
 - Type your message; `BackSpace` deletes; `Escape` exits input mode (message is preserved)
 - `Enter` — commits staged changes with the typed message (clears message on success)
 
-**Three expandable sections** (Tab to collapse/expand):
+**Four expandable sections** (Tab to collapse/expand):
 - **Staged Changes** — files indexed for the next commit (`A` added, `M` modified, `D` deleted, `R` renamed)
 - **Changes** — unstaged modifications and untracked files
-- **Worktrees** — all git worktrees with ✓ marking the current one
+- **Worktrees** — all git worktrees with ✓ marking the current one (hidden when no linked worktrees exist)
+- **Recent Commits** — last 20 commit messages (`Enter` on an entry shows its hash + message in the status bar)
 
 **Navigation and file actions:**
 - `j` / `k` — move selection up/down
@@ -815,12 +816,12 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 
 ```
 src/
-├── main.rs          (~7100 lines)  GTK4/Relm4 UI, rendering, sidebar resize, fuzzy popup, context menu, drag-and-drop
-├── tui_main.rs      (~6450 lines)  ratatui/crossterm TUI backend, fuzzy popup, rename/move prompts
-├── render.rs        (~2820 lines)  Platform-agnostic ScreenLayout bridge (DebugSidebarData, SourceControlData, BottomPanelTabs)
+├── main.rs          (~7700 lines)  GTK4/Relm4 UI, rendering, sidebar resize, fuzzy popup, context menu, drag-and-drop
+├── tui_main.rs      (~7100 lines)  ratatui/crossterm TUI backend, fuzzy popup, rename/move prompts
+├── render.rs        (~2950 lines)  Platform-agnostic ScreenLayout bridge (DebugSidebarData, SourceControlData, BottomPanelTabs)
 ├── icons.rs            (~30 lines)  Nerd Font file-type icons (GTK + TUI)
-└── core/            (~29,000 lines)  Zero GTK/rendering deps — fully testable
-    ├── engine.rs    (~24,900 lines)  Orchestrator: keys, commands, git, macros, LSP, DAP, plugins, workspaces
+└── core/            (~29,500 lines)  Zero GTK/rendering deps — fully testable
+    ├── engine.rs    (~25,500 lines)  Orchestrator: keys, commands, git, macros, LSP, DAP, plugins, workspaces
     ├── plugin.rs       (~430 lines)  Lua 5.4 plugin manager (mlua vendored; vimcode.* API)
     ├── terminal.rs     (~320 lines)  PTY-backed terminal pane (portable-pty + vt100, history ring buffer)
     ├── lsp.rs        (~2,045 lines)  LSP protocol transport + single-server client (request ID tracking, JSON-RPC framing)
@@ -832,7 +833,7 @@ src/
     ├── buffer.rs       (~120 lines)  Rope-based text storage (ropey)
     ├── settings.rs   (~1,095 lines)  JSON config, :set parsing, key binding notation
     ├── session.rs      (~235 lines)  Session state persistence + per-workspace paths
-    ├── git.rs          (~900 lines)  Git subprocesses: diff, blame, stage_hunk, SC panel, worktrees
+    ├── git.rs        (~1,000 lines)  Git subprocesses: diff, blame, stage_hunk, SC panel, worktrees, git log
     └── window.rs, tab.rs, view.rs, cursor.rs, mode.rs, syntax.rs (~893 lines)
 ```
 

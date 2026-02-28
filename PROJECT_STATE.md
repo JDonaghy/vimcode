@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Feb 27, 2026 (Session 99 fixes) | **Tests:** 817
+**Last updated:** Feb 27, 2026 (Session 99 — git log section) | **Tests:** 817
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 72 are in **SESSION_HISTORY.md**.
@@ -8,6 +8,9 @@
 ---
 
 ## Recent Work
+
+**Session 99 (git log) — SC Panel Recent Commits section:**
+`core/git.rs`: Added `GitLogEntry { hash, message }` struct and `git_log(dir, limit)` function (runs `git log --oneline -N`, parses into `Vec<GitLogEntry>`). `engine.rs`: Added `sc_log: Vec<git::GitLogEntry>` field; expanded `sc_sections_expanded` from `[bool; 3]` to `[bool; 4]`; `sc_refresh()` now calls `git::git_log(&dir, 20)` to populate; `sc_flat_len()`, `sc_visual_row_to_flat()`, `sc_flat_to_section_idx()` updated to include the always-present LOG section (section 3) after staged/unstaged/worktrees; Tab toggle updated for 4 sections; Enter on a log entry shows `"<hash> <message>"` in the status bar. `render.rs`: Added `ScLogItem { hash, message }` struct; `SourceControlData` gains `log: Vec<ScLogItem>` field; `sections_expanded` updated to `[bool; 4]`; `build_source_control_data()` maps `sc_log` to `ScLogItem` list. `tui_main.rs`: LOG section rendered after the sections loop with `\u{f417}` header, hash in dim color, message in item color. `main.rs` (GTK): `log_flat_start` calculated; log section drawn via `draw_section` closure. 817 tests (no change).
 
 **Session 99 (fixes) — SC Panel Bug Fixes:**
 `engine.rs`: Fixed `handle_sc_key` Return arm — removed `sc_has_focus = false` so the SC panel keeps focus after pressing Enter (press `q`/`Esc` to return to editor, matching click behavior); added `idx != usize::MAX` guard so Enter on a section header row is a no-op. Fixed all SC git operations (`sc_stage_selected`, `sc_discard_selected`, `sc_stage_all`, `sc_unstage_all`, `sc_discard_all_unstaged`) to resolve the git repository root via `git::find_repo_root(&self.cwd)` before calling git helpers — previously, git-relative paths from `git status --porcelain` failed to resolve when cwd was a subdirectory of the git root. Added error messages for failed stage/unstage/discard operations (instead of silent no-ops). Added "SC: file not found" diagnostic when SC panel tries to open a file whose path doesn't exist on disk. 817 tests (no change).
@@ -82,12 +85,12 @@ Phase A (UI Polish): `engine.rs`: `active_buffer_name() -> Option<String>` helpe
 
 ```
 src/
-├── main.rs          (~7500 lines)  GTK4/Relm4 UI, rendering, all panels
-├── tui_main.rs      (~6950 lines)  ratatui/crossterm TUI backend
-├── render.rs        (~2920 lines)  Platform-agnostic ScreenLayout bridge
+├── main.rs          (~7700 lines)  GTK4/Relm4 UI, rendering, all panels
+├── tui_main.rs      (~7100 lines)  ratatui/crossterm TUI backend
+├── render.rs        (~2950 lines)  Platform-agnostic ScreenLayout bridge
 ├── icons.rs            (~30 lines)  Nerd Font file-type icons
 └── core/            (~29,500 lines)  Zero GTK/rendering deps — fully testable
-    ├── engine.rs    (~25,200 lines)  Orchestrator: keys, commands, all features
+    ├── engine.rs    (~25,500 lines)  Orchestrator: keys, commands, all features
     ├── plugin.rs       (~430 lines)  Lua 5.4 plugin manager (mlua vendored)
     ├── terminal.rs     (~320 lines)  PTY-backed terminal pane (portable-pty + vt100)
     ├── lsp.rs        (~2,045 lines)  LSP protocol transport + single-server client
@@ -99,10 +102,10 @@ src/
     ├── buffer_manager.rs (~600 lines)  Buffer lifecycle, undo/redo
     ├── buffer.rs       (~120 lines)  Rope-based text storage (ropey)
     ├── session.rs      (~235 lines)  Session state persistence + per-workspace paths
-    ├── git.rs          (~975 lines)  git subprocess integration + SC panel data
+    ├── git.rs        (~1,000 lines)  git subprocess integration + SC panel data + git log
     └── window.rs, tab.rs, view.rs, cursor.rs, mode.rs, syntax.rs (~893 lines)
-Tests: 813 passing
-Total: ~47,000 lines
+Tests: 817 passing
+Total: ~47,300 lines
 ```
 
 ---
@@ -151,6 +154,7 @@ Total: ~47,000 lines
 - [x] Workspaces + Open Folder — `.vimcode-workspace` JSON; `open_folder`/`open_workspace`/`save_workspace_as`; per-project session (FNV-1a hashed path); GTK `FileDialog` for Open File/Folder/Workspace; TUI fuzzy directory picker modal; `:cd`/`:OpenFolder`/`:OpenWorkspace`/`:SaveWorkspaceAs` commands
 - [x] Source Control Panel — git icon in activity bar; Staged Changes / Changes / Worktrees sections (expandable); `j`/`k` navigation; `s` stage/unstage; `d` discard; `r` refresh; `Enter` open file / switch worktree; `Tab` collapse/expand; `:GWorktreeAdd`/`:GWorktreeRemove` commands; GTK Cairo panel + TUI panel (both backends)
 - [x] SC Panel VSCode Parity — commit message input row (`c`/`Enter`/`Esc`); push/pull/fetch from panel (`p`/`P`/`f`); bulk stage-all/unstage-all on section headers (`s`); discard-all on Changes header (`D`); `:Gpull`/`:Gfetch` commands
+- [x] SC Panel Recent Commits — collapsible RECENT COMMITS section (last 20 commits); `Enter` shows hash+message in status bar
 - [x] Lua Extension Mechanism — mlua 5.4 vendored; `~/.config/vimcode/plugins/` auto-loaded; `vimcode.*` API (on/command/keymap/message/cwd/command_run/buf.*); `:Plugin list/reload/enable/disable`; hook points on save/open/normal-key/insert-key/command
 
 ### Planned / Ideas

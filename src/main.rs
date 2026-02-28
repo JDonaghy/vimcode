@@ -3731,7 +3731,7 @@ impl SimpleComponent for App {
                 }
                 self.redraw = !self.redraw;
             }
-            Msg::ScSidebarClick(_, y) => {
+            Msg::ScSidebarClick(x_click, y) => {
                 let lh = self.cached_line_height;
                 if lh <= 0.0 {
                     return;
@@ -3753,6 +3753,22 @@ impl SimpleComponent for App {
                         // Commit input row
                         engine.sc_commit_input_active = true;
                         None
+                    } else if row_idx == 2 {
+                        // Button row: Commit (~50%), Push/Pull/Sync (~17% each, icon-only).
+                        if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
+                            let da_w = da.width() as f64;
+                            if da_w > 0.0 {
+                                let commit_w = da_w / 2.0;
+                                let btn_idx = if x_click < commit_w {
+                                    0
+                                } else {
+                                    let icon_w = (da_w - commit_w) / 3.0;
+                                    ((1.0 + (x_click - commit_w) / icon_w) as usize).min(3)
+                                };
+                                engine.sc_activate_button(btn_idx);
+                            }
+                        }
+                        None
                     } else {
                         // GTK does not render a "(no changes)" hint for empty
                         // expanded sections, so empty_section_hint = false.
@@ -3762,8 +3778,7 @@ impl SimpleComponent for App {
                                 if is_header {
                                     Some("Tab")
                                 } else {
-                                    // Click just selects; Enter key opens the file.
-                                    None
+                                    Some("Return")
                                 }
                             }
                             None => None,
@@ -3772,6 +3787,16 @@ impl SimpleComponent for App {
                 };
                 if let Some(key) = action {
                     self.engine.borrow_mut().handle_sc_key(key, false, None);
+                    // Click opens the file but keeps panel focus so s/d work immediately.
+                    // (Keyboard Enter clears sc_has_focus to return to the editor.)
+                    if key == "Return" {
+                        let mut engine = self.engine.borrow_mut();
+                        engine.sc_has_focus = true;
+                        drop(engine);
+                        if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
+                            da.grab_focus();
+                        }
+                    }
                 }
                 if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
                     da.queue_draw();
@@ -3802,11 +3827,15 @@ impl SimpleComponent for App {
                         "Return" | "KP_Enter" => "Return",
                         "Escape" => "Escape",
                         "Tab" => "Tab",
-                        "Down" => "Down",
-                        "Up" => "Up",
+                        "Down" => "j",
+                        "Up" => "k",
+                        "Left" => "h",
+                        "Right" => "l",
                         "BackSpace" => "BackSpace",
                         "j" => "j",
                         "k" => "k",
+                        "h" => "h",
+                        "l" => "l",
                         "s" => "s",
                         "S" => "S",
                         "d" => "d",
@@ -6542,6 +6571,69 @@ fn draw_source_control_panel(
         row += 1;
     }
 
+    // ── Row 2: action buttons ────────────────────────────────────────────────
+    if row as f64 * line_height < h {
+        // Commit gets ~50% of the width (with label text).
+        // Push / Pull / Sync get equal shares of the remaining width, icon only.
+        let commit_w = w / 2.0;
+        let remain_w = w - commit_w;
+        let icon_w = remain_w / 3.0;
+        let btn_y_base = y + row as f64 * line_height;
+
+        // Helper: fill and label one button segment.
+        let draw_btn = |bx: f64, seg_w: f64, text: &str, focused: bool| {
+            let (fill_r, fill_g, fill_b) = if focused {
+                (hdr_r, hdr_g, hdr_b)
+            } else {
+                (bg_r, bg_g, bg_b)
+            };
+            let (text_r, text_g, text_b) = if focused {
+                (fg_r, fg_g, fg_b)
+            } else {
+                (dim_r, dim_g, dim_b)
+            };
+            cr.set_source_rgb(fill_r, fill_g, fill_b);
+            cr.rectangle(bx, btn_y_base, seg_w, line_height);
+            cr.fill().ok();
+            cr.set_source_rgb(text_r, text_g, text_b);
+            layout.set_text(text);
+            let (_, lh_btn) = layout.pixel_size();
+            cr.move_to(bx + 2.0, btn_y_base + (line_height - lh_btn as f64) / 2.0);
+            pangocairo::show_layout(cr, layout);
+        };
+
+        // Commit button (index 0)
+        draw_btn(
+            x,
+            commit_w,
+            " \u{e729} Commit",
+            sc.button_focused == Some(0),
+        );
+        // Push (index 1)
+        draw_btn(
+            x + commit_w,
+            icon_w,
+            " \u{f093}",
+            sc.button_focused == Some(1),
+        );
+        // Pull (index 2)
+        draw_btn(
+            x + commit_w + icon_w,
+            icon_w,
+            " \u{f019}",
+            sc.button_focused == Some(2),
+        );
+        // Sync (index 3): fill to the right edge
+        draw_btn(
+            x + commit_w + icon_w * 2.0,
+            w - (commit_w + icon_w * 2.0),
+            " \u{f021}",
+            sc.button_focused == Some(3),
+        );
+
+        row += 1;
+    }
+
     // Helper to draw a section
     let draw_section = |cr: &Context,
                         layout: &pango::Layout,
@@ -6628,6 +6720,18 @@ fn draw_source_control_panel(
         } else {
             0
         };
+    let show_worktrees = sc.worktrees.len() > 1;
+    let log_flat_start = if show_worktrees {
+        wt_flat_start
+            + 1
+            + if sc.sections_expanded[2] {
+                sc.worktrees.len()
+            } else {
+                0
+            }
+    } else {
+        wt_flat_start
+    };
 
     // Draw staged section
     if row as f64 * line_height < h {
@@ -6660,8 +6764,8 @@ fn draw_source_control_panel(
         );
     }
 
-    // Draw worktrees section
-    if row as f64 * line_height < h {
+    // Draw worktrees section (only when there are linked worktrees beyond the main one).
+    if row as f64 * line_height < h && show_worktrees {
         draw_section(
             cr,
             layout,
@@ -6670,6 +6774,25 @@ fn draw_source_control_panel(
             sc.sections_expanded[2],
             &mut row,
             wt_flat_start,
+            sc.selected,
+        );
+    }
+
+    // Draw log section (RECENT COMMITS) — always present.
+    if row as f64 * line_height < h {
+        let log_items: Vec<String> = sc
+            .log
+            .iter()
+            .map(|e| format!("{} {}", e.hash, e.message))
+            .collect();
+        draw_section(
+            cr,
+            layout,
+            "\u{f417} RECENT COMMITS",
+            &log_items,
+            sc.sections_expanded[3],
+            &mut row,
+            log_flat_start,
             sc.selected,
         );
     }

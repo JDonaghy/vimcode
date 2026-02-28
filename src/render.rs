@@ -384,6 +384,15 @@ pub struct ScWorktreeItem {
     pub is_main: bool,
 }
 
+/// A single git log entry in the Source Control panel.
+#[derive(Debug, Clone)]
+pub struct ScLogItem {
+    /// Short (abbreviated) commit hash.
+    pub hash: String,
+    /// Commit subject line.
+    pub message: String,
+}
+
 /// Rendering data for the Source Control panel sidebar.
 #[derive(Debug, Clone)]
 pub struct SourceControlData {
@@ -399,8 +408,10 @@ pub struct SourceControlData {
     pub unstaged: Vec<ScFileItem>,
     /// Git worktrees.
     pub worktrees: Vec<ScWorktreeItem>,
-    /// Which sections are expanded: [staged, unstaged, worktrees].
-    pub sections_expanded: [bool; 3],
+    /// Recent git log entries.
+    pub log: Vec<ScLogItem>,
+    /// Which sections are expanded: [staged, unstaged, worktrees, log].
+    pub sections_expanded: [bool; 4],
     /// Flat selection index.
     pub selected: usize,
     /// Whether the panel currently has keyboard focus.
@@ -409,6 +420,8 @@ pub struct SourceControlData {
     pub commit_message: String,
     /// True when the commit input row is in edit mode.
     pub commit_input_active: bool,
+    /// Which action button is keyboard-focused (0=Commit 1=Push 2=Pull 3=Sync), or None.
+    pub button_focused: Option<usize>,
 }
 
 /// Always present in `ScreenLayout`; each section may be empty.
@@ -1767,6 +1780,15 @@ fn build_source_control_data(engine: &Engine) -> Option<SourceControlData> {
         })
         .collect();
 
+    let log: Vec<ScLogItem> = engine
+        .sc_log
+        .iter()
+        .map(|e| ScLogItem {
+            hash: e.hash.clone(),
+            message: e.message.clone(),
+        })
+        .collect();
+
     Some(SourceControlData {
         branch,
         ahead: engine.sc_ahead,
@@ -1774,11 +1796,13 @@ fn build_source_control_data(engine: &Engine) -> Option<SourceControlData> {
         staged,
         unstaged,
         worktrees,
+        log,
         sections_expanded: engine.sc_sections_expanded,
         selected: engine.sc_selected,
         has_focus: engine.sc_has_focus,
         commit_message: engine.sc_commit_message.clone(),
         commit_input_active: engine.sc_commit_input_active,
+        button_focused: engine.sc_button_focused,
     })
 }
 

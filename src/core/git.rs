@@ -882,6 +882,34 @@ pub fn worktree_remove(dir: &Path, path: &str) -> Result<(), String> {
     run_git_result(dir, &["worktree", "remove", path])
 }
 
+/// A single entry from `git log --oneline`.
+#[derive(Debug, Clone)]
+pub struct GitLogEntry {
+    /// Short (abbreviated) commit hash.
+    pub hash: String,
+    /// Commit subject line.
+    pub message: String,
+}
+
+/// Return the last `limit` commits as `GitLogEntry` items.
+pub fn git_log(dir: &Path, limit: usize) -> Vec<GitLogEntry> {
+    let limit_str = format!("-{}", limit);
+    let output = match run_git(dir, &["log", "--oneline", &limit_str]) {
+        Some(o) => o,
+        None => return Vec::new(),
+    };
+    output
+        .lines()
+        .filter_map(|line| {
+            let (hash, rest) = line.split_once(' ')?;
+            Some(GitLogEntry {
+                hash: hash.to_string(),
+                message: rest.to_string(),
+            })
+        })
+        .collect()
+}
+
 /// Return `(ahead, behind)` commit counts relative to the upstream branch.
 pub fn ahead_behind(dir: &Path) -> (u32, u32) {
     let out = match run_git(dir, &["rev-list", "--left-right", "--count", "HEAD...@{u}"]) {

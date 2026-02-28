@@ -2,6 +2,8 @@
 
 ## Recently Completed
 
+**Session 99 (git log) — SC Panel Recent Commits section:** `core/git.rs`: `GitLogEntry { hash, message }` struct + `git_log(dir, limit)` function (parses `git log --oneline -N`). `engine.rs`: `sc_log: Vec<git::GitLogEntry>` field; `sc_sections_expanded` expanded to `[bool; 4]`; `sc_refresh()` populates log; `sc_flat_len()`/`sc_visual_row_to_flat()`/`sc_flat_to_section_idx()` updated for section 3 (LOG); Tab handler covers 4 sections; Enter on log item shows hash+message in status bar. `render.rs`: `ScLogItem { hash, message }` struct; `SourceControlData.log: Vec<ScLogItem>` + `sections_expanded: [bool; 4]`; `build_source_control_data()` maps sc_log. `tui_main.rs`: LOG section rendered after sections loop with `\u{f417}` header. `main.rs`: `log_flat_start` + `draw_section` call for log. 817 tests (no change).
+
 **Session 99 (fixes) — SC Panel Bug Fixes:**
 `engine.rs`: Keep `sc_has_focus=true` after Enter in `handle_sc_key` (press q/Esc to return to editor); skip header rows (idx==MAX) on Enter. All SC git operations now resolve `git::find_repo_root(&cwd)` before calling `stage_path`/`unstage_path`/`discard_path`/etc. — fixes path resolution when cwd is a subdirectory of the git root. Stage/unstage/discard show error messages on failure instead of silently ignoring. "SC: file not found" diagnostic when opening a missing file. 817 tests (no change).
 

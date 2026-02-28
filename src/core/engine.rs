@@ -375,17 +375,21 @@ pub struct Engine {
     pub sc_worktrees: Vec<git::WorktreeEntry>,
     /// Flat selection index across all SC sections (staged/unstaged/worktrees).
     pub sc_selected: usize,
-    /// Which of the three sections are expanded: [staged, unstaged, worktrees].
-    pub sc_sections_expanded: [bool; 3],
+    /// Which sections are expanded: [staged, unstaged, worktrees, log].
+    pub sc_sections_expanded: [bool; 4],
     /// Whether the Source Control panel currently has keyboard focus.
     pub sc_has_focus: bool,
     /// Ahead/behind counts relative to upstream (cached alongside `sc_refresh`).
     pub sc_ahead: u32,
     pub sc_behind: u32,
+    /// Cached git log entries (recent commits) from the last `sc_refresh()` call.
+    pub sc_log: Vec<git::GitLogEntry>,
     /// Commit message being typed in the SC panel input row.
     pub sc_commit_message: String,
     /// True when the SC commit input row has keyboard focus.
     pub sc_commit_input_active: bool,
+    /// Which action button (0=Commit 1=Push 2=Pull 3=Sync) is keyboard-focused, or None.
+    pub sc_button_focused: Option<usize>,
 
     // --- Plugin system ---
     /// Manages loaded Lua plugins. `None` if no plugins dir or plugins disabled.
@@ -673,12 +677,14 @@ impl Engine {
             sc_file_statuses: Vec::new(),
             sc_worktrees: Vec::new(),
             sc_selected: 0,
-            sc_sections_expanded: [true, true, true],
+            sc_sections_expanded: [true, true, true, true],
             sc_has_focus: false,
             sc_ahead: 0,
             sc_behind: 0,
+            sc_log: Vec::new(),
             sc_commit_message: String::new(),
             sc_commit_input_active: false,
+            sc_button_focused: None,
             plugin_manager: None,
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             fuzzy_open: false,
@@ -6138,12 +6144,13 @@ impl Engine {
 
     /// Refresh SC panel: re-run `git status` and `git worktree list`.
     pub fn sc_refresh(&mut self) {
-        let dir = self.cwd.clone();
+        let dir = git::find_repo_root(&self.cwd).unwrap_or_else(|| self.cwd.clone());
         self.sc_file_statuses = git::status_detailed(&dir);
         self.sc_worktrees = git::worktree_list(&dir);
         let (ahead, behind) = git::ahead_behind(&dir);
         self.sc_ahead = ahead;
         self.sc_behind = behind;
+        self.sc_log = git::git_log(&dir, 20);
     }
 
     /// Stage or unstage the currently selected SC item.
@@ -6222,7 +6229,7 @@ impl Engine {
 
     /// Run `git pull` and show the result as a status message.
     pub fn sc_pull(&mut self) {
-        let dir = self.cwd.clone();
+        let dir = git::find_repo_root(&self.cwd).unwrap_or_else(|| self.cwd.clone());
         match git::pull(&dir) {
             Ok(msg) => {
                 self.message = if msg.is_empty() {
@@ -6238,7 +6245,7 @@ impl Engine {
 
     /// Run `git fetch` and show the result as a status message.
     pub fn sc_fetch(&mut self) {
-        let dir = self.cwd.clone();
+        let dir = git::find_repo_root(&self.cwd).unwrap_or_else(|| self.cwd.clone());
         match git::fetch(&dir) {
             Ok(msg) => {
                 self.message = if msg.is_empty() {
@@ -6254,7 +6261,7 @@ impl Engine {
 
     /// Run `git push` and show the result as a status message.
     pub fn sc_push(&mut self) {
-        let dir = self.cwd.clone();
+        let dir = git::find_repo_root(&self.cwd).unwrap_or_else(|| self.cwd.clone());
         match git::push(&dir) {
             Ok(msg) => {
                 self.message = if msg.is_empty() {
@@ -6295,12 +6302,18 @@ impl Engine {
     pub fn handle_sc_commit_input_key(
         &mut self,
         key: &str,
-        _ctrl: bool,
+        ctrl: bool,
         unicode: Option<char>,
     ) -> bool {
         match key {
             "Return" | "KP_Enter" => {
-                self.sc_do_commit();
+                if ctrl {
+                    // Ctrl+Enter commits.
+                    self.sc_do_commit();
+                } else {
+                    // Plain Enter just exits input mode (keeps message).
+                    self.sc_commit_input_active = false;
+                }
                 true
             }
             "Escape" => {
@@ -6319,6 +6332,66 @@ impl Engine {
                     false
                 }
             }
+        }
+    }
+
+    /// Activate an SC action button by index: 0=Commit, 1=Push, 2=Pull, 3=Sync.
+    pub fn sc_activate_button(&mut self, idx: usize) {
+        match idx {
+            0 => self.sc_do_commit(),
+            1 => self.sc_push(),
+            2 => self.sc_pull(),
+            3 => self.sc_sync(),
+            _ => {}
+        }
+    }
+
+    /// Pull, then push (VSCode-style "Sync Changes").
+    pub fn sc_sync(&mut self) {
+        let dir = git::find_repo_root(&self.cwd).unwrap_or_else(|| self.cwd.clone());
+        match git::pull(&dir) {
+            Ok(_) => match git::push(&dir) {
+                Ok(msg) => {
+                    self.message = format!("sync: {}", msg.lines().next().unwrap_or("done"));
+                }
+                Err(e) => {
+                    self.message = format!("sync push failed: {}", e.lines().next().unwrap_or(&e));
+                }
+            },
+            Err(e) => {
+                self.message = format!("sync pull failed: {}", e.lines().next().unwrap_or(&e));
+            }
+        }
+        self.sc_refresh();
+    }
+
+    /// Handle a key when a button row button has keyboard focus.
+    fn handle_sc_button_key(&mut self, key: &str, btn: usize) -> bool {
+        match key {
+            "h" | "Left" => {
+                self.sc_button_focused = Some(btn.saturating_sub(1));
+                true
+            }
+            "l" | "Right" => {
+                self.sc_button_focused = Some((btn + 1).min(3));
+                true
+            }
+            "Return" | "Enter" | " " => {
+                self.sc_activate_button(btn);
+                true
+            }
+            // Drop back to file list without leaving the panel.
+            "j" | "k" | "Tab" | "Escape" => {
+                self.sc_button_focused = None;
+                true
+            }
+            // Fully exit SC panel.
+            "q" => {
+                self.sc_button_focused = None;
+                self.sc_has_focus = false;
+                true
+            }
+            _ => true,
         }
     }
 
@@ -6359,6 +6432,10 @@ impl Engine {
         // If commit input is active, delegate to the input handler.
         if self.sc_commit_input_active {
             return self.handle_sc_commit_input_key(key, ctrl, unicode);
+        }
+        // If a button is focused, delegate to the button handler.
+        if let Some(btn) = self.sc_button_focused {
+            return self.handle_sc_button_key(key, btn);
         }
         let flat_len = self.sc_flat_len();
         match key {
@@ -6405,10 +6482,15 @@ impl Engine {
                 true
             }
             "Tab" => {
-                // Toggle the expansion of the current section
-                let (section, _) = self.sc_flat_to_section_idx(self.sc_selected);
-                if section < 3 {
-                    self.sc_sections_expanded[section] = !self.sc_sections_expanded[section];
+                let (section, idx) = self.sc_flat_to_section_idx(self.sc_selected);
+                if idx == usize::MAX {
+                    // On a section header: toggle expand/collapse.
+                    if section < 4 {
+                        self.sc_sections_expanded[section] = !self.sc_sections_expanded[section];
+                    }
+                } else {
+                    // On a file/item row: enter button row.
+                    self.sc_button_focused = Some(0);
                 }
                 true
             }
@@ -6417,6 +6499,11 @@ impl Engine {
                 if section == 2 {
                     // Worktree: switch and keep panel focus.
                     self.sc_switch_worktree(idx);
+                } else if section == 3 && idx != usize::MAX {
+                    // Log entry: show the commit hash + message in the status bar.
+                    if let Some(entry) = self.sc_log.get(idx) {
+                        self.message = format!("{} {}", entry.hash, entry.message);
+                    }
                 } else if idx != usize::MAX {
                     // File row: open in editor, keep SC panel focus so the user
                     // can continue navigating / staging without re-clicking.
@@ -6440,6 +6527,7 @@ impl Engine {
                                 self.open_file_with_mode(&path, crate::core::OpenMode::Permanent);
                             // Clear focus so the editor receives keys after opening.
                             self.sc_has_focus = false;
+                            self.sc_button_focused = None;
                         }
                     }
                 }
@@ -6448,6 +6536,7 @@ impl Engine {
             }
             "q" | "Escape" => {
                 self.sc_has_focus = false;
+                self.sc_button_focused = None;
                 true
             }
             "r" => {
@@ -6459,6 +6548,8 @@ impl Engine {
     }
 
     /// Number of visible flat rows across all sections.
+    /// The WORKTREES section is only counted when there are linked worktrees
+    /// (i.e. `sc_worktrees.len() > 1` — the main worktree is always present).
     pub fn sc_flat_len(&self) -> usize {
         let staged_count = self
             .sc_file_statuses
@@ -6470,9 +6561,10 @@ impl Engine {
             .iter()
             .filter(|f| f.unstaged.is_some())
             .count();
-        let wt_count = self.sc_worktrees.len();
-        // 3 section headers + contents (when expanded)
-        3 + if self.sc_sections_expanded[0] {
+        let show_worktrees = self.sc_worktrees.len() > 1;
+        // 2–3 section headers (staged + unstaged + optional worktrees) + 1 log header
+        let base = if show_worktrees { 4 } else { 3 };
+        base + if self.sc_sections_expanded[0] {
             staged_count
         } else {
             0
@@ -6480,8 +6572,12 @@ impl Engine {
             unstaged_count
         } else {
             0
-        } + if self.sc_sections_expanded[2] {
-            wt_count
+        } + if show_worktrees && self.sc_sections_expanded[2] {
+            self.sc_worktrees.len()
+        } else {
+            0
+        } + if self.sc_sections_expanded[3] {
+            self.sc_log.len()
         } else {
             0
         }
@@ -6499,7 +6595,8 @@ impl Engine {
         visual_row: usize,
         empty_section_hint: bool,
     ) -> Option<(usize, bool)> {
-        if visual_row < 2 {
+        if visual_row < 3 {
+            // Rows 0 (header), 1 (commit input), 2 (button row) are not selectable.
             return None;
         }
         let staged_count = self
@@ -6513,9 +6610,16 @@ impl Engine {
             .filter(|f| f.unstaged.is_some())
             .count();
         let wt_count = self.sc_worktrees.len();
-        let counts = [staged_count, unstaged_count, wt_count];
+        // Only show the WORKTREES section when there are linked worktrees.
+        let three_counts = [staged_count, unstaged_count, wt_count];
+        let two_counts = [staged_count, unstaged_count];
+        let counts: &[usize] = if wt_count > 1 {
+            &three_counts
+        } else {
+            &two_counts
+        };
 
-        let mut row = 2usize;
+        let mut row = 3usize; // sections start after header + commit + button rows
         let mut flat = 0usize;
 
         for (sec, &count) in counts.iter().enumerate() {
@@ -6542,11 +6646,32 @@ impl Engine {
                 }
             }
         }
+        // Log section (always present, section index 3)
+        let log_count = self.sc_log.len();
+        if row == visual_row {
+            return Some((flat, true)); // log header
+        }
+        row += 1;
+        flat += 1;
+        if self.sc_sections_expanded[3] {
+            if log_count == 0 && empty_section_hint {
+                row += 1;
+            } else {
+                for _ in 0..log_count {
+                    if row == visual_row {
+                        return Some((flat, false));
+                    }
+                    row += 1;
+                    flat += 1;
+                }
+            }
+        }
+        let _ = row; // used for loop tracking only
         None
     }
 
     /// Map a flat index to (section_idx, item_idx_within_section).
-    /// Sections: 0=staged, 1=unstaged, 2=worktrees.
+    /// Sections: 0=staged, 1=unstaged, 2=worktrees (optional), 3=log.
     /// Header rows are represented as item_idx = usize::MAX.
     pub fn sc_flat_to_section_idx(&self, flat: usize) -> (usize, usize) {
         let staged_count = self
@@ -6560,6 +6685,7 @@ impl Engine {
             .filter(|f| f.unstaged.is_some())
             .count();
         let wt_count = self.sc_worktrees.len();
+        let show_worktrees = wt_count > 1;
 
         let mut pos = 0usize;
         // Staged section header
@@ -6584,15 +6710,29 @@ impl Engine {
             }
             pos += unstaged_count;
         }
-        // Worktrees section header
+        // Worktrees section (only when there are linked worktrees)
+        if show_worktrees {
+            if flat == pos {
+                return (2, usize::MAX);
+            }
+            pos += 1;
+            if self.sc_sections_expanded[2] {
+                if flat < pos + wt_count {
+                    return (2, flat - pos);
+                }
+                pos += wt_count;
+            }
+        }
+        // Log section (always present)
+        let log_count = self.sc_log.len();
         if flat == pos {
-            return (2, usize::MAX);
+            return (3, usize::MAX);
         }
         pos += 1;
-        if self.sc_sections_expanded[2] && flat < pos + wt_count {
-            return (2, flat - pos);
+        if self.sc_sections_expanded[3] && flat < pos + log_count {
+            return (3, flat - pos);
         }
-        (2, usize::MAX) // fallback
+        (3, usize::MAX) // fallback
     }
 
     // =========================================================================
@@ -25185,7 +25325,7 @@ mod tests {
                 unstaged: Some(git::StatusKind::Modified),
             },
         ];
-        engine.sc_sections_expanded = [true, true, false];
+        engine.sc_sections_expanded = [true, true, false, true];
         engine
     }
 
@@ -25311,41 +25451,46 @@ mod tests {
     // ─── sc_visual_row_to_flat tests (click-math correctness) ─────────────────
 
     /// make_sc_engine_with_files gives: 1 staged file + 1 unstaged file,
-    /// sections_expanded = [true, true, false].
-    /// GTK (no hint) flat layout:
-    ///   row 2  → flat 0  (STAGED header)
-    ///   row 3  → flat 1  (a.rs – staged)
-    ///   row 4  → flat 2  (CHANGES header)
-    ///   row 5  → flat 3  (b.rs – unstaged)
-    ///   row 6  → flat 4  (WORKTREES header)
+    /// sections_expanded = [true, true, false, true], sc_worktrees = [] (no linked worktrees).
+    /// GTK (no hint) flat layout (row 0=header, 1=commit, 2=buttons, 3+=sections):
+    ///   row 3  → flat 0  (STAGED header)
+    ///   row 4  → flat 1  (a.rs – staged)
+    ///   row 5  → flat 2  (CHANGES header)
+    ///   row 6  → flat 3  (b.rs – unstaged)
+    ///   row 7  → flat 4  (LOG header — WORKTREES hidden, sc_worktrees.len() == 0)
+    ///   row 8  → None    (log expanded but empty, no hint in GTK mode)
     #[test]
     fn test_sc_visual_row_to_flat_gtk() {
-        let engine = make_sc_engine_with_files(); // staged=1, unstaged=1
-                                                  // Row 0 and 1 are panel header / commit input — should return None.
+        let engine = make_sc_engine_with_files(); // staged=1, unstaged=1, worktrees=0
+                                                  // Rows 0–2 are header / commit input / button row — should return None.
         assert_eq!(engine.sc_visual_row_to_flat(0, false), None);
         assert_eq!(engine.sc_visual_row_to_flat(1, false), None);
+        assert_eq!(engine.sc_visual_row_to_flat(2, false), None);
         // STAGED header
-        assert_eq!(engine.sc_visual_row_to_flat(2, false), Some((0, true)));
+        assert_eq!(engine.sc_visual_row_to_flat(3, false), Some((0, true)));
         // staged file a.rs
-        assert_eq!(engine.sc_visual_row_to_flat(3, false), Some((1, false)));
+        assert_eq!(engine.sc_visual_row_to_flat(4, false), Some((1, false)));
         // CHANGES header
-        assert_eq!(engine.sc_visual_row_to_flat(4, false), Some((2, true)));
+        assert_eq!(engine.sc_visual_row_to_flat(5, false), Some((2, true)));
         // unstaged file b.rs
-        assert_eq!(engine.sc_visual_row_to_flat(5, false), Some((3, false)));
-        // WORKTREES header (worktrees section collapsed — but header is always present)
-        assert_eq!(engine.sc_visual_row_to_flat(6, false), Some((4, true)));
-        // Beyond last section
-        assert_eq!(engine.sc_visual_row_to_flat(7, false), None);
+        assert_eq!(engine.sc_visual_row_to_flat(6, false), Some((3, false)));
+        // LOG header (WORKTREES hidden, log section is always present)
+        assert_eq!(engine.sc_visual_row_to_flat(7, false), Some((4, true)));
+        // row 8: log expanded but sc_log is empty in test, no GTK hint → None
+        assert_eq!(engine.sc_visual_row_to_flat(8, false), None);
     }
 
     /// TUI: STAGED is expanded but empty; CHANGES has 1 file.
     /// TUI adds a "(no changes)" visual row for the empty STAGED section.
-    /// Visual layout:
-    ///   row 2  → flat 0  (STAGED header)
-    ///   row 3  → visual "(no changes)" — NO flat entry
-    ///   row 4  → flat 1  (CHANGES header)
-    ///   row 5  → flat 2  (b.rs – unstaged)
-    ///   row 6  → flat 3  (WORKTREES header)
+    /// sc_worktrees is empty so WORKTREES section is hidden.
+    /// sc_sections_expanded[3]=false so LOG is collapsed (header only).
+    /// Visual layout (row 0=header, 1=commit, 2=buttons, 3+=sections):
+    ///   row 3  → flat 0  (STAGED header)
+    ///   row 4  → visual "(no changes)" — NO flat entry
+    ///   row 5  → flat 1  (CHANGES header)
+    ///   row 6  → flat 2  (b.rs – unstaged)
+    ///   row 7  → flat 3  (LOG header — WORKTREES hidden, log collapsed)
+    ///   row 8  → None    (log collapsed, no items shown)
     #[test]
     fn test_sc_visual_row_to_flat_tui_empty_staged() {
         let mut engine = Engine::new();
@@ -25354,17 +25499,19 @@ mod tests {
             staged: None,
             unstaged: Some(git::StatusKind::Modified),
         }];
-        engine.sc_sections_expanded = [true, true, false]; // staged expanded but empty
-                                                           // Row 2: STAGED header (flat 0)
-        assert_eq!(engine.sc_visual_row_to_flat(2, true), Some((0, true)));
-        // Row 3: "(no changes)" hint — None
-        assert_eq!(engine.sc_visual_row_to_flat(3, true), None);
-        // Row 4: CHANGES header (flat 1)
-        assert_eq!(engine.sc_visual_row_to_flat(4, true), Some((1, true)));
-        // Row 5: b.rs (flat 2)
-        assert_eq!(engine.sc_visual_row_to_flat(5, true), Some((2, false)));
-        // Row 6: WORKTREES header (flat 3)
-        assert_eq!(engine.sc_visual_row_to_flat(6, true), Some((3, true)));
+        engine.sc_sections_expanded = [true, true, false, false]; // staged expanded but empty; log collapsed
+                                                                  // Row 3: STAGED header (flat 0)
+        assert_eq!(engine.sc_visual_row_to_flat(3, true), Some((0, true)));
+        // Row 4: "(no changes)" hint — None
+        assert_eq!(engine.sc_visual_row_to_flat(4, true), None);
+        // Row 5: CHANGES header (flat 1)
+        assert_eq!(engine.sc_visual_row_to_flat(5, true), Some((1, true)));
+        // Row 6: b.rs (flat 2)
+        assert_eq!(engine.sc_visual_row_to_flat(6, true), Some((2, false)));
+        // Row 7: LOG header (flat 3) — WORKTREES hidden, log section always present
+        assert_eq!(engine.sc_visual_row_to_flat(7, true), Some((3, true)));
+        // Row 8: log collapsed → None
+        assert_eq!(engine.sc_visual_row_to_flat(8, true), None);
     }
 
     /// s on STAGED section header calls sc_unstage_all path (no panic in test context).

@@ -1294,6 +1294,8 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                             let key_name: Option<&str> = match key_event.code {
                                 KeyCode::Char('j') | KeyCode::Down => Some("j"),
                                 KeyCode::Char('k') | KeyCode::Up => Some("k"),
+                                KeyCode::Char('h') | KeyCode::Left => Some("h"),
+                                KeyCode::Char('l') | KeyCode::Right => Some("l"),
                                 KeyCode::Char('s') => Some("s"),
                                 KeyCode::Char('S') => Some("S"),
                                 KeyCode::Char('d') => Some("d"),
@@ -2836,12 +2838,25 @@ fn handle_mouse(
             engine.sc_has_focus = true;
 
             // sidebar_row layout:
-            //   0 = header, 1 = commit input, 2+ = section rows
+            //   0 = header, 1 = commit input, 2 = button row, 3+ = section rows
             if sidebar_row == 0 {
                 // Panel header — no-op
             } else if sidebar_row == 1 {
                 // Commit input row — enter commit mode
                 engine.sc_commit_input_active = true;
+            } else if sidebar_row == 2 {
+                // Button row: Commit (~50%), Push/Pull/Sync (~17% each, icon-only).
+                // Use column relative to the sidebar content area start.
+                let rel_col = col.saturating_sub(ACTIVITY_BAR_WIDTH);
+                let commit_w = sidebar_width / 2;
+                let btn_idx = if rel_col < commit_w {
+                    0
+                } else {
+                    let icon_w = (sidebar_width - commit_w) / 3;
+                    let x = rel_col - commit_w;
+                    (1 + (x / icon_w.max(1))).min(3) as usize
+                };
+                engine.sc_activate_button(btn_idx);
             } else {
                 // TUI shows a "(no changes)" hint for expanded-but-empty sections
                 // (extra visual row with no flat-index entry), so empty_section_hint = true.
@@ -2852,8 +2867,11 @@ fn handle_mouse(
                     if is_header {
                         engine.handle_sc_key("Tab", false, None);
                     } else {
-                        // Click just selects the item; Enter key opens the file.
-                        // sc_has_focus stays true so s/d/etc work immediately.
+                        // Click opens the file but keeps panel focus so s/d work immediately.
+                        // (Keyboard Enter clears sc_has_focus to return to the editor.)
+                        engine.handle_sc_key("Return", false, None);
+                        engine.sc_has_focus = true;
+                        sidebar.has_focus = true;
                     }
                 }
             }
@@ -6094,6 +6112,16 @@ fn render_source_control(
     }
     let hdr_fg = rc(theme.status_fg);
     let hdr_bg = rc(theme.status_bg);
+    // Clear the entire area first to prevent stale content from previous renders.
+    {
+        let clear_fg = rc(theme.foreground);
+        let clear_bg = rc(theme.tab_bar_bg);
+        for cy in area.y..area.y + area.height {
+            for cx in area.x..area.x + area.width {
+                set_cell(buf, cx, cy, ' ', clear_fg, clear_bg);
+            }
+        }
+    }
     let item_fg = rc(theme.foreground);
     let dim_fg = rc(theme.line_number_fg);
     let sel_bg = rc(theme.fuzzy_selected_bg);
@@ -6160,7 +6188,57 @@ fn render_source_control(
         return;
     }
 
-    // Sections: [staged, unstaged, worktrees]
+    // ── Row 2: action buttons ────────────────────────────────────────────────
+    {
+        // Commit gets ~50% of the width (with label text).
+        // Push / Pull / Sync get equal shares of the remaining width, icon only.
+        let btn_y = area.y + 2;
+        let commit_w = (area.width / 2).max(1);
+        let remain = area.width.saturating_sub(commit_w);
+        let icon_w = (remain / 3).max(1);
+
+        // (x_offset_from_area_x, segment_width, display_text, button_index)
+        let buttons: [(u16, u16, &str, usize); 4] = [
+            (0, commit_w, " \u{e729} Commit", 0),
+            (commit_w, icon_w, " \u{f093}", 1),
+            (commit_w + icon_w, icon_w, " \u{f019}", 2),
+            (
+                commit_w + icon_w * 2,
+                area.width.saturating_sub(commit_w + icon_w * 2),
+                " \u{f021}",
+                3,
+            ),
+        ];
+        for (x_off, seg_w, text, btn_idx) in &buttons {
+            let bx = area.x + x_off;
+            let seg_end = if *btn_idx == 3 {
+                area.x + area.width
+            } else {
+                (bx + seg_w).min(area.x + area.width)
+            };
+            let is_focused = sc.button_focused == Some(*btn_idx);
+            let (fg, bg) = if is_focused {
+                (hdr_bg, hdr_fg) // inverted = highlighted
+            } else {
+                (hdr_fg, row_bg)
+            };
+            for px in bx..seg_end {
+                set_cell(buf, px, btn_y, ' ', fg, bg);
+            }
+            for (j, ch) in text.chars().enumerate() {
+                let cx = bx + j as u16;
+                if cx < seg_end {
+                    set_cell(buf, cx, btn_y, ch, fg, bg);
+                }
+            }
+        }
+    }
+
+    if area.height < 4 {
+        return;
+    }
+
+    // Sections: staged, unstaged, and optionally worktrees (only when linked worktrees exist).
     #[allow(clippy::type_complexity)]
     let sections: [(
         &str,
@@ -6172,12 +6250,18 @@ fn render_source_control(
         ("\u{f02b} CHANGES", &sc.unstaged, None, 1),
         ("\u{e702} WORKTREES", &[], Some(&sc.worktrees), 2),
     ];
+    // Only show WORKTREES section when there are linked worktrees (>1 total).
+    let show_worktrees = sc.worktrees.len() > 1;
 
-    let mut row_y = area.y + 2; // start after header + commit row
+    let mut row_y = area.y + 3; // start after header + commit row + button row
     let max_y = area.y + area.height;
     let mut flat_row: usize = 0; // tracks position in flat selection space
 
     for (section_label, file_items, wt_items, sec_idx) in &sections {
+        // Skip the WORKTREES section unless there are linked worktrees.
+        if *sec_idx == 2 && !show_worktrees {
+            continue;
+        }
         if row_y >= max_y {
             break;
         }
@@ -6315,6 +6399,76 @@ fn render_source_control(
             }
         }
     }
+
+    // ── Log section (RECENT COMMITS) ─────────────────────────────────────────
+    if row_y < max_y {
+        let is_expanded = sc.sections_expanded[3];
+        let expand_icon = if is_expanded { '\u{25bc}' } else { '\u{25b6}' };
+
+        // Section header
+        let is_hdr_selected = sc.has_focus && sc.selected == flat_row;
+        let (log_hdr_fg, log_hdr_bg) = if is_hdr_selected {
+            (hdr_fg, sel_bg)
+        } else {
+            (hdr_fg, hdr_bg)
+        };
+        for x in area.x..area.x + area.width {
+            set_cell(buf, x, row_y, ' ', log_hdr_fg, log_hdr_bg);
+        }
+        let count_badge = if !sc.log.is_empty() {
+            format!(" ({})", sc.log.len())
+        } else {
+            String::new()
+        };
+        let hdr_text = format!(" {} \u{f417} RECENT COMMITS{}", expand_icon, count_badge);
+        for (i, ch) in hdr_text.chars().enumerate().take(area.width as usize) {
+            set_cell(buf, area.x + i as u16, row_y, ch, log_hdr_fg, log_hdr_bg);
+        }
+        row_y += 1;
+        flat_row += 1;
+
+        if is_expanded && row_y < max_y {
+            if sc.log.is_empty() {
+                // "(no commits)" hint
+                for x in area.x..area.x + area.width {
+                    set_cell(buf, x, row_y, ' ', dim_fg, row_bg);
+                }
+                let hint = "  (no commits)";
+                for (i, ch) in hint.chars().enumerate().take(area.width as usize) {
+                    set_cell(buf, area.x + i as u16, row_y, ch, dim_fg, row_bg);
+                }
+                row_y += 1;
+            } else {
+                for entry in &sc.log {
+                    if row_y >= max_y {
+                        break;
+                    }
+                    let is_selected = sc.has_focus && sc.selected == flat_row;
+                    let r_bg = if is_selected { sel_bg } else { row_bg };
+                    for x in area.x..area.x + area.width {
+                        set_cell(buf, x, row_y, ' ', dim_fg, r_bg);
+                    }
+                    // Hash in dim color, message in item_fg
+                    let hash_text = format!("  {} ", entry.hash);
+                    let hash_w = hash_text.chars().count();
+                    for (i, ch) in hash_text.chars().enumerate().take(area.width as usize) {
+                        set_cell(buf, area.x + i as u16, row_y, ch, dim_fg, r_bg);
+                    }
+                    let msg_fg = if is_selected { item_fg } else { dim_fg };
+                    for (i, ch) in entry.message.chars().enumerate() {
+                        let col = hash_w + i;
+                        if col >= area.width as usize {
+                            break;
+                        }
+                        set_cell(buf, area.x + col as u16, row_y, ch, msg_fg, r_bg);
+                    }
+                    row_y += 1;
+                    flat_row += 1;
+                }
+            }
+        }
+    }
+    let _ = (row_y, flat_row); // consumed by rendering loop
 }
 
 // ─── Debug sidebar panel ──────────────────────────────────────────────────────
