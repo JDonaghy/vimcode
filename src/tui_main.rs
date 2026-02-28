@@ -2853,10 +2853,9 @@ fn handle_mouse(
                         engine.handle_sc_key("Tab", false, None);
                     } else {
                         engine.handle_sc_key("Return", false, None);
-                        // Keep SC panel focus after click-opening a file so the
-                        // user can continue staging/navigating without re-clicking.
-                        engine.sc_has_focus = true;
-                        sidebar.has_focus = true;
+                        // Sync sidebar focus with engine decision (opening a file
+                        // clears sc_has_focus, returning control to the editor).
+                        sidebar.has_focus = engine.sc_has_focus;
                     }
                 }
             }

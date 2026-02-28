@@ -3771,17 +3771,6 @@ impl SimpleComponent for App {
                 };
                 if let Some(key) = action {
                     self.engine.borrow_mut().handle_sc_key(key, false, None);
-                    // When a file is opened via click, keep SC panel focus so
-                    // the user can continue navigating and staging/unstaging.
-                    // (Keyboard Return intentionally clears focus; click does not.)
-                    if key == "Return" {
-                        let mut engine = self.engine.borrow_mut();
-                        engine.sc_has_focus = true;
-                        drop(engine);
-                        if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
-                            da.grab_focus();
-                        }
-                    }
                 }
                 if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
                     da.queue_draw();

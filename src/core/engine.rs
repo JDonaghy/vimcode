@@ -6438,9 +6438,9 @@ impl Engine {
                         } else {
                             let _ =
                                 self.open_file_with_mode(&path, crate::core::OpenMode::Permanent);
+                            // Clear focus so the editor receives keys after opening.
+                            self.sc_has_focus = false;
                         }
-                        // sc_has_focus intentionally NOT cleared here — panel keeps
-                        // focus so j/k/s/d continue to work immediately.
                     }
                 }
                 // Header rows (idx == usize::MAX): no action for Enter.
