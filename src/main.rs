@@ -77,6 +77,11 @@ struct App {
     debug_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>>,
     git_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>>,
     sidebar_inner_box: Rc<RefCell<Option<gtk4::Box>>>,
+    /// Direct refs to each panel's outer Box for programmatic show/hide.
+    explorer_panel_box: Rc<RefCell<Option<gtk4::Box>>>,
+    search_panel_box: Rc<RefCell<Option<gtk4::Box>>>,
+    debug_panel_box: Rc<RefCell<Option<gtk4::Box>>>,
+    git_panel_box: Rc<RefCell<Option<gtk4::Box>>>,
     // Per-window scrollbars and indicators
     window_scrollbars: Rc<RefCell<HashMap<core::WindowId, WindowScrollbars>>>,
     overlay: Rc<RefCell<Option<gtk4::Overlay>>>,
@@ -519,6 +524,7 @@ impl SimpleComponent for App {
                         set_width_request: 300,
 
                         // Explorer panel
+                        #[name = "explorer_panel"]
                         gtk4::Box {
                             set_orientation: gtk4::Orientation::Vertical,
                             set_css_classes: &["sidebar"],
@@ -673,6 +679,7 @@ impl SimpleComponent for App {
                         },
 
                         // Search panel
+                        #[name = "search_panel"]
                         gtk4::Box {
                             set_orientation: gtk4::Orientation::Vertical,
                             set_css_classes: &["sidebar"],
@@ -829,6 +836,7 @@ impl SimpleComponent for App {
                     },
 
                     // Debug sidebar panel
+                    #[name = "debug_panel"]
                     gtk4::Box {
                         set_orientation: gtk4::Orientation::Vertical,
                         set_css_classes: &["sidebar"],
@@ -849,6 +857,7 @@ impl SimpleComponent for App {
                     },
 
                     // Source Control (Git) sidebar panel
+                    #[name = "git_panel"]
                     gtk4::Box {
                         set_orientation: gtk4::Orientation::Vertical,
                         set_css_classes: &["sidebar"],
@@ -879,10 +888,16 @@ impl SimpleComponent for App {
                     set_visible: model.sidebar_visible,
 
                     add_controller = gtk4::GestureDrag {
-                        connect_drag_update[sidebar_inner_box_ref] => move |_, dx, _| {
+                        // Save the initial width when the drag begins.
+                        connect_drag_begin[sidebar_inner_box_ref, sidebar_drag_start_w] => move |_, _, _| {
                             if let Some(ref sb) = *sidebar_inner_box_ref.borrow() {
-                                let current = sb.width_request();
-                                let new_w = (current as f64 + dx).round() as i32;
+                                sidebar_drag_start_w.set(sb.width_request());
+                            }
+                        },
+                        // Use initial_width + total_offset (not current + delta) to avoid accumulation.
+                        connect_drag_update[sidebar_inner_box_ref, sidebar_drag_start_w] => move |_, dx, _| {
+                            let new_w = (sidebar_drag_start_w.get() as f64 + dx).round() as i32;
+                            if let Some(ref sb) = *sidebar_inner_box_ref.borrow() {
                                 sb.set_width_request(new_w.clamp(100, 600));
                             }
                         },
@@ -1330,6 +1345,13 @@ impl SimpleComponent for App {
         let overlay_ref = Rc::new(RefCell::new(None));
         let window_scrollbars_ref = Rc::new(RefCell::new(HashMap::new()));
         let sidebar_inner_box_ref: Rc<RefCell<Option<gtk4::Box>>> = Rc::new(RefCell::new(None));
+        // Saves the sidebar width at the start of a drag so we can compute
+        // initial_width + total_offset instead of accumulating delta per event.
+        let sidebar_drag_start_w: Rc<Cell<i32>> = Rc::new(Cell::new(300));
+        let explorer_panel_box_ref: Rc<RefCell<Option<gtk4::Box>>> = Rc::new(RefCell::new(None));
+        let search_panel_box_ref: Rc<RefCell<Option<gtk4::Box>>> = Rc::new(RefCell::new(None));
+        let debug_panel_box_ref: Rc<RefCell<Option<gtk4::Box>>> = Rc::new(RefCell::new(None));
+        let git_panel_box_ref: Rc<RefCell<Option<gtk4::Box>>> = Rc::new(RefCell::new(None));
         let search_results_list_ref: Rc<RefCell<Option<gtk4::ListBox>>> =
             Rc::new(RefCell::new(None));
 
@@ -1389,6 +1411,10 @@ impl SimpleComponent for App {
             find_case_sensitive: false,
             find_whole_word: false,
             sidebar_inner_box: sidebar_inner_box_ref.clone(),
+            explorer_panel_box: explorer_panel_box_ref.clone(),
+            search_panel_box: search_panel_box_ref.clone(),
+            debug_panel_box: debug_panel_box_ref.clone(),
+            git_panel_box: git_panel_box_ref.clone(),
             project_search_status: String::new(),
             search_results_list: search_results_list_ref.clone(),
             diff_selected_file: None,
@@ -1409,6 +1435,10 @@ impl SimpleComponent for App {
         *menu_bar_da_ref.borrow_mut() = Some(widgets.menu_bar_da.clone());
         *overlay_ref.borrow_mut() = Some(widgets.editor_overlay.clone());
         *sidebar_inner_box_ref.borrow_mut() = Some(widgets.sidebar_inner_box.clone());
+        *explorer_panel_box_ref.borrow_mut() = Some(widgets.explorer_panel.clone());
+        *search_panel_box_ref.borrow_mut() = Some(widgets.search_panel.clone());
+        *debug_panel_box_ref.borrow_mut() = Some(widgets.debug_panel.clone());
+        *git_panel_box_ref.borrow_mut() = Some(widgets.git_panel.clone());
         *search_results_list_ref.borrow_mut() = Some(widgets.search_results_list.clone());
 
         // ── Menu dropdown overlay DrawingArea ─────────────────────────────────
@@ -2782,6 +2812,19 @@ impl SimpleComponent for App {
                 self.sidebar_visible = !self.sidebar_visible;
                 self.redraw = !self.redraw;
 
+                // Hide all panel boxes when sidebar is closing.
+                if !self.sidebar_visible {
+                    for panel_ref in [
+                        &self.explorer_panel_box,
+                        &self.search_panel_box,
+                        &self.debug_panel_box,
+                        &self.git_panel_box,
+                    ] {
+                        if let Some(ref b) = *panel_ref.borrow() {
+                            b.set_visible(false);
+                        }
+                    }
+                }
                 // Save sidebar visibility to session state
                 let mut engine = self.engine.borrow_mut();
                 engine.session.explorer_visible = self.sidebar_visible;
@@ -2804,6 +2847,22 @@ impl SimpleComponent for App {
                         if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
                             da.grab_focus();
                         }
+                    }
+                }
+                // Directly set visibility on each panel box in addition to the
+                // #[watch] set_visible — ensures the switch takes effect immediately
+                // even if the Relm4 update cycle hasn't completed yet.
+                let p = self.active_panel;
+                let show_sidebar = self.sidebar_visible;
+                let panels: &[(SidebarPanel, &Rc<RefCell<Option<gtk4::Box>>>)] = &[
+                    (SidebarPanel::Explorer, &self.explorer_panel_box),
+                    (SidebarPanel::Search, &self.search_panel_box),
+                    (SidebarPanel::Debug, &self.debug_panel_box),
+                    (SidebarPanel::Git, &self.git_panel_box),
+                ];
+                for (which, panel_ref) in panels {
+                    if let Some(ref b) = *panel_ref.borrow() {
+                        b.set_visible(show_sidebar && p == *which);
                     }
                 }
                 self.redraw = !self.redraw;
@@ -3701,6 +3760,11 @@ impl SimpleComponent for App {
                     }
                     "openrecent" => {
                         sender.input(Msg::OpenRecentDialog);
+                    }
+                    "find" => {
+                        // Open the GTK find/replace dialog (same as Ctrl+F).
+                        self.engine.borrow_mut().close_menu();
+                        sender.input(Msg::ToggleFindDialog);
                     }
                     "quit_menu" => {
                         // Close the menu first, then quit (or show dialog if unsaved).
