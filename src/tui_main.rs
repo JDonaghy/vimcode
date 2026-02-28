@@ -18,12 +18,14 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::cursor::SetCursorStyle;
 use ratatui::crossterm::event::{
     self as ct_event, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste,
-    EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton,
-    MouseEvent, MouseEventKind,
+    EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, SetTitle,
+    disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement, EnterAlternateScreen,
+    LeaveAlternateScreen, SetTitle,
 };
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color as RColor, Modifier};
@@ -657,6 +659,16 @@ pub fn run(file_path: Option<PathBuf>) {
     )
     .expect("enter alternate screen");
 
+    // Enable keyboard enhancement protocol (Kitty protocol) so terminals that support it
+    // will send distinct escape sequences for Ctrl+Shift+X vs Ctrl+X.
+    let keyboard_enhanced = supports_keyboard_enhancement().unwrap_or(false);
+    if keyboard_enhanced {
+        let _ = execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        );
+    }
+
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).expect("create terminal");
     terminal.clear().expect("clear terminal");
@@ -665,14 +677,17 @@ pub fn run(file_path: Option<PathBuf>) {
         event_loop(&mut terminal, &mut engine);
     }));
 
-    restore_terminal(&mut terminal);
+    restore_terminal(&mut terminal, keyboard_enhanced);
 
     if let Err(e) = result {
         std::panic::resume_unwind(e);
     }
 }
 
-fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) {
+fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>, keyboard_enhanced: bool) {
+    if keyboard_enhanced {
+        let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
+    }
     let _ = disable_raw_mode();
     let _ = execute!(
         terminal.backend_mut(),
@@ -739,6 +754,8 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
 
     // Track unnamed register content so we only write to clipboard on changes.
     let mut last_clipboard_content: Option<String> = None;
+    // True when the quit-confirm overlay is shown (unsaved changes on exit).
+    let mut quit_confirm = false;
 
     let mut needs_redraw = true;
     // Track last draw time to cap frame rate at ~60 fps and keep CPU low.
@@ -856,6 +873,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                             quickfix_scroll_top,
                             debug_output_scroll,
                             folder_picker.as_ref(),
+                            quit_confirm,
                         );
                     }
                 })
@@ -940,6 +958,33 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
 
         match ct_event::read().expect("read event") {
             Event::Key(key_event) => {
+                // ── Quit confirm overlay — intercept all keys ───────────────
+                if quit_confirm && key_event.kind != KeyEventKind::Release {
+                    match key_event.code {
+                        KeyCode::Char('s') | KeyCode::Char('S') => {
+                            engine.save_all_dirty();
+                            engine.lsp_shutdown();
+                            save_session(engine);
+                            return;
+                        }
+                        KeyCode::Char('q') | KeyCode::Char('Q') => {
+                            engine.lsp_shutdown();
+                            save_session(engine);
+                            return;
+                        }
+                        KeyCode::Esc
+                        | KeyCode::Char('c')
+                        | KeyCode::Char('C')
+                        | KeyCode::Char('n')
+                        | KeyCode::Char('N') => {
+                            quit_confirm = false;
+                        }
+                        _ => {}
+                    }
+                    needs_redraw = true;
+                    continue;
+                }
+
                 // ── Prompt mode (sidebar CRUD) ──────────────────────────────
                 if let Some(ref mut prompt) = sidebar_prompt {
                     match key_event.code {
@@ -1828,6 +1873,12 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                                                         Some(FolderPickerState::new_recent(
                                                             &engine.session.recent_workspaces,
                                                         ));
+                                                } else if act == EngineAction::QuitWithUnsaved {
+                                                    quit_confirm = true;
+                                                } else if act == EngineAction::ToggleSidebar {
+                                                    sidebar.visible = !sidebar.visible;
+                                                } else {
+                                                    handle_action(engine, act);
                                                 }
                                             } // close else { (open_file_dialog branch)
                                         }
@@ -1949,6 +2000,12 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                             let ws_path = engine.cwd.join(".vimcode-workspace");
                             engine.save_workspace_as(&ws_path);
                             needs_redraw = true;
+                        } else if action == EngineAction::QuitWithUnsaved {
+                            quit_confirm = true;
+                            needs_redraw = true;
+                        } else if action == EngineAction::ToggleSidebar {
+                            sidebar.visible = !sidebar.visible;
+                            needs_redraw = true;
                         } else if handle_action(engine, action) {
                             break;
                         }
@@ -2015,6 +2072,22 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                     } else {
                         quickfix_scroll_top = 0;
                     }
+                    // Sync palette scroll_top back to engine from TUI scroll state
+                    if engine.palette_open {
+                        if let Ok(size) = terminal.size() {
+                            let popup_h = ((size.height as usize) * 60 / 100).max(16);
+                            let visible_rows = popup_h.saturating_sub(4); // title+query+sep+border
+                            if engine.palette_selected < engine.palette_scroll_top {
+                                engine.palette_scroll_top = engine.palette_selected;
+                            }
+                            if engine.palette_selected >= engine.palette_scroll_top + visible_rows {
+                                engine.palette_scroll_top =
+                                    engine.palette_selected + 1 - visible_rows;
+                            }
+                        }
+                    } else {
+                        engine.palette_scroll_top = 0;
+                    }
                 }
             }
             Event::Mouse(mut mouse_event) => {
@@ -2048,6 +2121,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                                 &mut last_click_pos,
                                 &mut mouse_text_drag,
                                 &mut folder_picker,
+                                &mut quit_confirm,
                             );
                             mouse_event = next;
                             break;
@@ -2077,6 +2151,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                     &mut last_click_pos,
                     &mut mouse_text_drag,
                     &mut folder_picker,
+                    &mut quit_confirm,
                 );
             }
             Event::Paste(text) => {
@@ -2148,6 +2223,7 @@ fn handle_mouse(
     last_click_pos: &mut (u16, u16),
     mouse_text_drag: &mut bool,
     folder_picker: &mut Option<FolderPickerState>,
+    quit_confirm: &mut bool,
 ) -> u16 {
     let col = ev.column;
     let row = ev.row;
@@ -2590,6 +2666,12 @@ fn handle_mouse(
                             *folder_picker = Some(FolderPickerState::new_recent(
                                 &engine.session.recent_workspaces,
                             ));
+                        } else if act == EngineAction::QuitWithUnsaved {
+                            *quit_confirm = true;
+                        } else if act == EngineAction::ToggleSidebar {
+                            sidebar.visible = !sidebar.visible;
+                        } else {
+                            let _ = handle_action(engine, act);
                         }
                     }
                 }
@@ -3272,6 +3354,7 @@ fn draw_frame(
     quickfix_scroll_top: usize,
     debug_output_scroll: usize,
     folder_picker: Option<&FolderPickerState>,
+    quit_confirm: bool,
 ) {
     let area = frame.size();
 
@@ -3447,6 +3530,11 @@ fn draw_frame(
         render_live_grep_popup(frame, grep, area, theme, grep_scroll_top);
     }
 
+    // ── Command palette modal (rendered on top of everything) ─────────────────
+    if let Some(ref palette) = screen.command_palette {
+        render_command_palette_popup(frame, palette, area, theme);
+    }
+
     // ── Quickfix panel (persistent bottom strip) ──────────────────────────────
     if let Some(ref qf) = screen.quickfix {
         render_quickfix_panel(
@@ -3550,6 +3638,11 @@ fn draw_frame(
         if menu_data.open_menu_idx.is_some() {
             render_menu_dropdown(frame.buffer_mut(), area, menu_data, theme);
         }
+    }
+
+    // ── Quit confirm overlay — rendered on top of absolutely everything ───────
+    if quit_confirm {
+        render_quit_confirm_overlay(frame.buffer_mut(), area, theme);
     }
 }
 
@@ -4447,6 +4540,323 @@ fn render_live_grep_popup(
     }
 }
 
+fn render_command_palette_popup(
+    frame: &mut ratatui::Frame,
+    palette: &render::CommandPalettePanel,
+    term_area: Rect,
+    theme: &Theme,
+) {
+    let term_cols = term_area.width;
+    let term_rows = term_area.height;
+
+    // Size: 55% of terminal width (min 55), 60% of terminal rows (min 16)
+    let width = (term_cols * 55 / 100).max(55);
+    let height = (term_rows * 60 / 100).max(16);
+
+    // Centered
+    let x = (term_cols.saturating_sub(width)) / 2;
+    let y = (term_rows.saturating_sub(height)) / 2;
+
+    let bg_color = rc(theme.fuzzy_bg);
+    let sel_bg_color = rc(theme.fuzzy_selected_bg);
+    let fg_color = rc(theme.fuzzy_fg);
+    let query_fg = rc(theme.fuzzy_query_fg);
+    let border_fg = rc(theme.fuzzy_border);
+    let title_fg = rc(theme.fuzzy_title_fg);
+
+    let buf = frame.buffer_mut();
+
+    // Row 0: top border ╭─ Command Palette ── N/M ──╮
+    let title_text = format!(" Command Palette  {} ", palette.items.len());
+    for col in 0..width {
+        let cx = x + col;
+        if cx < term_area.width && y < term_area.height {
+            let ch = if col == 0 {
+                '╭'
+            } else if col == width - 1 {
+                '╮'
+            } else {
+                '─'
+            };
+            set_cell(buf, cx, y, ch, border_fg, bg_color);
+        }
+    }
+    // Overlay title text starting at col 2
+    for (i, ch) in title_text.chars().enumerate() {
+        let cx = x + 2 + i as u16;
+        if cx + 1 < x + width && cx < term_area.width && y < term_area.height {
+            set_cell(buf, cx, y, ch, title_fg, bg_color);
+        }
+    }
+
+    // Row 1: query line │ > query▌ │
+    let row1 = y + 1;
+    if row1 < term_area.height {
+        set_cell(buf, x, row1, '│', border_fg, bg_color);
+        if x + width - 1 < term_area.width {
+            set_cell(buf, x + width - 1, row1, '│', border_fg, bg_color);
+        }
+        for col in 1..width - 1 {
+            let cx = x + col;
+            if cx < term_area.width {
+                set_cell(buf, cx, row1, ' ', fg_color, bg_color);
+            }
+        }
+        let query_display = format!("> {}", palette.query);
+        for (i, ch) in query_display.chars().enumerate() {
+            let cx = x + 1 + i as u16;
+            if cx + 1 < x + width && cx < term_area.width {
+                set_cell(buf, cx, row1, ch, query_fg, bg_color);
+            }
+        }
+        let cursor_col = x + 1 + query_display.chars().count() as u16;
+        if cursor_col + 1 < x + width && cursor_col < term_area.width {
+            set_cell(buf, cursor_col, row1, '▌', query_fg, bg_color);
+        }
+    }
+
+    // Row 2: separator ├────────────────────────────────────────────────┤
+    let row2 = y + 2;
+    if row2 < term_area.height {
+        for col in 0..width {
+            let cx = x + col;
+            if cx < term_area.width {
+                let ch = if col == 0 {
+                    '├'
+                } else if col == width - 1 {
+                    '┤'
+                } else {
+                    '─'
+                };
+                set_cell(buf, cx, row2, ch, border_fg, bg_color);
+            }
+        }
+    }
+
+    // Result rows (title+query+sep = 3 rows, bottom border = 1 row)
+    let inner_rows = height.saturating_sub(4) as usize;
+    let total_items = palette.items.len();
+    // Scrollbar: use the last inner column when content overflows
+    let has_scrollbar = total_items > inner_rows;
+    // Inner content width: strip left │, right │, and scrollbar column if present
+    let inner_w = width.saturating_sub(2 + if has_scrollbar { 1 } else { 0 }) as usize;
+    let visible_count = inner_rows.min(total_items.saturating_sub(palette.scroll_top));
+
+    for i in 0..visible_count {
+        let display_idx = palette.scroll_top + i;
+        let ry = row2 + 1 + i as u16;
+        if ry >= y + height - 1 || ry >= term_area.height {
+            break;
+        }
+
+        let is_selected = display_idx == palette.selected_idx;
+
+        // Fill row background
+        let row_bg = if is_selected { sel_bg_color } else { bg_color };
+        set_cell(buf, x, ry, '│', border_fg, bg_color);
+        if x + width - 1 < term_area.width {
+            set_cell(buf, x + width - 1, ry, '│', border_fg, bg_color);
+        }
+        // Fill inner content columns (excluding scrollbar column)
+        let content_end = width - 1 - if has_scrollbar { 1 } else { 0 };
+        for col in 1..content_end {
+            let cx = x + col;
+            if cx < term_area.width {
+                set_cell(buf, cx, ry, ' ', fg_color, row_bg);
+            }
+        }
+
+        let (label, shortcut) = &palette.items[display_idx];
+        let prefix = if is_selected { "▶ " } else { "  " };
+        let label_text = format!("{}{}", prefix, label);
+
+        // Draw label (left-aligned)
+        for (j, ch) in label_text.chars().enumerate() {
+            let cx = x + 1 + j as u16;
+            let limit = x + 1 + content_end - 1;
+            if cx < limit && cx < term_area.width {
+                set_cell(buf, cx, ry, ch, fg_color, row_bg);
+            }
+        }
+
+        // Draw shortcut (right-aligned within content area, dimmed)
+        if !shortcut.is_empty() {
+            let sc_with_pad = format!("{}  ", shortcut);
+            let sc_len = sc_with_pad.chars().count();
+            let sc_start = (inner_w + 1).saturating_sub(sc_len);
+            for (j, ch) in sc_with_pad.chars().enumerate() {
+                let cx = x + sc_start as u16 + j as u16;
+                let limit = x + 1 + content_end - 1;
+                if cx < limit && cx < term_area.width {
+                    set_cell(buf, cx, ry, ch, border_fg, row_bg);
+                }
+            }
+        }
+    }
+
+    // Scrollbar column (between content and right border)
+    if has_scrollbar && inner_rows > 0 {
+        let sb_col = x + width - 2; // column to the left of right border
+        let track_start = (row2 + 1) as usize;
+        let track_len = inner_rows;
+        let thumb_size = ((inner_rows * inner_rows) / total_items).max(1);
+        let max_scroll = total_items.saturating_sub(inner_rows);
+        let thumb_offset = if max_scroll > 0 {
+            (palette.scroll_top * (track_len.saturating_sub(thumb_size))) / max_scroll
+        } else {
+            0
+        };
+
+        for row_off in 0..track_len {
+            let ry = (track_start + row_off) as u16;
+            if ry >= y + height - 1 || ry >= term_area.height {
+                break;
+            }
+            let in_thumb = row_off >= thumb_offset && row_off < thumb_offset + thumb_size;
+            let sb_char = if in_thumb { '█' } else { '░' };
+            if sb_col < term_area.width {
+                set_cell(buf, sb_col, ry, sb_char, border_fg, bg_color);
+            }
+        }
+    }
+
+    // Bottom border ╰────────────────────────────────────────────────────╯
+    let bottom = y + height - 1;
+    if bottom < term_area.height {
+        for col in 0..width {
+            let cx = x + col;
+            if cx < term_area.width {
+                let ch = if col == 0 {
+                    '╰'
+                } else if col == width - 1 {
+                    '╯'
+                } else {
+                    '─'
+                };
+                set_cell(buf, cx, bottom, ch, border_fg, bg_color);
+            }
+        }
+    }
+}
+
+fn render_quit_confirm_overlay(buf: &mut ratatui::buffer::Buffer, term_area: Rect, theme: &Theme) {
+    // Lines of content (title, blank, message, blank, 3 options, blank, bottom)
+    let lines: &[(&str, bool)] = &[
+        ("  You have unsaved changes.", false),
+        ("", false),
+        ("  [S]   Save All & Quit", true),
+        ("  [Q]   Quit Without Saving", true),
+        ("  [Esc] Cancel", true),
+    ];
+    let title = " Unsaved Changes ";
+    let width: u16 = 42;
+    // top border + blank + content rows + blank + bottom border
+    let height: u16 = 2 + 1 + lines.len() as u16 + 1;
+
+    let x = (term_area.width.saturating_sub(width)) / 2;
+    let y = (term_area.height.saturating_sub(height)) / 2;
+
+    let bg_color = rc(theme.fuzzy_bg);
+    let fg_color = rc(theme.fuzzy_fg);
+    let border_fg = rc(theme.fuzzy_border);
+    let title_fg = rc(theme.fuzzy_title_fg);
+    let key_fg = rc(theme.fuzzy_query_fg);
+
+    // Top border row ╭─ Unsaved Changes ─╮
+    for col in 0..width {
+        let cx = x + col;
+        let ch = if col == 0 {
+            '╭'
+        } else if col == width - 1 {
+            '╮'
+        } else {
+            '─'
+        };
+        set_cell(buf, cx, y, ch, border_fg, bg_color);
+    }
+    // Overlay title
+    for (i, ch) in title.chars().enumerate() {
+        let cx = x + 2 + i as u16;
+        if cx + 1 < x + width {
+            set_cell(buf, cx, y, ch, title_fg, bg_color);
+        }
+    }
+
+    // Blank row after title
+    let blank_row = y + 1;
+    for col in 0..width {
+        let cx = x + col;
+        let ch = if col == 0 || col == width - 1 {
+            '│'
+        } else {
+            ' '
+        };
+        let fg = if col == 0 || col == width - 1 {
+            border_fg
+        } else {
+            fg_color
+        };
+        set_cell(buf, cx, blank_row, ch, fg, bg_color);
+    }
+
+    // Content rows
+    for (row_i, (text, is_key_row)) in lines.iter().enumerate() {
+        let ry = y + 2 + row_i as u16;
+        for col in 0..width {
+            let cx = x + col;
+            let ch = if col == 0 || col == width - 1 {
+                '│'
+            } else {
+                ' '
+            };
+            let fg = if col == 0 || col == width - 1 {
+                border_fg
+            } else {
+                fg_color
+            };
+            set_cell(buf, cx, ry, ch, fg, bg_color);
+        }
+        let row_fg = if *is_key_row { key_fg } else { fg_color };
+        for (j, ch) in text.chars().enumerate() {
+            let cx = x + 1 + j as u16;
+            if cx + 1 < x + width {
+                set_cell(buf, cx, ry, ch, row_fg, bg_color);
+            }
+        }
+    }
+
+    // Blank row before bottom border
+    let pre_bottom = y + 2 + lines.len() as u16;
+    for col in 0..width {
+        let cx = x + col;
+        let ch = if col == 0 || col == width - 1 {
+            '│'
+        } else {
+            ' '
+        };
+        let fg = if col == 0 || col == width - 1 {
+            border_fg
+        } else {
+            fg_color
+        };
+        set_cell(buf, cx, pre_bottom, ch, fg, bg_color);
+    }
+
+    // Bottom border ╰──────╯
+    let bottom = y + height - 1;
+    for col in 0..width {
+        let cx = x + col;
+        let ch = if col == 0 {
+            '╰'
+        } else if col == width - 1 {
+            '╯'
+        } else {
+            '─'
+        };
+        set_cell(buf, cx, bottom, ch, border_fg, bg_color);
+    }
+}
+
 fn render_window(frame: &mut ratatui::Frame, area: Rect, window: &RenderedWindow, theme: &Theme) {
     let window_bg = rc(if window.show_active_bg {
         theme.active_background
@@ -5032,7 +5442,13 @@ fn render_menu_dropdown(
     let max_shortcut = data
         .open_items
         .iter()
-        .map(|i| i.shortcut.len())
+        .map(|i| {
+            if data.is_vscode_mode && !i.vscode_shortcut.is_empty() {
+                i.vscode_shortcut.len()
+            } else {
+                i.shortcut.len()
+            }
+        })
         .max()
         .unwrap_or(0);
     let popup_width = (max_label + max_shortcut + 6).clamp(20, 50) as u16;
@@ -5114,12 +5530,17 @@ fn render_menu_dropdown(
                 }
                 set_cell(buf, x, row, ch, item_fg, item_bg);
             }
-            // Right-aligned shortcut
-            if !item.shortcut.is_empty() {
+            // Right-aligned shortcut (use VSCode variant when in VSCode mode)
+            let sc = if data.is_vscode_mode && !item.vscode_shortcut.is_empty() {
+                item.vscode_shortcut
+            } else {
+                item.shortcut
+            };
+            if !sc.is_empty() {
                 let sc_fg = if is_highlighted { item_fg } else { shortcut_fg };
-                let sc_len = item.shortcut.len() as u16;
+                let sc_len = sc.len() as u16;
                 let sc_x = popup_x + popup_width - 1 - sc_len - 1;
-                for (i, ch) in item.shortcut.chars().enumerate() {
+                for (i, ch) in sc.chars().enumerate() {
                     let x = sc_x + i as u16;
                     if x < full_area.x + full_area.width {
                         set_cell(buf, x, row, ch, sc_fg, item_bg);
@@ -6102,8 +6523,12 @@ fn translate_key(event: KeyEvent) -> Option<(String, Option<char>, bool)> {
             let (key_name, unicode) = if ctrl {
                 // Engine dispatches Ctrl combos via key_name (e.g. "d" for Ctrl-D).
                 // Space is a named key; use "space" to match GTK and the engine's convention.
+                // Ctrl+Shift+X: the char arrives as uppercase (or SHIFT flag is set); keep
+                // uppercase so the engine can distinguish Ctrl+P from Ctrl+Shift+P ("P").
                 let name = if lower == ' ' {
                     "space".to_string()
+                } else if c.is_uppercase() || shift {
+                    lower.to_ascii_uppercase().to_string()
                 } else {
                     lower.to_string()
                 };
@@ -6208,6 +6633,8 @@ fn handle_action(engine: &mut Engine, action: EngineAction) -> bool {
         | EngineAction::OpenWorkspaceDialog
         | EngineAction::SaveWorkspaceAsDialog
         | EngineAction::OpenRecentDialog => false, // handled by caller
+        EngineAction::QuitWithUnsaved => false, // handled by caller (shows quit confirm overlay)
+        EngineAction::ToggleSidebar => false, // handled by caller (has access to sidebar state)
         EngineAction::None | EngineAction::Error => false,
     }
 }

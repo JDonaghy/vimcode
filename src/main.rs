@@ -331,6 +331,10 @@ enum Msg {
     SaveWorkspaceAsDialog,
     /// Show a "Open Recent" picker.
     OpenRecentDialog,
+    /// User triggered quit from menu/close-button; check for unsaved changes.
+    ShowQuitConfirm,
+    /// User confirmed quit (after saving or choosing to discard changes).
+    QuitConfirmed,
 }
 
 #[relm4::component]
@@ -346,12 +350,10 @@ impl SimpleComponent for App {
             // Remove OS titlebar — our menu bar row acts as the title bar.
             set_decorated: false,
 
-            // Save window geometry on close
-            connect_close_request[sender] => move |window| {
-                let width = window.default_width();
-                let height = window.default_height();
-                sender.input(Msg::WindowClosing { width, height });
-                gtk4::glib::Propagation::Proceed
+            // Intercept window close — check for unsaved changes before allowing quit.
+            connect_close_request[sender] => move |_window| {
+                sender.input(Msg::ShowQuitConfirm);
+                gtk4::glib::Propagation::Stop
             },
 
             #[name = "window_overlay"]
@@ -1450,6 +1452,7 @@ impl SimpleComponent for App {
                         highlighted_item_idx: engine.menu_highlighted_item,
                         title,
                         show_window_controls: true,
+                        is_vscode_mode: engine.is_vscode_mode(),
                     };
                     let line_height = lh.get();
                     // Draw the dropdown at window-level coordinates.
@@ -1579,6 +1582,7 @@ impl SimpleComponent for App {
                     highlighted_item_idx: engine.menu_highlighted_item,
                     title,
                     show_window_controls: true,
+                    is_vscode_mode: engine.is_vscode_mode(),
                 };
                 let w = da.width() as f64;
                 let h = da.height() as f64;
@@ -2298,6 +2302,12 @@ impl SimpleComponent for App {
                     EngineAction::OpenRecentDialog => {
                         sender.input(Msg::OpenRecentDialog);
                     }
+                    EngineAction::QuitWithUnsaved => {
+                        sender.input(Msg::ShowQuitConfirm);
+                    }
+                    EngineAction::ToggleSidebar => {
+                        sender.input(Msg::ToggleSidebar);
+                    }
                     EngineAction::None | EngineAction::Error => {}
                 }
 
@@ -2362,6 +2372,12 @@ impl SimpleComponent for App {
                         | EngineAction::SaveWorkspaceAsDialog
                         | EngineAction::OpenRecentDialog => {
                             // Dialog actions don't fire during macro playback
+                        }
+                        EngineAction::QuitWithUnsaved => {
+                            sender.input(Msg::ShowQuitConfirm);
+                        }
+                        EngineAction::ToggleSidebar => {
+                            sender.input(Msg::ToggleSidebar);
                         }
                         EngineAction::None | EngineAction::Error => {}
                     }
@@ -3686,10 +3702,32 @@ impl SimpleComponent for App {
                     "openrecent" => {
                         sender.input(Msg::OpenRecentDialog);
                     }
+                    "quit_menu" => {
+                        // Close the menu first, then quit (or show dialog if unsaved).
+                        self.engine.borrow_mut().close_menu();
+                        if self.engine.borrow().has_any_unsaved() {
+                            sender.input(Msg::ShowQuitConfirm);
+                        } else {
+                            self.save_session_and_exit();
+                        }
+                    }
                     _ => {
-                        self.engine
+                        let engine_action = self
+                            .engine
                             .borrow_mut()
                             .menu_activate_item(menu_idx, item_idx, &action);
+                        match engine_action {
+                            EngineAction::Quit | EngineAction::SaveQuit => {
+                                sender.input(Msg::QuitConfirmed);
+                            }
+                            EngineAction::QuitWithUnsaved => {
+                                sender.input(Msg::ShowQuitConfirm);
+                            }
+                            EngineAction::ToggleSidebar => {
+                                sender.input(Msg::ToggleSidebar);
+                            }
+                            _ => {}
+                        }
                     }
                 }
                 // Disable overlay so clicks pass through again after item selection.
@@ -4133,6 +4171,53 @@ impl SimpleComponent for App {
                 }
                 self.redraw = true;
             }
+
+            Msg::ShowQuitConfirm => {
+                if !self.engine.borrow().has_any_unsaved() {
+                    // No unsaved changes — save session and exit immediately.
+                    self.save_session_and_exit();
+                }
+                // Show a confirmation dialog listing the choice.
+                let dialog = gtk4::Dialog::with_buttons(
+                    Some("Unsaved Changes"),
+                    Some(&self.window),
+                    gtk4::DialogFlags::MODAL | gtk4::DialogFlags::DESTROY_WITH_PARENT,
+                    &[
+                        ("Save All & Quit", gtk4::ResponseType::Accept),
+                        ("Quit Without Saving", gtk4::ResponseType::Reject),
+                        ("Cancel", gtk4::ResponseType::Cancel),
+                    ],
+                );
+                let label = gtk4::Label::new(Some(
+                    "You have unsaved changes.\nDo you want to save before quitting?",
+                ));
+                label.set_margin_top(12);
+                label.set_margin_bottom(12);
+                label.set_margin_start(12);
+                label.set_margin_end(12);
+                dialog.content_area().append(&label);
+                let engine_clone = self.engine.clone();
+                let s = sender.input_sender().clone();
+                dialog.connect_response(move |dlg, resp| {
+                    dlg.close();
+                    match resp {
+                        gtk4::ResponseType::Accept => {
+                            engine_clone.borrow_mut().save_all_dirty();
+                            s.send(Msg::QuitConfirmed).ok();
+                        }
+                        gtk4::ResponseType::Reject => {
+                            s.send(Msg::QuitConfirmed).ok();
+                        }
+                        _ => {} // Cancel — do nothing
+                    }
+                });
+                dialog.present();
+            }
+
+            Msg::QuitConfirmed => {
+                // Save session state then exit the process.
+                self.save_session_and_exit();
+            }
         }
 
         // Sync scrollbar position to match engine state (except when scrollbar itself changed)
@@ -4143,6 +4228,37 @@ impl SimpleComponent for App {
 }
 
 impl App {
+    /// Save the current session state and exit the process immediately.
+    /// This is the canonical quit path — called when there are no unsaved changes.
+    fn save_session_and_exit(&self) -> ! {
+        let mut engine = self.engine.borrow_mut();
+        let buffer_id = engine.active_buffer_id();
+        if let Some(path) = engine
+            .buffer_manager
+            .get(buffer_id)
+            .and_then(|s| s.file_path.as_deref())
+            .map(|p| p.to_path_buf())
+        {
+            let view = engine.active_window().view.clone();
+            engine.session.save_file_position(
+                &path,
+                view.cursor.line,
+                view.cursor.col,
+                view.scroll_top,
+            );
+        }
+        engine.session.window.width = self.window.default_width();
+        engine.session.window.height = self.window.default_height();
+        engine.collect_session_open_files();
+        if let Some(ref root) = engine.workspace_root.clone() {
+            engine.save_session_for_workspace(root);
+        }
+        let _ = engine.session.save();
+        engine.lsp_shutdown();
+        drop(engine);
+        std::process::exit(0);
+    }
+
     /// Sync the unnamed `"` register to the system clipboard whenever its content changes
     /// (clipboard=unnamedplus semantics: every yank/cut is auto-copied).
     /// Uses the background arboard thread to avoid blocking GTK's X11 connection.
@@ -4670,6 +4786,17 @@ fn draw_editor(
 
     // 5e. Draw live grep modal (on top of everything else)
     draw_live_grep_popup(
+        cr,
+        &layout,
+        &screen,
+        &theme,
+        width as f64,
+        height as f64,
+        line_height,
+    );
+
+    // 5e2. Draw command palette modal (on top of everything else)
+    draw_command_palette_popup(
         cr,
         &layout,
         &screen,
@@ -5798,6 +5925,145 @@ fn draw_live_grep_popup(
     cr.restore().ok();
 }
 
+/// Draw the command palette modal (Ctrl+Shift+P) on top of the editor.
+fn draw_command_palette_popup(
+    cr: &Context,
+    layout: &pango::Layout,
+    screen: &render::ScreenLayout,
+    theme: &Theme,
+    editor_width: f64,
+    editor_height: f64,
+    line_height: f64,
+) {
+    let Some(palette) = &screen.command_palette else {
+        return;
+    };
+
+    // Size: 55% of editor width (min 500px), 60% of editor height (min 350px)
+    let popup_w = (editor_width * 0.55).max(500.0);
+    let popup_h = (editor_height * 0.60).max(350.0);
+
+    // Centered in editor area
+    let popup_x = (editor_width - popup_w) / 2.0;
+    let popup_y = (editor_height - popup_h) / 2.0;
+
+    // Background
+    let (r, g, b) = theme.fuzzy_bg.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
+    cr.fill().ok();
+
+    // Border
+    let (r, g, b) = theme.fuzzy_border.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    cr.set_line_width(1.0);
+    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
+    cr.stroke().ok();
+
+    // Title row
+    let title = format!("  Command Palette  ({} commands)", palette.items.len());
+    let (r, g, b) = theme.fuzzy_title_fg.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    layout.set_text(&title);
+    layout.set_attributes(None);
+    cr.move_to(popup_x, popup_y);
+    pangocairo::show_layout(cr, layout);
+
+    // Query row: "> " + query + cursor
+    let query_text = format!("> {}_", palette.query);
+    let (r, g, b) = theme.fuzzy_query_fg.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    layout.set_text(&query_text);
+    layout.set_attributes(None);
+    cr.move_to(popup_x, popup_y + line_height);
+    pangocairo::show_layout(cr, layout);
+
+    // Horizontal separator
+    let sep_y = popup_y + 2.0 * line_height;
+    let (r, g, b) = theme.fuzzy_border.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    cr.set_line_width(1.0);
+    cr.move_to(popup_x, sep_y);
+    cr.line_to(popup_x + popup_w, sep_y);
+    cr.stroke().ok();
+
+    // Result rows (label left, shortcut right-aligned, VSCode style)
+    let rows_area_h = popup_h - 2.0 * line_height - 2.0;
+    let visible_rows = (rows_area_h / line_height) as usize;
+    let total_items = palette.items.len();
+    let items_to_show = palette.items.iter().skip(palette.scroll_top);
+
+    // Scrollbar geometry (6px wide strip on the right edge)
+    const SB_W: f64 = 6.0;
+    let sb_x = popup_x + popup_w - SB_W;
+    let sb_track_y = sep_y + 1.0;
+    let sb_track_h = rows_area_h;
+
+    // Content area is narrowed by scrollbar width
+    let content_w = popup_w - SB_W;
+
+    for (i, (label, shortcut)) in items_to_show.enumerate().take(visible_rows) {
+        let item_y = sep_y + 1.0 + i as f64 * line_height;
+        let display_idx = palette.scroll_top + i;
+        let is_selected = display_idx == palette.selected_idx;
+
+        // Selected row highlight
+        if is_selected {
+            let (r, g, b) = theme.fuzzy_selected_bg.to_cairo();
+            cr.set_source_rgb(r, g, b);
+            cr.rectangle(popup_x, item_y, content_w, line_height);
+            cr.fill().ok();
+        }
+
+        // Label (left-aligned with ▶ prefix for selected)
+        let prefix = if is_selected { "▶ " } else { "  " };
+        let row_text = format!("{}{}", prefix, label);
+        let (r, g, b) = theme.fuzzy_fg.to_cairo();
+        cr.set_source_rgb(r, g, b);
+        layout.set_text(&row_text);
+        layout.set_attributes(None);
+        cr.move_to(popup_x, item_y);
+        pangocairo::show_layout(cr, layout);
+
+        // Shortcut (right-aligned within content area, dimmed)
+        if !shortcut.is_empty() {
+            let shortcut_text = format!("{}  ", shortcut);
+            let (r, g, b) = theme.fuzzy_border.to_cairo();
+            cr.set_source_rgb(r, g, b);
+            layout.set_text(&shortcut_text);
+            layout.set_attributes(None);
+            let (sc_w, _) = layout.pixel_size();
+            cr.move_to(popup_x + content_w - sc_w as f64, item_y);
+            pangocairo::show_layout(cr, layout);
+        }
+    }
+
+    // Scrollbar — only draw when content overflows
+    if total_items > visible_rows && visible_rows > 0 {
+        // Track background
+        let (tr, tg, tb) = theme.fuzzy_bg.to_cairo();
+        cr.set_source_rgb(tr * 0.7, tg * 0.7, tb * 0.7);
+        cr.rectangle(sb_x, sb_track_y, SB_W, sb_track_h);
+        cr.fill().ok();
+
+        // Thumb position and size
+        let thumb_ratio = visible_rows as f64 / total_items as f64;
+        let thumb_h = (sb_track_h * thumb_ratio).max(8.0);
+        let max_scroll = total_items.saturating_sub(visible_rows) as f64;
+        let scroll_frac = if max_scroll > 0.0 {
+            palette.scroll_top as f64 / max_scroll
+        } else {
+            0.0
+        };
+        let thumb_y = sb_track_y + scroll_frac * (sb_track_h - thumb_h);
+
+        let (br, bg_c, bb) = theme.fuzzy_border.to_cairo();
+        cr.set_source_rgb(br, bg_c, bb);
+        cr.rectangle(sb_x + 1.0, thumb_y, SB_W - 2.0, thumb_h);
+        cr.fill().ok();
+    }
+}
+
 /// Draw the tab bar for the bottom panel (Terminal / Debug Output).
 /// One row high at `(x, y)`, full width `w`.
 #[allow(clippy::too_many_arguments)]
@@ -6675,13 +6941,18 @@ fn draw_menu_dropdown(
         } else {
             cr.move_to(popup_x + 8.0, item_y);
             let _ = cr.show_text(item.label);
-            if !item.shortcut.is_empty() {
+            let sc = if data.is_vscode_mode && !item.vscode_shortcut.is_empty() {
+                item.vscode_shortcut
+            } else {
+                item.shortcut
+            };
+            if !sc.is_empty() {
                 cr.set_source_rgb(sr, sg, sb);
                 cr.move_to(
-                    popup_x + popup_width - (item.shortcut.len() as f64 * 7.0) - 8.0,
+                    popup_x + popup_width - (sc.len() as f64 * 7.0) - 8.0,
                     item_y,
                 );
-                let _ = cr.show_text(item.shortcut);
+                let _ = cr.show_text(sc);
                 cr.set_source_rgb(fr, fg_c, fb);
             }
         }

@@ -48,7 +48,346 @@ pub enum EngineAction {
     SaveWorkspaceAsDialog,
     /// Open Recent workspaces dialog requested (UI layer shows picker)
     OpenRecentDialog,
+    /// There are unsaved buffers; the UI must ask the user to confirm before quitting.
+    QuitWithUnsaved,
+    /// Toggle the file-explorer sidebar (UI layer handles show/hide).
+    ToggleSidebar,
 }
+
+/// A single entry in the command palette.
+pub struct PaletteCommand {
+    pub label: &'static str,
+    /// Shortcut displayed in Vim mode (may be a Vim key like "gd" or "u").
+    pub shortcut: &'static str,
+    /// Shortcut displayed in VSCode mode; empty means fall back to `shortcut`.
+    pub vscode_shortcut: &'static str,
+    pub action: &'static str,
+}
+
+/// All commands available in the command palette.
+pub static PALETTE_COMMANDS: &[PaletteCommand] = &[
+    // File
+    PaletteCommand {
+        label: "File: New Tab",
+        shortcut: "Ctrl+T",
+        vscode_shortcut: "",
+        action: "tabnew",
+    },
+    PaletteCommand {
+        label: "File: Open File…",
+        shortcut: "",
+        vscode_shortcut: "",
+        action: "open_file_dialog",
+    },
+    PaletteCommand {
+        label: "File: Open Folder…",
+        shortcut: "",
+        vscode_shortcut: "",
+        action: "open_folder_dialog",
+    },
+    PaletteCommand {
+        label: "File: Open Workspace…",
+        shortcut: "",
+        vscode_shortcut: "",
+        action: "open_workspace_dialog",
+    },
+    PaletteCommand {
+        label: "File: Save Workspace As…",
+        shortcut: "",
+        vscode_shortcut: "",
+        action: "save_workspace_as_dialog",
+    },
+    PaletteCommand {
+        label: "File: Open Recent…",
+        shortcut: "",
+        vscode_shortcut: "",
+        action: "openrecent",
+    },
+    PaletteCommand {
+        label: "File: Save",
+        shortcut: "Ctrl+S",
+        vscode_shortcut: "",
+        action: "w",
+    },
+    PaletteCommand {
+        label: "File: Save As…",
+        shortcut: "",
+        vscode_shortcut: "",
+        action: "saveas",
+    },
+    PaletteCommand {
+        label: "File: Close Tab",
+        shortcut: "",
+        vscode_shortcut: "Ctrl+W",
+        action: "tabclose",
+    },
+    PaletteCommand {
+        label: "File: Quit",
+        shortcut: "",
+        vscode_shortcut: "",
+        action: "q",
+    },
+    // Edit
+    PaletteCommand {
+        label: "Edit: Undo",
+        shortcut: "u",
+        vscode_shortcut: "Ctrl+Z",
+        action: "undo",
+    },
+    PaletteCommand {
+        label: "Edit: Redo",
+        shortcut: "Ctrl+R",
+        vscode_shortcut: "Ctrl+Y",
+        action: "redo",
+    },
+    PaletteCommand {
+        label: "Edit: Find & Replace",
+        shortcut: "",
+        vscode_shortcut: "Ctrl+H",
+        action: "substitute",
+    },
+    // View
+    PaletteCommand {
+        label: "View: Toggle Sidebar",
+        shortcut: "Ctrl+B",
+        vscode_shortcut: "",
+        action: "sidebar",
+    },
+    PaletteCommand {
+        label: "View: Toggle Terminal",
+        shortcut: "Ctrl+T",
+        vscode_shortcut: "",
+        action: "term",
+    },
+    PaletteCommand {
+        label: "View: Toggle Menu Bar",
+        shortcut: "",
+        vscode_shortcut: "",
+        action: "togglemenu",
+    },
+    PaletteCommand {
+        label: "View: Zoom In",
+        shortcut: "Ctrl++",
+        vscode_shortcut: "",
+        action: "zoomin",
+    },
+    PaletteCommand {
+        label: "View: Zoom Out",
+        shortcut: "Ctrl+-",
+        vscode_shortcut: "",
+        action: "zoomout",
+    },
+    PaletteCommand {
+        label: "View: Command Palette",
+        shortcut: "Ctrl+Shift+P",
+        vscode_shortcut: "",
+        action: "palette",
+    },
+    // Go
+    PaletteCommand {
+        label: "Go: Find File (Fuzzy)",
+        shortcut: "Ctrl+P",
+        vscode_shortcut: "",
+        action: "fuzzy",
+    },
+    PaletteCommand {
+        label: "Go: Live Grep",
+        shortcut: "Ctrl+G",
+        vscode_shortcut: "Ctrl+Shift+F",
+        action: "grep",
+    },
+    PaletteCommand {
+        label: "Go: Go to Line",
+        shortcut: "",
+        vscode_shortcut: "Ctrl+G",
+        action: "goto_line",
+    },
+    PaletteCommand {
+        label: "Go: Go to Definition",
+        shortcut: "gd",
+        vscode_shortcut: "F12",
+        action: "lsp_definition",
+    },
+    PaletteCommand {
+        label: "Go: Go to References",
+        shortcut: "gr",
+        vscode_shortcut: "Shift+F12",
+        action: "lsp_references",
+    },
+    PaletteCommand {
+        label: "Go: Go to Implementation",
+        shortcut: "gi",
+        vscode_shortcut: "Ctrl+F12",
+        action: "LspImpl",
+    },
+    PaletteCommand {
+        label: "Go: Jump Back",
+        shortcut: "Ctrl+O",
+        vscode_shortcut: "Alt+Left",
+        action: "jump_back",
+    },
+    // Run / Debug
+    PaletteCommand {
+        label: "Debug: Start / Continue",
+        shortcut: "F5",
+        vscode_shortcut: "",
+        action: "debug",
+    },
+    PaletteCommand {
+        label: "Debug: Pause",
+        shortcut: "F6",
+        vscode_shortcut: "",
+        action: "pause",
+    },
+    PaletteCommand {
+        label: "Debug: Stop",
+        shortcut: "Shift+F5",
+        vscode_shortcut: "",
+        action: "stop",
+    },
+    PaletteCommand {
+        label: "Debug: Step Over",
+        shortcut: "F10",
+        vscode_shortcut: "",
+        action: "stepover",
+    },
+    PaletteCommand {
+        label: "Debug: Step Into",
+        shortcut: "F11",
+        vscode_shortcut: "",
+        action: "stepin",
+    },
+    PaletteCommand {
+        label: "Debug: Step Out",
+        shortcut: "Shift+F11",
+        vscode_shortcut: "",
+        action: "stepout",
+    },
+    PaletteCommand {
+        label: "Debug: Toggle Breakpoint",
+        shortcut: "F9",
+        vscode_shortcut: "",
+        action: "togglebp",
+    },
+    PaletteCommand {
+        label: "Debug: Install Adapter",
+        shortcut: "",
+        vscode_shortcut: "",
+        action: "DapInstall",
+    },
+    // Terminal
+    PaletteCommand {
+        label: "Terminal: New Terminal",
+        shortcut: "",
+        vscode_shortcut: "",
+        action: "term",
+    },
+    PaletteCommand {
+        label: "Terminal: Close Terminal",
+        shortcut: "",
+        vscode_shortcut: "",
+        action: "termclose",
+    },
+    // Git
+    PaletteCommand {
+        label: "Git: Status",
+        shortcut: "",
+        vscode_shortcut: "",
+        action: "Gstatus",
+    },
+    PaletteCommand {
+        label: "Git: Diff",
+        shortcut: "",
+        vscode_shortcut: "",
+        action: "Gdiff",
+    },
+    PaletteCommand {
+        label: "Git: Blame",
+        shortcut: "",
+        vscode_shortcut: "",
+        action: "Gblame",
+    },
+    PaletteCommand {
+        label: "Git: Stage Hunk",
+        shortcut: "gs",
+        vscode_shortcut: "gs",
+        action: "Ghs",
+    },
+    PaletteCommand {
+        label: "Git: Push",
+        shortcut: "",
+        vscode_shortcut: "",
+        action: "Gpush",
+    },
+    PaletteCommand {
+        label: "Git: Pull",
+        shortcut: "",
+        vscode_shortcut: "",
+        action: "Gpull",
+    },
+    PaletteCommand {
+        label: "Git: Fetch",
+        shortcut: "",
+        vscode_shortcut: "",
+        action: "Gfetch",
+    },
+    // LSP
+    PaletteCommand {
+        label: "LSP: Info",
+        shortcut: "",
+        vscode_shortcut: "",
+        action: "LspInfo",
+    },
+    PaletteCommand {
+        label: "LSP: Restart",
+        shortcut: "",
+        vscode_shortcut: "",
+        action: "LspRestart",
+    },
+    PaletteCommand {
+        label: "LSP: Format Document",
+        shortcut: "",
+        vscode_shortcut: "Shift+Alt+F",
+        action: "Lformat",
+    },
+    PaletteCommand {
+        label: "LSP: Rename Symbol",
+        shortcut: "",
+        vscode_shortcut: "F2",
+        action: "Rename",
+    },
+    PaletteCommand {
+        label: "LSP: Install Server",
+        shortcut: "",
+        vscode_shortcut: "",
+        action: "LspInstall",
+    },
+    // Settings
+    PaletteCommand {
+        label: "Settings: Toggle Wrap",
+        shortcut: "",
+        vscode_shortcut: "",
+        action: "set_wrap_toggle",
+    },
+    PaletteCommand {
+        label: "Settings: Toggle Line Numbers",
+        shortcut: "",
+        vscode_shortcut: "",
+        action: "set_number_toggle",
+    },
+    PaletteCommand {
+        label: "Settings: Toggle Relative Numbers",
+        shortcut: "",
+        vscode_shortcut: "",
+        action: "set_rnu_toggle",
+    },
+    PaletteCommand {
+        label: "Settings: Plugin List",
+        shortcut: "",
+        vscode_shortcut: "",
+        action: "Plugin list",
+    },
+];
 
 /// How a file should be opened: as a temporary preview or permanent buffer.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -438,6 +777,18 @@ pub struct Engine {
     /// Whether the debug sidebar has keyboard focus.
     pub dap_sidebar_has_focus: bool,
 
+    // --- Command palette ---
+    /// Whether the command palette modal is open.
+    pub palette_open: bool,
+    /// Current query typed in the palette.
+    pub palette_query: String,
+    /// Indices into PALETTE_COMMANDS after fuzzy filtering.
+    pub palette_results: Vec<usize>,
+    /// Index of the currently highlighted result.
+    pub palette_selected: usize,
+    /// Scroll offset for the result list.
+    pub palette_scroll_top: usize,
+
     // --- Two-way diff state ---
     /// The pair of windows currently in diff mode, or None when diff is off.
     pub diff_window_pair: Option<(WindowId, WindowId)>,
@@ -708,6 +1059,11 @@ impl Engine {
             quickfix_open: false,
             quickfix_has_focus: false,
             dap_sidebar_has_focus: false,
+            palette_open: false,
+            palette_query: String::new(),
+            palette_results: Vec::new(),
+            palette_selected: 0,
+            palette_scroll_top: 0,
             diff_window_pair: None,
             diff_results: HashMap::new(),
             clipboard_read: None,
@@ -885,6 +1241,38 @@ impl Engine {
     /// Check if the active buffer has unsaved changes.
     pub fn dirty(&self) -> bool {
         self.active_buffer_state().dirty
+    }
+
+    /// True if ANY open buffer has unsaved changes.
+    pub fn has_any_unsaved(&self) -> bool {
+        self.buffer_manager
+            .list()
+            .into_iter()
+            .any(|id| self.buffer_manager.get(id).is_some_and(|s| s.dirty))
+    }
+
+    /// Save every dirty buffer that has a known file path.
+    /// Returns the number of buffers successfully saved.
+    pub fn save_all_dirty(&mut self) -> usize {
+        let dirty_ids: Vec<_> = self
+            .buffer_manager
+            .list()
+            .into_iter()
+            .filter(|&id| {
+                self.buffer_manager
+                    .get(id)
+                    .is_some_and(|s| s.dirty && s.file_path.is_some())
+            })
+            .collect();
+        let mut saved = 0;
+        for id in dirty_ids {
+            if let Some(state) = self.buffer_manager.get_mut(id) {
+                if state.save().is_ok() {
+                    saved += 1;
+                }
+            }
+        }
+        saved
     }
 
     /// Set the dirty flag for the active buffer.
@@ -2910,6 +3298,11 @@ impl Engine {
             }
         }
 
+        // Command palette intercepts all keys when open.
+        if self.palette_open {
+            return self.handle_palette_key(key_name, unicode, ctrl);
+        }
+
         // Fuzzy finder intercepts all keys when open.
         if self.fuzzy_open {
             return self.handle_fuzzy_key(key_name, unicode, ctrl);
@@ -3183,6 +3576,11 @@ impl Engine {
                 "p" => {
                     // Ctrl-P: Open fuzzy file finder
                     self.open_fuzzy_finder();
+                    return EngineAction::None;
+                }
+                "P" => {
+                    // Ctrl-Shift-P: Open command palette
+                    self.open_command_palette();
                     return EngineAction::None;
                 }
                 "g" => {
@@ -7744,6 +8142,14 @@ impl Engine {
                 }
             }
             "qa!" => EngineAction::Quit,
+            // Menu/button "Quit" — asks UI to confirm when there are unsaved changes.
+            "quit_menu" | "QuitMenu" => {
+                if self.has_any_unsaved() {
+                    EngineAction::QuitWithUnsaved
+                } else {
+                    EngineAction::Quit
+                }
+            }
             "wq" | "x" => {
                 if self.save().is_ok() {
                     EngineAction::SaveQuit
@@ -7825,6 +8231,81 @@ impl Engine {
                 EngineAction::None
             }
             "openrecent" | "OpenRecent" => EngineAction::OpenRecentDialog,
+            "palette" | "CommandPalette" => {
+                self.open_command_palette();
+                EngineAction::None
+            }
+            // ── Menu / palette action aliases ─────────────────────────────────
+            "fuzzy" => {
+                self.open_fuzzy_finder();
+                EngineAction::None
+            }
+            "undo" => {
+                self.undo();
+                EngineAction::None
+            }
+            "redo" => {
+                self.redo();
+                EngineAction::None
+            }
+            "find" => {
+                // Open incremental forward search (same as pressing /)
+                self.mode = Mode::Search;
+                self.command_buffer.clear();
+                self.search_direction = SearchDirection::Forward;
+                self.search_start_cursor = Some(self.view().cursor);
+                self.search_word_bounded = false;
+                self.count = None;
+                EngineAction::None
+            }
+            "replace" => {
+                // Open ex command mode pre-filled with %s/ for find & replace
+                self.mode = Mode::Command;
+                self.command_buffer = "%s/".to_string();
+                self.count = None;
+                EngineAction::None
+            }
+            "sidebar" => EngineAction::ToggleSidebar,
+            "zoomin" => {
+                self.settings.font_size = (self.settings.font_size + 1).min(72);
+                let _ = self.settings.save();
+                EngineAction::None
+            }
+            "zoomout" => {
+                self.settings.font_size = (self.settings.font_size - 1).max(6);
+                let _ = self.settings.save();
+                EngineAction::None
+            }
+            "goto" => {
+                self.message = "Use :N to go to line N".to_string();
+                EngineAction::None
+            }
+            "def" => {
+                self.lsp_request_definition();
+                EngineAction::None
+            }
+            "refs" => {
+                self.lsp_request_references();
+                EngineAction::None
+            }
+            "back" => {
+                self.jump_list_back();
+                EngineAction::None
+            }
+            "fwd" => {
+                self.jump_list_forward();
+                EngineAction::None
+            }
+            "saveas" => {
+                self.message = "Use :w <path> to save to a new location".to_string();
+                EngineAction::None
+            }
+            "keys" => {
+                self.message =
+                    "Key ref: / search  :N line  gd def  gr refs  Ctrl+P fuzzy  Ctrl+G grep"
+                        .to_string();
+                EngineAction::None
+            }
             _ => {
                 // Try plugin commands before giving up
                 let (cmd_name, cmd_args) = cmd.split_once(' ').unwrap_or((cmd, ""));
@@ -12105,6 +12586,176 @@ impl Engine {
     }
 }
 
+// ─── Command Palette ──────────────────────────────────────────────────────────
+
+impl Engine {
+    /// Open the command palette modal and reset state.
+    pub fn open_command_palette(&mut self) {
+        self.palette_open = true;
+        self.palette_query.clear();
+        self.palette_selected = 0;
+        self.palette_scroll_top = 0;
+        self.palette_update_filter();
+    }
+
+    /// Close the command palette.
+    pub fn close_command_palette(&mut self) {
+        self.palette_open = false;
+    }
+
+    /// Re-filter PALETTE_COMMANDS against the current query.
+    pub fn palette_update_filter(&mut self) {
+        if self.palette_query.is_empty() {
+            self.palette_results = (0..PALETTE_COMMANDS.len()).collect();
+        } else {
+            let q = self.palette_query.clone();
+            let mut scored: Vec<(i32, usize)> = PALETTE_COMMANDS
+                .iter()
+                .enumerate()
+                .filter_map(|(i, cmd)| {
+                    let combined = format!("{} {}", cmd.label, cmd.action);
+                    Self::fuzzy_score(&combined, &q).map(|s| (s, i))
+                })
+                .collect();
+            scored.sort_by(|a, b| b.0.cmp(&a.0));
+            self.palette_results = scored.into_iter().map(|(_, i)| i).collect();
+        }
+        let max = self.palette_results.len().saturating_sub(1);
+        self.palette_selected = self.palette_selected.min(max);
+        self.palette_scroll_top = 0;
+    }
+
+    /// Execute the currently selected palette command.
+    pub fn palette_confirm(&mut self) -> EngineAction {
+        let Some(&idx) = self.palette_results.get(self.palette_selected) else {
+            self.close_command_palette();
+            return EngineAction::None;
+        };
+        let action = PALETTE_COMMANDS[idx].action;
+        self.close_command_palette();
+        // In Vim mode, ensure Normal mode so all commands work reliably.
+        // VSCode mode stays in Insert (its default editing state).
+        if !self.is_vscode_mode() {
+            self.mode = Mode::Normal;
+        }
+        // Handle special palette-only actions that map to internal operations
+        match action {
+            "fuzzy" => {
+                self.open_fuzzy_finder();
+                EngineAction::None
+            }
+            "grep" => {
+                self.open_live_grep();
+                EngineAction::None
+            }
+            "goto_line" => {
+                self.message = "Use :N to go to line N".to_string();
+                EngineAction::None
+            }
+            "undo" => {
+                self.undo();
+                EngineAction::None
+            }
+            "redo" => {
+                self.redo();
+                EngineAction::None
+            }
+            "substitute" => {
+                self.message = "Use :%s/old/new/g for find & replace".to_string();
+                EngineAction::None
+            }
+            "jump_back" => {
+                self.jump_list_back();
+                EngineAction::None
+            }
+            "lsp_definition" => {
+                self.lsp_request_definition();
+                EngineAction::None
+            }
+            "lsp_references" => {
+                self.lsp_request_references();
+                EngineAction::None
+            }
+            "set_wrap_toggle" => {
+                self.settings.wrap = !self.settings.wrap;
+                let _ = self.settings.save();
+                let state = if self.settings.wrap { "wrap" } else { "nowrap" };
+                self.message = format!("set {}", state);
+                EngineAction::None
+            }
+            "set_number_toggle" => {
+                use super::settings::LineNumberMode;
+                self.settings.line_numbers = match self.settings.line_numbers {
+                    LineNumberMode::None | LineNumberMode::Relative => LineNumberMode::Absolute,
+                    LineNumberMode::Absolute | LineNumberMode::Hybrid => LineNumberMode::None,
+                };
+                let _ = self.settings.save();
+                EngineAction::None
+            }
+            "set_rnu_toggle" => {
+                use super::settings::LineNumberMode;
+                self.settings.line_numbers = match self.settings.line_numbers {
+                    LineNumberMode::None | LineNumberMode::Absolute => LineNumberMode::Relative,
+                    LineNumberMode::Relative | LineNumberMode::Hybrid => LineNumberMode::None,
+                };
+                let _ = self.settings.save();
+                EngineAction::None
+            }
+            _ => self.execute_command(action),
+        }
+    }
+
+    /// Route a key press when the command palette is open.
+    pub fn handle_palette_key(
+        &mut self,
+        key_name: &str,
+        unicode: Option<char>,
+        ctrl: bool,
+    ) -> EngineAction {
+        match key_name {
+            "Escape" => {
+                self.close_command_palette();
+                EngineAction::None
+            }
+            "Return" => self.palette_confirm(),
+            "Down" => {
+                let max = self.palette_results.len().saturating_sub(1);
+                self.palette_selected = (self.palette_selected + 1).min(max);
+                EngineAction::None
+            }
+            "Up" => {
+                self.palette_selected = self.palette_selected.saturating_sub(1);
+                EngineAction::None
+            }
+            "n" if ctrl => {
+                let max = self.palette_results.len().saturating_sub(1);
+                self.palette_selected = (self.palette_selected + 1).min(max);
+                EngineAction::None
+            }
+            "p" if ctrl => {
+                self.palette_selected = self.palette_selected.saturating_sub(1);
+                EngineAction::None
+            }
+            "BackSpace" => {
+                self.palette_query.pop();
+                self.palette_update_filter();
+                EngineAction::None
+            }
+            _ => {
+                if !ctrl {
+                    if let Some(c) = unicode {
+                        if !c.is_control() {
+                            self.palette_query.push(c);
+                            self.palette_update_filter();
+                        }
+                    }
+                }
+                EngineAction::None
+            }
+        }
+    }
+}
+
 // ─── Quickfix ─────────────────────────────────────────────────────────────────
 
 impl Engine {
@@ -12825,6 +13476,11 @@ impl Engine {
         action: &str,
     ) -> EngineAction {
         let _ = (menu_idx, item_idx); // indices are for the UI; engine just dispatches
+                                      // Ensure Normal mode before executing menu actions so all Vim commands work.
+                                      // VSCode mode stays in Insert (its default editing state).
+        if !self.is_vscode_mode() {
+            self.mode = Mode::Normal;
+        }
         let result = if !action.is_empty() {
             self.execute_command(action)
         } else {
@@ -25614,5 +26270,135 @@ mod tests {
         // flat 2 = CHANGES header (1 staged file shifts CHANGES header to flat 2)
         engine.sc_selected = 2;
         engine.sc_stage_selected(); // should not panic
+    }
+
+    // ── Command palette tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_palette_open_close() {
+        let mut engine = Engine::new();
+        assert!(!engine.palette_open);
+
+        engine.open_command_palette();
+        assert!(engine.palette_open);
+        assert!(engine.palette_query.is_empty());
+        assert_eq!(engine.palette_selected, 0);
+        assert!(
+            !engine.palette_results.is_empty(),
+            "all commands shown on empty query"
+        );
+
+        engine.close_command_palette();
+        assert!(!engine.palette_open);
+    }
+
+    #[test]
+    fn test_palette_all_commands_shown_on_empty_query() {
+        let mut engine = Engine::new();
+        engine.open_command_palette();
+        assert_eq!(engine.palette_results.len(), PALETTE_COMMANDS.len());
+    }
+
+    #[test]
+    fn test_palette_filter_reduces_results() {
+        let mut engine = Engine::new();
+        engine.open_command_palette();
+        let all_count = engine.palette_results.len();
+
+        engine.palette_query = "save".to_string();
+        engine.palette_update_filter();
+        assert!(
+            engine.palette_results.len() < all_count,
+            "filter should reduce results"
+        );
+        assert!(
+            !engine.palette_results.is_empty(),
+            "should still find save commands"
+        );
+    }
+
+    #[test]
+    fn test_palette_escape_closes() {
+        let mut engine = Engine::new();
+        engine.open_command_palette();
+        assert!(engine.palette_open);
+
+        engine.handle_key("Escape", None, false);
+        assert!(!engine.palette_open);
+    }
+
+    #[test]
+    fn test_palette_backspace_removes_char() {
+        let mut engine = Engine::new();
+        engine.open_command_palette();
+        engine.handle_key("s", Some('s'), false);
+        engine.handle_key("a", Some('a'), false);
+        engine.handle_key("v", Some('v'), false);
+        assert_eq!(engine.palette_query, "sav");
+
+        engine.handle_key("BackSpace", None, false);
+        assert_eq!(engine.palette_query, "sa");
+    }
+
+    #[test]
+    fn test_palette_nav_up_down() {
+        let mut engine = Engine::new();
+        engine.open_command_palette();
+        assert_eq!(engine.palette_selected, 0);
+
+        engine.handle_key("Down", None, false);
+        assert_eq!(engine.palette_selected, 1);
+
+        engine.handle_key("Up", None, false);
+        assert_eq!(engine.palette_selected, 0);
+
+        // Up from 0 stays at 0
+        engine.handle_key("Up", None, false);
+        assert_eq!(engine.palette_selected, 0);
+    }
+
+    #[test]
+    fn test_ctrl_shift_p_opens_palette() {
+        let mut engine = Engine::new();
+        assert!(!engine.palette_open);
+        // Ctrl+Shift+P sends key_name="P" (uppercase) with ctrl=true
+        engine.handle_key("P", Some('P'), true);
+        assert!(engine.palette_open);
+    }
+
+    #[test]
+    fn test_palette_command_opens_palette() {
+        let mut engine = Engine::new();
+        assert!(!engine.palette_open);
+        engine.execute_command("palette");
+        assert!(engine.palette_open);
+    }
+
+    #[test]
+    fn test_palette_confirm_closes_palette() {
+        let mut engine = Engine::new();
+        engine.open_command_palette();
+        // Filter to something that matches
+        engine.palette_query = "sidebar".to_string();
+        engine.palette_update_filter();
+        assert!(!engine.palette_results.is_empty());
+
+        engine.handle_key("Return", Some('\n'), false);
+        assert!(!engine.palette_open, "palette should close after confirm");
+    }
+
+    #[test]
+    fn test_palette_intercepts_keys_when_open() {
+        let mut engine = Engine::new();
+        engine.open_command_palette();
+        // Typing 'i' should append to palette_query (not enter insert mode)
+        engine.handle_key("i", Some('i'), false);
+        assert_eq!(engine.palette_query, "i");
+        assert_eq!(
+            engine.mode,
+            super::Mode::Normal,
+            "should stay in Normal mode"
+        );
+        assert!(engine.palette_open, "palette should remain open");
     }
 }

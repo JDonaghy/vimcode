@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Feb 28, 2026 (Session 100 — GTK menu position fix) | **Tests:** 817
+**Last updated:** Feb 28, 2026 (Session 101 — Command Palette + Quit Confirm) | **Tests:** 827
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 72 are in **SESSION_HISTORY.md**.
@@ -8,6 +8,9 @@
 ---
 
 ## Recent Work
+
+**Session 101 — Command Palette + Quit Confirm:**
+`engine.rs`: `PaletteCommand` struct + `PALETTE_COMMANDS` static (~55 entries); `palette_open/query/results/selected/scroll_top` fields; `open_command_palette/close_command_palette/palette_update_filter/palette_confirm/handle_palette_key` methods; modal guard in `handle_key()`; Ctrl+Shift+P (uppercase "P" with ctrl) opens palette; `"palette"/"CommandPalette"` command; `QuitWithUnsaved` EngineAction; `has_any_unsaved()/save_all_dirty()` methods; `"quit_menu"/"QuitMenu"` command. `render.rs`: `CommandPalettePanel` struct; `command_palette: Option<CommandPalettePanel>` on `ScreenLayout`; `MenuItemData.vscode_shortcut` field; `MenuBarData.is_vscode_mode` field; Quit action changed to `"quit_menu"`; "Command Palette" item in View menu. `main.rs`: `draw_command_palette_popup()` with GTK/Cairo rendering; `Msg::ShowQuitConfirm/QuitConfirmed`; `connect_close_request` returns `Propagation::Stop` and routes to `ShowQuitConfirm`; GTK dialog with Save All/Quit/Cancel buttons; VSCode-mode shortcut display in menu dropdown. `tui_main.rs`: Keyboard enhancement protocol (`PushKeyboardEnhancementFlags(DISAMBIGUATE_ESCAPE_CODES)`) for Ctrl+Shift+P in supporting terminals; `render_command_palette_popup()`; `quit_confirm: bool` event-loop state; key intercept for S/Q/Esc when confirm shown; `render_quit_confirm_overlay()` TUI overlay; VSCode-mode shortcut display in menu dropdown. 827 tests (+10 for palette).
 
 **Session 100 (follow-up) — GTK menu dropdown position fix:**
 `main.rs`: Root cause: `draw_menu_dropdown` was called from `draw_editor()` whose DrawingArea x=0 is offset 48px rightward (activity bar) from the window left, causing dropdowns to appear under the wrong menu label. Fix: wrapped the top-level `gtk4::Box` in a new `#[name = "window_overlay"] gtk4::Overlay`; imperatively created a full-window `menu_dropdown_da: gtk4::DrawingArea` overlay child with `can_target=false` by default. When a menu opens (`Msg::OpenMenu`), `can_target=true` so the overlay captures all clicks; when closed (`Msg::CloseMenu`/`Msg::MenuActivateItem`), `can_target=false` so clicks pass through to the editor. The draw func renders the dropdown at correct window-level coordinates (x=0 = window left). The GestureClick handler routes clicks to `MenuActivateItem`, `CloseMenu`, or `OpenMenu` (clicking a different label while one is open switches menus). Removed old `draw_menu_dropdown` call from `draw_editor()` and obsolete dropdown detection block from `Msg::MouseClick`. Added `menu_dropdown_da: Rc<RefCell<Option<DrawingArea>>>` and `menu_dd_line_height: Rc<Cell<f64>>` fields to App struct. Also fixed TUI folder picker up-navigation (added `..` entry, `navigate_up()` method, `-` key binding) and snake_case menu action aliases in `execute_command`. `engine.rs`: Fixed `test_restore_session_files_opens_separate_tabs` — set `engine.cwd = temp_dir()` to prevent workspace session interference. 817 tests (no change).

@@ -338,6 +338,21 @@ pub struct LiveGrepPanel {
     pub preview_lines: Vec<(usize, String, bool)>,
 }
 
+// ─── CommandPalettePanel ──────────────────────────────────────────────────────
+
+/// Data needed to render the command palette modal.
+#[derive(Debug, Clone)]
+pub struct CommandPalettePanel {
+    /// Current query typed by the user.
+    pub query: String,
+    /// Filtered command list: (label, shortcut) display pairs.
+    pub items: Vec<(String, String)>,
+    /// Index of the currently highlighted result.
+    pub selected_idx: usize,
+    /// Scroll offset into the filtered list.
+    pub scroll_top: usize,
+}
+
 // ─── QuickfixPanel ────────────────────────────────────────────────────────────
 
 /// Data needed to render the quickfix bottom panel.
@@ -542,8 +557,11 @@ pub struct TerminalPanel {
 pub struct MenuItemData {
     /// Display label shown in the dropdown (e.g. "Save").
     pub label: &'static str,
-    /// Right-aligned keyboard shortcut hint (e.g. "Ctrl+S").
+    /// Right-aligned keyboard shortcut hint in Vim mode (e.g. "u" for Undo).
     pub shortcut: &'static str,
+    /// Right-aligned keyboard shortcut hint in VSCode mode (e.g. "Ctrl+Z" for Undo).
+    /// Empty string means fall back to `shortcut`.
+    pub vscode_shortcut: &'static str,
     /// Command string dispatched to the engine when activated (e.g. "w").
     /// Empty string means no action (for separators).
     pub action: &'static str,
@@ -569,6 +587,8 @@ pub struct MenuBarData {
     /// When true the backend should render its own window control buttons (─ ☐ ✕).
     /// Set to true by the GTK backend which uses `set_decorated(false)`.
     pub show_window_controls: bool,
+    /// When true, use `vscode_shortcut` instead of `shortcut` for menu items.
+    pub is_vscode_mode: bool,
 }
 
 /// One button in the debug toolbar strip.
@@ -608,6 +628,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
             MenuItemData {
                 label: "New Tab",
                 shortcut: "Ctrl+T",
+                vscode_shortcut: "",
                 action: "tabnew",
                 enabled: true,
                 separator: false,
@@ -615,6 +636,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
             MenuItemData {
                 label: "Open File…",
                 shortcut: "",
+                vscode_shortcut: "",
                 action: "open_file_dialog",
                 enabled: true,
                 separator: false,
@@ -622,6 +644,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
             MenuItemData {
                 label: "Open Folder…",
                 shortcut: "",
+                vscode_shortcut: "",
                 action: "open_folder_dialog",
                 enabled: true,
                 separator: false,
@@ -629,6 +652,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
             MenuItemData {
                 label: "Open Recent…",
                 shortcut: "",
+                vscode_shortcut: "",
                 action: "openrecent",
                 enabled: true,
                 separator: false,
@@ -636,6 +660,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
             MenuItemData {
                 label: "",
                 shortcut: "",
+                vscode_shortcut: "",
                 action: "",
                 enabled: false,
                 separator: true,
@@ -643,6 +668,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
             MenuItemData {
                 label: "Open Workspace…",
                 shortcut: "",
+                vscode_shortcut: "",
                 action: "open_workspace_dialog",
                 enabled: true,
                 separator: false,
@@ -650,6 +676,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
             MenuItemData {
                 label: "Save Workspace As…",
                 shortcut: "",
+                vscode_shortcut: "",
                 action: "save_workspace_as_dialog",
                 enabled: true,
                 separator: false,
@@ -657,6 +684,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
             MenuItemData {
                 label: "",
                 shortcut: "",
+                vscode_shortcut: "",
                 action: "",
                 enabled: false,
                 separator: true,
@@ -664,6 +692,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
             MenuItemData {
                 label: "Save",
                 shortcut: "Ctrl+S",
+                vscode_shortcut: "",
                 action: "w",
                 enabled: true,
                 separator: false,
@@ -671,6 +700,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
             MenuItemData {
                 label: "Save As",
                 shortcut: "",
+                vscode_shortcut: "",
                 action: "saveas",
                 enabled: true,
                 separator: false,
@@ -678,6 +708,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
             MenuItemData {
                 label: "Close Tab",
                 shortcut: "",
+                vscode_shortcut: "Ctrl+W",
                 action: "bd",
                 enabled: true,
                 separator: false,
@@ -685,6 +716,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
             MenuItemData {
                 label: "",
                 shortcut: "",
+                vscode_shortcut: "",
                 action: "",
                 enabled: false,
                 separator: true,
@@ -692,7 +724,8 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
             MenuItemData {
                 label: "Quit",
                 shortcut: "",
-                action: "qa",
+                vscode_shortcut: "",
+                action: "quit_menu",
                 enabled: true,
                 separator: false,
             },
@@ -705,13 +738,15 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
             MenuItemData {
                 label: "Undo",
                 shortcut: "u",
-                action: "u",
+                vscode_shortcut: "Ctrl+Z",
+                action: "undo",
                 enabled: true,
                 separator: false,
             },
             MenuItemData {
                 label: "Redo",
                 shortcut: "Ctrl+R",
+                vscode_shortcut: "Ctrl+Y",
                 action: "redo",
                 enabled: true,
                 separator: false,
@@ -719,6 +754,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
             MenuItemData {
                 label: "",
                 shortcut: "",
+                vscode_shortcut: "",
                 action: "",
                 enabled: false,
                 separator: true,
@@ -726,6 +762,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
             MenuItemData {
                 label: "Cut",
                 shortcut: "",
+                vscode_shortcut: "Ctrl+X",
                 action: "cut",
                 enabled: true,
                 separator: false,
@@ -733,6 +770,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
             MenuItemData {
                 label: "Copy",
                 shortcut: "",
+                vscode_shortcut: "Ctrl+C",
                 action: "copy",
                 enabled: true,
                 separator: false,
@@ -740,6 +778,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
             MenuItemData {
                 label: "Paste",
                 shortcut: "",
+                vscode_shortcut: "Ctrl+V",
                 action: "paste",
                 enabled: true,
                 separator: false,
@@ -747,6 +786,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
             MenuItemData {
                 label: "",
                 shortcut: "",
+                vscode_shortcut: "",
                 action: "",
                 enabled: false,
                 separator: true,
@@ -754,6 +794,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
             MenuItemData {
                 label: "Find",
                 shortcut: "Ctrl+F",
+                vscode_shortcut: "",
                 action: "find",
                 enabled: true,
                 separator: false,
@@ -761,6 +802,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
             MenuItemData {
                 label: "Replace",
                 shortcut: "",
+                vscode_shortcut: "",
                 action: "replace",
                 enabled: true,
                 separator: false,
@@ -774,6 +816,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
             MenuItemData {
                 label: "Toggle Sidebar",
                 shortcut: "Ctrl+B",
+                vscode_shortcut: "",
                 action: "sidebar",
                 enabled: true,
                 separator: false,
@@ -781,6 +824,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
             MenuItemData {
                 label: "Toggle Terminal",
                 shortcut: "Ctrl+T",
+                vscode_shortcut: "",
                 action: "term",
                 enabled: true,
                 separator: false,
@@ -788,6 +832,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
             MenuItemData {
                 label: "",
                 shortcut: "",
+                vscode_shortcut: "",
                 action: "",
                 enabled: false,
                 separator: true,
@@ -795,6 +840,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
             MenuItemData {
                 label: "Zoom In",
                 shortcut: "Ctrl++",
+                vscode_shortcut: "",
                 action: "zoomin",
                 enabled: true,
                 separator: false,
@@ -802,7 +848,24 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
             MenuItemData {
                 label: "Zoom Out",
                 shortcut: "Ctrl+-",
+                vscode_shortcut: "",
                 action: "zoomout",
+                enabled: true,
+                separator: false,
+            },
+            MenuItemData {
+                label: "",
+                shortcut: "",
+                vscode_shortcut: "",
+                action: "",
+                enabled: false,
+                separator: true,
+            },
+            MenuItemData {
+                label: "Command Palette",
+                shortcut: "Ctrl+Shift+P",
+                vscode_shortcut: "",
+                action: "palette",
                 enabled: true,
                 separator: false,
             },
@@ -815,6 +878,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
             MenuItemData {
                 label: "Go to File",
                 shortcut: "Ctrl+P",
+                vscode_shortcut: "",
                 action: "fuzzy",
                 enabled: true,
                 separator: false,
@@ -822,6 +886,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
             MenuItemData {
                 label: "Go to Line",
                 shortcut: "",
+                vscode_shortcut: "",
                 action: "goto",
                 enabled: true,
                 separator: false,
@@ -829,6 +894,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
             MenuItemData {
                 label: "",
                 shortcut: "",
+                vscode_shortcut: "",
                 action: "",
                 enabled: false,
                 separator: true,
@@ -836,6 +902,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
             MenuItemData {
                 label: "Go to Definition",
                 shortcut: "gd",
+                vscode_shortcut: "F12",
                 action: "def",
                 enabled: true,
                 separator: false,
@@ -843,6 +910,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
             MenuItemData {
                 label: "Find References",
                 shortcut: "gr",
+                vscode_shortcut: "Shift+F12",
                 action: "refs",
                 enabled: true,
                 separator: false,
@@ -850,6 +918,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
             MenuItemData {
                 label: "",
                 shortcut: "",
+                vscode_shortcut: "",
                 action: "",
                 enabled: false,
                 separator: true,
@@ -857,6 +926,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
             MenuItemData {
                 label: "Back",
                 shortcut: "Ctrl+O",
+                vscode_shortcut: "",
                 action: "back",
                 enabled: true,
                 separator: false,
@@ -864,6 +934,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
             MenuItemData {
                 label: "Forward",
                 shortcut: "Ctrl+I",
+                vscode_shortcut: "",
                 action: "fwd",
                 enabled: true,
                 separator: false,
@@ -877,6 +948,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
             MenuItemData {
                 label: "Start Debugging",
                 shortcut: "F5",
+                vscode_shortcut: "",
                 action: "debug",
                 enabled: true,
                 separator: false,
@@ -884,6 +956,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
             MenuItemData {
                 label: "",
                 shortcut: "",
+                vscode_shortcut: "",
                 action: "",
                 enabled: false,
                 separator: true,
@@ -891,6 +964,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
             MenuItemData {
                 label: "Continue",
                 shortcut: "F5",
+                vscode_shortcut: "",
                 action: "continue",
                 enabled: true,
                 separator: false,
@@ -898,6 +972,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
             MenuItemData {
                 label: "Pause",
                 shortcut: "F6",
+                vscode_shortcut: "",
                 action: "pause",
                 enabled: true,
                 separator: false,
@@ -905,6 +980,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
             MenuItemData {
                 label: "Stop",
                 shortcut: "Shift+F5",
+                vscode_shortcut: "",
                 action: "stop",
                 enabled: true,
                 separator: false,
@@ -912,6 +988,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
             MenuItemData {
                 label: "",
                 shortcut: "",
+                vscode_shortcut: "",
                 action: "",
                 enabled: false,
                 separator: true,
@@ -919,6 +996,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
             MenuItemData {
                 label: "Step Over",
                 shortcut: "F10",
+                vscode_shortcut: "",
                 action: "stepover",
                 enabled: true,
                 separator: false,
@@ -926,6 +1004,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
             MenuItemData {
                 label: "Step Into",
                 shortcut: "F11",
+                vscode_shortcut: "",
                 action: "stepin",
                 enabled: true,
                 separator: false,
@@ -933,6 +1012,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
             MenuItemData {
                 label: "Step Out",
                 shortcut: "Shift+F11",
+                vscode_shortcut: "",
                 action: "stepout",
                 enabled: true,
                 separator: false,
@@ -940,6 +1020,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
             MenuItemData {
                 label: "",
                 shortcut: "",
+                vscode_shortcut: "",
                 action: "",
                 enabled: false,
                 separator: true,
@@ -947,6 +1028,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
             MenuItemData {
                 label: "Toggle Breakpoint",
                 shortcut: "F9",
+                vscode_shortcut: "",
                 action: "brkpt",
                 enabled: true,
                 separator: false,
@@ -960,6 +1042,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
             MenuItemData {
                 label: "New Terminal",
                 shortcut: "",
+                vscode_shortcut: "",
                 action: "term",
                 enabled: true,
                 separator: false,
@@ -967,6 +1050,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
             MenuItemData {
                 label: "Close Terminal",
                 shortcut: "",
+                vscode_shortcut: "",
                 action: "termkill",
                 enabled: true,
                 separator: false,
@@ -980,6 +1064,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
             MenuItemData {
                 label: "Key Bindings",
                 shortcut: "",
+                vscode_shortcut: "",
                 action: "keys",
                 enabled: true,
                 separator: false,
@@ -987,6 +1072,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
             MenuItemData {
                 label: "About",
                 shortcut: "",
+                vscode_shortcut: "",
                 action: "about",
                 enabled: true,
                 separator: false,
@@ -1083,6 +1169,8 @@ pub struct ScreenLayout {
     pub debug_sidebar: DebugSidebarData,
     /// Source Control panel data — `Some` when the SC panel is the active sidebar panel.
     pub source_control: Option<SourceControlData>,
+    /// Command palette modal — `Some` when open.
+    pub command_palette: Option<CommandPalettePanel>,
 }
 
 // ─── Theme ────────────────────────────────────────────────────────────────────
@@ -1459,6 +1547,7 @@ pub fn build_screen_layout(
             highlighted_item_idx: engine.menu_highlighted_item,
             title,
             show_window_controls: false, // GTK backend overrides this
+            is_vscode_mode: engine.is_vscode_mode(),
         }
     });
 
@@ -1723,6 +1812,30 @@ pub fn build_screen_layout(
     // Build Source Control panel data (populated when the panel is visible).
     let source_control = build_source_control_data(engine);
 
+    // Build command palette panel data.
+    let command_palette = engine.palette_open.then(|| {
+        use crate::core::engine::PALETTE_COMMANDS;
+        let use_vscode = engine.is_vscode_mode();
+        CommandPalettePanel {
+            query: engine.palette_query.clone(),
+            items: engine
+                .palette_results
+                .iter()
+                .map(|&i| {
+                    let cmd = &PALETTE_COMMANDS[i];
+                    let sc = if use_vscode && !cmd.vscode_shortcut.is_empty() {
+                        cmd.vscode_shortcut.to_string()
+                    } else {
+                        cmd.shortcut.to_string()
+                    };
+                    (cmd.label.to_string(), sc)
+                })
+                .collect(),
+            selected_idx: engine.palette_selected,
+            scroll_top: engine.palette_scroll_top,
+        }
+    });
+
     ScreenLayout {
         tab_bar,
         windows,
@@ -1741,6 +1854,7 @@ pub fn build_screen_layout(
         debug_toolbar,
         debug_sidebar,
         source_control,
+        command_palette,
     }
 }
 
