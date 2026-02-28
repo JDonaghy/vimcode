@@ -2852,10 +2852,8 @@ fn handle_mouse(
                     if is_header {
                         engine.handle_sc_key("Tab", false, None);
                     } else {
-                        engine.handle_sc_key("Return", false, None);
-                        // Sync sidebar focus with engine decision (opening a file
-                        // clears sc_has_focus, returning control to the editor).
-                        sidebar.has_focus = engine.sc_has_focus;
+                        // Click just selects the item; Enter key opens the file.
+                        // sc_has_focus stays true so s/d/etc work immediately.
                     }
                 }
             }

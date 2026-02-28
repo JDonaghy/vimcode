@@ -3762,7 +3762,8 @@ impl SimpleComponent for App {
                                 if is_header {
                                     Some("Tab")
                                 } else {
-                                    Some("Return")
+                                    // Click just selects; Enter key opens the file.
+                                    None
                                 }
                             }
                             None => None,
