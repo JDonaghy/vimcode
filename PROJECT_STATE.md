@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Feb 27, 2026 (Session 100 — Menus + Workspace Parity) | **Tests:** 817
+**Last updated:** Feb 28, 2026 (Session 100 — GTK menu position fix) | **Tests:** 817
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 72 are in **SESSION_HISTORY.md**.
@@ -8,6 +8,9 @@
 ---
 
 ## Recent Work
+
+**Session 100 (follow-up) — GTK menu dropdown position fix:**
+`main.rs`: Root cause: `draw_menu_dropdown` was called from `draw_editor()` whose DrawingArea x=0 is offset 48px rightward (activity bar) from the window left, causing dropdowns to appear under the wrong menu label. Fix: wrapped the top-level `gtk4::Box` in a new `#[name = "window_overlay"] gtk4::Overlay`; imperatively created a full-window `menu_dropdown_da: gtk4::DrawingArea` overlay child with `can_target=false` by default. When a menu opens (`Msg::OpenMenu`), `can_target=true` so the overlay captures all clicks; when closed (`Msg::CloseMenu`/`Msg::MenuActivateItem`), `can_target=false` so clicks pass through to the editor. The draw func renders the dropdown at correct window-level coordinates (x=0 = window left). The GestureClick handler routes clicks to `MenuActivateItem`, `CloseMenu`, or `OpenMenu` (clicking a different label while one is open switches menus). Removed old `draw_menu_dropdown` call from `draw_editor()` and obsolete dropdown detection block from `Msg::MouseClick`. Added `menu_dropdown_da: Rc<RefCell<Option<DrawingArea>>>` and `menu_dd_line_height: Rc<Cell<f64>>` fields to App struct. Also fixed TUI folder picker up-navigation (added `..` entry, `navigate_up()` method, `-` key binding) and snake_case menu action aliases in `execute_command`. `engine.rs`: Fixed `test_restore_session_files_opens_separate_tabs` — set `engine.cwd = temp_dir()` to prevent workspace session interference. 817 tests (no change).
 
 **Session 100 — Menus + Workspace Parity:**
 `engine.rs`: Added `OpenRecentDialog` to `EngineAction` enum. Added `base_settings: Option<Box<Settings>>` field to Engine struct; `open_workspace()` saves baseline settings before applying overlay; `open_folder()` restores `base_settings` before applying any new per-folder `.vimcode/settings.json` overlay. Updated `restore_session_files()` to prefer per-workspace session (for cwd) over global session — open files now restore automatically on startup in the correct project folder. Made `save_session_for_workspace` pub. Added new `execute_command` arms: "copy"→"y", "cut"→"dd", "paste"→"p", "termkill" (closes active terminal), "about" (shows version message), "openrecent"/"OpenRecent"→`OpenRecentDialog`. `render.rs`: Added "Open Recent…" menu item (action "openrecent") to File submenu in `MENU_STRUCTURE`. `main.rs`: Fixed GTK dropdown drawing order — moved `draw_menu_dropdown` to the very last step of `draw_editor()` so the dropdown floats above the tab bar and all other panels; Fixed GTK dialog action routing in `Msg::MouseClick` — collects action in `pending_menu_action` scoped variable then routes through `sender.input(Msg::MenuActivateItem(...))` to avoid borrow conflicts; Added `Msg::OpenRecentDialog` variant and handler (GTK Dialog listing recent workspaces as clickable buttons); Added `EngineAction::OpenRecentDialog` handling in key press handler; Added workspace session save (before global save) in both quit handlers. `tui_main.rs`: Added `FolderPickerMode::OpenRecent` + `FolderPickerState::new_recent(recents)` constructor; Extended `handle_mouse()` with `folder_picker: &mut Option<FolderPickerState>` param; Menu Enter and click handlers now route `OpenFolderDialog`/`OpenWorkspaceDialog`/`SaveWorkspaceAsDialog`/`OpenRecentDialog` instead of silently dropping them; Updated folder picker Enter handler for `OpenRecent` mode (uses absolute path directly); `save_session()` saves workspace session before global session. 817 tests (no change).
@@ -88,8 +91,8 @@ Phase A (UI Polish): `engine.rs`: `active_buffer_name() -> Option<String>` helpe
 
 ```
 src/
-├── main.rs          (~7700 lines)  GTK4/Relm4 UI, rendering, all panels
-├── tui_main.rs      (~7100 lines)  ratatui/crossterm TUI backend
+├── main.rs          (~7866 lines)  GTK4/Relm4 UI, rendering, all panels
+├── tui_main.rs      (~7264 lines)  ratatui/crossterm TUI backend
 ├── render.rs        (~2950 lines)  Platform-agnostic ScreenLayout bridge
 ├── icons.rs            (~30 lines)  Nerd Font file-type icons
 └── core/            (~29,500 lines)  Zero GTK/rendering deps — fully testable
