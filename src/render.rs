@@ -405,6 +405,10 @@ pub struct SourceControlData {
     pub selected: usize,
     /// Whether the panel currently has keyboard focus.
     pub has_focus: bool,
+    /// Commit message being typed in the input row.
+    pub commit_message: String,
+    /// True when the commit input row is in edit mode.
+    pub commit_input_active: bool,
 }
 
 /// Always present in `ScreenLayout`; each section may be empty.
@@ -1773,6 +1777,8 @@ fn build_source_control_data(engine: &Engine) -> Option<SourceControlData> {
         sections_expanded: engine.sc_sections_expanded,
         selected: engine.sc_selected,
         has_focus: engine.sc_has_focus,
+        commit_message: engine.sc_commit_message.clone(),
+        commit_input_active: engine.sc_commit_input_active,
     })
 }
 

@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Feb 26, 2026 (Session 98) | **Tests:** 801
+**Last updated:** Feb 27, 2026 (Session 99) | **Tests:** 813
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 72 are in **SESSION_HISTORY.md**.
@@ -8,6 +8,9 @@
 ---
 
 ## Recent Work
+
+**Session 99 — SC Panel VSCode Parity:**
+`core/git.rs`: 4 new functions — `pull(dir)` (`git pull`), `fetch(dir)` (`git fetch`), `unstage_all(dir)` (`git restore --staged .`), `discard_all(dir)` (`git restore .`). `engine.rs`: 2 new fields `sc_commit_message: String` + `sc_commit_input_active: bool`; `handle_sc_key` signature extended to `(key, ctrl, unicode: Option<char>)`; new methods `handle_sc_commit_input_key()` (printable chars accumulate into message, BackSpace pops, Return commits, Escape exits), `sc_do_commit()` (validates non-empty, calls `git::commit`, clears message on success), `sc_pull/fetch/push()` (call git helpers, set status message, refresh), `sc_stage_all/unstage_all/discard_all_unstaged()` (bulk operations on whole sections); `sc_stage_selected()` updated to detect `idx == usize::MAX` (section header row) — section 0 header → unstage all, section 1 header → stage all; new `"c"`, `"p"`, `"P"`, `"f"`, `"D"` arms in `handle_sc_key`; commit-input mode dispatch at top; `:Gpull`/`:Gpl` + `:Gfetch`/`:Gf` command arms in `execute_command()`; 12 new tests. `render.rs`: `SourceControlData` gains `commit_message: String` + `commit_input_active: bool`; `build_source_control_data()` populates both. `main.rs`: `draw_source_control_panel()` renders commit input row at row 1 (sections shift to row+2); `Msg::ScKey` handler passes `ctrl` + `unicode` to `handle_sc_key`, routes commit-input mode keys. `tui_main.rs`: `render_source_control()` renders commit input at `area.y + 1`, sections at `area.y + 2`; Git panel keyboard block handles commit-input mode branch + new normal-mode keys. 813 tests (+12).
 
 **Session 98 — Lua Extension Mechanism (Phase D):**
 `mlua = { version = "0.9", features = ["lua54", "vendored"] }` added to Cargo.toml (bundles Lua 5.4 — no system dep). `src/core/mod.rs`: `pub mod plugin;`. `src/core/settings.rs`: `plugins_enabled: bool` (default true) + `disabled_plugins: Vec<String>` (default empty) fields with `#[serde(default)]`. `src/core/plugin.rs` (new, ~430 lines): `PluginManager` struct with `lua: Lua`, `plugins: Vec<LoadedPlugin>`, `commands/keymaps/hooks` registry maps; `LoadedPlugin` struct (name/path/enabled/error); `PluginCallContext` `#[derive(Default)]` struct (cwd/buf_path/buf_lines inputs + message/set_lines/run_commands outputs); `PluginRegistrations` internal accumulator; `setup_vimcode_api()` installs full `vimcode.*` Lua API: `vimcode.on(event, fn)`, `vimcode.command(name, fn)`, `vimcode.keymap(mode, key, fn)`, `vimcode.message(text)`, `vimcode.cwd()`, `vimcode.command_run(cmd)`, `vimcode.buf.lines()`, `vimcode.buf.line(n)`, `vimcode.buf.set_line(n, text)`, `vimcode.buf.path()`, `vimcode.buf.line_count()`; `load_plugins_dir(dir, disabled)` / `load_one_plugin()` methods; `call_command/call_event/call_keymap` dispatch using take/put-back app_data pattern; 6 unit tests. `src/core/engine.rs`: `use super::plugin;` import; `plugin_manager: Option<plugin::PluginManager>` field; `plugin_init()` (loads `~/.config/vimcode/plugins/`); `make_plugin_ctx()` / `apply_plugin_ctx()` helpers; `plugin_event()`, `plugin_run_command()`, `plugin_run_keymap()` public methods (take/put-back PluginManager to avoid borrow conflict); hook points: `save()` fires "save" event, `lsp_did_open()` fires "open" event (before LSP check), `execute_command()` `_ =>` arm tries `plugin_run_command` before "Not an editor command", `handle_normal_key()` tries `plugin_run_keymap("n", key_name)` before final return, `handle_insert_key()` `_ =>` arm tries `plugin_run_keymap("i", key_name)` for non-printable keys; `:Plugin list/reload/enable <name>/disable <name>` commands; 3 new engine-integration tests. 801 tests (+9).
@@ -76,12 +79,12 @@ Phase A (UI Polish): `engine.rs`: `active_buffer_name() -> Option<String>` helpe
 
 ```
 src/
-├── main.rs          (~7100 lines)  GTK4/Relm4 UI, rendering, all panels
-├── tui_main.rs      (~6450 lines)  ratatui/crossterm TUI backend
-├── render.rs        (~2820 lines)  Platform-agnostic ScreenLayout bridge
+├── main.rs          (~7500 lines)  GTK4/Relm4 UI, rendering, all panels
+├── tui_main.rs      (~6950 lines)  ratatui/crossterm TUI backend
+├── render.rs        (~2920 lines)  Platform-agnostic ScreenLayout bridge
 ├── icons.rs            (~30 lines)  Nerd Font file-type icons
-└── core/            (~29,000 lines)  Zero GTK/rendering deps — fully testable
-    ├── engine.rs    (~24,900 lines)  Orchestrator: keys, commands, all features
+└── core/            (~29,500 lines)  Zero GTK/rendering deps — fully testable
+    ├── engine.rs    (~25,200 lines)  Orchestrator: keys, commands, all features
     ├── plugin.rs       (~430 lines)  Lua 5.4 plugin manager (mlua vendored)
     ├── terminal.rs     (~320 lines)  PTY-backed terminal pane (portable-pty + vt100)
     ├── lsp.rs        (~2,045 lines)  LSP protocol transport + single-server client
@@ -93,10 +96,10 @@ src/
     ├── buffer_manager.rs (~600 lines)  Buffer lifecycle, undo/redo
     ├── buffer.rs       (~120 lines)  Rope-based text storage (ropey)
     ├── session.rs      (~235 lines)  Session state persistence + per-workspace paths
-    ├── git.rs          (~900 lines)  git subprocess integration + SC panel data
+    ├── git.rs          (~975 lines)  git subprocess integration + SC panel data
     └── window.rs, tab.rs, view.rs, cursor.rs, mode.rs, syntax.rs (~893 lines)
-Tests: 801 passing
-Total: ~46,500 lines
+Tests: 813 passing
+Total: ~47,000 lines
 ```
 
 ---
@@ -144,6 +147,7 @@ Total: ~46,500 lines
 - [x] GTK titlebar removal + window controls — `set_decorated(false)`; `WindowHandle` drag-to-move menu bar; [─][☐][✕] buttons embedded in menu bar; menu bar always-on in GTK (hamburger removed); TUI hamburger toggle unchanged; terminal title sync (`SetTitle` in TUI; `window.set_title()` in GTK)
 - [x] Workspaces + Open Folder — `.vimcode-workspace` JSON; `open_folder`/`open_workspace`/`save_workspace_as`; per-project session (FNV-1a hashed path); GTK `FileDialog` for Open File/Folder/Workspace; TUI fuzzy directory picker modal; `:cd`/`:OpenFolder`/`:OpenWorkspace`/`:SaveWorkspaceAs` commands
 - [x] Source Control Panel — git icon in activity bar; Staged Changes / Changes / Worktrees sections (expandable); `j`/`k` navigation; `s` stage/unstage; `d` discard; `r` refresh; `Enter` open file / switch worktree; `Tab` collapse/expand; `:GWorktreeAdd`/`:GWorktreeRemove` commands; GTK Cairo panel + TUI panel (both backends)
+- [x] SC Panel VSCode Parity — commit message input row (`c`/`Enter`/`Esc`); push/pull/fetch from panel (`p`/`P`/`f`); bulk stage-all/unstage-all on section headers (`s`); discard-all on Changes header (`D`); `:Gpull`/`:Gfetch` commands
 - [x] Lua Extension Mechanism — mlua 5.4 vendored; `~/.config/vimcode/plugins/` auto-loaded; `vimcode.*` API (on/command/keymap/message/cwd/command_run/buf.*); `:Plugin list/reload/enable/disable`; hook points on save/open/normal-key/insert-key/command
 
 ### Planned / Ideas

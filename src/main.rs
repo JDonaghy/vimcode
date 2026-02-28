@@ -113,6 +113,8 @@ struct App {
     terminal_split_dragging: bool,
     /// Reference to the root GTK window used for minimize / maximize / close actions.
     window: gtk4::Window,
+    /// Last time sc_refresh() was called for the Git sidebar auto-refresh.
+    last_sc_refresh: std::time::Instant,
 }
 
 /// Scrollbars and indicators for a single window
@@ -304,6 +306,8 @@ enum Msg {
     DebugSidebarKey(String, bool),
     /// Scroll in the debug sidebar DrawingArea (dy value from EventControllerScroll).
     DebugSidebarScroll(f64),
+    /// Click in the Source Control sidebar DrawingArea (x, y coordinates in pixels).
+    ScSidebarClick(f64, f64),
     /// Key press in the Source Control sidebar DrawingArea.
     ScKey(String, bool),
     /// Minimize the application window.
@@ -1376,6 +1380,7 @@ impl SimpleComponent for App {
             terminal_sb_dragging: false,
             terminal_resize_dragging: false,
             terminal_split_dragging: false,
+            last_sc_refresh: std::time::Instant::now(),
         };
         let widgets = view_output!();
 
@@ -1572,6 +1577,15 @@ impl SimpleComponent for App {
             });
             widgets.git_sidebar_da.set_focusable(true);
             widgets.git_sidebar_da.add_controller(key_ctrl);
+        }
+        {
+            let sender_sc = sender.input_sender().clone();
+            let gesture = gtk4::GestureClick::new();
+            gesture.set_button(1);
+            gesture.connect_pressed(move |_, _, x, y| {
+                sender_sc.send(Msg::ScSidebarClick(x, y)).ok();
+            });
+            widgets.git_sidebar_da.add_controller(gesture);
         }
         *git_sidebar_da_ref.borrow_mut() = Some(widgets.git_sidebar_da.clone());
 
@@ -2645,7 +2659,10 @@ impl SimpleComponent for App {
                     self.sidebar_visible = true;
                     // Refresh SC data when switching to the Git panel
                     if self.active_panel == SidebarPanel::Git {
-                        self.engine.borrow_mut().sc_refresh();
+                        let mut engine = self.engine.borrow_mut();
+                        engine.sc_refresh();
+                        engine.sc_has_focus = true;
+                        drop(engine);
                         if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
                             da.grab_focus();
                         }
@@ -3184,6 +3201,18 @@ impl SimpleComponent for App {
                         da.queue_draw();
                     }
                 }
+                // Auto-refresh SC panel every 2s to pick up external git changes.
+                if self.sidebar_visible
+                    && self.active_panel == SidebarPanel::Git
+                    && self.last_sc_refresh.elapsed() >= std::time::Duration::from_secs(2)
+                {
+                    self.engine.borrow_mut().sc_refresh();
+                    self.last_sc_refresh = std::time::Instant::now();
+                    if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
+                        da.queue_draw();
+                    }
+                    self.redraw = true;
+                }
                 // Sync the OS window title with the active buffer name (taskbar/pager).
                 let win_title = self
                     .engine
@@ -3702,25 +3731,107 @@ impl SimpleComponent for App {
                 }
                 self.redraw = !self.redraw;
             }
-            Msg::ScKey(key_name, _ctrl) => {
-                // Map GTK key names to engine key names
-                let mapped = match key_name.as_str() {
-                    "Return" | "KP_Enter" => "Return",
-                    "Escape" => "Escape",
-                    "Tab" => "Tab",
-                    "Down" => "Down",
-                    "Up" => "Up",
-                    "j" => "j",
-                    "k" => "k",
-                    "s" => "s",
-                    "d" => "d",
-                    "r" => "r",
-                    "q" => "q",
-                    _ => "",
+            Msg::ScSidebarClick(_, y) => {
+                let lh = self.cached_line_height;
+                if lh <= 0.0 {
+                    return;
+                }
+                let row_idx = (y / lh) as usize;
+                self.tree_has_focus = false;
+                if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
+                    da.grab_focus();
+                }
+                // Update selection/focus in one borrow scope.
+                // Returns: Some("Return") = open file, Some("Tab") = toggle expand, None = no-op
+                let action: Option<&'static str> = {
+                    let mut engine = self.engine.borrow_mut();
+                    engine.sc_has_focus = true;
+                    if row_idx == 0 {
+                        // Panel header — no-op
+                        None
+                    } else if row_idx == 1 {
+                        // Commit input row
+                        engine.sc_commit_input_active = true;
+                        None
+                    } else {
+                        // GTK does not render a "(no changes)" hint for empty
+                        // expanded sections, so empty_section_hint = false.
+                        match engine.sc_visual_row_to_flat(row_idx, false) {
+                            Some((flat_idx, is_header)) => {
+                                engine.sc_selected = flat_idx;
+                                if is_header {
+                                    Some("Tab")
+                                } else {
+                                    Some("Return")
+                                }
+                            }
+                            None => None,
+                        }
+                    }
                 };
+                if let Some(key) = action {
+                    self.engine.borrow_mut().handle_sc_key(key, false, None);
+                    // When a file is opened via click, keep SC panel focus so
+                    // the user can continue navigating and staging/unstaging.
+                    // (Keyboard Return intentionally clears focus; click does not.)
+                    if key == "Return" {
+                        let mut engine = self.engine.borrow_mut();
+                        engine.sc_has_focus = true;
+                        drop(engine);
+                        if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
+                            da.grab_focus();
+                        }
+                    }
+                }
+                if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
+                    da.queue_draw();
+                }
+                self.redraw = !self.redraw;
+            }
+            Msg::ScKey(key_name, ctrl) => {
                 let mut engine = self.engine.borrow_mut();
-                if !mapped.is_empty() {
-                    engine.handle_sc_key(mapped);
+                if engine.sc_commit_input_active {
+                    // In commit input mode, pass everything through.
+                    let (mapped_key, unicode): (&str, Option<char>) = match key_name.as_str() {
+                        "Return" | "KP_Enter" => ("Return", None),
+                        "Escape" => ("Escape", None),
+                        "BackSpace" => ("BackSpace", None),
+                        other => {
+                            let mut chars = other.chars();
+                            if let (Some(ch), None) = (chars.next(), chars.next()) {
+                                (other, Some(ch))
+                            } else {
+                                (other, None)
+                            }
+                        }
+                    };
+                    engine.handle_sc_key(mapped_key, ctrl, unicode);
+                } else {
+                    // Normal navigation: map known keys only.
+                    let mapped = match key_name.as_str() {
+                        "Return" | "KP_Enter" => "Return",
+                        "Escape" => "Escape",
+                        "Tab" => "Tab",
+                        "Down" => "Down",
+                        "Up" => "Up",
+                        "BackSpace" => "BackSpace",
+                        "j" => "j",
+                        "k" => "k",
+                        "s" => "s",
+                        "S" => "S",
+                        "d" => "d",
+                        "D" => "D",
+                        "r" => "r",
+                        "q" => "q",
+                        "c" => "c",
+                        "p" => "p",
+                        "P" => "P",
+                        "f" => "f",
+                        _ => "",
+                    };
+                    if !mapped.is_empty() {
+                        engine.handle_sc_key(mapped, ctrl, None);
+                    }
                 }
                 let still_focused = engine.sc_has_focus;
                 drop(engine);
@@ -6407,6 +6518,39 @@ fn draw_source_control_panel(
     pangocairo::show_layout(cr, layout);
     let _ = (lw, lh);
     row += 1;
+
+    // ── Row 1: commit input row ───────────────────────────────────────────────
+    if row as f64 * line_height < h {
+        let (inp_bg_r, inp_bg_g, inp_bg_b) = if sc.commit_input_active {
+            theme.fuzzy_selected_bg.to_cairo()
+        } else {
+            theme.completion_bg.to_cairo()
+        };
+        cr.set_source_rgb(inp_bg_r, inp_bg_g, inp_bg_b);
+        cr.rectangle(x, y + row as f64 * line_height, w, line_height);
+        cr.fill().ok();
+        let prompt = if sc.commit_input_active {
+            format!(" \u{f044}  {}|", sc.commit_message)
+        } else if sc.commit_message.is_empty() {
+            " \u{f044}  Message (press c to type)".to_string()
+        } else {
+            format!(" \u{f044}  {}", sc.commit_message)
+        };
+        let (prompt_r, prompt_g, prompt_b) = if sc.commit_input_active {
+            (fg_r, fg_g, fg_b)
+        } else {
+            (dim_r, dim_g, dim_b)
+        };
+        cr.set_source_rgb(prompt_r, prompt_g, prompt_b);
+        layout.set_text(&prompt);
+        let (_, lh2) = layout.pixel_size();
+        cr.move_to(
+            x + 2.0,
+            y + row as f64 * line_height + (line_height - lh2 as f64) / 2.0,
+        );
+        pangocairo::show_layout(cr, layout);
+        row += 1;
+    }
 
     // Helper to draw a section
     let draw_section = |cr: &Context,

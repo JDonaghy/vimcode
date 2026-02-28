@@ -357,6 +357,61 @@ pub fn push(dir: &Path) -> Result<String, String> {
     }
 }
 
+/// Run `git pull`. Returns Ok(summary) or Err(message).
+pub fn pull(dir: &Path) -> Result<String, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["pull"])
+        .output()
+        .map_err(|e| format!("git pull failed: {}", e))?;
+    if output.status.success() {
+        let out = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let err_out = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Ok(if out.is_empty() { err_out } else { out })
+    } else {
+        let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(if err.is_empty() {
+            "git pull failed".to_string()
+        } else {
+            err
+        })
+    }
+}
+
+/// Run `git fetch`. Returns Ok(summary) or Err(message).
+pub fn fetch(dir: &Path) -> Result<String, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["fetch"])
+        .output()
+        .map_err(|e| format!("git fetch failed: {}", e))?;
+    if output.status.success() {
+        let out = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let err_out = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Ok(if out.is_empty() { err_out } else { out })
+    } else {
+        let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(if err.is_empty() {
+            "git fetch failed".to_string()
+        } else {
+            err
+        })
+    }
+}
+
+/// Unstage all staged files (`git restore --staged .`).
+#[allow(dead_code)]
+pub fn unstage_all(dir: &Path) -> Result<(), String> {
+    run_git_result(dir, &["restore", "--staged", "."])
+}
+
+/// Discard all working-tree changes (`git restore .`).
+pub fn discard_all(dir: &Path) -> Result<(), String> {
+    run_git_result(dir, &["restore", "."])
+}
+
 // ─── Blame ────────────────────────────────────────────────────────────────────
 
 fn is_leap_year(year: i32) -> bool {

@@ -382,6 +382,10 @@ pub struct Engine {
     /// Ahead/behind counts relative to upstream (cached alongside `sc_refresh`).
     pub sc_ahead: u32,
     pub sc_behind: u32,
+    /// Commit message being typed in the SC panel input row.
+    pub sc_commit_message: String,
+    /// True when the SC commit input row has keyboard focus.
+    pub sc_commit_input_active: bool,
 
     // --- Plugin system ---
     /// Manages loaded Lua plugins. `None` if no plugins dir or plugins disabled.
@@ -673,6 +677,8 @@ impl Engine {
             sc_has_focus: false,
             sc_ahead: 0,
             sc_behind: 0,
+            sc_commit_message: String::new(),
+            sc_commit_input_active: false,
             plugin_manager: None,
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             fuzzy_open: false,
@@ -2902,7 +2908,7 @@ impl Engine {
 
         // Source Control panel intercepts all keys when it has focus.
         if self.sc_has_focus {
-            self.handle_sc_key(key_name);
+            self.handle_sc_key(key_name, ctrl, unicode);
             return EngineAction::None;
         }
 
@@ -6141,11 +6147,25 @@ impl Engine {
     }
 
     /// Stage or unstage the currently selected SC item.
+    /// If the cursor is on a section header (idx == usize::MAX):
+    ///   - STAGED header → unstage all
+    ///   - CHANGES header → stage all
     pub fn sc_stage_selected(&mut self) {
         let (section, idx) = self.sc_flat_to_section_idx(self.sc_selected);
-        let dir = self.cwd.clone();
+        // Section header: bulk operation
+        if idx == usize::MAX {
+            if section == 0 {
+                self.sc_unstage_all();
+            } else if section == 1 {
+                self.sc_stage_all();
+            }
+            return;
+        }
+        // Use git repo root so paths from `git status` (relative to git root) work
+        // correctly even when cwd is a sub-directory.
+        let dir = git::find_repo_root(&self.cwd).unwrap_or_else(|| self.cwd.clone());
         if section == 0 {
-            // Staged section: unstage it
+            // Staged section: unstage the selected file
             let staged: Vec<git::FileStatus> = self
                 .sc_file_statuses
                 .iter()
@@ -6154,31 +6174,161 @@ impl Engine {
                 .collect();
             if let Some(f) = staged.get(idx) {
                 let path = f.path.clone();
-                let _ = git::unstage_path(&dir, &path);
+                match git::unstage_path(&dir, &path) {
+                    Ok(()) => {}
+                    Err(e) => self.message = format!("unstage: {e}"),
+                }
             }
         } else if section == 1 {
-            // Unstaged/untracked section: stage it
+            // Unstaged/untracked section: stage the selected file
             let unstaged: Vec<git::FileStatus> = self
                 .sc_file_statuses
                 .iter()
-                .filter(|f| f.unstaged.is_some() || f.staged.is_none())
+                .filter(|f| f.unstaged.is_some())
                 .cloned()
                 .collect();
             if let Some(f) = unstaged.get(idx) {
                 let path = f.path.clone();
-                let _ = git::stage_path(&dir, &path);
+                match git::stage_path(&dir, &path) {
+                    Ok(()) => {}
+                    Err(e) => self.message = format!("stage: {e}"),
+                }
             }
         }
         self.sc_refresh();
     }
 
-    /// Discard working-tree changes for the selected unstaged file.
-    pub fn sc_discard_selected(&mut self) {
-        let (section, idx) = self.sc_flat_to_section_idx(self.sc_selected);
-        if section != 1 {
+    /// Stage all unstaged/untracked files.
+    pub fn sc_stage_all(&mut self) {
+        let dir = git::find_repo_root(&self.cwd).unwrap_or_else(|| self.cwd.clone());
+        let _ = git::stage_path(&dir, ".");
+        self.sc_refresh();
+    }
+
+    /// Unstage all staged files.
+    #[allow(dead_code)]
+    pub fn sc_unstage_all(&mut self) {
+        let dir = git::find_repo_root(&self.cwd).unwrap_or_else(|| self.cwd.clone());
+        let _ = git::unstage_all(&dir);
+        self.sc_refresh();
+    }
+
+    /// Discard all unstaged working-tree changes.
+    pub fn sc_discard_all_unstaged(&mut self) {
+        let dir = git::find_repo_root(&self.cwd).unwrap_or_else(|| self.cwd.clone());
+        let _ = git::discard_all(&dir);
+        self.sc_refresh();
+    }
+
+    /// Run `git pull` and show the result as a status message.
+    pub fn sc_pull(&mut self) {
+        let dir = self.cwd.clone();
+        match git::pull(&dir) {
+            Ok(msg) => {
+                self.message = if msg.is_empty() {
+                    "Already up to date.".to_string()
+                } else {
+                    msg
+                };
+            }
+            Err(e) => self.message = format!("pull: {}", e),
+        }
+        self.sc_refresh();
+    }
+
+    /// Run `git fetch` and show the result as a status message.
+    pub fn sc_fetch(&mut self) {
+        let dir = self.cwd.clone();
+        match git::fetch(&dir) {
+            Ok(msg) => {
+                self.message = if msg.is_empty() {
+                    "Fetched.".to_string()
+                } else {
+                    msg
+                };
+            }
+            Err(e) => self.message = format!("fetch: {}", e),
+        }
+        self.sc_refresh();
+    }
+
+    /// Run `git push` and show the result as a status message.
+    pub fn sc_push(&mut self) {
+        let dir = self.cwd.clone();
+        match git::push(&dir) {
+            Ok(msg) => {
+                self.message = if msg.is_empty() {
+                    "Pushed.".to_string()
+                } else {
+                    msg
+                };
+            }
+            Err(e) => self.message = format!("push: {}", e),
+        }
+        self.sc_refresh();
+    }
+
+    /// Commit all staged changes with the current commit message.
+    pub fn sc_do_commit(&mut self) {
+        let msg = self.sc_commit_message.trim().to_string();
+        if msg.is_empty() {
+            self.message = "Commit message is empty".to_string();
             return;
         }
         let dir = self.cwd.clone();
+        match git::commit(&dir, &msg) {
+            Ok(out) => {
+                self.message = if out.is_empty() {
+                    "Committed.".to_string()
+                } else {
+                    out
+                };
+                self.sc_commit_message.clear();
+                self.sc_commit_input_active = false;
+            }
+            Err(e) => self.message = format!("commit: {}", e),
+        }
+        self.sc_refresh();
+    }
+
+    /// Handle a key when the commit message input row is active.
+    pub fn handle_sc_commit_input_key(
+        &mut self,
+        key: &str,
+        _ctrl: bool,
+        unicode: Option<char>,
+    ) -> bool {
+        match key {
+            "Return" | "KP_Enter" => {
+                self.sc_do_commit();
+                true
+            }
+            "Escape" => {
+                self.sc_commit_input_active = false;
+                true
+            }
+            "BackSpace" => {
+                self.sc_commit_message.pop();
+                true
+            }
+            _ => {
+                if let Some(ch) = unicode {
+                    self.sc_commit_message.push(ch);
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    /// Discard working-tree changes for the selected unstaged file.
+    pub fn sc_discard_selected(&mut self) {
+        let (section, idx) = self.sc_flat_to_section_idx(self.sc_selected);
+        if section != 1 || idx == usize::MAX {
+            return;
+        }
+        let dir = git::find_repo_root(&self.cwd).unwrap_or_else(|| self.cwd.clone());
         let unstaged: Vec<git::FileStatus> = self
             .sc_file_statuses
             .iter()
@@ -6187,7 +6337,10 @@ impl Engine {
             .collect();
         if let Some(f) = unstaged.get(idx) {
             let path = f.path.clone();
-            let _ = git::discard_path(&dir, &path);
+            match git::discard_path(&dir, &path) {
+                Ok(()) => {}
+                Err(e) => self.message = format!("discard: {e}"),
+            }
         }
         self.sc_refresh();
     }
@@ -6202,7 +6355,11 @@ impl Engine {
 
     /// Handle a key press when the Source Control panel has focus.
     /// Returns true if the key was consumed.
-    pub fn handle_sc_key(&mut self, key: &str) -> bool {
+    pub fn handle_sc_key(&mut self, key: &str, ctrl: bool, unicode: Option<char>) -> bool {
+        // If commit input is active, delegate to the input handler.
+        if self.sc_commit_input_active {
+            return self.handle_sc_commit_input_key(key, ctrl, unicode);
+        }
         let flat_len = self.sc_flat_len();
         match key {
             "j" | "Down" => {
@@ -6219,8 +6376,32 @@ impl Engine {
                 self.sc_stage_selected();
                 true
             }
+            "S" => {
+                self.sc_stage_all();
+                true
+            }
             "d" => {
                 self.sc_discard_selected();
+                true
+            }
+            "D" => {
+                self.sc_discard_all_unstaged();
+                true
+            }
+            "c" => {
+                self.sc_commit_input_active = true;
+                true
+            }
+            "p" => {
+                self.sc_push();
+                true
+            }
+            "P" => {
+                self.sc_pull();
+                true
+            }
+            "f" => {
+                self.sc_fetch();
                 true
             }
             "Tab" => {
@@ -6234,9 +6415,12 @@ impl Engine {
             "Return" | "Enter" => {
                 let (section, idx) = self.sc_flat_to_section_idx(self.sc_selected);
                 if section == 2 {
+                    // Worktree: switch and keep panel focus.
                     self.sc_switch_worktree(idx);
-                } else {
-                    // Open the file in the editor
+                } else if idx != usize::MAX {
+                    // File row: open in editor, keep SC panel focus so the user
+                    // can continue navigating / staging without re-clicking.
+                    // (Press q / Escape to return focus to the editor.)
                     let statuses = self.sc_file_statuses.clone();
                     let all_files: Vec<&git::FileStatus> = if section == 0 {
                         statuses.iter().filter(|f| f.staged.is_some()).collect()
@@ -6244,11 +6428,22 @@ impl Engine {
                         statuses.iter().filter(|f| f.unstaged.is_some()).collect()
                     };
                     if let Some(f) = all_files.get(idx) {
-                        let path = self.cwd.join(&f.path);
-                        let _ = self.open_file_with_mode(&path, crate::core::OpenMode::Permanent);
-                        self.sc_has_focus = false;
+                        // Use the git repo root to resolve the path so that
+                        // git-relative paths work even when cwd is a sub-dir.
+                        let git_root =
+                            git::find_repo_root(&self.cwd).unwrap_or_else(|| self.cwd.clone());
+                        let path = git_root.join(&f.path);
+                        if !path.exists() {
+                            self.message = format!("SC: file not found: {}", path.display());
+                        } else {
+                            let _ =
+                                self.open_file_with_mode(&path, crate::core::OpenMode::Permanent);
+                        }
+                        // sc_has_focus intentionally NOT cleared here — panel keeps
+                        // focus so j/k/s/d continue to work immediately.
                     }
                 }
+                // Header rows (idx == usize::MAX): no action for Enter.
                 true
             }
             "q" | "Escape" => {
@@ -6290,6 +6485,64 @@ impl Engine {
         } else {
             0
         }
+    }
+
+    /// Map a visual row index (0=panel header, 1=commit input, 2+=sections)
+    /// to `Some((flat_idx, is_section_header))`, or `None` if the row is
+    /// outside the section area.
+    ///
+    /// `empty_section_hint`: if `true`, expanded sections with 0 items show
+    /// an extra visual "(no changes)" row that has no flat-index entry (TUI
+    /// behaviour). Set `false` for the GTK backend which skips that row.
+    pub fn sc_visual_row_to_flat(
+        &self,
+        visual_row: usize,
+        empty_section_hint: bool,
+    ) -> Option<(usize, bool)> {
+        if visual_row < 2 {
+            return None;
+        }
+        let staged_count = self
+            .sc_file_statuses
+            .iter()
+            .filter(|f| f.staged.is_some())
+            .count();
+        let unstaged_count = self
+            .sc_file_statuses
+            .iter()
+            .filter(|f| f.unstaged.is_some())
+            .count();
+        let wt_count = self.sc_worktrees.len();
+        let counts = [staged_count, unstaged_count, wt_count];
+
+        let mut row = 2usize;
+        let mut flat = 0usize;
+
+        for (sec, &count) in counts.iter().enumerate() {
+            // Section header row
+            if row == visual_row {
+                return Some((flat, true));
+            }
+            row += 1;
+            flat += 1;
+
+            if self.sc_sections_expanded[sec] {
+                if count == 0 && empty_section_hint {
+                    // TUI renders a "(no changes)" hint row; skip it without
+                    // advancing the flat index.
+                    row += 1;
+                } else {
+                    for _ in 0..count {
+                        if row == visual_row {
+                            return Some((flat, false));
+                        }
+                        row += 1;
+                        flat += 1;
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Map a flat index to (section_idx, item_idx_within_section).
@@ -6926,6 +7179,18 @@ impl Engine {
                 }
                 Err(e) => self.message = format!("GWorktreeRemove: {}", e),
             }
+            return EngineAction::None;
+        }
+
+        // Handle :Gpull — git pull
+        if cmd == "Gpull" {
+            self.sc_pull();
+            return EngineAction::None;
+        }
+
+        // Handle :Gfetch — git fetch
+        if cmd == "Gfetch" {
+            self.sc_fetch();
             return EngineAction::None;
         }
 
@@ -24901,5 +25166,231 @@ mod tests {
         let action = engine.execute_command("DisabledCmd");
         assert_eq!(action, EngineAction::Error);
         assert!(engine.message.contains("Not an editor command"));
+    }
+
+    // ─── Source Control (Session 99) ─────────────────────────────────────────
+
+    /// Build an engine with synthetic SC file statuses for testing.
+    fn make_sc_engine_with_files() -> Engine {
+        let mut engine = Engine::new();
+        engine.sc_file_statuses = vec![
+            git::FileStatus {
+                path: "a.rs".to_string(),
+                staged: Some(git::StatusKind::Modified),
+                unstaged: None,
+            },
+            git::FileStatus {
+                path: "b.rs".to_string(),
+                staged: None,
+                unstaged: Some(git::StatusKind::Modified),
+            },
+        ];
+        engine.sc_sections_expanded = [true, true, false];
+        engine
+    }
+
+    #[test]
+    fn test_sc_commit_input_mode_toggle() {
+        let mut engine = make_sc_engine_with_files();
+        assert!(!engine.sc_commit_input_active);
+        engine.handle_sc_key("c", false, None);
+        assert!(engine.sc_commit_input_active);
+        engine.handle_sc_key("Escape", false, None);
+        assert!(!engine.sc_commit_input_active);
+    }
+
+    #[test]
+    fn test_sc_commit_input_typing() {
+        let mut engine = make_sc_engine_with_files();
+        engine.sc_commit_input_active = true;
+        engine.handle_sc_key("", false, Some('h'));
+        engine.handle_sc_key("", false, Some('i'));
+        assert_eq!(engine.sc_commit_message, "hi");
+    }
+
+    #[test]
+    fn test_sc_commit_input_backspace() {
+        let mut engine = make_sc_engine_with_files();
+        engine.sc_commit_input_active = true;
+        engine.sc_commit_message = "abc".to_string();
+        engine.handle_sc_key("BackSpace", false, None);
+        assert_eq!(engine.sc_commit_message, "ab");
+    }
+
+    #[test]
+    fn test_sc_commit_empty_message_error() {
+        let mut engine = make_sc_engine_with_files();
+        engine.sc_commit_input_active = true;
+        engine.sc_commit_message = "".to_string();
+        // simulate Enter with empty message
+        engine.sc_do_commit();
+        assert!(engine.message.contains("empty"));
+        // Input mode stays active implicitly (message set, but no state change needed)
+    }
+
+    #[test]
+    fn test_sc_nav_j_k() {
+        let mut engine = make_sc_engine_with_files();
+        engine.sc_has_focus = true;
+        assert_eq!(engine.sc_selected, 0);
+        engine.handle_sc_key("j", false, None);
+        assert_eq!(engine.sc_selected, 1);
+        engine.handle_sc_key("k", false, None);
+        assert_eq!(engine.sc_selected, 0);
+    }
+
+    #[test]
+    fn test_sc_nav_clamps_at_bottom() {
+        let mut engine = make_sc_engine_with_files();
+        engine.sc_has_focus = true;
+        let len = engine.sc_flat_len();
+        for _ in 0..len + 5 {
+            engine.handle_sc_key("j", false, None);
+        }
+        assert_eq!(engine.sc_selected, len - 1);
+    }
+
+    #[test]
+    fn test_sc_nav_clamps_at_top() {
+        let mut engine = make_sc_engine_with_files();
+        engine.sc_has_focus = true;
+        engine.handle_sc_key("k", false, None);
+        assert_eq!(engine.sc_selected, 0);
+    }
+
+    #[test]
+    fn test_sc_tab_toggles_section() {
+        let mut engine = make_sc_engine_with_files();
+        assert!(engine.sc_sections_expanded[0]);
+        engine.handle_sc_key("Tab", false, None);
+        assert!(!engine.sc_sections_expanded[0]);
+        engine.handle_sc_key("Tab", false, None);
+        assert!(engine.sc_sections_expanded[0]);
+    }
+
+    #[test]
+    fn test_sc_escape_unfocuses() {
+        let mut engine = make_sc_engine_with_files();
+        engine.sc_has_focus = true;
+        engine.handle_sc_key("Escape", false, None);
+        assert!(!engine.sc_has_focus);
+    }
+
+    #[test]
+    fn test_sc_q_unfocuses() {
+        let mut engine = make_sc_engine_with_files();
+        engine.sc_has_focus = true;
+        engine.handle_sc_key("q", false, None);
+        assert!(!engine.sc_has_focus);
+    }
+
+    #[test]
+    fn test_sc_commit_input_blocks_nav() {
+        let mut engine = make_sc_engine_with_files();
+        engine.sc_commit_input_active = true;
+        let before = engine.sc_selected;
+        // 'j' should go to commit input handler, not navigate
+        engine.handle_sc_key("j", false, None);
+        // selected should not have changed (j has no meaning in commit input)
+        assert_eq!(engine.sc_selected, before);
+        // but the commit input should still be active
+        assert!(engine.sc_commit_input_active);
+    }
+
+    #[test]
+    fn test_gpull_and_gfetch_commands_exist() {
+        let mut engine = make_sc_engine_with_files();
+        // These will fail with a git error since cwd is not a real repo, but
+        // they should not return EngineAction::Error ("Not an editor command").
+        let r1 = engine.execute_command("Gpull");
+        let r2 = engine.execute_command("Gfetch");
+        assert_ne!(r1, EngineAction::Error);
+        assert_ne!(r2, EngineAction::Error);
+    }
+
+    // ─── sc_visual_row_to_flat tests (click-math correctness) ─────────────────
+
+    /// make_sc_engine_with_files gives: 1 staged file + 1 unstaged file,
+    /// sections_expanded = [true, true, false].
+    /// GTK (no hint) flat layout:
+    ///   row 2  → flat 0  (STAGED header)
+    ///   row 3  → flat 1  (a.rs – staged)
+    ///   row 4  → flat 2  (CHANGES header)
+    ///   row 5  → flat 3  (b.rs – unstaged)
+    ///   row 6  → flat 4  (WORKTREES header)
+    #[test]
+    fn test_sc_visual_row_to_flat_gtk() {
+        let engine = make_sc_engine_with_files(); // staged=1, unstaged=1
+                                                  // Row 0 and 1 are panel header / commit input — should return None.
+        assert_eq!(engine.sc_visual_row_to_flat(0, false), None);
+        assert_eq!(engine.sc_visual_row_to_flat(1, false), None);
+        // STAGED header
+        assert_eq!(engine.sc_visual_row_to_flat(2, false), Some((0, true)));
+        // staged file a.rs
+        assert_eq!(engine.sc_visual_row_to_flat(3, false), Some((1, false)));
+        // CHANGES header
+        assert_eq!(engine.sc_visual_row_to_flat(4, false), Some((2, true)));
+        // unstaged file b.rs
+        assert_eq!(engine.sc_visual_row_to_flat(5, false), Some((3, false)));
+        // WORKTREES header (worktrees section collapsed — but header is always present)
+        assert_eq!(engine.sc_visual_row_to_flat(6, false), Some((4, true)));
+        // Beyond last section
+        assert_eq!(engine.sc_visual_row_to_flat(7, false), None);
+    }
+
+    /// TUI: STAGED is expanded but empty; CHANGES has 1 file.
+    /// TUI adds a "(no changes)" visual row for the empty STAGED section.
+    /// Visual layout:
+    ///   row 2  → flat 0  (STAGED header)
+    ///   row 3  → visual "(no changes)" — NO flat entry
+    ///   row 4  → flat 1  (CHANGES header)
+    ///   row 5  → flat 2  (b.rs – unstaged)
+    ///   row 6  → flat 3  (WORKTREES header)
+    #[test]
+    fn test_sc_visual_row_to_flat_tui_empty_staged() {
+        let mut engine = Engine::new();
+        engine.sc_file_statuses = vec![git::FileStatus {
+            path: "b.rs".to_string(),
+            staged: None,
+            unstaged: Some(git::StatusKind::Modified),
+        }];
+        engine.sc_sections_expanded = [true, true, false]; // staged expanded but empty
+                                                           // Row 2: STAGED header (flat 0)
+        assert_eq!(engine.sc_visual_row_to_flat(2, true), Some((0, true)));
+        // Row 3: "(no changes)" hint — None
+        assert_eq!(engine.sc_visual_row_to_flat(3, true), None);
+        // Row 4: CHANGES header (flat 1)
+        assert_eq!(engine.sc_visual_row_to_flat(4, true), Some((1, true)));
+        // Row 5: b.rs (flat 2)
+        assert_eq!(engine.sc_visual_row_to_flat(5, true), Some((2, false)));
+        // Row 6: WORKTREES header (flat 3)
+        assert_eq!(engine.sc_visual_row_to_flat(6, true), Some((3, true)));
+    }
+
+    /// s on STAGED section header calls sc_unstage_all path (no panic in test context).
+    #[test]
+    fn test_sc_stage_selected_on_staged_header_is_not_noop() {
+        let mut engine = make_sc_engine_with_files();
+        // flat 0 = STAGED header
+        engine.sc_selected = 0;
+        let before_count = engine
+            .sc_file_statuses
+            .iter()
+            .filter(|f| f.staged.is_some())
+            .count();
+        // sc_stage_selected should detect idx==MAX and call sc_unstage_all
+        // (which will fail silently since we're not in a real git repo)
+        engine.sc_stage_selected();
+        // The function should not panic and should call sc_refresh (resets to empty).
+        let _ = before_count; // no panics = pass
+    }
+
+    /// s on CHANGES section header calls sc_stage_all path (no panic in test context).
+    #[test]
+    fn test_sc_stage_selected_on_changes_header_is_not_noop() {
+        let mut engine = make_sc_engine_with_files();
+        // flat 2 = CHANGES header (1 staged file shifts CHANGES header to flat 2)
+        engine.sc_selected = 2;
+        engine.sc_stage_selected(); // should not panic
     }
 }

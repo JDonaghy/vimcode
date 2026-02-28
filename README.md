@@ -11,7 +11,7 @@ There's a touch of irony here - using a cli tool to write the editor that I've w
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 801 tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 813 tests, zero async runtime dependency
 
 ## Building
 
@@ -365,6 +365,8 @@ Built-in Debug Adapter Protocol support with a VSCode-like UI. Open the debug si
 | `:Gadd!` | `:Ga!` | Stage all changes (`git add -A`) |
 | `:Gcommit <msg>` | `:Gc <msg>` | Commit with message |
 | `:Gpush` | `:Gp` | Push current branch |
+| `:Gpull` | `:Gpl` | Pull current branch |
+| `:Gfetch` | `:Gf` | Fetch |
 | `:Gblame` | `:Gb` | Open `git blame` in scroll-synced vertical split |
 | `:Ghs` | `:Ghunk` | Stage hunk under cursor (in a `:Gdiff` buffer) |
 
@@ -377,28 +379,41 @@ Built-in Debug Adapter Protocol support with a VSCode-like UI. Open the debug si
 
 ### Source Control Panel
 
-Click the git branch icon in the activity bar (or press `Alt+G` once implemented) to open the Source Control panel — a VSCode-style panel showing the full working tree status.
+Click the git branch icon in the activity bar to open the Source Control panel — a VSCode-style panel showing the full working tree status. The header shows the current branch plus ↑N↓N ahead/behind counts.
+
+**Commit input row** (always visible, below the header):
+- `c` — enter commit message input mode (row highlights, `|` cursor appears)
+- Type your message; `BackSpace` deletes; `Escape` exits input mode (message is preserved)
+- `Enter` — commits staged changes with the typed message (clears message on success)
 
 **Three expandable sections** (Tab to collapse/expand):
 - **Staged Changes** — files indexed for the next commit (`A` added, `M` modified, `D` deleted, `R` renamed)
 - **Changes** — unstaged modifications and untracked files
 - **Worktrees** — all git worktrees with ✓ marking the current one
 
-**Navigation:**
+**Navigation and file actions:**
 - `j` / `k` — move selection up/down
-- `s` — stage (if unstaged) or unstage (if staged) the selected file
-- `d` — discard unstaged changes (`git checkout -- <path>`)
+- `s` — stage/unstage the selected file; on a **section header**: stage all (Changes) or unstage all (Staged Changes)
+- `d` — discard unstaged changes for the selected file (`git checkout -- <path>`)
+- `D` — on the **Changes section header**: discard all unstaged changes (`git restore .`)
 - `r` — refresh the panel
 - `Enter` — open the selected file in the editor / switch to the selected worktree
 - `Tab` — collapse/expand the current section
 - `q` / `Escape` — return focus to the editor
 
-**Worktree commands:**
+**Remote operations (from panel):**
+- `p` — push current branch
+- `P` — pull current branch
+- `f` — fetch
 
-| Command | Action |
-|---------|--------|
-| `:GWorktreeAdd <branch> <path>` | Add a new git worktree at `<path>` for `<branch>` |
-| `:GWorktreeRemove <path>` | Remove the worktree at `<path>` |
+**Worktree and remote commands:**
+
+| Command | Alias | Action |
+|---------|-------|--------|
+| `:GWorktreeAdd <branch> <path>` | — | Add a new git worktree at `<path>` for `<branch>` |
+| `:GWorktreeRemove <path>` | — | Remove the worktree at `<path>` |
+| `:Gpull` | `:Gpl` | Pull current branch |
+| `:Gfetch` | `:Gf` | Fetch |
 
 ---
 
@@ -754,6 +769,8 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `:Gadd` / `:Gadd!` | Stage file / stage all |
 | `:Gcommit <msg>` | Commit |
 | `:Gpush` | Push |
+| `:Gpull` / `:Gpl` | Pull |
+| `:Gfetch` / `:Gf` | Fetch |
 | `:Gblame` | Blame (scroll-synced split) |
 | `:Ghs` / `:Ghunk` | Stage hunk under cursor |
 | `:GWorktreeAdd <branch> <path>` | Add git worktree |

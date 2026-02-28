@@ -862,9 +862,12 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
             if engine.poll_project_replace() {
                 needs_redraw = true;
             }
-            // Auto-refresh explorer to reflect external filesystem changes.
+            // Auto-refresh explorer and SC panel to reflect external filesystem changes.
             if sidebar.visible && last_sidebar_refresh.elapsed() >= Duration::from_secs(2) {
                 sidebar.build_rows();
+                if sidebar.active_panel == TuiPanel::Git {
+                    engine.sc_refresh();
+                }
                 last_sidebar_refresh = Instant::now();
                 needs_redraw = true;
             }
@@ -1273,28 +1276,51 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
 
                     // ── Source Control panel keyboard handling ──────────────
                     if sidebar.active_panel == TuiPanel::Git {
-                        let key_name: Option<&str> = match key_event.code {
-                            KeyCode::Char('j') | KeyCode::Down => Some("j"),
-                            KeyCode::Char('k') | KeyCode::Up => Some("k"),
-                            KeyCode::Char('s') => Some("s"),
-                            KeyCode::Char('d') => Some("d"),
-                            KeyCode::Tab => Some("Tab"),
-                            KeyCode::Enter => Some("Return"),
-                            KeyCode::Char('q') | KeyCode::Esc => Some("Escape"),
-                            KeyCode::Char('b') if ctrl => {
-                                sidebar.visible = false;
-                                sidebar.has_focus = false;
-                                engine.session.explorer_visible = false;
-                                engine.sc_has_focus = false;
-                                let _ = engine.session.save();
-                                None
+                        if engine.sc_commit_input_active {
+                            // In commit input mode, route all keys to commit handler.
+                            let (key_str, unicode): (&str, Option<char>) = match key_event.code {
+                                KeyCode::Enter => ("Return", None),
+                                KeyCode::Esc => ("Escape", None),
+                                KeyCode::Backspace => ("BackSpace", None),
+                                KeyCode::Char(ch) => ("char", Some(ch)),
+                                _ => ("", None),
+                            };
+                            if key_str == "char" {
+                                engine.handle_sc_key("", ctrl, unicode);
+                            } else if !key_str.is_empty() {
+                                engine.handle_sc_key(key_str, ctrl, None);
                             }
-                            _ => None,
-                        };
-                        if let Some(name) = key_name {
-                            engine.handle_sc_key(name);
-                            if !engine.sc_has_focus {
-                                sidebar.has_focus = false;
+                        } else {
+                            let key_name: Option<&str> = match key_event.code {
+                                KeyCode::Char('j') | KeyCode::Down => Some("j"),
+                                KeyCode::Char('k') | KeyCode::Up => Some("k"),
+                                KeyCode::Char('s') => Some("s"),
+                                KeyCode::Char('S') => Some("S"),
+                                KeyCode::Char('d') => Some("d"),
+                                KeyCode::Char('D') => Some("D"),
+                                KeyCode::Char('c') => Some("c"),
+                                KeyCode::Char('p') => Some("p"),
+                                KeyCode::Char('P') => Some("P"),
+                                KeyCode::Char('f') => Some("f"),
+                                KeyCode::Tab => Some("Tab"),
+                                KeyCode::Enter => Some("Return"),
+                                KeyCode::Char('q') | KeyCode::Esc => Some("Escape"),
+                                KeyCode::Char('r') => Some("r"),
+                                KeyCode::Char('b') if ctrl => {
+                                    sidebar.visible = false;
+                                    sidebar.has_focus = false;
+                                    engine.session.explorer_visible = false;
+                                    engine.sc_has_focus = false;
+                                    let _ = engine.session.save();
+                                    None
+                                }
+                                _ => None,
+                            };
+                            if let Some(name) = key_name {
+                                engine.handle_sc_key(name, ctrl, None);
+                                if !engine.sc_has_focus {
+                                    sidebar.has_focus = false;
+                                }
                             }
                         }
                         needs_redraw = true;
@@ -2802,6 +2828,36 @@ fn handle_mouse(
                         break;
                     }
                     cur_row = items_end;
+                }
+            }
+            return sidebar_width;
+        } else if sidebar.active_panel == TuiPanel::Git {
+            sidebar.has_focus = true;
+            engine.sc_has_focus = true;
+
+            // sidebar_row layout:
+            //   0 = header, 1 = commit input, 2+ = section rows
+            if sidebar_row == 0 {
+                // Panel header — no-op
+            } else if sidebar_row == 1 {
+                // Commit input row — enter commit mode
+                engine.sc_commit_input_active = true;
+            } else {
+                // TUI shows a "(no changes)" hint for expanded-but-empty sections
+                // (extra visual row with no flat-index entry), so empty_section_hint = true.
+                if let Some((flat_idx, is_header)) =
+                    engine.sc_visual_row_to_flat(sidebar_row as usize, true)
+                {
+                    engine.sc_selected = flat_idx;
+                    if is_header {
+                        engine.handle_sc_key("Tab", false, None);
+                    } else {
+                        engine.handle_sc_key("Return", false, None);
+                        // Keep SC panel focus after click-opening a file so the
+                        // user can continue staging/navigating without re-clicking.
+                        engine.sc_has_focus = true;
+                        sidebar.has_focus = true;
+                    }
                 }
             }
             return sidebar_width;
@@ -6075,6 +6131,38 @@ fn render_source_control(
         return;
     }
 
+    // ── Row 1: commit input row ───────────────────────────────────────────────
+    {
+        let commit_y = area.y + 1;
+        let inp_bg = if sc.commit_input_active {
+            sel_bg
+        } else {
+            row_bg
+        };
+        for x in area.x..area.x + area.width {
+            set_cell(buf, x, commit_y, ' ', item_fg, inp_bg);
+        }
+        let prompt = if sc.commit_input_active {
+            format!(" \u{f044}  {}|", sc.commit_message)
+        } else if sc.commit_message.is_empty() {
+            " \u{f044}  Message (press c)".to_string()
+        } else {
+            format!(" \u{f044}  {}", sc.commit_message)
+        };
+        let prompt_fg = if sc.commit_input_active {
+            item_fg
+        } else {
+            dim_fg
+        };
+        for (i, ch) in prompt.chars().enumerate().take(area.width as usize) {
+            set_cell(buf, area.x + i as u16, commit_y, ch, prompt_fg, inp_bg);
+        }
+    }
+
+    if area.height < 3 {
+        return;
+    }
+
     // Sections: [staged, unstaged, worktrees]
     #[allow(clippy::type_complexity)]
     let sections: [(
@@ -6088,7 +6176,7 @@ fn render_source_control(
         ("\u{e702} WORKTREES", &[], Some(&sc.worktrees), 2),
     ];
 
-    let mut row_y = area.y + 1; // start after header
+    let mut row_y = area.y + 2; // start after header + commit row
     let max_y = area.y + area.height;
     let mut flat_row: usize = 0; // tracks position in flat selection space
 
