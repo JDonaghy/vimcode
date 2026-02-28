@@ -46,6 +46,8 @@ pub enum EngineAction {
     OpenWorkspaceDialog,
     /// Save Workspace As dialog requested (UI layer shows the native picker)
     SaveWorkspaceAsDialog,
+    /// Open Recent workspaces dialog requested (UI layer shows picker)
+    OpenRecentDialog,
 }
 
 /// How a file should be opened: as a temporary preview or permanent buffer.
@@ -367,6 +369,9 @@ pub struct Engine {
     pub workspace_file: Option<PathBuf>,
     /// Resolved workspace root directory (derived from `workspace_file`), if any.
     pub workspace_root: Option<PathBuf>,
+    /// Snapshot of user settings before any workspace/folder overlay was applied.
+    /// Set when entering a workspace, restored when leaving. `None` if no overlay active.
+    pub base_settings: Option<Box<Settings>>,
 
     // --- Source Control panel ---
     /// Cached file statuses from the last `sc_refresh()` call.
@@ -674,6 +679,7 @@ impl Engine {
             search_word_bounded: false,
             workspace_file: None,
             workspace_root: None,
+            base_settings: None,
             sc_file_statuses: Vec::new(),
             sc_worktrees: Vec::new(),
             sc_selected: 0,
@@ -2287,8 +2293,20 @@ impl Engine {
     /// Each file gets its own tab; the previously-active file's tab is focused.
     /// Skips files that no longer exist. Removes the initial empty scratch buffer.
     pub fn restore_session_files(&mut self) {
-        let paths = self.session.open_files.clone();
-        let active = self.session.active_file.clone();
+        // Prefer per-workspace session if one exists for cwd
+        let ws_session = SessionState::load_for_workspace(&self.cwd.clone());
+        let (paths, active) = if !ws_session.open_files.is_empty() {
+            // Merge workspace file positions into current session
+            for (k, v) in ws_session.file_positions {
+                self.session.file_positions.entry(k).or_insert(v);
+            }
+            (ws_session.open_files, ws_session.active_file)
+        } else {
+            (
+                self.session.open_files.clone(),
+                self.session.active_file.clone(),
+            )
+        };
 
         if paths.is_empty() {
             return;
@@ -5989,6 +6007,39 @@ impl Engine {
             self.save_session_for_workspace(root);
         }
 
+        // Restore user settings baseline before applying any new folder overlay
+        if let Some(base) = self.base_settings.take() {
+            self.settings = *base;
+        }
+
+        // Check if the new folder has a per-folder settings file to apply as overlay
+        let folder_settings_path = canonical.join(".vimcode").join("settings.json");
+        if folder_settings_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&folder_settings_path) {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                    if let Some(obj) = json.as_object() {
+                        // Save baseline before overlay
+                        self.base_settings = Some(Box::new(self.settings.clone()));
+                        for (key, value) in obj {
+                            let arg = match value {
+                                serde_json::Value::Bool(b) => {
+                                    if *b {
+                                        key.clone()
+                                    } else {
+                                        format!("no{}", key)
+                                    }
+                                }
+                                serde_json::Value::Number(n) => format!("{}={}", key, n),
+                                serde_json::Value::String(s) => format!("{}={}", key, s),
+                                _ => continue,
+                            };
+                            self.settings.parse_set_option(&arg).ok();
+                        }
+                    }
+                }
+            }
+        }
+
         // Clear all existing buffers and tabs, reset to single empty window
         self.buffer_manager = super::buffer_manager::BufferManager::new();
         let buffer_id = self.buffer_manager.create();
@@ -6063,6 +6114,10 @@ impl Engine {
 
         // Apply any settings overrides from workspace
         if let Some(settings_obj) = json.get("settings").and_then(|s| s.as_object()) {
+            // Save baseline settings before applying workspace overlay (once only)
+            if self.base_settings.is_none() {
+                self.base_settings = Some(Box::new(self.settings.clone()));
+            }
             for (key, value) in settings_obj {
                 let arg = match value {
                     serde_json::Value::Bool(b) => {
@@ -6121,7 +6176,7 @@ impl Engine {
     }
 
     /// Save per-workspace session state (open files, cursor positions).
-    fn save_session_for_workspace(&self, root: &Path) {
+    pub fn save_session_for_workspace(&self, root: &Path) {
         let mut ws_session = SessionState::default();
         // Collect all unique open file paths across windows
         let mut open_files: Vec<PathBuf> = Vec::new();
@@ -6880,14 +6935,14 @@ impl Engine {
             return EngineAction::OpenTerminal;
         }
 
-        // Handle workspace / folder commands
-        if cmd == "OpenFolder" {
+        // Handle workspace / folder commands (both user-typed names and menu action strings)
+        if cmd == "OpenFolder" || cmd == "open_folder_dialog" {
             return EngineAction::OpenFolderDialog;
         }
-        if cmd == "OpenWorkspace" {
+        if cmd == "OpenWorkspace" || cmd == "open_workspace_dialog" {
             return EngineAction::OpenWorkspaceDialog;
         }
-        if cmd == "SaveWorkspaceAs" {
+        if cmd == "SaveWorkspaceAs" || cmd == "save_workspace_as_dialog" {
             return EngineAction::SaveWorkspaceAsDialog;
         }
         if let Some(path_str) = cmd.strip_prefix("cd ").map(|s| s.trim()) {
@@ -7752,6 +7807,24 @@ impl Engine {
                 self.dap_toggle_breakpoint(&file, line);
                 EngineAction::None
             }
+            "copy" => {
+                // Yank current line to clipboard-style yank
+                self.execute_command("y")
+            }
+            "cut" => {
+                // Cut current line
+                self.execute_command("dd")
+            }
+            "paste" => self.execute_command("p"),
+            "termkill" => {
+                self.terminal_close_active_tab();
+                EngineAction::None
+            }
+            "about" => {
+                self.message = "VimCode — Vim-like editor in Rust + GTK4".to_string();
+                EngineAction::None
+            }
+            "openrecent" | "OpenRecent" => EngineAction::OpenRecentDialog,
             _ => {
                 // Try plugin commands before giving up
                 let (cmd_name, cmd_args) = cmd.split_once(' ').unwrap_or((cmd, ""));

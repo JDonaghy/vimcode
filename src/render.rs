@@ -627,6 +627,13 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
                 separator: false,
             },
             MenuItemData {
+                label: "Open Recent…",
+                shortcut: "",
+                action: "openrecent",
+                enabled: true,
+                separator: false,
+            },
+            MenuItemData {
                 label: "",
                 shortcut: "",
                 action: "",

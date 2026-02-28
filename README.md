@@ -13,6 +13,7 @@ There's a touch of irony here - using a cli tool to write the editor that I've w
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
 - **Clean architecture** — platform-agnostic core, 817 tests, zero async runtime dependency
 
+
 ## Building
 
 **Prerequisites (GTK backend):**
@@ -423,9 +424,9 @@ Click the git branch icon in the activity bar to open the Source Control panel �
 A `.vimcode-workspace` file at the project root captures folder settings and enables per-project session restoration.
 
 **Opening a folder or workspace:**
-- **GTK:** File → "Open Folder…" / "Open Workspace…" → native file dialog
-- **TUI:** same menu actions open a fuzzy directory picker modal
-- **Commands:** `:OpenFolder <path>`, `:OpenWorkspace <path>`, `:SaveWorkspaceAs <path>`, `:cd <path>`
+- **GTK:** File → "Open Folder…" / "Open Workspace…" / "Open Recent…" → native file dialog or recent-workspaces picker
+- **TUI:** same menu actions open a fuzzy directory picker or recent-workspaces list modal
+- **Commands:** `:OpenFolder <path>`, `:OpenWorkspace <path>`, `:SaveWorkspaceAs <path>`, `:cd <path>`, `:OpenRecent`
 
 **Workspace file format** (`.vimcode-workspace`):
 ```json
@@ -437,7 +438,9 @@ A `.vimcode-workspace` file at the project root captures folder settings and ena
 ```
 Settings in the workspace file overlay your global `settings.json`.
 
-**Per-project sessions** — when a workspace or folder is open, the session (open files, cursor/scroll positions) is stored separately from the global session using a stable hash of the workspace root path (`~/.config/vimcode/sessions/<hash>.json`).
+**Per-project sessions** — when a workspace or folder is open, the session (open files, cursor/scroll positions) is stored separately from the global session using a stable hash of the workspace root path (`~/.config/vimcode/sessions/<hash>.json`). The session is saved on quit and restored automatically the next time you open the same folder.
+
+**Settings overlay** — workspace settings in `.vimcode-workspace` are applied on top of your global `settings.json`. When you switch to a different folder, the overlay is reverted so your global settings are restored. Per-folder `.vimcode/settings.json` files work the same way.
 
 ---
 
@@ -779,6 +782,7 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `:OpenFolder <path>` | Open folder (clears buffers, loads per-project session) |
 | `:OpenWorkspace <path>` | Open `.vimcode-workspace` file |
 | `:SaveWorkspaceAs <path>` | Save current folder as workspace file |
+| `:OpenRecent` | Open recent workspaces picker |
 | `:cd <path>` | Change working directory |
 | `:diffsplit <file>` | Open file in vsplit with diff highlighting |
 | `:diffthis` | Mark current window as diff participant (two calls activate diff) |
@@ -802,6 +806,7 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `:OpenFolder <path>` | Open folder as workspace root |
 | `:OpenWorkspace <path>` | Open `.vimcode-workspace` file |
 | `:SaveWorkspaceAs <path>` | Save workspace file |
+| `:OpenRecent` | Open recent workspaces picker |
 | `:cd <path>` | Change working directory |
 | `:Plugin list` | List loaded plugins |
 | `:Plugin reload` | Reload plugins from disk |

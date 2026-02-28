@@ -316,12 +316,16 @@ enum Msg {
     WindowMaximize,
     /// Close the application window.
     WindowClose,
+    /// Show a native "Open File" dialog.
+    OpenFileDialog,
     /// Show a native "Open Folder" dialog.
     OpenFolderDialog,
     /// Show a native "Open Workspace" dialog.
     OpenWorkspaceDialog,
     /// Show a native "Save Workspace As" dialog.
     SaveWorkspaceAsDialog,
+    /// Show a "Open Recent" picker.
+    OpenRecentDialog,
 }
 
 #[relm4::component]
@@ -2108,6 +2112,9 @@ impl SimpleComponent for App {
                             );
                         }
                         engine.collect_session_open_files();
+                        if let Some(ref root) = engine.workspace_root.clone() {
+                            engine.save_session_for_workspace(root);
+                        }
                         let _ = engine.session.save();
                         engine.lsp_shutdown();
                         drop(engine);
@@ -2144,6 +2151,9 @@ impl SimpleComponent for App {
                     EngineAction::SaveWorkspaceAsDialog => {
                         sender.input(Msg::SaveWorkspaceAsDialog);
                     }
+                    EngineAction::OpenRecentDialog => {
+                        sender.input(Msg::OpenRecentDialog);
+                    }
                     EngineAction::None | EngineAction::Error => {}
                 }
 
@@ -2174,6 +2184,9 @@ impl SimpleComponent for App {
                                 );
                             }
                             engine.collect_session_open_files();
+                            if let Some(ref root) = engine.workspace_root.clone() {
+                                engine.save_session_for_workspace(root);
+                            }
                             let _ = engine.session.save();
                             engine.lsp_shutdown();
                             drop(engine);
@@ -2202,7 +2215,8 @@ impl SimpleComponent for App {
                         }
                         EngineAction::OpenFolderDialog
                         | EngineAction::OpenWorkspaceDialog
-                        | EngineAction::SaveWorkspaceAsDialog => {
+                        | EngineAction::SaveWorkspaceAsDialog
+                        | EngineAction::OpenRecentDialog => {
                             // Dialog actions don't fire during macro playback
                         }
                         EngineAction::None | EngineAction::Error => {}
@@ -2376,102 +2390,120 @@ impl SimpleComponent for App {
                     }
                     self.redraw = true;
                 } else {
-                    let mut engine = self.engine.borrow_mut();
-                    // Clicking outside the terminal panel returns focus to the editor.
-                    engine.terminal_has_focus = false;
+                    {
+                        let mut engine = self.engine.borrow_mut();
+                        // Clicking outside the terminal panel returns focus to the editor.
+                        engine.terminal_has_focus = false;
+                    }
 
                     // ── Dropdown click detection ──────────────────────────────
                     // Menu bar strip clicks are handled by menu_bar_da's GestureClick.
                     // Here we only check for dropdown item clicks.
+                    // We collect the pending action first so we can drop engine before
+                    // calling sender.input() (needed so MenuActivateItem handler can
+                    // re-borrow engine to intercept dialog actions like OpenFolderDialog).
                     let line_height = self.cached_line_height;
                     let mut menu_handled = false;
-                    if let Some(open_idx) = engine.menu_open_idx {
-                        if let Some((_, _, items)) = render::MENU_STRUCTURE.get(open_idx) {
-                            // Dropdown is drawn at y=0 of the drawing_area
-                            // (which starts just below the full-width menu_bar_da widget).
-                            let popup_y = 0.0_f64;
-                            let popup_h = (items.len() as f64 + 1.0) * line_height;
-                            // Compute popup_x to match draw_menu_dropdown.
-                            let mut col_pos: u16 = 0;
-                            for i in 0..open_idx {
-                                if let Some((name, _, _)) = render::MENU_STRUCTURE.get(i) {
-                                    col_pos += name.len() as u16 + 2;
-                                }
-                            }
-                            let popup_x = col_pos as f64 * 7.0;
-                            let popup_w = 200.0_f64;
-                            if y >= popup_y
-                                && y < popup_y + popup_h
-                                && x >= popup_x
-                                && x < popup_x + popup_w
-                            {
-                                // Click inside the dropdown.
-                                if y >= popup_y + line_height * 0.5 {
-                                    let item_idx = ((y - popup_y) / line_height) as usize;
-                                    let actual = item_idx.saturating_sub(1);
-                                    if actual < items.len() && !items[actual].separator {
-                                        let action = items[actual].action.to_string();
-                                        engine.menu_activate_item(open_idx, actual, &action);
+                    let mut pending_menu_action: Option<(usize, usize, String)> = None;
+                    {
+                        let mut engine = self.engine.borrow_mut();
+                        if let Some(open_idx) = engine.menu_open_idx {
+                            if let Some((_, _, items)) = render::MENU_STRUCTURE.get(open_idx) {
+                                // Dropdown is drawn at y=0 of the drawing_area
+                                // (which starts just below the full-width menu_bar_da widget).
+                                let popup_y = 0.0_f64;
+                                let popup_h = (items.len() as f64 + 1.0) * line_height;
+                                // Compute popup_x using same layout as draw_menu_bar/draw_menu_dropdown.
+                                let mut popup_x = 8.0_f64;
+                                for i in 0..open_idx {
+                                    if let Some((name, _, _)) = render::MENU_STRUCTURE.get(i) {
+                                        popup_x += name.len() as f64 * 7.0 + 8.0;
                                     }
                                 }
-                                menu_handled = true;
-                            } else {
-                                // Click outside dropdown → close it.
-                                engine.close_menu();
-                            }
-                        }
-                    }
-
-                    // ── Debug toolbar hit-test ────────────────────────────────
-                    let mut toolbar_handled = false;
-                    if !menu_handled
-                        && engine.debug_toolbar_visible
-                        && self.cached_line_height > 0.0
-                    {
-                        // Toolbar is the single row above status(1)+cmd(1).
-                        // It is always at a fixed position; terminal/quickfix/DAP
-                        // panels stack above it, not below it.
-                        let toolbar_y =
-                            height - 2.0 * self.cached_line_height - self.cached_line_height;
-                        if y >= toolbar_y && y < toolbar_y + self.cached_line_height {
-                            let mut cursor_x = 8.0_f64;
-                            for (idx, btn) in render::DEBUG_BUTTONS.iter().enumerate() {
-                                if idx == 4 {
-                                    cursor_x += 16.0; // visual separator gap
+                                let popup_w = 200.0_f64;
+                                if y >= popup_y
+                                    && y < popup_y + popup_h
+                                    && x >= popup_x
+                                    && x < popup_x + popup_w
+                                {
+                                    // Click inside the dropdown.
+                                    if y >= popup_y + line_height * 0.5 {
+                                        let item_idx = ((y - popup_y) / line_height) as usize;
+                                        let actual = item_idx.saturating_sub(1);
+                                        if actual < items.len() && !items[actual].separator {
+                                            let action = items[actual].action.to_string();
+                                            // Store action; engine borrow released at end of
+                                            // this block so MenuActivateItem handler can reborrow.
+                                            pending_menu_action = Some((open_idx, actual, action));
+                                        }
+                                    }
+                                    menu_handled = true;
+                                } else {
+                                    // Click outside dropdown → close it.
+                                    engine.close_menu();
                                 }
-                                let text_len =
-                                    btn.icon.chars().count() + btn.key_hint.chars().count() + 4; // " (hint) "
-                                let btn_w = text_len as f64 * self.cached_char_width;
-                                if x >= cursor_x && x < cursor_x + btn_w {
-                                    let _ = engine.execute_command(btn.action);
-                                    toolbar_handled = true;
-                                    break;
+                            }
+                        }
+                    } // engine borrow dropped here
+                    if let Some((menu_idx, item_idx, action)) = pending_menu_action {
+                        sender.input(Msg::MenuActivateItem(menu_idx, item_idx, action));
+                        self.redraw = true;
+                        // Don't fall through to other hit-tests; menu handled it.
+                        // Return to avoid re-borrowing engine unnecessarily.
+                    } else {
+                        let mut engine = self.engine.borrow_mut();
+
+                        // ── Debug toolbar hit-test ────────────────────────────────
+                        let mut toolbar_handled = false;
+                        if !menu_handled
+                            && engine.debug_toolbar_visible
+                            && self.cached_line_height > 0.0
+                        {
+                            // Toolbar is the single row above status(1)+cmd(1).
+                            // It is always at a fixed position; terminal/quickfix/DAP
+                            // panels stack above it, not below it.
+                            let toolbar_y =
+                                height - 2.0 * self.cached_line_height - self.cached_line_height;
+                            if y >= toolbar_y && y < toolbar_y + self.cached_line_height {
+                                let mut cursor_x = 8.0_f64;
+                                for (idx, btn) in render::DEBUG_BUTTONS.iter().enumerate() {
+                                    if idx == 4 {
+                                        cursor_x += 16.0; // visual separator gap
+                                    }
+                                    let text_len =
+                                        btn.icon.chars().count() + btn.key_hint.chars().count() + 4; // " (hint) "
+                                    let btn_w = text_len as f64 * self.cached_char_width;
+                                    if x >= cursor_x && x < cursor_x + btn_w {
+                                        let _ = engine.execute_command(btn.action);
+                                        toolbar_handled = true;
+                                        break;
+                                    }
+                                    cursor_x += btn_w;
                                 }
-                                cursor_x += btn_w;
+                                if !toolbar_handled {
+                                    toolbar_handled = true; // click in toolbar row, consume event
+                                }
                             }
-                            if !toolbar_handled {
-                                toolbar_handled = true; // click in toolbar row, consume event
+                        }
+
+                        if !menu_handled && !toolbar_handled {
+                            // Clear selection on click in VSCode mode.
+                            if engine.is_vscode_mode() {
+                                engine.vscode_clear_selection();
+                            }
+                            handle_mouse_click(&mut engine, x, y, width, height);
+                        }
+
+                        // Reveal the active file in the sidebar tree (e.g. after tab click)
+                        let file_path = engine.file_path().cloned();
+                        drop(engine);
+                        if let Some(path) = file_path {
+                            if let Some(ref tree) = *self.file_tree_view.borrow() {
+                                highlight_file_in_tree(tree, &path);
                             }
                         }
-                    }
-
-                    if !menu_handled && !toolbar_handled {
-                        // Clear selection on click in VSCode mode.
-                        if engine.is_vscode_mode() {
-                            engine.vscode_clear_selection();
-                        }
-                        handle_mouse_click(&mut engine, x, y, width, height);
-                    }
-
-                    // Reveal the active file in the sidebar tree (e.g. after tab click)
-                    let file_path = engine.file_path().cloned();
-                    drop(engine);
-                    if let Some(path) = file_path {
-                        if let Some(ref tree) = *self.file_tree_view.borrow() {
-                            highlight_file_in_tree(tree, &path);
-                        }
-                    }
-                    self.redraw = !self.redraw;
+                        self.redraw = !self.redraw;
+                    } // close the `else` branch for pending_menu_action
                 }
             }
             Msg::MouseDoubleClick {
@@ -3537,6 +3569,9 @@ impl SimpleComponent for App {
             Msg::MenuActivateItem(menu_idx, item_idx, action) => {
                 // Intercept dialog actions that need GTK-side handling
                 match action.as_str() {
+                    "open_file_dialog" => {
+                        sender.input(Msg::OpenFileDialog);
+                    }
                     "open_folder_dialog" => {
                         sender.input(Msg::OpenFolderDialog);
                     }
@@ -3545,6 +3580,9 @@ impl SimpleComponent for App {
                     }
                     "save_workspace_as_dialog" => {
                         sender.input(Msg::SaveWorkspaceAsDialog);
+                    }
+                    "openrecent" => {
+                        sender.input(Msg::OpenRecentDialog);
                     }
                     _ => {
                         self.engine
@@ -3877,6 +3915,25 @@ impl SimpleComponent for App {
             Msg::WindowClose => {
                 self.window.close();
             }
+            Msg::OpenFileDialog => {
+                let engine = self.engine.clone();
+                let sender2 = sender.input_sender().clone();
+                let dialog = gtk4::FileDialog::new();
+                dialog.set_title("Open File");
+                let win = self.window.clone();
+                dialog.open(Some(&win), gtk4::gio::Cancellable::NONE, move |result| {
+                    if let Ok(file) = result {
+                        if let Some(path) = gtk4::prelude::FileExt::path(&file) {
+                            let _ = engine.borrow_mut().open_file_with_mode(
+                                &path,
+                                crate::core::engine::OpenMode::Permanent,
+                            );
+                            sender2.send(Msg::RefreshFileTree).ok();
+                        }
+                    }
+                });
+                self.redraw = true;
+            }
             Msg::OpenFolderDialog => {
                 let engine = self.engine.clone();
                 let sender2 = sender.input_sender().clone();
@@ -3924,6 +3981,49 @@ impl SimpleComponent for App {
                         }
                     }
                 });
+                self.redraw = true;
+            }
+            Msg::OpenRecentDialog => {
+                let paths: Vec<std::path::PathBuf> = self
+                    .engine
+                    .borrow()
+                    .session
+                    .recent_workspaces
+                    .iter()
+                    .rev()
+                    .cloned()
+                    .collect();
+                if paths.is_empty() {
+                    self.engine.borrow_mut().message = "No recent workspaces".to_string();
+                } else {
+                    let engine = self.engine.clone();
+                    let sender2 = sender.input_sender().clone();
+                    let dialog = gtk4::Dialog::with_buttons(
+                        Some("Open Recent Workspace"),
+                        Some(&self.window),
+                        gtk4::DialogFlags::MODAL | gtk4::DialogFlags::DESTROY_WITH_PARENT,
+                        &[("Cancel", gtk4::ResponseType::Cancel)],
+                    );
+                    let content = dialog.content_area();
+                    let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+                    content.append(&vbox);
+                    for (idx, path) in paths.iter().enumerate() {
+                        let label = path.to_string_lossy().into_owned();
+                        let btn = gtk4::Button::with_label(&label);
+                        let dialog_clone = dialog.clone();
+                        let engine_clone = engine.clone();
+                        let sender_clone = sender2.clone();
+                        let path_clone = path.clone();
+                        btn.connect_clicked(move |_| {
+                            let _ = idx; // suppress unused var warning
+                            engine_clone.borrow_mut().open_folder(&path_clone);
+                            sender_clone.send(Msg::RefreshFileTree).ok();
+                            dialog_clone.close();
+                        });
+                        vbox.append(&btn);
+                    }
+                    dialog.show();
+                }
                 self.redraw = true;
             }
         }
@@ -4413,22 +4513,6 @@ fn draw_editor(
     // Build the platform-agnostic screen layout
     let screen = build_screen_layout(engine, &theme, &window_rects, line_height, char_width);
 
-    // 3. Draw menu dropdown overlay if a menu is open (bar itself is in menu_bar_da widget)
-    if let Some(ref menu_data) = screen.menu_bar {
-        if menu_data.open_menu_idx.is_some() {
-            draw_menu_dropdown(
-                cr,
-                menu_data,
-                &theme,
-                0.0,
-                0.0, // drawing_area starts just below the menu bar widget
-                width as f64,
-                height as f64,
-                line_height,
-            );
-        }
-    }
-
     // 3b. Draw tab bar (at y=0; the menu bar widget is above the drawing_area)
     draw_tab_bar(
         cr,
@@ -4590,6 +4674,22 @@ fn draw_editor(
         cmd_y,
         line_height,
     );
+
+    // 8. Draw menu dropdown overlay last so it floats above all other content
+    if let Some(ref menu_data) = screen.menu_bar {
+        if menu_data.open_menu_idx.is_some() {
+            draw_menu_dropdown(
+                cr,
+                menu_data,
+                &theme,
+                0.0,
+                0.0, // drawing_area starts just below the menu bar widget
+                width as f64,
+                height as f64,
+                line_height,
+            );
+        }
+    }
 }
 
 fn draw_tab_bar(
@@ -6438,10 +6538,19 @@ fn draw_menu_dropdown(
     if data.open_items.is_empty() {
         return;
     }
+    // Compute popup_x using the same layout as draw_menu_bar:
+    // starts at x+8, each menu advances by name.len()*7.0 + 8.0
+    let mut popup_x = x + 8.0;
+    if let Some(midx) = data.open_menu_idx {
+        for i in 0..midx {
+            if let Some((name, _, _)) = render::MENU_STRUCTURE.get(i) {
+                popup_x += name.len() as f64 * 7.0 + 8.0;
+            }
+        }
+    }
     let item_count = data.open_items.len() as f64;
     let popup_width = 200.0_f64;
     let popup_height = (item_count + 1.0) * line_height;
-    let popup_x = x + data.open_menu_col as f64 * 7.0;
     let popup_y = anchor_y;
 
     // Background

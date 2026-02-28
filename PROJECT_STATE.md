@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Feb 27, 2026 (Session 99 — git log section) | **Tests:** 817
+**Last updated:** Feb 27, 2026 (Session 100 — Menus + Workspace Parity) | **Tests:** 817
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 72 are in **SESSION_HISTORY.md**.
@@ -8,6 +8,9 @@
 ---
 
 ## Recent Work
+
+**Session 100 — Menus + Workspace Parity:**
+`engine.rs`: Added `OpenRecentDialog` to `EngineAction` enum. Added `base_settings: Option<Box<Settings>>` field to Engine struct; `open_workspace()` saves baseline settings before applying overlay; `open_folder()` restores `base_settings` before applying any new per-folder `.vimcode/settings.json` overlay. Updated `restore_session_files()` to prefer per-workspace session (for cwd) over global session — open files now restore automatically on startup in the correct project folder. Made `save_session_for_workspace` pub. Added new `execute_command` arms: "copy"→"y", "cut"→"dd", "paste"→"p", "termkill" (closes active terminal), "about" (shows version message), "openrecent"/"OpenRecent"→`OpenRecentDialog`. `render.rs`: Added "Open Recent…" menu item (action "openrecent") to File submenu in `MENU_STRUCTURE`. `main.rs`: Fixed GTK dropdown drawing order — moved `draw_menu_dropdown` to the very last step of `draw_editor()` so the dropdown floats above the tab bar and all other panels; Fixed GTK dialog action routing in `Msg::MouseClick` — collects action in `pending_menu_action` scoped variable then routes through `sender.input(Msg::MenuActivateItem(...))` to avoid borrow conflicts; Added `Msg::OpenRecentDialog` variant and handler (GTK Dialog listing recent workspaces as clickable buttons); Added `EngineAction::OpenRecentDialog` handling in key press handler; Added workspace session save (before global save) in both quit handlers. `tui_main.rs`: Added `FolderPickerMode::OpenRecent` + `FolderPickerState::new_recent(recents)` constructor; Extended `handle_mouse()` with `folder_picker: &mut Option<FolderPickerState>` param; Menu Enter and click handlers now route `OpenFolderDialog`/`OpenWorkspaceDialog`/`SaveWorkspaceAsDialog`/`OpenRecentDialog` instead of silently dropping them; Updated folder picker Enter handler for `OpenRecent` mode (uses absolute path directly); `save_session()` saves workspace session before global session. 817 tests (no change).
 
 **Session 99 (git log) — SC Panel Recent Commits section:**
 `core/git.rs`: Added `GitLogEntry { hash, message }` struct and `git_log(dir, limit)` function (runs `git log --oneline -N`, parses into `Vec<GitLogEntry>`). `engine.rs`: Added `sc_log: Vec<git::GitLogEntry>` field; expanded `sc_sections_expanded` from `[bool; 3]` to `[bool; 4]`; `sc_refresh()` now calls `git::git_log(&dir, 20)` to populate; `sc_flat_len()`, `sc_visual_row_to_flat()`, `sc_flat_to_section_idx()` updated to include the always-present LOG section (section 3) after staged/unstaged/worktrees; Tab toggle updated for 4 sections; Enter on a log entry shows `"<hash> <message>"` in the status bar. `render.rs`: Added `ScLogItem { hash, message }` struct; `SourceControlData` gains `log: Vec<ScLogItem>` field; `sections_expanded` updated to `[bool; 4]`; `build_source_control_data()` maps `sc_log` to `ScLogItem` list. `tui_main.rs`: LOG section rendered after the sections loop with `\u{f417}` header, hash in dim color, message in item color. `main.rs` (GTK): `log_flat_start` calculated; log section drawn via `draw_section` closure. 817 tests (no change).
@@ -156,6 +159,7 @@ Total: ~47,300 lines
 - [x] SC Panel VSCode Parity — commit message input row (`c`/`Enter`/`Esc`); push/pull/fetch from panel (`p`/`P`/`f`); bulk stage-all/unstage-all on section headers (`s`); discard-all on Changes header (`D`); `:Gpull`/`:Gfetch` commands
 - [x] SC Panel Recent Commits — collapsible RECENT COMMITS section (last 20 commits); `Enter` shows hash+message in status bar
 - [x] Lua Extension Mechanism — mlua 5.4 vendored; `~/.config/vimcode/plugins/` auto-loaded; `vimcode.*` API (on/command/keymap/message/cwd/command_run/buf.*); `:Plugin list/reload/enable/disable`; hook points on save/open/normal-key/insert-key/command
+- [x] Menus + Workspace Parity — GTK dropdown drawing order fixed (floats above tab bar); GTK dialog action routing fixed; TUI menu actions fully wired (Open Folder/Workspace/Recent from Enter or click); "Open Recent…" menu item + picker in both backends; workspace session saved on quit + restored at startup; workspace settings overlay reverts on folder switch (`base_settings`); new commands: copy/cut/paste/termkill/about/openrecent
 
 ### Planned / Ideas
 - [ ] More Tree-sitter grammars (HTML, YAML, Lua — await tree-sitter 0.22 migration)

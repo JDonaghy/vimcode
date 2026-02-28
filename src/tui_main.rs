@@ -300,18 +300,23 @@ struct DebugSidebarScrollDrag {
 
 /// What the folder picker should do when the user confirms a selection.
 #[derive(Clone, PartialEq)]
+#[allow(clippy::enum_variant_names)]
 enum FolderPickerMode {
     /// Open as a workspace folder (`engine.open_folder()`).
     OpenFolder,
     /// Open as a workspace file (`engine.open_workspace()`).
     OpenWorkspace,
+    /// Pick from the list of recently opened workspaces.
+    OpenRecent,
 }
 
 /// TUI folder/workspace directory picker modal.
 struct FolderPickerState {
     mode: FolderPickerMode,
+    /// Current browsing root (may differ from engine.cwd when user navigates up/down).
+    root: PathBuf,
     query: String,
-    /// All candidate directories (and .vimcode-workspace files) relative to cwd.
+    /// All candidate directories (and .vimcode-workspace files) relative to root.
     all_entries: Vec<PathBuf>,
     /// Currently filtered + sorted entries.
     filtered: Vec<PathBuf>,
@@ -321,10 +326,45 @@ struct FolderPickerState {
 
 impl FolderPickerState {
     fn new(cwd: &Path, mode: FolderPickerMode) -> Self {
-        let all_entries = collect_dir_entries(cwd);
+        let root = cwd.to_path_buf();
+        let all_entries = collect_dir_entries(&root);
         let filtered = all_entries.iter().take(50).cloned().collect();
         Self {
             mode,
+            root,
+            query: String::new(),
+            all_entries,
+            filtered,
+            selected: 0,
+            scroll_top: 0,
+        }
+    }
+
+    /// Navigate to a new root directory (clears query, reloads entries).
+    fn navigate_to(&mut self, new_root: PathBuf) {
+        self.root = new_root;
+        self.query.clear();
+        self.all_entries = collect_dir_entries(&self.root);
+        self.filtered = self.all_entries.iter().take(50).cloned().collect();
+        self.selected = 0;
+        self.scroll_top = 0;
+    }
+
+    /// Navigate up to the parent directory.
+    fn navigate_up(&mut self) {
+        if let Some(parent) = self.root.parent() {
+            self.navigate_to(parent.to_path_buf());
+        }
+    }
+
+    /// Create an Open Recent picker pre-populated with recent workspace paths.
+    fn new_recent(recents: &[std::path::PathBuf]) -> Self {
+        // Show most-recent first
+        let all_entries: Vec<PathBuf> = recents.iter().rev().cloned().collect();
+        let filtered = all_entries.clone();
+        Self {
+            mode: FolderPickerMode::OpenRecent,
+            root: PathBuf::new(), // not used for OpenRecent
             query: String::new(),
             all_entries,
             filtered,
@@ -359,9 +399,13 @@ impl FolderPickerState {
         }
     }
 
-    fn selected_path(&self, cwd: &Path) -> Option<PathBuf> {
+    fn selected_path(&self) -> Option<PathBuf> {
         let rel = self.filtered.get(self.selected)?;
-        Some(cwd.join(rel))
+        if rel.as_os_str() == ".." {
+            self.root.parent().map(|p| p.to_path_buf())
+        } else {
+            Some(self.root.join(rel))
+        }
     }
 
     /// Clamp `scroll_top` so `selected` is always in the visible window.
@@ -379,7 +423,12 @@ impl FolderPickerState {
 /// `.vimcode-workspace` files. Skips hidden dirs, `target/`, `node_modules/`.
 /// The entry `"."` (current directory) is prepended so the user can open root.
 fn collect_dir_entries(root: &Path) -> Vec<PathBuf> {
-    let mut out = vec![PathBuf::from(".")];
+    let mut out = Vec::new();
+    // Prepend ".." so the user can navigate up (unless already at filesystem root)
+    if root.parent().is_some() {
+        out.push(PathBuf::from(".."));
+    }
+    out.push(PathBuf::from("."));
     walk_dir_entries_recursive(root, root, &mut out, 0);
     out
 }
@@ -993,24 +1042,42 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                             folder_picker = None;
                         }
                         KeyCode::Enter => {
-                            let cwd = engine.cwd.clone();
-                            if let Some(path) = picker.selected_path(&cwd) {
-                                let mode = picker.mode.clone();
-                                folder_picker = None;
-                                match mode {
-                                    FolderPickerMode::OpenFolder => {
-                                        engine.open_folder(&path);
-                                        // Rebuild sidebar at new root
-                                        sidebar =
-                                            TuiSidebar::new(engine.cwd.clone(), sidebar.visible);
+                            let mode = picker.mode.clone();
+                            if mode == FolderPickerMode::OpenRecent {
+                                if let Some(path) = picker.filtered.get(picker.selected).cloned() {
+                                    folder_picker = None;
+                                    engine.open_folder(&path);
+                                    sidebar = TuiSidebar::new(engine.cwd.clone(), sidebar.visible);
+                                }
+                            } else {
+                                // Check if ".." was selected — navigate up instead of opening
+                                let is_dotdot = picker
+                                    .filtered
+                                    .get(picker.selected)
+                                    .map(|p| p.as_os_str() == "..")
+                                    .unwrap_or(false);
+                                if is_dotdot {
+                                    picker.navigate_up();
+                                } else if let Some(path) = picker.selected_path() {
+                                    folder_picker = None;
+                                    match mode {
+                                        FolderPickerMode::OpenFolder => {
+                                            engine.open_folder(&path);
+                                        }
+                                        FolderPickerMode::OpenWorkspace => {
+                                            engine.open_workspace(&path);
+                                        }
+                                        FolderPickerMode::OpenRecent => {}
                                     }
-                                    FolderPickerMode::OpenWorkspace => {
-                                        engine.open_workspace(&path);
-                                        sidebar =
-                                            TuiSidebar::new(engine.cwd.clone(), sidebar.visible);
-                                    }
+                                    sidebar = TuiSidebar::new(engine.cwd.clone(), sidebar.visible);
                                 }
                             }
+                        }
+                        // '-' navigates up to the parent directory (like vim netrw)
+                        KeyCode::Char('-')
+                            if !ctrl && picker.mode != FolderPickerMode::OpenRecent =>
+                        {
+                            picker.navigate_up();
                         }
                         KeyCode::Up | KeyCode::Char('k') if !ctrl => {
                             picker.move_up();
@@ -1724,19 +1791,45 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                                     {
                                         if let Some(item) = items.get(item_idx) {
                                             let action = item.action.to_string();
-                                            let act = engine
-                                                .menu_activate_item(menu_idx, item_idx, &action);
-                                            if act == EngineAction::OpenTerminal {
-                                                let cols = terminal
-                                                    .size()
-                                                    .ok()
-                                                    .map(|s| s.width)
-                                                    .unwrap_or(80);
-                                                engine.terminal_new_tab(
-                                                    cols,
-                                                    engine.session.terminal_panel_rows,
+                                            if action == "open_file_dialog" {
+                                                engine.close_menu();
+                                                engine.open_fuzzy_finder();
+                                            } else {
+                                                let act = engine.menu_activate_item(
+                                                    menu_idx, item_idx, &action,
                                                 );
-                                            }
+                                                if act == EngineAction::OpenTerminal {
+                                                    let cols = terminal
+                                                        .size()
+                                                        .ok()
+                                                        .map(|s| s.width)
+                                                        .unwrap_or(80);
+                                                    engine.terminal_new_tab(
+                                                        cols,
+                                                        engine.session.terminal_panel_rows,
+                                                    );
+                                                } else if act == EngineAction::OpenFolderDialog {
+                                                    folder_picker = Some(FolderPickerState::new(
+                                                        &engine.cwd.clone(),
+                                                        FolderPickerMode::OpenFolder,
+                                                    ));
+                                                } else if act == EngineAction::OpenWorkspaceDialog {
+                                                    folder_picker = Some(FolderPickerState::new(
+                                                        &engine.cwd.clone(),
+                                                        FolderPickerMode::OpenWorkspace,
+                                                    ));
+                                                } else if act == EngineAction::SaveWorkspaceAsDialog
+                                                {
+                                                    let ws_path =
+                                                        engine.cwd.join(".vimcode-workspace");
+                                                    engine.save_workspace_as(&ws_path);
+                                                } else if act == EngineAction::OpenRecentDialog {
+                                                    folder_picker =
+                                                        Some(FolderPickerState::new_recent(
+                                                            &engine.session.recent_workspaces,
+                                                        ));
+                                                }
+                                            } // close else { (open_file_dialog branch)
                                         }
                                     }
                                 }
@@ -1954,6 +2047,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                                 &mut last_click_time,
                                 &mut last_click_pos,
                                 &mut mouse_text_drag,
+                                &mut folder_picker,
                             );
                             mouse_event = next;
                             break;
@@ -1982,6 +2076,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                     &mut last_click_time,
                     &mut last_click_pos,
                     &mut mouse_text_drag,
+                    &mut folder_picker,
                 );
             }
             Event::Paste(text) => {
@@ -2052,6 +2147,7 @@ fn handle_mouse(
     last_click_time: &mut Instant,
     last_click_pos: &mut (u16, u16),
     mouse_text_drag: &mut bool,
+    folder_picker: &mut Option<FolderPickerState>,
 ) -> u16 {
     let col = ev.column;
     let row = ev.row;
@@ -2469,10 +2565,32 @@ fn handle_mouse(
                 let item_idx = (row - popup_y - 1) as usize;
                 if item_idx < items.len() && !items[item_idx].separator && items[item_idx].enabled {
                     let action = items[item_idx].action.to_string();
-                    let act = engine.menu_activate_item(open_idx, item_idx, &action);
-                    if act == EngineAction::OpenTerminal {
-                        let cols = terminal_size.map(|s| s.width).unwrap_or(80);
-                        engine.terminal_new_tab(cols, engine.session.terminal_panel_rows);
+                    if action == "open_file_dialog" {
+                        engine.close_menu();
+                        engine.open_fuzzy_finder();
+                    } else {
+                        let act = engine.menu_activate_item(open_idx, item_idx, &action);
+                        if act == EngineAction::OpenTerminal {
+                            let cols = terminal_size.map(|s| s.width).unwrap_or(80);
+                            engine.terminal_new_tab(cols, engine.session.terminal_panel_rows);
+                        } else if act == EngineAction::OpenFolderDialog {
+                            *folder_picker = Some(FolderPickerState::new(
+                                &engine.cwd.clone(),
+                                FolderPickerMode::OpenFolder,
+                            ));
+                        } else if act == EngineAction::OpenWorkspaceDialog {
+                            *folder_picker = Some(FolderPickerState::new(
+                                &engine.cwd.clone(),
+                                FolderPickerMode::OpenWorkspace,
+                            ));
+                        } else if act == EngineAction::SaveWorkspaceAsDialog {
+                            let ws_path = engine.cwd.join(".vimcode-workspace");
+                            engine.save_workspace_as(&ws_path);
+                        } else if act == EngineAction::OpenRecentDialog {
+                            *folder_picker = Some(FolderPickerState::new_recent(
+                                &engine.session.recent_workspaces,
+                            ));
+                        }
                     }
                 }
                 return sidebar_width;
@@ -3986,18 +4104,33 @@ fn render_folder_picker(
 
     let buf = frame.buffer_mut();
 
-    // Title varies by mode
+    // Title varies by mode; for folder modes show the current root for orientation
+    let root_display = if picker.mode != FolderPickerMode::OpenRecent {
+        let r = picker.root.to_string_lossy();
+        // Truncate from left if too long
+        let max = (width as usize).saturating_sub(30).max(10);
+        if r.len() > max {
+            format!("…{}", &r[r.len() - max..])
+        } else {
+            r.into_owned()
+        }
+    } else {
+        String::new()
+    };
     let title_text = match picker.mode {
         FolderPickerMode::OpenFolder => format!(
-            " Open Folder  {}/{} ",
+            " Open Folder {}  {}/{} ",
+            root_display,
             picker.filtered.len(),
             picker.all_entries.len()
         ),
         FolderPickerMode::OpenWorkspace => format!(
-            " Open Workspace  {}/{} ",
+            " Open Workspace {}  {}/{} ",
+            root_display,
             picker.filtered.len(),
             picker.all_entries.len()
         ),
+        FolderPickerMode::OpenRecent => format!(" Open Recent  {} ", picker.filtered.len()),
     };
 
     // Row 0: top border ╭─ Title ── N/M ──╮
@@ -6073,7 +6206,8 @@ fn handle_action(engine: &mut Engine, action: EngineAction) -> bool {
         EngineAction::OpenTerminal => false, // TUI handles terminal open in main event loop
         EngineAction::OpenFolderDialog
         | EngineAction::OpenWorkspaceDialog
-        | EngineAction::SaveWorkspaceAsDialog => false, // handled by caller via tui_show_folder_picker
+        | EngineAction::SaveWorkspaceAsDialog
+        | EngineAction::OpenRecentDialog => false, // handled by caller
         EngineAction::None | EngineAction::Error => false,
     }
 }
@@ -6095,6 +6229,9 @@ fn save_session(engine: &mut Engine) {
         );
     }
     engine.collect_session_open_files();
+    if let Some(ref root) = engine.workspace_root.clone() {
+        engine.save_session_for_workspace(root);
+    }
     let _ = engine.session.save();
 }
 
