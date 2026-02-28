@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Feb 27, 2026 (Session 99) | **Tests:** 813
+**Last updated:** Feb 27, 2026 (Session 99 fixes) | **Tests:** 817
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 72 are in **SESSION_HISTORY.md**.
@@ -8,6 +8,9 @@
 ---
 
 ## Recent Work
+
+**Session 99 (fixes) — SC Panel Bug Fixes:**
+`engine.rs`: Fixed `handle_sc_key` Return arm — removed `sc_has_focus = false` so the SC panel keeps focus after pressing Enter (press `q`/`Esc` to return to editor, matching click behavior); added `idx != usize::MAX` guard so Enter on a section header row is a no-op. Fixed all SC git operations (`sc_stage_selected`, `sc_discard_selected`, `sc_stage_all`, `sc_unstage_all`, `sc_discard_all_unstaged`) to resolve the git repository root via `git::find_repo_root(&self.cwd)` before calling git helpers — previously, git-relative paths from `git status --porcelain` failed to resolve when cwd was a subdirectory of the git root. Added error messages for failed stage/unstage/discard operations (instead of silent no-ops). Added "SC: file not found" diagnostic when SC panel tries to open a file whose path doesn't exist on disk. 817 tests (no change).
 
 **Session 99 — SC Panel VSCode Parity:**
 `core/git.rs`: 4 new functions — `pull(dir)` (`git pull`), `fetch(dir)` (`git fetch`), `unstage_all(dir)` (`git restore --staged .`), `discard_all(dir)` (`git restore .`). `engine.rs`: 2 new fields `sc_commit_message: String` + `sc_commit_input_active: bool`; `handle_sc_key` signature extended to `(key, ctrl, unicode: Option<char>)`; new methods `handle_sc_commit_input_key()` (printable chars accumulate into message, BackSpace pops, Return commits, Escape exits), `sc_do_commit()` (validates non-empty, calls `git::commit`, clears message on success), `sc_pull/fetch/push()` (call git helpers, set status message, refresh), `sc_stage_all/unstage_all/discard_all_unstaged()` (bulk operations on whole sections); `sc_stage_selected()` updated to detect `idx == usize::MAX` (section header row) — section 0 header → unstage all, section 1 header → stage all; new `"c"`, `"p"`, `"P"`, `"f"`, `"D"` arms in `handle_sc_key`; commit-input mode dispatch at top; `:Gpull`/`:Gpl` + `:Gfetch`/`:Gf` command arms in `execute_command()`; 12 new tests. `render.rs`: `SourceControlData` gains `commit_message: String` + `commit_input_active: bool`; `build_source_control_data()` populates both. `main.rs`: `draw_source_control_panel()` renders commit input row at row 1 (sections shift to row+2); `Msg::ScKey` handler passes `ctrl` + `unicode` to `handle_sc_key`, routes commit-input mode keys. `tui_main.rs`: `render_source_control()` renders commit input at `area.y + 1`, sections at `area.y + 2`; Git panel keyboard block handles commit-input mode branch + new normal-mode keys. 813 tests (+12).
