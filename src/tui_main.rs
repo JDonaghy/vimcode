@@ -1877,8 +1877,8 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                                                     quit_confirm = true;
                                                 } else if act == EngineAction::ToggleSidebar {
                                                     sidebar.visible = !sidebar.visible;
-                                                } else {
-                                                    handle_action(engine, act);
+                                                } else if handle_action(engine, act) {
+                                                    return;
                                                 }
                                             } // close else { (open_file_dialog branch)
                                         }
@@ -2100,6 +2100,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                                 continue;
                             }
                             // Non-drag event: handle the coalesced drag first, then the new event
+                            let mut mouse_should_quit = false;
                             sidebar_width = handle_mouse(
                                 mouse_event,
                                 &mut sidebar,
@@ -2122,7 +2123,11 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                                 &mut mouse_text_drag,
                                 &mut folder_picker,
                                 &mut quit_confirm,
+                                &mut mouse_should_quit,
                             );
+                            if mouse_should_quit {
+                                return;
+                            }
                             mouse_event = next;
                             break;
                         } else {
@@ -2130,6 +2135,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                         }
                     }
                 }
+                let mut mouse_should_quit = false;
                 sidebar_width = handle_mouse(
                     mouse_event,
                     &mut sidebar,
@@ -2152,7 +2158,11 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                     &mut mouse_text_drag,
                     &mut folder_picker,
                     &mut quit_confirm,
+                    &mut mouse_should_quit,
                 );
+                if mouse_should_quit {
+                    return;
+                }
             }
             Event::Paste(text) => {
                 // Bracketed paste — text delivered directly from the terminal emulator.
@@ -2224,6 +2234,7 @@ fn handle_mouse(
     mouse_text_drag: &mut bool,
     folder_picker: &mut Option<FolderPickerState>,
     quit_confirm: &mut bool,
+    should_quit: &mut bool,
 ) -> u16 {
     let col = ev.column;
     let row = ev.row;
@@ -2670,8 +2681,8 @@ fn handle_mouse(
                             *quit_confirm = true;
                         } else if act == EngineAction::ToggleSidebar {
                             sidebar.visible = !sidebar.visible;
-                        } else {
-                            let _ = handle_action(engine, act);
+                        } else if handle_action(engine, act) {
+                            *should_quit = true;
                         }
                     }
                 }
