@@ -942,6 +942,8 @@ impl Engine {
 
         let tab = Tab::new(TabId(1), window_id);
 
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+
         let mut engine = Self {
             buffer_manager,
             windows,
@@ -1029,7 +1031,7 @@ impl Engine {
             jump_list_pos: 0,
             search_word_bounded: false,
             workspace_file: None,
-            workspace_root: None,
+            workspace_root: Some(cwd.clone()),
             base_settings: None,
             sc_file_statuses: Vec::new(),
             sc_worktrees: Vec::new(),
@@ -1043,7 +1045,7 @@ impl Engine {
             sc_commit_input_active: false,
             sc_button_focused: None,
             plugin_manager: None,
-            cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            cwd,
             fuzzy_open: false,
             fuzzy_query: String::new(),
             fuzzy_all_files: Vec::new(),
@@ -1125,6 +1127,7 @@ impl Engine {
     }
 
     /// Create an engine with a file loaded (or empty buffer for new file).
+    #[cfg(test)]
     pub fn open(path: &Path) -> Self {
         let mut engine = Self::new();
 

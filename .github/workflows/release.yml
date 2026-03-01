@@ -1,0 +1,63 @@
+name: Release Build
+
+on:
+  push:
+    branches: [ main ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-linux:
+    name: Build Linux binary
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install GTK4 and dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          libgtk-4-dev \
+          build-essential \
+          pkg-config \
+          binutils
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: ${{ runner.os }}-cargo-
+
+    - name: Cache build target
+      uses: actions/cache@v4
+      with:
+        path: target
+        key: ${{ runner.os }}-release-target-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: ${{ runner.os }}-release-target-
+
+    - name: Build release binary
+      run: cargo build --release --verbose
+
+    - name: Strip binary
+      run: strip target/release/vimcode
+
+    - name: Rename binary with version
+      run: |
+        VERSION="0.1.0-${{ github.run_number }}"
+        cp target/release/vimcode vimcode-${VERSION}-linux-x86_64
+        echo "ARTIFACT_NAME=vimcode-${VERSION}-linux-x86_64" >> $GITHUB_ENV
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ env.ARTIFACT_NAME }}
+        path: ${{ env.ARTIFACT_NAME }}
+        retention-days: 30

@@ -639,12 +639,10 @@ fn intercept_paste_key(engine: &mut Engine, before: bool) -> bool {
 /// the terminal on exit.
 pub fn run(file_path: Option<PathBuf>) {
     let mut engine = Engine::new();
+    engine.restore_session_files();
     if let Some(path) = file_path {
-        if let Err(e) = engine.open_file_with_mode(&path, OpenMode::Permanent) {
-            eprintln!("vimcode: {}", e);
-        }
-    } else {
-        engine.restore_session_files();
+        // Open the CLI file in a tab (on top of any restored session files)
+        engine.open_file_in_tab(&path);
     }
 
     setup_tui_clipboard(&mut engine);

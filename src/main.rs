@@ -90,6 +90,15 @@ struct App {
     overlay: Rc<RefCell<Option<gtk4::Overlay>>>,
     cached_line_height: f64,
     cached_char_width: f64,
+    /// Shared with the drawing-area resize callback so scrollbars can be
+    /// repositioned synchronously (before each frame) without going through
+    /// Relm4's async message queue.
+    line_height_cell: Rc<Cell<f64>>,
+    char_width_cell: Rc<Cell<f64>>,
+    /// Shared with draw closure: hovered state for Cairo h scrollbars.
+    h_sb_hovered_cell: Rc<Cell<bool>>,
+    /// Shared with draw closure: which window (if any) has an active h scrollbar drag.
+    h_sb_drag_cell: Rc<Cell<Option<core::WindowId>>>,
     #[allow(dead_code)] // Kept alive to continue monitoring settings.json
     settings_monitor: Option<gio::FileMonitor>,
     sender: relm4::Sender<Msg>,
@@ -113,6 +122,10 @@ struct App {
     /// System clipboard context (copypasta-ext).  None if unavailable.
     // Box<dyn ClipboardProviderExt> is !Send; GTK App lives on main thread only.
     clipboard: Option<Box<dyn ClipboardProviderExt>>,
+    /// Drag state while the user drags a Cairo horizontal scrollbar thumb.
+    h_sb_dragging: Option<HScrollDragState>,
+    /// True while the mouse cursor is over any horizontal scrollbar track.
+    h_sb_hovered: bool,
     /// True while the user is dragging the terminal panel's scrollbar thumb.
     terminal_sb_dragging: bool,
     /// True while the user drags the terminal header row to resize the panel.
@@ -130,10 +143,21 @@ struct App {
     menu_dd_line_height: Rc<Cell<f64>>,
 }
 
-/// Scrollbars and indicators for a single window
+/// Drag state for a Cairo-drawn horizontal scrollbar.
+struct HScrollDragState {
+    window_id: core::WindowId,
+    drag_start_x: f64,
+    scroll_left_at_start: usize,
+    /// pixels per one column unit: `(track_w - thumb_w) / scroll_range`
+    px_per_col: f64,
+}
+
+/// Scrollbars and indicators for a single window.
+/// The horizontal scrollbar is drawn in Cairo (draw_editor) so it can be
+/// pixel-exact in height — GTK's Scrollbar widget enforces theme minimum
+/// heights that can't be overridden with CSS.
 struct WindowScrollbars {
     vertical: gtk4::Scrollbar,
-    horizontal: gtk4::Scrollbar,
     cursor_indicator: gtk4::DrawingArea,
 }
 
@@ -257,6 +281,8 @@ enum Msg {
     },
     /// Mouse button released in editor.
     MouseUp,
+    /// Mouse moved (used for hover detection on Cairo-drawn scrollbars).
+    MouseMove { x: f64, y: f64 },
     /// Rename a file: (old_path, new_name_without_dir)
     RenameFile(PathBuf, String),
     /// Move a file to a different directory: (src, dest_dir)
@@ -355,8 +381,6 @@ impl SimpleComponent for App {
         gtk4::Window {
             set_title: Some("VimCode"),
             set_default_size: (800, 600),
-            // Remove OS titlebar — our menu bar row acts as the title bar.
-            set_decorated: false,
 
             // Intercept window close — check for unsaved changes before allowing quit.
             connect_close_request[sender] => move |_window| {
@@ -369,10 +393,12 @@ impl SimpleComponent for App {
             gtk4::Box {
                 set_orientation: gtk4::Orientation::Vertical,
 
-                // Menu bar row — always visible, acts as the title bar.
-                // A WindowHandle wraps the DrawingArea so dragging it moves the window.
+                // Menu bar row — set as custom titlebar imperatively in init().
+                // CSD provides edge resize handles; WindowHandle enables drag-to-move.
+                #[name = "menu_bar_row"]
                 gtk4::Box {
                     set_orientation: gtk4::Orientation::Horizontal,
+                    set_css_classes: &["custom-titlebar"],
 
                     gtk4::WindowHandle {
                         set_hexpand: true,
@@ -384,17 +410,19 @@ impl SimpleComponent for App {
                         },
                     },
 
-                    // Window control buttons (─ ☐ ✕)
+                    // Window control buttons — VSCode style
+                    // Minimize: thin dash; Maximize: thin square; Close: thin ×
                     gtk4::Button {
-                        set_label: "─",
+                        set_label: "\u{2212}",
                         set_tooltip_text: Some("Minimize"),
                         set_css_classes: &["window-control"],
                         connect_clicked[sender] => move |_| {
                             sender.input(Msg::WindowMinimize);
                         }
                     },
+                    #[name = "maximize_button"]
                     gtk4::Button {
-                        set_label: "☐",
+                        set_label: "\u{25a1}",
                         set_tooltip_text: Some("Maximize"),
                         set_css_classes: &["window-control"],
                         connect_clicked[sender] => move |_| {
@@ -402,7 +430,7 @@ impl SimpleComponent for App {
                         }
                     },
                     gtk4::Button {
-                        set_label: "✕",
+                        set_label: "\u{2715}",
                         set_tooltip_text: Some("Close"),
                         set_css_classes: &["window-control"],
                         connect_clicked[sender] => move |_| {
@@ -524,7 +552,7 @@ impl SimpleComponent for App {
                     #[name = "sidebar_inner_box"]
                     gtk4::Box {
                         set_orientation: gtk4::Orientation::Vertical,
-                        set_width_request: 300,
+                        set_width_request: 260,
 
                         // Explorer panel
                         #[name = "explorer_panel"]
@@ -714,6 +742,7 @@ impl SimpleComponent for App {
                                 #[name = "project_search_entry"]
                                 gtk4::Entry {
                                     set_hexpand: true,
+                                    set_width_chars: 1,
                                     set_placeholder_text: Some("Search files…"),
 
                                     connect_changed[sender] => move |entry| {
@@ -787,6 +816,7 @@ impl SimpleComponent for App {
 
                                 gtk4::Entry {
                                     set_hexpand: true,
+                                    set_width_chars: 1,
                                     set_placeholder_text: Some("Replace…"),
 
                                     connect_changed[sender] => move |entry| {
@@ -801,7 +831,7 @@ impl SimpleComponent for App {
                                 },
 
                                 gtk4::Button {
-                                    set_label: "Replace All",
+                                    set_label: "All",
                                     set_tooltip_text: Some("Replace all matches in project"),
                                     set_css_classes: &["search-toggle-btn"],
 
@@ -1268,13 +1298,13 @@ impl SimpleComponent for App {
         // Load CSS before creating widgets
         load_css();
 
-        let engine = match file_path {
-            Some(ref path) => Engine::open(path),
-            None => {
-                let mut e = Engine::new();
-                e.restore_session_files();
-                e
+        let engine = {
+            let mut e = Engine::new();
+            e.restore_session_files();
+            if let Some(ref path) = file_path {
+                e.open_file_in_tab(path);
             }
+            e
         };
 
         // On X11 use x11_bin (xclip/xsel subprocesses) explicitly: try_context() picks
@@ -1328,6 +1358,11 @@ impl SimpleComponent for App {
             Rc::new(RefCell::new(None));
         let overlay_ref = Rc::new(RefCell::new(None));
         let window_scrollbars_ref = Rc::new(RefCell::new(HashMap::new()));
+        let line_height_cell: Rc<Cell<f64>> = Rc::new(Cell::new(24.0));
+        let char_width_cell: Rc<Cell<f64>> = Rc::new(Cell::new(9.0));
+        // Shared state for Cairo h scrollbar hover/drag — read by set_draw_func closure.
+        let h_sb_hovered_cell: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let h_sb_drag_cell: Rc<Cell<Option<core::WindowId>>> = Rc::new(Cell::new(None));
         let sidebar_inner_box_ref: Rc<RefCell<Option<gtk4::Box>>> = Rc::new(RefCell::new(None));
         let sidebar_revealer_ref: Rc<RefCell<Option<gtk4::Revealer>>> = Rc::new(RefCell::new(None));
         // Saves the sidebar width at the start of a drag so we can compute
@@ -1389,6 +1424,10 @@ impl SimpleComponent for App {
             overlay: overlay_ref.clone(),
             cached_line_height: 24.0,
             cached_char_width: 9.0,
+            line_height_cell: line_height_cell.clone(),
+            char_width_cell: char_width_cell.clone(),
+            h_sb_hovered_cell: h_sb_hovered_cell.clone(),
+            h_sb_drag_cell: h_sb_drag_cell.clone(),
             settings_monitor,
             sender: sender.input_sender().clone(),
             find_dialog_visible: false,
@@ -1408,6 +1447,8 @@ impl SimpleComponent for App {
             diff_selected_file: None,
             last_clipboard_content: None,
             clipboard,
+            h_sb_dragging: None,
+            h_sb_hovered: false,
             terminal_sb_dragging: false,
             terminal_resize_dragging: false,
             terminal_split_dragging: false,
@@ -1448,7 +1489,7 @@ impl SimpleComponent for App {
             gesture.connect_drag_update(move |_, dx, _| {
                 let new_w = (sw2.get() as f64 + dx).round() as i32;
                 if let Some(ref sb) = *sb_ref2.borrow() {
-                    sb.set_width_request(new_w.clamp(100, 600));
+                    sb.set_width_request(new_w.clamp(80, 600));
                 }
             });
             let sender_resize = sender.input_sender().clone();
@@ -1503,8 +1544,9 @@ impl SimpleComponent for App {
                     };
                     let line_height = lh.get();
                     // Draw the dropdown at window-level coordinates.
-                    // anchor_y = line_height (below the menu bar row).
-                    draw_menu_dropdown(cr, &data, &theme, 0.0, line_height, 0.0, 0.0, line_height);
+                    // anchor_y = 0: menu bar is now the titlebar, so the overlay
+                    // content starts right below it.
+                    draw_menu_dropdown(cr, &data, &theme, 0.0, 0.0, 0.0, 0.0, line_height);
                 });
             }
 
@@ -1521,37 +1563,19 @@ impl SimpleComponent for App {
                     let Some(open_idx) = engine.menu_open_idx else {
                         return;
                     };
-                    if y < line_height {
-                        // Click in the menu-bar row — check if another label was clicked.
-                        let mut cursor_x = 8.0_f64;
-                        let mut clicked_menu: Option<usize> = None;
-                        for (idx, (name, _, _)) in render::MENU_STRUCTURE.iter().enumerate() {
-                            let item_w = name.len() as f64 * 7.0 + 8.0;
-                            if x >= cursor_x && x < cursor_x + item_w {
-                                clicked_menu = Some(idx);
-                                break;
-                            }
-                            cursor_x += item_w;
-                        }
-                        drop(engine);
-                        match clicked_menu {
-                            Some(idx) if idx != open_idx => {
-                                sender_dd.send(Msg::OpenMenu(idx)).ok();
-                            }
-                            _ => {
-                                sender_dd.send(Msg::CloseMenu).ok();
-                            }
-                        }
-                    } else if let Some((_, _, items)) = render::MENU_STRUCTURE.get(open_idx) {
+                    // Menu bar is now the titlebar — the overlay starts below it.
+                    // The dropdown draws at y=0 in the overlay.
+                    if let Some((_, _, items)) = render::MENU_STRUCTURE.get(open_idx) {
                         // Click in the dropdown area.
+                        // Use ~7px per char as a rough approximation matching draw_menu_bar.
                         let mut popup_x = 8.0_f64;
                         for i in 0..open_idx {
                             if let Some((name, _, _)) = render::MENU_STRUCTURE.get(i) {
-                                popup_x += name.len() as f64 * 7.0 + 8.0;
+                                popup_x += name.len() as f64 * 7.0 + 10.0;
                             }
                         }
-                        let popup_w = 200.0_f64;
-                        let popup_y = line_height;
+                        let popup_w = 220.0_f64;
+                        let popup_y = 0.0;
                         let popup_h = (items.len() as f64 + 1.0) * line_height;
                         if y >= popup_y
                             && y < popup_y + popup_h
@@ -1644,10 +1668,11 @@ impl SimpleComponent for App {
             gesture.set_button(1);
             gesture.connect_pressed(move |_, _, x, _y| {
                 let engine = engine_menu.borrow();
-                // Scan menu labels from left edge (no hamburger on this widget)
+                // Scan menu labels from left edge (no hamburger on this widget).
+                // Use ~7px/char + 10px padding as approximation for UI font metrics.
                 let mut cursor_x = 8.0_f64;
                 for (idx, (name, _, _)) in render::MENU_STRUCTURE.iter().enumerate() {
-                    let item_w = name.len() as f64 * 7.0 + 8.0;
+                    let item_w = name.len() as f64 * 7.0 + 10.0;
                     if x >= cursor_x && x < cursor_x + item_w {
                         if engine.menu_open_idx == Some(idx) {
                             sender_menu.send(Msg::CloseMenu).ok();
@@ -1673,11 +1698,7 @@ impl SimpleComponent for App {
                 .set_draw_func(move |da, cr, _w, _h| {
                     let engine = engine.borrow();
                     let theme = Theme::onedark();
-                    let font_str = format!(
-                        "{} {}",
-                        engine.settings.font_family, engine.settings.font_size
-                    );
-                    let font_desc = FontDescription::from_string(&font_str);
+                    let font_desc = FontDescription::from_string(UI_FONT);
                     let pango_ctx = pangocairo::create_context(cr);
                     let layout = pango::Layout::new(&pango_ctx);
                     layout.set_font_description(Some(&font_desc));
@@ -1737,11 +1758,7 @@ impl SimpleComponent for App {
             widgets.git_sidebar_da.set_draw_func(move |da, cr, _w, _h| {
                 let engine = engine.borrow();
                 let theme = Theme::onedark();
-                let font_str = format!(
-                    "{} {}",
-                    engine.settings.font_family, engine.settings.font_size
-                );
-                let font_desc = FontDescription::from_string(&font_str);
+                let font_desc = FontDescription::from_string(UI_FONT);
                 let pango_ctx = pangocairo::create_context(cr);
                 let layout = pango::Layout::new(&pango_ctx);
                 layout.set_font_description(Some(&font_desc));
@@ -1788,6 +1805,19 @@ impl SimpleComponent for App {
         }
         *git_sidebar_da_ref.borrow_mut() = Some(widgets.git_sidebar_da.clone());
 
+        // Move the menu bar row out of the content Box and set it as the window's
+        // custom titlebar.  This gives us CSD edge resize handles while keeping
+        // our dark custom title strip with WindowHandle for drag-to-move.
+        {
+            let menu_row = &widgets.menu_bar_row;
+            if let Some(parent) = menu_row.parent() {
+                if let Some(parent_box) = parent.downcast_ref::<gtk4::Box>() {
+                    parent_box.remove(menu_row);
+                }
+            }
+            root.set_titlebar(Some(menu_row));
+        }
+
         // Restore saved sidebar width
         {
             let saved_width = engine.borrow().session.sidebar_width;
@@ -1804,6 +1834,21 @@ impl SimpleComponent for App {
             let eng = engine.borrow();
             let geom = &eng.session.window;
             root.set_default_size(geom.width, geom.height);
+        }
+
+        // Update maximize button icon and tooltip when window maximized state changes.
+        // □ = maximize; ❐ (U+2750 HEAVY RIGHT ARROW) not ideal; use ⧉ (TWO JOINED SQUARES).
+        {
+            let btn = widgets.maximize_button.clone();
+            root.connect_notify_local(Some("maximized"), move |win, _| {
+                if win.is_maximized() {
+                    btn.set_label("\u{29c9}"); // ⧉ two joined squares = restore
+                    btn.set_tooltip_text(Some("Restore Down"));
+                } else {
+                    btn.set_label("\u{25a1}"); // □ = maximize
+                    btn.set_tooltip_text(Some("Maximize"));
+                }
+            });
         }
 
         // Build tree from current working directory
@@ -2188,14 +2233,64 @@ impl SimpleComponent for App {
                 sender_clone.input(Msg::Resize);
             });
 
+        // Second connect_resize: synchronously reposition scrollbar widgets so
+        // they track the new size in the *same* frame as the editor redraw.
+        // This avoids the 1-frame lag that occurs when going through Relm4's
+        // message queue (Msg::Resize → sync_scrollbar).
+        {
+            let engine_for_sb = engine.clone();
+            let scrollbars_for_sb = window_scrollbars_ref.clone();
+            let lh_cell = line_height_cell.clone();
+            let cw_cell = char_width_cell.clone();
+            widgets
+                .drawing_area
+                .connect_resize(move |_, width, height| {
+                    let engine = engine_for_sb.borrow();
+                    let scrollbars = scrollbars_for_sb.borrow();
+                    sync_scrollbar_positions(
+                        width as f64,
+                        height as f64,
+                        lh_cell.get(),
+                        cw_cell.get(),
+                        &engine,
+                        &scrollbars,
+                    );
+                });
+        }
+
         let engine_clone = engine.clone();
         let sender_for_draw = sender.input_sender().clone();
+        let h_sb_hovered_for_draw = h_sb_hovered_cell.clone();
+        let h_sb_drag_for_draw = h_sb_drag_cell.clone();
         widgets
             .drawing_area
             .set_draw_func(move |_, cr, width, height| {
                 let engine = engine_clone.borrow();
-                draw_editor(cr, &engine, width, height, &sender_for_draw);
+                draw_editor(
+                    cr,
+                    &engine,
+                    width,
+                    height,
+                    &sender_for_draw,
+                    h_sb_hovered_for_draw.get(),
+                    h_sb_drag_for_draw.get(),
+                );
             });
+
+        // Motion controller: drives h scrollbar hover colour changes.
+        {
+            let sender_motion = sender.input_sender().clone();
+            let sender_leave = sender.input_sender().clone();
+            let mc = gtk4::EventControllerMotion::new();
+            mc.connect_motion(move |_, x, y| {
+                sender_motion.send(Msg::MouseMove { x, y }).ok();
+            });
+            // When the pointer leaves the drawing area, clear hover state.
+            mc.connect_leave(move |_| {
+                sender_leave.send(Msg::MouseMove { x: -1.0, y: -1.0 }).ok();
+            });
+            widgets.drawing_area.add_controller(mc);
+        }
 
         // Ensure drawing area has focus on startup
         widgets.drawing_area.grab_focus();
@@ -2606,6 +2701,31 @@ impl SimpleComponent for App {
                     // Dropdown clicks are fully handled by the menu_dropdown_da overlay
                     // widget (which has can_target=true while a menu is open).
                     // If we reach here, no menu is open and we proceed with normal handling.
+
+                    // ── H scrollbar hit-test (before editor click) ────────────────
+                    // If the click lands on a Cairo h scrollbar, start a drag and
+                    // don't pass the click through to the editor.
+                    {
+                        let lh = self.cached_line_height;
+                        let cw = self.cached_char_width;
+                        let engine = self.engine.borrow();
+                        let rects = compute_editor_window_rects(&engine, width, height, lh);
+                        if let Some((win_id, px_per_col, scroll_left)) =
+                            h_scrollbar_hit_test(&engine, x, y, &rects, cw, lh)
+                        {
+                            drop(engine);
+                            self.h_sb_dragging = Some(HScrollDragState {
+                                window_id: win_id,
+                                drag_start_x: x,
+                                scroll_left_at_start: scroll_left,
+                                px_per_col,
+                            });
+                            self.h_sb_drag_cell.set(Some(win_id));
+                            self.redraw = !self.redraw;
+                            return; // consume click; don't send it to the editor
+                        }
+                    }
+
                     {
                         let mut engine = self.engine.borrow_mut();
 
@@ -2675,6 +2795,20 @@ impl SimpleComponent for App {
                 width,
                 height,
             } => {
+                // H scrollbar thumb drag — convert pointer delta to scroll_left.
+                if let Some(ref state) = self.h_sb_dragging {
+                    if state.px_per_col > 0.0 {
+                        let delta_cols =
+                            ((x - state.drag_start_x) / state.px_per_col).round() as isize;
+                        let new_left =
+                            (state.scroll_left_at_start as isize + delta_cols).max(0) as usize;
+                        self.engine
+                            .borrow_mut()
+                            .set_scroll_left_for_window(state.window_id, new_left);
+                        self.redraw = !self.redraw;
+                    }
+                    return;
+                }
                 // Terminal split divider drag — update visual position (no PTY resize yet).
                 if self.terminal_split_dragging {
                     if self.cached_char_width > 0.0 {
@@ -2821,9 +2955,30 @@ impl SimpleComponent for App {
                     self.engine.borrow_mut().terminal_resize(cols, rows);
                     let _ = self.engine.borrow().session.save();
                 }
+                self.h_sb_dragging = None;
+                self.h_sb_drag_cell.set(None);
                 let mut engine = self.engine.borrow_mut();
                 engine.mouse_drag_active = false;
                 self.redraw = !self.redraw;
+            }
+            Msg::MouseMove { x, y } => {
+                // Update hover state for Cairo h scrollbars; redraw only if it changed.
+                let lh = self.cached_line_height;
+                let cw = self.cached_char_width;
+                let (da_w, da_h) = if let Some(da) = self.drawing_area.borrow().as_ref() {
+                    (da.width() as f64, da.height() as f64)
+                } else {
+                    return;
+                };
+                let engine = self.engine.borrow();
+                let rects = compute_editor_window_rects(&engine, da_w, da_h, lh);
+                let now_hovered = h_scrollbar_hit_test(&engine, x, y, &rects, cw, lh).is_some();
+                drop(engine);
+                if now_hovered != self.h_sb_hovered {
+                    self.h_sb_hovered = now_hovered;
+                    self.h_sb_hovered_cell.set(now_hovered);
+                    self.redraw = !self.redraw;
+                }
             }
             Msg::ToggleSidebar => {
                 self.sidebar_visible = !self.sidebar_visible;
@@ -3196,6 +3351,9 @@ impl SimpleComponent for App {
                 let old_char_width = self.cached_char_width;
                 self.cached_line_height = line_height;
                 self.cached_char_width = char_width;
+                // Keep shared cells in sync so the resize callback can use accurate values.
+                self.line_height_cell.set(line_height);
+                self.char_width_cell.set(char_width);
                 // Keep menu dropdown overlay in sync with current line height.
                 self.menu_dd_line_height.set(line_height);
                 // Sync menu bar height to font metrics
@@ -4313,6 +4471,79 @@ impl SimpleComponent for App {
     }
 }
 
+/// Reposition existing scrollbar widgets for the given drawing-area size.
+///
+/// This is a free function so it can be called both from `sync_scrollbar` (via
+/// Relm4's message queue) AND from a `connect_resize` callback that runs
+/// synchronously during GTK's layout pass — before each frame is rendered.
+/// Calling it synchronously eliminates the 1-frame lag where the editor draws
+/// at the new size while scrollbars are still at the old position.
+///
+/// It only updates widget geometry; it does NOT create/remove scrollbars or
+/// update adjustment values (that is `sync_scrollbar`'s job).
+#[allow(clippy::too_many_arguments)]
+fn sync_scrollbar_positions(
+    da_width: f64,
+    da_height: f64,
+    line_height: f64,
+    _char_width: f64,
+    engine: &core::Engine,
+    scrollbars: &HashMap<core::WindowId, WindowScrollbars>,
+) {
+    if da_width < 20.0 || da_height < 20.0 || line_height < 1.0 {
+        return;
+    }
+    let tab_bar_height = line_height;
+    let status_bar_height = line_height * 2.0;
+    let debug_toolbar_px = if engine.debug_toolbar_visible {
+        line_height
+    } else {
+        0.0
+    };
+    let qf_px = if engine.quickfix_open && !engine.quickfix_items.is_empty() {
+        6.0 * line_height
+    } else {
+        0.0
+    };
+    let term_px = if engine.terminal_open || engine.bottom_panel_open {
+        (engine.session.terminal_panel_rows as f64 + 1.0) * line_height
+    } else {
+        0.0
+    };
+    let content_bounds = core::WindowRect::new(
+        0.0,
+        tab_bar_height,
+        da_width,
+        da_height - tab_bar_height - status_bar_height - debug_toolbar_px - qf_px - term_px,
+    );
+    let window_rects = engine.calculate_window_rects(content_bounds);
+
+    for (window_id, rect) in &window_rects {
+        let ws = match scrollbars.get(window_id) {
+            Some(ws) => ws,
+            None => continue,
+        };
+        let window = match engine.windows.get(window_id) {
+            Some(w) => w,
+            None => continue,
+        };
+        if engine.buffer_manager.get(window.buffer_id).is_none() {
+            continue;
+        }
+
+        // — Vertical scrollbar —
+        ws.vertical.set_halign(gtk4::Align::Start);
+        ws.vertical.set_valign(gtk4::Align::Start);
+        ws.vertical
+            .set_margin_start(rect.x as i32 + (rect.width - 10.0) as i32);
+        ws.vertical.set_margin_top(rect.y as i32);
+        ws.vertical
+            .set_height_request((rect.height as i32 - 10).max(0));
+
+        // Horizontal scrollbar is drawn in Cairo by draw_editor — nothing to do here.
+    }
+}
+
 impl App {
     /// Save the current session state and exit the process immediately.
     /// This is the canonical quit path — called when there are no unsaved changes.
@@ -4436,6 +4667,20 @@ impl App {
 
     /// Rebuild and sync scrollbars for all windows
     fn sync_scrollbar(&self) {
+        // Also run the fast positional sync so callers that go through the
+        // Relm4 message queue still converge to the right layout.
+        if let Some(da) = self.drawing_area.borrow().as_ref() {
+            let scrollbars = self.window_scrollbars.borrow();
+            let engine = self.engine.borrow();
+            sync_scrollbar_positions(
+                da.width() as f64,
+                da.height() as f64,
+                self.cached_line_height,
+                self.cached_char_width,
+                &engine,
+                &scrollbars,
+            );
+        }
         let overlay = match self.overlay.borrow().as_ref() {
             Some(o) => o.clone(),
             None => return,
@@ -4481,13 +4726,8 @@ impl App {
             0.0,
             tab_bar_height,
             da_width,
-            da_height
-                - tab_bar_height
-                - status_bar_height
-                - debug_toolbar_px
-                - qf_px
-                - term_px
-                - 10.0,
+            da_height - tab_bar_height - status_bar_height - debug_toolbar_px - qf_px - term_px,
+            // No gap: h-scrollbar overlays the content bottom (VSCode style)
         );
 
         let window_rects = engine.calculate_window_rects(content_bounds);
@@ -4554,62 +4794,8 @@ impl App {
                 ws.cursor_indicator.set_width_request(10);
                 ws.cursor_indicator.set_height_request(4);
             }
-
-            // Position and sync horizontal scrollbar in the 10px gap above status line
-            let h_scrollbar_y = da_height - status_bar_height - 10.0;
-
-            // Use absolute positioning with Start alignment
-            ws.horizontal.set_halign(gtk4::Align::Start);
-            ws.horizontal.set_valign(gtk4::Align::Start);
-
-            ws.horizontal.set_margin_start(rect.x as i32);
-            ws.horizontal.set_margin_top(h_scrollbar_y as i32);
-            ws.horizontal.set_width_request(rect.width as i32);
-            ws.horizontal.set_height_request(10);
-
-            let max_line_length = buffer_state
-                .buffer
-                .content
-                .lines()
-                .map(|line| line.chars().count())
-                .max()
-                .unwrap_or(80);
-
-            // Compute visible text columns for this specific window.
-            // We subtract the gutter (char cells × char_width) and the 10px
-            // vertical scrollbar so that the thumb correctly reflects how much
-            // of the longest line fits on screen.
-            let cw = self.cached_char_width.max(1.0);
-            let has_bp_sb = {
-                let key = buffer_state
-                    .file_path
-                    .as_ref()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                !engine
-                    .dap_breakpoints
-                    .get(&key)
-                    .is_none_or(|v| v.is_empty())
-                    || engine.dap_session_active
-            };
-            let gutter_cols = render::calculate_gutter_cols(
-                engine.settings.line_numbers,
-                buffer_state.buffer.content.len_lines(),
-                cw,
-                !buffer_state.git_diff.is_empty(),
-                has_bp_sb,
-            );
-            let gutter_px = gutter_cols as f64 * cw;
-            let v_scrollbar_px = 10.0_f64;
-            let visible_cols = ((rect.width - gutter_px - v_scrollbar_px) / cw)
-                .floor()
-                .max(1.0);
-
-            let h_adj = ws.horizontal.adjustment();
-            h_adj.set_upper(max_line_length as f64);
-            h_adj.set_page_size(visible_cols);
-            h_adj.set_value(window.view.scroll_left as f64);
         }
+        // Horizontal scrollbar is drawn in Cairo by draw_h_scrollbars() in draw_editor().
 
         // Remove overlay widgets for deleted windows
         // (GTK will automatically remove them when we drop the references)
@@ -4629,25 +4815,16 @@ impl App {
         vertical.set_hexpand(false);
         vertical.set_vexpand(false);
 
-        // Horizontal scrollbar
-        let h_adj = gtk4::Adjustment::new(0.0, 0.0, 200.0, 1.0, 10.0, 80.0);
-        let horizontal = gtk4::Scrollbar::new(gtk4::Orientation::Horizontal, Some(&h_adj));
-        horizontal.set_height_request(10);
-        horizontal.set_hexpand(false);
-        horizontal.set_vexpand(false);
-
         // Cursor indicator
         let cursor_indicator = gtk4::DrawingArea::new();
         cursor_indicator.set_width_request(10);
         cursor_indicator.set_height_request(4);
         cursor_indicator.set_can_target(false);
-        // Set alignments and prevent expansion to maintain fixed 4px height
         cursor_indicator.set_halign(gtk4::Align::Start);
         cursor_indicator.set_valign(gtk4::Align::Start);
         cursor_indicator.set_hexpand(false);
         cursor_indicator.set_vexpand(false);
         cursor_indicator.set_draw_func(|_, cr, w, h| {
-            // Darker grey color like VSCode (darker than scrollbar handle)
             cr.set_source_rgba(0.5, 0.5, 0.5, 0.8);
             cr.rectangle(0.0, 0.0, w as f64, h as f64);
             let _ = cr.fill();
@@ -4655,15 +4832,12 @@ impl App {
 
         // Add to overlay
         overlay.add_overlay(&vertical);
-        overlay.add_overlay(&horizontal);
         overlay.add_overlay(&cursor_indicator);
 
-        // Make scrollbars visible
         vertical.show();
-        horizontal.show();
         cursor_indicator.show();
 
-        // Connect signals (always, for all windows)
+        // Connect vertical scrollbar signal
         let sender_v = sender.clone();
         v_adj.connect_value_changed(move |adj| {
             sender_v
@@ -4674,19 +4848,8 @@ impl App {
                 .ok();
         });
 
-        let sender_h = sender.clone();
-        h_adj.connect_value_changed(move |adj| {
-            sender_h
-                .send(Msg::HorizontalScrollbarChanged {
-                    window_id,
-                    value: adj.value(),
-                })
-                .ok();
-        });
-
         WindowScrollbars {
             vertical,
-            horizontal,
             cursor_indicator,
         }
     }
@@ -4740,12 +4903,18 @@ fn calculate_gutter_width(mode: LineNumberMode, total_lines: usize, char_width: 
     }
 }
 
+/// Pango font description string for UI panels (menu bar, sidebars, dropdown).
+/// Matches VSCode's Linux font stack at 11pt ≈ 13px @ 96 dpi.
+const UI_FONT: &str = "Segoe UI, Ubuntu, Droid Sans, Sans 10";
+
 fn draw_editor(
     cr: &Context,
     engine: &Engine,
     width: i32,
     height: i32,
     sender: &relm4::Sender<Msg>,
+    h_sb_hovered: bool,
+    h_sb_dragging_window: Option<core::WindowId>,
 ) {
     let theme = Theme::onedark();
 
@@ -4809,13 +4978,8 @@ fn draw_editor(
         0.0,
         tab_bar_height,
         width as f64,
-        height as f64
-            - tab_bar_height
-            - status_bar_height
-            - debug_toolbar_px
-            - qf_px
-            - term_px
-            - 10.0, // Reserve 10px for h-scrollbar
+        height as f64 - tab_bar_height - status_bar_height - debug_toolbar_px - qf_px - term_px,
+        // No gap reserved: h-scrollbar overlays the bottom of content (VSCode style)
     );
     let window_rects = engine.calculate_window_rects(content_bounds);
 
@@ -4970,6 +5134,17 @@ fn draw_editor(
         );
     }
 
+    // 5i. Draw horizontal scrollbars in Cairo (VSCode-style overlay on window bottom)
+    draw_h_scrollbars(
+        cr,
+        engine,
+        &window_rects,
+        char_width,
+        line_height,
+        h_sb_hovered,
+        h_sb_dragging_window,
+    );
+
     // 6. Status Line (second-to-last line)
     let status_y = height as f64 - status_bar_height;
     draw_status_line(
@@ -4998,6 +5173,171 @@ fn draw_editor(
 // Note: menu dropdown is drawn by the full-window `menu_dropdown_da` overlay,
 // not here — this drawing_area's x=0 is offset from the window left by the
 // activity bar, so popup_x values would appear at the wrong horizontal position.
+
+/// Compute editor window rects with the same formula used by draw_editor and
+/// sync_scrollbar, so event handlers can do hit-testing without duplicating the
+/// layout logic.
+fn compute_editor_window_rects(
+    engine: &Engine,
+    da_width: f64,
+    da_height: f64,
+    line_height: f64,
+) -> Vec<(core::WindowId, core::WindowRect)> {
+    let tab_bar_height = line_height;
+    let status_bar_height = line_height * 2.0;
+    let debug_toolbar_px = if engine.debug_toolbar_visible {
+        line_height
+    } else {
+        0.0
+    };
+    let qf_px = if engine.quickfix_open && !engine.quickfix_items.is_empty() {
+        6.0 * line_height
+    } else {
+        0.0
+    };
+    let term_px = if engine.terminal_open || engine.bottom_panel_open {
+        (engine.session.terminal_panel_rows as f64 + 1.0) * line_height
+    } else {
+        0.0
+    };
+    let content_bounds = core::WindowRect::new(
+        0.0,
+        tab_bar_height,
+        da_width,
+        da_height - tab_bar_height - status_bar_height - debug_toolbar_px - qf_px - term_px,
+    );
+    engine.calculate_window_rects(content_bounds)
+}
+
+/// Compute the thumb geometry for one window's h scrollbar.
+/// Returns `(track_x, track_y, track_w, sb_height, thumb_x, thumb_w, scroll_range, px_per_col)`.
+/// Returns `None` when no scrollbar is needed (content fits).
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn h_scrollbar_geometry(
+    engine: &Engine,
+    window_id: core::WindowId,
+    rect: &core::WindowRect,
+    char_width: f64,
+    line_height: f64,
+) -> Option<(f64, f64, f64, f64, f64, f64, f64, f64)> {
+    let window = engine.windows.get(&window_id)?;
+    let buffer_state = engine.buffer_manager.get(window.buffer_id)?;
+
+    let max_line_length = buffer_state
+        .buffer
+        .content
+        .lines()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(0) as f64;
+
+    let v_scrollbar_px = 10.0_f64;
+    let track_w = (rect.width - v_scrollbar_px).max(1.0);
+    let visible_cols = (track_w / char_width).floor().max(1.0);
+
+    if max_line_length <= visible_cols {
+        return None;
+    }
+
+    let sb_height = (line_height * 0.35).round().max(4.0);
+    let track_x = rect.x;
+    let track_y = rect.y + rect.height - sb_height;
+    let scroll_range = (max_line_length - visible_cols).max(1.0);
+    let thumb_frac = visible_cols / max_line_length;
+    let thumb_w = (thumb_frac * track_w).max(20.0).min(track_w);
+    let px_per_col = (track_w - thumb_w) / scroll_range;
+    let scroll_left = window.view.scroll_left as f64;
+    let thumb_x = track_x + (scroll_left / scroll_range) * (track_w - thumb_w);
+
+    Some((
+        track_x,
+        track_y,
+        track_w,
+        sb_height,
+        thumb_x,
+        thumb_w,
+        scroll_range,
+        px_per_col,
+    ))
+}
+
+/// Hit-test a point against all h scrollbars. Returns `(window_id, px_per_col,
+/// scroll_left_at_click)` when the point is on any h scrollbar track (not only
+/// the thumb), so the caller can decide between thumb-drag and track-click.
+fn h_scrollbar_hit_test(
+    engine: &Engine,
+    x: f64,
+    y: f64,
+    window_rects: &[(core::WindowId, core::WindowRect)],
+    char_width: f64,
+    line_height: f64,
+) -> Option<(core::WindowId, f64, usize)> {
+    for (window_id, rect) in window_rects {
+        if let Some((
+            track_x,
+            track_y,
+            track_w,
+            sb_height,
+            _thumb_x,
+            _thumb_w,
+            _range,
+            px_per_col,
+        )) = h_scrollbar_geometry(engine, *window_id, rect, char_width, line_height)
+        {
+            if x >= track_x && x <= track_x + track_w && y >= track_y && y <= track_y + sb_height {
+                let scroll_left = engine
+                    .windows
+                    .get(window_id)
+                    .map(|w| w.view.scroll_left)
+                    .unwrap_or(0);
+                return Some((*window_id, px_per_col, scroll_left));
+            }
+        }
+    }
+    None
+}
+
+/// Draw thin Cairo horizontal scrollbars that overlay the bottom of each editor
+/// window (VSCode style). Only shown when content is wider than the viewport.
+/// `hovered` — mouse is over any scrollbar track (brightens the thumb).
+/// `dragging_window` — window being dragged (shows the active/dragging colour).
+fn draw_h_scrollbars(
+    cr: &Context,
+    engine: &Engine,
+    window_rects: &[(core::WindowId, core::WindowRect)],
+    char_width: f64,
+    line_height: f64,
+    hovered: bool,
+    dragging_window: Option<core::WindowId>,
+) {
+    for (window_id, rect) in window_rects {
+        let Some((track_x, track_y, track_w, sb_height, thumb_x, thumb_w, _, _)) =
+            h_scrollbar_geometry(engine, *window_id, rect, char_width, line_height)
+        else {
+            continue;
+        };
+
+        let is_active = dragging_window == Some(*window_id);
+
+        // Track background (slightly darker when hovered/active)
+        let track_alpha = if hovered || is_active { 0.35 } else { 0.20 };
+        cr.set_source_rgba(0.0, 0.0, 0.0, track_alpha);
+        cr.rectangle(track_x, track_y, track_w, sb_height);
+        cr.fill().ok();
+
+        // Thumb: brighter on hover, brighter still on active drag
+        let thumb_alpha = if is_active {
+            0.85
+        } else if hovered {
+            0.70
+        } else {
+            0.50
+        };
+        cr.set_source_rgba(0.65, 0.65, 0.65, thumb_alpha);
+        cr.rectangle(thumb_x, track_y, thumb_w, sb_height);
+        cr.fill().ok();
+    }
+}
 
 fn draw_tab_bar(
     cr: &Context,
@@ -6935,10 +7275,15 @@ fn draw_menu_bar(
     width: f64,
     height: f64,
 ) {
-    let (r, g, b) = theme.status_bg.to_cairo();
-    cr.set_source_rgb(r, g, b);
+    // VSCode title bar background: #3c3c3c
+    cr.set_source_rgb(0.235, 0.235, 0.235);
     cr.rectangle(x, y, width, height);
     let _ = cr.fill();
+
+    let pango_ctx = pangocairo::create_context(cr);
+    let font_desc = pango::FontDescription::from_string(UI_FONT);
+    let layout = pango::Layout::new(&pango_ctx);
+    layout.set_font_description(Some(&font_desc));
 
     let (fr, fg, fb) = theme.status_fg.to_cairo();
     cr.set_source_rgb(fr, fg, fb);
@@ -6954,19 +7299,25 @@ fn draw_menu_bar(
         } else {
             cr.set_source_rgb(fr, fg, fb);
         }
-        cr.move_to(cursor_x, y + height * 0.7);
-        let _ = cr.show_text(name);
-        cursor_x += (name.len() as f64 * 7.0) + 8.0;
+        layout.set_text(name);
+        let (lw, lh) = layout.pixel_size();
+        cr.move_to(cursor_x, y + (height - lh as f64) / 2.0);
+        pangocairo::show_layout(cr, &layout);
+        cursor_x += lw as f64 + 10.0;
     }
 
     // Title centered in remaining space (dimmed)
     if !data.title.is_empty() {
         let (dr, dg, db) = theme.line_number_fg.to_cairo();
         cr.set_source_rgb(dr, dg, db);
-        let title_w = data.title.len() as f64 * 7.0;
-        let title_x = (x + width - title_w) / 2.0 + x / 2.0;
-        cr.move_to(title_x.max(cursor_x + 8.0), y + height * 0.7);
-        let _ = cr.show_text(&data.title);
+        layout.set_text(&data.title);
+        let (title_w, title_h) = layout.pixel_size();
+        let title_x = (x + width - title_w as f64) / 2.0 + x / 2.0;
+        cr.move_to(
+            title_x.max(cursor_x + 8.0),
+            y + (height - title_h as f64) / 2.0,
+        );
+        pangocairo::show_layout(cr, &layout);
     }
 }
 
@@ -6984,30 +7335,35 @@ fn draw_menu_dropdown(
     if data.open_items.is_empty() {
         return;
     }
-    // Compute popup_x using the same layout as draw_menu_bar:
-    // starts at x+8, each menu advances by name.len()*7.0 + 8.0
+
+    let pango_ctx = pangocairo::create_context(cr);
+    let font_desc = pango::FontDescription::from_string(UI_FONT);
+    let layout = pango::Layout::new(&pango_ctx);
+    layout.set_font_description(Some(&font_desc));
+
+    // Compute popup_x the same way draw_menu_bar does: measure each label
     let mut popup_x = x + 8.0;
     if let Some(midx) = data.open_menu_idx {
         for i in 0..midx {
             if let Some((name, _, _)) = render::MENU_STRUCTURE.get(i) {
-                popup_x += name.len() as f64 * 7.0 + 8.0;
+                layout.set_text(name);
+                let (lw, _) = layout.pixel_size();
+                popup_x += lw as f64 + 10.0;
             }
         }
     }
     let item_count = data.open_items.len() as f64;
-    let popup_width = 200.0_f64;
+    let popup_width = 220.0_f64;
     let popup_height = (item_count + 1.0) * line_height;
     let popup_y = anchor_y;
 
-    // Background
-    let (r, g, b) = theme.tab_bar_bg.to_cairo();
-    cr.set_source_rgb(r, g, b);
+    // Background — VSCode dropdown: #3c3c3c
+    cr.set_source_rgb(0.235, 0.235, 0.235);
     cr.rectangle(popup_x, popup_y, popup_width, popup_height);
     let _ = cr.fill();
 
-    // Border
-    let (br, bg_c, bb) = theme.separator.to_cairo();
-    cr.set_source_rgb(br, bg_c, bb);
+    // Border — VSCode: slightly lighter #454545
+    cr.set_source_rgb(0.271, 0.271, 0.271);
     cr.rectangle(popup_x, popup_y, popup_width, popup_height);
     let _ = cr.stroke();
 
@@ -7015,7 +7371,7 @@ fn draw_menu_dropdown(
     let (fr, fg_c, fb) = theme.foreground.to_cairo();
     let (sr, sg, sb) = theme.line_number_fg.to_cairo();
     cr.set_source_rgb(fr, fg_c, fb);
-    let mut item_y = popup_y + line_height * 0.8;
+    let mut item_y = popup_y + line_height * 0.1;
     for item in &data.open_items {
         item_y += line_height;
         if item.separator {
@@ -7025,20 +7381,25 @@ fn draw_menu_dropdown(
             let _ = cr.stroke();
             cr.set_source_rgb(fr, fg_c, fb);
         } else {
-            cr.move_to(popup_x + 8.0, item_y);
-            let _ = cr.show_text(item.label);
+            layout.set_text(item.label);
+            let (_, lh) = layout.pixel_size();
+            cr.set_source_rgb(fr, fg_c, fb);
+            cr.move_to(popup_x + 8.0, item_y - lh as f64 * 0.9);
+            pangocairo::show_layout(cr, &layout);
             let sc = if data.is_vscode_mode && !item.vscode_shortcut.is_empty() {
                 item.vscode_shortcut
             } else {
                 item.shortcut
             };
             if !sc.is_empty() {
+                layout.set_text(sc);
+                let (sc_w, _) = layout.pixel_size();
                 cr.set_source_rgb(sr, sg, sb);
                 cr.move_to(
-                    popup_x + popup_width - (sc.len() as f64 * 7.0) - 8.0,
-                    item_y,
+                    popup_x + popup_width - sc_w as f64 - 8.0,
+                    item_y - lh as f64 * 0.9,
                 );
-                let _ = cr.show_text(sc);
+                pangocairo::show_layout(cr, &layout);
                 cr.set_source_rgb(fr, fg_c, fb);
             }
         }
@@ -7669,22 +8030,63 @@ fn load_css() {
     let provider = gtk4::CssProvider::new();
     provider.load_from_data(
         "
-        /* Window control buttons (─ ☐ ✕) in the menu bar */
+        /* Custom titlebar — VSCode title bar color #3c3c3c.
+           CSD provides edge resize handles; WindowHandle enables drag-to-move. */
+        .custom-titlebar {
+            background-color: #3c3c3c;
+            min-height: 0;
+            padding: 0;
+            margin: 0;
+            border: none;
+            box-shadow: none;
+        }
+        headerbar {
+            min-height: 0;
+            padding: 0;
+            margin: 0;
+            border: none;
+            box-shadow: none;
+            background: transparent;
+        }
+
+        /* VSCode UI font stack — 'Segoe UI' on Windows, 'Ubuntu' on Ubuntu,
+           system-ui/sans elsewhere.  13px matches VSCode default UI size. */
+        .sidebar,
+        .sidebar *,
+        .sidebar-header,
+        .sidebar-title,
+        .search-results-list,
+        .search-results-list *,
+        .search-file-header {
+            font-family: 'Segoe UI', system-ui, -apple-system, 'Ubuntu', 'Droid Sans', sans-serif;
+            font-size: 13px;
+        }
+
+        /* Window control buttons — VSCode style (transparent bg, subtle hover) */
         .window-control {
-            background-color: #252526;
+            background: transparent;
             border: none;
             border-radius: 0;
             color: #cccccc;
-            font-size: 14px;
-            padding: 0 10px;
-            min-width: 40px;
-            min-height: 24px;
+            font-size: 13px;
+            padding: 0;
+            min-width: 46px;
+            min-height: 30px;
         }
         .window-control:hover {
-            background-color: #3e3e42;
+            background-color: rgba(255, 255, 255, 0.12);
+            color: #ffffff;
         }
+        .window-control:active {
+            background-color: rgba(255, 255, 255, 0.08);
+        }
+        /* Close button: red on hover, matching Windows/VSCode */
         .window-control:last-child:hover {
-            background-color: #c42b1c;
+            background-color: #e81123;
+            color: #ffffff;
+        }
+        .window-control:last-child:active {
+            background-color: #f1707a;
             color: #ffffff;
         }
 
@@ -7755,7 +8157,7 @@ fn load_css() {
             background-color: #252526;
             color: #cccccc;
             border: none;
-            font-family: Ubuntu, Roboto, sans-serif;
+            font-family: 'Segoe UI', system-ui, -apple-system, 'Ubuntu', 'Droid Sans', sans-serif;
             font-size: 13px;
             outline: none;
         }
@@ -7912,6 +8314,36 @@ fn load_css() {
             background-color: #0e639c;
             color: #ffffff;
             border-color: #0e639c;
+        }
+
+        /* Horizontal editor scrollbar — overlays the bottom of editor content.
+           Semi-transparent like VSCode so text beneath is still visible.
+           min-height/min-width: 0 prevents the GTK theme from forcing the
+           widget taller than our height_request(10), which would push it
+           into the status line. */
+        .h-editor-scrollbar {
+            background: transparent;
+            border: none;
+            padding: 0;
+            min-height: 0;
+            min-width: 0;
+        }
+        .h-editor-scrollbar trough {
+            background: transparent;
+            border: none;
+            min-height: 0;
+            min-width: 0;
+            padding: 0;
+        }
+        .h-editor-scrollbar slider {
+            background: rgba(100, 100, 100, 0.45);
+            border-radius: 2px;
+            min-height: 0;
+            min-width: 20px;
+            margin: 1px 0;
+        }
+        .h-editor-scrollbar slider:hover {
+            background: rgba(150, 150, 150, 0.7);
         }
 
         /* Find/Replace Dialog */

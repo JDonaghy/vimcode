@@ -70,7 +70,7 @@ pub struct WindowGeometry {
 }
 
 fn default_sidebar_width() -> i32 {
-    300
+    260
 }
 
 fn default_terminal_rows() -> u16 {
