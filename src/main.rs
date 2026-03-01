@@ -77,11 +77,14 @@ struct App {
     debug_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>>,
     git_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>>,
     sidebar_inner_box: Rc<RefCell<Option<gtk4::Box>>>,
+    /// Direct ref to the sidebar Revealer for programmatic open/close.
+    sidebar_revealer: Rc<RefCell<Option<gtk4::Revealer>>>,
     /// Direct refs to each panel's outer Box for programmatic show/hide.
     explorer_panel_box: Rc<RefCell<Option<gtk4::Box>>>,
     search_panel_box: Rc<RefCell<Option<gtk4::Box>>>,
     debug_panel_box: Rc<RefCell<Option<gtk4::Box>>>,
     git_panel_box: Rc<RefCell<Option<gtk4::Box>>>,
+    settings_panel_box: Rc<RefCell<Option<gtk4::Box>>>,
     // Per-window scrollbars and indicators
     window_scrollbars: Rc<RefCell<HashMap<core::WindowId, WindowScrollbars>>>,
     overlay: Rc<RefCell<Option<gtk4::Overlay>>>,
@@ -644,6 +647,7 @@ impl SimpleComponent for App {
                         },
 
                         // Settings panel
+                        #[name = "settings_panel"]
                         gtk4::Box {
                             set_orientation: gtk4::Orientation::Vertical,
                             set_css_classes: &["sidebar"],
@@ -887,24 +891,7 @@ impl SimpleComponent for App {
                     #[watch]
                     set_visible: model.sidebar_visible,
 
-                    add_controller = gtk4::GestureDrag {
-                        // Save the initial width when the drag begins.
-                        connect_drag_begin[sidebar_inner_box_ref, sidebar_drag_start_w] => move |_, _, _| {
-                            if let Some(ref sb) = *sidebar_inner_box_ref.borrow() {
-                                sidebar_drag_start_w.set(sb.width_request());
-                            }
-                        },
-                        // Use initial_width + total_offset (not current + delta) to avoid accumulation.
-                        connect_drag_update[sidebar_inner_box_ref, sidebar_drag_start_w] => move |_, dx, _| {
-                            let new_w = (sidebar_drag_start_w.get() as f64 + dx).round() as i32;
-                            if let Some(ref sb) = *sidebar_inner_box_ref.borrow() {
-                                sb.set_width_request(new_w.clamp(100, 600));
-                            }
-                        },
-                        connect_drag_end[sender] => move |_, _, _| {
-                            sender.input(Msg::SidebarResized);
-                        },
-                    },
+
                 },
 
                 // Editor area (DrawingArea wrapped in Overlay for scrollbars)
@@ -1345,6 +1332,7 @@ impl SimpleComponent for App {
         let overlay_ref = Rc::new(RefCell::new(None));
         let window_scrollbars_ref = Rc::new(RefCell::new(HashMap::new()));
         let sidebar_inner_box_ref: Rc<RefCell<Option<gtk4::Box>>> = Rc::new(RefCell::new(None));
+        let sidebar_revealer_ref: Rc<RefCell<Option<gtk4::Revealer>>> = Rc::new(RefCell::new(None));
         // Saves the sidebar width at the start of a drag so we can compute
         // initial_width + total_offset instead of accumulating delta per event.
         let sidebar_drag_start_w: Rc<Cell<i32>> = Rc::new(Cell::new(300));
@@ -1352,6 +1340,7 @@ impl SimpleComponent for App {
         let search_panel_box_ref: Rc<RefCell<Option<gtk4::Box>>> = Rc::new(RefCell::new(None));
         let debug_panel_box_ref: Rc<RefCell<Option<gtk4::Box>>> = Rc::new(RefCell::new(None));
         let git_panel_box_ref: Rc<RefCell<Option<gtk4::Box>>> = Rc::new(RefCell::new(None));
+        let settings_panel_box_ref: Rc<RefCell<Option<gtk4::Box>>> = Rc::new(RefCell::new(None));
         let search_results_list_ref: Rc<RefCell<Option<gtk4::ListBox>>> =
             Rc::new(RefCell::new(None));
 
@@ -1411,10 +1400,12 @@ impl SimpleComponent for App {
             find_case_sensitive: false,
             find_whole_word: false,
             sidebar_inner_box: sidebar_inner_box_ref.clone(),
+            sidebar_revealer: sidebar_revealer_ref.clone(),
             explorer_panel_box: explorer_panel_box_ref.clone(),
             search_panel_box: search_panel_box_ref.clone(),
             debug_panel_box: debug_panel_box_ref.clone(),
             git_panel_box: git_panel_box_ref.clone(),
+            settings_panel_box: settings_panel_box_ref.clone(),
             project_search_status: String::new(),
             search_results_list: search_results_list_ref.clone(),
             diff_selected_file: None,
@@ -1435,11 +1426,40 @@ impl SimpleComponent for App {
         *menu_bar_da_ref.borrow_mut() = Some(widgets.menu_bar_da.clone());
         *overlay_ref.borrow_mut() = Some(widgets.editor_overlay.clone());
         *sidebar_inner_box_ref.borrow_mut() = Some(widgets.sidebar_inner_box.clone());
+        *sidebar_revealer_ref.borrow_mut() = Some(widgets.sidebar_revealer.clone());
         *explorer_panel_box_ref.borrow_mut() = Some(widgets.explorer_panel.clone());
         *search_panel_box_ref.borrow_mut() = Some(widgets.search_panel.clone());
         *debug_panel_box_ref.borrow_mut() = Some(widgets.debug_panel.clone());
         *git_panel_box_ref.borrow_mut() = Some(widgets.git_panel.clone());
+        *settings_panel_box_ref.borrow_mut() = Some(widgets.settings_panel.clone());
         *search_results_list_ref.borrow_mut() = Some(widgets.search_results_list.clone());
+
+        // ── Sidebar resize drag handle ─────────────────────────────────────────
+        // Set up the GestureDrag imperatively (outside the view! macro) so that
+        // the variable captures work reliably with the post-view_output!() refs.
+        {
+            let gesture = gtk4::GestureDrag::new();
+            let sb_ref = sidebar_inner_box_ref.clone();
+            let sw = sidebar_drag_start_w.clone();
+            gesture.connect_drag_begin(move |_, _, _| {
+                if let Some(ref sb) = *sb_ref.borrow() {
+                    sw.set(sb.width_request());
+                }
+            });
+            let sb_ref2 = sidebar_inner_box_ref.clone();
+            let sw2 = sidebar_drag_start_w.clone();
+            gesture.connect_drag_update(move |_, dx, _| {
+                let new_w = (sw2.get() as f64 + dx).round() as i32;
+                if let Some(ref sb) = *sb_ref2.borrow() {
+                    sb.set_width_request(new_w.clamp(100, 600));
+                }
+            });
+            let sender_resize = sender.input_sender().clone();
+            gesture.connect_drag_end(move |_, _, _| {
+                sender_resize.send(Msg::SidebarResized).ok();
+            });
+            widgets.sidebar_resize_handle.add_controller(gesture);
+        }
 
         // ── Menu dropdown overlay DrawingArea ─────────────────────────────────
         // A full-window transparent overlay that draws the dropdown in window
@@ -2812,17 +2832,21 @@ impl SimpleComponent for App {
                 self.sidebar_visible = !self.sidebar_visible;
                 self.redraw = !self.redraw;
 
-                // Hide all panel boxes when sidebar is closing.
-                if !self.sidebar_visible {
-                    for panel_ref in [
-                        &self.explorer_panel_box,
-                        &self.search_panel_box,
-                        &self.debug_panel_box,
-                        &self.git_panel_box,
-                    ] {
-                        if let Some(ref b) = *panel_ref.borrow() {
-                            b.set_visible(false);
-                        }
+                // Directly control the revealer and panel visibility.
+                let show = self.sidebar_visible;
+                let p = self.active_panel;
+                if let Some(ref r) = *self.sidebar_revealer.borrow() {
+                    r.set_reveal_child(show);
+                }
+                for (which, panel_ref) in [
+                    (SidebarPanel::Explorer, &self.explorer_panel_box),
+                    (SidebarPanel::Search, &self.search_panel_box),
+                    (SidebarPanel::Debug, &self.debug_panel_box),
+                    (SidebarPanel::Git, &self.git_panel_box),
+                    (SidebarPanel::Settings, &self.settings_panel_box),
+                ] {
+                    if let Some(ref b) = *panel_ref.borrow() {
+                        b.set_visible(show && p == which);
                     }
                 }
                 // Save sidebar visibility to session state
@@ -2849,20 +2873,23 @@ impl SimpleComponent for App {
                         }
                     }
                 }
-                // Directly set visibility on each panel box in addition to the
-                // #[watch] set_visible — ensures the switch takes effect immediately
-                // even if the Relm4 update cycle hasn't completed yet.
+                // Directly set visibility on the revealer and each panel box.
+                // Belt-and-suspenders: these calls work even if Relm4's #[watch]
+                // update_view() hasn't fired yet.
                 let p = self.active_panel;
                 let show_sidebar = self.sidebar_visible;
-                let panels: &[(SidebarPanel, &Rc<RefCell<Option<gtk4::Box>>>)] = &[
+                if let Some(ref r) = *self.sidebar_revealer.borrow() {
+                    r.set_reveal_child(show_sidebar);
+                }
+                for (which, panel_ref) in [
                     (SidebarPanel::Explorer, &self.explorer_panel_box),
                     (SidebarPanel::Search, &self.search_panel_box),
                     (SidebarPanel::Debug, &self.debug_panel_box),
                     (SidebarPanel::Git, &self.git_panel_box),
-                ];
-                for (which, panel_ref) in panels {
+                    (SidebarPanel::Settings, &self.settings_panel_box),
+                ] {
                     if let Some(ref b) = *panel_ref.borrow() {
-                        b.set_visible(show_sidebar && p == *which);
+                        b.set_visible(show_sidebar && p == which);
                     }
                 }
                 self.redraw = !self.redraw;
