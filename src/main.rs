@@ -837,47 +837,45 @@ impl SimpleComponent for App {
                                 },
                             },
                         },
-                    },
 
-                    // Debug sidebar panel
-                    #[name = "debug_panel"]
-                    gtk4::Box {
-                        set_orientation: gtk4::Orientation::Vertical,
-                        set_css_classes: &["sidebar"],
+                        // Debug sidebar panel
+                        #[name = "debug_panel"]
+                        gtk4::Box {
+                            set_orientation: gtk4::Orientation::Vertical,
+                            set_css_classes: &["sidebar"],
 
-                        #[watch]
-                        set_visible: {
-                            if model.active_panel == SidebarPanel::Debug {
-                                debug_sidebar_da.queue_draw();
-                            }
-                            model.active_panel == SidebarPanel::Debug
+                            #[watch]
+                            set_visible: {
+                                if model.active_panel == SidebarPanel::Debug {
+                                    debug_sidebar_da.queue_draw();
+                                }
+                                model.active_panel == SidebarPanel::Debug
+                            },
+
+                            #[name = "debug_sidebar_da"]
+                            gtk4::DrawingArea {
+                                set_vexpand: true,
+                            },
                         },
 
-                        #[name = "debug_sidebar_da"]
-                        gtk4::DrawingArea {
-                            set_vexpand: true,
-                            set_hexpand: true,
-                        },
-                    },
+                        // Source Control (Git) sidebar panel
+                        #[name = "git_panel"]
+                        gtk4::Box {
+                            set_orientation: gtk4::Orientation::Vertical,
+                            set_css_classes: &["sidebar"],
 
-                    // Source Control (Git) sidebar panel
-                    #[name = "git_panel"]
-                    gtk4::Box {
-                        set_orientation: gtk4::Orientation::Vertical,
-                        set_css_classes: &["sidebar"],
+                            #[watch]
+                            set_visible: {
+                                if model.active_panel == SidebarPanel::Git {
+                                    git_sidebar_da.queue_draw();
+                                }
+                                model.active_panel == SidebarPanel::Git
+                            },
 
-                        #[watch]
-                        set_visible: {
-                            if model.active_panel == SidebarPanel::Git {
-                                git_sidebar_da.queue_draw();
-                            }
-                            model.active_panel == SidebarPanel::Git
-                        },
-
-                        #[name = "git_sidebar_da"]
-                        gtk4::DrawingArea {
-                            set_vexpand: true,
-                            set_hexpand: true,
+                            #[name = "git_sidebar_da"]
+                            gtk4::DrawingArea {
+                                set_vexpand: true,
+                            },
                         },
                     },
                 },
@@ -886,12 +884,11 @@ impl SimpleComponent for App {
                 #[name = "sidebar_resize_handle"]
                 gtk4::Box {
                     set_width_request: 6,
+                    set_vexpand: true,
                     set_css_classes: &["sidebar-resize-handle"],
 
                     #[watch]
                     set_visible: model.sidebar_visible,
-
-
                 },
 
                 // Editor area (DrawingArea wrapped in Overlay for scrollbars)
@@ -2874,8 +2871,6 @@ impl SimpleComponent for App {
                     }
                 }
                 // Directly set visibility on the revealer and each panel box.
-                // Belt-and-suspenders: these calls work even if Relm4's #[watch]
-                // update_view() hasn't fired yet.
                 let p = self.active_panel;
                 let show_sidebar = self.sidebar_visible;
                 if let Some(ref r) = *self.sidebar_revealer.borrow() {
