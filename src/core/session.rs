@@ -2,6 +2,123 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+// ---------------------------------------------------------------------------
+// HistoryState — command/search history in its own file
+// ---------------------------------------------------------------------------
+
+/// Command and search history, persisted to ~/.config/vimcode/history.json
+/// (separate from session.json so it is never overwritten by workspace sessions).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct HistoryState {
+    /// Command-mode history (most recent last, max 100 entries)
+    #[serde(default)]
+    pub command_history: Vec<String>,
+
+    /// Search history (most recent last, max 100 entries)
+    #[serde(default)]
+    pub search_history: Vec<String>,
+}
+
+/// Minimal view of legacy session.json used only during one-time migration.
+#[derive(Debug, Deserialize, Default)]
+struct LegacySession {
+    #[serde(default)]
+    command_history: Vec<String>,
+    #[serde(default)]
+    search_history: Vec<String>,
+}
+
+impl HistoryState {
+    fn history_path() -> PathBuf {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        PathBuf::from(home).join(".config/vimcode/history.json")
+    }
+
+    fn legacy_session_path() -> PathBuf {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        PathBuf::from(home).join(".config/vimcode/session.json")
+    }
+
+    /// Load history from history.json.
+    /// If history.json is absent, attempts a one-time migration from session.json.
+    pub fn load() -> Self {
+        let path = Self::history_path();
+        if let Ok(contents) = std::fs::read_to_string(&path) {
+            if let Ok(state) = serde_json::from_str(&contents) {
+                return state;
+            }
+        }
+        // history.json not found — try migrating from legacy session.json
+        let session_path = Self::legacy_session_path();
+        if let Ok(contents) = std::fs::read_to_string(&session_path) {
+            if let Ok(legacy) = serde_json::from_str::<LegacySession>(&contents) {
+                if !legacy.command_history.is_empty() || !legacy.search_history.is_empty() {
+                    return Self {
+                        command_history: legacy.command_history,
+                        search_history: legacy.search_history,
+                    };
+                }
+            }
+        }
+        Self::default()
+    }
+
+    /// Save history to history.json using an atomic write.
+    pub fn save(&self) -> std::io::Result<()> {
+        let path = Self::history_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_string_pretty(self)?;
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, &json)?;
+        std::fs::rename(&tmp, &path)?;
+        Ok(())
+    }
+
+    /// Add a command to history (max 100, removes duplicates, moves to end).
+    pub fn add_command(&mut self, cmd: &str) {
+        if cmd.is_empty() {
+            return;
+        }
+        self.command_history.retain(|c| c != cmd);
+        self.command_history.push(cmd.to_string());
+        if self.command_history.len() > 100 {
+            self.command_history.remove(0);
+        }
+    }
+
+    /// Add a search query to history (max 100, removes duplicates, moves to end).
+    pub fn add_search(&mut self, query: &str) {
+        if query.is_empty() {
+            return;
+        }
+        self.search_history.retain(|q| q != query);
+        self.search_history.push(query.to_string());
+        if self.search_history.len() > 100 {
+            self.search_history.remove(0);
+        }
+    }
+}
+
+/// Recursive group layout for session persistence.
+/// Each leaf stores the files open in that group.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum SessionGroupLayout {
+    /// A single editor group with its open files.
+    Leaf { files: Vec<PathBuf> },
+    /// A split containing two sub-layouts.
+    Split {
+        /// 0 = Vertical (side-by-side), 1 = Horizontal (stacked).
+        direction: u8,
+        /// Split ratio (0.1..0.9).
+        ratio: f64,
+        first: Box<SessionGroupLayout>,
+        second: Box<SessionGroupLayout>,
+    },
+}
+
 /// Saved cursor and scroll position for a file
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FilePosition {
@@ -15,14 +132,6 @@ pub struct FilePosition {
 pub struct SessionState {
     /// Window geometry
     pub window: WindowGeometry,
-
-    /// Command history (most recent last)
-    #[serde(default)]
-    pub command_history: Vec<String>,
-
-    /// Search history (most recent last)
-    #[serde(default)]
-    pub search_history: Vec<String>,
 
     /// Explorer sidebar visible on startup
     #[serde(default)]
@@ -55,6 +164,27 @@ pub struct SessionState {
     /// Recently opened workspace root paths (last 10, stored in global session only).
     #[serde(default)]
     pub recent_workspaces: Vec<PathBuf>,
+
+    /// Files open in the second editor group (empty = single-group mode).
+    #[serde(default)]
+    pub open_files_group1: Vec<PathBuf>,
+
+    /// Which editor group was active (0 or 1).
+    #[serde(default)]
+    pub active_group: usize,
+
+    /// Split direction: 0 = Vertical (side-by-side), 1 = Horizontal (stacked).
+    #[serde(default)]
+    pub group_split_direction: u8,
+
+    /// Editor group split ratio (0.2..0.8, default 0.5).
+    #[serde(default = "default_group_split_ratio")]
+    pub group_split_ratio: f64,
+
+    /// Recursive group layout tree (new format).
+    /// When present, takes priority over the flat open_files_group1/active_group fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_layout: Option<SessionGroupLayout>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,6 +207,10 @@ fn default_terminal_rows() -> u16 {
     12
 }
 
+fn default_group_split_ratio() -> f64 {
+    0.5
+}
+
 impl Default for SessionState {
     fn default() -> Self {
         Self {
@@ -87,8 +221,6 @@ impl Default for SessionState {
                 y: None,
                 maximized: false,
             },
-            command_history: Vec::new(),
-            search_history: Vec::new(),
             explorer_visible: false,
             sidebar_width: default_sidebar_width(),
             recent_files: Vec::new(),
@@ -97,6 +229,11 @@ impl Default for SessionState {
             active_file: None,
             terminal_panel_rows: default_terminal_rows(),
             recent_workspaces: Vec::new(),
+            open_files_group1: Vec::new(),
+            active_group: 0,
+            group_split_direction: 0,
+            group_split_ratio: default_group_split_ratio(),
+            group_layout: None,
         }
     }
 }
@@ -188,32 +325,6 @@ impl SessionState {
         }
     }
 
-    /// Add command to history (max 100 entries, removes duplicates)
-    pub fn add_command(&mut self, cmd: &str) {
-        if cmd.is_empty() {
-            return;
-        }
-        // Remove duplicates (move to end if exists)
-        self.command_history.retain(|c| c != cmd);
-        self.command_history.push(cmd.to_string());
-        // Keep last 100
-        if self.command_history.len() > 100 {
-            self.command_history.remove(0);
-        }
-    }
-
-    /// Add search to history (max 100 entries, removes duplicates)
-    pub fn add_search(&mut self, query: &str) {
-        if query.is_empty() {
-            return;
-        }
-        self.search_history.retain(|q| q != query);
-        self.search_history.push(query.to_string());
-        if self.search_history.len() > 100 {
-            self.search_history.remove(0);
-        }
-    }
-
     /// Save cursor and scroll position for a file path
     pub fn save_file_position(&mut self, path: &Path, line: usize, col: usize, scroll_top: usize) {
         let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
@@ -243,54 +354,52 @@ mod tests {
         let session = SessionState::default();
         assert_eq!(session.window.width, 800);
         assert_eq!(session.window.height, 600);
-        assert_eq!(session.command_history.len(), 0);
-        assert_eq!(session.search_history.len(), 0);
         assert!(!session.explorer_visible);
     }
 
     #[test]
-    fn test_add_command_history() {
-        let mut session = SessionState::default();
-        session.add_command("w");
-        session.add_command("q");
-        assert_eq!(session.command_history, vec!["w", "q"]);
+    fn test_history_state_add_command() {
+        let mut h = HistoryState::default();
+        h.add_command("w");
+        h.add_command("q");
+        assert_eq!(h.command_history, vec!["w", "q"]);
 
         // Duplicate: moved to end
-        session.add_command("w");
-        assert_eq!(session.command_history, vec!["q", "w"]);
+        h.add_command("w");
+        assert_eq!(h.command_history, vec!["q", "w"]);
     }
 
     #[test]
-    fn test_add_search_history() {
-        let mut session = SessionState::default();
-        session.add_search("hello");
-        session.add_search("world");
-        assert_eq!(session.search_history, vec!["hello", "world"]);
+    fn test_history_state_add_search() {
+        let mut h = HistoryState::default();
+        h.add_search("hello");
+        h.add_search("world");
+        assert_eq!(h.search_history, vec!["hello", "world"]);
 
         // Duplicate: moved to end
-        session.add_search("hello");
-        assert_eq!(session.search_history, vec!["world", "hello"]);
+        h.add_search("hello");
+        assert_eq!(h.search_history, vec!["world", "hello"]);
     }
 
     #[test]
     fn test_history_limit() {
-        let mut session = SessionState::default();
+        let mut h = HistoryState::default();
         for i in 0..150 {
-            session.add_command(&format!("cmd{}", i));
+            h.add_command(&format!("cmd{}", i));
         }
-        assert_eq!(session.command_history.len(), 100);
+        assert_eq!(h.command_history.len(), 100);
         // Should have kept the last 100
-        assert_eq!(session.command_history[0], "cmd50");
-        assert_eq!(session.command_history[99], "cmd149");
+        assert_eq!(h.command_history[0], "cmd50");
+        assert_eq!(h.command_history[99], "cmd149");
     }
 
     #[test]
-    fn test_empty_strings_ignored() {
-        let mut session = SessionState::default();
-        session.add_command("");
-        session.add_search("");
-        assert_eq!(session.command_history.len(), 0);
-        assert_eq!(session.search_history.len(), 0);
+    fn test_history_empty_strings_ignored() {
+        let mut h = HistoryState::default();
+        h.add_command("");
+        h.add_search("");
+        assert_eq!(h.command_history.len(), 0);
+        assert_eq!(h.search_history.len(), 0);
     }
 
     #[test]
@@ -379,5 +488,58 @@ mod tests {
             session.add_recent_workspace(&PathBuf::from(format!("/tmp/proj_{}", i)));
         }
         assert_eq!(session.recent_workspaces.len(), 10);
+    }
+
+    #[test]
+    fn test_session_group_layout_serialization() {
+        let layout = SessionGroupLayout::Split {
+            direction: 0,
+            ratio: 0.5,
+            first: Box::new(SessionGroupLayout::Leaf {
+                files: vec![PathBuf::from("/tmp/a.rs")],
+            }),
+            second: Box::new(SessionGroupLayout::Split {
+                direction: 1,
+                ratio: 0.6,
+                first: Box::new(SessionGroupLayout::Leaf {
+                    files: vec![PathBuf::from("/tmp/b.rs"), PathBuf::from("/tmp/c.rs")],
+                }),
+                second: Box::new(SessionGroupLayout::Leaf { files: vec![] }),
+            }),
+        };
+        let json = serde_json::to_string(&layout).unwrap();
+        let restored: SessionGroupLayout = serde_json::from_str(&json).unwrap();
+        // Verify round-trip: top split is vertical (0).
+        if let SessionGroupLayout::Split {
+            direction, ratio, ..
+        } = &restored
+        {
+            assert_eq!(*direction, 0);
+            assert!((ratio - 0.5).abs() < f64::EPSILON);
+        } else {
+            panic!("expected Split");
+        }
+    }
+
+    #[test]
+    fn test_session_group_layout_backward_compat() {
+        // Old session JSON (no group_layout field) should deserialize with group_layout = None.
+        let json = r#"{
+            "window": {"width": 800, "height": 600, "maximized": false},
+            "explorer_visible": false,
+            "sidebar_width": 260,
+            "recent_files": [],
+            "file_positions": {},
+            "open_files": ["/tmp/x.rs"],
+            "terminal_panel_rows": 12,
+            "recent_workspaces": [],
+            "open_files_group1": [],
+            "active_group": 0,
+            "group_split_direction": 0,
+            "group_split_ratio": 0.5
+        }"#;
+        let session: SessionState = serde_json::from_str(json).unwrap();
+        assert!(session.group_layout.is_none());
+        assert_eq!(session.open_files, vec![PathBuf::from("/tmp/x.rs")]);
     }
 }

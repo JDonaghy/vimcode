@@ -13,7 +13,6 @@
 #![allow(dead_code)]
 
 use crate::core::buffer::Buffer;
-use crate::core::buffer_manager::BufferState;
 use crate::core::dap::DapVariable;
 pub use crate::core::engine::{BottomPanelKind, DebugSidebarSection};
 use crate::core::engine::{DiffLine, Engine, SearchDirection};
@@ -21,6 +20,7 @@ use crate::core::lsp::SignatureHelpData;
 use crate::core::settings::LineNumberMode;
 use crate::core::terminal::TermSelection as CoreTermSelection;
 use crate::core::view::View;
+use crate::core::window::{GroupDivider, GroupId};
 use crate::core::{Cursor, GitLineStatus, Mode, WindowId, WindowRect};
 
 // ─── Color ───────────────────────────────────────────────────────────────────
@@ -205,6 +205,32 @@ pub struct TabInfo {
     pub dirty: bool,
     /// Whether the buffer is in preview mode.
     pub preview: bool,
+}
+
+// ─── EditorGroupSplitData ─────────────────────────────────────────────────────
+
+/// Tab bar + bounds for one editor group.
+#[derive(Debug, Clone)]
+pub struct GroupTabBar {
+    pub group_id: GroupId,
+    pub tabs: Vec<TabInfo>,
+    /// Content area of this group (tab bar drawn at top edge).
+    pub bounds: WindowRect,
+}
+
+/// Present when the editor area is split into two or more independent groups.
+/// `ScreenLayout.tab_bar` always contains the first group's tab bar for
+/// backward compat in single-group mode.
+#[derive(Debug, Clone)]
+pub struct EditorGroupSplitData {
+    /// Tab bars for ALL groups (in tree traversal order).
+    pub group_tab_bars: Vec<GroupTabBar>,
+    /// ID of the currently focused group.
+    pub active_group: GroupId,
+    /// Dividers between groups (for drawing divider lines and drag handling).
+    pub dividers: Vec<GroupDivider>,
+    /// Total number of groups (always >= 2 when this is Some).
+    pub num_groups: usize,
 }
 
 // ─── RenderedWindow ───────────────────────────────────────────────────────────
@@ -869,6 +895,38 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
                 enabled: true,
                 separator: false,
             },
+            MenuItemData {
+                label: "",
+                shortcut: "",
+                vscode_shortcut: "",
+                action: "",
+                enabled: false,
+                separator: true,
+            },
+            MenuItemData {
+                label: "Split Editor Right",
+                shortcut: "Ctrl+\\",
+                vscode_shortcut: "",
+                action: "EditorGroupSplit",
+                enabled: true,
+                separator: false,
+            },
+            MenuItemData {
+                label: "Split Editor Down",
+                shortcut: "Ctrl-W E",
+                vscode_shortcut: "",
+                action: "EditorGroupSplitDown",
+                enabled: true,
+                separator: false,
+            },
+            MenuItemData {
+                label: "Close Editor Group",
+                shortcut: "",
+                vscode_shortcut: "",
+                action: "EditorGroupClose",
+                enabled: true,
+                separator: false,
+            },
         ],
     ),
     (
@@ -1171,6 +1229,9 @@ pub struct ScreenLayout {
     pub source_control: Option<SourceControlData>,
     /// Command palette modal — `Some` when open.
     pub command_palette: Option<CommandPalettePanel>,
+    /// When the editor is split into two groups, this carries group 1's tab bar
+    /// and split geometry. `None` in the default single-group mode.
+    pub editor_group_split: Option<EditorGroupSplitData>,
 }
 
 // ─── Theme ────────────────────────────────────────────────────────────────────
@@ -1394,7 +1455,7 @@ impl Theme {
 /// - `engine` — current editor state (no GTK types)
 /// - `theme` — colour scheme
 /// - `window_rects` — pixel-space rects for each window in the current tab,
-///   as returned by `engine.calculate_window_rects()`
+///   as returned by `engine.calculate_group_window_rects()`
 /// - `line_height` — pixel height of one text line (from Pango font metrics)
 /// - `char_width` — pixel width of one character (from Pango font metrics),
 ///   used to compute gutter width
@@ -1836,6 +1897,77 @@ pub fn build_screen_layout(
         }
     });
 
+    let n = engine.group_layout.leaf_count();
+    let editor_group_split = if n >= 2 {
+        // Build group rects using a dummy content_bounds — backends will compute
+        // their own actual rects, but we need the bounds here for GroupTabBar.
+        // The caller supplies window_rects which already reflect actual bounds.
+        let group_ids = engine.group_layout.group_ids();
+        // Compute group bounds from the window_rects: each group's bounds is
+        // the bounding box of its windows, expanded upward by line_height for tab bar.
+        let group_tab_bars: Vec<GroupTabBar> = group_ids
+            .iter()
+            .map(|&gid| {
+                let tabs = build_tab_bar_for_group_by_id(engine, gid);
+                // Find bounding rect for all windows in this group
+                let mut min_x = f64::MAX;
+                let mut min_y = f64::MAX;
+                let mut max_x = f64::MIN;
+                let mut max_y = f64::MIN;
+                if let Some(group) = engine.editor_groups.get(&gid) {
+                    for wr in window_rects {
+                        if group.active_tab().layout.window_ids().contains(&wr.0) {
+                            min_x = min_x.min(wr.1.x);
+                            min_y = min_y.min(wr.1.y);
+                            max_x = max_x.max(wr.1.x + wr.1.width);
+                            max_y = max_y.max(wr.1.y + wr.1.height);
+                        }
+                    }
+                }
+                if min_x == f64::MAX {
+                    min_x = 0.0;
+                    min_y = 0.0;
+                    max_x = 0.0;
+                    max_y = 0.0;
+                }
+                let bounds = WindowRect::new(min_x, min_y, max_x - min_x, max_y - min_y);
+                GroupTabBar {
+                    group_id: gid,
+                    tabs,
+                    bounds,
+                }
+            })
+            .collect();
+        // Collect dividers — use the total content bounds from window_rects
+        let content_bounds = if !window_rects.is_empty() {
+            let min_x = window_rects.iter().map(|r| r.1.x).fold(f64::MAX, f64::min);
+            let min_y = window_rects
+                .iter()
+                .map(|r| r.1.y - line_height)
+                .fold(f64::MAX, f64::min);
+            let max_x = window_rects
+                .iter()
+                .map(|r| r.1.x + r.1.width)
+                .fold(f64::MIN, f64::max);
+            let max_y = window_rects
+                .iter()
+                .map(|r| r.1.y + r.1.height)
+                .fold(f64::MIN, f64::max);
+            WindowRect::new(min_x, min_y, max_x - min_x, max_y - min_y)
+        } else {
+            WindowRect::new(0.0, 0.0, 0.0, 0.0)
+        };
+        let dividers = engine.group_layout.dividers(content_bounds, &mut 0);
+        Some(EditorGroupSplitData {
+            group_tab_bars,
+            active_group: engine.active_group,
+            dividers,
+            num_groups: n,
+        })
+    } else {
+        None
+    };
+
     ScreenLayout {
         tab_bar,
         windows,
@@ -1855,6 +1987,7 @@ pub fn build_screen_layout(
         debug_sidebar,
         source_control,
         command_palette,
+        editor_group_split,
     }
 }
 
@@ -2246,13 +2379,17 @@ fn build_terminal_panel(engine: &Engine) -> Option<TerminalPanel> {
 
 // ─── Private builder helpers ──────────────────────────────────────────────────
 
-fn build_tab_bar(engine: &Engine) -> Vec<TabInfo> {
-    engine
+fn build_tab_bar_for_group_by_id(engine: &Engine, group_id: GroupId) -> Vec<TabInfo> {
+    let group = match engine.editor_groups.get(&group_id) {
+        Some(g) => g,
+        None => return vec![],
+    };
+    group
         .tabs
         .iter()
         .enumerate()
         .map(|(i, tab)| {
-            let active = i == engine.active_tab;
+            let active = i == group.active_tab;
             let window_id = tab.active_window;
             let (name, dirty, preview) = if let Some(window) = engine.windows.get(&window_id) {
                 if let Some(state) = engine.buffer_manager.get(window.buffer_id) {
@@ -2276,6 +2413,15 @@ fn build_tab_bar(engine: &Engine) -> Vec<TabInfo> {
             }
         })
         .collect()
+}
+
+fn build_tab_bar(engine: &Engine) -> Vec<TabInfo> {
+    // ScreenLayout.tab_bar always holds the first group's tabs.
+    let first_id = engine.group_layout.group_ids().first().copied();
+    match first_id {
+        Some(gid) => build_tab_bar_for_group_by_id(engine, gid),
+        None => vec![],
+    }
 }
 
 /// Return the number of visual rows a buffer line of `line_char_len` characters
@@ -2378,6 +2524,26 @@ fn build_rendered_window(
         .as_ref()
         .and_then(|p| engine.lsp_diagnostics.get(p));
 
+    // Pre-index diagnostics by start line in a single pass.
+    // This gives O(1) per-line lookup during visible-line rendering AND builds the gutter
+    // severity map simultaneously, replacing two separate O(N_diags) scans with one.
+    let mut diag_by_line: std::collections::HashMap<usize, Vec<&crate::core::lsp::Diagnostic>> =
+        std::collections::HashMap::new();
+    let mut diagnostic_gutter: std::collections::HashMap<
+        usize,
+        crate::core::lsp::DiagnosticSeverity,
+    > = std::collections::HashMap::new();
+    if let Some(diags) = file_diagnostics {
+        for d in diags {
+            let line = d.range.start.line as usize;
+            diag_by_line.entry(line).or_default().push(d);
+            let entry = diagnostic_gutter.entry(line).or_insert(d.severity);
+            if (d.severity as u8) < (*entry as u8) {
+                *entry = d.severity;
+            }
+        }
+    }
+
     // DAP breakpoints for this buffer.
     // Use the raw buffer path as key (matches how dap_toggle_breakpoint stores them).
     let bp_file_key = buffer_state
@@ -2407,6 +2573,24 @@ fn build_rendered_window(
         has_bp,
     );
 
+    // Narrow the highlights slice to only the visible window using binary search.
+    // Tree-sitter emits highlights sorted by start_byte, so partition_point is valid.
+    // This reduces build_spans from O(N_total_highlights) per line to O(N_window_highlights).
+    let window_start_byte = buffer.content.line_to_byte(scroll_top);
+    let approx_end_line = (scroll_top + visible_lines + 1).min(total_lines);
+    let window_end_byte = if approx_end_line < total_lines {
+        buffer.content.line_to_byte(approx_end_line)
+    } else {
+        buffer.content.len_bytes()
+    };
+    let hl_lo = buffer_state
+        .highlights
+        .partition_point(|h| h.1 <= window_start_byte);
+    let hl_hi = buffer_state
+        .highlights
+        .partition_point(|h| h.0 < window_end_byte);
+    let visible_hl = &buffer_state.highlights[hl_lo..hl_hi];
+
     // Build rendered lines (fold-aware: skip hidden lines, jump over fold bodies)
     let mut lines = Vec::with_capacity(visible_lines);
     let mut line_idx = scroll_top;
@@ -2428,7 +2612,7 @@ fn build_rendered_window(
         let spans = build_spans(
             engine,
             theme,
-            buffer_state,
+            visible_hl,
             buffer,
             line_idx,
             &line_str,
@@ -2502,36 +2686,31 @@ fn build_rendered_window(
             format!("{}{}{}", bp_part, git_part, base_gutter)
         };
 
-        // LSP diagnostics for this line.
-        let line_diagnostics: Vec<DiagnosticMark> = file_diagnostics
-            .map(|diags| {
-                diags
-                    .iter()
-                    .filter(|d| d.range.start.line as usize == line_idx)
-                    .map(|d| {
-                        let line_text: String = buffer.content.line(line_idx).chars().collect();
-                        let start_col = crate::core::lsp::utf16_offset_to_char(
-                            &line_text,
-                            d.range.start.character,
-                        );
-                        let end_col = if d.range.end.line as usize == line_idx {
-                            crate::core::lsp::utf16_offset_to_char(
-                                &line_text,
-                                d.range.end.character,
-                            )
-                        } else {
-                            line_text.len()
-                        };
-                        DiagnosticMark {
-                            start_col,
-                            end_col: end_col.max(start_col + 1),
-                            severity: d.severity,
-                            message: d.message.clone(),
-                        }
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        // LSP diagnostics for this line — O(1) lookup via pre-indexed map.
+        let line_diagnostics: Vec<DiagnosticMark> = if let Some(diags) = diag_by_line.get(&line_idx)
+        {
+            diags
+                .iter()
+                .map(|d| {
+                    // Reuse line_str already computed above — avoids redundant rope lookup.
+                    let start_col =
+                        crate::core::lsp::utf16_offset_to_char(&line_str, d.range.start.character);
+                    let end_col = if d.range.end.line as usize == line_idx {
+                        crate::core::lsp::utf16_offset_to_char(&line_str, d.range.end.character)
+                    } else {
+                        line_str.len()
+                    };
+                    DiagnosticMark {
+                        start_col,
+                        end_col: end_col.max(start_col + 1),
+                        severity: d.severity,
+                        message: d.message.clone(),
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         // Two-way diff status for this line.
         let diff_status = engine
@@ -2657,18 +2836,7 @@ fn build_rendered_window(
         buffer_state.max_col
     };
 
-    // Build diagnostic gutter map (line → worst severity).
-    let mut diagnostic_gutter = std::collections::HashMap::new();
-    if let Some(diags) = file_diagnostics {
-        for d in diags {
-            let line = d.range.start.line as usize;
-            let entry = diagnostic_gutter.entry(line).or_insert(d.severity);
-            // Lower numeric value = worse severity (Error=1 < Warning=2 etc.)
-            if (d.severity as u8) < (*entry as u8) {
-                *entry = d.severity;
-            }
-        }
-    }
+    // diagnostic_gutter is already built in the single-pass pre-indexing above.
 
     RenderedWindow {
         window_id,
@@ -2694,7 +2862,7 @@ fn build_rendered_window(
 fn build_spans(
     engine: &Engine,
     theme: &Theme,
-    buffer_state: &BufferState,
+    highlights: &[(usize, usize, String)],
     buffer: &crate::core::buffer::Buffer,
     line_idx: usize,
     line_str: &str,
@@ -2703,8 +2871,8 @@ fn build_spans(
 ) -> Vec<StyledSpan> {
     let mut spans = Vec::new();
 
-    // Syntax highlighting
-    for (start, end, scope) in &buffer_state.highlights {
+    // Syntax highlighting — iterate only the pre-narrowed window slice.
+    for (start, end, scope) in highlights {
         if *end <= line_start_byte || *start >= line_end_byte {
             continue;
         }
@@ -3039,16 +3207,28 @@ fn build_command_line(engine: &Engine) -> CommandLineData {
             (display, false, true, anchor)
         }
         Mode::Command => {
-            let t = format!(":{}", engine.command_buffer);
-            (t.clone(), false, true, t)
+            let prefix_chars: String = engine
+                .command_buffer
+                .chars()
+                .take(engine.command_cursor)
+                .collect();
+            let anchor = format!(":{}", prefix_chars);
+            let full = format!(":{}", engine.command_buffer);
+            (full, false, true, anchor)
         }
         Mode::Search => {
             let ch = match engine.search_direction {
                 SearchDirection::Forward => '/',
                 SearchDirection::Backward => '?',
             };
-            let t = format!("{}{}", ch, engine.command_buffer);
-            (t.clone(), false, true, t)
+            let prefix_chars: String = engine
+                .command_buffer
+                .chars()
+                .take(engine.command_cursor)
+                .collect();
+            let anchor = format!("{}{}", ch, prefix_chars);
+            let full = format!("{}{}", ch, engine.command_buffer);
+            (full, false, true, anchor)
         }
         Mode::Normal | Mode::Visual | Mode::VisualLine => {
             if let Some(count) = engine.peek_count() {

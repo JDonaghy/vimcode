@@ -10,9 +10,43 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::io::{self, Stdout};
+use std::io::{self, Stdout, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+// ─── Debug logging ────────────────────────────────────────────────────────────
+
+/// Global debug log file handle, set once at startup via `--debug <path>`.
+static DEBUG_LOG: std::sync::OnceLock<Mutex<std::fs::File>> = std::sync::OnceLock::new();
+
+/// Initialise the debug log.  Call once before the event loop starts.
+fn init_debug_log(path: &str) {
+    match std::fs::File::create(path) {
+        Ok(f) => {
+            let _ = DEBUG_LOG.set(Mutex::new(f));
+        }
+        Err(e) => {
+            eprintln!("Warning: cannot open debug log {path}: {e}");
+        }
+    }
+}
+
+/// Write a formatted message to the debug log (if enabled).  No-op when
+/// `--debug` was not passed.
+#[allow(unused_macros)]
+macro_rules! debug_log {
+    ($($arg:tt)*) => {
+        if let Some(mtx) = $crate::tui_main::DEBUG_LOG.get() {
+            if let Ok(mut f) = mtx.lock() {
+                let _ = writeln!(f, $($arg)*);
+                let _ = f.flush();
+            }
+        }
+    };
+}
+#[allow(unused_imports)]
+pub(crate) use debug_log;
 
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::cursor::SetCursorStyle;
@@ -34,6 +68,7 @@ use ratatui::Terminal;
 use crate::core::engine::{DiffLine, EngineAction};
 use crate::core::lsp::DiagnosticSeverity;
 use crate::core::settings::{parse_key_binding, ExplorerAction};
+use crate::core::window::SplitDirection;
 use crate::core::{Engine, GitLineStatus, Mode, OpenMode, WindowRect};
 use crate::render::{
     self, build_screen_layout, Color, CompletionMenu, CursorShape, RenderedLine, RenderedWindow,
@@ -637,11 +672,17 @@ fn intercept_paste_key(engine: &mut Engine, before: bool) -> bool {
 
 /// Initialise the engine, set up the terminal, run the event loop, and restore
 /// the terminal on exit.
-pub fn run(file_path: Option<PathBuf>) {
+pub fn run(file_path: Option<PathBuf>, debug_log_path: Option<String>) {
+    if let Some(ref path) = debug_log_path {
+        init_debug_log(path);
+        debug_log!("=== VimCode TUI debug log started ===");
+    }
+
     let mut engine = Engine::new();
     engine.restore_session_files();
     if let Some(path) = file_path {
         // Open the CLI file in a tab (on top of any restored session files)
+        debug_log!("Opening file from CLI: {:?}", path);
         engine.open_file_in_tab(&path);
     }
 
@@ -667,12 +708,30 @@ pub fn run(file_path: Option<PathBuf>) {
         );
     }
 
+    // Install a panic hook that writes to the debug log (if active) so we can
+    // capture panics that would otherwise be swallowed by the alternate screen.
+    if DEBUG_LOG.get().is_some() {
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            debug_log!("PANIC: {}", info);
+            if let Some(loc) = info.location() {
+                debug_log!("  at {}:{}:{}", loc.file(), loc.line(), loc.column());
+            }
+            // Also capture a backtrace
+            debug_log!(
+                "  backtrace:\n{}",
+                std::backtrace::Backtrace::force_capture()
+            );
+            prev_hook(info);
+        }));
+    }
+
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).expect("create terminal");
     terminal.clear().expect("clear terminal");
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        event_loop(&mut terminal, &mut engine);
+        event_loop(&mut terminal, &mut engine, keyboard_enhanced);
     }));
 
     restore_terminal(&mut terminal, keyboard_enhanced);
@@ -698,7 +757,11 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>, keyboard_
 
 // ─── Event loop ───────────────────────────────────────────────────────────────
 
-fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut Engine) {
+fn event_loop(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    engine: &mut Engine,
+    keyboard_enhanced: bool,
+) {
     let theme = Theme::onedark();
 
     // Initialise sidebar from session/settings
@@ -749,11 +812,16 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
     let mut last_click_pos: (u16, u16) = (0, 0);
     // Whether a mouse text drag is active (not scrollbar drag)
     let mut mouse_text_drag = false;
+    // Command-line mouse text selection: (start_col, end_col) in the rendered row.
+    let mut cmd_sel: Option<(usize, usize)> = None;
+    let mut cmd_dragging = false;
 
     // Track unnamed register content so we only write to clipboard on changes.
     let mut last_clipboard_content: Option<String> = None;
     // True when the quit-confirm overlay is shown (unsaved changes on exit).
     let mut quit_confirm = false;
+    // True when the close-tab-confirm overlay is shown (unsaved changes on tab close).
+    let mut close_tab_confirm = false;
 
     let mut needs_redraw = true;
     // Track last draw time to cap frame rate at ~60 fps and keep CPU low.
@@ -855,6 +923,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                 }
             }
 
+            debug_log!(">>> terminal.draw() begin");
             terminal
                 .draw(|frame| {
                     if let Some(s) = &screen {
@@ -872,10 +941,13 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                             debug_output_scroll,
                             folder_picker.as_ref(),
                             quit_confirm,
+                            close_tab_confirm,
+                            cmd_sel,
                         );
                     }
                 })
                 .expect("draw frame");
+            debug_log!("<<< terminal.draw() done");
 
             // Set terminal cursor shape to match mode / pending key.
             let cursor_style = if !sidebar.has_focus && engine.pending_key == Some('r') {
@@ -976,6 +1048,30 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                         | KeyCode::Char('n')
                         | KeyCode::Char('N') => {
                             quit_confirm = false;
+                        }
+                        _ => {}
+                    }
+                    needs_redraw = true;
+                    continue;
+                }
+
+                // ── Close-tab confirm overlay — intercept all keys ─────────
+                if close_tab_confirm && key_event.kind != KeyEventKind::Release {
+                    match key_event.code {
+                        KeyCode::Char('s') | KeyCode::Char('S') => {
+                            engine.escape_to_normal();
+                            let _ = engine.save();
+                            engine.close_tab();
+                            close_tab_confirm = false;
+                        }
+                        KeyCode::Char('d') | KeyCode::Char('D') => {
+                            engine.escape_to_normal();
+                            engine.close_tab();
+                            close_tab_confirm = false;
+                        }
+                        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                            engine.escape_to_normal();
+                            close_tab_confirm = false;
                         }
                         _ => {}
                     }
@@ -1601,7 +1697,8 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                 }
 
                 // ── Editor focused ──────────────────────────────────────────
-                if let Some((key_name, unicode, ctrl)) = translate_key(key_event) {
+                if let Some((key_name, unicode, ctrl)) = translate_key(key_event, keyboard_enhanced)
+                {
                     // Panel navigation — all driven by panel_keys settings
                     if key_event.kind != KeyEventKind::Release {
                         let pk = &engine.settings.panel_keys;
@@ -1763,6 +1860,42 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
 
                         if matches_tui_key(&pk.live_grep, code, mods) {
                             engine.open_live_grep();
+                            needs_redraw = true;
+                            continue;
+                        }
+
+                        if !pk.split_editor_right.is_empty()
+                            && matches_tui_key(&pk.split_editor_right, code, mods)
+                        {
+                            debug_log!(
+                                "split_editor_right keybinding: groups={} active={:?}",
+                                engine.group_layout.leaf_count(),
+                                engine.active_group
+                            );
+                            engine.open_editor_group(SplitDirection::Vertical);
+                            debug_log!(
+                                "  after split: groups={} layout={:?}",
+                                engine.group_layout.leaf_count(),
+                                engine.group_layout
+                            );
+                            needs_redraw = true;
+                            continue;
+                        }
+
+                        if !pk.split_editor_down.is_empty()
+                            && matches_tui_key(&pk.split_editor_down, code, mods)
+                        {
+                            debug_log!(
+                                "split_editor_down keybinding: groups={} active={:?}",
+                                engine.group_layout.leaf_count(),
+                                engine.active_group
+                            );
+                            engine.open_editor_group(SplitDirection::Horizontal);
+                            debug_log!(
+                                "  after split: groups={} layout={:?}",
+                                engine.group_layout.leaf_count(),
+                                engine.group_layout
+                            );
                             needs_redraw = true;
                             continue;
                         }
@@ -1932,6 +2065,17 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                                 needs_redraw = true;
                                 continue;
                             }
+                            // Alt+, / Alt+. — resize editor group split
+                            KeyCode::Char(',') => {
+                                engine.group_resize(-0.05);
+                                needs_redraw = true;
+                                continue;
+                            }
+                            KeyCode::Char('.') => {
+                                engine.group_resize(0.05);
+                                needs_redraw = true;
+                                continue;
+                            }
                             _ => {}
                         }
                     }
@@ -1967,15 +2111,63 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                         }
                     }
 
+                    // ── Command-line selection: Ctrl-C copies, any other key clears ──
+                    {
+                        use crate::core::Mode;
+                        if matches!(engine.mode, Mode::Command | Mode::Search) {
+                            if ctrl && matches!(unicode, Some('c') | Some('C')) {
+                                // Copy selected command-line text to clipboard
+                                if let Some((start, end)) = cmd_sel {
+                                    let lo = start.min(end);
+                                    let hi = start.max(end);
+                                    // lo/hi are column indices on screen (col 0 = ':' prefix, col 1+ = buffer chars)
+                                    let buf_lo = lo.saturating_sub(1);
+                                    let buf_hi = hi.saturating_sub(1);
+                                    let text: String = engine
+                                        .command_buffer
+                                        .chars()
+                                        .enumerate()
+                                        .filter(|(i, _)| *i >= buf_lo && *i <= buf_hi)
+                                        .map(|(_, c)| c)
+                                        .collect();
+                                    if !text.is_empty() {
+                                        if let Some(ref cb) = engine.clipboard_write {
+                                            let _ = cb(&text);
+                                        }
+                                        engine.message = "Copied".to_string();
+                                    }
+                                }
+                                cmd_sel = None;
+                                needs_redraw = true;
+                                continue;
+                            }
+                            // Any other key clears the selection
+                            cmd_sel = None;
+                        }
+                    }
+
                     // clipboard=unnamedplus: intercept p/P to read from system clipboard.
                     // TUI translate_key() sets key_name="" for regular chars; check unicode.
                     let paste_intercepted = !ctrl
                         && matches!(unicode, Some('p') | Some('P'))
                         && intercept_paste_key(engine, unicode == Some('P'));
 
-                    let prev_tab = engine.active_tab;
+                    let prev_tab = engine.active_group().active_tab;
                     if !paste_intercepted {
+                        debug_log!(
+                            "handle_key: key_name={:?} unicode={:?} ctrl={} groups={} active_group={:?}",
+                            key_name,
+                            unicode,
+                            ctrl,
+                            engine.group_layout.leaf_count(),
+                            engine.active_group
+                        );
                         let action = engine.handle_key(&key_name, unicode, ctrl);
+                        debug_log!(
+                            "handle_key result: action={:?} groups_after={}",
+                            action,
+                            engine.group_layout.leaf_count()
+                        );
                         // Handle OpenTerminal specially (needs terminal size info)
                         if action == EngineAction::OpenTerminal {
                             let cols = terminal.size().ok().map(|s| s.width).unwrap_or(80);
@@ -2020,7 +2212,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                     // Sync unnamed register → system clipboard (clipboard=unnamedplus).
                     sync_tui_clipboard(engine, &mut last_clipboard_content);
                     // Reveal the active file in the sidebar when the tab changed
-                    if engine.active_tab != prev_tab {
+                    if engine.active_group().active_tab != prev_tab {
                         if let Some(path) = engine.file_path().cloned() {
                             let h = terminal
                                 .size()
@@ -2121,6 +2313,9 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                                 &mut mouse_text_drag,
                                 &mut folder_picker,
                                 &mut quit_confirm,
+                                &mut close_tab_confirm,
+                                &mut cmd_sel,
+                                &mut cmd_dragging,
                                 &mut mouse_should_quit,
                             );
                             if mouse_should_quit {
@@ -2156,6 +2351,9 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                     &mut mouse_text_drag,
                     &mut folder_picker,
                     &mut quit_confirm,
+                    &mut close_tab_confirm,
+                    &mut cmd_sel,
+                    &mut cmd_dragging,
                     &mut mouse_should_quit,
                 );
                 if mouse_should_quit {
@@ -2232,6 +2430,9 @@ fn handle_mouse(
     mouse_text_drag: &mut bool,
     folder_picker: &mut Option<FolderPickerState>,
     quit_confirm: &mut bool,
+    close_tab_confirm: &mut bool,
+    cmd_sel: &mut Option<(usize, usize)>,
+    cmd_dragging: &mut bool,
     should_quit: &mut bool,
 ) -> u16 {
     let col = ev.column;
@@ -2257,6 +2458,13 @@ fn handle_mouse(
             return new_w.clamp(15, 60);
         }
         MouseEventKind::Drag(MouseButton::Left) => {
+            // Command-line text selection drag
+            if *cmd_dragging {
+                if let Some(ref mut sel) = *cmd_sel {
+                    sel.1 = col as usize;
+                }
+                return sidebar_width;
+            }
             // Debug sidebar section scrollbar drag
             if let Some(ref drag) = *dragging_debug_sb {
                 if drag.track_len > 0 && drag.total > 0 {
@@ -2347,7 +2555,8 @@ fn handle_mouse(
             // Text drag-to-select — find window under cursor and extend visual selection
             if col >= editor_left {
                 if let Some(layout) = last_layout {
-                    let editor_row = row;
+                    let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
+                    let editor_row = row.saturating_sub(1 + menu_rows);
                     for rw in &layout.windows {
                         let wx = rw.rect.x as u16;
                         let wy = rw.rect.y as u16;
@@ -2406,6 +2615,7 @@ fn handle_mouse(
             *dragging_debug_sb = None;
             *dragging_terminal_sb = None;
             *dragging_debug_output_sb = None;
+            *cmd_dragging = false;
             if *dragging_terminal_resize {
                 *dragging_terminal_resize = false;
                 let rows = engine.session.terminal_panel_rows;
@@ -2603,6 +2813,19 @@ fn handle_mouse(
     // Only process left-click presses from here on
     if ev.kind != MouseEventKind::Down(MouseButton::Left) {
         return sidebar_width;
+    }
+
+    // ── Command line click — start text selection ──────────────────────────────
+    {
+        use crate::core::Mode;
+        if row + 1 == term_height && matches!(engine.mode, Mode::Command | Mode::Search) {
+            let char_idx = col as usize;
+            let buf_len = engine.command_buffer.chars().count();
+            engine.command_cursor = char_idx.saturating_sub(1).min(buf_len);
+            *cmd_sel = Some((char_idx, char_idx));
+            *cmd_dragging = true;
+            return sidebar_width;
+        }
     }
 
     // Bottom 2 rows are status + cmd — ignore
@@ -3166,27 +3389,171 @@ fn handle_mouse(
     // and editor content down by `menu_rows`.
     let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
 
-    // ── Tab bar click (first row of editor column, below menu bar) ──────────
-    if row == menu_rows {
-        if let Some(layout) = last_layout {
-            let rel_col = col - editor_left;
+    // ── Tab bar click ──────────────────────────────────────────────────────
+    // For split groups, any group's tab bar row is clickable (not just the top row).
+    if let Some(layout) = last_layout {
+        let rel_col = col - editor_left;
+
+        if let Some(ref split) = layout.editor_group_split {
+            // Find which group's tab bar row matches the clicked row.
+            // Must match the rendering logic: first group uses tab_area.y
+            // (= menu_rows), others use editor_area.y + bounds.y - 1
+            // (= menu_rows + 1 + bounds.y - 1 = menu_rows + bounds.y).
+            let mut matched_group = None;
+            for gtb in split.group_tab_bars.iter() {
+                let tab_bar_row = if gtb.bounds.y <= 1.0 {
+                    menu_rows
+                } else {
+                    menu_rows + 1 + (gtb.bounds.y as u16).saturating_sub(1)
+                };
+                let gx = gtb.bounds.x as u16;
+                let gw = gtb.bounds.width as u16;
+                if row == tab_bar_row && rel_col >= gx && rel_col < gx + gw {
+                    matched_group = Some((gtb.group_id, rel_col - gx, gw, &gtb.tabs));
+                    break;
+                }
+            }
+            if let Some((group_id, local_col, bar_width, group_tabs)) = matched_group {
+                engine.active_group = group_id;
+
+                let mut x: u16 = 0;
+                let mut tab_matched = false;
+                // Collect tab hit info from immutable borrow, then apply mutably.
+                let mut hit_info: Option<(usize, bool)> = None;
+                for (i, tab) in group_tabs.iter().enumerate() {
+                    let name_width = tab.name.chars().count() as u16;
+                    let tab_width = name_width + TAB_CLOSE_COLS;
+                    if local_col >= x && local_col < x + tab_width {
+                        tab_matched = true;
+                        let valid = engine
+                            .editor_groups
+                            .get(&group_id)
+                            .is_some_and(|g| i < g.tabs.len());
+                        if valid {
+                            let is_close = local_col >= x + name_width;
+                            hit_info = Some((i, is_close));
+                        }
+                        break;
+                    }
+                    x += tab_width;
+                }
+                if let Some((tab_idx, is_close)) = hit_info {
+                    if let Some(g) = engine.editor_groups.get_mut(&group_id) {
+                        g.active_tab = tab_idx;
+                    }
+                    engine.active_group = group_id;
+                    if is_close {
+                        if engine.dirty() {
+                            *close_tab_confirm = true;
+                        } else {
+                            engine.close_tab();
+                        }
+                    } else if let Some(path) = engine.file_path().cloned() {
+                        sidebar.reveal_path(&path, term_height.saturating_sub(4) as usize);
+                    }
+                }
+                if !tab_matched {
+                    if bar_width >= TAB_SPLIT_BTN_COLS
+                        && local_col >= bar_width - TAB_SPLIT_BTN_COLS
+                    {
+                        debug_log!(
+                            "split-down btn (multi-group): groups={} active={:?}",
+                            engine.group_layout.leaf_count(),
+                            engine.active_group
+                        );
+                        engine.open_editor_group(SplitDirection::Horizontal);
+                        debug_log!(
+                            "  after split: groups={} layout={:?}",
+                            engine.group_layout.leaf_count(),
+                            engine.group_layout
+                        );
+                    } else {
+                        let both = TAB_SPLIT_BTN_COLS * 2;
+                        if bar_width >= both && local_col >= bar_width - both {
+                            debug_log!(
+                                "split-right btn (multi-group): groups={} active={:?}",
+                                engine.group_layout.leaf_count(),
+                                engine.active_group
+                            );
+                            engine.open_editor_group(SplitDirection::Vertical);
+                            debug_log!(
+                                "  after split: groups={} layout={:?}",
+                                engine.group_layout.leaf_count(),
+                                engine.group_layout
+                            );
+                        }
+                    }
+                }
+                return sidebar_width;
+            }
+        }
+        // Single group: check top tab bar row only.
+        if row == menu_rows && layout.editor_group_split.is_none() {
+            let editor_col_width = terminal_size
+                .map(|s| s.width)
+                .unwrap_or(80)
+                .saturating_sub(editor_left);
+            let bar_width = editor_col_width;
+            let local_col = rel_col;
             let mut x: u16 = 0;
+            let mut tab_matched = false;
             for (i, tab) in layout.tab_bar.iter().enumerate() {
-                let tab_width = tab.name.len() as u16 + 1; // +1 for trailing separator
-                if rel_col >= x && rel_col < x + tab_width {
-                    if i < engine.tabs.len() {
-                        engine.active_tab = i;
-                        // Reveal the active file in the sidebar tree
-                        if let Some(path) = engine.file_path().cloned() {
-                            sidebar.reveal_path(&path, term_height.saturating_sub(4) as usize);
+                let name_width = tab.name.chars().count() as u16;
+                let tab_width = name_width + TAB_CLOSE_COLS;
+                if local_col >= x && local_col < x + tab_width {
+                    tab_matched = true;
+                    if i < engine.active_group().tabs.len() {
+                        let close_col = x + name_width;
+                        if local_col >= close_col {
+                            engine.active_group_mut().active_tab = i;
+                            if engine.dirty() {
+                                *close_tab_confirm = true;
+                            } else {
+                                engine.close_tab();
+                            }
+                        } else {
+                            engine.active_group_mut().active_tab = i;
+                            if let Some(path) = engine.file_path().cloned() {
+                                sidebar.reveal_path(&path, term_height.saturating_sub(4) as usize);
+                            }
                         }
                     }
                     break;
                 }
                 x += tab_width;
             }
+            if !tab_matched {
+                if bar_width >= TAB_SPLIT_BTN_COLS && local_col >= bar_width - TAB_SPLIT_BTN_COLS {
+                    debug_log!(
+                        "split-down btn (single-group): groups={} active={:?}",
+                        engine.group_layout.leaf_count(),
+                        engine.active_group
+                    );
+                    engine.open_editor_group(SplitDirection::Horizontal);
+                    debug_log!(
+                        "  after split: groups={} layout={:?}",
+                        engine.group_layout.leaf_count(),
+                        engine.group_layout
+                    );
+                } else {
+                    let both = TAB_SPLIT_BTN_COLS * 2;
+                    if bar_width >= both && local_col >= bar_width - both {
+                        debug_log!(
+                            "split-right btn (single-group): groups={} active={:?}",
+                            engine.group_layout.leaf_count(),
+                            engine.active_group
+                        );
+                        engine.open_editor_group(SplitDirection::Vertical);
+                        debug_log!(
+                            "  after split: groups={} layout={:?}",
+                            engine.group_layout.leaf_count(),
+                            engine.group_layout
+                        );
+                    }
+                }
+            }
+            return sidebar_width;
         }
-        return sidebar_width;
     }
 
     let rel_col = col - editor_left;
@@ -3343,7 +3710,24 @@ fn build_screen_for_tui(
     }; // +1 sep
     let content_cols = area.width.saturating_sub(ACTIVITY_BAR_WIDTH + sidebar_cols);
     let content_bounds = WindowRect::new(0.0, 0.0, content_cols as f64, content_rows as f64);
-    let window_rects = engine.calculate_window_rects(content_bounds);
+    let (window_rects, _dividers) = engine.calculate_group_window_rects(content_bounds, 1.0);
+    debug_log!(
+        "build_screen: content_rows={} content_cols={} groups={} window_rects={}",
+        content_rows,
+        content_cols,
+        engine.group_layout.leaf_count(),
+        window_rects.len()
+    );
+    for (wid, r) in &window_rects {
+        debug_log!(
+            "  window {:?}: x={:.1} y={:.1} w={:.1} h={:.1}",
+            wid,
+            r.x,
+            r.y,
+            r.width,
+            r.height
+        );
+    }
     build_screen_layout(engine, theme, &window_rects, 1.0, 1.0)
 }
 
@@ -3364,6 +3748,8 @@ fn draw_frame(
     debug_output_scroll: usize,
     folder_picker: Option<&FolderPickerState>,
     quit_confirm: bool,
+    close_tab_confirm: bool,
+    cmd_sel: Option<(usize, usize)>,
 ) {
     let area = frame.size();
 
@@ -3466,8 +3852,78 @@ fn draw_frame(
     }
 
     // ── Render editor ─────────────────────────────────────────────────────────
-    render_tab_bar(frame.buffer_mut(), tab_area, &screen.tab_bar, theme);
-    render_all_windows(frame, editor_area, &screen.windows, theme);
+    if let Some(ref split) = screen.editor_group_split {
+        debug_log!(
+            "draw_frame split: tab_area=({},{},{}x{}) editor_area=({},{},{}x{}) groups={}",
+            tab_area.x,
+            tab_area.y,
+            tab_area.width,
+            tab_area.height,
+            editor_area.x,
+            editor_area.y,
+            editor_area.width,
+            editor_area.height,
+            split.group_tab_bars.len()
+        );
+        for (idx, gtb) in split.group_tab_bars.iter().enumerate() {
+            debug_log!(
+                "  group[{}] id={:?} bounds=({:.1},{:.1},{:.1}x{:.1}) tabs={}",
+                idx,
+                gtb.group_id,
+                gtb.bounds.x,
+                gtb.bounds.y,
+                gtb.bounds.width,
+                gtb.bounds.height,
+                gtb.tabs.len()
+            );
+        }
+        // Render windows first so tab bars draw on top (prevents window content
+        // from overwriting an adjacent group's tab bar in horizontal splits).
+        render_all_windows(frame, editor_area, &screen.windows, theme);
+        // Draw each group's tab bar.  The first group (bounds.y <= 1) uses
+        // tab_area.y; subsequent groups use editor_area.y-based positioning so
+        // the tab bar sits directly above its window content with no gap.
+        for gtb in split.group_tab_bars.iter() {
+            let tab_x = gtb.bounds.x as u16 + tab_area.x;
+            let tab_w = gtb.bounds.width as u16;
+            let is_active = gtb.group_id == split.active_group;
+            if tab_w > 0 {
+                // Groups at the top (bounds.y <= 1.0) share the dedicated
+                // tab_area row.  Lower groups place their tab bar 1 row
+                // above their window content inside editor_area.
+                let bar_y = if gtb.bounds.y <= 1.0 {
+                    tab_area.y
+                } else {
+                    editor_area.y + (gtb.bounds.y as u16).saturating_sub(1)
+                };
+                let g_tab = Rect {
+                    x: tab_x,
+                    y: bar_y,
+                    width: tab_w,
+                    height: 1,
+                };
+                render_tab_bar(frame.buffer_mut(), g_tab, &gtb.tabs, theme, is_active);
+            }
+        }
+        // Draw divider lines (vertical only — horizontal splits use the tab bar as divider).
+        let sep_fg = rc(theme.separator);
+        let sep_bg = rc(theme.background);
+        for div in &split.dividers {
+            if div.direction == SplitDirection::Vertical {
+                let div_x = tab_area.x + div.position as u16;
+                let y_start = tab_area.y + div.cross_start as u16;
+                let y_end = y_start + div.cross_size as u16;
+                for y in y_start..y_end {
+                    if div_x < tab_area.x + tab_area.width {
+                        set_cell(frame.buffer_mut(), div_x, y, '│', sep_fg, sep_bg);
+                    }
+                }
+            }
+        }
+    } else {
+        render_tab_bar(frame.buffer_mut(), tab_area, &screen.tab_bar, theme, true);
+        render_all_windows(frame, editor_area, &screen.windows, theme);
+    }
 
     // ── Completion popup (rendered on top of editor) ───────────────────────
     if let Some(ref menu) = screen.completion {
@@ -3640,6 +4096,21 @@ fn draw_frame(
         );
     } else {
         render_command_line(frame.buffer_mut(), cmd_area, &screen.command, theme);
+        // Highlight command-line mouse selection (invert fg/bg for selected cells)
+        if let Some((start, end)) = cmd_sel {
+            let lo = start.min(end);
+            let hi = start.max(end);
+            let buf = frame.buffer_mut();
+            for i in lo..=hi {
+                let cx = cmd_area.x + i as u16;
+                if cx < cmd_area.x + cmd_area.width {
+                    let cell = buf.get_mut(cx, cmd_area.y);
+                    let old_fg = cell.fg;
+                    let old_bg = cell.bg;
+                    cell.set_fg(old_bg).set_bg(old_fg);
+                }
+            }
+        }
     }
 
     // ── Menu dropdown — rendered last so it draws on top of everything ────────
@@ -3652,6 +4123,11 @@ fn draw_frame(
     // ── Quit confirm overlay — rendered on top of absolutely everything ───────
     if quit_confirm {
         render_quit_confirm_overlay(frame.buffer_mut(), area, theme);
+    }
+
+    // ── Close-tab confirm overlay ──────────────────────────────────────────────
+    if close_tab_confirm {
+        render_close_tab_confirm_overlay(frame.buffer_mut(), area, theme);
     }
 }
 
@@ -3777,17 +4253,39 @@ fn set_cell_styled(
 
 // ─── Tab bar ──────────────────────────────────────────────────────────────────
 
+/// Close-tab × button character (shown on every tab).
+const TAB_CLOSE_CHAR: char = '×'; // U+00D7 MULTIPLICATION SIGN
+/// Terminal columns used by each tab's close button (the × itself + trailing space).
+const TAB_CLOSE_COLS: u16 = 2;
+
+/// Split-right button: space + nf-md-view_split_vertical (2-wide NF glyph).
+const TAB_BTN_SPLIT_RIGHT: &str = " \u{F0932}"; // " 󰤲"
+/// Split-down button: space + nf-md-view_split_horizontal (2-wide NF glyph).
+const TAB_BTN_SPLIT_DOWN: &str = " \u{F0931}"; // " 󰤱"
+/// Terminal columns occupied by each split button (1 space + 2-wide NF glyph).
+const TAB_SPLIT_BTN_COLS: u16 = 3;
+/// Total columns reserved for both split buttons.
+const TAB_SPLIT_BOTH_COLS: u16 = TAB_SPLIT_BTN_COLS * 2;
+
 fn render_tab_bar(
     buf: &mut ratatui::buffer::Buffer,
     area: Rect,
     tabs: &[render::TabInfo],
     theme: &Theme,
+    show_split_btns: bool,
 ) {
     let bar_bg = rc(theme.tab_bar_bg);
 
     for x in area.x..area.x + area.width {
         set_cell(buf, x, area.y, ' ', bar_bg, bar_bg);
     }
+
+    // Reserve columns at the right edge for the two split buttons.
+    let tab_end = if show_split_btns && area.width >= TAB_SPLIT_BOTH_COLS {
+        area.x + area.width - TAB_SPLIT_BOTH_COLS
+    } else {
+        area.x + area.width
+    };
 
     let mut x = area.x;
     for tab in tabs {
@@ -3804,15 +4302,40 @@ fn render_tab_bar(
         };
 
         for ch in tab.name.chars() {
-            if x >= area.x + area.width {
+            if x >= tab_end {
                 break;
             }
             set_cell_styled(buf, x, area.y, ch, fg, bg, modifier);
             x += 1;
         }
-        if x < area.x + area.width {
+        // Close (×) button — dim on inactive tabs, slightly brighter on active.
+        if x < tab_end {
+            let close_fg = if tab.active {
+                rc(theme.tab_active_fg)
+            } else {
+                rc(theme.separator)
+            };
+            set_cell(buf, x, area.y, TAB_CLOSE_CHAR, close_fg, bg);
+            x += 1;
+        }
+        // Trailing separator space.
+        if x < tab_end {
             set_cell(buf, x, area.y, ' ', bar_bg, bar_bg);
             x += 1;
+        }
+    }
+
+    // Draw split-right then split-down buttons at the right edge.
+    if show_split_btns && area.width >= TAB_SPLIT_BOTH_COLS {
+        let btn_fg = rc(theme.tab_inactive_fg);
+        let mut bx = area.x + area.width - TAB_SPLIT_BOTH_COLS;
+        for ch in TAB_BTN_SPLIT_RIGHT.chars() {
+            set_cell(buf, bx, area.y, ch, btn_fg, bar_bg);
+            bx += 1;
+        }
+        for ch in TAB_BTN_SPLIT_DOWN.chars() {
+            set_cell(buf, bx, area.y, ch, btn_fg, bar_bg);
+            bx += 1;
         }
     }
 }
@@ -4866,6 +5389,125 @@ fn render_quit_confirm_overlay(buf: &mut ratatui::buffer::Buffer, term_area: Rec
     }
 }
 
+fn render_close_tab_confirm_overlay(
+    buf: &mut ratatui::buffer::Buffer,
+    term_area: Rect,
+    theme: &Theme,
+) {
+    let lines: &[(&str, bool)] = &[
+        ("  This file has unsaved changes.", false),
+        ("", false),
+        ("  [S]   Save & Close Tab", true),
+        ("  [D]   Discard & Close Tab", true),
+        ("  [Esc] Cancel", true),
+    ];
+    let title = " Unsaved Changes ";
+    let width: u16 = 42;
+    let height: u16 = 2 + 1 + lines.len() as u16 + 1;
+
+    let x = (term_area.width.saturating_sub(width)) / 2;
+    let y = (term_area.height.saturating_sub(height)) / 2;
+
+    let bg_color = rc(theme.fuzzy_bg);
+    let fg_color = rc(theme.fuzzy_fg);
+    let border_fg = rc(theme.fuzzy_border);
+    let title_fg = rc(theme.fuzzy_title_fg);
+    let key_fg = rc(theme.fuzzy_query_fg);
+
+    // Top border row
+    for col in 0..width {
+        let cx = x + col;
+        let ch = if col == 0 {
+            '╭'
+        } else if col == width - 1 {
+            '╮'
+        } else {
+            '─'
+        };
+        set_cell(buf, cx, y, ch, border_fg, bg_color);
+    }
+    for (i, ch) in title.chars().enumerate() {
+        let cx = x + 2 + i as u16;
+        if cx + 1 < x + width {
+            set_cell(buf, cx, y, ch, title_fg, bg_color);
+        }
+    }
+
+    // Blank row after title
+    let blank_row = y + 1;
+    for col in 0..width {
+        let cx = x + col;
+        let ch = if col == 0 || col == width - 1 {
+            '│'
+        } else {
+            ' '
+        };
+        let fg = if col == 0 || col == width - 1 {
+            border_fg
+        } else {
+            fg_color
+        };
+        set_cell(buf, cx, blank_row, ch, fg, bg_color);
+    }
+
+    // Content rows
+    for (row_i, (text, is_key_row)) in lines.iter().enumerate() {
+        let ry = y + 2 + row_i as u16;
+        for col in 0..width {
+            let cx = x + col;
+            let ch = if col == 0 || col == width - 1 {
+                '│'
+            } else {
+                ' '
+            };
+            let fg = if col == 0 || col == width - 1 {
+                border_fg
+            } else {
+                fg_color
+            };
+            set_cell(buf, cx, ry, ch, fg, bg_color);
+        }
+        let row_fg = if *is_key_row { key_fg } else { fg_color };
+        for (j, ch) in text.chars().enumerate() {
+            let cx = x + 1 + j as u16;
+            if cx + 1 < x + width {
+                set_cell(buf, cx, ry, ch, row_fg, bg_color);
+            }
+        }
+    }
+
+    // Blank row before bottom border
+    let pre_bottom = y + 2 + lines.len() as u16;
+    for col in 0..width {
+        let cx = x + col;
+        let ch = if col == 0 || col == width - 1 {
+            '│'
+        } else {
+            ' '
+        };
+        let fg = if col == 0 || col == width - 1 {
+            border_fg
+        } else {
+            fg_color
+        };
+        set_cell(buf, cx, pre_bottom, ch, fg, bg_color);
+    }
+
+    // Bottom border
+    let bottom = y + height - 1;
+    for col in 0..width {
+        let cx = x + col;
+        let ch = if col == 0 {
+            '╰'
+        } else if col == width - 1 {
+            '╯'
+        } else {
+            '─'
+        };
+        set_cell(buf, cx, bottom, ch, border_fg, bg_color);
+    }
+}
+
 fn render_window(frame: &mut ratatui::Frame, area: Rect, window: &RenderedWindow, theme: &Theme) {
     let window_bg = rc(if window.show_active_bg {
         theme.active_background
@@ -5300,12 +5942,16 @@ fn render_separators(
             // Vertical separator: window a is the left pane, b is the right pane.
             // The separator is drawn in the last column of a. We draw scrollbar
             // chars there so the user can see and interact with a's scroll position.
-            if (a.rect.x + a.rect.width - b.rect.x).abs() < 1.0 {
+            // Also require vertical overlap — windows from different groups may
+            // share an x edge but not overlap in y (e.g. 2×2 grid).
+            let v_overlap =
+                a.rect.y.max(b.rect.y) < (a.rect.y + a.rect.height).min(b.rect.y + b.rect.height);
+            if (a.rect.x + a.rect.width - b.rect.x).abs() < 1.0 && v_overlap {
                 let sep_x = editor_area.x + (a.rect.x + a.rect.width) as u16;
                 let y_start = editor_area.y + a.rect.y.max(b.rect.y) as u16;
                 let y_end =
                     editor_area.y + (a.rect.y + a.rect.height).min(b.rect.y + b.rect.height) as u16;
-                let track_h = (y_end - y_start) as usize;
+                let track_h = y_end.saturating_sub(y_start) as usize;
                 let viewport_lines = a.rect.height as usize;
                 let has_scroll = a.total_lines > viewport_lines && track_h > 0;
 
@@ -5320,7 +5966,7 @@ fn render_separators(
                     (0, track_h)
                 };
 
-                for dy in 0..(y_end - y_start) {
+                for dy in 0..y_end.saturating_sub(y_start) {
                     let y = y_start + dy;
                     let (ch, fg) = if has_scroll {
                         let in_thumb =
@@ -5337,13 +5983,15 @@ fn render_separators(
                 }
             }
 
-            // Horizontal separator
-            if (a.rect.y + a.rect.height - b.rect.y).abs() < 1.0 {
+            // Horizontal separator — also require horizontal overlap.
+            let h_overlap =
+                a.rect.x.max(b.rect.x) < (a.rect.x + a.rect.width).min(b.rect.x + b.rect.width);
+            if (a.rect.y + a.rect.height - b.rect.y).abs() < 1.0 && h_overlap {
                 let sep_y = editor_area.y + (a.rect.y + a.rect.height) as u16;
                 let x_start = editor_area.x + a.rect.x.max(b.rect.x) as u16;
                 let x_end =
                     editor_area.x + (a.rect.x + a.rect.width).min(b.rect.x + b.rect.width) as u16;
-                for x in x_start..x_end {
+                for x in x_start..x_end.max(x_start) {
                     set_cell(buf, x, sep_y.saturating_sub(1), '─', sep_fg, sep_bg);
                 }
             }
@@ -6520,7 +7168,7 @@ fn render_command_line(
 
 // ─── Input translation ────────────────────────────────────────────────────────
 
-fn translate_key(event: KeyEvent) -> Option<(String, Option<char>, bool)> {
+fn translate_key(event: KeyEvent, keyboard_enhanced: bool) -> Option<(String, Option<char>, bool)> {
     if event.kind == KeyEventKind::Release {
         return None;
     }
@@ -6534,8 +7182,14 @@ fn translate_key(event: KeyEvent) -> Option<(String, Option<char>, bool)> {
                 // Space is a named key; use "space" to match GTK and the engine's convention.
                 // Ctrl+Shift+X: the char arrives as uppercase (or SHIFT flag is set); keep
                 // uppercase so the engine can distinguish Ctrl+P from Ctrl+Shift+P ("P").
+                // Some special chars use GTK-style names to match GTK backend conventions.
                 let name = if lower == ' ' {
                     "space".to_string()
+                } else if lower == '\\' || (!keyboard_enhanced && lower == '4') {
+                    // Ctrl+\ sends byte 0x1C; without keyboard enhancement crossterm decodes
+                    // 0x1C as KeyCode::Char('4')+CONTROL (formula: 0x1C-0x1C+'4'='4').
+                    // Map both to "backslash" so Ctrl+\ works in all terminals.
+                    "backslash".to_string()
                 } else if c.is_uppercase() || shift {
                     lower.to_ascii_uppercase().to_string()
                 } else {
