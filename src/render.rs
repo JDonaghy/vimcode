@@ -219,6 +219,8 @@ pub struct RenderedWindow {
     pub lines: Vec<RenderedLine>,
     /// Cursor position + shape, or `None` if the cursor is scrolled off-screen.
     pub cursor: Option<(CursorPos, CursorShape)>,
+    /// Secondary cursor positions (multi-cursor Alt-D). Rendered as dimmed blocks.
+    pub extra_cursors: Vec<CursorPos>,
     /// Active visual selection, or `None`.
     pub selection: Option<SelectionRange>,
     /// Index of the first visible buffer line.
@@ -2336,6 +2338,7 @@ fn build_rendered_window(
         rect: *rect,
         lines: vec![],
         cursor: None,
+        extra_cursors: vec![],
         selection: None,
         scroll_top: 0,
         scroll_left: 0,
@@ -2642,6 +2645,22 @@ fn build_rendered_window(
         None
     };
 
+    // Secondary cursors — map each extra cursor to its view_line + col.
+    let extra_cursors: Vec<CursorPos> = view
+        .extra_cursors
+        .iter()
+        .filter_map(|ec| {
+            lines
+                .iter()
+                .enumerate()
+                .find(|(_, l)| l.line_idx == ec.line && !l.is_wrap_continuation)
+                .map(|(view_line, l)| {
+                    let col = ec.col.saturating_sub(l.segment_col_offset);
+                    CursorPos { view_line, col }
+                })
+        })
+        .collect();
+
     // Visual selection (only for active window)
     let selection = if is_active {
         build_selection(engine, scroll_top, visible_lines)
@@ -2675,6 +2694,7 @@ fn build_rendered_window(
         rect: *rect,
         lines,
         cursor,
+        extra_cursors,
         selection,
         scroll_top,
         scroll_left: view.scroll_left,

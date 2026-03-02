@@ -17,6 +17,10 @@ pub struct FoldRegion {
 pub struct View {
     /// Cursor position within the buffer (line, col).
     pub cursor: Cursor,
+    /// Additional cursors added via Alt-D (add cursor at next match).
+    /// All extra cursors receive the same insert-mode keystrokes as the primary cursor.
+    /// Cleared on Escape from insert mode.
+    pub extra_cursors: Vec<Cursor>,
     /// First visible line (for viewport scrolling).
     pub scroll_top: usize,
     /// Number of lines that fit in this window's text viewport.
@@ -34,6 +38,7 @@ impl View {
     pub fn new() -> Self {
         Self {
             cursor: Cursor::new(),
+            extra_cursors: Vec::new(),
             scroll_top: 0,
             viewport_lines: 40, // sensible default, overridden by UI
             scroll_left: 0,

@@ -263,6 +263,12 @@ fn pk_live_grep() -> String {
 fn pk_open_terminal() -> String {
     "<C-t>".to_string()
 }
+fn pk_add_cursor() -> String {
+    "<A-d>".to_string()
+}
+fn pk_select_all_matches() -> String {
+    "<C-S-l>".to_string()
+}
 
 /// Global keyboard shortcuts for panel navigation.
 ///
@@ -290,6 +296,12 @@ pub struct PanelKeys {
     /// Toggle integrated terminal panel. Default: `<C-t>`
     #[serde(default = "pk_open_terminal")]
     pub open_terminal: String,
+    /// Add cursor at next match of word under cursor. Default: `<A-d>`
+    #[serde(default = "pk_add_cursor")]
+    pub add_cursor: String,
+    /// Select all occurrences of word under cursor. Default: `<C-S-l>`
+    #[serde(default = "pk_select_all_matches")]
+    pub select_all_matches: String,
 }
 
 impl Default for PanelKeys {
@@ -301,6 +313,8 @@ impl Default for PanelKeys {
             fuzzy_finder: pk_fuzzy_finder(),
             live_grep: pk_live_grep(),
             open_terminal: pk_open_terminal(),
+            add_cursor: pk_add_cursor(),
+            select_all_matches: pk_select_all_matches(),
         }
     }
 }
@@ -703,8 +717,12 @@ mod tests {
     use super::*;
     use std::fs;
 
-    fn test_settings_path() -> PathBuf {
-        PathBuf::from("/tmp/vimcode_test_settings.json")
+    fn test_settings_path_load_save() -> PathBuf {
+        std::env::temp_dir().join("vimcode_test_settings_load_save.json")
+    }
+
+    fn test_settings_path_invalid_json() -> PathBuf {
+        std::env::temp_dir().join("vimcode_test_settings_invalid_json.json")
     }
 
     #[test]
@@ -733,7 +751,7 @@ mod tests {
 
     #[test]
     fn test_settings_load_save() {
-        let test_path = test_settings_path();
+        let test_path = test_settings_path_load_save();
 
         // Clean up before test
         let _ = fs::remove_file(&test_path);
@@ -757,7 +775,7 @@ mod tests {
 
     #[test]
     fn test_settings_invalid_json() {
-        let test_path = test_settings_path();
+        let test_path = test_settings_path_invalid_json();
 
         // Write invalid JSON
         fs::write(&test_path, "{ invalid json }").unwrap();
@@ -1087,6 +1105,8 @@ mod tests {
         assert_eq!(pk.focus_search, "<A-f>");
         assert_eq!(pk.fuzzy_finder, "<C-p>");
         assert_eq!(pk.live_grep, "<C-g>");
+        assert_eq!(pk.add_cursor, "<A-d>");
+        assert_eq!(pk.select_all_matches, "<C-S-l>");
     }
 
     #[test]

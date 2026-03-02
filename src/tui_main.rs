@@ -616,8 +616,7 @@ fn intercept_paste_key(engine: &mut Engine, before: bool) -> bool {
         None => Some("Clipboard unavailable — install xclip or xsel".to_string()),
         Some(ref cb_read) => match cb_read() {
             Ok(text) if !text.is_empty() => {
-                engine.registers.insert('"', (text.clone(), false));
-                engine.load_clipboard_register(text);
+                engine.load_clipboard_for_paste(text);
                 None
             }
             Ok(_) => None, // empty clipboard — fall through to use internal register
@@ -659,11 +658,18 @@ pub fn run(file_path: Option<PathBuf>) {
 
     // Enable keyboard enhancement protocol (Kitty protocol) so terminals that support it
     // will send distinct escape sequences for Ctrl+Shift+X vs Ctrl+X.
+    // DISAMBIGUATE_ESCAPE_CODES alone is insufficient: it doesn't guarantee that
+    // Ctrl+letter combos arrive as CSI u sequences (they may still come as raw
+    // control characters, losing the Shift modifier).  REPORT_ALL_KEYS_AS_ESCAPE_CODES
+    // forces every keypress to be a CSI u sequence, so Ctrl+Shift+L is unambiguous.
     let keyboard_enhanced = supports_keyboard_enhancement().unwrap_or(false);
     if keyboard_enhanced {
         let _ = execute!(
             stdout,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+            )
         );
     }
 
@@ -1763,6 +1769,17 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
 
                         if matches_tui_key(&pk.live_grep, code, mods) {
                             engine.open_live_grep();
+                            needs_redraw = true;
+                            continue;
+                        }
+
+                        if matches_tui_key(&pk.add_cursor, code, mods) {
+                            engine.add_cursor_at_next_match();
+                            needs_redraw = true;
+                            continue;
+                        }
+                        if matches_tui_key(&pk.select_all_matches, code, mods) {
+                            engine.select_all_word_occurrences();
                             needs_redraw = true;
                             continue;
                         }
@@ -3297,7 +3314,9 @@ fn handle_mouse(
                 *last_click_time = now;
                 *last_click_pos = (col, row);
 
-                if is_double {
+                if ev.modifiers.contains(KeyModifiers::CONTROL) {
+                    engine.add_cursor_at_pos(buf_line, col_in_text);
+                } else if is_double {
                     engine.mouse_double_click(rw.window_id, buf_line, col_in_text);
                 } else {
                     // Clear selection on click in VSCode mode.
@@ -5080,6 +5099,20 @@ fn render_window(frame: &mut ratatui::Frame, area: Rect, window: &RenderedWindow
             CursorShape::Bar | CursorShape::Underline => {
                 frame.set_cursor(cursor_screen_x, cursor_screen_y);
             }
+        }
+    }
+
+    // Secondary cursors (multi-cursor Alt-D) — invert fg/bg like a block cursor.
+    for extra_pos in &window.extra_cursors {
+        let sy = area.y + extra_pos.view_line as u16;
+        let vis_col = extra_pos.col.saturating_sub(window.scroll_left) as u16;
+        let sx = area.x + gutter_w + vis_col;
+        let buf = frame.buffer_mut();
+        if sx < buf.area.x + buf.area.width && sy < buf.area.y + buf.area.height {
+            let cell = buf.get_mut(sx, sy);
+            let old_fg = cell.fg;
+            let old_bg = cell.bg;
+            cell.set_fg(old_bg).set_bg(old_fg);
         }
     }
 }

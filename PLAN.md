@@ -2,6 +2,12 @@
 
 ## Recently Completed
 
+**Session 107c — Linewise paste fix + Ctrl+Shift+L TUI fix:** `engine.rs`: `load_clipboard_for_paste()` — preserves `is_linewise` on `'"'` register when clipboard text matches current register content, fixing `yyp` pasting inline instead of on the next line (root cause: both backends were unconditionally overwriting `'"'` with `is_linewise=false` before every p/P). `main.rs` + `tui_main.rs`: use `load_clipboard_for_paste()` instead of manual insert. `tui_main.rs`: push `REPORT_ALL_KEYS_AS_ESCAPE_CODES | DISAMBIGUATE_ESCAPE_CODES` (was DISAMBIGUATE only) — DISAMBIGUATE alone doesn't guarantee Ctrl+letter combos arrive as CSI u sequences, so Shift was lost on Ctrl+Shift+L. 848 tests (+3).
+
+**Session 107b — Multi-Cursor Enhancements + Fixes:** `select_all_matches` (Ctrl+Shift+L) added to settings + engine; `add_cursor_at_pos` for Ctrl+Click; `add_cursor_at_next_match` shows count message; Normal-mode buffer changes clear stale extra_cursors; Escape in normal mode clears extra_cursors. 845 tests (+10).
+
+**Session 107 — Multiple Cursors (Alt-D):** `core/settings.rs`: `add_cursor: String` field in `PanelKeys` (default `"<A-d>"`); `pk_add_cursor()` default fn; also fixed race condition in `test_settings_load_save`/`test_settings_invalid_json` (unique temp paths). `core/view.rs`: `extra_cursors: Vec<Cursor>` field on `View`. `core/engine.rs`: `char_idx_to_cursor`, `byte_offset_to_cursor`, `find_next_occurrence` (forward search with wrap-around), `pub add_cursor_at_next_match`, `mc_insert`, `mc_backspace`, `mc_delete_forward`, `mc_return` helpers; all insert-mode edit arms dispatch to multi-cursor helpers when `extra_cursors` non-empty; `extra_cursors.clear()` in Escape arm; 8 new tests. `render.rs`: `extra_cursors: Vec<CursorPos>` on `RenderedWindow`; populated by mapping `view.extra_cursors` through visible lines. `main.rs`: `add_cursor` key check via `matches_gtk_key`; secondary cursor drawing (half-alpha Pango-measured blocks). `tui_main.rs`: `add_cursor` key check via `matches_tui_key`; secondary cursor rendering (inverted fg/bg). 835 tests (+8).
+
 **Session 100 (follow-up) — GTK menu dropdown at correct window position:**
 Root cause: `draw_menu_dropdown` was called from `draw_editor()`'s DrawingArea whose x=0 is 48px right of the window left edge (activity bar), causing dropdowns to appear under the wrong menu label. Fix: added `#[name = "window_overlay"] gtk4::Overlay` wrapping the top-level Box in the view! macro; imperatively created `menu_dropdown_da` (full-window overlay DrawingArea, `can_target=false` by default). On `Msg::OpenMenu` sets `can_target=true`; on `Msg::CloseMenu`/`Msg::MenuActivateItem` sets `can_target=false`. Draw func renders dropdown in window coordinates. GestureClick handler routes to `MenuActivateItem`/`CloseMenu`/`OpenMenu`. Removed old `draw_menu_dropdown` from `draw_editor()` and dead dropdown block from `Msg::MouseClick`. Also committed in this round: TUI folder picker up-navigation (`..` entry, `navigate_up()`, `-` key), snake_case menu action aliases, and `open_file_dialog` routing in both backends. Fixed pre-existing test with `engine.cwd = temp_dir()`. 817 tests.
 
@@ -683,7 +689,7 @@ Root cause: `draw_menu_dropdown` was called from `draw_editor()`'s DrawingArea w
 - [x] **`gd` / `gD`** — go-to-definition via LSP
 - [x] **`:norm`** — execute normal command on a range of lines
 - [x] **Fuzzy finder / Telescope-style** — Ctrl-P opens centered file-picker modal with subsequence scoring (session 53)
-- [ ] **Multiple cursors** — `Ctrl-D` adds cursor at next match of word under cursor; all cursors receive identical keystrokes; Escape collapses to one
+- [x] **Multiple cursors** — `Alt-D` (configurable) adds cursor at next match of word under cursor; all cursors receive identical keystrokes; Escape collapses to one
 - [ ] **Themes / plugin system** — named color themes selectable via `:colorscheme`; theme file format TBD
 
 ### Enhanced Editor

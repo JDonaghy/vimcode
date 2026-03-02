@@ -3349,6 +3349,7 @@ impl Engine {
 
         let mut changed = false;
         let mut action = EngineAction::None;
+        let was_normal = matches!(self.mode, Mode::Normal);
 
         match self.mode {
             Mode::Normal => {
@@ -3369,6 +3370,11 @@ impl Engine {
         }
 
         if changed {
+            // A normal-mode buffer modification (paste, delete, replace…) invalidates
+            // any extra-cursor positions — clear them so stale cursors don't appear.
+            if was_normal && !self.view().extra_cursors.is_empty() {
+                self.view_mut().extra_cursors.clear();
+            }
             self.set_dirty(true);
             self.update_syntax();
             // Auto-promote preview buffer on text modification
@@ -4184,9 +4190,10 @@ impl Engine {
             }
             _ => match key_name {
                 "Escape" => {
-                    // Clear count and pending key in normal mode
+                    // Clear count, pending key, and any extra cursors in normal mode
                     self.count = None;
                     self.pending_key = None;
+                    self.view_mut().extra_cursors.clear();
                 }
                 "Left" => {
                     let count = self.take_count();
@@ -4995,73 +5002,107 @@ impl Engine {
                 self.clamp_cursor_col();
                 // Dismiss signature help when leaving insert mode
                 self.lsp_signature_help = None;
+                // Collapse all extra cursors.
+                self.view_mut().extra_cursors.clear();
             }
             "BackSpace" => {
-                let line = self.view().cursor.line;
-                let col = self.view().cursor.col;
-                let char_idx = self.buffer().line_to_char(line) + col;
-                if col > 0 {
-                    self.delete_with_undo(char_idx - 1, char_idx);
-                    self.view_mut().cursor.col -= 1;
-                    *changed = true;
-                } else if line > 0 {
-                    let prev_line_len = self.buffer().line_len_chars(line - 1);
-                    let new_col = if prev_line_len > 0 {
-                        prev_line_len - 1
+                if !self.view().extra_cursors.is_empty() {
+                    // Multi-cursor BackSpace: delete before every eligible cursor.
+                    if self.mc_backspace() {
+                        *changed = true;
                     } else {
-                        0
-                    };
-                    self.delete_with_undo(char_idx - 1, char_idx);
-                    self.view_mut().cursor.line -= 1;
-                    self.view_mut().cursor.col = new_col;
-                    *changed = true;
+                        // All cursors at col==0 — do nothing in multi-cursor mode.
+                    }
+                } else {
+                    let line = self.view().cursor.line;
+                    let col = self.view().cursor.col;
+                    let char_idx = self.buffer().line_to_char(line) + col;
+                    if col > 0 {
+                        self.delete_with_undo(char_idx - 1, char_idx);
+                        self.view_mut().cursor.col -= 1;
+                        *changed = true;
+                    } else if line > 0 {
+                        let prev_line_len = self.buffer().line_len_chars(line - 1);
+                        let new_col = if prev_line_len > 0 {
+                            prev_line_len - 1
+                        } else {
+                            0
+                        };
+                        self.delete_with_undo(char_idx - 1, char_idx);
+                        self.view_mut().cursor.line -= 1;
+                        self.view_mut().cursor.col = new_col;
+                        *changed = true;
+                    }
                 }
                 if *changed {
                     self.trigger_auto_completion();
                 }
             }
             "Delete" => {
-                let line = self.view().cursor.line;
-                let col = self.view().cursor.col;
-                let char_idx = self.buffer().line_to_char(line) + col;
-                if char_idx < self.buffer().len_chars() {
-                    self.delete_with_undo(char_idx, char_idx + 1);
-                    *changed = true;
+                if !self.view().extra_cursors.is_empty() {
+                    if self.mc_delete_forward() {
+                        *changed = true;
+                    }
+                } else {
+                    let line = self.view().cursor.line;
+                    let col = self.view().cursor.col;
+                    let char_idx = self.buffer().line_to_char(line) + col;
+                    if char_idx < self.buffer().len_chars() {
+                        self.delete_with_undo(char_idx, char_idx + 1);
+                        *changed = true;
+                    }
                 }
             }
             "Return" => {
-                let line = self.view().cursor.line;
-                let col = self.view().cursor.col;
-                let char_idx = self.buffer().line_to_char(line) + col;
-                let indent = if self.settings.auto_indent {
-                    self.get_line_indent_str(line)
+                if !self.view().extra_cursors.is_empty() {
+                    self.mc_return();
+                    self.insert_text_buffer.push('\n');
+                    *changed = true;
                 } else {
-                    String::new()
-                };
-                let indent_len = indent.len();
-                let text = format!("\n{}", indent);
-                self.insert_with_undo(char_idx, &text);
-                self.insert_text_buffer.push('\n');
-                self.view_mut().cursor.line += 1;
-                self.view_mut().cursor.col = indent_len;
-                *changed = true;
+                    let line = self.view().cursor.line;
+                    let col = self.view().cursor.col;
+                    let char_idx = self.buffer().line_to_char(line) + col;
+                    let indent = if self.settings.auto_indent {
+                        self.get_line_indent_str(line)
+                    } else {
+                        String::new()
+                    };
+                    let indent_len = indent.len();
+                    let text = format!("\n{}", indent);
+                    self.insert_with_undo(char_idx, &text);
+                    self.insert_text_buffer.push('\n');
+                    self.view_mut().cursor.line += 1;
+                    self.view_mut().cursor.col = indent_len;
+                    *changed = true;
+                }
             }
             "Tab" => {
-                let line = self.view().cursor.line;
-                let col = self.view().cursor.col;
-                let char_idx = self.buffer().line_to_char(line) + col;
-                if self.settings.expand_tab {
-                    let n = self.settings.tabstop as usize;
-                    let spaces = " ".repeat(n);
-                    self.insert_with_undo(char_idx, &spaces);
-                    self.insert_text_buffer.push_str(&spaces);
-                    self.view_mut().cursor.col += n;
+                if !self.view().extra_cursors.is_empty() {
+                    let tab_text = if self.settings.expand_tab {
+                        " ".repeat(self.settings.tabstop as usize)
+                    } else {
+                        "\t".to_string()
+                    };
+                    self.insert_text_buffer.push_str(&tab_text);
+                    self.mc_insert(&tab_text);
+                    *changed = true;
                 } else {
-                    self.insert_with_undo(char_idx, "\t");
-                    self.insert_text_buffer.push('\t');
-                    self.view_mut().cursor.col += 1;
+                    let line = self.view().cursor.line;
+                    let col = self.view().cursor.col;
+                    let char_idx = self.buffer().line_to_char(line) + col;
+                    if self.settings.expand_tab {
+                        let n = self.settings.tabstop as usize;
+                        let spaces = " ".repeat(n);
+                        self.insert_with_undo(char_idx, &spaces);
+                        self.insert_text_buffer.push_str(&spaces);
+                        self.view_mut().cursor.col += n;
+                    } else {
+                        self.insert_with_undo(char_idx, "\t");
+                        self.insert_text_buffer.push('\t');
+                        self.view_mut().cursor.col += 1;
+                    }
+                    *changed = true;
                 }
-                *changed = true;
             }
             "Left" => self.move_left(),
             "Right" => self.move_right_insert(),
@@ -5088,15 +5129,24 @@ impl Engine {
                 if unicode.is_none() && self.plugin_run_keymap("i", key_name) {
                     // keymap handled it — skip default character insertion
                 } else if let Some(ch) = unicode {
-                    let line = self.view().cursor.line;
-                    let col = self.view().cursor.col;
-                    let char_idx = self.buffer().line_to_char(line) + col;
-                    let mut buf = [0u8; 4];
-                    let s = ch.encode_utf8(&mut buf);
-                    self.insert_with_undo(char_idx, s);
-                    self.insert_text_buffer.push(ch);
-                    self.view_mut().cursor.col += 1;
-                    *changed = true;
+                    if !self.view().extra_cursors.is_empty() {
+                        // Multi-cursor character insert.
+                        let mut buf = [0u8; 4];
+                        let s = ch.encode_utf8(&mut buf).to_string();
+                        self.mc_insert(&s);
+                        self.insert_text_buffer.push(ch);
+                        *changed = true;
+                    } else {
+                        let line = self.view().cursor.line;
+                        let col = self.view().cursor.col;
+                        let char_idx = self.buffer().line_to_char(line) + col;
+                        let mut buf = [0u8; 4];
+                        let s = ch.encode_utf8(&mut buf);
+                        self.insert_with_undo(char_idx, s);
+                        self.insert_text_buffer.push(ch);
+                        self.view_mut().cursor.col += 1;
+                        *changed = true;
+                    }
                     // Trigger signature help after '(' or ','
                     if ch == '(' || ch == ',' {
                         self.ensure_lsp_manager();
@@ -10802,6 +10852,24 @@ impl Engine {
         self.registers.insert('*', (text, false));
     }
 
+    /// Pre-load clipboard text into `"`, `+`, and `*` before a p/P keypress.
+    ///
+    /// If the clipboard content exactly matches what is already in `"`, the
+    /// existing `is_linewise` flag is **preserved** — this covers the common
+    /// `yy` → `p` flow where the yank wrote linewise text to both the register
+    /// and the system clipboard.  When the clipboard holds different text (from
+    /// another application) `is_linewise` is set to `false` as usual.
+    pub fn load_clipboard_for_paste(&mut self, text: String) {
+        let existing_lw = self
+            .registers
+            .get(&'"')
+            .map(|(c, lw)| c == &text && *lw)
+            .unwrap_or(false);
+        self.registers.insert('"', (text.clone(), existing_lw));
+        self.registers.insert('+', (text.clone(), false));
+        self.registers.insert('*', (text, false));
+    }
+
     // =======================================================================
     // LSP integration
     // =======================================================================
@@ -12061,6 +12129,490 @@ impl Engine {
 
             byte_pos = start_byte + 1;
         }
+    }
+
+    // =======================================================================
+    // Multiple cursors (Alt-D)
+    // =======================================================================
+
+    /// Convert a char index in the current buffer into a `Cursor` (line, col).
+    fn char_idx_to_cursor(&self, char_idx: usize) -> Cursor {
+        let len = self.buffer().content.len_chars();
+        let char_idx = char_idx.min(len);
+        if len == 0 {
+            return Cursor { line: 0, col: 0 };
+        }
+        let line = self.buffer().content.char_to_line(char_idx);
+        let line_start = self.buffer().line_to_char(line);
+        Cursor {
+            line,
+            col: char_idx - line_start,
+        }
+    }
+
+    /// Convert a byte offset in the buffer text into a `Cursor`.
+    fn byte_offset_to_cursor(&self, byte_offset: usize) -> Cursor {
+        let char_idx = self.buffer().content.byte_to_char(byte_offset);
+        self.char_idx_to_cursor(char_idx)
+    }
+
+    /// Search for the next occurrence of `pattern` in the buffer, starting
+    /// one pattern-length past `after`.  Wraps around the document end.
+    /// Returns `None` if `pattern` is not found anywhere in the buffer.
+    fn find_next_occurrence(
+        &self,
+        pattern: &str,
+        after: Cursor,
+        word_bounded: bool,
+    ) -> Option<Cursor> {
+        if pattern.is_empty() {
+            return None;
+        }
+
+        let text = self.buffer().to_string();
+        // Start searching one pattern-length past the given cursor position.
+        let after_char_idx =
+            self.buffer().line_to_char(after.line) + after.col + pattern.chars().count();
+        let after_byte = self
+            .buffer()
+            .content
+            .char_to_byte(after_char_idx.min(self.buffer().content.len_chars()));
+
+        let check_boundary = |sb: usize, eb: usize| -> bool {
+            if !word_bounded {
+                return true;
+            }
+            let before_ok =
+                sb == 0 || !Self::is_word_char(text[..sb].chars().last().unwrap_or(' '));
+            let after_ok =
+                eb >= text.len() || !Self::is_word_char(text[eb..].chars().next().unwrap_or(' '));
+            before_ok && after_ok
+        };
+
+        // Pass 1: from after_byte to end of document.
+        let mut byte_pos = after_byte;
+        while byte_pos < text.len() {
+            match text[byte_pos..].find(pattern) {
+                None => break,
+                Some(found) => {
+                    let sb = byte_pos + found;
+                    let eb = sb + pattern.len();
+                    if check_boundary(sb, eb) {
+                        return Some(self.byte_offset_to_cursor(sb));
+                    }
+                    byte_pos = sb + 1;
+                }
+            }
+        }
+
+        // Pass 2: wrap around from document start to after_byte.
+        byte_pos = 0;
+        while byte_pos < after_byte {
+            match text[byte_pos..].find(pattern) {
+                None => break,
+                Some(found) => {
+                    let sb = byte_pos + found;
+                    if sb >= after_byte {
+                        break;
+                    }
+                    let eb = sb + pattern.len();
+                    if check_boundary(sb, eb) {
+                        return Some(self.byte_offset_to_cursor(sb));
+                    }
+                    byte_pos = sb + 1;
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Collect all byte-offset positions of `pattern` in the current buffer,
+    /// returning them as `Cursor` values.  When `word_bounded` is true only
+    /// whole-word matches are returned.
+    fn collect_all_occurrences(&self, pattern: &str, word_bounded: bool) -> Vec<Cursor> {
+        if pattern.is_empty() {
+            return vec![];
+        }
+        let text = self.buffer().to_string();
+        let mut results = Vec::new();
+        let mut byte_pos = 0;
+        while byte_pos < text.len() {
+            match text[byte_pos..].find(pattern) {
+                None => break,
+                Some(found) => {
+                    let sb = byte_pos + found;
+                    let eb = sb + pattern.len();
+                    let ok = if word_bounded {
+                        let before_ok = sb == 0
+                            || !Self::is_word_char(text[..sb].chars().last().unwrap_or(' '));
+                        let after_ok = eb >= text.len()
+                            || !Self::is_word_char(text[eb..].chars().next().unwrap_or(' '));
+                        before_ok && after_ok
+                    } else {
+                        true
+                    };
+                    if ok {
+                        results.push(self.byte_offset_to_cursor(sb));
+                    }
+                    byte_pos = sb + 1;
+                }
+            }
+        }
+        results
+    }
+
+    /// Add secondary cursors at *every* occurrence of the word under the
+    /// primary cursor.  Called by backends when `select_all_matches` is pressed.
+    pub fn select_all_word_occurrences(&mut self) -> EngineAction {
+        let word = match self.word_under_cursor() {
+            Some(w) => w,
+            None => {
+                self.message = "No word under cursor".to_string();
+                return EngineAction::None;
+            }
+        };
+        let all = self.collect_all_occurrences(&word, true);
+        if all.is_empty() {
+            self.message = format!("No occurrences of '{}'", word);
+            return EngineAction::None;
+        }
+        let primary = *self.cursor();
+        let extras: Vec<Cursor> = all.into_iter().filter(|&c| c != primary).collect();
+        let n = extras.len();
+        self.view_mut().extra_cursors = extras;
+        self.message = format!("{} cursors (all occurrences of '{}')", n + 1, word);
+        EngineAction::None
+    }
+
+    /// Add a secondary cursor at the given `(line, col)` position.
+    /// Does nothing if the position equals the primary cursor or is already
+    /// present in `extra_cursors`.
+    pub fn add_cursor_at_pos(&mut self, line: usize, col: usize) {
+        let new_cursor = Cursor { line, col };
+        if new_cursor == *self.cursor() {
+            return;
+        }
+        if self.view().extra_cursors.contains(&new_cursor) {
+            return;
+        }
+        self.view_mut().extra_cursors.push(new_cursor);
+    }
+
+    /// Add a secondary cursor at the next occurrence of the word under the
+    /// primary cursor (or after the last extra cursor if any exist).
+    /// Called by backends when the configured `add_cursor` key is pressed.
+    pub fn add_cursor_at_next_match(&mut self) -> EngineAction {
+        let word = match self.word_under_cursor() {
+            Some(w) => w,
+            None => {
+                self.message = "No word under cursor".to_string();
+                return EngineAction::None;
+            }
+        };
+        let search_after = self
+            .view()
+            .extra_cursors
+            .last()
+            .copied()
+            .unwrap_or_else(|| *self.cursor());
+        if let Some(new_cursor) = self.find_next_occurrence(&word, search_after, true) {
+            let is_primary = new_cursor == *self.cursor();
+            let already_extra = self.view().extra_cursors.contains(&new_cursor);
+            if !is_primary && !already_extra {
+                self.view_mut().extra_cursors.push(new_cursor);
+                let total = self.view().extra_cursors.len() + 1; // +1 for primary
+                self.message = format!("{} cursors ('{}')", total, word);
+            } else {
+                self.message = format!("No more occurrences of '{}'", word);
+            }
+        } else {
+            self.message = format!("No more occurrences of '{}'", word);
+        }
+        EngineAction::None
+    }
+
+    // ── Multi-cursor editing helpers ─────────────────────────────────────────
+
+    /// Insert `text` at every cursor position (primary + extra) simultaneously.
+    /// Processes in ascending char-index order with a running offset so that
+    /// each subsequent insert uses the correct adjusted position.
+    /// Updates primary cursor and all extra cursors to point just after their
+    /// respective inserted text.
+    fn mc_insert(&mut self, text: &str) {
+        let extra = self.view().extra_cursors.clone();
+        let primary = *self.cursor();
+
+        let primary_orig = self.buffer().line_to_char(primary.line) + primary.col;
+        let extra_origs: Vec<usize> = extra
+            .iter()
+            .map(|c| self.buffer().line_to_char(c.line) + c.col)
+            .collect();
+
+        // All original char indices sorted ascending (safe to sort since positions are distinct).
+        let mut all_origs: Vec<usize> = extra_origs.clone();
+        all_origs.push(primary_orig);
+        all_origs.sort_unstable();
+
+        let insert_chars = text.chars().count();
+
+        // Pre-compute new char indices before modifying the buffer.
+        // Cursor at ascending rank i → new_cidx = orig + (rank+1)*insert_chars.
+        let rank_of = |orig: usize| all_origs.iter().position(|&x| x == orig).unwrap_or(0);
+        let primary_new_cidx = primary_orig + (rank_of(primary_orig) + 1) * insert_chars;
+        let extra_new_cidxs: Vec<usize> = extra_origs
+            .iter()
+            .map(|&orig| orig + (rank_of(orig) + 1) * insert_chars)
+            .collect();
+
+        // Insert in ascending order with cumulative offset.
+        let mut offset = 0usize;
+        for &orig in &all_origs {
+            self.insert_with_undo(orig + offset, text);
+            offset += insert_chars;
+        }
+
+        // Apply updated positions (buffer is now modified; char_idx_to_cursor uses new state).
+        self.view_mut().cursor = self.char_idx_to_cursor(primary_new_cidx);
+        self.view_mut().extra_cursors = extra_new_cidxs
+            .iter()
+            .map(|&cidx| self.char_idx_to_cursor(cidx))
+            .collect();
+    }
+
+    /// Delete one char before every cursor position with col > 0.
+    /// Extra cursors at col == 0 are left in place (line-merge not done in multi-cursor mode).
+    /// Returns `true` if at least one deletion was performed.
+    fn mc_backspace(&mut self) -> bool {
+        let extra = self.view().extra_cursors.clone();
+        let primary = *self.cursor();
+
+        let primary_orig = self.buffer().line_to_char(primary.line) + primary.col;
+
+        // Pre-compute original char indices for extra cursors (before any modification).
+        let extra_data: Vec<(usize, bool)> = extra
+            .iter()
+            .map(|c| {
+                let orig = self.buffer().line_to_char(c.line) + c.col;
+                (orig, c.col > 0)
+            })
+            .collect();
+
+        // Collect eligible (col > 0) original char indices.
+        let mut all_eligible: Vec<usize> = Vec::new();
+        let primary_eligible = primary.col > 0;
+        if primary_eligible {
+            all_eligible.push(primary_orig);
+        }
+        for &(orig, eligible) in &extra_data {
+            if eligible {
+                all_eligible.push(orig);
+            }
+        }
+
+        if all_eligible.is_empty() {
+            return false;
+        }
+
+        all_eligible.sort_unstable();
+
+        // Pre-compute new char indices before modifying the buffer.
+        // Cursor at ascending rank i → new_cidx = orig - (rank+1).
+        let rank_of = |orig: usize| all_eligible.iter().position(|&x| x == orig).unwrap_or(0);
+        let primary_new_cidx = if primary_eligible {
+            Some(primary_orig - (rank_of(primary_orig) + 1))
+        } else {
+            None
+        };
+        let extra_new_cidxs: Vec<Option<usize>> = extra_data
+            .iter()
+            .map(|&(orig, eligible)| {
+                if eligible {
+                    Some(orig - (rank_of(orig) + 1))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Delete in DESCENDING order (no offset adjustment needed).
+        for &orig in all_eligible.iter().rev() {
+            self.delete_with_undo(orig - 1, orig);
+        }
+
+        // Apply updated positions.
+        if let Some(new_cidx) = primary_new_cidx {
+            self.view_mut().cursor = self.char_idx_to_cursor(new_cidx);
+        }
+        self.view_mut().extra_cursors = extra_new_cidxs
+            .iter()
+            .zip(extra.iter())
+            .map(|(&opt, ec)| {
+                if let Some(new_cidx) = opt {
+                    self.char_idx_to_cursor(new_cidx)
+                } else {
+                    *ec // unchanged (was at col == 0)
+                }
+            })
+            .collect();
+
+        true
+    }
+
+    /// Delete one char after every cursor position that is not at end-of-buffer.
+    /// Returns `true` if at least one deletion was performed.
+    fn mc_delete_forward(&mut self) -> bool {
+        let extra = self.view().extra_cursors.clone();
+        let primary = *self.cursor();
+
+        let buf_len = self.buffer().content.len_chars();
+        let primary_orig = self.buffer().line_to_char(primary.line) + primary.col;
+
+        let extra_data: Vec<(usize, bool)> = extra
+            .iter()
+            .map(|c| {
+                let orig = self.buffer().line_to_char(c.line) + c.col;
+                (orig, orig < buf_len)
+            })
+            .collect();
+
+        let mut all_eligible: Vec<usize> = Vec::new();
+        let primary_eligible = primary_orig < buf_len;
+        if primary_eligible {
+            all_eligible.push(primary_orig);
+        }
+        for &(orig, eligible) in &extra_data {
+            if eligible {
+                all_eligible.push(orig);
+            }
+        }
+
+        if all_eligible.is_empty() {
+            return false;
+        }
+
+        all_eligible.sort_unstable();
+
+        // Pre-compute new char indices.
+        // Delete-forward: cursor stays in place; earlier deletions shift it left.
+        // Cursor at ascending rank i → new_cidx = orig - rank (not rank+1).
+        let rank_of = |orig: usize| all_eligible.iter().position(|&x| x == orig).unwrap_or(0);
+        let primary_new_cidx = if primary_eligible {
+            Some(primary_orig - rank_of(primary_orig))
+        } else {
+            None
+        };
+        let extra_new_cidxs: Vec<Option<usize>> = extra_data
+            .iter()
+            .map(|&(orig, eligible)| {
+                if eligible {
+                    Some(orig - rank_of(orig))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Delete in DESCENDING order.
+        for &orig in all_eligible.iter().rev() {
+            self.delete_with_undo(orig, orig + 1);
+        }
+
+        if let Some(new_cidx) = primary_new_cidx {
+            self.view_mut().cursor = self.char_idx_to_cursor(new_cidx);
+        }
+        self.view_mut().extra_cursors = extra_new_cidxs
+            .iter()
+            .zip(extra.iter())
+            .map(|(&opt, ec)| {
+                if let Some(new_cidx) = opt {
+                    self.char_idx_to_cursor(new_cidx)
+                } else {
+                    *ec
+                }
+            })
+            .collect();
+
+        true
+    }
+
+    /// Insert a newline (+ auto-indent) at every cursor position.
+    /// Each cursor gets the indent of its own line computed before any modification.
+    fn mc_return(&mut self) {
+        let extra = self.view().extra_cursors.clone();
+        let primary = *self.cursor();
+
+        // Pre-compute (orig_cidx, insert_text) for every cursor, ascending.
+        struct ReturnOp {
+            orig_cidx: usize,
+            text: String,
+            is_primary: bool,
+            extra_idx: usize,
+        }
+
+        let primary_indent = if self.settings.auto_indent {
+            self.get_line_indent_str(primary.line)
+        } else {
+            String::new()
+        };
+
+        let extra_ops: Vec<(usize, String)> = extra
+            .iter()
+            .map(|c| {
+                let orig = self.buffer().line_to_char(c.line) + c.col;
+                let indent = if self.settings.auto_indent {
+                    self.get_line_indent_str(c.line)
+                } else {
+                    String::new()
+                };
+                (orig, format!("\n{}", indent))
+            })
+            .collect();
+
+        let primary_orig = self.buffer().line_to_char(primary.line) + primary.col;
+        let primary_text = format!("\n{}", primary_indent);
+
+        let mut all_ops: Vec<ReturnOp> = extra_ops
+            .iter()
+            .enumerate()
+            .map(|(i, (orig, text))| ReturnOp {
+                orig_cidx: *orig,
+                text: text.clone(),
+                is_primary: false,
+                extra_idx: i,
+            })
+            .collect();
+        all_ops.push(ReturnOp {
+            orig_cidx: primary_orig,
+            text: primary_text,
+            is_primary: true,
+            extra_idx: 0,
+        });
+        all_ops.sort_by_key(|op| op.orig_cidx);
+
+        // Apply inserts ascending with cumulative offset; cursor goes to end of each insert.
+        let mut running_offset = 0usize;
+        let mut primary_new_cidx = 0usize;
+        let mut extra_new_cidxs = vec![0usize; extra.len()];
+
+        for op in &all_ops {
+            let text_chars = op.text.chars().count();
+            let insert_at = op.orig_cidx + running_offset;
+            self.insert_with_undo(insert_at, &op.text);
+            let new_cidx = insert_at + text_chars;
+            running_offset += text_chars;
+            if op.is_primary {
+                primary_new_cidx = new_cidx;
+            } else {
+                extra_new_cidxs[op.extra_idx] = new_cidx;
+            }
+        }
+
+        self.view_mut().cursor = self.char_idx_to_cursor(primary_new_cidx);
+        self.view_mut().extra_cursors = extra_new_cidxs
+            .iter()
+            .map(|&cidx| self.char_idx_to_cursor(cidx))
+            .collect();
     }
 
     // =======================================================================
@@ -26403,5 +26955,331 @@ mod tests {
             "should stay in Normal mode"
         );
         assert!(engine.palette_open, "palette should remain open");
+    }
+
+    // ── Multi-cursor tests ────────────────────────────────────────────────────
+
+    fn engine_with_text(text: &str) -> Engine {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, text);
+        engine
+    }
+
+    #[test]
+    fn test_alt_d_adds_extra_cursor() {
+        // "foo bar foo" — cursor on first "foo", Alt-D should add cursor at second "foo"
+        let mut engine = engine_with_text("foo bar foo\n");
+        // Cursor is at line 0, col 0 (on "foo")
+        assert_eq!(engine.view().cursor, Cursor { line: 0, col: 0 });
+        engine.add_cursor_at_next_match();
+        assert_eq!(engine.view().extra_cursors.len(), 1);
+        assert_eq!(engine.view().extra_cursors[0], Cursor { line: 0, col: 8 });
+    }
+
+    #[test]
+    fn test_alt_d_multiple_presses() {
+        // "foo foo foo" — two Alt-D presses add two extra cursors in order
+        let mut engine = engine_with_text("foo foo foo\n");
+        engine.add_cursor_at_next_match();
+        assert_eq!(engine.view().extra_cursors.len(), 1);
+        assert_eq!(engine.view().extra_cursors[0].col, 4);
+        engine.add_cursor_at_next_match();
+        assert_eq!(engine.view().extra_cursors.len(), 2);
+        assert_eq!(engine.view().extra_cursors[1].col, 8);
+    }
+
+    #[test]
+    fn test_alt_d_no_more_matches() {
+        // Only one "foo" — Alt-D should show a message and not add a cursor
+        let mut engine = engine_with_text("foo bar baz\n");
+        engine.add_cursor_at_next_match();
+        assert!(engine.view().extra_cursors.is_empty());
+        assert!(engine.message.contains("No more occurrences"));
+    }
+
+    #[test]
+    fn test_multi_cursor_insert_char() {
+        // "foo bar foo" — add extra cursor at second "foo", then type 'x' in insert mode
+        let mut engine = engine_with_text("foo bar foo\n");
+        engine.add_cursor_at_next_match();
+        assert_eq!(engine.view().extra_cursors.len(), 1);
+
+        // Enter insert mode and type 'x'
+        engine.handle_key("i", Some('i'), false);
+        assert_eq!(engine.mode, super::Mode::Insert);
+        engine.handle_key("x", Some('x'), false);
+
+        let buf = engine.buffer().to_string();
+        // Both "foo" occurrences should have 'x' prepended: "xfoo bar xfoo\n"
+        assert_eq!(buf, "xfoo bar xfoo\n");
+    }
+
+    #[test]
+    fn test_multi_cursor_backspace() {
+        // "foo bar foo" — primary at col 1, extra at col 9
+        // BackSpace should remove char before each cursor
+        let mut engine = engine_with_text("foo bar foo\n");
+        // Move primary cursor to col 1
+        engine.view_mut().cursor.col = 1;
+        // Extra cursor at second "foo", col 9
+        engine.view_mut().extra_cursors = vec![Cursor { line: 0, col: 9 }];
+
+        engine.handle_key("i", Some('i'), false);
+        engine.handle_key("BackSpace", None, false);
+        engine.handle_key("Escape", None, false);
+
+        let buf = engine.buffer().to_string();
+        // Primary deletes char before col 1 (the 'f'), extra deletes char before col 9 (the 'f' of second foo)
+        assert_eq!(buf, "oo bar oo\n");
+    }
+
+    #[test]
+    fn test_multi_cursor_escape_collapses() {
+        // Escape from insert mode should clear extra cursors
+        let mut engine = engine_with_text("foo bar foo\n");
+        engine.add_cursor_at_next_match();
+        assert_eq!(engine.view().extra_cursors.len(), 1);
+
+        engine.handle_key("i", Some('i'), false);
+        engine.handle_key("Escape", None, false);
+
+        assert!(
+            engine.view().extra_cursors.is_empty(),
+            "extra cursors should be cleared on Escape"
+        );
+        assert_eq!(engine.mode, super::Mode::Normal);
+    }
+
+    #[test]
+    fn test_multi_cursor_undo() {
+        // Type 'x' with 2 cursors, then undo — both insertions should be reverted atomically
+        let mut engine = engine_with_text("foo bar foo\n");
+        engine.add_cursor_at_next_match();
+
+        engine.handle_key("i", Some('i'), false);
+        engine.handle_key("x", Some('x'), false);
+
+        let buf_after = engine.buffer().to_string();
+        assert_eq!(buf_after, "xfoo bar xfoo\n");
+
+        engine.handle_key("Escape", None, false);
+        engine.handle_key("u", Some('u'), false); // undo
+
+        let buf_undone = engine.buffer().to_string();
+        assert_eq!(
+            buf_undone, "foo bar foo\n",
+            "undo should revert all multi-cursor insertions"
+        );
+    }
+
+    #[test]
+    fn test_add_cursor_keybinding_configurable() {
+        // Verify that the default binding parses correctly
+        use crate::core::settings::parse_key_binding;
+        let default = crate::core::settings::PanelKeys::default();
+        assert_eq!(default.add_cursor, "<A-d>");
+        let parsed = parse_key_binding(&default.add_cursor);
+        assert_eq!(parsed, Some((false, false, true, 'd')));
+    }
+
+    // ── select_all_word_occurrences tests ─────────────────────────────────────
+
+    #[test]
+    fn test_select_all_word_occurrences() {
+        // "foo bar foo foo\n" — cursor on first "foo" → 2 extra cursors
+        let mut engine = engine_with_text("foo bar foo foo\n");
+        // cursor at (0,0) which is on "foo"
+        engine.select_all_word_occurrences();
+        // primary stays on first foo; extra cursors at second and third
+        assert_eq!(engine.view().extra_cursors.len(), 2);
+        assert_eq!(engine.view().extra_cursors[0], Cursor { line: 0, col: 8 });
+        assert_eq!(engine.view().extra_cursors[1], Cursor { line: 0, col: 12 });
+        assert!(engine.message.contains("3 cursors"));
+        assert!(engine.message.contains("foo"));
+    }
+
+    #[test]
+    fn test_select_all_single_occurrence() {
+        // Only one "foo" — extra_cursors should be empty, primary stays
+        // n+1 == 1, message says "1 cursors (all occurrences of 'foo')"
+        let mut engine = engine_with_text("foo bar baz\n");
+        engine.select_all_word_occurrences();
+        assert!(engine.view().extra_cursors.is_empty());
+        assert!(engine.message.contains("1 cursors"));
+    }
+
+    // ── add_cursor_at_pos tests ───────────────────────────────────────────────
+
+    #[test]
+    fn test_add_cursor_at_pos_basic() {
+        let mut engine = engine_with_text("hello world\n");
+        // primary is at (0,0); add a cursor at col 6
+        engine.add_cursor_at_pos(0, 6);
+        assert_eq!(engine.view().extra_cursors.len(), 1);
+        assert_eq!(engine.view().extra_cursors[0], Cursor { line: 0, col: 6 });
+    }
+
+    #[test]
+    fn test_add_cursor_at_pos_no_duplicate_primary() {
+        let mut engine = engine_with_text("hello world\n");
+        // primary is at (0,0) — adding there should not create an extra cursor
+        engine.add_cursor_at_pos(0, 0);
+        assert!(engine.view().extra_cursors.is_empty());
+    }
+
+    #[test]
+    fn test_add_cursor_at_pos_no_duplicate_extra() {
+        let mut engine = engine_with_text("hello world\n");
+        engine.add_cursor_at_pos(0, 6);
+        assert_eq!(engine.view().extra_cursors.len(), 1);
+        // Adding the same position again should be a no-op
+        engine.add_cursor_at_pos(0, 6);
+        assert_eq!(engine.view().extra_cursors.len(), 1);
+    }
+
+    // ── Regression: Alt+D across blank lines + trailing spaces ───────────────
+
+    #[test]
+    fn test_add_cursor_next_match_blank_lines_trailing_space() {
+        // Exact text the user reported: 4 "foo" occurrences across blank lines
+        // and a line with trailing space.
+        let text = "foo\n\nfoo \n   foo foo\n";
+        let mut engine = engine_with_text(text);
+        // cursor at (0,0)
+        engine.add_cursor_at_next_match(); // → line 2, col 0
+        assert_eq!(
+            engine.view().extra_cursors.len(),
+            1,
+            "after 1st: cursors={:?}",
+            engine.view().extra_cursors
+        );
+        engine.add_cursor_at_next_match(); // → line 3, col 3
+        assert_eq!(
+            engine.view().extra_cursors.len(),
+            2,
+            "after 2nd: cursors={:?}",
+            engine.view().extra_cursors
+        );
+        engine.add_cursor_at_next_match(); // → line 3, col 7
+        assert_eq!(
+            engine.view().extra_cursors.len(),
+            3,
+            "after 3rd: cursors={:?}",
+            engine.view().extra_cursors
+        );
+    }
+
+    // ── Regression: yyp pastes on next line ──────────────────────────────────
+
+    #[test]
+    fn test_yyp_pastes_on_next_line() {
+        let text = "foo\n\nfoo \n   foo foo\n";
+        let mut engine = engine_with_text(text);
+        // cursor at line 0
+        press_char(&mut engine, 'y');
+        press_char(&mut engine, 'y');
+        let (reg_content, is_lw) = engine.registers.get(&'"').unwrap().clone();
+        assert_eq!(reg_content, "foo\n", "yanked content");
+        assert!(is_lw, "should be linewise");
+        press_char(&mut engine, 'p');
+        // Expected: "foo\nfoo\n\nfoo \n   foo foo\n"
+        let result = engine.buffer().to_string();
+        assert!(
+            result.starts_with("foo\nfoo\n"),
+            "paste should be on next line; got: {:?}",
+            result
+        );
+        assert_eq!(
+            engine.view().cursor.line,
+            1,
+            "cursor should move to pasted line"
+        );
+    }
+
+    #[test]
+    fn test_extra_cursors_cleared_on_normal_mode_paste() {
+        // Extra cursors become stale after a normal-mode buffer modification.
+        // Verify they are cleared automatically so the user doesn't see ghost cursors.
+        let mut engine = engine_with_text("foo bar foo\n");
+        // Add an extra cursor at (0, 8)
+        engine.view_mut().extra_cursors = vec![Cursor { line: 0, col: 8 }];
+        // yank the line then paste — this is a normal-mode buffer modification
+        press_char(&mut engine, 'y');
+        press_char(&mut engine, 'y');
+        press_char(&mut engine, 'p');
+        // After paste, extra_cursors must be empty
+        assert!(
+            engine.view().extra_cursors.is_empty(),
+            "extra_cursors should be cleared after normal-mode paste"
+        );
+    }
+
+    #[test]
+    fn test_extra_cursors_preserved_on_insert_mode_entry() {
+        // Pressing 'i' (no buffer modification) must NOT clear extra cursors.
+        let mut engine = engine_with_text("foo bar\n");
+        engine.view_mut().extra_cursors = vec![Cursor { line: 0, col: 4 }];
+        engine.handle_key("i", Some('i'), false);
+        assert!(
+            !engine.view().extra_cursors.is_empty(),
+            "extra_cursors should be preserved when entering insert mode with 'i'"
+        );
+    }
+
+    #[test]
+    fn test_add_cursor_at_next_match_shows_count_message() {
+        let mut engine = engine_with_text("foo bar foo\n");
+        engine.add_cursor_at_next_match();
+        assert!(
+            engine.message.contains("2 cursors"),
+            "message should show cursor count; got: {:?}",
+            engine.message
+        );
+    }
+
+    #[test]
+    fn test_load_clipboard_for_paste_preserves_linewise() {
+        // When clipboard content matches the existing '"' register, is_linewise is kept.
+        let mut engine = engine_with_text("foo\nbar\n");
+        engine.registers.insert('"', ("foo\n".to_string(), true));
+        engine.load_clipboard_for_paste("foo\n".to_string());
+        let (_, lw) = engine.registers[&'"'].clone();
+        assert!(
+            lw,
+            "load_clipboard_for_paste should preserve is_linewise when content matches"
+        );
+    }
+
+    #[test]
+    fn test_load_clipboard_for_paste_clears_linewise_for_foreign_content() {
+        // When clipboard content differs (from another app), is_linewise becomes false.
+        let mut engine = engine_with_text("foo\nbar\n");
+        engine.registers.insert('"', ("foo\n".to_string(), true));
+        engine.load_clipboard_for_paste("different text".to_string());
+        let (_, lw) = engine.registers[&'"'].clone();
+        assert!(
+            !lw,
+            "load_clipboard_for_paste should clear is_linewise for external content"
+        );
+    }
+
+    #[test]
+    fn test_yyp_linewise_via_clipboard_intercept() {
+        // Simulate the yy → clipboard-intercept-before-p flow that the backends perform.
+        let mut engine = engine_with_text("foo\nbar\n");
+        press_char(&mut engine, 'y');
+        press_char(&mut engine, 'y');
+        let (content, lw) = engine.registers[&'"'].clone();
+        assert!(lw, "yy should set is_linewise=true");
+        // Backend intercepts p, reads same text from clipboard, calls load_clipboard_for_paste.
+        engine.load_clipboard_for_paste(content);
+        press_char(&mut engine, 'p');
+        // Buffer should be "foo\nfoo\nbar\n" — pasted on the line below, not inline.
+        assert_eq!(
+            engine.buffer().to_string(),
+            "foo\nfoo\nbar\n",
+            "linewise paste via clipboard intercept should insert on next line"
+        );
+        assert_eq!(engine.view().cursor.line, 1, "cursor on pasted line");
     }
 }

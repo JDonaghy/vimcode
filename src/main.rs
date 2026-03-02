@@ -265,6 +265,13 @@ enum Msg {
     ProjectReplaceAll,
     /// Mouse scroll wheel on editor drawing area.
     MouseScroll { delta_x: f64, delta_y: f64 },
+    /// Ctrl+Click — plant a secondary cursor at the clicked buffer position.
+    CtrlMouseClick {
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+    },
     /// Mouse double-click at (x, y) coordinates in drawing area.
     MouseDoubleClick {
         x: f64,
@@ -1084,6 +1091,16 @@ impl SimpleComponent for App {
                                         });
                                         return gtk4::glib::Propagation::Stop;
                                     }
+                                    if matches_gtk_key(&pk.add_cursor, key, modifier) {
+                                        engine.borrow_mut().add_cursor_at_next_match();
+                                        sender.input(Msg::Resize);
+                                        return gtk4::glib::Propagation::Stop;
+                                    }
+                                    if matches_gtk_key(&pk.select_all_matches, key, modifier) {
+                                        engine.borrow_mut().select_all_word_occurrences();
+                                        sender.input(Msg::Resize);
+                                        return gtk4::glib::Propagation::Stop;
+                                    }
 
                                     // Shift+F5 → stop, Shift+F11 → stepout (debug shortcuts)
                                     if shift && !ctrl && !alt {
@@ -1123,13 +1140,16 @@ impl SimpleComponent for App {
 
                             add_controller = gtk4::GestureClick {
                                 set_button: 1,
-                                connect_pressed[sender, drawing_area] => move |_, n_press, x, y| {
+                                connect_pressed[sender, drawing_area] => move |gesture, n_press, x, y| {
                                     // Grab focus when clicking in editor
                                     drawing_area.grab_focus();
 
                                     let width = drawing_area.width() as f64;
                                     let height = drawing_area.height() as f64;
-                                    if n_press >= 2 {
+                                    let modifier = gesture.current_event_state();
+                                    if modifier.contains(gdk::ModifierType::CONTROL_MASK) {
+                                        sender.input(Msg::CtrlMouseClick { x, y, width, height });
+                                    } else if n_press >= 2 {
                                         sender.input(Msg::MouseDoubleClick { x, y, width, height });
                                     } else {
                                         sender.input(Msg::MouseClick { x, y, width, height });
@@ -2367,8 +2387,7 @@ impl SimpleComponent for App {
                             if !text.is_empty() {
                                 let mut engine = self.engine.borrow_mut();
                                 self.last_clipboard_content = Some(text.clone());
-                                engine.registers.insert('"', (text.clone(), false));
-                                engine.load_clipboard_register(text);
+                                engine.load_clipboard_for_paste(text);
                             }
                         }
                         // Fall through — handle_key() will execute the paste.
@@ -2778,6 +2797,20 @@ impl SimpleComponent for App {
                         self.redraw = !self.redraw;
                     }
                 }
+            }
+            Msg::CtrlMouseClick {
+                x,
+                y,
+                width,
+                height,
+            } => {
+                let mut engine = self.engine.borrow_mut();
+                if let ClickTarget::BufferPos(_, line, col) =
+                    pixel_to_click_target(&mut engine, x, y, width, height)
+                {
+                    engine.add_cursor_at_pos(line, col);
+                }
+                self.redraw = !self.redraw;
             }
             Msg::MouseDoubleClick {
                 x,
@@ -5692,6 +5725,36 @@ fn draw_window(
                     cr.fill().unwrap();
                 }
             }
+        }
+    }
+
+    // Secondary cursors (multi-cursor Alt-D) — dimmed block at each extra position.
+    let fallback_char_w = font_metrics.approximate_char_width() as f64 / pango::SCALE as f64;
+    let (cr_r, cr_g, cr_b) = theme.cursor.to_cairo();
+    for extra_pos in &rw.extra_cursors {
+        if let Some(rl) = rw.lines.get(extra_pos.view_line) {
+            layout.set_text(&rl.raw_text);
+            layout.set_attributes(None);
+            let byte_offset: usize = rl
+                .raw_text
+                .char_indices()
+                .nth(extra_pos.col)
+                .map(|(i, _)| i)
+                .unwrap_or(rl.raw_text.len());
+            let pos = layout.index_to_pos(byte_offset as i32);
+            let ex = text_x_offset + pos.x() as f64 / pango::SCALE as f64;
+            let ew = {
+                let w = pos.width() as f64 / pango::SCALE as f64;
+                if w > 0.0 {
+                    w
+                } else {
+                    fallback_char_w
+                }
+            };
+            let ey = rect.y + extra_pos.view_line as f64 * line_height;
+            cr.set_source_rgba(cr_r, cr_g, cr_b, theme.cursor_normal_alpha * 0.5);
+            cr.rectangle(ex, ey, ew, line_height);
+            cr.fill().unwrap();
         }
     }
 }

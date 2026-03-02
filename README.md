@@ -11,7 +11,7 @@ There's a touch of irony here - using a cli tool to write the editor that I've w
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 817 tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 848 tests, zero async runtime dependency
 
 
 ## Building
@@ -133,6 +133,15 @@ cargo fmt
 - Flags: `g` (global), `i` (case-insensitive)
 - `Ctrl-F` — VSCode-style dialog (live search, replace, replace all)
 - Full undo/redo support
+
+**Multiple Cursors**
+- `Alt-D` (default) — add a secondary cursor at the next occurrence of the word under the cursor; press again to add the next match
+- `Ctrl+Shift+L` (default) — add a cursor at **every** occurrence of the word under the cursor at once
+- `Ctrl+Click` — plant a secondary cursor at the clicked position
+- Enter insert mode and type — all cursors receive identical edits simultaneously
+- `Escape` collapses all extra cursors and exits insert mode
+- Keybindings configurable via `panel_keys.add_cursor` and `panel_keys.select_all_matches` in `settings.json`
+- `Ctrl+Shift+L` requires a terminal with Kitty keyboard protocol support (Kitty, WezTerm, Alacritty, foot) in TUI mode
 
 **Code Folding**
 - `za` — toggle fold; `zo` — open; `zc` — close; `zR` — open all
@@ -589,6 +598,7 @@ Additional options (set directly in `settings.json`):
 | `fuzzy_finder` | `<C-p>` | Open fuzzy file finder |
 | `live_grep` | `<C-g>` | Open live grep modal |
 | `open_terminal` | `<C-t>` | Toggle integrated terminal panel |
+| `add_cursor` | `<A-d>` | Add cursor at next occurrence of word under cursor |
 
 Key notation: `<C-x>` = Ctrl+x, `<A-x>` = Alt+x, `<C-S-x>` = Ctrl+Shift+x.
 
