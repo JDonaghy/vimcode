@@ -10,7 +10,7 @@ env:
 jobs:
   build-and-release:
     name: Build and publish release
-    runs-on: ubuntu-22.04   # GTK4 4.6+ is available on 22.04+; 20.04 only has GTK3
+    runs-on: ubuntu-24.04   # Ubuntu 24.04 ships GTK 4.14 which satisfies features = ["v4_10"]
 
     permissions:
       contents: write       # needed to create/update the rolling release
@@ -82,7 +82,7 @@ jobs:
         body: |
           Automated build from the latest commit on `main`.
 
-          ## Installation (Ubuntu 22.04+)
+          ## Installation (Ubuntu 24.04+)
 
           **Option A — .deb package (recommended)**
           ```
@@ -99,7 +99,7 @@ jobs:
           ./vimcode-linux-x86_64
           ```
 
-          > Requires Ubuntu 22.04 or later (GTK 4.6+).
+          > Requires Ubuntu 24.04 or later (GTK 4.10+).
         prerelease: true
         make_latest: false         # don't overwrite a real tagged release's "latest" badge
         files: |

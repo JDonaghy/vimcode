@@ -10,7 +10,7 @@ maintainer = "VimCode contributors"
 copyright = "2024-2026, VimCode contributors"
 extended-description = "VimCode is a Vim-inspired code editor built with GTK4, featuring tree-sitter syntax highlighting, LSP support, and a built-in terminal."
 # GTK4 runtime libs — apt will install these if missing when the user runs `sudo apt -f install`
-depends = "libgtk-4-1 (>= 4.6), libglib2.0-0 (>= 2.68), libpango-1.0-0, libcairo2, libgdk-pixbuf-2.0-0, libgraphene-1.0-0"
+depends = "libgtk-4-1 (>= 4.10), libglib2.0-0 (>= 2.68), libpango-1.0-0, libcairo2, libgdk-pixbuf-2.0-0, libgraphene-1.0-0"
 section = "editors"
 priority = "optional"
 assets = [
