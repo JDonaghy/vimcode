@@ -2,9 +2,18 @@
 -- Shows author, relative date, and commit message as virtual text.
 
 local last_line = -1
+local last_path = ""
 
 vimcode.on("cursor_move", function(_)
   local cur = vimcode.buf.cursor()
+  local path = vimcode.buf.path()
+
+  -- Reset when switching to a different file (tab switch, window switch, etc.)
+  if path ~= last_path then
+    last_path = path
+    last_line = -1
+  end
+
   if cur.line == last_line then return end
   last_line = cur.line
   vimcode.buf.clear_annotations()

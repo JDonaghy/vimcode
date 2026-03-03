@@ -2631,6 +2631,7 @@ impl Engine {
         let tabs_len = self.active_group().tabs.len();
         if !self.active_group().tabs.is_empty() {
             self.active_group_mut().active_tab = (self.active_group().active_tab + 1) % tabs_len;
+            self.line_annotations.clear();
         }
     }
 
@@ -2640,6 +2641,7 @@ impl Engine {
             let at = self.active_group().active_tab;
             let tabs_len = self.active_group().tabs.len();
             self.active_group_mut().active_tab = if at == 0 { tabs_len - 1 } else { at - 1 };
+            self.line_annotations.clear();
         }
     }
 
@@ -2648,6 +2650,7 @@ impl Engine {
     pub fn goto_tab(&mut self, index: usize) {
         if index < self.active_group().tabs.len() {
             self.active_group_mut().active_tab = index;
+            self.line_annotations.clear();
         }
     }
 
