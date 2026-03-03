@@ -3004,6 +3004,10 @@ impl SimpleComponent for App {
                             }
                         }
 
+                        // Fire cursor_move hook so plugins (e.g. git-insights blame)
+                        // see the new cursor position after a mouse click.
+                        engine.fire_cursor_move_hook();
+
                         // Reveal the active file in the sidebar tree only when the
                         // active file actually changed (e.g. tab click), NOT on every
                         // editor click.  highlight_file_in_tree does a full DFS of the

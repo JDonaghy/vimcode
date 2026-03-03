@@ -9200,6 +9200,15 @@ impl Engine {
         self.apply_plugin_ctx(ctx);
     }
 
+    /// Fire the `cursor_move` plugin hook for the current cursor position.
+    /// Call this after any cursor movement that doesn't go through `handle_key()`
+    /// (e.g. file open, mouse click, session restore).
+    pub fn fire_cursor_move_hook(&mut self) {
+        let cursor = self.cursor();
+        let arg = format!("{},{}", cursor.line + 1, cursor.col + 1);
+        self.plugin_event("cursor_move", &arg);
+    }
+
     /// Try to run a named plugin command. Returns `true` if the command was found.
     pub fn plugin_run_command(&mut self, name: &str, args: &str) -> bool {
         if !self.settings.plugins_enabled {
@@ -14311,6 +14320,9 @@ impl Engine {
                 self.plugin_event("open", &path_str);
             }
         }
+        // Fire cursor_move so position-aware plugins (e.g. git-insights blame) annotate
+        // the initial cursor line immediately on file open without requiring a keypress.
+        self.fire_cursor_move_hook();
         if !self.settings.lsp_enabled {
             return;
         }

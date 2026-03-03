@@ -3758,6 +3758,9 @@ fn handle_mouse(
                     }
                     engine.mouse_click(rw.window_id, buf_line, col_in_text);
                 }
+                // Fire cursor_move hook so plugins (e.g. git-insights blame) see
+                // the new cursor position after a mouse click on a buffer line.
+                engine.fire_cursor_move_hook();
                 return sidebar_width;
             }
         }
