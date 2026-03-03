@@ -910,6 +910,153 @@ pub fn git_log(dir: &Path, limit: usize) -> Vec<GitLogEntry> {
         .collect()
 }
 
+// ─── blame_line / log_file (for Lua plugin API) ───────────────────────────────
+
+/// Parsed blame information for a single line.
+#[derive(Debug, Clone)]
+pub struct BlameInfo {
+    /// Short (8-char) commit hash.
+    pub hash: String,
+    /// Commit author name.
+    pub author: String,
+    /// Unix timestamp of the commit.
+    pub timestamp: i64,
+    /// Commit subject line.
+    pub message: String,
+    /// Human-readable relative date (e.g. "3 days ago").
+    pub relative_date: String,
+}
+
+/// Return blame information for a single 1-indexed line using
+/// `git blame -L {line},{line} --porcelain -- {file}`.
+/// Returns `None` when the file is untracked, has no commits, or any git
+/// failure occurs.
+pub fn blame_line(repo_root: &Path, file: &Path, line: usize) -> Option<BlameInfo> {
+    let line_spec = format!("{},{}", line, line);
+    let file_str = file.to_str()?;
+    let raw = run_git(
+        repo_root,
+        &["blame", "-L", &line_spec, "--porcelain", "--", file_str],
+    )?;
+    if raw.trim().is_empty() {
+        return None;
+    }
+
+    let mut hash = String::new();
+    let mut author = String::new();
+    let mut timestamp: i64 = 0;
+    let mut summary = String::new();
+
+    for blame_line in raw.lines() {
+        if let Some(s) = blame_line.strip_prefix("summary ") {
+            summary = s.to_string();
+        } else if let Some(a) = blame_line.strip_prefix("author ") {
+            author = a.to_string();
+        } else if let Some(t) = blame_line.strip_prefix("author-time ") {
+            timestamp = t.trim().parse().unwrap_or(0);
+        } else {
+            // Header line: 40 hex chars followed by space + line numbers
+            let bytes = blame_line.as_bytes();
+            if bytes.len() >= 42
+                && bytes[40] == b' '
+                && bytes[..40].iter().all(|&b| b.is_ascii_hexdigit())
+            {
+                hash = blame_line[..8].to_string();
+            }
+        }
+    }
+
+    if hash.is_empty() {
+        return None;
+    }
+
+    // Compute relative date from timestamp
+    let relative_date = epoch_to_relative(timestamp);
+
+    Some(BlameInfo {
+        hash,
+        author,
+        timestamp,
+        message: summary,
+        relative_date,
+    })
+}
+
+/// Convert a Unix timestamp into a human-readable relative string
+/// (e.g. "just now", "3 hours ago", "2 days ago", "1 week ago", "Mar 2026").
+fn epoch_to_relative(ts: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let diff = now.saturating_sub(ts);
+    if diff < 60 {
+        "just now".to_string()
+    } else if diff < 3600 {
+        let m = diff / 60;
+        if m == 1 {
+            "1 minute ago".to_string()
+        } else {
+            format!("{} minutes ago", m)
+        }
+    } else if diff < 86400 {
+        let h = diff / 3600;
+        if h == 1 {
+            "1 hour ago".to_string()
+        } else {
+            format!("{} hours ago", h)
+        }
+    } else if diff < 7 * 86400 {
+        let d = diff / 86400;
+        if d == 1 {
+            "1 day ago".to_string()
+        } else {
+            format!("{} days ago", d)
+        }
+    } else if diff < 30 * 86400 {
+        let w = diff / (7 * 86400);
+        if w == 1 {
+            "1 week ago".to_string()
+        } else {
+            format!("{} weeks ago", w)
+        }
+    } else if diff < 365 * 86400 {
+        let mo = diff / (30 * 86400);
+        if mo == 1 {
+            "1 month ago".to_string()
+        } else {
+            format!("{} months ago", mo)
+        }
+    } else {
+        // Fall back to a YYYY-MM format
+        epoch_to_date(ts)[..7].to_string()
+    }
+}
+
+/// Return the last `limit` commits for a specific file as `GitLogEntry` items.
+/// Uses `git log --oneline -N -- <file>`.
+pub fn log_file(repo_root: &Path, file: &Path, limit: usize) -> Vec<GitLogEntry> {
+    let limit_str = format!("-{}", limit);
+    let file_str = match file.to_str() {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+    let output = match run_git(repo_root, &["log", "--oneline", &limit_str, "--", file_str]) {
+        Some(o) => o,
+        None => return Vec::new(),
+    };
+    output
+        .lines()
+        .filter_map(|line| {
+            let (hash, rest) = line.split_once(' ')?;
+            Some(GitLogEntry {
+                hash: hash.to_string(),
+                message: rest.to_string(),
+            })
+        })
+        .collect()
+}
+
 /// Return `(ahead, behind)` commit counts relative to the upstream branch.
 pub fn ahead_behind(dir: &Path) -> (u32, u32) {
     let out = match run_git(dir, &["rev-list", "--left-right", "--count", "HEAD...@{u}"]) {
@@ -963,6 +1110,103 @@ worktree /home/user/project-feat\nHEAD def456\nbranch refs/heads/feature/auth\n\
         assert!(!entries[1].is_main);
         assert_eq!(entries[1].branch.as_deref(), Some("feature/auth"));
     }
+
+    #[test]
+    fn test_blame_line_porcelain_parses() {
+        // Synthesise a minimal porcelain blame output for one line.
+        let raw = "\
+abc123456789012345678901234567890abc1234 1 1 1\n\
+author Alice Smith\n\
+author-mail <alice@example.com>\n\
+author-time 1700000000\n\
+author-tz +0000\n\
+committer Alice Smith\n\
+committer-mail <alice@example.com>\n\
+committer-time 1700000000\n\
+committer-tz +0000\n\
+summary Fix a bug\n\
+filename src/main.rs\n\
+\tlet x = 1;\n";
+
+        let info = parse_blame_line_porcelain(raw).expect("should parse");
+        assert_eq!(info.hash, "abc12345");
+        assert_eq!(info.author, "Alice Smith");
+        assert_eq!(info.timestamp, 1_700_000_000);
+        assert_eq!(info.message, "Fix a bug");
+        assert!(!info.relative_date.is_empty());
+    }
+
+    #[test]
+    fn test_blame_line_porcelain_empty_returns_none() {
+        assert!(parse_blame_line_porcelain("").is_none());
+        assert!(parse_blame_line_porcelain("no hash here\n").is_none());
+    }
+
+    #[test]
+    fn test_epoch_to_relative_just_now() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        assert_eq!(epoch_to_relative(now), "just now");
+    }
+
+    #[test]
+    fn test_epoch_to_relative_days() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        // 3 days ago
+        let ts = now - 3 * 86400;
+        assert_eq!(epoch_to_relative(ts), "3 days ago");
+    }
+
+    #[test]
+    fn test_epoch_to_relative_old() {
+        // Far in the past — should return YYYY-MM format
+        let result = epoch_to_relative(0); // Unix epoch: 1970-01
+        assert!(result.starts_with("1970"), "expected YYYY-MM, got {result}");
+    }
+}
+
+/// Unit-testable helper — parse a `git blame --porcelain` output for a single
+/// line as if called by `blame_line`. Defined after `mod sc_tests` so that
+/// `use super::*` inside the module can pick it up.
+#[cfg(test)]
+pub(crate) fn parse_blame_line_porcelain(raw: &str) -> Option<BlameInfo> {
+    let mut hash = String::new();
+    let mut author = String::new();
+    let mut timestamp: i64 = 0;
+    let mut summary = String::new();
+
+    for line in raw.lines() {
+        if let Some(s) = line.strip_prefix("summary ") {
+            summary = s.to_string();
+        } else if let Some(a) = line.strip_prefix("author ") {
+            author = a.to_string();
+        } else if let Some(t) = line.strip_prefix("author-time ") {
+            timestamp = t.trim().parse().unwrap_or(0);
+        } else {
+            let bytes = line.as_bytes();
+            if bytes.len() >= 42
+                && bytes[40] == b' '
+                && bytes[..40].iter().all(|&b| b.is_ascii_hexdigit())
+            {
+                hash = line[..8].to_string();
+            }
+        }
+    }
+    if hash.is_empty() {
+        return None;
+    }
+    Some(BlameInfo {
+        relative_date: epoch_to_relative(timestamp),
+        hash,
+        author,
+        timestamp,
+        message: summary,
+    })
 }
 
 /// Exposed for testing — same parse logic as `worktree_list` but on a string.

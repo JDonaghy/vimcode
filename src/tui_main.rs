@@ -115,6 +115,7 @@ enum TuiPanel {
     Settings,
     Debug,
     Git,
+    Extensions,
 }
 
 // ─── Sidebar data structures ──────────────────────────────────────────────────
@@ -1044,6 +1045,10 @@ fn event_loop(
                 sidebar.visible = true;
                 needs_redraw = true;
             }
+            // Poll for completed extension registry fetch.
+            if engine.poll_ext_registry() {
+                needs_redraw = true;
+            }
             continue;
         }
 
@@ -1494,6 +1499,36 @@ fn event_loop(
                         if let Some(name) = key_name {
                             engine.handle_debug_sidebar_key(name, ctrl);
                             if !engine.dap_sidebar_has_focus {
+                                sidebar.has_focus = false;
+                            }
+                        }
+                        needs_redraw = true;
+                        continue;
+                    }
+
+                    // ── Extensions panel keyboard handling ──────────────────
+                    if sidebar.active_panel == TuiPanel::Extensions {
+                        let (key_name, unicode): (&str, Option<char>) = match key_event.code {
+                            KeyCode::Char('j') | KeyCode::Down => ("j", None),
+                            KeyCode::Char('k') | KeyCode::Up => ("k", None),
+                            KeyCode::Tab => ("Tab", None),
+                            KeyCode::Enter => ("Return", None),
+                            KeyCode::Char('d') => ("d", None),
+                            KeyCode::Char('r') => ("r", None),
+                            KeyCode::Char('/') => ("/", None),
+                            KeyCode::Char('q') | KeyCode::Esc => ("Escape", None),
+                            KeyCode::Backspace => ("BackSpace", None),
+                            KeyCode::Char(ch) => ("char", Some(ch)),
+                            _ => ("", None),
+                        };
+                        if !key_name.is_empty() {
+                            let ch = if key_name == "char" { unicode } else { None };
+                            engine.handle_ext_sidebar_key(
+                                if key_name == "char" { "" } else { key_name },
+                                ctrl,
+                                ch,
+                            );
+                            if !engine.ext_sidebar_has_focus {
                                 sidebar.has_focus = false;
                             }
                         }
@@ -3124,7 +3159,8 @@ fn handle_mouse(
             2 => Some(TuiPanel::Search),
             3 => Some(TuiPanel::Debug),
             4 => Some(TuiPanel::Git),
-            r if r == settings_row && settings_row >= 5 => Some(TuiPanel::Settings),
+            5 => Some(TuiPanel::Extensions),
+            r if r == settings_row && settings_row >= 6 => Some(TuiPanel::Settings),
             _ => None,
         };
         if let Some(panel) = target_panel {
@@ -3139,6 +3175,13 @@ fn handle_mouse(
                 }
                 if panel == TuiPanel::Git {
                     engine.sc_refresh();
+                }
+                if panel == TuiPanel::Extensions {
+                    engine.ext_sidebar_has_focus = true;
+                    if engine.ext_registry.is_none() && !engine.ext_registry_fetching {
+                        engine.ext_refresh();
+                    }
+                    sidebar.has_focus = true;
                 }
             }
             engine.session.explorer_visible = sidebar.visible;
@@ -5924,6 +5967,20 @@ fn render_text_line(
         let bg = char_bgs[i].map(rc).unwrap_or(window_bg);
         set_cell(buf, x_start + col, y, chars[i], fg, bg);
     }
+
+    // Inline annotation / virtual text (e.g. git blame)
+    if let Some(ann) = &line.annotation {
+        let visible_chars = chars.len().saturating_sub(scroll_left);
+        let ann_start = x_start + visible_chars.min(max_width as usize) as u16;
+        let ann_fg = rc(theme.annotation_fg);
+        for (i, ch) in ann.chars().enumerate() {
+            let col = ann_start + i as u16;
+            if col >= x_start + max_width {
+                break;
+            }
+            set_cell(buf, col, y, ch, ann_fg, window_bg);
+        }
+    }
 }
 
 fn render_selection(
@@ -6392,12 +6449,13 @@ fn render_activity_bar(
         }
     }
 
-    // Top buttons: Explorer (row 1), Search (row 2), Debug (row 3), Git (row 4)
+    // Top buttons: Explorer (row 1), Search (row 2), Debug (row 3), Git (row 4), Extensions (row 5)
     let top_buttons: &[(u16, TuiPanel, char)] = &[
-        (1, TuiPanel::Explorer, '\u{f07c}'), // nf-fa-folder_open
-        (2, TuiPanel::Search, '\u{f002}'),   // nf-fa-search
-        (3, TuiPanel::Debug, '\u{f188}'),    // nf-fa-bug
-        (4, TuiPanel::Git, '\u{e702}'),      // nf-dev-git_branch
+        (1, TuiPanel::Explorer, '\u{f07c}'),   // nf-fa-folder_open
+        (2, TuiPanel::Search, '\u{f002}'),     // nf-fa-search
+        (3, TuiPanel::Debug, '\u{f188}'),      // nf-fa-bug
+        (4, TuiPanel::Git, '\u{e702}'),        // nf-dev-git_branch
+        (5, TuiPanel::Extensions, '\u{eb85}'), // nf-cod-extensions
     ];
 
     for &(row_off, panel, icon) in top_buttons {
@@ -6475,6 +6533,12 @@ fn render_sidebar(
     // Source Control panel
     if sidebar.active_panel == TuiPanel::Git {
         render_source_control(buf, area, engine, theme);
+        return;
+    }
+
+    // Extensions panel
+    if sidebar.active_panel == TuiPanel::Extensions {
+        render_ext_sidebar(buf, area, engine, theme);
         return;
     }
 
@@ -7772,6 +7836,185 @@ fn render_source_control(
         }
     }
     let _ = (row_y, flat_row); // consumed by rendering loop
+}
+
+// ─── Extensions sidebar panel ─────────────────────────────────────────────────
+
+/// Render the Extensions sidebar panel.
+fn render_ext_sidebar(
+    buf: &mut ratatui::buffer::Buffer,
+    area: Rect,
+    engine: &Engine,
+    theme: &Theme,
+) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+
+    let screen = render::build_screen_layout(engine, theme, &[], 1.0, 1.0);
+    let Some(ref ext) = screen.ext_sidebar else {
+        return;
+    };
+
+    let header_fg = rc(theme.status_fg);
+    let header_bg = rc(theme.status_bg);
+    let sec_bg = ratatui::style::Color::Rgb(
+        (theme.status_bg.r as f64 * 0.85) as u8,
+        (theme.status_bg.g as f64 * 0.85) as u8,
+        (theme.status_bg.b as f64 * 0.85) as u8,
+    );
+    let default_fg = rc(theme.foreground);
+    let dim_fg = rc(theme.line_number_fg);
+    let sel_bg = rc(theme.fuzzy_selected_bg);
+    let panel_bg = rc(theme.completion_bg);
+
+    // Helper: fill one row then write text chars
+    let write_row =
+        |buf: &mut ratatui::buffer::Buffer, y: u16, text: &str, fg: RColor, bg: RColor| {
+            for x in area.x..area.x + area.width {
+                set_cell(buf, x, y, ' ', fg, bg);
+            }
+            for (i, ch) in text.chars().enumerate().take(area.width as usize) {
+                set_cell(buf, area.x + i as u16, y, ch, fg, bg);
+            }
+        };
+
+    let mut y = area.y;
+
+    // ── Row 0: header ────────────────────────────────────────────────────────
+    if y < area.y + area.height {
+        let hdr = if ext.fetching {
+            " \u{eb85} EXTENSIONS  (fetching…)".to_string()
+        } else {
+            " \u{eb85} EXTENSIONS".to_string()
+        };
+        write_row(buf, y, &hdr, header_fg, header_bg);
+        y += 1;
+    }
+
+    // ── Row 1: search box ─────────────────────────────────────────────────────
+    if y < area.y + area.height {
+        let search_bg = if ext.input_active { sel_bg } else { panel_bg };
+        let search_fg = if ext.input_active || !ext.query.is_empty() {
+            default_fg
+        } else {
+            dim_fg
+        };
+        let search_text = if ext.input_active {
+            format!(" \u{f002} {}|", ext.query)
+        } else if ext.query.is_empty() {
+            " \u{f002} Search extensions (press /)".to_string()
+        } else {
+            format!(" \u{f002} {}", ext.query)
+        };
+        write_row(buf, y, &search_text, search_fg, search_bg);
+        y += 1;
+    }
+
+    // ── INSTALLED section ─────────────────────────────────────────────────────
+    let installed_count = ext.items_installed.len();
+    if y < area.y + area.height {
+        let arrow = if ext.sections_expanded[0] {
+            '▼'
+        } else {
+            '▶'
+        };
+        let sec_hdr = format!("  {} INSTALLED ({})", arrow, installed_count);
+        write_row(buf, y, &sec_hdr, dim_fg, sec_bg);
+        y += 1;
+    }
+
+    if ext.sections_expanded[0] {
+        for (idx, item) in ext.items_installed.iter().enumerate() {
+            if y >= area.y + area.height {
+                break;
+            }
+            let is_sel = ext.has_focus && ext.selected == idx;
+            let (fg, bg) = if is_sel {
+                (panel_bg, default_fg)
+            } else {
+                (default_fg, panel_bg)
+            };
+            write_row(buf, y, &format!("  ● {}", item.display_name), fg, bg);
+            // Right-aligned hint
+            let hint = "[d] remove";
+            let hint_start = area.x + area.width.saturating_sub(hint.len() as u16 + 1);
+            for (i, ch) in hint.chars().enumerate() {
+                let cx = hint_start + i as u16;
+                if cx < area.x + area.width {
+                    set_cell(buf, cx, y, ch, dim_fg, bg);
+                }
+            }
+            y += 1;
+        }
+        if installed_count == 0 && y < area.y + area.height {
+            write_row(buf, y, "    (none installed)", dim_fg, panel_bg);
+            y += 1;
+        }
+    }
+
+    // ── AVAILABLE section ─────────────────────────────────────────────────────
+    let installed_section_len = if ext.sections_expanded[0] {
+        installed_count.max(1)
+    } else {
+        0
+    };
+    let available_count = ext.items_available.len();
+    if y < area.y + area.height {
+        let arrow = if ext.sections_expanded[1] {
+            '▼'
+        } else {
+            '▶'
+        };
+        let sec_hdr = format!("  {} AVAILABLE ({})", arrow, available_count);
+        write_row(buf, y, &sec_hdr, dim_fg, sec_bg);
+        y += 1;
+    }
+
+    if ext.sections_expanded[1] {
+        for (idx, item) in ext.items_available.iter().enumerate() {
+            if y >= area.y + area.height {
+                break;
+            }
+            let flat_idx = installed_section_len + idx;
+            let is_sel = ext.has_focus && ext.selected == flat_idx;
+            let (fg, bg) = if is_sel {
+                (panel_bg, default_fg)
+            } else {
+                (default_fg, panel_bg)
+            };
+            write_row(buf, y, &format!("  ○ {}", item.display_name), fg, bg);
+            // Right-aligned hint
+            let hint = "[Enter] install";
+            let hint_start = area.x + area.width.saturating_sub(hint.len() as u16 + 1);
+            for (i, ch) in hint.chars().enumerate() {
+                let cx = hint_start + i as u16;
+                if cx < area.x + area.width {
+                    set_cell(buf, cx, y, ch, dim_fg, bg);
+                }
+            }
+            y += 1;
+        }
+        if available_count == 0 && y < area.y + area.height {
+            let msg = if ext.fetching {
+                "    Fetching registry…"
+            } else {
+                "    (all installed)"
+            };
+            write_row(buf, y, msg, dim_fg, panel_bg);
+            y += 1;
+        }
+    }
+
+    // Fill remainder with panel_bg
+    while y < area.y + area.height {
+        for x in area.x..area.x + area.width {
+            set_cell(buf, x, y, ' ', dim_fg, panel_bg);
+        }
+        y += 1;
+    }
+
+    let _ = (installed_section_len, sel_bg);
 }
 
 // ─── Debug sidebar panel ──────────────────────────────────────────────────────

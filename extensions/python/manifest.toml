@@ -1,0 +1,15 @@
+name = "python"
+display_name = "Python Language Support"
+description = "LSP and debugger for Python"
+version = "1.0.0"
+file_extensions = [".py", ".pyi", ".pyw"]
+language_ids = ["python"]
+
+[lsp]
+binary = "pyright-langserver"
+install = "npm install -g pyright"
+
+[dap]
+adapter = "debugpy"
+
+scripts = []

@@ -2137,6 +2137,7 @@ dependencies = [
  "ropey",
  "serde",
  "serde_json",
+ "toml",
  "tree-sitter",
  "tree-sitter-bash",
  "tree-sitter-c",

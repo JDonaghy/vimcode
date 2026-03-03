@@ -3,8 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use super::lsp::{
-    language_id_from_path, mason_package_for_language, parse_mason_package_yaml, path_to_uri,
-    LspEvent, LspServer, LspServerConfig, LspServerId, MasonPackageInfo,
+    language_id_from_path, path_to_uri, LspEvent, LspServer, LspServerConfig, LspServerId,
 };
 
 // ---------------------------------------------------------------------------
@@ -207,8 +206,6 @@ pub struct LspManager {
     event_rx: Receiver<LspEvent>,
     /// Track which servers have completed initialization
     initialized: HashMap<LspServerId, bool>,
-    /// In-memory cache of Mason registry lookups (keyed by language ID).
-    pub registry_cache: HashMap<String, MasonPackageInfo>,
 }
 
 impl LspManager {
@@ -237,7 +234,6 @@ impl LspManager {
             event_tx,
             event_rx,
             initialized: HashMap::new(),
-            registry_cache: HashMap::new(),
         }
     }
 
@@ -281,49 +277,6 @@ impl LspManager {
     /// Add a server config to the in-memory registry (does not persist to disk).
     pub fn add_registry_entry(&mut self, config: LspServerConfig) {
         self.registry.push(config);
-    }
-
-    /// Spawn a background thread to fetch Mason registry metadata for a language.
-    /// The result is sent as `LspEvent::RegistryLookup` on the shared channel.
-    pub fn fetch_mason_registry_for_language(&self, lang_id: &str) {
-        let pkg_name = match mason_package_for_language(lang_id) {
-            Some(p) => p,
-            None => {
-                // No Mason mapping — send None immediately
-                let _ = self.event_tx.send(LspEvent::RegistryLookup {
-                    lang_id: lang_id.to_string(),
-                    info: None,
-                });
-                return;
-            }
-        };
-        let tx = self.event_tx.clone();
-        let lang_id = lang_id.to_string();
-        let pkg_name = pkg_name.to_string();
-        std::thread::spawn(move || {
-            let url = format!(
-                "https://raw.githubusercontent.com/mason-org/mason-registry/main/packages/{pkg_name}/package.yaml"
-            );
-            let output = std::process::Command::new("curl")
-                .args(["-sf", "--max-time", "10", &url])
-                .output();
-            match output {
-                Ok(out) if out.status.success() => {
-                    let yaml = String::from_utf8_lossy(&out.stdout);
-                    let info = parse_mason_package_yaml(&yaml);
-                    let _ = tx.send(LspEvent::RegistryLookup {
-                        lang_id,
-                        info: Some(info),
-                    });
-                }
-                _ => {
-                    let _ = tx.send(LspEvent::RegistryLookup {
-                        lang_id,
-                        info: None,
-                    });
-                }
-            }
-        });
     }
 
     /// Spawn a background thread to run an install command.

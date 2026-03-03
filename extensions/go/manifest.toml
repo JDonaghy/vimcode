@@ -1,0 +1,15 @@
+name = "go"
+display_name = "Go Language Support"
+description = "LSP and debugger for Go"
+version = "1.0.0"
+file_extensions = [".go"]
+language_ids = ["go"]
+
+[lsp]
+binary = "gopls"
+install = "go install golang.org/x/tools/gopls@latest"
+
+[dap]
+adapter = "delve"
+
+scripts = []

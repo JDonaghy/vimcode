@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Mar 2, 2026 (Session 112 — :set wrap fix + release pipeline) | **Tests:** 1078
+**Last updated:** Mar 3, 2026 (Session 114 — Extensions Sidebar Panel + GitHub Registry) | **Tests:** 1125
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 72 are in **SESSION_HISTORY.md**.
@@ -25,6 +25,34 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 114 — Extensions Sidebar Panel + GitHub Registry (16 new tests, 1125 total):**
+VSCode-style Extensions sidebar + first-party GitHub-hosted registry replacing Mason.
+- **`extensions/registry.json`**: JSON array of all 11 extension manifests for remote registry
+- **`extensions/*/README.md`**: Per-extension docs for GitHub Pages browsing (11 files)
+- **`src/core/registry.rs`**: `fetch_registry()` + `download_script()` + `REGISTRY_URL`/`FILES_BASE_URL` constants
+- **`src/core/settings.rs`**: `extension_registry_url` field with GitHub raw default
+- **Engine fields**: `ext_registry`, `ext_registry_fetching`, `ext_registry_rx`, `ext_sidebar_has_focus`, `ext_sidebar_selected`, `ext_sidebar_query`, `ext_sidebar_sections_expanded`, `ext_sidebar_input_active`, `prompted_extensions`
+- **Engine methods**: `ext_available_manifests()` (registry overrides bundled), `ext_refresh()` (background thread), `poll_ext_registry()`, `handle_ext_sidebar_key()`, `ext_install_from_registry()`, `ext_remove()`
+- **New commands**: `:ExtRemove <name>`, `:ExtRefresh`; `:LspInstall`/`:DapInstall` redirect to `:ExtInstall`
+- **Mason registry removed** from `lsp_manager.rs`: `fetch_mason_registry_for_language()`, `registry_cache`, `LspEvent::RegistryLookup` all deleted
+- **`src/render.rs`**: `ExtSidebarItem`, `ExtSidebarData` structs; `build_ext_sidebar_data()`; `ScreenLayout.ext_sidebar`
+- **GTK `src/main.rs`**: `SidebarPanel::Extensions`, `ext_sidebar_da_ref`, activity bar icon (󱧅), `draw_ext_sidebar()`, `Msg::ExtSidebarKey`/`Msg::ExtSidebarClick` handlers, auto-refresh on panel switch
+- **TUI `src/tui_main.rs`**: `TuiPanel::Extensions`, `render_ext_sidebar()`, activity bar row 5, key routing, poll_ext_registry in event loop
+- **Tests**: `tests/extensions.rs` expanded from 16 → 30 tests (`:ExtRemove`, registry merge, sidebar state, `:LspInstall` redirect, `:ExtRefresh`)
+
+**Session 113 — Extension/Language Pack System (31 new tests, 1109 total):**
+Full VSCode-style extension system: language packs bundle LSP + DAP + Lua scripts into named packages.
+- **11 bundled extensions**: csharp, python, rust, javascript, go, java, cpp, php, ruby, bash, git-insights
+- **`src/core/extensions.rs`**: `BundledExtension`, `ExtensionManifest`, `BUNDLED` array; manifests compiled in via `include_str!()`; `find_by_name/find_for_file_ext/find_for_language_id` helpers
+- **`ExtensionState`** in `session.rs`: installed/dismissed persistence to `~/.config/vimcode/extensions.json`
+- **Engine**: `:ExtInstall/:ExtList/:ExtEnable/:ExtDisable` commands; auto-detect hint on file open when no LSP + extension available; `line_annotations: HashMap<usize, String>` for virtual text (cleared on file switch)
+- **`src/render.rs`**: `RenderedLine.annotation: Option<String>`; `Theme.annotation_fg` (#5c6370 muted grey)
+- **GTK + TUI backends**: render annotations as dim text after line content
+- **`src/core/git.rs`**: `BlameInfo` struct; `blame_line()` via `git blame -L n,n --porcelain`; `epoch_to_relative()` for human dates; `log_file()` with file filter
+- **`src/core/plugin.rs`**: `vimcode.buf.cursor()/annotate_line()/clear_annotations()`; `vimcode.git.blame_line()/log_file()`; `cursor_move` event hook; scripts loaded from `~/.config/vimcode/extensions/` dirs
+- **`extensions/git-insights/blame.lua`**: inline blame annotation on cursor move + `:GitLog` command
+- **Tests**: `tests/extensions.rs` (16 integration tests); `engine_with()` now resets `extension_state` for hermeticity; fixed 41-char test hash bug in git.rs blame parser
 
 **Session 112 — :set wrap fix + release pipeline (4 new tests, 1078 total):**
 - Fixed `:set wrap` rendering: `build_rendered_window` now computes accurate `render_viewport_cols` from `rect.width / char_width - gutter_char_width` instead of the stored `view.viewport_cols` (which used a hardcoded 9.0 px estimate). Fixes wrap only working when buffer lacked GTK focus.

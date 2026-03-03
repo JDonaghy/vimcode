@@ -1,0 +1,7 @@
+name = "git-insights"
+display_name = "Git Insights"
+description = "Inline git blame annotations and per-line blame, file history"
+version = "1.0.0"
+file_extensions = []
+language_ids = []
+scripts = ["blame.lua"]

@@ -131,6 +131,9 @@ pub struct RenderedLine {
     /// Character offset within the buffer line where this visual segment begins.
     /// 0 for non-wrapped lines and the first visual segment of a wrapped line.
     pub segment_col_offset: usize,
+    /// Optional inline annotation (virtual text) shown after line content in a
+    /// muted colour. Set by Lua plugins via `vimcode.buf.annotate_line()`.
+    pub annotation: Option<String>,
 }
 
 /// A single diagnostic mark on a rendered line (for inline underlines/squiggles).
@@ -467,6 +470,44 @@ pub struct SourceControlData {
     pub commit_input_active: bool,
     /// Which action button is keyboard-focused (0=Commit 1=Push 2=Pull 3=Sync), or None.
     pub button_focused: Option<usize>,
+}
+
+// ─── ExtSidebarData ───────────────────────────────────────────────────────────
+
+/// A single extension item in the Extensions sidebar.
+#[derive(Debug, Clone)]
+pub struct ExtSidebarItem {
+    pub name: String,
+    pub display_name: String,
+    pub description: String,
+    /// LSP binary name (empty string if none).
+    pub lsp_binary: String,
+    /// DAP adapter name (empty string if none).
+    pub dap_adapter: String,
+    /// Number of bundled Lua scripts.
+    pub script_count: usize,
+    pub installed: bool,
+}
+
+/// Rendering data for the Extensions sidebar panel.
+#[derive(Debug, Clone)]
+pub struct ExtSidebarData {
+    /// Installed extensions (filtered by query).
+    pub items_installed: Vec<ExtSidebarItem>,
+    /// Available (not yet installed) extensions (filtered by query).
+    pub items_available: Vec<ExtSidebarItem>,
+    /// Whether each section is expanded: [installed, available].
+    pub sections_expanded: [bool; 2],
+    /// Flat selection index (installed items first, then available).
+    pub selected: usize,
+    /// Whether the panel currently has keyboard focus.
+    pub has_focus: bool,
+    /// Current search query string.
+    pub query: String,
+    /// Whether the search input is in active edit mode.
+    pub input_active: bool,
+    /// True while a background registry fetch is in-flight.
+    pub fetching: bool,
 }
 
 /// Always present in `ScreenLayout`; each section may be empty.
@@ -1236,6 +1277,8 @@ pub struct ScreenLayout {
     /// When the editor is split into two groups, this carries group 1's tab bar
     /// and split geometry. `None` in the default single-group mode.
     pub editor_group_split: Option<EditorGroupSplitData>,
+    /// Extensions sidebar data — `Some` when the Extensions panel is the active sidebar panel.
+    pub ext_sidebar: Option<ExtSidebarData>,
 }
 
 // ─── Theme ────────────────────────────────────────────────────────────────────
@@ -1276,6 +1319,9 @@ pub struct Theme {
     // Yank highlight flash
     pub yank_highlight_bg: Color,
     pub yank_highlight_alpha: f64,
+
+    // Virtual text / line annotations (e.g. git blame inline)
+    pub annotation_fg: Color,
 
     // Tab bar
     pub tab_bar_bg: Color,
@@ -1442,6 +1488,9 @@ impl Theme {
             // Yank highlight flash (green, matching Neovim default)
             yank_highlight_bg: Color::from_hex("#57d45e"),
             yank_highlight_alpha: 0.35,
+
+            // Virtual text annotations (muted grey — matches comment colour)
+            annotation_fg: Color::from_hex("#5c6370"),
         }
     }
 
@@ -1980,6 +2029,8 @@ pub fn build_screen_layout(
         None
     };
 
+    let ext_sidebar = build_ext_sidebar_data(engine);
+
     ScreenLayout {
         tab_bar,
         windows,
@@ -2000,6 +2051,7 @@ pub fn build_screen_layout(
         source_control,
         command_palette,
         editor_group_split,
+        ext_sidebar,
     }
 }
 
@@ -2069,6 +2121,63 @@ fn build_source_control_data(engine: &Engine) -> Option<SourceControlData> {
         commit_message: engine.sc_commit_message.clone(),
         commit_input_active: engine.sc_commit_input_active,
         button_focused: engine.sc_button_focused,
+    })
+}
+
+fn build_ext_sidebar_data(engine: &Engine) -> Option<ExtSidebarData> {
+    // Always build so backends can check ext_sidebar_has_focus.
+    let manifest_to_item =
+        |m: &crate::core::extensions::ExtensionManifest, installed: bool| -> ExtSidebarItem {
+            ExtSidebarItem {
+                name: m.name.clone(),
+                display_name: if m.display_name.is_empty() {
+                    m.name.clone()
+                } else {
+                    m.display_name.clone()
+                },
+                description: m.description.clone(),
+                lsp_binary: m.lsp.binary.clone(),
+                dap_adapter: m.dap.adapter.clone(),
+                script_count: m.scripts.len(),
+                installed,
+            }
+        };
+
+    let items_installed: Vec<ExtSidebarItem> = engine
+        .ext_available_manifests()
+        .iter()
+        .filter(|m| engine.extension_state.is_installed(&m.name))
+        .filter(|m| {
+            let q = engine.ext_sidebar_query.to_lowercase();
+            q.is_empty()
+                || m.name.to_lowercase().contains(&q)
+                || m.display_name.to_lowercase().contains(&q)
+        })
+        .map(|m| manifest_to_item(m, true))
+        .collect();
+
+    let items_available: Vec<ExtSidebarItem> = engine
+        .ext_available_manifests()
+        .iter()
+        .filter(|m| !engine.extension_state.is_installed(&m.name))
+        .filter(|m| {
+            let q = engine.ext_sidebar_query.to_lowercase();
+            q.is_empty()
+                || m.name.to_lowercase().contains(&q)
+                || m.display_name.to_lowercase().contains(&q)
+        })
+        .map(|m| manifest_to_item(m, false))
+        .collect();
+
+    Some(ExtSidebarData {
+        items_installed,
+        items_available,
+        sections_expanded: engine.ext_sidebar_sections_expanded,
+        selected: engine.ext_sidebar_selected,
+        has_focus: engine.ext_sidebar_has_focus,
+        query: engine.ext_sidebar_query.clone(),
+        input_active: engine.ext_sidebar_input_active,
+        fetching: engine.ext_registry_fetching,
     })
 }
 
@@ -2795,6 +2904,11 @@ fn build_rendered_window(
                     is_dap_current,
                     is_wrap_continuation: is_cont,
                     segment_col_offset: seg_start_char,
+                    annotation: if is_cont {
+                        None
+                    } else {
+                        engine.line_annotations.get(&line_idx).cloned()
+                    },
                 });
             }
         } else {
@@ -2814,6 +2928,7 @@ fn build_rendered_window(
                 is_dap_current,
                 is_wrap_continuation: false,
                 segment_col_offset: 0,
+                annotation: engine.line_annotations.get(&line_idx).cloned(),
             });
         }
 

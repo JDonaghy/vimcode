@@ -8,6 +8,7 @@ use super::dap_manager::{
     generate_launch_json, parse_launch_json, parse_tasks_json, task_to_shell_command,
     type_to_adapter, DapManager, LaunchConfig,
 };
+use super::extensions;
 use super::git;
 use super::lsp::{
     self, Diagnostic, DiagnosticSeverity, FormattingEdit, LspEvent, SignatureHelpData,
@@ -16,7 +17,8 @@ use super::lsp::{
 use super::lsp_manager::LspManager;
 use super::plugin;
 use super::project_search::{self, ProjectMatch, ReplaceResult, SearchError, SearchOptions};
-use super::session::{HistoryState, SessionGroupLayout, SessionState};
+use super::registry;
+use super::session::{ExtensionState, HistoryState, SessionGroupLayout, SessionState};
 use super::settings::{EditorMode, Settings};
 use super::tab::{Tab, TabId};
 use super::terminal::{default_shell, TerminalPane};
@@ -1036,6 +1038,38 @@ pub struct Engine {
     // --- Insert mode Ctrl+r pending ---
     /// When true, the next keypress in Insert (or Replace) mode inserts a register's content.
     pub insert_ctrl_r_pending: bool,
+
+    // --- Extension system ---
+    /// Which extensions are installed / dismissed (persisted to extensions.json).
+    pub extension_state: ExtensionState,
+    /// Extensions for which an install prompt was shown this session (avoids re-prompting).
+    pub prompted_extensions: HashSet<String>,
+
+    // --- Extension registry (remote) ---
+    /// Fetched remote registry entries (None until first :ExtRefresh or sidebar open).
+    pub ext_registry: Option<Vec<extensions::ExtensionManifest>>,
+    /// True while the background registry fetch thread is running.
+    pub ext_registry_fetching: bool,
+    /// Channel for receiving the registry fetch result from the background thread.
+    pub ext_registry_rx:
+        Option<std::sync::mpsc::Receiver<Option<Vec<extensions::ExtensionManifest>>>>,
+
+    // --- Extensions sidebar state ---
+    /// Whether the Extensions sidebar panel has keyboard focus.
+    pub ext_sidebar_has_focus: bool,
+    /// Flat selection index across installed + available items.
+    pub ext_sidebar_selected: usize,
+    /// Filter query typed in the sidebar search box.
+    pub ext_sidebar_query: String,
+    /// Which sections are expanded: [installed, available].
+    pub ext_sidebar_sections_expanded: [bool; 2],
+    /// Whether the sidebar search input field is active.
+    pub ext_sidebar_input_active: bool,
+
+    // --- Virtual text / line annotations ---
+    /// Inline annotation text indexed by 0-based buffer line number.
+    /// Cleared when the active buffer changes.
+    pub line_annotations: HashMap<usize, String>,
 }
 
 impl Engine {
@@ -1247,6 +1281,17 @@ impl Engine {
             last_inserted_text: String::new(),
             yank_highlight: None,
             insert_ctrl_r_pending: false,
+            extension_state: ExtensionState::load(),
+            prompted_extensions: HashSet::new(),
+            ext_registry: None,
+            ext_registry_fetching: false,
+            ext_registry_rx: None,
+            ext_sidebar_has_focus: false,
+            ext_sidebar_selected: 0,
+            ext_sidebar_query: String::new(),
+            ext_sidebar_sections_expanded: [true, true],
+            ext_sidebar_input_active: false,
+            line_annotations: HashMap::new(),
         };
         // If vscode mode is configured, start in Insert mode (no Normal mode)
         if engine.is_vscode_mode() {
@@ -2724,6 +2769,8 @@ impl Engine {
     /// This is the correct handler for sidebar file clicks — it never replaces
     /// the current tab's contents.
     pub fn open_file_in_tab(&mut self, path: &Path) {
+        // Clear per-buffer virtual text annotations when switching files.
+        self.line_annotations.clear();
         let buffer_id = match self.buffer_manager.open_file(path) {
             Ok(id) => id,
             Err(e) => {
@@ -3810,6 +3857,10 @@ impl Engine {
         let mut action = EngineAction::None;
         let was_normal = matches!(self.mode, Mode::Normal);
 
+        // Capture cursor position before dispatching (used by cursor_move hook below).
+        let pre_cursor_line = self.cursor().line;
+        let pre_cursor_col = self.cursor().col;
+
         match self.mode {
             Mode::Normal => {
                 action = self.handle_normal_key(key_name, unicode, ctrl, &mut changed);
@@ -3879,6 +3930,20 @@ impl Engine {
 
         self.ensure_cursor_visible();
         self.sync_scroll_binds();
+
+        // Fire cursor_move plugin hook when the cursor position changed.
+        // Only fire in Normal/Insert/Replace/Visual modes (not command-line).
+        if !matches!(self.mode, Mode::Command | Mode::Search) {
+            let (cur_line, cur_col) = {
+                let cur = self.cursor();
+                (cur.line, cur.col)
+            };
+            if cur_line != pre_cursor_line || cur_col != pre_cursor_col {
+                let arg = format!("{},{}", cur_line + 1, cur_col + 1);
+                self.plugin_event("cursor_move", &arg);
+            }
+        }
+
         action
     }
 
@@ -8980,13 +9045,43 @@ impl Engine {
             Ok(h) => h,
             Err(_) => return,
         };
-        let plugins_dir = PathBuf::from(home).join(".config/vimcode/plugins");
-        if !plugins_dir.exists() {
+        let config_base = PathBuf::from(&home).join(".config/vimcode");
+        let plugins_dir = config_base.join("plugins");
+        let extensions_dir = config_base.join("extensions");
+
+        // Create a plugin manager even if neither directory exists, so that
+        // extensions installed during this session can register commands.
+        let has_plugins = plugins_dir.exists();
+        let has_extensions = extensions_dir.exists();
+        if !has_plugins && !has_extensions {
             return;
         }
+
         match plugin::PluginManager::new() {
             Ok(mut mgr) => {
-                mgr.load_plugins_dir(&plugins_dir, &self.settings.disabled_plugins);
+                if has_plugins {
+                    mgr.load_plugins_dir(&plugins_dir, &self.settings.disabled_plugins);
+                }
+                // Load Lua scripts from each installed extension sub-directory.
+                if has_extensions {
+                    if let Ok(entries) = std::fs::read_dir(&extensions_dir) {
+                        let mut dirs: Vec<_> = entries
+                            .filter_map(|e| e.ok().map(|e| e.path()))
+                            .filter(|p| p.is_dir())
+                            .collect();
+                        dirs.sort();
+                        for ext_dir in dirs {
+                            let ext_name = ext_dir
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            if self.settings.disabled_plugins.contains(&ext_name) {
+                                continue;
+                            }
+                            mgr.load_plugins_dir(&ext_dir, &self.settings.disabled_plugins);
+                        }
+                    }
+                }
                 self.plugin_manager = Some(mgr);
             }
             Err(e) => {
@@ -8998,24 +9093,27 @@ impl Engine {
     /// Build a `PluginCallContext` from the current active buffer state.
     fn make_plugin_ctx(&self) -> plugin::PluginCallContext {
         let cwd = self.cwd.to_string_lossy().into_owned();
-        let buf_path = self
-            .buffer_manager
-            .get(self.active_buffer_id())
-            .and_then(|s| s.file_path.as_ref())
+        let buf_state = self.buffer_manager.get(self.active_buffer_id());
+        let buf_path_os = buf_state.as_ref().and_then(|s| s.file_path.clone());
+        let buf_path = buf_path_os
+            .as_ref()
             .map(|p| p.to_string_lossy().into_owned());
-        let buf_lines = self
-            .buffer_manager
-            .get(self.active_buffer_id())
+        let buf_lines = buf_state
             .map(|s| {
                 (0..s.buffer.len_lines())
                     .map(|i| s.buffer.content.line(i).to_string())
                     .collect()
             })
             .unwrap_or_default();
+        let cursor = self.cursor();
         plugin::PluginCallContext {
             cwd,
             buf_path,
             buf_lines,
+            cursor_line: cursor.line + 1,
+            cursor_col: cursor.col + 1,
+            cwd_path: Some(self.cwd.clone()),
+            buf_path_os,
             ..Default::default()
         }
     }
@@ -9047,6 +9145,15 @@ impl Engine {
                         state.dirty = true;
                     }
                 }
+            }
+        }
+        // Apply virtual-text line annotations
+        if ctx.clear_annotations {
+            self.line_annotations.clear();
+        }
+        for (line_1indexed, text) in ctx.annotate_lines {
+            if line_1indexed > 0 {
+                self.line_annotations.insert(line_1indexed - 1, text);
             }
         }
         for cmd in ctx.run_commands {
@@ -9135,28 +9242,18 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // Handle :DapInfo — show detected DAP adapters from Mason registry cache
+        // Handle :DapInfo — show available DAP adapters from installed extensions
         if cmd == "DapInfo" {
-            if let Some(mgr) = &self.lsp_manager {
-                let dap_langs: Vec<String> = mgr
-                    .registry_cache
-                    .iter()
-                    .filter(|(_, info)| info.is_dap())
-                    .map(|(lang, _)| lang.clone())
-                    .collect();
-                if dap_langs.is_empty() {
-                    self.message =
-                        "No DAP adapters detected (open a file to trigger registry lookup)"
-                            .to_string();
-                } else {
-                    let mut sorted = dap_langs;
-                    sorted.sort();
-                    self.message = format!("DAP adapters: {}", sorted.join(", "));
-                }
+            let adapters: Vec<String> = self
+                .ext_available_manifests()
+                .into_iter()
+                .filter(|m| self.extension_state.is_installed(&m.name) && !m.dap.adapter.is_empty())
+                .map(|m| format!("{} ({})", m.name, m.dap.adapter))
+                .collect();
+            if adapters.is_empty() {
+                self.message = "No DAP-capable extensions installed — use :ExtInstall".to_string();
             } else {
-                self.message =
-                    "LSP manager not started — open a file first to initialise Mason registry"
-                        .to_string();
+                self.message = format!("DAP extensions: {}", adapters.join(", "));
             }
             return EngineAction::None;
         }
@@ -9271,54 +9368,50 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // Handle :DapInstall <lang> — install a DAP adapter via Mason
+        // Handle :DapInstall <lang> — redirect to extension system
         if let Some(lang_id) = cmd.strip_prefix("DapInstall").map(|s| s.trim()) {
             if lang_id.is_empty() {
                 self.message = "Usage: :DapInstall <language>  (e.g. :DapInstall rust)".to_string();
                 return EngineAction::None;
             }
-            // Check the built-in adapter registry for this language
-            let adapter_info = match super::dap_manager::DapManager::adapter_for_language(lang_id) {
-                Some(info) => info,
-                None => {
-                    self.message = format!(
-                            "No built-in DAP adapter for '{lang_id}' (supported: rust, python, go, javascript, typescript, java)"
-                        );
-                    return EngineAction::None;
-                }
-            };
-            let adapter_name = adapter_info.name;
-            let binary_name = adapter_info.binary;
-            // Delegate to the LSP manager's Mason infrastructure (same install path).
-            // Look up by adapter name (e.g. "codelldb"), NOT by language ID ("rust"),
-            // since Mason package names match adapter names, not language IDs.
-            self.ensure_lsp_manager();
-            // Use "dap:{adapter_name}" as the install key so InstallComplete can
-            // distinguish DAP installs from LSP installs and skip the LSP-start logic.
-            let dap_key = format!("dap:{adapter_name}");
-            if self.lsp_installing.contains(&dap_key) {
-                self.message = format!("Install already running for {adapter_name}");
-                return EngineAction::None;
-            }
-            // Prefer a Mason registry install_cmd if one is cached under the adapter name,
-            // otherwise fall back to the built-in install command for this adapter.
-            let install_cmd = self
-                .lsp_manager
-                .as_ref()
-                .and_then(|m| m.registry_cache.get(adapter_name))
-                .and_then(|info| info.install_cmd.clone())
-                .or_else(|| super::dap_manager::install_cmd_for_adapter(adapter_name));
-            match install_cmd {
-                Some(cmd_str) => {
-                    self.lsp_installing.insert(dap_key.clone());
-                    if let Some(mgr) = &self.lsp_manager {
-                        mgr.run_install_command(&dap_key, &cmd_str);
+            // Validate that a built-in DAP adapter exists for this language (for error message)
+            match super::dap_manager::DapManager::adapter_for_language(lang_id) {
+                Some(info) => {
+                    let adapter_name = info.name;
+                    // Look up matching extension by language_id
+                    let ext_name = self
+                        .ext_available_manifests()
+                        .into_iter()
+                        .find(|m| {
+                            m.language_ids.iter().any(|l| l == lang_id)
+                                || m.dap.adapter == adapter_name
+                        })
+                        .map(|m| m.name.clone());
+                    if let Some(name) = ext_name {
+                        self.message =
+                            format!("Use :ExtInstall {name} instead  (or open Extensions panel)");
+                    } else {
+                        // Fall back to direct adapter install
+                        let dap_key = format!("dap:{adapter_name}");
+                        if self.lsp_installing.contains(&dap_key) {
+                            self.message = format!("Install already running for {adapter_name}");
+                        } else if let Some(cmd_str) =
+                            super::dap_manager::install_cmd_for_adapter(adapter_name)
+                        {
+                            self.ensure_lsp_manager();
+                            self.lsp_installing.insert(dap_key.clone());
+                            if let Some(mgr) = &self.lsp_manager {
+                                mgr.run_install_command(&dap_key, &cmd_str);
+                            }
+                            self.message = format!("Installing {adapter_name}…");
+                        } else {
+                            self.message = format!("No automated installer for '{adapter_name}'");
+                        }
                     }
-                    self.message = format!("Installing {adapter_name}…");
                 }
                 None => {
                     self.message = format!(
-                        "No automated installer for '{adapter_name}' — install '{binary_name}' manually and ensure it is on PATH"
+                        "No built-in DAP adapter for '{lang_id}' (supported: rust, python, go, javascript, typescript, java)"
                     );
                 }
             }
@@ -9393,54 +9486,25 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // Handle :LspInstall <language> — install LSP server via package manager
+        // Handle :LspInstall <language> — redirect to extension system
         if let Some(lang_id) = cmd.strip_prefix("LspInstall").map(|s| s.trim()) {
             if lang_id.is_empty() {
                 self.message =
                     "Usage: :LspInstall <language>  (e.g. :LspInstall csharp)".to_string();
                 return EngineAction::None;
             }
-            self.ensure_lsp_manager();
-            // Check if already installing
-            if self.lsp_installing.contains(lang_id) {
-                self.message = format!("Install already running for {lang_id}");
-                return EngineAction::None;
-            }
-            // Get install command from cache
-            let install_cmd = self
-                .lsp_manager
-                .as_ref()
-                .and_then(|m| m.registry_cache.get(lang_id))
-                .and_then(|info| info.install_cmd.clone());
-            match install_cmd {
-                Some(cmd_str) => {
-                    self.lsp_installing.insert(lang_id.to_string());
-                    self.message = format!("Installing LSP for {lang_id}...");
-                    if let Some(mgr) = &self.lsp_manager {
-                        mgr.run_install_command(lang_id, &cmd_str);
-                    }
-                }
-                None => {
-                    // Not cached — may need a registry fetch first, or no installable package
-                    let has_cache = self
-                        .lsp_manager
-                        .as_ref()
-                        .map(|m| m.registry_cache.contains_key(lang_id))
-                        .unwrap_or(false);
-                    if has_cache {
-                        self.message = format!(
-                            "No automated installer for {lang_id} (pkg:github or pkg:generic — see Mason docs)"
-                        );
-                    } else {
-                        // Trigger a lookup first so the user can retry
-                        self.trigger_lsp_registry_lookup(lang_id);
-                        if self.message.starts_with("Looking up") {
-                            self.message = format!(
-                                "Fetching LSP info for {lang_id}... run :LspInstall {lang_id} again after"
-                            );
-                        }
-                    }
-                }
+            // Look up by language_id in the merged manifest list
+            let ext_name = self
+                .ext_available_manifests()
+                .into_iter()
+                .find(|m| m.language_ids.iter().any(|l| l == lang_id))
+                .map(|m| m.name.clone());
+            if let Some(name) = ext_name {
+                self.message =
+                    format!("Use :ExtInstall {name} instead  (or open Extensions panel)");
+            } else {
+                self.message =
+                    format!("Unknown language '{lang_id}' — try :ExtRefresh then :ExtList");
             }
             return EngineAction::None;
         }
@@ -9625,6 +9689,86 @@ impl Engine {
                         "Usage: :Plugin list|reload|enable <name>|disable <name>".to_string();
                 }
             }
+            return EngineAction::None;
+        }
+
+        // ── Extension commands (:ExtInstall / :ExtRemove / :ExtRefresh / :ExtList /
+        //                        :ExtEnable / :ExtDisable) ──────────────────────────────
+        if let Some(subcmd) = cmd.strip_prefix("Ext").map(|s| s.trim()) {
+            if let Some(name) = subcmd.strip_prefix("Install").map(|s| s.trim()) {
+                // :ExtInstall <name>
+                if name.is_empty() {
+                    self.message =
+                        "Usage: :ExtInstall <name>  (e.g. :ExtInstall csharp)".to_string();
+                    return EngineAction::None;
+                }
+                self.ext_install_from_registry(name);
+                return EngineAction::None;
+            }
+
+            if let Some(name) = subcmd.strip_prefix("Remove").map(|s| s.trim()) {
+                // :ExtRemove <name>
+                if name.is_empty() {
+                    self.message = "Usage: :ExtRemove <name>  (e.g. :ExtRemove csharp)".to_string();
+                    return EngineAction::None;
+                }
+                self.ext_remove(name);
+                return EngineAction::None;
+            }
+
+            if subcmd.eq_ignore_ascii_case("Refresh") {
+                // :ExtRefresh — fetch the remote registry
+                self.ext_refresh();
+                return EngineAction::None;
+            }
+
+            if let Some(name) = subcmd.strip_prefix("Enable").map(|s| s.trim()) {
+                // :ExtEnable <name>
+                if name.is_empty() {
+                    self.message = "Usage: :ExtEnable <name>".to_string();
+                    return EngineAction::None;
+                }
+                self.extension_state.dismissed.retain(|n| n != name);
+                let _ = self.extension_state.save();
+                self.message = format!("Extension '{name}' enabled");
+                return EngineAction::None;
+            }
+
+            if let Some(name) = subcmd.strip_prefix("Disable").map(|s| s.trim()) {
+                // :ExtDisable <name>
+                if name.is_empty() {
+                    self.message = "Usage: :ExtDisable <name>".to_string();
+                    return EngineAction::None;
+                }
+                self.extension_state.mark_dismissed(name);
+                let _ = self.extension_state.save();
+                self.message = format!("Extension '{name}' disabled");
+                return EngineAction::None;
+            }
+
+            if subcmd == "List" || subcmd == "list" {
+                // :ExtList — show all available extensions and install status
+                let lines: Vec<String> = self
+                    .ext_available_manifests()
+                    .iter()
+                    .map(|m| {
+                        let status = if self.extension_state.is_installed(&m.name) {
+                            "installed"
+                        } else if self.extension_state.is_dismissed(&m.name) {
+                            "dismissed"
+                        } else {
+                            "available"
+                        };
+                        format!("{} [{}]", m.name, status)
+                    })
+                    .collect();
+                self.message = lines.join(", ");
+                return EngineAction::None;
+            }
+
+            self.message =
+                "Usage: :ExtInstall <name> | :ExtRemove <name> | :ExtRefresh | :ExtList | :ExtEnable <name> | :ExtDisable <name>"
+                    .to_string();
             return EngineAction::None;
         }
 
@@ -14171,38 +14315,333 @@ impl Engine {
             None
         };
         if no_server.is_some() {
-            self.trigger_lsp_registry_lookup(&lang_id);
+            // Show an extension install hint if we have a bundled extension for this language.
+            if let Some((bundle, manifest)) = extensions::find_for_language_id(&lang_id) {
+                let name = bundle.name;
+                if !self.extension_state.is_installed(name)
+                    && !self.extension_state.is_dismissed(name)
+                    && !self.prompted_extensions.contains(name)
+                {
+                    self.prompted_extensions.insert(name.to_string());
+                    self.message = format!(
+                        "No {} extension — :ExtInstall {}  (N to dismiss)",
+                        manifest.display_name, name
+                    );
+                }
+            } else {
+                self.message =
+                    format!("No LSP for {lang_id} — add to lsp_servers in settings.json");
+            }
         }
     }
 
-    /// Trigger a Mason registry lookup for a language if not already in flight or cached.
-    fn trigger_lsp_registry_lookup(&mut self, lang_id: &str) {
-        if self.lsp_lookup_in_flight.contains(lang_id) {
-            return; // already fetching
+    // ── Extension registry + sidebar ──────────────────────────────────────────
+
+    /// Build the merged list of available extensions.
+    /// Registry entries (fetched from GitHub) override BUNDLED entries on name conflict.
+    pub fn ext_available_manifests(&self) -> Vec<extensions::ExtensionManifest> {
+        use std::collections::HashMap as StdMap;
+        let mut map: StdMap<String, extensions::ExtensionManifest> = extensions::BUNDLED
+            .iter()
+            .filter_map(|b| {
+                extensions::ExtensionManifest::parse(b.manifest_toml)
+                    .map(|m| (b.name.to_string(), m))
+            })
+            .collect();
+        if let Some(reg) = &self.ext_registry {
+            for m in reg {
+                map.insert(m.name.clone(), m.clone());
+            }
+        }
+        let mut result: Vec<extensions::ExtensionManifest> = map.into_values().collect();
+        result.sort_by(|a, b| a.name.cmp(&b.name));
+        result
+    }
+
+    /// Spawn a background thread to fetch the remote registry.
+    /// Result arrives via `ext_registry_rx`.
+    pub fn ext_refresh(&mut self) {
+        if self.ext_registry_fetching {
+            return; // already in progress
+        }
+        let url = self.settings.extension_registry_url.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = registry::fetch_registry(&url);
+            let _ = tx.send(result);
+        });
+        self.ext_registry_rx = Some(rx);
+        self.ext_registry_fetching = true;
+        self.message = "Fetching extension registry...".to_string();
+    }
+
+    /// Non-blocking check for a completed registry fetch.
+    /// Call this from `handle_key` / `poll_lsp`.
+    pub fn poll_ext_registry(&mut self) -> bool {
+        let result = if let Some(rx) = &self.ext_registry_rx {
+            rx.try_recv().ok()
+        } else {
+            return false;
+        };
+        if let Some(maybe_reg) = result {
+            self.ext_registry_fetching = false;
+            self.ext_registry_rx = None;
+            match maybe_reg {
+                Some(entries) => {
+                    let count = entries.len();
+                    self.ext_registry = Some(entries);
+                    self.message = format!("Extension registry updated ({count} extensions)");
+                }
+                None => {
+                    self.message = "Registry fetch failed — using bundled extensions".to_string();
+                }
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Install an extension by name: download scripts, run LSP/DAP install, mark installed.
+    pub fn ext_install_from_registry(&mut self, name: &str) {
+        // Find manifest (registry takes priority over BUNDLED)
+        let manifest = self
+            .ext_available_manifests()
+            .into_iter()
+            .find(|m| m.name.eq_ignore_ascii_case(name));
+        let manifest = match manifest {
+            Some(m) => m,
+            None => {
+                self.message =
+                    format!("Unknown extension '{name}' — try :ExtRefresh then :ExtList");
+                return;
+            }
+        };
+        let ext_name = manifest.name.clone();
+
+        // Try BUNDLED scripts first (offline fallback), then download if registry has entries.
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        let ext_dir = std::path::PathBuf::from(&home)
+            .join(".config/vimcode/extensions")
+            .join(&ext_name);
+        if let Some(bundle) = extensions::find_by_name(&ext_name) {
+            if !bundle.scripts.is_empty() && std::fs::create_dir_all(&ext_dir).is_ok() {
+                for (filename, source) in bundle.scripts {
+                    let dest = ext_dir.join(filename);
+                    let _ = std::fs::write(&dest, source);
+                }
+            }
+        } else if !manifest.scripts.is_empty() && self.ext_registry.is_some() {
+            // Download scripts from the registry base URL
+            if std::fs::create_dir_all(&ext_dir).is_ok() {
+                for script in &manifest.scripts {
+                    let url = format!("{}/{}/{}", registry::FILES_BASE_URL, ext_name, script);
+                    let dest = ext_dir.join(script);
+                    let _ = registry::download_script(&url, &dest);
+                }
+            }
         }
 
-        // If we already fetched and found no binary, show the install hint immediately
-        let cached_info = self
-            .lsp_manager
-            .as_ref()
-            .and_then(|m| m.registry_cache.get(lang_id))
-            .cloned();
-        if let Some(info) = cached_info {
-            let hint = if let Some(cmd) = &info.install_cmd {
-                format!("No LSP for {lang_id} — run :LspInstall {lang_id}  (installs via: {cmd})")
-            } else {
-                format!("No LSP for {lang_id} — run :LspInstall {lang_id}")
-            };
-            self.message = hint;
-            return;
+        // Run LSP install command in the background if configured
+        if !manifest.lsp.install.is_empty() {
+            let lsp_key = format!("ext:{ext_name}:lsp");
+            if !self.lsp_installing.contains(&lsp_key) {
+                self.ensure_lsp_manager();
+                if let Some(mgr) = &self.lsp_manager {
+                    mgr.run_install_command(&lsp_key, &manifest.lsp.install);
+                }
+                self.lsp_installing.insert(lsp_key);
+            }
         }
 
-        // Trigger background fetch
-        self.lsp_lookup_in_flight.insert(lang_id.to_string());
-        self.message = format!("Looking up LSP for {lang_id}...");
-        if let Some(mgr) = &self.lsp_manager {
-            mgr.fetch_mason_registry_for_language(lang_id);
+        // Run DAP adapter install if configured
+        if !manifest.dap.adapter.is_empty() {
+            let dap_key = format!("dap:{}", manifest.dap.adapter);
+            if !self.lsp_installing.contains(&dap_key) {
+                if let Some(cmd_str) =
+                    super::dap_manager::install_cmd_for_adapter(&manifest.dap.adapter)
+                {
+                    self.ensure_lsp_manager();
+                    if let Some(mgr) = &self.lsp_manager {
+                        mgr.run_install_command(&dap_key, &cmd_str);
+                    }
+                    self.lsp_installing.insert(dap_key);
+                }
+            }
         }
+
+        // Mark installed and persist
+        self.extension_state.mark_installed(&ext_name);
+        let _ = self.extension_state.save();
+
+        // Reload plugins so newly extracted scripts are active
+        self.plugin_manager = None;
+        self.plugin_init();
+
+        self.message = format!("Installing '{ext_name}' — LSP/DAP install started");
+    }
+
+    /// Remove an extension: unmark as installed, delete its Lua scripts.
+    /// LSP binaries are NOT removed (they may be shared with other tools).
+    pub fn ext_remove(&mut self, name: &str) {
+        let name = name.to_string();
+        self.extension_state.installed.retain(|n| n != &name);
+        let _ = self.extension_state.save();
+
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        let ext_dir = std::path::PathBuf::from(&home)
+            .join(".config/vimcode/extensions")
+            .join(&name);
+        let _ = std::fs::remove_dir_all(&ext_dir);
+
+        // Reload plugins so removed scripts are no longer active
+        self.plugin_manager = None;
+        self.plugin_init();
+
+        self.message = format!("Extension '{name}' removed (LSP binary untouched)");
+    }
+
+    /// Handle keyboard input for the Extensions sidebar panel.
+    /// Returns `true` if the key was consumed.
+    pub fn handle_ext_sidebar_key(
+        &mut self,
+        key: &str,
+        _ctrl: bool,
+        unicode: Option<char>,
+    ) -> bool {
+        // Search input active — route printable chars to query
+        if self.ext_sidebar_input_active {
+            match key {
+                "Escape" => {
+                    self.ext_sidebar_input_active = false;
+                }
+                "BackSpace" => {
+                    self.ext_sidebar_query.pop();
+                    self.ext_sidebar_selected = 0;
+                }
+                _ => {
+                    if let Some(ch) = unicode {
+                        if !ch.is_control() {
+                            self.ext_sidebar_query.push(ch);
+                            self.ext_sidebar_selected = 0;
+                        }
+                    }
+                }
+            }
+            return true;
+        }
+
+        match key {
+            "q" | "Escape" => {
+                self.ext_sidebar_has_focus = false;
+                true
+            }
+            "/" => {
+                self.ext_sidebar_input_active = true;
+                true
+            }
+            "r" => {
+                self.ext_refresh();
+                true
+            }
+            "Tab" => {
+                // Toggle the section the cursor is in
+                let installed = self.ext_installed_items();
+                let in_installed = self.ext_sidebar_selected < installed.len();
+                if in_installed {
+                    self.ext_sidebar_sections_expanded[0] = !self.ext_sidebar_sections_expanded[0];
+                } else {
+                    self.ext_sidebar_sections_expanded[1] = !self.ext_sidebar_sections_expanded[1];
+                }
+                true
+            }
+            "j" | "Down" => {
+                let total = self.ext_flat_item_count();
+                if total > 0 {
+                    self.ext_sidebar_selected = (self.ext_sidebar_selected + 1).min(total - 1);
+                }
+                true
+            }
+            "k" | "Up" => {
+                self.ext_sidebar_selected = self.ext_sidebar_selected.saturating_sub(1);
+                true
+            }
+            "Return" | "i" => {
+                let installed = self.ext_installed_items();
+                let sel = self.ext_sidebar_selected;
+                if sel < installed.len() {
+                    // Already installed — show info
+                    let name = installed[sel].name.clone();
+                    self.message = format!("Extension '{name}' is installed. Use d to remove.");
+                } else {
+                    let available = self.ext_available_items();
+                    let avail_idx = sel.saturating_sub(installed.len());
+                    if avail_idx < available.len() {
+                        let name = available[avail_idx].name.clone();
+                        self.ext_install_from_registry(&name);
+                    }
+                }
+                true
+            }
+            "d" => {
+                let installed = self.ext_installed_items();
+                let sel = self.ext_sidebar_selected;
+                if sel < installed.len() {
+                    let name = installed[sel].name.clone();
+                    self.ext_remove(&name);
+                    // Keep selection in bounds
+                    let new_total = self.ext_flat_item_count();
+                    if new_total > 0 && self.ext_sidebar_selected >= new_total {
+                        self.ext_sidebar_selected = new_total - 1;
+                    }
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Returns the filtered list of installed extension manifests.
+    pub fn ext_installed_items(&self) -> Vec<extensions::ExtensionManifest> {
+        let q = self.ext_sidebar_query.to_lowercase();
+        self.ext_available_manifests()
+            .into_iter()
+            .filter(|m| self.extension_state.is_installed(&m.name))
+            .filter(|m| {
+                q.is_empty()
+                    || m.name.to_lowercase().contains(&q)
+                    || m.display_name.to_lowercase().contains(&q)
+            })
+            .collect()
+    }
+
+    /// Returns the filtered list of available (not yet installed) extension manifests.
+    fn ext_available_items(&self) -> Vec<extensions::ExtensionManifest> {
+        let q = self.ext_sidebar_query.to_lowercase();
+        self.ext_available_manifests()
+            .into_iter()
+            .filter(|m| !self.extension_state.is_installed(&m.name))
+            .filter(|m| {
+                q.is_empty()
+                    || m.name.to_lowercase().contains(&q)
+                    || m.display_name.to_lowercase().contains(&q)
+            })
+            .collect()
+    }
+
+    /// Total number of flat items in the sidebar (installed + available, respecting collapse).
+    fn ext_flat_item_count(&self) -> usize {
+        let installed = if self.ext_sidebar_sections_expanded[0] {
+            self.ext_installed_items().len()
+        } else {
+            0
+        };
+        let available = if self.ext_sidebar_sections_expanded[1] {
+            self.ext_available_items().len()
+        } else {
+            0
+        };
+        installed + available
     }
 
     /// Re-send didOpen for all open buffers that match a given language ID.
@@ -14421,78 +14860,9 @@ impl Engine {
                     self.message = format!("LSP server {} exited", id);
                     redraw = true;
                 }
-                LspEvent::RegistryLookup { lang_id, info } => {
+                LspEvent::RegistryLookup { lang_id, .. } => {
+                    // Mason registry lookups are no longer used. Ignore stale events.
                     self.lsp_lookup_in_flight.remove(&lang_id);
-                    match info {
-                        None => {
-                            self.message = format!(
-                                "No LSP for {lang_id} — unknown language (add to lsp_servers in settings.json)"
-                            );
-                        }
-                        Some(pkg_info) => {
-                            // Try to find one of the advertised binaries on PATH/Mason
-                            let found_binary = pkg_info.binaries.iter().find_map(|bin| {
-                                // Use a shell check: `which <bin>` or check Mason bin dir
-                                let mason_found = std::env::var_os("HOME")
-                                    .map(std::path::PathBuf::from)
-                                    .map(|h| {
-                                        h.join(".local")
-                                            .join("share")
-                                            .join("nvim")
-                                            .join("mason")
-                                            .join("bin")
-                                            .join(bin)
-                                    })
-                                    .filter(|p| p.exists())
-                                    .is_some();
-                                if mason_found {
-                                    return Some(bin.clone());
-                                }
-                                let on_path = std::process::Command::new("which")
-                                    .arg(bin)
-                                    .stdout(std::process::Stdio::null())
-                                    .stderr(std::process::Stdio::null())
-                                    .status()
-                                    .map(|s| s.success())
-                                    .unwrap_or(false);
-                                if on_path {
-                                    Some(bin.clone())
-                                } else {
-                                    None
-                                }
-                            });
-
-                            if let Some(binary) = found_binary {
-                                // Binary found — add config to manager and retry
-                                let config = lsp::LspServerConfig {
-                                    command: binary.clone(),
-                                    args: vec![],
-                                    languages: vec![lang_id.clone()],
-                                };
-                                if let Some(mgr) = &mut self.lsp_manager {
-                                    mgr.add_registry_entry(config);
-                                    mgr.registry_cache.insert(lang_id.clone(), pkg_info);
-                                    mgr.ensure_server_for_language(&lang_id);
-                                }
-                                // Re-open any buffers of this language
-                                self.lsp_reopen_buffers_for_language(&lang_id);
-                                self.message =
-                                    format!("LSP server started for {lang_id} ({binary})");
-                                redraw = true;
-                            } else {
-                                // Binary not found — cache and show install hint
-                                let hint = if let Some(cmd) = &pkg_info.install_cmd {
-                                    format!("No LSP for {lang_id} — run :LspInstall {lang_id}  (installs via: {cmd})")
-                                } else {
-                                    format!("No LSP for {lang_id} — run :LspInstall {lang_id}")
-                                };
-                                if let Some(mgr) = &mut self.lsp_manager {
-                                    mgr.registry_cache.insert(lang_id, pkg_info);
-                                }
-                                self.message = hint;
-                            }
-                        }
-                    }
                 }
                 LspEvent::InstallComplete {
                     lang_id,
@@ -14538,37 +14908,46 @@ impl Engine {
                         }
                         redraw = true;
                     } else if success {
-                        // LSP install: retry adding config and starting server
-                        let cached_info = self
-                            .lsp_manager
-                            .as_ref()
-                            .and_then(|m| m.registry_cache.get(&lang_id))
-                            .cloned();
-                        if let Some(info) = cached_info {
-                            let binary = info.binaries.first().cloned().unwrap_or_default();
-                            if !binary.is_empty() {
+                        // LSP install (from :ExtInstall): look up binary from extension manifest
+                        // lang_id format is "ext:{ext_name}:lsp"
+                        let ext_name = lang_id
+                            .strip_prefix("ext:")
+                            .and_then(|s| s.strip_suffix(":lsp"))
+                            .unwrap_or(&lang_id);
+                        let binary = self
+                            .ext_available_manifests()
+                            .into_iter()
+                            .find(|m| m.name == ext_name)
+                            .map(|m| m.lsp.binary.clone())
+                            .unwrap_or_default();
+                        if !binary.is_empty() {
+                            // Register the binary so future files auto-start the server
+                            for lsp_lang in self
+                                .ext_available_manifests()
+                                .into_iter()
+                                .find(|m| m.name == ext_name)
+                                .map(|m| m.language_ids.clone())
+                                .unwrap_or_default()
+                            {
                                 let config = lsp::LspServerConfig {
                                     command: binary.clone(),
                                     args: vec![],
-                                    languages: vec![lang_id.clone()],
+                                    languages: vec![lsp_lang.clone()],
                                 };
                                 if let Some(mgr) = &mut self.lsp_manager {
                                     mgr.add_registry_entry(config);
-                                    mgr.ensure_server_for_language(&lang_id);
+                                    mgr.ensure_server_for_language(&lsp_lang);
                                 }
-                                self.lsp_reopen_buffers_for_language(&lang_id);
-                                self.message = format!(
-                                    "LSP server for {lang_id} installed and started ({binary})"
-                                );
-                                redraw = true;
-                            } else {
-                                self.message = format!(
-                                    "LSP for {lang_id} installed — reopen a file to activate"
-                                );
+                                self.lsp_reopen_buffers_for_language(&lsp_lang);
                             }
+                            self.message = format!(
+                                "LSP server for '{ext_name}' installed and started ({binary})"
+                            );
+                            redraw = true;
                         } else {
-                            self.message =
-                                format!("LSP for {lang_id} installed — reopen a file to activate");
+                            self.message = format!(
+                                "LSP for '{ext_name}' installed — reopen a file to activate"
+                            );
                         }
                     } else {
                         let short = output.lines().next().unwrap_or("unknown error").to_string();
@@ -28975,8 +29354,7 @@ mod tests {
     #[test]
     fn test_dap_install_known_language_no_lsp_message() {
         // DapInstall must NEVER show "No LSP for ..." messages.
-        // It should either show "Installing ..." (if an install command is known)
-        // or a DAP-specific manual-install hint.
+        // It now redirects to the extension system.
         let mut engine = Engine::new();
         engine.execute_command("DapInstall rust");
         assert!(
@@ -28984,10 +29362,10 @@ mod tests {
             "DapInstall should not emit LSP messages: {}",
             engine.message
         );
-        // The message must mention the adapter (codelldb)
+        // The message should redirect to :ExtInstall
         assert!(
-            engine.message.contains("codelldb"),
-            "DapInstall should mention the adapter: {}",
+            engine.message.contains("ExtInstall") || engine.message.contains("rust"),
+            "DapInstall should redirect to ExtInstall or mention rust: {}",
             engine.message
         );
     }

@@ -37,6 +37,7 @@ enum SidebarPanel {
     Search,
     Debug,
     Git,
+    Extensions,
     Settings,
     None,
 }
@@ -78,6 +79,7 @@ struct App {
     menu_bar_da: Rc<RefCell<Option<gtk4::DrawingArea>>>,
     debug_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>>,
     git_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>>,
+    ext_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>>,
     sidebar_inner_box: Rc<RefCell<Option<gtk4::Box>>>,
     /// Direct ref to the sidebar Revealer for programmatic open/close.
     sidebar_revealer: Rc<RefCell<Option<gtk4::Revealer>>>,
@@ -86,6 +88,7 @@ struct App {
     search_panel_box: Rc<RefCell<Option<gtk4::Box>>>,
     debug_panel_box: Rc<RefCell<Option<gtk4::Box>>>,
     git_panel_box: Rc<RefCell<Option<gtk4::Box>>>,
+    ext_panel_box: Rc<RefCell<Option<gtk4::Box>>>,
     settings_panel_box: Rc<RefCell<Option<gtk4::Box>>>,
     // Per-window scrollbars and indicators
     window_scrollbars: Rc<RefCell<HashMap<core::WindowId, WindowScrollbars>>>,
@@ -362,6 +365,10 @@ enum Msg {
     ScSidebarClick(f64, f64),
     /// Key press in the Source Control sidebar DrawingArea.
     ScKey(String, bool),
+    /// Key press in the Extensions sidebar DrawingArea.
+    ExtSidebarKey(String),
+    /// Click in the Extensions sidebar DrawingArea (x, y).
+    ExtSidebarClick(f64, f64),
     /// Minimize the application window.
     WindowMinimize,
     /// Maximize or restore the application window.
@@ -537,6 +544,19 @@ impl SimpleComponent for App {
 
                         connect_clicked[sender] => move |_| {
                             sender.input(Msg::SwitchPanel(SidebarPanel::Git));
+                        }
+                    },
+
+                    gtk4::Button {
+                        set_label: "\u{eb85}",
+                        set_tooltip_text: Some("Extensions"),
+                        set_width_request: 48,
+                        set_height_request: 48,
+                        set_css_classes: &["activity-button"],
+                        set_sensitive: true,
+
+                        connect_clicked[sender] => move |_| {
+                            sender.input(Msg::SwitchPanel(SidebarPanel::Extensions));
                         }
                     },
 
@@ -922,6 +942,26 @@ impl SimpleComponent for App {
                             },
 
                             #[name = "git_sidebar_da"]
+                            gtk4::DrawingArea {
+                                set_vexpand: true,
+                            },
+                        },
+
+                        // Extensions sidebar panel
+                        #[name = "ext_panel"]
+                        gtk4::Box {
+                            set_orientation: gtk4::Orientation::Vertical,
+                            set_css_classes: &["sidebar"],
+
+                            #[watch]
+                            set_visible: {
+                                if model.active_panel == SidebarPanel::Extensions {
+                                    ext_sidebar_da.queue_draw();
+                                }
+                                model.active_panel == SidebarPanel::Extensions
+                            },
+
+                            #[name = "ext_sidebar_da"]
                             gtk4::DrawingArea {
                                 set_vexpand: true,
                             },
@@ -1439,6 +1479,9 @@ impl SimpleComponent for App {
         let search_panel_box_ref: Rc<RefCell<Option<gtk4::Box>>> = Rc::new(RefCell::new(None));
         let debug_panel_box_ref: Rc<RefCell<Option<gtk4::Box>>> = Rc::new(RefCell::new(None));
         let git_panel_box_ref: Rc<RefCell<Option<gtk4::Box>>> = Rc::new(RefCell::new(None));
+        let ext_panel_box_ref: Rc<RefCell<Option<gtk4::Box>>> = Rc::new(RefCell::new(None));
+        let ext_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> =
+            Rc::new(RefCell::new(None));
         let settings_panel_box_ref: Rc<RefCell<Option<gtk4::Box>>> = Rc::new(RefCell::new(None));
         let search_results_list_ref: Rc<RefCell<Option<gtk4::ListBox>>> =
             Rc::new(RefCell::new(None));
@@ -1486,6 +1529,7 @@ impl SimpleComponent for App {
             menu_bar_da: menu_bar_da_ref.clone(),
             debug_sidebar_da_ref: debug_sidebar_da_ref.clone(),
             git_sidebar_da_ref: git_sidebar_da_ref.clone(),
+            ext_sidebar_da_ref: ext_sidebar_da_ref.clone(),
             window_scrollbars: window_scrollbars_ref.clone(),
             overlay: overlay_ref.clone(),
             cached_line_height: 24.0,
@@ -1509,6 +1553,7 @@ impl SimpleComponent for App {
             search_panel_box: search_panel_box_ref.clone(),
             debug_panel_box: debug_panel_box_ref.clone(),
             git_panel_box: git_panel_box_ref.clone(),
+            ext_panel_box: ext_panel_box_ref.clone(),
             settings_panel_box: settings_panel_box_ref.clone(),
             project_search_status: String::new(),
             search_results_list: search_results_list_ref.clone(),
@@ -1538,6 +1583,7 @@ impl SimpleComponent for App {
         *search_panel_box_ref.borrow_mut() = Some(widgets.search_panel.clone());
         *debug_panel_box_ref.borrow_mut() = Some(widgets.debug_panel.clone());
         *git_panel_box_ref.borrow_mut() = Some(widgets.git_panel.clone());
+        *ext_panel_box_ref.borrow_mut() = Some(widgets.ext_panel.clone());
         *settings_panel_box_ref.borrow_mut() = Some(widgets.settings_panel.clone());
         *search_results_list_ref.borrow_mut() = Some(widgets.search_results_list.clone());
 
@@ -1873,6 +1919,48 @@ impl SimpleComponent for App {
             widgets.git_sidebar_da.add_controller(gesture);
         }
         *git_sidebar_da_ref.borrow_mut() = Some(widgets.git_sidebar_da.clone());
+
+        // ── Extensions sidebar draw + key setup ───────────────────────────────
+        {
+            let engine = engine.clone();
+            widgets.ext_sidebar_da.set_draw_func(move |da, cr, _w, _h| {
+                let engine = engine.borrow();
+                let theme = Theme::onedark();
+                let font_desc = FontDescription::from_string(UI_FONT);
+                let pango_ctx = pangocairo::create_context(cr);
+                let layout = pango::Layout::new(&pango_ctx);
+                layout.set_font_description(Some(&font_desc));
+                let font_metrics = pango_ctx.metrics(Some(&font_desc), None);
+                let line_height =
+                    (font_metrics.ascent() + font_metrics.descent()) as f64 / pango::SCALE as f64;
+                let char_width = font_metrics.approximate_char_width() as f64 / pango::SCALE as f64;
+                let screen = build_screen_layout(&engine, &theme, &[], line_height, char_width);
+                let w = da.width() as f64;
+                let h = da.height() as f64;
+                draw_ext_sidebar(cr, &layout, &screen, &theme, 0.0, 0.0, w, h, line_height);
+            });
+        }
+        {
+            let sender_ext = sender.input_sender().clone();
+            let key_ctrl = gtk4::EventControllerKey::new();
+            key_ctrl.connect_key_pressed(move |_, key, _, _modifier| {
+                let key_name = key.name().map(|s| s.to_string()).unwrap_or_default();
+                sender_ext.send(Msg::ExtSidebarKey(key_name)).ok();
+                gtk4::glib::Propagation::Stop
+            });
+            widgets.ext_sidebar_da.set_focusable(true);
+            widgets.ext_sidebar_da.add_controller(key_ctrl);
+        }
+        {
+            let sender_ext = sender.input_sender().clone();
+            let gesture = gtk4::GestureClick::new();
+            gesture.set_button(1);
+            gesture.connect_pressed(move |_, _, x, y| {
+                sender_ext.send(Msg::ExtSidebarClick(x, y)).ok();
+            });
+            widgets.ext_sidebar_da.add_controller(gesture);
+        }
+        *ext_sidebar_da_ref.borrow_mut() = Some(widgets.ext_sidebar_da.clone());
 
         // Move the menu bar row out of the content Box and set it as the window's
         // custom titlebar.  This gives us CSD edge resize handles while keeping
@@ -3190,6 +3278,7 @@ impl SimpleComponent for App {
                     (SidebarPanel::Search, &self.search_panel_box),
                     (SidebarPanel::Debug, &self.debug_panel_box),
                     (SidebarPanel::Git, &self.git_panel_box),
+                    (SidebarPanel::Extensions, &self.ext_panel_box),
                     (SidebarPanel::Settings, &self.settings_panel_box),
                 ] {
                     if let Some(ref b) = *panel_ref.borrow() {
@@ -3219,6 +3308,19 @@ impl SimpleComponent for App {
                             da.grab_focus();
                         }
                     }
+                    // Focus + refresh when switching to Extensions panel
+                    if self.active_panel == SidebarPanel::Extensions {
+                        let mut engine = self.engine.borrow_mut();
+                        engine.ext_sidebar_has_focus = true;
+                        // Auto-fetch registry if not already done
+                        if engine.ext_registry.is_none() && !engine.ext_registry_fetching {
+                            engine.ext_refresh();
+                        }
+                        drop(engine);
+                        if let Some(ref da) = *self.ext_sidebar_da_ref.borrow() {
+                            da.grab_focus();
+                        }
+                    }
                 }
                 // Directly set visibility on the revealer and each panel box.
                 let p = self.active_panel;
@@ -3231,6 +3333,7 @@ impl SimpleComponent for App {
                     (SidebarPanel::Search, &self.search_panel_box),
                     (SidebarPanel::Debug, &self.debug_panel_box),
                     (SidebarPanel::Git, &self.git_panel_box),
+                    (SidebarPanel::Extensions, &self.ext_panel_box),
                     (SidebarPanel::Settings, &self.settings_panel_box),
                 ] {
                     if let Some(ref b) = *panel_ref.borrow() {
@@ -3814,6 +3917,17 @@ impl SimpleComponent for App {
                         da.queue_draw();
                     }
                     self.draw_needed.set(true);
+                }
+                // Poll for completed extension registry fetch.
+                {
+                    let mut engine = self.engine.borrow_mut();
+                    if engine.poll_ext_registry() {
+                        drop(engine);
+                        if let Some(ref da) = *self.ext_sidebar_da_ref.borrow() {
+                            da.queue_draw();
+                        }
+                        self.draw_needed.set(true);
+                    }
                 }
                 // Sync the OS window title with the active buffer name (taskbar/pager).
                 let win_title = self
@@ -4510,6 +4624,64 @@ impl SimpleComponent for App {
                     }
                 }
                 if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
+                    da.queue_draw();
+                }
+                self.draw_needed.set(true);
+            }
+            Msg::ExtSidebarKey(key_name) => {
+                let mut engine = self.engine.borrow_mut();
+                engine.handle_ext_sidebar_key(&key_name, false, None);
+                let still_focused = engine.ext_sidebar_has_focus;
+                drop(engine);
+                if !still_focused {
+                    if let Some(ref drawing) = *self.drawing_area.borrow() {
+                        drawing.grab_focus();
+                    }
+                }
+                if let Some(ref da) = *self.ext_sidebar_da_ref.borrow() {
+                    da.queue_draw();
+                }
+                self.draw_needed.set(true);
+            }
+            Msg::ExtSidebarClick(x_click, y_click) => {
+                let mut engine = self.engine.borrow_mut();
+                // Compute line_height from cached value
+                let line_height = self.cached_line_height.max(1.0);
+                let row = (y_click / line_height) as usize;
+                // Row 0 = header, Row 1 = search, Row 2+ = sections
+                // Focus the panel on any click
+                engine.ext_sidebar_has_focus = true;
+                // Rows 0-1 are header/search — clicking row 1 activates search input
+                if row == 1 {
+                    engine.ext_sidebar_input_active = true;
+                } else if row >= 2 {
+                    // Determine flat index from click position
+                    // Row 2 = INSTALLED header, rows 3..N = installed items, N+1 = AVAILABLE header, N+2.. = available items
+                    let installed = engine.ext_installed_items().len();
+                    let installed_len = if engine.ext_sidebar_sections_expanded[0] {
+                        installed
+                    } else {
+                        0
+                    };
+                    let installed_header_row = 2usize;
+                    let available_header_row = installed_header_row + 1 + installed_len.max(1);
+                    if row == installed_header_row {
+                        engine.ext_sidebar_sections_expanded[0] =
+                            !engine.ext_sidebar_sections_expanded[0];
+                    } else if row > installed_header_row && row < available_header_row {
+                        let idx = row - installed_header_row - 1;
+                        engine.ext_sidebar_selected = idx;
+                    } else if row == available_header_row {
+                        engine.ext_sidebar_sections_expanded[1] =
+                            !engine.ext_sidebar_sections_expanded[1];
+                    } else if row > available_header_row {
+                        let idx = installed_len.max(1) + (row - available_header_row - 1);
+                        engine.ext_sidebar_selected = idx;
+                    }
+                }
+                let _ = x_click;
+                drop(engine);
+                if let Some(ref da) = *self.ext_sidebar_da_ref.borrow() {
                     da.queue_draw();
                 }
                 self.draw_needed.set(true);
@@ -6008,6 +6180,18 @@ fn draw_window(
         cr.set_source_rgb(fr, fg_g, fb);
         cr.move_to(text_x_offset, y);
         pangocairo::show_layout(cr, layout);
+
+        // Inline annotation / virtual text (e.g. git blame)
+        if let Some(ann) = &rl.annotation {
+            let text_pixel_width = layout.pixel_size().0 as f64;
+            let ann_x = text_x_offset + text_pixel_width + char_width * 2.0;
+            let (ar, ag, ab) = theme.annotation_fg.to_cairo();
+            cr.set_source_rgb(ar, ag, ab);
+            cr.move_to(ann_x, y);
+            layout.set_text(ann);
+            layout.set_attributes(None);
+            pangocairo::show_layout(cr, layout);
+        }
 
         // Diagnostic underlines (wavy squiggles)
         for dm in &rl.diagnostics {
@@ -8170,6 +8354,252 @@ fn draw_source_control_panel(
             sc.selected,
         );
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_ext_sidebar(
+    cr: &Context,
+    layout: &pango::Layout,
+    screen: &render::ScreenLayout,
+    theme: &Theme,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    line_height: f64,
+) {
+    let Some(ref ext) = screen.ext_sidebar else {
+        return;
+    };
+
+    let (bg_r, bg_g, bg_b) = theme.completion_bg.to_cairo();
+    let (hdr_r, hdr_g, hdr_b) = theme.status_bg.to_cairo();
+    let (fg_r, fg_g, fg_b) = theme.status_fg.to_cairo();
+    let (dim_r, dim_g, dim_b) = theme.line_number_fg.to_cairo();
+    let (sel_r, sel_g, sel_b) = theme.fuzzy_selected_bg.to_cairo();
+
+    // Background
+    cr.set_source_rgb(bg_r, bg_g, bg_b);
+    cr.rectangle(x, y, w, h);
+    cr.fill().ok();
+
+    layout.set_attributes(None);
+    let mut row: usize = 0;
+
+    // ── Row 0: panel header ──────────────────────────────────────────────────
+    cr.set_source_rgb(hdr_r, hdr_g, hdr_b);
+    cr.rectangle(x, y + row as f64 * line_height, w, line_height);
+    cr.fill().ok();
+    let hdr_text = if ext.fetching {
+        "  \u{eb85} EXTENSIONS  (fetching…)".to_string()
+    } else {
+        "  \u{eb85} EXTENSIONS".to_string()
+    };
+    cr.set_source_rgb(fg_r, fg_g, fg_b);
+    layout.set_text(&hdr_text);
+    let (_, lh) = layout.pixel_size();
+    cr.move_to(
+        x + 2.0,
+        y + row as f64 * line_height + (line_height - lh as f64) / 2.0,
+    );
+    pangocairo::show_layout(cr, layout);
+    row += 1;
+
+    // ── Row 1: search box ─────────────────────────────────────────────────────
+    if row as f64 * line_height < h {
+        let (inp_bg_r, inp_bg_g, inp_bg_b) = if ext.input_active {
+            theme.fuzzy_selected_bg.to_cairo()
+        } else {
+            theme.completion_bg.to_cairo()
+        };
+        cr.set_source_rgb(inp_bg_r, inp_bg_g, inp_bg_b);
+        cr.rectangle(x, y + row as f64 * line_height, w, line_height);
+        cr.fill().ok();
+        let search_text = if ext.input_active {
+            format!(" \u{f002}  {}|", ext.query)
+        } else if ext.query.is_empty() {
+            " \u{f002}  Search extensions (press /)".to_string()
+        } else {
+            format!(" \u{f002}  {}", ext.query)
+        };
+        let (text_r, text_g, text_b) = if ext.input_active || !ext.query.is_empty() {
+            (fg_r, fg_g, fg_b)
+        } else {
+            (dim_r, dim_g, dim_b)
+        };
+        cr.set_source_rgb(text_r, text_g, text_b);
+        layout.set_text(&search_text);
+        let (_, lh2) = layout.pixel_size();
+        cr.move_to(
+            x + 2.0,
+            y + row as f64 * line_height + (line_height - lh2 as f64) / 2.0,
+        );
+        pangocairo::show_layout(cr, layout);
+        row += 1;
+    }
+
+    // ── INSTALLED section ─────────────────────────────────────────────────────
+    let installed_count = ext.items_installed.len();
+    if row as f64 * line_height < h {
+        // Section header
+        let arrow = if ext.sections_expanded[0] {
+            "▼"
+        } else {
+            "▶"
+        };
+        let sec_hdr = format!("  {} INSTALLED ({})", arrow, installed_count);
+        cr.set_source_rgb(hdr_r * 0.85, hdr_g * 0.85, hdr_b * 0.85);
+        cr.rectangle(x, y + row as f64 * line_height, w, line_height);
+        cr.fill().ok();
+        cr.set_source_rgb(dim_r, dim_g, dim_b);
+        layout.set_text(&sec_hdr);
+        let (_, lh3) = layout.pixel_size();
+        cr.move_to(
+            x + 2.0,
+            y + row as f64 * line_height + (line_height - lh3 as f64) / 2.0,
+        );
+        pangocairo::show_layout(cr, layout);
+        row += 1;
+    }
+
+    if ext.sections_expanded[0] {
+        for (idx, item) in ext.items_installed.iter().enumerate() {
+            if row as f64 * line_height >= h {
+                break;
+            }
+            let flat_idx = idx;
+            let is_selected = ext.has_focus && ext.selected == flat_idx;
+            if is_selected {
+                cr.set_source_rgb(sel_r, sel_g, sel_b);
+                cr.rectangle(x, y + row as f64 * line_height, w, line_height);
+                cr.fill().ok();
+            }
+            // Status dot + name
+            let name_text = format!("  ● {}", item.display_name);
+            cr.set_source_rgb(fg_r, fg_g, fg_b);
+            layout.set_text(&name_text);
+            let (_, lh4) = layout.pixel_size();
+            cr.move_to(
+                x + 2.0,
+                y + row as f64 * line_height + (line_height - lh4 as f64) / 2.0,
+            );
+            pangocairo::show_layout(cr, layout);
+            // Right-aligned hint
+            let hint = "  [d] remove";
+            cr.set_source_rgb(dim_r, dim_g, dim_b);
+            layout.set_text(hint);
+            let (hint_w, _) = layout.pixel_size();
+            cr.move_to(
+                x + w - hint_w as f64 - 4.0,
+                y + row as f64 * line_height + (line_height - lh4 as f64) / 2.0,
+            );
+            pangocairo::show_layout(cr, layout);
+            row += 1;
+        }
+        if installed_count == 0 && row as f64 * line_height < h {
+            cr.set_source_rgb(dim_r, dim_g, dim_b);
+            layout.set_text("    (none installed)");
+            let (_, lhn) = layout.pixel_size();
+            cr.move_to(
+                x + 2.0,
+                y + row as f64 * line_height + (line_height - lhn as f64) / 2.0,
+            );
+            pangocairo::show_layout(cr, layout);
+            row += 1;
+        }
+    }
+
+    // ── AVAILABLE section ─────────────────────────────────────────────────────
+    let installed_section_len = if ext.sections_expanded[0] {
+        installed_count.max(1)
+    } else {
+        0
+    };
+    let available_count = ext.items_available.len();
+    if row as f64 * line_height < h {
+        let arrow = if ext.sections_expanded[1] {
+            "▼"
+        } else {
+            "▶"
+        };
+        let sec_hdr = format!("  {} AVAILABLE ({})", arrow, available_count);
+        cr.set_source_rgb(hdr_r * 0.85, hdr_g * 0.85, hdr_b * 0.85);
+        cr.rectangle(x, y + row as f64 * line_height, w, line_height);
+        cr.fill().ok();
+        cr.set_source_rgb(dim_r, dim_g, dim_b);
+        layout.set_text(&sec_hdr);
+        let (_, lh5) = layout.pixel_size();
+        cr.move_to(
+            x + 2.0,
+            y + row as f64 * line_height + (line_height - lh5 as f64) / 2.0,
+        );
+        pangocairo::show_layout(cr, layout);
+        row += 1;
+    }
+
+    if ext.sections_expanded[1] {
+        for (idx, item) in ext.items_available.iter().enumerate() {
+            if row as f64 * line_height >= h {
+                break;
+            }
+            // flat index = installed_section_len (installed items, min 1) + available index
+            // but sections_expanded[0] affects offset
+            let flat_idx = installed_section_len + idx;
+            let is_selected = ext.has_focus && ext.selected == flat_idx;
+            if is_selected {
+                cr.set_source_rgb(sel_r, sel_g, sel_b);
+                cr.rectangle(x, y + row as f64 * line_height, w, line_height);
+                cr.fill().ok();
+            }
+            let name_text = format!("  ○ {}", item.display_name);
+            cr.set_source_rgb(fg_r, fg_g, fg_b);
+            layout.set_text(&name_text);
+            let (_, lh6) = layout.pixel_size();
+            cr.move_to(
+                x + 2.0,
+                y + row as f64 * line_height + (line_height - lh6 as f64) / 2.0,
+            );
+            pangocairo::show_layout(cr, layout);
+            // Right-aligned hint
+            let hint = "  [Enter] install";
+            cr.set_source_rgb(dim_r, dim_g, dim_b);
+            layout.set_text(hint);
+            let (hint_w, _) = layout.pixel_size();
+            cr.move_to(
+                x + w - hint_w as f64 - 4.0,
+                y + row as f64 * line_height + (line_height - lh6 as f64) / 2.0,
+            );
+            pangocairo::show_layout(cr, layout);
+            // Description row (dim, smaller - we skip to keep it simple, one row per item)
+            row += 1;
+        }
+        if available_count == 0 && row as f64 * line_height < h {
+            let msg = if ext.fetching {
+                "    Fetching registry…"
+            } else {
+                "    (all extensions installed)"
+            };
+            cr.set_source_rgb(dim_r, dim_g, dim_b);
+            layout.set_text(msg);
+            let (_, lhn) = layout.pixel_size();
+            cr.move_to(
+                x + 2.0,
+                y + row as f64 * line_height + (line_height - lhn as f64) / 2.0,
+            );
+            pangocairo::show_layout(cr, layout);
+            row += 1;
+        }
+    }
+
+    // Focus border
+    if ext.has_focus {
+        cr.set_source_rgb(fg_r * 0.4, fg_g * 0.4, fg_b * 0.9);
+        cr.set_line_width(1.5);
+        cr.rectangle(x + 0.75, y + 0.75, w - 1.5, h - 1.5);
+        cr.stroke().ok();
+    }
+
+    let _ = (sel_r, sel_g, sel_b, row);
 }
 
 fn draw_debug_toolbar(

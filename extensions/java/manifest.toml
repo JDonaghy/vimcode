@@ -1,0 +1,12 @@
+name = "java"
+display_name = "Java Language Support"
+description = "LSP for Java (manual jdtls install required)"
+version = "1.0.0"
+file_extensions = [".java"]
+language_ids = ["java"]
+
+[lsp]
+binary = "jdtls"
+install = ""
+
+scripts = []

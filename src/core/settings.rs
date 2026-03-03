@@ -166,6 +166,12 @@ pub struct Settings {
     /// Auto-wrap inserted text at this column (0 = disabled). Corresponds to Vim's `textwidth`.
     #[serde(default)]
     pub textwidth: usize,
+
+    /// URL of the extension registry JSON file.
+    /// Default points to the official VimCode GitHub registry.
+    /// Override for self-hosted or GitHub Pages custom domain setups.
+    #[serde(default = "default_extension_registry_url")]
+    pub extension_registry_url: String,
 }
 
 fn default_explorer_visible() -> bool {
@@ -210,6 +216,10 @@ fn default_terminal_scrollback_lines() -> usize {
 
 fn default_leader() -> char {
     ' '
+}
+
+fn default_extension_registry_url() -> String {
+    crate::core::registry::REGISTRY_URL.to_string()
 }
 
 // ── Explorer key defaults ──────────────────────────────────────────────────
@@ -478,6 +488,7 @@ impl Default for Settings {
             splitright: false,
             colorcolumn: String::new(),
             textwidth: 0,
+            extension_registry_url: default_extension_registry_url(),
         }
     }
 }

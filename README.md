@@ -11,7 +11,7 @@ There's a touch of irony here - using a cli tool to write the editor that I've w
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 1078 tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 1125 tests, zero async runtime dependency
 
 
 ## Download (Ubuntu)
@@ -515,16 +515,14 @@ VimCode embeds Lua 5.4 (via `mlua`, fully vendored — no system Lua required). 
 
 ```lua
 -- Event hooks
-vimcode.on("save",  function(path) end)   -- fired after :w
-vimcode.on("open",  function(path) end)   -- fired on file open
-vimcode.on("close", function(path) end)   -- (reserved for future use)
+vimcode.on("save",        function(path) end)     -- fired after :w
+vimcode.on("open",        function(path) end)     -- fired on file open
+vimcode.on("cursor_move", function(line_col) end) -- fired when cursor moves (arg: "line,col")
 
--- Custom commands
+-- Custom commands / key mappings
 vimcode.command("MyCmd", function(args) end)
-
--- Custom key mappings
 vimcode.keymap("n", "<leader>x", function() end)   -- normal mode
-vimcode.keymap("i", "<C-Space>", function() end)   -- insert mode (non-printable keys)
+vimcode.keymap("i", "<C-Space>", function() end)   -- insert mode
 
 -- Editor API
 vimcode.message(text)         -- show in status bar
@@ -532,11 +530,18 @@ vimcode.cwd()                 -- current working directory string
 vimcode.command_run(cmd)      -- execute a VimCode : command
 
 -- Buffer API (current active buffer)
-vimcode.buf.lines()           -- returns table of all lines (strings)
-vimcode.buf.line(n)           -- returns line n (1-indexed) or nil
-vimcode.buf.set_line(n, text) -- replace line n (applied after callback returns)
-vimcode.buf.path()            -- returns file path string or nil
-vimcode.buf.line_count()      -- returns integer
+vimcode.buf.lines()              -- all lines as table
+vimcode.buf.line(n)              -- line n (1-indexed) or nil
+vimcode.buf.set_line(n, text)    -- replace line n
+vimcode.buf.path()               -- file path string or nil
+vimcode.buf.line_count()         -- integer
+vimcode.buf.cursor()             -- {line, col} (1-indexed)
+vimcode.buf.annotate_line(n, s)  -- show virtual text after line n
+vimcode.buf.clear_annotations()  -- remove all virtual text
+
+-- Git API (synchronous, <50ms subprocess calls)
+vimcode.git.blame_line(n)        -- {hash,author,date,relative_date,message} or nil
+vimcode.git.log_file(limit)      -- [{hash,message}, ...] for current file
 ```
 
 **Example plugin** (`~/.config/vimcode/plugins/hello.lua`):
@@ -561,6 +566,57 @@ Then `:Hello world` shows "Hello from Lua! world" in the status bar.
 | `:Plugin disable <name>` | Disable a plugin (persisted in settings) |
 
 Plugins are loaded in alphabetical order on startup. Security: plugins have unrestricted file and process access (same trust model as Neovim).
+
+---
+
+### Language Extensions
+
+Language extensions bundle an LSP server, optional DAP debugger, and Lua scripts into a single named package. When you open a file for a language that has a known extension but no LSP server installed, the status bar shows a one-line hint:
+
+```
+No C# Language Support extension — :ExtInstall csharp  (N to dismiss)
+```
+
+**Bundled extensions:**
+
+| Extension | Language | LSP | DAP |
+|-----------|----------|-----|-----|
+| `csharp` | C# / .NET | csharp-ls | netcoredbg |
+| `python` | Python | pyright | debugpy |
+| `rust` | Rust | rust-analyzer | codelldb |
+| `javascript` | JS / TypeScript | typescript-language-server | — |
+| `go` | Go | gopls | delve |
+| `java` | Java | jdtls | — |
+| `cpp` | C / C++ | clangd | codelldb |
+| `php` | PHP | intelephense | — |
+| `ruby` | Ruby | ruby-lsp | — |
+| `bash` | Bash | bash-language-server | — |
+| `git-insights` | (all files) | — | — |
+
+**Extensions sidebar panel** — click the extensions icon (󱧅) in the activity bar to open a VSCode-style panel with two sections:
+- **INSTALLED** — extensions currently installed; press `Enter` to view info, `d` to remove
+- **AVAILABLE** — all bundled and registry extensions; press `Enter` or `i` to install
+- `/` — activate search input to filter both sections; `Escape` exits search, `q`/`Escape` unfocuses panel
+- `j` / `k` — navigate items; `r` — refresh registry from GitHub; `Tab` — collapse/expand section
+
+**Extension commands:**
+
+| Command | Action |
+|---------|--------|
+| `:ExtInstall <name>` | Install LSP + DAP + extract Lua scripts |
+| `:ExtRemove <name>` | Unmark extension as installed + delete its Lua scripts (LSP binary untouched) |
+| `:ExtList` | Show all extensions and their install status |
+| `:ExtEnable <name>` | Re-enable a disabled extension |
+| `:ExtDisable <name>` | Suppress install prompts for this extension |
+| `:ExtRefresh` | Fetch the latest extension list from the GitHub registry |
+
+**Git Insights extension** — when installed, shows inline blame annotations as dim virtual text at the end of the cursor's current line:
+
+```
+42  let result = compute();   Alice • 3 days ago • fix off-by-one
+```
+
+Also adds `:GitLog` command to display recent commits for the current file in the status bar.
 
 ---
 
@@ -599,6 +655,7 @@ Automatic language server integration — open a file and diagnostics, completio
 | `:LspInfo` | Show running servers and their status |
 | `:LspRestart` | Restart server for current file type |
 | `:LspStop` | Stop server for current file type |
+| `:LspInstall <lang>` | Redirect to `:ExtInstall <name>` (use `:ExtInstall` directly) |
 | `:Lformat` | Format current buffer via LSP |
 | `:Rename <name>` | Rename symbol under cursor across all files |
 
@@ -647,6 +704,7 @@ Additional options (set directly in `settings.json`):
 |-----|---------|-------------|
 | `terminal_scrollback_lines` | `5000` | Rows kept in terminal scrollback history (0 = unlimited) |
 | `leader` | `" "` (Space) | Leader key character for `<leader>gf` / `<leader>rn` sequences |
+| `extension_registry_url` | GitHub raw URL | URL for the remote extension registry JSON (override for self-hosted) |
 
 - `:set option?` — query current value (e.g. `:set ts?` → `tabstop=4`)
 - `:set option!` — toggle a boolean option (e.g. `:set wrap!`); `no<option>!` explicitly disables (e.g. `:set nowrap!`)
@@ -925,6 +983,10 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `:Plugin reload` | Reload plugins from disk |
 | `:Plugin enable <name>` | Enable a plugin |
 | `:Plugin disable <name>` | Disable a plugin |
+| `:ExtInstall <name>` | Install a language extension (LSP + DAP + Lua scripts) |
+| `:ExtList` | List available extensions and their install status |
+| `:ExtEnable <name>` | Re-enable a disabled extension |
+| `:ExtDisable <name>` | Disable an extension (suppress install prompts) |
 | `:config reload` | Reload settings from disk |
 | `:help [topic]` / `:h [topic]` | Show help (topics: explorer, keys, commands) |
 

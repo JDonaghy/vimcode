@@ -59,6 +59,7 @@ copypasta-ext = "0.4"
 portable-pty = "0.8"
 vt100 = "0.15"
 mlua = { version = "0.9", features = ["lua54", "vendored"] }
+toml = "0.8"
 
 # Optimize dependencies in dev builds — GTK/Relm4/Cairo/Pango FFI calls and
 # Tree-sitter parsing are 10-50× slower without optimization, causing visible

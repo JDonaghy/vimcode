@@ -101,6 +101,83 @@ impl HistoryState {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ExtensionState — installed/dismissed extension tracking
+// ---------------------------------------------------------------------------
+
+/// Which extensions the user has installed or dismissed, persisted to
+/// `~/.config/vimcode/extensions.json`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ExtensionState {
+    /// Names of extensions the user has installed (e.g. `["csharp", "git-insights"]`).
+    #[serde(default)]
+    pub installed: Vec<String>,
+    /// Names of extensions the user dismissed the install prompt for.
+    #[serde(default)]
+    pub dismissed: Vec<String>,
+}
+
+impl ExtensionState {
+    fn extensions_path() -> std::path::PathBuf {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        std::path::PathBuf::from(home).join(".config/vimcode/extensions.json")
+    }
+
+    /// Load extension state from disk.  Returns `Default` when the file is
+    /// absent or malformed.
+    pub fn load() -> Self {
+        let path = Self::extensions_path();
+        if let Ok(contents) = std::fs::read_to_string(&path) {
+            if let Ok(state) = serde_json::from_str(&contents) {
+                return state;
+            }
+        }
+        Self::default()
+    }
+
+    /// Persist extension state (atomic write).
+    pub fn save(&self) -> std::io::Result<()> {
+        #[cfg(test)]
+        return Ok(());
+
+        #[cfg_attr(test, allow(unreachable_code))]
+        {
+            let path = Self::extensions_path();
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let json = serde_json::to_string_pretty(self)?;
+            let tmp = path.with_extension("json.tmp");
+            std::fs::write(&tmp, &json)?;
+            std::fs::rename(&tmp, &path)?;
+            Ok(())
+        }
+    }
+
+    /// Mark an extension as installed, removing any dismissed entry.
+    pub fn mark_installed(&mut self, name: &str) {
+        self.dismissed.retain(|n| n != name);
+        if !self.installed.contains(&name.to_string()) {
+            self.installed.push(name.to_string());
+        }
+    }
+
+    /// Mark an extension as dismissed (suppress future install prompts).
+    pub fn mark_dismissed(&mut self, name: &str) {
+        if !self.dismissed.contains(&name.to_string()) {
+            self.dismissed.push(name.to_string());
+        }
+    }
+
+    pub fn is_installed(&self, name: &str) -> bool {
+        self.installed.iter().any(|n| n == name)
+    }
+
+    pub fn is_dismissed(&self, name: &str) -> bool {
+        self.dismissed.iter().any(|n| n == name)
+    }
+}
+
 /// Recursive group layout for session persistence.
 /// Each leaf stores the files open in that group.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -531,6 +608,48 @@ mod tests {
         } else {
             panic!("expected Split");
         }
+    }
+
+    #[test]
+    fn test_extension_state_mark_installed() {
+        let mut es = ExtensionState::default();
+        assert!(!es.is_installed("csharp"));
+        es.mark_installed("csharp");
+        assert!(es.is_installed("csharp"));
+        // idempotent
+        es.mark_installed("csharp");
+        assert_eq!(es.installed.iter().filter(|n| *n == "csharp").count(), 1);
+    }
+
+    #[test]
+    fn test_extension_state_mark_dismissed() {
+        let mut es = ExtensionState::default();
+        es.mark_dismissed("java");
+        assert!(es.is_dismissed("java"));
+        // idempotent
+        es.mark_dismissed("java");
+        assert_eq!(es.dismissed.iter().filter(|n| *n == "java").count(), 1);
+    }
+
+    #[test]
+    fn test_extension_state_install_clears_dismissed() {
+        let mut es = ExtensionState::default();
+        es.mark_dismissed("python");
+        assert!(es.is_dismissed("python"));
+        es.mark_installed("python");
+        assert!(es.is_installed("python"));
+        assert!(!es.is_dismissed("python"));
+    }
+
+    #[test]
+    fn test_extension_state_serialization() {
+        let mut es = ExtensionState::default();
+        es.mark_installed("csharp");
+        es.mark_dismissed("java");
+        let json = serde_json::to_string(&es).unwrap();
+        let restored: ExtensionState = serde_json::from_str(&json).unwrap();
+        assert!(restored.is_installed("csharp"));
+        assert!(restored.is_dismissed("java"));
     }
 
     #[test]

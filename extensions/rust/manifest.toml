@@ -1,0 +1,15 @@
+name = "rust"
+display_name = "Rust Language Support"
+description = "LSP and debugger for Rust"
+version = "1.0.0"
+file_extensions = [".rs"]
+language_ids = ["rust"]
+
+[lsp]
+binary = "rust-analyzer"
+install = "cargo install rust-analyzer"
+
+[dap]
+adapter = "codelldb"
+
+scripts = []

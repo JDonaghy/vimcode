@@ -5,12 +5,14 @@ use vimcode_core::{Cursor, Engine, EngineAction, Mode};
 
 /// Create an engine with pre-populated buffer content.
 ///
-/// Resets settings to library defaults so integration tests are hermetic:
-/// `Settings::load()` reads the user's real settings.json (no `#[cfg(test)]`
-/// guard in the compiled library), which could vary between machines.
+/// Resets settings and extension state to library defaults so integration tests
+/// are hermetic: `Settings::load()` and `ExtensionState::load()` read real
+/// config files on disk (no `#[cfg(test)]` guard in the compiled library),
+/// which would vary between machines.
 pub fn engine_with(text: &str) -> Engine {
     let mut e = Engine::new();
     e.settings = vimcode_core::Settings::default();
+    e.extension_state = vimcode_core::core::session::ExtensionState::default();
     if !text.is_empty() {
         e.buffer_mut().insert(0, text);
     }

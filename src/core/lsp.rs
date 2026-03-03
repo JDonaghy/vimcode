@@ -349,10 +349,11 @@ pub fn completion_kind_label(kind: u32) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
-// Mason registry helpers
+// Mason registry helpers (kept for reference; no longer actively used)
 // ---------------------------------------------------------------------------
 
 /// Information parsed from a Mason package.yaml.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct MasonPackageInfo {
     /// Binary names that the package installs (from the `bin:` section).
@@ -380,7 +381,8 @@ impl MasonPackageInfo {
 }
 
 /// Static mapping: LSP language ID → Mason registry package name.
-/// Used to look up package metadata when no server is configured.
+/// Kept for reference; no longer actively called.
+#[allow(dead_code)]
 pub fn mason_package_for_language(lang_id: &str) -> Option<&'static str> {
     match lang_id {
         "csharp" => Some("csharp-language-server"),
@@ -412,6 +414,7 @@ pub fn mason_package_for_language(lang_id: &str) -> Option<&'static str> {
 }
 
 /// Convert a PURL string (e.g. `pkg:npm/bash-language-server`) to a shell install command.
+#[allow(dead_code)]
 pub fn parse_purl_install_cmd(purl: &str) -> Option<String> {
     let purl = purl.trim();
     if let Some(rest) = purl.strip_prefix("pkg:npm/") {
@@ -447,6 +450,7 @@ pub fn parse_purl_install_cmd(purl: &str) -> Option<String> {
 /// - Binary names from the `bin:` section (indented key lines).
 /// - Install command from the first `id: pkg:` line under `source:`.
 /// - Package categories from the `categories:` section (e.g. LSP, DAP, Linter).
+#[allow(dead_code)]
 pub fn parse_mason_package_yaml(yaml: &str) -> MasonPackageInfo {
     let mut binaries = Vec::new();
     let mut install_cmd = None;

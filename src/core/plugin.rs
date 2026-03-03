@@ -12,6 +12,8 @@ use mlua::prelude::*;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use super::git;
+
 // ─── Public types ─────────────────────────────────────────────────────────────
 
 /// Manages all loaded Lua plugins and their registered callbacks.
@@ -47,12 +49,24 @@ pub struct PluginCallContext {
     pub cwd: String,
     pub buf_path: Option<String>,
     pub buf_lines: Vec<String>,
+    /// Cursor line (1-indexed) in the active buffer.
+    pub cursor_line: usize,
+    /// Cursor column (1-indexed) in the active buffer.
+    pub cursor_col: usize,
+    /// Filesystem path for the current working directory (for git operations).
+    pub cwd_path: Option<PathBuf>,
+    /// Filesystem path for the active buffer (for git operations).
+    pub buf_path_os: Option<PathBuf>,
     // ── Outputs written by callbacks ────────────────────────────────────────
     pub message: Option<String>,
     /// `(0-based line index, new text)` — applied by the engine after the call.
     pub set_lines: Vec<(usize, String)>,
     /// VimCode commands to execute after the call (e.g. `"w"` to save).
     pub run_commands: Vec<String>,
+    /// Inline annotations to set: `(1-indexed line, annotation text)`.
+    pub annotate_lines: Vec<(usize, String)>,
+    /// When true, all existing line annotations are cleared first.
+    pub clear_annotations: bool,
 }
 
 // ─── Internal registration accumulator ───────────────────────────────────────
@@ -377,7 +391,116 @@ impl PluginManager {
             })?,
         )?;
 
+        // vimcode.buf.cursor() → {line, col}  (1-indexed)
+        buf.set(
+            "cursor",
+            lua.create_function(|lua, ()| {
+                let t = lua.create_table()?;
+                if let Some(ctx) = lua.app_data_ref::<PluginCallContext>() {
+                    t.set("line", ctx.cursor_line)?;
+                    t.set("col", ctx.cursor_col)?;
+                } else {
+                    t.set("line", 1usize)?;
+                    t.set("col", 1usize)?;
+                }
+                Ok(t)
+            })?,
+        )?;
+
+        // vimcode.buf.annotate_line(n, text)  (1-indexed)
+        buf.set(
+            "annotate_line",
+            lua.create_function(|lua, (n, text): (usize, String)| {
+                if let Some(mut ctx) = lua.app_data_mut::<PluginCallContext>() {
+                    if n > 0 {
+                        ctx.annotate_lines.push((n, text));
+                    }
+                }
+                Ok(())
+            })?,
+        )?;
+
+        // vimcode.buf.clear_annotations()
+        buf.set(
+            "clear_annotations",
+            lua.create_function(|lua, ()| {
+                if let Some(mut ctx) = lua.app_data_mut::<PluginCallContext>() {
+                    ctx.clear_annotations = true;
+                    ctx.annotate_lines.clear();
+                }
+                Ok(())
+            })?,
+        )?;
+
         vimcode.set("buf", buf)?;
+
+        // ── vimcode.git subtable ────────────────────────────────────────────
+        let git_tbl = lua.create_table()?;
+
+        // vimcode.git.blame_line(n) → {hash, author, date, relative_date, message} or nil
+        git_tbl.set(
+            "blame_line",
+            lua.create_function(|lua, n: usize| {
+                let (cwd_path, buf_path_os) = {
+                    let ctx = match lua.app_data_ref::<PluginCallContext>() {
+                        Some(c) => c,
+                        None => return Ok(LuaValue::Nil),
+                    };
+                    (ctx.cwd_path.clone(), ctx.buf_path_os.clone())
+                };
+                let file = match buf_path_os {
+                    Some(p) => p,
+                    None => return Ok(LuaValue::Nil),
+                };
+                let repo_root = git::find_repo_root(cwd_path.as_deref().unwrap_or(&file))
+                    .unwrap_or_else(|| file.parent().map(|p| p.to_path_buf()).unwrap_or_default());
+                let info = match git::blame_line(&repo_root, &file, n) {
+                    Some(i) => i,
+                    None => return Ok(LuaValue::Nil),
+                };
+                let t = lua.create_table()?;
+                t.set("hash", info.hash)?;
+                t.set("author", info.author)?;
+                t.set("date", info.timestamp)?;
+                t.set("relative_date", info.relative_date)?;
+                t.set("message", info.message)?;
+                Ok(LuaValue::Table(t))
+            })?,
+        )?;
+
+        // vimcode.git.log_file(limit) → [{hash, message}, ...]
+        git_tbl.set(
+            "log_file",
+            lua.create_function(|lua, limit: usize| {
+                let (cwd_path, buf_path_os) = {
+                    let ctx = match lua.app_data_ref::<PluginCallContext>() {
+                        Some(c) => c,
+                        None => {
+                            return lua.create_table();
+                        }
+                    };
+                    (ctx.cwd_path.clone(), ctx.buf_path_os.clone())
+                };
+                let file = match buf_path_os {
+                    Some(p) => p,
+                    None => return lua.create_table(),
+                };
+                let repo_root = git::find_repo_root(cwd_path.as_deref().unwrap_or(&file))
+                    .unwrap_or_else(|| file.parent().map(|p| p.to_path_buf()).unwrap_or_default());
+                let entries = git::log_file(&repo_root, &file, limit);
+                let t = lua.create_table()?;
+                for (i, e) in entries.into_iter().enumerate() {
+                    let row = lua.create_table()?;
+                    row.set("hash", e.hash)?;
+                    row.set("message", e.message)?;
+                    t.set(i + 1, row)?;
+                }
+                Ok(t)
+            })?,
+        )?;
+
+        vimcode.set("git", git_tbl)?;
+
         lua.globals().set("vimcode", vimcode)?;
         Ok(())
     }
