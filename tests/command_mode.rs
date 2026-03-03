@@ -120,10 +120,10 @@ fn test_norm_append_to_all_lines() {
 #[test]
 fn test_tabnew_adds_tab() {
     let mut e = engine_with("hello\n");
-    let initial_tabs = e.tabs.len();
+    let initial_tabs = e.active_group().tabs.len();
     exec(&mut e, "tabnew");
     assert_eq!(
-        e.tabs.len(),
+        e.active_group().tabs.len(),
         initial_tabs + 1,
         "expected one more tab after :tabnew"
     );

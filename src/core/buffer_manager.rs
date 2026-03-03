@@ -345,6 +345,7 @@ impl BufferState {
     }
 
     /// Undo all changes on the current line (U command)
+    #[allow(dead_code)]
     pub fn undo_line(&mut self, current_line: usize, cursor: Cursor) -> Option<Cursor> {
         let (saved_line, original_content) = self.line_undo_state.take()?;
 

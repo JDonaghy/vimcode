@@ -30,8 +30,9 @@ sudo pacman -S gtk4 pango
 
 ```bash
 cargo build
-cargo run -- <file>          # GTK window
-cargo run --bin vimcode-tui  # Terminal UI
+cargo run -- <file>                         # GTK window
+cargo run -- --tui <file>                   # Terminal UI (alias: -t)
+cargo run -- --tui --debug /tmp/v.log       # TUI with debug log
 cargo test -- --test-threads=1
 cargo clippy -- -D warnings
 cargo fmt
@@ -191,6 +192,16 @@ cargo fmt
 **Tabs**
 - `:tabnew` — new tab; `:tabclose` — close tab
 - `gt` / `gT` or `g` + `t` / `T` — next/previous tab
+
+**Editor Groups (VSCode-style split panes, recursive)**
+- `Ctrl+\` — split editor right (any group can be split again for nested layouts)
+- `Ctrl-W e` / `Ctrl-W E` — split editor right / down
+- `Ctrl+1` through `Ctrl+9` — focus group by position (tree order)
+- `:EditorGroupFocus` / `:egf` — cycle focus to the next group
+- `:EditorGroupClose` / `:egc` — close the active group (sibling promoted)
+- `:EditorGroupMoveTab` / `:egmt` — move the current tab to the next group
+- `Alt+,` / `Alt+.` (TUI) — resize the parent split of the active group
+- Drag any divider (GTK) — resize that specific split
 
 **Quit / Save**
 - `:w` — save; `:wq` — save and quit
@@ -467,7 +478,7 @@ A `.vimcode-workspace` file at the project root captures folder settings and ena
 ```
 Settings in the workspace file overlay your global `settings.json`.
 
-**Per-project sessions** — when a workspace or folder is open, the session (open files, cursor/scroll positions) is stored separately from the global session using a stable hash of the workspace root path (`~/.config/vimcode/sessions/<hash>.json`). The session is saved on quit and restored automatically the next time you open the same folder.
+**Per-project sessions** — the session (open files, cursor/scroll positions) is stored per-directory using a stable hash of the workspace root path (`~/.config/vimcode/sessions/<hash>.json`). The session is saved on quit and restored automatically the next time you open the same folder. Opening a new or different directory always starts with a clean editor — files from other projects are never carried over.
 
 **Settings overlay** — workspace settings in `.vimcode-workspace` are applied on top of your global `settings.json`. When you switch to a different folder, the overlay is reverted so your global settings are restored. Per-folder `.vimcode/settings.json` files work the same way.
 
@@ -803,6 +814,9 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `Shift+F11` | Step out |
 | `Alt+E` | Focus / unfocus file explorer |
 | `Alt+F` | Focus / unfocus search panel |
+| `Ctrl+\` | Split editor right (new editor group) |
+| `Ctrl+1` / `Ctrl+2` | Focus editor group 0 / 1 |
+| `Alt+,` / `Alt+.` | Resize group split (TUI) |
 
 ### Command Mode
 
@@ -872,6 +886,11 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `:DapWatch <expr>` | Add watch expression to debug sidebar |
 | `:GWorktreeAdd <branch> <path>` | Add git worktree |
 | `:GWorktreeRemove <path>` | Remove git worktree |
+| `:EditorGroupSplit` / `:egsp` | Split editor right (new editor group) |
+| `:EditorGroupSplitDown` / `:egspd` | Split editor down |
+| `:EditorGroupClose` / `:egc` | Close active editor group |
+| `:EditorGroupFocus` / `:egf` | Toggle focus between editor groups |
+| `:EditorGroupMoveTab` / `:egmt` | Move current tab to other editor group |
 | `:OpenFolder <path>` | Open folder as workspace root |
 | `:OpenWorkspace <path>` | Open `.vimcode-workspace` file |
 | `:SaveWorkspaceAs <path>` | Save workspace file |

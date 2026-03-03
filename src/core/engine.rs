@@ -16,12 +16,14 @@ use super::lsp::{
 use super::lsp_manager::LspManager;
 use super::plugin;
 use super::project_search::{self, ProjectMatch, ReplaceResult, SearchError, SearchOptions};
-use super::session::SessionState;
+use super::session::{HistoryState, SessionGroupLayout, SessionState};
 use super::settings::{EditorMode, Settings};
 use super::tab::{Tab, TabId};
 use super::terminal::{default_shell, TerminalPane};
 use super::view::View;
-use super::window::{SplitDirection, Window, WindowId, WindowLayout, WindowRect};
+use super::window::{
+    GroupDivider, GroupId, GroupLayout, SplitDirection, Window, WindowId, WindowLayout, WindowRect,
+};
 use super::{Cursor, Mode};
 
 /// High bit marker for synthetic "Non-Public Members" group var_refs.
@@ -387,6 +389,37 @@ pub static PALETTE_COMMANDS: &[PaletteCommand] = &[
         vscode_shortcut: "",
         action: "Plugin list",
     },
+    // Editor groups
+    PaletteCommand {
+        label: "View: Split Editor Right",
+        shortcut: "Ctrl+\\",
+        vscode_shortcut: "Ctrl+\\",
+        action: "EditorGroupSplit",
+    },
+    PaletteCommand {
+        label: "View: Split Editor Down",
+        shortcut: "Ctrl-W E",
+        vscode_shortcut: "",
+        action: "EditorGroupSplitDown",
+    },
+    PaletteCommand {
+        label: "View: Close Editor Group",
+        shortcut: "",
+        vscode_shortcut: "",
+        action: "EditorGroupClose",
+    },
+    PaletteCommand {
+        label: "View: Focus Other Group",
+        shortcut: "Ctrl+2",
+        vscode_shortcut: "Ctrl+2",
+        action: "EditorGroupFocus",
+    },
+    PaletteCommand {
+        label: "View: Move Tab to Other Group",
+        shortcut: "",
+        vscode_shortcut: "",
+        action: "EditorGroupMoveTab",
+    },
 ];
 
 /// How a file should be opened: as a temporary preview or permanent buffer.
@@ -486,12 +519,44 @@ pub enum BottomPanelKind {
     DebugOutput,
 }
 
+/// One panel in a VSCode-style editor-group split.
+/// Each group owns its own tab bar and independent tab navigation.
+/// Single-group mode (the default) is identical to the previous behaviour.
+#[derive(Debug, Clone)]
+pub struct EditorGroup {
+    pub tabs: Vec<Tab>,
+    pub active_tab: usize,
+}
+
+impl EditorGroup {
+    pub fn new(initial_tab: Tab) -> Self {
+        Self {
+            tabs: vec![initial_tab],
+            active_tab: 0,
+        }
+    }
+
+    pub fn active_tab(&self) -> &Tab {
+        &self.tabs[self.active_tab]
+    }
+
+    pub fn active_tab_mut(&mut self) -> &mut Tab {
+        &mut self.tabs[self.active_tab]
+    }
+}
+
 pub struct Engine {
     // --- Multi-buffer/window state ---
     pub buffer_manager: BufferManager,
     pub windows: HashMap<WindowId, Window>,
-    pub tabs: Vec<Tab>,
-    pub active_tab: usize,
+    /// Editor groups stored by ID (recursive split layout).
+    pub editor_groups: HashMap<GroupId, EditorGroup>,
+    /// ID of the currently focused editor group.
+    pub active_group: GroupId,
+    /// Recursive binary tree of group splits.
+    pub group_layout: GroupLayout,
+    /// Counter for generating unique GroupIds.
+    next_group_id: usize,
     next_window_id: usize,
     next_tab_id: usize,
 
@@ -503,6 +568,8 @@ pub struct Engine {
     pub mode: Mode,
     /// Accumulates typed characters in Command/Search mode.
     pub command_buffer: String,
+    /// Cursor position within `command_buffer` (char index, 0 = before first char).
+    pub command_cursor: usize,
     /// Status message shown in the command line area (e.g. "written", errors).
     pub message: String,
     /// Current search query (from last `/` or `?` search).
@@ -572,6 +639,8 @@ pub struct Engine {
     // --- Session state (history, window geometry, etc.) ---
     /// Session state persisted across restarts
     pub session: SessionState,
+    /// Command/search history — saved to a separate history.json file
+    pub history: HistoryState,
 
     /// Current position in command history (None = typing new command)
     pub command_history_index: Option<usize>,
@@ -986,13 +1055,20 @@ impl Engine {
         let mut engine = Self {
             buffer_manager,
             windows,
-            tabs: vec![tab],
-            active_tab: 0,
+            editor_groups: {
+                let mut m = HashMap::new();
+                m.insert(GroupId(0), EditorGroup::new(tab));
+                m
+            },
+            active_group: GroupId(0),
+            group_layout: GroupLayout::leaf(GroupId(0)),
+            next_group_id: 1,
             next_window_id: 2,
             next_tab_id: 2,
             preview_buffer_id: None,
             mode: Mode::Normal,
             command_buffer: String::new(),
+            command_cursor: 0,
             message: String::new(),
             search_query: String::new(),
             search_matches: Vec::new(),
@@ -1018,6 +1094,7 @@ impl Engine {
                 Settings::load()
             },
             session: SessionState::load(),
+            history: HistoryState::load(),
             command_history_index: None,
             command_typing_buffer: String::new(),
             history_search_active: false,
@@ -1219,15 +1296,34 @@ impl Engine {
     }
 
     // =======================================================================
+    // Editor group accessors
+    // =======================================================================
+
+    pub fn active_group(&self) -> &EditorGroup {
+        self.editor_groups.get(&self.active_group).unwrap()
+    }
+
+    pub fn active_group_mut(&mut self) -> &mut EditorGroup {
+        self.editor_groups.get_mut(&self.active_group).unwrap()
+    }
+
+    /// Allocate a new unique GroupId.
+    fn new_group_id(&mut self) -> GroupId {
+        let id = GroupId(self.next_group_id);
+        self.next_group_id += 1;
+        id
+    }
+
+    // =======================================================================
     // Accessors for active window/buffer (facade for backward compatibility)
     // =======================================================================
 
     pub fn active_tab(&self) -> &Tab {
-        &self.tabs[self.active_tab]
+        self.active_group().active_tab()
     }
 
     pub fn active_tab_mut(&mut self) -> &mut Tab {
-        &mut self.tabs[self.active_tab]
+        self.active_group_mut().active_tab_mut()
     }
 
     pub fn active_window_id(&self) -> WindowId {
@@ -1434,6 +1530,27 @@ impl Engine {
         self.active_buffer_state_mut().finish_undo_group();
     }
 
+    /// Return to Normal mode from any mode, performing any necessary cleanup
+    /// (finish undo group if in Insert, clear pending state, etc.).
+    /// Call this when a UI action (dialog, overlay) takes control outside the
+    /// normal keypress flow so the editor doesn't unexpectedly stay in Insert mode.
+    pub fn escape_to_normal(&mut self) {
+        match self.mode {
+            Mode::Insert => {
+                self.finish_undo_group();
+                self.mode = Mode::Normal;
+                self.clamp_cursor_col();
+                self.lsp_signature_help = None;
+            }
+            Mode::Visual | Mode::VisualLine | Mode::VisualBlock => {
+                self.mode = Mode::Normal;
+            }
+            _ => {}
+        }
+        self.pending_key = None;
+        self.count = None;
+    }
+
     /// Insert text with undo recording.
     pub fn insert_with_undo(&mut self, pos: usize, text: &str) {
         self.active_buffer_state_mut().record_insert(pos, text);
@@ -1490,6 +1607,7 @@ impl Engine {
     }
 
     /// Undo all changes on the current line (U command). Returns true if undo was performed.
+    #[allow(dead_code)]
     pub fn undo_line(&mut self) -> bool {
         let current_line = self.view().cursor.line;
         let cursor = self.view().cursor;
@@ -1503,7 +1621,8 @@ impl Engine {
             self.message = "Line restored".to_string();
             true
         } else {
-            self.message = "No changes to undo on this line".to_string();
+            // Silently do nothing — no "no changes" message, matching the behaviour of u
+            // when there's nothing to undo (which shows "Already at oldest change" only once).
             false
         }
     }
@@ -2261,18 +2380,19 @@ impl Engine {
 
     /// Close the active window. Returns true if the window was closed.
     pub fn close_window(&mut self) -> bool {
-        let tab = &self.tabs[self.active_tab];
+        let is_single_tab = self.active_group().tabs.len() == 1;
+        let is_single_window = self.active_tab().layout.is_single_window();
 
-        // Can't close the last window in the last tab
-        if tab.layout.is_single_window() && self.tabs.len() == 1 {
+        // Can't close the last window in the last tab of the last group
+        if is_single_window && is_single_tab && self.group_layout.is_single_group() {
             self.message = "Cannot close last window".to_string();
             return false;
         }
 
-        let window_id = tab.active_window;
+        let window_id = self.active_tab().active_window;
 
         // If this is the last window in the tab, close the tab
-        if tab.layout.is_single_window() {
+        if is_single_window {
             return self.close_tab();
         }
 
@@ -2339,9 +2459,19 @@ impl Engine {
         }
     }
 
-    /// Get the layout rectangles for the current tab.
-    pub fn calculate_window_rects(&self, bounds: WindowRect) -> Vec<(WindowId, WindowRect)> {
-        self.active_tab().layout.calculate_rects(bounds)
+    /// Switch `active_group` to whichever group owns `window_id`.
+    fn focus_group_for_window(&mut self, window_id: WindowId) {
+        for (&gid, group) in &self.editor_groups {
+            for (ti, tab) in group.tabs.iter().enumerate() {
+                if tab.window_ids().contains(&window_id) {
+                    self.active_group = gid;
+                    if let Some(g) = self.editor_groups.get_mut(&gid) {
+                        g.active_tab = ti;
+                    }
+                    return;
+                }
+            }
+        }
     }
 
     /// Set cursor position for a specific window and make it active.
@@ -2391,8 +2521,8 @@ impl Engine {
 
         let tab_id = self.new_tab_id();
         let tab = Tab::new(tab_id, window_id);
-        self.tabs.push(tab);
-        self.active_tab = self.tabs.len() - 1;
+        self.active_group_mut().tabs.push(tab);
+        self.active_group_mut().active_tab = self.active_group().tabs.len() - 1;
 
         if file_path.is_some() {
             self.lsp_did_open(buffer_id);
@@ -2402,22 +2532,47 @@ impl Engine {
 
     /// Close the current tab. Returns true if closed.
     pub fn close_tab(&mut self) -> bool {
-        if self.tabs.len() <= 1 {
+        if self.active_group().tabs.len() <= 1 {
+            // If there is a second group, close this group instead of erroring.
+            if !self.group_layout.is_single_group() {
+                self.close_editor_group();
+                return true;
+            }
             self.message = "Cannot close last tab".to_string();
             return false;
         }
 
+        // Collect the buffer IDs of windows being closed so we can clean them
+        // up from the buffer manager if nothing else references them.
+        let active_tab_idx = self.active_group().active_tab;
+        let window_ids: Vec<WindowId> = self.active_group().tabs[active_tab_idx].window_ids();
+        let closed_buffer_ids: Vec<BufferId> = window_ids
+            .iter()
+            .filter_map(|wid| self.windows.get(wid).map(|w| w.buffer_id))
+            .collect();
+
         // Remove all windows in this tab
-        let tab = &self.tabs[self.active_tab];
-        for window_id in tab.window_ids() {
-            self.windows.remove(&window_id);
+        for window_id in &window_ids {
+            self.windows.remove(window_id);
         }
 
-        self.tabs.remove(self.active_tab);
+        self.active_group_mut().tabs.remove(active_tab_idx);
 
         // Adjust active tab index
-        if self.active_tab >= self.tabs.len() {
-            self.active_tab = self.tabs.len() - 1;
+        let tabs_len = self.active_group().tabs.len();
+        if self.active_group().active_tab >= tabs_len {
+            self.active_group_mut().active_tab = tabs_len - 1;
+        }
+
+        // Remove any buffers that are no longer referenced by any window.
+        // This prevents orphaned dirty buffers from falsely triggering `:qa`
+        // unsaved-changes prompts after the user discards a tab.
+        let still_referenced: std::collections::HashSet<BufferId> =
+            self.windows.values().map(|w| w.buffer_id).collect();
+        for buf_id in closed_buffer_ids {
+            if !still_referenced.contains(&buf_id) {
+                let _ = self.buffer_manager.delete(buf_id, true /* force */);
+            }
         }
 
         true
@@ -2425,28 +2580,142 @@ impl Engine {
 
     /// Switch to the next tab.
     pub fn next_tab(&mut self) {
-        if !self.tabs.is_empty() {
-            self.active_tab = (self.active_tab + 1) % self.tabs.len();
+        let tabs_len = self.active_group().tabs.len();
+        if !self.active_group().tabs.is_empty() {
+            self.active_group_mut().active_tab = (self.active_group().active_tab + 1) % tabs_len;
         }
     }
 
     /// Switch to the previous tab.
     pub fn prev_tab(&mut self) {
-        if !self.tabs.is_empty() {
-            self.active_tab = if self.active_tab == 0 {
-                self.tabs.len() - 1
-            } else {
-                self.active_tab - 1
-            };
+        if !self.active_group().tabs.is_empty() {
+            let at = self.active_group().active_tab;
+            let tabs_len = self.active_group().tabs.len();
+            self.active_group_mut().active_tab = if at == 0 { tabs_len - 1 } else { at - 1 };
         }
     }
 
     /// Switch to a specific tab (0-indexed).
     #[allow(dead_code)]
     pub fn goto_tab(&mut self, index: usize) {
-        if index < self.tabs.len() {
-            self.active_tab = index;
+        if index < self.active_group().tabs.len() {
+            self.active_group_mut().active_tab = index;
         }
+    }
+
+    // =======================================================================
+    // Editor group management (VSCode-style split panes)
+    // =======================================================================
+
+    /// Split the active editor group in the given direction.
+    /// The new group opens a view of the current buffer.
+    pub fn open_editor_group(&mut self, direction: SplitDirection) {
+        let buf_id = self.active_buffer_id();
+        let new_window_id = self.new_window_id();
+        let mut new_window = Window::new(new_window_id, buf_id);
+        // Copy view state for visual continuity.
+        if let Some(src) = self.windows.get(&self.active_window_id()) {
+            new_window.view = src.view.clone();
+        }
+        self.windows.insert(new_window_id, new_window);
+        let tab_id = self.new_tab_id();
+        let tab = Tab::new(tab_id, new_window_id);
+        let new_id = self.new_group_id();
+        self.editor_groups.insert(new_id, EditorGroup::new(tab));
+        self.group_layout
+            .split_at(self.active_group, direction, new_id, false);
+        self.active_group = new_id;
+        self.message = "Editor split".to_string();
+    }
+
+    /// Close the currently focused editor group.
+    /// All windows in the closing group are removed; sibling is promoted.
+    pub fn close_editor_group(&mut self) {
+        if self.group_layout.is_single_group() {
+            return;
+        }
+        let closing = self.active_group;
+        // Collect window IDs before modifying groups
+        if let Some(group) = self.editor_groups.get(&closing) {
+            let window_ids: Vec<WindowId> =
+                group.tabs.iter().flat_map(|t| t.window_ids()).collect();
+            for wid in window_ids {
+                self.windows.remove(&wid);
+            }
+        }
+        self.editor_groups.remove(&closing);
+        self.group_layout.remove(closing);
+        self.active_group = self.group_layout.group_ids()[0];
+    }
+
+    /// Move focus to the next editor group (wraps around).
+    pub fn focus_other_group(&mut self) {
+        if let Some(next) = self.group_layout.next_group(self.active_group) {
+            self.active_group = next;
+        }
+    }
+
+    /// Move the current tab from the active group to the next group.
+    pub fn move_tab_to_other_group(&mut self) {
+        if self.group_layout.is_single_group() {
+            return;
+        }
+        if self.active_group().tabs.len() <= 1 {
+            self.message = "Cannot move last tab out of group".to_string();
+            return;
+        }
+        let idx = self.active_group().active_tab;
+        let tab = self.active_group_mut().tabs.remove(idx);
+        // Adjust active tab if needed
+        let tabs_len = self.active_group().tabs.len();
+        if self.active_group().active_tab >= tabs_len && tabs_len > 0 {
+            self.active_group_mut().active_tab = tabs_len - 1;
+        }
+        let other = self
+            .group_layout
+            .next_group(self.active_group)
+            .unwrap_or(self.active_group);
+        if let Some(other_group) = self.editor_groups.get_mut(&other) {
+            other_group.tabs.push(tab);
+            other_group.active_tab = other_group.tabs.len() - 1;
+        }
+        self.active_group = other;
+    }
+
+    /// Adjust the group split ratio of the parent split containing the active group.
+    /// Positive delta expands the active group (shrinks its sibling).
+    pub fn group_resize(&mut self, delta: f64) {
+        if let Some((split_index, _dir, is_first)) =
+            self.group_layout.parent_split_of(self.active_group)
+        {
+            // If active group is first child, increase ratio expands it.
+            // If second child, decrease ratio expands it.
+            let adjusted = if is_first { delta } else { -delta };
+            self.group_layout
+                .adjust_ratio_at_index(split_index, adjusted);
+        }
+    }
+
+    /// Compute window rectangles for all editor groups, and return group dividers.
+    ///
+    /// `content_bounds` is the full editor content area (excluding status/command bars).
+    /// `tab_bar_height` is subtracted from each group's usable height for the window area.
+    pub fn calculate_group_window_rects(
+        &self,
+        content_bounds: WindowRect,
+        tab_bar_height: f64,
+    ) -> (Vec<(WindowId, WindowRect)>, Vec<GroupDivider>) {
+        let group_rects = self
+            .group_layout
+            .calculate_group_rects(content_bounds, tab_bar_height);
+        let mut all_rects: Vec<(WindowId, WindowRect)> = Vec::new();
+        for (gid, rect) in &group_rects {
+            if let Some(group) = self.editor_groups.get(gid) {
+                all_rects.extend(group.active_tab().layout.calculate_rects(*rect));
+            }
+        }
+        let dividers = self.group_layout.dividers(content_bounds, &mut 0);
+        (all_rects, dividers)
     }
 
     /// Open a file from the explorer: switch to an existing tab that shows it,
@@ -2473,16 +2742,23 @@ impl Engine {
         }
 
         // Switch to any existing tab whose active window already shows this buffer.
-        for (tab_idx, tab) in self.tabs.iter().enumerate() {
-            if let Some(win) = self.windows.get(&tab.active_window) {
-                if win.buffer_id == buffer_id {
-                    self.active_tab = tab_idx;
-                    self.refresh_git_diff(buffer_id);
-                    self.lsp_did_open(buffer_id);
-                    self.message = format!("\"{}\"", path.display());
-                    return;
-                }
-            }
+        let found = self
+            .active_group()
+            .tabs
+            .iter()
+            .enumerate()
+            .find(|(_, tab)| {
+                self.windows
+                    .get(&tab.active_window)
+                    .is_some_and(|w| w.buffer_id == buffer_id)
+            })
+            .map(|(idx, _)| idx);
+        if let Some(tab_idx) = found {
+            self.active_group_mut().active_tab = tab_idx;
+            self.refresh_git_diff(buffer_id);
+            self.lsp_did_open(buffer_id);
+            self.message = format!("\"{}\"", path.display());
+            return;
         }
 
         // No existing tab shows this file — open it in a new tab.
@@ -2492,8 +2768,8 @@ impl Engine {
 
         let tab_id = self.new_tab_id();
         let tab = Tab::new(tab_id, window_id);
-        self.tabs.push(tab);
-        self.active_tab = self.tabs.len() - 1;
+        self.active_group_mut().tabs.push(tab);
+        self.active_group_mut().active_tab = self.active_group().tabs.len() - 1;
 
         // Restore saved cursor/scroll position.
         let view = self.restore_file_position(buffer_id);
@@ -2526,27 +2802,37 @@ impl Engine {
         };
 
         // Already shown in any tab? Just switch to it (permanent or current preview).
-        for (tab_idx, tab) in self.tabs.iter().enumerate() {
-            if let Some(win) = self.windows.get(&tab.active_window) {
-                if win.buffer_id == buffer_id {
-                    self.active_tab = tab_idx;
-                    self.refresh_git_diff(buffer_id);
-                    self.lsp_did_open(buffer_id);
-                    self.message = format!("\"{}\"", path.display());
-                    return;
-                }
-            }
+        let found = self
+            .active_group()
+            .tabs
+            .iter()
+            .enumerate()
+            .find(|(_, tab)| {
+                self.windows
+                    .get(&tab.active_window)
+                    .is_some_and(|w| w.buffer_id == buffer_id)
+            })
+            .map(|(idx, _)| idx);
+        if let Some(tab_idx) = found {
+            self.active_group_mut().active_tab = tab_idx;
+            self.refresh_git_diff(buffer_id);
+            self.lsp_did_open(buffer_id);
+            self.message = format!("\"{}\"", path.display());
+            return;
         }
 
-        // Find the existing preview tab, if any.
+        // Find the existing preview tab, if any (within the active group).
         let mut preview_slot: Option<(usize, WindowId, BufferId)> = None;
         if let Some(preview_buf_id) = self.preview_buffer_id {
-            for (idx, tab) in self.tabs.iter().enumerate() {
-                if let Some(win) = self.windows.get(&tab.active_window) {
-                    if win.buffer_id == preview_buf_id {
-                        preview_slot = Some((idx, tab.active_window, preview_buf_id));
-                        break;
-                    }
+            for (idx, tab) in self.active_group().tabs.iter().enumerate() {
+                let win_id = tab.active_window;
+                if self
+                    .windows
+                    .get(&win_id)
+                    .is_some_and(|w| w.buffer_id == preview_buf_id)
+                {
+                    preview_slot = Some((idx, win_id, preview_buf_id));
+                    break;
                 }
             }
         }
@@ -2562,7 +2848,7 @@ impl Engine {
                 state.preview = true;
             }
             self.preview_buffer_id = Some(buffer_id);
-            self.active_tab = tab_idx;
+            self.active_group_mut().active_tab = tab_idx;
             let view = self.restore_file_position(buffer_id);
             if let Some(w) = self.windows.get_mut(&win_id) {
                 w.view = view;
@@ -2574,8 +2860,8 @@ impl Engine {
             self.windows.insert(window_id, window);
             let tab_id = self.new_tab_id();
             let tab = Tab::new(tab_id, window_id);
-            self.tabs.push(tab);
-            self.active_tab = self.tabs.len() - 1;
+            self.active_group_mut().tabs.push(tab);
+            self.active_group_mut().active_tab = self.active_group().tabs.len() - 1;
             if let Some(state) = self.buffer_manager.get_mut(buffer_id) {
                 state.preview = true;
             }
@@ -2738,17 +3024,48 @@ impl Engine {
     pub fn restore_session_files(&mut self) {
         // Prefer per-workspace session if one exists for cwd
         let ws_session = SessionState::load_for_workspace(&self.cwd.clone());
-        let (paths, active) = if !ws_session.open_files.is_empty() {
-            // Merge workspace file positions into current session
-            for (k, v) in ws_session.file_positions {
+
+        // Merge workspace file positions into current session.
+        if !ws_session.open_files.is_empty() || ws_session.group_layout.is_some() {
+            for (k, v) in ws_session.file_positions.clone() {
                 self.session.file_positions.entry(k).or_insert(v);
             }
+        }
+
+        // New tree format takes priority if present.
+        if let Some(ref tree_layout) = ws_session.group_layout {
+            self.restore_session_from_tree(tree_layout, &ws_session.active_file);
+            return;
+        }
+
+        // Fall back to old flat-field format.
+        let paths_g1 = if !ws_session.open_files.is_empty() {
+            ws_session.open_files_group1.clone()
+        } else {
+            vec![]
+        };
+        let saved_active_group = if !ws_session.open_files.is_empty() {
+            ws_session.active_group
+        } else {
+            0
+        };
+        let saved_split_dir = if !ws_session.open_files.is_empty() {
+            ws_session.group_split_direction
+        } else {
+            0u8
+        };
+        let saved_split_ratio = if !ws_session.open_files.is_empty() {
+            ws_session.group_split_ratio
+        } else {
+            0.5
+        };
+        let (paths, active) = if !ws_session.open_files.is_empty() {
             (ws_session.open_files, ws_session.active_file)
         } else {
-            (
-                self.session.open_files.clone(),
-                self.session.active_file.clone(),
-            )
+            // No workspace session for this directory — start with empty editor.
+            // Do NOT fall back to the global session's open_files: that would
+            // bleed files from a different workspace into the current one.
+            (vec![], None)
         };
 
         if paths.is_empty() {
@@ -2792,7 +3109,7 @@ impl Engine {
         // Switch focus to the tab showing the previously-active file.
         if let Some(ref ap) = active {
             if let Ok(canonical_ap) = ap.canonicalize() {
-                let tab_idx = self.tabs.iter().position(|t| {
+                let tab_idx = self.active_group().tabs.iter().position(|t| {
                     self.windows
                         .get(&t.active_window)
                         .and_then(|w| self.buffer_manager.get(w.buffer_id))
@@ -2801,7 +3118,83 @@ impl Engine {
                         .is_some_and(|p| p == canonical_ap)
                 });
                 if let Some(idx) = tab_idx {
-                    self.active_tab = idx;
+                    self.active_group_mut().active_tab = idx;
+                }
+            }
+        }
+
+        // Restore editor group 1 if it was open (old flat-field format).
+        let valid_g1: Vec<PathBuf> = paths_g1.into_iter().filter(|p| p.exists()).collect();
+        if !valid_g1.is_empty() {
+            let direction = if saved_split_dir == 1 {
+                SplitDirection::Horizontal
+            } else {
+                SplitDirection::Vertical
+            };
+            self.open_editor_group(direction);
+            // Set saved ratio on the root split (split_index 0).
+            self.group_layout.set_ratio_at_index(0, saved_split_ratio);
+            // open_editor_group switches to new group — open files there
+            let mut first_g1 = true;
+            for path in &valid_g1 {
+                if first_g1 {
+                    let _ = self.open_file_with_mode(path, OpenMode::Permanent);
+                    first_g1 = false;
+                } else {
+                    self.new_tab(Some(path));
+                }
+            }
+            // Restore active group: clamp to valid range
+            let ids = self.group_layout.group_ids();
+            if saved_active_group < ids.len() {
+                self.active_group = ids[saved_active_group];
+            }
+        }
+    }
+
+    /// Restore session from the recursive tree format.
+    fn restore_session_from_tree(
+        &mut self,
+        tree_layout: &SessionGroupLayout,
+        active_file: &Option<PathBuf>,
+    ) {
+        let initial_id = self.active_buffer_id();
+        let initial_group = self.active_group;
+
+        // Reconstruct the full group layout tree, creating groups/windows/buffers.
+        let new_layout = self.restore_session_group_layout(tree_layout);
+
+        // Remove the initial scratch group and its buffer.
+        self.editor_groups.remove(&initial_group);
+        let _ = self.delete_buffer(initial_id, true);
+
+        // Install the new layout.
+        self.group_layout = new_layout;
+        let ids = self.group_layout.group_ids();
+        self.active_group = ids.first().copied().unwrap_or(GroupId(0));
+
+        // Focus the group+tab containing the previously-active file.
+        if let Some(ref ap) = active_file {
+            if let Ok(canonical_ap) = ap.canonicalize() {
+                'outer: for &gid in &ids {
+                    if let Some(group) = self.editor_groups.get(&gid) {
+                        for (ti, tab) in group.tabs.iter().enumerate() {
+                            let matches = self
+                                .windows
+                                .get(&tab.active_window)
+                                .and_then(|w| self.buffer_manager.get(w.buffer_id))
+                                .and_then(|s| s.file_path.as_ref())
+                                .and_then(|p| p.canonicalize().ok())
+                                .is_some_and(|p| p == canonical_ap);
+                            if matches {
+                                self.active_group = gid;
+                                if let Some(g) = self.editor_groups.get_mut(&gid) {
+                                    g.active_tab = ti;
+                                }
+                                break 'outer;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -3431,7 +3824,7 @@ impl Engine {
                 action = self.handle_command_key(key_name, unicode, ctrl);
             }
             Mode::Search => {
-                self.handle_search_key(key_name, unicode);
+                self.handle_search_key(key_name, unicode, ctrl);
             }
             Mode::Visual | Mode::VisualLine | Mode::VisualBlock => {
                 // Save pre-call visual state for 'gv' support
@@ -3733,6 +4126,19 @@ impl Engine {
                     // Ctrl-X: decrement number under cursor
                     let count = self.take_count();
                     self.increment_number_at_cursor(-(count as i64), &mut false);
+                    return EngineAction::None;
+                }
+                "backslash" => {
+                    // Ctrl+\: Split editor group to the right (VSCode style)
+                    self.open_editor_group(SplitDirection::Vertical);
+                    return EngineAction::None;
+                }
+                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" => {
+                    // Ctrl+N: Focus group N (1-indexed)
+                    let n: usize = key_name.parse().unwrap_or(1);
+                    if let Some(gid) = self.group_layout.nth_leaf(n - 1) {
+                        self.active_group = gid;
+                    }
                     return EngineAction::None;
                 }
                 _ => {}
@@ -4417,11 +4823,13 @@ impl Engine {
             Some(':') => {
                 self.mode = Mode::Command;
                 self.command_buffer.clear();
+                self.command_cursor = 0;
                 self.count = None; // Clear count when entering command mode
             }
             Some('/') => {
                 self.mode = Mode::Search;
                 self.command_buffer.clear();
+                self.command_cursor = 0;
                 self.search_direction = SearchDirection::Forward;
                 self.search_start_cursor = Some(self.view().cursor);
                 self.search_word_bounded = false; // Clear word-boundary mode
@@ -4430,6 +4838,7 @@ impl Engine {
             Some('?') => {
                 self.mode = Mode::Search;
                 self.command_buffer.clear();
+                self.command_cursor = 0;
                 self.search_direction = SearchDirection::Backward;
                 self.search_start_cursor = Some(self.view().cursor);
                 self.search_word_bounded = false; // Clear word-boundary mode
@@ -4810,6 +5219,8 @@ impl Engine {
                     Some('o') | Some('O') => self.close_other_windows(),
                     Some('s') | Some('S') => self.split_window(SplitDirection::Horizontal, None),
                     Some('v') | Some('V') => self.split_window(SplitDirection::Vertical, None),
+                    Some('e') => self.open_editor_group(SplitDirection::Vertical),
+                    Some('E') => self.open_editor_group(SplitDirection::Horizontal),
                     _ => {
                         // Also handle by key_name for special keys
                         match key_name {
@@ -5485,6 +5896,7 @@ impl Engine {
                 let word = self.word_under_cursor().unwrap_or_default();
                 self.mode = crate::core::Mode::Command;
                 self.command_buffer = format!("Rename {word}");
+                self.command_cursor = self.command_buffer.chars().count();
             }
             "gf" | "gF" => {
                 // LSP format whole file
@@ -6124,6 +6536,14 @@ impl Engine {
         }
     }
 
+    /// Insert `text` at the current command-line cursor position and advance the cursor.
+    /// Used by backends to paste clipboard content into the command line.
+    pub fn command_insert_str(&mut self, text: &str) {
+        let byte_off = cmd_char_to_byte(&self.command_buffer, self.command_cursor);
+        self.command_buffer.insert_str(byte_off, text);
+        self.command_cursor += text.chars().count();
+    }
+
     fn handle_command_key(
         &mut self,
         key_name: &str,
@@ -6132,7 +6552,7 @@ impl Engine {
     ) -> EngineAction {
         // --- Ctrl-R: activate / cycle reverse history search ---
         if ctrl && key_name == "r" {
-            if self.session.command_history.is_empty() {
+            if self.history.command_history.is_empty() {
                 return EngineAction::None;
             }
             if !self.history_search_active {
@@ -6153,7 +6573,24 @@ impl Engine {
             self.history_search_query.clear();
             self.history_search_index = None;
             self.command_buffer = self.command_typing_buffer.clone();
+            self.command_cursor = self.command_buffer.chars().count();
             self.command_typing_buffer.clear();
+            return EngineAction::None;
+        }
+
+        // --- Ctrl-A / Ctrl-E: move cursor to start/end of command line ---
+        if ctrl && key_name == "a" && !self.history_search_active {
+            self.command_cursor = 0;
+            return EngineAction::None;
+        }
+        if ctrl && key_name == "e" && !self.history_search_active {
+            self.command_cursor = self.command_buffer.chars().count();
+            return EngineAction::None;
+        }
+        // --- Ctrl-K: kill to end of line ---
+        if ctrl && key_name == "k" && !self.history_search_active {
+            let byte_off = cmd_char_to_byte(&self.command_buffer, self.command_cursor);
+            self.command_buffer.truncate(byte_off);
             return EngineAction::None;
         }
 
@@ -6165,6 +6602,7 @@ impl Engine {
                     self.history_search_query.clear();
                     self.history_search_index = None;
                     self.command_buffer = self.command_typing_buffer.clone();
+                    self.command_cursor = self.command_buffer.chars().count();
                     self.command_typing_buffer.clear();
                 } else {
                     self.mode = if self.is_vscode_mode() {
@@ -6173,6 +6611,7 @@ impl Engine {
                         Mode::Normal
                     };
                     self.command_buffer.clear();
+                    self.command_cursor = 0;
                     self.command_history_index = None;
                     self.command_typing_buffer.clear();
                 }
@@ -6187,10 +6626,12 @@ impl Engine {
 
                 let cmd = self.command_buffer.clone();
                 self.command_buffer.clear();
-                self.session.add_command(&cmd);
+                self.command_cursor = 0;
+                self.history.add_command(&cmd);
                 self.command_history_index = None;
                 self.command_typing_buffer.clear();
                 let _ = self.session.save();
+                let _ = self.history.save();
                 let result = self.execute_command(&cmd);
                 // If still in VSCode mode after the command, return to Insert (EDIT) mode.
                 // (If the command switched to Vim mode, is_vscode_mode() will be false,
@@ -6200,26 +6641,66 @@ impl Engine {
                 }
                 result
             }
+            "Left" => {
+                if !self.history_search_active && self.command_cursor > 0 {
+                    self.command_cursor -= 1;
+                }
+                EngineAction::None
+            }
+            "Right" => {
+                if !self.history_search_active {
+                    let len = self.command_buffer.chars().count();
+                    if self.command_cursor < len {
+                        self.command_cursor += 1;
+                    }
+                }
+                EngineAction::None
+            }
+            "Home" => {
+                if !self.history_search_active {
+                    self.command_cursor = 0;
+                }
+                EngineAction::None
+            }
+            "End" => {
+                if !self.history_search_active {
+                    self.command_cursor = self.command_buffer.chars().count();
+                }
+                EngineAction::None
+            }
+            "Delete" => {
+                if !self.history_search_active {
+                    let len = self.command_buffer.chars().count();
+                    if self.command_cursor < len {
+                        let byte_off = cmd_char_to_byte(&self.command_buffer, self.command_cursor);
+                        let next_off =
+                            cmd_char_to_byte(&self.command_buffer, self.command_cursor + 1);
+                        self.command_buffer.drain(byte_off..next_off);
+                    }
+                }
+                EngineAction::None
+            }
             "Up" => {
                 // Exit history search first
                 self.history_search_active = false;
                 self.history_search_query.clear();
                 self.history_search_index = None;
 
-                if self.session.command_history.is_empty() {
+                if self.history.command_history.is_empty() {
                     return EngineAction::None;
                 }
                 if self.command_history_index.is_none() {
                     self.command_typing_buffer = self.command_buffer.clone();
-                    self.command_history_index = Some(self.session.command_history.len() - 1);
+                    self.command_history_index = Some(self.history.command_history.len() - 1);
                 } else if let Some(idx) = self.command_history_index {
                     if idx > 0 {
                         self.command_history_index = Some(idx - 1);
                     }
                 }
                 if let Some(idx) = self.command_history_index {
-                    if let Some(cmd) = self.session.command_history.get(idx) {
+                    if let Some(cmd) = self.history.command_history.get(idx) {
                         self.command_buffer = cmd.clone();
+                        self.command_cursor = self.command_buffer.chars().count();
                     }
                 }
                 EngineAction::None
@@ -6234,13 +6715,15 @@ impl Engine {
                     return EngineAction::None;
                 }
                 let idx = self.command_history_index.unwrap();
-                if idx + 1 >= self.session.command_history.len() {
+                if idx + 1 >= self.history.command_history.len() {
                     self.command_buffer = self.command_typing_buffer.clone();
+                    self.command_cursor = self.command_buffer.chars().count();
                     self.command_history_index = None;
                 } else {
                     self.command_history_index = Some(idx + 1);
-                    if let Some(cmd) = self.session.command_history.get(idx + 1) {
+                    if let Some(cmd) = self.history.command_history.get(idx + 1) {
                         self.command_buffer = cmd.clone();
+                        self.command_cursor = self.command_buffer.chars().count();
                     }
                 }
                 EngineAction::None
@@ -6256,10 +6739,12 @@ impl Engine {
                     return EngineAction::None;
                 } else if completions.len() == 1 {
                     self.command_buffer = completions[0].clone();
+                    self.command_cursor = self.command_buffer.chars().count();
                 } else {
                     let common = Self::find_common_prefix(&completions);
                     if common.len() > self.command_buffer.len() {
                         self.command_buffer = common;
+                        self.command_cursor = self.command_buffer.chars().count();
                     } else {
                         self.message = format!("Completions: {}", completions.join(", "));
                     }
@@ -6275,9 +6760,19 @@ impl Engine {
                 } else {
                     self.command_history_index = None;
                     self.command_typing_buffer.clear();
-                    self.command_buffer.pop();
-                    if self.command_buffer.is_empty() {
-                        self.mode = Mode::Normal;
+                    if self.command_cursor > 0 {
+                        self.command_cursor -= 1;
+                        let byte_off = cmd_char_to_byte(&self.command_buffer, self.command_cursor);
+                        let next_off =
+                            cmd_char_to_byte(&self.command_buffer, self.command_cursor + 1);
+                        self.command_buffer.drain(byte_off..next_off);
+                    } else {
+                        // Backspace at position 0 with empty buffer exits command mode.
+                        // This matches Vim: you must press Backspace once on the empty
+                        // line (not while there are still characters) to exit.
+                        if self.command_buffer.is_empty() {
+                            self.mode = Mode::Normal;
+                        }
                     }
                 }
                 EngineAction::None
@@ -6296,7 +6791,12 @@ impl Engine {
                     self.command_history_index = None;
                     self.command_typing_buffer.clear();
                     if let Some(ch) = unicode {
-                        self.command_buffer.push(ch);
+                        if !ch.is_control() {
+                            let byte_off =
+                                cmd_char_to_byte(&self.command_buffer, self.command_cursor);
+                            self.command_buffer.insert(byte_off, ch);
+                            self.command_cursor += 1;
+                        }
                     }
                 }
                 EngineAction::None
@@ -6309,7 +6809,7 @@ impl Engine {
     /// Updates `command_buffer` with the match, or shows "no match" message.
     fn history_search_step(&mut self, next: bool) {
         let query = self.history_search_query.clone();
-        let history = &self.session.command_history;
+        let history = &self.history.command_history;
         if history.is_empty() {
             return;
         }
@@ -6338,6 +6838,7 @@ impl Engine {
             Some(idx) => {
                 self.history_search_index = Some(idx);
                 self.command_buffer = history[idx].clone();
+                self.command_cursor = self.command_buffer.chars().count();
                 self.message.clear();
             }
             None => {
@@ -6346,7 +6847,25 @@ impl Engine {
         }
     }
 
-    fn handle_search_key(&mut self, key_name: &str, unicode: Option<char>) {
+    fn handle_search_key(&mut self, key_name: &str, unicode: Option<char>, ctrl: bool) {
+        // Ctrl-A / Ctrl-E: move cursor to start/end
+        if ctrl && key_name == "a" {
+            self.command_cursor = 0;
+            return;
+        }
+        if ctrl && key_name == "e" {
+            self.command_cursor = self.command_buffer.chars().count();
+            return;
+        }
+        // Ctrl-K: kill to end of search query
+        if ctrl && key_name == "k" {
+            let byte_off = cmd_char_to_byte(&self.command_buffer, self.command_cursor);
+            self.command_buffer.truncate(byte_off);
+            if self.settings.incremental_search {
+                self.perform_incremental_search();
+            }
+            return;
+        }
         match key_name {
             "Escape" => {
                 self.mode = Mode::Normal;
@@ -6382,12 +6901,13 @@ impl Engine {
 
                     self.search_start_cursor = None; // Clear saved cursor position
 
-                    self.session.add_search(&query);
+                    self.history.add_search(&query);
                     self.search_history_index = None;
                     self.search_typing_buffer.clear();
 
                     // Save session state
                     let _ = self.session.save();
+                    let _ = self.history.save();
 
                     self.search_query = query;
                     self.run_search();
@@ -6405,14 +6925,14 @@ impl Engine {
             }
             "Up" => {
                 // Cycle to previous search
-                if self.session.search_history.is_empty() {
+                if self.history.search_history.is_empty() {
                     return;
                 }
 
                 // First Up press: save current typing
                 if self.search_history_index.is_none() {
                     self.search_typing_buffer = self.command_buffer.clone();
-                    self.search_history_index = Some(self.session.search_history.len() - 1);
+                    self.search_history_index = Some(self.history.search_history.len() - 1);
                 } else if let Some(idx) = self.search_history_index {
                     if idx > 0 {
                         self.search_history_index = Some(idx - 1);
@@ -6421,8 +6941,9 @@ impl Engine {
 
                 // Load history entry
                 if let Some(idx) = self.search_history_index {
-                    if let Some(query) = self.session.search_history.get(idx) {
+                    if let Some(query) = self.history.search_history.get(idx) {
                         self.command_buffer = query.clone();
+                        self.command_cursor = self.command_buffer.chars().count();
                     }
                 }
             }
@@ -6433,14 +6954,46 @@ impl Engine {
                 }
 
                 let idx = self.search_history_index.unwrap();
-                if idx + 1 >= self.session.search_history.len() {
+                if idx + 1 >= self.history.search_history.len() {
                     // Reached end, restore typing buffer
                     self.command_buffer = self.search_typing_buffer.clone();
+                    self.command_cursor = self.command_buffer.chars().count();
                     self.search_history_index = None;
                 } else {
                     self.search_history_index = Some(idx + 1);
-                    if let Some(query) = self.session.search_history.get(idx + 1) {
+                    if let Some(query) = self.history.search_history.get(idx + 1) {
                         self.command_buffer = query.clone();
+                        self.command_cursor = self.command_buffer.chars().count();
+                    }
+                }
+            }
+            "Left" => {
+                if self.command_cursor > 0 {
+                    self.command_cursor -= 1;
+                }
+            }
+            "Right" => {
+                let len = self.command_buffer.chars().count();
+                if self.command_cursor < len {
+                    self.command_cursor += 1;
+                }
+            }
+            "Home" => {
+                self.command_cursor = 0;
+            }
+            "End" => {
+                self.command_cursor = self.command_buffer.chars().count();
+            }
+            "Delete" => {
+                self.search_history_index = None;
+                self.search_typing_buffer.clear();
+                let len = self.command_buffer.chars().count();
+                if self.command_cursor < len {
+                    let byte_off = cmd_char_to_byte(&self.command_buffer, self.command_cursor);
+                    let next_off = cmd_char_to_byte(&self.command_buffer, self.command_cursor + 1);
+                    self.command_buffer.drain(byte_off..next_off);
+                    if self.settings.incremental_search {
+                        self.perform_incremental_search();
                     }
                 }
             }
@@ -6449,7 +7002,12 @@ impl Engine {
                 self.search_history_index = None;
                 self.search_typing_buffer.clear();
 
-                self.command_buffer.pop();
+                if self.command_cursor > 0 {
+                    self.command_cursor -= 1;
+                    let byte_off = cmd_char_to_byte(&self.command_buffer, self.command_cursor);
+                    let next_off = cmd_char_to_byte(&self.command_buffer, self.command_cursor + 1);
+                    self.command_buffer.drain(byte_off..next_off);
+                }
                 if self.command_buffer.is_empty() {
                     self.mode = Mode::Normal;
                     // Restore cursor to original position
@@ -6470,10 +7028,14 @@ impl Engine {
                 self.search_typing_buffer.clear();
 
                 if let Some(ch) = unicode {
-                    self.command_buffer.push(ch);
-                    // Incremental search: update search as user types
-                    if self.settings.incremental_search {
-                        self.perform_incremental_search();
+                    if !ch.is_control() {
+                        let byte_off = cmd_char_to_byte(&self.command_buffer, self.command_cursor);
+                        self.command_buffer.insert(byte_off, ch);
+                        self.command_cursor += 1;
+                        // Incremental search: update search as user types
+                        if self.settings.incremental_search {
+                            self.perform_incremental_search();
+                        }
                     }
                 }
             }
@@ -6675,6 +7237,7 @@ impl Engine {
                 ':' => {
                     self.mode = Mode::Command;
                     self.command_buffer = "'<,'>".to_string(); // Auto-populate visual range
+                    self.command_cursor = self.command_buffer.chars().count();
                     self.count = None;
                     return EngineAction::None;
                 }
@@ -7417,6 +7980,16 @@ impl Engine {
             "s/",
             "%s/",
             "config reload",
+            "EditorGroupSplit",
+            "EditorGroupSplitDown",
+            "EditorGroupClose",
+            "EditorGroupFocus",
+            "EditorGroupMoveTab",
+            "egsp",
+            "egspd",
+            "egc",
+            "egf",
+            "egmt",
         ]
     }
 
@@ -7508,8 +8081,12 @@ impl Engine {
         self.windows.insert(window_id, window);
         let tab = super::tab::Tab::new(super::tab::TabId(self.next_tab_id), window_id);
         self.next_tab_id += 1;
-        self.tabs = vec![tab];
-        self.active_tab = 0;
+        self.editor_groups.clear();
+        let gid = GroupId(0);
+        self.editor_groups.insert(gid, EditorGroup::new(tab));
+        self.active_group = gid;
+        self.group_layout = GroupLayout::leaf(gid);
+        self.next_group_id = 1;
         self.mode = Mode::Normal;
 
         // Update cwd + workspace root
@@ -7636,21 +8213,165 @@ impl Engine {
     /// Save per-workspace session state (open files, cursor positions).
     pub fn save_session_for_workspace(&self, root: &Path) {
         let mut ws_session = SessionState::default();
-        // Collect all unique open file paths across windows
-        let mut open_files: Vec<PathBuf> = Vec::new();
-        for window in self.windows.values() {
-            if let Some(bs) = self.buffer_manager.get(window.buffer_id) {
-                if let Some(ref fp) = bs.file_path {
-                    if !open_files.contains(fp) {
-                        open_files.push(fp.clone());
+
+        // Collect open file paths per group (by iterating each group's tabs).
+        let files_for_group = |group: &EditorGroup| -> Vec<PathBuf> {
+            let mut files: Vec<PathBuf> = Vec::new();
+            for tab in &group.tabs {
+                if let Some(window) = self.windows.get(&tab.active_window) {
+                    if let Some(bs) = self.buffer_manager.get(window.buffer_id) {
+                        if let Some(ref fp) = bs.file_path {
+                            if !files.contains(fp) {
+                                files.push(fp.clone());
+                            }
+                        }
                     }
                 }
             }
+            files
+        };
+
+        let group_ids = self.group_layout.group_ids();
+        if let Some(gid) = group_ids.first() {
+            if let Some(group) = self.editor_groups.get(gid) {
+                ws_session.open_files = files_for_group(group);
+            }
         }
-        ws_session.open_files = open_files;
+        if group_ids.len() >= 2 {
+            if let Some(group) = self.editor_groups.get(&group_ids[1]) {
+                ws_session.open_files_group1 = files_for_group(group);
+            }
+        }
         ws_session.active_file = self.file_path().cloned();
         ws_session.file_positions = self.session.file_positions.clone();
+        // Save active_group as index position in leaf order for backward compat
+        ws_session.active_group = group_ids
+            .iter()
+            .position(|&id| id == self.active_group)
+            .unwrap_or(0);
+        // For backward-compat, extract direction and ratio from root split
+        // (old format only supported a single split).
+        if let GroupLayout::Split {
+            direction, ratio, ..
+        } = &self.group_layout
+        {
+            ws_session.group_split_direction = match direction {
+                SplitDirection::Vertical => 0,
+                SplitDirection::Horizontal => 1,
+            };
+            ws_session.group_split_ratio = *ratio;
+        }
+        // Save the full recursive tree layout (new format).
+        ws_session.group_layout = Some(self.build_session_group_layout(&self.group_layout));
         ws_session.save_for_workspace(root).ok();
+    }
+
+    /// Recursively convert the engine's GroupLayout tree into a SessionGroupLayout
+    /// for serialization, collecting each leaf group's open file paths.
+    fn build_session_group_layout(&self, layout: &GroupLayout) -> SessionGroupLayout {
+        match layout {
+            GroupLayout::Leaf(gid) => {
+                let files = self
+                    .editor_groups
+                    .get(gid)
+                    .map(|group| {
+                        let mut files: Vec<PathBuf> = Vec::new();
+                        for tab in &group.tabs {
+                            if let Some(window) = self.windows.get(&tab.active_window) {
+                                if let Some(bs) = self.buffer_manager.get(window.buffer_id) {
+                                    if let Some(ref fp) = bs.file_path {
+                                        if !files.contains(fp) {
+                                            files.push(fp.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        files
+                    })
+                    .unwrap_or_default();
+                SessionGroupLayout::Leaf { files }
+            }
+            GroupLayout::Split {
+                direction,
+                ratio,
+                first,
+                second,
+            } => SessionGroupLayout::Split {
+                direction: match direction {
+                    SplitDirection::Vertical => 0,
+                    SplitDirection::Horizontal => 1,
+                },
+                ratio: *ratio,
+                first: Box::new(self.build_session_group_layout(first)),
+                second: Box::new(self.build_session_group_layout(second)),
+            },
+        }
+    }
+
+    /// Recursively restore groups from a SessionGroupLayout tree.
+    /// Returns the reconstructed GroupLayout tree.
+    fn restore_session_group_layout(&mut self, session_layout: &SessionGroupLayout) -> GroupLayout {
+        match session_layout {
+            SessionGroupLayout::Leaf { files } => {
+                let gid = self.new_group_id();
+                // Create the group with the first file (or a scratch tab if no files).
+                let valid: Vec<&PathBuf> = files.iter().filter(|p| p.exists()).collect();
+                if valid.is_empty() {
+                    // Empty group: create a fresh scratch buffer (don't rely on active_group chain).
+                    let wid = self.new_window_id();
+                    let buf_id = self.buffer_manager.create();
+                    let w = Window::new(wid, buf_id);
+                    self.windows.insert(wid, w);
+                    let tid = self.new_tab_id();
+                    let tab = Tab::new(tid, wid);
+                    self.editor_groups.insert(gid, EditorGroup::new(tab));
+                } else {
+                    // Open files in this group's tabs.
+                    let mut first = true;
+                    for path in &valid {
+                        let wid = self.new_window_id();
+                        let buf_id = self
+                            .buffer_manager
+                            .open_file(path)
+                            .unwrap_or_else(|_| self.buffer_manager.create());
+                        let mut w = Window::new(wid, buf_id);
+                        let view = self.restore_file_position(buf_id);
+                        w.view = view;
+                        self.windows.insert(wid, w);
+                        let tid = self.new_tab_id();
+                        let tab = Tab::new(tid, wid);
+                        if first {
+                            self.editor_groups.insert(gid, EditorGroup::new(tab));
+                            first = false;
+                        } else if let Some(group) = self.editor_groups.get_mut(&gid) {
+                            group.tabs.push(tab);
+                        }
+                    }
+                }
+                GroupLayout::Leaf(gid)
+            }
+            SessionGroupLayout::Split {
+                direction,
+                ratio,
+                first,
+                second,
+            } => {
+                let dir = if *direction == 1 {
+                    SplitDirection::Horizontal
+                } else {
+                    SplitDirection::Vertical
+                };
+                let first_layout = self.restore_session_group_layout(first);
+                let second_layout = self.restore_session_group_layout(second);
+                GroupLayout::Split {
+                    direction: dir,
+                    ratio: *ratio,
+                    first: Box::new(first_layout),
+                    second: Box::new(second_layout),
+                }
+            }
+        }
     }
 
     // ─── Source Control ────────────────────────────────────────────────────────
@@ -8737,6 +9458,7 @@ impl Engine {
                 let word = self.word_under_cursor().unwrap_or_default();
                 self.mode = crate::core::Mode::Command;
                 self.command_buffer = format!("Rename {word}");
+                self.command_cursor = self.command_buffer.chars().count();
             } else {
                 self.lsp_request_rename(new_name);
             }
@@ -9256,8 +9978,8 @@ impl Engine {
         // Handle :tabmove [N] — move current tab to position N (0-based)
         if cmd == "tabmove" || cmd.starts_with("tabmove ") {
             let arg = cmd.strip_prefix("tabmove").unwrap_or("").trim();
-            let num_tabs = self.tabs.len();
-            let current = self.active_tab;
+            let num_tabs = self.active_group().tabs.len();
+            let current = self.active_group().active_tab;
             let dest = if arg.is_empty() {
                 num_tabs.saturating_sub(1) // move to end
             } else if let Ok(n) = arg.parse::<usize>() {
@@ -9267,9 +9989,9 @@ impl Engine {
                 return EngineAction::None;
             };
             if current != dest && dest < num_tabs {
-                let tab = self.tabs.remove(current);
-                self.tabs.insert(dest, tab);
-                self.active_tab = dest;
+                let tab = self.active_group_mut().tabs.remove(current);
+                self.active_group_mut().tabs.insert(dest, tab);
+                self.active_group_mut().active_tab = dest;
                 self.message = format!("Tab moved to position {}", dest);
             }
             return EngineAction::None;
@@ -9296,8 +10018,10 @@ impl Engine {
                     self.message = "No write since last change (add ! to override)".to_string();
                     return EngineAction::Error;
                 }
-                // If this is the very last window in the very last tab: quit the app.
-                let is_last = self.tabs.len() == 1 && self.active_tab().layout.is_single_window();
+                // If this is the very last window in the very last tab of the last group: quit.
+                let is_last = self.group_layout.is_single_group()
+                    && self.active_group().tabs.len() == 1
+                    && self.active_tab().layout.is_single_window();
                 if is_last {
                     return EngineAction::Quit;
                 }
@@ -9313,8 +10037,10 @@ impl Engine {
                 EngineAction::None
             }
             "q!" => {
-                // If this is the very last window in the very last tab: force-quit.
-                let is_last = self.tabs.len() == 1 && self.active_tab().layout.is_single_window();
+                // If this is the very last window in the very last tab of the last group: quit.
+                let is_last = self.group_layout.is_single_group()
+                    && self.active_group().tabs.len() == 1
+                    && self.active_tab().layout.is_single_window();
                 if is_last {
                     return EngineAction::Quit;
                 }
@@ -9461,7 +10187,7 @@ impl Engine {
             "history" => {
                 let mut lines: Vec<String> = Vec::new();
                 lines.push("--- Command History ---".to_string());
-                for (i, cmd) in self.session.command_history.iter().enumerate() {
+                for (i, cmd) in self.history.command_history.iter().enumerate() {
                     lines.push(format!("{:4}  {}", i + 1, cmd));
                 }
                 self.message = lines.join("\n");
@@ -9587,6 +10313,7 @@ impl Engine {
                 // Open ex command mode pre-filled with %s/ for find & replace
                 self.mode = Mode::Command;
                 self.command_buffer = "%s/".to_string();
+                self.command_cursor = self.command_buffer.chars().count();
                 self.count = None;
                 EngineAction::None
             }
@@ -9635,6 +10362,27 @@ impl Engine {
                 // :d — delete current line (used by :g/pat/d etc.)
                 let mut changed = false;
                 self.delete_lines(1, &mut changed);
+                EngineAction::None
+            }
+            // ── Editor group commands ─────────────────────────────────────────
+            "EditorGroupSplit" | "egsp" => {
+                self.open_editor_group(SplitDirection::Vertical);
+                EngineAction::None
+            }
+            "EditorGroupSplitDown" | "egspd" => {
+                self.open_editor_group(SplitDirection::Horizontal);
+                EngineAction::None
+            }
+            "EditorGroupClose" | "egc" => {
+                self.close_editor_group();
+                EngineAction::None
+            }
+            "EditorGroupFocus" | "egf" => {
+                self.focus_other_group();
+                EngineAction::None
+            }
+            "EditorGroupMoveTab" | "egmt" => {
+                self.move_tab_to_other_group();
                 EngineAction::None
             }
             _ => {
@@ -13216,6 +13964,8 @@ impl Engine {
             self.visual_anchor = None;
         }
         self.mouse_drag_active = false;
+        // Switch to the group that owns this window.
+        self.focus_group_for_window(window_id);
         self.set_cursor_for_window(window_id, line, col);
     }
 
@@ -13225,19 +13975,28 @@ impl Engine {
     /// If already in Visual mode (e.g. from double-click word select),
     /// preserves the existing anchor and just extends.
     pub fn mouse_drag(&mut self, window_id: WindowId, line: usize, col: usize) {
-        // Ensure this window is active
+        // Ensure this window's group and tab are active.
+        self.focus_group_for_window(window_id);
         if self.windows.contains_key(&window_id) {
             self.active_tab_mut().active_window = window_id;
         }
 
         if !self.mouse_drag_active {
             // First drag event — only set anchor if not already in visual mode
-            // (double-click word select already set the anchor at word start)
+            // (double-click word select already set the anchor at word start).
+            // Also require the drag to actually reach a *different* buffer position
+            // than the click origin; sub-character mouse jitter on mousedown otherwise
+            // silently enters visual mode before `:` can be pressed.
+            let cursor = self.view().cursor;
+            let moved = line != cursor.line || col != cursor.col;
+            if !moved {
+                return; // Sub-pixel jitter at same cell — ignore.
+            }
             if !matches!(
                 self.mode,
                 Mode::Visual | Mode::VisualLine | Mode::VisualBlock
             ) {
-                self.visual_anchor = Some(self.view().cursor);
+                self.visual_anchor = Some(cursor);
                 self.mode = Mode::Visual;
             }
             self.mouse_drag_active = true;
@@ -13258,6 +14017,7 @@ impl Engine {
     /// Positions cursor, finds word boundaries, enters Visual mode.
     pub fn mouse_double_click(&mut self, window_id: WindowId, line: usize, col: usize) {
         self.mouse_drag_active = false;
+        self.focus_group_for_window(window_id);
         self.set_cursor_for_window(window_id, line, col);
 
         // Find word boundaries at cursor
@@ -13327,7 +14087,7 @@ impl Engine {
         }
         match self.mode {
             Mode::Command | Mode::Search => {
-                self.command_buffer.push_str(first_line);
+                self.command_insert_str(first_line);
                 if self.mode == Mode::Search && self.settings.incremental_search {
                     self.perform_incremental_search();
                 }
@@ -16322,6 +17082,15 @@ impl Engine {
 }
 
 /// Return the number of visual rows a buffer line of `line_char_len` characters
+/// Convert a char index in `s` to a byte offset.
+/// Returns `s.len()` if `char_idx` is at or beyond the end.
+fn cmd_char_to_byte(s: &str, char_idx: usize) -> usize {
+    s.char_indices()
+        .nth(char_idx)
+        .map(|(b, _)| b)
+        .unwrap_or(s.len())
+}
+
 /// occupies when the viewport is `viewport_cols` columns wide.
 /// Always returns at least 1 (even for empty lines).
 /// Duplicated from render.rs so core/ stays GTK/render-free.
@@ -18858,6 +19627,33 @@ mod tests {
     }
 
     #[test]
+    fn test_command_backspace_stays_in_command() {
+        let mut engine = Engine::new();
+        // Type ":a" then backspace — should stay in Command with empty buffer.
+        press_char(&mut engine, ':');
+        assert_eq!(engine.mode, Mode::Command);
+        press_char(&mut engine, 'a');
+        assert_eq!(engine.command_buffer, "a");
+        press_special(&mut engine, "BackSpace");
+        assert_eq!(
+            engine.mode,
+            Mode::Command,
+            "BackSpace on last char should stay in Command"
+        );
+        assert_eq!(
+            engine.command_buffer, "",
+            "buffer should be empty after BackSpace"
+        );
+        // Second BackSpace on empty buffer → exit
+        press_special(&mut engine, "BackSpace");
+        assert_eq!(
+            engine.mode,
+            Mode::Normal,
+            "BackSpace on empty buffer should exit Command"
+        );
+    }
+
+    #[test]
     fn test_command_quit_clean() {
         let mut engine = Engine::new();
         engine.buffer_mut().insert(0, "Hello");
@@ -18910,12 +19706,12 @@ mod tests {
         engine.new_tab(None);
         engine.buffer_mut().insert(0, "second");
         engine.set_dirty(false);
-        assert_eq!(engine.tabs.len(), 2);
+        assert_eq!(engine.active_group().tabs.len(), 2);
         assert_eq!(engine.buffer_manager.len(), 2);
         // :q closes the active tab, not the whole app
         let action = type_command_action(&mut engine, "q");
         assert_eq!(action, EngineAction::None);
-        assert_eq!(engine.tabs.len(), 1, "tab should be closed");
+        assert_eq!(engine.active_group().tabs.len(), 1, "tab should be closed");
         // The closed buffer is freed; session restore excludes it via window-filter.
         assert_eq!(engine.buffer_manager.len(), 1);
         assert!(engine.buffer_manager.get(first_id).is_some());
@@ -18945,10 +19741,10 @@ mod tests {
         engine.new_tab(None);
         engine.buffer_mut().insert(0, "second");
         engine.set_dirty(true); // dirty but force-close with q!
-        assert_eq!(engine.tabs.len(), 2);
+        assert_eq!(engine.active_group().tabs.len(), 2);
         let action = type_command_action(&mut engine, "q!");
         assert_eq!(action, EngineAction::None);
-        assert_eq!(engine.tabs.len(), 1, "tab should be closed");
+        assert_eq!(engine.active_group().tabs.len(), 1, "tab should be closed");
         assert_eq!(engine.buffer_manager.len(), 1);
     }
 
@@ -18986,6 +19782,7 @@ mod tests {
 
     #[test]
     fn test_restore_session_files_opens_separate_tabs() {
+        use crate::core::session::SessionState;
         let dir = std::env::temp_dir();
         let p1 = dir.join("vimcode_restore_a.txt");
         let p2 = dir.join("vimcode_restore_b.txt");
@@ -18994,15 +19791,31 @@ mod tests {
         std::fs::write(&p2, "bbb").unwrap();
         std::fs::write(&p3, "ccc").unwrap();
 
+        // Write a per-workspace session so restore_session_files finds it.
+        // (Session files live in ~/.config/vimcode/sessions/{hash}.json.)
+        let workspace_dir = dir.join("vimcode_restore_test_ws");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+        let mut ws_session = SessionState::default();
+        ws_session.open_files = vec![p1.clone(), p2.clone(), p3.clone()];
+        ws_session.active_file = Some(p2.clone());
+        // save_for_workspace is a no-op under #[cfg(test)], so write directly.
+        let session_path = SessionState::session_path_for_workspace(&workspace_dir);
+        if let Some(parent) = session_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&session_path, serde_json::to_string_pretty(&ws_session).unwrap())
+            .unwrap();
+
         let mut engine = Engine::new();
-        // Use temp dir as cwd so no per-workspace session interferes.
-        engine.cwd = std::env::temp_dir();
-        engine.session.open_files = vec![p1.clone(), p2.clone(), p3.clone()];
-        engine.session.active_file = Some(p2.clone());
+        engine.cwd = workspace_dir.clone();
         engine.restore_session_files();
 
         // Three files → three tabs.
-        assert_eq!(engine.tabs.len(), 3, "each file should get its own tab");
+        assert_eq!(
+            engine.active_group().tabs.len(),
+            3,
+            "each file should get its own tab"
+        );
         // Three buffers in manager (no scratch buffer).
         assert_eq!(engine.buffer_manager.len(), 3);
         // Active tab should be the one showing p2.
@@ -19016,6 +19829,46 @@ mod tests {
         let _ = std::fs::remove_file(&p1);
         let _ = std::fs::remove_file(&p2);
         let _ = std::fs::remove_file(&p3);
+        let _ = std::fs::remove_dir(&workspace_dir);
+        let _ = std::fs::remove_file(SessionState::session_path_for_workspace(&workspace_dir));
+    }
+
+    /// Regression test: opening vimcode in a fresh directory must NOT restore files
+    /// from a different workspace (the old global-session fallback caused this).
+    #[test]
+    fn test_restore_session_does_not_bleed_across_workspaces() {
+        use crate::core::session::SessionState;
+        let dir = std::env::temp_dir();
+        let p1 = dir.join("vimcode_bleed_a.txt");
+        std::fs::write(&p1, "from workspace A").unwrap();
+
+        // Set global session to simulate "last used workspace A had p1 open".
+        let mut engine = Engine::new();
+        // Point cwd to a directory with NO workspace session.
+        let fresh_dir = dir.join("vimcode_fresh_workspace");
+        std::fs::create_dir_all(&fresh_dir).unwrap();
+        // Ensure no session exists for this dir.
+        let _ = std::fs::remove_file(SessionState::session_path_for_workspace(&fresh_dir));
+        engine.cwd = fresh_dir.clone();
+        // Populate global session as if we'd just come from workspace A.
+        engine.session.open_files = vec![p1.clone()];
+        engine.session.active_file = Some(p1.clone());
+
+        engine.restore_session_files();
+
+        // Fresh workspace → should open NO files (just the scratch buffer).
+        assert_eq!(
+            engine.active_group().tabs.len(),
+            1,
+            "no files should bleed from another workspace"
+        );
+        // The single buffer should be the empty scratch buffer (no file_path).
+        let buf_id = engine.active_buffer_id();
+        let buf_path = engine.buffer_manager.get(buf_id).and_then(|s| s.file_path.clone());
+        assert!(buf_path.is_none(), "scratch buffer should have no path");
+
+        let _ = std::fs::remove_file(&p1);
+        let _ = std::fs::remove_dir(&fresh_dir);
     }
 
     #[test]
@@ -19047,9 +19900,9 @@ mod tests {
     #[test]
     fn test_history_search_basic() {
         let mut engine = Engine::new();
-        engine.session.add_command("write");
-        engine.session.add_command("quit");
-        engine.session.add_command("wall");
+        engine.history.add_command("write");
+        engine.history.add_command("quit");
+        engine.history.add_command("wall");
 
         // Enter command mode, then Ctrl-R
         press_char(&mut engine, ':');
@@ -19063,9 +19916,9 @@ mod tests {
     #[test]
     fn test_history_search_typing_filters() {
         let mut engine = Engine::new();
-        engine.session.add_command("write");
-        engine.session.add_command("quit");
-        engine.session.add_command("wall");
+        engine.history.add_command("write");
+        engine.history.add_command("quit");
+        engine.history.add_command("wall");
 
         press_char(&mut engine, ':');
         press_ctrl(&mut engine, 'r');
@@ -19084,9 +19937,9 @@ mod tests {
     #[test]
     fn test_history_search_ctrl_r_cycles() {
         let mut engine = Engine::new();
-        engine.session.add_command("write");
-        engine.session.add_command("wquit");
-        engine.session.add_command("wall");
+        engine.history.add_command("write");
+        engine.history.add_command("wquit");
+        engine.history.add_command("wall");
 
         press_char(&mut engine, ':');
         press_ctrl(&mut engine, 'r');
@@ -19107,8 +19960,8 @@ mod tests {
     #[test]
     fn test_history_search_escape_cancels() {
         let mut engine = Engine::new();
-        engine.session.add_command("write");
-        engine.session.add_command("quit");
+        engine.history.add_command("write");
+        engine.history.add_command("quit");
 
         press_char(&mut engine, ':');
         engine.handle_key("w", Some('w'), false); // type "w" normally
@@ -19128,7 +19981,7 @@ mod tests {
     fn test_history_search_enter_accepts() {
         let mut engine = Engine::new();
         engine.buffer_mut().insert(0, "hello\nworld\nfoo");
-        engine.session.add_command("3");
+        engine.history.add_command("3");
 
         press_char(&mut engine, ':');
         press_ctrl(&mut engine, 'r');
@@ -19146,8 +19999,8 @@ mod tests {
     #[test]
     fn test_history_search_backspace_narrows() {
         let mut engine = Engine::new();
-        engine.session.add_command("write");
-        engine.session.add_command("wall");
+        engine.history.add_command("write");
+        engine.history.add_command("wall");
 
         press_char(&mut engine, ':');
         press_ctrl(&mut engine, 'r');
@@ -19869,11 +20722,11 @@ mod tests {
     #[test]
     fn test_new_tab() {
         let mut engine = Engine::new();
-        assert_eq!(engine.tabs.len(), 1);
+        assert_eq!(engine.active_group().tabs.len(), 1);
 
         engine.new_tab(None);
-        assert_eq!(engine.tabs.len(), 2);
-        assert_eq!(engine.active_tab, 1);
+        assert_eq!(engine.active_group().tabs.len(), 2);
+        assert_eq!(engine.active_group().active_tab, 1);
     }
 
     #[test]
@@ -19881,17 +20734,17 @@ mod tests {
         let mut engine = Engine::new();
         engine.new_tab(None);
         engine.new_tab(None);
-        assert_eq!(engine.tabs.len(), 3);
-        assert_eq!(engine.active_tab, 2);
+        assert_eq!(engine.active_group().tabs.len(), 3);
+        assert_eq!(engine.active_group().active_tab, 2);
 
         engine.prev_tab();
-        assert_eq!(engine.active_tab, 1);
+        assert_eq!(engine.active_group().active_tab, 1);
 
         engine.next_tab();
-        assert_eq!(engine.active_tab, 2);
+        assert_eq!(engine.active_group().active_tab, 2);
 
         engine.goto_tab(0);
-        assert_eq!(engine.active_tab, 0);
+        assert_eq!(engine.active_group().active_tab, 0);
     }
 
     #[test]
@@ -19951,6 +20804,30 @@ mod tests {
     }
 
     #[test]
+    fn test_close_tab_removes_orphaned_dirty_buffer() {
+        // When a tab is closed (discarded), its buffer should be removed from
+        // buffer_manager so has_any_unsaved() doesn't report it as dirty.
+        let mut engine = Engine::new();
+        // Open a second tab so we can close the first
+        engine.new_tab(None);
+        assert_eq!(engine.active_group().tabs.len(), 2);
+        // Make the active (second) tab's buffer dirty by typing in insert mode
+        engine.handle_key("i", Some('i'), false); // enter insert mode
+        engine.handle_key("", Some('x'), false); // type a char
+        engine.handle_key("Escape", None, false); // back to normal
+        assert!(engine.dirty(), "buffer should be dirty after typing");
+        assert!(engine.has_any_unsaved());
+        // Close the tab (discard) — this is what pressing D does
+        let closed = engine.close_tab();
+        assert!(closed);
+        // The buffer should have been removed from the buffer manager
+        assert!(
+            !engine.has_any_unsaved(),
+            "has_any_unsaved should be false after discarding tab"
+        );
+    }
+
+    #[test]
     fn test_gt_gT_tab_navigation() {
         let mut engine = Engine::new();
         engine.new_tab(None);
@@ -19960,12 +20837,12 @@ mod tests {
         // gt should go to next tab
         press_char(&mut engine, 'g');
         press_char(&mut engine, 't');
-        assert_eq!(engine.active_tab, 1);
+        assert_eq!(engine.active_group().active_tab, 1);
 
         // gT should go to previous tab
         press_char(&mut engine, 'g');
         press_char(&mut engine, 'T');
-        assert_eq!(engine.active_tab, 0);
+        assert_eq!(engine.active_group().active_tab, 0);
     }
 
     // --- Undo/Redo tests ---
@@ -23615,7 +24492,7 @@ mod tests {
         assert_eq!(engine.preview_buffer_id, Some(bid2));
         // Tab count should not have grown (reused the preview slot).
         assert_eq!(
-            engine.tabs.len(),
+            engine.active_group().tabs.len(),
             2,
             "still only 2 tabs (initial + 1 preview)"
         );
@@ -23664,13 +24541,14 @@ mod tests {
         let mut engine = Engine::new();
         // Open file1 permanently in a second tab.
         engine.open_file_in_tab(&path1);
-        let permanent_tab_idx = engine.active_tab;
+        let permanent_tab_idx = engine.active_group().active_tab;
         let bid1 = engine.active_buffer_id();
 
         // Single-click file1 — should just switch back to it, not make it a preview.
         engine.open_file_preview(&path1);
         assert_eq!(
-            engine.active_tab, permanent_tab_idx,
+            engine.active_group().active_tab,
+            permanent_tab_idx,
             "switched to existing tab"
         );
         assert!(
@@ -27302,11 +28180,11 @@ mod tests {
             .open_file_with_mode(&f1, OpenMode::Permanent)
             .unwrap();
 
-        let initial_win_count = engine.tabs[engine.active_tab].layout.window_ids().len();
+        let initial_win_count = engine.active_tab().layout.window_ids().len();
 
         engine.execute_command(&format!("diffsplit {}", f2.display()));
 
-        let new_win_count = engine.tabs[engine.active_tab].layout.window_ids().len();
+        let new_win_count = engine.active_tab().layout.window_ids().len();
         assert!(
             new_win_count > initial_win_count,
             "diffsplit should open a new window"
@@ -27320,9 +28198,9 @@ mod tests {
     #[test]
     fn test_help_command_explorer() {
         let mut engine = Engine::new();
-        let initial_wins = engine.tabs[engine.active_tab].layout.window_ids().len();
+        let initial_wins = engine.active_tab().layout.window_ids().len();
         engine.execute_command("help explorer");
-        let new_wins = engine.tabs[engine.active_tab].layout.window_ids().len();
+        let new_wins = engine.active_tab().layout.window_ids().len();
         assert_eq!(new_wins, initial_wins + 1, "help should open a vsplit");
         let content: String = engine.buffer().content.chars().collect();
         assert!(content.contains("Explorer Sidebar"));
@@ -27349,9 +28227,9 @@ mod tests {
     #[test]
     fn test_help_unknown_topic() {
         let mut engine = Engine::new();
-        let initial_wins = engine.tabs[engine.active_tab].layout.window_ids().len();
+        let initial_wins = engine.active_tab().layout.window_ids().len();
         engine.execute_command("help nonexistent");
-        let new_wins = engine.tabs[engine.active_tab].layout.window_ids().len();
+        let new_wins = engine.active_tab().layout.window_ids().len();
         assert_eq!(
             new_wins, initial_wins,
             "unknown topic should not open a split"
@@ -29004,7 +29882,7 @@ mod tests {
         // workspace_root should be set
         assert_eq!(engine.workspace_root, Some(expected));
         // Should have exactly one tab with one empty buffer
-        assert_eq!(engine.tabs.len(), 1);
+        assert_eq!(engine.active_group().tabs.len(), 1);
     }
 
     #[test]
@@ -29793,5 +30671,275 @@ mod tests {
             "linewise paste via clipboard intercept should insert on next line"
         );
         assert_eq!(engine.view().cursor.line, 1, "cursor on pasted line");
+    }
+
+    // ── Editor group tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_editor_group_split_commands() {
+        let mut engine = Engine::new();
+        assert_eq!(engine.group_layout.leaf_count(), 1);
+
+        // :EditorGroupSplit should create a second group.
+        let r = engine.execute_command("EditorGroupSplit");
+        assert_ne!(
+            r,
+            EngineAction::Error,
+            "EditorGroupSplit should not return error"
+        );
+        assert_eq!(
+            engine.group_layout.leaf_count(),
+            2,
+            "EditorGroupSplit should create a second group"
+        );
+
+        // A third split should now work (no cap at 2).
+        let r2 = engine.execute_command("egsp");
+        assert_ne!(r2, EngineAction::Error, "egsp should not return error");
+        assert_eq!(
+            engine.group_layout.leaf_count(),
+            3,
+            "egsp should create third group"
+        );
+
+        // Close back to 2, then close to 1.
+        engine.execute_command("egc");
+        assert_eq!(engine.group_layout.leaf_count(), 2);
+        engine.execute_command("egc");
+        assert_eq!(engine.group_layout.leaf_count(), 1);
+
+        let r3 = engine.execute_command("EditorGroupSplitDown");
+        assert_ne!(
+            r3,
+            EngineAction::Error,
+            "EditorGroupSplitDown should not return error"
+        );
+        assert_eq!(engine.group_layout.leaf_count(), 2);
+
+        // :egspd creates a third.
+        let r4 = engine.execute_command("egspd");
+        assert_ne!(r4, EngineAction::Error, "egspd should not return error");
+        assert_eq!(engine.group_layout.leaf_count(), 3);
+    }
+
+    #[test]
+    fn test_recursive_split_three_groups() {
+        let mut engine = Engine::new();
+        // Split right
+        engine.open_editor_group(SplitDirection::Vertical);
+        assert_eq!(engine.group_layout.leaf_count(), 2);
+        // Focus group 0 and split down
+        let first_id = engine.group_layout.group_ids()[0];
+        engine.active_group = first_id;
+        engine.open_editor_group(SplitDirection::Horizontal);
+        assert_eq!(engine.group_layout.leaf_count(), 3);
+        // Verify all 3 groups exist in the HashMap
+        assert_eq!(engine.editor_groups.len(), 3);
+    }
+
+    #[test]
+    fn test_focus_cycling_three_groups() {
+        let mut engine = Engine::new();
+        engine.open_editor_group(SplitDirection::Vertical);
+        let first_id = engine.group_layout.group_ids()[0];
+        engine.active_group = first_id;
+        engine.open_editor_group(SplitDirection::Horizontal);
+        let ids = engine.group_layout.group_ids();
+        assert_eq!(ids.len(), 3);
+        // Start at the newly split group (last created)
+        let start = engine.active_group;
+        engine.focus_other_group();
+        let second = engine.active_group;
+        assert_ne!(start, second);
+        engine.focus_other_group();
+        let third = engine.active_group;
+        assert_ne!(second, third);
+        engine.focus_other_group();
+        // Should wrap back
+        assert_eq!(engine.active_group, start);
+    }
+
+    #[test]
+    fn test_close_nested_group() {
+        let mut engine = Engine::new();
+        engine.open_editor_group(SplitDirection::Vertical);
+        let first_id = engine.group_layout.group_ids()[0];
+        engine.active_group = first_id;
+        engine.open_editor_group(SplitDirection::Horizontal);
+        assert_eq!(engine.group_layout.leaf_count(), 3);
+        // Close the active group
+        engine.close_editor_group();
+        assert_eq!(engine.group_layout.leaf_count(), 2);
+        // Close again
+        engine.close_editor_group();
+        assert_eq!(engine.group_layout.leaf_count(), 1);
+        assert!(engine.group_layout.is_single_group());
+    }
+
+    #[test]
+    fn test_four_groups_nested_splits() {
+        // Reproduce: split right, focus left, split down, split down again → 4 groups
+        let mut engine = Engine::new();
+        engine.open_editor_group(SplitDirection::Vertical);
+        assert_eq!(engine.group_layout.leaf_count(), 2);
+        let first_id = engine.group_layout.group_ids()[0];
+        engine.active_group = first_id;
+        engine.open_editor_group(SplitDirection::Horizontal);
+        assert_eq!(engine.group_layout.leaf_count(), 3);
+        // Second split down on the newly created group
+        engine.open_editor_group(SplitDirection::Horizontal);
+        assert_eq!(engine.group_layout.leaf_count(), 4);
+
+        // Simulate TUI rendering: content_bounds includes tab bar row (+1)
+        let content_bounds = WindowRect::new(0.0, 0.0, 80.0, 25.0);
+        let (rects, dividers) = engine.calculate_group_window_rects(content_bounds, 1.0);
+        assert_eq!(rects.len(), 4, "should have 4 window rects");
+
+        // All rects should have positive width and non-negative height
+        for (wid, r) in &rects {
+            assert!(r.width > 0.0, "window {:?} has zero width", wid);
+            assert!(r.height >= 0.0, "window {:?} has negative height", wid);
+            assert!(r.y >= 0.0, "window {:?} has negative y", wid);
+            assert!(
+                r.y + r.height <= content_bounds.height,
+                "window {:?} extends beyond content bounds: y={} h={} max={}",
+                wid,
+                r.y,
+                r.height,
+                content_bounds.height
+            );
+        }
+        assert!(!dividers.is_empty(), "should have dividers");
+    }
+
+    #[test]
+    fn test_group_resize_nested() {
+        let mut engine = Engine::new();
+        engine.open_editor_group(SplitDirection::Vertical);
+        let first_id = engine.group_layout.group_ids()[0];
+        engine.active_group = first_id;
+        // Resize: should adjust the parent split ratio
+        engine.group_resize(0.1);
+        // Verify it changed (default was 0.5, now should be 0.6)
+        if let GroupLayout::Split { ratio, .. } = &engine.group_layout {
+            assert!((*ratio - 0.6).abs() < 0.01);
+        } else {
+            panic!("Expected split layout");
+        }
+    }
+
+    #[test]
+    fn test_command_cursor_initial_position() {
+        // Entering command mode should set cursor to 0 (after the ':')
+        let mut engine = Engine::new();
+        engine.handle_key(":", Some(':'), false);
+        assert_eq!(engine.command_cursor, 0);
+        assert_eq!(engine.command_buffer, "");
+    }
+
+    #[test]
+    fn test_command_cursor_advances_on_type() {
+        let mut engine = Engine::new();
+        engine.handle_key(":", Some(':'), false);
+        engine.handle_key("", Some('h'), false);
+        engine.handle_key("", Some('i'), false);
+        assert_eq!(engine.command_buffer, "hi");
+        assert_eq!(engine.command_cursor, 2);
+    }
+
+    #[test]
+    fn test_command_cursor_left_right() {
+        let mut engine = Engine::new();
+        engine.handle_key(":", Some(':'), false);
+        engine.handle_key("", Some('a'), false);
+        engine.handle_key("", Some('b'), false);
+        engine.handle_key("", Some('c'), false);
+        assert_eq!(engine.command_cursor, 3);
+
+        engine.handle_key("Left", None, false);
+        assert_eq!(engine.command_cursor, 2);
+        engine.handle_key("Left", None, false);
+        assert_eq!(engine.command_cursor, 1);
+        // Insert at position 1
+        engine.handle_key("", Some('X'), false);
+        assert_eq!(engine.command_buffer, "aXbc");
+        assert_eq!(engine.command_cursor, 2);
+
+        engine.handle_key("Right", None, false);
+        assert_eq!(engine.command_cursor, 3);
+    }
+
+    #[test]
+    fn test_command_cursor_home_end() {
+        let mut engine = Engine::new();
+        engine.handle_key(":", Some(':'), false);
+        for ch in "hello".chars() {
+            engine.handle_key("", Some(ch), false);
+        }
+        engine.handle_key("Home", None, false);
+        assert_eq!(engine.command_cursor, 0);
+        engine.handle_key("End", None, false);
+        assert_eq!(engine.command_cursor, 5);
+    }
+
+    #[test]
+    fn test_command_cursor_delete_key() {
+        let mut engine = Engine::new();
+        engine.handle_key(":", Some(':'), false);
+        for ch in "abc".chars() {
+            engine.handle_key("", Some(ch), false);
+        }
+        // Move to start, delete first char
+        engine.handle_key("Home", None, false);
+        engine.handle_key("Delete", None, false);
+        assert_eq!(engine.command_buffer, "bc");
+        assert_eq!(engine.command_cursor, 0);
+    }
+
+    #[test]
+    fn test_command_cursor_backspace_at_cursor() {
+        let mut engine = Engine::new();
+        engine.handle_key(":", Some(':'), false);
+        for ch in "abc".chars() {
+            engine.handle_key("", Some(ch), false);
+        }
+        engine.handle_key("Left", None, false); // cursor at 2
+        engine.handle_key("BackSpace", None, false); // deletes 'b'
+        assert_eq!(engine.command_buffer, "ac");
+        assert_eq!(engine.command_cursor, 1);
+    }
+
+    #[test]
+    fn test_command_insert_str_at_cursor() {
+        let mut engine = Engine::new();
+        engine.handle_key(":", Some(':'), false);
+        for ch in "ac".chars() {
+            engine.handle_key("", Some(ch), false);
+        }
+        engine.handle_key("Left", None, false); // cursor between 'a' and 'c'
+        engine.command_insert_str("b");
+        assert_eq!(engine.command_buffer, "abc");
+        assert_eq!(engine.command_cursor, 2);
+    }
+
+    #[test]
+    fn test_command_ctrl_a_e_k() {
+        let mut engine = Engine::new();
+        engine.handle_key(":", Some(':'), false);
+        for ch in "hello".chars() {
+            engine.handle_key("", Some(ch), false);
+        }
+        // Ctrl-A goes to start
+        engine.handle_key("a", Some('a'), true);
+        assert_eq!(engine.command_cursor, 0);
+        // Ctrl-E goes to end
+        engine.handle_key("e", Some('e'), true);
+        assert_eq!(engine.command_cursor, 5);
+        // Move to middle, Ctrl-K kills to end
+        engine.handle_key("Left", None, false);
+        engine.handle_key("Left", None, false);
+        engine.handle_key("k", Some('k'), true);
+        assert_eq!(engine.command_buffer, "hel");
+        assert_eq!(engine.command_cursor, 3);
     }
 }

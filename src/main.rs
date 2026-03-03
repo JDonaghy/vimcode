@@ -66,7 +66,9 @@ fn matches_gtk_key(binding: &str, key: gdk::Key, state: gdk::ModifierType) -> bo
 
 struct App {
     engine: Rc<RefCell<Engine>>,
-    redraw: bool,
+    /// Set to true in update() whenever a draw is needed; cleared by the #[watch] block.
+    /// This prevents the 20/sec SearchPollTick timer from unconditionally calling queue_draw().
+    draw_needed: Rc<Cell<bool>>,
     sidebar_visible: bool,
     active_panel: SidebarPanel,
     tree_store: Option<gtk4::TreeStore>,
@@ -95,6 +97,8 @@ struct App {
     /// Relm4's async message queue.
     line_height_cell: Rc<Cell<f64>>,
     char_width_cell: Rc<Cell<f64>>,
+    /// Current mouse position, updated directly from the motion callback (no Relm4 message).
+    mouse_pos_cell: Rc<Cell<(f64, f64)>>,
     /// Shared with draw closure: hovered state for Cairo h scrollbars.
     h_sb_hovered_cell: Rc<Cell<bool>>,
     /// Shared with draw closure: which window (if any) has an active h scrollbar drag.
@@ -132,6 +136,8 @@ struct App {
     terminal_resize_dragging: bool,
     /// True while the user drags the terminal split divider left/right.
     terminal_split_dragging: bool,
+    /// Split index being dragged (None if not dragging a group divider).
+    group_divider_dragging: Option<usize>,
     /// Reference to the root GTK window used for minimize / maximize / close actions.
     window: gtk4::Window,
     /// Last time sc_refresh() was called for the Git sidebar auto-refresh.
@@ -179,6 +185,8 @@ enum Msg {
         y: f64,
         width: f64,
         height: f64,
+        /// True if the Alt modifier was held when the mouse button was pressed.
+        alt: bool,
     },
     /// Toggle sidebar visibility.
     ToggleSidebar,
@@ -288,8 +296,6 @@ enum Msg {
     },
     /// Mouse button released in editor.
     MouseUp,
-    /// Mouse moved (used for hover detection on Cairo-drawn scrollbars).
-    MouseMove { x: f64, y: f64 },
     /// Rename a file: (old_path, new_name_without_dir)
     RenameFile(PathBuf, String),
     /// Move a file to a different directory: (src, dest_dir)
@@ -378,6 +384,10 @@ enum Msg {
     QuitConfirmed,
     /// Clear the yank highlight after the flash duration has elapsed.
     ClearYankHighlight,
+    /// User clicked ✕ on a tab with unsaved changes — ask what to do.
+    ShowCloseTabConfirm,
+    /// User responded to the close-tab unsaved-changes dialog.
+    CloseTabConfirmed { save: bool },
 }
 
 #[relm4::component]
@@ -1104,6 +1114,24 @@ impl SimpleComponent for App {
                                         return gtk4::glib::Propagation::Stop;
                                     }
 
+                                    if !pk.split_editor_right.is_empty()
+                                        && matches_gtk_key(&pk.split_editor_right, key, modifier)
+                                    {
+                                        engine.borrow_mut().open_editor_group(
+                                            crate::core::window::SplitDirection::Vertical,
+                                        );
+                                        return gtk4::glib::Propagation::Stop;
+                                    }
+
+                                    if !pk.split_editor_down.is_empty()
+                                        && matches_gtk_key(&pk.split_editor_down, key, modifier)
+                                    {
+                                        engine.borrow_mut().open_editor_group(
+                                            crate::core::window::SplitDirection::Horizontal,
+                                        );
+                                        return gtk4::glib::Propagation::Stop;
+                                    }
+
                                     // Shift+F5 → stop, Shift+F11 → stepout (debug shortcuts)
                                     if shift && !ctrl && !alt {
                                         match key_name.as_str() {
@@ -1149,12 +1177,16 @@ impl SimpleComponent for App {
                                     let width = drawing_area.width() as f64;
                                     let height = drawing_area.height() as f64;
                                     let modifier = gesture.current_event_state();
+                                    let alt = gesture
+                                        .current_event()
+                                        .map(|ev| ev.modifier_state().contains(gdk::ModifierType::ALT_MASK))
+                                        .unwrap_or(false);
                                     if modifier.contains(gdk::ModifierType::CONTROL_MASK) {
                                         sender.input(Msg::CtrlMouseClick { x, y, width, height });
                                     } else if n_press >= 2 {
                                         sender.input(Msg::MouseDoubleClick { x, y, width, height });
                                     } else {
-                                        sender.input(Msg::MouseClick { x, y, width, height });
+                                        sender.input(Msg::MouseClick { x, y, width, height, alt });
                                     }
                                 }
                             },
@@ -1186,8 +1218,15 @@ impl SimpleComponent for App {
 
                             #[watch]
                             set_css_classes: {
-                                drawing_area.queue_draw();
-                                if model.redraw { &["vim-code", "even"] } else { &["vim-code", "odd"] }
+                                // Only queue a draw when explicitly requested by update().
+                                // Using take() clears the flag atomically so it fires once per request.
+                                if model.draw_needed.take() {
+                                    drawing_area.queue_draw();
+                                }
+                                // Return static classes — no even/odd alternation — so GTK
+                                // skips CSS re-resolution when classes haven't changed.
+                                // This eliminates expensive CSS thrashing on every update().
+                                &["vim-code"]
                             },
                         },
 
@@ -1382,6 +1421,12 @@ impl SimpleComponent for App {
         let window_scrollbars_ref = Rc::new(RefCell::new(HashMap::new()));
         let line_height_cell: Rc<Cell<f64>> = Rc::new(Cell::new(24.0));
         let char_width_cell: Rc<Cell<f64>> = Rc::new(Cell::new(9.0));
+        // Last font metrics sent via CacheFontMetrics — avoids sending on every draw.
+        let last_metrics_cell: Rc<Cell<(f64, f64)>> = Rc::new(Cell::new((0.0, 0.0)));
+        // Current mouse position written directly from the motion callback — avoids routing
+        // every motion event through the Relm4 message loop (which fires at 100-200 Hz).
+        // (-1.0, -1.0) means the pointer is outside the drawing area.
+        let mouse_pos_cell: Rc<Cell<(f64, f64)>> = Rc::new(Cell::new((-1.0, -1.0)));
         // Shared state for Cairo h scrollbar hover/drag — read by set_draw_func closure.
         let h_sb_hovered_cell: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let h_sb_drag_cell: Rc<Cell<Option<core::WindowId>>> = Rc::new(Cell::new(None));
@@ -1431,7 +1476,6 @@ impl SimpleComponent for App {
 
         let model = App {
             engine: engine.clone(),
-            redraw: false,
             sidebar_visible,
             window: root.clone(),
             active_panel: SidebarPanel::Explorer,
@@ -1448,6 +1492,8 @@ impl SimpleComponent for App {
             cached_char_width: 9.0,
             line_height_cell: line_height_cell.clone(),
             char_width_cell: char_width_cell.clone(),
+            draw_needed: Rc::new(Cell::new(false)),
+            mouse_pos_cell: mouse_pos_cell.clone(),
             h_sb_hovered_cell: h_sb_hovered_cell.clone(),
             h_sb_drag_cell: h_sb_drag_cell.clone(),
             settings_monitor,
@@ -1474,6 +1520,7 @@ impl SimpleComponent for App {
             terminal_sb_dragging: false,
             terminal_resize_dragging: false,
             terminal_split_dragging: false,
+            group_divider_dragging: None,
             last_sc_refresh: std::time::Instant::now(),
             menu_dropdown_da: menu_dropdown_da_ref.clone(),
             menu_dd_line_height: menu_dd_lh.clone(),
@@ -1905,6 +1952,11 @@ impl SimpleComponent for App {
             .file_tree_view
             .expand_row(&gtk4::TreePath::from_indices(&[0]), false);
 
+        // Highlight the active file from the restored session in the tree.
+        if let Some(path) = engine.borrow().file_path().cloned() {
+            highlight_file_in_tree(&widgets.file_tree_view, &path);
+        }
+
         // Connect double-click signal to open files
         let sender_for_tree = sender.clone();
         widgets
@@ -2284,6 +2336,7 @@ impl SimpleComponent for App {
         let sender_for_draw = sender.input_sender().clone();
         let h_sb_hovered_for_draw = h_sb_hovered_cell.clone();
         let h_sb_drag_for_draw = h_sb_drag_cell.clone();
+        let last_metrics_for_draw = last_metrics_cell.clone();
         widgets
             .drawing_area
             .set_draw_func(move |_, cr, width, height| {
@@ -2296,20 +2349,22 @@ impl SimpleComponent for App {
                     &sender_for_draw,
                     h_sb_hovered_for_draw.get(),
                     h_sb_drag_for_draw.get(),
+                    &last_metrics_for_draw,
                 );
             });
 
-        // Motion controller: drives h scrollbar hover colour changes.
+        // Motion controller: write mouse position directly into a shared cell.
+        // This avoids routing every motion event (100-200 Hz on Linux) through the Relm4
+        // message loop. The hover state is computed in SearchPollTick (20 Hz) instead.
         {
-            let sender_motion = sender.input_sender().clone();
-            let sender_leave = sender.input_sender().clone();
+            let pos_cell = mouse_pos_cell.clone();
+            let pos_cell_leave = mouse_pos_cell.clone();
             let mc = gtk4::EventControllerMotion::new();
             mc.connect_motion(move |_, x, y| {
-                sender_motion.send(Msg::MouseMove { x, y }).ok();
+                pos_cell.set((x, y));
             });
-            // When the pointer leaves the drawing area, clear hover state.
             mc.connect_leave(move |_| {
-                sender_leave.send(Msg::MouseMove { x: -1.0, y: -1.0 }).ok();
+                pos_cell_leave.set((-1.0, -1.0));
             });
             widgets.drawing_area.add_controller(mc);
         }
@@ -2398,7 +2453,7 @@ impl SimpleComponent for App {
 
                 let (action, prev_tab) = {
                     let mut engine = self.engine.borrow_mut();
-                    let prev = engine.active_tab;
+                    let prev = engine.active_group().active_tab;
                     let a = engine.handle_key(&key_name, unicode, ctrl);
                     (a, prev)
                 };
@@ -2553,7 +2608,7 @@ impl SimpleComponent for App {
                 // Reveal the active file in the sidebar when tab changed (gt/gT/:tabn/:tabp)
                 {
                     let engine = self.engine.borrow();
-                    if engine.active_tab != prev_tab {
+                    if engine.active_group().active_tab != prev_tab {
                         let file_path = engine.file_path().cloned();
                         drop(engine);
                         if let Some(path) = file_path {
@@ -2579,11 +2634,11 @@ impl SimpleComponent for App {
                     );
                 }
 
-                self.redraw = !self.redraw;
+                self.draw_needed.set(true);
             }
             Msg::ClearYankHighlight => {
                 self.engine.borrow_mut().clear_yank_highlight();
-                self.redraw = !self.redraw;
+                self.draw_needed.set(true);
             }
             Msg::Resize => {
                 // Propagate window resize to open terminal panes.
@@ -2594,14 +2649,18 @@ impl SimpleComponent for App {
                         self.engine.borrow_mut().terminal_resize(cols, rows);
                     }
                 }
-                self.redraw = !self.redraw;
+                self.draw_needed.set(true);
             }
             Msg::MouseClick {
                 x,
                 y,
                 width,
                 height,
+                alt,
             } => {
+                // Snapshot the active file path before processing the click so we
+                // can detect tab switches (and only then highlight in the tree).
+                let file_before_click = self.engine.borrow().file_path().cloned();
                 // Clicking in the editor clears debug sidebar focus.
                 self.engine.borrow_mut().dap_sidebar_has_focus = false;
                 // Check if click lands in the terminal panel before general handling.
@@ -2726,7 +2785,7 @@ impl SimpleComponent for App {
                             self.terminal_resize_dragging = true;
                         }
                     }
-                    self.redraw = true;
+                    self.draw_needed.set(true);
                 } else {
                     {
                         let mut engine = self.engine.borrow_mut();
@@ -2757,8 +2816,39 @@ impl SimpleComponent for App {
                                 px_per_col,
                             });
                             self.h_sb_drag_cell.set(Some(win_id));
-                            self.redraw = !self.redraw;
+                            self.draw_needed.set(true);
                             return; // consume click; don't send it to the editor
+                        }
+                    }
+
+                    // ── Editor group divider hit-test ─────────────────────────────
+                    {
+                        let engine = self.engine.borrow();
+                        if !engine.group_layout.is_single_group() {
+                            let editor_bottom = height - 2.0 * self.cached_line_height;
+                            let content_bounds =
+                                core::window::WindowRect::new(0.0, 0.0, width, editor_bottom);
+                            let dividers = engine.group_layout.dividers(content_bounds, &mut 0);
+                            for div in &dividers {
+                                let hit = match div.direction {
+                                    core::window::SplitDirection::Vertical => {
+                                        (x - div.position).abs() < 6.0
+                                            && y >= div.cross_start
+                                            && y < div.cross_start + div.cross_size
+                                    }
+                                    core::window::SplitDirection::Horizontal => {
+                                        (y - div.position).abs() < 6.0
+                                            && x >= div.cross_start
+                                            && x < div.cross_start + div.cross_size
+                                    }
+                                };
+                                if hit {
+                                    let si = div.split_index;
+                                    drop(engine);
+                                    self.group_divider_dragging = Some(si);
+                                    return;
+                                }
+                            }
                         }
                     }
 
@@ -2800,18 +2890,37 @@ impl SimpleComponent for App {
                             if engine.is_vscode_mode() {
                                 engine.vscode_clear_selection();
                             }
-                            handle_mouse_click(&mut engine, x, y, width, height);
-                        }
-
-                        // Reveal the active file in the sidebar tree (e.g. after tab click)
-                        let file_path = engine.file_path().cloned();
-                        drop(engine);
-                        if let Some(path) = file_path {
-                            if let Some(ref tree) = *self.file_tree_view.borrow() {
-                                highlight_file_in_tree(tree, &path);
+                            if handle_mouse_click(
+                                &mut engine,
+                                x,
+                                y,
+                                width,
+                                height,
+                                alt,
+                                self.cached_line_height,
+                                self.cached_char_width,
+                            ) {
+                                drop(engine);
+                                sender.input(Msg::ShowCloseTabConfirm);
+                                self.draw_needed.set(true);
+                                return;
                             }
                         }
-                        self.redraw = !self.redraw;
+
+                        // Reveal the active file in the sidebar tree only when the
+                        // active file actually changed (e.g. tab click), NOT on every
+                        // editor click.  highlight_file_in_tree does a full DFS of the
+                        // GTK TreeStore which is O(N_files) and very slow in debug builds.
+                        let new_file_path = engine.file_path().cloned();
+                        drop(engine);
+                        if new_file_path != file_before_click {
+                            if let Some(path) = new_file_path {
+                                if let Some(ref tree) = *self.file_tree_view.borrow() {
+                                    highlight_file_in_tree(tree, &path);
+                                }
+                            }
+                        }
+                        self.draw_needed.set(true);
                     }
                 }
             }
@@ -2822,12 +2931,18 @@ impl SimpleComponent for App {
                 height,
             } => {
                 let mut engine = self.engine.borrow_mut();
-                if let ClickTarget::BufferPos(_, line, col) =
-                    pixel_to_click_target(&mut engine, x, y, width, height)
-                {
+                if let ClickTarget::BufferPos(_, line, col) = pixel_to_click_target(
+                    &mut engine,
+                    x,
+                    y,
+                    width,
+                    height,
+                    self.cached_line_height,
+                    self.cached_char_width,
+                ) {
                     engine.add_cursor_at_pos(line, col);
                 }
-                self.redraw = !self.redraw;
+                self.draw_needed.set(true);
             }
             Msg::MouseDoubleClick {
                 x,
@@ -2836,8 +2951,16 @@ impl SimpleComponent for App {
                 height,
             } => {
                 let mut engine = self.engine.borrow_mut();
-                handle_mouse_double_click(&mut engine, x, y, width, height);
-                self.redraw = !self.redraw;
+                handle_mouse_double_click(
+                    &mut engine,
+                    x,
+                    y,
+                    width,
+                    height,
+                    self.cached_line_height,
+                    self.cached_char_width,
+                );
+                self.draw_needed.set(true);
             }
             Msg::MouseDrag {
                 x,
@@ -2855,8 +2978,32 @@ impl SimpleComponent for App {
                         self.engine
                             .borrow_mut()
                             .set_scroll_left_for_window(state.window_id, new_left);
-                        self.redraw = !self.redraw;
+                        self.draw_needed.set(true);
                     }
+                    return;
+                }
+                // Editor group divider drag — adjust split ratio.
+                if let Some(split_index) = self.group_divider_dragging {
+                    let editor_bottom = height - 2.0 * self.cached_line_height;
+                    let content_bounds =
+                        core::window::WindowRect::new(0.0, 0.0, width, editor_bottom);
+                    let dividers = self
+                        .engine
+                        .borrow()
+                        .group_layout
+                        .dividers(content_bounds, &mut 0);
+                    if let Some(div) = dividers.iter().find(|d| d.split_index == split_index) {
+                        let mouse_pos = match div.direction {
+                            core::window::SplitDirection::Vertical => x,
+                            core::window::SplitDirection::Horizontal => y,
+                        };
+                        let new_ratio = (mouse_pos - div.axis_start) / div.axis_size;
+                        self.engine
+                            .borrow_mut()
+                            .group_layout
+                            .set_ratio_at_index(split_index, new_ratio);
+                    }
+                    self.draw_needed.set(true);
                     return;
                 }
                 // Terminal split divider drag — update visual position (no PTY resize yet).
@@ -2870,7 +3017,7 @@ impl SimpleComponent for App {
                         self.engine
                             .borrow_mut()
                             .terminal_split_set_drag_cols(left_cols);
-                        self.redraw = true;
+                        self.draw_needed.set(true);
                     }
                 // Terminal panel resize drag.
                 } else if self.terminal_resize_dragging {
@@ -2881,7 +3028,7 @@ impl SimpleComponent for App {
                             .saturating_sub(1)
                             .clamp(5, 30);
                         self.engine.borrow_mut().session.terminal_panel_rows = new_rows;
-                        self.redraw = true;
+                        self.draw_needed.set(true);
                     }
                 } else if self.terminal_sb_dragging {
                     let (term_rows, scrollback_rows) = {
@@ -2915,7 +3062,7 @@ impl SimpleComponent for App {
                             }
                         }
                     }
-                    self.redraw = true;
+                    self.draw_needed.set(true);
                 } else {
                     // Check if drag is in the terminal content area (text selection).
                     let in_terminal = if self.cached_line_height > 0.0 {
@@ -2951,11 +3098,19 @@ impl SimpleComponent for App {
                                 sel.end_col = col;
                             }
                         }
-                        self.redraw = true;
+                        self.draw_needed.set(true);
                     } else {
                         let mut engine = self.engine.borrow_mut();
-                        handle_mouse_drag(&mut engine, x, y, width, height);
-                        self.redraw = !self.redraw;
+                        handle_mouse_drag(
+                            &mut engine,
+                            x,
+                            y,
+                            width,
+                            height,
+                            self.cached_line_height,
+                            self.cached_char_width,
+                        );
+                        self.draw_needed.set(true);
                     }
                 }
             }
@@ -3007,32 +3162,14 @@ impl SimpleComponent for App {
                 }
                 self.h_sb_dragging = None;
                 self.h_sb_drag_cell.set(None);
+                self.group_divider_dragging = None;
                 let mut engine = self.engine.borrow_mut();
                 engine.mouse_drag_active = false;
-                self.redraw = !self.redraw;
-            }
-            Msg::MouseMove { x, y } => {
-                // Update hover state for Cairo h scrollbars; redraw only if it changed.
-                let lh = self.cached_line_height;
-                let cw = self.cached_char_width;
-                let (da_w, da_h) = if let Some(da) = self.drawing_area.borrow().as_ref() {
-                    (da.width() as f64, da.height() as f64)
-                } else {
-                    return;
-                };
-                let engine = self.engine.borrow();
-                let rects = compute_editor_window_rects(&engine, da_w, da_h, lh);
-                let now_hovered = h_scrollbar_hit_test(&engine, x, y, &rects, cw, lh).is_some();
-                drop(engine);
-                if now_hovered != self.h_sb_hovered {
-                    self.h_sb_hovered = now_hovered;
-                    self.h_sb_hovered_cell.set(now_hovered);
-                    self.redraw = !self.redraw;
-                }
+                self.draw_needed.set(true);
             }
             Msg::ToggleSidebar => {
                 self.sidebar_visible = !self.sidebar_visible;
-                self.redraw = !self.redraw;
+                self.draw_needed.set(true);
 
                 // Directly control the revealer and panel visibility.
                 let show = self.sidebar_visible;
@@ -3092,7 +3229,7 @@ impl SimpleComponent for App {
                         b.set_visible(show_sidebar && p == which);
                     }
                 }
-                self.redraw = !self.redraw;
+                self.draw_needed.set(true);
             }
             Msg::OpenFileFromSidebar(path) => {
                 let mut engine = self.engine.borrow_mut();
@@ -3106,7 +3243,7 @@ impl SimpleComponent for App {
                     drawing.grab_focus();
                 }
                 self.tree_has_focus = false;
-                self.redraw = !self.redraw;
+                self.draw_needed.set(true);
             }
             Msg::PreviewFileFromSidebar(path) => {
                 let mut engine = self.engine.borrow_mut();
@@ -3120,13 +3257,13 @@ impl SimpleComponent for App {
                     drawing.grab_focus();
                 }
                 self.tree_has_focus = false;
-                self.redraw = !self.redraw;
+                self.draw_needed.set(true);
             }
             Msg::CreateFile(parent_dir, name) => {
                 // Validate name
                 if let Err(msg) = validate_name(&name) {
                     self.engine.borrow_mut().message = msg;
-                    self.redraw = !self.redraw;
+                    self.draw_needed.set(true);
                     return;
                 }
 
@@ -3135,7 +3272,7 @@ impl SimpleComponent for App {
                 // Check if already exists
                 if file_path.exists() {
                     self.engine.borrow_mut().message = format!("'{}' already exists", name);
-                    self.redraw = !self.redraw;
+                    self.draw_needed.set(true);
                     return;
                 }
 
@@ -3155,13 +3292,13 @@ impl SimpleComponent for App {
                             format!("Error creating '{}': {}", name, e);
                     }
                 }
-                self.redraw = !self.redraw;
+                self.draw_needed.set(true);
             }
             Msg::CreateFolder(parent_dir, name) => {
                 // Validate name
                 if let Err(msg) = validate_name(&name) {
                     self.engine.borrow_mut().message = msg;
-                    self.redraw = !self.redraw;
+                    self.draw_needed.set(true);
                     return;
                 }
 
@@ -3170,7 +3307,7 @@ impl SimpleComponent for App {
                 // Check if already exists
                 if folder_path.exists() {
                     self.engine.borrow_mut().message = format!("'{}' already exists", name);
-                    self.redraw = !self.redraw;
+                    self.draw_needed.set(true);
                     return;
                 }
 
@@ -3193,7 +3330,7 @@ impl SimpleComponent for App {
                             format!("Error creating folder '{}': {}", name, e);
                     }
                 }
-                self.redraw = !self.redraw;
+                self.draw_needed.set(true);
             }
             Msg::ConfirmDeletePath(path) => {
                 let filename = path
@@ -3237,7 +3374,7 @@ impl SimpleComponent for App {
                 // Check if path exists
                 if !path.exists() {
                     self.engine.borrow_mut().message = format!("'{}' does not exist", filename);
-                    self.redraw = !self.redraw;
+                    self.draw_needed.set(true);
                     return;
                 }
 
@@ -3277,7 +3414,7 @@ impl SimpleComponent for App {
                         self.engine.borrow_mut().message = msg;
                     }
                 }
-                self.redraw = !self.redraw;
+                self.draw_needed.set(true);
             }
             Msg::RefreshFileTree => {
                 if let Some(ref store) = self.tree_store {
@@ -3287,6 +3424,10 @@ impl SimpleComponent for App {
                             build_file_tree_with_root(store, &cwd);
                             if let Some(ref tv) = *self.file_tree_view.borrow() {
                                 tv.expand_row(&gtk4::TreePath::from_indices(&[0]), false);
+                                // Highlight the active file in the tree after rebuild.
+                                if let Some(path) = self.engine.borrow().file_path().cloned() {
+                                    highlight_file_in_tree(tv, &path);
+                                }
                             }
                         }
                         Err(e) => {
@@ -3295,7 +3436,7 @@ impl SimpleComponent for App {
                         }
                     }
                 }
-                self.redraw = !self.redraw;
+                self.draw_needed.set(true);
             }
             Msg::FocusExplorer => {
                 // Ensure sidebar is visible and explorer is active
@@ -3308,7 +3449,7 @@ impl SimpleComponent for App {
                     tree.grab_focus();
                 }
 
-                self.redraw = !self.redraw;
+                self.draw_needed.set(true);
             }
             Msg::ToggleFocusExplorer => {
                 if self.tree_has_focus {
@@ -3325,7 +3466,7 @@ impl SimpleComponent for App {
                         tree.grab_focus();
                     }
                 }
-                self.redraw = !self.redraw;
+                self.draw_needed.set(true);
             }
             Msg::ToggleFocusSearch => {
                 // Same pattern as ToggleFocusExplorer: toggle between showing the search
@@ -3346,7 +3487,7 @@ impl SimpleComponent for App {
                         drawing.grab_focus();
                     }
                 }
-                self.redraw = !self.redraw;
+                self.draw_needed.set(true);
             }
             Msg::FocusEditor => {
                 self.tree_has_focus = false;
@@ -3357,7 +3498,7 @@ impl SimpleComponent for App {
                     drawing.grab_focus();
                 }
 
-                self.redraw = !self.redraw;
+                self.draw_needed.set(true);
             }
             Msg::VerticalScrollbarChanged { window_id, value } => {
                 // Update specific window's scroll_top based on scrollbar value
@@ -3368,13 +3509,13 @@ impl SimpleComponent for App {
                     engine.sync_scroll_binds();
                 }
                 drop(engine);
-                self.redraw = !self.redraw;
+                self.draw_needed.set(true);
             }
             Msg::HorizontalScrollbarChanged { window_id, value } => {
                 let mut engine = self.engine.borrow_mut();
                 engine.set_scroll_left_for_window(window_id, value.round() as usize);
                 drop(engine);
-                self.redraw = !self.redraw;
+                self.draw_needed.set(true);
             }
             Msg::MouseScroll { delta_x, delta_y } => {
                 let mut engine = self.engine.borrow_mut();
@@ -3395,7 +3536,7 @@ impl SimpleComponent for App {
                     engine.set_scroll_left_for_window(win_id, new_left);
                 }
                 drop(engine);
-                self.redraw = !self.redraw;
+                self.draw_needed.set(true);
             }
             Msg::CacheFontMetrics(line_height, char_width) => {
                 let old_char_width = self.cached_char_width;
@@ -3434,7 +3575,7 @@ impl SimpleComponent for App {
                 // Open settings in a new tab
                 engine.new_tab(Some(Path::new(&settings_path)));
                 drop(engine);
-                self.redraw = !self.redraw;
+                self.draw_needed.set(true);
             }
             Msg::SettingsFileChanged => {
                 // Use load_with_validation (not load) to avoid writing back to the file,
@@ -3450,19 +3591,19 @@ impl SimpleComponent for App {
                     if let Some(drawing_area) = self.drawing_area.borrow().as_ref() {
                         drawing_area.queue_draw();
                     }
-                    self.redraw = !self.redraw;
+                    self.draw_needed.set(true);
                 }
             }
             Msg::ToggleFindDialog => {
                 self.find_dialog_visible = !self.find_dialog_visible;
-                self.redraw = !self.redraw;
+                self.draw_needed.set(true);
             }
             Msg::FindTextChanged(text) => {
                 self.find_text = text.clone();
                 let mut engine = self.engine.borrow_mut();
                 engine.search_query = text;
                 engine.run_search();
-                self.redraw = !self.redraw;
+                self.draw_needed.set(true);
             }
             Msg::ReplaceTextChanged(text) => {
                 self.replace_text = text;
@@ -3470,12 +3611,12 @@ impl SimpleComponent for App {
             Msg::FindNext => {
                 let mut engine = self.engine.borrow_mut();
                 engine.search_next();
-                self.redraw = !self.redraw;
+                self.draw_needed.set(true);
             }
             Msg::FindPrevious => {
                 let mut engine = self.engine.borrow_mut();
                 engine.search_prev();
-                self.redraw = !self.redraw;
+                self.draw_needed.set(true);
             }
             Msg::ReplaceNext => {
                 let mut engine = self.engine.borrow_mut();
@@ -3494,7 +3635,7 @@ impl SimpleComponent for App {
                     }
                 }
 
-                self.redraw = !self.redraw;
+                self.draw_needed.set(true);
             }
             Msg::ReplaceAll => {
                 let mut engine = self.engine.borrow_mut();
@@ -3518,7 +3659,7 @@ impl SimpleComponent for App {
 
                 // Re-run search to update highlights
                 engine.run_search();
-                self.redraw = !self.redraw;
+                self.draw_needed.set(true);
             }
             Msg::CloseFindDialog => {
                 self.find_dialog_visible = false;
@@ -3533,7 +3674,7 @@ impl SimpleComponent for App {
                     drawing_area.grab_focus();
                 }
 
-                self.redraw = !self.redraw;
+                self.draw_needed.set(true);
             }
             Msg::WindowResized { width, height } => {
                 // Update session state with new window geometry (debounced save)
@@ -3555,15 +3696,15 @@ impl SimpleComponent for App {
             }
             Msg::ProjectSearchToggleCase => {
                 self.engine.borrow_mut().toggle_project_search_case();
-                self.redraw = true;
+                self.draw_needed.set(true);
             }
             Msg::ProjectSearchToggleWholeWord => {
                 self.engine.borrow_mut().toggle_project_search_whole_word();
-                self.redraw = true;
+                self.draw_needed.set(true);
             }
             Msg::ProjectSearchToggleRegex => {
                 self.engine.borrow_mut().toggle_project_search_regex();
-                self.redraw = true;
+                self.draw_needed.set(true);
             }
             Msg::ProjectReplaceTextChanged(t) => {
                 self.engine.borrow_mut().project_replace_text = t;
@@ -3573,54 +3714,78 @@ impl SimpleComponent for App {
                 self.engine.borrow_mut().start_project_replace(cwd);
                 let status = self.engine.borrow().message.clone();
                 self.project_search_status = status;
-                self.redraw = true;
+                self.draw_needed.set(true);
             }
             Msg::ProjectSearchSubmit => {
                 let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                 self.engine.borrow_mut().start_project_search(cwd);
                 let status = self.engine.borrow().message.clone();
                 self.project_search_status = status;
-                self.redraw = true;
+                self.draw_needed.set(true);
             }
             Msg::SearchPollTick => {
+                // Check h scrollbar hover state from the shared mouse position cell.
+                // This replaces per-motion-event Relm4 messages with a 20 Hz poll.
+                {
+                    let (mx, my) = self.mouse_pos_cell.get();
+                    let lh = self.cached_line_height;
+                    let cw = self.cached_char_width;
+                    let da_size = self
+                        .drawing_area
+                        .borrow()
+                        .as_ref()
+                        .map(|da| (da.width() as f64, da.height() as f64));
+                    if let Some((da_w, da_h)) = da_size {
+                        let engine = self.engine.borrow();
+                        let rects = compute_editor_window_rects(&engine, da_w, da_h, lh);
+                        let now_hovered = mx >= 0.0
+                            && h_scrollbar_hit_test(&engine, mx, my, &rects, cw, lh).is_some();
+                        drop(engine);
+                        if now_hovered != self.h_sb_hovered {
+                            self.h_sb_hovered = now_hovered;
+                            self.h_sb_hovered_cell.set(now_hovered);
+                            self.draw_needed.set(true);
+                        }
+                    }
+                }
                 if self.engine.borrow_mut().poll_project_search() {
                     let status = self.engine.borrow().message.clone();
                     self.project_search_status = status;
                     let s = self.sender.clone();
                     self.rebuild_search_results(&s);
-                    self.redraw = true;
+                    self.draw_needed.set(true);
                 }
                 if self.engine.borrow_mut().poll_project_replace() {
                     let status = self.engine.borrow().message.clone();
                     self.project_search_status = status;
                     let s = self.sender.clone();
                     self.rebuild_search_results(&s);
-                    self.redraw = true;
+                    self.draw_needed.set(true);
                 }
                 // LSP: flush debounced didChange notifications and poll for events
                 {
                     let mut engine = self.engine.borrow_mut();
                     engine.lsp_flush_changes();
                     if engine.poll_lsp() {
-                        self.redraw = true;
+                        self.draw_needed.set(true);
                     }
                 }
                 // Terminal: drain PTY output and refresh display if needed
                 if self.engine.borrow_mut().poll_terminal() {
-                    self.redraw = true;
+                    self.draw_needed.set(true);
                 }
                 // DAP: drain adapter events (breakpoint hits, stops, output)
                 {
                     let mut engine = self.engine.borrow_mut();
                     if engine.poll_dap() {
-                        self.redraw = true;
+                        self.draw_needed.set(true);
                     }
                     // Auto-switch to Debug sidebar when a session starts.
                     if engine.dap_wants_sidebar {
                         engine.dap_wants_sidebar = false;
                         self.active_panel = SidebarPanel::Debug;
                         self.sidebar_visible = true;
-                        self.redraw = true;
+                        self.draw_needed.set(true);
                     }
                 }
                 // Explicitly redraw the debug sidebar if it's active so the
@@ -3640,7 +3805,7 @@ impl SimpleComponent for App {
                     if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
                         da.queue_draw();
                     }
-                    self.redraw = true;
+                    self.draw_needed.set(true);
                 }
                 // Sync the OS window title with the active buffer name (taskbar/pager).
                 let win_title = self
@@ -3667,7 +3832,7 @@ impl SimpleComponent for App {
                         .set_cursor_for_window(win_id, line, 0);
                     self.engine.borrow_mut().ensure_cursor_visible();
                 }
-                self.redraw = true;
+                self.draw_needed.set(true);
             }
             Msg::RenameFile(old_path, new_name) => {
                 let result = self.engine.borrow_mut().rename_file(&old_path, &new_name);
@@ -3680,7 +3845,7 @@ impl SimpleComponent for App {
                         self.engine.borrow_mut().message = e;
                     }
                 }
-                self.redraw = !self.redraw;
+                self.draw_needed.set(true);
             }
             Msg::MoveFile(src, dest_dir) => {
                 let name = src
@@ -3709,7 +3874,7 @@ impl SimpleComponent for App {
                         self.engine.borrow_mut().message = e;
                     }
                 }
-                self.redraw = !self.redraw;
+                self.draw_needed.set(true);
             }
             Msg::CopyPath(path) => {
                 let path_str = path.to_string_lossy().to_string();
@@ -3717,7 +3882,7 @@ impl SimpleComponent for App {
                     display.clipboard().set_text(&path_str);
                     self.engine.borrow_mut().message = format!("Copied: {}", path_str);
                 }
-                self.redraw = !self.redraw;
+                self.draw_needed.set(true);
             }
             Msg::SelectForDiff(path) => {
                 let name = path
@@ -3729,7 +3894,7 @@ impl SimpleComponent for App {
                     "Selected '{}' for diff. Right-click another file → Diff with…",
                     name
                 );
-                self.redraw = !self.redraw;
+                self.draw_needed.set(true);
             }
             Msg::DiffWithSelected(right_path) => {
                 if let Some(left_path) = self.diff_selected_file.take() {
@@ -3743,7 +3908,7 @@ impl SimpleComponent for App {
                         "No file selected for diff. Right-click a file → Select for Diff first."
                             .to_string();
                 }
-                self.redraw = !self.redraw;
+                self.draw_needed.set(true);
             }
             Msg::ClipboardPasteToInput { text } => {
                 // GDK clipboard text arrived for Ctrl-Shift-V paste into command/search/insert.
@@ -3764,7 +3929,7 @@ impl SimpleComponent for App {
                     }
                     _ => {}
                 }
-                self.redraw = !self.redraw;
+                self.draw_needed.set(true);
             }
             Msg::WindowClosing { width, height } => {
                 let mut engine = self.engine.borrow_mut();
@@ -3819,7 +3984,7 @@ impl SimpleComponent for App {
                 } else {
                     self.engine.borrow_mut().toggle_terminal();
                 }
-                self.redraw = true;
+                self.draw_needed.set(true);
             }
             Msg::NewTerminalTab => {
                 let cols = if let Some(da) = self.drawing_area.borrow().as_ref() {
@@ -3834,19 +3999,19 @@ impl SimpleComponent for App {
                 .max(40);
                 let rows = self.engine.borrow().session.terminal_panel_rows;
                 self.engine.borrow_mut().terminal_new_tab(cols, rows);
-                self.redraw = true;
+                self.draw_needed.set(true);
             }
             Msg::TerminalSwitchTab(idx) => {
                 self.engine.borrow_mut().terminal_switch_tab(idx);
-                self.redraw = true;
+                self.draw_needed.set(true);
             }
             Msg::TerminalCloseActiveTab => {
                 self.engine.borrow_mut().terminal_close_active_tab();
-                self.redraw = true;
+                self.draw_needed.set(true);
             }
             Msg::TerminalKill => {
                 self.engine.borrow_mut().terminal_close_active_tab();
-                self.redraw = true;
+                self.draw_needed.set(true);
             }
             Msg::TerminalToggleSplit => {
                 let (full_cols, rows) = {
@@ -3866,14 +4031,14 @@ impl SimpleComponent for App {
                 self.engine
                     .borrow_mut()
                     .terminal_toggle_split(full_cols, rows);
-                self.redraw = true;
+                self.draw_needed.set(true);
             }
             Msg::TerminalSplitFocus(idx) => {
                 let mut engine = self.engine.borrow_mut();
                 if engine.terminal_split && idx < engine.terminal_panes.len() {
                     engine.terminal_active = idx;
                 }
-                self.redraw = true;
+                self.draw_needed.set(true);
             }
             Msg::TerminalCopySelection => {
                 if let Some(text) = self.engine.borrow_mut().terminal_copy_selection() {
@@ -3891,7 +4056,7 @@ impl SimpleComponent for App {
                 if let Some(text) = text {
                     self.engine.borrow_mut().terminal_write(text.as_bytes());
                 }
-                self.redraw = true;
+                self.draw_needed.set(true);
             }
             Msg::TerminalMouseDown { row, col } => {
                 if let Some(term) = self.engine.borrow_mut().active_terminal_mut() {
@@ -3902,7 +4067,7 @@ impl SimpleComponent for App {
                         end_col: col,
                     });
                 }
-                self.redraw = true;
+                self.draw_needed.set(true);
             }
             Msg::TerminalMouseDrag { row, col } => {
                 if let Some(term) = self.engine.borrow_mut().active_terminal_mut() {
@@ -3911,35 +4076,35 @@ impl SimpleComponent for App {
                         sel.end_col = col;
                     }
                 }
-                self.redraw = true;
+                self.draw_needed.set(true);
             }
             Msg::TerminalMouseUp => {
                 // Selection stays in place; user can now copy
-                self.redraw = true;
+                self.draw_needed.set(true);
             }
             Msg::TerminalFindOpen => {
                 self.engine.borrow_mut().terminal_find_open();
-                self.redraw = true;
+                self.draw_needed.set(true);
             }
             Msg::TerminalFindClose => {
                 self.engine.borrow_mut().terminal_find_close();
-                self.redraw = true;
+                self.draw_needed.set(true);
             }
             Msg::TerminalFindChar(ch) => {
                 self.engine.borrow_mut().terminal_find_char(ch);
-                self.redraw = true;
+                self.draw_needed.set(true);
             }
             Msg::TerminalFindBackspace => {
                 self.engine.borrow_mut().terminal_find_backspace();
-                self.redraw = true;
+                self.draw_needed.set(true);
             }
             Msg::TerminalFindNext => {
                 self.engine.borrow_mut().terminal_find_next();
-                self.redraw = true;
+                self.draw_needed.set(true);
             }
             Msg::TerminalFindPrev => {
                 self.engine.borrow_mut().terminal_find_prev();
-                self.redraw = true;
+                self.draw_needed.set(true);
             }
             Msg::ToggleMenuBar => {
                 // In GTK the menu bar is always on (it's our title bar).
@@ -3947,7 +4112,7 @@ impl SimpleComponent for App {
                 if let Some(ref da) = *self.menu_bar_da.borrow() {
                     da.queue_draw();
                 }
-                self.redraw = true;
+                self.draw_needed.set(true);
             }
             Msg::OpenMenu(idx) => {
                 self.engine.borrow_mut().open_menu(idx);
@@ -3959,7 +4124,7 @@ impl SimpleComponent for App {
                     da.set_can_target(true);
                     da.queue_draw();
                 }
-                self.redraw = true;
+                self.draw_needed.set(true);
             }
             Msg::CloseMenu => {
                 self.engine.borrow_mut().close_menu();
@@ -3971,7 +4136,7 @@ impl SimpleComponent for App {
                     da.set_can_target(false);
                     da.queue_draw();
                 }
-                self.redraw = true;
+                self.draw_needed.set(true);
             }
             Msg::MenuActivateItem(menu_idx, item_idx, action) => {
                 // Intercept dialog actions that need GTK-side handling
@@ -4032,7 +4197,7 @@ impl SimpleComponent for App {
                 if let Some(ref da) = *self.menu_bar_da.borrow() {
                     da.queue_draw();
                 }
-                self.redraw = true;
+                self.draw_needed.set(true);
             }
             Msg::DebugSidebarClick(click_x, y) => {
                 use crate::core::engine::DebugSidebarSection;
@@ -4124,7 +4289,7 @@ impl SimpleComponent for App {
                     da.grab_focus();
                     da.queue_draw();
                 }
-                self.redraw = !self.redraw;
+                self.draw_needed.set(true);
             }
             Msg::DebugSidebarKey(key_name, ctrl) => {
                 let mut engine = self.engine.borrow_mut();
@@ -4174,7 +4339,7 @@ impl SimpleComponent for App {
                 if let Some(ref da) = *self.debug_sidebar_da_ref.borrow() {
                     da.queue_draw();
                 }
-                self.redraw = !self.redraw;
+                self.draw_needed.set(true);
             }
             Msg::DebugSidebarScroll(dy) => {
                 let mut engine = self.engine.borrow_mut();
@@ -4206,7 +4371,7 @@ impl SimpleComponent for App {
                 if let Some(ref da) = *self.debug_sidebar_da_ref.borrow() {
                     da.queue_draw();
                 }
-                self.redraw = !self.redraw;
+                self.draw_needed.set(true);
             }
             Msg::ScSidebarClick(x_click, y) => {
                 let lh = self.cached_line_height;
@@ -4278,7 +4443,7 @@ impl SimpleComponent for App {
                 if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
                     da.queue_draw();
                 }
-                self.redraw = !self.redraw;
+                self.draw_needed.set(true);
             }
             Msg::ScKey(key_name, ctrl) => {
                 let mut engine = self.engine.borrow_mut();
@@ -4339,7 +4504,7 @@ impl SimpleComponent for App {
                 if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
                     da.queue_draw();
                 }
-                self.redraw = !self.redraw;
+                self.draw_needed.set(true);
             }
             Msg::WindowMinimize => {
                 self.window.minimize();
@@ -4371,7 +4536,7 @@ impl SimpleComponent for App {
                         }
                     }
                 });
-                self.redraw = true;
+                self.draw_needed.set(true);
             }
             Msg::OpenFolderDialog => {
                 let engine = self.engine.clone();
@@ -4389,7 +4554,7 @@ impl SimpleComponent for App {
                         }
                     }
                 });
-                self.redraw = true;
+                self.draw_needed.set(true);
             }
             Msg::OpenWorkspaceDialog => {
                 let engine = self.engine.clone();
@@ -4405,7 +4570,7 @@ impl SimpleComponent for App {
                         }
                     }
                 });
-                self.redraw = true;
+                self.draw_needed.set(true);
             }
             Msg::SaveWorkspaceAsDialog => {
                 let engine = self.engine.clone();
@@ -4420,7 +4585,7 @@ impl SimpleComponent for App {
                         }
                     }
                 });
-                self.redraw = true;
+                self.draw_needed.set(true);
             }
             Msg::OpenRecentDialog => {
                 let paths: Vec<std::path::PathBuf> = self
@@ -4463,7 +4628,7 @@ impl SimpleComponent for App {
                     }
                     dialog.show();
                 }
-                self.redraw = true;
+                self.draw_needed.set(true);
             }
 
             Msg::ShowQuitConfirm => {
@@ -4511,6 +4676,53 @@ impl SimpleComponent for App {
             Msg::QuitConfirmed => {
                 // Save session state then exit the process.
                 self.save_session_and_exit();
+            }
+
+            Msg::ShowCloseTabConfirm => {
+                let dialog = gtk4::Dialog::with_buttons(
+                    Some("Unsaved Changes"),
+                    Some(&self.window),
+                    gtk4::DialogFlags::MODAL | gtk4::DialogFlags::DESTROY_WITH_PARENT,
+                    &[
+                        ("Save & Close Tab", gtk4::ResponseType::Accept),
+                        ("Discard & Close Tab", gtk4::ResponseType::Reject),
+                        ("Cancel", gtk4::ResponseType::Cancel),
+                    ],
+                );
+                let label = gtk4::Label::new(Some(
+                    "This file has unsaved changes.\nDo you want to save before closing the tab?",
+                ));
+                label.set_margin_top(12);
+                label.set_margin_bottom(12);
+                label.set_margin_start(12);
+                label.set_margin_end(12);
+                dialog.content_area().append(&label);
+                let s = sender.input_sender().clone();
+                dialog.connect_response(move |dlg, resp| {
+                    dlg.close();
+                    match resp {
+                        gtk4::ResponseType::Accept => {
+                            s.send(Msg::CloseTabConfirmed { save: true }).ok();
+                        }
+                        gtk4::ResponseType::Reject => {
+                            s.send(Msg::CloseTabConfirmed { save: false }).ok();
+                        }
+                        _ => {} // Cancel — do nothing
+                    }
+                });
+                dialog.present();
+                self.draw_needed.set(true);
+            }
+
+            Msg::CloseTabConfirmed { save } => {
+                let mut engine = self.engine.borrow_mut();
+                engine.escape_to_normal();
+                if save {
+                    let _ = engine.save();
+                }
+                engine.close_tab();
+                drop(engine);
+                self.draw_needed.set(true);
             }
         }
 
@@ -4560,13 +4772,14 @@ fn sync_scrollbar_positions(
     } else {
         0.0
     };
-    let content_bounds = core::WindowRect::new(
+    let editor_bounds = core::WindowRect::new(
         0.0,
-        tab_bar_height,
+        0.0,
         da_width,
-        da_height - tab_bar_height - status_bar_height - debug_toolbar_px - qf_px - term_px,
+        da_height - status_bar_height - debug_toolbar_px - qf_px - term_px,
     );
-    let window_rects = engine.calculate_window_rects(content_bounds);
+    let (window_rects, _dividers) =
+        engine.calculate_group_window_rects(editor_bounds, tab_bar_height);
 
     for (window_id, rect) in &window_rects {
         let ws = match scrollbars.get(window_id) {
@@ -4772,18 +4985,29 @@ impl App {
             0.0
         };
 
-        let content_bounds = WindowRect::new(
+        let editor_bounds = WindowRect::new(
             0.0,
-            tab_bar_height,
+            0.0,
             da_width,
-            da_height - tab_bar_height - status_bar_height - debug_toolbar_px - qf_px - term_px,
-            // No gap: h-scrollbar overlays the content bottom (VSCode style)
+            da_height - status_bar_height - debug_toolbar_px - qf_px - term_px,
         );
+        let (window_rects, _dividers) =
+            engine.calculate_group_window_rects(editor_bounds, tab_bar_height);
 
-        let window_rects = engine.calculate_window_rects(content_bounds);
-
-        // Remove scrollbars for windows that no longer exist
-        scrollbars.retain(|window_id, _| engine.windows.contains_key(window_id));
+        // Remove scrollbars for windows that no longer exist.
+        // Must explicitly remove GTK widgets from the overlay before dropping them,
+        // otherwise the widgets remain visible even after the window is gone.
+        let dead_ids: Vec<core::WindowId> = scrollbars
+            .keys()
+            .filter(|wid| !engine.windows.contains_key(*wid))
+            .copied()
+            .collect();
+        for wid in dead_ids {
+            if let Some(ws) = scrollbars.remove(&wid) {
+                overlay.remove_overlay(&ws.vertical);
+                overlay.remove_overlay(&ws.cursor_indicator);
+            }
+        }
 
         // Create/update scrollbars for each window
         for (window_id, rect) in &window_rects {
@@ -4957,6 +5181,7 @@ fn calculate_gutter_width(mode: LineNumberMode, total_lines: usize, char_width: 
 /// Matches VSCode's Linux font stack at 11pt ≈ 13px @ 96 dpi.
 const UI_FONT: &str = "Segoe UI, Ubuntu, Droid Sans, Sans 10";
 
+#[allow(clippy::too_many_arguments)]
 fn draw_editor(
     cr: &Context,
     engine: &Engine,
@@ -4965,6 +5190,7 @@ fn draw_editor(
     sender: &relm4::Sender<Msg>,
     h_sb_hovered: bool,
     h_sb_dragging_window: Option<core::WindowId>,
+    last_metrics: &std::rc::Rc<std::cell::Cell<(f64, f64)>>,
 ) {
     let theme = Theme::onedark();
 
@@ -4990,10 +5216,15 @@ fn draw_editor(
     let line_height = (font_metrics.ascent() + font_metrics.descent()) as f64 / pango::SCALE as f64;
     let char_width = font_metrics.approximate_char_width() as f64 / pango::SCALE as f64;
 
-    // Cache font metrics for use in sync_scrollbar
-    sender
-        .send(Msg::CacheFontMetrics(line_height, char_width))
-        .ok();
+    // Only send CacheFontMetrics when metrics actually change (e.g. on startup or font change).
+    // Sending on every draw creates a feedback loop: draw → message → #[watch] → queue_draw → draw.
+    let (last_lh, last_cw) = last_metrics.get();
+    if (last_lh - line_height).abs() > 0.01 || (last_cw - char_width).abs() > 0.01 {
+        last_metrics.set((line_height, char_width));
+        sender
+            .send(Msg::CacheFontMetrics(line_height, char_width))
+            .ok();
+    }
 
     // Calculate layout regions
     let tab_bar_height = line_height; // Always show tab bar
@@ -5021,31 +5252,84 @@ fn draw_editor(
         0.0
     };
 
-    // Calculate window rects for the current tab
-    // Note: menu bar is now a separate full-width GTK widget above the drawing area,
-    // so we do NOT subtract menu_bar_px from the content bounds here.
-    let content_bounds = WindowRect::new(
+    // Calculate window rects for all editor groups.
+    // editor_bounds spans the full editor area from y=0; tab_bar_height is reserved per group.
+    let editor_bounds = WindowRect::new(
         0.0,
-        tab_bar_height,
+        0.0,
         width as f64,
-        height as f64 - tab_bar_height - status_bar_height - debug_toolbar_px - qf_px - term_px,
-        // No gap reserved: h-scrollbar overlays the bottom of content (VSCode style)
+        height as f64 - status_bar_height - debug_toolbar_px - qf_px - term_px,
     );
-    let window_rects = engine.calculate_window_rects(content_bounds);
+    let (window_rects, _group_dividers) =
+        engine.calculate_group_window_rects(editor_bounds, tab_bar_height);
 
     // Build the platform-agnostic screen layout
     let screen = build_screen_layout(engine, &theme, &window_rects, line_height, char_width);
 
-    // 3b. Draw tab bar (at y=0; the menu bar widget is above the drawing_area)
-    draw_tab_bar(
-        cr,
-        &layout,
-        &theme,
-        &screen.tab_bar,
-        width as f64,
-        line_height,
-        0.0,
-    );
+    // 3b. Draw tab bar(s) — one per editor group
+    if let Some(ref split) = screen.editor_group_split {
+        // Draw each group's tab bar at the top of its bounds.
+        for gtb in &split.group_tab_bars {
+            let tab_y = gtb.bounds.y - line_height;
+            let tab_x = gtb.bounds.x;
+            let tab_w = gtb.bounds.width;
+            let is_active = gtb.group_id == split.active_group;
+            cr.save().ok();
+            cr.rectangle(tab_x, tab_y, tab_w, line_height);
+            cr.clip();
+            cr.translate(tab_x, tab_y);
+            draw_tab_bar(
+                cr,
+                &layout,
+                &theme,
+                &gtb.tabs,
+                tab_w,
+                line_height,
+                0.0,
+                is_active,
+            );
+            cr.restore().ok();
+            // Active-group indicator: bright bottom border.
+            if is_active {
+                let (ar, ag, ab) = theme.tab_active_bg.to_cairo();
+                cr.set_source_rgb(ar, ag, ab);
+                cr.set_line_width(2.0);
+                cr.move_to(tab_x, tab_y + line_height - 1.0);
+                cr.line_to(tab_x + tab_w, tab_y + line_height - 1.0);
+                cr.stroke().ok();
+            }
+        }
+        // Draw divider lines.
+        let (sr, sg, sb) = theme.separator.to_cairo();
+        cr.set_source_rgb(sr, sg, sb);
+        cr.set_line_width(1.0);
+        for div in &split.dividers {
+            match div.direction {
+                crate::core::window::SplitDirection::Vertical => {
+                    cr.move_to(div.position, div.cross_start);
+                    cr.line_to(div.position, div.cross_start + div.cross_size);
+                    cr.stroke().ok();
+                }
+                crate::core::window::SplitDirection::Horizontal => {
+                    cr.move_to(div.cross_start, div.position);
+                    cr.line_to(div.cross_start + div.cross_size, div.position);
+                    cr.stroke().ok();
+                }
+            }
+        }
+    } else {
+        // Single group: draw tab bar at full width with split buttons.
+        draw_tab_bar(
+            cr,
+            &layout,
+            &theme,
+            &screen.tab_bar,
+            width as f64,
+            line_height,
+            0.0,
+            true,
+        );
+    }
 
     // 4. Draw each window
     for rendered_window in &screen.windows {
@@ -5250,13 +5534,14 @@ fn compute_editor_window_rects(
     } else {
         0.0
     };
-    let content_bounds = core::WindowRect::new(
+    let editor_bounds = core::WindowRect::new(
         0.0,
-        tab_bar_height,
+        0.0,
         da_width,
-        da_height - tab_bar_height - status_bar_height - debug_toolbar_px - qf_px - term_px,
+        da_height - status_bar_height - debug_toolbar_px - qf_px - term_px,
     );
-    engine.calculate_window_rects(content_bounds)
+    let (rects, _dividers) = engine.calculate_group_window_rects(editor_bounds, tab_bar_height);
+    rects
 }
 
 /// Compute the thumb geometry for one window's h scrollbar.
@@ -5273,13 +5558,8 @@ fn h_scrollbar_geometry(
     let window = engine.windows.get(&window_id)?;
     let buffer_state = engine.buffer_manager.get(window.buffer_id)?;
 
-    let max_line_length = buffer_state
-        .buffer
-        .content
-        .lines()
-        .map(|line| line.chars().count())
-        .max()
-        .unwrap_or(0) as f64;
+    // max_col is pre-computed and cached in BufferState on every edit — O(1) vs O(N_lines).
+    let max_line_length = buffer_state.max_col as f64;
 
     let v_scrollbar_px = 10.0_f64;
     let track_w = (rect.width - v_scrollbar_px).max(1.0);
@@ -5389,6 +5669,7 @@ fn draw_h_scrollbars(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_tab_bar(
     cr: &Context,
     layout: &pango::Layout,
@@ -5397,6 +5678,7 @@ fn draw_tab_bar(
     width: f64,
     line_height: f64,
     y_offset: f64,
+    show_split_btn: bool,
 ) {
     // Tab bar background
     let (r, g, b) = theme.tab_bar_bg.to_cairo();
@@ -5409,6 +5691,30 @@ fn draw_tab_bar(
     let mut italic_font = normal_font.clone();
     italic_font.set_style(pango::Style::Italic);
 
+    // Measure both split buttons so tabs don't overlap them.
+    let btn_right_text = " \u{F0932}"; // " 󰤲"  split right
+    let btn_down_text = " \u{F0931}"; // " 󰤱"  split down
+    let (both_btns_px, btn_right_px) = if show_split_btn {
+        layout.set_font_description(Some(&normal_font));
+        layout.set_text(btn_right_text);
+        let (wr, _) = layout.pixel_size();
+        layout.set_text(btn_down_text);
+        let (wd, _) = layout.pixel_size();
+        (wr as f64 + wd as f64, wr as f64)
+    } else {
+        (0.0, 0.0)
+    };
+    let tab_area_width = width - both_btns_px;
+
+    // Measure the close button (×) once for use in every tab.
+    layout.set_font_description(Some(&normal_font));
+    layout.set_text("×");
+    let (close_w_i, _) = layout.pixel_size();
+    let close_w = close_w_i as f64;
+    // Gap between tab name and ×, and gap between tabs.
+    let tab_inner_gap = 4.0; // space between name and ×
+    let tab_outer_gap = 4.0; // space between tabs
+
     let mut x = 0.0;
     for tab in tabs {
         // Use italic font for preview tabs
@@ -5420,8 +5726,16 @@ fn draw_tab_bar(
 
         layout.set_text(&tab.name);
         let (tab_width, _) = layout.pixel_size();
+        let tab_w = tab_width as f64;
+        // Total per-tab slot: name + gap + × + outer_gap
+        let slot_w = tab_w + tab_inner_gap + close_w + tab_outer_gap;
 
-        // Tab background
+        // Stop drawing tabs if they would overrun the area reserved for the split button.
+        if x + slot_w > tab_area_width {
+            break;
+        }
+
+        // Tab background (covers name + gap + ×)
         let bg = if tab.active {
             theme.tab_active_bg
         } else {
@@ -5429,7 +5743,7 @@ fn draw_tab_bar(
         };
         let (br, bg_g, bb) = bg.to_cairo();
         cr.set_source_rgb(br, bg_g, bb);
-        cr.rectangle(x, y_offset, tab_width as f64, line_height);
+        cr.rectangle(x, y_offset, tab_w + tab_inner_gap + close_w, line_height);
         cr.fill().unwrap();
 
         // Tab text — dimmed colours for preview tabs
@@ -5447,9 +5761,43 @@ fn draw_tab_bar(
         };
         let (fr, fg_g, fb) = fg.to_cairo();
         cr.set_source_rgb(fr, fg_g, fb);
+        layout.set_font_description(Some(
+            &(if tab.preview {
+                italic_font.clone()
+            } else {
+                normal_font.clone()
+            }),
+        ));
         pangocairo::show_layout(cr, layout);
 
-        x += tab_width as f64 + 2.0;
+        // Close (×) button — dim on inactive, matches active fg on the active tab.
+        let (xr, xg, xb) = if tab.active {
+            theme.tab_inactive_fg.to_cairo()
+        } else {
+            theme.separator.to_cairo()
+        };
+        cr.set_source_rgb(xr, xg, xb);
+        layout.set_font_description(Some(&normal_font));
+        layout.set_text("×");
+        cr.move_to(x + tab_w + tab_inner_gap, y_offset);
+        pangocairo::show_layout(cr, layout);
+
+        x += slot_w;
+    }
+
+    // Draw split-right then split-down buttons at the right edge.
+    if show_split_btn && both_btns_px > 0.0 {
+        layout.set_font_description(Some(&normal_font));
+        let (fr, fg_g, fb) = theme.tab_inactive_fg.to_cairo();
+        cr.set_source_rgb(fr, fg_g, fb);
+        // Split-right button
+        layout.set_text(btn_right_text);
+        cr.move_to(width - both_btns_px, y_offset);
+        pangocairo::show_layout(cr, layout);
+        // Split-down button
+        layout.set_text(btn_down_text);
+        cr.move_to(width - both_btns_px + btn_right_px, y_offset);
+        pangocairo::show_layout(cr, layout);
     }
 
     // Restore normal font for subsequent rendering
@@ -5716,7 +6064,6 @@ fn draw_window(
     }
 
     cr.restore().unwrap();
-
     // Render cursor
     if let Some((cursor_pos, cursor_shape)) = &rw.cursor {
         if let Some(rl) = rw.lines.get(cursor_pos.view_line) {
@@ -7865,6 +8212,10 @@ enum ClickTarget {
     Gutter,
     /// Click resolved to a buffer position in a specific window.
     BufferPos(core::WindowId, usize, usize),
+    /// Click was on a tab-bar split button: (group_id, direction).
+    SplitButton(core::window::GroupId, crate::core::window::SplitDirection),
+    /// Click was on a tab's × close button: (group_id, tab_idx).
+    CloseTab(core::window::GroupId, usize),
     /// Click was outside any actionable area.
     None,
 }
@@ -7877,81 +8228,106 @@ fn pixel_to_click_target(
     y: f64,
     width: f64,
     height: f64,
+    line_height: f64,
+    char_width: f64,
 ) -> ClickTarget {
-    use gtk4::cairo::{Context as CairoContext, Format, ImageSurface};
-
-    let surface = ImageSurface::create(Format::Rgb24, 1, 1).unwrap();
-    let cr = CairoContext::new(&surface).unwrap();
-
-    let pango_ctx = pangocairo::create_context(&cr);
-    let font_str = format!(
-        "{} {}",
-        engine.settings.font_family, engine.settings.font_size
-    );
-    let font_desc = FontDescription::from_string(&font_str);
-    let font_metrics = pango_ctx.metrics(Some(&font_desc), None);
-    let line_height = (font_metrics.ascent() + font_metrics.descent()) as f64 / pango::SCALE as f64;
-
     let tab_bar_height = line_height;
 
-    // Check if click is in tab bar (menu bar is a separate widget above, not in drawing_area)
-    if y < tab_bar_height {
-        let layout = pangocairo::create_layout(&cr);
-        layout.set_font_description(Some(&font_desc));
+    // Check if click is in a group's tab bar region.
+    // Use the group layout tree to find group bounds.
+    {
+        let editor_bottom = height - line_height * 2.0;
+        let content_bounds = WindowRect::new(0.0, 0.0, width, editor_bottom);
+        let group_rects = engine
+            .group_layout
+            .calculate_group_rects(content_bounds, tab_bar_height);
 
-        let normal_font = font_desc.clone();
-        let mut italic_font = font_desc.clone();
-        italic_font.set_style(pango::Style::Italic);
+        // Check if click is in any group's tab bar (the line_height above each group's bounds).
+        for (gid, grect) in &group_rects {
+            let tab_y = grect.y - line_height;
+            let tab_x_start = grect.x;
+            let bar_width = grect.width;
+            if y >= tab_y
+                && y < tab_y + line_height
+                && x >= tab_x_start
+                && x < tab_x_start + bar_width
+            {
+                let group_id = *gid;
+                engine.active_group = group_id;
+                let local_x = x - tab_x_start;
 
-        let mut tab_x = 0.0;
-        for (i, tab) in engine.tabs.iter().enumerate() {
-            let window_id = tab.active_window;
-            let (name, is_preview) = if let Some(window) = engine.windows.get(&window_id) {
-                if let Some(state) = engine.buffer_manager.get(window.buffer_id) {
-                    let dirty = if state.dirty { "*" } else { "" };
-                    (
-                        format!(" {}: {}{} ", i + 1, state.display_name(), dirty),
-                        state.preview,
-                    )
-                } else {
-                    (format!(" {}: [No Name] ", i + 1), false)
+                // Hit-test split buttons.
+                let btn_right_px = " \u{F0932}".chars().count() as f64 * char_width;
+                let btn_down_px = " \u{F0931}".chars().count() as f64 * char_width;
+                let both_btns_px = btn_right_px + btn_down_px;
+                if local_x >= bar_width - btn_down_px {
+                    return ClickTarget::SplitButton(
+                        group_id,
+                        crate::core::window::SplitDirection::Horizontal,
+                    );
                 }
-            } else {
-                (format!(" {}: [No Name] ", i + 1), false)
-            };
+                if both_btns_px > 0.0 && local_x >= bar_width - both_btns_px {
+                    return ClickTarget::SplitButton(
+                        group_id,
+                        crate::core::window::SplitDirection::Vertical,
+                    );
+                }
 
-            if is_preview {
-                layout.set_font_description(Some(&italic_font));
-            } else {
-                layout.set_font_description(Some(&normal_font));
-            }
-
-            layout.set_text(&name);
-            let (tab_width, _) = layout.pixel_size();
-
-            if x >= tab_x && x < tab_x + tab_width as f64 {
-                engine.goto_tab(i);
+                // Hit-test tabs.
+                let close_w = char_width;
+                let tab_inner_gap = 4.0_f64;
+                let tab_outer_gap = 4.0_f64;
+                let mut tab_x = 0.0;
+                // Collect tab hit info from immutable borrow, then apply mutably.
+                let hit = engine.editor_groups.get(&group_id).and_then(|group| {
+                    for (i, tab) in group.tabs.iter().enumerate() {
+                        let wid = tab.active_window;
+                        let name = if let Some(window) = engine.windows.get(&wid) {
+                            if let Some(state) = engine.buffer_manager.get(window.buffer_id) {
+                                let dirty = if state.dirty { "*" } else { "" };
+                                format!(" {}: {}{} ", i + 1, state.display_name(), dirty)
+                            } else {
+                                format!(" {}: [No Name] ", i + 1)
+                            }
+                        } else {
+                            format!(" {}: [No Name] ", i + 1)
+                        };
+                        let tab_w = name.chars().count() as f64 * char_width;
+                        let slot_w = tab_w + tab_inner_gap + close_w + tab_outer_gap;
+                        if local_x >= tab_x && local_x < tab_x + slot_w {
+                            let close_x_start = tab_x + tab_w + tab_inner_gap;
+                            let is_close =
+                                local_x >= close_x_start && local_x < close_x_start + close_w;
+                            return Some((i, is_close));
+                        }
+                        tab_x += slot_w;
+                    }
+                    None
+                });
+                if let Some((tab_idx, is_close)) = hit {
+                    if let Some(g) = engine.editor_groups.get_mut(&group_id) {
+                        g.active_tab = tab_idx;
+                    }
+                    if is_close {
+                        return ClickTarget::CloseTab(group_id, tab_idx);
+                    }
+                    return ClickTarget::TabBar;
+                }
                 return ClickTarget::TabBar;
             }
-
-            tab_x += tab_width as f64 + 2.0;
         }
-        return ClickTarget::TabBar;
     }
 
     let status_bar_height = line_height * 2.0;
-    let content_bounds = WindowRect::new(
-        0.0,
-        tab_bar_height,
-        width,
-        height - tab_bar_height - status_bar_height,
-    );
+    let editor_bottom = height - status_bar_height;
 
-    if y >= content_bounds.y + content_bounds.height {
+    if y >= editor_bottom {
         return ClickTarget::None;
     }
 
-    let window_rects = engine.calculate_window_rects(content_bounds);
+    let editor_bounds = WindowRect::new(0.0, 0.0, width, editor_bottom);
+    let (window_rects, _dividers) =
+        engine.calculate_group_window_rects(editor_bounds, tab_bar_height);
     let clicked_window = window_rects.iter().find(|(_, rect)| {
         x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
     });
@@ -7960,6 +8336,18 @@ fn pixel_to_click_target(
         Some((id, r)) => (*id, r),
         None => return ClickTarget::None,
     };
+
+    // Update active_group if the clicked window belongs to a different group.
+    for (&gid, group) in &engine.editor_groups {
+        if group
+            .tabs
+            .iter()
+            .any(|t| t.window_ids().contains(&window_id))
+        {
+            engine.active_group = gid;
+            break;
+        }
+    }
 
     let window = match engine.windows.get(&window_id) {
         Some(w) => w,
@@ -7974,7 +8362,6 @@ fn pixel_to_click_target(
     let buffer = &buffer_state.buffer;
     let view = &window.view;
 
-    let char_width = font_metrics.approximate_char_width() as f64 / pango::SCALE as f64;
     let total_lines = buffer.content.len_lines();
     let has_git = !buffer_state.git_diff.is_empty();
     let has_bp_click = {
@@ -8033,92 +8420,98 @@ fn pixel_to_click_target(
 
     let relative_x = x - (rect.x + gutter_width);
     let line = line.min(buffer.content.len_lines().saturating_sub(1));
+
+    // For a monospace font, column = floor(relative_x / char_width).
+    // Tabs are displayed as 4 spaces, so we walk the line chars mapping
+    // display columns to logical columns without any Pango calls.
+    let display_col = if char_width > 0.0 && relative_x >= 0.0 {
+        (relative_x / char_width) as usize
+    } else {
+        0
+    };
+
     let line_text = buffer.content.line(line).to_string();
-
-    let layout = pango::Layout::new(&pango_ctx);
-    layout.set_font_description(Some(&font_desc));
-
     let mut col = 0;
-
-    if !line_text.is_empty() {
-        let expanded_text = line_text.replace('\t', "    ");
-        layout.set_text(&expanded_text);
-
-        let mut best_col = 0;
-        let mut prev_width = 0.0;
-
-        let char_indices: Vec<(usize, char)> = expanded_text.char_indices().collect();
-
-        for i in 0..char_indices.len() {
-            let (byte_idx, _) = char_indices[i];
-
-            let next_byte_idx = if i + 1 < char_indices.len() {
-                char_indices[i + 1].0
-            } else {
-                expanded_text.len()
-            };
-
-            layout.set_text(&expanded_text[..next_byte_idx]);
-            let (curr_width, _) = layout.pixel_size();
-            let curr_width_f64 = curr_width as f64;
-
-            if relative_x >= prev_width && relative_x < curr_width_f64 {
-                best_col = byte_idx;
-                break;
-            }
-
-            prev_width = curr_width_f64;
-
-            if i == char_indices.len() - 1 && relative_x >= curr_width_f64 {
-                best_col = next_byte_idx;
-            }
+    let mut display_pos = 0;
+    for ch in line_text.chars() {
+        if display_pos >= display_col {
+            break;
         }
-
-        if relative_x < 0.0 {
-            best_col = 0;
+        if ch == '\t' {
+            display_pos += 4;
+        } else {
+            display_pos += 1;
         }
-
-        let mut original_col = 0;
-        let mut expanded_pos = 0;
-        for ch in line_text.chars() {
-            if expanded_pos >= best_col {
-                break;
-            }
-            if ch == '\t' {
-                expanded_pos += 4;
-            } else {
-                expanded_pos += ch.len_utf8();
-            }
-            original_col += 1;
-        }
-        col = original_col;
+        col += 1;
     }
 
     ClickTarget::BufferPos(window_id, line, col)
 }
 
 /// Handle mouse click by converting coordinates to buffer position.
-fn handle_mouse_click(engine: &mut Engine, x: f64, y: f64, width: f64, height: f64) {
-    if let ClickTarget::BufferPos(wid, line, col) =
-        pixel_to_click_target(engine, x, y, width, height)
-    {
-        engine.mouse_click(wid, line, col);
+/// Returns `true` if the click hit a tab-close button on a dirty buffer
+/// (caller should show the close-tab confirm dialog instead of closing).
+#[allow(clippy::too_many_arguments)]
+fn handle_mouse_click(
+    engine: &mut Engine,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    _alt: bool,
+    line_height: f64,
+    char_width: f64,
+) -> bool {
+    match pixel_to_click_target(engine, x, y, width, height, line_height, char_width) {
+        ClickTarget::BufferPos(wid, line, col) => engine.mouse_click(wid, line, col),
+        ClickTarget::SplitButton(group_id, dir) => {
+            engine.active_group = group_id;
+            engine.open_editor_group(dir);
+        }
+        ClickTarget::CloseTab(group_id, tab_idx) => {
+            if let Some(g) = engine.editor_groups.get_mut(&group_id) {
+                g.active_tab = tab_idx;
+            }
+            engine.active_group = group_id;
+            if engine.dirty() {
+                return true;
+            }
+            engine.close_tab();
+        }
+        _ => {}
     }
+    false
 }
 
 /// Handle mouse double-click — select word at position.
-fn handle_mouse_double_click(engine: &mut Engine, x: f64, y: f64, width: f64, height: f64) {
+fn handle_mouse_double_click(
+    engine: &mut Engine,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    line_height: f64,
+    char_width: f64,
+) {
     if let ClickTarget::BufferPos(wid, line, col) =
-        pixel_to_click_target(engine, x, y, width, height)
+        pixel_to_click_target(engine, x, y, width, height, line_height, char_width)
     {
         engine.mouse_double_click(wid, line, col);
     }
 }
 
 /// Handle mouse drag — extend visual selection.
-fn handle_mouse_drag(engine: &mut Engine, x: f64, y: f64, width: f64, height: f64) {
+fn handle_mouse_drag(
+    engine: &mut Engine,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    line_height: f64,
+    char_width: f64,
+) {
     if let ClickTarget::BufferPos(wid, line, col) =
-        pixel_to_click_target(engine, x, y, width, height)
+        pixel_to_click_target(engine, x, y, width, height, line_height, char_width)
     {
         engine.mouse_drag(wid, line, col);
     }
@@ -8717,22 +9110,36 @@ fn main() {
     // Parse CLI args to get optional file path
     let args: Vec<String> = std::env::args().collect();
 
-    // --tui flag: launch the terminal UI instead of GTK
-    if args.iter().any(|a| a == "--tui") {
-        let file_path = args
-            .iter()
-            .skip(1)
-            .find(|a| !a.starts_with('-'))
-            .map(PathBuf::from);
-        tui_main::run(file_path);
+    // --tui / -t flag: launch the terminal UI instead of GTK
+    let tui_mode = args.iter().any(|a| a == "--tui" || a == "-t");
+
+    // --debug <logfile>: write debug log to the given file
+    let debug_log = args
+        .iter()
+        .position(|a| a == "--debug")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+
+    // First positional argument (not starting with '-', not a --debug value)
+    let skip_args: std::collections::HashSet<usize> = {
+        let mut s = std::collections::HashSet::new();
+        if let Some(i) = args.iter().position(|a| a == "--debug") {
+            s.insert(i);
+            s.insert(i + 1);
+        }
+        s
+    };
+    let file_path = args
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find(|(i, a)| !a.starts_with('-') && !skip_args.contains(i))
+        .map(|(_, a)| PathBuf::from(a));
+
+    if tui_mode {
+        tui_main::run(file_path, debug_log);
         return;
     }
-
-    let file_path = if args.len() > 1 && !args[1].starts_with('-') {
-        Some(PathBuf::from(&args[1]))
-    } else {
-        None
-    };
 
     let gtk_app = gtk4::Application::builder()
         .application_id("com.vimcode.VimCode")

@@ -344,6 +344,14 @@ pub struct PanelKeys {
     /// Select all occurrences of word under cursor. Default: `<C-S-l>`
     #[serde(default = "pk_select_all_matches")]
     pub select_all_matches: String,
+    /// Split the active editor group to the right (vertical split). Default: `""` (use Ctrl+\).
+    /// Example: `"<C-|>"` to bind Ctrl+|.
+    #[serde(default)]
+    pub split_editor_right: String,
+    /// Split the active editor group downward (horizontal split). Default: `""` (unbound).
+    /// Example: `"<C-_>"` to bind Ctrl+_.
+    #[serde(default)]
+    pub split_editor_down: String,
 }
 
 impl Default for PanelKeys {
@@ -357,6 +365,8 @@ impl Default for PanelKeys {
             open_terminal: pk_open_terminal(),
             add_cursor: pk_add_cursor(),
             select_all_matches: pk_select_all_matches(),
+            split_editor_right: String::new(),
+            split_editor_down: String::new(),
         }
     }
 }
@@ -802,6 +812,12 @@ impl Settings {
 
     /// Save settings to ~/.config/vimcode/settings.json
     pub fn save(&self) -> std::io::Result<()> {
+        // Tests must not write to the user's real settings file — they'd race with each other.
+        // test_config_reload writes directly via fs::write to set up test fixtures.
+        #[cfg(test)]
+        return Ok(());
+
+        #[cfg_attr(test, allow(unreachable_code))]
         let path = Self::settings_path();
 
         // Create config directory if it doesn't exist
