@@ -679,6 +679,7 @@ pub fn run(file_path: Option<PathBuf>, debug_log_path: Option<String>) {
     }
 
     let mut engine = Engine::new();
+    engine.plugin_init();
     engine.restore_session_files();
     if let Some(path) = file_path {
         // Open the CLI file in a tab (on top of any restored session files)

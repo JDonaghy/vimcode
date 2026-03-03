@@ -1401,6 +1401,7 @@ impl SimpleComponent for App {
 
         let engine = {
             let mut e = Engine::new();
+            e.plugin_init();
             e.restore_session_files();
             if let Some(ref path) = file_path {
                 e.open_file_in_tab(path);
