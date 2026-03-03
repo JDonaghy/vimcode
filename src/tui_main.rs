@@ -7954,11 +7954,6 @@ fn render_ext_sidebar(
     }
 
     // ── AVAILABLE section ─────────────────────────────────────────────────────
-    let installed_section_len = if ext.sections_expanded[0] {
-        installed_count.max(1)
-    } else {
-        0
-    };
     let available_count = ext.items_available.len();
     if y < area.y + area.height {
         let arrow = if ext.sections_expanded[1] {
@@ -7976,7 +7971,7 @@ fn render_ext_sidebar(
             if y >= area.y + area.height {
                 break;
             }
-            let flat_idx = installed_section_len + idx;
+            let flat_idx = installed_count + idx;
             let is_sel = ext.has_focus && ext.selected == flat_idx;
             let (fg, bg) = if is_sel {
                 (panel_bg, default_fg)
@@ -8014,7 +8009,7 @@ fn render_ext_sidebar(
         y += 1;
     }
 
-    let _ = (installed_section_len, sel_bg);
+    let _ = sel_bg;
 }
 
 // ─── Debug sidebar panel ──────────────────────────────────────────────────────

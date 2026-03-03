@@ -4675,7 +4675,7 @@ impl SimpleComponent for App {
                         engine.ext_sidebar_sections_expanded[1] =
                             !engine.ext_sidebar_sections_expanded[1];
                     } else if row > available_header_row {
-                        let idx = installed_len.max(1) + (row - available_header_row - 1);
+                        let idx = installed_len + (row - available_header_row - 1);
                         engine.ext_sidebar_selected = idx;
                     }
                 }
@@ -8510,11 +8510,6 @@ fn draw_ext_sidebar(
     }
 
     // ── AVAILABLE section ─────────────────────────────────────────────────────
-    let installed_section_len = if ext.sections_expanded[0] {
-        installed_count.max(1)
-    } else {
-        0
-    };
     let available_count = ext.items_available.len();
     if row as f64 * line_height < h {
         let arrow = if ext.sections_expanded[1] {
@@ -8542,9 +8537,8 @@ fn draw_ext_sidebar(
             if row as f64 * line_height >= h {
                 break;
             }
-            // flat index = installed_section_len (installed items, min 1) + available index
-            // but sections_expanded[0] affects offset
-            let flat_idx = installed_section_len + idx;
+            // flat index matches engine: installed items (no placeholder) + available index
+            let flat_idx = installed_count + idx;
             let is_selected = ext.has_focus && ext.selected == flat_idx;
             if is_selected {
                 cr.set_source_rgb(sel_r, sel_g, sel_b);
