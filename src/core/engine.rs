@@ -1044,6 +1044,8 @@ pub struct Engine {
     pub extension_state: ExtensionState,
     /// Extensions for which an install prompt was shown this session (avoids re-prompting).
     pub prompted_extensions: HashSet<String>,
+    /// Name of the extension currently being hinted in the status bar (enables N-to-dismiss).
+    pub ext_hint_pending_name: Option<String>,
 
     // --- Extension registry (remote) ---
     /// Fetched remote registry entries (None until first :ExtRefresh or sidebar open).
@@ -1283,6 +1285,7 @@ impl Engine {
             insert_ctrl_r_pending: false,
             extension_state: ExtensionState::load(),
             prompted_extensions: HashSet::new(),
+            ext_hint_pending_name: None,
             ext_registry: None,
             ext_registry_fetching: false,
             ext_registry_rx: None,
@@ -2418,9 +2421,9 @@ impl Engine {
         tab.active_window = new_window_id;
 
         if file_path.is_some() {
+            self.message = String::new();
             self.lsp_did_open(new_buffer_id);
         }
-        self.message = String::new();
     }
 
     /// Close the active window. Returns true if the window was closed.
@@ -2570,9 +2573,9 @@ impl Engine {
         self.active_group_mut().active_tab = self.active_group().tabs.len() - 1;
 
         if file_path.is_some() {
+            self.message = String::new();
             self.lsp_did_open(buffer_id);
         }
-        self.message = String::new();
     }
 
     /// Close the current tab. Returns true if closed.
@@ -2783,8 +2786,8 @@ impl Engine {
         if self.preview_buffer_id == Some(buffer_id) {
             self.promote_preview(buffer_id);
             self.refresh_git_diff(buffer_id);
-            self.lsp_did_open(buffer_id);
             self.message = format!("\"{}\"", path.display());
+            self.lsp_did_open(buffer_id);
             return;
         }
 
@@ -2803,8 +2806,8 @@ impl Engine {
         if let Some(tab_idx) = found {
             self.active_group_mut().active_tab = tab_idx;
             self.refresh_git_diff(buffer_id);
-            self.lsp_did_open(buffer_id);
             self.message = format!("\"{}\"", path.display());
+            self.lsp_did_open(buffer_id);
             return;
         }
 
@@ -2825,8 +2828,8 @@ impl Engine {
         }
 
         self.refresh_git_diff(buffer_id);
-        self.lsp_did_open(buffer_id);
         self.message = format!("\"{}\"", path.display());
+        self.lsp_did_open(buffer_id);
     }
 
     /// Open a file from the sidebar via single-click (preview mode).
@@ -2863,8 +2866,8 @@ impl Engine {
         if let Some(tab_idx) = found {
             self.active_group_mut().active_tab = tab_idx;
             self.refresh_git_diff(buffer_id);
-            self.lsp_did_open(buffer_id);
             self.message = format!("\"{}\"", path.display());
+            self.lsp_did_open(buffer_id);
             return;
         }
 
@@ -2920,8 +2923,8 @@ impl Engine {
         }
 
         self.refresh_git_diff(buffer_id);
-        self.lsp_did_open(buffer_id);
         self.message = format!("\"{}\"", path.display());
+        self.lsp_did_open(buffer_id);
     }
 
     // =======================================================================
@@ -3856,6 +3859,27 @@ impl Engine {
         let mut changed = false;
         let mut action = EngineAction::None;
         let was_normal = matches!(self.mode, Mode::Normal);
+
+        // N-to-dismiss extension hint: intercept 'N' in Normal mode when a hint is visible.
+        // Only active while the hint is still the current status message (cleared on any edit).
+        if let Some(ref name) = self.ext_hint_pending_name.clone() {
+            if !self.message.contains(name.as_str()) {
+                // Message was overwritten — forget the pending name silently.
+                self.ext_hint_pending_name = None;
+            } else if key_name == "N"
+                && !ctrl
+                && matches!(self.mode, Mode::Normal)
+                && self.pending_key.is_none()
+                && self.pending_operator.is_none()
+            {
+                let name = self.ext_hint_pending_name.take().unwrap();
+                self.extension_state.mark_dismissed(&name);
+                let _ = self.extension_state.save();
+                self.message =
+                    format!("Extension '{name}' dismissed — :ExtEnable {name} to re-enable");
+                return EngineAction::None;
+            }
+        }
 
         // Capture cursor position before dispatching (used by cursor_move hook below).
         let pre_cursor_line = self.cursor().line;
@@ -14323,6 +14347,7 @@ impl Engine {
                 && !self.prompted_extensions.contains(name)
             {
                 self.prompted_extensions.insert(name.to_string());
+                self.ext_hint_pending_name = Some(name.to_string());
                 self.message = format!(
                     "No {} extension — :ExtInstall {}  (N to dismiss)",
                     manifest.display_name, name
@@ -14330,8 +14355,7 @@ impl Engine {
             }
         } else if no_server.is_some() {
             // No VimCode extension for this language and no LSP binary found either.
-            self.message =
-                format!("No LSP for {lang_id} — add to lsp_servers in settings.json");
+            self.message = format!("No LSP for {lang_id} — add to lsp_servers in settings.json");
         }
     }
 
