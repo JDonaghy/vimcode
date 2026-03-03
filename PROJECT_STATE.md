@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Mar 2, 2026 (Session 111 — Missing Vim commands Batch 1–3) | **Tests:** 1045
+**Last updated:** Mar 2, 2026 (Session 112 — :set wrap fix + release pipeline) | **Tests:** 1078
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 72 are in **SESSION_HISTORY.md**.
@@ -25,6 +25,13 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 112 — :set wrap fix + release pipeline (4 new tests, 1078 total):**
+- Fixed `:set wrap` rendering: `build_rendered_window` now computes accurate `render_viewport_cols` from `rect.width / char_width - gutter_char_width` instead of the stored `view.viewport_cols` (which used a hardcoded 9.0 px estimate). Fixes wrap only working when buffer lacked GTK focus.
+- Fixed GTK resize callback: now reads actual `char_width_cell.get()` instead of hardcoded `9.0`, improving viewport_cols accuracy for cursor scroll clamping.
+- Fixed TUI: `needs_redraw = true` set unconditionally after any keypress, so `:set wrap` and other `EngineAction::None` commands trigger a redraw.
+- Added `:set option!` toggle syntax (e.g. `:set wrap!` toggles, `:set nowrap!` explicitly disables). 4 new unit tests in `settings.rs`.
+- Release pipeline: updated `release.yml` to produce a public GitHub Release (using `softprops/action-gh-release`) with a `.deb` package (`cargo-deb`) and raw binary on every push to `main`. Added `[package.metadata.deb]` to `Cargo.toml` declaring GTK4 runtime deps so `apt -f install` resolves them automatically.
 
 **Session 111 — Missing Vim Commands (55 new tests, Batches 1–3):**
 Implemented the following missing Vim features:

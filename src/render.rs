@@ -2587,6 +2587,19 @@ fn build_rendered_window(
         has_bp,
     );
 
+    // Compute the accurate content width (in character columns) directly from the
+    // precise pixel rect and measured char_width.  This avoids the approximate
+    // viewport_cols that was stored during the resize callback (which used a
+    // hardcoded char_width_approx of 9.0 px and a fixed gutter offset of 5).
+    // For the TUI backend, rect.width is already in cell columns and char_width=1.0,
+    // so the formula reduces to rect.width - gutter_char_width, which is exact.
+    let render_viewport_cols = if char_width > 0.0 {
+        let total_chars = (rect.width / char_width).floor() as usize;
+        total_chars.saturating_sub(gutter_char_width).max(1)
+    } else {
+        view.viewport_cols.max(1)
+    };
+
     // Narrow the highlights slice to only the visible window using binary search.
     // Tree-sitter emits highlights sorted by start_byte, so partition_point is valid.
     // This reduces build_spans from O(N_total_highlights) per line to O(N_window_highlights).
@@ -2733,12 +2746,12 @@ fn build_rendered_window(
             .and_then(|v| v.get(line_idx))
             .copied();
 
-        let wrap_on = engine.settings.wrap && view.viewport_cols > 0 && !is_fold_header;
+        let wrap_on = engine.settings.wrap && render_viewport_cols > 0 && !is_fold_header;
         let line_char_len = line_str.chars().count();
 
-        if wrap_on && line_char_len > view.viewport_cols {
+        if wrap_on && line_char_len > render_viewport_cols {
             // Split long line into viewport-width segments.
-            let vp = view.viewport_cols;
+            let vp = render_viewport_cols;
             let num_segments = visual_rows_for_line(line_char_len, vp);
             let cursor_seg = if line_idx == cursor_line {
                 view.cursor.col / vp

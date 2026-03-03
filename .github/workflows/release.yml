@@ -8,14 +8,17 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build-linux:
-    name: Build Linux binary
-    runs-on: ubuntu-latest
+  build-and-release:
+    name: Build and publish release
+    runs-on: ubuntu-22.04   # GTK4 4.6+ is available on 22.04+; 20.04 only has GTK3
+
+    permissions:
+      contents: write       # needed to create/update the rolling release
 
     steps:
     - uses: actions/checkout@v4
 
-    - name: Install GTK4 and dependencies
+    - name: Install GTK4 and build dependencies
       run: |
         sudo apt-get update
         sudo apt-get install -y \
@@ -44,20 +47,61 @@ jobs:
         restore-keys: ${{ runner.os }}-release-target-
 
     - name: Build release binary
-      run: cargo build --release --verbose
+      run: cargo build --release
 
     - name: Strip binary
       run: strip target/release/vimcode
 
-    - name: Rename binary with version
-      run: |
-        VERSION="0.1.0-${{ github.run_number }}"
-        cp target/release/vimcode vimcode-${VERSION}-linux-x86_64
-        echo "ARTIFACT_NAME=vimcode-${VERSION}-linux-x86_64" >> $GITHUB_ENV
+    # ── .deb package ──────────────────────────────────────────────────────────
+    - name: Install cargo-deb
+      run: cargo install cargo-deb --locked
 
-    - name: Upload artifact
-      uses: actions/upload-artifact@v4
+    - name: Build .deb package
+      run: cargo deb --no-build   # binary already built above; just package it
+
+    - name: Locate .deb file
+      run: |
+        DEB=$(ls target/debian/vimcode_*.deb | head -1)
+        echo "DEB_PATH=$DEB" >> $GITHUB_ENV
+        echo "DEB_NAME=$(basename $DEB)" >> $GITHUB_ENV
+
+    # ── Rename raw binary ─────────────────────────────────────────────────────
+    - name: Prepare raw binary artifact
+      run: |
+        cp target/release/vimcode vimcode-linux-x86_64
+        echo "BIN_NAME=vimcode-linux-x86_64" >> $GITHUB_ENV
+
+    # ── Publish to GitHub Releases ────────────────────────────────────────────
+    # This creates/updates a rolling "latest" release on every main push.
+    # The release is public — anyone can download the assets without logging in.
+    - name: Publish GitHub Release
+      uses: softprops/action-gh-release@v2
       with:
-        name: ${{ env.ARTIFACT_NAME }}
-        path: ${{ env.ARTIFACT_NAME }}
-        retention-days: 30
+        tag_name: latest
+        name: "Latest build (main)"
+        body: |
+          Automated build from the latest commit on `main`.
+
+          ## Installation (Ubuntu 22.04+)
+
+          **Option A — .deb package (recommended)**
+          ```
+          sudo dpkg -i ${{ env.DEB_NAME }}
+          sudo apt -f install    # installs any missing GTK4 runtime libraries
+          ```
+
+          **Option B — raw binary**
+          ```
+          # First install runtime dependencies:
+          sudo apt install libgtk-4-1 libglib2.0-0 libpango-1.0-0 libcairo2
+          # Then run:
+          chmod +x vimcode-linux-x86_64
+          ./vimcode-linux-x86_64
+          ```
+
+          > Requires Ubuntu 22.04 or later (GTK 4.6+).
+        prerelease: true
+        make_latest: false         # don't overwrite a real tagged release's "latest" badge
+        files: |
+          ${{ env.DEB_PATH }}
+          ${{ env.BIN_NAME }}

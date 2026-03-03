@@ -19803,8 +19803,11 @@ mod tests {
         if let Some(parent) = session_path.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
-        std::fs::write(&session_path, serde_json::to_string_pretty(&ws_session).unwrap())
-            .unwrap();
+        std::fs::write(
+            &session_path,
+            serde_json::to_string_pretty(&ws_session).unwrap(),
+        )
+        .unwrap();
 
         let mut engine = Engine::new();
         engine.cwd = workspace_dir.clone();
@@ -19864,7 +19867,10 @@ mod tests {
         );
         // The single buffer should be the empty scratch buffer (no file_path).
         let buf_id = engine.active_buffer_id();
-        let buf_path = engine.buffer_manager.get(buf_id).and_then(|s| s.file_path.clone());
+        let buf_path = engine
+            .buffer_manager
+            .get(buf_id)
+            .and_then(|s| s.file_path.clone());
         assert!(buf_path.is_none(), "scratch buffer should have no path");
 
         let _ = std::fs::remove_file(&p1);

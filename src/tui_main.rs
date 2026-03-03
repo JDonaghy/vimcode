@@ -2231,6 +2231,9 @@ fn event_loop(
                             break;
                         }
                     }
+                    // Any keypress warrants a redraw (e.g. :set wrap returns None but
+                    // must still trigger a re-render to show the new wrapping).
+                    needs_redraw = true;
                     loop {
                         let (has_more, action) = engine.advance_macro_playback();
                         if handle_action(engine, action) {

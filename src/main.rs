@@ -2287,16 +2287,24 @@ impl SimpleComponent for App {
         // Track resize to update viewport_lines and viewport_cols
         let sender_clone = sender.clone();
         let engine_for_resize = engine.clone();
+        let cw_cell_resize = char_width_cell.clone();
+        let lh_cell_resize = line_height_cell.clone();
         widgets
             .drawing_area
             .connect_resize(move |_, width, height| {
-                let line_height_approx = 24.0_f64;
-                let char_width_approx = 9.0_f64; // Approximate for monospace font
+                // Use actual measured font metrics when available; fall back to
+                // reasonable defaults before the first draw (Pango not yet measured).
+                let line_height = lh_cell_resize.get().max(1.0);
+                let char_width = cw_cell_resize.get().max(1.0);
 
-                let total_lines = (height as f64 / line_height_approx).floor() as usize;
+                let total_lines = (height as f64 / line_height).floor() as usize;
                 let viewport_lines = total_lines.saturating_sub(2);
 
-                let total_cols = (width as f64 / char_width_approx).floor() as usize;
+                // viewport_cols here is a rough estimate used by ensure_cursor_visible.
+                // The accurate wrap column is computed in build_rendered_window from
+                // the precise rect + char_width, so a small error here only affects
+                // cursor scroll clamping, not wrap rendering.
+                let total_cols = (width as f64 / char_width).floor() as usize;
                 let viewport_cols = total_cols.saturating_sub(5); // Account for gutter
 
                 {

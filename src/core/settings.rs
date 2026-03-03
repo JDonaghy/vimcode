@@ -546,6 +546,29 @@ impl Settings {
             return self.query_option(opt.trim());
         }
 
+        // Toggle or explicitly set a boolean option with ! suffix.
+        // :set wrap!   → toggle
+        // :set nowrap! → disable (no<opt>! is an explicit disable, not a toggle)
+        if let Some(opt) = arg.strip_suffix('!') {
+            let opt = opt.trim();
+            if let Some(base) = opt.strip_prefix("no") {
+                // :set nowrap! — explicit disable
+                self.set_bool_option(base, false)?;
+                return Ok(format!("no{base}"));
+            }
+            let current = self.query_option(opt)?;
+            if current.contains('=') {
+                return Err(format!("Option '{opt}' cannot be toggled"));
+            }
+            let currently_enabled = !current.starts_with("no");
+            self.set_bool_option(opt, !currently_enabled)?;
+            return Ok(if !currently_enabled {
+                opt.to_string()
+            } else {
+                format!("no{opt}")
+            });
+        }
+
         // Disable a boolean option.
         if let Some(opt) = arg.strip_prefix("no") {
             self.set_bool_option(opt, false)?;
@@ -1136,6 +1159,51 @@ mod tests {
         s.wrap = true;
         let msg = s.parse_set_option("wrap?").unwrap();
         assert_eq!(msg, "wrap");
+    }
+
+    #[test]
+    fn test_toggle_bang_wrap() {
+        let mut s = Settings::default();
+        assert!(!s.wrap);
+        // :set wrap! toggles from off → on
+        let msg = s.parse_set_option("wrap!").unwrap();
+        assert_eq!(msg, "wrap");
+        assert!(s.wrap);
+        // :set wrap! toggles from on → off
+        let msg = s.parse_set_option("wrap!").unwrap();
+        assert_eq!(msg, "nowrap");
+        assert!(!s.wrap);
+    }
+
+    #[test]
+    fn test_nowrap_bang_disables() {
+        let mut s = Settings::default();
+        s.wrap = true;
+        // :set nowrap! explicitly disables wrap
+        let msg = s.parse_set_option("nowrap!").unwrap();
+        assert_eq!(msg, "nowrap");
+        assert!(!s.wrap);
+        // idempotent: already off, stays off
+        let msg = s.parse_set_option("nowrap!").unwrap();
+        assert_eq!(msg, "nowrap");
+        assert!(!s.wrap);
+    }
+
+    #[test]
+    fn test_toggle_bang_expandtab() {
+        let mut s = Settings::default();
+        let initial = s.expand_tab;
+        s.parse_set_option("expandtab!").unwrap();
+        assert_eq!(s.expand_tab, !initial);
+        s.parse_set_option("et!").unwrap();
+        assert_eq!(s.expand_tab, initial);
+    }
+
+    #[test]
+    fn test_toggle_bang_nonbool_is_error() {
+        let mut s = Settings::default();
+        assert!(s.parse_set_option("tabstop!").is_err());
+        assert!(s.parse_set_option("ts!").is_err());
     }
 
     #[test]

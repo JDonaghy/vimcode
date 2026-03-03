@@ -2,6 +2,9 @@
 
 ## Recently Completed
 
+**Session 112 — :set wrap fix + release pipeline (4 new tests, 1078 total):**
+Fixed `:set wrap` rendering accuracy (`render_viewport_cols` from rect+char_width instead of approximate stored value), GTK resize callback now uses measured char_width, TUI always redraws after keypress. Added `:set option!` toggle + `:set nowrap!` explicit-disable syntax. Rewrote `release.yml` to publish a public GitHub Release with `.deb` + raw binary on every `main` push; added `[package.metadata.deb]` to `Cargo.toml`.
+
 **Session 111 — Missing Vim Commands Batches 1–3 (55 new tests, 1045 total):**
 Implemented: `^`, `g_`, `W`/`B`/`E`/`gE`, `H`/`M`/`L`, `(`/`)`, `Ctrl+E`/`Ctrl+Y`, `g*`/`g#`, `gJ`, `gf`, `R` (Replace mode), `Ctrl+A`/`Ctrl+X`, `=` operator, `]p`/`[p`, `iW`/`aW`, `Ctrl+R`/`Ctrl+U`/`Ctrl+O` in insert. Ex commands: `:noh`, `:wa`, `:wqa`/`:xa`, `:reg`, `:marks`, `:jumps`, `:changes`, `:history`, `:echo`, `:tabmove`, `:!cmd`, `:r file`. Settings: `hlsearch`, `ignorecase`, `smartcase`, `scrolloff`, `cursorline`, `colorcolumn`, `textwidth`, `splitbelow`, `splitright`. New test file: `tests/new_vim_features.rs` (55 tests).
 
