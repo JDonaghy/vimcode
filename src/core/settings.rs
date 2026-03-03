@@ -32,7 +32,7 @@ pub enum LineNumberMode {
 ///    to include the new field with its default value, preserving all existing settings
 ///
 /// Example:
-/// ```rust
+/// ```rust,ignore
 /// #[serde(default = "default_my_feature")]
 /// pub my_feature: bool,
 ///

@@ -115,7 +115,7 @@ impl BufferState {
 
     pub fn with_file(buffer: Buffer, path: PathBuf) -> Self {
         // Try to detect language from file path, fallback to Rust
-        let syntax = Syntax::new_from_path(path.to_str()).unwrap_or_else(Syntax::new);
+        let syntax = Syntax::new_from_path(path.to_str()).unwrap_or_default();
         let lsp_language_id = crate::core::lsp::language_id_from_path(&path);
 
         let mut state = Self {

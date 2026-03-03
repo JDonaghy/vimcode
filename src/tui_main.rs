@@ -769,6 +769,8 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
         .unwrap_or_else(Instant::now);
     // Auto-refresh sidebar to reflect external filesystem changes.
     let mut last_sidebar_refresh = Instant::now();
+    // Deadline to clear the yank highlight flash.
+    let mut yank_hl_deadline: Option<Instant> = None;
 
     loop {
         // Sync viewport dimensions so ensure_cursor_visible uses real terminal size.
@@ -907,11 +909,24 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
             needs_redraw = false;
         }
 
+        // Clear yank highlight after 200 ms deadline.
+        if let Some(dl) = yank_hl_deadline {
+            if Instant::now() >= dl {
+                engine.clear_yank_highlight();
+                yank_hl_deadline = None;
+                needs_redraw = true;
+            }
+        }
+
         // When a redraw is pending but rate-limited, wait only until the next frame is due.
         // When idle, poll slowly to keep CPU near zero.
+        // If a yank highlight is active, cap the wait so we clear it on time.
         let poll_timeout = if needs_redraw {
             min_frame
                 .saturating_sub(last_draw.elapsed())
+                .max(Duration::from_millis(1))
+        } else if let Some(dl) = yank_hl_deadline {
+            dl.saturating_duration_since(Instant::now())
                 .max(Duration::from_millis(1))
         } else {
             Duration::from_millis(50)
@@ -2036,6 +2051,11 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, engine: &mut En
                     }
                     // Sync unnamed register → system clipboard (clipboard=unnamedplus).
                     sync_tui_clipboard(engine, &mut last_clipboard_content);
+                    // Schedule yank highlight clear after 200 ms.
+                    if engine.yank_highlight.is_some() {
+                        yank_hl_deadline = Some(Instant::now() + Duration::from_millis(200));
+                        needs_redraw = true;
+                    }
                     // Reveal the active file in the sidebar when the tab changed
                     if engine.active_tab != prev_tab {
                         if let Some(path) = engine.file_path().cloned() {
@@ -5046,7 +5066,28 @@ fn render_window(frame: &mut ratatui::Frame, area: Rect, window: &RenderedWindow
 
     // Selection overlay
     if let Some(sel) = &window.selection {
-        render_selection(frame.buffer_mut(), area, window, sel, window_bg, theme);
+        render_selection(
+            frame.buffer_mut(),
+            area,
+            window,
+            sel,
+            window_bg,
+            theme.selection,
+            rc(theme.foreground),
+        );
+    }
+
+    // Yank highlight overlay (brief flash after yank)
+    if let Some(yh) = &window.yank_highlight {
+        render_selection(
+            frame.buffer_mut(),
+            area,
+            window,
+            yh,
+            window_bg,
+            theme.yank_highlight_bg,
+            rc(theme.foreground),
+        );
     }
 
     // Vertical scrollbar
@@ -5247,10 +5288,10 @@ fn render_selection(
     window: &RenderedWindow,
     sel: &render::SelectionRange,
     window_bg: RColor,
-    theme: &Theme,
+    color: render::Color,
+    default_fg: RColor,
 ) {
-    let sel_bg = rc(theme.selection);
-    let default_fg = rc(theme.foreground);
+    let sel_bg = rc(color);
     let gutter_w = window.gutter_char_width as u16;
     let text_area_x = area.x + gutter_w;
     let text_width = area.width.saturating_sub(gutter_w) as usize;

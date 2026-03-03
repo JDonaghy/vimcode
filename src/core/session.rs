@@ -119,6 +119,11 @@ impl SessionState {
     /// A rename is atomic on Linux/macOS (same filesystem), so a crash
     /// mid-write cannot corrupt the existing session file.
     pub fn save(&self) -> std::io::Result<()> {
+        // Prevent races on ~/.config/vimcode/session.json during parallel tests
+        #[cfg(test)]
+        return Ok(());
+
+        #[cfg_attr(test, allow(unreachable_code))]
         let path = Self::session_path();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -166,6 +171,13 @@ impl SessionState {
 
     /// Save per-workspace session state to the per-project file.
     pub fn save_for_workspace(&self, root: &Path) -> std::io::Result<()> {
+        #[cfg(test)]
+        {
+            let _ = root;
+            return Ok(());
+        }
+
+        #[cfg_attr(test, allow(unreachable_code))]
         let path = Self::session_path_for_workspace(root);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;

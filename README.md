@@ -11,7 +11,7 @@ There's a touch of irony here - using a cli tool to write the editor that I've w
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 848 tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 990 tests, zero async runtime dependency
 
 
 ## Building
@@ -74,6 +74,12 @@ cargo fmt
 - `U` — undo all changes on current line
 - `.` — repeat last change
 - `~` / (visual `u` / `U`) — toggle/lower/upper case
+- `g~{motion}` / `g~~` — toggle case of motion / entire line
+- `gu{motion}` / `guu` — lowercase motion / entire line
+- `gU{motion}` / `gUU` — uppercase motion / entire line
+- `gn` / `gN` — visually select next/prev search match
+- `cgn` — change next match (repeat with `.`)
+- `g;` / `g,` — jump to previous/next change list position
 
 **Text objects**
 - `iw` / `aw` — inner/around word
@@ -95,12 +101,17 @@ cargo fmt
 - `Backspace` — delete left; joins lines at start of line
 - Tab key — accepts auto-popup completion if active; otherwise inserts spaces (width = `tabstop`) or literal `\t` (when `noexpandtab`)
 - **Auto-indent** — Enter/`o`/`O` copy leading whitespace from current line
+- `Ctrl-W` — delete word backward from cursor
+- `Ctrl-T` — indent current line by shiftwidth
+- `Ctrl-D` — dedent current line by shiftwidth
 
 **Visual mode**
 - `v` — character selection; `V` — line selection; `Ctrl-V` — block selection
 - All operators work on selection: `d`, `c`, `y`, `u`, `U`, `~`
 - Block mode: rectangular selections, change/delete/yank uniform columns
-- `gv` — reselect last visual selection (via `ge` → visual restore)
+- `o` — swap cursor to opposite end of selection (character/line visual)
+- `O` — swap cursor to opposite column corner (visual block)
+- `gv` — reselect last visual selection
 
 **Search**
 - `/` — forward incremental search (real-time highlight as you type)
@@ -109,10 +120,12 @@ cargo fmt
 - Escape cancels and restores cursor position
 
 **Marks**
-- `m{a-z}` — set file-local mark
-- `'{a-z}` — jump to mark line
-- `` `{a-z} `` — jump to exact mark position
-- Marks stored per-buffer
+- `m{a-z}` — set file-local mark; `m{A-Z}` — set global (cross-file) mark
+- `'{a-z}/{A-Z}` — jump to mark line; `` `{a-z}/{A-Z} `` — jump to exact mark position
+- `''` / ` `` ` — jump to position before last jump
+- `'.` / `` `. `` — jump to last edit position
+- `'<` / `'>` — jump to visual selection start/end
+- Marks stored per-buffer (lowercase) or globally with filepath (uppercase)
 
 **Macros**
 - `q{a-z}` — start recording into register; `q` — stop
@@ -123,6 +136,13 @@ cargo fmt
 - `"` — unnamed (default)
 - `"{a-z}` — named registers (`"ay` yank into `a`, `"ap` paste from `a`)
 - `"+` / `"*` — system clipboard registers (`"+y` yank to clipboard, `"+p` paste from clipboard)
+- `"0` — yank-only register; every yank sets it, deletes do not
+- `"1`–`"9` — delete history; each linewise/multi-line delete shifts 1→2→…→9
+- `"-` — small-delete register; character-wise deletions less than one full line
+- `"%` — current filename (read-only)
+- `"/` — last search pattern (read-only)
+- `".` — last inserted text (read-only)
+- `"_` — black hole register (discard without affecting other registers)
 - Registers preserve linewise/characterwise type
 - `Ctrl-Shift-V` — paste clipboard in Command/Search/Insert mode (GTK); bracketed paste in TUI
 
@@ -778,6 +798,12 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `:%s/pat/rep/[gi]` | Substitute all lines |
 | `:norm[al][!] {keys}` | Execute normal-mode keys on current line |
 | `:[range]norm {keys}` | Execute on range (`%` all, `N,M` lines, `'<,'>` visual) |
+| `:g/pat/cmd` | Run ex command on every line matching pattern |
+| `:v/pat/cmd` | Run ex command on every line NOT matching pattern |
+| `:d` / `:delete` | Delete current line (used as `:g/pat/d` subcommand) |
+| `:m[ove] {dest}` | Move current line to after line {dest} (0-indexed) |
+| `:t {dest}` / `:co[py] {dest}` | Copy current line to after line {dest} (0-indexed) |
+| `:sort [n] [r] [u] [i]` | Sort lines: `n`=numeric, `r`=reverse, `u`=unique, `i`=ignorecase |
 | `:set [option]` | Change / query setting |
 | `:Gdiff` / `:Gstatus` | Git diff / status |
 | `:Gadd` / `:Gadd!` | Stage file / stage all |
@@ -831,12 +857,12 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 
 ```
 src/
-├── main.rs          (~7866 lines)  GTK4/Relm4 UI, rendering, sidebar resize, fuzzy popup, context menu, drag-and-drop
-├── tui_main.rs      (~7264 lines)  ratatui/crossterm TUI backend, fuzzy popup, rename/move prompts
-├── render.rs        (~2950 lines)  Platform-agnostic ScreenLayout bridge (DebugSidebarData, SourceControlData, BottomPanelTabs)
+├── main.rs          (~8753 lines)  GTK4/Relm4 UI, rendering, sidebar resize, fuzzy popup, context menu, drag-and-drop
+├── tui_main.rs      (~7774 lines)  ratatui/crossterm TUI backend, fuzzy popup, rename/move prompts
+├── render.rs        (~3125 lines)  Platform-agnostic ScreenLayout bridge (DebugSidebarData, SourceControlData, BottomPanelTabs)
 ├── icons.rs            (~30 lines)  Nerd Font file-type icons (GTK + TUI)
 └── core/            (~29,500 lines)  Zero GTK/rendering deps — fully testable
-    ├── engine.rs    (~25,618 lines)  Orchestrator: keys, commands, git, macros, LSP, DAP, plugins, workspaces
+    ├── engine.rs    (~28,431 lines)  Orchestrator: keys, commands, git, macros, LSP, DAP, plugins, workspaces
     ├── plugin.rs       (~430 lines)  Lua 5.4 plugin manager (mlua vendored; vimcode.* API)
     ├── terminal.rs     (~320 lines)  PTY-backed terminal pane (portable-pty + vt100, history ring buffer)
     ├── lsp.rs        (~2,045 lines)  LSP protocol transport + single-server client (request ID tracking, JSON-RPC framing)

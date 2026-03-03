@@ -928,6 +928,41 @@ pub struct Engine {
     /// Zero means "use the pane's actual PTY column count".
     /// Set by `terminal_split_set_drag_cols`; cleared by `terminal_split_finalize_drag`.
     pub terminal_split_left_cols: u16,
+
+    // --- Special marks (for '', '., '<, '>) ---
+    /// Position before last jump (for '' and `` marks).
+    pub last_jump_pos: Option<(usize, usize)>,
+    /// Position of last buffer edit (for '. and `. marks).
+    pub last_edit_pos: Option<(usize, usize)>,
+    /// Start of last visual selection (for '< and `< marks).
+    pub visual_mark_start: Option<(usize, usize)>,
+    /// End of last visual selection (for '> and `> marks).
+    pub visual_mark_end: Option<(usize, usize)>,
+    /// Global marks A-Z: char -> (optional file path, line, col).
+    pub global_marks: HashMap<char, (Option<PathBuf>, usize, usize)>,
+
+    // --- gv state (reselect last visual) ---
+    /// Visual anchor saved when leaving visual mode (for gv).
+    pub last_visual_anchor: Option<Cursor>,
+    /// Cursor position saved when leaving visual mode (for gv).
+    pub last_visual_cursor: Option<Cursor>,
+    /// Visual mode saved when leaving visual mode (for gv).
+    pub last_visual_mode: Mode,
+
+    // --- Change list (g; / g,) ---
+    /// List of (line, col) positions where buffer changes occurred. Max 100.
+    pub change_list: Vec<(usize, usize)>,
+    /// Index into change_list for g;/g, navigation (points past end when at newest).
+    pub change_list_pos: usize,
+
+    // --- Last inserted text (". register) ---
+    /// Text typed during the last Insert mode session (for ". register).
+    pub last_inserted_text: String,
+
+    // --- Yank highlight (transient visual feedback) ---
+    /// Region to highlight briefly after a yank operation: (start, end, is_linewise).
+    /// Cleared by the UI backend after ~200 ms.
+    pub yank_highlight: Option<(Cursor, Cursor, bool)>,
 }
 
 impl Engine {
@@ -1118,6 +1153,18 @@ impl Engine {
             dap_pending_watch_seqs: HashMap::new(),
             dap_pre_launch_done: false,
             dap_deferred_lang: None,
+            last_jump_pos: None,
+            last_edit_pos: None,
+            visual_mark_start: None,
+            visual_mark_end: None,
+            global_marks: HashMap::new(),
+            last_visual_anchor: None,
+            last_visual_cursor: None,
+            last_visual_mode: Mode::Normal,
+            change_list: Vec::new(),
+            change_list_pos: 0,
+            last_inserted_text: String::new(),
+            yank_highlight: None,
         };
         // If vscode mode is configured, start in Insert mode (no Normal mode)
         if engine.is_vscode_mode() {
@@ -3365,11 +3412,40 @@ impl Engine {
                 self.handle_search_key(key_name, unicode);
             }
             Mode::Visual | Mode::VisualLine | Mode::VisualBlock => {
+                // Save pre-call visual state for 'gv' support
+                let pre_mode = self.mode;
+                let pre_anchor = self.visual_anchor;
+                let pre_cursor = self.view().cursor;
                 action = self.handle_visual_key(key_name, unicode, ctrl, &mut changed);
+                // If we just left visual mode, record the selection for gv and '< / '>
+                if !matches!(
+                    self.mode,
+                    Mode::Visual | Mode::VisualLine | Mode::VisualBlock
+                ) {
+                    self.last_visual_mode = pre_mode;
+                    self.last_visual_anchor = pre_anchor;
+                    self.last_visual_cursor = Some(pre_cursor);
+                    // Save '< and '> marks (sorted)
+                    if let Some(anchor) = pre_anchor {
+                        let (start, end) =
+                            if (anchor.line, anchor.col) <= (pre_cursor.line, pre_cursor.col) {
+                                (anchor, pre_cursor)
+                            } else {
+                                (pre_cursor, anchor)
+                            };
+                        self.visual_mark_start = Some((start.line, start.col));
+                        self.visual_mark_end = Some((end.line, end.col));
+                    }
+                }
             }
         }
 
         if changed {
+            // Track last edit position for '. mark and change list
+            let cur = self.view().cursor;
+            self.last_edit_pos = Some((cur.line, cur.col));
+            self.push_change_location(cur.line, cur.col);
+
             // A normal-mode buffer modification (paste, delete, replace…) invalidates
             // any extra-cursor positions — clear them so stale cursors don't appear.
             if was_normal && !self.view().extra_cursors.is_empty() {
@@ -3805,7 +3881,7 @@ impl Engine {
                             .chars()
                             .collect();
                         let reg = self.active_register();
-                        self.set_register(reg, deleted_chars, false);
+                        self.set_delete_register(reg, deleted_chars, false);
                         self.clear_selected_register();
 
                         self.start_undo_group();
@@ -3822,6 +3898,32 @@ impl Engine {
                             motion: Some(Motion::Right),
                         });
                     }
+                }
+            }
+            Some('X') => {
+                // X: delete character(s) before cursor (like Backspace in normal mode)
+                let count = self.take_count();
+                let line = self.view().cursor.line;
+                let col = self.view().cursor.col;
+                if col > 0 {
+                    let to_delete = count.min(col);
+                    let line_start = self.buffer().line_to_char(line);
+                    let char_idx = line_start + col - to_delete;
+                    let deleted_chars: String = self
+                        .buffer()
+                        .content
+                        .slice(char_idx..char_idx + to_delete)
+                        .chars()
+                        .collect();
+                    let reg = self.active_register();
+                    self.set_delete_register(reg, deleted_chars, false);
+                    self.clear_selected_register();
+
+                    self.start_undo_group();
+                    self.delete_with_undo(char_idx, char_idx + to_delete);
+                    self.finish_undo_group();
+                    self.view_mut().cursor.col = col - to_delete;
+                    *changed = true;
                 }
             }
             Some('w') => {
@@ -4099,7 +4201,7 @@ impl Engine {
                 self.repeat_last_change(count, changed);
             }
             Some('y') => {
-                self.pending_key = Some('y');
+                self.pending_operator = Some('y');
             }
             Some('Y') => {
                 let count = self.take_count();
@@ -4322,6 +4424,72 @@ impl Engine {
                         self.move_visual_up();
                     }
                 }
+                Some('~') => {
+                    // g~{motion}: toggle case operator — set pending_operator and await motion
+                    self.pending_operator = Some('~');
+                }
+                Some('u') => {
+                    // gu{motion}: lowercase operator
+                    // Check if operator is pending (e.g. c/d + g + u) — handled elsewhere
+                    self.pending_operator = Some('u');
+                }
+                Some('U') => {
+                    // gU{motion}: uppercase operator
+                    self.pending_operator = Some('U');
+                }
+                Some('n') => {
+                    // gn: enter visual mode selecting next search match
+                    // If an operator was saved (cgn), apply it; otherwise just select
+                    let op = self.pending_operator.take();
+                    self.cmd_gn(op, false, changed);
+                }
+                Some('N') => {
+                    // gN: enter visual mode selecting previous search match
+                    let op = self.pending_operator.take();
+                    self.cmd_gn(op, true, changed);
+                }
+                Some('v') => {
+                    // gv: reselect last visual selection
+                    if let (Some(anchor), Some(cursor)) =
+                        (self.last_visual_anchor, self.last_visual_cursor)
+                    {
+                        let mode = self.last_visual_mode;
+                        self.mode = mode;
+                        self.visual_anchor = Some(anchor);
+                        self.view_mut().cursor = cursor;
+                    }
+                }
+                Some(';') => {
+                    // g;: jump to previous change position
+                    if self.change_list.is_empty() {
+                        self.message = "Change list is empty".to_string();
+                    } else if self.change_list_pos == 0 {
+                        self.message = "Already at oldest change".to_string();
+                    } else {
+                        self.change_list_pos -= 1;
+                        let (line, col) = self.change_list[self.change_list_pos];
+                        let max_line = self.buffer().len_lines().saturating_sub(1);
+                        self.view_mut().cursor.line = line.min(max_line);
+                        self.view_mut().cursor.col = col;
+                        self.clamp_cursor_col();
+                    }
+                }
+                Some(',') => {
+                    // g,: jump to next change position
+                    if self.change_list.is_empty() {
+                        self.message = "Change list is empty".to_string();
+                    } else if self.change_list_pos >= self.change_list.len() {
+                        self.message = "Already at newest change".to_string();
+                    } else {
+                        let (line, col) = self.change_list[self.change_list_pos];
+                        let max_line = self.buffer().len_lines().saturating_sub(1);
+                        self.view_mut().cursor.line = line.min(max_line);
+                        self.view_mut().cursor.col = col;
+                        self.clamp_cursor_col();
+                        self.change_list_pos =
+                            (self.change_list_pos + 1).min(self.change_list.len());
+                    }
+                }
                 _ => {}
             },
             ']' => match unicode {
@@ -4342,18 +4510,6 @@ impl Engine {
                     self.start_undo_group();
                     self.delete_lines(count, changed);
                     self.finish_undo_group();
-                }
-            }
-            'y' => {
-                if unicode == Some('y') {
-                    let count = self.take_count();
-                    self.yank_lines(count);
-                } else if unicode == Some('i') || unicode == Some('a') {
-                    // Text object yank: yi", ya(, etc.
-                    self.pending_text_object = unicode;
-                    self.pending_operator = Some('y'); // Set y as the operator
-                } else {
-                    // Invalid - clear pending
                 }
             }
             '"' => {
@@ -4456,56 +4612,173 @@ impl Engine {
                 }
             }
             'm' => {
-                // Set mark: m{a-z}
+                // Set mark: m{a-z} (local) or m{A-Z} (global)
                 if let Some(ch) = unicode {
                     if ch.is_ascii_lowercase() {
                         let buffer_id = self.active_window().buffer_id;
                         let cursor = self.view().cursor;
                         self.marks.entry(buffer_id).or_default().insert(ch, cursor);
                         self.message = format!("Mark '{}' set", ch);
+                    } else if ch.is_ascii_uppercase() {
+                        let file = self.active_buffer_state().file_path.clone();
+                        let line = self.view().cursor.line;
+                        let col = self.view().cursor.col;
+                        self.global_marks.insert(ch, (file, line, col));
+                        self.message = format!("Mark '{}' set", ch);
                     } else {
-                        self.message = "Only lowercase marks (a-z) are supported".to_string();
+                        self.message = "Marks must be a letter (a-z or A-Z)".to_string();
                     }
                 }
             }
             '\'' => {
-                // Jump to mark line: '{a-z}
+                // Jump to mark line: '{a-z|A-Z|'|.|<|>}
                 if let Some(ch) = unicode {
-                    if ch.is_ascii_lowercase() {
-                        let buffer_id = self.active_window().buffer_id;
-                        if let Some(buffer_marks) = self.marks.get(&buffer_id) {
-                            if let Some(mark_cursor) = buffer_marks.get(&ch) {
-                                self.view_mut().cursor.line = mark_cursor.line;
+                    match ch {
+                        '\'' => {
+                            // '' jump to position before last jump
+                            if let Some((line, _)) = self.last_jump_pos {
+                                let max_line = self.buffer().len_lines().saturating_sub(1);
+                                self.view_mut().cursor.line = line.min(max_line);
+                                self.view_mut().cursor.col = 0;
+                                self.clamp_cursor_col();
+                            } else {
+                                self.message = "No previous jump position".to_string();
+                            }
+                        }
+                        '.' => {
+                            // '. jump to last edit position
+                            if let Some((line, _)) = self.last_edit_pos {
+                                let max_line = self.buffer().len_lines().saturating_sub(1);
+                                self.view_mut().cursor.line = line.min(max_line);
+                                self.view_mut().cursor.col = 0;
+                                self.clamp_cursor_col();
+                            } else {
+                                self.message = "No previous edit position".to_string();
+                            }
+                        }
+                        '<' => {
+                            // '< jump to start of last visual selection
+                            if let Some((line, _)) = self.visual_mark_start {
+                                let max_line = self.buffer().len_lines().saturating_sub(1);
+                                self.view_mut().cursor.line = line.min(max_line);
+                                self.view_mut().cursor.col = 0;
+                                self.clamp_cursor_col();
+                            } else {
+                                self.message = "No previous visual selection".to_string();
+                            }
+                        }
+                        '>' => {
+                            // '> jump to end of last visual selection
+                            if let Some((line, _)) = self.visual_mark_end {
+                                let max_line = self.buffer().len_lines().saturating_sub(1);
+                                self.view_mut().cursor.line = line.min(max_line);
+                                self.view_mut().cursor.col = 0;
+                                self.clamp_cursor_col();
+                            } else {
+                                self.message = "No previous visual selection".to_string();
+                            }
+                        }
+                        _ if ch.is_ascii_lowercase() => {
+                            let buffer_id = self.active_window().buffer_id;
+                            if let Some(buffer_marks) = self.marks.get(&buffer_id) {
+                                if let Some(mark_cursor) = buffer_marks.get(&ch) {
+                                    self.view_mut().cursor.line = mark_cursor.line;
+                                    self.view_mut().cursor.col = 0;
+                                    self.clamp_cursor_col();
+                                } else {
+                                    self.message = format!("Mark '{}' not set", ch);
+                                }
+                            } else {
+                                self.message = format!("Mark '{}' not set", ch);
+                            }
+                        }
+                        _ if ch.is_ascii_uppercase() => {
+                            if let Some(&(_, line, _)) = self.global_marks.get(&ch) {
+                                let max_line = self.buffer().len_lines().saturating_sub(1);
+                                self.view_mut().cursor.line = line.min(max_line);
                                 self.view_mut().cursor.col = 0;
                                 self.clamp_cursor_col();
                             } else {
                                 self.message = format!("Mark '{}' not set", ch);
                             }
-                        } else {
-                            self.message = format!("Mark '{}' not set", ch);
                         }
-                    } else {
-                        self.message = "Only lowercase marks (a-z) are supported".to_string();
+                        _ => {
+                            self.message = "Marks must be a letter or special char".to_string();
+                        }
                     }
                 }
             }
             '`' => {
-                // Jump to exact mark position: `{a-z}
+                // Jump to exact mark position: `{a-z|A-Z|`|.|<|>}
                 if let Some(ch) = unicode {
-                    if ch.is_ascii_lowercase() {
-                        let buffer_id = self.active_window().buffer_id;
-                        if let Some(buffer_marks) = self.marks.get(&buffer_id) {
-                            if let Some(mark_cursor) = buffer_marks.get(&ch) {
-                                self.view_mut().cursor = *mark_cursor;
+                    match ch {
+                        '`' => {
+                            // `` jump to exact position before last jump
+                            if let Some((line, col)) = self.last_jump_pos {
+                                let max_line = self.buffer().len_lines().saturating_sub(1);
+                                self.view_mut().cursor.line = line.min(max_line);
+                                self.view_mut().cursor.col = col;
+                                self.clamp_cursor_col();
+                            } else {
+                                self.message = "No previous jump position".to_string();
+                            }
+                        }
+                        '.' => {
+                            if let Some((line, col)) = self.last_edit_pos {
+                                let max_line = self.buffer().len_lines().saturating_sub(1);
+                                self.view_mut().cursor.line = line.min(max_line);
+                                self.view_mut().cursor.col = col;
+                                self.clamp_cursor_col();
+                            } else {
+                                self.message = "No previous edit position".to_string();
+                            }
+                        }
+                        '<' => {
+                            if let Some((line, col)) = self.visual_mark_start {
+                                let max_line = self.buffer().len_lines().saturating_sub(1);
+                                self.view_mut().cursor.line = line.min(max_line);
+                                self.view_mut().cursor.col = col;
+                                self.clamp_cursor_col();
+                            } else {
+                                self.message = "No previous visual selection".to_string();
+                            }
+                        }
+                        '>' => {
+                            if let Some((line, col)) = self.visual_mark_end {
+                                let max_line = self.buffer().len_lines().saturating_sub(1);
+                                self.view_mut().cursor.line = line.min(max_line);
+                                self.view_mut().cursor.col = col;
+                                self.clamp_cursor_col();
+                            } else {
+                                self.message = "No previous visual selection".to_string();
+                            }
+                        }
+                        _ if ch.is_ascii_lowercase() => {
+                            let buffer_id = self.active_window().buffer_id;
+                            if let Some(buffer_marks) = self.marks.get(&buffer_id) {
+                                if let Some(mark_cursor) = buffer_marks.get(&ch) {
+                                    self.view_mut().cursor = *mark_cursor;
+                                    self.clamp_cursor_col();
+                                } else {
+                                    self.message = format!("Mark `{}` not set", ch);
+                                }
+                            } else {
+                                self.message = format!("Mark `{}` not set", ch);
+                            }
+                        }
+                        _ if ch.is_ascii_uppercase() => {
+                            if let Some(&(_, line, col)) = self.global_marks.get(&ch) {
+                                let max_line = self.buffer().len_lines().saturating_sub(1);
+                                self.view_mut().cursor.line = line.min(max_line);
+                                self.view_mut().cursor.col = col;
                                 self.clamp_cursor_col();
                             } else {
                                 self.message = format!("Mark `{}` not set", ch);
                             }
-                        } else {
-                            self.message = format!("Mark `{}` not set", ch);
                         }
-                    } else {
-                        self.message = "Only lowercase marks (a-z) are supported".to_string();
+                        _ => {
+                            self.message = "Marks must be a letter or special char".to_string();
+                        }
                     }
                 }
             }
@@ -4536,6 +4809,56 @@ impl Engine {
         unicode: Option<char>,
         changed: &mut bool,
     ) -> EngineAction {
+        // Handle 'g' motion for cgn / dgn (operator + gn)
+        if unicode == Some('g') && (operator == 'c' || operator == 'd' || operator == 'y') {
+            // Re-set pending_key = 'g' and pending_operator = operator so next key ('n'/'N')
+            // is handled by handle_pending_key('g') which checks pending_operator.
+            self.pending_key = Some('g');
+            self.pending_operator = Some(operator);
+            return EngineAction::None;
+        }
+
+        // Handle case-transform operators (~=toggle, u=lower, U=upper)
+        if operator == '~' || operator == 'u' || operator == 'U' {
+            // Doubled operator (g~~, guu, gUU) = apply to current line
+            let is_doubled = match operator {
+                '~' => unicode == Some('~'),
+                'u' => unicode == Some('u'),
+                'U' => unicode == Some('U'),
+                _ => false,
+            };
+            if is_doubled {
+                let count = self.take_count();
+                let line = self.view().cursor.line;
+                let num_lines = self.buffer().len_lines();
+                for i in 0..count {
+                    let ln = line + i;
+                    if ln >= num_lines {
+                        break;
+                    }
+                    let line_start = self.buffer().line_to_char(ln);
+                    let line_len = self.buffer().line_len_chars(ln);
+                    // Exclude trailing newline
+                    let line_end = line_start
+                        + if self.buffer().content.line(ln).chars().last() == Some('\n') {
+                            line_len.saturating_sub(1)
+                        } else {
+                            line_len
+                        };
+                    if line_start < line_end {
+                        self.apply_case_range(line_start, line_end, operator, changed);
+                    }
+                }
+            } else if let Some(motion) = unicode {
+                // Apply operator to motion range
+                let count = self.take_count();
+                self.apply_case_with_motion(operator, motion, count, changed);
+            } else {
+                self.count = None; // Cancel
+            }
+            return EngineAction::None;
+        }
+
         // Handle indent/dedent operators (>> and <<)
         if operator == '>' || operator == '<' {
             match unicode {
@@ -4588,6 +4911,11 @@ impl Engine {
 
         // Handle operator + motion combinations (dw, cw, db, cb, de, ce, etc.)
         match unicode {
+            Some('y') if operator == 'y' => {
+                // yy: yank current line(s)
+                let count = self.take_count();
+                self.yank_lines(count);
+            }
             Some('d') if operator == 'd' => {
                 // dd: delete line
                 let count = self.take_count();
@@ -4673,12 +5001,238 @@ impl Engine {
                 // d%/c%: delete/change to matching bracket
                 self.apply_operator_bracket_motion(operator, changed);
             }
+            Some('$') => {
+                // y$/d$/c$: to end of current line (does not include the newline)
+                let _ = self.take_count(); // count ignored for simplicity (same as D/C)
+                let line = self.view().cursor.line;
+                let col = self.view().cursor.col;
+                let line_char_start = self.buffer().line_to_char(line);
+                let line_len = self.buffer().line_len_chars(line);
+                let has_newline = self.buffer().content.line(line).chars().last() == Some('\n');
+                let line_end = if has_newline {
+                    line_char_start + line_len - 1
+                } else {
+                    line_char_start + line_len
+                };
+                let start_pos = line_char_start + col;
+                if start_pos >= line_end {
+                    return EngineAction::None;
+                }
+                let text: String = self
+                    .buffer()
+                    .content
+                    .slice(start_pos..line_end)
+                    .chars()
+                    .collect();
+                let reg = self.active_register();
+                if operator == 'y' {
+                    let end_col = line_end.saturating_sub(line_char_start).saturating_sub(1);
+                    self.set_yank_register(reg, text, false);
+                    self.clear_selected_register();
+                    self.record_yank_highlight(
+                        Cursor { line, col },
+                        Cursor { line, col: end_col },
+                        false,
+                    );
+                } else {
+                    self.set_delete_register(reg, text, false);
+                    self.clear_selected_register();
+                    self.start_undo_group();
+                    self.delete_with_undo(start_pos, line_end);
+                    self.clamp_cursor_col();
+                    self.finish_undo_group();
+                    *changed = true;
+                    if operator == 'c' {
+                        self.mode = Mode::Insert;
+                        self.count = None;
+                    }
+                }
+            }
+            Some('0') => {
+                // y0/d0: from start of line to (not including) cursor
+                let _ = self.take_count();
+                let line = self.view().cursor.line;
+                let col = self.view().cursor.col;
+                if col == 0 {
+                    return EngineAction::None;
+                }
+                let line_char_start = self.buffer().line_to_char(line);
+                let start_pos = line_char_start;
+                let end_pos = line_char_start + col;
+                let text: String = self
+                    .buffer()
+                    .content
+                    .slice(start_pos..end_pos)
+                    .chars()
+                    .collect();
+                let reg = self.active_register();
+                if operator == 'y' {
+                    self.set_yank_register(reg, text, false);
+                    self.clear_selected_register();
+                    self.record_yank_highlight(
+                        Cursor { line, col: 0 },
+                        Cursor {
+                            line,
+                            col: col.saturating_sub(1),
+                        },
+                        false,
+                    );
+                } else {
+                    self.set_delete_register(reg, text, false);
+                    self.clear_selected_register();
+                    self.start_undo_group();
+                    self.delete_with_undo(start_pos, end_pos);
+                    self.view_mut().cursor.col = 0;
+                    self.finish_undo_group();
+                    *changed = true;
+                }
+            }
             _ => {
                 // Invalid motion - cancel operator
                 self.count = None;
             }
         }
         EngineAction::None
+    }
+
+    /// Apply a case transform (toggle/lower/upper) over a char range in the buffer.
+    fn apply_case_range(&mut self, start: usize, end: usize, op: char, changed: &mut bool) {
+        if start >= end {
+            return;
+        }
+        let original: String = self.buffer().content.slice(start..end).chars().collect();
+        let transformed: String = original
+            .chars()
+            .map(|c| match op {
+                '~' => {
+                    if c.is_uppercase() {
+                        c.to_lowercase().next().unwrap_or(c)
+                    } else if c.is_lowercase() {
+                        c.to_uppercase().next().unwrap_or(c)
+                    } else {
+                        c
+                    }
+                }
+                'u' => c.to_lowercase().next().unwrap_or(c),
+                'U' => c.to_uppercase().next().unwrap_or(c),
+                _ => c,
+            })
+            .collect();
+        if transformed != original {
+            self.start_undo_group();
+            self.delete_with_undo(start, end);
+            self.insert_with_undo(start, &transformed);
+            self.finish_undo_group();
+            *changed = true;
+        }
+    }
+
+    /// Apply a case operator over a word/motion.
+    fn apply_case_with_motion(&mut self, op: char, motion: char, count: usize, changed: &mut bool) {
+        let start_cursor = self.view().cursor;
+        let start_pos = self.buffer().line_to_char(start_cursor.line) + start_cursor.col;
+
+        for _ in 0..count {
+            match motion {
+                'w' => self.move_word_forward(),
+                'b' => self.move_word_backward(),
+                'e' => self.move_word_end(),
+                _ => {
+                    self.view_mut().cursor = start_cursor;
+                    return;
+                }
+            }
+        }
+
+        let end_cursor = self.view().cursor;
+        let end_pos = self.buffer().line_to_char(end_cursor.line) + end_cursor.col;
+        self.view_mut().cursor = start_cursor;
+
+        let (range_start, range_end) = if start_pos <= end_pos {
+            let end = if motion == 'e' {
+                (end_pos + 1).min(self.buffer().len_chars())
+            } else {
+                end_pos
+            };
+            (start_pos, end)
+        } else {
+            (end_pos, start_pos)
+        };
+
+        self.apply_case_range(range_start, range_end, op, changed);
+    }
+
+    /// gn: find next (or prev if `backward`) search match, enter Visual mode selecting it.
+    /// If `op` is Some('c'), delete the match and enter Insert (cgn).
+    fn cmd_gn(&mut self, op: Option<char>, backward: bool, changed: &mut bool) {
+        if self.search_matches.is_empty() {
+            self.message = format!("Pattern not found: {}", self.search_query);
+            return;
+        }
+        let line = self.view().cursor.line;
+        let col = self.view().cursor.col;
+        let cursor_char = self.buffer().line_to_char(line) + col;
+
+        let idx = if backward {
+            self.search_matches
+                .iter()
+                .rposition(|(start, _)| *start < cursor_char)
+                .unwrap_or(self.search_matches.len() - 1)
+        } else {
+            self.search_matches
+                .iter()
+                .position(|(start, _)| *start >= cursor_char)
+                .unwrap_or(0)
+        };
+
+        let (match_start, match_end) = self.search_matches[idx];
+
+        // Convert char positions to line/col
+        let start_line = self.buffer().content.char_to_line(match_start);
+        let start_line_char = self.buffer().line_to_char(start_line);
+        let start_col = match_start - start_line_char;
+
+        let end_char = match_end.saturating_sub(1).max(match_start);
+        let end_line = self.buffer().content.char_to_line(end_char);
+        let end_line_char = self.buffer().line_to_char(end_line);
+        let end_col = end_char - end_line_char;
+
+        if let Some(op_char) = op {
+            // Operator mode: delete the match, optionally enter Insert
+            self.view_mut().cursor.line = start_line;
+            self.view_mut().cursor.col = start_col;
+            let delete_start = match_start;
+            let delete_end = match_end;
+            let deleted: String = self
+                .buffer()
+                .content
+                .slice(delete_start..delete_end)
+                .chars()
+                .collect();
+            let reg = self.active_register();
+            self.set_delete_register(reg, deleted, false);
+            self.start_undo_group();
+            self.delete_with_undo(delete_start, delete_end);
+            *changed = true;
+            if op_char == 'c' {
+                self.mode = Mode::Insert;
+                self.insert_text_buffer.clear();
+                // Don't finish_undo_group — let insert mode do it
+            } else {
+                self.finish_undo_group();
+                self.clamp_cursor_col();
+            }
+        } else {
+            // Select the match in Visual mode
+            self.mode = Mode::Visual;
+            self.visual_anchor = Some(Cursor {
+                line: start_line,
+                col: start_col,
+            });
+            self.view_mut().cursor.line = end_line;
+            self.view_mut().cursor.col = end_col;
+            self.search_index = Some(idx);
+        }
     }
 
     /// Handle a key press while leader mode is active (after pressing the leader key).
@@ -4746,6 +5300,24 @@ impl Engine {
         // Restore cursor to start position
         self.view_mut().cursor = start_cursor;
 
+        // Vim rule: 'w' operator motion does not cross line boundaries.
+        // When the motion lands on the next line (col 0), clamp the end to
+        // just before the newline on the start line, so dw/yw on the last word
+        // of a line does not delete/yank the newline character.
+        let end_pos = if motion == 'w' && end_cursor.line > start_cursor.line {
+            let line = start_cursor.line;
+            let line_char_start = self.buffer().line_to_char(line);
+            let line_len = self.buffer().line_len_chars(line);
+            let has_newline = self.buffer().content.line(line).chars().last() == Some('\n');
+            if has_newline {
+                (line_char_start + line_len - 1).min(end_pos) // before the \n
+            } else {
+                (line_char_start + line_len).min(end_pos)
+            }
+        } else {
+            end_pos
+        };
+
         // Determine range to delete
         let (delete_start, delete_end) = match start_pos.cmp(&end_pos) {
             std::cmp::Ordering::Less => {
@@ -4754,8 +5326,24 @@ impl Engine {
                     // 'e' moves to end of word, so include that character
                     (start_pos, (end_pos + 1).min(self.buffer().len_chars()))
                 } else {
-                    // 'w' moves to start of next word, already at correct position
-                    (start_pos, end_pos)
+                    // 'w' moves to start of next word (exclusive end).
+                    // Exception: when the file has no trailing newline and the word
+                    // is the last one, move_word_forward clamps to total_chars-1
+                    // (the last char) instead of going past it.  The normal range
+                    // [start, end_pos) would then miss that final character.
+                    // Detect this by checking that end_pos is the last char and it
+                    // is not a newline (if it were '\n', the existing line-boundary
+                    // clamping has already handled things correctly).
+                    let total = self.buffer().len_chars();
+                    let end = if end_pos + 1 == total
+                        && total > 0
+                        && self.buffer().content.char(end_pos) != '\n'
+                    {
+                        total
+                    } else {
+                        end_pos
+                    };
+                    (start_pos, end)
                 }
             }
             std::cmp::Ordering::Greater => {
@@ -4763,7 +5351,7 @@ impl Engine {
                 (end_pos, start_pos)
             }
             std::cmp::Ordering::Equal => {
-                // No movement
+                // No movement (e.g. single word on line, w clamps to end of word)
                 return;
             }
         };
@@ -4772,15 +5360,44 @@ impl Engine {
             return;
         }
 
-        // Save deleted text to register
+        // Save text to register
         let deleted_text: String = self
             .buffer()
             .content
             .slice(delete_start..delete_end)
             .chars()
             .collect();
+
+        // For yank: save to yank register and return without deleting
+        if operator == 'y' {
+            let reg = self.active_register();
+            self.set_yank_register(reg, deleted_text.clone(), false);
+            self.clear_selected_register();
+            // Record highlight region for brief visual flash
+            let end_char = delete_start + deleted_text.chars().count();
+            let end_line = if end_char > 0 {
+                self.buffer()
+                    .content
+                    .char_to_line(end_char.saturating_sub(1))
+            } else {
+                start_cursor.line
+            };
+            let end_line_start = self.buffer().line_to_char(end_line);
+            let end_col = end_char.saturating_sub(1).saturating_sub(end_line_start);
+            self.record_yank_highlight(
+                start_cursor,
+                Cursor {
+                    line: end_line,
+                    col: end_col,
+                },
+                false,
+            );
+            // Cursor is already restored to start_cursor above
+            return;
+        }
+
         let reg = self.active_register();
-        self.set_register(reg, deleted_text, false);
+        self.set_delete_register(reg, deleted_text, false);
         self.clear_selected_register();
 
         // Perform deletion
@@ -4986,11 +5603,81 @@ impl Engine {
             self.completion_display_only = false;
         }
 
+        // Ctrl+W: delete word backward from cursor
+        if ctrl && key_name == "w" {
+            let line = self.view().cursor.line;
+            let col = self.view().cursor.col;
+            if col > 0 {
+                // Find start of word backward
+                let line_start = self.buffer().line_to_char(line);
+                let char_idx = line_start + col;
+                let line_text: String = self
+                    .buffer()
+                    .content
+                    .slice(line_start..char_idx)
+                    .chars()
+                    .collect();
+                // Skip trailing spaces, then skip non-spaces
+                let chars: Vec<char> = line_text.chars().collect();
+                let mut i = chars.len();
+                // Skip trailing whitespace
+                while i > 0 && chars[i - 1] == ' ' {
+                    i -= 1;
+                }
+                // Skip word chars
+                while i > 0 && chars[i - 1] != ' ' {
+                    i -= 1;
+                }
+                let delete_start = line_start + i;
+                let delete_end = char_idx;
+                if delete_start < delete_end {
+                    self.delete_with_undo(delete_start, delete_end);
+                    self.view_mut().cursor.col = i;
+                    *changed = true;
+                }
+            }
+            return;
+        }
+
+        // Ctrl+T: indent current line by shiftwidth
+        if ctrl && key_name == "t" {
+            let line = self.view().cursor.line;
+            let line_start = self.buffer().line_to_char(line);
+            let sw = self.settings.shift_width as usize;
+            let indent = if self.settings.expand_tab {
+                " ".repeat(sw)
+            } else {
+                "\t".to_string()
+            };
+            self.insert_with_undo(line_start, &indent);
+            self.view_mut().cursor.col += indent.len();
+            *changed = true;
+            return;
+        }
+
+        // Ctrl+D: dedent current line by shiftwidth
+        if ctrl && key_name == "d" {
+            let line = self.view().cursor.line;
+            let line_start = self.buffer().line_to_char(line);
+            let sw = self.settings.shift_width as usize;
+            // Count leading spaces
+            let line_text: String = self.buffer().content.line(line).chars().take(sw).collect();
+            let spaces = line_text.chars().take_while(|c| *c == ' ').count();
+            let to_remove = spaces.min(sw);
+            if to_remove > 0 {
+                self.delete_with_undo(line_start, line_start + to_remove);
+                self.view_mut().cursor.col = self.view().cursor.col.saturating_sub(to_remove);
+                *changed = true;
+            }
+            return;
+        }
+
         match key_name {
             "Escape" => {
                 self.finish_undo_group();
-                // Record the insert operation for repeat
+                // Record the insert operation for repeat and ". register
                 if !self.insert_text_buffer.is_empty() {
+                    self.last_inserted_text = self.insert_text_buffer.clone();
                     self.last_change = Some(Change {
                         op: ChangeOp::Insert,
                         text: self.insert_text_buffer.clone(),
@@ -5714,6 +6401,39 @@ impl Engine {
                     self.count = None;
                     return EngineAction::None;
                 }
+                'o' => {
+                    // o: swap cursor to other end of selection
+                    self.count = None;
+                    if let Some(anchor) = self.visual_anchor {
+                        let cursor = self.view().cursor;
+                        self.visual_anchor = Some(cursor);
+                        self.view_mut().cursor = anchor;
+                    }
+                    return EngineAction::None;
+                }
+                'O' => {
+                    // O in VisualBlock: swap to opposite column corner
+                    self.count = None;
+                    if self.mode == Mode::VisualBlock {
+                        if let Some(anchor) = self.visual_anchor {
+                            let cursor_col = self.view().cursor.col;
+                            let anchor_col = anchor.col;
+                            self.view_mut().cursor.col = anchor_col;
+                            self.visual_anchor = Some(Cursor {
+                                line: anchor.line,
+                                col: cursor_col,
+                            });
+                        }
+                    } else {
+                        // In Visual/VisualLine O is same as o
+                        if let Some(anchor) = self.visual_anchor {
+                            let cursor = self.view().cursor;
+                            self.visual_anchor = Some(cursor);
+                            self.view_mut().cursor = anchor;
+                        }
+                    }
+                    return EngineAction::None;
+                }
                 _ => {}
             }
         }
@@ -6023,13 +6743,23 @@ impl Engine {
     }
 
     fn yank_visual_selection(&mut self) {
+        // Capture the selection region for highlight before exiting visual mode
+        let hl_region = self.get_visual_selection_range().map(|(start, end)| {
+            let is_linewise = matches!(self.mode, Mode::VisualLine);
+            (start, end, is_linewise)
+        });
+
         if let Some((text, is_linewise)) = self.get_visual_selection_text() {
             // Store in selected register (or unnamed register)
             let reg = self.selected_register.unwrap_or('"');
-            self.set_register(reg, text, is_linewise);
+            self.set_yank_register(reg, text, is_linewise);
 
             self.selected_register = None;
             self.message = format!("{} yanked", if is_linewise { "Line(s)" } else { "Text" });
+
+            if let Some((start, end, lw)) = hl_region {
+                self.record_yank_highlight(start, end, lw);
+            }
         }
 
         // Exit visual mode
@@ -6041,7 +6771,7 @@ impl Engine {
         if let Some((text, is_linewise)) = self.get_visual_selection_text() {
             // Store in register
             let reg = self.selected_register.unwrap_or('"');
-            self.set_register(reg, text, is_linewise);
+            self.set_delete_register(reg, text, is_linewise);
             self.selected_register = None;
 
             // Delete the selection
@@ -8129,6 +8859,35 @@ impl Engine {
             return self.execute_substitute_command(cmd);
         }
 
+        // :g/pat/cmd — global command (run ex cmd on lines matching pattern)
+        if let Some(rest) = cmd.strip_prefix("g/") {
+            return self.execute_global_command(rest, false);
+        }
+        // :v/pat/cmd — inverse global (run ex cmd on lines NOT matching pattern)
+        if let Some(rest) = cmd.strip_prefix("v/") {
+            return self.execute_global_command(rest, true);
+        }
+
+        // :sort [flags] — sort lines in buffer
+        if cmd == "sort" || cmd.starts_with("sort ") {
+            let flags = cmd.strip_prefix("sort").unwrap_or("").trim();
+            return self.execute_sort_command(flags);
+        }
+
+        // :m[ove] {dest} — move current line to after dest
+        if let Some(dest) = cmd.strip_prefix("move ").or_else(|| cmd.strip_prefix("m ")) {
+            return self.execute_move_command(dest.trim());
+        }
+
+        // :t {dest} / :co[py] {dest} — copy current line to after dest
+        if let Some(dest) = cmd
+            .strip_prefix("copy ")
+            .or_else(|| cmd.strip_prefix("co "))
+            .or_else(|| cmd.strip_prefix("t "))
+        {
+            return self.execute_copy_command(dest.trim());
+        }
+
         // Handle :N (jump to line number)
         if let Ok(line_num) = cmd.parse::<usize>() {
             let target = if line_num > 0 { line_num - 1 } else { 0 };
@@ -8359,6 +9118,12 @@ impl Engine {
                         .to_string();
                 EngineAction::None
             }
+            "d" | "delete" => {
+                // :d — delete current line (used by :g/pat/d etc.)
+                let mut changed = false;
+                self.delete_lines(1, &mut changed);
+                EngineAction::None
+            }
             _ => {
                 // Try plugin commands before giving up
                 let (cmd_name, cmd_args) = cmd.split_once(' ').unwrap_or((cmd, ""));
@@ -8481,6 +9246,293 @@ impl Engine {
         let n = end_line.saturating_sub(start_line) + 1;
         self.message = format!("{} line{} affected", n, if n == 1 { "" } else { "s" });
         EngineAction::None
+    }
+
+    /// :g/pat/cmd or :v/pat/cmd — run ex cmd on matching (or non-matching) lines.
+    fn execute_global_command(&mut self, rest: &str, invert: bool) -> EngineAction {
+        // rest is "pat/cmd" — find the closing '/' after pattern
+        let sep_pos = match rest.find('/') {
+            Some(p) => p,
+            None => {
+                self.message = "Usage: :g/pattern/command".to_string();
+                return EngineAction::None;
+            }
+        };
+        let pattern = &rest[..sep_pos];
+        let subcmd = rest[sep_pos + 1..].trim().to_string();
+        if pattern.is_empty() {
+            self.message = "Empty pattern".to_string();
+            return EngineAction::None;
+        }
+
+        // Collect matching line indices BEFORE executing (avoid borrow issues)
+        let num_lines = self.buffer().len_lines();
+        let mut matching: Vec<usize> = Vec::new();
+        for line_idx in 0..num_lines {
+            let line_text: String = self.buffer().content.line(line_idx).chars().collect();
+            let matches = line_text.contains(pattern);
+            if matches != invert {
+                matching.push(line_idx);
+            }
+        }
+
+        if matching.is_empty() {
+            self.message = format!("Pattern not found: {}", pattern);
+            return EngineAction::None;
+        }
+
+        // Execute subcommand on each matching line in REVERSE order (preserves line numbers)
+        let mut executed = 0usize;
+        for &line_idx in matching.iter().rev() {
+            let current_lines = self.buffer().len_lines();
+            if line_idx >= current_lines {
+                continue;
+            }
+            self.view_mut().cursor.line = line_idx;
+            self.view_mut().cursor.col = 0;
+            self.execute_command(&subcmd.clone());
+            executed += 1;
+        }
+
+        self.message = format!(
+            "{} line{} affected",
+            executed,
+            if executed == 1 { "" } else { "s" }
+        );
+        EngineAction::None
+    }
+
+    /// :sort [flags] — sort all lines, with optional flags (n=numeric, r=reverse, u=unique, i=ignorecase).
+    fn execute_sort_command(&mut self, flags: &str) -> EngineAction {
+        let numeric = flags.contains('n');
+        let reverse = flags.contains('r');
+        let unique = flags.contains('u');
+        let ignorecase = flags.contains('i');
+
+        let num_lines = self.buffer().len_lines();
+        if num_lines == 0 {
+            return EngineAction::None;
+        }
+
+        // Collect all lines (excluding trailing newline per line)
+        let mut lines: Vec<String> = (0..num_lines)
+            .map(|i| {
+                let s: String = self.buffer().content.line(i).chars().collect();
+                if s.ends_with('\n') {
+                    s[..s.len() - 1].to_string()
+                } else {
+                    s
+                }
+            })
+            .collect();
+
+        // Sort
+        if numeric {
+            lines.sort_by(|a, b| {
+                let na: i64 = a.trim().parse().unwrap_or(i64::MIN);
+                let nb: i64 = b.trim().parse().unwrap_or(i64::MIN);
+                let ord = na.cmp(&nb);
+                if reverse {
+                    ord.reverse()
+                } else {
+                    ord
+                }
+            });
+        } else {
+            lines.sort_by(|a, b| {
+                let ka = if ignorecase {
+                    a.to_lowercase()
+                } else {
+                    a.clone()
+                };
+                let kb = if ignorecase {
+                    b.to_lowercase()
+                } else {
+                    b.clone()
+                };
+                let ord = ka.cmp(&kb);
+                if reverse {
+                    ord.reverse()
+                } else {
+                    ord
+                }
+            });
+        }
+
+        if unique {
+            lines.dedup_by(|a, b| {
+                if ignorecase {
+                    a.to_lowercase() == b.to_lowercase()
+                } else {
+                    a == b
+                }
+            });
+        }
+
+        // Replace buffer content
+        let new_content = lines.join("\n") + "\n";
+        let total_chars = self.buffer().len_chars();
+        self.start_undo_group();
+        self.delete_with_undo(0, total_chars);
+        self.insert_with_undo(0, &new_content);
+        self.finish_undo_group();
+        self.view_mut().cursor.line = 0;
+        self.view_mut().cursor.col = 0;
+        self.message = format!("{} lines sorted", lines.len());
+        EngineAction::None
+    }
+
+    /// :m[ove] {dest} — move current line to after line {dest}.
+    /// dest: absolute line number (1-based), 0 = before first line, . = current, $ = last, +N/-N = relative.
+    fn execute_move_command(&mut self, dest: &str) -> EngineAction {
+        let current_line = self.view().cursor.line;
+        let num_lines = self.buffer().len_lines();
+        let dest_line = self.parse_line_address(dest, current_line, num_lines);
+
+        if dest_line == current_line {
+            return EngineAction::None;
+        }
+
+        // Grab the line content to move
+        let line_start = self.buffer().line_to_char(current_line);
+        let line_end = if current_line + 1 < num_lines {
+            self.buffer().line_to_char(current_line + 1)
+        } else {
+            self.buffer().len_chars()
+        };
+        let line_text: String = self
+            .buffer()
+            .content
+            .slice(line_start..line_end)
+            .chars()
+            .collect();
+        let line_text = if line_text.ends_with('\n') {
+            line_text
+        } else {
+            format!("{}\n", line_text)
+        };
+
+        self.start_undo_group();
+
+        if dest_line > current_line {
+            // Insert first (positions shift after deletion)
+            let insert_after = dest_line.min(num_lines - 1);
+            let insert_pos = if insert_after + 1 < num_lines {
+                self.buffer().line_to_char(insert_after + 1)
+            } else {
+                self.buffer().len_chars()
+            };
+            self.insert_with_undo(insert_pos, &line_text);
+            // Delete original
+            let line_start2 = self.buffer().line_to_char(current_line);
+            let line_end2 = self.buffer().line_to_char(current_line + 1);
+            self.delete_with_undo(line_start2, line_end2);
+            self.view_mut().cursor.line = dest_line;
+        } else {
+            // Delete first
+            let del_end = if current_line < self.buffer().len_lines() {
+                self.buffer().line_to_char(current_line + 1)
+            } else {
+                self.buffer().len_chars()
+            };
+            self.delete_with_undo(line_start, del_end);
+            // Insert after dest_line
+            let insert_pos = if dest_line < self.buffer().len_lines() {
+                let after = if dest_line == 0 { 0 } else { dest_line };
+                if after == 0 {
+                    0usize
+                } else {
+                    self.buffer().line_to_char(after)
+                }
+            } else {
+                self.buffer().len_chars()
+            };
+            self.insert_with_undo(insert_pos, &line_text);
+            self.view_mut().cursor.line = if dest_line == 0 { 0 } else { dest_line };
+        }
+
+        self.finish_undo_group();
+        let max_line = self.buffer().len_lines().saturating_sub(1);
+        self.view_mut().cursor.line = self.view().cursor.line.min(max_line);
+        self.view_mut().cursor.col = 0;
+        EngineAction::None
+    }
+
+    /// :t {dest} / :co[py] {dest} — copy current line to after line {dest}.
+    fn execute_copy_command(&mut self, dest: &str) -> EngineAction {
+        let current_line = self.view().cursor.line;
+        let num_lines = self.buffer().len_lines();
+        let dest_line = self.parse_line_address(dest, current_line, num_lines);
+
+        // Grab the line content to copy
+        let line_start = self.buffer().line_to_char(current_line);
+        let line_end = if current_line + 1 < num_lines {
+            self.buffer().line_to_char(current_line + 1)
+        } else {
+            self.buffer().len_chars()
+        };
+        let line_text: String = self
+            .buffer()
+            .content
+            .slice(line_start..line_end)
+            .chars()
+            .collect();
+        let line_text = if line_text.ends_with('\n') {
+            line_text
+        } else {
+            format!("{}\n", line_text)
+        };
+
+        // Insert copy after dest_line (after the line at dest_line index)
+        let insert_pos = if dest_line >= num_lines {
+            self.buffer().len_chars()
+        } else {
+            let after = dest_line.min(num_lines - 1);
+            if after + 1 < num_lines {
+                self.buffer().line_to_char(after + 1)
+            } else {
+                self.buffer().len_chars()
+            }
+        };
+
+        self.start_undo_group();
+        self.insert_with_undo(insert_pos, &line_text);
+        self.finish_undo_group();
+
+        let new_line = if dest_line < current_line {
+            current_line + 1
+        } else {
+            dest_line + 1
+        };
+        let max_line = self.buffer().len_lines().saturating_sub(1);
+        self.view_mut().cursor.line = new_line.min(max_line);
+        self.view_mut().cursor.col = 0;
+        EngineAction::None
+    }
+
+    /// Parse a line address string to a 0-based line index.
+    /// Supports: "0", "1"-"N" (1-based absolute), ".", "$", "+N", "-N".
+    fn parse_line_address(&self, addr: &str, current: usize, total: usize) -> usize {
+        let addr = addr.trim();
+        if addr == "." {
+            return current;
+        }
+        if addr == "$" {
+            return total.saturating_sub(1);
+        }
+        if let Some(n_str) = addr.strip_prefix('+') {
+            let n: usize = n_str.parse().unwrap_or(0);
+            return (current + n).min(total.saturating_sub(1));
+        }
+        if let Some(n_str) = addr.strip_prefix('-') {
+            let n: usize = n_str.parse().unwrap_or(0);
+            return current.saturating_sub(n);
+        }
+        if let Ok(n) = addr.parse::<usize>() {
+            // 0-based absolute line index
+            return n.min(total.saturating_sub(1));
+        }
+        current
     }
 
     fn execute_substitute_command(&mut self, cmd: &str) -> EngineAction {
@@ -9926,7 +10978,7 @@ impl Engine {
             format!("{}\n", deleted_content)
         };
         let reg = self.active_register();
-        self.set_register(reg, deleted_content, true);
+        self.set_delete_register(reg, deleted_content, true);
         self.clear_selected_register();
 
         // Determine what to delete
@@ -10375,28 +11427,88 @@ impl Engine {
         self.registers.get(&reg)
     }
 
-    /// Gets register content as owned data.
-    /// For `+` and `*` registers, reads from the system clipboard.
-    pub fn get_register_content(&mut self, reg: char) -> Option<(String, bool)> {
-        if reg == '+' || reg == '*' {
-            if let Some(ref cb_read) = self.clipboard_read {
-                match cb_read() {
-                    Ok(text) => return Some((text, false)),
-                    Err(e) => {
-                        self.message = format!("Clipboard read failed: {}", e);
-                    }
+    /// Sets a yank register. Like set_register, but ALSO always updates "0.
+    fn set_yank_register(&mut self, reg: char, content: String, is_linewise: bool) {
+        self.set_register(reg, content.clone(), is_linewise);
+        // "0 is the yank-only register — set on every yank, never on deletes.
+        self.registers.insert('0', (content, is_linewise));
+    }
+
+    /// Sets a delete register. Like set_register, but:
+    /// - Linewise / multi-line: shifts "1"-"8" → "2"-"9", sets "1".
+    /// - Character (< 1 line): sets "-" (small-delete register).
+    fn set_delete_register(&mut self, reg: char, content: String, is_linewise: bool) {
+        self.set_register(reg, content.clone(), is_linewise);
+        if is_linewise || content.contains('\n') {
+            // Multi-line delete: shift numbered registers down
+            for i in (1usize..=8).rev() {
+                let from = char::from_digit(i as u32, 10).unwrap();
+                let to = char::from_digit((i + 1) as u32, 10).unwrap();
+                if let Some(val) = self.registers.get(&from).cloned() {
+                    self.registers.insert(to, val);
                 }
             }
-            // Fall back to internal register if clipboard unavailable
-            self.registers.get(&reg).cloned()
-        } else {
-            self.registers.get(&reg).cloned()
+            self.registers.insert('1', (content, is_linewise));
+        } else if !content.is_empty() {
+            // Small character delete: set "-" register
+            self.registers.insert('-', (content, false));
+        }
+    }
+
+    /// Gets register content as owned data.
+    /// For `+` and `*` registers, reads from the system clipboard.
+    /// For `%`, `/`, `.` read-only registers, returns the appropriate value.
+    pub fn get_register_content(&mut self, reg: char) -> Option<(String, bool)> {
+        match reg {
+            '+' | '*' => {
+                if let Some(ref cb_read) = self.clipboard_read {
+                    match cb_read() {
+                        Ok(text) => return Some((text, false)),
+                        Err(e) => {
+                            self.message = format!("Clipboard read failed: {}", e);
+                        }
+                    }
+                }
+                // Fall back to internal register if clipboard unavailable
+                self.registers.get(&reg).cloned()
+            }
+            '%' => {
+                // Current filename (read-only)
+                let name = self
+                    .active_buffer_state()
+                    .file_path
+                    .as_ref()
+                    .and_then(|p| p.file_name())
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                Some((name, false))
+            }
+            '/' => {
+                // Last search pattern (read-only)
+                Some((self.search_query.clone(), false))
+            }
+            '.' => {
+                // Last inserted text (read-only)
+                Some((self.last_inserted_text.clone(), false))
+            }
+            _ => self.registers.get(&reg).cloned(),
         }
     }
 
     /// Clears the selected register after an operation.
     fn clear_selected_register(&mut self) {
         self.selected_register = None;
+    }
+
+    /// Records a yank highlight region for brief visual feedback.
+    /// `end` is the inclusive last cursor position of the yanked range.
+    fn record_yank_highlight(&mut self, start: Cursor, end: Cursor, is_linewise: bool) {
+        self.yank_highlight = Some((start, end, is_linewise));
+    }
+
+    /// Clears the yank highlight. Called by the UI backend after ~200 ms.
+    pub fn clear_yank_highlight(&mut self) {
+        self.yank_highlight = None;
     }
 
     // --- Macro operations ---
@@ -10607,8 +11719,22 @@ impl Engine {
         };
 
         let reg = self.active_register();
-        self.set_register(reg, content, true);
+        self.set_yank_register(reg, content, true);
         self.clear_selected_register();
+
+        // Record highlight region for brief visual flash
+        let hl_end_line = end_line.saturating_sub(1).max(start_line);
+        self.record_yank_highlight(
+            Cursor {
+                line: start_line,
+                col: 0,
+            },
+            Cursor {
+                line: hl_end_line,
+                col: 0,
+            },
+            true,
+        );
 
         let msg = if actual_count == 1 {
             "1 line yanked".to_string()
@@ -12619,8 +13745,28 @@ impl Engine {
     // Jump list (Ctrl-O / Ctrl-I)
     // =======================================================================
 
+    /// Push (line, col) to the change list, capped at 100 entries.
+    fn push_change_location(&mut self, line: usize, col: usize) {
+        // Truncate any forward entries (if we navigated back with g;)
+        self.change_list.truncate(self.change_list_pos);
+        // Avoid duplicate consecutive entries
+        if self.change_list.last() == Some(&(line, col)) {
+            return;
+        }
+        self.change_list.push((line, col));
+        if self.change_list.len() > 100 {
+            self.change_list.remove(0);
+        }
+        self.change_list_pos = self.change_list.len();
+    }
+
     /// Push the current cursor position onto the jump list.
     pub fn push_jump_location(&mut self) {
+        // Save pre-jump position for '' / `` marks
+        let line = self.view().cursor.line;
+        let col = self.view().cursor.col;
+        self.last_jump_pos = Some((line, col));
+
         let file = self.active_buffer_state().file_path.clone();
         let line = self.view().cursor.line;
         let col = self.view().cursor.col;
@@ -16149,8 +17295,8 @@ impl Engine {
 
 #[cfg(test)]
 mod tests {
+    use super::super::settings::LineNumberMode;
     use super::*;
-    use crate::LineNumberMode;
 
     fn press_char(engine: &mut Engine, ch: char) {
         engine.handle_key(&ch.to_string(), Some(ch), false);

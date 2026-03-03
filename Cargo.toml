@@ -3,6 +3,14 @@ name = "vimcode"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "vimcode_core"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vimcode"
+path = "src/main.rs"
+
 [dependencies]
 gtk4 = { version = "0.7", features = ["v4_10"] }
 relm4 = "0.7"

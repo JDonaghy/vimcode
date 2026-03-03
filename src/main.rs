@@ -376,6 +376,8 @@ enum Msg {
     ShowQuitConfirm,
     /// User confirmed quit (after saving or choosing to discard changes).
     QuitConfirmed,
+    /// Clear the yank highlight after the flash duration has elapsed.
+    ClearYankHighlight,
 }
 
 #[relm4::component]
@@ -2566,6 +2568,21 @@ impl SimpleComponent for App {
                 // The comparison is O(1); actual write is deferred to the background thread.
                 self.sync_plus_register_to_clipboard();
 
+                // If a yank just happened, schedule a 200 ms one-shot to clear the highlight.
+                if self.engine.borrow().yank_highlight.is_some() {
+                    let s = sender.clone();
+                    gtk4::glib::timeout_add_local_once(
+                        std::time::Duration::from_millis(200),
+                        move || {
+                            s.input(Msg::ClearYankHighlight);
+                        },
+                    );
+                }
+
+                self.redraw = !self.redraw;
+            }
+            Msg::ClearYankHighlight => {
+                self.engine.borrow_mut().clear_yank_highlight();
                 self.redraw = !self.redraw;
             }
             Msg::Resize => {
@@ -5503,7 +5520,24 @@ fn draw_window(
             line_height,
             rw.scroll_top,
             text_x_offset,
-            theme,
+            theme.selection,
+            theme.selection_alpha,
+        );
+    }
+
+    // Yank highlight (brief flash after yank)
+    if let Some(yh) = &rw.yank_highlight {
+        draw_visual_selection(
+            cr,
+            layout,
+            yh,
+            &rw.lines,
+            rect,
+            line_height,
+            rw.scroll_top,
+            text_x_offset,
+            theme.yank_highlight_bg,
+            theme.yank_highlight_alpha,
         );
     }
 
@@ -5790,11 +5824,12 @@ fn draw_visual_selection(
     line_height: f64,
     scroll_top: usize,
     text_x_offset: f64,
-    theme: &Theme,
+    color: render::Color,
+    alpha: f64,
 ) {
     let visible_lines = lines.len();
-    let (sr, sg, sb) = theme.selection.to_cairo();
-    cr.set_source_rgba(sr, sg, sb, theme.selection_alpha);
+    let (sr, sg, sb) = color.to_cairo();
+    cr.set_source_rgba(sr, sg, sb, alpha);
 
     match sel.kind {
         SelectionKind::Line => {

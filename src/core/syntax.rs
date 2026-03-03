@@ -508,7 +508,15 @@ impl Syntax {
     pub fn new() -> Self {
         Self::new_for_language(SyntaxLanguage::Rust)
     }
+}
 
+impl Default for Syntax {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Syntax {
     #[allow(dead_code)] // Used in tests
     pub fn language(&self) -> SyntaxLanguage {
         self.language

@@ -9,3 +9,9 @@ impl Cursor {
         Self { line: 0, col: 0 }
     }
 }
+
+impl Default for Cursor {
+    fn default() -> Self {
+        Self::new()
+    }
+}

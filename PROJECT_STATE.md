@@ -1,13 +1,69 @@
 # VimCode Project State
 
-**Last updated:** Mar 2, 2026 (Session 107c — Linewise Paste Fix) | **Tests:** 848
+**Last updated:** Mar 2, 2026 (Session 110c — Last-word-of-file yank fix) | **Tests:** 990
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 72 are in **SESSION_HISTORY.md**.
 
 ---
 
+## Testing Policy
+
+**Every new Vim feature and every bug fix MUST have comprehensive integration tests before the work is considered done.** Subtle bugs (register content, cursor position, newline handling, linewise vs. char-mode paste) are only reliably caught by tests. The process is:
+
+1. Write failing tests that document the expected Vim behavior
+2. Implement/fix the feature until all tests pass
+3. Run the full suite (`cargo test`) — no regressions allowed
+
+When implementing a new key/command, add tests covering:
+- Basic happy path
+- Edge cases: start/middle/end of line, start/end of file, empty buffer, count prefix
+- Register content (text and `is_linewise` flag)
+- Cursor position after the operation
+- Interaction with paste (`p`/`P`) to verify the yanked/deleted content behaves correctly
+
+---
+
 ## Recent Work
+
+**Session 110c — Last-word-of-file yank bug fix (4 new tests):**
+Fixed `yw`/`dw` missing the final character when the last word of a file has no trailing newline. Root cause: `move_word_forward()` clamps `pos` to `total_chars - 1` when the end of file is reached, leaving the cursor AT the last char. The `w`-motion range `[start, end_pos)` is exclusive, so it excluded that final char. Fix: in `apply_operator_with_motion`, detect when `end_pos + 1 == total_chars` and the last char is not `\n`, and extend `delete_end` to `total_chars` to include it. 4 tests added: `test_yw_last_word_of_file_no_newline`, `test_yw_only_word_no_newline`, `test_dw_last_word_of_file_no_newline`, `test_yw_last_word_of_last_line_no_newline`.
+
+**Session 110b — Yank Highlight Flash:**
+Implemented Neovim-style visual yank highlight (brief green flash after yank). Changes:
+- `Engine.yank_highlight: Option<(Cursor, Cursor, bool)>` — set at every yank call site (`yank_lines`, `apply_operator_with_motion` y-path, `$`/`0` yank arms, `yank_visual_selection`)
+- `RenderedWindow.yank_highlight: Option<SelectionRange>` — populated in `build_rendered_window` from active window only
+- `Theme.yank_highlight_bg / yank_highlight_alpha` — green `#57d45e` at 0.35 alpha
+- GTK: `draw_visual_selection` now takes explicit `color`/`alpha` params; draws yank highlight after visual selection; `Msg::ClearYankHighlight` + `glib::timeout_add_local_once(200ms)` clears it
+- TUI: same `render_selection` param refactor; `yank_hl_deadline: Option<Instant>` state; poll_timeout caps at deadline; deadline check at loop top calls `engine.clear_yank_highlight()`
+
+**Session 110 — Operator-Motion Coverage (31 new integration tests + 3 bug fixes):**
+Created `tests/operator_motions.rs` with 31 tests covering every `y`/`d` + motion combination. Exposed and fixed 3 bugs:
+
+1. **`yw`/`dw` at end of line included the newline** — `apply_operator_with_motion` now clamps the `w` motion end to before the `\n` when the motion crosses a line boundary. Result: `yw` on last word of line yanks just the word; `dw` leaves the newline.
+2. **`y$`/`d$`/`c$` (to end of line) not implemented** — Added `Some('$')` arm to `handle_operator_motion`. Works for `y`/`d`/`c`.
+3. **`y0`/`d0` (to start of line) not implemented** — Added `Some('0')` arm to `handle_operator_motion`.
+4. **Root cause of original `"ayw` bug** — `y` was incorrectly using `pending_key = Some('y')` instead of `pending_operator = Some('y')`, so `yw`/`yb`/`ye`/`y$` all silently no-oped. Fixed by routing `y` through the operator infrastructure (same as `d`/`c`).
+
+**Session 109 — Vim Feature Completeness (43 new integration tests):**
+Implemented ~20 missing Vim features across 7 groups using strict TDD. Created `tests/vim_features.rs` with 43 integration tests (all passing). All changes in `src/core/engine.rs`.
+
+**Normal mode (Group 1):** `X` (delete before cursor, with count); `g~{motion}`/`g~~` (toggle case); `gu{motion}`/`guu` (lowercase); `gU{motion}`/`gUU` (uppercase) — uses `apply_case_range()` and `apply_case_with_motion()` helpers, case ops added to pending_operator; `gn`/`gN` (visually select next/prev search match via `cmd_gn()`); `cgn` (change next match, repeatable with `.`).
+
+**Visual mode (Group 2):** `o` (swap cursor to other end of selection); `O` (visual block: swap column only); `gv` (reselect last visual selection — saved on visual exit: `last_visual_anchor/cursor/mode` fields).
+
+**Register completeness (Group 3):** `"0` yank-only register (set via `set_yank_register()`); `"1`–`"9` delete history shifting (via `set_delete_register()` for linewise/multi-line deletes); `"-` small-delete register (character deletes < 1 full line); `"%` current filename; `"/` last search pattern; `".` last inserted text — all via updated `get_register_content()`.
+
+**Mark completeness (Group 4):** Uppercase marks `A`–`Z` in `global_marks: HashMap<char, (Option<PathBuf>, usize, usize)>`; special marks `''`/` `` ` `` (last jump pos — `push_jump_location` updated); `'.`/`` `. `` (last edit pos — tracked in `if changed` block); `'<`/`'>` (visual selection extents — saved on visual exit).
+
+**Insert mode (Group 5):** `Ctrl+W` (delete word backward); `Ctrl+T` (indent by shiftwidth); `Ctrl+D` (dedent by shiftwidth) — all added before the match block in `handle_insert_key()`.
+
+**Ex commands (Group 6):** `:g/pat/cmd` and `:v/pat/cmd` (`execute_global_command()` — reverse iteration for correctness); `:d`/`:delete` (delete current line ex command, makes `:g/pat/d` work); `:m[ove] {dest}` (`execute_move_command()`); `:t {dest}`/`:co[py] {dest}` (`execute_copy_command()`); `:sort [n] [r] [u] [i]` (`execute_sort_command()`); `parse_line_address()` helper (handles `.`/`$`/`+N`/`-N`/absolute 0-indexed).
+
+**Change list (Group 7):** `change_list: Vec<(usize,usize)>` + `change_list_pos: usize` fields; `push_change_location()` helper; `g;`/`g,` in pending 'g' key handler; last edit pos tracked on every buffer change.
+
+**Session 108 — Integration Test Suite:**
+Added `[lib]` crate target (`vimcode_core`) enabling integration tests in `tests/`. Created `src/lib.rs` shim (re-exports `Engine`, `EngineAction`, `Mode`, `Cursor`, `View`, `Buffer`, `Settings` — no GTK deps). Added `#[cfg(test)]` guards to `SessionState::save()` and `save_for_workspace()` in `session.rs` to prevent parallel test races on the filesystem. Fixed pre-existing issues exposed by the new lib target: `use crate::LineNumberMode` → `use super::super::settings::LineNumberMode` in `engine.rs` tests; doctest marked `ignore` in `settings.rs`; added `Default` impls to `Cursor` and `Syntax`; changed `unwrap_or_else(Syntax::new)` → `unwrap_or_default()` in `buffer_manager.rs`. Created `tests/common/mod.rs` (shared helpers: `engine_with` resets `Settings::default()` for hermetic tests, `drain_macro_queue` for lazy macro playback, `press`/`ctrl`/`exec`/`search_fwd`/`search_bwd`, assertions). 64 new integration tests across 4 files: `normal_mode.rs` (25 tests: hjkl, word/line motion, gg/G, dd/dw/D/cc/yy/p/P, text objects, named/black-hole registers, undo/redo, marks, macros, indent, dot-repeat), `search.rs` (16 tests: /n/N/wrap, ?backward, */#, not-found message, :s basic/global/case-insensitive/%s/undo, search+cw, multi-line n), `visual_mode.rs` (10 tests: v/V/Ctrl-V entry, yank/delete/change/indent operations), `command_mode.rs` (13 tests: :q/:w/:wq, :set, :norm/%norm, :tabnew, :s substitute). 912 tests total (+64).
 
 **Session 107c — Linewise Paste Fix (yyp):**
 `core/engine.rs`: Added `load_clipboard_for_paste()` method — preserves the `is_linewise` flag on the `'"'` register when the clipboard text matches the current register content (same content = just yanked in VimCode, so keep the linewise flag); uses `is_linewise=false` only for external clipboard content. Previously, both backends unconditionally overwrote `'"'` with `is_linewise=false` before every `p`/`P`, silently turning every linewise yank into a character paste when clipboard sync was active. `main.rs`: Replace the two-line `registers.insert('"', ...) + load_clipboard_register(text)` with the single `load_clipboard_for_paste(text)` call. `tui_main.rs`: Same replacement in `intercept_paste_key`. 3 new tests: `test_load_clipboard_for_paste_preserves_linewise`, `test_load_clipboard_for_paste_clears_linewise_for_foreign_content`, `test_yyp_linewise_via_clipboard_intercept`. 848 tests (+3).

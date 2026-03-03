@@ -247,6 +247,8 @@ pub struct RenderedWindow {
     pub max_col: usize,
     /// Per-line worst diagnostic severity (line index → severity). Used for gutter icons.
     pub diagnostic_gutter: std::collections::HashMap<usize, crate::core::lsp::DiagnosticSeverity>,
+    /// Transient yank-highlight region (flashes briefly after a yank). `None` if no active highlight.
+    pub yank_highlight: Option<SelectionRange>,
 }
 
 // ─── CommandLineData ──────────────────────────────────────────────────────────
@@ -1210,6 +1212,10 @@ pub struct Theme {
     pub search_current_match_bg: Color,
     pub search_match_fg: Color,
 
+    // Yank highlight flash
+    pub yank_highlight_bg: Color,
+    pub yank_highlight_alpha: f64,
+
     // Tab bar
     pub tab_bar_bg: Color,
     pub tab_active_bg: Color,
@@ -1371,6 +1377,10 @@ impl Theme {
 
             // DAP stopped-line (dark amber)
             dap_stopped_bg: Color::from_hex("#3a3000"),
+
+            // Yank highlight flash (green, matching Neovim default)
+            yank_highlight_bg: Color::from_hex("#57d45e"),
+            yank_highlight_alpha: 0.35,
         }
     }
 
@@ -2340,6 +2350,7 @@ fn build_rendered_window(
         cursor: None,
         extra_cursors: vec![],
         selection: None,
+        yank_highlight: None,
         scroll_top: 0,
         scroll_left: 0,
         total_lines: 0,
@@ -2668,6 +2679,30 @@ fn build_rendered_window(
         None
     };
 
+    // Yank highlight (only for active window)
+    let yank_highlight = if is_active {
+        engine.yank_highlight.map(|(start, end, is_linewise)| {
+            let (s, e) = if (start.line, start.col) <= (end.line, end.col) {
+                (start, end)
+            } else {
+                (end, start)
+            };
+            SelectionRange {
+                kind: if is_linewise {
+                    SelectionKind::Line
+                } else {
+                    SelectionKind::Char
+                },
+                start_line: s.line,
+                start_col: s.col,
+                end_line: e.line,
+                end_col: e.col,
+            }
+        })
+    } else {
+        None
+    };
+
     // Maximum line length across the whole buffer. When wrap is on, there is no
     // horizontal scrolling, so we report 0 to suppress the horizontal scrollbar.
     let max_col = if engine.settings.wrap {
@@ -2696,6 +2731,7 @@ fn build_rendered_window(
         cursor,
         extra_cursors,
         selection,
+        yank_highlight,
         scroll_top,
         scroll_left: view.scroll_left,
         total_lines,
