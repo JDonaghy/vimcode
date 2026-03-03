@@ -14314,24 +14314,24 @@ impl Engine {
         } else {
             None
         };
-        if no_server.is_some() {
-            // Show an extension install hint if we have a bundled extension for this language.
-            if let Some((bundle, manifest)) = extensions::find_for_language_id(&lang_id) {
-                let name = bundle.name;
-                if !self.extension_state.is_installed(name)
-                    && !self.extension_state.is_dismissed(name)
-                    && !self.prompted_extensions.contains(name)
-                {
-                    self.prompted_extensions.insert(name.to_string());
-                    self.message = format!(
-                        "No {} extension — :ExtInstall {}  (N to dismiss)",
-                        manifest.display_name, name
-                    );
-                }
-            } else {
-                self.message =
-                    format!("No LSP for {lang_id} — add to lsp_servers in settings.json");
+        // Show extension hint based on VimCode extension state (independent of LSP binary
+        // availability — ext_remove intentionally leaves the binary on disk).
+        if let Some((bundle, manifest)) = extensions::find_for_language_id(&lang_id) {
+            let name = bundle.name;
+            if !self.extension_state.is_installed(name)
+                && !self.extension_state.is_dismissed(name)
+                && !self.prompted_extensions.contains(name)
+            {
+                self.prompted_extensions.insert(name.to_string());
+                self.message = format!(
+                    "No {} extension — :ExtInstall {}  (N to dismiss)",
+                    manifest.display_name, name
+                );
             }
+        } else if no_server.is_some() {
+            // No VimCode extension for this language and no LSP binary found either.
+            self.message =
+                format!("No LSP for {lang_id} — add to lsp_servers in settings.json");
         }
     }
 
