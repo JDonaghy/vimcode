@@ -3525,6 +3525,7 @@ fn handle_mouse(
                         g.active_tab = tab_idx;
                     }
                     engine.active_group = group_id;
+                    engine.line_annotations.clear();
                     if is_close {
                         if engine.dirty() {
                             *close_tab_confirm = true;
@@ -3589,6 +3590,7 @@ fn handle_mouse(
                         let close_col = x + name_width;
                         if local_col >= close_col {
                             engine.active_group_mut().active_tab = i;
+                            engine.line_annotations.clear();
                             if engine.dirty() {
                                 *close_tab_confirm = true;
                             } else {
@@ -3596,6 +3598,7 @@ fn handle_mouse(
                             }
                         } else {
                             engine.active_group_mut().active_tab = i;
+                            engine.line_annotations.clear();
                             if let Some(path) = engine.file_path().cloned() {
                                 sidebar.reveal_path(&path, term_height.saturating_sub(4) as usize);
                             }

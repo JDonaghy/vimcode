@@ -8745,6 +8745,7 @@ fn pixel_to_click_target(
                     if let Some(g) = engine.editor_groups.get_mut(&group_id) {
                         g.active_tab = tab_idx;
                     }
+                    engine.line_annotations.clear();
                     if is_close {
                         return ClickTarget::CloseTab(group_id, tab_idx);
                     }
@@ -8910,6 +8911,7 @@ fn handle_mouse_click(
                 g.active_tab = tab_idx;
             }
             engine.active_group = group_id;
+            engine.line_annotations.clear();
             if engine.dirty() {
                 return true;
             }
