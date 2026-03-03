@@ -128,6 +128,44 @@ pub struct Settings {
     /// Names of plugins that have been explicitly disabled via `:Plugin disable`.
     #[serde(default)]
     pub disabled_plugins: Vec<String>,
+
+    /// Highlight all search matches (default true). Disable with `:set nohlsearch`.
+    #[serde(default = "default_hlsearch")]
+    pub hlsearch: bool,
+
+    /// Case-insensitive search (default false). Enable with `:set ignorecase`.
+    #[serde(default)]
+    pub ignorecase: bool,
+
+    /// Override `ignorecase` when the pattern has an uppercase letter (default false).
+    /// Only has effect when `ignorecase` is also set.
+    #[serde(default)]
+    pub smartcase: bool,
+
+    /// Number of lines to keep visible above/below the cursor (default 0).
+    #[serde(default)]
+    pub scrolloff: usize,
+
+    /// Highlight the line the cursor is on (default false).
+    #[serde(default)]
+    pub cursorline: bool,
+
+    /// Open new horizontal splits below the current window (default false).
+    #[serde(default)]
+    pub splitbelow: bool,
+
+    /// Open new vertical splits to the right of the current window (default false).
+    #[serde(default)]
+    pub splitright: bool,
+
+    /// Comma-separated list of columns to highlight as color columns (e.g. "80,120").
+    /// Empty string means no color columns.
+    #[serde(default)]
+    pub colorcolumn: String,
+
+    /// Auto-wrap inserted text at this column (0 = disabled). Corresponds to Vim's `textwidth`.
+    #[serde(default)]
+    pub textwidth: usize,
 }
 
 fn default_explorer_visible() -> bool {
@@ -159,6 +197,10 @@ fn default_lsp_enabled() -> bool {
 }
 
 fn default_plugins_enabled() -> bool {
+    true
+}
+
+fn default_hlsearch() -> bool {
     true
 }
 
@@ -417,6 +459,15 @@ impl Default for Settings {
             wrap: false,
             plugins_enabled: default_plugins_enabled(),
             disabled_plugins: Vec::new(),
+            hlsearch: default_hlsearch(),
+            ignorecase: false,
+            smartcase: false,
+            scrolloff: 0,
+            cursorline: false,
+            splitbelow: false,
+            splitright: false,
+            colorcolumn: String::new(),
+            textwidth: 0,
         }
     }
 }
@@ -534,9 +585,37 @@ impl Settings {
             EditorMode::Vscode => "mode=vscode",
         };
         let wrap = if self.wrap { "wrap" } else { "nowrap" };
+        let hls = if self.hlsearch {
+            "hlsearch"
+        } else {
+            "nohlsearch"
+        };
+        let ic = if self.ignorecase {
+            "ignorecase"
+        } else {
+            "noignorecase"
+        };
+        let sc = if self.smartcase {
+            "smartcase"
+        } else {
+            "nosmartcase"
+        };
         format!(
-            "{}  {}  ts={}  sw={}  {}  {}  {}  {}  {}",
-            num, et, self.tabstop, self.shift_width, ai, is, lsp, mode, wrap
+            "{}  {}  ts={}  sw={}  {}  {}  {}  {}  {}  {}  {}  {}  so={}  tw={}",
+            num,
+            et,
+            self.tabstop,
+            self.shift_width,
+            ai,
+            is,
+            lsp,
+            mode,
+            wrap,
+            hls,
+            ic,
+            sc,
+            self.scrolloff,
+            self.textwidth
         )
     }
 
@@ -573,6 +652,12 @@ impl Settings {
             "incsearch" | "is" => self.incremental_search = enable,
             "lsp" => self.lsp_enabled = enable,
             "wrap" => self.wrap = enable,
+            "hlsearch" | "hls" => self.hlsearch = enable,
+            "ignorecase" | "ic" => self.ignorecase = enable,
+            "smartcase" | "scs" => self.smartcase = enable,
+            "cursorline" | "cul" => self.cursorline = enable,
+            "splitbelow" | "sb" => self.splitbelow = enable,
+            "splitright" | "spr" => self.splitright = enable,
             _ => return Err(format!("Unknown option: {opt}")),
         }
         Ok(())
@@ -600,6 +685,21 @@ impl Settings {
                 "vscode" => self.editor_mode = EditorMode::Vscode,
                 _ => return Err(format!("Unknown mode '{}' (vim|vscode)", value)),
             },
+            "scrolloff" | "so" => {
+                let n: usize = value
+                    .parse()
+                    .map_err(|_| format!("Invalid value for {name}: '{value}'"))?;
+                self.scrolloff = n;
+            }
+            "colorcolumn" | "cc" => {
+                self.colorcolumn = value.to_string();
+            }
+            "textwidth" | "tw" => {
+                let n: usize = value
+                    .parse()
+                    .map_err(|_| format!("Invalid value for {name}: '{value}'"))?;
+                self.textwidth = n;
+            }
             _ => return Err(format!("Unknown option: {name}")),
         }
         Ok(())
@@ -663,6 +763,39 @@ impl Settings {
             } else {
                 "nowrap".to_string()
             }),
+            "hlsearch" | "hls" => Ok(if self.hlsearch {
+                "hlsearch".to_string()
+            } else {
+                "nohlsearch".to_string()
+            }),
+            "ignorecase" | "ic" => Ok(if self.ignorecase {
+                "ignorecase".to_string()
+            } else {
+                "noignorecase".to_string()
+            }),
+            "smartcase" | "scs" => Ok(if self.smartcase {
+                "smartcase".to_string()
+            } else {
+                "nosmartcase".to_string()
+            }),
+            "scrolloff" | "so" => Ok(format!("scrolloff={}", self.scrolloff)),
+            "cursorline" | "cul" => Ok(if self.cursorline {
+                "cursorline".to_string()
+            } else {
+                "nocursorline".to_string()
+            }),
+            "splitbelow" | "sb" => Ok(if self.splitbelow {
+                "splitbelow".to_string()
+            } else {
+                "nosplitbelow".to_string()
+            }),
+            "splitright" | "spr" => Ok(if self.splitright {
+                "splitright".to_string()
+            } else {
+                "nosplitright".to_string()
+            }),
+            "colorcolumn" | "cc" => Ok(format!("colorcolumn={}", self.colorcolumn)),
+            "textwidth" | "tw" => Ok(format!("textwidth={}", self.textwidth)),
             _ => Err(format!("Unknown option: {opt}")),
         }
     }

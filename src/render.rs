@@ -2781,8 +2781,8 @@ fn build_spans(
         });
     }
 
-    // Search match highlighting
-    if !engine.search_matches.is_empty() {
+    // Search match highlighting (skipped when hlsearch is disabled)
+    if engine.settings.hlsearch && !engine.search_matches.is_empty() {
         let line_start_char = buffer.content.line_to_char(line_idx);
         let line_char_count = line_str.chars().count();
         let line_end_char = line_start_char + line_char_count;

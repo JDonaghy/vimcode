@@ -11,7 +11,7 @@ There's a touch of irony here - using a cli tool to write the editor that I've w
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 990 tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 1045 tests, zero async runtime dependency
 
 
 ## Building
@@ -594,6 +594,15 @@ Runtime changes are written through to `~/.config/vimcode/settings.json` immedia
 | `shiftwidth=N` | `sw` | 4 | Indent width for `>>` / `<<` |
 | `autoindent` / `noautoindent` | `ai` | on | Copy indent from current line on Enter/o/O |
 | `incsearch` / `noincsearch` | `is` | on | Incremental search as you type |
+| `hlsearch` / `nohlsearch` | `hls` | on | Highlight all search matches |
+| `ignorecase` / `noignorecase` | `ic` | off | Case-insensitive search |
+| `smartcase` / `nosmartcase` | `scs` | off | Override `ignorecase` when pattern has uppercase |
+| `scrolloff=N` | `so` | 0 | Lines to keep above/below cursor when scrolling |
+| `cursorline` / `nocursorline` | `cul` | off | Highlight the line the cursor is on |
+| `colorcolumn=N` | `cc` | "" | Comma-list of column guides to highlight |
+| `textwidth=N` | `tw` | 0 | Auto-wrap inserted text at column N (0=off) |
+| `splitbelow` / `nosplitbelow` | `sb` | off | Horizontal splits open below current window |
+| `splitright` / `nosplitright` | `spr` | off | Vertical splits open to right of current window |
 | `lsp` / `nolsp` | | on | Enable/disable LSP language servers |
 | `mode=vim` / `mode=vscode` | | vim | Editor mode (see **VSCode Mode** below) |
 
@@ -731,7 +740,11 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 |-----|--------|
 | `hjkl` | Move left/down/up/right |
 | `w` / `b` / `e` / `ge` | Word forward/back start/end |
+| `W` / `B` / `E` / `gE` | WORD forward/back start/end (whitespace-delimited) |
+| `^` / `g_` | First / last non-blank character of line |
+| `(` / `)` | Sentence backward / forward |
 | `{` / `}` | Paragraph backward/forward |
+| `H` / `M` / `L` | Screen top / middle / bottom |
 | `gg` / `G` | First / last line |
 | `0` / `$` | Line start / end |
 | `f{c}` / `t{c}` | Find / till char (`;` `,` repeat) |
@@ -739,6 +752,7 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `zz` / `zt` / `zb` | Scroll cursor to center / top / bottom |
 | `Ctrl-O` / `Ctrl-I` | Jump list back / forward |
 | `Ctrl-D` / `Ctrl-U` | Half-page down / up |
+| `Ctrl-E` / `Ctrl-Y` | Scroll one line down / up (cursor stays) |
 | `i` / `I` / `a` / `A` | Insert (cursor / line-start / append / line-end) |
 | `o` / `O` | Open line below / above |
 | `x` / `dd` / `D` | Delete char / line / to EOL |
@@ -748,10 +762,17 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `U` | Undo all changes on line |
 | `.` | Repeat last change |
 | `r{c}` | Replace character |
+| `R` | Replace mode — overtype until `Escape` |
 | `~` | Toggle case of char under cursor (count supported) |
 | `J` | Join lines (collapse next line's whitespace to one space) |
+| `gJ` | Join lines without inserting a space |
+| `Ctrl-A` / `Ctrl-X` | Increment / decrement number under cursor |
+| `=` operator | Auto-indent range (`==` current line, `gg=G` whole file) |
+| `]p` / `[p` | Paste after / before with indent adjusted to current line |
 | `>>` / `<<` | Indent / dedent line(s) by `shiftwidth` |
-| `*` / `#` | Search forward / backward for word under cursor |
+| `*` / `#` | Search forward / backward for word under cursor (word-bounded) |
+| `g*` / `g#` | Search forward / backward for word under cursor (partial match) |
+| `gf` | Open file path under cursor |
 | `v` / `V` / `Ctrl-V` | Visual / Visual Line / Visual Block |
 | `/` / `?` | Search forward / backward |
 | `n` / `N` | Next / previous match |
@@ -788,6 +809,8 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | Command | Action |
 |---------|--------|
 | `:w` / `:wq` | Save / save and quit |
+| `:wa` | Write all dirty buffers |
+| `:wqa` / `:xa` | Write all and quit |
 | `:q` / `:q!` / `:qa` / `:qa!` | Quit / force / all / force-all |
 | `:e <file>` | Open file |
 | `:split` / `:vsplit` | Horizontal / vertical split |
@@ -805,6 +828,16 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `:t {dest}` / `:co[py] {dest}` | Copy current line to after line {dest} (0-indexed) |
 | `:sort [n] [r] [u] [i]` | Sort lines: `n`=numeric, `r`=reverse, `u`=unique, `i`=ignorecase |
 | `:set [option]` | Change / query setting |
+| `:noh` / `:nohlsearch` | Clear current search highlight |
+| `:echo {text}` | Display a message in the status bar |
+| `:reg` / `:registers` | Display register contents |
+| `:marks` | Display all set marks |
+| `:jumps` | Display jump list |
+| `:changes` | Display change list |
+| `:history` | Display command history |
+| `:!{cmd}` | Execute shell command and show output |
+| `:r {file}` | Read file contents into buffer after cursor line |
+| `:tabmove [N]` | Move current tab to position N (0-based, default = end) |
 | `:Gdiff` / `:Gstatus` | Git diff / status |
 | `:Gadd` / `:Gadd!` | Stage file / stage all |
 | `:Gcommit <msg>` | Commit |
@@ -862,7 +895,7 @@ src/
 ├── render.rs        (~3125 lines)  Platform-agnostic ScreenLayout bridge (DebugSidebarData, SourceControlData, BottomPanelTabs)
 ├── icons.rs            (~30 lines)  Nerd Font file-type icons (GTK + TUI)
 └── core/            (~29,500 lines)  Zero GTK/rendering deps — fully testable
-    ├── engine.rs    (~28,431 lines)  Orchestrator: keys, commands, git, macros, LSP, DAP, plugins, workspaces
+    ├── engine.rs    (~29,797 lines)  Orchestrator: keys, commands, git, macros, LSP, DAP, plugins, workspaces
     ├── plugin.rs       (~430 lines)  Lua 5.4 plugin manager (mlua vendored; vimcode.* API)
     ├── terminal.rs     (~320 lines)  PTY-backed terminal pane (portable-pty + vt100, history ring buffer)
     ├── lsp.rs        (~2,045 lines)  LSP protocol transport + single-server client (request ID tracking, JSON-RPC framing)
@@ -872,7 +905,7 @@ src/
     ├── project_search.rs (~630 lines)  Regex/case/whole-word search + replace (ignore + regex crates)
     ├── buffer_manager.rs (~600 lines)  Buffer lifecycle, undo/redo stacks
     ├── buffer.rs       (~120 lines)  Rope-based text storage (ropey)
-    ├── settings.rs   (~1,095 lines)  JSON config, :set parsing, key binding notation
+    ├── settings.rs   (~1,262 lines)  JSON config, :set parsing, key binding notation
     ├── session.rs      (~235 lines)  Session state persistence + per-workspace paths
     ├── git.rs        (~1,000 lines)  Git subprocesses: diff, blame, stage_hunk, SC panel, worktrees, git log
     └── window.rs, tab.rs, view.rs, cursor.rs, mode.rs, syntax.rs (~893 lines)

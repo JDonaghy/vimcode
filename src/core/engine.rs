@@ -963,6 +963,10 @@ pub struct Engine {
     /// Region to highlight briefly after a yank operation: (start, end, is_linewise).
     /// Cleared by the UI backend after ~200 ms.
     pub yank_highlight: Option<(Cursor, Cursor, bool)>,
+
+    // --- Insert mode Ctrl+r pending ---
+    /// When true, the next keypress in Insert (or Replace) mode inserts a register's content.
+    pub insert_ctrl_r_pending: bool,
 }
 
 impl Engine {
@@ -1165,6 +1169,7 @@ impl Engine {
             change_list_pos: 0,
             last_inserted_text: String::new(),
             yank_highlight: None,
+            insert_ctrl_r_pending: false,
         };
         // If vscode mode is configured, start in Insert mode (no Normal mode)
         if engine.is_vscode_mode() {
@@ -2900,7 +2905,21 @@ impl Engine {
         if self.settings.wrap && self.view().viewport_cols > 0 {
             self.ensure_cursor_visible_wrap();
         } else {
-            self.view_mut().ensure_cursor_visible();
+            let scrolloff = self.settings.scrolloff;
+            if scrolloff == 0 {
+                self.view_mut().ensure_cursor_visible();
+            } else {
+                let cursor_line = self.view().cursor.line;
+                let viewport_lines = self.view().viewport_lines;
+                let scroll_top = self.view().scroll_top;
+                if cursor_line < scroll_top + scrolloff {
+                    self.view_mut().scroll_top = cursor_line.saturating_sub(scrolloff);
+                } else if viewport_lines > 0
+                    && cursor_line + scrolloff + 1 > scroll_top + viewport_lines
+                {
+                    self.view_mut().scroll_top = cursor_line + scrolloff + 1 - viewport_lines;
+                }
+            }
         }
     }
 
@@ -3405,6 +3424,9 @@ impl Engine {
             Mode::Insert => {
                 self.handle_insert_key(key_name, unicode, ctrl, &mut changed);
             }
+            Mode::Replace => {
+                self.handle_replace_key(key_name, unicode, ctrl, &mut changed);
+            }
             Mode::Command => {
                 action = self.handle_command_key(key_name, unicode, ctrl);
             }
@@ -3673,6 +3695,46 @@ impl Engine {
                     self.open_live_grep();
                     return EngineAction::None;
                 }
+                "e" => {
+                    // Ctrl-E: scroll down one line (cursor stays in place if possible)
+                    let count = self.take_count();
+                    let max_scroll = self.buffer().len_lines().saturating_sub(1);
+                    let new_top = (self.view().scroll_top + count).min(max_scroll);
+                    self.view_mut().scroll_top = new_top;
+                    // Keep cursor visible
+                    let viewport = self.viewport_lines();
+                    if viewport > 0 && self.view().cursor.line < self.view().scroll_top {
+                        self.view_mut().cursor.line = self.view().scroll_top;
+                        self.clamp_cursor_col();
+                    }
+                    return EngineAction::None;
+                }
+                "y" => {
+                    // Ctrl-Y: scroll up one line (cursor stays in place if possible)
+                    let count = self.take_count();
+                    let new_top = self.view().scroll_top.saturating_sub(count);
+                    self.view_mut().scroll_top = new_top;
+                    // Keep cursor visible
+                    let viewport = self.viewport_lines();
+                    if viewport > 0 && self.view().cursor.line >= self.view().scroll_top + viewport
+                    {
+                        self.view_mut().cursor.line = self.view().scroll_top + viewport - 1;
+                        self.clamp_cursor_col();
+                    }
+                    return EngineAction::None;
+                }
+                "a" => {
+                    // Ctrl-A: increment number under cursor
+                    let count = self.take_count();
+                    self.increment_number_at_cursor(count as i64, &mut false);
+                    return EngineAction::None;
+                }
+                "x" => {
+                    // Ctrl-X: decrement number under cursor
+                    let count = self.take_count();
+                    self.increment_number_at_cursor(-(count as i64), &mut false);
+                    return EngineAction::None;
+                }
                 _ => {}
             }
         }
@@ -3855,6 +3917,11 @@ impl Engine {
                 *changed = true;
             }
             Some('0') => self.view_mut().cursor.col = 0,
+            Some('^') => {
+                // ^ : first non-blank character of line
+                let line = self.view().cursor.line;
+                self.view_mut().cursor.col = self.first_non_blank_col(line);
+            }
             Some('$') => {
                 let line = self.view().cursor.line;
                 self.view_mut().cursor.col = self.get_max_cursor_col(line);
@@ -3932,16 +3999,90 @@ impl Engine {
                     self.move_word_forward();
                 }
             }
+            Some('W') => {
+                let count = self.take_count();
+                for _ in 0..count {
+                    self.move_bigword_forward();
+                }
+            }
             Some('b') => {
                 let count = self.take_count();
                 for _ in 0..count {
                     self.move_word_backward();
                 }
             }
+            Some('B') => {
+                let count = self.take_count();
+                for _ in 0..count {
+                    self.move_bigword_backward();
+                }
+            }
             Some('e') => {
                 let count = self.take_count();
                 for _ in 0..count {
                     self.move_word_end();
+                }
+            }
+            Some('E') => {
+                let count = self.take_count();
+                for _ in 0..count {
+                    self.move_bigword_end();
+                }
+            }
+            Some('H') => {
+                // H: jump to top of visible screen
+                let count = self.take_count().max(1);
+                let scroll_top = self.view().scroll_top;
+                let viewport = self.viewport_lines();
+                let max_line = self.buffer().len_lines().saturating_sub(1);
+                let target = (scroll_top + count - 1).min(max_line);
+                let target = target.min(scroll_top + viewport.saturating_sub(1));
+                self.push_jump_location();
+                self.view_mut().cursor.line = target;
+                self.clamp_cursor_col();
+            }
+            Some('M') => {
+                // M: jump to middle of visible screen
+                let scroll_top = self.view().scroll_top;
+                let viewport = self.viewport_lines();
+                let max_line = self.buffer().len_lines().saturating_sub(1);
+                let mid = scroll_top + viewport / 2;
+                self.push_jump_location();
+                self.view_mut().cursor.line = mid.min(max_line);
+                self.clamp_cursor_col();
+            }
+            Some('L') => {
+                // L: jump to bottom of visible screen
+                let count = self.take_count().max(1);
+                let scroll_top = self.view().scroll_top;
+                let viewport = self.viewport_lines();
+                let max_line = self.buffer().len_lines().saturating_sub(1);
+                let target_from_bottom = scroll_top + viewport.saturating_sub(count);
+                self.push_jump_location();
+                self.view_mut().cursor.line = target_from_bottom.min(max_line);
+                self.clamp_cursor_col();
+            }
+            Some('R') => {
+                // R: enter Replace mode
+                self.start_undo_group();
+                self.insert_text_buffer.clear();
+                self.mode = Mode::Replace;
+                self.count = None;
+            }
+            Some('(') => {
+                // (: backward sentence
+                let count = self.take_count();
+                self.push_jump_location();
+                for _ in 0..count {
+                    self.move_sentence_backward();
+                }
+            }
+            Some(')') => {
+                // ): forward sentence
+                let count = self.take_count();
+                self.push_jump_location();
+                for _ in 0..count {
+                    self.move_sentence_forward();
                 }
             }
             Some('f') => {
@@ -4189,6 +4330,10 @@ impl Engine {
                 // < operator: set pending for <<
                 self.pending_operator = Some('<');
             }
+            Some('=') => {
+                // = operator: auto-indent (== indents current line)
+                self.pending_operator = Some('=');
+            }
             Some('u') => {
                 self.undo();
             }
@@ -4385,6 +4530,58 @@ impl Engine {
                         self.move_word_end_backward();
                     }
                 }
+                Some('E') => {
+                    // gE: backward to end of WORD
+                    let count = self.take_count();
+                    for _ in 0..count {
+                        self.move_bigword_end_backward();
+                    }
+                }
+                Some('_') => {
+                    // g_: last non-blank character of line (count: Nth line below)
+                    let count = self.take_count();
+                    let line = (self.view().cursor.line + count - 1)
+                        .min(self.buffer().len_lines().saturating_sub(1));
+                    self.view_mut().cursor.line = line;
+                    self.view_mut().cursor.col = self.last_non_blank_col(line);
+                }
+                Some('*') => {
+                    // g*: forward search for word under cursor (no word boundaries)
+                    let count = self.take_count();
+                    self.push_jump_location();
+                    self.search_word_under_cursor_partial(true);
+                    for _ in 1..count {
+                        self.search_next();
+                    }
+                }
+                Some('#') => {
+                    // g#: backward search for word under cursor (no word boundaries)
+                    let count = self.take_count();
+                    self.push_jump_location();
+                    self.search_word_under_cursor_partial(false);
+                    for _ in 1..count {
+                        self.search_prev();
+                    }
+                }
+                Some('J') => {
+                    // gJ: join lines without inserting space
+                    let count = self.take_count().max(1);
+                    self.push_jump_location();
+                    self.join_lines_no_space(count, changed);
+                }
+                Some('f') => {
+                    // gf: open file path under cursor
+                    if let Some(path) = self.file_path_under_cursor() {
+                        let abs_path = if path.is_absolute() {
+                            path
+                        } else {
+                            self.cwd.join(&path)
+                        };
+                        return EngineAction::OpenFile(abs_path);
+                    } else {
+                        self.message = "No file path under cursor".to_string();
+                    }
+                }
                 Some('t') => {
                     self.next_tab();
                 }
@@ -4495,11 +4692,25 @@ impl Engine {
             ']' => match unicode {
                 Some('c') => self.jump_next_hunk(),
                 Some('d') => self.jump_next_diagnostic(),
+                Some('p') => {
+                    // ]p: paste after with indent matching current line
+                    let count = self.take_count();
+                    for _ in 0..count {
+                        self.paste_after_adjusted_indent(changed);
+                    }
+                }
                 _ => {}
             },
             '[' => match unicode {
                 Some('c') => self.jump_prev_hunk(),
                 Some('d') => self.jump_prev_diagnostic(),
+                Some('p') => {
+                    // [p: paste before with indent matching current line
+                    let count = self.take_count();
+                    for _ in 0..count {
+                        self.paste_before_adjusted_indent(changed);
+                    }
+                }
                 _ => {}
             },
             'd' => {
@@ -4885,6 +5096,23 @@ impl Engine {
                         count,
                         motion: None,
                     });
+                }
+                _ => {
+                    // Cancel operator
+                    self.count = None;
+                }
+            }
+            return EngineAction::None;
+        }
+
+        // Handle auto-indent operator (=)
+        if operator == '=' {
+            match unicode {
+                Some('=') => {
+                    // ==: auto-indent current line(s)
+                    let count = self.take_count();
+                    let line = self.view().cursor.line;
+                    self.auto_indent_lines(line, count, changed);
                 }
                 _ => {
                     // Cancel operator
@@ -5601,6 +5829,55 @@ impl Engine {
             self.completion_candidates.clear();
             self.completion_idx = None;
             self.completion_display_only = false;
+        }
+
+        // Ctrl+R: insert register content at cursor
+        if ctrl && key_name == "r" {
+            self.insert_ctrl_r_pending = true;
+            return;
+        }
+        // When Ctrl+R pending, next char selects the register to insert
+        if self.insert_ctrl_r_pending {
+            self.insert_ctrl_r_pending = false;
+            if let Some(reg_char) = unicode {
+                if let Some((content, _)) = self.get_register_content(reg_char) {
+                    let content_clone = content.clone();
+                    let line = self.view().cursor.line;
+                    let col = self.view().cursor.col;
+                    let char_idx = self.buffer().line_to_char(line) + col;
+                    let char_count = content_clone.chars().count();
+                    self.insert_with_undo(char_idx, &content_clone);
+                    self.view_mut().cursor.col += char_count;
+                    *changed = true;
+                }
+            }
+            return;
+        }
+
+        // Ctrl+U: delete from cursor to start of line
+        if ctrl && key_name == "u" {
+            let line = self.view().cursor.line;
+            let col = self.view().cursor.col;
+            if col > 0 {
+                let line_start = self.buffer().line_to_char(line);
+                let char_idx = line_start + col;
+                self.delete_with_undo(line_start, char_idx);
+                self.view_mut().cursor.col = 0;
+                *changed = true;
+            }
+            return;
+        }
+
+        // Ctrl+O: execute one normal-mode command then return to insert
+        if ctrl && key_name == "o" {
+            // We'll handle this via a pending state — set mode to Normal for one command
+            // After one command, the next handle_key call will restore Insert mode
+            // This is simplified: we just switch modes; full Ctrl+O would track return
+            self.finish_undo_group();
+            self.mode = Mode::Normal;
+            // Note: full re-entry to insert is complex; for now mode returns to Normal.
+            // The user must press i to go back to Insert. Full Ctrl+O support is deferred.
+            return;
         }
 
         // Ctrl+W: delete word backward from cursor
@@ -8888,6 +9165,116 @@ impl Engine {
             return self.execute_copy_command(dest.trim());
         }
 
+        // Handle :! {command} — run a shell command and show output
+        if let Some(shell_cmd_raw) = cmd.strip_prefix('!') {
+            let shell_cmd = shell_cmd_raw.trim();
+            if shell_cmd.is_empty() {
+                self.message = "Usage: :!command".to_string();
+                return EngineAction::None;
+            }
+            match std::process::Command::new("sh")
+                .arg("-c")
+                .arg(shell_cmd)
+                .output()
+            {
+                Ok(output) => {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let combined = if stderr.is_empty() {
+                        stdout.to_string()
+                    } else if stdout.is_empty() {
+                        stderr.to_string()
+                    } else {
+                        format!("{}{}", stdout, stderr)
+                    };
+                    // Show first line in message, rest truncated
+                    let first_line = combined.lines().next().unwrap_or("(no output)");
+                    let total_lines = combined.lines().count();
+                    if total_lines > 1 {
+                        self.message = format!("{} ({} lines)", first_line, total_lines);
+                    } else {
+                        self.message = first_line.to_string();
+                    }
+                }
+                Err(e) => {
+                    self.message = format!("Shell error: {}", e);
+                }
+            }
+            return EngineAction::None;
+        }
+
+        // Handle :r {file} — read file and insert after cursor line
+        if let Some(file_arg) = cmd.strip_prefix("r ").map(|s| s.trim()) {
+            let path = if Path::new(file_arg).is_absolute() {
+                PathBuf::from(file_arg)
+            } else {
+                self.cwd.join(file_arg)
+            };
+            match std::fs::read_to_string(&path) {
+                Ok(content) => {
+                    let line = self.view().cursor.line;
+                    let num_lines = self.buffer().len_lines();
+                    let insert_pos = if line + 1 < num_lines {
+                        self.buffer().line_to_char(line + 1)
+                    } else {
+                        let end = self.buffer().len_chars();
+                        // Ensure there's a newline before inserting
+                        if end > 0 && self.buffer().content.char(end - 1) != '\n' {
+                            self.start_undo_group();
+                            self.insert_with_undo(end, "\n");
+                            self.insert_with_undo(end + 1, &content);
+                            self.finish_undo_group();
+                            let inserted_lines = content.lines().count();
+                            self.message = format!("{} line(s) read", inserted_lines);
+                            return EngineAction::None;
+                        }
+                        end
+                    };
+                    let inserted_lines = content.lines().count();
+                    self.start_undo_group();
+                    self.insert_with_undo(insert_pos, &content);
+                    self.finish_undo_group();
+                    self.message = format!("{} line(s) read", inserted_lines);
+                }
+                Err(e) => {
+                    self.message = format!("Cannot read file: {}", e);
+                }
+            }
+            return EngineAction::None;
+        }
+
+        // Handle :echo {text}
+        if let Some(text) = cmd.strip_prefix("echo ") {
+            self.message = text.trim().trim_matches('"').trim_matches('\'').to_string();
+            return EngineAction::None;
+        }
+        if cmd == "echo" {
+            self.message = String::new();
+            return EngineAction::None;
+        }
+
+        // Handle :tabmove [N] — move current tab to position N (0-based)
+        if cmd == "tabmove" || cmd.starts_with("tabmove ") {
+            let arg = cmd.strip_prefix("tabmove").unwrap_or("").trim();
+            let num_tabs = self.tabs.len();
+            let current = self.active_tab;
+            let dest = if arg.is_empty() {
+                num_tabs.saturating_sub(1) // move to end
+            } else if let Ok(n) = arg.parse::<usize>() {
+                n.min(num_tabs.saturating_sub(1))
+            } else {
+                self.message = "Usage: :tabmove [N]".to_string();
+                return EngineAction::None;
+            };
+            if current != dest && dest < num_tabs {
+                let tab = self.tabs.remove(current);
+                self.tabs.insert(dest, tab);
+                self.active_tab = dest;
+                self.message = format!("Tab moved to position {}", dest);
+            }
+            return EngineAction::None;
+        }
+
         // Handle :N (jump to line number)
         if let Ok(line_num) = cmd.parse::<usize>() {
             let target = if line_num > 0 { line_num - 1 } else { 0 };
@@ -8954,6 +9341,132 @@ impl Engine {
                 }
             }
             "qa!" => EngineAction::Quit,
+            // Write all dirty buffers
+            "wa" => {
+                let saved = self.save_all_dirty();
+                self.message = format!("{} file(s) written", saved);
+                EngineAction::None
+            }
+            // Write all + quit
+            "wqa" | "xa" => {
+                let _ = self.save_all_dirty();
+                EngineAction::Quit
+            }
+            "wqa!" => EngineAction::Quit,
+            // Clear search highlight
+            "noh" | "nohlsearch" => {
+                self.search_matches.clear();
+                self.search_index = None;
+                EngineAction::None
+            }
+            // Display registers
+            "reg" | "registers" => {
+                let mut lines: Vec<String> = Vec::new();
+                lines.push("--- Registers ---".to_string());
+                let special_regs: Vec<char> = vec![
+                    '"', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '-', '+', '*', '.', '%',
+                    '/',
+                ];
+                for &r in &special_regs {
+                    if let Some((content, is_lw)) = self.registers.get(&r).cloned() {
+                        let kind = if is_lw { "l" } else { "c" };
+                        let preview: String = content.chars().take(40).collect();
+                        lines.push(format!(
+                            "\"{}  {}  {}",
+                            r,
+                            kind,
+                            preview.replace('\n', "\\n")
+                        ));
+                    }
+                }
+                for c in 'a'..='z' {
+                    if let Some((content, is_lw)) = self.registers.get(&c).cloned() {
+                        let kind = if is_lw { "l" } else { "c" };
+                        let preview: String = content.chars().take(40).collect();
+                        lines.push(format!(
+                            "\"{}  {}  {}",
+                            c,
+                            kind,
+                            preview.replace('\n', "\\n")
+                        ));
+                    }
+                }
+                self.message = lines.join("\n");
+                EngineAction::None
+            }
+            // Display marks
+            "marks" => {
+                let buf_id = self.active_buffer_id();
+                let mut lines: Vec<String> = Vec::new();
+                lines.push("mark line  col  file/text".to_string());
+                if let Some(marks_map) = self.marks.get(&buf_id).cloned() {
+                    let mut sorted: Vec<(char, Cursor)> = marks_map.into_iter().collect();
+                    sorted.sort_by_key(|(c, _)| *c);
+                    for (c, cur) in sorted {
+                        lines.push(format!(" {}   {:4}  {:3}", c, cur.line + 1, cur.col));
+                    }
+                }
+                for (c, (path, line, col)) in &self.global_marks {
+                    let path_str = path
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    lines.push(format!(" {}   {:4}  {:3}  {}", c, line + 1, col, path_str));
+                }
+                self.message = lines.join("\n");
+                EngineAction::None
+            }
+            // Display jump list
+            "jumps" => {
+                let mut lines: Vec<String> = Vec::new();
+                lines.push(" jump line  col  file/text".to_string());
+                for (i, (path, line, col)) in self.jump_list.iter().enumerate() {
+                    let marker = if i == self.jump_list_pos { ">" } else { " " };
+                    let path_str = path
+                        .as_ref()
+                        .map(|p| {
+                            p.file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_default()
+                        })
+                        .unwrap_or_default();
+                    lines.push(format!(
+                        "{} {:4}  {:4}  {:3}  {}",
+                        marker,
+                        i,
+                        line + 1,
+                        col,
+                        path_str
+                    ));
+                }
+                self.message = lines.join("\n");
+                EngineAction::None
+            }
+            // Display change list
+            "changes" => {
+                let mut lines: Vec<String> = Vec::new();
+                lines.push("change line  col".to_string());
+                for (i, (line, col)) in self.change_list.iter().enumerate() {
+                    let marker = if i + 1 == self.change_list_pos {
+                        ">"
+                    } else {
+                        " "
+                    };
+                    lines.push(format!("{} {:4}  {:4}  {:3}", marker, i, line + 1, col));
+                }
+                self.message = lines.join("\n");
+                EngineAction::None
+            }
+            // Display command history
+            "history" => {
+                let mut lines: Vec<String> = Vec::new();
+                lines.push("--- Command History ---".to_string());
+                for (i, cmd) in self.session.command_history.iter().enumerate() {
+                    lines.push(format!("{:4}  {}", i + 1, cmd));
+                }
+                self.message = lines.join("\n");
+                EngineAction::None
+            }
             // Menu/button "Quit" — asks UI to confirm when there are unsaved changes.
             "quit_menu" | "QuitMenu" => {
                 if self.has_any_unsaved() {
@@ -9611,15 +10124,34 @@ impl Engine {
         }
 
         let text = self.buffer().to_string();
-        let query = &self.search_query;
-        let mut byte_pos = 0;
-        while let Some(found) = text[byte_pos..].find(query) {
-            let start_byte = byte_pos + found;
-            let end_byte = start_byte + query.len();
-            let start_char = self.buffer().content.byte_to_char(start_byte);
-            let end_char = self.buffer().content.byte_to_char(end_byte);
-            self.search_matches.push((start_char, end_char));
-            byte_pos = start_byte + 1;
+        let query_orig = self.search_query.clone();
+
+        // Apply ignorecase / smartcase
+        let case_insensitive = self.settings.ignorecase
+            && !(self.settings.smartcase && query_orig.chars().any(|c| c.is_uppercase()));
+
+        if case_insensitive {
+            let text_lower = text.to_lowercase();
+            let query_lower = query_orig.to_lowercase();
+            let mut byte_pos = 0;
+            while let Some(found) = text_lower[byte_pos..].find(&query_lower) {
+                let start_byte = byte_pos + found;
+                let end_byte = start_byte + query_lower.len();
+                let start_char = self.buffer().content.byte_to_char(start_byte);
+                let end_char = self.buffer().content.byte_to_char(end_byte);
+                self.search_matches.push((start_char, end_char));
+                byte_pos = start_byte + 1;
+            }
+        } else {
+            let mut byte_pos = 0;
+            while let Some(found) = text[byte_pos..].find(query_orig.as_str()) {
+                let start_byte = byte_pos + found;
+                let end_byte = start_byte + query_orig.len();
+                let start_char = self.buffer().content.byte_to_char(start_byte);
+                let end_char = self.buffer().content.byte_to_char(end_byte);
+                self.search_matches.push((start_char, end_char));
+                byte_pos = start_byte + 1;
+            }
         }
 
         if self.search_matches.is_empty() {
@@ -10070,6 +10602,838 @@ impl Engine {
         self.view_mut().cursor.col = pos - line_start;
     }
 
+    // --- WORD motions (whitespace-delimited) ---
+
+    fn move_bigword_forward(&mut self) {
+        let total_chars = self.buffer().len_chars();
+        let line = self.view().cursor.line;
+        let col = self.view().cursor.col;
+        let mut pos = self.buffer().line_to_char(line) + col;
+
+        if pos >= total_chars {
+            return;
+        }
+
+        // Skip current WORD (non-whitespace)
+        while pos < total_chars && !self.buffer().content.char(pos).is_whitespace() {
+            pos += 1;
+        }
+        // Skip whitespace
+        while pos < total_chars && self.buffer().content.char(pos).is_whitespace() {
+            pos += 1;
+        }
+
+        if pos >= total_chars {
+            pos = total_chars.saturating_sub(1);
+        }
+
+        let new_line = self.buffer().content.char_to_line(pos);
+        let line_start = self.buffer().line_to_char(new_line);
+        self.view_mut().cursor.line = new_line;
+        self.view_mut().cursor.col = pos - line_start;
+    }
+
+    fn move_bigword_backward(&mut self) {
+        let line = self.view().cursor.line;
+        let col = self.view().cursor.col;
+        let mut pos = self.buffer().line_to_char(line) + col;
+
+        if pos == 0 {
+            return;
+        }
+        pos -= 1;
+
+        // Skip whitespace backward
+        while pos > 0 && self.buffer().content.char(pos).is_whitespace() {
+            pos -= 1;
+        }
+
+        // Skip WORD backward (non-whitespace)
+        while pos > 0 && !self.buffer().content.char(pos - 1).is_whitespace() {
+            pos -= 1;
+        }
+
+        let new_line = self.buffer().content.char_to_line(pos);
+        let line_start = self.buffer().line_to_char(new_line);
+        self.view_mut().cursor.line = new_line;
+        self.view_mut().cursor.col = pos - line_start;
+    }
+
+    fn move_bigword_end(&mut self) {
+        let total_chars = self.buffer().len_chars();
+        let line = self.view().cursor.line;
+        let col = self.view().cursor.col;
+        let mut pos = self.buffer().line_to_char(line) + col;
+
+        if pos >= total_chars {
+            return;
+        }
+
+        // If next char is whitespace or we're at end of WORD, advance first
+        let at_end = pos + 1 >= total_chars || self.buffer().content.char(pos + 1).is_whitespace();
+        if at_end || self.buffer().content.char(pos).is_whitespace() {
+            pos += 1;
+            while pos < total_chars && self.buffer().content.char(pos).is_whitespace() {
+                pos += 1;
+            }
+        }
+
+        if pos >= total_chars {
+            pos = total_chars - 1;
+        }
+
+        // Move to end of current WORD
+        while pos + 1 < total_chars && !self.buffer().content.char(pos + 1).is_whitespace() {
+            pos += 1;
+        }
+
+        let new_line = self.buffer().content.char_to_line(pos);
+        let line_start = self.buffer().line_to_char(new_line);
+        self.view_mut().cursor.line = new_line;
+        self.view_mut().cursor.col = pos - line_start;
+    }
+
+    fn move_bigword_end_backward(&mut self) {
+        let line = self.view().cursor.line;
+        let col = self.view().cursor.col;
+        let mut pos = self.buffer().line_to_char(line) + col;
+
+        if pos == 0 {
+            return;
+        }
+        pos -= 1;
+
+        // Skip whitespace backward
+        while pos > 0 && self.buffer().content.char(pos).is_whitespace() {
+            pos -= 1;
+        }
+
+        if pos == 0 {
+            let new_line = self.buffer().content.char_to_line(pos);
+            let line_start = self.buffer().line_to_char(new_line);
+            self.view_mut().cursor.line = new_line;
+            self.view_mut().cursor.col = pos - line_start;
+            return;
+        }
+
+        // Skip non-whitespace backward to start of WORD
+        while pos > 0 && !self.buffer().content.char(pos - 1).is_whitespace() {
+            pos -= 1;
+        }
+
+        // We now point to start of a WORD; go back one more
+        if pos == 0 {
+            return;
+        }
+        pos -= 1;
+
+        // Skip whitespace backward
+        while pos > 0 && self.buffer().content.char(pos).is_whitespace() {
+            pos -= 1;
+        }
+
+        let new_line = self.buffer().content.char_to_line(pos);
+        let line_start = self.buffer().line_to_char(new_line);
+        self.view_mut().cursor.line = new_line;
+        self.view_mut().cursor.col = pos - line_start;
+    }
+
+    // --- First/last non-blank column helpers ---
+
+    fn first_non_blank_col(&self, line: usize) -> usize {
+        if line >= self.buffer().len_lines() {
+            return 0;
+        }
+        let line_start = self.buffer().line_to_char(line);
+        let line_len = self.buffer().line_len_chars(line);
+        for i in 0..line_len {
+            let ch = self.buffer().content.char(line_start + i);
+            if ch != ' ' && ch != '\t' && ch != '\n' && ch != '\r' {
+                return i;
+            }
+        }
+        0
+    }
+
+    fn last_non_blank_col(&self, line: usize) -> usize {
+        if line >= self.buffer().len_lines() {
+            return 0;
+        }
+        let line_start = self.buffer().line_to_char(line);
+        let line_len = self.buffer().line_len_chars(line);
+        let mut last = 0usize;
+        for i in 0..line_len {
+            let ch = self.buffer().content.char(line_start + i);
+            if ch != '\n' && ch != '\r' && !ch.is_whitespace() {
+                last = i;
+            }
+        }
+        last
+    }
+
+    // --- Sentence motions ---
+
+    fn move_sentence_forward(&mut self) {
+        let total_chars = self.buffer().len_chars();
+        let line = self.view().cursor.line;
+        let col = self.view().cursor.col;
+        let mut pos = self.buffer().line_to_char(line) + col;
+
+        if pos >= total_chars {
+            return;
+        }
+
+        // Advance past current position
+        pos += 1;
+
+        // Look for sentence end: '.', '!', or '?' followed by optional closing
+        // brackets/quotes, then whitespace
+        while pos < total_chars {
+            let ch = self.buffer().content.char(pos.saturating_sub(1));
+            if matches!(ch, '.' | '!' | '?') {
+                // Skip closing brackets/quotes
+                while pos < total_chars
+                    && matches!(self.buffer().content.char(pos), ')' | ']' | '"' | '\'')
+                {
+                    pos += 1;
+                }
+                // Need at least one whitespace after
+                if pos < total_chars && self.buffer().content.char(pos).is_whitespace() {
+                    // Skip whitespace to land on first char of next sentence
+                    while pos < total_chars && self.buffer().content.char(pos).is_whitespace() {
+                        pos += 1;
+                    }
+                    break;
+                }
+            }
+            // Empty line also ends a sentence
+            if ch == '\n' && pos < total_chars && self.buffer().content.char(pos) == '\n' {
+                pos += 1;
+                while pos < total_chars && self.buffer().content.char(pos) == '\n' {
+                    pos += 1;
+                }
+                break;
+            }
+            pos += 1;
+        }
+
+        if pos >= total_chars {
+            pos = total_chars.saturating_sub(1);
+        }
+
+        let new_line = self.buffer().content.char_to_line(pos);
+        let line_start = self.buffer().line_to_char(new_line);
+        self.view_mut().cursor.line = new_line;
+        self.view_mut().cursor.col = pos - line_start;
+    }
+
+    fn move_sentence_backward(&mut self) {
+        let line = self.view().cursor.line;
+        let col = self.view().cursor.col;
+        let mut pos = self.buffer().line_to_char(line) + col;
+
+        if pos == 0 {
+            return;
+        }
+
+        // Step back to skip current whitespace / sentence start
+        pos = pos.saturating_sub(1);
+        while pos > 0 && self.buffer().content.char(pos).is_whitespace() {
+            pos -= 1;
+        }
+
+        // Now find the sentence boundary going backward
+        while pos > 0 {
+            let ch = self.buffer().content.char(pos.saturating_sub(1));
+            if matches!(ch, '.' | '!' | '?') {
+                // Skip forward past whitespace to land on sentence start
+                break;
+            }
+            // Empty line also signals boundary
+            if ch == '\n' && pos > 0 && self.buffer().content.char(pos.saturating_sub(1)) == '\n' {
+                break;
+            }
+            pos -= 1;
+        }
+
+        // Skip any leading whitespace at new position
+        while pos < self.buffer().len_chars()
+            && self.buffer().content.char(pos).is_whitespace()
+            && self.buffer().content.char(pos) != '\n'
+        {
+            pos += 1;
+        }
+
+        let new_line = self.buffer().content.char_to_line(pos);
+        let line_start = self.buffer().line_to_char(new_line);
+        self.view_mut().cursor.line = new_line;
+        self.view_mut().cursor.col = pos - line_start;
+    }
+
+    // --- Number increment/decrement (Ctrl+a / Ctrl+x) ---
+
+    fn increment_number_at_cursor(&mut self, delta: i64, changed: &mut bool) {
+        let line = self.view().cursor.line;
+        let col = self.view().cursor.col;
+        let line_start = self.buffer().line_to_char(line);
+        let line_len = self.buffer().line_len_chars(line);
+
+        let line_text: String = self.buffer().content.line(line).chars().collect();
+        let chars: Vec<char> = line_text.chars().collect();
+
+        // Find number at or after cursor
+        // First, look for a digit at or after current col
+        let mut num_start = None;
+        let mut num_end = 0;
+
+        // Check if we're inside a number already
+        let search_start = col;
+        for i in search_start..chars.len() {
+            if chars[i].is_ascii_digit() {
+                // Find start of this number (walk back)
+                let mut s = i;
+                // Check for hex prefix (0x)
+                if s > 0 && chars[s - 1] == 'x' && s > 1 && chars[s - 2] == '0' {
+                    s -= 2;
+                } else if s > 0 && chars[s - 1] == '-' {
+                    // Could be negative
+                }
+                // Find exact start: walk back from i
+                let mut start = i;
+                while start > 0
+                    && (chars[start - 1].is_ascii_digit()
+                        || (start >= 2 && chars[start - 1] == 'x' && chars[start - 2] == '0'))
+                {
+                    start -= 1;
+                }
+                // Check negative sign
+                if start > 0 && chars[start - 1] == '-' {
+                    start -= 1;
+                }
+                // Find end
+                let mut end = i;
+                while end < chars.len() && chars[end].is_ascii_hexdigit() {
+                    end += 1;
+                }
+                let _ = s;
+                num_start = Some(start);
+                num_end = end;
+                break;
+            }
+        }
+
+        let start_col = match num_start {
+            Some(s) => s,
+            None => {
+                self.message = "No number under cursor".to_string();
+                return;
+            }
+        };
+
+        let num_str: String = chars[start_col..num_end].iter().collect();
+        let trimmed = num_str.trim_start_matches('-');
+        let negative = num_str.starts_with('-');
+
+        // Parse the number
+        let (value, radix, prefix_len): (i64, u32, usize) =
+            if trimmed.starts_with("0x") || trimmed.starts_with("0X") {
+                let v = i64::from_str_radix(&trimmed[2..], 16).unwrap_or(0);
+                let v = if negative { -v } else { v };
+                (v, 16, if negative { 3 } else { 2 })
+            } else if trimmed.starts_with('0')
+                && trimmed.len() > 1
+                && trimmed.chars().all(|c| c.is_ascii_digit())
+            {
+                let v = i64::from_str_radix(trimmed, 8).unwrap_or(0);
+                let v = if negative { -v } else { v };
+                (v, 8, 0)
+            } else {
+                let v: i64 = num_str.parse().unwrap_or(0);
+                (v, 10, 0)
+            };
+
+        let new_value = value + delta;
+
+        // Format new value preserving radix and padding
+        let new_str = if radix == 16 {
+            let prefix = if negative { "-0x" } else { "0x" };
+            let digits = trimmed.len() - prefix_len; // digit count
+            format!(
+                "{}{:0>width$x}",
+                prefix,
+                new_value.unsigned_abs(),
+                width = digits
+            )
+        } else if radix == 8 {
+            format!("{:o}", new_value)
+        } else {
+            format!("{}", new_value)
+        };
+
+        // Replace in buffer
+        let del_start = line_start + start_col;
+        let del_end = line_start + num_end.min(line_len);
+        self.start_undo_group();
+        self.delete_with_undo(del_start, del_end);
+        self.insert_with_undo(del_start, &new_str);
+        self.finish_undo_group();
+
+        // Position cursor at end of new number
+        self.view_mut().cursor.col = start_col + new_str.chars().count().saturating_sub(1);
+        *changed = true;
+    }
+
+    // --- Auto-indent lines (= operator) ---
+
+    fn auto_indent_lines(&mut self, line: usize, count: usize, changed: &mut bool) {
+        let total_lines = self.buffer().len_lines();
+        let end_line = (line + count).min(total_lines);
+        if line >= total_lines {
+            return;
+        }
+
+        let sw = self.settings.shift_width as usize;
+
+        self.start_undo_group();
+
+        for l in line..end_line {
+            let cur_indent = self.get_line_indent_str(l);
+            // Compute desired indent based on previous non-empty line
+            let desired_indent = if l == 0 {
+                String::new()
+            } else {
+                // Find last non-empty line above
+                let mut prev = l;
+                loop {
+                    if prev == 0 {
+                        break String::new();
+                    }
+                    prev -= 1;
+                    if !self.is_line_empty(prev) {
+                        let prev_indent = self.get_line_indent_str(prev);
+                        // Check if prev line ends with '{', '(', or '[' — increase indent
+                        let prev_text: String = self.buffer().content.line(prev).chars().collect();
+                        let prev_trimmed = prev_text.trim_end_matches(['\n', '\r']);
+                        if prev_trimmed.ends_with('{')
+                            || prev_trimmed.ends_with('(')
+                            || prev_trimmed.ends_with('[')
+                        {
+                            let extra = if self.settings.expand_tab {
+                                " ".repeat(sw)
+                            } else {
+                                "\t".to_string()
+                            };
+                            break format!("{}{}", prev_indent, extra);
+                        }
+                        // Check if current line starts with '}', ')', ']' — decrease indent
+                        let cur_text: String = self.buffer().content.line(l).chars().collect();
+                        let cur_trimmed = cur_text.trim_start_matches([' ', '\t']);
+                        if cur_trimmed.starts_with('}')
+                            || cur_trimmed.starts_with(')')
+                            || cur_trimmed.starts_with(']')
+                        {
+                            let indent_len = prev_indent.len().saturating_sub(sw);
+                            break " ".repeat(indent_len);
+                        }
+                        break prev_indent;
+                    }
+                }
+            };
+
+            if desired_indent != cur_indent {
+                let line_start = self.buffer().line_to_char(l);
+                let cur_indent_len = cur_indent.chars().count();
+                // Remove old indent
+                if cur_indent_len > 0 {
+                    self.delete_with_undo(line_start, line_start + cur_indent_len);
+                }
+                // Insert new indent
+                if !desired_indent.is_empty() {
+                    self.insert_with_undo(line_start, &desired_indent);
+                }
+            }
+        }
+
+        self.finish_undo_group();
+        self.clamp_cursor_col();
+        *changed = true;
+    }
+
+    // --- WORD text object (iW / aW) ---
+
+    fn find_bigword_object(&self, modifier: char, cursor_pos: usize) -> Option<(usize, usize)> {
+        let total_chars = self.buffer().len_chars();
+        if cursor_pos >= total_chars {
+            return None;
+        }
+
+        let char_at_cursor = self.buffer().content.char(cursor_pos);
+
+        // If on whitespace and modifier is 'i', no match
+        if modifier == 'i' && char_at_cursor.is_whitespace() {
+            return None;
+        }
+
+        let mut start = cursor_pos;
+        let mut end = cursor_pos;
+
+        // Expand backward to start of WORD (non-whitespace)
+        while start > 0 && !self.buffer().content.char(start - 1).is_whitespace() {
+            start -= 1;
+        }
+
+        // Expand forward to end of WORD
+        while end < total_chars && !self.buffer().content.char(end).is_whitespace() {
+            end += 1;
+        }
+
+        // For 'aW', include trailing whitespace
+        if modifier == 'a' {
+            while end < total_chars {
+                let ch = self.buffer().content.char(end);
+                if !ch.is_whitespace() || ch == '\n' {
+                    break;
+                }
+                end += 1;
+            }
+        }
+
+        if start < end {
+            Some((start, end))
+        } else {
+            None
+        }
+    }
+
+    // --- gJ: join lines without inserting space ---
+
+    fn join_lines_no_space(&mut self, count: usize, changed: &mut bool) {
+        let total_lines = self.buffer().len_lines();
+        let start_line = self.view().cursor.line;
+        let joins = count.min(total_lines.saturating_sub(start_line + 1));
+        if joins == 0 {
+            return;
+        }
+
+        self.start_undo_group();
+        for _ in 0..joins {
+            let cur_line = self.view().cursor.line;
+            let next_line = cur_line + 1;
+            if next_line >= self.buffer().len_lines() {
+                break;
+            }
+
+            let cur_line_len = self.buffer().line_len_chars(cur_line);
+            let cur_line_start = self.buffer().line_to_char(cur_line);
+            let newline_pos = cur_line_start + cur_line_len - 1;
+
+            // Count leading whitespace on next line
+            let next_line_content: String = self.buffer().content.line(next_line).chars().collect();
+            let leading_ws = next_line_content
+                .chars()
+                .take_while(|c| *c == ' ' || *c == '\t')
+                .count();
+
+            // Delete newline + all leading whitespace of next line (no space inserted)
+            let next_line_start = self.buffer().line_to_char(next_line);
+            let del_end = next_line_start + leading_ws;
+            self.delete_with_undo(newline_pos, del_end);
+        }
+        self.finish_undo_group();
+
+        self.clamp_cursor_col();
+        *changed = true;
+    }
+
+    // --- gf: open file path under cursor ---
+
+    fn file_path_under_cursor(&self) -> Option<std::path::PathBuf> {
+        let line = self.view().cursor.line;
+        let col = self.view().cursor.col;
+        let total_chars = self.buffer().len_chars();
+        let line_start = self.buffer().line_to_char(line);
+        let line_len = self.buffer().line_len_chars(line);
+
+        let line_text: String = self.buffer().content.line(line).chars().collect();
+        let chars: Vec<char> = line_text.chars().collect();
+
+        // Find boundaries of path-like token at cursor (non-whitespace, non-quote chars)
+        let is_path_char = |c: char| {
+            !c.is_whitespace() && c != '"' && c != '\'' && c != ':' && c != ',' && c != ';'
+        };
+
+        let _ = total_chars;
+        let _ = line_len;
+
+        let mut start = col;
+        let mut end = col;
+
+        while start > 0 && is_path_char(chars[start - 1]) {
+            start -= 1;
+        }
+        while end < chars.len() && is_path_char(chars[end]) {
+            end += 1;
+        }
+        // Strip trailing newline chars
+        while end > start && (chars[end - 1] == '\n' || chars[end - 1] == '\r') {
+            end -= 1;
+        }
+
+        if start >= end {
+            return None;
+        }
+
+        let _ = line_start;
+        let path_str: String = chars[start..end].iter().collect();
+        if path_str.is_empty() {
+            return None;
+        }
+
+        let path = std::path::PathBuf::from(&path_str);
+
+        // Try relative to workspace root, then to current file's dir
+        if path.is_absolute() {
+            if path.exists() {
+                return Some(path);
+            }
+        } else {
+            if let Some(ref root) = self.workspace_root {
+                let abs = root.join(&path);
+                if abs.exists() {
+                    return Some(abs);
+                }
+            }
+            if let Some(file_path) = self.active_buffer_state().file_path.as_ref() {
+                if let Some(dir) = file_path.parent() {
+                    let abs = dir.join(&path);
+                    if abs.exists() {
+                        return Some(abs);
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    // --- g* / g#: partial word search ---
+
+    fn search_word_under_cursor_partial(&mut self, forward: bool) {
+        let word = match self.word_under_cursor() {
+            Some(w) => w,
+            None => {
+                self.message = "No word under cursor".to_string();
+                return;
+            }
+        };
+
+        self.search_query = word.clone();
+        self.search_direction = if forward {
+            SearchDirection::Forward
+        } else {
+            SearchDirection::Backward
+        };
+        self.search_word_bounded = false;
+
+        // Use plain text search (no word boundaries)
+        self.run_search();
+
+        if self.search_matches.is_empty() {
+            self.message = format!("Pattern not found: {}", word);
+            return;
+        }
+
+        if forward {
+            self.search_next();
+        } else {
+            self.search_prev();
+        }
+    }
+
+    // --- ]p / [p: paste with indent adjustment ---
+
+    fn paste_after_adjusted_indent(&mut self, changed: &mut bool) {
+        let reg = self.active_register();
+        let (content, is_linewise) = match self.get_register_content(reg) {
+            Some(pair) => pair,
+            None => {
+                self.clear_selected_register();
+                return;
+            }
+        };
+
+        if !is_linewise {
+            // For characterwise, just paste normally
+            self.paste_after(changed);
+            return;
+        }
+
+        let cur_line = self.view().cursor.line;
+        let cur_indent = self.get_line_indent_str(cur_line);
+        let sw = self.settings.shift_width as usize;
+
+        // Adjust each pasted line's indent to match current line
+        let adjusted = self.adjust_paste_indent(&content, &cur_indent, sw);
+
+        self.start_undo_group();
+        let line_end =
+            self.buffer().line_to_char(cur_line) + self.buffer().line_len_chars(cur_line);
+        let last_char = if self.buffer().line_len_chars(cur_line) > 0 {
+            self.buffer().content.char(line_end - 1)
+        } else {
+            '\0'
+        };
+        if last_char == '\n' {
+            self.insert_with_undo(line_end, &adjusted);
+        } else {
+            let s = format!("\n{}", adjusted);
+            self.insert_with_undo(line_end, &s);
+        }
+        self.view_mut().cursor.line += 1;
+        self.view_mut().cursor.col = 0;
+        self.finish_undo_group();
+        self.clear_selected_register();
+        *changed = true;
+    }
+
+    fn paste_before_adjusted_indent(&mut self, changed: &mut bool) {
+        let reg = self.active_register();
+        let (content, is_linewise) = match self.get_register_content(reg) {
+            Some(pair) => pair,
+            None => {
+                self.clear_selected_register();
+                return;
+            }
+        };
+
+        if !is_linewise {
+            self.paste_before(changed);
+            return;
+        }
+
+        let cur_line = self.view().cursor.line;
+        let cur_indent = self.get_line_indent_str(cur_line);
+        let sw = self.settings.shift_width as usize;
+
+        let adjusted = self.adjust_paste_indent(&content, &cur_indent, sw);
+
+        self.start_undo_group();
+        let line_start = self.buffer().line_to_char(cur_line);
+        self.insert_with_undo(line_start, &adjusted);
+        self.view_mut().cursor.col = 0;
+        self.finish_undo_group();
+        self.clear_selected_register();
+        *changed = true;
+    }
+
+    /// Adjust each line's indentation in `text` to match `target_indent`.
+    fn adjust_paste_indent(&self, text: &str, target_indent: &str, sw: usize) -> String {
+        let _ = sw;
+        let lines: Vec<&str> = text.lines().collect();
+        if lines.is_empty() {
+            return text.to_string();
+        }
+
+        // Determine the minimum indent of pasted content
+        let min_indent = lines
+            .iter()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| l.len() - l.trim_start().len())
+            .min()
+            .unwrap_or(0);
+
+        let mut result = String::new();
+        for (i, l) in lines.iter().enumerate() {
+            let cur_indent_len = l.len() - l.trim_start().len();
+            let excess = cur_indent_len.saturating_sub(min_indent);
+            let extra = " ".repeat(excess);
+            let new_line = format!("{}{}{}", target_indent, extra, l.trim_start());
+            result.push_str(&new_line);
+            if i + 1 < lines.len() || text.ends_with('\n') {
+                result.push('\n');
+            }
+        }
+        result
+    }
+
+    // --- Replace mode key handler ---
+
+    fn handle_replace_key(
+        &mut self,
+        key_name: &str,
+        unicode: Option<char>,
+        ctrl: bool,
+        changed: &mut bool,
+    ) {
+        let _ = ctrl;
+        match key_name {
+            "Escape" => {
+                self.mode = Mode::Normal;
+                self.clamp_cursor_col();
+            }
+            "BackSpace" => {
+                // In replace mode, backspace just moves cursor back (simplified)
+                self.move_left();
+            }
+            "Left" => self.move_left(),
+            "Right" => self.move_right(),
+            "Up" => {
+                if self.view().cursor.line > 0 {
+                    self.view_mut().cursor.line -= 1;
+                    self.clamp_cursor_col();
+                }
+            }
+            "Down" => {
+                let max_line = self.buffer().len_lines().saturating_sub(1);
+                if self.view().cursor.line < max_line {
+                    self.view_mut().cursor.line += 1;
+                    self.clamp_cursor_col();
+                }
+            }
+            _ => {
+                if let Some(ch) = unicode {
+                    let line = self.view().cursor.line;
+                    let col = self.view().cursor.col;
+                    let line_len = self.buffer().line_len_chars(line);
+                    let char_idx = self.buffer().line_to_char(line) + col;
+
+                    // At or beyond end of line: just insert (like insert mode)
+                    let line_content_len = if line_len > 0 {
+                        let last = self
+                            .buffer()
+                            .content
+                            .char(self.buffer().line_to_char(line) + line_len - 1);
+                        if last == '\n' {
+                            line_len - 1
+                        } else {
+                            line_len
+                        }
+                    } else {
+                        0
+                    };
+
+                    self.start_undo_group();
+                    if col < line_content_len {
+                        // Overwrite: delete one char, insert replacement
+                        self.delete_with_undo(char_idx, char_idx + 1);
+                        let mut buf = [0u8; 4];
+                        let s = ch.encode_utf8(&mut buf);
+                        self.insert_with_undo(char_idx, s);
+                        self.view_mut().cursor.col += 1;
+                    } else {
+                        // Past end of line: insert
+                        let mut buf = [0u8; 4];
+                        let s = ch.encode_utf8(&mut buf);
+                        self.insert_with_undo(char_idx, s);
+                        self.view_mut().cursor.col += 1;
+                    }
+                    self.finish_undo_group();
+                    *changed = true;
+                }
+            }
+        }
+    }
+
     // --- Paragraph motions ---
 
     fn move_paragraph_forward(&mut self) {
@@ -10351,6 +11715,7 @@ impl Engine {
     ) -> Option<(usize, usize)> {
         match obj_type {
             'w' => self.find_word_object(modifier, cursor_pos),
+            'W' => self.find_bigword_object(modifier, cursor_pos),
             '"' => self.find_quote_object(modifier, '"', cursor_pos),
             '\'' => self.find_quote_object(modifier, '\'', cursor_pos),
             '(' | ')' => self.find_bracket_object(modifier, '(', ')', cursor_pos),
@@ -15139,6 +16504,7 @@ impl Engine {
         match self.mode {
             Mode::Normal | Mode::Command | Mode::Search => "NORMAL",
             Mode::Insert => "INSERT",
+            Mode::Replace => "REPLACE",
             Mode::Visual => "VISUAL",
             Mode::VisualLine => "VISUAL LINE",
             Mode::VisualBlock => "VISUAL BLOCK",

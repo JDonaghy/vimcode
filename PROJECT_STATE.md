@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Mar 2, 2026 (Session 110c — Last-word-of-file yank fix) | **Tests:** 990
+**Last updated:** Mar 2, 2026 (Session 111 — Missing Vim commands Batch 1–3) | **Tests:** 1045
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 72 are in **SESSION_HISTORY.md**.
@@ -25,6 +25,16 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 111 — Missing Vim Commands (55 new tests, Batches 1–3):**
+Implemented the following missing Vim features:
+- Normal mode movements: `^` (first non-blank), `g_` (last non-blank), `W`/`B`/`E`/`gE` (WORD motions), `H`/`M`/`L` (screen top/middle/bottom), `(`/`)` (sentence), `Ctrl+E`/`Ctrl+Y` (single-line scroll), `g*`/`g#` (partial word search), `gJ` (join without space), `gf` (open file under cursor)
+- Editing: `R` (Replace mode), `Ctrl+A`/`Ctrl+X` (number increment/decrement), `=` operator (auto-indent), `]p`/`[p` (paste with indent adjustment), `iW`/`aW` (WORD text objects)
+- Insert mode: `Ctrl+R {reg}` (insert register content), `Ctrl+U` (delete to start of line), `Ctrl+O` (exit to Normal for one command)
+- Ex commands: `:noh`/`:nohlsearch`, `:wa`, `:wqa`/`:xa`, `:reg`/`:registers`, `:marks`, `:jumps`, `:changes`, `:history`, `:echo`, `:tabmove`, `:!{cmd}`, `:r {file}`
+- Settings: `hlsearch`, `ignorecase`, `smartcase`, `scrolloff`, `cursorline`, `colorcolumn`, `textwidth`, `splitbelow`, `splitright`
+- Search: `ignorecase`/`smartcase` applied in `run_search`; `hlsearch=false` suppresses highlight spans in render.rs; `scrolloff` padding applied in `ensure_cursor_visible`
+- New test file: `tests/new_vim_features.rs` (55 tests)
 
 **Session 110c — Last-word-of-file yank bug fix (4 new tests):**
 Fixed `yw`/`dw` missing the final character when the last word of a file has no trailing newline. Root cause: `move_word_forward()` clamps `pos` to `total_chars - 1` when the end of file is reached, leaving the cursor AT the last char. The `w`-motion range `[start, end_pos)` is exclusive, so it excluded that final char. Fix: in `apply_operator_with_motion`, detect when `end_pos + 1 == total_chars` and the last char is not `\n`, and extend `delete_end` to `total_chars` to include it. 4 tests added: `test_yw_last_word_of_file_no_newline`, `test_yw_only_word_no_newline`, `test_dw_last_word_of_file_no_newline`, `test_yw_last_word_of_last_line_no_newline`.

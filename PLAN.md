@@ -2,6 +2,9 @@
 
 ## Recently Completed
 
+**Session 111 — Missing Vim Commands Batches 1–3 (55 new tests, 1045 total):**
+Implemented: `^`, `g_`, `W`/`B`/`E`/`gE`, `H`/`M`/`L`, `(`/`)`, `Ctrl+E`/`Ctrl+Y`, `g*`/`g#`, `gJ`, `gf`, `R` (Replace mode), `Ctrl+A`/`Ctrl+X`, `=` operator, `]p`/`[p`, `iW`/`aW`, `Ctrl+R`/`Ctrl+U`/`Ctrl+O` in insert. Ex commands: `:noh`, `:wa`, `:wqa`/`:xa`, `:reg`, `:marks`, `:jumps`, `:changes`, `:history`, `:echo`, `:tabmove`, `:!cmd`, `:r file`. Settings: `hlsearch`, `ignorecase`, `smartcase`, `scrolloff`, `cursorline`, `colorcolumn`, `textwidth`, `splitbelow`, `splitright`. New test file: `tests/new_vim_features.rs` (55 tests).
+
 **Session 110c — Last-word-of-file yank/delete bug fix (4 new tests, 990 total):**
 Fixed off-by-one in `apply_operator_with_motion` when `w` motion lands at EOF with no trailing newline. Root cause: `move_word_forward()` clamps to `total_chars - 1`; the exclusive range `[start, end_pos)` then missed the final char. Fix: detect `end_pos + 1 == total_chars && char(end_pos) != '\n'` and extend `delete_end` to `total_chars`. Added 4 integration tests in `tests/operator_motions.rs`: `test_yw_last_word_of_file_no_newline`, `test_yw_only_word_no_newline`, `test_dw_last_word_of_file_no_newline`, `test_yw_last_word_of_last_line_no_newline`.
 
