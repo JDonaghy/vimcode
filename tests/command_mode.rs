@@ -257,3 +257,54 @@ fn test_colorscheme_no_args_lists_themes() {
         "listing should mention 'gruvbox-dark'"
     );
 }
+
+// ── :Settings ─────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_settings_command_opens_settings_file() {
+    let mut e = engine_with("hello\n");
+    let initial_tabs = e.active_group().tabs.len();
+    exec(&mut e, "Settings");
+    // :Settings should open a new tab with the settings file
+    assert_eq!(
+        e.active_group().tabs.len(),
+        initial_tabs + 1,
+        ":Settings should open settings.json in a new tab"
+    );
+    // The new tab should have a file path pointing at settings.json
+    let tab = e.active_tab();
+    let window = e.windows.get(&tab.active_window).unwrap();
+    let buf = e.buffer_manager.get(window.buffer_id).unwrap();
+    assert!(
+        buf.file_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().ends_with("settings.json"))
+            .unwrap_or(false),
+        "new tab should be settings.json, got: {:?}",
+        buf.file_path
+    );
+}
+
+#[test]
+fn test_settings_command_lowercase_alias() {
+    let mut e = engine_with("hello\n");
+    let initial_tabs = e.active_group().tabs.len();
+    exec(&mut e, "settings");
+    assert_eq!(
+        e.active_group().tabs.len(),
+        initial_tabs + 1,
+        ":settings (lowercase) should also open settings.json"
+    );
+}
+
+#[test]
+fn test_settings_file_path_ends_with_settings_json() {
+    // Verify the settings_file_path() returns the expected suffix
+    use vimcode_core::core::settings::Settings;
+    let path = Settings::settings_file_path();
+    assert!(
+        path.ends_with("settings.json"),
+        "settings_file_path() should end with settings.json, got: {}",
+        path.display()
+    );
+}

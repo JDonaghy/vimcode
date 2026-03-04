@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Mar 4, 2026 (Session 116 — Named colour themes / :colorscheme + GTK live-reload fix) | **Tests:** 1196
+**Last updated:** Mar 4, 2026 (Session 117 — Settings editor / :Settings command) | **Tests:** 1199
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 72 are in **SESSION_HISTORY.md**.
@@ -25,6 +25,13 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 117 — Settings editor / :Settings command (3 new tests, 1199 total):**
+Implements the settings editor roadmap item. `:Settings` (and `:settings`) opens `~/.config/vimcode/settings.json` in a new editor tab — the same file the engine reads on startup and on `:config reload`. Both backends now auto-reload settings when the file is saved:
+- **`src/core/settings.rs`**: renamed `settings_path()` → `pub fn settings_file_path()` so backends and tests can reference it without duplicating the path.
+- **`src/core/engine.rs`**: added `:Settings`/`:settings` command arm in `execute_command()` (calls `open_file_in_tab(&Settings::settings_file_path())`); added `"Settings"` to command-completion list and `"Preferences: Open Settings (JSON)"` to `PALETTE_COMMANDS`.
+- **`src/tui_main.rs`**: clicking the gear icon in the activity bar now also calls `:Settings` (opens the file in a tab) in addition to toggling the Settings sidebar; `render_settings_panel` updated to show live current values (colorscheme, tabstop, wrap, lsp, etc.) right-aligned in keyword colour; mtime-based auto-reload — on every event-loop iteration the settings.json mtime is checked and the file is reloaded if it changed, mirroring GTK's `gio::FileMonitor` behaviour; added `LineNumberMode` to imports.
+- **`tests/command_mode.rs`**: 3 new tests (`test_settings_command_opens_settings_file`, `test_settings_command_lowercase_alias`, `test_settings_file_path_ends_with_settings_json`).
 
 **Session 116 — Named colour themes / :colorscheme (10 new tests, 1196 total):**
 Four built-in themes: OneDark (default), Gruvbox Dark, Tokyo Night, Solarized Dark. `src/render.rs`: `Theme::gruvbox_dark()`, `Theme::tokyo_night()`, `Theme::solarized_dark()` constructors; `Theme::from_name(name) -> Self` dispatcher (normalises aliases: gruvbox→gruvbox-dark, tokyonight→tokyo-night, solarized→solarized-dark); `Theme::available_names()`; `Color::to_hex()` helper. `src/core/settings.rs`: `colorscheme: String` field (serde default `"onedark"`). `src/core/engine.rs`: `:colorscheme` (lists themes) and `:colorscheme <name>` (validates, normalises, saves settings) commands. `src/main.rs` (GTK): all `Theme::onedark()` calls → `Theme::from_name()`; `make_theme_css(theme)` generates activity-bar/sidebar/treeview CSS from theme colours; `STATIC_CSS` const holds structural CSS (titlebar, window controls, scrollbars, find-dialog); hot-reload in `SearchPollTick` reloads the full combined CSS (structural + theme colours) so live theme switching preserves button shapes and window decorations. `src/tui_main.rs`: theme refreshed at top of every event-loop iteration; `render_sidebar` fills full sidebar background before drawing tree rows. `tests/command_mode.rs`: 10 new tests (default, all 4 themes, 3 aliases, unknown-returns-error, no-args-lists-themes).

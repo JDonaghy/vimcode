@@ -542,7 +542,7 @@ impl Settings {
     /// Load settings from ~/.config/vimcode/settings.json with validation
     /// Returns Result with descriptive error messages for UI display
     pub fn load_with_validation() -> Result<Self, String> {
-        let path = Self::settings_path();
+        let path = Self::settings_file_path();
 
         let contents = fs::read_to_string(&path)
             .map_err(|e| format!("Failed to read settings file at {}: {}", path.display(), e))?;
@@ -863,7 +863,7 @@ impl Settings {
         return Ok(());
 
         #[cfg_attr(test, allow(unreachable_code))]
-        let path = Self::settings_path();
+        let path = Self::settings_file_path();
 
         // Create config directory if it doesn't exist
         if let Some(parent) = path.parent() {
@@ -876,7 +876,7 @@ impl Settings {
         Ok(())
     }
 
-    fn settings_path() -> PathBuf {
+    pub fn settings_file_path() -> PathBuf {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
         PathBuf::from(home)
             .join(".config")
@@ -889,7 +889,7 @@ impl Settings {
     /// when Settings::load() is called - it adds new fields with defaults while preserving
     /// existing user settings.
     pub fn ensure_exists() -> Result<(), std::io::Error> {
-        let path = Self::settings_path();
+        let path = Self::settings_file_path();
 
         // Only create if file doesn't exist
         if !path.exists() {

@@ -391,6 +391,12 @@ pub static PALETTE_COMMANDS: &[PaletteCommand] = &[
         vscode_shortcut: "",
         action: "Plugin list",
     },
+    PaletteCommand {
+        label: "Preferences: Open Settings (JSON)",
+        shortcut: "",
+        vscode_shortcut: "",
+        action: "Settings",
+    },
     // Editor groups
     PaletteCommand {
         label: "View: Split Editor Right",
@@ -8078,6 +8084,7 @@ impl Engine {
             "s/",
             "%s/",
             "config reload",
+            "Settings",
             "EditorGroupSplit",
             "EditorGroupSplitDown",
             "EditorGroupClose",
@@ -10001,6 +10008,13 @@ impl Engine {
         }
 
         // Handle :config reload
+        // Handle :Settings — open settings.json in a new tab
+        if cmd == "Settings" || cmd == "settings" {
+            let path = Settings::settings_file_path();
+            self.open_file_in_tab(&path);
+            return EngineAction::None;
+        }
+
         if cmd == "config reload" {
             match Settings::load_with_validation() {
                 Ok(new_settings) => {

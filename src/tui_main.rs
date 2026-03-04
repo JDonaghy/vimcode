@@ -67,7 +67,7 @@ use ratatui::Terminal;
 
 use crate::core::engine::{DiffLine, EngineAction};
 use crate::core::lsp::DiagnosticSeverity;
-use crate::core::settings::{parse_key_binding, ExplorerAction};
+use crate::core::settings::{parse_key_binding, ExplorerAction, LineNumberMode};
 use crate::core::window::SplitDirection;
 use crate::core::{Engine, GitLineStatus, Mode, OpenMode, WindowRect};
 use crate::render::{
@@ -853,6 +853,11 @@ fn event_loop(
         .unwrap_or_else(Instant::now);
     // Auto-refresh sidebar to reflect external filesystem changes.
     let mut last_sidebar_refresh = Instant::now();
+    // mtime of settings.json at last check — used to auto-reload when user edits the file.
+    let mut settings_mtime: Option<std::time::SystemTime> = {
+        let path = crate::core::settings::Settings::settings_file_path();
+        fs::metadata(&path).ok().and_then(|m| m.modified().ok())
+    };
     // Deadline to clear the yank highlight flash.
     let mut yank_hl_deadline: Option<Instant> = None;
 
@@ -1047,6 +1052,25 @@ fn event_loop(
                 }
                 last_sidebar_refresh = Instant::now();
                 needs_redraw = true;
+            }
+            // Auto-reload settings.json when its mtime changes (e.g. after :w in the editor).
+            {
+                let path = crate::core::settings::Settings::settings_file_path();
+                if let Ok(meta) = fs::metadata(&path) {
+                    if let Ok(mtime) = meta.modified() {
+                        let changed = settings_mtime != Some(mtime);
+                        if changed {
+                            settings_mtime = Some(mtime);
+                            if let Ok(new_settings) =
+                                crate::core::settings::Settings::load_with_validation()
+                            {
+                                engine.settings = new_settings;
+                                engine.message = "Settings reloaded".to_string();
+                                needs_redraw = true;
+                            }
+                        }
+                    }
+                }
             }
             // Terminal: drain PTY output and refresh display if new data arrived.
             if engine.poll_terminal() {
@@ -3200,6 +3224,10 @@ fn handle_mouse(
                         engine.ext_refresh();
                     }
                     sidebar.has_focus = true;
+                }
+                if panel == TuiPanel::Settings {
+                    // Opening Settings panel also opens settings.json in the editor
+                    engine.execute_command("Settings");
                 }
             }
             engine.session.explorer_visible = sidebar.visible;
@@ -6538,7 +6566,7 @@ fn render_sidebar(
 
     // Settings panel
     if sidebar.active_panel == TuiPanel::Settings {
-        render_settings_panel(buf, area, theme);
+        render_settings_panel(buf, area, theme, engine);
         return;
     }
 
@@ -6758,13 +6786,19 @@ fn render_sidebar(
     }
 }
 
-/// Render the settings panel (placeholder — settings are file-based).
-fn render_settings_panel(buf: &mut ratatui::buffer::Buffer, area: Rect, theme: &Theme) {
+/// Render the settings panel — shows current key settings and the file path.
+fn render_settings_panel(
+    buf: &mut ratatui::buffer::Buffer,
+    area: Rect,
+    theme: &Theme,
+    engine: &Engine,
+) {
     let header_fg = rc(theme.status_fg);
     let header_bg = rc(theme.status_bg);
     let fg = rc(theme.foreground);
     let bg = rc(theme.tab_bar_bg);
     let dim_fg = rc(theme.line_number_fg);
+    let key_fg = rc(theme.keyword);
 
     if area.height == 0 {
         return;
@@ -6791,33 +6825,64 @@ fn render_settings_panel(buf: &mut ratatui::buffer::Buffer, area: Rect, theme: &
         x += 1;
     }
 
-    // Content lines
-    let lines: &[&str] = &[
-        "",
-        " Edit settings file:",
-        " ~/.config/vimcode/settings.json",
-        "",
-        " Reload: :config reload",
-        "",
-        " Available settings:",
-        "  line_numbers: none|abs|rel|hybrid",
-        "  font_family: string",
-        "  font_size: number",
-        "  incremental_search: bool",
-        "  explorer_visible_on_startup: bool",
+    let s = &engine.settings;
+    let ln = match s.line_numbers {
+        LineNumberMode::None => "none",
+        LineNumberMode::Absolute => "absolute",
+        LineNumberMode::Relative => "relative",
+        LineNumberMode::Hybrid => "hybrid",
+    };
+
+    // Build rows: (label, value)
+    let rows: &[(&str, String)] = &[
+        ("", String::new()),
+        ("  File:", "~/.config/vimcode/settings.json".into()),
+        ("  :Settings to open   :config reload", String::new()),
+        ("", String::new()),
+        ("  — Current settings —", String::new()),
+        ("  colorscheme", s.colorscheme.clone()),
+        ("  line_numbers", ln.into()),
+        ("  tabstop", s.tabstop.to_string()),
+        ("  shiftwidth", s.shift_width.to_string()),
+        ("  expandtab", s.expand_tab.to_string()),
+        ("  wrap", s.wrap.to_string()),
+        ("  hlsearch", s.hlsearch.to_string()),
+        ("  ignorecase", s.ignorecase.to_string()),
+        ("  smartcase", s.smartcase.to_string()),
+        ("  cursorline", s.cursorline.to_string()),
+        ("  scrolloff", s.scrolloff.to_string()),
+        ("  lsp", s.lsp_enabled.to_string()),
+        ("  autoindent", s.auto_indent.to_string()),
     ];
-    for (i, line) in lines.iter().enumerate() {
+
+    for (i, (label, value)) in rows.iter().enumerate() {
         let y = area.y + 1 + i as u16;
         if y >= area.y + area.height {
             break;
         }
+        // Write label in dim colour
         let mut x = area.x;
-        for ch in line.chars() {
+        for ch in label.chars() {
             if x >= area.x + area.width {
                 break;
             }
             set_cell(buf, x, y, ch, dim_fg, bg);
             x += 1;
+        }
+        // Write value in keyword colour if non-empty
+        if !value.is_empty() {
+            // Right-align the value
+            let val_len = value.chars().count() as u16;
+            let right_edge = area.x + area.width;
+            let val_x = right_edge.saturating_sub(val_len + 1);
+            let mut vx = val_x.max(x);
+            for ch in value.chars() {
+                if vx >= right_edge {
+                    break;
+                }
+                set_cell(buf, vx, y, ch, key_fg, bg);
+                vx += 1;
+            }
         }
     }
 }
