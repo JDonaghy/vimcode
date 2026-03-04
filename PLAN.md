@@ -2,6 +2,9 @@
 
 ## Recently Completed
 
+**Session 116 — Named colour themes / :colorscheme + GTK live-reload fix (10 new tests, 1196 total):**
+Four built-in themes: OneDark (default), Gruvbox Dark, Tokyo Night, Solarized Dark. `src/render.rs`: `Theme::gruvbox_dark()`, `Theme::tokyo_night()`, `Theme::solarized_dark()` constructors; `Theme::from_name(name) -> Self` dispatcher (normalises aliases: gruvbox→gruvbox-dark, tokyonight→tokyo-night, solarized→solarized-dark); `Theme::available_names() -> &[&str]`; `Color::to_hex()`. `src/core/settings.rs`: `colorscheme: String` field (serde default `"onedark"`); `default_colorscheme()` fn; `Default` impl updated. `src/core/engine.rs`: `:colorscheme` (lists available themes) and `:colorscheme <name>` (validates, normalises, saves settings) commands. `src/main.rs` (GTK): all 6 `Theme::onedark()` calls → `Theme::from_name()`; `make_theme_css(theme)` generates dynamic CSS for activity-bar/sidebar/treeview/entry colours; extracted `STATIC_CSS: &str` const for structural styles (titlebar, window-control buttons, scrollbars, find-dialog — was incorrectly set to `""` during hot-reload causing buttons to lose shape); `SearchPollTick` hot-reload now concatenates `STATIC_CSS + make_theme_css()` so live theme switching preserves button shapes and window decorations. `src/tui_main.rs`: theme declared `mut`, refreshed at top of every event-loop iteration; `render_sidebar` fills full background before tree rows (fixes empty space below file tree staying terminal default colour). `tests/command_mode.rs`: 10 new tests (default, set all 4 themes, 3 aliases, unknown-returns-error, no-args-lists-themes).
+
 **Session 115 — DAP SIGTTIN fix + ANSI carry buffer (3 new tests, 1128 total):**
 Fixed TUI suspension when DAP breakpoints hit. Root cause: debugpy (and its child target script) inherited the editor's session and could call `tcsetpgrp()` to steal the foreground group, causing SIGTTIN. Fix: `setsid()` via `pre_exec` on all DAP and LSP child spawns (`dap.rs`, `lsp.rs`). Also added `dap_ansi_carry: String` to buffer incomplete ANSI escape sequences split across DAP output events, preventing partial SGR codes from appearing as literal text in the Debug Output panel. Added `libc = "0.2"` dependency. 3 new tests.
 
@@ -739,7 +742,7 @@ Root cause: `draw_menu_dropdown` was called from `draw_editor()`'s DrawingArea w
 - [x] **`:norm`** — execute normal command on a range of lines
 - [x] **Fuzzy finder / Telescope-style** — Ctrl-P opens centered file-picker modal with subsequence scoring (session 53)
 - [x] **Multiple cursors** — `Alt-D` (configurable) adds cursor at next match of word under cursor; all cursors receive identical keystrokes; Escape collapses to one
-- [ ] **Themes / plugin system** — named color themes selectable via `:colorscheme`; theme file format TBD
+- [x] **Themes / plugin system** — named color themes selectable via `:colorscheme`; 4 built-in themes: onedark (default), gruvbox-dark, tokyo-night, solarized-dark (session 116)
 
 ### Enhanced Editor
 - [x] **Autosuggestions (inline ghost text)** — as-you-type completions shown as dimmed ghost text inline after the cursor; sources: buffer word scan (sync) + LSP `textDocument/completion` (async); Tab accepts, any other key dismisses; coexists with Ctrl-N/Ctrl-P popup (ghost hidden when popup active)

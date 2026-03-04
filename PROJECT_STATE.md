@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Mar 4, 2026 (Session 115 — DAP SIGTTIN fix + ANSI carry buffer) | **Tests:** 1128
+**Last updated:** Mar 4, 2026 (Session 116 — Named colour themes / :colorscheme + GTK live-reload fix) | **Tests:** 1196
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 72 are in **SESSION_HISTORY.md**.
@@ -25,6 +25,9 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 116 — Named colour themes / :colorscheme (10 new tests, 1196 total):**
+Four built-in themes: OneDark (default), Gruvbox Dark, Tokyo Night, Solarized Dark. `src/render.rs`: `Theme::gruvbox_dark()`, `Theme::tokyo_night()`, `Theme::solarized_dark()` constructors; `Theme::from_name(name) -> Self` dispatcher (normalises aliases: gruvbox→gruvbox-dark, tokyonight→tokyo-night, solarized→solarized-dark); `Theme::available_names()`; `Color::to_hex()` helper. `src/core/settings.rs`: `colorscheme: String` field (serde default `"onedark"`). `src/core/engine.rs`: `:colorscheme` (lists themes) and `:colorscheme <name>` (validates, normalises, saves settings) commands. `src/main.rs` (GTK): all `Theme::onedark()` calls → `Theme::from_name()`; `make_theme_css(theme)` generates activity-bar/sidebar/treeview CSS from theme colours; `STATIC_CSS` const holds structural CSS (titlebar, window controls, scrollbars, find-dialog); hot-reload in `SearchPollTick` reloads the full combined CSS (structural + theme colours) so live theme switching preserves button shapes and window decorations. `src/tui_main.rs`: theme refreshed at top of every event-loop iteration; `render_sidebar` fills full sidebar background before drawing tree rows. `tests/command_mode.rs`: 10 new tests (default, all 4 themes, 3 aliases, unknown-returns-error, no-args-lists-themes).
 
 **Session 115 — DAP SIGTTIN fix + ANSI carry buffer (3 new tests, 1128 total):**
 Fixed TUI suspension during DAP debugging and hardened DAP output stripping.

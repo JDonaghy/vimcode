@@ -162,3 +162,98 @@ fn test_wq_clean_buffer() {
     assert!(path.exists(), "file should have been written by :wq");
     let _ = fs::remove_file(&path);
 }
+
+// ── :colorscheme ──────────────────────────────────────────────────────────────
+
+#[test]
+fn test_colorscheme_default_is_onedark() {
+    let e = engine_with("hello\n");
+    assert_eq!(e.settings.colorscheme, "onedark");
+}
+
+#[test]
+fn test_colorscheme_set_gruvbox_dark() {
+    let mut e = engine_with("hello\n");
+    exec(&mut e, "colorscheme gruvbox-dark");
+    assert_eq!(e.settings.colorscheme, "gruvbox-dark");
+}
+
+#[test]
+fn test_colorscheme_alias_gruvbox() {
+    let mut e = engine_with("hello\n");
+    exec(&mut e, "colorscheme gruvbox");
+    assert_eq!(
+        e.settings.colorscheme, "gruvbox-dark",
+        "alias 'gruvbox' should normalize to 'gruvbox-dark'"
+    );
+}
+
+#[test]
+fn test_colorscheme_set_tokyo_night() {
+    let mut e = engine_with("hello\n");
+    exec(&mut e, "colorscheme tokyo-night");
+    assert_eq!(e.settings.colorscheme, "tokyo-night");
+}
+
+#[test]
+fn test_colorscheme_alias_tokyonight() {
+    let mut e = engine_with("hello\n");
+    exec(&mut e, "colorscheme tokyonight");
+    assert_eq!(
+        e.settings.colorscheme, "tokyo-night",
+        "alias 'tokyonight' should normalize to 'tokyo-night'"
+    );
+}
+
+#[test]
+fn test_colorscheme_set_solarized_dark() {
+    let mut e = engine_with("hello\n");
+    exec(&mut e, "colorscheme solarized-dark");
+    assert_eq!(e.settings.colorscheme, "solarized-dark");
+}
+
+#[test]
+fn test_colorscheme_alias_solarized() {
+    let mut e = engine_with("hello\n");
+    exec(&mut e, "colorscheme solarized");
+    assert_eq!(
+        e.settings.colorscheme, "solarized-dark",
+        "alias 'solarized' should normalize to 'solarized-dark'"
+    );
+}
+
+#[test]
+fn test_colorscheme_set_onedark() {
+    let mut e = engine_with("hello\n");
+    exec(&mut e, "colorscheme gruvbox-dark");
+    exec(&mut e, "colorscheme onedark");
+    assert_eq!(e.settings.colorscheme, "onedark");
+}
+
+#[test]
+fn test_colorscheme_unknown_returns_error() {
+    let mut e = engine_with("hello\n");
+    let action = exec(&mut e, "colorscheme dracula");
+    assert!(
+        matches!(action, EngineAction::Error),
+        "unknown theme should return Error"
+    );
+    assert_eq!(
+        e.settings.colorscheme, "onedark",
+        "colorscheme unchanged after bad name"
+    );
+}
+
+#[test]
+fn test_colorscheme_no_args_lists_themes() {
+    let mut e = engine_with("hello\n");
+    exec(&mut e, "colorscheme");
+    assert!(
+        e.message.contains("onedark"),
+        "listing should mention 'onedark'"
+    );
+    assert!(
+        e.message.contains("gruvbox-dark"),
+        "listing should mention 'gruvbox-dark'"
+    );
+}

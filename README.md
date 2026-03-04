@@ -11,7 +11,7 @@ There's a touch of irony here - using a cli tool to write the editor that I've w
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 1128 tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 1196 tests, zero async runtime dependency
 
 
 ## Download (Ubuntu)
@@ -710,6 +710,7 @@ Additional options (set directly in `settings.json`):
 - `:set option!` — toggle a boolean option (e.g. `:set wrap!`); `no<option>!` explicitly disables (e.g. `:set nowrap!`)
 - `:set` (no args) — show one-line summary of all settings
 - `:config reload` — reload settings file from disk
+- `:colorscheme <name>` — switch colour theme live (aliases: `gruvbox`, `tokyonight`, `solarized`); `:colorscheme` lists available themes. Themes: `onedark` (default), `gruvbox-dark`, `tokyo-night`, `solarized-dark`.
 
 **Panel navigation key bindings** — configurable in `settings.json` under `"panel_keys"`:
 

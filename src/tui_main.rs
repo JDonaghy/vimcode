@@ -784,7 +784,7 @@ fn event_loop(
     engine: &mut Engine,
     keyboard_enhanced: bool,
 ) {
-    let theme = Theme::onedark();
+    let mut theme = Theme::from_name(&engine.settings.colorscheme);
 
     // Initialise sidebar from session/settings
     let initial_visible =
@@ -857,6 +857,9 @@ fn event_loop(
     let mut yank_hl_deadline: Option<Instant> = None;
 
     loop {
+        // Refresh theme in case :colorscheme was run.
+        theme = Theme::from_name(&engine.settings.colorscheme);
+
         // Sync viewport dimensions so ensure_cursor_visible uses real terminal size.
         // Layout: [activity_bar(3)] [sidebar(sw+1sep, if visible)] [editor_col]
         // editor_col: [tab(1)] / [editor] then global [status(1)] [cmd(1)]
@@ -6577,10 +6580,16 @@ fn render_sidebar(
         })
         .collect();
 
-    // ── Header row ──────────────────────────────────────────────────────
+    // ── Background fill — covers empty space below tree rows ────────────
     if area.height == 0 {
         return;
     }
+    for y in area.y..area.y + area.height {
+        for x in area.x..area.x + area.width {
+            set_cell(buf, x, y, ' ', default_fg, row_bg);
+        }
+    }
+
     let header_y = area.y;
     // Fill header
     for x in area.x..area.x + area.width {

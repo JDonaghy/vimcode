@@ -150,6 +150,10 @@ struct App {
     menu_dropdown_da: Rc<RefCell<Option<gtk4::DrawingArea>>>,
     /// Cached line height shared with menu_dropdown_da draw/click closures.
     menu_dd_line_height: Rc<Cell<f64>>,
+    /// CSS provider registered with the GTK display — updated when colorscheme changes.
+    css_provider: gtk4::CssProvider,
+    /// Colorscheme name at the time the CSS was last applied.
+    last_colorscheme: String,
 }
 
 /// Drag state for a Cairo-drawn horizontal scrollbar.
@@ -1396,9 +1400,6 @@ impl SimpleComponent for App {
         root: Self::Root,
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
-        // Load CSS before creating widgets
-        load_css();
-
         let engine = {
             let mut e = Engine::new();
             e.plugin_init();
@@ -1408,6 +1409,11 @@ impl SimpleComponent for App {
             }
             e
         };
+
+        // Load CSS after engine so we can read the saved colorscheme setting.
+        let initial_theme = Theme::from_name(&engine.settings.colorscheme);
+        let css_provider = load_css(&initial_theme);
+        let last_colorscheme = engine.settings.colorscheme.clone();
 
         // On X11 use x11_bin (xclip/xsel subprocesses) explicitly: try_context() picks
         // x11_fork first, whose get_contents() uses X11ClipboardContext directly and
@@ -1570,6 +1576,8 @@ impl SimpleComponent for App {
             last_sc_refresh: std::time::Instant::now(),
             menu_dropdown_da: menu_dropdown_da_ref.clone(),
             menu_dd_line_height: menu_dd_lh.clone(),
+            css_provider,
+            last_colorscheme,
         };
         let widgets = view_output!();
 
@@ -1634,7 +1642,7 @@ impl SimpleComponent for App {
                     let Some(midx) = engine.menu_open_idx else {
                         return;
                     };
-                    let theme = Theme::onedark();
+                    let theme = Theme::from_name(&engine.settings.colorscheme);
                     let open_items: Vec<render::MenuItemData> = render::MENU_STRUCTURE
                         .get(midx)
                         .map(|(_, _, items)| items.to_vec())
@@ -1737,7 +1745,7 @@ impl SimpleComponent for App {
             widgets.menu_bar_da.set_draw_func(move |da, cr, _w, _h| {
                 let engine = engine.borrow();
                 // Menu bar is always visible in GTK (acts as the window title bar).
-                let theme = Theme::onedark();
+                let theme = Theme::from_name(&engine.settings.colorscheme);
                 let open_items: Vec<render::MenuItemData> = if let Some(midx) = engine.menu_open_idx
                 {
                     render::MENU_STRUCTURE
@@ -1813,7 +1821,7 @@ impl SimpleComponent for App {
                 .debug_sidebar_da
                 .set_draw_func(move |da, cr, _w, _h| {
                     let engine = engine.borrow();
-                    let theme = Theme::onedark();
+                    let theme = Theme::from_name(&engine.settings.colorscheme);
                     let font_desc = FontDescription::from_string(UI_FONT);
                     let pango_ctx = pangocairo::create_context(cr);
                     let layout = pango::Layout::new(&pango_ctx);
@@ -1873,7 +1881,7 @@ impl SimpleComponent for App {
             let engine = engine.clone();
             widgets.git_sidebar_da.set_draw_func(move |da, cr, _w, _h| {
                 let engine = engine.borrow();
-                let theme = Theme::onedark();
+                let theme = Theme::from_name(&engine.settings.colorscheme);
                 let font_desc = FontDescription::from_string(UI_FONT);
                 let pango_ctx = pangocairo::create_context(cr);
                 let layout = pango::Layout::new(&pango_ctx);
@@ -1926,7 +1934,7 @@ impl SimpleComponent for App {
             let engine = engine.clone();
             widgets.ext_sidebar_da.set_draw_func(move |da, cr, _w, _h| {
                 let engine = engine.borrow();
-                let theme = Theme::onedark();
+                let theme = Theme::from_name(&engine.settings.colorscheme);
                 let font_desc = FontDescription::from_string(UI_FONT);
                 let pango_ctx = pangocairo::create_context(cr);
                 let layout = pango::Layout::new(&pango_ctx);
@@ -3840,6 +3848,18 @@ impl SimpleComponent for App {
                 self.draw_needed.set(true);
             }
             Msg::SearchPollTick => {
+                // Reload CSS if the colorscheme changed (e.g. via :colorscheme command).
+                {
+                    let current = self.engine.borrow().settings.colorscheme.clone();
+                    if current != self.last_colorscheme {
+                        let theme = Theme::from_name(&current);
+                        let combined = format!("{STATIC_CSS}\n{}", make_theme_css(&theme));
+                        self.css_provider.load_from_data(&combined);
+                        self.last_colorscheme = current;
+                        self.draw_needed.set(true);
+                    }
+                }
+
                 // Check h scrollbar hover state from the shared mouse position cell.
                 // This replaces per-motion-event Relm4 messages with a 20 Hz poll.
                 {
@@ -5377,7 +5397,7 @@ fn draw_editor(
     h_sb_dragging_window: Option<core::WindowId>,
     last_metrics: &std::rc::Rc<std::cell::Cell<(f64, f64)>>,
 ) {
-    let theme = Theme::onedark();
+    let theme = Theme::from_name(&engine.settings.colorscheme);
 
     // 1. Background
     let (bg_r, bg_g, bg_b) = theme.background.to_cairo();
@@ -8956,11 +8976,174 @@ fn handle_mouse_drag(
     }
 }
 
-fn load_css() {
-    let provider = gtk4::CssProvider::new();
-    provider.load_from_data(
-        "
-        /* Custom titlebar — VSCode title bar color #3c3c3c.
+/// Generate the full CSS string with colors taken from the active theme.
+fn make_theme_css(theme: &Theme) -> String {
+    let bar_bg = theme.tab_bar_bg.to_hex();
+    let bar_fg = theme.status_fg.to_hex();
+    let active_bg = theme.status_bg.to_hex();
+    let editor_bg = theme.background.to_hex();
+    let text_fg = theme.foreground.to_hex();
+    let accent = theme.function.to_hex();
+    let sel_bg = theme.fuzzy_selected_bg.to_hex();
+    let hover_bg = theme.tab_active_bg.to_hex();
+    let dim_fg = theme.line_number_fg.to_hex();
+    let entry_bg = theme.active_background.to_hex();
+    let border_col = theme.separator.to_hex();
+    format!(
+        r#"
+        /* Activity Bar */
+        .activity-bar {{
+            background-color: {bar_bg};
+            border-right: 1px solid {border_col};
+        }}
+
+        .activity-button {{
+            background: transparent;
+            border: none;
+            border-radius: 0;
+            font-size: 24px;
+            color: {dim_fg};
+            padding: 0;
+        }}
+
+        .activity-button:hover {{
+            background-color: {hover_bg};
+            color: {bar_fg};
+        }}
+
+        .activity-button.active {{
+            color: {bar_fg};
+            border-left: 2px solid {accent};
+        }}
+
+        /* Sidebar */
+        .sidebar {{
+            background-color: {bar_bg};
+            border-right: 1px solid {border_col};
+        }}
+
+        .sidebar label {{
+            color: {bar_fg};
+        }}
+
+        /* Explorer Toolbar */
+        .explorer-toolbar {{
+            background-color: {active_bg};
+            border-bottom: 1px solid {border_col};
+        }}
+
+        /* Tree View */
+        treeview {{
+            background-color: {bar_bg};
+            color: {bar_fg};
+            border: none;
+            outline: none;
+        }}
+
+        treeview:selected {{
+            background-color: {sel_bg};
+            border-left: 3px solid {accent};
+        }}
+
+        treeview:selected:focus {{
+            background-color: {sel_bg};
+        }}
+
+        treeview row:hover {{
+            background-color: {hover_bg};
+        }}
+
+        treeview row {{
+            padding: 4px 8px;
+            min-height: 22px;
+        }}
+
+        treeview expander {{
+            min-width: 16px;
+            min-height: 16px;
+        }}
+
+        treeview expander:checked {{
+            color: {bar_fg};
+        }}
+
+        treeview expander:not(:checked) {{
+            color: {dim_fg};
+        }}
+
+        /* Search results */
+        .search-results-list {{
+            background-color: {bar_bg};
+            color: {bar_fg};
+        }}
+
+        .search-results-list > row {{
+            background-color: {bar_bg};
+            color: {bar_fg};
+            padding: 2px 4px;
+        }}
+
+        .search-results-list > row:selected,
+        .search-results-list > row:selected:focus {{
+            background-color: {sel_bg};
+        }}
+
+        .search-results-list > row:selected label,
+        .search-results-list > row:selected:focus label {{
+            color: {bar_fg};
+        }}
+
+        .search-results-scroll {{
+            background-color: {bar_bg};
+        }}
+
+        /* Search file header */
+        .search-file-header {{
+            color: {accent};
+            font-weight: bold;
+            font-size: 12px;
+        }}
+
+        /* Search input entry inside sidebar */
+        .sidebar entry {{
+            background-color: {entry_bg};
+            color: {text_fg};
+            border: 1px solid {border_col};
+            border-radius: 2px;
+            padding: 4px;
+        }}
+
+        .sidebar entry:focus {{
+            border-color: {accent};
+        }}
+
+        /* Search toggle buttons */
+        .search-toggle-btn {{
+            background: transparent;
+            color: {dim_fg};
+            border: 1px solid {border_col};
+            border-radius: 2px;
+            padding: 2px 6px;
+            min-width: 0;
+            min-height: 0;
+            font-size: 12px;
+        }}
+        .search-toggle-btn:hover {{
+            background-color: {hover_bg};
+        }}
+        .search-toggle-btn:checked {{
+            background-color: {accent};
+            color: {editor_bg};
+            border-color: {accent};
+        }}
+        "#
+    )
+}
+
+/// Static structural CSS that never changes with the theme.
+/// Theme-specific colours live in `make_theme_css()` and are appended after this.
+const STATIC_CSS: &str = "
+        /* Custom titlebar — matches status bar color.
            CSD provides edge resize handles; WindowHandle enables drag-to-move. */
         .custom-titlebar {
             background-color: #3c3c3c;
@@ -9020,49 +9203,7 @@ fn load_css() {
             color: #ffffff;
         }
 
-        /* Activity Bar */
-        .activity-bar {
-            background-color: #252526;
-            border-right: 1px solid #3e3e42;
-        }
-
-        .activity-button {
-            background: transparent;
-            border: none;
-            border-radius: 0;
-            font-size: 24px;
-            color: #cccccc;
-            padding: 0;
-        }
-        
-        .activity-button:hover {
-            background-color: #2a2d2e;
-        }
-        
-        .activity-button.active {
-            background-color: #094771;
-            border-left: 2px solid #0e639c;
-        }
-        
-        .activity-button:disabled {
-            opacity: 0.4;
-        }
-        
-        /* Sidebar */
-        .sidebar {
-            background-color: #252526;
-            border-right: 1px solid #3e3e42;
-        }
-        
-        .sidebar label {
-            color: #cccccc;
-        }
-        
-        /* Explorer Toolbar */
-        .explorer-toolbar {
-            background-color: #2d2d30;
-            border-bottom: 1px solid #3e3e42;
-        }
+        /* Activity bar, sidebar, treeview: see make_theme_css() — applied dynamically */
         
         .explorer-toolbar button {
             background: transparent;
@@ -9082,50 +9223,7 @@ fn load_css() {
             background-color: #094771;
         }
         
-        /* Tree View - VSCode Style */
-        treeview {
-            background-color: #252526;
-            color: #cccccc;
-            border: none;
-            font-family: 'Segoe UI', system-ui, -apple-system, 'Ubuntu', 'Droid Sans', sans-serif;
-            font-size: 13px;
-            outline: none;
-        }
-        
-        /* Selection - VSCode style with left accent */
-        treeview:selected {
-            background-color: rgba(9, 71, 113, 0.3);
-            border-left: 3px solid #0e639c;
-        }
-        
-        treeview:selected:focus {
-            background-color: rgba(9, 71, 113, 0.5);
-        }
-        
-        /* Hover - very subtle */
-        treeview row:hover {
-            background-color: rgba(42, 45, 46, 0.5);
-        }
-        
-        /* Better padding and spacing */
-        treeview row {
-            padding: 4px 8px;
-            min-height: 22px;
-        }
-        
-        /* Expander (arrow) styling - more subtle */
-        treeview expander {
-            min-width: 16px;
-            min-height: 16px;
-        }
-        
-        treeview expander:checked {
-            color: #cccccc;
-        }
-        
-        treeview expander:not(:checked) {
-            color: #999999;
-        }
+        /* treeview: see make_theme_css() — applied dynamically */
 
         /* Thin overlay scrollbars */
         scrollbar {
@@ -9167,66 +9265,8 @@ fn load_css() {
             opacity: 0.4;
         }
 
-        /* Search results ListBox — GTK4 CSS node for GtkListBox is 'list' */
-        .search-results-list {
-            background-color: #252526;
-            color: #cccccc;
-        }
-
-        .search-results-list > row {
-            background-color: #252526;
-            color: #cccccc;
-            padding: 2px 4px;
-            min-height: 20px;
-        }
-
-        .search-results-list > row:hover {
-            background-color: #2a2d2e;
-        }
-
-        .search-results-list > row:selected,
-        .search-results-list > row:selected:focus {
-            background-color: rgba(9, 71, 113, 0.5);
-            color: #cccccc;
-        }
-
-        /* Search results ScrolledWindow background */
-        .search-results-scroll {
-            background-color: #252526;
-        }
-
-        /* Labels inside search results list */
-        .search-results-list label {
-            color: #cccccc;
-            background-color: transparent;
-        }
-
-        .search-results-list > row:selected label,
-        .search-results-list > row:selected:focus label {
-            color: #cccccc;
-        }
-
-        /* File-header rows in search results */
-        .search-file-header {
-            color: #569cd6;
-            font-weight: bold;
-            font-size: 12px;
-        }
-
-        /* Search input entry inside sidebar */
-        .sidebar entry {
-            background-color: #3c3c3c;
-            color: #cccccc;
-            border: 1px solid #3e3e42;
-            border-radius: 2px;
-            padding: 4px;
-        }
-
-        .sidebar entry:focus {
-            border-color: #0e639c;
-        }
-
-        /* Search toggle buttons (Aa / Ab| / .*) */
+        /* search-results-list, sidebar entry, search-toggle-btn: see make_theme_css() */
+        /* Search toggle buttons (Aa / Ab| / .*) — base layout only, colors via make_theme_css */
         .search-toggle-btn {
             background: transparent;
             color: #808080;
@@ -9308,14 +9348,19 @@ fn load_css() {
             color: #858585;
             font-size: 11px;
         }
-        ",
-    );
+        ";
+
+fn load_css(theme: &Theme) -> gtk4::CssProvider {
+    let provider = gtk4::CssProvider::new();
+    let combined = format!("{STATIC_CSS}\n{}", make_theme_css(theme));
+    provider.load_from_data(&combined);
 
     gtk4::style_context_add_provider_for_display(
         &gtk4::gdk::Display::default().unwrap(),
         &provider,
         gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
+    provider
 }
 
 /// Build file tree with a root folder node at the top (like VSCode).

@@ -59,6 +59,11 @@ impl Color {
         )
     }
 
+    /// Format as a CSS `#rrggbb` hex string.
+    pub fn to_hex(self) -> String {
+        format!("#{:02x}{:02x}{:02x}", self.r, self.g, self.b)
+    }
+
     /// Expand to the 16-bit (0..65535) values expected by Pango attribute
     /// constructors (`AttrColor::new_foreground` etc.).
     pub fn to_pango_u16(self) -> (u16, u16, u16) {
@@ -1492,6 +1497,258 @@ impl Theme {
             // Virtual text annotations (muted grey — matches comment colour)
             annotation_fg: Color::from_hex("#5c6370"),
         }
+    }
+
+    /// Gruvbox Dark colour scheme.
+    pub fn gruvbox_dark() -> Self {
+        Self {
+            background: Color::from_hex("#282828"),
+            active_background: Color::from_hex("#32302f"),
+            foreground: Color::from_hex("#ebdbb2"),
+
+            keyword: Color::from_hex("#fb4934"),
+            string_lit: Color::from_hex("#b8bb26"),
+            comment: Color::from_hex("#928374"),
+            function: Color::from_hex("#8ec07c"),
+            type_name: Color::from_hex("#fabd2f"),
+            variable: Color::from_hex("#83a598"),
+            default_fg: Color::from_hex("#ebdbb2"),
+
+            selection: Color::from_hex("#458588"),
+            selection_alpha: 0.4,
+
+            cursor: Color::from_hex("#ebdbb2"),
+            cursor_normal_alpha: 0.6,
+
+            search_match_bg: Color::from_hex("#d65d0e"),
+            search_current_match_bg: Color::from_hex("#fe8019"),
+            search_match_fg: Color::from_hex("#1d2021"),
+
+            tab_bar_bg: Color::from_hex("#3c3836"),
+            tab_active_bg: Color::from_hex("#504945"),
+            tab_active_fg: Color::from_hex("#ebdbb2"),
+            tab_inactive_fg: Color::from_hex("#a89984"),
+            tab_preview_active_fg: Color::from_hex("#d5c4a1"),
+            tab_preview_inactive_fg: Color::from_hex("#7c6f64"),
+
+            status_bg: Color::from_hex("#504945"),
+            status_fg: Color::from_hex("#ebdbb2"),
+
+            command_bg: Color::from_hex("#282828"),
+            command_fg: Color::from_hex("#ebdbb2"),
+
+            line_number_fg: Color::from_hex("#7c6f64"),
+            line_number_active_fg: Color::from_hex("#fabd2f"),
+
+            separator: Color::from_hex("#665c54"),
+
+            git_added: Color::from_hex("#b8bb26"),
+            git_modified: Color::from_hex("#fabd2f"),
+
+            completion_bg: Color::from_hex("#32302f"),
+            completion_selected_bg: Color::from_hex("#504945"),
+            completion_fg: Color::from_hex("#ebdbb2"),
+            completion_border: Color::from_hex("#458588"),
+
+            diagnostic_error: Color::from_hex("#fb4934"),
+            diagnostic_warning: Color::from_hex("#fabd2f"),
+            diagnostic_info: Color::from_hex("#83a598"),
+            diagnostic_hint: Color::from_hex("#928374"),
+
+            hover_bg: Color::from_hex("#32302f"),
+            hover_fg: Color::from_hex("#ebdbb2"),
+            hover_border: Color::from_hex("#458588"),
+
+            fuzzy_bg: Color::from_hex("#32302f"),
+            fuzzy_selected_bg: Color::from_hex("#504945"),
+            fuzzy_fg: Color::from_hex("#ebdbb2"),
+            fuzzy_query_fg: Color::from_hex("#8ec07c"),
+            fuzzy_border: Color::from_hex("#458588"),
+            fuzzy_title_fg: Color::from_hex("#fabd2f"),
+
+            diff_added_bg: Color::from_hex("#1e2e1e"),
+            diff_removed_bg: Color::from_hex("#2e1e1e"),
+
+            dap_stopped_bg: Color::from_hex("#3a3000"),
+
+            yank_highlight_bg: Color::from_hex("#b8bb26"),
+            yank_highlight_alpha: 0.35,
+
+            annotation_fg: Color::from_hex("#928374"),
+        }
+    }
+
+    /// Tokyo Night colour scheme.
+    pub fn tokyo_night() -> Self {
+        Self {
+            background: Color::from_hex("#1a1b26"),
+            active_background: Color::from_hex("#1f2335"),
+            foreground: Color::from_hex("#c0caf5"),
+
+            keyword: Color::from_hex("#bb9af7"),
+            string_lit: Color::from_hex("#9ece6a"),
+            comment: Color::from_hex("#565f89"),
+            function: Color::from_hex("#7aa2f7"),
+            type_name: Color::from_hex("#e0af68"),
+            variable: Color::from_hex("#f7768e"),
+            default_fg: Color::from_hex("#a9b1d6"),
+
+            selection: Color::from_hex("#364a82"),
+            selection_alpha: 0.5,
+
+            cursor: Color::from_hex("#c0caf5"),
+            cursor_normal_alpha: 0.5,
+
+            search_match_bg: Color::from_hex("#3d59a1"),
+            search_current_match_bg: Color::from_hex("#ff9e64"),
+            search_match_fg: Color::from_hex("#c0caf5"),
+
+            tab_bar_bg: Color::from_hex("#16161e"),
+            tab_active_bg: Color::from_hex("#292e42"),
+            tab_active_fg: Color::from_hex("#c0caf5"),
+            tab_inactive_fg: Color::from_hex("#545c7e"),
+            tab_preview_active_fg: Color::from_hex("#a9b1d6"),
+            tab_preview_inactive_fg: Color::from_hex("#3b4261"),
+
+            status_bg: Color::from_hex("#292e42"),
+            status_fg: Color::from_hex("#c0caf5"),
+
+            command_bg: Color::from_hex("#1a1b26"),
+            command_fg: Color::from_hex("#c0caf5"),
+
+            line_number_fg: Color::from_hex("#3b4261"),
+            line_number_active_fg: Color::from_hex("#e0af68"),
+
+            separator: Color::from_hex("#292e42"),
+
+            git_added: Color::from_hex("#9ece6a"),
+            git_modified: Color::from_hex("#e0af68"),
+
+            completion_bg: Color::from_hex("#1f2335"),
+            completion_selected_bg: Color::from_hex("#364a82"),
+            completion_fg: Color::from_hex("#c0caf5"),
+            completion_border: Color::from_hex("#7aa2f7"),
+
+            diagnostic_error: Color::from_hex("#f7768e"),
+            diagnostic_warning: Color::from_hex("#e0af68"),
+            diagnostic_info: Color::from_hex("#7aa2f7"),
+            diagnostic_hint: Color::from_hex("#565f89"),
+
+            hover_bg: Color::from_hex("#1f2335"),
+            hover_fg: Color::from_hex("#c0caf5"),
+            hover_border: Color::from_hex("#7aa2f7"),
+
+            fuzzy_bg: Color::from_hex("#1f2335"),
+            fuzzy_selected_bg: Color::from_hex("#364a82"),
+            fuzzy_fg: Color::from_hex("#c0caf5"),
+            fuzzy_query_fg: Color::from_hex("#7aa2f7"),
+            fuzzy_border: Color::from_hex("#7aa2f7"),
+            fuzzy_title_fg: Color::from_hex("#e0af68"),
+
+            diff_added_bg: Color::from_hex("#1a2a1a"),
+            diff_removed_bg: Color::from_hex("#2a1a1a"),
+
+            dap_stopped_bg: Color::from_hex("#2a2500"),
+
+            yank_highlight_bg: Color::from_hex("#9ece6a"),
+            yank_highlight_alpha: 0.35,
+
+            annotation_fg: Color::from_hex("#565f89"),
+        }
+    }
+
+    /// Solarized Dark colour scheme.
+    pub fn solarized_dark() -> Self {
+        Self {
+            background: Color::from_hex("#002b36"),
+            active_background: Color::from_hex("#073642"),
+            foreground: Color::from_hex("#839496"),
+
+            keyword: Color::from_hex("#859900"),
+            string_lit: Color::from_hex("#2aa198"),
+            comment: Color::from_hex("#586e75"),
+            function: Color::from_hex("#268bd2"),
+            type_name: Color::from_hex("#b58900"),
+            variable: Color::from_hex("#dc322f"),
+            default_fg: Color::from_hex("#93a1a1"),
+
+            selection: Color::from_hex("#073642"),
+            selection_alpha: 0.6,
+
+            cursor: Color::from_hex("#93a1a1"),
+            cursor_normal_alpha: 0.6,
+
+            search_match_bg: Color::from_hex("#cb4b16"),
+            search_current_match_bg: Color::from_hex("#d33682"),
+            search_match_fg: Color::from_hex("#fdf6e3"),
+
+            tab_bar_bg: Color::from_hex("#073642"),
+            tab_active_bg: Color::from_hex("#0d4a5a"),
+            tab_active_fg: Color::from_hex("#93a1a1"),
+            tab_inactive_fg: Color::from_hex("#586e75"),
+            tab_preview_active_fg: Color::from_hex("#839496"),
+            tab_preview_inactive_fg: Color::from_hex("#4a6570"),
+
+            status_bg: Color::from_hex("#073642"),
+            status_fg: Color::from_hex("#93a1a1"),
+
+            command_bg: Color::from_hex("#002b36"),
+            command_fg: Color::from_hex("#839496"),
+
+            line_number_fg: Color::from_hex("#586e75"),
+            line_number_active_fg: Color::from_hex("#b58900"),
+
+            separator: Color::from_hex("#073642"),
+
+            git_added: Color::from_hex("#859900"),
+            git_modified: Color::from_hex("#b58900"),
+
+            completion_bg: Color::from_hex("#073642"),
+            completion_selected_bg: Color::from_hex("#0d4a5a"),
+            completion_fg: Color::from_hex("#839496"),
+            completion_border: Color::from_hex("#268bd2"),
+
+            diagnostic_error: Color::from_hex("#dc322f"),
+            diagnostic_warning: Color::from_hex("#b58900"),
+            diagnostic_info: Color::from_hex("#268bd2"),
+            diagnostic_hint: Color::from_hex("#586e75"),
+
+            hover_bg: Color::from_hex("#073642"),
+            hover_fg: Color::from_hex("#93a1a1"),
+            hover_border: Color::from_hex("#268bd2"),
+
+            fuzzy_bg: Color::from_hex("#073642"),
+            fuzzy_selected_bg: Color::from_hex("#0d4a5a"),
+            fuzzy_fg: Color::from_hex("#839496"),
+            fuzzy_query_fg: Color::from_hex("#268bd2"),
+            fuzzy_border: Color::from_hex("#268bd2"),
+            fuzzy_title_fg: Color::from_hex("#b58900"),
+
+            diff_added_bg: Color::from_hex("#00261a"),
+            diff_removed_bg: Color::from_hex("#260007"),
+
+            dap_stopped_bg: Color::from_hex("#2b2000"),
+
+            yank_highlight_bg: Color::from_hex("#859900"),
+            yank_highlight_alpha: 0.35,
+
+            annotation_fg: Color::from_hex("#586e75"),
+        }
+    }
+
+    /// Return a theme by name. Falls back to `onedark` for unknown names.
+    pub fn from_name(name: &str) -> Self {
+        match name {
+            "gruvbox" | "gruvbox-dark" => Self::gruvbox_dark(),
+            "tokyo-night" | "tokyonight" => Self::tokyo_night(),
+            "solarized" | "solarized-dark" => Self::solarized_dark(),
+            _ => Self::onedark(),
+        }
+    }
+
+    /// Return the list of all built-in theme names.
+    pub fn available_names() -> &'static [&'static str] {
+        &["onedark", "gruvbox-dark", "tokyo-night", "solarized-dark"]
     }
 
     /// Return the foreground colour for a Tree-sitter scope name.

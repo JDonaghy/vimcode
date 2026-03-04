@@ -172,6 +172,12 @@ pub struct Settings {
     /// Override for self-hosted or GitHub Pages custom domain setups.
     #[serde(default = "default_extension_registry_url")]
     pub extension_registry_url: String,
+
+    /// Name of the active colour scheme. Built-in options: "onedark" (default),
+    /// "gruvbox-dark", "tokyo-night", "solarized-dark".
+    /// Select with `:colorscheme <name>`.
+    #[serde(default = "default_colorscheme")]
+    pub colorscheme: String,
 }
 
 fn default_explorer_visible() -> bool {
@@ -220,6 +226,10 @@ fn default_leader() -> char {
 
 fn default_extension_registry_url() -> String {
     crate::core::registry::REGISTRY_URL.to_string()
+}
+
+fn default_colorscheme() -> String {
+    "onedark".to_string()
 }
 
 // ── Explorer key defaults ──────────────────────────────────────────────────
@@ -489,6 +499,7 @@ impl Default for Settings {
             colorcolumn: String::new(),
             textwidth: 0,
             extension_registry_url: default_extension_registry_url(),
+            colorscheme: default_colorscheme(),
         }
     }
 }

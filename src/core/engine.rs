@@ -9962,6 +9962,44 @@ impl Engine {
             return EngineAction::None;
         }
 
+        // Handle :colorscheme [name]
+        if cmd == "colorscheme" {
+            let names = ["onedark", "gruvbox-dark", "tokyo-night", "solarized-dark"];
+            self.message = format!("Available themes: {}", names.join(", "));
+            return EngineAction::None;
+        }
+        if let Some(name) = cmd.strip_prefix("colorscheme ") {
+            let name = name.trim();
+            let valid = [
+                "onedark",
+                "gruvbox-dark",
+                "gruvbox",
+                "tokyo-night",
+                "tokyonight",
+                "solarized-dark",
+                "solarized",
+            ];
+            if valid.contains(&name) {
+                // Normalize to canonical name
+                let canonical = match name {
+                    "gruvbox" => "gruvbox-dark",
+                    "tokyonight" => "tokyo-night",
+                    "solarized" => "solarized-dark",
+                    other => other,
+                };
+                self.settings.colorscheme = canonical.to_string();
+                if let Err(e) = self.settings.save() {
+                    self.message = format!("Theme set to '{canonical}' (save failed: {e})");
+                } else {
+                    self.message = format!("Theme: {canonical}");
+                }
+            } else {
+                self.message = format!("Unknown theme '{name}'. Available: onedark, gruvbox-dark, tokyo-night, solarized-dark");
+                return EngineAction::Error;
+            }
+            return EngineAction::None;
+        }
+
         // Handle :config reload
         if cmd == "config reload" {
             match Settings::load_with_validation() {
