@@ -6366,8 +6366,44 @@ impl Engine {
                 *changed = true;
                 return;
             }
-            // Any other key dismisses the ghost text.
-            self.ai_ghost_clear();
+            // If the typed character matches the start of the ghost text,
+            // consume it rather than clearing — avoids doubled characters
+            // when the AI includes a character the user just typed (e.g.
+            // typing `"` when ghost starts with `"PlayerObject":`).
+            if let Some(ch) = unicode {
+                if !ctrl {
+                    let ghost_starts_with_ch = self
+                        .ai_ghost_text
+                        .as_deref()
+                        .and_then(|g| g.chars().next())
+                        == Some(ch);
+                    if ghost_starts_with_ch {
+                        // Advance all alternatives past this character.
+                        for alt in &mut self.ai_ghost_alternatives {
+                            if alt.starts_with(ch) {
+                                *alt = alt[ch.len_utf8()..].to_string();
+                            } else {
+                                alt.clear();
+                            }
+                        }
+                        self.ai_ghost_text = self
+                            .ai_ghost_alternatives
+                            .get(self.ai_ghost_alt_idx)
+                            .cloned();
+                        if self.ai_ghost_text.as_deref() == Some("") {
+                            self.ai_ghost_clear();
+                        }
+                        // Fall through — let the character be inserted normally.
+                    } else {
+                        self.ai_ghost_clear();
+                    }
+                } else {
+                    self.ai_ghost_clear();
+                }
+            } else {
+                // Non-printable key (arrow, backspace, etc.) — clear ghost.
+                self.ai_ghost_clear();
+            }
         }
 
         // ── Tab: accept display-only popup OR fall through ────────────────────

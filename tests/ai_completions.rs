@@ -171,12 +171,35 @@ fn test_accept_ghost_clears_state() {
 // ── Ghost text cleared on non-Tab keys in insert mode ─────────────────────
 
 #[test]
-fn test_ghost_cleared_on_char_key_in_insert() {
+fn test_ghost_cleared_on_non_matching_char_in_insert() {
     let mut e = engine();
     e.handle_key("i", Some('i'), false); // enter insert mode
     e.ai_ghost_text = Some("suggestion".to_string());
-    // Typing any character should clear ghost text
+    // Typing a character that does NOT match the ghost prefix clears it
     e.handle_key("", Some('x'), false);
+    assert!(e.ai_ghost_text.is_none());
+}
+
+#[test]
+fn test_ghost_consumed_on_matching_char_in_insert() {
+    let mut e = engine();
+    e.handle_key("i", Some('i'), false);
+    // Ghost starts with `"` — simulate user typing `"` after AI included it
+    e.ai_ghost_text = Some("\"PlayerObject\":".to_string());
+    e.ai_ghost_alternatives = vec!["\"PlayerObject\":".to_string()];
+    e.handle_key("\"", Some('"'), false);
+    // Ghost should have consumed the leading `"`, not been cleared
+    assert_eq!(e.ai_ghost_text.as_deref(), Some("PlayerObject\":"));
+}
+
+#[test]
+fn test_ghost_cleared_when_consumed_to_empty() {
+    let mut e = engine();
+    e.handle_key("i", Some('i'), false);
+    e.ai_ghost_text = Some("x".to_string());
+    e.ai_ghost_alternatives = vec!["x".to_string()];
+    // Typing the only char in ghost should clear it (nothing left to show)
+    e.handle_key("x", Some('x'), false);
     assert!(e.ai_ghost_text.is_none());
 }
 
