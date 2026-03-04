@@ -2,6 +2,9 @@
 
 ## Recently Completed
 
+**Session 117b — GTK settings form (1199 total):**
+VSCode-style settings sidebar with native GTK widgets. `render.rs`: `SettingType`/`SettingDef`/`SETTING_DEFS` (~30 settings, 7 categories). `settings.rs`: `get_value_str(key)`/`set_value_str(key,value)` methods. `main.rs`: `Msg::SettingChanged`; `build_setting_row()`/`build_settings_form()` free functions; imperatively-built panel with header + search (category-aware filtering) + scrolled list (Switch/SpinButton/DropDown/Entry per type) + Open JSON button; CSS for compact sidebar widgets.
+
 **Session 117 — Settings editor / :Settings command (3 new tests, 1199 total):**
 `:Settings` opens `~/.config/vimcode/settings.json` in a new editor tab. `settings_path()` renamed to `pub fn settings_file_path()`. Engine: `:Settings`/`:settings` command + `PALETTE_COMMANDS` entry. TUI: gear icon click also opens the file; `render_settings_panel` shows live values; mtime auto-reload. 3 new tests.
 

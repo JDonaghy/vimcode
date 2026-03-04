@@ -884,6 +884,119 @@ impl Settings {
             .join("settings.json")
     }
 
+    /// Get the current value of a setting as a string.
+    /// Returns an empty string for unknown keys.
+    /// Used by the settings UI form to populate widget initial values.
+    pub fn get_value_str(&self, key: &str) -> String {
+        match key {
+            "colorscheme" => self.colorscheme.clone(),
+            "font_family" => self.font_family.clone(),
+            "font_size" => self.font_size.to_string(),
+            "line_numbers" => match self.line_numbers {
+                LineNumberMode::None => "none".to_string(),
+                LineNumberMode::Absolute => "absolute".to_string(),
+                LineNumberMode::Relative => "relative".to_string(),
+                LineNumberMode::Hybrid => "hybrid".to_string(),
+            },
+            "cursorline" => self.cursorline.to_string(),
+            "tabstop" => self.tabstop.to_string(),
+            "shift_width" => self.shift_width.to_string(),
+            "expand_tab" => self.expand_tab.to_string(),
+            "auto_indent" => self.auto_indent.to_string(),
+            "wrap" => self.wrap.to_string(),
+            "scrolloff" => self.scrolloff.to_string(),
+            "colorcolumn" => self.colorcolumn.clone(),
+            "textwidth" => self.textwidth.to_string(),
+            "hlsearch" => self.hlsearch.to_string(),
+            "ignorecase" => self.ignorecase.to_string(),
+            "smartcase" => self.smartcase.to_string(),
+            "incremental_search" => self.incremental_search.to_string(),
+            "editor_mode" => match self.editor_mode {
+                EditorMode::Vim => "vim".to_string(),
+                EditorMode::Vscode => "vscode".to_string(),
+            },
+            "explorer_visible_on_startup" => self.explorer_visible_on_startup.to_string(),
+            "splitbelow" => self.splitbelow.to_string(),
+            "splitright" => self.splitright.to_string(),
+            "lsp_enabled" => self.lsp_enabled.to_string(),
+            "terminal_scrollback_lines" => self.terminal_scrollback_lines.to_string(),
+            "plugins_enabled" => self.plugins_enabled.to_string(),
+            _ => String::new(),
+        }
+    }
+
+    /// Set a setting value from a string.
+    /// Returns an error if the key or value is invalid.
+    /// Does not persist to disk — call `save()` afterwards.
+    pub fn set_value_str(&mut self, key: &str, value: &str) -> Result<(), String> {
+        match key {
+            "colorscheme" => self.colorscheme = value.to_string(),
+            "font_family" => self.font_family = value.to_string(),
+            "font_size" => {
+                self.font_size = value
+                    .parse()
+                    .map_err(|_| format!("Invalid font_size: {value}"))?;
+            }
+            "line_numbers" => {
+                self.line_numbers = match value {
+                    "none" => LineNumberMode::None,
+                    "absolute" => LineNumberMode::Absolute,
+                    "relative" => LineNumberMode::Relative,
+                    "hybrid" => LineNumberMode::Hybrid,
+                    _ => return Err(format!("Unknown line_numbers value: {value}")),
+                };
+            }
+            "cursorline" => self.cursorline = value == "true",
+            "tabstop" => {
+                self.tabstop = value
+                    .parse()
+                    .map_err(|_| format!("Invalid tabstop: {value}"))?;
+            }
+            "shift_width" => {
+                self.shift_width = value
+                    .parse()
+                    .map_err(|_| format!("Invalid shift_width: {value}"))?;
+            }
+            "expand_tab" => self.expand_tab = value == "true",
+            "auto_indent" => self.auto_indent = value == "true",
+            "wrap" => self.wrap = value == "true",
+            "scrolloff" => {
+                self.scrolloff = value
+                    .parse()
+                    .map_err(|_| format!("Invalid scrolloff: {value}"))?;
+            }
+            "colorcolumn" => self.colorcolumn = value.to_string(),
+            "textwidth" => {
+                self.textwidth = value
+                    .parse()
+                    .map_err(|_| format!("Invalid textwidth: {value}"))?;
+            }
+            "hlsearch" => self.hlsearch = value == "true",
+            "ignorecase" => self.ignorecase = value == "true",
+            "smartcase" => self.smartcase = value == "true",
+            "incremental_search" => self.incremental_search = value == "true",
+            "editor_mode" => {
+                self.editor_mode = match value {
+                    "vim" => EditorMode::Vim,
+                    "vscode" => EditorMode::Vscode,
+                    _ => return Err(format!("Unknown editor_mode: {value}")),
+                };
+            }
+            "explorer_visible_on_startup" => self.explorer_visible_on_startup = value == "true",
+            "splitbelow" => self.splitbelow = value == "true",
+            "splitright" => self.splitright = value == "true",
+            "lsp_enabled" => self.lsp_enabled = value == "true",
+            "terminal_scrollback_lines" => {
+                self.terminal_scrollback_lines = value
+                    .parse()
+                    .map_err(|_| format!("Invalid terminal_scrollback_lines: {value}"))?;
+            }
+            "plugins_enabled" => self.plugins_enabled = value == "true",
+            _ => return Err(format!("Unknown setting key: {key}")),
+        }
+        Ok(())
+    }
+
     /// Ensure settings.json exists with default values
     /// Creates the file if missing. Note that existing files are automatically updated
     /// when Settings::load() is called - it adds new fields with defaults while preserving

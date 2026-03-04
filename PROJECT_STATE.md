@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Mar 4, 2026 (Session 117 — Settings editor / :Settings command) | **Tests:** 1199
+**Last updated:** Mar 4, 2026 (Session 117b — GTK settings form) | **Tests:** 1199
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 72 are in **SESSION_HISTORY.md**.
@@ -25,6 +25,12 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 117b — GTK settings form (no new tests, 1199 total):**
+VSCode-style settings sidebar form for GTK mode. Clicking the gear icon in the activity bar now shows a live settings panel instead of a placeholder.
+- **`src/render.rs`**: Added `SettingType` enum (`Bool`/`Integer{min,max}`/`StringVal`/`Enum(&[&str])`), `SettingDef` struct, and `SETTING_DEFS: &[SettingDef]` static (~30 settings in 7 categories: Appearance, Editor, Search, Workspace, LSP, Terminal, Plugins).
+- **`src/core/settings.rs`**: Added `get_value_str(&self, key) -> String` and `set_value_str(&mut self, key, value) -> Result<()>` methods to `Settings` — used by the form to read/write settings by key string.
+- **`src/main.rs`**: Added `Msg::SettingChanged { key, value }` variant; two free functions `build_setting_row()` and `build_settings_form()` build native GTK widgets (Switch for bool, SpinButton for int, DropDown for enum, Entry for string); settings panel built imperatively in `init()` after `view_output!()` — includes header, search entry (with category-aware show/hide filtering), scrolled list of all setting rows, and "Open settings.json" button at bottom; `Msg::SettingChanged` handler calls `settings.set_value_str()` then `settings.save()`; CSS for `.settings-category-header` and compact sidebar switch/spinbutton/dropdown/entry styles.
 
 **Session 117 — Settings editor / :Settings command (3 new tests, 1199 total):**
 Implements the settings editor roadmap item. `:Settings` (and `:settings`) opens `~/.config/vimcode/settings.json` in a new editor tab — the same file the engine reads on startup and on `:config reload`. Both backends now auto-reload settings when the file is saved:

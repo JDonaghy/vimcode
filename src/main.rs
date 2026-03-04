@@ -399,6 +399,161 @@ enum Msg {
     ShowCloseTabConfirm,
     /// User responded to the close-tab unsaved-changes dialog.
     CloseTabConfirmed { save: bool },
+    /// A setting was changed via the Settings sidebar form widget.
+    SettingChanged { key: String, value: String },
+}
+
+/// Build a single setting row widget (label+description on left, control widget on right).
+fn build_setting_row(
+    def: &render::SettingDef,
+    settings: &core::settings::Settings,
+    sender: &relm4::Sender<Msg>,
+) -> gtk4::Box {
+    let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    row.set_margin_top(3);
+    row.set_margin_bottom(3);
+    row.set_margin_start(4);
+    row.set_margin_end(4);
+
+    // Left side: label + dim description
+    let left = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
+    left.set_hexpand(true);
+    left.set_valign(gtk4::Align::Center);
+
+    let label = gtk4::Label::new(Some(def.label));
+    label.set_halign(gtk4::Align::Start);
+    left.append(&label);
+
+    if !def.description.is_empty() {
+        let desc = gtk4::Label::new(Some(def.description));
+        desc.set_css_classes(&["dim-label"]);
+        desc.set_halign(gtk4::Align::Start);
+        desc.set_wrap(true);
+        desc.set_max_width_chars(26);
+        left.append(&desc);
+    }
+    row.append(&left);
+
+    let key = def.key.to_string();
+    let current_val = settings.get_value_str(def.key);
+
+    // Right side: control widget based on setting type
+    match &def.setting_type {
+        render::SettingType::Bool => {
+            let switch = gtk4::Switch::new();
+            switch.set_active(current_val == "true");
+            switch.set_valign(gtk4::Align::Center);
+            let sender_c = sender.clone();
+            let key_c = key.clone();
+            switch.connect_state_set(move |_, state| {
+                sender_c
+                    .send(Msg::SettingChanged {
+                        key: key_c.clone(),
+                        value: if state { "true" } else { "false" }.to_string(),
+                    })
+                    .ok();
+                gtk4::glib::Propagation::Proceed
+            });
+            row.append(&switch);
+        }
+        render::SettingType::Integer { min, max } => {
+            let val: f64 = current_val.parse().unwrap_or(0.0);
+            let adj = gtk4::Adjustment::new(val, *min as f64, *max as f64 + 1.0, 1.0, 10.0, 1.0);
+            let spin = gtk4::SpinButton::new(Some(&adj), 1.0, 0);
+            spin.set_valign(gtk4::Align::Center);
+            spin.set_width_chars(7);
+            let sender_c = sender.clone();
+            let key_c = key.clone();
+            spin.connect_value_changed(move |sp| {
+                sender_c
+                    .send(Msg::SettingChanged {
+                        key: key_c.clone(),
+                        value: (sp.value() as i64).to_string(),
+                    })
+                    .ok();
+            });
+            row.append(&spin);
+        }
+        render::SettingType::StringVal => {
+            let entry = gtk4::Entry::new();
+            entry.set_text(&current_val);
+            entry.set_width_chars(14);
+            entry.set_valign(gtk4::Align::Center);
+            let sender_c = sender.clone();
+            let key_c = key.clone();
+            entry.connect_changed(move |e| {
+                sender_c
+                    .send(Msg::SettingChanged {
+                        key: key_c.clone(),
+                        value: e.text().to_string(),
+                    })
+                    .ok();
+            });
+            row.append(&entry);
+        }
+        render::SettingType::Enum(options) => {
+            let current_idx = options.iter().position(|o| *o == current_val).unwrap_or(0) as u32;
+            let dropdown = gtk4::DropDown::from_strings(options);
+            dropdown.set_selected(current_idx);
+            dropdown.set_valign(gtk4::Align::Center);
+            let sender_c = sender.clone();
+            let key_c = key.clone();
+            let options_vec: Vec<String> = options.iter().map(|s| s.to_string()).collect();
+            dropdown.connect_selected_notify(move |dd| {
+                let idx = dd.selected() as usize;
+                if let Some(opt) = options_vec.get(idx) {
+                    sender_c
+                        .send(Msg::SettingChanged {
+                            key: key_c.clone(),
+                            value: opt.clone(),
+                        })
+                        .ok();
+                }
+            });
+            row.append(&dropdown);
+        }
+    }
+
+    row
+}
+
+/// Populate a settings form container with category headers and setting rows.
+/// Returns category sections as `(header_label, Vec<(search_text, row_box)>)` for
+/// search filtering.
+fn build_settings_form(
+    container: &gtk4::Box,
+    settings: &core::settings::Settings,
+    sender: &relm4::Sender<Msg>,
+) -> Vec<(gtk4::Label, Vec<(String, gtk4::Box)>)> {
+    let mut sections: Vec<(gtk4::Label, Vec<(String, gtk4::Box)>)> = Vec::new();
+    let mut current_category = "";
+
+    for def in render::SETTING_DEFS {
+        if def.category != current_category {
+            current_category = def.category;
+
+            let header = gtk4::Label::new(Some(def.category));
+            header.set_halign(gtk4::Align::Start);
+            header.set_css_classes(&["settings-category-header"]);
+            header.set_margin_top(12);
+            header.set_margin_bottom(4);
+            header.set_margin_start(4);
+            container.append(&header);
+
+            sections.push((header, Vec::new()));
+        }
+
+        let row = build_setting_row(def, settings, sender);
+        let search_text =
+            format!("{} {} {}", def.label, def.description, def.category).to_lowercase();
+
+        container.append(&row);
+        if let Some(section) = sections.last_mut() {
+            section.1.push((search_text, row));
+        }
+    }
+
+    sections
 }
 
 #[relm4::component]
@@ -725,32 +880,7 @@ impl SimpleComponent for App {
 
                             #[watch]
                             set_visible: model.active_panel == SidebarPanel::Settings,
-
-                        gtk4::Box {
-                            set_orientation: gtk4::Orientation::Vertical,
-                            set_margin_all: 12,
-                            set_spacing: 12,
-
-                            gtk4::Label {
-                                set_text: "Settings",
-                                set_halign: gtk4::Align::Start,
-                                set_css_classes: &["heading"],
-                            },
-
-                            gtk4::Button {
-                                set_label: "Open settings.json",
-
-                                connect_clicked[sender] => move |_| {
-                                    sender.input(Msg::OpenSettingsFile);
-                                }
-                            },
-
-                            gtk4::Label {
-                                set_text: "Settings file will auto-reload on save",
-                                set_halign: gtk4::Align::Start,
-                                set_css_classes: &["dim-label"],
-                            },
-                        },
+                            // Content built imperatively in init() after view_output!()
                         },
 
                         // Search panel
@@ -1595,6 +1725,75 @@ impl SimpleComponent for App {
         *ext_panel_box_ref.borrow_mut() = Some(widgets.ext_panel.clone());
         *settings_panel_box_ref.borrow_mut() = Some(widgets.settings_panel.clone());
         *search_results_list_ref.borrow_mut() = Some(widgets.search_results_list.clone());
+
+        // ── Settings sidebar form (built imperatively) ─────────────────────────
+        {
+            let panel = widgets.settings_panel.clone();
+            let engine_b = engine.borrow();
+
+            // Header row
+            let header_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+            header_row.set_css_classes(&["sidebar-header"]);
+            let title_lbl = gtk4::Label::new(Some("  SETTINGS"));
+            title_lbl.set_css_classes(&["sidebar-title"]);
+            title_lbl.set_halign(gtk4::Align::Start);
+            title_lbl.set_hexpand(true);
+            header_row.append(&title_lbl);
+            panel.append(&header_row);
+
+            // Search entry
+            let search_entry = gtk4::SearchEntry::new();
+            search_entry.set_placeholder_text(Some("Search settings..."));
+            search_entry.set_margin_start(8);
+            search_entry.set_margin_end(8);
+            search_entry.set_margin_top(4);
+            search_entry.set_margin_bottom(4);
+            panel.append(&search_entry);
+
+            // Scrolled list of settings rows
+            let scroll = gtk4::ScrolledWindow::new();
+            scroll.set_vexpand(true);
+            scroll.set_hscrollbar_policy(gtk4::PolicyType::Never);
+
+            let list_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+            list_box.set_margin_bottom(8);
+
+            let sender_s = sender.input_sender().clone();
+            let sections = build_settings_form(&list_box, &engine_b.settings, &sender_s);
+            drop(engine_b);
+
+            // Wire up search filtering: show/hide rows + category headers
+            let sections_rc = std::rc::Rc::new(sections);
+            search_entry.connect_search_changed(move |entry| {
+                let query = entry.text().to_string().to_lowercase();
+                for (header, rows) in sections_rc.iter() {
+                    let mut any_visible = false;
+                    for (search_text, row) in rows {
+                        let visible = query.is_empty() || search_text.contains(&query);
+                        row.set_visible(visible);
+                        if visible {
+                            any_visible = true;
+                        }
+                    }
+                    header.set_visible(any_visible);
+                }
+            });
+
+            scroll.set_child(Some(&list_box));
+            panel.append(&scroll);
+
+            // Bottom: quick access to settings.json
+            let open_btn = gtk4::Button::with_label("Open settings.json");
+            open_btn.set_margin_start(8);
+            open_btn.set_margin_end(8);
+            open_btn.set_margin_top(4);
+            open_btn.set_margin_bottom(8);
+            let s_open = sender.input_sender().clone();
+            open_btn.connect_clicked(move |_| {
+                s_open.send(Msg::OpenSettingsFile).ok();
+            });
+            panel.append(&open_btn);
+        }
 
         // ── Sidebar resize drag handle ─────────────────────────────────────────
         // Set up the GestureDrag imperatively (outside the view! macro) so that
@@ -3717,6 +3916,14 @@ impl SimpleComponent for App {
                     }
                     self.draw_needed.set(true);
                 }
+            }
+            Msg::SettingChanged { key, value } => {
+                let mut engine = self.engine.borrow_mut();
+                if engine.settings.set_value_str(&key, &value).is_ok() {
+                    let _ = engine.settings.save();
+                }
+                drop(engine);
+                self.draw_needed.set(true);
             }
             Msg::ToggleFindDialog => {
                 self.find_dialog_visible = !self.find_dialog_visible;
@@ -9347,6 +9554,39 @@ const STATIC_CSS: &str = "
         .find-match-count {
             color: #858585;
             font-size: 11px;
+        }
+
+        /* Settings sidebar form */
+        .settings-category-header {
+            color: #bbbbbb;
+            font-size: 11px;
+            font-weight: bold;
+            letter-spacing: 1px;
+            text-transform: uppercase;
+        }
+
+        /* Compact switch widget in settings rows */
+        .sidebar switch {
+            min-height: 20px;
+            min-width: 36px;
+        }
+
+        /* SpinButton in settings rows */
+        .sidebar spinbutton entry {
+            min-width: 40px;
+            padding: 2px 4px;
+        }
+
+        /* DropDown in settings rows — compact */
+        .sidebar dropdown {
+            min-height: 24px;
+            padding: 1px 4px;
+        }
+
+        /* Entry in settings rows */
+        .sidebar entry {
+            min-height: 24px;
+            padding: 2px 6px;
         }
         ";
 

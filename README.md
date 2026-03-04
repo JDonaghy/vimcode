@@ -712,6 +712,7 @@ Additional options (set directly in `settings.json`):
 - `:config reload` — reload settings file from disk
 - `:colorscheme <name>` — switch colour theme live (aliases: `gruvbox`, `tokyonight`, `solarized`); `:colorscheme` lists available themes. Themes: `onedark` (default), `gruvbox-dark`, `tokyo-night`, `solarized-dark`.
 - `:Settings` — open `settings.json` in a new editor tab for direct editing; saved changes reload automatically in both GTK and TUI backends.
+- **Settings sidebar (GTK)** — click the gear icon in the activity bar to open a VSCode-style settings form: searchable list of all settings grouped by category (Appearance, Editor, Search, Workspace, LSP, Terminal, Plugins) with native widgets (Toggle switch, spinner, dropdown, text entry); changes apply and save immediately.
 
 **Panel navigation key bindings** — configurable in `settings.json` under `"panel_keys"`:
 
