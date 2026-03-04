@@ -197,6 +197,12 @@ pub struct Settings {
     /// Useful for OpenAI-compatible local servers or proxies.
     #[serde(default)]
     pub ai_base_url: String,
+
+    /// Enable AI inline completions (ghost text at cursor in insert mode).
+    /// Requires a configured AI provider and API key.
+    /// Default: false (opt-in due to API cost per keystroke).
+    #[serde(default)]
+    pub ai_completions: bool,
 }
 
 fn default_explorer_visible() -> bool {
@@ -527,6 +533,7 @@ impl Default for Settings {
             ai_api_key: String::new(),
             ai_model: String::new(),
             ai_base_url: String::new(),
+            ai_completions: false,
         }
     }
 }
@@ -948,6 +955,11 @@ impl Settings {
             "lsp_enabled" => self.lsp_enabled.to_string(),
             "terminal_scrollback_lines" => self.terminal_scrollback_lines.to_string(),
             "plugins_enabled" => self.plugins_enabled.to_string(),
+            "ai_provider" => self.ai_provider.clone(),
+            "ai_api_key" => self.ai_api_key.clone(),
+            "ai_model" => self.ai_model.clone(),
+            "ai_base_url" => self.ai_base_url.clone(),
+            "ai_completions" => self.ai_completions.to_string(),
             _ => String::new(),
         }
     }
@@ -1019,6 +1031,14 @@ impl Settings {
                     .map_err(|_| format!("Invalid terminal_scrollback_lines: {value}"))?;
             }
             "plugins_enabled" => self.plugins_enabled = value == "true",
+            "ai_provider" => match value {
+                "anthropic" | "openai" | "ollama" => self.ai_provider = value.to_string(),
+                _ => return Err(format!("Unknown ai_provider: {value}")),
+            },
+            "ai_api_key" => self.ai_api_key = value.to_string(),
+            "ai_model" => self.ai_model = value.to_string(),
+            "ai_base_url" => self.ai_base_url = value.to_string(),
+            "ai_completions" => self.ai_completions = value == "true",
             _ => return Err(format!("Unknown setting key: {key}")),
         }
         Ok(())

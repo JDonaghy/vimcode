@@ -1090,6 +1090,8 @@ pub struct Engine {
     pub ai_messages: Vec<AiMessage>,
     /// Current input text being composed.
     pub ai_input: String,
+    /// Cursor position in `ai_input` (char index, 0 = before first char).
+    pub ai_input_cursor: usize,
     /// Whether the AI sidebar has keyboard focus.
     pub ai_has_focus: bool,
     /// Whether the input box is in active editing mode.
@@ -1100,6 +1102,21 @@ pub struct Engine {
     pub ai_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
     /// Scroll offset for the conversation history (in lines).
     pub ai_scroll_top: usize,
+
+    // --- AI inline completions (ghost text) ---
+    /// Ghost text currently shown at the cursor (first/current alternative).
+    /// `None` means no ghost text is visible.
+    pub ai_ghost_text: Option<String>,
+    /// All completion alternatives returned from the last request.
+    pub ai_ghost_alternatives: Vec<String>,
+    /// Index into `ai_ghost_alternatives` for the currently shown alternative.
+    pub ai_ghost_alt_idx: usize,
+    /// Countdown ticker for debouncing inline completions.
+    /// Set to ~30 on every insert-mode keystroke; the backend decrements it
+    /// each frame and calls `tick_ai_completion()` when it reaches zero.
+    pub ai_completion_ticks: Option<u32>,
+    /// Channel for receiving ghost text from the background completion thread.
+    pub ai_completion_rx: Option<std::sync::mpsc::Receiver<Result<Vec<String>, String>>>,
 }
 
 impl Engine {
@@ -1324,8 +1341,14 @@ impl Engine {
             ext_sidebar_sections_expanded: [true, true],
             ext_sidebar_input_active: false,
             line_annotations: HashMap::new(),
+            ai_ghost_text: None,
+            ai_ghost_alternatives: Vec::new(),
+            ai_ghost_alt_idx: 0,
+            ai_completion_ticks: None,
+            ai_completion_rx: None,
             ai_messages: Vec::new(),
             ai_input: String::new(),
+            ai_input_cursor: 0,
             ai_has_focus: false,
             ai_input_active: false,
             ai_streaming: false,
@@ -3995,8 +4018,11 @@ impl Engine {
         self.sync_scroll_binds();
 
         // Fire cursor_move plugin hook when the cursor position changed.
-        // Only fire in Normal/Insert/Replace/Visual modes (not command-line).
-        if !matches!(self.mode, Mode::Command | Mode::Search) {
+        // Excluded from Insert mode: cursor moves caused by typing call git blame
+        // on the committed file, which produces stale annotations for lines that
+        // don't exist yet in the commit (e.g. the empty line created by Enter).
+        // cursor_move is fired explicitly when Escape exits insert mode instead.
+        if !matches!(self.mode, Mode::Command | Mode::Search | Mode::Insert) {
             let (cur_line, cur_col) = {
                 let cur = self.cursor();
                 (cur.line, cur.col)
@@ -6333,6 +6359,17 @@ impl Engine {
             return;
         }
 
+        // ── AI ghost text: accept with Tab; clear on any other key ───────────
+        if self.ai_ghost_text.is_some() {
+            if !ctrl && key_name == "Tab" {
+                self.ai_accept_ghost();
+                *changed = true;
+                return;
+            }
+            // Any other key dismisses the ghost text.
+            self.ai_ghost_clear();
+        }
+
         // ── Tab: accept display-only popup OR fall through ────────────────────
         if !ctrl && key_name == "Tab" && self.completion_display_only {
             if let Some(idx) = self.completion_idx {
@@ -6508,6 +6545,10 @@ impl Engine {
                 self.lsp_signature_help = None;
                 // Collapse all extra cursors.
                 self.view_mut().extra_cursors.clear();
+                // Refresh position-aware annotations (e.g. git blame) now that
+                // we're back in Normal mode. cursor_move is suppressed during
+                // Insert mode to avoid stale blame on uncommitted lines.
+                self.fire_cursor_move_hook();
             }
             "BackSpace" => {
                 if !self.view().extra_cursors.is_empty() {
@@ -14792,6 +14833,7 @@ impl Engine {
             content: text,
         });
         self.ai_input.clear();
+        self.ai_input_cursor = 0;
         self.ai_streaming = true;
 
         let provider = self.settings.ai_provider.clone();
@@ -14852,8 +14894,16 @@ impl Engine {
 
     /// Handle keyboard input for the AI sidebar panel.
     /// Returns `true` if the key was consumed.
+    /// Insert text at the current ai_input cursor position (used for paste).
+    pub fn ai_insert_text(&mut self, text: &str) {
+        let byte = cmd_char_to_byte(&self.ai_input, self.ai_input_cursor);
+        self.ai_input.insert_str(byte, text);
+        self.ai_input_cursor += text.chars().count();
+    }
+
     pub fn handle_ai_panel_key(&mut self, key: &str, ctrl: bool, unicode: Option<char>) -> bool {
         if self.ai_input_active {
+            let char_len = self.ai_input.chars().count();
             match key {
                 "Escape" => {
                     self.ai_input_active = false;
@@ -14863,12 +14913,48 @@ impl Engine {
                     self.ai_input_active = false;
                 }
                 "BackSpace" => {
-                    self.ai_input.pop();
+                    if self.ai_input_cursor > 0 {
+                        self.ai_input_cursor -= 1;
+                        let byte = cmd_char_to_byte(&self.ai_input, self.ai_input_cursor);
+                        let next = cmd_char_to_byte(&self.ai_input, self.ai_input_cursor + 1);
+                        self.ai_input.drain(byte..next);
+                    }
+                }
+                "Delete" => {
+                    if self.ai_input_cursor < char_len {
+                        let byte = cmd_char_to_byte(&self.ai_input, self.ai_input_cursor);
+                        let next = cmd_char_to_byte(&self.ai_input, self.ai_input_cursor + 1);
+                        self.ai_input.drain(byte..next);
+                    }
+                }
+                "Left" => {
+                    self.ai_input_cursor = self.ai_input_cursor.saturating_sub(1);
+                }
+                "Right" => {
+                    self.ai_input_cursor = (self.ai_input_cursor + 1).min(char_len);
+                }
+                "Home" => {
+                    self.ai_input_cursor = 0;
+                }
+                "End" => {
+                    self.ai_input_cursor = char_len;
+                }
+                _ if ctrl && key == "a" => {
+                    self.ai_input_cursor = 0;
+                }
+                _ if ctrl && key == "e" => {
+                    self.ai_input_cursor = char_len;
+                }
+                _ if ctrl && key == "k" => {
+                    let byte = cmd_char_to_byte(&self.ai_input, self.ai_input_cursor);
+                    self.ai_input.truncate(byte);
                 }
                 _ => {
                     if let Some(ch) = unicode {
                         if !ch.is_control() {
-                            self.ai_input.push(ch);
+                            let byte = cmd_char_to_byte(&self.ai_input, self.ai_input_cursor);
+                            self.ai_input.insert(byte, ch);
+                            self.ai_input_cursor += 1;
                         }
                     }
                 }
@@ -14908,6 +14994,168 @@ impl Engine {
             }
             _ => false,
         }
+    }
+
+    // ── AI inline completions (ghost text) ───────────────────────────────────
+
+    /// Clear any visible ghost text and cancel the pending completion timer.
+    pub fn ai_ghost_clear(&mut self) {
+        self.ai_ghost_text = None;
+        self.ai_ghost_alternatives.clear();
+        self.ai_ghost_alt_idx = 0;
+        self.ai_completion_ticks = None;
+        // Don't close the rx; the background thread may still send — we'll
+        // just ignore the result since ai_completion_rx is checked only when
+        // ticks fires.
+    }
+
+    /// Reset the debounce counter. Called after every insert-mode keystroke
+    /// when `settings.ai_completions` is enabled.
+    pub fn ai_completion_reset_timer(&mut self) {
+        // Clear any stale ghost text; the counter will fire a new request.
+        self.ai_ghost_text = None;
+        self.ai_ghost_alternatives.clear();
+        self.ai_ghost_alt_idx = 0;
+        // ~30 ticks ≈ 500 ms at 60 fps; backends decrement each frame.
+        self.ai_completion_ticks = Some(30);
+    }
+
+    /// Called by the backend each frame. Decrements the tick counter and
+    /// fires a completion request when it reaches zero. Returns `true` if
+    /// a redraw is needed.
+    pub fn tick_ai_completion(&mut self) -> bool {
+        // First, check if a background completion has arrived.
+        let mut redraw = false;
+        if let Some(rx) = &self.ai_completion_rx {
+            if let Ok(result) = rx.try_recv() {
+                self.ai_completion_rx = None;
+                match result {
+                    Ok(alternatives) => {
+                        if !alternatives.is_empty() {
+                            self.ai_ghost_alternatives = alternatives;
+                            self.ai_ghost_alt_idx = 0;
+                            self.ai_ghost_text = Some(self.ai_ghost_alternatives[0].clone());
+                            redraw = true;
+                        }
+                    }
+                    Err(_) => {
+                        // Silently ignore errors for inline completions.
+                    }
+                }
+            }
+        }
+
+        // Decrement the countdown and fire when it hits zero.
+        if let Some(ticks) = self.ai_completion_ticks {
+            if ticks == 0 {
+                self.ai_completion_ticks = None;
+                self.ai_fire_completion_request();
+            } else {
+                self.ai_completion_ticks = Some(ticks - 1);
+            }
+        }
+
+        redraw
+    }
+
+    /// Spawn a background thread to request a ghost-text completion.
+    fn ai_fire_completion_request(&mut self) {
+        if !self.settings.ai_completions {
+            return;
+        }
+        // Only trigger in Insert mode.
+        if self.mode != Mode::Insert {
+            return;
+        }
+
+        // Build prefix: all text in the active buffer up to the cursor.
+        let line = self.view().cursor.line;
+        let col = self.view().cursor.col;
+        let line_start = self.buffer().line_to_char(line);
+        let cursor_char = line_start + col;
+        let total_chars = self.buffer().content.len_chars();
+
+        // Limit prefix to last ~2000 chars to keep latency reasonable.
+        let prefix_start = cursor_char.saturating_sub(2000);
+        let prefix: String = self
+            .buffer()
+            .content
+            .slice(prefix_start..cursor_char)
+            .chars()
+            .collect();
+
+        // Suffix: text after the cursor on the same line (for FIM models).
+        let line_end = self
+            .buffer()
+            .content
+            .slice(..)
+            .chars()
+            .enumerate()
+            .skip(cursor_char)
+            .find(|&(_, c)| c == '\n')
+            .map(|(i, _)| i)
+            .unwrap_or(total_chars);
+        let suffix: String = self
+            .buffer()
+            .content
+            .slice(cursor_char..line_end)
+            .chars()
+            .collect();
+
+        let provider = self.settings.ai_provider.clone();
+        let api_key = self.settings.ai_api_key.clone();
+        let base_url = self.settings.ai_base_url.clone();
+        let model = self.settings.ai_model.clone();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.ai_completion_rx = Some(rx);
+
+        std::thread::spawn(move || {
+            let result = super::ai::complete(
+                &provider, &api_key, &base_url, &model, &prefix, &suffix,
+            )
+            .map(|text| {
+                // Trim leading/trailing whitespace that many models add.
+                let trimmed = text.trim_end_matches('\n').to_string();
+                // Return a single alternative for now.
+                vec![trimmed]
+            });
+            let _ = tx.send(result);
+        });
+    }
+
+    /// Accept the current ghost text by inserting it at the cursor.
+    pub fn ai_accept_ghost(&mut self) {
+        if let Some(ghost) = self.ai_ghost_text.take() {
+            if !ghost.is_empty() {
+                let line = self.view().cursor.line;
+                let col = self.view().cursor.col;
+                let char_idx = self.buffer().line_to_char(line) + col;
+                let char_count = ghost.chars().count();
+                self.insert_with_undo(char_idx, &ghost);
+                self.view_mut().cursor.col += char_count;
+            }
+        }
+        self.ai_ghost_clear();
+    }
+
+    /// Show the next ghost text alternative (Alt+]).
+    pub fn ai_ghost_next_alt(&mut self) {
+        if self.ai_ghost_alternatives.is_empty() {
+            return;
+        }
+        self.ai_ghost_alt_idx = (self.ai_ghost_alt_idx + 1) % self.ai_ghost_alternatives.len();
+        self.ai_ghost_text = Some(self.ai_ghost_alternatives[self.ai_ghost_alt_idx].clone());
+    }
+
+    /// Show the previous ghost text alternative (Alt+[).
+    pub fn ai_ghost_prev_alt(&mut self) {
+        if self.ai_ghost_alternatives.is_empty() {
+            return;
+        }
+        let len = self.ai_ghost_alternatives.len();
+        self.ai_ghost_alt_idx = (self.ai_ghost_alt_idx + len - 1) % len;
+        self.ai_ghost_text = Some(self.ai_ghost_alternatives[self.ai_ghost_alt_idx].clone());
     }
 
     /// Re-send didOpen for all open buffers that match a given language ID.

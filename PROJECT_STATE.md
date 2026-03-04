@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Mar 4, 2026 (Session 118 — AI assistant panel) | **Tests:** 1212
+**Last updated:** Mar 4, 2026 (Session 119b — git blame fixes + TUI mouse crash) | **Tests:** 1231
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 117b are in **SESSION_HISTORY.md**.
@@ -25,6 +25,12 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 119b — git-insights blame fixes + TUI mouse crash (no new tests, 1231 total):**
+Three related fixes for the git-insights inline blame extension: (1) `cursor_move` hook suppressed in Insert mode — git blame reads the committed file so querying it for new in-buffer lines produces wrong blame; `fire_cursor_move_hook()` called explicitly on Escape instead; (2) `render.rs` hides `line_annotations` when `engine.mode == Mode::Insert` so existing annotations disappear visually as soon as insert mode is entered; (3) `BlameInfo` gains `not_committed: bool` (true when hash is all zeros); `blame_line()` now takes `buf_contents: Option<&str>` and uses `git blame --contents -` with stdin pipe so git sees the current unsaved buffer content — new empty lines correctly return `not_committed: true`; `blame.lua` updated to show `"Not committed yet"` for those lines; bug fix: `buf_lines.join("")` not `join("\n")` since Ropey `line(i)` already includes the trailing `\n`. TUI crash fix: `(rel_col - wx).saturating_sub(gutter)` in `handle_mouse` drag handler — u16 subtraction overflow when user drags into the line-number gutter area.
+
+**Session 119 — AI inline completions / ghost text (19 new tests, 1231 total):**
+Opt-in AI ghost text shown at cursor in insert mode. `src/core/ai.rs`: added `complete()` fill-in-the-middle function (sends prefix+suffix, returns completion text). `src/core/engine.rs`: fields `ai_ghost_text`, `ai_ghost_alternatives`, `ai_ghost_alt_idx`, `ai_completion_ticks`, `ai_completion_rx`; methods `ai_ghost_clear()`, `ai_completion_reset_timer()`, `tick_ai_completion()`, `ai_fire_completion_request()`, `ai_accept_ghost()`, `ai_ghost_next_alt()`, `ai_ghost_prev_alt()`; Tab in insert mode accepts ghost text, any other key dismisses it. `src/core/settings.rs`: `ai_completions: bool` (default false). `src/render.rs`: `ghost_suffix: Option<String>` on `RenderedLine`; `ghost_text_fg` on `Theme` (muted grey across all 4 themes); `ai_completions` in `SETTING_DEFS`. GTK/TUI backends: ghost text drawn after cursor in muted colour; `tick_ai_completion()` called each frame; `ai_completion_reset_timer()` called after each insert-mode keystroke; Alt+]/Alt+[ cycle alternatives. New `tests/ai_completions.rs` (19 tests) covering initial state, timer logic, ghost clearing, alternative cycling, accept, dismiss, and channel polling.
 
 **Session 118 — AI assistant panel (13 new tests, 1212 total):**
 Built-in AI chat panel with support for Anthropic Claude, OpenAI, and local Ollama. New file `src/core/ai.rs` (~336 lines): `send_chat()` dispatcher, `send_anthropic()` / `send_openai()` / `send_ollama()` provider implementations, JSON helpers, 5 unit tests. New integration test file `tests/ai_panel.rs` (~160 lines, 16 tests) covering AI state machine (send, poll, clear, provider routing). Engine: `ai_messages: Vec<AiMessage>`, `ai_input: String`, `ai_has_focus`, `ai_input_active`, `ai_streaming`, `ai_rx: Option<mpsc::Receiver<String>>`, `ai_scroll_top` fields; `ai_send_message()`, `poll_ai()`, `ai_clear()`, `handle_ai_panel_key()` methods; `:AI <msg>` and `:AiClear` commands. Settings: `ai_provider` (default `"anthropic"`), `ai_api_key`, `ai_model`, `ai_base_url` fields. Render: `AiPanelMessage`, `AiPanelData` structs; `ai_panel: Option<AiPanelData>` on `ScreenLayout`; `build_ai_panel_data()`. GTK: `SidebarPanel::Ai`, activity bar chat icon `\u{f0e5}`, `ai_sidebar_da_ref` / `ai_panel_box_ref` fields, `Msg::AiSidebarKey` / `Msg::AiSidebarClick`, `draw_ai_sidebar()`, `poll_ai()` in tick. TUI: `TuiPanel::Ai` at activity bar row 6, keyboard routing, `render_ai_sidebar()`, `poll_ai()` in event loop.

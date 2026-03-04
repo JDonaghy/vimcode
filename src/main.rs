@@ -1364,6 +1364,23 @@ impl SimpleComponent for App {
                                         }
                                     }
 
+                                    // Alt+] / Alt+[ — cycle AI ghost text alternatives.
+                                    if alt && !ctrl && !shift {
+                                        let in_insert = engine.borrow().mode == crate::core::Mode::Insert;
+                                        if in_insert {
+                                            if key_name == "bracketright" {
+                                                engine.borrow_mut().ai_ghost_next_alt();
+                                                sender.input(Msg::Resize);
+                                                return gtk4::glib::Propagation::Stop;
+                                            }
+                                            if key_name == "bracketleft" {
+                                                engine.borrow_mut().ai_ghost_prev_alt();
+                                                sender.input(Msg::Resize);
+                                                return gtk4::glib::Propagation::Stop;
+                                            }
+                                        }
+                                    }
+
                                     // In VSCode mode, transform Shift+Arrow to "Shift_" prefixed
                                     // key names so the engine's vscode handler can distinguish them.
                                     let effective_key = if engine.borrow().is_vscode_mode() && shift {
@@ -1852,30 +1869,66 @@ impl SimpleComponent for App {
         }
 
         // ── Sidebar resize drag handle ─────────────────────────────────────────
-        // Set up the GestureDrag imperatively (outside the view! macro) so that
-        // the variable captures work reliably with the post-view_output!() refs.
+        // Attach the GestureDrag to main_hbox (which never moves during a sidebar
+        // resize) rather than to the 6-px handle strip itself.  When the handle
+        // strip is a child of a reflowing layout, GTK4 may cancel the gesture as
+        // soon as the widget allocation changes (premature drag-end / jitter).
+        // We gate on the x-position in drag_begin so that only clicks near the
+        // sidebar/editor boundary are treated as a sidebar resize.
         {
+            let is_sb_drag: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+            let is_sb_drag_begin = is_sb_drag.clone();
+            let is_sb_drag_update = is_sb_drag.clone();
+            let is_sb_drag_end = is_sb_drag.clone();
+
             let gesture = gtk4::GestureDrag::new();
+
             let sb_ref = sidebar_inner_box_ref.clone();
             let sw = sidebar_drag_start_w.clone();
-            gesture.connect_drag_begin(move |_, _, _| {
-                if let Some(ref sb) = *sb_ref.borrow() {
-                    sw.set(sb.width_request());
+            gesture.connect_drag_begin(move |_, x, _| {
+                let Some(ref sb) = *sb_ref.borrow() else {
+                    is_sb_drag_begin.set(false);
+                    return;
+                };
+                if !sb.is_visible() {
+                    is_sb_drag_begin.set(false);
+                    return;
+                }
+                // The handle strip sits right after the sidebar.
+                // activity bar (48px) + sidebar_width = left edge of handle.
+                const ACTIVITY_W: f64 = 48.0;
+                let sidebar_right = ACTIVITY_W + sb.allocated_width() as f64;
+                // Accept clicks within ±10 px of the handle centre.
+                if (x - (sidebar_right + 3.0)).abs() <= 10.0 {
+                    is_sb_drag_begin.set(true);
+                    sw.set(sb.allocated_width());
+                } else {
+                    is_sb_drag_begin.set(false);
                 }
             });
+
             let sb_ref2 = sidebar_inner_box_ref.clone();
             let sw2 = sidebar_drag_start_w.clone();
             gesture.connect_drag_update(move |_, dx, _| {
+                if !is_sb_drag_update.get() {
+                    return;
+                }
                 let new_w = (sw2.get() as f64 + dx).round() as i32;
                 if let Some(ref sb) = *sb_ref2.borrow() {
                     sb.set_width_request(new_w.clamp(80, 600));
                 }
             });
+
             let sender_resize = sender.input_sender().clone();
             gesture.connect_drag_end(move |_, _, _| {
+                if !is_sb_drag_end.get() {
+                    return;
+                }
+                is_sb_drag_end.set(false);
                 sender_resize.send(Msg::SidebarResized).ok();
             });
-            widgets.sidebar_resize_handle.add_controller(gesture);
+
+            widgets.main_hbox.add_controller(gesture);
         }
 
         // ── Menu dropdown overlay DrawingArea ─────────────────────────────────
@@ -2863,6 +2916,11 @@ impl SimpleComponent for App {
                     let mut engine = self.engine.borrow_mut();
                     let prev = engine.active_group().active_tab;
                     let a = engine.handle_key(&key_name, unicode, ctrl);
+                    // After any key press in insert mode, reset the AI completion
+                    // debounce timer so a new suggestion fires after idle.
+                    if engine.mode == crate::core::Mode::Insert && engine.settings.ai_completions {
+                        engine.ai_completion_reset_timer();
+                    }
                     (a, prev)
                 };
 
@@ -4285,6 +4343,12 @@ impl SimpleComponent for App {
                         self.draw_needed.set(true);
                     }
                 }
+                // Tick AI inline completions debounce counter.
+                {
+                    if self.engine.borrow_mut().tick_ai_completion() {
+                        self.draw_needed.set(true);
+                    }
+                }
                 // Sync the OS window title with the active buffer name (taskbar/pager).
                 let win_title = self
                     .engine
@@ -5043,6 +5107,19 @@ impl SimpleComponent for App {
                 self.draw_needed.set(true);
             }
             Msg::AiSidebarKey(key_name, ctrl, unicode) => {
+                // Ctrl-V: paste from system clipboard into AI input.
+                if ctrl && key_name == "v" {
+                    if let Some(ref mut ctx) = self.clipboard {
+                        let text = ctx.get_contents().unwrap_or_default();
+                        if !text.is_empty() {
+                            self.engine.borrow_mut().ai_insert_text(&text);
+                        }
+                    }
+                    if let Some(ref da) = *self.ai_sidebar_da_ref.borrow() {
+                        da.queue_draw();
+                    }
+                    return;
+                }
                 let mut engine = self.engine.borrow_mut();
                 engine.handle_ai_panel_key(&key_name, ctrl, unicode);
                 let still_focused = engine.ai_has_focus;
@@ -6686,6 +6763,31 @@ fn draw_window(
                     cr.rectangle(cursor_x, cursor_y + line_height - bar_h, char_w, bar_h);
                     cr.fill().unwrap();
                 }
+            }
+        }
+    }
+
+    // AI ghost text — draw after cursor so it's clearly a suggestion.
+    if let Some((cursor_pos, _)) = &rw.cursor {
+        if let Some(rl) = rw.lines.get(cursor_pos.view_line) {
+            if let Some(ghost) = &rl.ghost_suffix {
+                layout.set_text(&rl.raw_text);
+                layout.set_attributes(None);
+                let byte_offset: usize = rl
+                    .raw_text
+                    .char_indices()
+                    .nth(cursor_pos.col)
+                    .map(|(i, _)| i)
+                    .unwrap_or(rl.raw_text.len());
+                let pos = layout.index_to_pos(byte_offset as i32);
+                let ghost_x = text_x_offset + pos.x() as f64 / pango::SCALE as f64;
+                let ghost_y = rect.y + cursor_pos.view_line as f64 * line_height;
+                let (gr, gg, gb) = theme.ghost_text_fg.to_cairo();
+                cr.set_source_rgb(gr, gg, gb);
+                cr.move_to(ghost_x, ghost_y);
+                layout.set_text(ghost);
+                layout.set_attributes(None);
+                pangocairo::show_layout(cr, layout);
             }
         }
     }
@@ -9037,69 +9139,81 @@ fn draw_ai_sidebar(
         row += 1;
     }
 
-    // ── Message history ───────────────────────────────────────────────────────
-    let scroll = ai.scroll_top;
-    let visible_rows = ((h - line_height * 3.0) / line_height) as usize; // leave room for input
-    let skip = scroll;
-    let mut msg_row = 0usize;
+    // ── Measure char width and compute input/message layout ───────────────────
+    layout.set_text("W");
+    let (char_w_px, _) = layout.pixel_size();
+    let wrap_cols = if char_w_px > 0 {
+        ((w - 20.0) / char_w_px as f64).floor() as usize
+    } else {
+        40
+    }
+    .max(10);
 
-    for msg in &ai.messages {
-        // Draw role label
-        let is_user = msg.role == "user";
-        let role_label = if is_user { "You:" } else { "AI:" };
-        let (role_r, role_g, role_b) = if is_user {
-            (user_r, user_g, user_b)
+    // Input: content width = wrap_cols - 1 (for " > " prefix equivalent)
+    let input_content_w = wrap_cols.saturating_sub(1).max(1);
+    let input_chars: Vec<char> = ai.input.chars().collect();
+    let input_line_count = {
+        let raw = if input_chars.is_empty() {
+            1
         } else {
-            (asst_r, asst_g, asst_b)
+            input_chars.len().div_ceil(input_content_w)
         };
+        // cap at half the panel height so messages are still visible
+        let max_lines = ((h / line_height) as usize / 2).max(1);
+        raw.min(max_lines).max(1)
+    };
+    // separator (1 line) + input lines
+    let input_height = (input_line_count + 1) as f64 * line_height;
+    let input_y = h - input_height;
+    let max_row_y = input_y; // messages render above this
 
-        // Each message: role label + content lines
-        let lines: Vec<&str> = msg.content.lines().collect();
-        let msg_height = 1 + lines.len(); // role + content lines
-
-        if msg_row + msg_height > skip {
-            // Role label row
-            if msg_row >= skip && row as f64 * line_height < h - line_height * 2.0 {
-                cr.set_source_rgb(role_r, role_g, role_b);
-                layout.set_text(role_label);
-                let (_, lh) = layout.pixel_size();
-                cr.move_to(
-                    x + 4.0,
-                    y + row as f64 * line_height + (line_height - lh as f64) / 2.0,
-                );
-                pangocairo::show_layout(cr, layout);
-                row += 1;
-            }
-            // Content lines
-            for line in &lines {
-                if msg_row >= skip && row as f64 * line_height < h - line_height * 2.0 {
-                    cr.set_source_rgb(fg_r, fg_g, fg_b);
-                    // Wrap long lines manually
-                    let display = if line.is_empty() { " " } else { line };
-                    layout.set_text(display);
-                    let (_, lh) = layout.pixel_size();
-                    cr.move_to(
-                        x + 12.0,
-                        y + row as f64 * line_height + (line_height - lh as f64) / 2.0,
-                    );
-                    pangocairo::show_layout(cr, layout);
-                    row += 1;
-                }
-                msg_row += 1;
-            }
+    // ── Message history ───────────────────────────────────────────────────────
+    let mut vis_rows: Vec<(String, f64, f64, f64, f64)> = Vec::new();
+    for msg in &ai.messages {
+        let is_user = msg.role == "user";
+        let (role_label, rr, rg, rb) = if is_user {
+            ("You:", user_r, user_g, user_b)
         } else {
-            msg_row += msg_height;
+            ("AI:", asst_r, asst_g, asst_b)
+        };
+        vis_rows.push((role_label.to_string(), rr, rg, rb, 4.0));
+        for line in msg.content.lines() {
+            if line.is_empty() {
+                vis_rows.push((" ".to_string(), fg_r, fg_g, fg_b, 12.0));
+                continue;
+            }
+            let chars: Vec<char> = line.chars().collect();
+            let mut pos = 0;
+            while pos < chars.len() {
+                let end = (pos + wrap_cols).min(chars.len());
+                let chunk: String = chars[pos..end].iter().collect();
+                vis_rows.push((chunk, fg_r, fg_g, fg_b, 12.0));
+                pos = end;
+            }
         }
-
-        let _ = visible_rows;
+        vis_rows.push((" ".to_string(), dim_r, dim_g, dim_b, 0.0));
     }
 
-    // ── Input row (near bottom) ───────────────────────────────────────────────
-    let input_y = h - line_height * 2.0;
-    // Separator
+    let scroll = ai.scroll_top.min(vis_rows.len().saturating_sub(1));
+    for (i, (text, rr, rg, rb, xi)) in vis_rows.iter().enumerate().skip(scroll) {
+        let vrow = (i - scroll + 1) as f64;
+        let ry = vrow * line_height;
+        if ry >= max_row_y {
+            break;
+        }
+        cr.set_source_rgb(*rr, *rg, *rb);
+        layout.set_text(text);
+        let (_, lh) = layout.pixel_size();
+        cr.move_to(x + xi, y + ry + (line_height - lh as f64) / 2.0);
+        pangocairo::show_layout(cr, layout);
+    }
+
+    // ── Input area (grows with content) ───────────────────────────────────────
+    // Separator line
     cr.set_source_rgb(hdr_r, hdr_g, hdr_b);
-    cr.rectangle(x, y + input_y - 1.0, w, 1.0);
+    cr.rectangle(x, y + input_y, w, 1.0);
     cr.fill().ok();
+
     // Input background
     let (inp_bg_r, inp_bg_g, inp_bg_b) = if ai.input_active {
         theme.fuzzy_selected_bg.to_cairo()
@@ -9107,30 +9221,89 @@ fn draw_ai_sidebar(
         theme.completion_bg.to_cairo()
     };
     cr.set_source_rgb(inp_bg_r, inp_bg_g, inp_bg_b);
-    cr.rectangle(x, y + input_y, w, line_height * 2.0);
+    cr.rectangle(x, y + input_y + 1.0, w, input_height - 1.0);
     cr.fill().ok();
-    // Input text
-    let input_text = if ai.input_active {
-        format!(" > {}|", ai.input)
-    } else if ai.input.is_empty() {
-        if ai.streaming {
-            " (waiting for response…)".to_string()
+
+    let cursor = ai.input_cursor.min(input_chars.len());
+    let cursor_line = if input_content_w > 0 {
+        cursor / input_content_w
+    } else {
+        0
+    };
+    let cursor_col = if input_content_w > 0 {
+        cursor % input_content_w
+    } else {
+        cursor
+    };
+
+    if ai.input_active || !ai.input.is_empty() {
+        // Split input into visual chunks and render each line
+        let chunks: Vec<Vec<char>> = if input_chars.is_empty() {
+            vec![vec![]]
         } else {
-            " Press i to type a message…".to_string()
+            input_chars
+                .chunks(input_content_w)
+                .map(|c| c.to_vec())
+                .collect()
+        };
+
+        // Measure the pixel width of the " > " prefix once
+        layout.set_text(" > ");
+        let (pfx_px, _) = layout.pixel_size();
+        let pfx_w = pfx_px as f64;
+
+        for (line_idx, chunk) in chunks.iter().enumerate().take(input_line_count) {
+            let ly = y + input_y + 1.0 + line_idx as f64 * line_height;
+            let pfx = if line_idx == 0 { " > " } else { "   " };
+
+            // Prefix
+            let (txt_r, txt_g, txt_b) = if ai.input_active {
+                (fg_r, fg_g, fg_b)
+            } else {
+                (dim_r, dim_g, dim_b)
+            };
+            cr.set_source_rgb(txt_r, txt_g, txt_b);
+            layout.set_text(pfx);
+            let (_, lh) = layout.pixel_size();
+            cr.move_to(x + 2.0, ly + (line_height - lh as f64) / 2.0);
+            pangocairo::show_layout(cr, layout);
+
+            // Content
+            if !chunk.is_empty() {
+                let s: String = chunk.iter().collect();
+                layout.set_text(&s);
+                let (_, lh) = layout.pixel_size();
+                cr.move_to(x + 2.0 + pfx_w, ly + (line_height - lh as f64) / 2.0);
+                pangocairo::show_layout(cr, layout);
+            }
+
+            // Cursor bar on the active cursor line
+            if ai.input_active && line_idx == cursor_line {
+                let before: String = chunk.iter().take(cursor_col).collect();
+                layout.set_text(&before);
+                let (before_px, lh) = layout.pixel_size();
+                let cx = x + 2.0 + pfx_w + before_px as f64;
+                let text_y = ly + (line_height - lh as f64) / 2.0;
+                cr.set_source_rgb(fg_r, fg_g, fg_b);
+                cr.set_line_width(1.5);
+                cr.move_to(cx, text_y);
+                cr.line_to(cx, text_y + lh as f64);
+                cr.stroke().ok();
+            }
         }
     } else {
-        format!(" > {}", ai.input)
-    };
-    let (text_r, text_g, text_b) = if ai.input_active || !ai.input.is_empty() {
-        (fg_r, fg_g, fg_b)
-    } else {
-        (dim_r, dim_g, dim_b)
-    };
-    cr.set_source_rgb(text_r, text_g, text_b);
-    layout.set_text(&input_text);
-    let (_, lh_inp) = layout.pixel_size();
-    cr.move_to(x + 2.0, y + input_y + (line_height - lh_inp as f64) / 2.0);
-    pangocairo::show_layout(cr, layout);
+        // Placeholder
+        let placeholder = if ai.streaming {
+            " (waiting for response…)"
+        } else {
+            " Press i to type a message…"
+        };
+        layout.set_text(placeholder);
+        let (_, lh) = layout.pixel_size();
+        cr.set_source_rgb(dim_r, dim_g, dim_b);
+        cr.move_to(x + 2.0, y + input_y + 1.0 + (line_height - lh as f64) / 2.0);
+        pangocairo::show_layout(cr, layout);
+    }
 
     // Focus border
     if ai.has_focus {
@@ -9140,7 +9313,7 @@ fn draw_ai_sidebar(
         cr.stroke().ok();
     }
 
-    let _ = (row, dim_r, dim_g, dim_b);
+    let _ = row;
 }
 
 fn draw_debug_toolbar(

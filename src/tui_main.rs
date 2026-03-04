@@ -1095,6 +1095,10 @@ fn event_loop(
             if engine.poll_ai() {
                 needs_redraw = true;
             }
+            // Tick AI inline completion debounce counter each event-loop frame.
+            if engine.tick_ai_completion() {
+                needs_redraw = true;
+            }
             continue;
         }
 
@@ -1584,24 +1588,49 @@ fn event_loop(
 
                     // ── AI assistant panel keyboard handling ─────────────────
                     if sidebar.active_panel == TuiPanel::Ai {
+                        // Ctrl-V paste
+                        if ctrl && key_event.code == KeyCode::Char('v') {
+                            let text = match engine.clipboard_read {
+                                Some(ref cb) => cb().ok(),
+                                None => None,
+                            };
+                            if let Some(t) = text {
+                                engine.ai_insert_text(&t);
+                            }
+                            needs_redraw = true;
+                            continue;
+                        }
                         let (key_name, unicode): (&str, Option<char>) = match key_event.code {
-                            KeyCode::Char('j') | KeyCode::Down => ("j", None),
-                            KeyCode::Char('k') | KeyCode::Up => ("k", None),
-                            KeyCode::Char('G') => ("G", None),
-                            KeyCode::Char('g') => ("g", None),
-                            KeyCode::Char('i') | KeyCode::Char('a') => ("i", None),
+                            KeyCode::Down if !engine.ai_input_active => ("j", None),
+                            KeyCode::Up if !engine.ai_input_active => ("k", None),
+                            KeyCode::Char('j') if !engine.ai_input_active => ("j", None),
+                            KeyCode::Char('k') if !engine.ai_input_active => ("k", None),
+                            KeyCode::Char('G') if !engine.ai_input_active => ("G", None),
+                            KeyCode::Char('g') if !engine.ai_input_active => ("g", None),
+                            KeyCode::Char('i') | KeyCode::Char('a') if !engine.ai_input_active => {
+                                ("i", None)
+                            }
                             KeyCode::Enter => ("Return", None),
-                            KeyCode::Char('q') | KeyCode::Esc => ("Escape", None),
+                            KeyCode::Esc => ("Escape", None),
+                            KeyCode::Char('q') if !engine.ai_input_active => ("Escape", None),
                             KeyCode::Backspace => ("BackSpace", None),
+                            KeyCode::Delete => ("Delete", None),
+                            KeyCode::Left => ("Left", None),
+                            KeyCode::Right => ("Right", None),
+                            KeyCode::Home => ("Home", None),
+                            KeyCode::End => ("End", None),
                             KeyCode::Char('c') if ctrl => ("c", None),
+                            KeyCode::Char('a') if ctrl => {
+                                ("a", None) // Ctrl-A → start of input
+                            }
+                            KeyCode::Char('e') if ctrl => ("e", None),
+                            KeyCode::Char('k') if ctrl => ("k", None),
                             KeyCode::Char(ch) => ("char", Some(ch)),
                             _ => ("", None),
                         };
                         if !key_name.is_empty() {
                             let (mapped, uni) = if key_name == "char" {
                                 ("", unicode)
-                            } else if key_name == "c" && ctrl {
-                                ("c", None)
                             } else {
                                 (key_name, None)
                             };
@@ -2199,7 +2228,7 @@ fn event_loop(
                                 continue;
                             }
                             KeyCode::Right => {
-                                sidebar_width = (sidebar_width + 1).min(60);
+                                sidebar_width = (sidebar_width + 1).min(150);
                                 needs_redraw = true;
                                 continue;
                             }
@@ -2219,6 +2248,21 @@ fn event_loop(
                                 engine.group_resize(0.05);
                                 needs_redraw = true;
                                 continue;
+                            }
+                            // Alt+] / Alt+[ — cycle AI ghost text alternatives
+                            KeyCode::Char(']') => {
+                                if engine.mode == crate::core::Mode::Insert {
+                                    engine.ai_ghost_next_alt();
+                                    needs_redraw = true;
+                                    continue;
+                                }
+                            }
+                            KeyCode::Char('[') => {
+                                if engine.mode == crate::core::Mode::Insert {
+                                    engine.ai_ghost_prev_alt();
+                                    needs_redraw = true;
+                                    continue;
+                                }
                             }
                             _ => {}
                         }
@@ -2307,6 +2351,12 @@ fn event_loop(
                             engine.active_group
                         );
                         let action = engine.handle_key(&key_name, unicode, ctrl);
+                        // After any key in insert mode, reset AI completion timer.
+                        if engine.mode == crate::core::Mode::Insert
+                            && engine.settings.ai_completions
+                        {
+                            engine.ai_completion_reset_timer();
+                        }
                         debug_log!(
                             "handle_key result: action={:?} groups_after={}",
                             action,
@@ -2607,7 +2657,7 @@ fn handle_mouse(
         }
         MouseEventKind::Drag(MouseButton::Left) if *dragging_sidebar => {
             let new_w = col.saturating_sub(ACTIVITY_BAR_WIDTH);
-            return new_w.clamp(15, 60);
+            return new_w.clamp(15, 150);
         }
         MouseEventKind::Drag(MouseButton::Left) => {
             // Command-line text selection drag
@@ -2727,7 +2777,8 @@ fn handle_mouse(
                                 .get(view_row)
                                 .map(|l| l.line_idx)
                                 .unwrap_or_else(|| rw.scroll_top + view_row);
-                            let col_in_text = (rel_col - wx - gutter) as usize + rw.scroll_left;
+                            let col_in_text =
+                                (rel_col - wx).saturating_sub(gutter) as usize + rw.scroll_left;
                             engine.mouse_drag(rw.window_id, buf_line, col_in_text);
                             *mouse_text_drag = true;
                             return sidebar_width;
@@ -5923,6 +5974,26 @@ fn render_window(frame: &mut ratatui::Frame, area: Rect, window: &RenderedWindow
         }
     }
 
+    // AI ghost text — draw after cursor at cursor position in muted colour.
+    if let Some((cursor_pos, _)) = &window.cursor {
+        if let Some(rl) = window.lines.get(cursor_pos.view_line) {
+            if let Some(ghost) = &rl.ghost_suffix {
+                let ghost_screen_y = area.y + cursor_pos.view_line as u16;
+                let vis_col = cursor_pos.col.saturating_sub(window.scroll_left) as u16;
+                let ghost_start_x = area.x + gutter_w + vis_col;
+                let ghost_fg = rc(theme.ghost_text_fg);
+                let buf = frame.buffer_mut();
+                for (i, ch) in ghost.chars().enumerate() {
+                    let gx = ghost_start_x + i as u16;
+                    if gx >= area.x + area.width {
+                        break;
+                    }
+                    set_cell(buf, gx, ghost_screen_y, ch, ghost_fg, window_bg);
+                }
+            }
+        }
+    }
+
     // Secondary cursors (multi-cursor Alt-D) — invert fg/bg like a block cursor.
     for extra_pos in &window.extra_cursors {
         let sy = area.y + extra_pos.view_line as u16;
@@ -8205,11 +8276,26 @@ fn render_ai_sidebar(
         y += 1;
     }
 
-    // ── Message history ───────────────────────────────────────────────────────
-    let input_rows: u16 = 2;
-    let msg_area_height = area.height.saturating_sub(1 + input_rows); // header + input
-    let scroll = ai.scroll_top;
+    // ── Compute input height (grows with content) ─────────────────────────────
+    let pfx_len = 3usize; // " > " / "   "
+    let content_w = (area.width as usize).saturating_sub(pfx_len).max(1);
+    let input_chars: Vec<char> = ai.input.chars().collect();
+    let input_line_count = {
+        let raw = if input_chars.is_empty() {
+            1
+        } else {
+            input_chars.len().div_ceil(content_w)
+        };
+        // cap so messages keep at least 3 rows
+        raw.min((area.height as usize).saturating_sub(5).max(1))
+    };
+    // +1 for separator row
+    let input_rows = input_line_count as u16 + 1;
+    let msg_area_height = area.height.saturating_sub(1 + input_rows); // 1 = header
 
+    // ── Message history ───────────────────────────────────────────────────────
+    let scroll = ai.scroll_top;
+    let wrap_w = content_w.saturating_sub(1).max(10); // slightly narrower for "  " indent
     let mut all_rows: Vec<(String, RColor)> = Vec::new();
     for msg in &ai.messages {
         let is_user = msg.role == "user";
@@ -8217,8 +8303,18 @@ fn render_ai_sidebar(
         let role_fg = if is_user { user_fg } else { asst_fg };
         all_rows.push((role_label.to_string(), role_fg));
         for line in msg.content.lines() {
-            let display = format!("  {}", if line.is_empty() { " " } else { line });
-            all_rows.push((display, default_fg));
+            if line.is_empty() {
+                all_rows.push(("  ".to_string(), default_fg));
+                continue;
+            }
+            let chars: Vec<char> = line.chars().collect();
+            let mut pos = 0;
+            while pos < chars.len() {
+                let end = (pos + wrap_w).min(chars.len());
+                let chunk: String = chars[pos..end].iter().collect();
+                all_rows.push((format!("  {}", chunk), default_fg));
+                pos = end;
+            }
         }
         all_rows.push((" ".to_string(), panel_bg)); // blank separator
     }
@@ -8242,33 +8338,84 @@ fn render_ai_sidebar(
         y += 1;
     }
 
-    // ── Input rows ────────────────────────────────────────────────────────────
-    // Separator row
+    // ── Separator ─────────────────────────────────────────────────────────────
     if y < area.y + area.height {
         for x in area.x..area.x + area.width {
             set_cell(buf, x, y, '─', dim_fg, header_bg);
         }
         y += 1;
     }
-    // Input text row
-    if y < area.y + area.height {
-        let (inp_bg, inp_fg) = if ai.input_active {
-            (input_bg, default_fg)
+
+    // ── Input area (multi-line, grows with content) ────────────────────────────
+    let (inp_bg, inp_fg) = if ai.input_active {
+        (input_bg, default_fg)
+    } else {
+        (panel_bg, dim_fg)
+    };
+    let cursor = ai.input_cursor.min(input_chars.len());
+    let cursor_line = if content_w > 0 { cursor / content_w } else { 0 };
+    let cursor_col = if content_w > 0 {
+        cursor % content_w
+    } else {
+        cursor
+    };
+
+    if ai.input_active || !ai.input.is_empty() {
+        // Split input into visual chunks
+        let chunks: Vec<&[char]> = if input_chars.is_empty() {
+            vec![&[][..]]
         } else {
-            (panel_bg, dim_fg)
+            input_chars.chunks(content_w).collect()
         };
-        let input_text = if ai.input_active {
-            format!(" > {}|", ai.input)
-        } else if ai.input.is_empty() {
-            if ai.streaming {
-                " (waiting for response…)".to_string()
-            } else {
-                " Press i to type…".to_string()
+        for (line_idx, chunk) in chunks.iter().enumerate().take(input_line_count) {
+            if y >= area.y + area.height {
+                break;
             }
-        } else {
-            format!(" > {}", ai.input)
-        };
-        write_row(buf, y, &input_text, inp_fg, inp_bg);
+            // Fill background
+            for x in area.x..area.x + area.width {
+                set_cell(buf, x, y, ' ', inp_fg, inp_bg);
+            }
+            // Prefix: " > " on first line, "   " on continuations
+            let pfx = if line_idx == 0 { " > " } else { "   " };
+            for (i, ch) in pfx.chars().enumerate() {
+                set_cell(buf, area.x + i as u16, y, ch, inp_fg, inp_bg);
+            }
+            // Content
+            for (i, &ch) in chunk.iter().enumerate() {
+                set_cell(
+                    buf,
+                    area.x + pfx_len as u16 + i as u16,
+                    y,
+                    ch,
+                    inp_fg,
+                    inp_bg,
+                );
+            }
+            // Cursor (inverted cell on the cursor line)
+            if ai.input_active && line_idx == cursor_line {
+                let cx = area.x + pfx_len as u16 + cursor_col as u16;
+                if cx < area.x + area.width {
+                    let cursor_ch = input_chars.get(cursor).copied().unwrap_or(' ');
+                    set_cell(buf, cx, y, cursor_ch, inp_bg, inp_fg);
+                }
+            }
+            y += 1;
+        }
+    } else {
+        // Placeholder when input is empty and not active
+        if y < area.y + area.height {
+            for x in area.x..area.x + area.width {
+                set_cell(buf, x, y, ' ', inp_fg, inp_bg);
+            }
+            let placeholder = if ai.streaming {
+                " (waiting for response…)"
+            } else {
+                " Press i to type…"
+            };
+            for (i, ch) in placeholder.chars().enumerate().take(area.width as usize) {
+                set_cell(buf, area.x + i as u16, y, ch, inp_fg, inp_bg);
+            }
+        }
     }
 }
 

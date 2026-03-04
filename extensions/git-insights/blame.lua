@@ -1,5 +1,7 @@
 -- Git Insights: inline blame annotation on current line
 -- Shows author, relative date, and commit message as virtual text.
+-- Annotations are hidden automatically while in insert mode (the engine
+-- suppresses cursor_move in insert mode, and the render layer clears them).
 
 local last_line = -1
 local last_path = ""
@@ -19,8 +21,13 @@ vimcode.on("cursor_move", function(_)
   vimcode.buf.clear_annotations()
   local info = vimcode.git.blame_line(cur.line)
   if info then
-    vimcode.buf.annotate_line(cur.line,
-      "   " .. info.author .. " \u{2022} " .. info.relative_date .. " \u{2022} " .. info.message)
+    local text
+    if info.not_committed then
+      text = "   Not committed yet"
+    else
+      text = "   " .. info.author .. " \u{2022} " .. info.relative_date .. " \u{2022} " .. info.message
+    end
+    vimcode.buf.annotate_line(cur.line, text)
   end
 end)
 

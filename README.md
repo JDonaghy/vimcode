@@ -11,7 +11,7 @@ There's a touch of irony here - using a cli tool to write the editor that I've w
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 1212 tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 1231 tests, zero async runtime dependency
 
 
 ## Download (Ubuntu)
@@ -648,8 +648,20 @@ Built-in AI chat panel powered by Anthropic Claude, OpenAI, or a local Ollama mo
 | `ai_api_key` | `""` | API key (falls back to `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` env vars) |
 | `ai_model` | `""` | Model override (leave empty for provider default) |
 | `ai_base_url` | `""` | Base URL override (used for Ollama; defaults to `http://localhost:11434`) |
+| `ai_completions` | `false` | Enable AI inline completions (ghost text) in insert mode |
 
 Responses are fetched asynchronously via a background `curl` subprocess — no async runtime required. The conversation is kept in memory for the session and cleared with `:AiClear`.
+
+#### AI Inline Completions
+
+When `ai_completions` is enabled, VimCode shows ghost text at the cursor while you type in insert mode. After ~500 ms of idle time a fill-in-the-middle request is sent to the configured AI provider; the suggestion appears as dimmed text.
+
+| Key | Action |
+|-----|--------|
+| `Tab` | Accept the ghost-text suggestion |
+| `Alt-]` | Cycle to next alternative suggestion |
+| `Alt-[` | Cycle to previous alternative suggestion |
+| Any other key | Dismiss the suggestion |
 
 ---
 
@@ -742,6 +754,7 @@ Additional options (set directly in `settings.json`):
 | `ai_api_key` | `""` | API key (falls back to `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` env vars) |
 | `ai_model` | `""` | Model override (leave empty for provider default) |
 | `ai_base_url` | `""` | Base URL override (used for Ollama; defaults to `http://localhost:11434`) |
+| `ai_completions` | `false` | Enable AI inline completions (ghost text) in insert mode |
 
 - `:set option?` — query current value (e.g. `:set ts?` → `tabstop=4`)
 - `:set option!` — toggle a boolean option (e.g. `:set wrap!`); `no<option>!` explicitly disables (e.g. `:set nowrap!`)

@@ -69,15 +69,18 @@ fn test_ai_panel_key_typing_in_input() {
     e.handle_ai_panel_key("char", false, Some('h'));
     e.handle_ai_panel_key("char", false, Some('i'));
     assert_eq!(e.ai_input, "hi");
+    assert_eq!(e.ai_input_cursor, 2);
 }
 
 #[test]
 fn test_ai_panel_key_backspace_in_input() {
     let mut e = engine();
     e.ai_input = "hello".to_string();
+    e.ai_input_cursor = 5; // cursor at end
     e.ai_input_active = true;
     e.handle_ai_panel_key("BackSpace", false, None);
     assert_eq!(e.ai_input, "hell");
+    assert_eq!(e.ai_input_cursor, 4);
 }
 
 #[test]
@@ -136,6 +139,47 @@ fn test_ai_clear_command() {
     });
     e.execute_command("AiClear");
     assert!(e.ai_messages.is_empty());
+}
+
+#[test]
+fn test_ai_input_cursor_arrow_keys() {
+    let mut e = engine();
+    e.ai_input = "hello".to_string();
+    e.ai_input_cursor = 5;
+    e.ai_input_active = true;
+    e.handle_ai_panel_key("Left", false, None);
+    assert_eq!(e.ai_input_cursor, 4);
+    e.handle_ai_panel_key("Right", false, None);
+    assert_eq!(e.ai_input_cursor, 5);
+    e.handle_ai_panel_key("Home", false, None);
+    assert_eq!(e.ai_input_cursor, 0);
+    e.handle_ai_panel_key("End", false, None);
+    assert_eq!(e.ai_input_cursor, 5);
+    // Left saturates at 0
+    e.handle_ai_panel_key("Home", false, None);
+    e.handle_ai_panel_key("Left", false, None);
+    assert_eq!(e.ai_input_cursor, 0);
+}
+
+#[test]
+fn test_ai_input_cursor_insert_at_middle() {
+    let mut e = engine();
+    e.ai_input = "hllo".to_string();
+    e.ai_input_cursor = 1; // insert 'e' between 'h' and 'l'
+    e.ai_input_active = true;
+    e.handle_ai_panel_key("", false, Some('e'));
+    assert_eq!(e.ai_input, "hello");
+    assert_eq!(e.ai_input_cursor, 2);
+}
+
+#[test]
+fn test_ai_insert_text_paste() {
+    let mut e = engine();
+    e.ai_input = "hi".to_string();
+    e.ai_input_cursor = 2;
+    e.ai_insert_text(" world");
+    assert_eq!(e.ai_input, "hi world");
+    assert_eq!(e.ai_input_cursor, 8);
 }
 
 #[test]

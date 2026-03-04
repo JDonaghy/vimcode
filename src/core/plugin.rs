@@ -454,7 +454,16 @@ impl PluginManager {
                 };
                 let repo_root = git::find_repo_root(cwd_path.as_deref().unwrap_or(&file))
                     .unwrap_or_else(|| file.parent().map(|p| p.to_path_buf()).unwrap_or_default());
-                let info = match git::blame_line(&repo_root, &file, n) {
+                // Join buffer lines so git blame sees the current in-memory
+                // content (catches unsaved new lines, which would otherwise
+                // read stale on-disk content and return wrong blame).
+                // buf_lines come from Ropey's line() which includes the
+                // trailing \n on each line, so join with "" not "\n".
+                let buf_content = {
+                    let ctx = lua.app_data_ref::<PluginCallContext>();
+                    ctx.map(|c| c.buf_lines.join(""))
+                };
+                let info = match git::blame_line(&repo_root, &file, n, buf_content.as_deref()) {
                     Some(i) => i,
                     None => return Ok(LuaValue::Nil),
                 };
@@ -464,6 +473,7 @@ impl PluginManager {
                 t.set("date", info.timestamp)?;
                 t.set("relative_date", info.relative_date)?;
                 t.set("message", info.message)?;
+                t.set("not_committed", info.not_committed)?;
                 Ok(LuaValue::Table(t))
             })?,
         )?;

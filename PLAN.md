@@ -2,6 +2,12 @@
 
 ## Recently Completed
 
+**Session 119b — git-insights blame fixes + TUI mouse crash (1231 total):**
+`cursor_move` suppressed in Insert mode; annotations hidden in render.rs during Insert; `BlameInfo.not_committed`; `blame_line(buf_contents)` uses `--contents -` stdin pipe; `buf_lines.join("")`; `blame.lua` shows "Not committed yet"; TUI drag crash: `saturating_sub(gutter)`.
+
+**Session 119 — AI inline completions / ghost text (19 new tests, 1231 total):**
+Opt-in ghost text completions from AI in insert mode. `src/core/ai.rs`: `complete()` fill-in-the-middle function. `src/core/settings.rs`: `ai_completions: bool` (default false). `src/core/engine.rs`: 5 new fields (`ai_ghost_text`, `ai_ghost_alternatives`, `ai_ghost_alt_idx`, `ai_completion_ticks`, `ai_completion_rx`); 7 new methods (`ai_ghost_clear`, `ai_completion_reset_timer`, `tick_ai_completion`, `ai_fire_completion_request`, `ai_accept_ghost`, `ai_ghost_next_alt`, `ai_ghost_prev_alt`); Tab accepts ghost in insert mode. `src/render.rs`: `ghost_suffix` on `RenderedLine`; `ghost_text_fg` on `Theme`; `ai_completions` in `SETTING_DEFS`. GTK + TUI: ghost text rendered in muted colour, `tick_ai_completion()` per frame, `ai_completion_reset_timer()` per insert keystroke, Alt+]/Alt+[ cycle alternatives. `tests/ai_completions.rs`: 19 new tests.
+
 **Session 118 — AI assistant panel (1212 total):**
 Built-in AI chat sidebar panel. `src/core/ai.rs` (new, ~336 lines): `send_chat()` dispatcher; `send_anthropic()` / `send_openai()` / `send_ollama()` via curl subprocess; JSON helpers; 5 unit tests. `tests/ai_panel.rs` (new, ~160 lines): 16 integration tests for state machine. `src/core/settings.rs`: `ai_provider` (default `"anthropic"`), `ai_api_key`, `ai_model`, `ai_base_url` fields. `src/core/engine.rs`: 7 new AI fields; `ai_send_message()`, `poll_ai()`, `ai_clear()`, `handle_ai_panel_key()` methods; `:AI <msg>` and `:AiClear` commands. `src/render.rs`: `AiPanelMessage`, `AiPanelData`; `ai_panel` on `ScreenLayout`; `build_ai_panel_data()`. GTK: `SidebarPanel::Ai`, `draw_ai_sidebar()`, activity bar chat icon, `poll_ai()` in tick. TUI: `TuiPanel::Ai`, `render_ai_sidebar()`, `poll_ai()` in event loop.
 
@@ -781,4 +787,4 @@ Root cause: `draw_menu_dropdown` was called from `draw_editor()`'s DrawingArea w
 
 ### AI Integration
 - [x] **AI assistant panel** — sidebar chat panel; configurable provider (Anthropic Claude, OpenAI, Ollama local); `ai_provider`/`ai_api_key`/`ai_model`/`ai_base_url` in settings; activity bar chat icon opens panel; multi-turn conversation; `:AI <msg>` and `:AiClear` commands (session 118)
-- [ ] **AI inline completions** — ghost-text completions from AI provider interleaved with LSP ghost text; separate `ai_completions` setting (default false to avoid unexpected API costs); debounced after 500ms idle in insert mode; Tab accepts whole suggestion, `Alt-]`/`Alt-[` cycle through alternatives
+- [x] **AI inline completions** — ghost-text completions from AI provider interleaved with LSP ghost text; separate `ai_completions` setting (default false to avoid unexpected API costs); debounced after 500ms idle in insert mode; Tab accepts whole suggestion, `Alt-]`/`Alt-[` cycle through alternatives

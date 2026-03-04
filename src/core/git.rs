@@ -925,19 +925,49 @@ pub struct BlameInfo {
     pub message: String,
     /// Human-readable relative date (e.g. "3 days ago").
     pub relative_date: String,
+    /// True when git reports the line as not yet committed (all-zero hash).
+    pub not_committed: bool,
 }
 
 /// Return blame information for a single 1-indexed line using
 /// `git blame -L {line},{line} --porcelain -- {file}`.
+///
+/// When `buf_contents` is supplied the buffer text is piped via stdin with
+/// `--contents -` so that git sees the current in-memory state of the file
+/// (including unsaved lines) rather than the stale on-disk version.
+///
 /// Returns `None` when the file is untracked, has no commits, or any git
 /// failure occurs.
-pub fn blame_line(repo_root: &Path, file: &Path, line: usize) -> Option<BlameInfo> {
+pub fn blame_line(
+    repo_root: &Path,
+    file: &Path,
+    line: usize,
+    buf_contents: Option<&str>,
+) -> Option<BlameInfo> {
     let line_spec = format!("{},{}", line, line);
     let file_str = file.to_str()?;
-    let raw = run_git(
-        repo_root,
-        &["blame", "-L", &line_spec, "--porcelain", "--", file_str],
-    )?;
+    let raw = if let Some(contents) = buf_contents {
+        run_git_stdin(
+            repo_root,
+            &[
+                "blame",
+                "-L",
+                &line_spec,
+                "--porcelain",
+                "--contents",
+                "-",
+                "--",
+                file_str,
+            ],
+            contents,
+        )
+        .ok()?
+    } else {
+        run_git(
+            repo_root,
+            &["blame", "-L", &line_spec, "--porcelain", "--", file_str],
+        )?
+    };
     if raw.trim().is_empty() {
         return None;
     }
@@ -974,6 +1004,7 @@ pub fn blame_line(repo_root: &Path, file: &Path, line: usize) -> Option<BlameInf
     let relative_date = epoch_to_relative(timestamp);
 
     Some(BlameInfo {
+        not_committed: hash.chars().all(|c| c == '0'),
         hash,
         author,
         timestamp,
@@ -1201,6 +1232,7 @@ pub(crate) fn parse_blame_line_porcelain(raw: &str) -> Option<BlameInfo> {
         return None;
     }
     Some(BlameInfo {
+        not_committed: hash.chars().all(|c| c == '0'),
         relative_date: epoch_to_relative(timestamp),
         hash,
         author,

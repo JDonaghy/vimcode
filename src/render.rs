@@ -139,6 +139,10 @@ pub struct RenderedLine {
     /// Optional inline annotation (virtual text) shown after line content in a
     /// muted colour. Set by Lua plugins via `vimcode.buf.annotate_line()`.
     pub annotation: Option<String>,
+    /// AI ghost text shown after the cursor position on this line (Insert mode).
+    /// Only set on the cursor line when `ai_completions` is enabled and a
+    /// completion is available. Rendered in a muted ghost colour.
+    pub ghost_suffix: Option<String>,
 }
 
 /// A single diagnostic mark on a rendered line (for inline underlines/squiggles).
@@ -540,6 +544,8 @@ pub struct AiPanelData {
     pub streaming: bool,
     /// Scroll offset into the messages list.
     pub scroll_top: usize,
+    /// Cursor position within `input` (char index).
+    pub input_cursor: usize,
 }
 
 // ─── SettingDef ───────────────────────────────────────────────────────────────
@@ -748,6 +754,42 @@ pub static SETTING_DEFS: &[SettingDef] = &[
         label: "Enable Plugins",
         description: "Enable the Lua plugin system (requires restart)",
         category: "Plugins",
+        setting_type: SettingType::Bool,
+    },
+    // ── AI ────────────────────────────────────────────────────────────────────
+    SettingDef {
+        key: "ai_provider",
+        label: "AI Provider",
+        description: "AI backend: anthropic, openai (or compatible), or ollama (local)",
+        category: "AI",
+        setting_type: SettingType::Enum(&["anthropic", "openai", "ollama"]),
+    },
+    SettingDef {
+        key: "ai_api_key",
+        label: "API Key",
+        description: "API key (or leave empty and set ANTHROPIC_API_KEY / OPENAI_API_KEY env var)",
+        category: "AI",
+        setting_type: SettingType::StringVal,
+    },
+    SettingDef {
+        key: "ai_model",
+        label: "Model",
+        description: "Model name override (leave empty to use the provider default)",
+        category: "AI",
+        setting_type: SettingType::StringVal,
+    },
+    SettingDef {
+        key: "ai_base_url",
+        label: "Base URL",
+        description: "Custom API endpoint URL (leave empty for provider default)",
+        category: "AI",
+        setting_type: SettingType::StringVal,
+    },
+    SettingDef {
+        key: "ai_completions",
+        label: "Inline Completions",
+        description: "Show AI ghost-text completions at the cursor in insert mode (Tab to accept, Alt+]/Alt+[ to cycle alternatives)",
+        category: "AI",
         setting_type: SettingType::Bool,
     },
 ];
@@ -1567,6 +1609,9 @@ pub struct Theme {
     // Virtual text / line annotations (e.g. git blame inline)
     pub annotation_fg: Color,
 
+    // AI ghost text (inline completions)
+    pub ghost_text_fg: Color,
+
     // Tab bar
     pub tab_bar_bg: Color,
     pub tab_active_bg: Color,
@@ -1735,6 +1780,9 @@ impl Theme {
 
             // Virtual text annotations (muted grey — matches comment colour)
             annotation_fg: Color::from_hex("#5c6370"),
+
+            // AI ghost text (inline completions) — slightly lighter than annotation
+            ghost_text_fg: Color::from_hex("#4b5263"),
         }
     }
 
@@ -1814,6 +1862,7 @@ impl Theme {
             yank_highlight_alpha: 0.35,
 
             annotation_fg: Color::from_hex("#928374"),
+            ghost_text_fg: Color::from_hex("#7c6f64"),
         }
     }
 
@@ -1893,6 +1942,7 @@ impl Theme {
             yank_highlight_alpha: 0.35,
 
             annotation_fg: Color::from_hex("#565f89"),
+            ghost_text_fg: Color::from_hex("#414868"),
         }
     }
 
@@ -1972,6 +2022,7 @@ impl Theme {
             yank_highlight_alpha: 0.35,
 
             annotation_fg: Color::from_hex("#586e75"),
+            ghost_text_fg: Color::from_hex("#4a5e68"),
         }
     }
 
@@ -2696,6 +2747,7 @@ fn build_ai_panel_data(engine: &Engine) -> Option<AiPanelData> {
         input_active: engine.ai_input_active,
         streaming: engine.ai_streaming,
         scroll_top: engine.ai_scroll_top,
+        input_cursor: engine.ai_input_cursor,
     })
 }
 
@@ -3248,6 +3300,16 @@ fn build_rendered_window(
         .partition_point(|h| h.0 < window_end_byte);
     let visible_hl = &buffer_state.highlights[hl_lo..hl_hi];
 
+    // Ghost text (AI inline completion): only in the active window, Insert mode.
+    let ghost_for_cursor_line: Option<String> = if is_active
+        && engine.mode == crate::core::Mode::Insert
+        && engine.settings.ai_completions
+    {
+        engine.ai_ghost_text.clone()
+    } else {
+        None
+    };
+
     // Build rendered lines (fold-aware: skip hidden lines, jump over fold bodies)
     let mut lines = Vec::with_capacity(visible_lines);
     let mut line_idx = scroll_top;
@@ -3425,10 +3487,15 @@ fn build_rendered_window(
                     is_dap_current,
                     is_wrap_continuation: is_cont,
                     segment_col_offset: seg_start_char,
-                    annotation: if is_cont {
+                    annotation: if is_cont || engine.mode == crate::core::Mode::Insert {
                         None
                     } else {
                         engine.line_annotations.get(&line_idx).cloned()
+                    },
+                    ghost_suffix: if line_idx == cursor_line && seg == cursor_seg {
+                        ghost_for_cursor_line.clone()
+                    } else {
+                        None
                     },
                 });
             }
@@ -3449,7 +3516,16 @@ fn build_rendered_window(
                 is_dap_current,
                 is_wrap_continuation: false,
                 segment_col_offset: 0,
-                annotation: engine.line_annotations.get(&line_idx).cloned(),
+                annotation: if engine.mode == crate::core::Mode::Insert {
+                    None
+                } else {
+                    engine.line_annotations.get(&line_idx).cloned()
+                },
+                ghost_suffix: if line_idx == cursor_line {
+                    ghost_for_cursor_line.clone()
+                } else {
+                    None
+                },
             });
         }
 

@@ -8,6 +8,42 @@ pub struct AiMessage {
     pub content: String,
 }
 
+/// Request an inline code completion (ghost text) from an AI provider.
+///
+/// Runs synchronously (blocking curl); call from a background thread.
+///
+/// `prefix` is the text before the cursor; `suffix` is text after the cursor
+/// (may be empty).  Returns the text that should be inserted at the cursor.
+pub fn complete(
+    provider: &str,
+    api_key: &str,
+    base_url: &str,
+    model: &str,
+    prefix: &str,
+    suffix: &str,
+) -> Result<String, String> {
+    // Build a fill-in-the-middle prompt. The AI should return only the
+    // code/text that belongs between `prefix` and `suffix`, with no
+    // explanation or markdown fencing.
+    let system = "You are a code completion engine. \
+        Output ONLY the text that should be inserted at the cursor — \
+        no explanation, no markdown, no backticks. \
+        Keep completions concise (usually one line, occasionally a short block).";
+
+    let user_msg = if suffix.is_empty() {
+        format!("Complete the following code at the cursor position marked with <CURSOR>:\n\n{prefix}<CURSOR>")
+    } else {
+        format!("Complete the following code at the cursor position marked with <CURSOR>:\n\n{prefix}<CURSOR>{suffix}")
+    };
+
+    let messages = [AiMessage {
+        role: "user".to_string(),
+        content: user_msg,
+    }];
+
+    send_chat(provider, api_key, base_url, model, &messages, system)
+}
+
 /// Send a chat request to an AI provider and return the assistant's reply.
 ///
 /// Runs synchronously (blocking curl); call from a background thread.
@@ -42,6 +78,14 @@ fn send_anthropic(
     messages: &[AiMessage],
     system: &str,
 ) -> Result<String, String> {
+    // Env var takes priority; settings value is a fallback.
+    let key_env = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
+    let api_key = if !key_env.is_empty() {
+        &key_env
+    } else {
+        api_key
+    };
+
     let url = if base_url.is_empty() {
         "https://api.anthropic.com/v1/messages".to_string()
     } else {
@@ -121,6 +165,13 @@ fn send_openai(
     model: &str,
     messages: &[AiMessage],
 ) -> Result<String, String> {
+    let key_env = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+    let api_key = if !key_env.is_empty() {
+        &key_env
+    } else {
+        api_key
+    };
+
     let url = if base_url.is_empty() {
         "https://api.openai.com/v1/chat/completions".to_string()
     } else {

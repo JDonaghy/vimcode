@@ -74,9 +74,11 @@ This prevents CI failures and maintains code quality.
 
 **Engine Facade Methods:** `buffer()`, `buffer_mut()`, `view()`, `view_mut()`, `cursor()` — all operate on active window's buffer
 
-**Add New Setting:** When adding a new user-configurable setting:
+**Add New Setting:** When adding a new user-configurable setting, update ALL FOUR of these:
 1. Add field to `Settings` struct in `settings.rs` with `#[serde(default = "default_fn_name")]`
 2. Create default function returning sensible default value
 3. Update `Default` impl to include the field
-4. Settings are automatically merged: new fields are added to existing settings files without overwriting user values
-5. Document the setting name and purpose in comments
+4. Add to `get_value_str()` and `set_value_str()` in `settings.rs`
+5. Add a `SettingDef` entry to `SETTING_DEFS` in `render.rs` (controls the Settings sidebar UI)
+6. Settings are automatically merged: new fields are added to existing settings files without overwriting user values
+7. Document the setting name and purpose in comments
