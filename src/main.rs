@@ -1761,6 +1761,7 @@ impl SimpleComponent for App {
             let scroll = gtk4::ScrolledWindow::new();
             scroll.set_vexpand(true);
             scroll.set_hscrollbar_policy(gtk4::PolicyType::Never);
+            scroll.set_overlay_scrolling(false);
 
             let list_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
             list_box.set_margin_bottom(8);
@@ -9577,26 +9578,15 @@ const STATIC_CSS: &str = "
             background-color: transparent;
         }
 
-        /* Dark-themed form widgets (fallback when GTK theme has no dark variant) */
+        /* Switch: let prefer_dark_theme (Adwaita dark) handle colors;
+           just ensure a reasonable compact size */
         .sidebar switch {
-            min-height: 20px;
-            min-width: 36px;
-        }
-        .sidebar switch:not(:checked) {
-            background-color: #6b6b6b;
-        }
-        .sidebar switch:checked {
-            background-color: #0e639c;
-        }
-        .sidebar switch slider {
-            background-color: #ffffff;
-            min-width: 16px;
-            min-height: 16px;
+            min-height: 24px;
+            min-width: 48px;
         }
 
-        /* SpinButton */
+        /* SpinButton: dark background + text matching the sidebar */
         .sidebar spinbutton {
-            min-height: 24px;
             background-color: #3c3c3c;
             color: #cccccc;
             border: 1px solid #555555;
@@ -9612,8 +9602,8 @@ const STATIC_CSS: &str = "
             background-color: #3c3c3c;
             color: #cccccc;
             border: none;
-            min-width: 18px;
-            padding: 0;
+            min-width: 20px;
+            padding: 0 2px;
         }
         .sidebar spinbutton button:hover {
             background-color: #505050;
