@@ -2,6 +2,9 @@
 
 ## Recently Completed
 
+**Session 118 — AI assistant panel (1212 total):**
+Built-in AI chat sidebar panel. `src/core/ai.rs` (new, ~336 lines): `send_chat()` dispatcher; `send_anthropic()` / `send_openai()` / `send_ollama()` via curl subprocess; JSON helpers; 5 unit tests. `tests/ai_panel.rs` (new, ~160 lines): 16 integration tests for state machine. `src/core/settings.rs`: `ai_provider` (default `"anthropic"`), `ai_api_key`, `ai_model`, `ai_base_url` fields. `src/core/engine.rs`: 7 new AI fields; `ai_send_message()`, `poll_ai()`, `ai_clear()`, `handle_ai_panel_key()` methods; `:AI <msg>` and `:AiClear` commands. `src/render.rs`: `AiPanelMessage`, `AiPanelData`; `ai_panel` on `ScreenLayout`; `build_ai_panel_data()`. GTK: `SidebarPanel::Ai`, `draw_ai_sidebar()`, activity bar chat icon, `poll_ai()` in tick. TUI: `TuiPanel::Ai`, `render_ai_sidebar()`, `poll_ai()` in event loop.
+
 **Session 117c — GTK settings panel bug fixes (1199 total):**
 Fixed three visual issues: (1) Settings panel not collapsing on second button click — removed `#[watch]` on `set_visible` so Relm4 doesn't fight the imperative hide; (2) Overlay scrollbar floating over widgets — `scroll.set_overlay_scrolling(false)`; (3) Toggle switches clipped by CSS `min-height`/`min-width` constraints — removed constraints and added 4px margin on all sides of each Switch widget.
 
@@ -777,5 +780,5 @@ Root cause: `draw_menu_dropdown` was called from `draw_editor()`'s DrawingArea w
 - [x] **Extension mechanism** — Lua 5.4 plugin sandbox; plugins register commands/keymaps/hooks, read/write buffer text, show messages; `~/.config/vimcode/plugins/` auto-loaded; bundled language-pack extensions + GitHub registry; `:ExtInstall/:ExtList/:ExtEnable/:ExtDisable/:ExtRemove` (sessions 98, 113–114)
 
 ### AI Integration
-- [ ] **AI assistant panel** — VSCode Copilot-style sidebar chat panel; configurable provider (Anthropic Claude API, OpenAI, Ollama local); `api_key` in settings; `Alt-A` opens panel; multi-turn conversation with editor context (current file, selection, diagnostics); "Insert at cursor" / "Replace selection" actions on responses
+- [x] **AI assistant panel** — sidebar chat panel; configurable provider (Anthropic Claude, OpenAI, Ollama local); `ai_provider`/`ai_api_key`/`ai_model`/`ai_base_url` in settings; activity bar chat icon opens panel; multi-turn conversation; `:AI <msg>` and `:AiClear` commands (session 118)
 - [ ] **AI inline completions** — ghost-text completions from AI provider interleaved with LSP ghost text; separate `ai_completions` setting (default false to avoid unexpected API costs); debounced after 500ms idle in insert mode; Tab accepts whole suggestion, `Alt-]`/`Alt-[` cycle through alternatives

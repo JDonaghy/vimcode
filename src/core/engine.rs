@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
+use super::ai::AiMessage;
 use super::buffer::{Buffer, BufferId};
 use super::buffer_manager::{BufferManager, BufferState, UndoEntry};
 use super::dap::{BreakpointInfo, DapEvent, DapVariable, StackFrame};
@@ -1083,6 +1084,22 @@ pub struct Engine {
     /// Inline annotation text indexed by 0-based buffer line number.
     /// Cleared when the active buffer changes.
     pub line_annotations: HashMap<usize, String>,
+
+    // --- AI assistant panel ---
+    /// Conversation history shown in the AI sidebar.
+    pub ai_messages: Vec<AiMessage>,
+    /// Current input text being composed.
+    pub ai_input: String,
+    /// Whether the AI sidebar has keyboard focus.
+    pub ai_has_focus: bool,
+    /// Whether the input box is in active editing mode.
+    pub ai_input_active: bool,
+    /// True while a request is in-flight.
+    pub ai_streaming: bool,
+    /// Channel for receiving the AI response from the background thread.
+    pub ai_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    /// Scroll offset for the conversation history (in lines).
+    pub ai_scroll_top: usize,
 }
 
 impl Engine {
@@ -1307,6 +1324,13 @@ impl Engine {
             ext_sidebar_sections_expanded: [true, true],
             ext_sidebar_input_active: false,
             line_annotations: HashMap::new(),
+            ai_messages: Vec::new(),
+            ai_input: String::new(),
+            ai_has_focus: false,
+            ai_input_active: false,
+            ai_streaming: false,
+            ai_rx: None,
+            ai_scroll_top: 0,
         };
         // If vscode mode is configured, start in Insert mode (no Normal mode)
         if engine.is_vscode_mode() {
@@ -9821,6 +9845,20 @@ impl Engine {
             return EngineAction::None;
         }
 
+        // :AI <message> — send a message to the AI assistant
+        if let Some(msg) = cmd.strip_prefix("AI ").map(|s| s.trim()) {
+            if !msg.is_empty() {
+                self.ai_input = msg.to_string();
+                self.ai_send_message();
+                self.ai_has_focus = true;
+            }
+            return EngineAction::None;
+        }
+        if cmd == "AiClear" || cmd == "AIclear" {
+            self.ai_clear();
+            return EngineAction::None;
+        }
+
         // Handle :e <filename>
         if let Some(filename) = cmd.strip_prefix("e ") {
             let filename = filename.trim();
@@ -14739,6 +14777,137 @@ impl Engine {
             0
         };
         installed + available
+    }
+
+    // ── AI assistant panel ─────────────────────────────────────────────────────
+
+    /// Send the current `ai_input` as a user message; clears input and spawns background thread.
+    pub fn ai_send_message(&mut self) {
+        let text = self.ai_input.trim().to_string();
+        if text.is_empty() || self.ai_streaming {
+            return;
+        }
+        self.ai_messages.push(AiMessage {
+            role: "user".to_string(),
+            content: text,
+        });
+        self.ai_input.clear();
+        self.ai_streaming = true;
+
+        let provider = self.settings.ai_provider.clone();
+        let api_key = self.settings.ai_api_key.clone();
+        let base_url = self.settings.ai_base_url.clone();
+        let model = self.settings.ai_model.clone();
+        let messages = self.ai_messages.clone();
+        let system = String::new();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.ai_rx = Some(rx);
+
+        std::thread::spawn(move || {
+            let result =
+                super::ai::send_chat(&provider, &api_key, &base_url, &model, &messages, &system);
+            let _ = tx.send(result);
+        });
+
+        // Scroll to bottom so the user sees the new message
+        self.ai_scroll_top = self.ai_messages.len().saturating_sub(1);
+    }
+
+    /// Non-blocking poll for a completed AI response. Returns `true` if something changed.
+    pub fn poll_ai(&mut self) -> bool {
+        let result = if let Some(rx) = &self.ai_rx {
+            rx.try_recv().ok()
+        } else {
+            return false;
+        };
+        let Some(res) = result else {
+            return false;
+        };
+        self.ai_rx = None;
+        self.ai_streaming = false;
+        match res {
+            Ok(reply) => {
+                self.ai_messages.push(AiMessage {
+                    role: "assistant".to_string(),
+                    content: reply,
+                });
+                self.ai_scroll_top = self.ai_messages.len().saturating_sub(1);
+            }
+            Err(e) => {
+                self.message = format!("AI error: {e}");
+            }
+        }
+        true
+    }
+
+    /// Clear the AI conversation history and cancel any in-flight request.
+    pub fn ai_clear(&mut self) {
+        self.ai_messages.clear();
+        self.ai_rx = None;
+        self.ai_streaming = false;
+        self.ai_scroll_top = 0;
+        self.message = "AI conversation cleared.".to_string();
+    }
+
+    /// Handle keyboard input for the AI sidebar panel.
+    /// Returns `true` if the key was consumed.
+    pub fn handle_ai_panel_key(&mut self, key: &str, ctrl: bool, unicode: Option<char>) -> bool {
+        if self.ai_input_active {
+            match key {
+                "Escape" => {
+                    self.ai_input_active = false;
+                }
+                "Return" if !ctrl => {
+                    self.ai_send_message();
+                    self.ai_input_active = false;
+                }
+                "BackSpace" => {
+                    self.ai_input.pop();
+                }
+                _ => {
+                    if let Some(ch) = unicode {
+                        if !ch.is_control() {
+                            self.ai_input.push(ch);
+                        }
+                    }
+                }
+            }
+            return true;
+        }
+
+        match key {
+            "q" | "Escape" => {
+                self.ai_has_focus = false;
+                true
+            }
+            "i" | "a" | "Return" => {
+                self.ai_input_active = true;
+                true
+            }
+            "j" | "Down" => {
+                self.ai_scroll_top = self.ai_scroll_top.saturating_add(1);
+                true
+            }
+            "k" | "Up" => {
+                self.ai_scroll_top = self.ai_scroll_top.saturating_sub(1);
+                true
+            }
+            "G" => {
+                self.ai_scroll_top = self.ai_messages.len().saturating_sub(1);
+                true
+            }
+            "g" => {
+                self.ai_scroll_top = 0;
+                true
+            }
+            "c" if ctrl => {
+                // Ctrl-C: clear conversation
+                self.ai_clear();
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Re-send didOpen for all open buffers that match a given language ID.

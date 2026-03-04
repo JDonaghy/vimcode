@@ -11,7 +11,7 @@ There's a touch of irony here - using a cli tool to write the editor that I've w
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 1199 tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 1212 tests, zero async runtime dependency
 
 
 ## Download (Ubuntu)
@@ -620,6 +620,39 @@ Also adds `:GitLog` command to display recent commits for the current file in th
 
 ---
 
+### AI Assistant
+
+Built-in AI chat panel powered by Anthropic Claude, OpenAI, or a local Ollama model. Click the chat icon in the activity bar (or configure a keybinding) to open the panel.
+
+**Supported providers** (configured in `settings.json`):
+
+| Provider | Default model | Notes |
+|----------|--------------|-------|
+| `anthropic` | `claude-opus-4-5` | Requires `ANTHROPIC_API_KEY` or `ai_api_key` in settings |
+| `openai` | `gpt-4o` | Requires `OPENAI_API_KEY` or `ai_api_key` in settings |
+| `ollama` | `llama3` | Runs locally; `ai_base_url` defaults to `http://localhost:11434` |
+
+**Usage:**
+- Click the chat icon (``) in the activity bar to open the AI sidebar panel
+- `i` — enter input mode; type a message and press `Enter` to send
+- `j` / `k` — scroll conversation history
+- `Escape` / `q` — exit input mode / unfocus panel
+- `:AI <message>` — send a message directly from command mode
+- `:AiClear` — clear the conversation history
+
+**Settings** (in `settings.json`):
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `ai_provider` | `"anthropic"` | AI provider: `"anthropic"`, `"openai"`, or `"ollama"` |
+| `ai_api_key` | `""` | API key (falls back to `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` env vars) |
+| `ai_model` | `""` | Model override (leave empty for provider default) |
+| `ai_base_url` | `""` | Base URL override (used for Ollama; defaults to `http://localhost:11434`) |
+
+Responses are fetched asynchronously via a background `curl` subprocess — no async runtime required. The conversation is kept in memory for the session and cleared with `:AiClear`.
+
+---
+
 ### LSP Support (Language Server Protocol)
 
 Automatic language server integration — open a file and diagnostics, completions, go-to-definition, and hover just work if the appropriate server is on `PATH`. LSP initializes on every file-opening path: `:e`, sidebar click, fuzzy finder (Ctrl-P), live grep confirm, `:split`/`:vsplit`, and `:tabnew`.
@@ -705,6 +738,10 @@ Additional options (set directly in `settings.json`):
 | `terminal_scrollback_lines` | `5000` | Rows kept in terminal scrollback history (0 = unlimited) |
 | `leader` | `" "` (Space) | Leader key character for `<leader>gf` / `<leader>rn` sequences |
 | `extension_registry_url` | GitHub raw URL | URL for the remote extension registry JSON (override for self-hosted) |
+| `ai_provider` | `"anthropic"` | AI provider: `"anthropic"`, `"openai"`, or `"ollama"` |
+| `ai_api_key` | `""` | API key (falls back to `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` env vars) |
+| `ai_model` | `""` | Model override (leave empty for provider default) |
+| `ai_base_url` | `""` | Base URL override (used for Ollama; defaults to `http://localhost:11434`) |
 
 - `:set option?` — query current value (e.g. `:set ts?` → `tabstop=4`)
 - `:set option!` — toggle a boolean option (e.g. `:set wrap!`); `no<option>!` explicitly disables (e.g. `:set nowrap!`)
@@ -991,6 +1028,8 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `:ExtEnable <name>` | Re-enable a disabled extension |
 | `:ExtDisable <name>` | Disable an extension (suppress install prompts) |
 | `:config reload` | Reload settings from disk |
+| `:AI <message>` | Send a message to the AI assistant |
+| `:AiClear` | Clear the AI conversation history |
 | `:help [topic]` / `:h [topic]` | Show help (topics: explorer, keys, commands) |
 
 ---
@@ -1011,6 +1050,7 @@ src/
     ├── lsp_manager.rs  (~671 lines)  Multi-server coordinator with initialization guards + built-in registry
     ├── dap.rs          (~671 lines)  DAP protocol transport + event routing + seq→command tracking + BreakpointInfo
     ├── dap_manager.rs  (~1,089 lines)  DAP multi-adapter coordinator + launch.json + tasks.json support + install scripts
+    ├── ai.rs               (~336 lines)  AI provider integration (Anthropic/OpenAI/Ollama via curl subprocess)
     ├── project_search.rs (~630 lines)  Regex/case/whole-word search + replace (ignore + regex crates)
     ├── buffer_manager.rs (~600 lines)  Buffer lifecycle, undo/redo stacks
     ├── buffer.rs       (~120 lines)  Rope-based text storage (ropey)

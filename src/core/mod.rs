@@ -1,3 +1,4 @@
+pub mod ai;
 pub mod buffer;
 pub mod buffer_manager;
 pub mod cursor;

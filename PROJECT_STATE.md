@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Mar 4, 2026 (Session 117c — GTK settings panel bug fixes) | **Tests:** 1199
+**Last updated:** Mar 4, 2026 (Session 118 — AI assistant panel) | **Tests:** 1212
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 117b are in **SESSION_HISTORY.md**.
@@ -25,6 +25,9 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 118 — AI assistant panel (13 new tests, 1212 total):**
+Built-in AI chat panel with support for Anthropic Claude, OpenAI, and local Ollama. New file `src/core/ai.rs` (~336 lines): `send_chat()` dispatcher, `send_anthropic()` / `send_openai()` / `send_ollama()` provider implementations, JSON helpers, 5 unit tests. New integration test file `tests/ai_panel.rs` (~160 lines, 16 tests) covering AI state machine (send, poll, clear, provider routing). Engine: `ai_messages: Vec<AiMessage>`, `ai_input: String`, `ai_has_focus`, `ai_input_active`, `ai_streaming`, `ai_rx: Option<mpsc::Receiver<String>>`, `ai_scroll_top` fields; `ai_send_message()`, `poll_ai()`, `ai_clear()`, `handle_ai_panel_key()` methods; `:AI <msg>` and `:AiClear` commands. Settings: `ai_provider` (default `"anthropic"`), `ai_api_key`, `ai_model`, `ai_base_url` fields. Render: `AiPanelMessage`, `AiPanelData` structs; `ai_panel: Option<AiPanelData>` on `ScreenLayout`; `build_ai_panel_data()`. GTK: `SidebarPanel::Ai`, activity bar chat icon `\u{f0e5}`, `ai_sidebar_da_ref` / `ai_panel_box_ref` fields, `Msg::AiSidebarKey` / `Msg::AiSidebarClick`, `draw_ai_sidebar()`, `poll_ai()` in tick. TUI: `TuiPanel::Ai` at activity bar row 6, keyboard routing, `render_ai_sidebar()`, `poll_ai()` in event loop.
 
 **Session 117c — GTK settings panel bug fixes (no new tests, 1199 total):**
 Three visual fixes for the settings sidebar: (1) Panel collapse — removed `#[watch]` from settings panel `set_visible` so Relm4 no longer overrides the imperative hide when pressing the Settings button again; (2) Overlay scrollbar — `scroll.set_overlay_scrolling(false)` prevents the vertical scrollbar from floating over Switch/SpinButton widgets; (3) Switch clipping — added 4px margin on all four sides of each `gtk4::Switch` widget and removed CSS `min-height`/`min-width` constraints that forced Adwaita's rendering into too-small a box.

@@ -515,6 +515,33 @@ pub struct ExtSidebarData {
     pub fetching: bool,
 }
 
+// ─── AiPanelData ─────────────────────────────────────────────────────────────
+
+/// A single message in the AI conversation history, pre-formatted for rendering.
+#[derive(Debug, Clone)]
+pub struct AiPanelMessage {
+    /// "user" or "assistant"
+    pub role: String,
+    /// Message text (may be multi-line)
+    pub content: String,
+}
+
+/// Rendering data for the AI assistant sidebar panel.
+#[derive(Debug, Clone)]
+pub struct AiPanelData {
+    pub messages: Vec<AiPanelMessage>,
+    /// Current input being composed.
+    pub input: String,
+    /// Whether the panel has keyboard focus.
+    pub has_focus: bool,
+    /// Whether the text input box is in active edit mode.
+    pub input_active: bool,
+    /// True while waiting for an AI response.
+    pub streaming: bool,
+    /// Scroll offset into the messages list.
+    pub scroll_top: usize,
+}
+
 // ─── SettingDef ───────────────────────────────────────────────────────────────
 
 /// The type of a user-configurable setting, used to generate appropriate form widgets.
@@ -1494,6 +1521,8 @@ pub struct ScreenLayout {
     pub editor_group_split: Option<EditorGroupSplitData>,
     /// Extensions sidebar data — `Some` when the Extensions panel is the active sidebar panel.
     pub ext_sidebar: Option<ExtSidebarData>,
+    /// AI assistant panel data — `Some` when the AI panel is the active sidebar panel.
+    pub ai_panel: Option<AiPanelData>,
 }
 
 // ─── Theme ────────────────────────────────────────────────────────────────────
@@ -2497,6 +2526,7 @@ pub fn build_screen_layout(
     };
 
     let ext_sidebar = build_ext_sidebar_data(engine);
+    let ai_panel = build_ai_panel_data(engine);
 
     ScreenLayout {
         tab_bar,
@@ -2519,6 +2549,7 @@ pub fn build_screen_layout(
         command_palette,
         editor_group_split,
         ext_sidebar,
+        ai_panel,
     }
 }
 
@@ -2645,6 +2676,26 @@ fn build_ext_sidebar_data(engine: &Engine) -> Option<ExtSidebarData> {
         query: engine.ext_sidebar_query.clone(),
         input_active: engine.ext_sidebar_input_active,
         fetching: engine.ext_registry_fetching,
+    })
+}
+
+fn build_ai_panel_data(engine: &Engine) -> Option<AiPanelData> {
+    // Always build so backends can check ai_has_focus.
+    let messages = engine
+        .ai_messages
+        .iter()
+        .map(|m| AiPanelMessage {
+            role: m.role.clone(),
+            content: m.content.clone(),
+        })
+        .collect();
+    Some(AiPanelData {
+        messages,
+        input: engine.ai_input.clone(),
+        has_focus: engine.ai_has_focus,
+        input_active: engine.ai_input_active,
+        streaming: engine.ai_streaming,
+        scroll_top: engine.ai_scroll_top,
     })
 }
 

@@ -39,6 +39,7 @@ enum SidebarPanel {
     Git,
     Extensions,
     Settings,
+    Ai,
     None,
 }
 
@@ -80,6 +81,7 @@ struct App {
     debug_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>>,
     git_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>>,
     ext_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>>,
+    ai_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>>,
     sidebar_inner_box: Rc<RefCell<Option<gtk4::Box>>>,
     /// Direct ref to the sidebar Revealer for programmatic open/close.
     sidebar_revealer: Rc<RefCell<Option<gtk4::Revealer>>>,
@@ -90,6 +92,7 @@ struct App {
     git_panel_box: Rc<RefCell<Option<gtk4::Box>>>,
     ext_panel_box: Rc<RefCell<Option<gtk4::Box>>>,
     settings_panel_box: Rc<RefCell<Option<gtk4::Box>>>,
+    ai_panel_box_ref: Rc<RefCell<Option<gtk4::Box>>>,
     // Per-window scrollbars and indicators
     window_scrollbars: Rc<RefCell<HashMap<core::WindowId, WindowScrollbars>>>,
     overlay: Rc<RefCell<Option<gtk4::Overlay>>>,
@@ -373,6 +376,10 @@ enum Msg {
     ExtSidebarKey(String),
     /// Click in the Extensions sidebar DrawingArea (x, y).
     ExtSidebarClick(f64, f64),
+    /// Key press in the AI sidebar DrawingArea.
+    AiSidebarKey(String, bool, Option<char>),
+    /// Click in the AI sidebar DrawingArea (x, y).
+    AiSidebarClick(f64, f64),
     /// Minimize the application window.
     WindowMinimize,
     /// Maximize or restore the application window.
@@ -720,6 +727,19 @@ impl SimpleComponent for App {
 
                         connect_clicked[sender] => move |_| {
                             sender.input(Msg::SwitchPanel(SidebarPanel::Extensions));
+                        }
+                    },
+
+                    gtk4::Button {
+                        set_label: "\u{f0e5}",
+                        set_tooltip_text: Some("AI Assistant"),
+                        set_width_request: 48,
+                        set_height_request: 48,
+                        set_css_classes: &["activity-button"],
+                        set_sensitive: true,
+
+                        connect_clicked[sender] => move |_| {
+                            sender.input(Msg::SwitchPanel(SidebarPanel::Ai));
                         }
                     },
 
@@ -1100,6 +1120,27 @@ impl SimpleComponent for App {
                             #[name = "ext_sidebar_da"]
                             gtk4::DrawingArea {
                                 set_vexpand: true,
+                            },
+                        },
+
+                        // AI assistant sidebar panel
+                        #[name = "ai_panel_box"]
+                        gtk4::Box {
+                            set_orientation: gtk4::Orientation::Vertical,
+                            set_css_classes: &["sidebar"],
+
+                            #[watch]
+                            set_visible: {
+                                if model.active_panel == SidebarPanel::Ai {
+                                    ai_sidebar_da.queue_draw();
+                                }
+                                model.active_panel == SidebarPanel::Ai
+                            },
+
+                            #[name = "ai_sidebar_da"]
+                            gtk4::DrawingArea {
+                                set_vexpand: true,
+                                set_focusable: true,
                             },
                         },
                     },
@@ -1629,6 +1670,8 @@ impl SimpleComponent for App {
         let ext_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> =
             Rc::new(RefCell::new(None));
         let settings_panel_box_ref: Rc<RefCell<Option<gtk4::Box>>> = Rc::new(RefCell::new(None));
+        let ai_panel_box_ref: Rc<RefCell<Option<gtk4::Box>>> = Rc::new(RefCell::new(None));
+        let ai_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> = Rc::new(RefCell::new(None));
         let search_results_list_ref: Rc<RefCell<Option<gtk4::ListBox>>> =
             Rc::new(RefCell::new(None));
 
@@ -1676,6 +1719,7 @@ impl SimpleComponent for App {
             debug_sidebar_da_ref: debug_sidebar_da_ref.clone(),
             git_sidebar_da_ref: git_sidebar_da_ref.clone(),
             ext_sidebar_da_ref: ext_sidebar_da_ref.clone(),
+            ai_sidebar_da_ref: ai_sidebar_da_ref.clone(),
             window_scrollbars: window_scrollbars_ref.clone(),
             overlay: overlay_ref.clone(),
             cached_line_height: 24.0,
@@ -1701,6 +1745,7 @@ impl SimpleComponent for App {
             git_panel_box: git_panel_box_ref.clone(),
             ext_panel_box: ext_panel_box_ref.clone(),
             settings_panel_box: settings_panel_box_ref.clone(),
+            ai_panel_box_ref: ai_panel_box_ref.clone(),
             project_search_status: String::new(),
             search_results_list: search_results_list_ref.clone(),
             diff_selected_file: None,
@@ -1733,6 +1778,7 @@ impl SimpleComponent for App {
         *git_panel_box_ref.borrow_mut() = Some(widgets.git_panel.clone());
         *ext_panel_box_ref.borrow_mut() = Some(widgets.ext_panel.clone());
         *settings_panel_box_ref.borrow_mut() = Some(widgets.settings_panel.clone());
+        *ai_panel_box_ref.borrow_mut() = Some(widgets.ai_panel_box.clone());
         *search_results_list_ref.borrow_mut() = Some(widgets.search_results_list.clone());
 
         // ── Settings sidebar form (built imperatively) ─────────────────────────
@@ -2179,6 +2225,54 @@ impl SimpleComponent for App {
             widgets.ext_sidebar_da.add_controller(gesture);
         }
         *ext_sidebar_da_ref.borrow_mut() = Some(widgets.ext_sidebar_da.clone());
+
+        // AI sidebar DrawingArea: draw function + key controller + click gesture
+        {
+            let engine = engine.clone();
+            widgets.ai_sidebar_da.set_draw_func(move |da, cr, _, _| {
+                let engine = engine.borrow();
+                let theme = Theme::onedark();
+                let font_size = engine.settings.font_size as f64;
+                let font_family = engine.settings.font_family.clone();
+                let font_desc =
+                    pango::FontDescription::from_string(&format!("{} {}", font_family, font_size));
+                let pango_ctx = pangocairo::create_context(cr);
+                let layout = pango::Layout::new(&pango_ctx);
+                layout.set_font_description(Some(&font_desc));
+                let font_metrics = pango_ctx.metrics(Some(&font_desc), None);
+                let line_height =
+                    (font_metrics.ascent() + font_metrics.descent()) as f64 / pango::SCALE as f64;
+                let char_width = font_metrics.approximate_char_width() as f64 / pango::SCALE as f64;
+                let screen = build_screen_layout(&engine, &theme, &[], line_height, char_width);
+                let w = da.width() as f64;
+                let h = da.height() as f64;
+                draw_ai_sidebar(cr, &layout, &screen, &theme, 0.0, 0.0, w, h, line_height);
+            });
+        }
+        {
+            let sender_ai = sender.input_sender().clone();
+            let key_ctrl = gtk4::EventControllerKey::new();
+            key_ctrl.connect_key_pressed(move |_, key, _, modifier| {
+                let key_name = key.name().map(|s| s.to_string()).unwrap_or_default();
+                let ctrl = modifier.contains(gdk::ModifierType::CONTROL_MASK);
+                let unicode = key.to_unicode().filter(|c| !c.is_control());
+                sender_ai
+                    .send(Msg::AiSidebarKey(key_name, ctrl, unicode))
+                    .ok();
+                gtk4::glib::Propagation::Stop
+            });
+            widgets.ai_sidebar_da.add_controller(key_ctrl);
+        }
+        {
+            let sender_ai = sender.input_sender().clone();
+            let gesture = gtk4::GestureClick::new();
+            gesture.set_button(1);
+            gesture.connect_pressed(move |_, _, x, y| {
+                sender_ai.send(Msg::AiSidebarClick(x, y)).ok();
+            });
+            widgets.ai_sidebar_da.add_controller(gesture);
+        }
+        *ai_sidebar_da_ref.borrow_mut() = Some(widgets.ai_sidebar_da.clone());
 
         // Move the menu bar row out of the content Box and set it as the window's
         // custom titlebar.  This gives us CSD edge resize handles while keeping
@@ -3502,6 +3596,7 @@ impl SimpleComponent for App {
                     (SidebarPanel::Git, &self.git_panel_box),
                     (SidebarPanel::Extensions, &self.ext_panel_box),
                     (SidebarPanel::Settings, &self.settings_panel_box),
+                    (SidebarPanel::Ai, &self.ai_panel_box_ref),
                 ] {
                     if let Some(ref b) = *panel_ref.borrow() {
                         b.set_visible(show && p == which);
@@ -3543,6 +3638,13 @@ impl SimpleComponent for App {
                             da.grab_focus();
                         }
                     }
+                    // Focus when switching to AI panel
+                    if self.active_panel == SidebarPanel::Ai {
+                        self.engine.borrow_mut().ai_has_focus = true;
+                        if let Some(ref da) = *self.ai_sidebar_da_ref.borrow() {
+                            da.grab_focus();
+                        }
+                    }
                 }
                 // Directly set visibility on the revealer and each panel box.
                 let p = self.active_panel;
@@ -3557,6 +3659,7 @@ impl SimpleComponent for App {
                     (SidebarPanel::Git, &self.git_panel_box),
                     (SidebarPanel::Extensions, &self.ext_panel_box),
                     (SidebarPanel::Settings, &self.settings_panel_box),
+                    (SidebarPanel::Ai, &self.ai_panel_box_ref),
                 ] {
                     if let Some(ref b) = *panel_ref.borrow() {
                         b.set_visible(show_sidebar && p == which);
@@ -4166,6 +4269,17 @@ impl SimpleComponent for App {
                     if engine.poll_ext_registry() {
                         drop(engine);
                         if let Some(ref da) = *self.ext_sidebar_da_ref.borrow() {
+                            da.queue_draw();
+                        }
+                        self.draw_needed.set(true);
+                    }
+                }
+                // Poll for completed AI response.
+                {
+                    let mut engine = self.engine.borrow_mut();
+                    if engine.poll_ai() {
+                        drop(engine);
+                        if let Some(ref da) = *self.ai_sidebar_da_ref.borrow() {
                             da.queue_draw();
                         }
                         self.draw_needed.set(true);
@@ -4924,6 +5038,39 @@ impl SimpleComponent for App {
                 let _ = x_click;
                 drop(engine);
                 if let Some(ref da) = *self.ext_sidebar_da_ref.borrow() {
+                    da.queue_draw();
+                }
+                self.draw_needed.set(true);
+            }
+            Msg::AiSidebarKey(key_name, ctrl, unicode) => {
+                let mut engine = self.engine.borrow_mut();
+                engine.handle_ai_panel_key(&key_name, ctrl, unicode);
+                let still_focused = engine.ai_has_focus;
+                drop(engine);
+                if !still_focused {
+                    if let Some(ref drawing) = *self.drawing_area.borrow() {
+                        drawing.grab_focus();
+                    }
+                }
+                if let Some(ref da) = *self.ai_sidebar_da_ref.borrow() {
+                    da.queue_draw();
+                }
+                self.draw_needed.set(true);
+            }
+            Msg::AiSidebarClick(x_click, y_click) => {
+                let mut engine = self.engine.borrow_mut();
+                let line_height = self.cached_line_height.max(1.0);
+                let row = (y_click / line_height) as usize;
+                // Last row = input box
+                let msg_count = engine.ai_messages.len();
+                let input_row = msg_count + 2; // header + messages
+                if row >= input_row {
+                    engine.ai_input_active = true;
+                }
+                engine.ai_has_focus = true;
+                let _ = x_click;
+                drop(engine);
+                if let Some(ref da) = *self.ai_sidebar_da_ref.borrow() {
                     da.queue_draw();
                 }
                 self.draw_needed.set(true);
@@ -8836,6 +8983,164 @@ fn draw_ext_sidebar(
     }
 
     let _ = (sel_r, sel_g, sel_b, row);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_ai_sidebar(
+    cr: &Context,
+    layout: &pango::Layout,
+    screen: &render::ScreenLayout,
+    theme: &Theme,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    line_height: f64,
+) {
+    let Some(ref ai) = screen.ai_panel else {
+        return;
+    };
+
+    let (bg_r, bg_g, bg_b) = theme.completion_bg.to_cairo();
+    let (hdr_r, hdr_g, hdr_b) = theme.status_bg.to_cairo();
+    let (fg_r, fg_g, fg_b) = theme.status_fg.to_cairo();
+    let (dim_r, dim_g, dim_b) = theme.line_number_fg.to_cairo();
+    let (user_r, user_g, user_b) = theme.keyword.to_cairo();
+    let (asst_r, asst_g, asst_b) = theme.string_lit.to_cairo();
+
+    // Background
+    cr.set_source_rgb(bg_r, bg_g, bg_b);
+    cr.rectangle(x, y, w, h);
+    cr.fill().ok();
+
+    layout.set_attributes(None);
+    let mut row: usize = 0;
+
+    // ── Row 0: header ─────────────────────────────────────────────────────────
+    {
+        cr.set_source_rgb(hdr_r, hdr_g, hdr_b);
+        cr.rectangle(x, y + row as f64 * line_height, w, line_height);
+        cr.fill().ok();
+        let hdr_text = if ai.streaming {
+            "  \u{f0e5} AI ASSISTANT  (thinking…)"
+        } else {
+            "  \u{f0e5} AI ASSISTANT"
+        };
+        cr.set_source_rgb(fg_r, fg_g, fg_b);
+        layout.set_text(hdr_text);
+        let (_, lh) = layout.pixel_size();
+        cr.move_to(
+            x + 2.0,
+            y + row as f64 * line_height + (line_height - lh as f64) / 2.0,
+        );
+        pangocairo::show_layout(cr, layout);
+        row += 1;
+    }
+
+    // ── Message history ───────────────────────────────────────────────────────
+    let scroll = ai.scroll_top;
+    let visible_rows = ((h - line_height * 3.0) / line_height) as usize; // leave room for input
+    let skip = scroll;
+    let mut msg_row = 0usize;
+
+    for msg in &ai.messages {
+        // Draw role label
+        let is_user = msg.role == "user";
+        let role_label = if is_user { "You:" } else { "AI:" };
+        let (role_r, role_g, role_b) = if is_user {
+            (user_r, user_g, user_b)
+        } else {
+            (asst_r, asst_g, asst_b)
+        };
+
+        // Each message: role label + content lines
+        let lines: Vec<&str> = msg.content.lines().collect();
+        let msg_height = 1 + lines.len(); // role + content lines
+
+        if msg_row + msg_height > skip {
+            // Role label row
+            if msg_row >= skip && row as f64 * line_height < h - line_height * 2.0 {
+                cr.set_source_rgb(role_r, role_g, role_b);
+                layout.set_text(role_label);
+                let (_, lh) = layout.pixel_size();
+                cr.move_to(
+                    x + 4.0,
+                    y + row as f64 * line_height + (line_height - lh as f64) / 2.0,
+                );
+                pangocairo::show_layout(cr, layout);
+                row += 1;
+            }
+            // Content lines
+            for line in &lines {
+                if msg_row >= skip && row as f64 * line_height < h - line_height * 2.0 {
+                    cr.set_source_rgb(fg_r, fg_g, fg_b);
+                    // Wrap long lines manually
+                    let display = if line.is_empty() { " " } else { line };
+                    layout.set_text(display);
+                    let (_, lh) = layout.pixel_size();
+                    cr.move_to(
+                        x + 12.0,
+                        y + row as f64 * line_height + (line_height - lh as f64) / 2.0,
+                    );
+                    pangocairo::show_layout(cr, layout);
+                    row += 1;
+                }
+                msg_row += 1;
+            }
+        } else {
+            msg_row += msg_height;
+        }
+
+        let _ = visible_rows;
+    }
+
+    // ── Input row (near bottom) ───────────────────────────────────────────────
+    let input_y = h - line_height * 2.0;
+    // Separator
+    cr.set_source_rgb(hdr_r, hdr_g, hdr_b);
+    cr.rectangle(x, y + input_y - 1.0, w, 1.0);
+    cr.fill().ok();
+    // Input background
+    let (inp_bg_r, inp_bg_g, inp_bg_b) = if ai.input_active {
+        theme.fuzzy_selected_bg.to_cairo()
+    } else {
+        theme.completion_bg.to_cairo()
+    };
+    cr.set_source_rgb(inp_bg_r, inp_bg_g, inp_bg_b);
+    cr.rectangle(x, y + input_y, w, line_height * 2.0);
+    cr.fill().ok();
+    // Input text
+    let input_text = if ai.input_active {
+        format!(" > {}|", ai.input)
+    } else if ai.input.is_empty() {
+        if ai.streaming {
+            " (waiting for response…)".to_string()
+        } else {
+            " Press i to type a message…".to_string()
+        }
+    } else {
+        format!(" > {}", ai.input)
+    };
+    let (text_r, text_g, text_b) = if ai.input_active || !ai.input.is_empty() {
+        (fg_r, fg_g, fg_b)
+    } else {
+        (dim_r, dim_g, dim_b)
+    };
+    cr.set_source_rgb(text_r, text_g, text_b);
+    layout.set_text(&input_text);
+    let (_, lh_inp) = layout.pixel_size();
+    cr.move_to(x + 2.0, y + input_y + (line_height - lh_inp as f64) / 2.0);
+    pangocairo::show_layout(cr, layout);
+
+    // Focus border
+    if ai.has_focus {
+        cr.set_source_rgb(fg_r * 0.4, fg_g * 0.4, fg_b * 0.9);
+        cr.set_line_width(1.5);
+        cr.rectangle(x + 0.75, y + 0.75, w - 1.5, h - 1.5);
+        cr.stroke().ok();
+    }
+
+    let _ = (row, dim_r, dim_g, dim_b);
 }
 
 fn draw_debug_toolbar(

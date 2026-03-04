@@ -116,6 +116,7 @@ enum TuiPanel {
     Debug,
     Git,
     Extensions,
+    Ai,
 }
 
 // ─── Sidebar data structures ──────────────────────────────────────────────────
@@ -1091,6 +1092,9 @@ fn event_loop(
             if engine.poll_ext_registry() {
                 needs_redraw = true;
             }
+            if engine.poll_ai() {
+                needs_redraw = true;
+            }
             continue;
         }
 
@@ -1571,6 +1575,38 @@ fn event_loop(
                                 ch,
                             );
                             if !engine.ext_sidebar_has_focus {
+                                sidebar.has_focus = false;
+                            }
+                        }
+                        needs_redraw = true;
+                        continue;
+                    }
+
+                    // ── AI assistant panel keyboard handling ─────────────────
+                    if sidebar.active_panel == TuiPanel::Ai {
+                        let (key_name, unicode): (&str, Option<char>) = match key_event.code {
+                            KeyCode::Char('j') | KeyCode::Down => ("j", None),
+                            KeyCode::Char('k') | KeyCode::Up => ("k", None),
+                            KeyCode::Char('G') => ("G", None),
+                            KeyCode::Char('g') => ("g", None),
+                            KeyCode::Char('i') | KeyCode::Char('a') => ("i", None),
+                            KeyCode::Enter => ("Return", None),
+                            KeyCode::Char('q') | KeyCode::Esc => ("Escape", None),
+                            KeyCode::Backspace => ("BackSpace", None),
+                            KeyCode::Char('c') if ctrl => ("c", None),
+                            KeyCode::Char(ch) => ("char", Some(ch)),
+                            _ => ("", None),
+                        };
+                        if !key_name.is_empty() {
+                            let (mapped, uni) = if key_name == "char" {
+                                ("", unicode)
+                            } else if key_name == "c" && ctrl {
+                                ("c", None)
+                            } else {
+                                (key_name, None)
+                            };
+                            engine.handle_ai_panel_key(mapped, ctrl, uni);
+                            if !engine.ai_has_focus {
                                 sidebar.has_focus = false;
                             }
                         }
@@ -3202,7 +3238,8 @@ fn handle_mouse(
             3 => Some(TuiPanel::Debug),
             4 => Some(TuiPanel::Git),
             5 => Some(TuiPanel::Extensions),
-            r if r == settings_row && settings_row >= 6 => Some(TuiPanel::Settings),
+            6 => Some(TuiPanel::Ai),
+            r if r == settings_row && settings_row >= 7 => Some(TuiPanel::Settings),
             _ => None,
         };
         if let Some(panel) = target_panel {
@@ -3223,6 +3260,10 @@ fn handle_mouse(
                     if engine.ext_registry.is_none() && !engine.ext_registry_fetching {
                         engine.ext_refresh();
                     }
+                    sidebar.has_focus = true;
+                }
+                if panel == TuiPanel::Ai {
+                    engine.ai_has_focus = true;
                     sidebar.has_focus = true;
                 }
                 if panel == TuiPanel::Settings {
@@ -6501,13 +6542,14 @@ fn render_activity_bar(
         }
     }
 
-    // Top buttons: Explorer (row 1), Search (row 2), Debug (row 3), Git (row 4), Extensions (row 5)
+    // Top buttons: Explorer (1), Search (2), Debug (3), Git (4), Extensions (5), AI (6)
     let top_buttons: &[(u16, TuiPanel, char)] = &[
         (1, TuiPanel::Explorer, '\u{f07c}'),   // nf-fa-folder_open
         (2, TuiPanel::Search, '\u{f002}'),     // nf-fa-search
         (3, TuiPanel::Debug, '\u{f188}'),      // nf-fa-bug
         (4, TuiPanel::Git, '\u{e702}'),        // nf-dev-git_branch
         (5, TuiPanel::Extensions, '\u{eb85}'), // nf-cod-extensions
+        (6, TuiPanel::Ai, '\u{f0e5}'),         // nf-fa-comment (AI chat)
     ];
 
     for &(row_off, panel, icon) in top_buttons {
@@ -6591,6 +6633,12 @@ fn render_sidebar(
     // Extensions panel
     if sidebar.active_panel == TuiPanel::Extensions {
         render_ext_sidebar(buf, area, engine, theme);
+        return;
+    }
+
+    // AI assistant panel
+    if sidebar.active_panel == TuiPanel::Ai {
+        render_ai_sidebar(buf, area, engine, theme);
         return;
     }
 
@@ -8105,6 +8153,123 @@ fn render_ext_sidebar(
     }
 
     let _ = sel_bg;
+}
+
+// ─── AI assistant sidebar panel ───────────────────────────────────────────────
+
+/// Render the AI assistant sidebar panel.
+fn render_ai_sidebar(
+    buf: &mut ratatui::buffer::Buffer,
+    area: Rect,
+    engine: &Engine,
+    theme: &Theme,
+) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+
+    let screen = render::build_screen_layout(engine, theme, &[], 1.0, 1.0);
+    let Some(ref ai) = screen.ai_panel else {
+        return;
+    };
+
+    let header_fg = rc(theme.status_fg);
+    let header_bg = rc(theme.status_bg);
+    let default_fg = rc(theme.foreground);
+    let dim_fg = rc(theme.line_number_fg);
+    let panel_bg = rc(theme.completion_bg);
+    let user_fg = rc(theme.keyword);
+    let asst_fg = rc(theme.string_lit);
+    let input_bg = rc(theme.fuzzy_selected_bg);
+
+    let write_row =
+        |buf: &mut ratatui::buffer::Buffer, y: u16, text: &str, fg: RColor, bg: RColor| {
+            for x in area.x..area.x + area.width {
+                set_cell(buf, x, y, ' ', fg, bg);
+            }
+            for (i, ch) in text.chars().enumerate().take(area.width as usize) {
+                set_cell(buf, area.x + i as u16, y, ch, fg, bg);
+            }
+        };
+
+    let mut y = area.y;
+
+    // ── Row 0: header ─────────────────────────────────────────────────────────
+    if y < area.y + area.height {
+        let hdr = if ai.streaming {
+            " \u{f0e5} AI ASSISTANT  (thinking…)"
+        } else {
+            " \u{f0e5} AI ASSISTANT"
+        };
+        write_row(buf, y, hdr, header_fg, header_bg);
+        y += 1;
+    }
+
+    // ── Message history ───────────────────────────────────────────────────────
+    let input_rows: u16 = 2;
+    let msg_area_height = area.height.saturating_sub(1 + input_rows); // header + input
+    let scroll = ai.scroll_top;
+
+    let mut all_rows: Vec<(String, RColor)> = Vec::new();
+    for msg in &ai.messages {
+        let is_user = msg.role == "user";
+        let role_label = if is_user { "You:" } else { "AI:" };
+        let role_fg = if is_user { user_fg } else { asst_fg };
+        all_rows.push((role_label.to_string(), role_fg));
+        for line in msg.content.lines() {
+            let display = format!("  {}", if line.is_empty() { " " } else { line });
+            all_rows.push((display, default_fg));
+        }
+        all_rows.push((" ".to_string(), panel_bg)); // blank separator
+    }
+
+    let total = all_rows.len();
+    let start = scroll.min(total.saturating_sub(msg_area_height as usize));
+    for (i, (text, fg)) in all_rows.iter().enumerate().skip(start) {
+        if y >= area.y + 1 + msg_area_height {
+            break;
+        }
+        write_row(buf, y, text, *fg, panel_bg);
+        y += 1;
+        let _ = i;
+    }
+
+    // Fill remaining message area
+    while y < area.y + 1 + msg_area_height {
+        for x in area.x..area.x + area.width {
+            set_cell(buf, x, y, ' ', dim_fg, panel_bg);
+        }
+        y += 1;
+    }
+
+    // ── Input rows ────────────────────────────────────────────────────────────
+    // Separator row
+    if y < area.y + area.height {
+        for x in area.x..area.x + area.width {
+            set_cell(buf, x, y, '─', dim_fg, header_bg);
+        }
+        y += 1;
+    }
+    // Input text row
+    if y < area.y + area.height {
+        let (inp_bg, inp_fg) = if ai.input_active {
+            (input_bg, default_fg)
+        } else {
+            (panel_bg, dim_fg)
+        };
+        let input_text = if ai.input_active {
+            format!(" > {}|", ai.input)
+        } else if ai.input.is_empty() {
+            if ai.streaming {
+                " (waiting for response…)".to_string()
+            } else {
+                " Press i to type…".to_string()
+            }
+        } else {
+            format!(" > {}", ai.input)
+        };
+        write_row(buf, y, &input_text, inp_fg, inp_bg);
+    }
 }
 
 // ─── Debug sidebar panel ──────────────────────────────────────────────────────

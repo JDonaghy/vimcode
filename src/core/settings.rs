@@ -178,6 +178,25 @@ pub struct Settings {
     /// Select with `:colorscheme <name>`.
     #[serde(default = "default_colorscheme")]
     pub colorscheme: String,
+
+    // ── AI Assistant ──────────────────────────────────────────────────────────
+    /// AI provider: "anthropic" (default), "openai", or "ollama".
+    #[serde(default = "default_ai_provider")]
+    pub ai_provider: String,
+
+    /// API key for Anthropic or OpenAI. Leave empty for Ollama.
+    #[serde(default)]
+    pub ai_api_key: String,
+
+    /// Override model name. Empty = provider default
+    /// (claude-sonnet-4-6 / gpt-4o / llama3.2).
+    #[serde(default)]
+    pub ai_model: String,
+
+    /// Override base URL for the API endpoint. Empty = provider default.
+    /// Useful for OpenAI-compatible local servers or proxies.
+    #[serde(default)]
+    pub ai_base_url: String,
 }
 
 fn default_explorer_visible() -> bool {
@@ -230,6 +249,10 @@ fn default_extension_registry_url() -> String {
 
 fn default_colorscheme() -> String {
     "onedark".to_string()
+}
+
+fn default_ai_provider() -> String {
+    "anthropic".to_string()
 }
 
 // ── Explorer key defaults ──────────────────────────────────────────────────
@@ -500,6 +523,10 @@ impl Default for Settings {
             textwidth: 0,
             extension_registry_url: default_extension_registry_url(),
             colorscheme: default_colorscheme(),
+            ai_provider: default_ai_provider(),
+            ai_api_key: String::new(),
+            ai_model: String::new(),
+            ai_base_url: String::new(),
         }
     }
 }
