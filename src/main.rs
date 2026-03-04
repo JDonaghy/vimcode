@@ -1530,6 +1530,13 @@ impl SimpleComponent for App {
         root: Self::Root,
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
+        // Request the dark variant of the active GTK theme. This makes all
+        // native widgets (Switch, SpinButton, DropDown, Entry, etc.) use dark
+        // colours automatically when the GTK theme supports it (e.g. Adwaita).
+        if let Some(gtk_settings) = gtk4::Settings::default() {
+            gtk_settings.set_gtk_application_prefer_dark_theme(true);
+        }
+
         let engine = {
             let mut e = Engine::new();
             e.plugin_init();
@@ -9562,31 +9569,101 @@ const STATIC_CSS: &str = "
             font-size: 11px;
             font-weight: bold;
             letter-spacing: 1px;
-            text-transform: uppercase;
         }
 
-        /* Compact switch widget in settings rows */
+        /* Make ScrolledWindow transparent so sidebar background shows through */
+        .sidebar scrolledwindow,
+        .sidebar scrolledwindow > viewport {
+            background-color: transparent;
+        }
+
+        /* Dark-themed form widgets (fallback when GTK theme has no dark variant) */
         .sidebar switch {
             min-height: 20px;
             min-width: 36px;
         }
-
-        /* SpinButton in settings rows */
-        .sidebar spinbutton entry {
-            min-width: 40px;
-            padding: 2px 4px;
+        .sidebar switch:not(:checked) {
+            background-color: #6b6b6b;
+        }
+        .sidebar switch:checked {
+            background-color: #0e639c;
+        }
+        .sidebar switch slider {
+            background-color: #ffffff;
+            min-width: 16px;
+            min-height: 16px;
         }
 
-        /* DropDown in settings rows — compact */
+        /* SpinButton */
+        .sidebar spinbutton {
+            min-height: 24px;
+            background-color: #3c3c3c;
+            color: #cccccc;
+            border: 1px solid #555555;
+            border-radius: 2px;
+        }
+        .sidebar spinbutton entry {
+            background-color: transparent;
+            color: #cccccc;
+            min-width: 44px;
+            padding: 2px 4px;
+        }
+        .sidebar spinbutton button {
+            background-color: #3c3c3c;
+            color: #cccccc;
+            border: none;
+            min-width: 18px;
+            padding: 0;
+        }
+        .sidebar spinbutton button:hover {
+            background-color: #505050;
+        }
+
+        /* DropDown */
         .sidebar dropdown {
             min-height: 24px;
-            padding: 1px 4px;
+            padding: 0 4px;
+            background-color: #3c3c3c;
+            color: #cccccc;
+            border: 1px solid #555555;
+            border-radius: 2px;
+        }
+        .sidebar dropdown button {
+            background-color: transparent;
+            color: #cccccc;
+            border: none;
+            padding: 2px 4px;
+        }
+        .sidebar dropdown button:hover {
+            background-color: #505050;
+        }
+
+        /* Popover list for DropDown options */
+        popover.menu contents,
+        popover contents {
+            background-color: #252526;
+            color: #cccccc;
+        }
+        popover.menu modelbutton,
+        popover modelbutton {
+            color: #cccccc;
+        }
+        popover.menu modelbutton:hover,
+        popover modelbutton:hover {
+            background-color: #094771;
         }
 
         /* Entry in settings rows */
         .sidebar entry {
             min-height: 24px;
             padding: 2px 6px;
+            background-color: #3c3c3c;
+            color: #cccccc;
+            border: 1px solid #555555;
+            border-radius: 2px;
+        }
+        .sidebar entry:focus {
+            border-color: #0e639c;
         }
         ";
 
