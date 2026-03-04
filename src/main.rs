@@ -443,8 +443,10 @@ fn build_setting_row(
             let switch = gtk4::Switch::new();
             switch.set_active(current_val == "true");
             switch.set_valign(gtk4::Align::Center);
-            switch.set_margin_top(2);
-            switch.set_margin_bottom(2);
+            switch.set_margin_top(4);
+            switch.set_margin_bottom(4);
+            switch.set_margin_start(4);
+            switch.set_margin_end(4);
             let sender_c = sender.clone();
             let key_c = key.clone();
             switch.connect_state_set(move |_, state| {
@@ -9578,12 +9580,7 @@ const STATIC_CSS: &str = "
             background-color: transparent;
         }
 
-        /* Switch: let prefer_dark_theme (Adwaita dark) handle colors;
-           just ensure a reasonable compact size */
-        .sidebar switch {
-            min-height: 24px;
-            min-width: 48px;
-        }
+        /* Switch: let prefer_dark_theme (Adwaita dark) handle size and colors */
 
         /* SpinButton: dark background + text matching the sidebar */
         .sidebar spinbutton {
