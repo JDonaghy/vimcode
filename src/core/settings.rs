@@ -747,6 +747,7 @@ impl Settings {
             "cursorline" | "cul" => self.cursorline = enable,
             "splitbelow" | "sb" => self.splitbelow = enable,
             "splitright" | "spr" => self.splitright = enable,
+            "ai_completions" => self.ai_completions = enable,
             _ => return Err(format!("Unknown option: {opt}")),
         }
         Ok(())
