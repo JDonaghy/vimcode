@@ -1,6 +1,20 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// When set to `true`, all `save()` methods in this module become no-ops.
+/// Integration tests call [`suppress_disk_saves`] once so `cargo test` never
+/// clobbers real user config files under `~/.config/vimcode/`.
+static SUPPRESS_SAVES: AtomicBool = AtomicBool::new(false);
+
+/// Permanently suppress all disk writes from `save()` in this process.
+/// Thread-safe: uses `AtomicBool`; safe to call from multiple threads.
+/// Intended for integration tests only.
+#[allow(dead_code)]
+pub fn suppress_disk_saves() {
+    SUPPRESS_SAVES.store(true, Ordering::Relaxed);
+}
 
 // ---------------------------------------------------------------------------
 // HistoryState — command/search history in its own file
@@ -139,6 +153,11 @@ impl ExtensionState {
     pub fn save(&self) -> std::io::Result<()> {
         #[cfg(test)]
         return Ok(());
+
+        #[cfg_attr(test, allow(unreachable_code))]
+        if SUPPRESS_SAVES.load(Ordering::Relaxed) {
+            return Ok(());
+        }
 
         #[cfg_attr(test, allow(unreachable_code))]
         {
@@ -338,6 +357,11 @@ impl SessionState {
         return Ok(());
 
         #[cfg_attr(test, allow(unreachable_code))]
+        if SUPPRESS_SAVES.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+
+        #[cfg_attr(test, allow(unreachable_code))]
         let path = Self::session_path();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -387,6 +411,12 @@ impl SessionState {
     pub fn save_for_workspace(&self, root: &Path) -> std::io::Result<()> {
         #[cfg(test)]
         {
+            let _ = root;
+            return Ok(());
+        }
+
+        #[cfg_attr(test, allow(unreachable_code))]
+        if SUPPRESS_SAVES.load(Ordering::Relaxed) {
             let _ = root;
             return Ok(());
         }

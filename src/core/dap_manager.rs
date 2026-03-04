@@ -35,7 +35,10 @@ static ADAPTER_REGISTRY: &[AdapterInfo] = &[
     AdapterInfo {
         name: "debugpy",
         binary: "python",
-        args: &["-m", "debugpy", "--listen", "0", "--wait-for-client"],
+        // debugpy.adapter speaks DAP over stdio (like all other adapters here).
+        // Do NOT use `python -m debugpy --listen PORT` — that is TCP-only and
+        // requires a script argument; the adapter module handles launch requests.
+        args: &["-m", "debugpy.adapter"],
         languages: &["python"],
         use_tcp: false,
     },
@@ -93,6 +96,82 @@ fn mason_bin_dir() -> Option<PathBuf> {
     }
 }
 
+/// Path to the editor-managed venv used exclusively for the debugpy adapter.
+///
+/// Using a dedicated venv avoids PEP 668 "externally managed environment"
+/// errors that modern Linux distros (Ubuntu 22.04+, Debian 12, Fedora 38+)
+/// produce when pip tries to install into the system Python.
+pub fn debugpy_venv_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(".config/vimcode/debugpy-venv"))
+}
+
+/// Find the Python interpreter for the *user's project* (not the adapter).
+///
+/// This is what debugpy uses to actually run the script being debugged.
+/// Search order:
+///   1. `$VIRTUAL_ENV/bin/python`          — explicitly activated venv
+///   2. `<workspace>/venv/bin/python`      — conventional local venv name
+///   3. `<workspace>/.venv/bin/python`     — PEP 582 / modern convention
+///   4. `<workspace>/env/bin/python`       — older convention
+///   5. `python3` on PATH                  — system / conda / pyenv
+///   6. `python`  on PATH                  — last resort
+#[allow(dead_code)]
+pub fn find_project_python() -> Option<PathBuf> {
+    find_project_python_in(None)
+}
+
+/// Same as [`find_project_python`] but also searches `workspace_root` for
+/// common venv directories so the user doesn't need to activate manually.
+pub fn find_project_python_in(workspace_root: Option<&std::path::Path>) -> Option<PathBuf> {
+    // 1. Explicitly activated venv takes priority.
+    if let Ok(venv) = std::env::var("VIRTUAL_ENV") {
+        #[cfg(target_os = "windows")]
+        let p = PathBuf::from(&venv).join("Scripts").join("python.exe");
+        #[cfg(not(target_os = "windows"))]
+        let p = PathBuf::from(&venv).join("bin").join("python");
+        if p.exists() {
+            return Some(p);
+        }
+    }
+
+    // 2-4. Common venv directory names relative to the workspace root.
+    if let Some(root) = workspace_root {
+        for venv_dir in &["venv", ".venv", "env"] {
+            #[cfg(target_os = "windows")]
+            let p = root.join(venv_dir).join("Scripts").join("python.exe");
+            #[cfg(not(target_os = "windows"))]
+            let p = root.join(venv_dir).join("bin").join("python");
+            if p.exists() {
+                return Some(p);
+            }
+        }
+    }
+
+    // 5-6. Fall back to whatever python3/python is on PATH.
+    resolve_binary("python3").or_else(|| resolve_binary("python"))
+}
+
+/// Find the Python 3 executable for the debugpy adapter.
+///
+/// Search order:
+///   1. `~/.config/vimcode/debugpy-venv/bin/python`  — managed venv (post-install)
+///   2. `python3` on PATH                             — system Python 3
+///   3. `python`  on PATH                             — last resort
+pub fn find_python_binary() -> Option<PathBuf> {
+    // Prefer the managed venv if it has already been created by :ExtInstall python.
+    if let Some(venv) = debugpy_venv_dir() {
+        #[cfg(target_os = "windows")]
+        let venv_python = venv.join("Scripts").join("python.exe");
+        #[cfg(not(target_os = "windows"))]
+        let venv_python = venv.join("bin").join("python");
+        if venv_python.exists() {
+            return Some(venv_python);
+        }
+    }
+    resolve_binary("python3").or_else(|| resolve_binary("python"))
+}
+
 /// Resolve a binary name to an absolute path.
 /// Checks Mason bin directory first, then falls back to PATH via `which`/`where`.
 pub fn resolve_binary(name: &str) -> Option<PathBuf> {
@@ -134,11 +213,24 @@ pub fn install_cmd_for_adapter(adapter_name: &str) -> Option<String> {
     match adapter_name {
         "codelldb" => Some(codelldb_install_cmd()),
         "debugpy" => {
-            // debugpy is a Python package; `python` is already the binary we launch
+            // Create a managed venv so we never touch the system Python (avoids
+            // PEP 668 "externally managed environment" errors on Ubuntu 22.04+,
+            // Debian 12, Fedora 38+, etc.).  After creation, install debugpy into
+            // that venv.  On the next F5 press, find_python_binary() will discover
+            // the venv python and launch the adapter from it.
+            let system_python = find_python_binary()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "python3".to_string());
+            let venv = debugpy_venv_dir()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "$HOME/.config/vimcode/debugpy-venv".to_string());
             #[cfg(target_os = "windows")]
-            return Some("pip install debugpy".to_string());
+            let venv_python = format!("{venv}\\Scripts\\python");
             #[cfg(not(target_os = "windows"))]
-            Some("pip3 install debugpy".to_string())
+            let venv_python = format!("{venv}/bin/python");
+            Some(format!(
+                "{system_python} -m venv {venv} && {venv_python} -m pip install debugpy"
+            ))
         }
         "delve" => Some("go install github.com/go-delve/delve/cmd/dlv@latest".to_string()),
         "netcoredbg" => Some(netcoredbg_install_cmd()),
@@ -674,12 +766,37 @@ impl DapManager {
             .or_else(|| Self::adapter_for_language(name_or_lang))
             .ok_or_else(|| format!("No DAP adapter registered for '{name_or_lang}'"))?;
 
-        let binary = resolve_binary(info.binary).ok_or_else(|| {
-            format!(
-                "DAP binary '{}' not found (install via :DapInstall {name_or_lang})",
-                info.binary
-            )
-        })?;
+        // For debugpy, try python3 before python — most modern Linux distributions
+        // ship Python 3 as `python3` without a `python` symlink.
+        let binary = if info.name == "debugpy" {
+            find_python_binary().ok_or_else(|| {
+                "Python not found — install Python 3 and run :ExtInstall python".to_string()
+            })?
+        } else {
+            resolve_binary(info.binary).ok_or_else(|| {
+                format!(
+                    "DAP binary '{}' not found (install via :DapInstall {name_or_lang})",
+                    info.binary
+                )
+            })?
+        };
+
+        // For debugpy: verify the module is importable before spawning the TCP
+        // server.  If it isn't, `spawn_tcp` would hang 2 s then show the opaque
+        // "connection refused" error.  Better to fail fast with a clear message.
+        if info.name == "debugpy" {
+            let ok = std::process::Command::new(&binary)
+                .args(["-c", "import debugpy"])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if !ok {
+                return Err(format!(
+                    "debugpy not installed for {} — run :ExtInstall python",
+                    binary.display()
+                ));
+            }
+        }
 
         let binary_str = binary.to_string_lossy().into_owned();
         let server = if info.use_tcp {
@@ -779,6 +896,101 @@ mod tests {
         assert!(cmd.is_some());
         let cmd = cmd.unwrap();
         assert!(cmd.contains("pip") && cmd.contains("debugpy"), "{cmd}");
+    }
+
+    #[test]
+    fn test_install_cmd_debugpy_creates_venv() {
+        // The install command must create a managed venv before installing into it.
+        // This avoids PEP 668 "externally managed environment" errors.
+        let cmd = install_cmd_for_adapter("debugpy").expect("debugpy should have install cmd");
+        assert!(
+            cmd.contains("venv"),
+            "install cmd should create a venv: {cmd}"
+        );
+    }
+
+    #[test]
+    fn test_install_cmd_debugpy_installs_into_venv_not_system() {
+        // debugpy must be installed into the managed venv, not the system Python.
+        let cmd = install_cmd_for_adapter("debugpy").expect("debugpy should have install cmd");
+        assert!(
+            cmd.contains("debugpy-venv"),
+            "install cmd should target the managed venv path: {cmd}"
+        );
+    }
+
+    #[test]
+    fn test_install_cmd_debugpy_uses_m_pip() {
+        // Install via `-m pip` so the pip belongs to the venv python.
+        let cmd = install_cmd_for_adapter("debugpy").expect("debugpy should have install cmd");
+        assert!(
+            cmd.contains("-m pip"),
+            "install cmd should use `-m pip`: {cmd}"
+        );
+    }
+
+    #[test]
+    fn test_install_cmd_debugpy_does_not_use_bare_pip3() {
+        // Must not start with a bare `pip`/`pip3` call — that would bypass the venv.
+        let cmd = install_cmd_for_adapter("debugpy").expect("debugpy should have install cmd");
+        assert!(
+            !cmd.starts_with("pip"),
+            "install cmd must not start with bare pip/pip3: {cmd}"
+        );
+    }
+
+    #[test]
+    fn test_debugpy_venv_dir_is_under_config_vimcode() {
+        let dir = debugpy_venv_dir().expect("venv dir should be determinable");
+        let s = dir.to_string_lossy();
+        assert!(
+            s.contains(".config") && s.contains("vimcode") && s.contains("debugpy-venv"),
+            "debugpy venv dir should be ~/.config/vimcode/debugpy-venv: {s}"
+        );
+    }
+
+    #[test]
+    fn test_find_python_binary_returns_some_or_none_without_panic() {
+        // Verifies the function doesn't panic regardless of what Python is installed.
+        // If Python is present the path should contain "python"; if absent it's None.
+        if let Some(path) = find_python_binary() {
+            assert!(
+                path.to_string_lossy().contains("python"),
+                "found binary should contain 'python': {path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_debugpy_adapter_binary_field_is_python() {
+        // The registry `binary` field stays "python" — it drives the error message
+        // path when find_python_binary() itself returns None.
+        let info = DapManager::adapter_by_name("debugpy").expect("debugpy should be registered");
+        assert_eq!(info.binary, "python");
+    }
+
+    #[test]
+    fn test_debugpy_uses_stdio_not_tcp() {
+        // debugpy.adapter speaks DAP over stdio, not TCP.
+        let info = DapManager::adapter_by_name("debugpy").expect("debugpy registered");
+        assert!(!info.use_tcp, "debugpy must use stdio (use_tcp=false)");
+    }
+
+    #[test]
+    fn test_debugpy_args_use_adapter_module() {
+        // Must use `python -m debugpy.adapter`, NOT `python -m debugpy --listen`.
+        // The adapter module handles DAP over stdio and accepts launch requests.
+        let info = DapManager::adapter_by_name("debugpy").expect("debugpy registered");
+        assert!(
+            info.args.contains(&"-m") && info.args.contains(&"debugpy.adapter"),
+            "debugpy args must use debugpy.adapter: {:?}",
+            info.args
+        );
+        assert!(
+            !info.args.contains(&"--listen"),
+            "debugpy must not use --listen (TCP mode): {:?}",
+            info.args
+        );
     }
 
     #[test]

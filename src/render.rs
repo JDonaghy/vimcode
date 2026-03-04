@@ -2629,8 +2629,11 @@ fn build_rendered_window(
 
     let buffer = &buffer_state.buffer;
     let view = &window.view;
-    let scroll_top = view.scroll_top;
     let total_lines = buffer.content.len_lines();
+    // Clamp scroll_top so that line_to_byte never panics when the cursor was
+    // set to a line beyond the buffer (e.g. DAP exception in a stdlib file
+    // that failed to open, leaving a small buffer with a large scroll offset).
+    let scroll_top = view.scroll_top.min(total_lines);
     let cursor_line = view.cursor.line;
 
     // Whether this buffer has git diff data.

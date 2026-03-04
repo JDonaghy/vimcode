@@ -116,11 +116,29 @@ pub struct DapServer {
 impl DapServer {
     /// Launch a debug adapter process that communicates over stdin/stdout.
     pub fn spawn(cmd: &str, args: &[&str]) -> Result<Self, String> {
-        let mut child = std::process::Command::new(cmd)
+        let mut command = std::process::Command::new(cmd);
+        command
             .args(args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        // Start the adapter in a brand-new session (setsid) so it — and any
+        // children it spawns (e.g. debugpy launching the target script) — are
+        // fully detached from the editor's controlling terminal.  Without this,
+        // the child can call tcsetpgrp() to steal the foreground process group,
+        // which causes SIGTTIN and suspends the editor.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            // SAFETY: setsid() is async-signal-safe (required by pre_exec).
+            unsafe {
+                command.pre_exec(|| {
+                    libc::setsid();
+                    Ok(())
+                });
+            }
+        }
+        let mut child = command
             .spawn()
             .map_err(|e| format!("Failed to spawn DAP adapter '{cmd}': {e}"))?;
 
@@ -162,11 +180,16 @@ impl DapServer {
         };
         let port_str = port.to_string();
 
-        // Replace the placeholder "0" that follows "--port" in args with the
-        // actual chosen port number.
+        // Replace the placeholder "0" that follows "--port" or "--listen" in
+        // args with the actual chosen port number.
+        // codelldb uses "--port 0"; debugpy uses "--listen 0".
         let resolved_args: Vec<&str> = {
             let mut v: Vec<&str> = args.to_vec();
-            if let Some(pos) = v.iter().position(|a| *a == "--port") {
+            let port_flag_pos = v
+                .iter()
+                .position(|a| *a == "--port")
+                .or_else(|| v.iter().position(|a| *a == "--listen"));
+            if let Some(pos) = port_flag_pos {
                 if pos + 1 < v.len() {
                     v[pos + 1] = &port_str;
                 }
@@ -174,19 +197,32 @@ impl DapServer {
             v
         };
 
-        let child = std::process::Command::new(cmd)
+        let mut tcp_command = std::process::Command::new(cmd);
+        tcp_command
             .args(&resolved_args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            unsafe {
+                tcp_command.pre_exec(|| {
+                    libc::setsid();
+                    Ok(())
+                });
+            }
+        }
+        let child = tcp_command
             .spawn()
             .map_err(|e| format!("Failed to spawn DAP adapter '{cmd}': {e}"))?;
 
         // Give the adapter a moment to start listening.
+        // 50 × 100 ms = 5 s — generous enough for debugpy (Python startup is slow).
         let tcp = {
             let mut last_err = String::new();
             let mut tcp = None;
-            for _ in 0..20 {
+            for _ in 0..50 {
                 match std::net::TcpStream::connect(format!("127.0.0.1:{port}")) {
                     Ok(s) => {
                         tcp = Some(s);

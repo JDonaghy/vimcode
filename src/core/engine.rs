@@ -915,6 +915,11 @@ pub struct Engine {
     /// DAP output console: stdout/stderr from the debugged process + adapter messages.
     /// Capped at 1000 lines; new lines appended, oldest dropped from the front.
     pub dap_output_lines: Vec<String>,
+    /// Carry buffer for incomplete ANSI escape sequences split across consecutive
+    /// DAP output events.  The tail of one event may be `\x1b[38;2;` while the
+    /// next event starts with `97;175;239m` — we prepend the carry so the combined
+    /// string is stripped correctly.
+    pub dap_ansi_carry: String,
     /// Index of the currently selected stack frame in the panel.
     pub dap_active_frame: usize,
     /// Set of variable-reference IDs that the user has expanded (to show child variables).
@@ -1247,6 +1252,7 @@ impl Engine {
             dap_stack_frames: Vec::new(),
             dap_variables: Vec::new(),
             dap_output_lines: Vec::new(),
+            dap_ansi_carry: String::new(),
             dap_active_frame: 0,
             dap_expanded_vars: HashSet::new(),
             dap_child_variables: HashMap::new(),
@@ -17943,7 +17949,7 @@ impl Engine {
         let cfg_idx = self
             .dap_selected_launch_config
             .min(configs.len().saturating_sub(1));
-        let config = if configs.is_empty() {
+        let mut config = if configs.is_empty() {
             // Absolute fallback: synthesise a minimal config.
             LaunchConfig {
                 name: "Debug".to_string(),
@@ -17959,6 +17965,15 @@ impl Engine {
         };
         self.dap_launch_configs = configs;
         self.dap_selected_launch_config = cfg_idx;
+
+        // Resolve ${file} to the currently-active buffer's file path.
+        // This is a standard VSCode variable used by language adapters like
+        // debugpy that default to debugging the file open in the editor.
+        if config.program.contains("${file}") {
+            if let Some(path) = self.file_path().map(|p| p.to_string_lossy().into_owned()) {
+                config.program = config.program.replace("${file}", &path);
+            }
+        }
 
         // --- preLaunchTask support ---
         // If the config references a preLaunchTask and we haven't run it yet,
@@ -18046,6 +18061,27 @@ impl Engine {
             serde_json::Map::new()
         };
 
+        // For debugpy: tell the adapter which Python to use for running the
+        // user's script.  The adapter itself runs from the debugpy-venv, but
+        // the user's project venv (if active) must be used to find installed
+        // packages (e.g. fastapi, django, etc.).
+        // Respects any `python`/`pythonPath` already set in launch.json.
+        if adapter_lang == "debugpy" {
+            // Only inject `python` when neither field is already in launch.json.
+            // `python` and `pythonPath` are mutually exclusive in debugpy.adapter;
+            // sending both causes "pythonPath is not valid if python is specified".
+            if !extra.contains_key("python") && !extra.contains_key("pythonPath") {
+                let project_python =
+                    super::dap_manager::find_project_python_in(Some(&workspace_root))
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "python3".to_string());
+                extra.insert(
+                    "python".to_string(),
+                    serde_json::Value::String(project_python),
+                );
+            }
+        }
+
         // sourceLanguages helps codelldb map Rust source files.
         if adapter_lang == "codelldb" || config.adapter_type == "lldb" {
             extra
@@ -18086,6 +18122,7 @@ impl Engine {
         // Clear previous output and switch to Debug Output tab so the user
         // can see all diagnostic logs without any extra commands.
         self.dap_output_lines.clear();
+        self.dap_ansi_carry.clear();
         self.bottom_panel_kind = BottomPanelKind::DebugOutput;
         // Open the bottom panel even if no terminal is running.
         // Only bump rows if completely collapsed (0) to avoid overriding user preferences.
@@ -18683,56 +18720,100 @@ impl Engine {
         self.message = "DAP: no active session".to_string();
     }
 
+    /// Strip ANSI escape sequences (CSI, OSC, etc.) and non-printable control
+    /// characters from a string.  Used to clean DAP adapter output before
+    /// storing it in the Debug Output panel.
+    pub(crate) fn strip_ansi_and_control(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\x1b' {
+                // ESC sequences: CSI ('['), OSC (']'), SS2 ('N'), SS3 ('O'), etc.
+                match chars.peek() {
+                    Some(&'[') => {
+                        chars.next(); // consume '['
+                                      // CSI: params (0x30-3F) + intermediates (0x20-2F) + final (0x40-7E)
+                        while let Some(&c) = chars.peek() {
+                            chars.next();
+                            if ('@'..='~').contains(&c) {
+                                break;
+                            }
+                        }
+                    }
+                    Some(&']') => {
+                        chars.next(); // consume ']'
+                                      // OSC: terminated by BEL (\x07) or ST (ESC \)
+                        while let Some(c) = chars.next() {
+                            if c == '\x07' {
+                                break;
+                            }
+                            if c == '\x1b' && chars.peek() == Some(&'\\') {
+                                chars.next();
+                                break;
+                            }
+                        }
+                    }
+                    Some(&c) if c.is_ascii_uppercase() || c == '(' || c == ')' || c == '#' => {
+                        chars.next(); // two-byte escape (ESC + letter/paren)
+                    }
+                    _ => {} // bare ESC — skip it
+                }
+            } else if ch == '\r' || (ch.is_control() && ch != '\n' && ch != '\t') {
+                // skip control chars (keep newlines and tabs)
+            } else {
+                out.push(ch);
+            }
+        }
+        out
+    }
+
+    /// If `s` ends with an incomplete (unterminated) ANSI escape sequence,
+    /// return the byte offset where that sequence begins so the caller can
+    /// split off the tail and carry it into the next event.  Returns `None`
+    /// when no incomplete tail is found.
+    pub(crate) fn ansi_incomplete_tail_start(s: &str) -> Option<usize> {
+        // Find the last ESC byte (0x1B is single-byte ASCII, always a valid UTF-8 boundary).
+        let esc_pos = s.as_bytes().iter().rposition(|&b| b == 0x1b)?;
+        let tail = &s[esc_pos..];
+        let mut chars = tail.chars().peekable();
+        chars.next(); // consume \x1b
+        match chars.peek().copied() {
+            Some('[') => {
+                chars.next(); // consume '['
+                              // CSI is complete when we see a final byte in 0x40–0x7E.
+                while let Some(&c) = chars.peek() {
+                    chars.next();
+                    if ('@'..='~').contains(&c) {
+                        return None; // complete
+                    }
+                }
+                Some(esc_pos) // ran out of chars before final byte
+            }
+            Some(']') => {
+                chars.next(); // consume ']'
+                let mut prev = '\0';
+                for c in chars {
+                    if c == '\x07' {
+                        return None; // BEL terminates OSC
+                    }
+                    if prev == '\x1b' && c == '\\' {
+                        return None; // ST terminates OSC
+                    }
+                    prev = c;
+                }
+                Some(esc_pos) // unterminated OSC
+            }
+            Some(c) if c.is_ascii_uppercase() || c == '(' || c == ')' || c == '#' => {
+                None // two-byte escape is always complete once the second char is present
+            }
+            None => Some(esc_pos), // bare \x1b at end of string
+            _ => None,             // other: treat as complete
+        }
+    }
+
     /// Drain all pending DAP events and update engine state accordingly.
     /// Called by both UI backends every poll tick (same cadence as `poll_lsp`).
     pub fn poll_dap(&mut self) -> bool {
-        /// Strip ANSI escape sequences (CSI, OSC, etc.) and non-printable
-        /// control characters from DAP adapter output so the Debug Output
-        /// panel doesn't show garbled text.
-        fn strip_ansi_and_control(s: &str) -> String {
-            let mut out = String::with_capacity(s.len());
-            let mut chars = s.chars().peekable();
-            while let Some(ch) = chars.next() {
-                if ch == '\x1b' {
-                    // ESC sequences: CSI ('['), OSC (']'), SS2 ('N'), SS3 ('O'), etc.
-                    match chars.peek() {
-                        Some(&'[') => {
-                            chars.next(); // consume '['
-                                          // CSI: params (0x30-3F) + intermediates (0x20-2F) + final (0x40-7E)
-                            while let Some(&c) = chars.peek() {
-                                chars.next();
-                                if ('@'..='~').contains(&c) {
-                                    break;
-                                }
-                            }
-                        }
-                        Some(&']') => {
-                            chars.next(); // consume ']'
-                                          // OSC: terminated by BEL (\x07) or ST (ESC \)
-                            while let Some(c) = chars.next() {
-                                if c == '\x07' {
-                                    break;
-                                }
-                                if c == '\x1b' && chars.peek() == Some(&'\\') {
-                                    chars.next();
-                                    break;
-                                }
-                            }
-                        }
-                        Some(&c) if c.is_ascii_uppercase() || c == '(' || c == ')' || c == '#' => {
-                            chars.next(); // two-byte escape (ESC + letter/paren)
-                        }
-                        _ => {} // bare ESC — skip it
-                    }
-                } else if ch == '\r' || (ch.is_control() && ch != '\n' && ch != '\t') {
-                    // skip control chars (keep newlines and tabs)
-                } else {
-                    out.push(ch);
-                }
-            }
-            out
-        }
-
         let events = match &mut self.dap_manager {
             Some(mgr) => match &mut mgr.server {
                 Some(server) => server.poll(),
@@ -18835,16 +18916,37 @@ impl Engine {
                     if category != "telemetry" {
                         let trimmed = output.trim_end_matches('\n');
                         if !trimmed.is_empty() {
+                            // Prepend any carry from a previously split ANSI sequence,
+                            // then split off any new incomplete tail for the next event.
+                            let combined = if self.dap_ansi_carry.is_empty() {
+                                trimmed.to_string()
+                            } else {
+                                let mut s = std::mem::take(&mut self.dap_ansi_carry);
+                                s.push_str(trimmed);
+                                s
+                            };
+                            let (to_strip, carry) = if let Some(tail_start) =
+                                Self::ansi_incomplete_tail_start(&combined)
+                            {
+                                let carry = combined[tail_start..].to_string();
+                                let clean_part = combined[..tail_start].to_string();
+                                (clean_part, carry)
+                            } else {
+                                (combined, String::new())
+                            };
+                            self.dap_ansi_carry = carry;
                             // Strip ANSI escape sequences and control chars that
                             // would garble the Debug Output panel.
-                            let clean: String = strip_ansi_and_control(trimmed);
-                            self.message = format!("[{category}] {clean}");
-                            for line in clean.lines() {
-                                self.dap_output_lines.push(format!("[{category}] {line}"));
-                            }
-                            if self.dap_output_lines.len() > 1000 {
-                                let excess = self.dap_output_lines.len() - 1000;
-                                self.dap_output_lines.drain(..excess);
+                            let clean: String = Self::strip_ansi_and_control(&to_strip);
+                            if !clean.is_empty() {
+                                self.message = format!("[{category}] {clean}");
+                                for line in clean.lines() {
+                                    self.dap_output_lines.push(format!("[{category}] {line}"));
+                                }
+                                if self.dap_output_lines.len() > 1000 {
+                                    let excess = self.dap_output_lines.len() - 1000;
+                                    self.dap_output_lines.drain(..excess);
+                                }
                             }
                         }
                     }
@@ -19030,10 +19132,19 @@ impl Engine {
                                     }
                                     // Jump to the stopped line (1-based → 0-based) and
                                     // center it in the viewport so it's always visible.
-                                    let target_line = (line as usize).saturating_sub(1);
-                                    self.view_mut().cursor.line = target_line;
-                                    self.view_mut().cursor.col = 0;
-                                    self.scroll_cursor_center();
+                                    // Clamp to the actual buffer length — the file open may
+                                    // have failed (leaving the old small buffer) or the
+                                    // adapter's line number may exceed the file's line count.
+                                    // Guard: only navigate if we have a valid active window.
+                                    let active_wid = self.active_window_id();
+                                    if self.windows.contains_key(&active_wid) {
+                                        let target_line = (line as usize).saturating_sub(1);
+                                        let max_line =
+                                            self.buffer().content.len_lines().saturating_sub(1);
+                                        self.view_mut().cursor.line = target_line.min(max_line);
+                                        self.view_mut().cursor.col = 0;
+                                        self.scroll_cursor_center();
+                                    }
                                 }
                             }
                             // Chain: request scopes for the top frame so we can show variables.
@@ -29574,6 +29685,66 @@ mod tests {
         assert_eq!(engine.dap_variables[0].name, "x");
         assert_eq!(engine.dap_variables[0].value, "42");
         assert_eq!(engine.dap_variables[1].name, "msg");
+    }
+
+    #[test]
+    fn test_strip_ansi_and_control_complete_sequence() {
+        // Complete CSI sequence is removed.
+        assert_eq!(
+            Engine::strip_ansi_and_control("\x1b[38;2;97;175;239mhello\x1b[0m"),
+            "hello"
+        );
+        // Bare text passes through unchanged.
+        assert_eq!(Engine::strip_ansi_and_control("plain text"), "plain text");
+        // Newlines and tabs are preserved; \r and other control chars are stripped.
+        assert_eq!(
+            Engine::strip_ansi_and_control("line1\nline2\ttab\r"),
+            "line1\nline2\ttab"
+        );
+    }
+
+    #[test]
+    fn test_ansi_incomplete_tail_start() {
+        // No ESC → no tail.
+        assert_eq!(Engine::ansi_incomplete_tail_start("hello"), None);
+        // Complete CSI → no tail.
+        assert_eq!(Engine::ansi_incomplete_tail_start("text\x1b[32m"), None);
+        // Partial CSI at end → returns its start offset.
+        let s = "text\x1b[38;2;97;175;239";
+        let pos = Engine::ansi_incomplete_tail_start(s).unwrap();
+        assert_eq!(&s[pos..], "\x1b[38;2;97;175;239");
+        // Bare ESC at end → carry.
+        let s2 = "hello\x1b";
+        assert_eq!(Engine::ansi_incomplete_tail_start(s2), Some(5));
+        // ESC [ with partial params → carry.
+        let s3 = "\x1b[";
+        assert_eq!(Engine::ansi_incomplete_tail_start(s3), Some(0));
+    }
+
+    #[test]
+    fn test_dap_ansi_carry_handles_split_sequence() {
+        // Simulate two consecutive DAP output events where an ANSI RGB colour
+        // sequence is split: first chunk ends at `\x1b[38;2;97;175;239` (no
+        // final byte), second chunk supplies `mtext`.  The output panel should
+        // receive "text", NOT "38;2;97;175;239mtext".
+        let first = "start\x1b[38;2;97;175;239";
+        let second = "mtext end";
+        // First event: tail is carried.
+        let combined1 = first.to_string();
+        let carry = if let Some(pos) = Engine::ansi_incomplete_tail_start(&combined1) {
+            combined1[pos..].to_string()
+        } else {
+            String::new()
+        };
+        let clean1 = Engine::strip_ansi_and_control(&combined1[..combined1.len() - carry.len()]);
+        assert_eq!(clean1, "start");
+        assert_eq!(carry, "\x1b[38;2;97;175;239");
+        // Second event: prepend carry, strip.
+        let combined2 = format!("{carry}{second}");
+        let tail2 = Engine::ansi_incomplete_tail_start(&combined2);
+        assert_eq!(tail2, None); // sequence is now complete
+        let clean2 = Engine::strip_ansi_and_control(&combined2);
+        assert_eq!(clean2, "text end");
     }
 
     #[test]

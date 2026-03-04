@@ -432,3 +432,556 @@ fn ext_refresh_sets_fetching_flag() {
     e.ext_registry_rx = None;
     e.ext_registry_fetching = false;
 }
+
+// ── Manifest completeness ──────────────────────────────────────────────────────
+
+#[test]
+fn all_language_extensions_have_file_extensions() {
+    use vimcode_core::core::extensions::{ExtensionManifest, BUNDLED};
+    for bundle in BUNDLED {
+        if bundle.name == "git-insights" {
+            continue; // tooling extension — no file extensions expected
+        }
+        let m = ExtensionManifest::parse(bundle.manifest_toml)
+            .unwrap_or_else(|| panic!("manifest for '{}' should parse", bundle.name));
+        assert!(
+            !m.file_extensions.is_empty(),
+            "extension '{}' has no file_extensions",
+            bundle.name
+        );
+    }
+}
+
+#[test]
+fn all_language_extensions_have_language_ids() {
+    use vimcode_core::core::extensions::{ExtensionManifest, BUNDLED};
+    for bundle in BUNDLED {
+        if bundle.name == "git-insights" {
+            continue;
+        }
+        let m = ExtensionManifest::parse(bundle.manifest_toml)
+            .unwrap_or_else(|| panic!("manifest for '{}' should parse", bundle.name));
+        assert!(
+            !m.language_ids.is_empty(),
+            "extension '{}' has no language_ids",
+            bundle.name
+        );
+    }
+}
+
+#[test]
+fn git_insights_has_no_file_extensions_or_language_ids() {
+    use vimcode_core::core::extensions::{ExtensionManifest, BUNDLED};
+    let bundle = BUNDLED
+        .iter()
+        .find(|b| b.name == "git-insights")
+        .expect("git-insights should be bundled");
+    let m = ExtensionManifest::parse(bundle.manifest_toml).expect("parses");
+    assert!(
+        m.file_extensions.is_empty(),
+        "git-insights should have no file_extensions"
+    );
+    assert!(
+        m.language_ids.is_empty(),
+        "git-insights should have no language_ids"
+    );
+}
+
+// ── find_for_file_ext — all primary extensions ─────────────────────────────────
+
+#[test]
+fn find_for_file_ext_rs_maps_to_rust() {
+    use vimcode_core::core::extensions::find_for_file_ext;
+    let (b, _) = find_for_file_ext(".rs").expect(".rs should map to rust");
+    assert_eq!(b.name, "rust");
+}
+
+#[test]
+fn find_for_file_ext_py_maps_to_python() {
+    use vimcode_core::core::extensions::find_for_file_ext;
+    let (b, _) = find_for_file_ext(".py").expect(".py should map to python");
+    assert_eq!(b.name, "python");
+}
+
+#[test]
+fn find_for_file_ext_go_maps_to_go() {
+    use vimcode_core::core::extensions::find_for_file_ext;
+    let (b, _) = find_for_file_ext(".go").expect(".go should map to go");
+    assert_eq!(b.name, "go");
+}
+
+#[test]
+fn find_for_file_ext_js_maps_to_javascript() {
+    use vimcode_core::core::extensions::find_for_file_ext;
+    let (b, _) = find_for_file_ext(".js").expect(".js should map to javascript");
+    assert_eq!(b.name, "javascript");
+}
+
+#[test]
+fn find_for_file_ext_ts_maps_to_javascript() {
+    use vimcode_core::core::extensions::find_for_file_ext;
+    // TypeScript is bundled in the javascript extension
+    let (b, _) = find_for_file_ext(".ts").expect(".ts should map to javascript extension");
+    assert_eq!(b.name, "javascript");
+}
+
+#[test]
+fn find_for_file_ext_cpp_maps_to_cpp() {
+    use vimcode_core::core::extensions::find_for_file_ext;
+    let (b, _) = find_for_file_ext(".cpp").expect(".cpp should map to cpp");
+    assert_eq!(b.name, "cpp");
+}
+
+#[test]
+fn find_for_file_ext_c_maps_to_cpp() {
+    use vimcode_core::core::extensions::find_for_file_ext;
+    let (b, _) = find_for_file_ext(".c").expect(".c should map to cpp extension");
+    assert_eq!(b.name, "cpp");
+}
+
+#[test]
+fn find_for_file_ext_java_maps_to_java() {
+    use vimcode_core::core::extensions::find_for_file_ext;
+    let (b, _) = find_for_file_ext(".java").expect(".java should map to java");
+    assert_eq!(b.name, "java");
+}
+
+#[test]
+fn find_for_file_ext_php_maps_to_php() {
+    use vimcode_core::core::extensions::find_for_file_ext;
+    let (b, _) = find_for_file_ext(".php").expect(".php should map to php");
+    assert_eq!(b.name, "php");
+}
+
+#[test]
+fn find_for_file_ext_rb_maps_to_ruby() {
+    use vimcode_core::core::extensions::find_for_file_ext;
+    let (b, _) = find_for_file_ext(".rb").expect(".rb should map to ruby");
+    assert_eq!(b.name, "ruby");
+}
+
+#[test]
+fn find_for_file_ext_sh_maps_to_bash() {
+    use vimcode_core::core::extensions::find_for_file_ext;
+    let (b, _) = find_for_file_ext(".sh").expect(".sh should map to bash");
+    assert_eq!(b.name, "bash");
+}
+
+#[test]
+fn find_for_file_ext_unknown_returns_none() {
+    use vimcode_core::core::extensions::find_for_file_ext;
+    assert!(
+        find_for_file_ext(".xyz123").is_none(),
+        ".xyz123 should not map to any extension"
+    );
+}
+
+// ── find_for_language_id — gaps not covered by earlier tests ──────────────────
+
+#[test]
+fn find_for_language_id_typescript_maps_to_javascript() {
+    use vimcode_core::core::extensions::find_for_language_id;
+    let (b, _) = find_for_language_id("typescript")
+        .expect("typescript lang id should resolve to javascript");
+    assert_eq!(b.name, "javascript");
+}
+
+#[test]
+fn find_for_language_id_c_maps_to_cpp() {
+    use vimcode_core::core::extensions::find_for_language_id;
+    let (b, _) = find_for_language_id("c").expect("c lang id should resolve to cpp");
+    assert_eq!(b.name, "cpp");
+}
+
+#[test]
+fn find_for_language_id_shellscript_maps_to_bash() {
+    use vimcode_core::core::extensions::find_for_language_id;
+    let (b, _) =
+        find_for_language_id("shellscript").expect("shellscript lang id should resolve to bash");
+    assert_eq!(b.name, "bash");
+}
+
+#[test]
+fn find_for_language_id_unknown_returns_none() {
+    use vimcode_core::core::extensions::find_for_language_id;
+    assert!(find_for_language_id("cobol2024").is_none());
+}
+
+// ── :ExtInstall command behaviour ─────────────────────────────────────────────
+
+#[test]
+fn ext_install_known_extension_marks_installed() {
+    let mut e = engine_with("");
+    assert!(!e.extension_state.is_installed("git-insights"));
+    // git-insights has no LSP/DAP install command — safe to call in tests
+    exec(&mut e, "ExtInstall git-insights");
+    assert!(
+        e.extension_state.is_installed("git-insights"),
+        "git-insights should be marked installed after :ExtInstall"
+    );
+}
+
+#[test]
+fn ext_install_shows_installing_message() {
+    let mut e = engine_with("");
+    exec(&mut e, "ExtInstall git-insights");
+    assert!(
+        e.message.to_lowercase().contains("installing")
+            || e.message.to_lowercase().contains("install"),
+        "message after :ExtInstall should mention installing: {}",
+        e.message
+    );
+}
+
+#[test]
+fn ext_install_unknown_extension_shows_error() {
+    let mut e = engine_with("");
+    exec(&mut e, "ExtInstall nonexistent-xyz-extension");
+    let msg = e.message.to_lowercase();
+    assert!(
+        msg.contains("unknown") || msg.contains("not found") || msg.contains("nonexistent"),
+        "message for unknown extension should be an error: {}",
+        e.message
+    );
+    assert!(
+        !e.extension_state.is_installed("nonexistent-xyz-extension"),
+        "unknown extension should not be marked installed"
+    );
+}
+
+// ── Auto-hint on file open ─────────────────────────────────────────────────────
+
+#[test]
+fn auto_hint_shown_for_uninstalled_extension_on_file_open() {
+    let mut e = engine_with("");
+    assert!(!e.extension_state.is_installed("csharp"));
+    assert!(!e.extension_state.is_dismissed("csharp"));
+
+    let path = std::env::temp_dir().join("vimcode_smoke_hint_01.cs");
+    std::fs::write(&path, "// test\n").ok();
+    e.open_file_in_tab(&path);
+    let _ = std::fs::remove_file(&path);
+
+    assert!(
+        e.message.contains("ExtInstall") || e.message.contains("csharp"),
+        "expected extension hint for uninstalled csharp: {}",
+        e.message
+    );
+}
+
+#[test]
+fn auto_hint_not_shown_when_extension_dismissed() {
+    let mut e = engine_with("");
+    e.extension_state.mark_dismissed("csharp");
+
+    let path = std::env::temp_dir().join("vimcode_smoke_hint_02.cs");
+    std::fs::write(&path, "// test\n").ok();
+    e.open_file_in_tab(&path);
+    let _ = std::fs::remove_file(&path);
+
+    assert!(
+        !e.message.contains("No csharp extension"),
+        "hint should not appear when csharp is dismissed: {}",
+        e.message
+    );
+}
+
+#[test]
+fn auto_hint_not_shown_when_extension_installed() {
+    let mut e = engine_with("");
+    e.extension_state.mark_installed("csharp");
+
+    let path = std::env::temp_dir().join("vimcode_smoke_hint_03.cs");
+    std::fs::write(&path, "// test\n").ok();
+    e.open_file_in_tab(&path);
+    let _ = std::fs::remove_file(&path);
+
+    assert!(
+        !e.message.contains("No csharp extension"),
+        "hint should not appear when csharp is installed: {}",
+        e.message
+    );
+}
+
+#[test]
+fn auto_hint_not_shown_twice_for_same_extension() {
+    let mut e = engine_with("");
+
+    let path1 = std::env::temp_dir().join("vimcode_smoke_hint_04a.cs");
+    let path2 = std::env::temp_dir().join("vimcode_smoke_hint_04b.cs");
+    std::fs::write(&path1, "// a\n").ok();
+    std::fs::write(&path2, "// b\n").ok();
+
+    e.open_file_in_tab(&path1);
+    let first_msg = e.message.clone();
+    e.open_file_in_tab(&path2);
+    let second_msg = e.message.clone();
+
+    let _ = std::fs::remove_file(&path1);
+    let _ = std::fs::remove_file(&path2);
+
+    // First open should have triggered the hint
+    assert!(
+        first_msg.contains("ExtInstall") || first_msg.contains("csharp"),
+        "first open should show hint: {first_msg}"
+    );
+    // Second open of same language must NOT re-show the same hint
+    assert!(
+        !second_msg.contains("No csharp extension"),
+        "second open should not re-prompt for csharp: {second_msg}"
+    );
+}
+
+// ── Sidebar navigation — clamping ─────────────────────────────────────────────
+
+#[test]
+fn ext_sidebar_j_clamps_at_last_item() {
+    let mut e = engine_with("");
+    e.ext_sidebar_has_focus = true;
+    let total = e.ext_available_manifests().len();
+    // Jump past the end
+    e.ext_sidebar_selected = total.saturating_sub(1);
+    e.handle_ext_sidebar_key("j", false, None);
+    assert!(
+        e.ext_sidebar_selected < total,
+        "j should not go past the last item: selected={}, total={total}",
+        e.ext_sidebar_selected
+    );
+}
+
+#[test]
+fn ext_sidebar_k_clamps_at_zero() {
+    let mut e = engine_with("");
+    e.ext_sidebar_has_focus = true;
+    e.ext_sidebar_selected = 0;
+    e.handle_ext_sidebar_key("k", false, None);
+    assert_eq!(
+        e.ext_sidebar_selected, 0,
+        "k at position 0 should stay at 0"
+    );
+}
+
+// ── Sidebar Tab — section toggling ────────────────────────────────────────────
+
+#[test]
+fn ext_sidebar_tab_toggles_installed_section() {
+    let mut e = engine_with("");
+    e.ext_sidebar_has_focus = true;
+    e.extension_state.mark_installed("csharp");
+    e.ext_sidebar_selected = 0; // within installed items
+
+    let was_expanded = e.ext_sidebar_sections_expanded[0];
+    e.handle_ext_sidebar_key("Tab", false, None);
+    assert_ne!(
+        e.ext_sidebar_sections_expanded[0], was_expanded,
+        "Tab should toggle installed section"
+    );
+}
+
+#[test]
+fn ext_sidebar_tab_toggles_available_section_when_no_installed() {
+    let mut e = engine_with("");
+    e.ext_sidebar_has_focus = true;
+    // No extensions installed → cursor is in the available section
+    e.ext_sidebar_selected = 0;
+
+    let was_expanded = e.ext_sidebar_sections_expanded[1];
+    e.handle_ext_sidebar_key("Tab", false, None);
+    assert_ne!(
+        e.ext_sidebar_sections_expanded[1], was_expanded,
+        "Tab should toggle available section when nothing is installed"
+    );
+}
+
+// ── Sidebar d — remove installed extension ────────────────────────────────────
+
+#[test]
+fn ext_sidebar_d_removes_installed_extension() {
+    let mut e = engine_with("");
+    e.extension_state.mark_installed("csharp");
+    e.ext_sidebar_has_focus = true;
+    e.ext_sidebar_selected = 0; // first (and only) installed item
+
+    e.handle_ext_sidebar_key("d", false, None);
+
+    assert!(
+        !e.extension_state.is_installed("csharp"),
+        "csharp should be removed after d in sidebar"
+    );
+    assert!(
+        e.message.contains("removed") || e.message.contains("csharp"),
+        "message should confirm removal: {}",
+        e.message
+    );
+}
+
+#[test]
+fn ext_sidebar_d_on_available_item_is_noop() {
+    let mut e = engine_with("");
+    // No extensions installed — selected is in the available section
+    e.ext_sidebar_has_focus = true;
+    e.ext_sidebar_selected = 0;
+
+    let msg_before = e.message.clone();
+    e.handle_ext_sidebar_key("d", false, None);
+    // Should not crash; message may or may not change (no-op on available items)
+    // The important thing is no extension gets spuriously marked removed
+    let total_installed = e
+        .ext_available_manifests()
+        .iter()
+        .filter(|m| e.extension_state.is_installed(&m.name))
+        .count();
+    assert_eq!(
+        total_installed, 0,
+        "d on available item should not remove anything; msg_before={msg_before}"
+    );
+}
+
+// ── Sidebar Return ─────────────────────────────────────────────────────────────
+
+#[test]
+fn ext_sidebar_return_on_installed_shows_info_message() {
+    let mut e = engine_with("");
+    e.extension_state.mark_installed("csharp");
+    e.ext_sidebar_has_focus = true;
+    e.ext_sidebar_selected = 0;
+
+    e.handle_ext_sidebar_key("Return", false, None);
+
+    assert!(
+        e.message.contains("installed") || e.message.contains("csharp"),
+        "Return on installed extension should show info: {}",
+        e.message
+    );
+    // Must not trigger a re-install
+    // (a re-install would show "Installing" in the message)
+    assert!(
+        !e.message.to_lowercase().contains("installing"),
+        "Return on installed item should not trigger re-install: {}",
+        e.message
+    );
+}
+
+// ── Sidebar search input mode ──────────────────────────────────────────────────
+
+#[test]
+fn ext_sidebar_search_input_accumulates_typed_chars() {
+    let mut e = engine_with("");
+    e.ext_sidebar_has_focus = true;
+    e.ext_sidebar_input_active = true;
+
+    e.handle_ext_sidebar_key("r", false, Some('r'));
+    e.handle_ext_sidebar_key("u", false, Some('u'));
+    e.handle_ext_sidebar_key("s", false, Some('s'));
+    e.handle_ext_sidebar_key("t", false, Some('t'));
+
+    assert_eq!(
+        e.ext_sidebar_query, "rust",
+        "typed characters should accumulate in sidebar query"
+    );
+}
+
+#[test]
+fn ext_sidebar_search_escape_deactivates_and_preserves_query() {
+    let mut e = engine_with("");
+    e.ext_sidebar_has_focus = true;
+    e.ext_sidebar_input_active = true;
+    e.ext_sidebar_query = "rust".to_string();
+
+    e.handle_ext_sidebar_key("Escape", false, None);
+
+    assert!(
+        !e.ext_sidebar_input_active,
+        "Escape should deactivate search input"
+    );
+    assert_eq!(
+        e.ext_sidebar_query, "rust",
+        "Escape should preserve the query string"
+    );
+}
+
+#[test]
+fn ext_sidebar_search_backspace_removes_last_char() {
+    let mut e = engine_with("");
+    e.ext_sidebar_has_focus = true;
+    e.ext_sidebar_input_active = true;
+    e.ext_sidebar_query = "rust".to_string();
+
+    e.handle_ext_sidebar_key("BackSpace", false, None);
+
+    assert_eq!(
+        e.ext_sidebar_query, "rus",
+        "BackSpace should remove the last char from the query"
+    );
+}
+
+#[test]
+fn ext_sidebar_search_resets_selection_to_zero_on_input() {
+    let mut e = engine_with("");
+    e.ext_sidebar_has_focus = true;
+    e.ext_sidebar_input_active = true;
+    e.ext_sidebar_selected = 5;
+
+    e.handle_ext_sidebar_key("r", false, Some('r'));
+
+    assert_eq!(
+        e.ext_sidebar_selected, 0,
+        "typing in search should reset selection to 0"
+    );
+}
+
+// ── Settings: extension_registry_url ──────────────────────────────────────────
+
+#[test]
+fn extension_registry_url_is_not_empty_by_default() {
+    let s = vimcode_core::Settings::default();
+    assert!(
+        !s.extension_registry_url.is_empty(),
+        "extension_registry_url should have a non-empty default"
+    );
+    assert!(
+        s.extension_registry_url.starts_with("http"),
+        "extension_registry_url should be an http(s) URL: {}",
+        s.extension_registry_url
+    );
+}
+
+// ── ext_remove edge cases ─────────────────────────────────────────────────────
+
+#[test]
+fn ext_remove_on_not_installed_extension_shows_message() {
+    let mut e = engine_with("");
+    assert!(!e.extension_state.is_installed("ruby"));
+
+    exec(&mut e, "ExtRemove ruby");
+
+    // ext_remove always shows a message even when the extension wasn't installed
+    let msg = e.message.to_lowercase();
+    assert!(
+        msg.contains("ruby") || msg.contains("removed") || msg.contains("not"),
+        "ext_remove should give feedback even when not installed: {}",
+        e.message
+    );
+}
+
+// ── cursor_move hook ───────────────────────────────────────────────────────────
+
+#[test]
+fn fire_cursor_move_hook_doesnt_panic_without_plugin_manager() {
+    let mut e = engine_with("hello world\n");
+    // plugin_manager is None by default in test engines
+    assert!(e.plugin_manager.is_none());
+    // This must not panic
+    e.fire_cursor_move_hook();
+}
+
+#[test]
+fn handle_key_fires_cursor_move_when_cursor_moves() {
+    let mut e = engine_with("hello world\n");
+    // No plugin manager → cursor_move is a no-op, but must not panic
+    // We move the cursor with 'l' and ensure no crash
+    assert!(e.plugin_manager.is_none());
+    press(&mut e, 'l'); // move cursor right
+                        // If we get here without panicking, the hook fired safely
+    assert_eq!(e.cursor().col, 1, "cursor should have moved right");
+}

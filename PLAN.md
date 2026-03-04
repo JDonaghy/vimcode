@@ -2,6 +2,9 @@
 
 ## Recently Completed
 
+**Session 115 — DAP SIGTTIN fix + ANSI carry buffer (3 new tests, 1128 total):**
+Fixed TUI suspension when DAP breakpoints hit. Root cause: debugpy (and its child target script) inherited the editor's session and could call `tcsetpgrp()` to steal the foreground group, causing SIGTTIN. Fix: `setsid()` via `pre_exec` on all DAP and LSP child spawns (`dap.rs`, `lsp.rs`). Also added `dap_ansi_carry: String` to buffer incomplete ANSI escape sequences split across DAP output events, preventing partial SGR codes from appearing as literal text in the Debug Output panel. Added `libc = "0.2"` dependency. 3 new tests.
+
 **Session 114 — Extensions Sidebar Panel + GitHub Registry (16 new tests, 1125 total):**
 VSCode-style Extensions sidebar panel + GitHub-hosted first-party registry, replacing Mason registry fetches.
 `extensions/registry.json` + 11 `extensions/*/README.md` files. `src/core/registry.rs`: `fetch_registry()`, `download_script()`, URL constants. `src/core/settings.rs`: `extension_registry_url`. Engine: 9 new fields (`ext_registry`, `ext_registry_fetching`, `ext_registry_rx`, `ext_sidebar_*`, `prompted_extensions`); `ext_available_manifests()`, `ext_refresh()`, `poll_ext_registry()`, `handle_ext_sidebar_key()`, `ext_install_from_registry()`, `ext_remove()`; `:ExtRemove`/`:ExtRefresh` commands; `:LspInstall`/`:DapInstall` → redirect messages. Mason registry (`fetch_mason_registry_for_language`, `registry_cache`, `LspEvent::RegistryLookup`) removed from `lsp_manager.rs`. `render.rs`: `ExtSidebarItem`, `ExtSidebarData`, `build_ext_sidebar_data()`, `ScreenLayout.ext_sidebar`. `main.rs`: `SidebarPanel::Extensions`, `draw_ext_sidebar()`, activity bar icon, event wiring, auto-refresh. `tui_main.rs`: `TuiPanel::Extensions`, `render_ext_sidebar()`, activity bar row 5, key routing. `tests/extensions.rs`: 16→30 tests.

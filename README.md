@@ -11,7 +11,7 @@ There's a touch of irony here - using a cli tool to write the editor that I've w
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 1125 tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 1128 tests, zero async runtime dependency
 
 
 ## Download (Ubuntu)

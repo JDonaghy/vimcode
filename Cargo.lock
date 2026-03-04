@@ -2127,6 +2127,7 @@ dependencies = [
  "gio 0.17.10",
  "gtk4",
  "ignore",
+ "libc",
  "lsp-types",
  "mlua",
  "pangocairo",

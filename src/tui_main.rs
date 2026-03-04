@@ -716,20 +716,22 @@ pub fn run(file_path: Option<PathBuf>, debug_log_path: Option<String>) {
         );
     }
 
-    // Install a panic hook that writes to the debug log (if active) so we can
-    // capture panics that would otherwise be swallowed by the alternate screen.
-    if DEBUG_LOG.get().is_some() {
+    // Always install a panic hook that writes crash info to /tmp/vimcode-crash.log
+    // AND to the debug log (if --debug is active).  This gives post-mortem diagnostics
+    // without requiring the user to reproduce the crash with --debug every time.
+    {
         let prev_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            debug_log!("PANIC: {}", info);
-            if let Some(loc) = info.location() {
-                debug_log!("  at {}:{}:{}", loc.file(), loc.line(), loc.column());
-            }
-            // Also capture a backtrace
-            debug_log!(
-                "  backtrace:\n{}",
-                std::backtrace::Backtrace::force_capture()
-            );
+            let bt = std::backtrace::Backtrace::force_capture();
+            let loc_str = info
+                .location()
+                .map(|l| format!("  at {}:{}:{}\n", l.file(), l.line(), l.column()))
+                .unwrap_or_default();
+            let crash_msg = format!("PANIC: {}\n{}backtrace:\n{}\n", info, loc_str, bt);
+            // Write to always-on crash log so it survives without --debug.
+            let _ = std::fs::write("/tmp/vimcode-crash.log", &crash_msg);
+            // Also mirror to the debug log when --debug is active.
+            debug_log!("{}", crash_msg);
             prev_hook(info);
         }));
     }
@@ -745,7 +747,19 @@ pub fn run(file_path: Option<PathBuf>, debug_log_path: Option<String>) {
     restore_terminal(&mut terminal, keyboard_enhanced);
 
     if let Err(e) = result {
-        std::panic::resume_unwind(e);
+        // Extract the panic message before aborting — resume_unwind would call
+        // abort() on Linux (via the default panic handler), producing a core dump.
+        let msg = if let Some(s) = e.downcast_ref::<&str>() {
+            format!("VimCode internal error: {s}")
+        } else if let Some(s) = e.downcast_ref::<String>() {
+            format!("VimCode internal error: {s}")
+        } else {
+            "VimCode internal error (unknown panic payload)".to_string()
+        };
+        eprintln!("{msg}");
+        eprintln!("Crash details written to /tmp/vimcode-crash.log");
+        eprintln!("Please report this at https://github.com/anthropics/claude-code/issues");
+        std::process::exit(1);
     }
 }
 

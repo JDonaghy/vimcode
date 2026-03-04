@@ -535,11 +535,22 @@ impl LspServer {
         root_path: &Path,
         event_tx: Sender<LspEvent>,
     ) -> Result<Self, String> {
-        let mut child = Command::new(&config.command)
-            .args(&config.args)
+        let mut cmd = Command::new(&config.command);
+        cmd.args(&config.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::null());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            unsafe {
+                cmd.pre_exec(|| {
+                    libc::setsid();
+                    Ok(())
+                });
+            }
+        }
+        let mut child = cmd
             .spawn()
             .map_err(|e| format!("Failed to start {}: {}", config.command, e))?;
 

@@ -9,7 +9,13 @@ use vimcode_core::{Cursor, Engine, EngineAction, Mode};
 /// are hermetic: `Settings::load()` and `ExtensionState::load()` read real
 /// config files on disk (no `#[cfg(test)]` guard in the compiled library),
 /// which would vary between machines.
+///
+/// Also calls `suppress_disk_saves()` so that commands like `:ExtInstall` that
+/// trigger `save()` do not overwrite the user's real `~/.config/vimcode/` files
+/// during `cargo test`.
 pub fn engine_with(text: &str) -> Engine {
+    // Suppress all disk writes for the lifetime of this test process.
+    vimcode_core::core::session::suppress_disk_saves();
     let mut e = Engine::new();
     e.settings = vimcode_core::Settings::default();
     e.extension_state = vimcode_core::core::session::ExtensionState::default();

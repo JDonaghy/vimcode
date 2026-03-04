@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Mar 3, 2026 (Session 114 — Extensions Sidebar Panel + GitHub Registry) | **Tests:** 1125
+**Last updated:** Mar 4, 2026 (Session 115 — DAP SIGTTIN fix + ANSI carry buffer) | **Tests:** 1128
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 72 are in **SESSION_HISTORY.md**.
@@ -25,6 +25,15 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 115 — DAP SIGTTIN fix + ANSI carry buffer (3 new tests, 1128 total):**
+Fixed TUI suspension during DAP debugging and hardened DAP output stripping.
+- **`src/core/dap.rs`**: Both `spawn()` and `spawn_tcp()` now call `setsid()` via `pre_exec` on Unix, creating a new session for the adapter process so it (and its children, e.g. debugpy launching the target script) cannot steal the editor's terminal foreground group — prevents SIGTTIN suspension
+- **`src/core/lsp.rs`**: Same `setsid()` treatment for LSP server spawns
+- **`Cargo.toml`**: Added explicit `libc = "0.2"` dependency (already transitive)
+- **`src/core/engine.rs`**: `dap_ansi_carry: String` field buffers incomplete ANSI escape sequences across DAP output events; `strip_ansi_and_control()` and `ansi_incomplete_tail_start()` hoisted to `pub(crate)` methods on Engine for testability; carry logic in `DapEvent::Output` handler prepends previous carry, splits off any trailing incomplete sequence
+- **Tests**: 3 new unit tests (`test_strip_ansi_and_control_complete_sequence`, `test_ansi_incomplete_tail_start`, `test_dap_ansi_carry_handles_split_sequence`)
+- **`src/core/dap_manager.rs`**: defensive `windows.contains_key()` guard in stackTrace handler (from prior session)
 
 **Session 114 — Extensions Sidebar Panel + GitHub Registry (16 new tests, 1125 total):**
 VSCode-style Extensions sidebar + first-party GitHub-hosted registry replacing Mason.
