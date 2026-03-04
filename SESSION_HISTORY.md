@@ -1,9 +1,168 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-Recent sessions (73+) are in PROJECT_STATE.md. Full PLAN.md entries are in PLAN.md.
+All sessions through 117c archived here. Recent work summary in PROJECT_STATE.md.
 
 ---
+
+**Session 117c — Settings panel bug fixes (no new tests, 1199 total):**
+Fixed two visual issues in the GTK settings sidebar: (1) settings panel not collapsing when clicking the Settings activity bar button a second time — removed `#[watch]` from the settings panel's `set_visible` so Relm4 no longer overrides the imperative hide; (2) Toggle switch widgets clipped — removed CSS `min-height`/`min-width` constraints on `.sidebar switch` and added 4px margin on all four sides of each Switch widget so Adwaita's rendering has room; also fixed overlay scrollbar floating over settings widgets via `set_overlay_scrolling(false)`.
+
+**Session 117b — GTK settings sidebar form (no new tests, 1199 total):**
+VSCode-style settings sidebar with native GTK widgets. `render.rs`: `SettingType`/`SettingDef`/`SETTING_DEFS` (~30 settings, 7 categories: Appearance/Editor/Search/Workspace/LSP/Terminal/Plugins). `settings.rs`: `get_value_str(key) -> String` and `set_value_str(key, value) -> Result<()>` reflection methods. `main.rs`: `Msg::SettingChanged`; `build_setting_row()` (Switch/SpinButton/DropDown/Entry per type) and `build_settings_form()` (category headers + rows) free functions; imperative panel with search bar (category-aware show/hide), scrolled list, "Open settings.json" button; CSS for `.settings-category-header`, transparent scrolledwindow, dark spinbutton/dropdown/entry; `gtk4::Settings::default().set_gtk_application_prefer_dark_theme(true)` in `init()`.
+
+**Session 117 — Settings editor / :Settings command (3 new tests, 1199 total):**
+`:Settings` / `:settings` opens `~/.config/vimcode/settings.json` in a new editor tab. `settings_path()` renamed to `pub fn settings_file_path()`. Engine: `:Settings` command arm + palette entry "Preferences: Open Settings (JSON)". TUI: gear icon click opens the file; `render_settings_panel` shows live current values right-aligned; mtime-based auto-reload on every event-loop iteration. 3 new tests.
+
+**Session 116 — Named colour themes / :colorscheme (10 new tests, 1196 total):**
+Four built-in themes: OneDark (default), Gruvbox Dark, Tokyo Night, Solarized Dark. `render.rs`: `Theme::gruvbox_dark/tokyo_night/solarized_dark()` constructors; `Theme::from_name(name)` with alias normalisation; `Theme::available_names()`; `Color::to_hex()`. `settings.rs`: `colorscheme: String` field. Engine: `:colorscheme` lists / `:colorscheme <name>` sets+saves theme. GTK: `make_theme_css(theme)` + `STATIC_CSS` const + hot-reload in `SearchPollTick`. TUI: theme refreshed each event-loop iteration; `render_sidebar` fills full background. 10 new tests.
+
+**Session 115 — DAP SIGTTIN fix + ANSI carry buffer (3 new tests, 1128 total):**
+Fixed TUI suspension when DAP breakpoints hit: `setsid()` via `pre_exec` on all DAP and LSP child spawns (`dap.rs`, `lsp.rs`). Added `dap_ansi_carry: String` to buffer incomplete ANSI escape sequences split across DAP output events. Added `libc = "0.2"` dependency. 3 new tests.
+
+**Session 114 — Extensions Sidebar Panel + GitHub Registry (16 new tests, 1125 total):**
+VSCode-style Extensions sidebar + GitHub-hosted first-party registry replacing Mason. `src/core/registry.rs`: `fetch_registry()`, `download_script()`, URL constants. Engine: 9 new fields; `ext_available_manifests()` (registry overrides bundled), `ext_refresh()` (background thread), `poll_ext_registry()`, `handle_ext_sidebar_key()`, `ext_install_from_registry()`, `ext_remove()`; `:ExtRemove`/`:ExtRefresh`; Mason registry removed from `lsp_manager.rs`. GTK: `SidebarPanel::Extensions`, `draw_ext_sidebar()`. TUI: `TuiPanel::Extensions`, `render_ext_sidebar()`. 16 new tests.
+
+**Session 113 — Extension/Language Pack System (31 new tests, 1109 total):**
+Full VSCode-style extension system: 11 bundled language packs (csharp/python/rust/javascript/go/java/cpp/php/ruby/bash/git-insights) compiled in via `include_str!()`. `extensions.rs`: `BundledExtension`, `ExtensionManifest`, lookup helpers. `ExtensionState` persistence in `session.rs`. Engine: `:ExtInstall/:ExtList/:ExtEnable/:ExtDisable`; `line_annotations: HashMap<usize,String>` for virtual text; auto-detect hint on file open. `git.rs`: `blame_line()`, `epoch_to_relative()`, `log_file()`. `plugin.rs`: `vimcode.buf.cursor/annotate_line/clear_annotations`, `vimcode.git.blame_line/log_file`, `cursor_move` hook. `extensions/git-insights/blame.lua`: inline blame annotation. 31 new tests.
+
+**Session 112 — :set wrap fix + release pipeline (4 new tests, 1078 total):**
+Fixed `:set wrap` rendering accuracy (uses `rect.width / char_width` instead of stored approximate value). Fixed GTK resize callback to use measured `char_width`. TUI always redraws after keypress. Added `:set option!` toggle syntax. Release pipeline: `release.yml` publishes public GitHub Release with `.deb` + raw binary on `main` push; `[package.metadata.deb]` in `Cargo.toml`. 4 new tests.
+
+**Session 111 — Missing Vim Commands Batches 1–3 (55 new tests, 1023 total):**
+Implemented `^`, `g_`, `W`/`B`/`E`/`gE`, `H`/`M`/`L`, `(`/`)`, `Ctrl+E`/`Ctrl+Y`, `g*`/`g#`, `gJ`, `gf`, `R` (Replace mode), `Ctrl+A`/`Ctrl+X`, `=` operator, `]p`/`[p`, `iW`/`aW`, `Ctrl+R`/`Ctrl+U`/`Ctrl+O` in insert. Ex: `:noh`, `:wa`, `:wqa`, `:reg`, `:marks`, `:jumps`, `:changes`, `:history`, `:echo`, `:tabmove`, `:!cmd`, `:r file`. Settings: `hlsearch`, `ignorecase`, `smartcase`, `scrolloff`, `cursorline`, `colorcolumn`, `textwidth`, `splitbelow`, `splitright`. New `tests/new_vim_features.rs` (55 tests).
+
+**Session 110c — Last-word-of-file yank bug fix (4 new tests, 990 total):**
+Fixed off-by-one in `apply_operator_with_motion` when `w` motion lands at EOF with no trailing newline. `move_word_forward()` clamps to `total_chars - 1`; exclusive range `[start, end_pos)` then missed the final char. Fix: detect `end_pos + 1 == total_chars && char != '\n'` and extend `delete_end` to `total_chars`. 4 new tests.
+
+**Session 110b — Yank highlight flash (986 total, no new tests):**
+Neovim-style green flash on yanked region (~200ms). Engine: `yank_highlight: Option<(Cursor,Cursor,bool)>` field; set at all yank sites. Render: `Theme.yank_highlight_bg` (`#57d45e`) + `yank_highlight_alpha` (0.35). GTK: `Msg::ClearYankHighlight` + 200ms timeout. TUI: `yank_hl_deadline: Option<Instant>` + deadline check in event loop.
+
+**Session 110 — Operator-Motion Coverage (31 new integration tests + 3 bug fixes, 982 total):**
+Created `tests/operator_motions.rs` (31 tests). Fixed 3 bugs: `y` routed through `pending_operator` (not `pending_key`); `yw`/`dw` clamp at line boundary (no newline crossing); `y$`/`d$`/`c$`/`y0`/`d0` added to `handle_operator_motion`.
+
+**Session 109 — Vim Feature Completeness (43 new tests, 955 total):**
+Implemented 20+ missing features in `tests/vim_features.rs`: `X`, `g~`/`gu`/`gU`, `gn`/`gN`/`cgn`, `g;`/`g,` (change list); visual `o`/`O`/`gv`; registers `"0`/`"1-9`/`"-`/`"%`/`"/`/`".`; uppercase/special marks; insert Ctrl+W/T/D; `:g`/`:v`/`:d`/`:m`/`:t`/`:sort` global commands.
+
+**Session 108 — Integration Test Suite (64 new tests, 912 total):**
+Added `[lib]` crate target (`vimcode_core`) + `[[bin]]` in `Cargo.toml`; `src/lib.rs` re-exports. `tests/common/mod.rs` with hermetic `engine_with()` and `drain_macro_queue()`. 64 integration tests across `normal_mode.rs` (25), `search.rs` (16), `visual_mode.rs` (10), `command_mode.rs` (13).
+
+**Session 107c — Linewise paste fix + Ctrl+Shift+L TUI fix (3 new tests, 848 total):**
+`load_clipboard_for_paste()` preserves `is_linewise` on `'"'` register when clipboard matches, fixing `yyp` pasting inline. TUI: push `REPORT_ALL_KEYS_AS_ESCAPE_CODES | DISAMBIGUATE_ESCAPE_CODES` so Ctrl+Shift combos arrive correctly. 3 new tests.
+
+**Session 107b — Multi-Cursor Enhancements (10 new tests, 845 total):**
+`select_all_word_occurrences` (Ctrl+Shift+L); `add_cursor_at_pos` for Ctrl+Click; Normal-mode buffer changes clear stale extra_cursors; Escape clears extra_cursors. 10 new tests.
+
+**Session 107 — Multiple Cursors (8 new tests, 835 total):**
+`extra_cursors: Vec<Cursor>` on `View`; `add_cursor_at_next_match` (Alt-D); multi-cursor insert/backspace/delete/return helpers; secondary cursor rendering in both GTK and TUI backends. 8 new tests.
+
+**Session 106 — Per-Workspace Session Isolation (2 new tests, 827 total):**
+Removed global-session fallback in `restore_session_files()` — editor starts clean when no workspace session exists. `Settings::save()` is no-op under `#[cfg(test)]`. 2 new tests.
+
+**Session 105b — Debug Logging + TUI Crash Fixes (1 new test, 854 total):**
+`--debug <logfile>` flag + `debug_log!` macro + panic hook. Fixed TUI u16 subtract overflow in `render_separators`. Fixed right-group tab bar positioning (`bounds.y <= 1.0` instead of `idx == 0`). 1 new test.
+
+**Session 105 — Recursive Editor Group Splits (16 new tests, 853 total):**
+`GroupLayout` recursive binary tree in `window.rs` — no cap on group count. `engine.rs`: `HashMap<GroupId, EditorGroup>` + `GroupLayout` tree; Ctrl+1–9 focus by tree position. `render.rs`: `GroupTabBar`. `session.rs`: `SessionGroupLayout` serde enum (backward-compat). GTK/TUI: multi-divider drag/draw, per-group tab bars. 16 new tests.
+
+**Session 104 — Three TUI/GTK Bug Fixes (827 total, no new tests):**
+TUI: drag handler off-by-one fixed; tab close confirmation overlay (S=save/D=discard/Esc=cancel); command-line mouse selection (Ctrl-C copies). GTK: `Msg::ShowCloseTabConfirm` + `Msg::CloseTabConfirmed` dialog. Buffer leak fix in `close_tab()` forces deletion of unreferenced buffers. `engine.escape_to_normal()` pub method.
+
+**Session 103 — Command Line Cursor Editing + History Separation (9 new tests, 836 total):**
+`command_cursor: usize` + `cmd_char_to_byte()` + `command_insert_str()`; full cursor-aware command editing (Left/Right/Home/End/Delete/BackSpace/Ctrl-A/E/K). `HistoryState` moved from `session.rs` to `history.json`. 9 new tests.
+
+**Session 102 — VSCode-Style Editor Groups (827 total, no new tests):**
+`EditorGroup { tabs, active_tab }` replaces flat tabs. `open_editor_group/close/focus/move_tab/resize`; `calculate_group_window_rects`. `render.rs`: `EditorGroupSplitData`. Ctrl+\ split right, Ctrl+1/2 focus, Ctrl-W e/E split.
+
+**Session 101 — Command Palette (10 new tests, 827 total):**
+`PALETTE_COMMANDS` static (~65 entries); `palette_open/query/results/selected/scroll_top` engine fields; `open/close/update_filter/confirm/handle_palette_key`. GTK: `draw_command_palette_popup()`. TUI: `render_command_palette_popup()` + keyboard enhancement (`PushKeyboardEnhancementFlags`). Ctrl+Shift+P opens palette. 10 new tests.
+
+**Session 100 — Menus + Workspace Parity + GTK overlay dropdown (817 total):**
+GTK dropdown drawing order fixed (overlay DrawingArea above all panels). Dialog action routing fixed (drop engine borrow before routing). TUI menu actions fully wired. "Open Recent…" menu item + picker in both backends. Workspace session saved on quit + restored at startup. `base_settings` restores settings on folder switch. New commands: copy/cut/paste/termkill/about/openrecent.
+
+**Session 99 — SC Panel VSCode Parity + Recent Commits + Bug Fixes (12 new tests, 813 total):**
+Commit input row (`c`/Enter/Esc); push/pull/fetch from panel (`p`/`P`/`f`); bulk stage/unstage/discard-all on section headers; `:Gpull`/`:Gfetch`. Recent Commits section (last 20, collapsible). Fixed path resolution via `git::find_repo_root()`. 12 new tests.
+
+**Session 98 — Lua Extension Mechanism (9 new tests, 801 total):**
+mlua 5.4 vendored; `src/core/plugin.rs` (~430 lines); `vimcode.*` Lua API: `on/command/keymap/message/cwd/command_run/buf.*`; `~/.config/vimcode/plugins/` auto-loaded; hook points: save/open/normal-key/insert-key/command; `:Plugin list/reload/enable/disable`. 9 new tests.
+
+**Session 97 — Source Control Panel (3 new tests, 792 total):**
+`git.rs`: `status_detailed()`, `stage/unstage/discard_path()`, `worktree_list/add/remove()`, `ahead_behind()`. Engine: 7 SC fields; `sc_refresh/stage/discard/switch_worktree/handle_sc_key`; `:GWorktreeAdd/Remove`. GTK: `draw_source_control_panel()`. TUI: `TuiPanel::Git`, `render_source_control()`. 3 new tests.
+
+**Session 96 — UI Polish + Workspaces (5 new tests, 789 total):**
+GTK: `set_decorated(false)` + `WindowHandle` drag + window-control buttons [─][☐][✕] in menu bar; terminal title sync. Workspaces: `.vimcode-workspace` JSON; `open_folder/workspace/save_workspace_as`; per-project session (FNV-1a hash); GTK `FileDialog`; TUI fuzzy directory picker modal; `:cd/:OpenFolder/:OpenWorkspace/:SaveWorkspaceAs`. 5 new tests.
+
+**Session 95 — C# Non-Public Members + Debug Output scrollbar (784 total, no new tests):**
+`DapVariable.is_nonpublic: bool`; synthetic "Non-Public Members" group node in variables panel. `render.rs`: `build_var_tree` omits ` = ` for empty values. TUI: `debug_output_scroll` + draggable scrollbar; fixed height-computation for `bp_h` when debug output panel is open.
+
+**Session 94 — Per-section scrollbars in debug sidebar (10 new tests, 784 total):**
+`dap_sidebar_scroll: [usize;4]` + `dap_sidebar_section_heights: [u16;4]`; `dap_sidebar_ensure_visible()` + `dap_sidebar_resize_section()`; `DebugSidebarData` gains scroll_offsets/section_heights; fixed-height section allocation with per-section scrollbar in both GTK and TUI. 10 new tests.
+
+**Session 93 — Scope-grouped variables in debug sidebar (5 new tests, 774 total):**
+`dap_scope_groups: Vec<(String, u64)>` for additional DAP scopes beyond "Locals"; `poll_dap` parses ALL non-expensive scopes; expandable scope group headers appended after primary variables in both backends. 5 new tests.
+
+**Session 92 — VSCode tasks.json + preLaunchTask (8 new tests, 769 total):**
+`TaskDefinition` struct; `parse_tasks_json()`; `task_to_shell_command()`. Engine: `dap_pre_launch_done/dap_deferred_lang` fields; `dap_start_debug` migrates `.vscode/tasks.json` → `.vimcode/tasks.json`; `preLaunchTask` executed via `lsp_manager.run_install_command()`; `InstallComplete` with `"dap_task:"` prefix resumes/aborts debug. 8 new tests.
+
+**Session 91 — Debug sidebar interactivity + C# DAP adapter (761 total):**
+`dap_sidebar_has_focus` field; key guard in `handle_key()`; `dap_sidebar_section_item_count()` method. TUI+GTK: j/k/Tab/Enter/Space/x/d/q keyboard + click handler walks sections. `netcoredbg` adapter added (`dap_manager.rs`); `find_workspace_root` checks `.sln`/`.csproj`; `substitute_vars` handles `${workspaceFolderBasename}`. 3 new tests.
+
+**Session 90 — Interactive debug sidebar + conditional breakpoints (12 new tests, 758 total):**
+`BreakpointInfo` struct (line/condition/hit_condition/log_message) replaces `u64` in `dap_breakpoints`; `set_breakpoints` sends conditions. Sidebar: `handle_debug_sidebar_key` fully wired (j/k/Tab/Enter/x/d/q); helpers `dap_sidebar_section_len`, `dap_var_flat_count`, `dap_bp_at_flat_index`; recursive `build_var_tree()` in render.rs; `is_conditional_bp`/`◆` gutter; `:DapCondition/:DapHitCondition/:DapLogMessage`. 12 new tests.
+
+**Session 89 — DAP polish + codelldb compatibility (746 total):**
+`DapServer.pending_commands: HashMap<u64,String>` + `resolve_command()` — codelldb omits `command` from responses. `dap_seq_initialize` for deferred launch. Three-state debug button (Start/Stop/Continue). Navigate to stopped file/line via `scroll_cursor_center()`. ANSI/control stripping. `dap_wants_sidebar` one-shot flag auto-opens debug panel. `DebugSidebarData.stopped: bool`.
+
+**Session 88b — Debugger bug fixes (743 total):**
+`set_breakpoints` includes `source.name`; `stopOnEntry: false` in launch args; `Initialized` handler skips empty BP lists; `debug_sidebar_da_ref` for explicit `queue_draw()` on DAP events.
+
+**Session 88 — VSCode-like debugger UI (12 new tests, 743 total):**
+`LaunchConfig` struct + `parse_launch_json/type_to_adapter/generate_launch_json` in `dap_manager.rs`. Engine: `DebugSidebarSection`/`BottomPanelKind` enums; 8 new fields; `dap_add/remove_watch()`; `handle_debug_sidebar_key()`; `debug_toolbar_visible` default false. GTK: `SidebarPanel::Debug`, `draw_debug_sidebar()`. TUI: `TuiPanel::Debug`, `render_debug_sidebar()`. 12 new tests.
+
+**Session 87 — :set wrap / soft line-wrap rendering (7 new tests, 731 total):**
+`Settings.wrap: bool` (default false). `render.rs`: `RenderedLine.is_wrap_continuation` + `segment_col_offset`; `build_rendered_window` splits lines at `viewport_cols`; `max_col=0` disables h-scroll. Engine: `ensure_cursor_visible_wrap`; `move_visual_down/up` helpers; `gj`/`gk` bindings. 7 new tests.
+
+**Session 86 — DAP panel interactivity + expression evaluation (4 new tests, 724 total):**
+`dap.rs`: `evaluate()` request helper. Engine: `dap_panel_has_focus`, `dap_active_frame`, `dap_expanded_vars: HashSet<u64>`, `dap_child_variables: HashMap<u64,Vec<DapVariable>>`, `dap_eval_result`; `dap_select_frame()`, `dap_toggle_expand_var()`, `dap_eval()`; variable tree shows `▶`/`▼` + indented children. `:DapPanel/:DapEval/:DapExpand`. 4 new tests.
+
+**Session 85 — DAP variables panel + call stack + output console (4 new tests, 720 total):**
+`dap_stack_frames`, `dap_variables`, `dap_output_lines` engine fields; `poll_dap` chains stackTrace→scopes→variables; Output appends to `dap_output_lines` (capped at 1000). `render.rs`: `DapPanel` struct; GTK `draw_dap_panel()`; TUI `render_dap_panel()`. 4 new tests.
+
+**Session 84 — DAP event loop + breakpoint gutter + stopped-line highlight (4 new tests, 716 total):**
+`dap_current_line: Option<(String,u64)>`; `poll_dap` wired; `RenderedLine.is_breakpoint/is_dap_current`; `Theme.dap_stopped_bg` (#3a3000 amber); breakpoint gutter `●`/`◉`/`▶`/`◉`; stopped-line background in GTK+TUI. 4 new tests.
+
+**Session 83 — DAP transport + engine + :DapInstall (23 new tests, 712 total):**
+`src/core/dap.rs` (new): Content-Length framing; `DapEvent` enum; request helpers; 8 unit tests. `src/core/dap_manager.rs` (new): 5 adapters (codelldb/debugpy/delve/js-debug/java-debug); Mason resolution; real install commands. Engine: 4 new fields + 9 methods; replaced 9 stub commands; `:DapInstall <lang>`. 23 new tests.
+
+**Session 82 — Menus + debug toolbar UI wiring (4 new tests, 684 total):**
+Engine: `menu_move_selection()`/`menu_activate_highlighted()`; `execute_command` made `pub`; F5/F6/F9-F11 dispatch; 9 debug stub commands. GTK: Shift+F5/F11; toolbar pixel hit-test. TUI: Up/Down/Enter dropdown keyboard nav; highlighted row inversion; menu/toolbar click. 4 new tests.
+
+**Session 81 — Menu bar + debug toolbar + Mason DAP detection (7 new tests, 680 total):**
+`lsp.rs`: `MasonPackageInfo.categories`; `is_dap()/is_linter()/is_formatter()` helpers. Engine: `menu_bar_visible`, `menu_open_idx`, `debug_toolbar_visible`; `toggle_menu_bar/open_menu/close_menu/menu_activate_item()`; `:DapInfo`. `render.rs`: `MENU_STRUCTURE` (7 menus) + `DEBUG_BUTTONS` statics. GTK+TUI: `draw/render_menu_bar`, `draw/render_menu_dropdown`, `draw/render_debug_toolbar`. 7 new tests.
+
+**Session 80 — Bug fix: LSP not starting for sidebar/fuzzy/split file opens (673 total):**
+`lsp_did_open()` was only called from `Engine::open()`. Fixed by adding `self.lsp_did_open(buffer_id)` in `open_file_in_tab()` (3 paths), `open_file_preview()` (2 paths), `new_tab()`, `split_window()`. No new tests.
+
+**Session 79 — Leader key + extended syntax highlighting + LSP features (19 new tests, 673 total):**
+`settings.rs`: `leader: char` (default `' '`). `syntax.rs`: 10 new languages (C/TS/TSX/CSS/JSON/Bash/Ruby/C#/Java/TOML); 19 new tests. `lsp_manager.rs`: 6 new request methods (references, implementation, type_definition, signature_help, formatting, rename). `lsp.rs`: 6 new event variants + response parsers. Engine: `leader_partial`; `handle_leader_key()`; `gr`/`gi`/`gy`; `<leader>gf`/`<leader>rn`; `:Lformat`/`:Rename`; signature help on `(`/`,`.
+
+**Session 78 — LSP expansion: Mason registry, auto-detect, :LspInstall (16 new tests, 654 total):**
+`language_id_from_path()` gains 12 new extensions. `lsp.rs`: `MasonPackageInfo` + `parse_mason_package_yaml()` + `RegistryLookup/InstallComplete` events. `lsp_manager.rs`: `mason_bin_dir()`, `resolve_command()`, `registry_cache`, `fetch_mason_registry_for_language()`, `run_install_command()`. Engine: `:LspInstall <lang>`. 16 new tests.
+
+**Session 77 — Terminal split drag-to-resize (638 total, no new tests):**
+`terminal_split_left_cols: u16` engine field; `terminal_split_set_drag_cols()` + `terminal_split_finalize_drag()`; GTK: drag 4px near divider; TUI: `dragging_terminal_split` state. No new tests.
+
+**Session 76 — Terminal horizontal split view (638 total, no new tests):**
+`terminal_split: bool` field; `terminal_open/close/toggle_split()`; `terminal_split_switch_focus()` (Ctrl-W). `render.rs`: `TerminalPanel.split_left_rows/cols/focus`; `build_pane_rows()` helper. GTK+TUI: left/`│`/right split rendering; `⊞` toolbar button. No new tests.
+
+**Session 75 — Terminal deep history + real PTY resize + CWD (638 total, no new tests):**
+`TerminalPane.history: VecDeque<Vec<HistCell>>` (configurable scrollback, default 5000); `process_with_capture()`/`capture_scrolled_rows()`. `resize()` calls `master.resize(PtySize)`. `terminal_new_tab()` passes `self.cwd`. No new tests.
+
+**Session 74 — Terminal find bug fixes (638 total, no new tests):**
+Find now scans scrollback history (`Vec<(required_offset, row, col)>`); `terminal_find_update_matches()` scans at both offsets; `build_terminal_panel()` uses required_offset. GTK full-width background fill + auto-resize on `CacheFontMetrics`. No new tests.
+
+**Session 73 — Terminal find bar (638 total, no new tests):**
+Ctrl+F while terminal has focus opens inline find bar replacing tab strip; case-insensitive; active match orange, others amber; Enter/Shift+Enter navigate; Escape/Ctrl+F close. Engine: 4 fields + 7 methods. `render.rs`: `TerminalCell` +2 bools; `TerminalPanel` +4 find fields. GTK+TUI: routing, toolbar, cell colors. No new tests.
 
 **Session 72:** Terminal multiple tabs + auto-close fix — `terminal_panes: Vec<TerminalPane>` + `terminal_active: usize` replace the single `terminal: Option<TerminalPane>` field. `terminal_new_tab()` always spawns a fresh shell; `terminal_close_active_tab()` removes current pane (closes panel if last); `terminal_switch_tab(idx)` switches active pane. `:term` always creates a new tab (via `EngineAction::OpenTerminal → NewTerminalTab`). Ctrl-T toggles panel (creates first tab if none). Alt-1–9 switches tabs (both GTK and TUI). Click on `[N]` tab label in toolbar switches tab; click on close icon closes active tab. `poll_terminal()` auto-removes exited panes immediately (all tabs, not just single-pane); panel closes when last pane exits. `terminal_resize()` resizes ALL panes. 638 tests (no change — PTY features are UI-only).
 

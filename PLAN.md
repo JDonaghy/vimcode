@@ -2,6 +2,9 @@
 
 ## Recently Completed
 
+**Session 117c — GTK settings panel bug fixes (1199 total):**
+Fixed three visual issues: (1) Settings panel not collapsing on second button click — removed `#[watch]` on `set_visible` so Relm4 doesn't fight the imperative hide; (2) Overlay scrollbar floating over widgets — `scroll.set_overlay_scrolling(false)`; (3) Toggle switches clipped by CSS `min-height`/`min-width` constraints — removed constraints and added 4px margin on all sides of each Switch widget.
+
 **Session 117b — GTK settings form (1199 total):**
 VSCode-style settings sidebar with native GTK widgets. `render.rs`: `SettingType`/`SettingDef`/`SETTING_DEFS` (~30 settings, 7 categories). `settings.rs`: `get_value_str(key)`/`set_value_str(key,value)` methods. `main.rs`: `Msg::SettingChanged`; `build_setting_row()`/`build_settings_form()` free functions; imperatively-built panel with header + search (category-aware filtering) + scrolled list (Switch/SpinButton/DropDown/Entry per type) + Open JSON button; CSS for compact sidebar widgets.
 
@@ -768,6 +771,7 @@ Root cause: `draw_menu_dropdown` was called from `draw_editor()`'s DrawingArea w
 - [x] **VSCode-style menus** — application menu bar (File / Edit / View / Go / Run / Terminal / Help) in GTK; command palette (`Ctrl-Shift-P`) lists all commands + key bindings; fuzzy-searchable; both GTK native menus and TUI pop-up menu overlay (sessions 81–82, 100–101)
 - [x] **Command palette** — `Ctrl-Shift-P` floating modal; lists named commands with descriptions and current keybindings; typing filters; Enter executes; shared GTK + TUI (session 101)
 - [x] **Settings editor** — `:Settings` opens `settings.json` in an editor tab; Settings sidebar panel shows live values; auto-reload on save in both backends (session 117)
+- [x] **Settings sidebar (GTK)** — native GTK form with 30 settings in 7 categories, search, Adwaita dark theme (session 117b/117c)
 
 ### Extension System
 - [x] **Extension mechanism** — Lua 5.4 plugin sandbox; plugins register commands/keymaps/hooks, read/write buffer text, show messages; `~/.config/vimcode/plugins/` auto-loaded; bundled language-pack extensions + GitHub registry; `:ExtInstall/:ExtList/:ExtEnable/:ExtDisable/:ExtRemove` (sessions 98, 113–114)

@@ -1,9 +1,9 @@
 # VimCode Project State
 
-**Last updated:** Mar 4, 2026 (Session 117b — GTK settings form) | **Tests:** 1199
+**Last updated:** Mar 4, 2026 (Session 117c — GTK settings panel bug fixes) | **Tests:** 1199
 
 > Feature documentation lives in **README.md**.
-> Per-session implementation notes through Session 72 are in **SESSION_HISTORY.md**.
+> Per-session implementation notes through Session 117b are in **SESSION_HISTORY.md**.
 
 ---
 
@@ -26,78 +26,20 @@ When implementing a new key/command, add tests covering:
 
 ## Recent Work
 
-**Session 117b — GTK settings form (no new tests, 1199 total):**
+**Session 117c — GTK settings panel bug fixes (no new tests, 1199 total):**
+Three visual fixes for the settings sidebar: (1) Panel collapse — removed `#[watch]` from settings panel `set_visible` so Relm4 no longer overrides the imperative hide when pressing the Settings button again; (2) Overlay scrollbar — `scroll.set_overlay_scrolling(false)` prevents the vertical scrollbar from floating over Switch/SpinButton widgets; (3) Switch clipping — added 4px margin on all four sides of each `gtk4::Switch` widget and removed CSS `min-height`/`min-width` constraints that forced Adwaita's rendering into too-small a box.
+
+**Session 117b — GTK settings sidebar form (no new tests, 1199 total):**
 VSCode-style settings sidebar form for GTK mode. Clicking the gear icon in the activity bar now shows a live settings panel instead of a placeholder.
 - **`src/render.rs`**: Added `SettingType` enum (`Bool`/`Integer{min,max}`/`StringVal`/`Enum(&[&str])`), `SettingDef` struct, and `SETTING_DEFS: &[SettingDef]` static (~30 settings in 7 categories: Appearance, Editor, Search, Workspace, LSP, Terminal, Plugins).
-- **`src/core/settings.rs`**: Added `get_value_str(&self, key) -> String` and `set_value_str(&mut self, key, value) -> Result<()>` methods to `Settings` — used by the form to read/write settings by key string.
-- **`src/main.rs`**: Added `Msg::SettingChanged { key, value }` variant; two free functions `build_setting_row()` and `build_settings_form()` build native GTK widgets (Switch for bool, SpinButton for int, DropDown for enum, Entry for string); settings panel built imperatively in `init()` after `view_output!()` — includes header, search entry (with category-aware show/hide filtering), scrolled list of all setting rows, and "Open settings.json" button at bottom; `Msg::SettingChanged` handler calls `settings.set_value_str()` then `settings.save()`; CSS for `.settings-category-header` and compact sidebar switch/spinbutton/dropdown/entry styles.
+- **`src/core/settings.rs`**: Added `get_value_str(&self, key) -> String` and `set_value_str(&mut self, key, value) -> Result<()>` methods to `Settings`.
+- **`src/main.rs`**: `Msg::SettingChanged { key, value }`; `build_setting_row()` and `build_settings_form()` free functions; settings panel built imperatively in `init()` with header + search bar (category-aware filtering) + scrolled list + "Open settings.json" button; dark CSS for sidebar widgets; `prefer_dark_theme(true)` in `init()`.
 
 **Session 117 — Settings editor / :Settings command (3 new tests, 1199 total):**
-Implements the settings editor roadmap item. `:Settings` (and `:settings`) opens `~/.config/vimcode/settings.json` in a new editor tab — the same file the engine reads on startup and on `:config reload`. Both backends now auto-reload settings when the file is saved:
-- **`src/core/settings.rs`**: renamed `settings_path()` → `pub fn settings_file_path()` so backends and tests can reference it without duplicating the path.
-- **`src/core/engine.rs`**: added `:Settings`/`:settings` command arm in `execute_command()` (calls `open_file_in_tab(&Settings::settings_file_path())`); added `"Settings"` to command-completion list and `"Preferences: Open Settings (JSON)"` to `PALETTE_COMMANDS`.
-- **`src/tui_main.rs`**: clicking the gear icon in the activity bar now also calls `:Settings` (opens the file in a tab) in addition to toggling the Settings sidebar; `render_settings_panel` updated to show live current values (colorscheme, tabstop, wrap, lsp, etc.) right-aligned in keyword colour; mtime-based auto-reload — on every event-loop iteration the settings.json mtime is checked and the file is reloaded if it changed, mirroring GTK's `gio::FileMonitor` behaviour; added `LineNumberMode` to imports.
-- **`tests/command_mode.rs`**: 3 new tests (`test_settings_command_opens_settings_file`, `test_settings_command_lowercase_alias`, `test_settings_file_path_ends_with_settings_json`).
+`:Settings` (and `:settings`) opens `~/.config/vimcode/settings.json` in a new editor tab. `settings_path()` renamed to `pub fn settings_file_path()`. Engine: `:Settings` command + palette entry. TUI: gear icon click opens the file; `render_settings_panel` shows live values; mtime auto-reload. 3 new tests.
 
 **Session 116 — Named colour themes / :colorscheme (10 new tests, 1196 total):**
-Four built-in themes: OneDark (default), Gruvbox Dark, Tokyo Night, Solarized Dark. `src/render.rs`: `Theme::gruvbox_dark()`, `Theme::tokyo_night()`, `Theme::solarized_dark()` constructors; `Theme::from_name(name) -> Self` dispatcher (normalises aliases: gruvbox→gruvbox-dark, tokyonight→tokyo-night, solarized→solarized-dark); `Theme::available_names()`; `Color::to_hex()` helper. `src/core/settings.rs`: `colorscheme: String` field (serde default `"onedark"`). `src/core/engine.rs`: `:colorscheme` (lists themes) and `:colorscheme <name>` (validates, normalises, saves settings) commands. `src/main.rs` (GTK): all `Theme::onedark()` calls → `Theme::from_name()`; `make_theme_css(theme)` generates activity-bar/sidebar/treeview CSS from theme colours; `STATIC_CSS` const holds structural CSS (titlebar, window controls, scrollbars, find-dialog); hot-reload in `SearchPollTick` reloads the full combined CSS (structural + theme colours) so live theme switching preserves button shapes and window decorations. `src/tui_main.rs`: theme refreshed at top of every event-loop iteration; `render_sidebar` fills full sidebar background before drawing tree rows. `tests/command_mode.rs`: 10 new tests (default, all 4 themes, 3 aliases, unknown-returns-error, no-args-lists-themes).
-
-**Session 115 — DAP SIGTTIN fix + ANSI carry buffer (3 new tests, 1128 total):**
-Fixed TUI suspension during DAP debugging and hardened DAP output stripping.
-- **`src/core/dap.rs`**: Both `spawn()` and `spawn_tcp()` now call `setsid()` via `pre_exec` on Unix, creating a new session for the adapter process so it (and its children, e.g. debugpy launching the target script) cannot steal the editor's terminal foreground group — prevents SIGTTIN suspension
-- **`src/core/lsp.rs`**: Same `setsid()` treatment for LSP server spawns
-- **`Cargo.toml`**: Added explicit `libc = "0.2"` dependency (already transitive)
-- **`src/core/engine.rs`**: `dap_ansi_carry: String` field buffers incomplete ANSI escape sequences across DAP output events; `strip_ansi_and_control()` and `ansi_incomplete_tail_start()` hoisted to `pub(crate)` methods on Engine for testability; carry logic in `DapEvent::Output` handler prepends previous carry, splits off any trailing incomplete sequence
-- **Tests**: 3 new unit tests (`test_strip_ansi_and_control_complete_sequence`, `test_ansi_incomplete_tail_start`, `test_dap_ansi_carry_handles_split_sequence`)
-- **`src/core/dap_manager.rs`**: defensive `windows.contains_key()` guard in stackTrace handler (from prior session)
-
-**Session 114 — Extensions Sidebar Panel + GitHub Registry (16 new tests, 1125 total):**
-VSCode-style Extensions sidebar + first-party GitHub-hosted registry replacing Mason.
-- **`extensions/registry.json`**: JSON array of all 11 extension manifests for remote registry
-- **`extensions/*/README.md`**: Per-extension docs for GitHub Pages browsing (11 files)
-- **`src/core/registry.rs`**: `fetch_registry()` + `download_script()` + `REGISTRY_URL`/`FILES_BASE_URL` constants
-- **`src/core/settings.rs`**: `extension_registry_url` field with GitHub raw default
-- **Engine fields**: `ext_registry`, `ext_registry_fetching`, `ext_registry_rx`, `ext_sidebar_has_focus`, `ext_sidebar_selected`, `ext_sidebar_query`, `ext_sidebar_sections_expanded`, `ext_sidebar_input_active`, `prompted_extensions`
-- **Engine methods**: `ext_available_manifests()` (registry overrides bundled), `ext_refresh()` (background thread), `poll_ext_registry()`, `handle_ext_sidebar_key()`, `ext_install_from_registry()`, `ext_remove()`
-- **New commands**: `:ExtRemove <name>`, `:ExtRefresh`; `:LspInstall`/`:DapInstall` redirect to `:ExtInstall`
-- **Mason registry removed** from `lsp_manager.rs`: `fetch_mason_registry_for_language()`, `registry_cache`, `LspEvent::RegistryLookup` all deleted
-- **`src/render.rs`**: `ExtSidebarItem`, `ExtSidebarData` structs; `build_ext_sidebar_data()`; `ScreenLayout.ext_sidebar`
-- **GTK `src/main.rs`**: `SidebarPanel::Extensions`, `ext_sidebar_da_ref`, activity bar icon (󱧅), `draw_ext_sidebar()`, `Msg::ExtSidebarKey`/`Msg::ExtSidebarClick` handlers, auto-refresh on panel switch
-- **TUI `src/tui_main.rs`**: `TuiPanel::Extensions`, `render_ext_sidebar()`, activity bar row 5, key routing, poll_ext_registry in event loop
-- **Tests**: `tests/extensions.rs` expanded from 16 → 30 tests (`:ExtRemove`, registry merge, sidebar state, `:LspInstall` redirect, `:ExtRefresh`)
-
-**Session 113 — Extension/Language Pack System (31 new tests, 1109 total):**
-Full VSCode-style extension system: language packs bundle LSP + DAP + Lua scripts into named packages.
-- **11 bundled extensions**: csharp, python, rust, javascript, go, java, cpp, php, ruby, bash, git-insights
-- **`src/core/extensions.rs`**: `BundledExtension`, `ExtensionManifest`, `BUNDLED` array; manifests compiled in via `include_str!()`; `find_by_name/find_for_file_ext/find_for_language_id` helpers
-- **`ExtensionState`** in `session.rs`: installed/dismissed persistence to `~/.config/vimcode/extensions.json`
-- **Engine**: `:ExtInstall/:ExtList/:ExtEnable/:ExtDisable` commands; auto-detect hint on file open when no LSP + extension available; `line_annotations: HashMap<usize, String>` for virtual text (cleared on file switch)
-- **`src/render.rs`**: `RenderedLine.annotation: Option<String>`; `Theme.annotation_fg` (#5c6370 muted grey)
-- **GTK + TUI backends**: render annotations as dim text after line content
-- **`src/core/git.rs`**: `BlameInfo` struct; `blame_line()` via `git blame -L n,n --porcelain`; `epoch_to_relative()` for human dates; `log_file()` with file filter
-- **`src/core/plugin.rs`**: `vimcode.buf.cursor()/annotate_line()/clear_annotations()`; `vimcode.git.blame_line()/log_file()`; `cursor_move` event hook; scripts loaded from `~/.config/vimcode/extensions/` dirs
-- **`extensions/git-insights/blame.lua`**: inline blame annotation on cursor move + `:GitLog` command
-- **Tests**: `tests/extensions.rs` (16 integration tests); `engine_with()` now resets `extension_state` for hermeticity; fixed 41-char test hash bug in git.rs blame parser
-
-**Session 112 — :set wrap fix + release pipeline (4 new tests, 1078 total):**
-- Fixed `:set wrap` rendering: `build_rendered_window` now computes accurate `render_viewport_cols` from `rect.width / char_width - gutter_char_width` instead of the stored `view.viewport_cols` (which used a hardcoded 9.0 px estimate). Fixes wrap only working when buffer lacked GTK focus.
-- Fixed GTK resize callback: now reads actual `char_width_cell.get()` instead of hardcoded `9.0`, improving viewport_cols accuracy for cursor scroll clamping.
-- Fixed TUI: `needs_redraw = true` set unconditionally after any keypress, so `:set wrap` and other `EngineAction::None` commands trigger a redraw.
-- Added `:set option!` toggle syntax (e.g. `:set wrap!` toggles, `:set nowrap!` explicitly disables). 4 new unit tests in `settings.rs`.
-- Release pipeline: updated `release.yml` to produce a public GitHub Release (using `softprops/action-gh-release`) with a `.deb` package (`cargo-deb`) and raw binary on every push to `main`. Added `[package.metadata.deb]` to `Cargo.toml` declaring GTK4 runtime deps so `apt -f install` resolves them automatically.
-
-**Session 111 — Missing Vim Commands (55 new tests, Batches 1–3):**
-Implemented the following missing Vim features:
-- Normal mode movements: `^` (first non-blank), `g_` (last non-blank), `W`/`B`/`E`/`gE` (WORD motions), `H`/`M`/`L` (screen top/middle/bottom), `(`/`)` (sentence), `Ctrl+E`/`Ctrl+Y` (single-line scroll), `g*`/`g#` (partial word search), `gJ` (join without space), `gf` (open file under cursor)
-- Editing: `R` (Replace mode), `Ctrl+A`/`Ctrl+X` (number increment/decrement), `=` operator (auto-indent), `]p`/`[p` (paste with indent adjustment), `iW`/`aW` (WORD text objects)
-- Insert mode: `Ctrl+R {reg}` (insert register content), `Ctrl+U` (delete to start of line), `Ctrl+O` (exit to Normal for one command)
-- Ex commands: `:noh`/`:nohlsearch`, `:wa`, `:wqa`/`:xa`, `:reg`/`:registers`, `:marks`, `:jumps`, `:changes`, `:history`, `:echo`, `:tabmove`, `:!{cmd}`, `:r {file}`
-- Settings: `hlsearch`, `ignorecase`, `smartcase`, `scrolloff`, `cursorline`, `colorcolumn`, `textwidth`, `splitbelow`, `splitright`
-- Search: `ignorecase`/`smartcase` applied in `run_search`; `hlsearch=false` suppresses highlight spans in render.rs; `scrolloff` padding applied in `ensure_cursor_visible`
-- New test file: `tests/new_vim_features.rs` (55 tests)
-
-**Session 110c — Last-word-of-file yank bug fix (4 new tests):**
-Fixed `yw`/`dw` missing the final character when the last word of a file has no trailing newline. Root cause: `move_word_forward()` clamps `pos` to `total_chars - 1` when the end of file is reached, leaving the cursor AT the last char. The `w`-motion range `[start, end_pos)` is exclusive, so it excluded that final char. Fix: in `apply_operator_with_motion`, detect when `end_pos + 1 == total_chars` and the last char is not `\n`, and extend `delete_end` to `total_chars` to include it. 4 tests added: `test_yw_last_word_of_file_no_newline`, `test_yw_only_word_no_newline`, `test_dw_last_word_of_file_no_newline`, `test_yw_last_word_of_last_line_no_newline`.
+Four built-in themes: OneDark (default), Gruvbox Dark, Tokyo Night, Solarized Dark. `render.rs`: `Theme::from_name(name)` dispatcher + alias normalisation; `Theme::available_names()`; `Color::to_hex()`. `settings.rs`: `colorscheme: String` (serde default `"onedark"`). Engine: `:colorscheme` command. GTK: `make_theme_css(theme)` + `STATIC_CSS` const + hot-reload. TUI: theme refreshed each iteration. 10 new tests.
 
 **Session 110b — Yank Highlight Flash:**
 Implemented Neovim-style visual yank highlight (brief green flash after yank). Changes:
@@ -247,9 +189,9 @@ Phase A (UI Polish): `engine.rs`: `active_buffer_name() -> Option<String>` helpe
 
 ```
 src/
-├── main.rs          (~7866 lines)  GTK4/Relm4 UI, rendering, all panels
-├── tui_main.rs      (~7264 lines)  ratatui/crossterm TUI backend
-├── render.rs        (~2950 lines)  Platform-agnostic ScreenLayout bridge
+├── main.rs          (~9950 lines)  GTK4/Relm4 UI, rendering, all panels
+├── tui_main.rs      (~8370 lines)  ratatui/crossterm TUI backend
+├── render.rs        (~3050 lines)  Platform-agnostic ScreenLayout bridge
 ├── icons.rs            (~30 lines)  Nerd Font file-type icons
 └── core/            (~29,500 lines)  Zero GTK/rendering deps — fully testable
     ├── engine.rs    (~25,500 lines)  Orchestrator: keys, commands, all features
@@ -266,7 +208,7 @@ src/
     ├── session.rs      (~235 lines)  Session state persistence + per-workspace paths
     ├── git.rs        (~1,000 lines)  git subprocess integration + SC panel data + git log
     └── window.rs, tab.rs, view.rs, cursor.rs, mode.rs, syntax.rs (~893 lines)
-Tests: 817 passing
+Tests: 1199 passing
 Total: ~47,300 lines
 ```
 
@@ -319,6 +261,9 @@ Total: ~47,300 lines
 - [x] SC Panel Recent Commits — collapsible RECENT COMMITS section (last 20 commits); `Enter` shows hash+message in status bar
 - [x] Lua Extension Mechanism — mlua 5.4 vendored; `~/.config/vimcode/plugins/` auto-loaded; `vimcode.*` API (on/command/keymap/message/cwd/command_run/buf.*); `:Plugin list/reload/enable/disable`; hook points on save/open/normal-key/insert-key/command
 - [x] Menus + Workspace Parity — GTK dropdown drawing order fixed (floats above tab bar); GTK dialog action routing fixed; TUI menu actions fully wired (Open Folder/Workspace/Recent from Enter or click); "Open Recent…" menu item + picker in both backends; workspace session saved on quit + restored at startup; workspace settings overlay reverts on folder switch (`base_settings`); new commands: copy/cut/paste/termkill/about/openrecent
+- [x] **Settings sidebar (GTK)** — VSCode-style settings form with Switch/SpinButton/DropDown/Entry widgets; 30 settings in 7 categories; search filtering; "Open settings.json" button; Adwaita dark theme; `SettingDef`/`SETTING_DEFS` in render.rs; `get_value_str`/`set_value_str` in settings.rs (session 117b)
+- [x] **Settings editor** — `:Settings` opens `settings.json` in an editor tab; TUI settings panel shows live values; auto-reload on save in both backends (session 117)
+- [x] **Named colour themes** — `:colorscheme` command with 4 built-in themes (onedark/gruvbox-dark/tokyo-night/solarized-dark); GTK live hot-reload (session 116)
 
 ### Planned / Ideas
 - [ ] More Tree-sitter grammars (HTML, YAML, Lua — await tree-sitter 0.22 migration)
