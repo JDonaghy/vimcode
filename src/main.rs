@@ -413,7 +413,7 @@ fn build_setting_row(
     row.set_margin_top(3);
     row.set_margin_bottom(3);
     row.set_margin_start(4);
-    row.set_margin_end(4);
+    row.set_margin_end(10);
 
     // Left side: label + dim description
     let left = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
@@ -443,6 +443,8 @@ fn build_setting_row(
             let switch = gtk4::Switch::new();
             switch.set_active(current_val == "true");
             switch.set_valign(gtk4::Align::Center);
+            switch.set_margin_top(2);
+            switch.set_margin_bottom(2);
             let sender_c = sender.clone();
             let key_c = key.clone();
             switch.connect_state_set(move |_, state| {
@@ -872,14 +874,12 @@ impl SimpleComponent for App {
                         },
                         },
 
-                        // Settings panel
+                        // Settings panel — visibility managed imperatively via settings_panel_box
                         #[name = "settings_panel"]
                         gtk4::Box {
                             set_orientation: gtk4::Orientation::Vertical,
                             set_css_classes: &["sidebar"],
-
-                            #[watch]
-                            set_visible: model.active_panel == SidebarPanel::Settings,
+                            set_visible: false,  // hidden initially; toggled via settings_panel_box
                             // Content built imperatively in init() after view_output!()
                         },
 
