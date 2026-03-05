@@ -261,6 +261,50 @@ fn test_tick_ignores_empty_alternatives() {
     assert!(e.ai_ghost_text.is_none());
 }
 
+// ── Prefix overlap stripping ───────────────────────────────────────────────
+
+#[test]
+fn test_completion_strips_repeated_prefix_char() {
+    // AI returns `"PlayerObject":` but cursor is already after `"` in the buffer.
+    // The engine should strip the repeated `"` so the ghost shows `PlayerObject":`.
+    let mut e = engine();
+    let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<String>, String>>();
+    e.ai_completion_rx = Some(rx);
+    e.settings.ai_completions = true;
+    // Simulate: prefix tail ended with `"`
+    e.ai_completion_prefix_tail = "case \"".to_string();
+    tx.send(Ok(vec!["\"PlayerObject\":".to_string()])).unwrap();
+    assert!(e.tick_ai_completion());
+    // The leading `"` should have been stripped
+    assert_eq!(e.ai_ghost_text.as_deref(), Some("PlayerObject\":"));
+}
+
+#[test]
+fn test_completion_no_overlap_unchanged() {
+    // AI returns `world` and buffer ends with `hello ` — no overlap, unchanged.
+    let mut e = engine();
+    let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<String>, String>>();
+    e.ai_completion_rx = Some(rx);
+    e.settings.ai_completions = true;
+    e.ai_completion_prefix_tail = "hello ".to_string();
+    tx.send(Ok(vec!["world".to_string()])).unwrap();
+    assert!(e.tick_ai_completion());
+    assert_eq!(e.ai_ghost_text.as_deref(), Some("world"));
+}
+
+#[test]
+fn test_completion_strips_multi_char_overlap() {
+    // AI returns `fn foo()` when prefix ends with `fn ` — strip `fn `.
+    let mut e = engine();
+    let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<String>, String>>();
+    e.ai_completion_rx = Some(rx);
+    e.settings.ai_completions = true;
+    e.ai_completion_prefix_tail = "fn ".to_string();
+    tx.send(Ok(vec!["fn foo()".to_string()])).unwrap();
+    assert!(e.tick_ai_completion());
+    assert_eq!(e.ai_ghost_text.as_deref(), Some("foo()"));
+}
+
 // ── settings.ai_completions round-trip ────────────────────────────────────
 
 #[test]

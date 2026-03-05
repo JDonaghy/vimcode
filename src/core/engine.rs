@@ -1117,6 +1117,11 @@ pub struct Engine {
     pub ai_completion_ticks: Option<u32>,
     /// Channel for receiving ghost text from the background completion thread.
     pub ai_completion_rx: Option<std::sync::mpsc::Receiver<Result<Vec<String>, String>>>,
+    /// Tail of the prefix (text before cursor) captured when the last completion
+    /// request was fired.  Used on arrival to strip any prefix characters the AI
+    /// repeated from the context (e.g. the `"` in `"PlayerObject":` when the
+    /// buffer already ends with `"`).
+    pub ai_completion_prefix_tail: String,
 }
 
 impl Engine {
@@ -1346,6 +1351,7 @@ impl Engine {
             ai_ghost_alt_idx: 0,
             ai_completion_ticks: None,
             ai_completion_rx: None,
+            ai_completion_prefix_tail: String::new(),
             ai_messages: Vec::new(),
             ai_input: String::new(),
             ai_input_cursor: 0,
@@ -15063,7 +15069,29 @@ impl Engine {
             if let Ok(result) = rx.try_recv() {
                 self.ai_completion_rx = None;
                 match result {
-                    Ok(alternatives) => {
+                    Ok(mut alternatives) => {
+                        if !alternatives.is_empty() {
+                            // Strip any leading characters that the AI repeated from the
+                            // prefix (e.g. the model returns `"PlayerObject":` when the
+                            // buffer already ends with `"` before the cursor).
+                            // We check overlaps up to 16 chars and strip the longest match.
+                            let tail = std::mem::take(&mut self.ai_completion_prefix_tail);
+                            for alt in &mut alternatives {
+                                let max_n = alt.chars().count().min(tail.chars().count()).min(16);
+                                let overlap_bytes = (1..=max_n).rev().find_map(|n| {
+                                    let alt_prefix: String = alt.chars().take(n).collect();
+                                    if tail.ends_with(alt_prefix.as_str()) {
+                                        Some(alt_prefix.len()) // String::len() = byte length
+                                    } else {
+                                        None
+                                    }
+                                });
+                                if let Some(b) = overlap_bytes {
+                                    *alt = alt[b..].to_string();
+                                }
+                            }
+                            alternatives.retain(|a| !a.is_empty());
+                        }
                         if !alternatives.is_empty() {
                             self.ai_ghost_alternatives = alternatives;
                             self.ai_ghost_alt_idx = 0;
@@ -15139,6 +15167,17 @@ impl Engine {
         let api_key = self.settings.ai_api_key.clone();
         let base_url = self.settings.ai_base_url.clone();
         let model = self.settings.ai_model.clone();
+
+        // Store the last 64 chars of the prefix so tick_ai_completion can detect
+        // and strip overlap when the AI repeats characters already in the buffer.
+        self.ai_completion_prefix_tail = prefix
+            .chars()
+            .rev()
+            .take(64)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
 
         let (tx, rx) = std::sync::mpsc::channel();
         self.ai_completion_rx = Some(rx);
