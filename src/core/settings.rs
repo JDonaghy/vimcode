@@ -892,12 +892,17 @@ impl Settings {
 
     /// Save settings to ~/.config/vimcode/settings.json
     pub fn save(&self) -> std::io::Result<()> {
-        // Tests must not write to the user's real settings file — they'd race with each other.
-        // test_config_reload writes directly via fs::write to set up test fixtures.
+        // Unit tests must not write to the user's real settings file.
         #[cfg(test)]
         return Ok(());
 
+        // Integration tests compile the library without cfg(test), so the guard above
+        // does not fire. Check the runtime flag instead.
         #[cfg_attr(test, allow(unreachable_code))]
+        if crate::core::session::saves_suppressed() {
+            return Ok(());
+        }
+
         let path = Self::settings_file_path();
 
         // Create config directory if it doesn't exist

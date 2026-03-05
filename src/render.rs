@@ -143,6 +143,10 @@ pub struct RenderedLine {
     /// Only set on the cursor line when `ai_completions` is enabled and a
     /// completion is available. Rendered in a muted ghost colour.
     pub ghost_suffix: Option<String>,
+    /// True for virtual rows inserted to show AI completion continuation lines.
+    /// These rows have empty `raw_text`; the full continuation text is in
+    /// `ghost_suffix` and backends draw it at the left edge of the content area.
+    pub is_ghost_continuation: bool,
 }
 
 /// A single diagnostic mark on a rendered line (for inline underlines/squiggles).
@@ -3301,24 +3305,27 @@ fn build_rendered_window(
     let visible_hl = &buffer_state.highlights[hl_lo..hl_hi];
 
     // Ghost text (AI inline completion): only in the active window, Insert mode.
-    // Multi-line completions are stored in full (Tab-accept inserts everything) but
-    // only the first line is shown as ghost_suffix — rendering all lines via a single
-    // Pango layout call spills onto the next real line and causes visual artifacts.
-    let ghost_for_cursor_line: Option<String> = if is_active
-        && engine.mode == crate::core::Mode::Insert
-        && engine.settings.ai_completions
-    {
-        engine.ai_ghost_text.as_deref().map(|g| {
-            if let Some((first, rest)) = g.split_once('\n') {
-                let extra = rest.lines().count() + 1; // +1 for the line after first '\n'
-                format!("{first} ↵+{extra}")
-            } else {
-                g.to_string()
+    // Multi-line completions are stored in full (Tab-accept inserts everything).
+    // The first line is shown after the cursor (ghost_suffix on the cursor line).
+    // Subsequent lines are inserted as virtual ghost continuation rows so the
+    // user can see the full suggestion before accepting with Tab.
+    let (ghost_for_cursor_line, ghost_continuation_lines): (Option<String>, Vec<String>) =
+        if is_active
+            && engine.mode == crate::core::Mode::Insert
+            && engine.settings.ai_completions
+        {
+            match &engine.ai_ghost_text {
+                None => (None, Vec::new()),
+                Some(g) => {
+                    let mut it = g.lines();
+                    let first = it.next().unwrap_or("").to_string();
+                    let cont: Vec<String> = it.map(|l| l.to_string()).collect();
+                    (Some(first), cont)
+                }
             }
-        })
-    } else {
-        None
-    };
+        } else {
+            (None, Vec::new())
+        };
 
     // Build rendered lines (fold-aware: skip hidden lines, jump over fold bodies)
     let mut lines = Vec::with_capacity(visible_lines);
@@ -3507,7 +3514,37 @@ fn build_rendered_window(
                     } else {
                         None
                     },
+                    is_ghost_continuation: false,
                 });
+
+                // After the cursor segment, insert ghost continuation rows.
+                if line_idx == cursor_line && seg == cursor_seg {
+                    for cont in &ghost_continuation_lines {
+                        if lines.len() >= visible_lines {
+                            break;
+                        }
+                        lines.push(RenderedLine {
+                            raw_text: String::new(),
+                            gutter_text: blank_gutter.clone(),
+                            is_current_line: false,
+                            spans: Vec::new(),
+                            is_fold_header: false,
+                            folded_line_count: 0,
+                            line_idx,
+                            git_diff: None,
+                            diagnostics: Vec::new(),
+                            diff_status: None,
+                            is_breakpoint: false,
+                            is_conditional_bp: false,
+                            is_dap_current: false,
+                            is_wrap_continuation: true,
+                            segment_col_offset: 0,
+                            annotation: None,
+                            ghost_suffix: Some(cont.clone()),
+                            is_ghost_continuation: true,
+                        });
+                    }
+                }
             }
         } else {
             lines.push(RenderedLine {
@@ -3536,7 +3573,38 @@ fn build_rendered_window(
                 } else {
                     None
                 },
+                is_ghost_continuation: false,
             });
+
+            // After the cursor line, insert ghost continuation rows.
+            if line_idx == cursor_line {
+                let blank_gutter = " ".repeat(gutter_char_width);
+                for cont in &ghost_continuation_lines {
+                    if lines.len() >= visible_lines {
+                        break;
+                    }
+                    lines.push(RenderedLine {
+                        raw_text: String::new(),
+                        gutter_text: blank_gutter.clone(),
+                        is_current_line: false,
+                        spans: Vec::new(),
+                        is_fold_header: false,
+                        folded_line_count: 0,
+                        line_idx,
+                        git_diff: None,
+                        diagnostics: Vec::new(),
+                        diff_status: None,
+                        is_breakpoint: false,
+                        is_conditional_bp: false,
+                        is_dap_current: false,
+                        is_wrap_continuation: true,
+                        segment_col_offset: 0,
+                        annotation: None,
+                        ghost_suffix: Some(cont.clone()),
+                        is_ghost_continuation: true,
+                    });
+                }
+            }
         }
 
         // Jump past the fold body for fold headers.

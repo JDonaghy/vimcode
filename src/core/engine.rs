@@ -15055,8 +15055,8 @@ impl Engine {
         self.ai_ghost_text = None;
         self.ai_ghost_alternatives.clear();
         self.ai_ghost_alt_idx = 0;
-        // ~30 ticks ≈ 500 ms at 60 fps; backends decrement each frame.
-        self.ai_completion_ticks = Some(30);
+        // ~15 ticks ≈ 250 ms at 60 fps; backends decrement each frame.
+        self.ai_completion_ticks = Some(15);
     }
 
     /// Called by the backend each frame. Decrements the tick counter and

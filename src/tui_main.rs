@@ -5869,6 +5869,20 @@ fn render_window(frame: &mut ratatui::Frame, area: Rect, window: &RenderedWindow
             line_bg,
         );
 
+        // Ghost continuation lines — draw full line in ghost colour.
+        if line.is_ghost_continuation {
+            if let Some(ghost) = &line.ghost_suffix {
+                let ghost_fg = rc(theme.ghost_text_fg);
+                for (i, ch) in ghost.chars().enumerate() {
+                    let gx = text_area_x + i as u16;
+                    if gx >= text_area_x + text_width {
+                        break;
+                    }
+                    set_cell(frame.buffer_mut(), gx, screen_y, ch, ghost_fg, line_bg);
+                }
+            }
+        }
+
         // Diagnostic underlines (UNDERLINED modifier on diagnostic spans)
         for dm in &line.diagnostics {
             let diag_fg = rc(match dm.severity {

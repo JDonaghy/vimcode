@@ -6702,6 +6702,18 @@ fn draw_window(
         cr.move_to(text_x_offset, y);
         pangocairo::show_layout(cr, layout);
 
+        // Ghost continuation lines — full line drawn in ghost colour.
+        if rl.is_ghost_continuation {
+            if let Some(ghost) = &rl.ghost_suffix {
+                let (gr, gg, gb) = theme.ghost_text_fg.to_cairo();
+                cr.set_source_rgb(gr, gg, gb);
+                cr.move_to(text_x_offset, y);
+                layout.set_text(ghost);
+                layout.set_attributes(None);
+                pangocairo::show_layout(cr, layout);
+            }
+        }
+
         // Inline annotation / virtual text (e.g. git blame)
         if let Some(ann) = &rl.annotation {
             let text_pixel_width = layout.pixel_size().0 as f64;

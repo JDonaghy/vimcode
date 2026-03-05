@@ -16,6 +16,14 @@ pub fn suppress_disk_saves() {
     SUPPRESS_SAVES.store(true, Ordering::Relaxed);
 }
 
+/// Returns `true` if disk saves have been suppressed (i.e. we are running in
+/// an integration-test process). Used by `Settings::save()` to avoid writing
+/// to the user's real config when called from integration test code that is
+/// compiled without `#[cfg(test)]`.
+pub fn saves_suppressed() -> bool {
+    SUPPRESS_SAVES.load(Ordering::Relaxed)
+}
+
 // ---------------------------------------------------------------------------
 // HistoryState — command/search history in its own file
 // ---------------------------------------------------------------------------
