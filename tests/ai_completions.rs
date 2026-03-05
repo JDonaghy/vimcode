@@ -2,8 +2,8 @@
 use vimcode_core::core::engine::Engine;
 
 fn engine() -> Engine {
-    let mut e = Engine::new();
     vimcode_core::core::session::suppress_disk_saves();
+    let mut e = Engine::new();
     e.settings = vimcode_core::core::settings::Settings::default();
     e
 }
