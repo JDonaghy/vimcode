@@ -6372,11 +6372,8 @@ impl Engine {
             // typing `"` when ghost starts with `"PlayerObject":`).
             if let Some(ch) = unicode {
                 if !ctrl {
-                    let ghost_starts_with_ch = self
-                        .ai_ghost_text
-                        .as_deref()
-                        .and_then(|g| g.chars().next())
-                        == Some(ch);
+                    let ghost_starts_with_ch =
+                        self.ai_ghost_text.as_deref().and_then(|g| g.chars().next()) == Some(ch);
                     if ghost_starts_with_ch {
                         // Advance all alternatives past this character.
                         for alt in &mut self.ai_ghost_alternatives {

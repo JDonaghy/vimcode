@@ -157,6 +157,11 @@ struct App {
     css_provider: gtk4::CssProvider,
     /// Colorscheme name at the time the CSS was last applied.
     last_colorscheme: String,
+    /// Set to true when VimCode writes settings.json itself (via SettingChanged or :set).
+    /// SettingsFileChanged skips the reload if this flag is true (we already have the
+    /// correct in-memory state) and clears the flag.  Prevents the GIO file watcher from
+    /// redundantly reloading settings that VimCode just saved.
+    settings_self_save: bool,
 }
 
 /// Drag state for a Cairo-drawn horizontal scrollbar.
@@ -1703,12 +1708,13 @@ impl SimpleComponent for App {
                 Ok(monitor) => {
                     let sender_for_monitor = sender.input_sender().clone();
                     monitor.connect_changed(move |_, _, _, event| {
-                        // ChangesDoneHint fires once after the write completes, avoiding
-                        // multiple events during a single save. Fall back to Changed on
-                        // filesystems that don't emit ChangesDoneHint.
-                        if event == gio::FileMonitorEvent::ChangesDoneHint
-                            || event == gio::FileMonitorEvent::Changed
-                        {
+                        // ChangesDoneHint fires once after the file is fully written and
+                        // closed (IN_CLOSE_WRITE on Linux/inotify).  This is the most
+                        // reliable single event per save.  We do NOT also listen for
+                        // Changed (IN_MODIFY) to avoid processing two events per VimCode
+                        // save — the self-save guard in SettingsFileChanged handles any
+                        // stray duplicates anyway.
+                        if event == gio::FileMonitorEvent::ChangesDoneHint {
                             sender_for_monitor.send(Msg::SettingsFileChanged).ok();
                         }
                     });
@@ -1779,6 +1785,7 @@ impl SimpleComponent for App {
             menu_dd_line_height: menu_dd_lh.clone(),
             css_provider,
             last_colorscheme,
+            settings_self_save: false,
         };
         let widgets = view_output!();
 
@@ -4072,13 +4079,23 @@ impl SimpleComponent for App {
                 self.draw_needed.set(true);
             }
             Msg::SettingsFileChanged => {
+                // If VimCode itself just saved the file, skip the reload — we already
+                // have the correct in-memory state and the file contains exactly what
+                // we wrote.  This prevents the GIO file watcher from firing an extra
+                // (redundant) Settings::load_with_validation() after every SettingChanged.
+                if self.settings_self_save {
+                    self.settings_self_save = false;
+                    return;
+                }
+
+                // External edit: reload from disk.
                 // Use load_with_validation (not load) to avoid writing back to the file,
                 // which would trigger the watcher again and cause an infinite reload loop.
                 // Silently ignore errors — the file may be mid-write.
                 if let Ok(new_settings) = core::settings::Settings::load_with_validation() {
                     let mut engine = self.engine.borrow_mut();
                     engine.settings = new_settings;
-                    engine.message = "Settings reloaded".to_string();
+                    engine.message = "Settings reloaded from disk".to_string();
                     drop(engine);
 
                     // Force redraw to apply new font/line number settings
@@ -4091,7 +4108,16 @@ impl SimpleComponent for App {
             Msg::SettingChanged { key, value } => {
                 let mut engine = self.engine.borrow_mut();
                 if engine.settings.set_value_str(&key, &value).is_ok() {
-                    let _ = engine.settings.save();
+                    match engine.settings.save() {
+                        Ok(()) => {
+                            // Mark that WE wrote the file so SettingsFileChanged can skip
+                            // the redundant reload (we already have the correct in-memory state).
+                            self.settings_self_save = true;
+                        }
+                        Err(e) => {
+                            engine.message = format!("Warning: setting changed but not saved: {e}");
+                        }
+                    }
                 }
                 drop(engine);
                 self.draw_needed.set(true);
