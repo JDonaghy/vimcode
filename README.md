@@ -11,7 +11,7 @@ There's a touch of irony here - using a cli tool to write the editor that I've w
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 1231 tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 1239 tests, zero async runtime dependency
 
 
 ## Download (Ubuntu)
@@ -654,7 +654,7 @@ Responses are fetched asynchronously via a background `curl` subprocess — no a
 
 #### AI Inline Completions
 
-When `ai_completions` is enabled, VimCode shows ghost text at the cursor while you type in insert mode. After ~500 ms of idle time a fill-in-the-middle request is sent to the configured AI provider; the suggestion appears as dimmed text.
+When `ai_completions` is enabled, VimCode shows ghost text at the cursor while you type in insert mode. After ~250 ms of idle time a fill-in-the-middle request is sent to the configured AI provider; the suggestion appears as dimmed text. Multi-line suggestions show all continuation lines as ghost text beneath the cursor line.
 
 | Key | Action |
 |-----|--------|

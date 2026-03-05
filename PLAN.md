@@ -2,6 +2,9 @@
 
 ## Recently Completed
 
+**Session 120 — AI ghost text improvements + settings persistence fix (1239 total):**
+Multi-line ghost text shown as virtual continuation rows beneath cursor line (both GTK + TUI); `is_ghost_continuation: bool` on `RenderedLine`. Settings write-through bug fixed: `saves_suppressed()` runtime guard added to `Settings::save()` — integration tests were writing `ai_completions=false` via `:set` commands; `suppress_disk_saves()` call order fixed in test helpers (must precede `Engine::new()`). GTK settings panel rebuilt from `engine.settings` each time it is opened. AI completion debounce reduced 500 ms → 250 ms.
+
 **Session 119b — git-insights blame fixes + TUI mouse crash (1231 total):**
 `cursor_move` suppressed in Insert mode; annotations hidden in render.rs during Insert; `BlameInfo.not_committed`; `blame_line(buf_contents)` uses `--contents -` stdin pipe; `buf_lines.join("")`; `blame.lua` shows "Not committed yet"; TUI drag crash: `saturating_sub(gutter)`.
 

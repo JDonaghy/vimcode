@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Mar 4, 2026 (Session 119b — git blame fixes + TUI mouse crash) | **Tests:** 1231
+**Last updated:** Mar 4, 2026 (Session 120 — AI ghost text + settings persistence) | **Tests:** 1239
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 117b are in **SESSION_HISTORY.md**.
@@ -25,6 +25,9 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 120 — AI ghost text improvements + settings persistence fix (8 new tests, 1239 total):**
+Four related fixes: (1) **Multi-line ghost text** — continuation lines now rendered as virtual `RenderedLine` rows with `is_ghost_continuation: true` beneath the cursor line in both GTK and TUI backends, replacing the previous `↵+N` count indicator; `render.rs` splits `ai_ghost_text` into first-line `ghost_suffix` + `ghost_continuation_lines`; (2) **Settings no longer reverted by tests** — `Settings::save()` had only a `#[cfg(test)]` guard which does not apply to integration tests compiled against the lib crate; added `saves_suppressed()` runtime check so `session::suppress_disk_saves()` also gates saves; `suppress_disk_saves()` must be called before `Engine::new()` — fixed ordering in `tests/ai_completions.rs` and `tests/ai_panel.rs`; (3) **GTK settings panel rebuilt on open** — added `settings_list_box` + `settings_sections` `Rc<RefCell<...>>` fields to `App`; `SwitchPanel(SidebarPanel::Settings)` handler clears and rebuilds the form from current `engine.settings` so `:set ai_completions` is immediately reflected; (4) **AI debounce halved** — `ai_completion_reset_timer()` sets 15 ticks (~250 ms at 60 fps) instead of 30 (~500 ms). File sizes: `engine.rs` ~32080 lines, `main.rs` ~10493 lines, `tui_main.rs` ~9089 lines, `render.rs` ~4108 lines.
 
 **Session 119b — git-insights blame fixes + TUI mouse crash (no new tests, 1231 total):**
 Three related fixes for the git-insights inline blame extension: (1) `cursor_move` hook suppressed in Insert mode — git blame reads the committed file so querying it for new in-buffer lines produces wrong blame; `fire_cursor_move_hook()` called explicitly on Escape instead; (2) `render.rs` hides `line_annotations` when `engine.mode == Mode::Insert` so existing annotations disappear visually as soon as insert mode is entered; (3) `BlameInfo` gains `not_committed: bool` (true when hash is all zeros); `blame_line()` now takes `buf_contents: Option<&str>` and uses `git blame --contents -` with stdin pipe so git sees the current unsaved buffer content — new empty lines correctly return `not_committed: true`; `blame.lua` updated to show `"Not committed yet"` for those lines; bug fix: `buf_lines.join("")` not `join("\n")` since Ropey `line(i)` already includes the trailing `\n`. TUI crash fix: `(rel_col - wx).saturating_sub(gutter)` in `handle_mouse` drag handler — u16 subtraction overflow when user drags into the line-number gutter area.
