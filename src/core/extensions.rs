@@ -107,6 +107,10 @@ pub struct ExtensionManifest {
     /// Lua script filenames bundled with this extension.
     #[serde(default)]
     pub scripts: Vec<String>,
+    /// Files/directories whose presence indicates this language's project root.
+    /// E.g. `["Cargo.toml"]` for Rust, `["go.mod"]` for Go.
+    #[serde(default)]
+    pub workspace_markers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -117,6 +121,13 @@ pub struct LspConfig {
     /// Shell command to install the LSP server.
     #[serde(default)]
     pub install: String,
+    /// Fallback binaries tried in order when `binary` is not found on PATH.
+    /// E.g. `["basedpyright-langserver", "pylsp", "jedi-language-server"]` for Python.
+    #[serde(default)]
+    pub fallback_binaries: Vec<String>,
+    /// Command-line arguments passed to the LSP binary (default: `["--stdio"]` if needed).
+    #[serde(default)]
+    pub args: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -124,6 +135,18 @@ pub struct DapConfig {
     /// Adapter name matching `dap_manager`'s registry (e.g. `"netcoredbg"`).
     #[serde(default)]
     pub adapter: String,
+    /// Executable to launch for the DAP adapter (e.g. `"codelldb"`, `"python"`).
+    #[serde(default)]
+    pub binary: String,
+    /// Shell command to install the DAP adapter.
+    #[serde(default)]
+    pub install: String,
+    /// Transport protocol: `"stdio"` (default) or `"tcp"`.
+    #[serde(default)]
+    pub transport: String,
+    /// Arguments passed to the DAP binary.
+    #[serde(default)]
+    pub args: Vec<String>,
 }
 
 impl ExtensionManifest {
@@ -227,5 +250,121 @@ mod tests {
     fn find_nonexistent_returns_none() {
         assert!(find_by_name("nonexistent").is_none());
         assert!(find_for_file_ext(".xyz").is_none());
+    }
+
+    // ── New manifest fields ───────────────────────────────────────────────────
+
+    #[test]
+    fn python_manifest_has_fallback_binaries() {
+        let (_, m) = find_for_language_id("python").expect("python manifest");
+        assert!(
+            !m.lsp.fallback_binaries.is_empty(),
+            "python should have LSP fallback binaries"
+        );
+        assert!(
+            m.lsp.fallback_binaries.contains(&"pylsp".to_string()),
+            "python fallbacks should include pylsp: {:?}",
+            m.lsp.fallback_binaries
+        );
+    }
+
+    #[test]
+    fn python_manifest_has_lsp_args() {
+        let (_, m) = find_for_language_id("python").expect("python manifest");
+        assert_eq!(
+            m.lsp.args,
+            vec!["--stdio"],
+            "python lsp should use --stdio arg"
+        );
+    }
+
+    #[test]
+    fn python_manifest_has_dap_binary_and_args() {
+        let (_, m) = find_for_language_id("python").expect("python manifest");
+        assert_eq!(m.dap.binary, "python", "python dap binary should be python");
+        assert_eq!(m.dap.transport, "stdio");
+        assert!(
+            m.dap.args.contains(&"-m".to_string())
+                && m.dap.args.contains(&"debugpy.adapter".to_string()),
+            "python dap args should include -m debugpy.adapter: {:?}",
+            m.dap.args
+        );
+    }
+
+    #[test]
+    fn python_manifest_has_workspace_markers() {
+        let (_, m) = find_for_language_id("python").expect("python manifest");
+        assert!(
+            !m.workspace_markers.is_empty(),
+            "python should have workspace_markers"
+        );
+        assert!(
+            m.workspace_markers.contains(&"pyproject.toml".to_string()),
+            "python workspace_markers should include pyproject.toml"
+        );
+    }
+
+    #[test]
+    fn rust_manifest_has_dap_config() {
+        let (_, m) = find_for_language_id("rust").expect("rust manifest");
+        assert_eq!(m.dap.adapter, "codelldb");
+        assert_eq!(m.dap.binary, "codelldb");
+        assert_eq!(m.dap.transport, "tcp");
+        assert!(
+            m.workspace_markers.contains(&"Cargo.toml".to_string()),
+            "rust should have Cargo.toml as workspace marker"
+        );
+    }
+
+    #[test]
+    fn go_manifest_has_dap_config() {
+        let (_, m) = find_for_language_id("go").expect("go manifest");
+        assert_eq!(m.dap.adapter, "delve");
+        assert_eq!(m.dap.binary, "dlv");
+        assert_eq!(m.dap.transport, "stdio");
+        assert_eq!(m.dap.args, vec!["dap"]);
+        assert!(!m.dap.install.is_empty(), "go dap should have install cmd");
+        assert!(
+            m.workspace_markers.contains(&"go.mod".to_string()),
+            "go should have go.mod as workspace marker"
+        );
+    }
+
+    #[test]
+    fn csharp_manifest_has_dap_config() {
+        let (_, m) = find_for_language_id("csharp").expect("csharp manifest");
+        assert_eq!(m.dap.adapter, "netcoredbg");
+        assert_eq!(m.dap.binary, "netcoredbg");
+        assert_eq!(m.dap.transport, "stdio");
+        assert!(
+            m.dap.args.contains(&"--interpreter=vscode".to_string()),
+            "netcoredbg args should include --interpreter=vscode"
+        );
+    }
+
+    #[test]
+    fn javascript_manifest_has_dap_config() {
+        let (_, m) = find_for_language_id("javascript").expect("javascript manifest");
+        assert_eq!(m.dap.adapter, "js-debug");
+        assert!(
+            m.workspace_markers.contains(&"package.json".to_string()),
+            "javascript should have package.json as workspace marker"
+        );
+    }
+
+    #[test]
+    fn all_manifests_parse_with_new_fields() {
+        for b in BUNDLED {
+            let m = ExtensionManifest::parse(b.manifest_toml)
+                .unwrap_or_else(|| panic!("failed to parse manifest for '{}'", b.name));
+            // New fields should deserialize correctly (even if empty/default).
+            let _ = m.lsp.fallback_binaries;
+            let _ = m.lsp.args;
+            let _ = m.dap.binary;
+            let _ = m.dap.install;
+            let _ = m.dap.transport;
+            let _ = m.dap.args;
+            let _ = m.workspace_markers;
+        }
     }
 }

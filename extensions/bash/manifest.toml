@@ -8,5 +8,6 @@ language_ids = ["shellscript", "bash"]
 [lsp]
 binary = "bash-language-server"
 install = "npm install -g bash-language-server"
+args = ["start"]
 
 scripts = []

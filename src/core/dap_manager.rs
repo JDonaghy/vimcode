@@ -4,6 +4,7 @@
 use std::path::PathBuf;
 
 use super::dap::DapServer;
+use super::extensions;
 
 // ---------------------------------------------------------------------------
 // Built-in adapter registry
@@ -207,9 +208,24 @@ pub fn resolve_binary(name: &str) -> Option<PathBuf> {
 
 /// Return a shell command that installs the named adapter, if one is known.
 ///
+/// Checks extension manifests first (via `dap.install`), then falls back to
+/// built-in install logic.  Returns `None` for adapters that require manual
+/// installation.
+///
 /// On Unix the command is run via `sh -c`; on Windows via `cmd /C`.
-/// Returns `None` for adapters that require manual installation.
 pub fn install_cmd_for_adapter(adapter_name: &str) -> Option<String> {
+    // Check manifests: find any manifest whose dap.adapter matches and has a
+    // non-empty dap.install field.
+    for bundle in extensions::BUNDLED {
+        if let Some(manifest) = extensions::ExtensionManifest::parse(bundle.manifest_toml) {
+            if manifest.dap.adapter == adapter_name && !manifest.dap.install.is_empty() {
+                return Some(manifest.dap.install.clone());
+            }
+        }
+    }
+
+    // Fall back to built-in install logic for adapters that need complex
+    // multi-step commands (codelldb, debugpy venv setup, netcoredbg archive).
     match adapter_name {
         "codelldb" => Some(codelldb_install_cmd()),
         "debugpy" => {
@@ -659,16 +675,15 @@ pub fn generate_launch_json(lang: &str, workspace_folder: &str) -> String {
 
 /// Walk up from `start_dir` to find the nearest workspace root.
 ///
-/// Workspace root markers (checked in order):
-/// - `Cargo.toml`  (Rust)
-/// - `package.json` (Node / JS / TS)
-/// - `go.mod`       (Go)
-/// - `pyproject.toml` / `setup.py` (Python)
-/// - `.git`         (any VCS root — last resort)
+/// Core markers always checked: `Cargo.toml`, `package.json`, `go.mod`,
+/// `pyproject.toml`, `setup.py`, `.git`.  Additional markers are gathered from
+/// bundled extension manifests' `workspace_markers` fields so that languages
+/// defined in extensions (e.g. `pom.xml` for Java, `Gemfile` for Ruby) are
+/// also detected without hardcoding them here.
 ///
 /// Falls back to `start_dir` itself if no marker is found.
 pub fn find_workspace_root(start_dir: &std::path::Path) -> std::path::PathBuf {
-    const MARKERS: &[&str] = &[
+    const CORE_MARKERS: &[&str] = &[
         "Cargo.toml",
         "package.json",
         "go.mod",
@@ -678,9 +693,27 @@ pub fn find_workspace_root(start_dir: &std::path::Path) -> std::path::PathBuf {
     ];
     // Glob-style markers checked via directory scan (e.g. *.sln for C#).
     const GLOB_EXTS: &[&str] = &["sln", "csproj"];
+
+    // Collect additional markers from bundled extension manifests.
+    let manifest_markers: Vec<String> = extensions::BUNDLED
+        .iter()
+        .filter_map(|b| extensions::ExtensionManifest::parse(b.manifest_toml))
+        .flat_map(|m| m.workspace_markers)
+        .filter(|mk| {
+            // Exclude glob-style markers (containing '*') — they are handled
+            // separately via the GLOB_EXTS extension scan.
+            !mk.contains('*')
+        })
+        .collect();
+
     let mut dir = start_dir.to_path_buf();
     loop {
-        for marker in MARKERS {
+        for marker in CORE_MARKERS {
+            if dir.join(marker).exists() {
+                return dir;
+            }
+        }
+        for marker in &manifest_markers {
             if dir.join(marker).exists() {
                 return dir;
             }
@@ -736,7 +769,8 @@ fn detect_rust_package_name(workspace_folder: &str) -> Option<String> {
 
 pub struct DapManager {
     pub server: Option<DapServer>,
-    pub adapter: Option<&'static AdapterInfo>,
+    /// The name of the active adapter (e.g. `"codelldb"`, `"debugpy"`).
+    pub adapter: Option<String>,
 }
 
 impl DapManager {
@@ -759,15 +793,81 @@ impl DapManager {
         ADAPTER_REGISTRY.iter().find(|a| a.name == name)
     }
 
-    /// Start the adapter for `name_or_lang`. Tries exact adapter name first,
-    /// then language identifier. Returns `Err` if nothing is registered.
+    /// Start the adapter for `name_or_lang`. Checks extension manifests first,
+    /// then falls back to the built-in `ADAPTER_REGISTRY`.
+    /// `name_or_lang` may be an adapter name (e.g. `"codelldb"`) or a language
+    /// identifier (e.g. `"rust"`).
     pub fn start_adapter(&mut self, name_or_lang: &str) -> Result<(), String> {
+        // ── 1. Try to resolve from extension manifest ────────────────────────
+        // Check by language ID first, then treat name_or_lang as an adapter name
+        // matched against manifest dap.adapter fields.
+        let manifest_dap = extensions::find_for_language_id(name_or_lang)
+            .map(|(_, m)| m)
+            .or_else(|| {
+                // Search all manifests for one whose dap.adapter matches.
+                extensions::BUNDLED
+                    .iter()
+                    .filter_map(|b| extensions::ExtensionManifest::parse(b.manifest_toml))
+                    .find(|m| m.dap.adapter == name_or_lang)
+            })
+            .filter(|m| !m.dap.binary.is_empty());
+
+        if let Some(ref m) = manifest_dap {
+            let dap = &m.dap;
+            let adapter_name = if dap.adapter.is_empty() {
+                name_or_lang
+            } else {
+                &dap.adapter
+            };
+
+            // Special-case debugpy: use find_python_binary() for venv discovery.
+            let binary = if adapter_name == "debugpy" {
+                find_python_binary().ok_or_else(|| {
+                    "Python not found — install Python 3 and run :ExtInstall python".to_string()
+                })?
+            } else {
+                resolve_binary(&dap.binary).ok_or_else(|| {
+                    format!(
+                        "DAP binary '{}' not found (install via :DapInstall {name_or_lang})",
+                        dap.binary
+                    )
+                })?
+            };
+
+            // Verify debugpy is importable before spawning.
+            if adapter_name == "debugpy" {
+                let ok = std::process::Command::new(&binary)
+                    .args(["-c", "import debugpy"])
+                    .output()
+                    .map(|o| o.status.success())
+                    .unwrap_or(false);
+                if !ok {
+                    return Err(format!(
+                        "debugpy not installed for {} — run :ExtInstall python",
+                        binary.display()
+                    ));
+                }
+            }
+
+            let binary_str = binary.to_string_lossy().into_owned();
+            let args: Vec<&str> = dap.args.iter().map(String::as_str).collect();
+            let use_tcp = dap.transport == "tcp";
+            let server = if use_tcp {
+                DapServer::spawn_tcp(&binary_str, &args)?
+            } else {
+                DapServer::spawn(&binary_str, &args)?
+            };
+            self.server = Some(server);
+            self.adapter = Some(adapter_name.to_string());
+            return Ok(());
+        }
+
+        // ── 2. Fall back to built-in ADAPTER_REGISTRY ────────────────────────
         let info = Self::adapter_by_name(name_or_lang)
             .or_else(|| Self::adapter_for_language(name_or_lang))
             .ok_or_else(|| format!("No DAP adapter registered for '{name_or_lang}'"))?;
 
-        // For debugpy, try python3 before python — most modern Linux distributions
-        // ship Python 3 as `python3` without a `python` symlink.
+        // For debugpy, use find_python_binary() for venv discovery.
         let binary = if info.name == "debugpy" {
             find_python_binary().ok_or_else(|| {
                 "Python not found — install Python 3 and run :ExtInstall python".to_string()
@@ -781,9 +881,7 @@ impl DapManager {
             })?
         };
 
-        // For debugpy: verify the module is importable before spawning the TCP
-        // server.  If it isn't, `spawn_tcp` would hang 2 s then show the opaque
-        // "connection refused" error.  Better to fail fast with a clear message.
+        // Verify debugpy is importable before spawning.
         if info.name == "debugpy" {
             let ok = std::process::Command::new(&binary)
                 .args(["-c", "import debugpy"])
@@ -805,7 +903,7 @@ impl DapManager {
             DapServer::spawn(&binary_str, info.args)?
         };
         self.server = Some(server);
-        self.adapter = Some(info);
+        self.adapter = Some(info.name.to_string());
         Ok(())
     }
 

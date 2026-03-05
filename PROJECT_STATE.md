@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Mar 4, 2026 (Session 120 — AI ghost text + settings persistence) | **Tests:** 1239
+**Last updated:** Mar 4, 2026 (Session 122 — Extension install UX + sidebar nav fixes) | **Tests:** 1257
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 117b are in **SESSION_HISTORY.md**.
@@ -25,6 +25,23 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 122 — Extension install UX + sidebar navigation fixes (2 new tests, 1257 total):**
+Three related fixes for the extension sidebar panel:
+- **Navigation bug after install+delete**: After installing an extension via Enter/`i`, `ext_sidebar_selected` now resets to the newly installed item in the installed section (installed section is also expanded). After deleting the last installed extension with `d`, if the available section was collapsed the available section is expanded so navigation remains possible.
+- **Idempotent extension install**: `ext_install_from_registry()` now calls `binary_on_path()` before running any install command. If the LSP binary (primary or any fallback) or DAP binary is already on PATH, the install step is skipped and the status message shows `"✓"`. If not found, the manifest's `install` command is run. `manifest.dap.install = ""` (e.g. codelldb) means "no auto-install" — a hint is shown to run `:DapInstall` instead.
+- **Accurate install status messages**: The message now reflects what actually happened: `"Extension 'rust' installed — LSP: rust-analyzer ✓, DAP: codelldb ✓"` for already-set-up toolchains, or `"…LSP: installing rust-analyzer…, DAP: run :DapInstall rust to set up codelldb"` for fresh installs.
+- **Install diagnostics log**: `src/core/lsp_manager.rs` gains `pub fn install_log(msg)` and `timestamp()` helpers. `run_install_command()` logs start/finish to `/tmp/vimcode-install.log` (command, PATH, stdout, stderr, exit status). `binary_on_path()` in `engine.rs` also logs found/not-found results to the same log.
+- 2 new regression tests in `tests/extensions.rs` (80 total): `ext_install_via_return_resets_selection_to_installed_item` and `ext_delete_last_installed_expands_available_if_collapsed`.
+
+**Session 121 — Manifest-driven LSP/DAP config (24 new tests, 1255 total):**
+Extension manifests are now the single source of truth for language-specific LSP/DAP configuration. Changes:
+- **`src/core/extensions.rs`**: `LspConfig` gains `fallback_binaries: Vec<String>` and `args: Vec<String>`; `DapConfig` gains `binary`, `install`, `transport`, `args`; `ExtensionManifest` gains `workspace_markers: Vec<String>`.
+- **All 11 bundled manifests updated**: `python` gets 3 LSP fallback binaries + full `[dap]` block with `binary="python" transport="stdio" args=["-m","debugpy.adapter"]`; `rust`/`cpp` get `[dap]` with `transport="tcp"`; `go` gets `[dap]` with `install` cmd; `javascript`/`csharp`/`java` get full `[dap]` blocks; all get `workspace_markers`; bash/php/ruby get `lsp.args`.
+- **`src/core/lsp_manager.rs`**: `ensure_server_for_language()` and `restart_server_for_language()` now try manifest-derived candidates (primary + fallback binaries) before falling back to the hardcoded `LANGUAGE_SERVERS` registry. New `server_configs_from_manifest()` helper. `debug_resolve()` also checks manifests first.
+- **`src/core/dap_manager.rs`**: `DapManager.adapter` changed from `Option<&'static AdapterInfo>` to `Option<String>`; `start_adapter()` tries extension manifest first (looks up by language ID or dap.adapter name), falls back to `ADAPTER_REGISTRY`; `install_cmd_for_adapter()` checks manifests first (via `dap.install` field) then built-in logic; `find_workspace_root()` collects `workspace_markers` from all bundled manifests and merges them with the core set.
+- **`src/core/engine.rs`**: `mgr.adapter.map(|a| a.name)` → `mgr.adapter.as_deref()` to match new `Option<String>` type.
+- 14 new unit tests in `extensions.rs` + 10 new integration tests in `tests/extensions.rs`.
 
 **Session 120 — AI ghost text improvements + settings persistence fix (8 new tests, 1239 total):**
 Four related fixes: (1) **Multi-line ghost text** — continuation lines now rendered as virtual `RenderedLine` rows with `is_ghost_continuation: true` beneath the cursor line in both GTK and TUI backends, replacing the previous `↵+N` count indicator; `render.rs` splits `ai_ghost_text` into first-line `ghost_suffix` + `ghost_continuation_lines`; (2) **Settings no longer reverted by tests** — `Settings::save()` had only a `#[cfg(test)]` guard which does not apply to integration tests compiled against the lib crate; added `saves_suppressed()` runtime check so `session::suppress_disk_saves()` also gates saves; `suppress_disk_saves()` must be called before `Engine::new()` — fixed ordering in `tests/ai_completions.rs` and `tests/ai_panel.rs`; (3) **GTK settings panel rebuilt on open** — added `settings_list_box` + `settings_sections` `Rc<RefCell<...>>` fields to `App`; `SwitchPanel(SidebarPanel::Settings)` handler clears and rebuilds the form from current `engine.settings` so `:set ai_completions` is immediately reflected; (4) **AI debounce halved** — `ai_completion_reset_timer()` sets 15 ticks (~250 ms at 60 fps) instead of 30 (~500 ms). File sizes: `engine.rs` ~32080 lines, `main.rs` ~10493 lines, `tui_main.rs` ~9089 lines, `render.rs` ~4108 lines.

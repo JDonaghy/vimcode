@@ -14657,31 +14657,58 @@ impl Engine {
             }
         }
 
-        // Run LSP install command in the background if configured
-        if !manifest.lsp.install.is_empty() {
-            let lsp_key = format!("ext:{ext_name}:lsp");
-            if !self.lsp_installing.contains(&lsp_key) {
-                self.ensure_lsp_manager();
-                if let Some(mgr) = &self.lsp_manager {
-                    mgr.run_install_command(&lsp_key, &manifest.lsp.install);
+        let mut status_parts: Vec<String> = Vec::new();
+
+        // ── LSP ──────────────────────────────────────────────────────────────
+        // Check if any LSP binary is already on PATH (idempotent: skip install
+        // if the server is already available, e.g. via `rustup component add`).
+        if !manifest.lsp.binary.is_empty() {
+            let all_lsp: Vec<&str> = std::iter::once(manifest.lsp.binary.as_str())
+                .chain(manifest.lsp.fallback_binaries.iter().map(|s| s.as_str()))
+                .filter(|b| !b.is_empty())
+                .collect();
+            let found_bin = all_lsp.iter().copied().find(|b| binary_on_path(b));
+            if let Some(bin) = found_bin {
+                status_parts.push(format!("LSP: {bin} ✓"));
+            } else if !manifest.lsp.install.is_empty() {
+                let lsp_key = format!("ext:{ext_name}:lsp");
+                if !self.lsp_installing.contains(&lsp_key) {
+                    self.ensure_lsp_manager();
+                    if let Some(mgr) = &self.lsp_manager {
+                        mgr.run_install_command(&lsp_key, &manifest.lsp.install);
+                    }
+                    self.lsp_installing.insert(lsp_key);
                 }
-                self.lsp_installing.insert(lsp_key);
+                status_parts.push(format!("LSP: installing {}…", manifest.lsp.binary));
             }
         }
 
-        // Run DAP adapter install if configured
+        // ── DAP ──────────────────────────────────────────────────────────────
+        // Check PATH first (idempotent).  Only auto-install if the manifest
+        // provides an explicit dap.install command.  An empty dap.install means
+        // "this adapter needs a manual/complex install" — guide the user to run
+        // :DapInstall instead of silently attempting a potentially large download.
         if !manifest.dap.adapter.is_empty() {
-            let dap_key = format!("dap:{}", manifest.dap.adapter);
-            if !self.lsp_installing.contains(&dap_key) {
-                if let Some(cmd_str) =
-                    super::dap_manager::install_cmd_for_adapter(&manifest.dap.adapter)
-                {
+            let dap_binary = manifest.dap.binary.as_str();
+            let already_on_path = !dap_binary.is_empty() && binary_on_path(dap_binary);
+            if already_on_path {
+                status_parts.push(format!("DAP: {dap_binary} ✓"));
+            } else if !manifest.dap.install.is_empty() {
+                // Manifest provides a simple install command (e.g. `go install …`).
+                let dap_key = format!("dap:{}", manifest.dap.adapter);
+                if !self.lsp_installing.contains(&dap_key) {
                     self.ensure_lsp_manager();
                     if let Some(mgr) = &self.lsp_manager {
-                        mgr.run_install_command(&dap_key, &cmd_str);
+                        mgr.run_install_command(&dap_key, &manifest.dap.install);
                     }
                     self.lsp_installing.insert(dap_key);
                 }
+                status_parts.push(format!("DAP: installing {}…", manifest.dap.adapter));
+            } else if !dap_binary.is_empty() {
+                // No auto-install — guide the user to :DapInstall.
+                status_parts.push(format!(
+                    "DAP: run :DapInstall {ext_name} to set up {dap_binary}"
+                ));
             }
         }
 
@@ -14693,7 +14720,14 @@ impl Engine {
         self.plugin_manager = None;
         self.plugin_init();
 
-        self.message = format!("Installing '{ext_name}' — LSP/DAP install started");
+        self.message = if status_parts.is_empty() {
+            format!("Extension '{ext_name}' installed")
+        } else {
+            format!(
+                "Extension '{ext_name}' installed — {}",
+                status_parts.join(", ")
+            )
+        };
     }
 
     /// Remove an extension: unmark as installed, delete its Lua scripts.
@@ -14794,6 +14828,14 @@ impl Engine {
                     if avail_idx < available.len() {
                         let name = available[avail_idx].name.clone();
                         self.ext_install_from_registry(&name);
+                        // Move cursor to the newly installed item so the user can see
+                        // it's installed and can press 'd' immediately if needed.
+                        self.ext_sidebar_sections_expanded[0] = true;
+                        let new_installed = self.ext_installed_items();
+                        self.ext_sidebar_selected = new_installed
+                            .iter()
+                            .position(|m| m.name == name)
+                            .unwrap_or(0);
                     }
                 }
                 true
@@ -14804,6 +14846,11 @@ impl Engine {
                 if sel < installed.len() {
                     let name = installed[sel].name.clone();
                     self.ext_remove(&name);
+                    // If collapsing sections left nothing visible, expand available so
+                    // the user can continue navigating.
+                    if self.ext_flat_item_count() == 0 {
+                        self.ext_sidebar_sections_expanded[1] = true;
+                    }
                     // Keep selection in bounds
                     let new_total = self.ext_flat_item_count();
                     if new_total > 0 && self.ext_sidebar_selected >= new_total {
@@ -18047,6 +18094,28 @@ impl Engine {
 }
 
 /// Return the number of visual rows a buffer line of `line_char_len` characters
+/// Returns true if `binary` is found anywhere on the current process PATH.
+/// Walks PATH directories directly (no subprocess) so it works even when
+/// the user's shell aliases or profile scripts are not sourced.
+fn binary_on_path(binary: &str) -> bool {
+    let path_var = std::env::var("PATH").unwrap_or_default();
+    for dir in path_var.split(':') {
+        let full = std::path::Path::new(dir).join(binary);
+        if full.exists() {
+            super::lsp_manager::install_log(&format!(
+                "[ext-check] FOUND {binary} at {}",
+                full.display()
+            ));
+            return true;
+        }
+    }
+    super::lsp_manager::install_log(&format!(
+        "[ext-check] NOT FOUND {binary} in PATH={}",
+        path_var
+    ));
+    false
+}
+
 /// Convert a char index in `s` to a byte offset.
 /// Returns `s.len()` if `char_idx` is at or beyond the end.
 fn cmd_char_to_byte(s: &str, char_idx: usize) -> usize {
@@ -18706,7 +18775,7 @@ impl Engine {
         self.dap_seq_launch = None; // will be assigned once launch is actually sent
         self.dap_seq_initialize = None;
 
-        let adapter_name = mgr.adapter.map(|a| a.name).unwrap_or("unknown");
+        let adapter_name = mgr.adapter.as_deref().unwrap_or("unknown");
         if let Some(server) = mgr.server.as_mut() {
             let init_seq = server.initialize(adapter_name);
             self.dap_seq_initialize = Some(init_seq);

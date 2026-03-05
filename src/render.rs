@@ -3310,10 +3310,7 @@ fn build_rendered_window(
     // Subsequent lines are inserted as virtual ghost continuation rows so the
     // user can see the full suggestion before accepting with Tab.
     let (ghost_for_cursor_line, ghost_continuation_lines): (Option<String>, Vec<String>) =
-        if is_active
-            && engine.mode == crate::core::Mode::Insert
-            && engine.settings.ai_completions
-        {
+        if is_active && engine.mode == crate::core::Mode::Insert && engine.settings.ai_completions {
             match &engine.ai_ghost_text {
                 None => (None, Vec::new()),
                 Some(g) => {

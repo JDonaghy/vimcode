@@ -964,6 +964,165 @@ fn ext_remove_on_not_installed_extension_shows_message() {
     );
 }
 
+// ── Manifest-driven LSP/DAP lookup (Session 121) ──────────────────────────────
+
+#[test]
+fn manifest_lsp_fallback_binaries_parsed() {
+    use vimcode_core::core::extensions::find_for_language_id;
+    let (_, m) = find_for_language_id("python").expect("python manifest");
+    assert!(
+        !m.lsp.fallback_binaries.is_empty(),
+        "python should have lsp.fallback_binaries"
+    );
+    assert!(
+        m.lsp
+            .fallback_binaries
+            .contains(&"basedpyright-langserver".to_string()),
+        "fallbacks should contain basedpyright-langserver: {:?}",
+        m.lsp.fallback_binaries
+    );
+    assert!(
+        m.lsp.fallback_binaries.contains(&"pylsp".to_string()),
+        "fallbacks should contain pylsp"
+    );
+    assert!(
+        m.lsp
+            .fallback_binaries
+            .contains(&"jedi-language-server".to_string()),
+        "fallbacks should contain jedi-language-server"
+    );
+}
+
+#[test]
+fn manifest_dap_config_fields_parsed() {
+    use vimcode_core::core::extensions::find_for_language_id;
+
+    // Go: has full DAP config with install command
+    let (_, m) = find_for_language_id("go").expect("go manifest");
+    assert_eq!(m.dap.binary, "dlv", "go dap binary should be dlv");
+    assert_eq!(m.dap.transport, "stdio", "go dap transport should be stdio");
+    assert_eq!(m.dap.args, vec!["dap"], "go dap args should be [dap]");
+    assert!(
+        !m.dap.install.is_empty(),
+        "go dap should have an install command"
+    );
+    assert!(
+        m.dap.install.contains("go install"),
+        "go dap install should use `go install`: {}",
+        m.dap.install
+    );
+
+    // Rust: TCP transport for codelldb
+    let (_, m) = find_for_language_id("rust").expect("rust manifest");
+    assert_eq!(m.dap.binary, "codelldb");
+    assert_eq!(m.dap.transport, "tcp");
+    assert!(m.dap.args.contains(&"--port".to_string()));
+}
+
+#[test]
+fn manifest_workspace_markers_parsed_for_multiple_languages() {
+    use vimcode_core::core::extensions::find_for_language_id;
+
+    let (_, m) = find_for_language_id("rust").expect("rust manifest");
+    assert!(
+        m.workspace_markers.contains(&"Cargo.toml".to_string()),
+        "rust should have Cargo.toml as workspace marker"
+    );
+
+    let (_, m) = find_for_language_id("go").expect("go manifest");
+    assert!(
+        m.workspace_markers.contains(&"go.mod".to_string()),
+        "go should have go.mod as workspace marker"
+    );
+
+    let (_, m) = find_for_language_id("python").expect("python manifest");
+    assert!(
+        m.workspace_markers.contains(&"pyproject.toml".to_string()),
+        "python should have pyproject.toml as workspace marker"
+    );
+
+    let (_, m) = find_for_language_id("javascript").expect("javascript manifest");
+    assert!(
+        m.workspace_markers.contains(&"package.json".to_string()),
+        "javascript should have package.json as workspace marker"
+    );
+}
+
+#[test]
+fn find_workspace_root_uses_manifest_markers() {
+    use std::fs;
+    use vimcode_core::core::dap_manager::find_workspace_root;
+
+    // Create a temp dir with a go.mod (a marker from the Go manifest)
+    let tmp = std::env::temp_dir().join("vimcode_test_wsroot_go");
+    let sub = tmp.join("src").join("pkg");
+    fs::create_dir_all(&sub).ok();
+    fs::write(tmp.join("go.mod"), "module example.com/mymod\n").ok();
+
+    // Start from a deep subdirectory — should walk up to tmp.
+    let root = find_workspace_root(&sub);
+    assert_eq!(
+        root, tmp,
+        "should find go.mod in parent dir via manifest marker"
+    );
+
+    // Cleanup
+    fs::remove_dir_all(&tmp).ok();
+}
+
+#[test]
+fn find_workspace_root_uses_gemfile_marker() {
+    use std::fs;
+    use vimcode_core::core::dap_manager::find_workspace_root;
+
+    let tmp = std::env::temp_dir().join("vimcode_test_wsroot_ruby");
+    let sub = tmp.join("lib");
+    fs::create_dir_all(&sub).ok();
+    fs::write(tmp.join("Gemfile"), "source 'https://rubygems.org'\n").ok();
+
+    let root = find_workspace_root(&sub);
+    assert_eq!(
+        root, tmp,
+        "should find Gemfile in parent dir via manifest marker"
+    );
+
+    fs::remove_dir_all(&tmp).ok();
+}
+
+#[test]
+fn dap_install_cmd_for_go_comes_from_manifest() {
+    use vimcode_core::core::dap_manager::install_cmd_for_adapter;
+    let cmd = install_cmd_for_adapter("delve");
+    assert!(cmd.is_some(), "delve should have an install command");
+    let cmd = cmd.unwrap();
+    assert!(
+        cmd.contains("go install") && cmd.contains("dlv"),
+        "delve install cmd should come from go manifest: {cmd}"
+    );
+}
+
+#[test]
+fn all_manifests_with_dap_binary_have_transport_set() {
+    use vimcode_core::core::extensions::{ExtensionManifest, BUNDLED};
+    for bundle in BUNDLED {
+        let m = ExtensionManifest::parse(bundle.manifest_toml)
+            .unwrap_or_else(|| panic!("manifest for '{}' should parse", bundle.name));
+        if !m.dap.binary.is_empty() {
+            assert!(
+                !m.dap.transport.is_empty(),
+                "extension '{}' has dap.binary but no dap.transport",
+                bundle.name
+            );
+            assert!(
+                m.dap.transport == "stdio" || m.dap.transport == "tcp",
+                "extension '{}' has unknown dap.transport: {}",
+                bundle.name,
+                m.dap.transport
+            );
+        }
+    }
+}
+
 // ── cursor_move hook ───────────────────────────────────────────────────────────
 
 #[test]
@@ -984,4 +1143,120 @@ fn handle_key_fires_cursor_move_when_cursor_moves() {
     press(&mut e, 'l'); // move cursor right
                         // If we get here without panicking, the hook fired safely
     assert_eq!(e.cursor().col, 1, "cursor should have moved right");
+}
+
+// ── Ext sidebar navigation regression tests ───────────────────────────────────
+
+/// After pressing Enter to install an extension, the selection should move to
+/// the newly installed item in the installed section, not stay at the old
+/// available-section index (which would point to a different item after install).
+#[test]
+fn ext_install_via_return_resets_selection_to_installed_item() {
+    let mut e = engine_with("");
+    e.ext_sidebar_has_focus = true;
+    e.ext_sidebar_sections_expanded = [true, true];
+    // Navigate to rust in the available list (alphabetically last: bash, cpp, csharp,
+    // git-insights, go, java, javascript, php, python, ruby, rust → index 10)
+    let available_before = e
+        .ext_available_manifests()
+        .into_iter()
+        .filter(|m| !e.extension_state.is_installed(&m.name))
+        .collect::<Vec<_>>();
+    let rust_idx = available_before
+        .iter()
+        .position(|m| m.name == "rust")
+        .expect("rust should be in available list");
+    e.ext_sidebar_selected = rust_idx; // point at rust in available section
+
+    // Install via Return
+    e.handle_ext_sidebar_key("Return", false, None);
+
+    // Rust should now be installed
+    assert!(
+        e.extension_state.is_installed("rust"),
+        "rust should be marked installed after Return"
+    );
+
+    // Selection should now be in the installed section, pointing at rust
+    let installed = e.ext_installed_items();
+    let sel = e.ext_sidebar_selected;
+    assert!(
+        sel < installed.len(),
+        "selection {sel} should be within installed section (len {})",
+        installed.len()
+    );
+    assert_eq!(
+        installed[sel].name, "rust",
+        "selection should point to rust in installed section"
+    );
+
+    // d should now work immediately (without extra navigation)
+    e.handle_ext_sidebar_key("d", false, None);
+    assert!(
+        !e.extension_state.is_installed("rust"),
+        "rust should be removed after pressing d on newly installed item"
+    );
+
+    // Clean up
+    e.extension_state.installed.clear();
+}
+
+/// After deleting the last installed extension when the available section is
+/// collapsed, the available section should be expanded so navigation still works.
+#[test]
+fn ext_delete_last_installed_expands_available_if_collapsed() {
+    let mut e = engine_with("");
+    e.ext_sidebar_has_focus = true;
+    // Install bash as the only extension
+    e.extension_state.mark_installed("bash");
+    // Collapse the available section (simulating user pressing Tab)
+    e.ext_sidebar_sections_expanded = [true, false];
+    // Selection points to bash (only installed item, flat index 0)
+    e.ext_sidebar_selected = 0;
+
+    // Verify only the installed item is selectable before deletion
+    // (available section is collapsed, so only 1 installed item is visible)
+    let installed_before = e.ext_installed_items();
+    assert_eq!(
+        installed_before.len(),
+        1,
+        "should have 1 installed item (bash)"
+    );
+
+    // Delete bash
+    e.handle_ext_sidebar_key("d", false, None);
+
+    assert!(
+        !e.extension_state.is_installed("bash"),
+        "bash should be removed"
+    );
+
+    // The available section should now be expanded
+    assert!(
+        e.ext_sidebar_sections_expanded[1],
+        "available section should be expanded after deleting last installed item"
+    );
+
+    // Navigation should work — available items are visible (all 11 bundled)
+    let available_after: Vec<_> = e
+        .ext_available_manifests()
+        .into_iter()
+        .filter(|m| !e.extension_state.is_installed(&m.name))
+        .collect();
+    assert!(
+        !available_after.is_empty(),
+        "available items should be visible after expanding section"
+    );
+
+    // j should move the selection
+    e.ext_sidebar_selected = 0;
+    e.handle_ext_sidebar_key("j", false, None);
+    assert!(
+        e.ext_sidebar_selected > 0,
+        "j should move selection after deletion, still at {}",
+        e.ext_sidebar_selected
+    );
+
+    // Clean up
+    e.extension_state.installed.clear();
 }

@@ -1,10 +1,36 @@
 use std::collections::HashMap;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 
+use super::extensions;
 use super::lsp::{
     language_id_from_path, path_to_uri, LspEvent, LspServer, LspServerConfig, LspServerId,
 };
+
+// ---------------------------------------------------------------------------
+// Install diagnostics — always written to /tmp/vimcode-install.log
+// ---------------------------------------------------------------------------
+
+fn timestamp() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("{secs}")
+}
+
+pub fn install_log(msg: &str) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/vimcode-install.log")
+    {
+        let _ = writeln!(f, "{msg}");
+        let _ = writeln!(f, "---");
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Built-in server registry
@@ -128,6 +154,40 @@ pub fn default_server_registry() -> Vec<LspServerConfig> {
     ]
 }
 
+/// Build `LspServerConfig` candidates from a bundled extension manifest for a
+/// given language ID.  Returns the primary binary first, then each fallback.
+fn server_configs_from_manifest(
+    manifest: &extensions::ExtensionManifest,
+    language_id: &str,
+) -> Vec<LspServerConfig> {
+    if manifest.lsp.binary.is_empty() {
+        return Vec::new();
+    }
+    // Use the manifest's args if set; otherwise empty.
+    let args = manifest.lsp.args.clone();
+    // Use all language IDs from the manifest so multi-language servers (e.g.
+    // typescript-language-server for js + ts) map all their languages at once.
+    let languages: Vec<String> = if manifest.language_ids.is_empty() {
+        vec![language_id.to_string()]
+    } else {
+        manifest.language_ids.clone()
+    };
+    let mut configs = Vec::new();
+    configs.push(LspServerConfig {
+        command: manifest.lsp.binary.clone(),
+        args: args.clone(),
+        languages: languages.clone(),
+    });
+    for fb in &manifest.lsp.fallback_binaries {
+        configs.push(LspServerConfig {
+            command: fb.clone(),
+            args: args.clone(),
+            languages: languages.clone(),
+        });
+    }
+    configs
+}
+
 /// Return the Mason LSP binary directory if it exists.
 /// On Linux/macOS: `$HOME/.local/share/nvim/mason/bin`
 /// On Windows: `%APPDATA%\nvim-data\mason\bin`
@@ -246,13 +306,23 @@ impl LspManager {
             return Some(id);
         }
 
-        // Find a matching config where the binary is available (try all configs — first one wins).
+        // Build candidate list: extension manifest entries first (primary + fallbacks),
+        // then the built-in registry.  First candidate with a resolvable binary wins.
+        let mut candidates: Vec<LspServerConfig> = Vec::new();
+        if let Some((_, manifest)) = extensions::find_for_language_id(language_id) {
+            candidates.extend(server_configs_from_manifest(&manifest, language_id));
+        }
+        candidates.extend(
+            self.registry
+                .iter()
+                .filter(|c| c.languages.iter().any(|l| l == language_id))
+                .cloned(),
+        );
+
         // Use the resolved full path so the spawn works regardless of the process's PATH.
-        let (mut config, resolved) = self
-            .registry
-            .iter()
-            .filter(|c| c.languages.iter().any(|l| l == language_id))
-            .find_map(|c| resolve_command(&c.command).map(|p| (c.clone(), p)))?;
+        let (mut config, resolved) = candidates
+            .into_iter()
+            .find_map(|c| resolve_command(&c.command).map(|p| (c, p)))?;
         config.command = resolved.to_string_lossy().into_owned();
 
         // Start the server
@@ -281,11 +351,18 @@ impl LspManager {
 
     /// Spawn a background thread to run an install command.
     /// The result is sent as `LspEvent::InstallComplete` on the shared channel.
+    /// Full command + output is always appended to `/tmp/vimcode-install.log`.
     pub fn run_install_command(&self, lang_id: &str, install_cmd: &str) {
         let tx = self.event_tx.clone();
         let lang_id = lang_id.to_string();
         let install_cmd = install_cmd.to_string();
         std::thread::spawn(move || {
+            install_log(&format!(
+                "[{}] START lang_id={lang_id}\nCMD: {install_cmd}\nPATH: {}",
+                timestamp(),
+                std::env::var("PATH").unwrap_or_else(|_| "(unset)".into()),
+            ));
+
             // Run via shell so npm/pip/dotnet etc. resolve from user PATH
             #[cfg(target_os = "windows")]
             let result = std::process::Command::new("cmd")
@@ -299,13 +376,20 @@ impl LspManager {
             match result {
                 Ok(out) => {
                     let success = out.status.success();
+                    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+                    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+                    install_log(&format!(
+                        "[{}] DONE lang_id={lang_id} status={} \nSTDOUT:\n{}\nSTDERR:\n{}",
+                        timestamp(),
+                        out.status,
+                        stdout.trim(),
+                        stderr.trim(),
+                    ));
                     let output = if success {
-                        String::from_utf8_lossy(&out.stdout).into_owned()
+                        stdout
                     } else {
                         // Combine stderr + stdout: some tools (e.g. unzip) write
                         // errors to stdout rather than stderr.
-                        let stderr = String::from_utf8_lossy(&out.stderr);
-                        let stdout = String::from_utf8_lossy(&out.stdout);
                         let combined = format!("{}\n{}", stderr.trim(), stdout.trim());
                         let combined = combined.trim().to_string();
                         if combined.is_empty() {
@@ -322,6 +406,10 @@ impl LspManager {
                     });
                 }
                 Err(e) => {
+                    install_log(&format!(
+                        "[{}] ERROR lang_id={lang_id} failed to spawn: {e}",
+                        timestamp()
+                    ));
                     let _ = tx.send(LspEvent::InstallComplete {
                         lang_id,
                         success: false,
@@ -569,13 +657,20 @@ impl LspManager {
             self.initialized.remove(&id);
         }
 
-        // Find config and restart, using the resolved full binary path.
-        let mut config = self
-            .registry
-            .iter()
-            .find(|c| c.languages.iter().any(|l| l == language_id))?
-            .clone();
-        let resolved = resolve_command(&config.command)?;
+        // Find config and restart: manifest first, then registry.
+        let mut candidates: Vec<LspServerConfig> = Vec::new();
+        if let Some((_, manifest)) = extensions::find_for_language_id(language_id) {
+            candidates.extend(server_configs_from_manifest(&manifest, language_id));
+        }
+        candidates.extend(
+            self.registry
+                .iter()
+                .filter(|c| c.languages.iter().any(|l| l == language_id))
+                .cloned(),
+        );
+        let (mut config, resolved) = candidates
+            .into_iter()
+            .find_map(|c| resolve_command(&c.command).map(|p| (c, p)))?;
         config.command = resolved.to_string_lossy().into_owned();
         let new_id = self.servers.len();
         match LspServer::start(new_id, &config, &self.root_path, self.event_tx.clone()) {
@@ -630,14 +725,19 @@ impl LspManager {
     }
 }
 
-/// Diagnostic helper: try to resolve binaries for all servers matching `lang_id`
-/// from the default registry, and report which were found or not found.
+/// Diagnostic helper: try to resolve binaries for all servers matching `lang_id`.
+/// Checks extension manifests first, then the default registry.
 pub fn debug_resolve(lang_id: &str) -> String {
+    let mut candidates: Vec<LspServerConfig> = Vec::new();
+    if let Some((_, manifest)) = extensions::find_for_language_id(lang_id) {
+        candidates.extend(server_configs_from_manifest(&manifest, lang_id));
+    }
     let registry = default_server_registry();
-    let candidates: Vec<_> = registry
-        .iter()
-        .filter(|c| c.languages.iter().any(|l| l == lang_id))
-        .collect();
+    candidates.extend(
+        registry
+            .into_iter()
+            .filter(|c| c.languages.iter().any(|l| l == lang_id)),
+    );
     if candidates.is_empty() {
         return format!("LspDebug: no registry entries for '{lang_id}'");
     }
