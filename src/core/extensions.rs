@@ -19,6 +19,8 @@ pub struct BundledExtension {
     pub manifest_toml: &'static str,
     /// Lua scripts bundled with the extension: `(filename, source)`.
     pub scripts: &'static [(&'static str, &'static str)],
+    /// README markdown bundled with the extension.
+    pub readme: &'static str,
 }
 
 /// All extensions compiled into the binary.
@@ -27,51 +29,61 @@ pub static BUNDLED: &[BundledExtension] = &[
         name: "csharp",
         manifest_toml: include_str!("../../extensions/csharp/manifest.toml"),
         scripts: &[],
+        readme: include_str!("../../extensions/csharp/README.md"),
     },
     BundledExtension {
         name: "python",
         manifest_toml: include_str!("../../extensions/python/manifest.toml"),
         scripts: &[],
+        readme: include_str!("../../extensions/python/README.md"),
     },
     BundledExtension {
         name: "rust",
         manifest_toml: include_str!("../../extensions/rust/manifest.toml"),
         scripts: &[],
+        readme: include_str!("../../extensions/rust/README.md"),
     },
     BundledExtension {
         name: "javascript",
         manifest_toml: include_str!("../../extensions/javascript/manifest.toml"),
         scripts: &[],
+        readme: include_str!("../../extensions/javascript/README.md"),
     },
     BundledExtension {
         name: "go",
         manifest_toml: include_str!("../../extensions/go/manifest.toml"),
         scripts: &[],
+        readme: include_str!("../../extensions/go/README.md"),
     },
     BundledExtension {
         name: "java",
         manifest_toml: include_str!("../../extensions/java/manifest.toml"),
         scripts: &[],
+        readme: include_str!("../../extensions/java/README.md"),
     },
     BundledExtension {
         name: "cpp",
         manifest_toml: include_str!("../../extensions/cpp/manifest.toml"),
         scripts: &[],
+        readme: include_str!("../../extensions/cpp/README.md"),
     },
     BundledExtension {
         name: "php",
         manifest_toml: include_str!("../../extensions/php/manifest.toml"),
         scripts: &[],
+        readme: include_str!("../../extensions/php/README.md"),
     },
     BundledExtension {
         name: "ruby",
         manifest_toml: include_str!("../../extensions/ruby/manifest.toml"),
         scripts: &[],
+        readme: include_str!("../../extensions/ruby/README.md"),
     },
     BundledExtension {
         name: "bash",
         manifest_toml: include_str!("../../extensions/bash/manifest.toml"),
         scripts: &[],
+        readme: include_str!("../../extensions/bash/README.md"),
     },
     BundledExtension {
         name: "git-insights",
@@ -80,6 +92,7 @@ pub static BUNDLED: &[BundledExtension] = &[
             "blame.lua",
             include_str!("../../extensions/git-insights/blame.lua"),
         )],
+        readme: include_str!("../../extensions/git-insights/README.md"),
     },
 ];
 

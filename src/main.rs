@@ -115,6 +115,8 @@ struct App {
     mouse_pos_cell: Rc<Cell<(f64, f64)>>,
     /// Shared with draw closure: hovered state for Cairo h scrollbars.
     h_sb_hovered_cell: Rc<Cell<bool>>,
+    /// Shared with draw closure: which tab close button (×) is hovered: (group_id.0, tab_idx).
+    tab_close_hover_cell: Rc<Cell<Option<(usize, usize)>>>,
     /// Shared with draw closure: which window (if any) has an active h scrollbar drag.
     h_sb_drag_cell: Rc<Cell<Option<core::WindowId>>>,
     #[allow(dead_code)] // Kept alive to continue monitoring settings.json
@@ -144,6 +146,8 @@ struct App {
     h_sb_dragging: Option<HScrollDragState>,
     /// True while the mouse cursor is over any horizontal scrollbar track.
     h_sb_hovered: bool,
+    /// Which tab close button (×) the mouse is over: (group_id.0, tab_idx).
+    tab_close_hover: Option<(usize, usize)>,
     /// True while the user is dragging the terminal panel's scrollbar thumb.
     terminal_sb_dragging: bool,
     /// True while the user drags the terminal header row to resize the panel.
@@ -1686,6 +1690,7 @@ impl SimpleComponent for App {
         let mouse_pos_cell: Rc<Cell<(f64, f64)>> = Rc::new(Cell::new((-1.0, -1.0)));
         // Shared state for Cairo h scrollbar hover/drag — read by set_draw_func closure.
         let h_sb_hovered_cell: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let tab_close_hover_cell: Rc<Cell<Option<(usize, usize)>>> = Rc::new(Cell::new(None));
         let h_sb_drag_cell: Rc<Cell<Option<core::WindowId>>> = Rc::new(Cell::new(None));
         let sidebar_inner_box_ref: Rc<RefCell<Option<gtk4::Box>>> = Rc::new(RefCell::new(None));
         let sidebar_revealer_ref: Rc<RefCell<Option<gtk4::Revealer>>> = Rc::new(RefCell::new(None));
@@ -1760,6 +1765,7 @@ impl SimpleComponent for App {
             draw_needed: Rc::new(Cell::new(false)),
             mouse_pos_cell: mouse_pos_cell.clone(),
             h_sb_hovered_cell: h_sb_hovered_cell.clone(),
+            tab_close_hover_cell: tab_close_hover_cell.clone(),
             h_sb_drag_cell: h_sb_drag_cell.clone(),
             settings_monitor,
             sender: sender.input_sender().clone(),
@@ -1786,6 +1792,7 @@ impl SimpleComponent for App {
             clipboard,
             h_sb_dragging: None,
             h_sb_hovered: false,
+            tab_close_hover: None,
             terminal_sb_dragging: false,
             terminal_resize_dragging: false,
             terminal_split_dragging: false,
@@ -2161,7 +2168,8 @@ impl SimpleComponent for App {
                         / pango::SCALE as f64;
                     let char_width =
                         font_metrics.approximate_char_width() as f64 / pango::SCALE as f64;
-                    let screen = build_screen_layout(&engine, &theme, &[], line_height, char_width);
+                    let screen =
+                        build_screen_layout(&engine, &theme, &[], line_height, char_width, false);
                     let w = da.width() as f64;
                     let h = da.height() as f64;
                     draw_debug_sidebar(cr, &layout, &screen, &theme, 0.0, 0.0, w, h, line_height);
@@ -2220,7 +2228,8 @@ impl SimpleComponent for App {
                 let line_height =
                     (font_metrics.ascent() + font_metrics.descent()) as f64 / pango::SCALE as f64;
                 let char_width = font_metrics.approximate_char_width() as f64 / pango::SCALE as f64;
-                let screen = build_screen_layout(&engine, &theme, &[], line_height, char_width);
+                let screen =
+                    build_screen_layout(&engine, &theme, &[], line_height, char_width, false);
                 let w = da.width() as f64;
                 let h = da.height() as f64;
                 draw_source_control_panel(
@@ -2273,7 +2282,8 @@ impl SimpleComponent for App {
                 let line_height =
                     (font_metrics.ascent() + font_metrics.descent()) as f64 / pango::SCALE as f64;
                 let char_width = font_metrics.approximate_char_width() as f64 / pango::SCALE as f64;
-                let screen = build_screen_layout(&engine, &theme, &[], line_height, char_width);
+                let screen =
+                    build_screen_layout(&engine, &theme, &[], line_height, char_width, false);
                 let w = da.width() as f64;
                 let h = da.height() as f64;
                 draw_ext_sidebar(cr, &layout, &screen, &theme, 0.0, 0.0, w, h, line_height);
@@ -2318,7 +2328,8 @@ impl SimpleComponent for App {
                 let line_height =
                     (font_metrics.ascent() + font_metrics.descent()) as f64 / pango::SCALE as f64;
                 let char_width = font_metrics.approximate_char_width() as f64 / pango::SCALE as f64;
-                let screen = build_screen_layout(&engine, &theme, &[], line_height, char_width);
+                let screen =
+                    build_screen_layout(&engine, &theme, &[], line_height, char_width, false);
                 let w = da.width() as f64;
                 let h = da.height() as f64;
                 draw_ai_sidebar(cr, &layout, &screen, &theme, 0.0, 0.0, w, h, line_height);
@@ -2818,6 +2829,7 @@ impl SimpleComponent for App {
         let engine_clone = engine.clone();
         let sender_for_draw = sender.input_sender().clone();
         let h_sb_hovered_for_draw = h_sb_hovered_cell.clone();
+        let tab_close_hover_for_draw = tab_close_hover_cell.clone();
         let h_sb_drag_for_draw = h_sb_drag_cell.clone();
         let last_metrics_for_draw = last_metrics_cell.clone();
         widgets
@@ -2831,6 +2843,7 @@ impl SimpleComponent for App {
                     height,
                     &sender_for_draw,
                     h_sb_hovered_for_draw.get(),
+                    tab_close_hover_for_draw.get(),
                     h_sb_drag_for_draw.get(),
                     &last_metrics_for_draw,
                 );
@@ -4055,7 +4068,18 @@ impl SimpleComponent for App {
                     let st = engine.view().scroll_top as isize;
                     let new_top = (st + scroll_amount).clamp(0, lines as isize) as usize;
                     engine.set_scroll_top(new_top);
-                    engine.ensure_cursor_visible();
+                    // Move cursor into viewport instead of snapping scroll back.
+                    let scrolloff = engine.settings.scrolloff;
+                    let vp = engine.view().viewport_lines.max(1);
+                    let cur = engine.view().cursor.line;
+                    if cur < new_top + scrolloff {
+                        engine.view_mut().cursor.line = (new_top + scrolloff).min(lines);
+                        engine.clamp_cursor_col();
+                    } else if cur >= new_top + vp.saturating_sub(scrolloff) {
+                        engine.view_mut().cursor.line =
+                            (new_top + vp.saturating_sub(scrolloff + 1)).min(lines);
+                        engine.clamp_cursor_col();
+                    }
                     engine.sync_scroll_binds();
                 }
                 if delta_x.abs() > 0.01 {
@@ -4313,6 +4337,20 @@ impl SimpleComponent for App {
                         if now_hovered != self.h_sb_hovered {
                             self.h_sb_hovered = now_hovered;
                             self.h_sb_hovered_cell.set(now_hovered);
+                            self.draw_needed.set(true);
+                        }
+
+                        // Tab close button hover detection.
+                        let engine = self.engine.borrow();
+                        let tab_hover = if mx >= 0.0 && lh > 0.0 {
+                            tab_close_hit_test(&engine, mx, my, da_w, da_h, lh, cw)
+                        } else {
+                            None
+                        };
+                        drop(engine);
+                        if tab_hover != self.tab_close_hover {
+                            self.tab_close_hover = tab_hover;
+                            self.tab_close_hover_cell.set(tab_hover);
                             self.draw_needed.set(true);
                         }
                     }
@@ -5896,6 +5934,7 @@ fn draw_editor(
     height: i32,
     sender: &relm4::Sender<Msg>,
     h_sb_hovered: bool,
+    tab_close_hover: Option<(usize, usize)>,
     h_sb_dragging_window: Option<core::WindowId>,
     last_metrics: &std::rc::Rc<std::cell::Cell<(f64, f64)>>,
 ) {
@@ -5971,7 +6010,14 @@ fn draw_editor(
         engine.calculate_group_window_rects(editor_bounds, tab_bar_height);
 
     // Build the platform-agnostic screen layout
-    let screen = build_screen_layout(engine, &theme, &window_rects, line_height, char_width);
+    let screen = build_screen_layout(
+        engine,
+        &theme,
+        &window_rects,
+        line_height,
+        char_width,
+        false,
+    );
 
     // 3b. Draw tab bar(s) — one per editor group
     if let Some(ref split) = screen.editor_group_split {
@@ -5985,6 +6031,13 @@ fn draw_editor(
             cr.rectangle(tab_x, tab_y, tab_w, line_height);
             cr.clip();
             cr.translate(tab_x, tab_y);
+            let hover_idx = tab_close_hover.and_then(|(gid, tidx)| {
+                if gid == gtb.group_id.0 {
+                    Some(tidx)
+                } else {
+                    None
+                }
+            });
             draw_tab_bar(
                 cr,
                 &layout,
@@ -5994,6 +6047,7 @@ fn draw_editor(
                 line_height,
                 0.0,
                 is_active,
+                hover_idx,
             );
             cr.restore().ok();
             // Active-group indicator: bright bottom border.
@@ -6026,6 +6080,7 @@ fn draw_editor(
         }
     } else {
         // Single group: draw tab bar at full width with split buttons.
+        let hover_idx = tab_close_hover.map(|(_gid, tidx)| tidx);
         draw_tab_bar(
             cr,
             &layout,
@@ -6035,6 +6090,7 @@ fn draw_editor(
             line_height,
             0.0,
             true,
+            hover_idx,
         );
     }
 
@@ -6334,6 +6390,67 @@ fn h_scrollbar_hit_test(
     None
 }
 
+/// Hit-test tab close buttons. Returns `Some((group_id.0, tab_idx))` if the
+/// mouse is over a tab's × button, matching the same geometry as the click handler.
+fn tab_close_hit_test(
+    engine: &Engine,
+    mx: f64,
+    my: f64,
+    da_w: f64,
+    da_h: f64,
+    line_height: f64,
+    char_width: f64,
+) -> Option<(usize, usize)> {
+    let tab_bar_height = line_height;
+    let status_bar_height = line_height * 2.0;
+    let editor_bottom = da_h - status_bar_height;
+    let content_bounds = core::WindowRect::new(0.0, 0.0, da_w, editor_bottom);
+    let group_rects = engine
+        .group_layout
+        .calculate_group_rects(content_bounds, tab_bar_height);
+
+    let close_w = char_width;
+    let tab_inner_gap = 4.0_f64;
+    let tab_outer_gap = 4.0_f64;
+    let close_pad = char_width;
+
+    for (gid, grect) in &group_rects {
+        let tab_y = grect.y - line_height;
+        if my < tab_y || my >= tab_y + line_height || mx < grect.x || mx >= grect.x + grect.width {
+            continue;
+        }
+        let local_x = mx - grect.x;
+        if let Some(group) = engine.editor_groups.get(gid) {
+            let mut tab_x = 0.0;
+            for (i, tab) in group.tabs.iter().enumerate() {
+                let wid = tab.active_window;
+                let name = if let Some(window) = engine.windows.get(&wid) {
+                    if let Some(state) = engine.buffer_manager.get(window.buffer_id) {
+                        let dirty = if state.dirty { "*" } else { "" };
+                        format!(" {}: {}{} ", i + 1, state.display_name(), dirty)
+                    } else {
+                        format!(" {}: [No Name] ", i + 1)
+                    }
+                } else {
+                    format!(" {}: [No Name] ", i + 1)
+                };
+                let tab_w = name.chars().count() as f64 * char_width;
+                let slot_w = tab_w + tab_inner_gap + close_w + tab_outer_gap;
+                if local_x >= tab_x && local_x < tab_x + slot_w {
+                    let close_x_start = tab_x + tab_w + tab_inner_gap - close_pad;
+                    let close_x_end = tab_x + slot_w;
+                    if local_x >= close_x_start && local_x < close_x_end {
+                        return Some((gid.0, i));
+                    }
+                    return None; // In this tab, but not on the close button.
+                }
+                tab_x += slot_w;
+            }
+        }
+    }
+    None
+}
+
 /// Draw thin Cairo horizontal scrollbars that overlay the bottom of each editor
 /// window (VSCode style). Only shown when content is wider than the viewport.
 /// `hovered` — mouse is over any scrollbar track (brightens the thumb).
@@ -6386,6 +6503,7 @@ fn draw_tab_bar(
     line_height: f64,
     y_offset: f64,
     show_split_btn: bool,
+    hovered_close_tab: Option<usize>,
 ) {
     // Tab bar background
     let (r, g, b) = theme.tab_bar_bg.to_cairo();
@@ -6423,7 +6541,7 @@ fn draw_tab_bar(
     let tab_outer_gap = 4.0; // space between tabs
 
     let mut x = 0.0;
-    for tab in tabs {
+    for (tab_idx, tab) in tabs.iter().enumerate() {
         // Use italic font for preview tabs
         if tab.preview {
             layout.set_font_description(Some(&italic_font));
@@ -6478,7 +6596,53 @@ fn draw_tab_bar(
         pangocairo::show_layout(cr, layout);
 
         // Close (×) button — dim on inactive, matches active fg on the active tab.
-        let (xr, xg, xb) = if tab.active {
+        let close_x = x + tab_w + tab_inner_gap;
+        let is_close_hovered = hovered_close_tab == Some(tab_idx);
+        if is_close_hovered {
+            // Draw a subtle rounded background behind the × on hover.
+            let pad = 2.0;
+            let rx = close_x - pad;
+            let ry = y_offset + pad;
+            let rw = close_w + pad * 2.0;
+            let rh = line_height - pad * 2.0;
+            let (hr, hg, hb) = theme.foreground.to_cairo();
+            cr.set_source_rgba(hr, hg, hb, 0.15);
+            let radius = 3.0;
+            cr.new_path();
+            cr.arc(
+                rx + rw - radius,
+                ry + radius,
+                radius,
+                -std::f64::consts::FRAC_PI_2,
+                0.0,
+            );
+            cr.arc(
+                rx + rw - radius,
+                ry + rh - radius,
+                radius,
+                0.0,
+                std::f64::consts::FRAC_PI_2,
+            );
+            cr.arc(
+                rx + radius,
+                ry + rh - radius,
+                radius,
+                std::f64::consts::FRAC_PI_2,
+                std::f64::consts::PI,
+            );
+            cr.arc(
+                rx + radius,
+                ry + radius,
+                radius,
+                std::f64::consts::PI,
+                3.0 * std::f64::consts::FRAC_PI_2,
+            );
+            cr.close_path();
+            cr.fill().ok();
+        }
+        let (xr, xg, xb) = if is_close_hovered {
+            theme.foreground.to_cairo()
+        } else if tab.active {
             theme.tab_inactive_fg.to_cairo()
         } else {
             theme.separator.to_cairo()
@@ -6486,7 +6650,7 @@ fn draw_tab_bar(
         cr.set_source_rgb(xr, xg, xb);
         layout.set_font_description(Some(&normal_font));
         layout.set_text("×");
-        cr.move_to(x + tab_w + tab_inner_gap, y_offset);
+        cr.move_to(close_x, y_offset);
         pangocairo::show_layout(cr, layout);
 
         x += slot_w;
@@ -6912,6 +7076,24 @@ fn build_pango_attrs(spans: &[StyledSpan]) -> AttrList {
             bg_attr.set_start_index(span.start_byte as u32);
             bg_attr.set_end_index(span.end_byte as u32);
             attrs.insert(bg_attr);
+        }
+        if span.style.bold {
+            let mut w = pango::AttrInt::new_weight(pango::Weight::Bold);
+            w.set_start_index(span.start_byte as u32);
+            w.set_end_index(span.end_byte as u32);
+            attrs.insert(w);
+        }
+        if span.style.italic {
+            let mut s = pango::AttrInt::new_style(pango::Style::Italic);
+            s.set_start_index(span.start_byte as u32);
+            s.set_end_index(span.end_byte as u32);
+            attrs.insert(s);
+        }
+        if (span.style.font_scale - 1.0).abs() > f64::EPSILON {
+            let mut sc = pango::AttrFloat::new_scale(span.style.font_scale);
+            sc.set_start_index(span.start_byte as u32);
+            sc.set_end_index(span.end_byte as u32);
+            attrs.insert(sc);
         }
     }
     attrs
@@ -9499,9 +9681,14 @@ fn pixel_to_click_target(
                 }
 
                 // Hit-test tabs.
+                // Use a wider close button hit zone (char_width + inner gap
+                // on each side) to compensate for the approximate tab-name
+                // width calculation that can drift from the Pango-measured
+                // widths used during drawing.
                 let close_w = char_width;
                 let tab_inner_gap = 4.0_f64;
                 let tab_outer_gap = 4.0_f64;
+                let close_pad = char_width; // extra padding on each side of ×
                 let mut tab_x = 0.0;
                 // Collect tab hit info from immutable borrow, then apply mutably.
                 let hit = engine.editor_groups.get(&group_id).and_then(|group| {
@@ -9520,9 +9707,10 @@ fn pixel_to_click_target(
                         let tab_w = name.chars().count() as f64 * char_width;
                         let slot_w = tab_w + tab_inner_gap + close_w + tab_outer_gap;
                         if local_x >= tab_x && local_x < tab_x + slot_w {
-                            let close_x_start = tab_x + tab_w + tab_inner_gap;
-                            let is_close =
-                                local_x >= close_x_start && local_x < close_x_start + close_w;
+                            // Widen the close-button hit zone to make it easier to click.
+                            let close_x_start = tab_x + tab_w + tab_inner_gap - close_pad;
+                            let close_x_end = tab_x + slot_w;
+                            let is_close = local_x >= close_x_start && local_x < close_x_end;
                             return Some((i, is_close));
                         }
                         tab_x += slot_w;

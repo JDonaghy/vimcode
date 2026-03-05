@@ -61,6 +61,7 @@ vt100 = "0.15"
 mlua = { version = "0.9", features = ["lua54", "vendored"] }
 toml = "0.8"
 libc = "0.2"
+pulldown-cmark = { version = "0.13", default-features = false }
 
 # Optimize dependencies in dev builds — GTK/Relm4/Cairo/Pango FFI calls and
 # Tree-sitter parsing are 10-50× slower without optimization, causing visible

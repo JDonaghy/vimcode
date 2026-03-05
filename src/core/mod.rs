@@ -9,6 +9,7 @@ pub mod extensions;
 pub mod git;
 pub mod lsp;
 pub mod lsp_manager;
+pub mod markdown;
 pub mod mode;
 pub mod plugin;
 pub mod project_search;

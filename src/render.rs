@@ -83,6 +83,12 @@ pub struct Style {
     pub fg: Color,
     /// Background override; `None` means the window background shows through.
     pub bg: Option<Color>,
+    /// Whether the text should be rendered in bold.
+    pub bold: bool,
+    /// Whether the text should be rendered in italic.
+    pub italic: bool,
+    /// Font scale factor (1.0 = normal). Used by GTK for markdown headings.
+    pub font_scale: f64,
 }
 
 /// A styled byte-range within a single line's text.
@@ -1674,6 +1680,13 @@ pub struct Theme {
 
     // DAP stopped-line highlight
     pub dap_stopped_bg: Color,
+
+    // Markdown preview colours
+    pub md_heading1: Color,
+    pub md_heading2: Color,
+    pub md_heading3: Color,
+    pub md_code: Color,
+    pub md_link: Color,
 }
 
 impl Theme {
@@ -1787,6 +1800,13 @@ impl Theme {
 
             // AI ghost text (inline completions) — slightly lighter than annotation
             ghost_text_fg: Color::from_hex("#4b5263"),
+
+            // Markdown preview
+            md_heading1: Color::from_hex("#e5c07b"), // gold
+            md_heading2: Color::from_hex("#61afef"), // blue
+            md_heading3: Color::from_hex("#c678dd"), // purple
+            md_code: Color::from_hex("#98c379"),     // green (string-like)
+            md_link: Color::from_hex("#61afef"),     // blue
         }
     }
 
@@ -1867,6 +1887,12 @@ impl Theme {
 
             annotation_fg: Color::from_hex("#928374"),
             ghost_text_fg: Color::from_hex("#7c6f64"),
+
+            md_heading1: Color::from_hex("#fabd2f"),
+            md_heading2: Color::from_hex("#83a598"),
+            md_heading3: Color::from_hex("#d3869b"),
+            md_code: Color::from_hex("#b8bb26"),
+            md_link: Color::from_hex("#83a598"),
         }
     }
 
@@ -1947,6 +1973,12 @@ impl Theme {
 
             annotation_fg: Color::from_hex("#565f89"),
             ghost_text_fg: Color::from_hex("#414868"),
+
+            md_heading1: Color::from_hex("#e0af68"),
+            md_heading2: Color::from_hex("#7aa2f7"),
+            md_heading3: Color::from_hex("#bb9af7"),
+            md_code: Color::from_hex("#9ece6a"),
+            md_link: Color::from_hex("#7aa2f7"),
         }
     }
 
@@ -2027,6 +2059,12 @@ impl Theme {
 
             annotation_fg: Color::from_hex("#586e75"),
             ghost_text_fg: Color::from_hex("#4a5e68"),
+
+            md_heading1: Color::from_hex("#b58900"),
+            md_heading2: Color::from_hex("#268bd2"),
+            md_heading3: Color::from_hex("#6c71c4"),
+            md_code: Color::from_hex("#859900"),
+            md_link: Color::from_hex("#268bd2"),
         }
     }
 
@@ -2079,6 +2117,7 @@ pub fn build_screen_layout(
     window_rects: &[(WindowId, WindowRect)],
     line_height: f64,
     char_width: f64,
+    color_headings: bool,
 ) -> ScreenLayout {
     let active_window_id = engine.active_window_id();
     let multi_window = engine.windows.len() > 1;
@@ -2099,6 +2138,7 @@ pub fn build_screen_layout(
                 char_width,
                 is_active,
                 multi_window,
+                color_headings,
             )
         })
         .collect();
@@ -3171,6 +3211,7 @@ fn build_rendered_window(
     char_width: f64,
     is_active: bool,
     multi_window: bool,
+    color_headings: bool,
 ) -> RenderedWindow {
     let empty = |id: WindowId| RenderedWindow {
         window_id: id,
@@ -3260,14 +3301,16 @@ fn build_rendered_window(
     // Stopped-line path for per-line comparison (try canonical, then raw).
     let dap_stop_path = engine.dap_current_line.as_ref().map(|(p, _)| p.as_str());
 
+    // Markdown preview buffers never show line numbers.
+    let line_number_mode = if buffer_state.md_rendered.is_some() {
+        LineNumberMode::None
+    } else {
+        engine.settings.line_numbers
+    };
+
     // Gutter width in character columns (always includes fold indicator column).
-    let gutter_char_width = calculate_gutter_cols(
-        engine.settings.line_numbers,
-        total_lines,
-        char_width,
-        has_git,
-        has_bp,
-    );
+    let gutter_char_width =
+        calculate_gutter_cols(line_number_mode, total_lines, char_width, has_git, has_bp);
 
     // Compute the accurate content width (in character columns) directly from the
     // precise pixel rect and measured char_width.  This avoids the approximate
@@ -3338,16 +3381,24 @@ fn build_rendered_window(
         let line_start_byte = buffer.content.line_to_byte(line_idx);
         let line_end_byte = line_start_byte + line.len_bytes();
 
-        let spans = build_spans(
-            engine,
-            theme,
-            visible_hl,
-            buffer,
-            line_idx,
-            &line_str,
-            line_start_byte,
-            line_end_byte,
-        );
+        let spans = if let Some(ref md) = buffer_state.md_rendered {
+            if line_idx < md.spans.len() {
+                md_spans_to_styled(&md.spans[line_idx], theme, color_headings)
+            } else {
+                vec![]
+            }
+        } else {
+            build_spans(
+                engine,
+                theme,
+                visible_hl,
+                buffer,
+                line_idx,
+                &line_str,
+                line_start_byte,
+                line_end_byte,
+            )
+        };
 
         // Git diff status for this line.
         let git_status = if has_git {
@@ -3380,7 +3431,7 @@ fn build_rendered_window(
         // numeric portion so line numbers fill their allotted width correctly.
         let marker_cols = if has_bp { 1 } else { 0 } + if has_git { 1 } else { 0 };
         let base_gutter = format_gutter_with_fold(
-            engine.settings.line_numbers,
+            line_number_mode,
             line_idx,
             cursor_line,
             gutter_char_width.saturating_sub(marker_cols),
@@ -3708,6 +3759,67 @@ fn build_rendered_window(
     }
 }
 
+/// Convert markdown style spans into rendering `StyledSpan`s.
+fn md_spans_to_styled(
+    md_spans: &[crate::core::markdown::MdSpan],
+    theme: &Theme,
+    color_headings: bool,
+) -> Vec<StyledSpan> {
+    use crate::core::markdown::MdStyle;
+    md_spans
+        .iter()
+        .map(|s| {
+            let (fg, bold, italic, font_scale) = match s.style {
+                MdStyle::Heading(1) => {
+                    let c = if color_headings {
+                        theme.md_heading1
+                    } else {
+                        theme.foreground
+                    };
+                    (c, true, false, 1.4)
+                }
+                MdStyle::Heading(2) => {
+                    let c = if color_headings {
+                        theme.md_heading2
+                    } else {
+                        theme.foreground
+                    };
+                    (c, true, false, 1.2)
+                }
+                MdStyle::Heading(_) => {
+                    let c = if color_headings {
+                        theme.md_heading3
+                    } else {
+                        theme.foreground
+                    };
+                    (c, true, false, 1.1)
+                }
+                MdStyle::Bold => (theme.foreground, true, false, 1.0),
+                MdStyle::Italic => (theme.foreground, false, true, 1.0),
+                MdStyle::BoldItalic => (theme.foreground, true, true, 1.0),
+                MdStyle::Code | MdStyle::CodeBlock => (theme.md_code, false, false, 1.0),
+                MdStyle::Link => (theme.md_link, false, false, 1.0),
+                MdStyle::LinkUrl => (theme.md_link, false, true, 1.0),
+                MdStyle::BlockQuote => (theme.md_heading3, false, true, 1.0),
+                MdStyle::ListBullet => (theme.md_heading1, true, false, 1.0),
+                MdStyle::HorizontalRule => (theme.annotation_fg, false, false, 1.0),
+                MdStyle::Image => (theme.md_link, false, true, 1.0),
+            };
+            StyledSpan {
+                start_byte: s.start_byte,
+                end_byte: s.end_byte,
+                style: Style {
+                    fg,
+                    bg: None,
+                    bold,
+                    italic,
+                    font_scale,
+                },
+            }
+        })
+        .collect()
+}
+
 /// Build styled spans for one line: syntax highlights + search matches.
 #[allow(clippy::too_many_arguments)]
 fn build_spans(
@@ -3740,6 +3852,9 @@ fn build_spans(
             style: Style {
                 fg: color,
                 bg: None,
+                bold: false,
+                italic: false,
+                font_scale: 1.0,
             },
         });
     }
@@ -3780,6 +3895,9 @@ fn build_spans(
                 style: Style {
                     fg: theme.search_match_fg,
                     bg: Some(bg),
+                    bold: false,
+                    italic: false,
+                    font_scale: 1.0,
                 },
             });
         }

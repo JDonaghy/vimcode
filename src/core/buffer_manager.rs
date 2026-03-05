@@ -80,6 +80,10 @@ pub struct BufferState {
     /// Cached maximum line length (in chars) across the whole buffer.
     /// Recomputed in `update_syntax` so renders don't need to scan every line.
     pub max_col: usize,
+    /// Whether this buffer is read-only (e.g. markdown preview).
+    pub read_only: bool,
+    /// Pre-rendered markdown content (set for markdown preview buffers).
+    pub md_rendered: Option<crate::core::markdown::MdRendered>,
 }
 
 impl std::fmt::Debug for BufferState {
@@ -113,6 +117,8 @@ impl BufferState {
             git_diff: Vec::new(),
             lsp_language_id: None,
             max_col: 0,
+            read_only: false,
+            md_rendered: None,
         };
         state.update_syntax();
         state
@@ -140,6 +146,8 @@ impl BufferState {
             git_diff: Vec::new(),
             lsp_language_id,
             max_col: 0,
+            read_only: false,
+            md_rendered: None,
         };
         state.update_syntax();
         state

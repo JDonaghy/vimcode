@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Mar 5, 2026 (Session 124 — Generic async plugin shell execution) | **Tests:** 1260
+**Last updated:** Mar 5, 2026 (Session 126 — Markdown preview polish) | **Tests:** 1289
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 117b are in **SESSION_HISTORY.md**.
@@ -25,6 +25,33 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 126 — Markdown preview polish (3 new tests, 1289 total):**
+Follow-up fixes and enhancements to the markdown preview feature:
+- **Undo/redo refresh**: `refresh_md_previews()` called after all 6 undo/redo call sites (normal `u`, Ctrl-R, menu/palette undo/redo, VSCode Ctrl-Z/Y). Previously undo/redo didn't update the live preview.
+- **Extension README opens in own tab**: New `open_markdown_preview_in_tab()` method follows `open_file_in_tab()` pattern. Extension sidebar Enter/install now opens READMEs in a new tab instead of a vsplit.
+- **Scroll sync**: `open_markdown_preview_linked()` registers `scroll_bind_pairs` so source and preview scroll together. Proportional mapping in `sync_scroll_binds()` handles preview being shorter than source.
+- **GTK heading font scale**: `font_scale: f64` added to `Style` struct. H1=1.4x, H2=1.2x, H3=1.1x applied via `pango::AttrFloat::new_scale()`. TUI uses heading colors instead (no font scaling support).
+- **No line numbers in preview**: `line_number_mode` overridden to `None` when `md_rendered.is_some()`.
+- **color_headings parameter**: Threaded through `build_screen_layout()` → `md_spans_to_styled()`. GTK=false (scale suffices), TUI=true (colors substitute for scale).
+- **Tab close button hover**: `tab_close_hover` tracking in GTK; subtle rounded-rect background (15% alpha) + brightened × on hover.
+- **Tab close hit area widened**: Close button padding extended for easier clicking.
+- **Free mouse scroll**: GTK MouseScroll handler clamps cursor into viewport instead of snapping back via `ensure_cursor_visible()`.
+- **`src/core/engine.rs`**: `open_markdown_preview_in_tab()`, proportional `sync_scroll_binds()`, `scroll_bind_pairs` made pub, `clamp_cursor_col` made pub.
+- **`src/render.rs`**: `font_scale` on `Style`, `color_headings` param, line number override for md.
+- **`src/main.rs`**: `build_pango_attrs()` font_scale, tab hover tracking + rendering, scroll cursor clamping, close hit area widening.
+- **`tests/markdown_preview.rs`**: 3 new tests (undo refresh, redo refresh, scroll bind registration). 14 total.
+
+**Session 125 — Markdown preview (26 new tests, 1286 total):**
+Added `:MarkdownPreview` / `:MdPreview` command: parses `.md` files with `pulldown-cmark` and opens a styled read-only preview in a vertical split. Live preview updates on source edits. Extension READMEs open on Enter in the Extensions sidebar and after install. Bold/italic rendering support added to both GTK (Pango attrs) and TUI (ratatui modifiers).
+- **`src/core/markdown.rs`** (new, ~497 lines): `MdStyle`/`MdSpan`/`MdRendered` types; `render_markdown()` converts CommonMark to styled plain text. 15 unit tests.
+- **`src/core/buffer_manager.rs`**: Added `read_only: bool` and `md_rendered: Option<MdRendered>` to `BufferState`.
+- **`src/render.rs`**: Added `bold`/`italic` to `Style`; 5 `md_*` theme colors (all 4 themes); `md_spans_to_styled()` function; wired into `build_rendered_window()`.
+- **`src/core/engine.rs`**: `md_preview_links` field; `open_markdown_preview()`/`open_markdown_preview_linked()`/`refresh_md_previews()` methods; read-only guard in `handle_normal_key()`; `:MarkdownPreview`/`:MdPreview` commands; live refresh in `handle_key()`; link cleanup in `close_tab()`; extension README opener in `handle_ext_sidebar_key()`.
+- **`src/core/extensions.rs`**: Added `readme: &'static str` to `BundledExtension`; all 11 extensions bundle their README.md.
+- **`src/main.rs`**: Bold/italic Pango attrs in `build_pango_attrs()`.
+- **`src/tui_main.rs`**: Bold/italic modifiers in `render_text_line()` via `set_cell_styled()`.
+- **`tests/markdown_preview.rs`** (new): 11 integration tests.
 
 **Session 124 — Generic async plugin shell execution (3 new tests, 1260 total):**
 Added `vimcode.async_shell(command, callback_event [, options])` Lua API that any plugin can use to run shell commands in background threads without blocking the UI. Results arrive as a plugin event on the next poll cycle. Last-writer-wins semantics: a new call with the same callback_event silently replaces any pending task.

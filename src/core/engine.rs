@@ -429,6 +429,12 @@ pub static PALETTE_COMMANDS: &[PaletteCommand] = &[
         vscode_shortcut: "",
         action: "EditorGroupMoveTab",
     },
+    PaletteCommand {
+        label: "Markdown: Preview Side-by-Side",
+        shortcut: "",
+        vscode_shortcut: "",
+        action: "MarkdownPreview",
+    },
 ];
 
 /// How a file should be opened: as a temporary preview or permanent buffer.
@@ -693,7 +699,7 @@ pub struct Engine {
     // --- Scroll binding ---
     /// Pairs of windows whose scroll_top should stay in sync (e.g. :Gblame).
     /// Each pair is (primary_window_id, secondary_window_id).
-    scroll_bind_pairs: Vec<(WindowId, WindowId)>,
+    pub scroll_bind_pairs: Vec<(WindowId, WindowId)>,
 
     // --- Completion state ---
     /// Current completion candidates (populated on first Ctrl-N/P or auto-trigger).
@@ -1127,6 +1133,9 @@ pub struct Engine {
     /// repeated from the context (e.g. the `"` in `"PlayerObject":` when the
     /// buffer already ends with `"`).
     pub ai_completion_prefix_tail: String,
+
+    /// Maps preview buffer ID → source buffer ID for live markdown preview.
+    pub md_preview_links: HashMap<BufferId, BufferId>,
 }
 
 impl Engine {
@@ -1366,6 +1375,7 @@ impl Engine {
             ai_streaming: false,
             ai_rx: None,
             ai_scroll_top: 0,
+            md_preview_links: HashMap::new(),
         };
         // If vscode mode is configured, start in Insert mode (no Normal mode)
         if engine.is_vscode_mode() {
@@ -1798,6 +1808,116 @@ impl Engine {
             let diff = git::compute_file_diff(&path);
             if let Some(state) = self.buffer_manager.get_mut(buffer_id) {
                 state.git_diff = diff;
+            }
+        }
+    }
+
+    // ─── Markdown Preview ─────────────────────────────────────────────────
+
+    /// Open a read-only markdown preview buffer with the given content (vsplit).
+    /// Returns the preview buffer ID.
+    #[allow(dead_code)]
+    pub fn open_markdown_preview(&mut self, content: &str, title: &str) -> BufferId {
+        use crate::core::markdown::render_markdown;
+        let rendered = render_markdown(content);
+        let text = rendered.lines.join("\n");
+
+        let buf_id = self.buffer_manager.create();
+        if let Some(state) = self.buffer_manager.get_mut(buf_id) {
+            state.buffer.content = ropey::Rope::from_str(&text);
+            state.read_only = true;
+            state.md_rendered = Some(rendered);
+        }
+
+        // Open in vsplit, then redirect new window to the preview buffer.
+        self.split_window(super::window::SplitDirection::Vertical, None);
+        self.active_window_mut().buffer_id = buf_id;
+        self.message = format!("[Preview] {title}");
+        buf_id
+    }
+
+    /// Open a live-linked markdown preview of the active buffer (must be .md).
+    pub fn open_markdown_preview_linked(&mut self) {
+        use crate::core::markdown::render_markdown;
+        let source_id = self.active_buffer_id();
+        let source_win = self.active_window_id();
+        let content = self.buffer().to_string();
+        let title = self.active_buffer_state().display_name();
+
+        let rendered = render_markdown(&content);
+        let text = rendered.lines.join("\n");
+
+        let buf_id = self.buffer_manager.create();
+        if let Some(state) = self.buffer_manager.get_mut(buf_id) {
+            state.buffer.content = ropey::Rope::from_str(&text);
+            state.read_only = true;
+            state.md_rendered = Some(rendered);
+        }
+
+        self.split_window(super::window::SplitDirection::Vertical, None);
+        let preview_win = self.active_window_id();
+        self.active_window_mut().buffer_id = buf_id;
+        self.md_preview_links.insert(buf_id, source_id);
+        self.scroll_bind_pairs.push((source_win, preview_win));
+        self.message = format!("[Preview] {title}");
+    }
+
+    /// Open a markdown preview in a new tab (not a vsplit). Used for extension
+    /// READMEs and other standalone rendered markdown content.
+    pub fn open_markdown_preview_in_tab(&mut self, content: &str, title: &str) -> BufferId {
+        use crate::core::markdown::render_markdown;
+        let rendered = render_markdown(content);
+        let text = rendered.lines.join("\n");
+
+        let buf_id = self.buffer_manager.create();
+        if let Some(state) = self.buffer_manager.get_mut(buf_id) {
+            state.buffer.content = ropey::Rope::from_str(&text);
+            state.read_only = true;
+            state.md_rendered = Some(rendered);
+        }
+
+        // Open in a new tab (like open_file_in_tab).
+        let window_id = self.new_window_id();
+        let window = Window::new(window_id, buf_id);
+        self.windows.insert(window_id, window);
+
+        let tab_id = self.new_tab_id();
+        let tab = Tab::new(tab_id, window_id);
+        self.active_group_mut().tabs.push(tab);
+        self.active_group_mut().active_tab = self.active_group().tabs.len() - 1;
+
+        self.message = format!("[README] {title}");
+        buf_id
+    }
+
+    /// Refresh any live markdown preview linked to the active source buffer.
+    pub fn refresh_md_previews(&mut self) {
+        use crate::core::markdown::render_markdown;
+        let source_id = self.active_buffer_id();
+        let content = match self.buffer_manager.get(source_id) {
+            Some(s) => s.buffer.to_string(),
+            None => return,
+        };
+
+        // Collect preview buf IDs linked to this source.
+        let preview_ids: Vec<BufferId> = self
+            .md_preview_links
+            .iter()
+            .filter(|(_, &src)| src == source_id)
+            .map(|(&prev, _)| prev)
+            .collect();
+
+        if preview_ids.is_empty() {
+            return;
+        }
+
+        let rendered = render_markdown(&content);
+        let text = rendered.lines.join("\n");
+
+        for prev_id in preview_ids {
+            if let Some(state) = self.buffer_manager.get_mut(prev_id) {
+                state.buffer.content = ropey::Rope::from_str(&text);
+                state.md_rendered = Some(rendered.clone());
             }
         }
     }
@@ -2693,6 +2813,8 @@ impl Engine {
         for buf_id in closed_buffer_ids {
             if !still_referenced.contains(&buf_id) {
                 let _ = self.buffer_manager.delete(buf_id, true /* force */);
+                // Clean up markdown preview link.
+                self.md_preview_links.remove(&buf_id);
             }
         }
 
@@ -3410,7 +3532,7 @@ impl Engine {
         }
     }
 
-    fn clamp_cursor_col(&mut self) {
+    pub fn clamp_cursor_col(&mut self) {
         let line = self.view().cursor.line;
         let max_col = self.get_max_cursor_col(line);
         let view = self.view_mut();
@@ -3571,7 +3693,16 @@ impl Engine {
             return;
         }
         let active_id = self.active_window_id();
-        let active_scroll = self.active_window().view.scroll_top;
+        let active_win = &self.windows[&active_id];
+        let active_scroll = active_win.view.scroll_top;
+        let active_buf_id = active_win.buffer_id;
+        let active_lines = self
+            .buffer_manager
+            .get(active_buf_id)
+            .map(|s| s.buffer.len_lines())
+            .unwrap_or(1)
+            .max(1);
+
         let pairs = self.scroll_bind_pairs.clone();
         for (a, b) in pairs {
             let partner = if a == active_id {
@@ -3582,8 +3713,25 @@ impl Engine {
                 None
             };
             if let Some(pid) = partner {
+                let partner_buf_id = self.windows.get(&pid).map(|w| w.buffer_id);
+                let is_md_pair = partner_buf_id.is_some_and(|pb| {
+                    self.md_preview_links.contains_key(&pb)
+                        || self.md_preview_links.contains_key(&active_buf_id)
+                });
                 if let Some(w) = self.windows.get_mut(&pid) {
-                    w.view.scroll_top = active_scroll;
+                    if is_md_pair {
+                        // Proportional scroll: map source position to preview position.
+                        let partner_lines = partner_buf_id
+                            .and_then(|id| self.buffer_manager.get(id))
+                            .map(|s| s.buffer.len_lines())
+                            .unwrap_or(1)
+                            .max(1);
+                        let ratio = active_scroll as f64 / active_lines as f64;
+                        w.view.scroll_top = ((ratio * partner_lines as f64).round() as usize)
+                            .min(partner_lines.saturating_sub(1));
+                    } else {
+                        w.view.scroll_top = active_scroll;
+                    }
                 }
             }
         }
@@ -4026,6 +4174,8 @@ impl Engine {
             }
             // Mark buffer as needing an LSP didChange (debounced)
             self.lsp_dirty_buffers.insert(active_id, true);
+            // Live-refresh any linked markdown preview.
+            self.refresh_md_previews();
         }
 
         self.ensure_cursor_visible();
@@ -4159,6 +4309,18 @@ impl Engine {
         ctrl: bool,
         changed: &mut bool,
     ) -> EngineAction {
+        // Read-only guard: block keys that would enter Insert/Replace mode.
+        if self.active_buffer_state().read_only {
+            let blocked = matches!(
+                unicode,
+                Some('i' | 'a' | 'o' | 'O' | 'I' | 'A' | 's' | 'S' | 'c' | 'C' | 'R')
+            );
+            if blocked && self.pending_key.is_none() && self.pending_operator.is_none() {
+                self.message = "Buffer is read-only".to_string();
+                return EngineAction::None;
+            }
+        }
+
         // If leader mode is active, route all keypresses there first.
         if self.leader_partial.is_some() {
             return self.handle_leader_key(unicode);
@@ -4197,6 +4359,7 @@ impl Engine {
                 "r" => {
                     // Ctrl-R: Redo
                     self.redo();
+                    self.refresh_md_previews();
                     return EngineAction::None;
                 }
                 "f" => {
@@ -4910,6 +5073,7 @@ impl Engine {
             }
             Some('u') => {
                 self.undo();
+                self.refresh_md_previews();
             }
             Some('U') => {
                 *changed = self.undo_line();
@@ -8207,6 +8371,8 @@ impl Engine {
             "egc",
             "egf",
             "egmt",
+            "MarkdownPreview",
+            "MdPreview",
         ]
     }
 
@@ -10774,10 +10940,12 @@ impl Engine {
             }
             "undo" => {
                 self.undo();
+                self.refresh_md_previews();
                 EngineAction::None
             }
             "redo" => {
                 self.redo();
+                self.refresh_md_previews();
                 EngineAction::None
             }
             "find" => {
@@ -10864,6 +11032,20 @@ impl Engine {
             }
             "EditorGroupMoveTab" | "egmt" => {
                 self.move_tab_to_other_group();
+                EngineAction::None
+            }
+            // ── Markdown Preview ─────────────────────────────────────────────
+            "MarkdownPreview" | "MdPreview" => {
+                let is_md = self
+                    .file_path()
+                    .and_then(|p| p.extension())
+                    .map(|ext| ext == "md" || ext == "markdown")
+                    .unwrap_or(false);
+                if !is_md {
+                    self.message = "Not a markdown file".to_string();
+                    return EngineAction::Error;
+                }
+                self.open_markdown_preview_linked();
                 EngineAction::None
             }
             _ => {
@@ -14944,15 +15126,31 @@ impl Engine {
                 let installed = self.ext_installed_items();
                 let sel = self.ext_sidebar_selected;
                 if sel < installed.len() {
-                    // Already installed — show info
+                    // Already installed — open README in its own tab
                     let name = installed[sel].name.clone();
-                    self.message = format!("Extension '{name}' is installed. Use d to remove.");
+                    let readme = crate::core::extensions::BUNDLED
+                        .iter()
+                        .find(|b| b.name == name)
+                        .map(|b| b.readme);
+                    if let Some(content) = readme {
+                        self.open_markdown_preview_in_tab(content, &name);
+                    } else {
+                        self.message = format!("Extension '{name}' is installed. Use d to remove.");
+                    }
                 } else {
                     let available = self.ext_available_items();
                     let avail_idx = sel.saturating_sub(installed.len());
                     if avail_idx < available.len() {
                         let name = available[avail_idx].name.clone();
                         self.ext_install_from_registry(&name);
+                        // Open README after install in its own tab.
+                        let readme = crate::core::extensions::BUNDLED
+                            .iter()
+                            .find(|b| b.name == name)
+                            .map(|b| b.readme);
+                        if let Some(content) = readme {
+                            self.open_markdown_preview_in_tab(content, &name);
+                        }
                         // Move cursor to the newly installed item so the user can see
                         // it's installed and can press 'd' immediately if needed.
                         self.ext_sidebar_sections_expanded[0] = true;
@@ -17617,10 +17815,12 @@ impl Engine {
             }
             "undo" => {
                 self.undo();
+                self.refresh_md_previews();
                 EngineAction::None
             }
             "redo" => {
                 self.redo();
+                self.refresh_md_previews();
                 EngineAction::None
             }
             "substitute" => {
@@ -20462,10 +20662,12 @@ impl Engine {
                 "z" => {
                     self.vscode_clear_selection();
                     self.undo();
+                    self.refresh_md_previews();
                 }
                 "y" => {
                     self.vscode_clear_selection();
                     self.redo();
+                    self.refresh_md_previews();
                 }
                 "a" => {
                     self.vscode_select_all();

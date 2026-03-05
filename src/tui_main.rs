@@ -3960,7 +3960,7 @@ fn build_screen_for_tui(
             r.height
         );
     }
-    build_screen_layout(engine, theme, &window_rects, 1.0, 1.0)
+    build_screen_layout(engine, theme, &window_rects, 1.0, 1.0, true)
 }
 
 // ─── Frame rendering ──────────────────────────────────────────────────────────
@@ -6130,6 +6130,7 @@ fn render_text_line(
 
     let mut char_fgs: Vec<Color> = vec![theme.foreground; chars.len()];
     let mut char_bgs: Vec<Option<Color>> = vec![None; chars.len()];
+    let mut char_mods: Vec<Modifier> = vec![Modifier::empty(); chars.len()];
 
     for span in &line.spans {
         let start = byte_to_char_idx(raw, span.start_byte);
@@ -6137,6 +6138,14 @@ fn render_text_line(
         for i in start..end {
             char_fgs[i] = span.style.fg;
             char_bgs[i] = span.style.bg;
+            let mut m = Modifier::empty();
+            if span.style.bold {
+                m |= Modifier::BOLD;
+            }
+            if span.style.italic {
+                m |= Modifier::ITALIC;
+            }
+            char_mods[i] = m;
         }
     }
 
@@ -6147,7 +6156,11 @@ fn render_text_line(
         }
         let fg = rc(char_fgs[i]);
         let bg = char_bgs[i].map(rc).unwrap_or(window_bg);
-        set_cell(buf, x_start + col, y, chars[i], fg, bg);
+        if char_mods[i].is_empty() {
+            set_cell(buf, x_start + col, y, chars[i], fg, bg);
+        } else {
+            set_cell_styled(buf, x_start + col, y, chars[i], fg, bg, char_mods[i]);
+        }
     }
 
     // Inline annotation / virtual text (e.g. git blame)
@@ -7730,7 +7743,7 @@ fn render_source_control(
     let mod_fg = RColor::Rgb(220, 180, 80);
 
     // Build SC data from engine state via the render abstraction.
-    let screen = render::build_screen_layout(engine, theme, &[], 1.0, 1.0);
+    let screen = render::build_screen_layout(engine, theme, &[], 1.0, 1.0, true);
     let Some(ref sc) = screen.source_control else {
         return;
     };
@@ -8083,7 +8096,7 @@ fn render_ext_sidebar(
         return;
     }
 
-    let screen = render::build_screen_layout(engine, theme, &[], 1.0, 1.0);
+    let screen = render::build_screen_layout(engine, theme, &[], 1.0, 1.0, true);
     let Some(ref ext) = screen.ext_sidebar else {
         return;
     };
@@ -8257,7 +8270,7 @@ fn render_ai_sidebar(
         return;
     }
 
-    let screen = render::build_screen_layout(engine, theme, &[], 1.0, 1.0);
+    let screen = render::build_screen_layout(engine, theme, &[], 1.0, 1.0, true);
     let Some(ref ai) = screen.ai_panel else {
         return;
     };
@@ -8496,7 +8509,7 @@ fn render_debug_sidebar(
 
     // ── Sections with fixed-height allocation + per-section scrolling ──────
     // Build minimal screen layout to get debug_sidebar data
-    let screen = render::build_screen_layout(engine, theme, &[], 1.0, 1.0);
+    let screen = render::build_screen_layout(engine, theme, &[], 1.0, 1.0, true);
     let sidebar = &screen.debug_sidebar;
 
     let sections: [(

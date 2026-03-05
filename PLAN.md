@@ -2,6 +2,12 @@
 
 ## Recently Completed
 
+**Session 126 — Markdown preview polish (3 new tests, 1289 total):**
+Follow-up fixes: undo/redo now refreshes live preview; extension READMEs open in own tab (not vsplit); scroll sync via `scroll_bind_pairs` with proportional mapping; GTK heading font scale (H1=1.4x, H2=1.2x, H3=1.1x via Pango); no line numbers in preview; `color_headings` param (GTK=false/TUI=true); tab close button hover effect + widened hit area; free mouse scroll (cursor clamped, not snapped back). 14 markdown preview integration tests total.
+
+**Session 125 — Markdown preview (26 new tests, 1286 total):**
+Added `:MarkdownPreview`/`:MdPreview` for live side-by-side markdown preview using `pulldown-cmark`. Read-only preview buffers with styled text (headings, bold, italic, code, links, lists). Live refresh on source edits. Extension READMEs open via sidebar Enter/install. Bold/italic rendering in GTK (Pango) and TUI (ratatui). New `src/core/markdown.rs` module. 15 unit + 11 integration tests.
+
 **Session 124 — Generic async plugin shell execution (3 new tests, 1260 total):**
 Added `vimcode.async_shell(command, callback_event [, options])` Lua API for non-blocking shell execution from plugins. Spawns background threads via `std::process::Command`; results delivered as plugin events on next poll cycle. Last-writer-wins semantics per callback_event name. `plugin.rs`: `AsyncShellRequest` struct + Lua API registration. `engine.rs`: `async_shell_tasks` field, thread spawning in `apply_plugin_ctx()`, `poll_async_shells()` method. Both GTK and TUI backends poll in their event loops. `blame.lua` rewritten to use `async_shell` — git blame no longer blocks the UI.
 
