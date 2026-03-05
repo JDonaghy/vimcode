@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Mar 4, 2026 (Session 122 — Extension install UX + sidebar nav fixes) | **Tests:** 1257
+**Last updated:** Mar 5, 2026 (Session 124 — Generic async plugin shell execution) | **Tests:** 1260
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 117b are in **SESSION_HISTORY.md**.
@@ -25,6 +25,24 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 124 — Generic async plugin shell execution (3 new tests, 1260 total):**
+Added `vimcode.async_shell(command, callback_event [, options])` Lua API that any plugin can use to run shell commands in background threads without blocking the UI. Results arrive as a plugin event on the next poll cycle. Last-writer-wins semantics: a new call with the same callback_event silently replaces any pending task.
+- **`src/core/plugin.rs`**: New `AsyncShellRequest` struct (`command`, `callback_event`, `stdin`, `cwd`); added `async_shell_requests: Vec<AsyncShellRequest>` to `PluginCallContext`; registered `vimcode.async_shell()` in `setup_vimcode_api()` (parses command, event, optional options table with `stdin`/`cwd`). 3 new unit tests.
+- **`src/core/engine.rs`**: New `async_shell_tasks: HashMap<String, Receiver<(bool, String)>>` field; thread spawning in `apply_plugin_ctx()` (runs `sh -c <command>` with optional stdin pipe and cwd); new `poll_async_shells()` method (`try_recv` + fires completed results as plugin events via `plugin_event()`).
+- **`src/main.rs`**: Calls `poll_async_shells()` in GTK tick handler.
+- **`src/tui_main.rs`**: Calls `poll_async_shells()` in TUI event loop.
+- **`extensions/git-insights/blame.lua`**: Rewritten to use `vimcode.async_shell()` instead of synchronous `vimcode.git.blame_line()`. Blame output parsing and relative date computation now done in Lua. `cursor_move` handler fires `async_shell("git blame ...")` and the `blame_result` event handler parses porcelain output and annotates the line. UI no longer blocks on git blame subprocess.
+
+**Session 123 — Performance: cursor movement lag on large files + extension loading fix (no new tests, 1257 total):**
+Targeted performance fixes for sluggish arrow-key navigation in large files (10,000+ lines), plus critical extension loading fixes:
+- **Extension scripts gated on `installed` state**: `plugin_init()` now only loads extension scripts from dirs whose name is in `extension_state.installed`. Previously ALL subdirs of `~/.config/vimcode/extensions/` were loaded, so git-insights blame.lua ran even when not "installed" — spawning a synchronous `git blame` subprocess (10–500ms) on every cursor-line change. This was the primary cause of the lag.
+- **O(N) buf_lines skipped for cursor_move on clean buffers**: `make_plugin_ctx(skip_buf_lines)` avoids allocating a Vec of all buffer lines when the buffer is clean and the event is cursor_move.
+- **O(N) context build eliminated when no hooks**: `has_event_hooks(event)` on `PluginManager` lets `plugin_event()` bail before any context build when no extension has a hook registered.
+- **`:ExtDisable`/`:ExtEnable` now work**: Fixed to update `settings.disabled_plugins` and immediately reload the plugin manager.
+- **Synchronous git blame optimized for clean buffers**: `blame_line()` skips `--contents -` stdin pipe when `buf_dirty` is false.
+- **`canonicalize()` cached per buffer**: `canonical_path: Option<PathBuf>` on `BufferState`, set once at file open.
+- **Incremental tree-sitter parsing**: `last_tree: Option<Tree>` on `Syntax` for incremental re-parsing.
 
 **Session 122 — Extension install UX + sidebar navigation fixes (2 new tests, 1257 total):**
 Three related fixes for the extension sidebar panel:

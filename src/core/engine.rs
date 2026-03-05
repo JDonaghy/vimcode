@@ -1085,6 +1085,11 @@ pub struct Engine {
     /// Cleared when the active buffer changes.
     pub line_annotations: HashMap<usize, String>,
 
+    // --- Async shell tasks (plugin background commands) ---
+    /// Background shell tasks spawned by plugins via `vimcode.async_shell()`.
+    /// Keyed by callback_event name (last-writer-wins: new request replaces old).
+    async_shell_tasks: HashMap<String, std::sync::mpsc::Receiver<(bool, String)>>,
+
     // --- AI assistant panel ---
     /// Conversation history shown in the AI sidebar.
     pub ai_messages: Vec<AiMessage>,
@@ -1346,6 +1351,7 @@ impl Engine {
             ext_sidebar_sections_expanded: [true, true],
             ext_sidebar_input_active: false,
             line_annotations: HashMap::new(),
+            async_shell_tasks: HashMap::new(),
             ai_ghost_text: None,
             ai_ghost_alternatives: Vec::new(),
             ai_ghost_alt_idx: 0,
@@ -2221,6 +2227,7 @@ impl Engine {
         for id in self.buffer_manager.list() {
             if let Some(state) = self.buffer_manager.get_mut(id) {
                 if state.file_path.as_deref() == Some(old_path) {
+                    state.canonical_path = new_path.canonicalize().ok();
                     state.file_path = Some(new_path.clone());
                     self.refresh_git_diff(id);
                 }
@@ -2256,6 +2263,7 @@ impl Engine {
         for id in self.buffer_manager.list() {
             if let Some(state) = self.buffer_manager.get_mut(id) {
                 if state.file_path.as_deref() == Some(src) {
+                    state.canonical_path = final_dest.canonicalize().ok();
                     state.file_path = Some(final_dest.clone());
                     self.refresh_git_diff(id);
                 }
@@ -9207,6 +9215,9 @@ impl Engine {
                     mgr.load_plugins_dir(&plugins_dir, &self.settings.disabled_plugins);
                 }
                 // Load Lua scripts from each installed extension sub-directory.
+                // Only load extensions that are in extension_state.installed
+                // (or disabled_plugins for the skip check).  Extensions whose
+                // scripts exist on disk but are not marked installed are ignored.
                 if has_extensions {
                     if let Ok(entries) = std::fs::read_dir(&extensions_dir) {
                         let mut dirs: Vec<_> = entries
@@ -9222,6 +9233,13 @@ impl Engine {
                             if self.settings.disabled_plugins.contains(&ext_name) {
                                 continue;
                             }
+                            // Only load scripts for extensions the user has
+                            // explicitly installed.  Scripts on disk from a
+                            // previous install (or leftover extraction) should
+                            // not run unless the extension is installed.
+                            if !self.extension_state.installed.contains(&ext_name) {
+                                continue;
+                            }
                             mgr.load_plugins_dir(&ext_dir, &self.settings.disabled_plugins);
                         }
                     }
@@ -9235,25 +9253,34 @@ impl Engine {
     }
 
     /// Build a `PluginCallContext` from the current active buffer state.
-    fn make_plugin_ctx(&self) -> plugin::PluginCallContext {
+    /// When `skip_buf_lines` is true the expensive O(N) line-by-line
+    /// collection is omitted (used for cursor_move on clean buffers where
+    /// no plugin actually needs the line contents).
+    fn make_plugin_ctx(&self, skip_buf_lines: bool) -> plugin::PluginCallContext {
         let cwd = self.cwd.to_string_lossy().into_owned();
         let buf_state = self.buffer_manager.get(self.active_buffer_id());
         let buf_path_os = buf_state.as_ref().and_then(|s| s.file_path.clone());
         let buf_path = buf_path_os
             .as_ref()
             .map(|p| p.to_string_lossy().into_owned());
-        let buf_lines = buf_state
-            .map(|s| {
-                (0..s.buffer.len_lines())
-                    .map(|i| s.buffer.content.line(i).to_string())
-                    .collect()
-            })
-            .unwrap_or_default();
+        let buf_dirty = buf_state.as_ref().map(|s| s.dirty).unwrap_or(false);
+        let buf_lines = if skip_buf_lines {
+            Vec::new()
+        } else {
+            buf_state
+                .map(|s| {
+                    (0..s.buffer.len_lines())
+                        .map(|i| s.buffer.content.line(i).to_string())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
         let cursor = self.cursor();
         plugin::PluginCallContext {
             cwd,
             buf_path,
             buf_lines,
+            buf_dirty,
             cursor_line: cursor.line + 1,
             cursor_col: cursor.col + 1,
             cwd_path: Some(self.cwd.clone()),
@@ -9303,6 +9330,66 @@ impl Engine {
         for cmd in ctx.run_commands {
             let _ = self.execute_command(&cmd);
         }
+        // Spawn background threads for async shell requests.
+        for req in ctx.async_shell_requests {
+            let (tx, rx) = std::sync::mpsc::channel();
+            // Last-writer-wins: replace any pending task for the same callback event.
+            self.async_shell_tasks.insert(req.callback_event, rx);
+            std::thread::spawn(move || {
+                use std::process::{Command, Stdio};
+                let mut cmd = Command::new("sh");
+                cmd.arg("-c").arg(&req.command);
+                if let Some(ref cwd) = req.cwd {
+                    cmd.current_dir(cwd);
+                }
+                if req.stdin.is_some() {
+                    cmd.stdin(Stdio::piped());
+                }
+                cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+                let result = if let Some(ref input) = req.stdin {
+                    match cmd.spawn() {
+                        Ok(mut child) => {
+                            if let Some(ref mut stdin_pipe) = child.stdin.take() {
+                                use std::io::Write;
+                                let _ = stdin_pipe.write_all(input.as_bytes());
+                            }
+                            child.wait_with_output()
+                        }
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    cmd.output()
+                };
+                match result {
+                    Ok(out) => {
+                        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+                        let _ = tx.send((out.status.success(), stdout));
+                    }
+                    Err(_) => {
+                        let _ = tx.send((false, String::new()));
+                    }
+                }
+            });
+        }
+    }
+
+    /// Poll for completed async shell tasks spawned by plugins.
+    /// Returns `true` if any results were delivered (caller should redraw).
+    pub fn poll_async_shells(&mut self) -> bool {
+        let mut completed = Vec::new();
+        for (event, rx) in &self.async_shell_tasks {
+            if let Ok(result) = rx.try_recv() {
+                completed.push((event.clone(), result));
+            }
+        }
+        if completed.is_empty() {
+            return false;
+        }
+        for (event, (_success, output)) in &completed {
+            self.async_shell_tasks.remove(event.as_str());
+            self.plugin_event(event, output);
+        }
+        true
     }
 
     /// Fire an event hook (e.g. "save", "open") for all registered listeners.
@@ -9314,7 +9401,24 @@ impl Engine {
             Some(p) => p,
             None => return,
         };
-        let ctx = self.make_plugin_ctx();
+        // Skip the potentially O(N_lines) context construction if no hooks are
+        // registered for this event.  For cursor_move this avoids building
+        // Vec<String> of all buffer lines on every keystroke when no extension
+        // has registered a cursor_move listener.
+        if !pm.has_event_hooks(event) {
+            self.plugin_manager = Some(pm);
+            return;
+        }
+        // For cursor_move on clean buffers, skip the O(N) buf_lines build.
+        // blame_line() already skips --contents stdin when buf_dirty is false,
+        // so the lines would never be read.
+        let skip = event == "cursor_move"
+            && !self
+                .buffer_manager
+                .get(self.active_buffer_id())
+                .map(|s| s.dirty)
+                .unwrap_or(false);
+        let ctx = self.make_plugin_ctx(skip);
         let ctx = pm.call_event(event, arg, ctx);
         self.plugin_manager = Some(pm);
         self.apply_plugin_ctx(ctx);
@@ -9338,7 +9442,7 @@ impl Engine {
             Some(p) => p,
             None => return false,
         };
-        let ctx = self.make_plugin_ctx();
+        let ctx = self.make_plugin_ctx(false);
         let (found, ctx) = pm.call_command(name, args, ctx);
         self.plugin_manager = Some(pm);
         self.apply_plugin_ctx(ctx);
@@ -9354,7 +9458,7 @@ impl Engine {
             Some(p) => p,
             None => return false,
         };
-        let ctx = self.make_plugin_ctx();
+        let ctx = self.make_plugin_ctx(false);
         let (found, ctx) = pm.call_keymap(mode, key, ctx);
         self.plugin_manager = Some(pm);
         self.apply_plugin_ctx(ctx);
@@ -9883,6 +9987,14 @@ impl Engine {
                 }
                 self.extension_state.dismissed.retain(|n| n != name);
                 let _ = self.extension_state.save();
+                // Remove from disabled_plugins so plugin_init() will load its scripts.
+                self.settings
+                    .disabled_plugins
+                    .retain(|n| n.as_str() != name);
+                let _ = self.settings.save();
+                // Reload plugin manager so the extension's hooks become active immediately.
+                self.plugin_manager = None;
+                self.plugin_init();
                 self.message = format!("Extension '{name}' enabled");
                 return EngineAction::None;
             }
@@ -9895,6 +10007,19 @@ impl Engine {
                 }
                 self.extension_state.mark_dismissed(name);
                 let _ = self.extension_state.save();
+                // Add to disabled_plugins so plugin_init() skips loading its scripts.
+                if !self
+                    .settings
+                    .disabled_plugins
+                    .iter()
+                    .any(|n| n.as_str() == name)
+                {
+                    self.settings.disabled_plugins.push(name.to_string());
+                    let _ = self.settings.save();
+                }
+                // Reload plugin manager so the extension's hooks are unregistered immediately.
+                self.plugin_manager = None;
+                self.plugin_init();
                 self.message = format!("Extension '{name}' disabled");
                 return EngineAction::None;
             }

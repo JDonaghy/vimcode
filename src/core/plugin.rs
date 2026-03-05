@@ -12,6 +12,14 @@ use mlua::prelude::*;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+/// A request from Lua to run a shell command in a background thread.
+pub struct AsyncShellRequest {
+    pub command: String,
+    pub callback_event: String,
+    pub stdin: Option<String>,
+    pub cwd: Option<PathBuf>,
+}
+
 use super::git;
 
 // ─── Public types ─────────────────────────────────────────────────────────────
@@ -57,6 +65,10 @@ pub struct PluginCallContext {
     pub cwd_path: Option<PathBuf>,
     /// Filesystem path for the active buffer (for git operations).
     pub buf_path_os: Option<PathBuf>,
+    /// Whether the active buffer has unsaved changes.
+    /// When false, `vimcode.git.blame_line()` skips piping the in-memory
+    /// contents via `--contents -` and uses the faster committed-content path.
+    pub buf_dirty: bool,
     // ── Outputs written by callbacks ────────────────────────────────────────
     pub message: Option<String>,
     /// `(0-based line index, new text)` — applied by the engine after the call.
@@ -67,6 +79,8 @@ pub struct PluginCallContext {
     pub annotate_lines: Vec<(usize, String)>,
     /// When true, all existing line annotations are cleared first.
     pub clear_annotations: bool,
+    /// Requests to run shell commands in background threads.
+    pub async_shell_requests: Vec<AsyncShellRequest>,
 }
 
 // ─── Internal registration accumulator ───────────────────────────────────────
@@ -203,6 +217,15 @@ impl PluginManager {
         (true, ctx)
     }
 
+    /// Return true if at least one hook is registered for `event`.
+    /// Use this to skip expensive context construction when no hooks exist.
+    pub fn has_event_hooks(&self, event: &str) -> bool {
+        self.hooks
+            .get(event)
+            .map(|h| !h.is_empty())
+            .unwrap_or(false)
+    }
+
     /// Fire all hooks registered for `event`. Returns the updated context.
     pub fn call_event(&self, event: &str, arg: &str, ctx: PluginCallContext) -> PluginCallContext {
         let Some(hooks) = self.hooks.get(event) else {
@@ -323,6 +346,50 @@ impl PluginManager {
             lua.create_function(|lua, cmd: String| {
                 if let Some(mut ctx) = lua.app_data_mut::<PluginCallContext>() {
                     ctx.run_commands.push(cmd);
+                }
+                Ok(())
+            })?,
+        )?;
+
+        // vimcode.async_shell(command, callback_event [, options_table])
+        // options: { stdin = "...", cwd = "..." }
+        vimcode.set(
+            "async_shell",
+            lua.create_function(|lua, args: LuaMultiValue| {
+                let command: String = args
+                    .get(0)
+                    .and_then(|v| match v {
+                        LuaValue::String(s) => Some(s.to_str().ok()?.to_string()),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                let callback_event: String = args
+                    .get(1)
+                    .and_then(|v| match v {
+                        LuaValue::String(s) => Some(s.to_str().ok()?.to_string()),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                if command.is_empty() || callback_event.is_empty() {
+                    return Ok(());
+                }
+                let mut stdin = None;
+                let mut cwd = None;
+                if let Some(LuaValue::Table(opts)) = args.get(2) {
+                    if let Ok(s) = opts.get::<_, String>("stdin") {
+                        stdin = Some(s);
+                    }
+                    if let Ok(s) = opts.get::<_, String>("cwd") {
+                        cwd = Some(PathBuf::from(s));
+                    }
+                }
+                if let Some(mut ctx) = lua.app_data_mut::<PluginCallContext>() {
+                    ctx.async_shell_requests.push(AsyncShellRequest {
+                        command,
+                        callback_event,
+                        stdin,
+                        cwd,
+                    });
                 }
                 Ok(())
             })?,
@@ -454,14 +521,21 @@ impl PluginManager {
                 };
                 let repo_root = git::find_repo_root(cwd_path.as_deref().unwrap_or(&file))
                     .unwrap_or_else(|| file.parent().map(|p| p.to_path_buf()).unwrap_or_default());
-                // Join buffer lines so git blame sees the current in-memory
-                // content (catches unsaved new lines, which would otherwise
-                // read stale on-disk content and return wrong blame).
-                // buf_lines come from Ropey's line() which includes the
-                // trailing \n on each line, so join with "" not "\n".
-                let buf_content = {
+                // Only pipe in-memory content when the buffer has unsaved changes.
+                // For a clean buffer the committed content on disk is identical,
+                // so we skip the expensive `--contents -` path (which requires
+                // building a full-file String and spawning git with stdin).
+                // buf_lines come from Ropey's line() which includes the trailing
+                // \n on each line, so join with "" not "\n".
+                let buf_content: Option<String> = {
                     let ctx = lua.app_data_ref::<PluginCallContext>();
-                    ctx.map(|c| c.buf_lines.join(""))
+                    ctx.and_then(|c| {
+                        if c.buf_dirty {
+                            Some(c.buf_lines.join(""))
+                        } else {
+                            None
+                        }
+                    })
                 };
                 let info = match git::blame_line(&repo_root, &file, n, buf_content.as_deref()) {
                     Some(i) => i,
@@ -669,5 +743,93 @@ mod tests {
         let (found, ctx) = pm.call_command("BufInfo", "", ctx);
         assert!(found);
         assert_eq!(ctx.message.as_deref(), Some("lines=2 first=hello"));
+    }
+
+    #[test]
+    fn test_async_shell_request_registered() {
+        let dir = std::env::temp_dir().join("vc_plugin_test_async_shell");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_temp_plugin(
+            &dir,
+            "asynctest",
+            r#"
+            vimcode.command("RunAsync", function(_)
+                vimcode.async_shell("echo hello", "my_callback")
+            end)
+            "#,
+        );
+
+        let mut pm = PluginManager::new().unwrap();
+        pm.load_plugins_dir(&dir, &[]);
+
+        let ctx = PluginCallContext::default();
+        let (found, ctx) = pm.call_command("RunAsync", "", ctx);
+        assert!(found);
+        assert_eq!(ctx.async_shell_requests.len(), 1);
+        assert_eq!(ctx.async_shell_requests[0].command, "echo hello");
+        assert_eq!(ctx.async_shell_requests[0].callback_event, "my_callback");
+        assert!(ctx.async_shell_requests[0].stdin.is_none());
+        assert!(ctx.async_shell_requests[0].cwd.is_none());
+    }
+
+    #[test]
+    fn test_async_shell_with_options() {
+        let dir = std::env::temp_dir().join("vc_plugin_test_async_opts");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_temp_plugin(
+            &dir,
+            "asyncopts",
+            r#"
+            vimcode.command("RunAsyncOpts", function(_)
+                vimcode.async_shell("cat", "cat_result", { stdin = "hello world", cwd = "/tmp" })
+            end)
+            "#,
+        );
+
+        let mut pm = PluginManager::new().unwrap();
+        pm.load_plugins_dir(&dir, &[]);
+
+        let ctx = PluginCallContext::default();
+        let (found, ctx) = pm.call_command("RunAsyncOpts", "", ctx);
+        assert!(found);
+        assert_eq!(ctx.async_shell_requests.len(), 1);
+        assert_eq!(ctx.async_shell_requests[0].command, "cat");
+        assert_eq!(ctx.async_shell_requests[0].callback_event, "cat_result");
+        assert_eq!(
+            ctx.async_shell_requests[0].stdin.as_deref(),
+            Some("hello world")
+        );
+        assert_eq!(
+            ctx.async_shell_requests[0].cwd.as_deref(),
+            Some(std::path::Path::new("/tmp"))
+        );
+    }
+
+    #[test]
+    fn test_async_shell_empty_args_ignored() {
+        let dir = std::env::temp_dir().join("vc_plugin_test_async_empty");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_temp_plugin(
+            &dir,
+            "asyncempty",
+            r#"
+            vimcode.command("RunEmpty", function(_)
+                vimcode.async_shell("", "my_callback")
+                vimcode.async_shell("echo hi", "")
+            end)
+            "#,
+        );
+
+        let mut pm = PluginManager::new().unwrap();
+        pm.load_plugins_dir(&dir, &[]);
+
+        let ctx = PluginCallContext::default();
+        let (found, ctx) = pm.call_command("RunEmpty", "", ctx);
+        assert!(found);
+        // Both calls should be silently ignored (empty command or empty event).
+        assert_eq!(ctx.async_shell_requests.len(), 0);
     }
 }

@@ -11,7 +11,7 @@ There's a touch of irony here - using a cli tool to write the editor that I've w
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 1239 tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 1260 tests, zero async runtime dependency
 
 
 ## Download (Ubuntu)
@@ -528,6 +528,9 @@ vimcode.keymap("i", "<C-Space>", function() end)   -- insert mode
 vimcode.message(text)         -- show in status bar
 vimcode.cwd()                 -- current working directory string
 vimcode.command_run(cmd)      -- execute a VimCode : command
+vimcode.async_shell(cmd, event [, opts])  -- run shell command in background thread;
+                              -- result delivered as plugin event(event, stdout)
+                              -- opts: { stdin = "...", cwd = "..." }
 
 -- Buffer API (current active buffer)
 vimcode.buf.lines()              -- all lines as table
@@ -539,7 +542,7 @@ vimcode.buf.cursor()             -- {line, col} (1-indexed)
 vimcode.buf.annotate_line(n, s)  -- show virtual text after line n
 vimcode.buf.clear_annotations()  -- remove all virtual text
 
--- Git API (synchronous, <50ms subprocess calls)
+-- Git API (synchronous subprocess calls)
 vimcode.git.blame_line(n)        -- {hash,author,date,relative_date,message} or nil
 vimcode.git.log_file(limit)      -- [{hash,message}, ...] for current file
 ```
@@ -610,7 +613,7 @@ No C# Language Support extension — :ExtInstall csharp  (N to dismiss)
 | `:ExtDisable <name>` | Suppress install prompts for this extension |
 | `:ExtRefresh` | Fetch the latest extension list from the GitHub registry |
 
-**Git Insights extension** — when installed, shows inline blame annotations as dim virtual text at the end of the cursor's current line:
+**Git Insights extension** — when installed, shows inline blame annotations as dim virtual text at the end of the cursor's current line (runs `git blame` asynchronously via `vimcode.async_shell()` so the UI never blocks):
 
 ```
 42  let result = compute();   Alice • 3 days ago • fix off-by-one
@@ -1057,7 +1060,7 @@ src/
 ├── icons.rs            (~30 lines)  Nerd Font file-type icons (GTK + TUI)
 └── core/            (~29,500 lines)  Zero GTK/rendering deps — fully testable
     ├── engine.rs    (~29,797 lines)  Orchestrator: keys, commands, git, macros, LSP, DAP, plugins, workspaces
-    ├── plugin.rs       (~430 lines)  Lua 5.4 plugin manager (mlua vendored; vimcode.* API)
+    ├── plugin.rs       (~835 lines)  Lua 5.4 plugin manager (mlua vendored; vimcode.* API; async_shell)
     ├── terminal.rs     (~320 lines)  PTY-backed terminal pane (portable-pty + vt100, history ring buffer)
     ├── lsp.rs        (~2,045 lines)  LSP protocol transport + single-server client (request ID tracking, JSON-RPC framing)
     ├── lsp_manager.rs  (~671 lines)  Multi-server coordinator with initialization guards + built-in registry

@@ -4387,6 +4387,12 @@ impl SimpleComponent for App {
                         self.draw_needed.set(true);
                     }
                 }
+                // Poll for completed async shell tasks (plugin background commands).
+                {
+                    if self.engine.borrow_mut().poll_async_shells() {
+                        self.draw_needed.set(true);
+                    }
+                }
                 // Poll for completed AI response.
                 {
                     let mut engine = self.engine.borrow_mut();

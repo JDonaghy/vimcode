@@ -2,6 +2,17 @@
 
 ## Recently Completed
 
+**Session 124 — Generic async plugin shell execution (3 new tests, 1260 total):**
+Added `vimcode.async_shell(command, callback_event [, options])` Lua API for non-blocking shell execution from plugins. Spawns background threads via `std::process::Command`; results delivered as plugin events on next poll cycle. Last-writer-wins semantics per callback_event name. `plugin.rs`: `AsyncShellRequest` struct + Lua API registration. `engine.rs`: `async_shell_tasks` field, thread spawning in `apply_plugin_ctx()`, `poll_async_shells()` method. Both GTK and TUI backends poll in their event loops. `blame.lua` rewritten to use `async_shell` — git blame no longer blocks the UI.
+
+**Session 123 — Performance: cursor movement lag on large files + extension loading fix (no new tests, 1257 total):**
+Targeted performance fixes for sluggish arrow-key navigation in large files (10,000+ lines) in both GTK and TUI modes, plus critical fixes for extension loading:
+- **`src/core/engine.rs`**: `plugin_init()` now only loads extension scripts from dirs whose name is in `extension_state.installed` — previously it loaded ALL subdirs of `~/.config/vimcode/extensions/`, which meant extensions with scripts on disk (e.g. git-insights blame.lua) ran even when not "installed". This was the root cause: every cursor-line change spawned a synchronous `git blame` subprocess (10–500ms). `make_plugin_ctx(skip_buf_lines)` gains a parameter to skip the O(N) `buf_lines` allocation; `plugin_event()` passes `skip=true` for cursor_move on clean buffers (blame_line already skips `--contents` stdin when clean, so lines are never read). `:ExtDisable` adds to `settings.disabled_plugins` + reloads plugin manager. `:ExtEnable` removes from `disabled_plugins` + reloads.
+- **`src/core/plugin.rs`**: Added `buf_dirty: bool` to `PluginCallContext`. `blame_line()` skips `--contents -` for clean buffers. Added `has_event_hooks(event)` method; `plugin_event()` early-exits before context build when no hooks registered.
+- **`src/core/buffer_manager.rs`**: Added `canonical_path: Option<PathBuf>` to `BufferState`, computed once in `with_file()` via `path.canonicalize()`.
+- **`src/render.rs`**: `build_rendered_window()` uses `buffer_state.canonical_path` instead of calling `canonicalize()` on every render frame.
+- **`src/core/syntax.rs`**: Added `last_tree: Option<Tree>` to `Syntax`. `parse()` passes the previous tree for incremental tree-sitter re-parsing.
+
 **Session 122 — Extension install UX + sidebar navigation fixes (2 new tests, 1257 total):**
 Two sidebar navigation bugs fixed: (1) After Enter/`i` install, `ext_sidebar_selected` resets to the installed item position and the installed section is expanded; (2) After `d` deletes the last installed extension, the available section is expanded if the flat count drops to zero. `ext_install_from_registry()` rewritten with `binary_on_path()` PATH checks — idempotent, skips install if binary already on PATH, shows `✓` or "installing…" or ":DapInstall" hint in status. `manifest.dap.install = ""` prevents auto-download of complex adapters (codelldb). Install diagnostics written to `/tmp/vimcode-install.log` by `install_log()` / `timestamp()` helpers in `lsp_manager.rs`. 2 new regression tests in `tests/extensions.rs`.
 

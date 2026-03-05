@@ -3215,14 +3215,10 @@ fn build_rendered_window(
 
     // Look up LSP diagnostics for this buffer.
     // Diagnostics are keyed by absolute path (from LSP URIs), but buffer file_path
-    // may be relative, so canonicalize for the lookup.
-    let canonical_path = buffer_state
-        .file_path
-        .as_ref()
-        .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()));
-    let file_diagnostics = canonical_path
-        .as_ref()
-        .and_then(|p| engine.lsp_diagnostics.get(p));
+    // may be relative, so use the pre-computed canonical_path cached at file-open
+    // time rather than calling canonicalize() (a filesystem syscall) every frame.
+    let canonical_path = buffer_state.canonical_path.as_ref();
+    let file_diagnostics = canonical_path.and_then(|p| engine.lsp_diagnostics.get(p));
 
     // Pre-index diagnostics by start line in a single pass.
     // This gives O(1) per-line lookup during visible-line rendering AND builds the gutter
@@ -3374,7 +3370,6 @@ fn build_rendered_window(
                 *l == line_1based
                     && (dap_stop_path == Some(path.as_str())
                         || canonical_path
-                            .as_ref()
                             .map(|cp| cp.to_string_lossy().as_ref() == path.as_str())
                             .unwrap_or(false))
             })

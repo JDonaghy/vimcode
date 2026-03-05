@@ -1095,6 +1095,10 @@ fn event_loop(
             if engine.poll_ai() {
                 needs_redraw = true;
             }
+            // Poll for completed async shell tasks (plugin background commands).
+            if engine.poll_async_shells() {
+                needs_redraw = true;
+            }
             // Tick AI inline completion debounce counter each event-loop frame.
             if engine.tick_ai_completion() {
                 needs_redraw = true;

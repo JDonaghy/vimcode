@@ -51,6 +51,10 @@ pub struct BufferState {
     pub buffer: Buffer,
     /// Path to the file being edited, if any.
     pub file_path: Option<PathBuf>,
+    /// Canonicalized (symlink-resolved, absolute) version of `file_path`.
+    /// Computed once on file open and cached so renderers don't need to call
+    /// `canonicalize()` (a filesystem syscall) on every frame.
+    pub canonical_path: Option<PathBuf>,
     /// Whether the buffer has unsaved changes.
     pub dirty: bool,
     /// Whether this is a preview buffer (single-click in file explorer).
@@ -96,6 +100,7 @@ impl BufferState {
         let mut state = Self {
             buffer,
             file_path: None,
+            canonical_path: None,
             dirty: false,
             preview: false,
             source_file: None,
@@ -117,9 +122,11 @@ impl BufferState {
         // Try to detect language from file path, fallback to Rust
         let syntax = Syntax::new_from_path(path.to_str()).unwrap_or_default();
         let lsp_language_id = crate::core::lsp::language_id_from_path(&path);
+        let canonical_path = path.canonicalize().ok();
 
         let mut state = Self {
             buffer,
+            canonical_path,
             file_path: Some(path),
             dirty: false,
             preview: false,
