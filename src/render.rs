@@ -3308,10 +3308,14 @@ fn build_rendered_window(
         && engine.mode == crate::core::Mode::Insert
         && engine.settings.ai_completions
     {
-        engine
-            .ai_ghost_text
-            .as_deref()
-            .map(|g| g.split_once('\n').map_or(g, |(first, _)| first).to_string())
+        engine.ai_ghost_text.as_deref().map(|g| {
+            if let Some((first, rest)) = g.split_once('\n') {
+                let extra = rest.lines().count() + 1; // +1 for the line after first '\n'
+                format!("{first} ↵+{extra}")
+            } else {
+                g.to_string()
+            }
+        })
     } else {
         None
     };
