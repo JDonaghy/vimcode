@@ -92,6 +92,14 @@ struct App {
     git_panel_box: Rc<RefCell<Option<gtk4::Box>>>,
     ext_panel_box: Rc<RefCell<Option<gtk4::Box>>>,
     settings_panel_box: Rc<RefCell<Option<gtk4::Box>>>,
+    /// The scrollable list box inside the Settings panel.
+    /// Cleared and rebuilt each time the panel is opened so widgets always
+    /// reflect the current engine.settings (e.g. after :set in the editor).
+    settings_list_box: Rc<RefCell<Option<gtk4::Box>>>,
+    /// Current search-filter sections for the Settings panel, shared with the
+    /// SearchEntry callback. Replaced (in place) on each panel rebuild.
+    #[allow(clippy::type_complexity)]
+    settings_sections: Rc<RefCell<Vec<(gtk4::Label, Vec<(String, gtk4::Box)>)>>>,
     ai_panel_box_ref: Rc<RefCell<Option<gtk4::Box>>>,
     // Per-window scrollbars and indicators
     window_scrollbars: Rc<RefCell<HashMap<core::WindowId, WindowScrollbars>>>,
@@ -1768,6 +1776,8 @@ impl SimpleComponent for App {
             git_panel_box: git_panel_box_ref.clone(),
             ext_panel_box: ext_panel_box_ref.clone(),
             settings_panel_box: settings_panel_box_ref.clone(),
+            settings_list_box: Rc::new(RefCell::new(None)),
+            settings_sections: Rc::new(RefCell::new(Vec::new())),
             ai_panel_box_ref: ai_panel_box_ref.clone(),
             project_search_status: String::new(),
             search_results_list: search_results_list_ref.clone(),
@@ -1842,11 +1852,16 @@ impl SimpleComponent for App {
             let sections = build_settings_form(&list_box, &engine_b.settings, &sender_s);
             drop(engine_b);
 
-            // Wire up search filtering: show/hide rows + category headers
-            let sections_rc = std::rc::Rc::new(sections);
+            // Store refs so the settings panel can be rebuilt when reopened.
+            *model.settings_list_box.borrow_mut() = Some(list_box.clone());
+            *model.settings_sections.borrow_mut() = sections;
+
+            // Wire up search filtering: show/hide rows + category headers.
+            // Capture the shared Rc so the callback still works after a rebuild.
+            let sections_rc = model.settings_sections.clone();
             search_entry.connect_search_changed(move |entry| {
                 let query = entry.text().to_string().to_lowercase();
-                for (header, rows) in sections_rc.iter() {
+                for (header, rows) in sections_rc.borrow().iter() {
                     let mut any_visible = false;
                     for (search_text, row) in rows {
                         let visible = query.is_empty() || search_text.contains(&query);
@@ -3708,6 +3723,20 @@ impl SimpleComponent for App {
                         self.engine.borrow_mut().ai_has_focus = true;
                         if let Some(ref da) = *self.ai_sidebar_da_ref.borrow() {
                             da.grab_focus();
+                        }
+                    }
+                    // Rebuild settings form so widgets reflect current engine.settings
+                    // (e.g. toggles changed via :set command since the panel was last open).
+                    if self.active_panel == SidebarPanel::Settings {
+                        if let Some(ref lb) = *self.settings_list_box.borrow() {
+                            while let Some(child) = lb.first_child() {
+                                lb.remove(&child);
+                            }
+                            let engine = self.engine.borrow();
+                            let new_sections =
+                                build_settings_form(lb, &engine.settings, &self.sender);
+                            drop(engine);
+                            *self.settings_sections.borrow_mut() = new_sections;
                         }
                     }
                 }

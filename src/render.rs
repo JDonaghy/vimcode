@@ -3301,11 +3301,17 @@ fn build_rendered_window(
     let visible_hl = &buffer_state.highlights[hl_lo..hl_hi];
 
     // Ghost text (AI inline completion): only in the active window, Insert mode.
+    // Multi-line completions are stored in full (Tab-accept inserts everything) but
+    // only the first line is shown as ghost_suffix — rendering all lines via a single
+    // Pango layout call spills onto the next real line and causes visual artifacts.
     let ghost_for_cursor_line: Option<String> = if is_active
         && engine.mode == crate::core::Mode::Insert
         && engine.settings.ai_completions
     {
-        engine.ai_ghost_text.clone()
+        engine
+            .ai_ghost_text
+            .as_deref()
+            .map(|g| g.split_once('\n').map_or(g, |(first, _)| first).to_string())
     } else {
         None
     };
