@@ -2515,7 +2515,11 @@ impl SimpleComponent for App {
 
         // Build tree from current working directory
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        build_file_tree_with_root(&tree_store, &cwd);
+        build_file_tree_with_root(
+            &tree_store,
+            &cwd,
+            engine.borrow().settings.show_hidden_files,
+        );
 
         // Read font family for nerd font icon rendering
         let nf_font = engine.borrow().settings.font_family.clone();
@@ -4082,7 +4086,11 @@ impl SimpleComponent for App {
                     match std::env::current_dir() {
                         Ok(cwd) => {
                             store.clear();
-                            build_file_tree_with_root(store, &cwd);
+                            build_file_tree_with_root(
+                                store,
+                                &cwd,
+                                self.engine.borrow().settings.show_hidden_files,
+                            );
                             if let Some(ref tv) = *self.file_tree_view.borrow() {
                                 tv.expand_row(&gtk4::TreePath::from_indices(&[0]), false);
                                 // Highlight the active file in the tree after rebuild.
@@ -4273,6 +4281,7 @@ impl SimpleComponent for App {
                     if let Some(drawing_area) = self.drawing_area.borrow().as_ref() {
                         drawing_area.queue_draw();
                     }
+                    sender.input(Msg::RefreshFileTree);
                     self.draw_needed.set(true);
                 }
             }
@@ -4291,6 +4300,9 @@ impl SimpleComponent for App {
                     }
                 }
                 drop(engine);
+                if key == "show_hidden_files" {
+                    sender.input(Msg::RefreshFileTree);
+                }
                 self.draw_needed.set(true);
             }
             Msg::ToggleFindDialog => {
@@ -4644,7 +4656,11 @@ impl SimpleComponent for App {
                         if let Some(ref store) = self.tree_store {
                             if let Ok(cwd) = std::env::current_dir() {
                                 store.clear();
-                                build_file_tree_with_root(store, &cwd);
+                                build_file_tree_with_root(
+                                    store,
+                                    &cwd,
+                                    self.engine.borrow().settings.show_hidden_files,
+                                );
                             }
                         }
                         let new_path = dest_dir.join(&name);
@@ -10613,7 +10629,7 @@ fn load_css(theme: &Theme) -> gtk4::CssProvider {
 }
 
 /// Build file tree with a root folder node at the top (like VSCode).
-fn build_file_tree_with_root(store: &gtk4::TreeStore, root: &Path) {
+fn build_file_tree_with_root(store: &gtk4::TreeStore, root: &Path, show_hidden: bool) {
     let root_name = root
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -10628,12 +10644,17 @@ fn build_file_tree_with_root(store: &gtk4::TreeStore, root: &Path) {
             (2, &root.to_string_lossy().to_string()),
         ],
     );
-    build_file_tree(store, Some(&root_iter), root);
+    build_file_tree(store, Some(&root_iter), root, show_hidden);
 }
 
 /// Build file tree recursively
 /// TreeStore columns: [Icon(String), Name(String), FullPath(String)]
-fn build_file_tree(store: &gtk4::TreeStore, parent: Option<&gtk4::TreeIter>, path: &Path) {
+fn build_file_tree(
+    store: &gtk4::TreeStore,
+    parent: Option<&gtk4::TreeIter>,
+    path: &Path,
+    show_hidden: bool,
+) {
     let entries = match fs::read_dir(path) {
         Ok(e) => e,
         Err(_) => return, // Handle permission errors silently
@@ -10657,9 +10678,9 @@ fn build_file_tree(store: &gtk4::TreeStore, parent: Option<&gtk4::TreeIter>, pat
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().to_string();
 
-        // Skip hidden files (optional - can make configurable later)
-        if name.starts_with('.') && name != "." && name != ".." {
-            continue; // Skip dotfiles for now
+        // Skip hidden files unless the setting is enabled
+        if name.starts_with('.') && name != "." && name != ".." && !show_hidden {
+            continue;
         }
 
         let is_dir = path.is_dir();
@@ -10685,7 +10706,7 @@ fn build_file_tree(store: &gtk4::TreeStore, parent: Option<&gtk4::TreeIter>, pat
             // Limit recursion depth to prevent hanging on deep trees
             let depth = parent.map_or(0, |_| 1); // Simple depth tracking
             if depth < 10 {
-                build_file_tree(store, Some(&iter), &path);
+                build_file_tree(store, Some(&iter), &path, show_hidden);
             }
         }
     }

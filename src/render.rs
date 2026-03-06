@@ -773,6 +773,14 @@ pub static SETTING_DEFS: &[SettingDef] = &[
         category: "Plugins",
         setting_type: SettingType::Bool,
     },
+    // ── Workspace ─────────────────────────────────────────────────────────────
+    SettingDef {
+        key: "show_hidden_files",
+        label: "Show Hidden Files",
+        description: "Display dotfiles and hidden directories in the file explorer",
+        category: "Workspace",
+        setting_type: SettingType::Bool,
+    },
     // ── Recovery ──────────────────────────────────────────────────────────────
     SettingDef {
         key: "swap_file",
@@ -3607,9 +3615,8 @@ fn build_rendered_window(
             .copied();
 
         let is_md_preview = engine.md_preview_links.contains_key(&window.buffer_id);
-        let wrap_on = (engine.settings.wrap || is_md_preview)
-            && render_viewport_cols > 0
-            && !is_fold_header;
+        let wrap_on =
+            (engine.settings.wrap || is_md_preview) && render_viewport_cols > 0 && !is_fold_header;
         let line_char_len = line_str.chars().count();
 
         if wrap_on && line_char_len > render_viewport_cols {

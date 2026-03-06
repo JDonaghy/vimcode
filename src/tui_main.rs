@@ -145,6 +145,8 @@ struct TuiSidebar {
     replace_input_focused: bool,
     /// Scroll offset for the search results area (written back by render_search_panel).
     search_scroll_top: usize,
+    /// Whether to show dotfiles in the explorer (mirrors Settings.show_hidden_files).
+    show_hidden_files: bool,
 }
 
 impl TuiSidebar {
@@ -164,6 +166,7 @@ impl TuiSidebar {
             search_input_mode: true,
             replace_input_focused: false,
             search_scroll_top: 0,
+            show_hidden_files: false,
         };
         sb.build_rows();
         sb
@@ -186,7 +189,13 @@ impl TuiSidebar {
             is_expanded: root_expanded,
         });
         if root_expanded {
-            collect_rows(&root, 1, &self.expanded, &mut self.rows);
+            collect_rows(
+                &root,
+                1,
+                &self.expanded,
+                self.show_hidden_files,
+                &mut self.rows,
+            );
         }
         if !self.rows.is_empty() && self.selected >= self.rows.len() {
             self.selected = self.rows.len() - 1;
@@ -238,7 +247,13 @@ impl TuiSidebar {
 }
 
 /// Recursively build the flat list of visible rows, respecting the `expanded` set.
-fn collect_rows(dir: &Path, depth: usize, expanded: &HashSet<PathBuf>, out: &mut Vec<ExplorerRow>) {
+fn collect_rows(
+    dir: &Path,
+    depth: usize,
+    expanded: &HashSet<PathBuf>,
+    show_hidden: bool,
+    out: &mut Vec<ExplorerRow>,
+) {
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return,
@@ -257,8 +272,8 @@ fn collect_rows(dir: &Path, depth: usize, expanded: &HashSet<PathBuf>, out: &mut
     for entry in entries {
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().to_string();
-        // Skip dotfiles
-        if name.starts_with('.') {
+        // Skip dotfiles unless show_hidden_files is enabled
+        if name.starts_with('.') && !show_hidden {
             continue;
         }
         let is_dir = path.is_dir();
@@ -271,7 +286,7 @@ fn collect_rows(dir: &Path, depth: usize, expanded: &HashSet<PathBuf>, out: &mut
             is_expanded,
         });
         if is_expanded {
-            collect_rows(&path, depth + 1, expanded, out);
+            collect_rows(&path, depth + 1, expanded, show_hidden, out);
         }
     }
 }
@@ -361,12 +376,13 @@ struct FolderPickerState {
     filtered: Vec<PathBuf>,
     selected: usize,
     scroll_top: usize,
+    show_hidden: bool,
 }
 
 impl FolderPickerState {
-    fn new(cwd: &Path, mode: FolderPickerMode) -> Self {
+    fn new(cwd: &Path, mode: FolderPickerMode, show_hidden: bool) -> Self {
         let root = cwd.to_path_buf();
-        let all_entries = collect_dir_entries(&root);
+        let all_entries = collect_dir_entries(&root, show_hidden);
         let filtered = all_entries.iter().take(50).cloned().collect();
         Self {
             mode,
@@ -376,6 +392,7 @@ impl FolderPickerState {
             filtered,
             selected: 0,
             scroll_top: 0,
+            show_hidden,
         }
     }
 
@@ -383,7 +400,7 @@ impl FolderPickerState {
     fn navigate_to(&mut self, new_root: PathBuf) {
         self.root = new_root;
         self.query.clear();
-        self.all_entries = collect_dir_entries(&self.root);
+        self.all_entries = collect_dir_entries(&self.root, self.show_hidden);
         self.filtered = self.all_entries.iter().take(50).cloned().collect();
         self.selected = 0;
         self.scroll_top = 0;
@@ -409,6 +426,7 @@ impl FolderPickerState {
             filtered,
             selected: 0,
             scroll_top: 0,
+            show_hidden: false,
         }
     }
 
@@ -461,18 +479,24 @@ impl FolderPickerState {
 /// Walk `root` collecting relative subdirectory paths (depth ≤ 5) plus any
 /// `.vimcode-workspace` files. Skips hidden dirs, `target/`, `node_modules/`.
 /// The entry `"."` (current directory) is prepended so the user can open root.
-fn collect_dir_entries(root: &Path) -> Vec<PathBuf> {
+fn collect_dir_entries(root: &Path, show_hidden: bool) -> Vec<PathBuf> {
     let mut out = Vec::new();
     // Prepend ".." so the user can navigate up (unless already at filesystem root)
     if root.parent().is_some() {
         out.push(PathBuf::from(".."));
     }
     out.push(PathBuf::from("."));
-    walk_dir_entries_recursive(root, root, &mut out, 0);
+    walk_dir_entries_recursive(root, root, &mut out, 0, show_hidden);
     out
 }
 
-fn walk_dir_entries_recursive(root: &Path, dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
+fn walk_dir_entries_recursive(
+    root: &Path,
+    dir: &Path,
+    out: &mut Vec<PathBuf>,
+    depth: usize,
+    show_hidden: bool,
+) {
     if depth > 5 {
         return;
     }
@@ -487,8 +511,8 @@ fn walk_dir_entries_recursive(root: &Path, dir: &Path, out: &mut Vec<PathBuf>, d
             Some(n) => n.to_owned(),
             None => continue,
         };
-        // Skip hidden entries (except .vimcode-workspace file specifically)
-        if name.starts_with('.') {
+        // Skip hidden entries unless show_hidden_files is enabled (except .vimcode-workspace file specifically)
+        if name.starts_with('.') && !show_hidden {
             if path.is_file() && name == ".vimcode-workspace" {
                 if let Ok(rel) = path.strip_prefix(root) {
                     out.push(rel.to_path_buf());
@@ -504,7 +528,7 @@ fn walk_dir_entries_recursive(root: &Path, dir: &Path, out: &mut Vec<PathBuf>, d
             if let Ok(rel) = path.strip_prefix(root) {
                 out.push(rel.to_path_buf());
             }
-            walk_dir_entries_recursive(root, &path, out, depth + 1);
+            walk_dir_entries_recursive(root, &path, out, depth + 1, show_hidden);
         }
     }
 }
@@ -792,6 +816,7 @@ fn event_loop(
         engine.session.explorer_visible || engine.settings.explorer_visible_on_startup;
     let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut sidebar = TuiSidebar::new(root, initial_visible);
+    sidebar.show_hidden_files = engine.settings.show_hidden_files;
 
     // Optional active prompt (for sidebar CRUD operations)
     let mut sidebar_prompt: Option<SidebarPrompt> = None;
@@ -1055,6 +1080,7 @@ fn event_loop(
             }
             // Auto-refresh explorer and SC panel to reflect external filesystem changes.
             if sidebar.visible && last_sidebar_refresh.elapsed() >= Duration::from_secs(2) {
+                sidebar.show_hidden_files = engine.settings.show_hidden_files;
                 sidebar.build_rows();
                 if sidebar.active_panel == TuiPanel::Git {
                     engine.sc_refresh();
@@ -1279,6 +1305,7 @@ fn event_loop(
                                     folder_picker = None;
                                     engine.open_folder(&path);
                                     sidebar = TuiSidebar::new(engine.cwd.clone(), sidebar.visible);
+                                    sidebar.show_hidden_files = engine.settings.show_hidden_files;
                                 }
                             } else {
                                 // Check if ".." was selected — navigate up instead of opening
@@ -1301,6 +1328,7 @@ fn event_loop(
                                         FolderPickerMode::OpenRecent => {}
                                     }
                                     sidebar = TuiSidebar::new(engine.cwd.clone(), sidebar.visible);
+                                    sidebar.show_hidden_files = engine.settings.show_hidden_files;
                                 }
                             }
                         }
@@ -2177,11 +2205,13 @@ fn event_loop(
                                                     folder_picker = Some(FolderPickerState::new(
                                                         &engine.cwd.clone(),
                                                         FolderPickerMode::OpenFolder,
+                                                        engine.settings.show_hidden_files,
                                                     ));
                                                 } else if act == EngineAction::OpenWorkspaceDialog {
                                                     folder_picker = Some(FolderPickerState::new(
                                                         &engine.cwd.clone(),
                                                         FolderPickerMode::OpenWorkspace,
+                                                        engine.settings.show_hidden_files,
                                                     ));
                                                 } else if act == EngineAction::SaveWorkspaceAsDialog
                                                 {
@@ -2395,12 +2425,14 @@ fn event_loop(
                             folder_picker = Some(FolderPickerState::new(
                                 &engine.cwd.clone(),
                                 FolderPickerMode::OpenFolder,
+                                engine.settings.show_hidden_files,
                             ));
                             needs_redraw = true;
                         } else if action == EngineAction::OpenWorkspaceDialog {
                             folder_picker = Some(FolderPickerState::new(
                                 &engine.cwd.clone(),
                                 FolderPickerMode::OpenWorkspace,
+                                engine.settings.show_hidden_files,
                             ));
                             needs_redraw = true;
                         } else if action == EngineAction::SaveWorkspaceAsDialog {
@@ -3112,11 +3144,13 @@ fn handle_mouse(
                             *folder_picker = Some(FolderPickerState::new(
                                 &engine.cwd.clone(),
                                 FolderPickerMode::OpenFolder,
+                                engine.settings.show_hidden_files,
                             ));
                         } else if act == EngineAction::OpenWorkspaceDialog {
                             *folder_picker = Some(FolderPickerState::new(
                                 &engine.cwd.clone(),
                                 FolderPickerMode::OpenWorkspace,
+                                engine.settings.show_hidden_files,
                             ));
                         } else if act == EngineAction::SaveWorkspaceAsDialog {
                             let ws_path = engine.cwd.join(".vimcode-workspace");

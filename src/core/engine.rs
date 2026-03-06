@@ -16470,6 +16470,9 @@ impl Engine {
                         let had_edits = !edits.is_empty();
                         if had_edits {
                             self.apply_lsp_edits(buffer_id, edits);
+                            // Mark buffer dirty so lsp_flush_changes sends didChange
+                            // and re-requests semantic tokens on the next poll tick.
+                            self.lsp_dirty_buffers.insert(buffer_id, true);
                         }
                         // If this was a format-on-save, perform the actual save now.
                         if self.format_on_save_pending.take() == Some(buffer_id) {
@@ -16739,7 +16742,16 @@ impl Engine {
                 .cmp(&a.range.start.line)
                 .then(b.range.start.character.cmp(&a.range.start.character))
         });
-        self.start_undo_group();
+        // Start undo group on the target buffer (not necessarily the active buffer).
+        let cursor = self
+            .windows
+            .values()
+            .find(|w| w.buffer_id == buffer_id)
+            .map(|w| w.view.cursor)
+            .unwrap_or_default();
+        if let Some(state) = self.buffer_manager.get_mut(buffer_id) {
+            state.start_undo_group(cursor);
+        }
         for edit in &edits {
             let state = match self.buffer_manager.get(buffer_id) {
                 Some(s) => s,
@@ -16762,13 +16774,25 @@ impl Engine {
 
             if let Some(state) = self.buffer_manager.get_mut(buffer_id) {
                 if end_offset > start_offset {
+                    let deleted: String = state
+                        .buffer
+                        .content
+                        .slice(start_offset..end_offset)
+                        .chars()
+                        .collect();
                     state.buffer.content.remove(start_offset..end_offset);
+                    state.record_delete(start_offset, &deleted);
                 }
-                state.buffer.content.insert(start_offset, &edit.new_text);
+                if !edit.new_text.is_empty() {
+                    state.buffer.content.insert(start_offset, &edit.new_text);
+                    state.record_insert(start_offset, &edit.new_text);
+                }
                 state.dirty = true;
             }
         }
-        self.finish_undo_group();
+        if let Some(state) = self.buffer_manager.get_mut(buffer_id) {
+            state.finish_undo_group();
+        }
     }
 
     /// Apply a workspace-wide rename edit.
@@ -17904,8 +17928,8 @@ impl Engine {
                 Some(n) => n.to_owned(),
                 None => continue,
             };
-            // Skip hidden files/dirs and the target/ build directory
-            if name.starts_with('.') || name == "target" {
+            // Skip hidden files/dirs (unless setting enabled) and the target/ build directory
+            if (name.starts_with('.') && !self.settings.show_hidden_files) || name == "target" {
                 continue;
             }
             if path.is_dir() {

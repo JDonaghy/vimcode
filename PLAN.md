@@ -5,8 +5,8 @@
 ---
 
 ## Recently Completed
+- **Session 135**: `show_hidden_files` setting (explorer/fuzzy/folder picker), LSP format undo fix, stale highlighting after format fix
 - **Session 134**: Search highlight refresh after edits, Escape clears highlights, extra line number fix, markdown preview wrap, TUI/GTK viewport layout fixes, 13 integration tests
-- **Session 133**: `%` bracket matching — visual mode support (`v%`/`V%`), `y%` yank-only bug fix, 30 integration tests
 
 ## Roadmap
 

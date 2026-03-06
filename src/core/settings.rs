@@ -208,6 +208,11 @@ pub struct Settings {
     #[serde(default)]
     pub ai_completions: bool,
 
+    // ── Explorer ──────────────────────────────────────────────────────────────
+    /// Show hidden files (dotfiles) in the file explorer (default: false).
+    #[serde(default)]
+    pub show_hidden_files: bool,
+
     // ── Swap files ────────────────────────────────────────────────────────────
     /// Enable swap file crash recovery (default: true).
     #[serde(default = "default_swap_file")]
@@ -556,6 +561,7 @@ impl Default for Settings {
             ai_model: String::new(),
             ai_base_url: String::new(),
             ai_completions: false,
+            show_hidden_files: false,
             swap_file: default_swap_file(),
             updatetime: default_updatetime(),
         }
@@ -779,6 +785,7 @@ impl Settings {
             "splitright" | "spr" => self.splitright = enable,
             "ai_completions" => self.ai_completions = enable,
             "formatonsave" | "fos" => self.format_on_save = enable,
+            "showhiddenfiles" | "shf" => self.show_hidden_files = enable,
             "swapfile" => self.swap_file = enable,
             _ => return Err(format!("Unknown option: {opt}")),
         }
@@ -929,6 +936,11 @@ impl Settings {
             } else {
                 "noformatonsave".to_string()
             }),
+            "showhiddenfiles" | "shf" => Ok(if self.show_hidden_files {
+                "showhiddenfiles".to_string()
+            } else {
+                "noshowhiddenfiles".to_string()
+            }),
             "swapfile" => Ok(if self.swap_file {
                 "swapfile".to_string()
             } else {
@@ -1016,6 +1028,7 @@ impl Settings {
             "ai_model" => self.ai_model.clone(),
             "ai_base_url" => self.ai_base_url.clone(),
             "ai_completions" => self.ai_completions.to_string(),
+            "showhiddenfiles" | "shf" | "show_hidden_files" => self.show_hidden_files.to_string(),
             "swapfile" | "swap_file" => self.swap_file.to_string(),
             "updatetime" | "ut" => self.updatetime.to_string(),
             _ => String::new(),
@@ -1098,6 +1111,9 @@ impl Settings {
             "ai_model" => self.ai_model = value.to_string(),
             "ai_base_url" => self.ai_base_url = value.to_string(),
             "ai_completions" => self.ai_completions = value == "true",
+            "showhiddenfiles" | "shf" | "show_hidden_files" => {
+                self.show_hidden_files = value == "true"
+            }
             "swapfile" | "swap_file" => self.swap_file = value == "true",
             "updatetime" | "ut" => {
                 self.updatetime = value

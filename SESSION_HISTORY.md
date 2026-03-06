@@ -1,9 +1,15 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 132 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 134 archived here. Recent work summary in PROJECT_STATE.md.
 
 ---
+
+**Session 134 — search highlight + viewport bug fixes (13 new tests, 2346 total):**
+Five bug fixes: search highlights refresh after edits (`run_search()` after buffer changes), Escape clears highlights, extra gutter line number fix (`buffer.len_lines()` vs raw Ropey), markdown preview always wraps, TUI viewport layout fix (double-counted tab bar row), GTK per-window viewport sync in SearchPollTick handler. 13 tests in `tests/search_highlight.rs`.
+
+**Session 133 — bracket matching: visual mode + y% fix + tests (30 new tests, 2333 total):**
+`%` bracket matching: visual mode `v%`/`V%`, `y%` yank-only bug fix (was always deleting), 30 integration tests in `tests/bracket_matching.rs`.
 
 **Session 132 — LSP session restore + semantic tokens bug fixes (1 new test, 2303 total):**
 Three bug fixes: (1) Tree-format session restore (`restore_session_group_layout`) never called `lsp_did_open()`, so LSP servers weren't started for restored files — fixed by adding calls after tree layout install. (2) `lsp_pending_semantic_tokens` was `Option<i64>` (single slot); changed to `HashMap<i64, PathBuf>` for multi-file init. (3) `semantic_parameter` color in OneDark changed from #e06c75 (same as variable) to #c8ae9d. 1 new test.
