@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Mar 6, 2026 (Session 132 — LSP session restore + semantic tokens bug fixes) | **Tests:** 2303
+**Last updated:** Mar 6, 2026 (Session 133 — bracket matching visual mode + y% fix + tests) | **Tests:** 2333
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 117b are in **SESSION_HISTORY.md**.
@@ -25,6 +25,12 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 133 — bracket matching: visual mode + y% fix + tests (30 new tests, 2333 total):**
+Complete `%` bracket matching implementation:
+- **Visual mode `%`**: Added `Some('%')` arm in `handle_visual_key()` so `v%`/`V%` extend selection to matching bracket
+- **`y%` bug fix**: `apply_operator_bracket_motion()` always deleted text regardless of operator. Fixed to yank-only for `y` operator (register set, yank highlight shown, no buffer modification). `d%` and `c%` continue to delete/change as before
+- **30 integration tests** in new `tests/bracket_matching.rs`: normal mode `%` (forward/backward for all 3 bracket types, nested, cross-line, mixed, forward search, unmatched, empty, edge cases), operator motions (`d%`/`y%`/`c%` with opening/closing brackets, cross-line, nested, no-bracket no-op), visual mode (`v%` select/yank/delete, cross-line, forward search, `V%` linewise)
 
 **Session 132 — LSP session restore + semantic tokens bug fixes (1 new test, 2303 total):**
 Three targeted bug fixes for LSP integration:

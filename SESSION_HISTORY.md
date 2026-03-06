@@ -1,9 +1,57 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 117c archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 132 archived here. Recent work summary in PROJECT_STATE.md.
 
 ---
+
+**Session 132 — LSP session restore + semantic tokens bug fixes (1 new test, 2303 total):**
+Three bug fixes: (1) Tree-format session restore (`restore_session_group_layout`) never called `lsp_did_open()`, so LSP servers weren't started for restored files — fixed by adding calls after tree layout install. (2) `lsp_pending_semantic_tokens` was `Option<i64>` (single slot); changed to `HashMap<i64, PathBuf>` for multi-file init. (3) `semantic_parameter` color in OneDark changed from #e06c75 (same as variable) to #c8ae9d. 1 new test.
+
+**Session 131 — LSP semantic tokens + develop branch workflow (17 new tests, 2302 total):**
+Full `textDocument/semanticTokens/full` implementation: `SemanticToken`/`SemanticTokensLegend` types, delta-decoder, `SemanticTokensResponse` event, legend caching in LspManager, `BufferState.semantic_tokens` storage, request triggers on didOpen/didChange/Initialized. 8 new theme colors (parameter/property/namespace/enumMember/interface/typeParameter/decorator/macro). `Theme::semantic_token_style()` with binary-search overlay in `build_spans()`. Branching: version-tagged releases in `release.yml`, deleted `rust.yml`, bumped to 0.2.0. 5 unit + 12 integration tests.
+
+**Session 130 — LSP formatting enhancements (12 new tests, 2268 total):**
+Format-on-save (`format_on_save` setting, off by default), LSP capability checking (`documentFormattingProvider`), Shift+Alt+F keybinding (GTK+TUI). `save_with_format()` defers save when format-on-save enabled; FormattingResponse applies edits then saves; `format_save_quit_ready` for deferred `:wq`/`:x`. LSP binary resolution fix (checks `~/.dotnet/tools`, `~/.cargo/bin`, etc.). On-demand server startup from LSP commands. GTK CSS/focus fixes. 12 integration tests.
+
+**Session 129 — GUI polish + sidebar/scrollbar fixes (no new tests, 2256 total):**
+Fixed sidebar layout (hexpand propagation), scrollbar ghosts from inactive tabs, visual mode click jitter (4px dead zone), redo dirty flag (`saved_undo_depth` tracking), status line overlap (Pango ellipsis + TUI clamping), search icon, menu dropdown hover highlight, menu actions close_menu centralization, logo embedding + taskbar icon, sidebar background CSS.
+
+**Session 128 — GUI mode polish + data format extensions (no new tests, 2256 total):**
+GTK menu hover switching, dialog menu-close fix, removed "Close Tab" from File menu. 4 new bundled extensions: JSON, XML, YAML, Markdown with LSP configs. Added `number` color to Theme (all 4 themes) + `scope_color()`. Expanded C# tree-sitter query with ~30 more keywords.
+
+**Session 127 — Swap file crash recovery (13 new tests, 2256 total):**
+Vim-like swap file system: `src/core/swap.rs` (~240 lines) with atomic I/O (FNV-1a hash, PID-based stale detection). Engine: swap created on file open, deleted on save/close, periodic writes via `tick_swap_files()`. Recovery dialog (`[R]ecover/[D]elete/[A]bort`). Settings: `:set swapfile`/`:set updatetime=N`. `swap_scan_stale()` for orphaned swaps. Both backends tick and clean up. 13 tests.
+
+**Session 126 — Markdown preview polish (3 new tests, 1289 total):**
+Undo/redo refreshes live preview; extension READMEs open in own tab; scroll sync via `scroll_bind_pairs`; GTK heading font scale (H1=1.4x, H2=1.2x, H3=1.1x via Pango); no line numbers in preview; `color_headings` param (GTK=false/TUI=true); tab close button hover + widened hit area; free mouse scroll.
+
+**Session 125 — Markdown preview (26 new tests, 1286 total):**
+`:MarkdownPreview`/`:MdPreview` for live side-by-side preview using `pulldown-cmark`. Read-only preview buffers with styled headings, bold, italic, code, links, lists. Live refresh on source edits. `src/core/markdown.rs` module. Bold/italic in GTK (Pango) and TUI (ratatui). 15 unit + 11 integration tests.
+
+**Session 124 — Generic async plugin shell execution (3 new tests, 1260 total):**
+`vimcode.async_shell(command, callback_event, options)` Lua API for non-blocking shell from plugins. Background threads via `std::process::Command`; results as plugin events on next poll. Last-writer-wins per callback_event. `blame.lua` rewritten to use `async_shell` — git blame no longer blocks UI. 3 new tests.
+
+**Session 123 — Performance: cursor movement lag + extension loading fix (no new tests, 1257 total):**
+Fixed sluggish arrow-key nav on large files: `plugin_init()` now only loads scripts from installed extensions (was loading all subdirs); `make_plugin_ctx(skip_buf_lines)` skips O(N) allocation for cursor_move; `has_event_hooks()` early-exit. `canonical_path` cached on `BufferState`. Incremental tree-sitter via `last_tree`. `:ExtDisable`/`:ExtEnable` now update `settings.disabled_plugins` + reload plugin manager.
+
+**Session 122 — Extension install UX + sidebar navigation fixes (2 new tests, 1257 total):**
+Sidebar navigation: after install, selected resets to installed item; after last delete, available section expands. `ext_install_from_registry()` rewritten with `binary_on_path()` PATH checks — idempotent, shows status. Install diagnostics to `/tmp/vimcode-install.log`. 2 regression tests.
+
+**Session 121 — Manifest-driven LSP/DAP config (24 new tests, 1255 total):**
+Extension manifests as single source of truth: `LspConfig` gains `fallback_binaries` + `args`; `DapConfig` gains `binary/install/transport/args`; `ExtensionManifest` gains `workspace_markers`. All 11 bundled manifests updated. `lsp_manager.rs`: manifest candidates tried before registry. `dap_manager.rs`: manifest-first adapter lookup + install. 24 new tests.
+
+**Session 120 — AI ghost text improvements + settings persistence fix (1239 total):**
+Multi-line ghost text shown as virtual continuation rows (both GTK + TUI); `is_ghost_continuation` on `RenderedLine`. Settings write-through bug fixed: `saves_suppressed()` runtime guard in `Settings::save()`. GTK settings panel rebuilt from engine.settings each open. AI debounce 500ms → 250ms.
+
+**Session 119b — git-insights blame fixes + TUI mouse crash (1231 total):**
+`cursor_move` suppressed in Insert mode; annotations hidden during Insert; `BlameInfo.not_committed`; `blame_line(buf_contents)` uses `--contents -` stdin pipe; `buf_lines.join("")`; TUI drag crash: `saturating_sub(gutter)`.
+
+**Session 119 — AI inline completions / ghost text (19 new tests, 1231 total):**
+Opt-in ghost text from AI in insert mode. `ai.rs`: `complete()` fill-in-the-middle. Engine: `ai_ghost_text/alternatives/alt_idx/completion_ticks/completion_rx` fields; Tab accepts, Alt+]/[ cycle alternatives; `ai_completions: bool` setting (default false). `ghost_suffix` on `RenderedLine`; `ghost_text_fg` on Theme. 19 tests.
+
+**Session 118 — AI assistant panel (1212 total):**
+Sidebar chat panel. `src/core/ai.rs`: `send_chat()` dispatcher; Anthropic/OpenAI/Ollama via curl. Engine: `ai_messages/ai_input/ai_has_focus/ai_streaming/ai_rx/ai_scroll_top`; `ai_send_message()`, `poll_ai()`, `ai_clear()`, `handle_ai_panel_key()`; `:AI <msg>`/`:AiClear`. Settings: `ai_provider/ai_api_key/ai_model/ai_base_url`. GTK: `SidebarPanel::Ai`, `draw_ai_sidebar()`. TUI: `TuiPanel::Ai`, `render_ai_sidebar()`. 16 integration tests.
 
 **Session 117c — Settings panel bug fixes (no new tests, 1199 total):**
 Fixed two visual issues in the GTK settings sidebar: (1) settings panel not collapsing when clicking the Settings activity bar button a second time — removed `#[watch]` from the settings panel's `set_visible` so Relm4 no longer overrides the imperative hide; (2) Toggle switch widgets clipped — removed CSS `min-height`/`min-width` constraints on `.sidebar switch` and added 4px margin on all four sides of each Switch widget so Adwaita's rendering has room; also fixed overlay scrollbar floating over settings widgets via `set_overlay_scrolling(false)`.

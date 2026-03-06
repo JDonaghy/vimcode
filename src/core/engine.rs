@@ -6534,37 +6534,60 @@ impl Engine {
                 (match_pos, start_pos + 1)
             };
 
-            // Save deleted text to register
-            let deleted_text: String = self
+            // Save text to register
+            let text: String = self
                 .buffer()
                 .content
                 .slice(delete_start..delete_end)
                 .chars()
                 .collect();
             let reg = self.active_register();
-            self.set_register(reg, deleted_text, false);
+            self.set_register(reg, text, false);
             self.clear_selected_register();
 
-            // Perform deletion
-            self.start_undo_group();
-            self.delete_with_undo(delete_start, delete_end);
-
-            // Move cursor to start of deletion
-            let new_line = self.buffer().content.char_to_line(delete_start);
-            let line_start = self.buffer().line_to_char(new_line);
-            self.view_mut().cursor.line = new_line;
-            self.view_mut().cursor.col = delete_start - line_start;
-
-            self.clamp_cursor_col();
-            *changed = true;
-
-            // If operator is 'c', enter insert mode
-            if operator == 'c' {
-                self.mode = Mode::Insert;
-                self.count = None;
-                // Don't finish_undo_group - let insert mode do it
+            if operator == 'y' {
+                // Yank only — move cursor to start of range, no deletion
+                let start_line = self.buffer().content.char_to_line(delete_start);
+                let start_line_char = self.buffer().line_to_char(start_line);
+                let end_line = self
+                    .buffer()
+                    .content
+                    .char_to_line((delete_end).saturating_sub(1));
+                let end_line_char = self.buffer().line_to_char(end_line);
+                self.view_mut().cursor.line = start_line;
+                self.view_mut().cursor.col = delete_start - start_line_char;
+                self.record_yank_highlight(
+                    Cursor {
+                        line: start_line,
+                        col: delete_start - start_line_char,
+                    },
+                    Cursor {
+                        line: end_line,
+                        col: (delete_end - 1) - end_line_char,
+                    },
+                    false,
+                );
             } else {
-                self.finish_undo_group();
+                // Delete or change
+                self.start_undo_group();
+                self.delete_with_undo(delete_start, delete_end);
+
+                // Move cursor to start of deletion
+                let new_line = self.buffer().content.char_to_line(delete_start);
+                let line_start = self.buffer().line_to_char(new_line);
+                self.view_mut().cursor.line = new_line;
+                self.view_mut().cursor.col = delete_start - line_start;
+
+                self.clamp_cursor_col();
+                *changed = true;
+
+                if operator == 'c' {
+                    self.mode = Mode::Insert;
+                    self.count = None;
+                    // Don't finish_undo_group - let insert mode do it
+                } else {
+                    self.finish_undo_group();
+                }
             }
         }
     }
@@ -7921,6 +7944,9 @@ impl Engine {
                 for _ in 0..count {
                     self.move_paragraph_forward();
                 }
+            }
+            Some('%') => {
+                self.move_to_matching_bracket();
             }
             _ => match key_name {
                 "Left" => {
