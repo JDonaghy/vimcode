@@ -78,6 +78,10 @@ pub struct Settings {
     #[serde(default = "default_lsp_enabled")]
     pub lsp_enabled: bool,
 
+    /// Automatically format the buffer via LSP before saving (default: false).
+    #[serde(default)]
+    pub format_on_save: bool,
+
     /// Number of lines kept in the integrated terminal's scrollback history.
     /// Increase for commands that produce very long output. Default: 5000.
     #[serde(default = "default_terminal_scrollback_lines")]
@@ -524,6 +528,7 @@ impl Default for Settings {
             tabstop: default_tabstop(),
             shift_width: default_shift_width(),
             lsp_enabled: default_lsp_enabled(),
+            format_on_save: false,
             lsp_servers: Vec::new(),
             language_map: std::collections::HashMap::new(),
             terminal_scrollback_lines: default_terminal_scrollback_lines(),
@@ -688,6 +693,11 @@ impl Settings {
             "noincsearch"
         };
         let lsp = if self.lsp_enabled { "lsp" } else { "nolsp" };
+        let fos = if self.format_on_save {
+            "formatonsave"
+        } else {
+            "noformatonsave"
+        };
         let mode = match self.editor_mode {
             EditorMode::Vim => "mode=vim",
             EditorMode::Vscode => "mode=vscode",
@@ -709,7 +719,7 @@ impl Settings {
             "nosmartcase"
         };
         format!(
-            "{}  {}  ts={}  sw={}  {}  {}  {}  {}  {}  {}  {}  {}  so={}  tw={}",
+            "{}  {}  ts={}  sw={}  {}  {}  {}  {}  {}  {}  {}  {}  {}  so={}  tw={}",
             num,
             et,
             self.tabstop,
@@ -717,6 +727,7 @@ impl Settings {
             ai,
             is,
             lsp,
+            fos,
             mode,
             wrap,
             hls,
@@ -767,6 +778,7 @@ impl Settings {
             "splitbelow" | "sb" => self.splitbelow = enable,
             "splitright" | "spr" => self.splitright = enable,
             "ai_completions" => self.ai_completions = enable,
+            "formatonsave" | "fos" => self.format_on_save = enable,
             "swapfile" => self.swap_file = enable,
             _ => return Err(format!("Unknown option: {opt}")),
         }
@@ -912,6 +924,11 @@ impl Settings {
             }),
             "colorcolumn" | "cc" => Ok(format!("colorcolumn={}", self.colorcolumn)),
             "textwidth" | "tw" => Ok(format!("textwidth={}", self.textwidth)),
+            "formatonsave" | "fos" => Ok(if self.format_on_save {
+                "formatonsave".to_string()
+            } else {
+                "noformatonsave".to_string()
+            }),
             "swapfile" => Ok(if self.swap_file {
                 "swapfile".to_string()
             } else {
@@ -991,6 +1008,7 @@ impl Settings {
             "splitbelow" => self.splitbelow.to_string(),
             "splitright" => self.splitright.to_string(),
             "lsp_enabled" => self.lsp_enabled.to_string(),
+            "format_on_save" => self.format_on_save.to_string(),
             "terminal_scrollback_lines" => self.terminal_scrollback_lines.to_string(),
             "plugins_enabled" => self.plugins_enabled.to_string(),
             "ai_provider" => self.ai_provider.clone(),
@@ -1065,6 +1083,7 @@ impl Settings {
             "splitbelow" => self.splitbelow = value == "true",
             "splitright" => self.splitright = value == "true",
             "lsp_enabled" => self.lsp_enabled = value == "true",
+            "format_on_save" => self.format_on_save = value == "true",
             "terminal_scrollback_lines" => {
                 self.terminal_scrollback_lines = value
                     .parse()

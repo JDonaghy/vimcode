@@ -769,6 +769,12 @@ pub struct Engine {
     pub lsp_pending_signature: Option<i64>,
     /// Request ID of the pending formatting request.
     pub lsp_pending_formatting: Option<i64>,
+    /// Buffer that triggered a format-on-save; after formatting completes we save it.
+    format_on_save_pending: Option<BufferId>,
+    /// If true, quit the editor after the deferred format-on-save completes.
+    quit_after_format_save: bool,
+    /// Set to true when a format-on-save + quit has completed; backends should exit.
+    pub format_save_quit_ready: bool,
     /// Request ID of the pending rename request.
     pub lsp_pending_rename: Option<i64>,
     /// Currently visible signature help data (set in insert mode after `(` or `,`).
@@ -1252,6 +1258,9 @@ impl Engine {
             lsp_pending_type_definition: None,
             lsp_pending_signature: None,
             lsp_pending_formatting: None,
+            format_on_save_pending: None,
+            quit_after_format_save: false,
+            format_save_quit_ready: false,
             lsp_pending_rename: None,
             lsp_signature_help: None,
             lsp_dirty_buffers: HashMap::new(),
@@ -1815,6 +1824,37 @@ impl Engine {
             self.message = "No file name".to_string();
             Err(self.message.clone())
         }
+    }
+
+    /// Save the current buffer, optionally requesting LSP formatting first.
+    ///
+    /// When `format_on_save` is enabled and an LSP server supports formatting,
+    /// this sends a formatting request and defers the actual disk save until the
+    /// formatting response arrives (handled in `poll_lsp`).
+    pub fn save_with_format(&mut self, quit_after: bool) -> Result<(), String> {
+        // Check if we should format first.
+        if self.settings.format_on_save && self.settings.lsp_enabled {
+            self.ensure_lsp_manager();
+            if let Some((path, _, _)) = self.lsp_cursor_position() {
+                let tab_size = self.settings.tabstop as u32;
+                let insert_spaces = self.settings.expand_tab;
+                if let Some(mgr) = &mut self.lsp_manager {
+                    if let Some(id) = mgr.request_formatting(&path, tab_size, insert_spaces) {
+                        self.lsp_pending_formatting = Some(id);
+                        self.format_on_save_pending = Some(self.active_buffer_id());
+                        self.quit_after_format_save = quit_after;
+                        self.message = "Formatting...".to_string();
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        // No format-on-save — save immediately.
+        let result = self.save();
+        if quit_after && result.is_ok() {
+            // Caller checks EngineAction — handled at call site.
+        }
+        result
     }
 
     // =======================================================================
@@ -4111,7 +4151,7 @@ impl Engine {
 
         // Ctrl-S: save in any mode (does not change mode).
         if ctrl && key_name == "s" {
-            if let Err(e) = self.save() {
+            if let Err(e) = self.save_with_format(false) {
                 self.message = format!("Save failed: {}", e);
             }
             return EngineAction::None;
@@ -10702,7 +10742,7 @@ impl Engine {
 
         match cmd {
             "w" => {
-                let _ = self.save();
+                let _ = self.save_with_format(false);
                 EngineAction::None
             }
             "q" => {
@@ -10895,8 +10935,14 @@ impl Engine {
                 }
             }
             "wq" | "x" => {
-                if self.save().is_ok() {
-                    EngineAction::SaveQuit
+                if self.save_with_format(true).is_ok() {
+                    // If format-on-save is pending, quit will happen after
+                    // the formatting response arrives (format_save_quit_ready).
+                    if self.format_on_save_pending.is_some() {
+                        EngineAction::None
+                    } else {
+                        EngineAction::SaveQuit
+                    }
                 } else {
                     EngineAction::Error
                 }
@@ -16030,7 +16076,7 @@ impl Engine {
         let mut redraw = false;
         for event in events {
             match event {
-                LspEvent::Initialized(_) => {
+                LspEvent::Initialized(..) => {
                     // Server is ready — re-open any already-open buffers
                     let buffers: Vec<(PathBuf, String)> = self
                         .buffer_manager
@@ -16335,8 +16381,18 @@ impl Engine {
                     if self.lsp_pending_formatting == Some(request_id) {
                         self.lsp_pending_formatting = None;
                         let buffer_id = self.active_buffer_id();
-                        if !edits.is_empty() {
+                        let had_edits = !edits.is_empty();
+                        if had_edits {
                             self.apply_lsp_edits(buffer_id, edits);
+                        }
+                        // If this was a format-on-save, perform the actual save now.
+                        if self.format_on_save_pending.take() == Some(buffer_id) {
+                            let _ = self.save();
+                            if self.quit_after_format_save {
+                                self.quit_after_format_save = false;
+                                self.format_save_quit_ready = true;
+                            }
+                        } else if had_edits {
                             self.message = "Buffer formatted".to_string();
                         } else {
                             self.message = "No formatting changes".to_string();
@@ -16512,7 +16568,7 @@ impl Engine {
     }
 
     /// Request LSP formatting for the current buffer.
-    fn lsp_format_current(&mut self) {
+    pub fn lsp_format_current(&mut self) {
         if !self.settings.lsp_enabled {
             return;
         }

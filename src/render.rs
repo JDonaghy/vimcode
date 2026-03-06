@@ -747,6 +747,13 @@ pub static SETTING_DEFS: &[SettingDef] = &[
         category: "LSP",
         setting_type: SettingType::Bool,
     },
+    SettingDef {
+        key: "format_on_save",
+        label: "Format on Save",
+        description: "Automatically format the buffer via LSP before saving",
+        category: "LSP",
+        setting_type: SettingType::Bool,
+    },
     // ── Terminal ─────────────────────────────────────────────────────────────
     SettingDef {
         key: "terminal_scrollback_lines",

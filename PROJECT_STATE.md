@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Mar 5, 2026 (Session 129 — GUI polish + sidebar/scrollbar fixes) | **Tests:** 2256
+**Last updated:** Mar 5, 2026 (Session 130 — LSP formatting enhancements) | **Tests:** 2268
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 117b are in **SESSION_HISTORY.md**.
@@ -25,6 +25,18 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 130 — LSP formatting enhancements + LSP/GUI fixes (12 new tests, 2268 total):**
+Format-on-save, capability tracking, Shift+Alt+F keybinding, LSP binary resolution fixes, and GUI polish:
+- **LSP capabilities tracking**: `LspServer.capabilities: serde_json::Value` stores server capabilities from initialize response; `supports_formatting()` checks `documentFormattingProvider`; `LspEvent::Initialized` now carries capabilities value
+- **`format_on_save` setting**: New boolean setting (default off); toggleable via `:set formatonsave`/`:set fos`; added to Settings struct, Default impl, get/set_value_str, set_bool_option, query_option, display_all, and SETTING_DEFS
+- **Format-on-save flow**: `save_with_format(quit_after)` sends LSP format request + defers save; `format_on_save_pending: Option<BufferId>` tracks pending buffer; FormattingResponse handler applies edits then calls `save()`; `format_save_quit_ready` flag for deferred `:wq`/`:x` quit; Ctrl-S, `:w`, `:wq`/`:x` all route through `save_with_format()`
+- **Shift+Alt+F keybinding**: Wired in both GTK (`main.rs`) and TUI (`tui_main.rs`) to call `lsp_format_current()`
+- **LSP binary resolution fix**: `resolve_command()` now checks common tool directories (`~/.dotnet/tools`, `~/.cargo/bin`, `~/.local/bin`, `~/go/bin`, `~/.npm-global/bin`) before falling back to `which` — fixes servers installed via `dotnet tool`, `cargo install`, etc. not being found when launched from desktop environments
+- **LSP on-demand server startup**: `server_and_uri()` now calls `ensure_server_for_language()` if no server is running — LSP commands (format, goto-def, hover, etc.) auto-start the server instead of failing silently
+- **GTK CSS fix**: Removed invalid `max-height` properties from scrollbar CSS (GTK4 doesn't support them) — eliminates theme parser warnings on startup
+- **GTK window focus fix**: Added `root.present()` + deferred `grab_focus()` via `idle_add_local_once` so the window receives keyboard focus on startup (fixes Cinnamon/Mutter ignoring focus during init)
+- **12 integration tests** in `tests/formatting.rs`: setting defaults, toggle, query, aliases, display_all, get/set_value_str, capability messages, save behavior with/without format_on_save
 
 **Session 129 — GUI polish + sidebar/scrollbar fixes (no new tests, 2256 total):**
 Bug fixes for GTK sidebar layout, scrollbar rendering, undo/redo dirty tracking, and visual mode:

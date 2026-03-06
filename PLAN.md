@@ -2,6 +2,9 @@
 
 ## Recently Completed
 
+**Session 130 — LSP formatting enhancements (12 new tests, 2268 total):**
+Format-on-save (`format_on_save` setting, off by default), LSP capability checking (documentFormattingProvider), Shift+Alt+F keybinding (GTK+TUI). `save_with_format()` defers save when format-on-save enabled + server supports it; FormattingResponse handler applies edits then saves; `format_save_quit_ready` flag handles deferred `:wq`/`:x` quit. 12 integration tests in `tests/formatting.rs`.
+
 **Session 129 — GUI polish + sidebar/scrollbar fixes (no new tests, 2256 total):**
 Fixed sidebar layout (hexpand propagation through ScrolledWindow wrapper, drag handler using width_request), scrollbar ghosts from inactive tabs (visibility tracking), visual mode click jitter (4px dead zone), redo dirty flag (saved_undo_depth tracking), status line overlap (Pango ellipsis + TUI clamping), search icon (codicons \u{ea6d}), menu dropdown hover highlighting + geometry, menu actions close_menu centralization, logo embedding + taskbar icon, sidebar background CSS.
 

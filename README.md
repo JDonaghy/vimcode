@@ -11,7 +11,7 @@ There's a touch of irony here - using a cli tool to write the editor that I've w
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 2256 tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 2268 tests, zero async runtime dependency
 
 
 ## Download (Ubuntu)
@@ -748,6 +748,7 @@ Runtime changes are written through to `~/.config/vimcode/settings.json` immedia
 | `splitbelow` / `nosplitbelow` | `sb` | off | Horizontal splits open below current window |
 | `splitright` / `nosplitright` | `spr` | off | Vertical splits open to right of current window |
 | `lsp` / `nolsp` | | on | Enable/disable LSP language servers |
+| `formatonsave` / `noformatonsave` | `fos` | off | Auto-format buffer via LSP before saving |
 | `mode=vim` / `mode=vscode` | | vim | Editor mode (see **VSCode Mode** below) |
 
 Additional options (set directly in `settings.json`):
@@ -961,6 +962,7 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `Alt+F` | Focus / unfocus search panel |
 | `Ctrl+\` | Split editor right (new editor group) |
 | `Ctrl+1` / `Ctrl+2` | Focus editor group 0 / 1 |
+| `Shift+Alt+F` | Format document (LSP) |
 | `Alt+,` / `Alt+.` | Resize group split (TUI) |
 
 ### Command Mode

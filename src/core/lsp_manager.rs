@@ -228,6 +228,25 @@ fn resolve_command(cmd: &str) -> Option<PathBuf> {
         }
     }
 
+    // Check common tool directories that may not be in PATH when launched
+    // from a desktop environment (not a login shell).
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        let tool_dirs = [
+            home.join(".dotnet/tools"),
+            home.join(".cargo/bin"),
+            home.join(".local/bin"),
+            home.join("go/bin"),
+            home.join(".npm-global/bin"),
+        ];
+        for dir in &tool_dirs {
+            let candidate = dir.join(binary);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+
     // Fall back to PATH lookup via `which`/`where`
     #[cfg(target_os = "windows")]
     let which_cmd = "where";
@@ -429,8 +448,9 @@ impl LspManager {
             match self.event_rx.try_recv() {
                 Ok(event) => {
                     // Handle Initialized event — send the initialized notification
-                    if let LspEvent::Initialized(server_id) = &event {
-                        if let Some(server) = self.servers.get(*server_id) {
+                    if let LspEvent::Initialized(server_id, capabilities) = &event {
+                        if let Some(server) = self.servers.get_mut(*server_id) {
+                            server.capabilities = capabilities.clone();
                             server.send_initialized();
                             self.initialized.insert(*server_id, true);
                         }
@@ -531,8 +551,13 @@ impl LspManager {
     }
 
     /// Helper: look up server for a path; returns (server_id, uri) if ready.
+    /// If no server is running yet, attempts to start one.
     fn server_and_uri(&mut self, path: &Path) -> Option<(usize, String)> {
         let language_id = language_id_from_path(path)?;
+        if !self.language_to_server.contains_key(&language_id) {
+            // No server running — try to start one.
+            self.ensure_server_for_language(&language_id);
+        }
         let server_id = *self.language_to_server.get(&language_id)?;
         if !self.initialized.get(&server_id).copied().unwrap_or(false) {
             return None;
@@ -623,6 +648,21 @@ impl LspManager {
     ) -> Option<i64> {
         let (sid, uri) = self.server_and_uri(path)?;
         Some(self.servers[sid].request_formatting(&uri, tab_size, insert_spaces))
+    }
+
+    /// Check if the server for the given file supports document formatting.
+    #[allow(dead_code)]
+    pub fn server_supports_formatting(&self, path: &Path) -> bool {
+        let language_id = match language_id_from_path(path) {
+            Some(l) => l,
+            None => return false,
+        };
+        if let Some(&server_id) = self.language_to_server.get(&language_id) {
+            if self.initialized.get(&server_id).copied().unwrap_or(false) {
+                return self.servers[server_id].supports_formatting();
+            }
+        }
+        false
     }
 
     /// Request rename from the appropriate server.

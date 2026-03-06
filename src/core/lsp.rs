@@ -16,7 +16,7 @@ pub type LspServerId = usize;
 #[derive(Debug)]
 #[allow(dead_code)] // server_id/request_id fields populated for future request correlation
 pub enum LspEvent {
-    Initialized(LspServerId),
+    Initialized(LspServerId, serde_json::Value),
     Diagnostics {
         server_id: LspServerId,
         path: PathBuf,
@@ -524,6 +524,8 @@ pub struct LspServer {
     document_versions: HashMap<String, i32>,
     /// Maps request IDs to method names so the reader thread can route responses.
     pending_requests: Arc<Mutex<HashMap<i64, String>>>,
+    /// Capabilities advertised by the server in the initialize response.
+    pub capabilities: serde_json::Value,
 }
 
 impl LspServer {
@@ -584,6 +586,7 @@ impl LspServer {
             child,
             document_versions: HashMap::new(),
             pending_requests,
+            capabilities: serde_json::Value::Null,
         };
 
         // Send initialize request
@@ -796,6 +799,14 @@ impl LspServer {
         )
     }
 
+    /// Whether the server advertises document formatting support.
+    #[allow(dead_code)]
+    pub fn supports_formatting(&self) -> bool {
+        let v = &self.capabilities["documentFormattingProvider"];
+        // Can be `true` or an options object (both mean supported).
+        v.as_bool().unwrap_or(false) || v.is_object()
+    }
+
     /// Request whole-file formatting.
     pub fn request_formatting(&mut self, uri: &str, tab_size: u32, insert_spaces: bool) -> i64 {
         self.send_request(
@@ -964,9 +975,9 @@ fn reader_thread(
                 Some("initialize") => {
                     if !initialized_sent {
                         if let Some(r) = result {
-                            if r.get("capabilities").is_some() {
+                            if let Some(caps) = r.get("capabilities") {
                                 initialized_sent = true;
-                                let _ = tx.send(LspEvent::Initialized(server_id));
+                                let _ = tx.send(LspEvent::Initialized(server_id, caps.clone()));
                             }
                         }
                     }

@@ -1035,6 +1035,14 @@ fn event_loop(
             if engine.poll_lsp() {
                 needs_redraw = true;
             }
+            // Format-on-save + :wq/:x deferred quit
+            if engine.format_save_quit_ready {
+                engine.format_save_quit_ready = false;
+                engine.cleanup_all_swaps();
+                engine.lsp_shutdown();
+                save_session(engine);
+                break;
+            }
             if engine.poll_project_search() && !engine.project_search_results.is_empty() {
                 sidebar.search_scroll_top = 0;
                 if sidebar.active_panel == TuiPanel::Search {
@@ -2239,6 +2247,14 @@ fn event_loop(
                                 sidebar_width = (sidebar_width + 1).min(150);
                                 needs_redraw = true;
                                 continue;
+                            }
+                            // Shift+Alt+F: LSP format document
+                            KeyCode::Char('F') => {
+                                if key_event.modifiers.contains(KeyModifiers::SHIFT) {
+                                    engine.lsp_format_current();
+                                    needs_redraw = true;
+                                    continue;
+                                }
                             }
                             // Alt-M: toggle Vim ↔ VSCode editing mode
                             KeyCode::Char('m') | KeyCode::Char('M') => {

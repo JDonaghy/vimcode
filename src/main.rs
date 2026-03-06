@@ -1235,6 +1235,16 @@ impl SimpleComponent for App {
                                         return gtk4::glib::Propagation::Stop;
                                     }
 
+                                    // Shift+Alt+F: LSP format document
+                                    if alt && shift && !ctrl {
+                                        let key_lower = key_name.to_ascii_lowercase();
+                                        if key_lower == "f" {
+                                            engine.borrow_mut().lsp_format_current();
+                                            sender.input(Msg::Resize);
+                                            return gtk4::glib::Propagation::Stop;
+                                        }
+                                    }
+
                                     // Ctrl-F: terminal find when terminal focused, else editor find dialog
                                     if ctrl && !shift && unicode == Some('f') {
                                         if engine.borrow().terminal_has_focus {
@@ -2962,8 +2972,17 @@ impl SimpleComponent for App {
             widgets.drawing_area.add_controller(mc);
         }
 
-        // Ensure drawing area has focus on startup
-        widgets.drawing_area.grab_focus();
+        // Ensure drawing area has keyboard focus on startup.
+        // grab_focus() during init runs before the window is mapped, so some
+        // window managers (e.g. Cinnamon/Mutter) ignore it.  Present the window
+        // and defer the grab until the first frame is drawn.
+        root.present();
+        {
+            let da = widgets.drawing_area.clone();
+            gtk4::glib::idle_add_local_once(move || {
+                da.grab_focus();
+            });
+        }
 
         // Poll for background search results every 50 ms.
         let sender_for_poll = sender.input_sender().clone();
@@ -4474,6 +4493,12 @@ impl SimpleComponent for App {
                     engine.lsp_flush_changes();
                     if engine.poll_lsp() {
                         self.draw_needed.set(true);
+                    }
+                    // Format-on-save + :wq/:x deferred quit
+                    if engine.format_save_quit_ready {
+                        engine.format_save_quit_ready = false;
+                        drop(engine);
+                        sender.input(Msg::QuitConfirmed);
                     }
                 }
                 // Terminal: drain PTY output and refresh display if needed
@@ -10360,12 +10385,10 @@ const STATIC_CSS: &str = "
 
         scrollbar.horizontal {
             min-height: 10px;
-            max-height: 10px;
         }
 
         scrollbar.horizontal slider {
             min-height: 10px;
-            max-height: 10px;
         }
 
         scrollbar slider {
