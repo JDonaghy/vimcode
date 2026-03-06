@@ -82,7 +82,7 @@ struct App {
     git_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>>,
     ext_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>>,
     ai_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>>,
-    sidebar_inner_box: Rc<RefCell<Option<gtk4::Box>>>,
+    sidebar_inner_sw: Rc<RefCell<Option<gtk4::ScrolledWindow>>>,
     /// Direct ref to the sidebar Revealer for programmatic open/close.
     sidebar_revealer: Rc<RefCell<Option<gtk4::Revealer>>>,
     /// Direct refs to each panel's outer Box for programmatic show/hide.
@@ -379,6 +379,8 @@ enum Msg {
     CloseMenu,
     /// Activate a menu item: (menu_idx, item_idx, action_str).
     MenuActivateItem(usize, usize, String),
+    /// Highlight a menu dropdown item by index (mouse hover).
+    MenuHighlight(Option<usize>),
     /// Click in the debug sidebar DrawingArea (x, y coordinates in pixels).
     DebugSidebarClick(f64, f64),
     /// Key press in the debug sidebar DrawingArea.
@@ -594,6 +596,7 @@ impl SimpleComponent for App {
         gtk4::Window {
             set_title: Some("VimCode"),
             set_default_size: (800, 600),
+            set_icon_name: Some("vimcode"),
 
             // Intercept window close — check for unsaved changes before allowing quit.
             connect_close_request[sender] => move |_window| {
@@ -685,7 +688,7 @@ impl SimpleComponent for App {
 
                     #[name = "search_button"]
                     gtk4::Button {
-                        set_label: "\u{f002}",
+                        set_label: "\u{ea6d}",  // nf-cod-search
                         set_tooltip_text: Some("Search (Ctrl+Shift+F)"),
                         set_width_request: 48,
                         set_height_request: 48,
@@ -787,11 +790,18 @@ impl SimpleComponent for App {
                     #[watch]
                     set_reveal_child: model.sidebar_visible,
 
-                    // Container for both panels (Explorer and Settings)
-                    #[name = "sidebar_inner_box"]
-                    gtk4::Box {
-                        set_orientation: gtk4::Orientation::Vertical,
+                    // ScrolledWindow constrains children to the allocated width
+                    // (hscrollbar Never prevents content from growing the sidebar).
+                    #[name = "sidebar_inner_sw"]
+                    gtk4::ScrolledWindow {
                         set_width_request: 260,
+                        set_hexpand: false,
+                        set_hscrollbar_policy: gtk4::PolicyType::Never,
+                        set_vscrollbar_policy: gtk4::PolicyType::Never,
+
+                        gtk4::Box {
+                            set_orientation: gtk4::Orientation::Vertical,
+                            set_css_classes: &["sidebar-container"],
 
                         // Explorer panel
                         #[name = "explorer_panel"]
@@ -1160,8 +1170,9 @@ impl SimpleComponent for App {
                                 set_focusable: true,
                             },
                         },
-                    },
-                },
+                    },  // close inner Box
+                    },  // close ScrolledWindow
+                },  // close Revealer
 
                 // Sidebar resize drag handle (6px wide, ew-resize cursor)
                 #[name = "sidebar_resize_handle"]
@@ -1445,6 +1456,11 @@ impl SimpleComponent for App {
                             add_controller = gtk4::GestureDrag {
                                 set_button: 1,
                                 connect_drag_update[sender, drawing_area] => move |gesture, dx, dy| {
+                                    // Dead zone: ignore sub-4px movement to avoid
+                                    // accidental visual mode on click jitter.
+                                    if dx * dx + dy * dy < 16.0 {
+                                        return;
+                                    }
                                     if let Some((start_x, start_y)) = gesture.start_point() {
                                         let x = start_x + dx;
                                         let y = start_y + dy;
@@ -1692,7 +1708,8 @@ impl SimpleComponent for App {
         let h_sb_hovered_cell: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let tab_close_hover_cell: Rc<Cell<Option<(usize, usize)>>> = Rc::new(Cell::new(None));
         let h_sb_drag_cell: Rc<Cell<Option<core::WindowId>>> = Rc::new(Cell::new(None));
-        let sidebar_inner_box_ref: Rc<RefCell<Option<gtk4::Box>>> = Rc::new(RefCell::new(None));
+        let sidebar_inner_sw_ref: Rc<RefCell<Option<gtk4::ScrolledWindow>>> =
+            Rc::new(RefCell::new(None));
         let sidebar_revealer_ref: Rc<RefCell<Option<gtk4::Revealer>>> = Rc::new(RefCell::new(None));
         // Saves the sidebar width at the start of a drag so we can compute
         // initial_width + total_offset instead of accumulating delta per event.
@@ -1774,7 +1791,7 @@ impl SimpleComponent for App {
             replace_text: String::new(),
             find_case_sensitive: false,
             find_whole_word: false,
-            sidebar_inner_box: sidebar_inner_box_ref.clone(),
+            sidebar_inner_sw: sidebar_inner_sw_ref.clone(),
             sidebar_revealer: sidebar_revealer_ref.clone(),
             explorer_panel_box: explorer_panel_box_ref.clone(),
             search_panel_box: search_panel_box_ref.clone(),
@@ -1811,7 +1828,7 @@ impl SimpleComponent for App {
         *drawing_area_ref.borrow_mut() = Some(widgets.drawing_area.clone());
         *menu_bar_da_ref.borrow_mut() = Some(widgets.menu_bar_da.clone());
         *overlay_ref.borrow_mut() = Some(widgets.editor_overlay.clone());
-        *sidebar_inner_box_ref.borrow_mut() = Some(widgets.sidebar_inner_box.clone());
+        *sidebar_inner_sw_ref.borrow_mut() = Some(widgets.sidebar_inner_sw.clone());
         *sidebar_revealer_ref.borrow_mut() = Some(widgets.sidebar_revealer.clone());
         *explorer_panel_box_ref.borrow_mut() = Some(widgets.explorer_panel.clone());
         *search_panel_box_ref.borrow_mut() = Some(widgets.search_panel.clone());
@@ -1844,6 +1861,8 @@ impl SimpleComponent for App {
             search_entry.set_margin_end(8);
             search_entry.set_margin_top(4);
             search_entry.set_margin_bottom(4);
+            search_entry.set_hexpand(true);
+            search_entry.set_width_chars(1);
             panel.append(&search_entry);
 
             // Scrolled list of settings rows
@@ -1912,7 +1931,7 @@ impl SimpleComponent for App {
 
             let gesture = gtk4::GestureDrag::new();
 
-            let sb_ref = sidebar_inner_box_ref.clone();
+            let sb_ref = sidebar_inner_sw_ref.clone();
             let sw = sidebar_drag_start_w.clone();
             gesture.connect_drag_begin(move |_, x, _| {
                 let Some(ref sb) = *sb_ref.borrow() else {
@@ -1926,17 +1945,20 @@ impl SimpleComponent for App {
                 // The handle strip sits right after the sidebar.
                 // activity bar (48px) + sidebar_width = left edge of handle.
                 const ACTIVITY_W: f64 = 48.0;
-                let sidebar_right = ACTIVITY_W + sb.allocated_width() as f64;
+                let aw = sb.allocated_width();
+                let sidebar_right = ACTIVITY_W + aw as f64;
                 // Accept clicks within ±10 px of the handle centre.
                 if (x - (sidebar_right + 3.0)).abs() <= 10.0 {
                     is_sb_drag_begin.set(true);
-                    sw.set(sb.allocated_width());
+                    // Use width_request (what we control) not allocated_width
+                    // (which may be larger due to GTK layout).
+                    sw.set(sb.width_request());
                 } else {
                     is_sb_drag_begin.set(false);
                 }
             });
 
-            let sb_ref2 = sidebar_inner_box_ref.clone();
+            let sb_ref2 = sidebar_inner_sw_ref.clone();
             let sw2 = sidebar_drag_start_w.clone();
             gesture.connect_drag_update(move |_, dx, _| {
                 if !is_sb_drag_update.get() {
@@ -2071,6 +2093,56 @@ impl SimpleComponent for App {
                 menu_dd_da.add_controller(gesture);
             }
 
+            // Motion handler — highlight menu items on hover.
+            {
+                let sender_motion = sender.input_sender().clone();
+                let engine_motion = engine.clone();
+                let lh_motion = menu_dd_lh.clone();
+                let motion = gtk4::EventControllerMotion::new();
+                motion.connect_motion(move |_, x, y| {
+                    let engine = engine_motion.borrow();
+                    let line_height = lh_motion.get();
+                    let Some(open_idx) = engine.menu_open_idx else {
+                        return;
+                    };
+                    if let Some((_, _, items)) = render::MENU_STRUCTURE.get(open_idx) {
+                        let mut popup_x = 8.0_f64;
+                        for i in 0..open_idx {
+                            if let Some((name, _, _)) = render::MENU_STRUCTURE.get(i) {
+                                popup_x += name.len() as f64 * 7.0 + 10.0;
+                            }
+                        }
+                        let popup_w = 220.0_f64;
+                        let popup_y = 0.0;
+                        let popup_h = (items.len() as f64 + 1.0) * line_height;
+                        if y >= popup_y
+                            && y < popup_y + popup_h
+                            && x >= popup_x
+                            && x < popup_x + popup_w
+                        {
+                            let raw_idx = ((y - popup_y) / line_height) as usize;
+                            let item_real = raw_idx.saturating_sub(1);
+                            if raw_idx >= 1
+                                && item_real < items.len()
+                                && !items[item_real].separator
+                            {
+                                if engine.menu_highlighted_item != Some(item_real) {
+                                    drop(engine);
+                                    sender_motion.send(Msg::MenuHighlight(Some(item_real))).ok();
+                                }
+                            } else if engine.menu_highlighted_item.is_some() {
+                                drop(engine);
+                                sender_motion.send(Msg::MenuHighlight(None)).ok();
+                            }
+                        } else if engine.menu_highlighted_item.is_some() {
+                            drop(engine);
+                            sender_motion.send(Msg::MenuHighlight(None)).ok();
+                        }
+                    }
+                });
+                menu_dd_da.add_controller(motion);
+            }
+
             widgets.window_overlay.add_overlay(&menu_dd_da);
             *menu_dropdown_da_ref.borrow_mut() = Some(menu_dd_da);
         }
@@ -2150,6 +2222,31 @@ impl SimpleComponent for App {
                 }
             });
             widgets.menu_bar_da.add_controller(gesture);
+        }
+        // Hover motion: switch dropdown when moving between menu labels while open.
+        {
+            let sender_hover = sender.input_sender().clone();
+            let engine_hover = engine.clone();
+            let motion = gtk4::EventControllerMotion::new();
+            motion.connect_motion(move |_, x, _y| {
+                let engine = engine_hover.borrow();
+                // Only switch if a menu is already open.
+                let Some(current) = engine.menu_open_idx else {
+                    return;
+                };
+                let mut cursor_x = 8.0_f64;
+                for (idx, (name, _, _)) in render::MENU_STRUCTURE.iter().enumerate() {
+                    let item_w = name.len() as f64 * 7.0 + 10.0;
+                    if x >= cursor_x && x < cursor_x + item_w {
+                        if idx != current {
+                            sender_hover.send(Msg::OpenMenu(idx)).ok();
+                        }
+                        return;
+                    }
+                    cursor_x += item_w;
+                }
+            });
+            widgets.menu_bar_da.add_controller(motion);
         }
         // ── Debug sidebar DrawingArea setup ───────────────────────────────────
         {
@@ -2373,10 +2470,10 @@ impl SimpleComponent for App {
             root.set_titlebar(Some(menu_row));
         }
 
-        // Restore saved sidebar width
+        // Restore saved sidebar width (clamp to reasonable range)
         {
-            let saved_width = engine.borrow().session.sidebar_width;
-            widgets.sidebar_inner_box.set_width_request(saved_width);
+            let saved_width = engine.borrow().session.sidebar_width.clamp(80, 600);
+            widgets.sidebar_inner_sw.set_width_request(saved_width);
         }
 
         // Set ew-resize cursor on drag handle
@@ -4268,7 +4365,7 @@ impl SimpleComponent for App {
                 // Window geometry is saved on close instead
             }
             Msg::SidebarResized => {
-                if let Some(ref sb) = *self.sidebar_inner_box.borrow() {
+                if let Some(ref sb) = *self.sidebar_inner_sw.borrow() {
                     let w = sb.width_request();
                     self.engine.borrow_mut().session.sidebar_width = w;
                     let _ = self.engine.borrow().session.save();
@@ -4582,7 +4679,7 @@ impl SimpleComponent for App {
                 engine.session.window.height = height;
                 engine.session.explorer_visible = self.sidebar_visible;
                 // Save sidebar width on close too
-                if let Some(ref sb) = *self.sidebar_inner_box.borrow() {
+                if let Some(ref sb) = *self.sidebar_inner_sw.borrow() {
                     engine.session.sidebar_width = sb.width_request();
                 }
 
@@ -4784,6 +4881,8 @@ impl SimpleComponent for App {
                 self.draw_needed.set(true);
             }
             Msg::MenuActivateItem(menu_idx, item_idx, action) => {
+                // Close the menu engine-side for every action.
+                self.engine.borrow_mut().close_menu();
                 // Intercept dialog actions that need GTK-side handling
                 match action.as_str() {
                     "open_file_dialog" => {
@@ -4802,13 +4901,9 @@ impl SimpleComponent for App {
                         sender.input(Msg::OpenRecentDialog);
                     }
                     "find" => {
-                        // Open the GTK find/replace dialog (same as Ctrl+F).
-                        self.engine.borrow_mut().close_menu();
                         sender.input(Msg::ToggleFindDialog);
                     }
                     "quit_menu" => {
-                        // Close the menu first, then quit (or show dialog if unsaved).
-                        self.engine.borrow_mut().close_menu();
                         if self.engine.borrow().has_any_unsaved() {
                             sender.input(Msg::ShowQuitConfirm);
                         } else {
@@ -4843,6 +4938,12 @@ impl SimpleComponent for App {
                     da.queue_draw();
                 }
                 self.draw_needed.set(true);
+            }
+            Msg::MenuHighlight(idx) => {
+                self.engine.borrow_mut().menu_highlighted_item = idx;
+                if let Some(ref da) = *self.menu_dropdown_da.borrow() {
+                    da.queue_draw();
+                }
             }
             Msg::DebugSidebarClick(click_x, y) => {
                 use crate::core::engine::DebugSidebarSection;
@@ -5530,6 +5631,20 @@ fn sync_scrollbar_positions(
     let (window_rects, _dividers) =
         engine.calculate_group_window_rects(editor_bounds, tab_bar_height);
 
+    // Hide scrollbars for windows not in the current visible set
+    // (e.g. windows in non-active tabs).
+    let visible_ids: std::collections::HashSet<core::WindowId> =
+        window_rects.iter().map(|(wid, _)| *wid).collect();
+    for (wid, ws) in scrollbars.iter() {
+        if visible_ids.contains(wid) {
+            ws.vertical.set_visible(true);
+            ws.cursor_indicator.set_visible(true);
+        } else {
+            ws.vertical.set_visible(false);
+            ws.cursor_indicator.set_visible(false);
+        }
+    }
+
     for (window_id, rect) in &window_rects {
         let ws = match scrollbars.get(window_id) {
             Some(ws) => ws,
@@ -5756,6 +5871,20 @@ impl App {
             if let Some(ws) = scrollbars.remove(&wid) {
                 overlay.remove_overlay(&ws.vertical);
                 overlay.remove_overlay(&ws.cursor_indicator);
+            }
+        }
+
+        // Hide scrollbars for windows that exist but aren't visible
+        // (e.g. windows in non-active tabs).
+        let visible_ids: std::collections::HashSet<core::WindowId> =
+            window_rects.iter().map(|(wid, _)| *wid).collect();
+        for (wid, ws) in scrollbars.iter() {
+            if visible_ids.contains(wid) {
+                ws.vertical.set_visible(true);
+                ws.cursor_indicator.set_visible(true);
+            } else {
+                ws.vertical.set_visible(false);
+                ws.cursor_indicator.set_visible(false);
             }
         }
 
@@ -8602,12 +8731,24 @@ fn draw_status_line(
     let (fr, fg, fb) = theme.status_fg.to_cairo();
     cr.set_source_rgb(fr, fg, fb);
 
-    layout.set_text(left);
-    cr.move_to(0.0, y);
-    pangocairo::show_layout(cr, layout);
-
+    // Measure right text first so we can clamp left text width.
+    layout.set_width(-1); // reset to natural width
+    layout.set_ellipsize(pango::EllipsizeMode::None);
     layout.set_text(right);
     let (right_w, _) = layout.pixel_size();
+
+    // Draw left text, truncated to not overlap right text.
+    let left_max = (width - right_w as f64 - 8.0).max(0.0);
+    layout.set_text(left);
+    layout.set_width((left_max * pango::SCALE as f64) as i32);
+    layout.set_ellipsize(pango::EllipsizeMode::End);
+    cr.move_to(0.0, y);
+    pangocairo::show_layout(cr, layout);
+    layout.set_width(-1);
+    layout.set_ellipsize(pango::EllipsizeMode::None);
+
+    // Draw right text, right-aligned.
+    layout.set_text(right);
     cr.move_to(width - right_w as f64, y);
     pangocairo::show_layout(cr, layout);
 }
@@ -8688,10 +8829,11 @@ fn draw_menu_bar(
             cr.set_source_rgb(fr, fg, fb);
         }
         layout.set_text(name);
-        let (lw, lh) = layout.pixel_size();
+        let (_lw, lh) = layout.pixel_size();
         cr.move_to(cursor_x, y + (height - lh as f64) / 2.0);
         pangocairo::show_layout(cr, &layout);
-        cursor_x += lw as f64 + 10.0;
+        // Use same metric as click/hover handlers: 7px/char + 10px padding.
+        cursor_x += name.len() as f64 * 7.0 + 10.0;
     }
 
     // Title centered in remaining space (dimmed)
@@ -8729,14 +8871,12 @@ fn draw_menu_dropdown(
     let layout = pango::Layout::new(&pango_ctx);
     layout.set_font_description(Some(&font_desc));
 
-    // Compute popup_x the same way draw_menu_bar does: measure each label
+    // Compute popup_x using the same metric as the click/hover handlers.
     let mut popup_x = x + 8.0;
     if let Some(midx) = data.open_menu_idx {
         for i in 0..midx {
             if let Some((name, _, _)) = render::MENU_STRUCTURE.get(i) {
-                layout.set_text(name);
-                let (lw, _) = layout.pixel_size();
-                popup_x += lw as f64 + 10.0;
+                popup_x += name.len() as f64 * 7.0 + 10.0;
             }
         }
     }
@@ -8755,24 +8895,32 @@ fn draw_menu_dropdown(
     cr.rectangle(popup_x, popup_y, popup_width, popup_height);
     let _ = cr.stroke();
 
-    // Items
+    // Items — each occupies one line_height row starting at popup_y + line_height
+    // (row 0 is the "header" behind the menu bar).
     let (fr, fg_c, fb) = theme.foreground.to_cairo();
     let (sr, sg, sb) = theme.line_number_fg.to_cairo();
     cr.set_source_rgb(fr, fg_c, fb);
-    let mut item_y = popup_y + line_height * 0.1;
-    for item in &data.open_items {
-        item_y += line_height;
+    for (i, item) in data.open_items.iter().enumerate() {
+        let row_top = popup_y + (i as f64 + 1.0) * line_height;
         if item.separator {
             cr.set_source_rgb(sr, sg, sb);
-            cr.move_to(popup_x + 4.0, item_y - line_height * 0.5);
-            cr.line_to(popup_x + popup_width - 4.0, item_y - line_height * 0.5);
+            let sep_y = row_top + line_height * 0.5;
+            cr.move_to(popup_x + 4.0, sep_y);
+            cr.line_to(popup_x + popup_width - 4.0, sep_y);
             let _ = cr.stroke();
             cr.set_source_rgb(fr, fg_c, fb);
         } else {
+            // Draw highlight bar for hovered/keyboard-selected item.
+            if data.highlighted_item_idx == Some(i) {
+                cr.set_source_rgb(0.18, 0.40, 0.73); // VSCode hover blue #2d65bb
+                cr.rectangle(popup_x + 1.0, row_top, popup_width - 2.0, line_height);
+                let _ = cr.fill();
+            }
             layout.set_text(item.label);
             let (_, lh) = layout.pixel_size();
+            let text_y = row_top + (line_height - lh as f64) * 0.5;
             cr.set_source_rgb(fr, fg_c, fb);
-            cr.move_to(popup_x + 8.0, item_y - lh as f64 * 0.9);
+            cr.move_to(popup_x + 8.0, text_y);
             pangocairo::show_layout(cr, &layout);
             let sc = if data.is_vscode_mode && !item.vscode_shortcut.is_empty() {
                 item.vscode_shortcut
@@ -8783,10 +8931,7 @@ fn draw_menu_dropdown(
                 layout.set_text(sc);
                 let (sc_w, _) = layout.pixel_size();
                 cr.set_source_rgb(sr, sg, sb);
-                cr.move_to(
-                    popup_x + popup_width - sc_w as f64 - 8.0,
-                    item_y - lh as f64 * 0.9,
-                );
+                cr.move_to(popup_x + popup_width - sc_w as f64 - 8.0, text_y);
                 pangocairo::show_layout(cr, &layout);
                 cr.set_source_rgb(fr, fg_c, fb);
             }
@@ -9978,6 +10123,10 @@ fn make_theme_css(theme: &Theme) -> String {
         }}
 
         /* Sidebar */
+        .sidebar-container {{
+            background-color: {bar_bg};
+        }}
+
         .sidebar {{
             background-color: {bar_bg};
             border-right: 1px solid {border_col};
@@ -10072,6 +10221,19 @@ fn make_theme_css(theme: &Theme) -> String {
             border: 1px solid {border_col};
             border-radius: 2px;
             padding: 4px;
+            min-width: 0;
+        }}
+
+        .sidebar entry > text {{
+            min-width: 0;
+        }}
+
+        .sidebar searchentry {{
+            min-width: 0;
+        }}
+
+        .sidebar searchentry > text {{
+            min-width: 0;
         }}
 
         .sidebar entry:focus {{
@@ -10638,6 +10800,56 @@ fn find_tree_path_for_file(
     None
 }
 
+/// Install the application icon and `.desktop` file to `~/.local/share/` so that
+/// desktop environments (GNOME, KDE, etc.) can show the icon in the taskbar and
+/// application launcher.  Runs once per launch; overwrites stale files silently.
+fn install_icon_and_desktop() {
+    use std::fs;
+    use std::path::PathBuf;
+
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return;
+    };
+    let data_dir = home.join(".local/share");
+
+    // Icon — 256×256 PNG embedded at compile time.
+    let icon_dir = data_dir.join("icons/hicolor/256x256/apps");
+    let icon_path = icon_dir.join("vimcode.png");
+    let icon_bytes: &[u8] = include_bytes!("../vimcode-color.png");
+    if fs::create_dir_all(&icon_dir).is_ok() {
+        let _ = fs::write(&icon_path, icon_bytes);
+    }
+
+    // SVG icon for scalable size.
+    let svg_dir = data_dir.join("icons/hicolor/scalable/apps");
+    let svg_path = svg_dir.join("vimcode.svg");
+    let svg_bytes: &[u8] = include_bytes!("../vimcode-color.svg");
+    if fs::create_dir_all(&svg_dir).is_ok() {
+        let _ = fs::write(&svg_path, svg_bytes);
+    }
+
+    // .desktop file
+    let app_dir = data_dir.join("applications");
+    let desktop_path = app_dir.join("com.vimcode.VimCode.desktop");
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "vimcode".to_string());
+    let desktop = format!(
+        "[Desktop Entry]\n\
+         Name=VimCode\n\
+         Comment=Vim-like code editor\n\
+         Exec={exe}\n\
+         Icon=vimcode\n\
+         Terminal=false\n\
+         Type=Application\n\
+         Categories=Development;TextEditor;\n\
+         StartupWMClass=com.vimcode.VimCode\n"
+    );
+    if fs::create_dir_all(&app_dir).is_ok() {
+        let _ = fs::write(&desktop_path, desktop);
+    }
+}
+
 fn main() {
     // Parse CLI args to get optional file path
     let args: Vec<String> = std::env::args().collect();
@@ -10672,6 +10884,9 @@ fn main() {
         tui_main::run(file_path, debug_log);
         return;
     }
+
+    // Install icon and .desktop file so the taskbar/launcher can find them.
+    install_icon_and_desktop();
 
     let gtk_app = gtk4::Application::builder()
         .application_id("com.vimcode.VimCode")

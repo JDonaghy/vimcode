@@ -1089,14 +1089,6 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
                 separator: false,
             },
             MenuItemData {
-                label: "Close Tab",
-                shortcut: "",
-                vscode_shortcut: "Ctrl+W",
-                action: "bd",
-                enabled: true,
-                separator: false,
-            },
-            MenuItemData {
                 label: "",
                 shortcut: "",
                 vscode_shortcut: "",
@@ -1614,6 +1606,7 @@ pub struct Theme {
     pub function: Color,
     pub type_name: Color,
     pub variable: Color,
+    pub number: Color,
     /// Fallback foreground for unrecognised scopes.
     pub default_fg: Color,
 
@@ -1726,6 +1719,7 @@ impl Theme {
             function: Color::from_hex("#61afef"),
             type_name: Color::from_hex("#e5c07b"),
             variable: Color::from_hex("#e06c75"),
+            number: Color::from_hex("#d19a66"),
             default_fg: Color::from_hex("#abb2bf"),
 
             // (0.3, 0.5, 0.7) with alpha 0.3
@@ -1841,6 +1835,7 @@ impl Theme {
             function: Color::from_hex("#8ec07c"),
             type_name: Color::from_hex("#fabd2f"),
             variable: Color::from_hex("#83a598"),
+            number: Color::from_hex("#d3869b"),
             default_fg: Color::from_hex("#ebdbb2"),
 
             selection: Color::from_hex("#458588"),
@@ -1927,6 +1922,7 @@ impl Theme {
             function: Color::from_hex("#7aa2f7"),
             type_name: Color::from_hex("#e0af68"),
             variable: Color::from_hex("#f7768e"),
+            number: Color::from_hex("#ff9e64"),
             default_fg: Color::from_hex("#a9b1d6"),
 
             selection: Color::from_hex("#364a82"),
@@ -2013,6 +2009,7 @@ impl Theme {
             function: Color::from_hex("#268bd2"),
             type_name: Color::from_hex("#b58900"),
             variable: Color::from_hex("#dc322f"),
+            number: Color::from_hex("#2aa198"),
             default_fg: Color::from_hex("#93a1a1"),
 
             selection: Color::from_hex("#073642"),
@@ -2110,6 +2107,7 @@ impl Theme {
             "function" | "method" => self.function,
             "type" | "class" | "struct" => self.type_name,
             "variable" => self.variable,
+            "number" => self.number,
             _ => self.default_fg,
         }
     }

@@ -86,6 +86,30 @@ pub static BUNDLED: &[BundledExtension] = &[
         readme: include_str!("../../extensions/bash/README.md"),
     },
     BundledExtension {
+        name: "json",
+        manifest_toml: include_str!("../../extensions/json/manifest.toml"),
+        scripts: &[],
+        readme: include_str!("../../extensions/json/README.md"),
+    },
+    BundledExtension {
+        name: "xml",
+        manifest_toml: include_str!("../../extensions/xml/manifest.toml"),
+        scripts: &[],
+        readme: include_str!("../../extensions/xml/README.md"),
+    },
+    BundledExtension {
+        name: "yaml",
+        manifest_toml: include_str!("../../extensions/yaml/manifest.toml"),
+        scripts: &[],
+        readme: include_str!("../../extensions/yaml/README.md"),
+    },
+    BundledExtension {
+        name: "markdown",
+        manifest_toml: include_str!("../../extensions/markdown/manifest.toml"),
+        scripts: &[],
+        readme: include_str!("../../extensions/markdown/README.md"),
+    },
+    BundledExtension {
         name: "git-insights",
         manifest_toml: include_str!("../../extensions/git-insights/manifest.toml"),
         scripts: &[(

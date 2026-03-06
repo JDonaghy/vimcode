@@ -7481,19 +7481,32 @@ fn render_status_line(
         set_cell(buf, x, area.y, ' ', fg, bg);
     }
 
+    let right_chars: Vec<char> = right.chars().collect();
+    let right_len = right_chars.len() as u16;
+    let right_start = if right_len <= area.width {
+        area.x + area.width - right_len
+    } else {
+        area.x + area.width
+    };
+
+    // Draw left text, stopping 1 col before right text to avoid overlap.
+    let left_limit = if right_start > area.x {
+        right_start - 1
+    } else {
+        area.x
+    };
     let mut x = area.x;
     for ch in left.chars() {
-        if x >= area.x + area.width {
+        if x >= left_limit {
             break;
         }
         set_cell(buf, x, area.y, ch, fg, bg);
         x += 1;
     }
 
-    let right_chars: Vec<char> = right.chars().collect();
-    let right_len = right_chars.len() as u16;
+    // Draw right text, right-aligned.
     if right_len <= area.width {
-        let mut rx = area.x + area.width - right_len;
+        let mut rx = right_start;
         for &ch in &right_chars {
             if rx >= area.x + area.width {
                 break;

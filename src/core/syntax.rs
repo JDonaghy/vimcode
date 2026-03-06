@@ -402,11 +402,45 @@ impl SyntaxLanguage {
             Self::CSharp => "
                 (method_declaration name: (identifier) @function)
                 (constructor_declaration name: (identifier) @function)
+                (local_function_statement name: (identifier) @function)
+                (invocation_expression function: (identifier) @function)
                 (class_declaration name: (identifier) @type)
                 (interface_declaration name: (identifier) @type)
                 (struct_declaration name: (identifier) @type)
+                (enum_declaration name: (identifier) @type)
+                (delegate_declaration name: (identifier) @type)
+                (generic_name (identifier) @type)
+                (void_keyword) @type
+                (implicit_type) @keyword
+
+                (variable_declaration type: (identifier) @type)
+                (parameter type: (identifier) @type)
+                (object_creation_expression type: (identifier) @type)
+                (method_declaration type: (identifier) @type)
+                (local_function_statement type: (identifier) @type)
+                (property_declaration type: (identifier) @type)
+                (event_declaration type: (identifier) @type)
+                (cast_expression type: (identifier) @type)
+                (for_each_statement type: (identifier) @type)
+                (catch_declaration type: (identifier) @type)
+                (base_list (identifier) @type)
+
+                (using_directive (identifier) @type)
+                (using_directive (qualified_name) @type)
+                (namespace_declaration name: (identifier) @type)
+                (namespace_declaration name: (qualified_name) @type)
+                (file_scoped_namespace_declaration name: (identifier) @type)
+                (file_scoped_namespace_declaration name: (qualified_name) @type)
+
                 (string_literal) @string
+                (verbatim_string_literal) @string
+                (interpolated_string_expression) @string
+                (character_literal) @string
+                (integer_literal) @number
+                (real_literal) @number
                 (comment) @comment
+                (member_access_expression name: (identifier) @variable)
+                (attribute name: (identifier) @function)
                 [
                   \"class\"
                   \"interface\"
@@ -416,14 +450,48 @@ impl SyntaxLanguage {
                   \"public\"
                   \"private\"
                   \"protected\"
+                  \"internal\"
                   \"static\"
                   \"if\"
                   \"else\"
                   \"for\"
                   \"foreach\"
                   \"while\"
+                  \"do\"
                   \"return\"
                   \"new\"
+                  \"override\"
+                  \"virtual\"
+                  \"abstract\"
+                  \"sealed\"
+                  \"async\"
+                  \"await\"
+                  \"readonly\"
+                  \"const\"
+                  \"base\"
+                  \"this\"
+                  \"throw\"
+                  \"try\"
+                  \"catch\"
+                  \"finally\"
+                  \"switch\"
+                  \"case\"
+                  \"default\"
+                  \"break\"
+                  \"continue\"
+                  \"enum\"
+                  \"delegate\"
+                  \"event\"
+                  \"get\"
+                  \"set\"
+                  \"in\"
+                  \"out\"
+                  \"ref\"
+                  \"params\"
+                  \"is\"
+                  \"as\"
+                  \"typeof\"
+                  \"partial\"
                 ] @keyword
                 (boolean_literal) @keyword
                 (null_literal) @keyword

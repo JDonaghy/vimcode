@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Mar 5, 2026 (Session 127 — Swap file crash recovery) | **Tests:** 2256
+**Last updated:** Mar 5, 2026 (Session 129 — GUI polish + sidebar/scrollbar fixes) | **Tests:** 2256
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 117b are in **SESSION_HISTORY.md**.
@@ -25,6 +25,28 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 129 — GUI polish + sidebar/scrollbar fixes (no new tests, 2256 total):**
+Bug fixes for GTK sidebar layout, scrollbar rendering, undo/redo dirty tracking, and visual mode:
+- **Sidebar width fix**: Sidebar was unresizable and opened at full window width because Entry widgets' `hexpand: true` propagated up through Box → ScrolledWindow → Revealer, making the sidebar compete for horizontal space. Fix: wrapped sidebar content in `ScrolledWindow` (`hscrollbar_policy: Never`, `hexpand: false`), and drag handler now uses `width_request()` instead of `allocated_width()` for starting width
+- **Scrollbar ghost fix**: Scrollbars from inactive tabs remained visible behind the active tab. Added visibility tracking in `sync_scrollbar()` and `sync_scrollbar_positions()` — scrollbar widgets for windows not in the current `window_rects` are hidden
+- **Visual mode click jitter**: Editor entered visual mode from slight mouse movement during clicks. Added 4px dead zone (`dx²+dy² < 16`) to GestureDrag handler
+- **Redo dirty flag**: Undo cleared the dirty indicator but redo didn't restore it. Added `saved_undo_depth: Option<usize>` to `BufferState` with `is_at_saved_state()` method; undo/redo now correctly track saved state
+- **Status line overlap**: Left and right text overwrote each other when space was tight. GTK: Pango `set_width()` + `EllipsizeMode::End` truncation. TUI: left text stops 1 col before right text start
+- **Search panel icon**: Changed from `\u{f002}` (broken in some Nerd Font builds) to `\u{ea6d}` (codicons search, same range as working Extensions icon)
+- **Menu dropdown highlight**: Added `EventControllerMotion` to dropdown overlay + highlight rendering with consistent geometry between draw and hit-test
+- **Menu actions fix**: `close_menu()` moved to top of `MenuActivateItem` handler so it runs for all actions (fixes Open Workspace, Quit not working)
+- **Logo integration**: Embedded vimcode-color.svg/png in binary; `install_icon_and_desktop()` writes icons + .desktop file; window `set_icon_name`
+- **Sidebar background**: Added `sidebar-container` CSS class with `background-color` to prevent grey area when Revealer hides sidebar
+
+**Session 128 — GUI mode polish + data format extensions (no new tests, 2256 total):**
+GTK menu and dialog fixes, new bundled extensions, improved C# syntax highlighting:
+- **GTK menu hover switching**: Added `EventControllerMotion` to `menu_bar_da` — hovering between menu labels switches the open dropdown (standard desktop behavior)
+- **Dialog menu-close fix**: `OpenFileDialog` and `OpenFolderDialog` handlers now close the menu and disable the overlay before opening the native dialog, preventing the menu from staying stuck
+- **Removed "Close Tab" from File menu** in `MENU_STRUCTURE` (render.rs)
+- **4 new bundled extensions**: JSON (`vscode-json-languageserver`), XML (`lemminx`), YAML (`yaml-language-server`), Markdown (`marksman`) — each with manifest.toml and README.md
+- **`number` color added to Theme**: New `pub number: Color` field + `"number"` arm in `scope_color()`; set in all 4 themes (OneDark: `#d19a66`, Gruvbox: `#d3869b`, Tokyo Night: `#ff9e64`, Solarized: `#2aa198`)
+- **Expanded C# tree-sitter query**: Added `implicit_type` (var), `generic_name`, `integer_literal`/`real_literal` (@number), `verbatim_string_literal`/`interpolated_string_expression`/`character_literal` (@string), `member_access_expression`, `invocation_expression`, `attribute`, `enum_declaration`, and ~30 additional keywords (override, virtual, abstract, sealed, async, await, try/catch/finally, switch/case/default, enum, delegate, event, etc.)
 
 **Session 127 — Swap file crash recovery (13 new tests, 2256 total):**
 Vim-like swap file system for crash recovery:

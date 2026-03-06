@@ -57,6 +57,9 @@ pub struct BufferState {
     pub canonical_path: Option<PathBuf>,
     /// Whether the buffer has unsaved changes.
     pub dirty: bool,
+    /// Undo stack depth at the time of last save (used to detect clean state after undo/redo).
+    /// `None` means never saved (new buffer).
+    pub saved_undo_depth: Option<usize>,
     /// Whether this is a preview buffer (single-click in file explorer).
     pub preview: bool,
     /// For diff buffers: the source file the diff was generated from.
@@ -106,6 +109,7 @@ impl BufferState {
             file_path: None,
             canonical_path: None,
             dirty: false,
+            saved_undo_depth: None,
             preview: false,
             source_file: None,
             syntax: Syntax::new(),
@@ -135,6 +139,7 @@ impl BufferState {
             canonical_path,
             file_path: Some(path),
             dirty: false,
+            saved_undo_depth: Some(0),
             preview: false,
             source_file: None,
             syntax,
@@ -166,6 +171,7 @@ impl BufferState {
         if let Some(ref path) = self.file_path {
             self.buffer.save_to_file(path)?;
             self.dirty = false;
+            self.saved_undo_depth = Some(self.undo_stack.len());
             Ok(self.buffer.len_lines())
         } else {
             Err(io::Error::new(io::ErrorKind::NotFound, "No file name"))
@@ -336,6 +342,15 @@ impl BufferState {
                 .current_undo_group
                 .as_ref()
                 .is_some_and(|g| !g.is_empty())
+    }
+
+    /// Check if the buffer content matches the last-saved state, based on undo stack depth.
+    pub fn is_at_saved_state(&self) -> bool {
+        match self.saved_undo_depth {
+            Some(depth) => self.undo_stack.len() == depth && self.current_undo_group.is_none(),
+            // Never saved: consider clean only if no edits at all.
+            None => self.undo_stack.is_empty() && self.current_undo_group.is_none(),
+        }
     }
 
     /// Check if redo is available.

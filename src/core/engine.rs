@@ -1718,10 +1718,9 @@ impl Engine {
         if let Some(cursor) = self.active_buffer_state_mut().undo() {
             self.view_mut().cursor = cursor;
             self.clamp_cursor_col();
-            // Clear dirty flag if we've undone all changes
-            if !self.active_buffer_state().can_undo() {
-                self.set_dirty(false);
-            }
+            // Update dirty flag based on whether we're back at the saved state.
+            let at_saved = self.active_buffer_state().is_at_saved_state();
+            self.set_dirty(!at_saved);
             true
         } else {
             self.message = "Already at oldest change".to_string();
@@ -1734,6 +1733,9 @@ impl Engine {
         if let Some(cursor) = self.active_buffer_state_mut().redo() {
             self.view_mut().cursor = cursor;
             self.clamp_cursor_col();
+            // Update dirty flag based on whether we're back at the saved state.
+            let at_saved = self.active_buffer_state().is_at_saved_state();
+            self.set_dirty(!at_saved);
             true
         } else {
             self.message = "Already at newest change".to_string();

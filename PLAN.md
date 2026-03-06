@@ -2,6 +2,12 @@
 
 ## Recently Completed
 
+**Session 129 — GUI polish + sidebar/scrollbar fixes (no new tests, 2256 total):**
+Fixed sidebar layout (hexpand propagation through ScrolledWindow wrapper, drag handler using width_request), scrollbar ghosts from inactive tabs (visibility tracking), visual mode click jitter (4px dead zone), redo dirty flag (saved_undo_depth tracking), status line overlap (Pango ellipsis + TUI clamping), search icon (codicons \u{ea6d}), menu dropdown hover highlighting + geometry, menu actions close_menu centralization, logo embedding + taskbar icon, sidebar background CSS.
+
+**Session 128 — GUI mode polish + data format extensions (no new tests, 2256 total):**
+GTK menu hover switching (EventControllerMotion on menu_bar_da), dialog menu-close fix (close overlay before opening FileDialog/FolderDialog), removed "Close Tab" from File menu. 4 new bundled extensions: JSON, XML, YAML, Markdown with LSP configs. Added `number` color to Theme (all 4 themes) + `scope_color()`. Expanded C# tree-sitter query with ~30 more keywords, number/string literals, type identifiers, member access, invocations, attributes.
+
 **Session 127 — Swap file crash recovery (13 new tests, 2256 total):**
 Vim-like swap file system for crash recovery. New `src/core/swap.rs` module (~240 lines) with atomic swap file I/O (FNV-1a path hashing, PID-based stale detection). Engine integration: swap created on file open, deleted on save/close, periodic writes via `tick_swap_files()` (configurable `updatetime`), full cleanup on shutdown. Recovery dialog (`[R]ecover/[D]elete/[A]bort`) intercepts keys in `handle_key()`. Settings: `:set swapfile`/`:set noswapfile`, `:set updatetime=N`. Both GTK and TUI backends tick and clean up swaps. Bug fixes: `swap_scan_stale()` scans for orphaned swaps not in restored session; `open_file_in_tab()` preserves recovery message; unrecognized keys re-display R/D/A prompt; preview buffers excluded. 13 integration tests.
 
@@ -790,6 +796,8 @@ Root cause: `draw_menu_dropdown` was called from `draw_editor()`'s DrawingArea w
 - [x] **Fuzzy finder / Telescope-style** — Ctrl-P opens centered file-picker modal with subsequence scoring (session 53)
 - [x] **Multiple cursors** — `Alt-D` (configurable) adds cursor at next match of word under cursor; all cursors receive identical keystrokes; Escape collapses to one
 - [x] **Themes / plugin system** — named color themes selectable via `:colorscheme`; 4 built-in themes: onedark (default), gruvbox-dark, tokyo-night, solarized-dark (session 116)
+
+- [ ] **LSP semantic tokens** — implement `textDocument/semanticTokens/full` to overlay LSP-derived highlights (namespace, type, parameter, property, etc.) on top of tree-sitter; enables Neovim-level syntax coloring for languages where tree-sitter alone can't distinguish identifiers by role
 
 ### Enhanced Editor
 - [x] **Autosuggestions (inline ghost text)** — as-you-type completions shown as dimmed ghost text inline after the cursor; sources: buffer word scan (sync) + LSP `textDocument/completion` (async); Tab accepts, any other key dismisses; coexists with Ctrl-N/Ctrl-P popup (ghost hidden when popup active)
