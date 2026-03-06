@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Mar 6, 2026 (Session 133 — bracket matching visual mode + y% fix + tests) | **Tests:** 2333
+**Last updated:** Mar 6, 2026 (Session 134 — search highlight + viewport bug fixes) | **Tests:** 2346
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 117b are in **SESSION_HISTORY.md**.
@@ -25,6 +25,16 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 134 — search highlight + viewport bug fixes (13 new tests, 2346 total):**
+Five bug fixes across search highlighting, rendering, and viewport layout:
+- **Search highlights refresh after edits**: `search_matches` (char offsets) were never recalculated when the buffer changed in insert or normal mode. Edits caused stale highlights on wrong characters. Fixed by calling `run_search()` after buffer modifications when `search_matches` is non-empty, in both normal-mode and insert-mode `if changed` blocks
+- **Escape clears search highlights**: Pressing Escape in normal mode now clears `search_matches` (like `:noh`), preserving `search_query` so `n`/`N` re-run the search. `search_next()`/`search_prev()` updated to re-run search when matches were cleared but query exists
+- **Extra line number in gutter**: `render.rs` used raw `buffer.content.len_lines()` (Ropey) which counts a trailing `\n` as an extra empty line. Changed to `buffer.len_lines()` which already has the correction
+- **Markdown preview always wraps**: Preview buffers now force `wrap_on = true` regardless of `:set wrap`/`:set nowrap` setting, and suppress the horizontal scrollbar
+- **TUI viewport layout fix**: Tab bar row was double-counted — `draw_frame` split editor column into `tab_area(1)` + `editor_area`, but `calculate_group_window_rects` also reserved 1 row for tab bar via `tab_bar_height=1`. Removed the `ec_chunks` split; `editor_area` is now the full editor column. Window rects' built-in `y=1` offset naturally places code below the tab bar. Changed `content_rows` from `-3` to `-2` (only status+cmd). Also fixed rough `viewport_lines` estimate (-1 for tab bar)
+- **GTK per-window viewport sync**: Added per-window viewport sync in SearchPollTick handler (20Hz) from actual window rects, matching what TUI already does. Fixes `G` not scrolling far enough when panels reduce editor height
+- **13 integration tests** in new `tests/search_highlight.rs`
 
 **Session 133 — bracket matching: visual mode + y% fix + tests (30 new tests, 2333 total):**
 Complete `%` bracket matching implementation:

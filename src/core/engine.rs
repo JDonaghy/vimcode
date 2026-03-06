@@ -4279,6 +4279,10 @@ impl Engine {
             self.refresh_md_previews();
             // Mark swap file as needing a write.
             self.swap_mark_dirty();
+            // Refresh search highlights so they track the new buffer content.
+            if !self.search_matches.is_empty() {
+                self.run_search();
+            }
         }
 
         self.ensure_cursor_visible();
@@ -5285,6 +5289,11 @@ impl Engine {
                     self.count = None;
                     self.pending_key = None;
                     self.view_mut().extra_cursors.clear();
+                    // Clear search highlights (like :noh)
+                    if !self.search_matches.is_empty() {
+                        self.search_matches.clear();
+                        self.search_index = None;
+                    }
                 }
                 "Left" => {
                     let count = self.take_count();
@@ -11708,9 +11717,15 @@ impl Engine {
     pub fn search_next(&mut self) {
         if self.search_matches.is_empty() {
             if !self.search_query.is_empty() {
-                self.message = format!("Pattern not found: {}", self.search_query);
+                // Re-run search (matches may have been cleared by Escape/:noh)
+                self.run_search();
+                if self.search_matches.is_empty() {
+                    self.message = format!("Pattern not found: {}", self.search_query);
+                    return;
+                }
+            } else {
+                return;
             }
-            return;
         }
 
         let line = self.view().cursor.line;
@@ -11730,9 +11745,15 @@ impl Engine {
     pub fn search_prev(&mut self) {
         if self.search_matches.is_empty() {
             if !self.search_query.is_empty() {
-                self.message = format!("Pattern not found: {}", self.search_query);
+                // Re-run search (matches may have been cleared by Escape/:noh)
+                self.run_search();
+                if self.search_matches.is_empty() {
+                    self.message = format!("Pattern not found: {}", self.search_query);
+                    return;
+                }
+            } else {
+                return;
             }
-            return;
         }
 
         let line = self.view().cursor.line;
@@ -21344,6 +21365,10 @@ impl Engine {
             }
             self.lsp_dirty_buffers.insert(active_id, true);
             self.swap_mark_dirty();
+            // Refresh search highlights so they track the new buffer content.
+            if !self.search_matches.is_empty() {
+                self.run_search();
+            }
         }
 
         self.ensure_cursor_visible();

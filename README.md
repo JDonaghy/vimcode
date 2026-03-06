@@ -11,7 +11,7 @@ There's a touch of irony here - using a cli tool to write the editor that I've w
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 2333 tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 2346 tests, zero async runtime dependency
 
 
 ## Download (Ubuntu)
@@ -140,8 +140,9 @@ cargo fmt
 **Search**
 - `/` — forward incremental search (real-time highlight as you type)
 - `?` — backward incremental search
-- `n` / `N` — next/previous match (direction-aware)
-- Escape cancels and restores cursor position
+- `n` / `N` — next/previous match (direction-aware; re-highlights after Escape)
+- `Escape` in normal mode clears search highlights (same as `:noh`)
+- `Escape` during search cancels and restores cursor position
 
 **Marks**
 - `m{a-z}` — set file-local mark; `m{A-Z}` — set global (cross-file) mark

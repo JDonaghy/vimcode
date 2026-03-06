@@ -3351,7 +3351,7 @@ fn build_rendered_window(
 
     let buffer = &buffer_state.buffer;
     let view = &window.view;
-    let total_lines = buffer.content.len_lines();
+    let total_lines = buffer.len_lines();
     // Clamp scroll_top so that line_to_byte never panics when the cursor was
     // set to a line beyond the buffer (e.g. DAP exception in a stdlib file
     // that failed to open, leaving a small buffer with a large scroll offset).
@@ -3606,7 +3606,10 @@ fn build_rendered_window(
             .and_then(|v| v.get(line_idx))
             .copied();
 
-        let wrap_on = engine.settings.wrap && render_viewport_cols > 0 && !is_fold_header;
+        let is_md_preview = engine.md_preview_links.contains_key(&window.buffer_id);
+        let wrap_on = (engine.settings.wrap || is_md_preview)
+            && render_viewport_cols > 0
+            && !is_fold_header;
         let line_char_len = line_str.chars().count();
 
         if wrap_on && line_char_len > render_viewport_cols {
@@ -3838,7 +3841,8 @@ fn build_rendered_window(
 
     // Maximum line length across the whole buffer. When wrap is on, there is no
     // horizontal scrolling, so we report 0 to suppress the horizontal scrollbar.
-    let max_col = if engine.settings.wrap {
+    let is_md_preview = engine.md_preview_links.contains_key(&window.buffer_id);
+    let max_col = if engine.settings.wrap || is_md_preview {
         0
     } else {
         buffer_state.max_col
@@ -4139,7 +4143,7 @@ fn fold_indicator_char(buffer: &Buffer, view: &View, line_idx: usize) -> char {
         return ' ';
     }
     // Confirm the next non-blank line has greater indentation.
-    let total = buffer.content.len_lines();
+    let total = buffer.len_lines();
     if line_idx + 1 < total {
         let next_line = buffer.content.line(line_idx + 1);
         let next_text: String = next_line.chars().collect();

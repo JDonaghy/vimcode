@@ -4471,6 +4471,22 @@ impl SimpleComponent for App {
                             self.tab_close_hover_cell.set(tab_hover);
                             self.draw_needed.set(true);
                         }
+
+                        // Sync per-window viewport dimensions from actual window rects
+                        // so ensure_cursor_visible uses accurate heights (not the rough
+                        // DrawingArea-based estimate from connect_resize).
+                        {
+                            let mut engine = self.engine.borrow_mut();
+                            for (wid, rect) in &rects {
+                                let pane_lines = (rect.height / lh).floor() as usize;
+                                let pane_cols = (rect.width / cw).floor() as usize;
+                                engine.set_viewport_for_window(
+                                    *wid,
+                                    pane_lines.max(1),
+                                    pane_cols.saturating_sub(5).max(1),
+                                );
+                            }
+                        }
                     }
                 }
                 if self.engine.borrow_mut().poll_project_search() {

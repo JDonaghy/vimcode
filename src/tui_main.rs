@@ -880,7 +880,7 @@ fn event_loop(
             let dbg_row: u16 = if engine.debug_toolbar_visible { 1 } else { 0 };
             let content_rows = size
                 .height
-                .saturating_sub(3 + qf_rows + trm_rows + menu_row + dbg_row); // tab + status + cmd + panels
+                .saturating_sub(2 + qf_rows + trm_rows + menu_row + dbg_row); // status + cmd + panels (tab bar inside content bounds)
             let gutter_approx = 4u16;
             let sidebar_cols = if sidebar.visible {
                 sidebar_width + 1
@@ -890,7 +890,7 @@ fn event_loop(
             let content_cols = size
                 .width
                 .saturating_sub(ACTIVITY_BAR_WIDTH + sidebar_cols + gutter_approx);
-            engine.set_viewport_lines(content_rows.max(1) as usize);
+            engine.set_viewport_lines(content_rows.saturating_sub(1).max(1) as usize); // -1 for tab bar row inside content_rows
             engine.set_viewport_cols(content_cols.max(1) as usize);
         }
 
@@ -3640,16 +3640,10 @@ fn handle_mouse(
 
         if let Some(ref split) = layout.editor_group_split {
             // Find which group's tab bar row matches the clicked row.
-            // Must match the rendering logic: first group uses tab_area.y
-            // (= menu_rows), others use editor_area.y + bounds.y - 1
-            // (= menu_rows + 1 + bounds.y - 1 = menu_rows + bounds.y).
+            // Tab bar sits 1 row above the group's window content (bounds.y - 1).
             let mut matched_group = None;
             for gtb in split.group_tab_bars.iter() {
-                let tab_bar_row = if gtb.bounds.y <= 1.0 {
-                    menu_rows
-                } else {
-                    menu_rows + 1 + (gtb.bounds.y as u16).saturating_sub(1)
-                };
+                let tab_bar_row = menu_rows + (gtb.bounds.y as u16).saturating_sub(1);
                 let gx = gtb.bounds.x as u16;
                 let gw = gtb.bounds.width as u16;
                 if row == tab_bar_row && rel_col >= gx && rel_col < gx + gw {
@@ -3942,8 +3936,8 @@ fn build_screen_for_tui(
     sidebar: &TuiSidebar,
     sidebar_width: u16,
 ) -> render::ScreenLayout {
-    // Global bottom rows: status(1) + cmd(1); editor column top: tab(1)
-    // Also subtract quickfix and terminal panels so window rects don't extend into them.
+    // Global bottom rows: status(1) + cmd(1).  The tab bar row is included in
+    // content_bounds and handled by calculate_group_window_rects (tab_bar_height=1).
     let qf_height: u16 = if engine.quickfix_open { 6 } else { 0 };
     let term_height: u16 = if engine.terminal_open || engine.bottom_panel_open {
         engine.session.terminal_panel_rows + 1
@@ -3954,7 +3948,7 @@ fn build_screen_for_tui(
     let dbg_height: u16 = if engine.debug_toolbar_visible { 1 } else { 0 };
     let content_rows = area
         .height
-        .saturating_sub(3 + qf_height + term_height + menu_height + dbg_height); // tab + status + cmd + panels
+        .saturating_sub(2 + qf_height + term_height + menu_height + dbg_height); // status + cmd + panels
     let sidebar_cols = if sidebar.visible {
         sidebar_width + 1
     } else {
@@ -4059,13 +4053,10 @@ fn draw_frame(
     let sidebar_sep_area = h_chunks[1];
     let editor_col = h_chunks[2];
 
-    // ── Editor column: [tab_bar(1)] / [editor_windows] ───────────────────────
-    let ec_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(0)])
-        .split(editor_col);
-    let tab_area = ec_chunks[0];
-    let editor_area = ec_chunks[1];
+    // The editor column includes the tab bar row(s).  Window rects from
+    // calculate_group_window_rects already have y >= 1 (tab_bar_height offset),
+    // so the tab bar occupies row 0 and windows start at row 1 automatically.
+    let editor_area = editor_col;
 
     // ── Render menu bar strip (if visible) ───────────────────────────────────
     if let Some(ref menu_data) = screen.menu_bar {
@@ -4106,11 +4097,7 @@ fn draw_frame(
     // ── Render editor ─────────────────────────────────────────────────────────
     if let Some(ref split) = screen.editor_group_split {
         debug_log!(
-            "draw_frame split: tab_area=({},{},{}x{}) editor_area=({},{},{}x{}) groups={}",
-            tab_area.x,
-            tab_area.y,
-            tab_area.width,
-            tab_area.height,
+            "draw_frame split: editor_area=({},{},{}x{}) groups={}",
             editor_area.x,
             editor_area.y,
             editor_area.width,
@@ -4132,22 +4119,14 @@ fn draw_frame(
         // Render windows first so tab bars draw on top (prevents window content
         // from overwriting an adjacent group's tab bar in horizontal splits).
         render_all_windows(frame, editor_area, &screen.windows, theme);
-        // Draw each group's tab bar.  The first group (bounds.y <= 1) uses
-        // tab_area.y; subsequent groups use editor_area.y-based positioning so
-        // the tab bar sits directly above its window content with no gap.
+        // Draw each group's tab bar.  Tab bar sits 1 row above the group's
+        // window content (bounds.y - 1).
         for gtb in split.group_tab_bars.iter() {
-            let tab_x = gtb.bounds.x as u16 + tab_area.x;
+            let tab_x = gtb.bounds.x as u16 + editor_area.x;
             let tab_w = gtb.bounds.width as u16;
             let is_active = gtb.group_id == split.active_group;
             if tab_w > 0 {
-                // Groups at the top (bounds.y <= 1.0) share the dedicated
-                // tab_area row.  Lower groups place their tab bar 1 row
-                // above their window content inside editor_area.
-                let bar_y = if gtb.bounds.y <= 1.0 {
-                    tab_area.y
-                } else {
-                    editor_area.y + (gtb.bounds.y as u16).saturating_sub(1)
-                };
+                let bar_y = editor_area.y + (gtb.bounds.y as u16).saturating_sub(1);
                 let g_tab = Rect {
                     x: tab_x,
                     y: bar_y,
@@ -4162,18 +4141,25 @@ fn draw_frame(
         let sep_bg = rc(theme.background);
         for div in &split.dividers {
             if div.direction == SplitDirection::Vertical {
-                let div_x = tab_area.x + div.position as u16;
-                let y_start = tab_area.y + div.cross_start as u16;
+                let div_x = editor_area.x + div.position as u16;
+                let y_start = editor_area.y + div.cross_start as u16;
                 let y_end = y_start + div.cross_size as u16;
                 for y in y_start..y_end {
-                    if div_x < tab_area.x + tab_area.width {
+                    if div_x < editor_area.x + editor_area.width {
                         set_cell(frame.buffer_mut(), div_x, y, '│', sep_fg, sep_bg);
                     }
                 }
             }
         }
     } else {
-        render_tab_bar(frame.buffer_mut(), tab_area, &screen.tab_bar, theme, true);
+        // Single group: tab bar at row 0 of editor_area, windows at row 1+.
+        let tab_rect = Rect {
+            x: editor_area.x,
+            y: editor_area.y,
+            width: editor_area.width,
+            height: 1,
+        };
+        render_tab_bar(frame.buffer_mut(), tab_rect, &screen.tab_bar, theme, true);
         render_all_windows(frame, editor_area, &screen.windows, theme);
     }
 
