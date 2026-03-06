@@ -2983,6 +2983,7 @@ impl SimpleComponent for App {
                             engine.save_session_for_workspace(root);
                         }
                         let _ = engine.session.save();
+                        engine.cleanup_all_swaps();
                         engine.lsp_shutdown();
                         drop(engine);
                         std::process::exit(0);
@@ -3061,6 +3062,7 @@ impl SimpleComponent for App {
                                 engine.save_session_for_workspace(root);
                             }
                             let _ = engine.session.save();
+                            engine.cleanup_all_swaps();
                             engine.lsp_shutdown();
                             drop(engine);
                             std::process::exit(0);
@@ -4448,6 +4450,8 @@ impl SimpleComponent for App {
                         self.draw_needed.set(true);
                     }
                 }
+                // Tick swap file writes (only does work when updatetime elapsed).
+                self.engine.borrow_mut().tick_swap_files();
                 // Sync the OS window title with the active buffer name (taskbar/pager).
                 let win_title = self
                     .engine
@@ -5579,6 +5583,7 @@ impl App {
             engine.save_session_for_workspace(root);
         }
         let _ = engine.session.save();
+        engine.cleanup_all_swaps();
         engine.lsp_shutdown();
         drop(engine);
         std::process::exit(0);

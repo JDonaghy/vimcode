@@ -59,6 +59,13 @@ pub enum EngineAction {
     ToggleSidebar,
 }
 
+/// Pending swap file recovery state — the user must press R/D/A.
+pub struct SwapRecovery {
+    pub swap_path: PathBuf,
+    pub recovered_content: String,
+    pub buffer_id: BufferId,
+}
+
 /// A single entry in the command palette.
 pub struct PaletteCommand {
     pub label: &'static str,
@@ -1136,6 +1143,14 @@ pub struct Engine {
 
     /// Maps preview buffer ID → source buffer ID for live markdown preview.
     pub md_preview_links: HashMap<BufferId, BufferId>,
+
+    // --- Swap file crash recovery ---
+    /// Buffers whose content changed since the last swap file write.
+    swap_write_needed: HashSet<BufferId>,
+    /// When we last wrote swap files to disk.
+    swap_last_write: std::time::Instant,
+    /// Pending recovery dialog (user must press R/D/A).
+    pub swap_recovery: Option<SwapRecovery>,
 }
 
 impl Engine {
@@ -1376,6 +1391,9 @@ impl Engine {
             ai_rx: None,
             ai_scroll_top: 0,
             md_preview_links: HashMap::new(),
+            swap_write_needed: HashSet::new(),
+            swap_last_write: std::time::Instant::now(),
+            swap_recovery: None,
         };
         // If vscode mode is configured, start in Insert mode (no Normal mode)
         if engine.is_vscode_mode() {
@@ -1779,6 +1797,9 @@ impl Engine {
                     let id = self.active_buffer_id();
                     self.refresh_git_diff(id);
                     self.lsp_did_save(id);
+                    // Delete swap file — content is safely on disk now.
+                    self.swap_delete_for_buffer(id);
+                    self.swap_write_needed.remove(&id);
                     let path_str = path.to_string_lossy().into_owned();
                     self.plugin_event("save", &path_str);
                     Ok(())
@@ -2768,6 +2789,7 @@ impl Engine {
         if file_path.is_some() {
             self.message = String::new();
             self.lsp_did_open(buffer_id);
+            self.swap_check_on_open(buffer_id);
         }
     }
 
@@ -2812,6 +2834,9 @@ impl Engine {
             self.windows.values().map(|w| w.buffer_id).collect();
         for buf_id in closed_buffer_ids {
             if !still_referenced.contains(&buf_id) {
+                // Delete swap file before removing the buffer.
+                self.swap_delete_for_buffer(buf_id);
+                self.swap_write_needed.remove(&buf_id);
                 let _ = self.buffer_manager.delete(buf_id, true /* force */);
                 // Clean up markdown preview link.
                 self.md_preview_links.remove(&buf_id);
@@ -3026,8 +3051,14 @@ impl Engine {
         }
 
         self.refresh_git_diff(buffer_id);
-        self.message = format!("\"{}\"", path.display());
+        // Don't overwrite a pending swap recovery message.
+        if self.swap_recovery.is_none() {
+            self.message = format!("\"{}\"", path.display());
+        }
         self.lsp_did_open(buffer_id);
+
+        // Swap file check: detect stale swaps and offer recovery.
+        self.swap_check_on_open(buffer_id);
     }
 
     /// Open a file from the sidebar via single-click (preview mode).
@@ -3398,6 +3429,9 @@ impl Engine {
                 self.active_group = ids[saved_active_group];
             }
         }
+
+        // Check all restored buffers for stale swap files.
+        self.swap_check_all_buffers();
     }
 
     /// Restore session from the recursive tree format.
@@ -3446,6 +3480,9 @@ impl Engine {
                 }
             }
         }
+
+        // Check all restored buffers for stale swap files.
+        self.swap_check_all_buffers();
     }
 
     /// Delete a buffer. Returns error if buffer is shown in any window or is dirty.
@@ -4034,6 +4071,11 @@ impl Engine {
             }
         }
 
+        // Swap recovery dialog intercepts R/D/A keys.
+        if self.swap_recovery.is_some() {
+            return self.handle_swap_recovery_key(key_name);
+        }
+
         // Command palette intercepts all keys when open.
         if self.palette_open {
             return self.handle_palette_key(key_name, unicode, ctrl);
@@ -4176,6 +4218,8 @@ impl Engine {
             self.lsp_dirty_buffers.insert(active_id, true);
             // Live-refresh any linked markdown preview.
             self.refresh_md_previews();
+            // Mark swap file as needing a write.
+            self.swap_mark_dirty();
         }
 
         self.ensure_cursor_visible();
@@ -15566,6 +15610,271 @@ impl Engine {
         });
     }
 
+    // ── Swap file crash recovery ───────────────────────────────────────────
+
+    /// Create a swap file for the given buffer.
+    fn swap_create_for_buffer(&self, buf_id: BufferId) {
+        if !self.settings.swap_file {
+            return;
+        }
+        let state = match self.buffer_manager.get(buf_id) {
+            Some(s) => s,
+            None => return,
+        };
+        // Don't create swaps for preview buffers — they're temporary.
+        if state.preview {
+            return;
+        }
+        let canonical = match &state.canonical_path {
+            Some(p) => p,
+            None => return,
+        };
+        let swap_path = super::swap::swap_path_for(canonical);
+        let header = super::swap::SwapHeader {
+            file_path: canonical.clone(),
+            pid: std::process::id(),
+            modified: super::swap::now_iso8601(),
+        };
+        let content = state.buffer.to_string();
+        super::swap::write_swap(&swap_path, &header, &content);
+    }
+
+    /// Check for a stale swap file when opening a file.
+    /// Returns `true` if a recovery dialog is now pending (caller should stop).
+    fn swap_check_on_open(&mut self, buf_id: BufferId) -> bool {
+        if !self.settings.swap_file {
+            return false;
+        }
+        // Don't overwrite an existing recovery dialog.
+        if self.swap_recovery.is_some() {
+            self.swap_create_for_buffer(buf_id);
+            return false;
+        }
+        let (canonical, file_path) = {
+            let state = match self.buffer_manager.get(buf_id) {
+                Some(s) => s,
+                None => return false,
+            };
+            // Don't create swaps for preview buffers.
+            if state.preview {
+                return false;
+            }
+            let canonical = match &state.canonical_path {
+                Some(p) => p.clone(),
+                None => return false,
+            };
+            let file_path = match &state.file_path {
+                Some(p) => p.clone(),
+                None => return false,
+            };
+            (canonical, file_path)
+        };
+        let swap_path = super::swap::swap_path_for(&canonical);
+        if !swap_path.exists() {
+            // No swap file — create a fresh one.
+            self.swap_create_for_buffer(buf_id);
+            return false;
+        }
+        // Swap file exists — parse it.
+        let (header, content) = match super::swap::read_swap(&swap_path) {
+            Some(pair) => pair,
+            None => {
+                // Malformed swap file — delete and create fresh.
+                super::swap::delete_swap(&swap_path);
+                self.swap_create_for_buffer(buf_id);
+                return false;
+            }
+        };
+        if super::swap::is_pid_alive(header.pid) {
+            if header.pid == std::process::id() {
+                // Same process re-opening the file — just update the swap.
+                self.swap_create_for_buffer(buf_id);
+                return false;
+            }
+            // Another live process is editing this file.
+            let fname = file_path.file_name().unwrap_or_default().to_string_lossy();
+            self.message = format!(
+                "W: \"{}\" is being edited by PID {} — opening read-only copy",
+                fname, header.pid
+            );
+            return false;
+        }
+        // PID is dead → offer recovery.
+        let fname = file_path.file_name().unwrap_or_default().to_string_lossy();
+        self.message = format!(
+            "Swap file found for \"{}\". [R]ecover, [D]elete swap, [A]bort",
+            fname
+        );
+        self.swap_recovery = Some(SwapRecovery {
+            swap_path,
+            recovered_content: content,
+            buffer_id: buf_id,
+        });
+        true
+    }
+
+    /// Handle a key press when a swap recovery dialog is pending.
+    /// Returns `true` if the key was consumed.
+    fn handle_swap_recovery_key(&mut self, key_name: &str) -> EngineAction {
+        let recovery = match self.swap_recovery.take() {
+            Some(r) => r,
+            None => return EngineAction::None,
+        };
+        match key_name {
+            "r" | "R" => {
+                // Replace buffer content with recovered content.
+                let state = self.buffer_manager.get_mut(recovery.buffer_id);
+                if let Some(state) = state {
+                    let len = state.buffer.len_chars();
+                    state.buffer.delete_range(0, len);
+                    if !recovery.recovered_content.is_empty() {
+                        state.buffer.insert(0, &recovery.recovered_content);
+                    }
+                    state.dirty = true;
+                }
+                super::swap::delete_swap(&recovery.swap_path);
+                self.swap_create_for_buffer(recovery.buffer_id);
+                self.message = "Recovered from swap file".to_string();
+            }
+            "d" | "D" => {
+                // Delete the stale swap, keep the file as-is.
+                super::swap::delete_swap(&recovery.swap_path);
+                self.swap_create_for_buffer(recovery.buffer_id);
+                self.message = "Swap file deleted".to_string();
+            }
+            "a" | "A" => {
+                // Abort — close the tab, leave swap for next time.
+                self.close_tab();
+                self.message.clear();
+            }
+            _ => {
+                // Unrecognized key — put recovery back and re-display prompt.
+                let fname = self
+                    .buffer_manager
+                    .get(recovery.buffer_id)
+                    .and_then(|s| s.file_path.as_ref())
+                    .and_then(|p| p.file_name())
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                self.message = format!(
+                    "Swap file found for \"{}\". [R]ecover, [D]elete swap, [A]bort",
+                    fname
+                );
+                self.swap_recovery = Some(recovery);
+            }
+        }
+        EngineAction::None
+    }
+
+    /// Mark the active buffer as needing a swap write.
+    pub fn swap_mark_dirty(&mut self) {
+        if self.settings.swap_file {
+            let id = self.active_buffer_id();
+            self.swap_write_needed.insert(id);
+        }
+    }
+
+    /// Periodically write swap files for dirty buffers.
+    /// Called from both GTK and TUI event loops (~20 Hz).  The method only
+    /// does real work when `updatetime` milliseconds have elapsed.
+    pub fn tick_swap_files(&mut self) {
+        if !self.settings.swap_file || self.swap_write_needed.is_empty() {
+            return;
+        }
+        let elapsed = self.swap_last_write.elapsed().as_millis() as u32;
+        if elapsed < self.settings.updatetime {
+            return;
+        }
+        let buf_ids: Vec<BufferId> = self.swap_write_needed.drain().collect();
+        for buf_id in buf_ids {
+            self.swap_create_for_buffer(buf_id);
+        }
+        self.swap_last_write = std::time::Instant::now();
+    }
+
+    /// Delete the swap file for a single buffer.
+    fn swap_delete_for_buffer(&self, buf_id: BufferId) {
+        let state = match self.buffer_manager.get(buf_id) {
+            Some(s) => s,
+            None => return,
+        };
+        let canonical = match &state.canonical_path {
+            Some(p) => p,
+            None => return,
+        };
+        let swap_path = super::swap::swap_path_for(canonical);
+        super::swap::delete_swap(&swap_path);
+    }
+
+    /// Delete swap files for ALL open buffers.  Called on clean shutdown.
+    pub fn cleanup_all_swaps(&self) {
+        for buf_id in self.buffer_manager.list() {
+            self.swap_delete_for_buffer(buf_id);
+        }
+    }
+
+    /// Check all open buffers for stale swap files.
+    /// Called after session restore to catch any crashed sessions.
+    /// Only the first stale swap triggers a recovery dialog — the rest
+    /// get fresh swap files created silently.
+    pub fn swap_check_all_buffers(&mut self) {
+        if !self.settings.swap_file {
+            return;
+        }
+        let buf_ids = self.buffer_manager.list();
+        for buf_id in buf_ids {
+            if self.swap_recovery.is_some() {
+                // Already showing a recovery dialog — just create swaps for the rest.
+                self.swap_create_for_buffer(buf_id);
+            } else {
+                self.swap_check_on_open(buf_id);
+            }
+        }
+        // Also scan the swap directory for orphaned swaps (files that
+        // aren't in the restored session).
+        self.swap_scan_stale();
+    }
+
+    /// Scan the swap directory for stale swap files with dead PIDs that
+    /// don't correspond to any currently-open buffer.  Opens the first
+    /// orphaned file in a new tab and offers recovery.
+    fn swap_scan_stale(&mut self) {
+        if !self.settings.swap_file || self.swap_recovery.is_some() {
+            return;
+        }
+        let stale = super::swap::find_stale_swaps();
+        // Collect canonical paths of all currently-open buffers.
+        let open_paths: std::collections::HashSet<PathBuf> = self
+            .buffer_manager
+            .list()
+            .into_iter()
+            .filter_map(|id| {
+                self.buffer_manager
+                    .get(id)
+                    .and_then(|s| s.canonical_path.clone())
+            })
+            .collect();
+        for (header, swap_path) in stale {
+            if open_paths.contains(&header.file_path) {
+                // Already handled by swap_check_all_buffers above.
+                continue;
+            }
+            // The file from this stale swap isn't open — open it and offer recovery.
+            if !header.file_path.exists() {
+                // Original file was deleted — clean up the orphaned swap.
+                super::swap::delete_swap(&swap_path);
+                continue;
+            }
+            // Open the file in a new tab.  `open_file_in_tab` calls
+            // `swap_check_on_open` internally, which will detect the
+            // stale swap and set `swap_recovery` for us.
+            self.open_file_in_tab(&header.file_path);
+            if self.swap_recovery.is_some() {
+                return;
+            }
+        }
+    }
+
     /// Accept the current ghost text by inserting it at the cursor.
     pub fn ai_accept_ghost(&mut self) {
         if let Some(ghost) = self.ai_ghost_text.take() {
@@ -20886,6 +21195,7 @@ impl Engine {
                 self.promote_preview(active_id);
             }
             self.lsp_dirty_buffers.insert(active_id, true);
+            self.swap_mark_dirty();
         }
 
         self.ensure_cursor_visible();

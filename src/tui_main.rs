@@ -1103,6 +1103,8 @@ fn event_loop(
             if engine.tick_ai_completion() {
                 needs_redraw = true;
             }
+            // Tick swap file writes (only does work when updatetime elapsed).
+            engine.tick_swap_files();
             continue;
         }
 
@@ -1113,11 +1115,13 @@ fn event_loop(
                     match key_event.code {
                         KeyCode::Char('s') | KeyCode::Char('S') => {
                             engine.save_all_dirty();
+                            engine.cleanup_all_swaps();
                             engine.lsp_shutdown();
                             save_session(engine);
                             return;
                         }
                         KeyCode::Char('q') | KeyCode::Char('Q') => {
+                            engine.cleanup_all_swaps();
                             engine.lsp_shutdown();
                             save_session(engine);
                             return;
@@ -7666,6 +7670,7 @@ fn translate_key_to_pty(event: KeyEvent) -> Vec<u8> {
 fn handle_action(engine: &mut Engine, action: EngineAction) -> bool {
     match action {
         EngineAction::Quit | EngineAction::SaveQuit => {
+            engine.cleanup_all_swaps();
             engine.lsp_shutdown();
             save_session(engine);
             true

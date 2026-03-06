@@ -766,6 +766,24 @@ pub static SETTING_DEFS: &[SettingDef] = &[
         category: "Plugins",
         setting_type: SettingType::Bool,
     },
+    // ── Recovery ──────────────────────────────────────────────────────────────
+    SettingDef {
+        key: "swap_file",
+        label: "Swap Files",
+        description: "Write swap files for crash recovery (like Vim's swapfile option)",
+        category: "Editor",
+        setting_type: SettingType::Bool,
+    },
+    SettingDef {
+        key: "updatetime",
+        label: "Update Time",
+        description: "Milliseconds between swap file writes for dirty buffers",
+        category: "Editor",
+        setting_type: SettingType::Integer {
+            min: 100,
+            max: 60000,
+        },
+    },
     // ── AI ────────────────────────────────────────────────────────────────────
     SettingDef {
         key: "ai_provider",

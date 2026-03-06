@@ -11,7 +11,7 @@ There's a touch of irony here - using a cli tool to write the editor that I've w
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 1289 tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 2256 tests, zero async runtime dependency
 
 
 ## Download (Ubuntu)
@@ -758,6 +758,8 @@ Additional options (set directly in `settings.json`):
 | `ai_model` | `""` | Model override (leave empty for provider default) |
 | `ai_base_url` | `""` | Base URL override (used for Ollama; defaults to `http://localhost:11434`) |
 | `ai_completions` | `false` | Enable AI inline completions (ghost text) in insert mode |
+| `swap_file` | `true` | Write swap files for crash recovery (`:set swapfile` / `:set noswapfile`) |
+| `updatetime` | `4000` | Milliseconds between swap file writes for dirty buffers (`:set updatetime=N`) |
 
 - `:set option?` — query current value (e.g. `:set ts?` → `tabstop=4`)
 - `:set option!` — toggle a boolean option (e.g. `:set wrap!`); `no<option>!` explicitly disables (e.g. `:set nowrap!`)

@@ -2,6 +2,9 @@
 
 ## Recently Completed
 
+**Session 127 — Swap file crash recovery (13 new tests, 2256 total):**
+Vim-like swap file system for crash recovery. New `src/core/swap.rs` module (~240 lines) with atomic swap file I/O (FNV-1a path hashing, PID-based stale detection). Engine integration: swap created on file open, deleted on save/close, periodic writes via `tick_swap_files()` (configurable `updatetime`), full cleanup on shutdown. Recovery dialog (`[R]ecover/[D]elete/[A]bort`) intercepts keys in `handle_key()`. Settings: `:set swapfile`/`:set noswapfile`, `:set updatetime=N`. Both GTK and TUI backends tick and clean up swaps. Bug fixes: `swap_scan_stale()` scans for orphaned swaps not in restored session; `open_file_in_tab()` preserves recovery message; unrecognized keys re-display R/D/A prompt; preview buffers excluded. 13 integration tests.
+
 **Session 126 — Markdown preview polish (3 new tests, 1289 total):**
 Follow-up fixes: undo/redo now refreshes live preview; extension READMEs open in own tab (not vsplit); scroll sync via `scroll_bind_pairs` with proportional mapping; GTK heading font scale (H1=1.4x, H2=1.2x, H3=1.1x via Pango); no line numbers in preview; `color_headings` param (GTK=false/TUI=true); tab close button hover effect + widened hit area; free mouse scroll (cursor clamped, not snapped back). 14 markdown preview integration tests total.
 
@@ -814,3 +817,4 @@ Root cause: `draw_menu_dropdown` was called from `draw_editor()`'s DrawingArea w
 ### AI Integration
 - [x] **AI assistant panel** — sidebar chat panel; configurable provider (Anthropic Claude, OpenAI, Ollama local); `ai_provider`/`ai_api_key`/`ai_model`/`ai_base_url` in settings; activity bar chat icon opens panel; multi-turn conversation; `:AI <msg>` and `:AiClear` commands (session 118)
 - [x] **AI inline completions** — ghost-text completions from AI provider interleaved with LSP ghost text; separate `ai_completions` setting (default false to avoid unexpected API costs); debounced after 500ms idle in insert mode; Tab accepts whole suggestion, `Alt-]`/`Alt-[` cycle through alternatives
+- [x] **Swap file crash recovery** — Vim-like swap files (`~/.config/vimcode/swap/`); FNV-1a path hashing; atomic writes (`.tmp` + rename); PID-based stale detection; `[R]ecover/[D]elete/[A]bort` recovery dialog; `:set swapfile`/`:set updatetime=N`; periodic writes via `tick_swap_files()`; cleanup on shutdown

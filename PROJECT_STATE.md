@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Mar 5, 2026 (Session 126 — Markdown preview polish) | **Tests:** 1289
+**Last updated:** Mar 5, 2026 (Session 127 — Swap file crash recovery) | **Tests:** 2256
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 117b are in **SESSION_HISTORY.md**.
@@ -25,6 +25,19 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 127 — Swap file crash recovery (13 new tests, 2256 total):**
+Vim-like swap file system for crash recovery:
+- **`src/core/swap.rs` (new, ~240 lines)**: Swap file I/O — `SwapHeader` struct, `swap_dir()`, `swap_path_for()` (FNV-1a hash), `write_swap()` (atomic via `.tmp` + rename), `read_swap()`, `delete_swap()`, `is_pid_alive()` (checks `/proc/<pid>`), `now_iso8601()`, `find_stale_swaps()`
+- **`src/core/engine.rs`**: `SwapRecovery` struct, engine fields (`swap_write_needed`, `swap_last_write`, `swap_recovery`), lifecycle methods (`swap_create_for_buffer`, `swap_check_on_open`, `handle_swap_recovery_key`, `swap_mark_dirty`, `tick_swap_files`, `swap_delete_for_buffer`, `cleanup_all_swaps`, `swap_check_all_buffers`, `swap_scan_stale`); recovery dialog intercept in `handle_key()`; hooks in `open_file_in_tab()`, `new_tab()`, `save()`, `close_tab()`; `swap_mark_dirty()` called from both normal and insert `if changed` blocks
+- **`src/core/settings.rs`**: `swap_file: bool` (default true), `updatetime: u32` (default 4000ms); `:set swapfile`/`:set noswapfile`/`:set updatetime=N` support
+- **`src/render.rs`**: `SETTING_DEFS` entries for `swap_file` and `updatetime` in Editor category
+- **`src/main.rs`**: `tick_swap_files()` in SearchPollTick handler; `cleanup_all_swaps()` at all 3 shutdown paths
+- **`src/tui_main.rs`**: `tick_swap_files()` in event loop; `cleanup_all_swaps()` at all exit paths
+- **`tests/swap_recovery.rs` (new)**: 13 integration tests (creation, deletion, recovery dialog R/D/A, settings, path determinism, key interception)
+- Swap files stored in `~/.config/vimcode/swap/` with FNV-1a hash naming
+- Recovery dialog: `[R]ecover, [D]elete swap, [A]bort` — intercepts all keys until resolved
+- **Bug fixes**: `swap_scan_stale()` scans swap dir for orphaned stale swaps not in the restored session (catches Ctrl-C kills where session wasn't saved); `open_file_in_tab()` no longer overwrites recovery message; unrecognized keys during recovery re-display the R/D/A prompt; preview buffers excluded from swap system; `cfg!(test)` guard on `write_swap`/`delete_swap` prevents unit tests leaking swap files
 
 **Session 126 — Markdown preview polish (3 new tests, 1289 total):**
 Follow-up fixes and enhancements to the markdown preview feature:
@@ -281,9 +294,10 @@ src/
     ├── buffer.rs       (~120 lines)  Rope-based text storage (ropey)
     ├── session.rs      (~235 lines)  Session state persistence + per-workspace paths
     ├── git.rs        (~1,000 lines)  git subprocess integration + SC panel data + git log
+    ├── swap.rs         (~170 lines)  Swap file I/O for crash recovery
     └── window.rs, tab.rs, view.rs, cursor.rs, mode.rs, syntax.rs (~893 lines)
-Tests: 1199 passing
-Total: ~47,300 lines
+Tests: 2256 passing
+Total: ~47,500 lines
 ```
 
 ---
@@ -338,6 +352,7 @@ Total: ~47,300 lines
 - [x] **Settings sidebar (GTK)** — VSCode-style settings form with Switch/SpinButton/DropDown/Entry widgets; 30 settings in 7 categories; search filtering; "Open settings.json" button; Adwaita dark theme; `SettingDef`/`SETTING_DEFS` in render.rs; `get_value_str`/`set_value_str` in settings.rs (session 117b)
 - [x] **Settings editor** — `:Settings` opens `settings.json` in an editor tab; TUI settings panel shows live values; auto-reload on save in both backends (session 117)
 - [x] **Named colour themes** — `:colorscheme` command with 4 built-in themes (onedark/gruvbox-dark/tokyo-night/solarized-dark); GTK live hot-reload (session 116)
+- [x] **Swap file crash recovery** — Vim-like swap files in `~/.config/vimcode/swap/`; FNV-1a path hashing; atomic writes; PID-based stale detection; `[R]ecover/[D]elete/[A]bort` dialog; `:set swapfile`/`:set updatetime=N`; periodic write via `tick_swap_files()` (session 127)
 
 ### Planned / Ideas
 - [ ] More Tree-sitter grammars (HTML, YAML, Lua — await tree-sitter 0.22 migration)

@@ -203,6 +203,23 @@ pub struct Settings {
     /// Default: false (opt-in due to API cost per keystroke).
     #[serde(default)]
     pub ai_completions: bool,
+
+    // ── Swap files ────────────────────────────────────────────────────────────
+    /// Enable swap file crash recovery (default: true).
+    #[serde(default = "default_swap_file")]
+    pub swap_file: bool,
+
+    /// Milliseconds between swap file writes for dirty buffers (default: 4000).
+    #[serde(default = "default_updatetime")]
+    pub updatetime: u32,
+}
+
+fn default_swap_file() -> bool {
+    true
+}
+
+fn default_updatetime() -> u32 {
+    4000
 }
 
 fn default_explorer_visible() -> bool {
@@ -534,6 +551,8 @@ impl Default for Settings {
             ai_model: String::new(),
             ai_base_url: String::new(),
             ai_completions: false,
+            swap_file: default_swap_file(),
+            updatetime: default_updatetime(),
         }
     }
 }
@@ -748,6 +767,7 @@ impl Settings {
             "splitbelow" | "sb" => self.splitbelow = enable,
             "splitright" | "spr" => self.splitright = enable,
             "ai_completions" => self.ai_completions = enable,
+            "swapfile" => self.swap_file = enable,
             _ => return Err(format!("Unknown option: {opt}")),
         }
         Ok(())
@@ -789,6 +809,12 @@ impl Settings {
                     .parse()
                     .map_err(|_| format!("Invalid value for {name}: '{value}'"))?;
                 self.textwidth = n;
+            }
+            "updatetime" | "ut" => {
+                let n: u32 = value
+                    .parse()
+                    .map_err(|_| format!("Invalid value for {name}: '{value}'"))?;
+                self.updatetime = n;
             }
             _ => return Err(format!("Unknown option: {name}")),
         }
@@ -886,6 +912,12 @@ impl Settings {
             }),
             "colorcolumn" | "cc" => Ok(format!("colorcolumn={}", self.colorcolumn)),
             "textwidth" | "tw" => Ok(format!("textwidth={}", self.textwidth)),
+            "swapfile" => Ok(if self.swap_file {
+                "swapfile".to_string()
+            } else {
+                "noswapfile".to_string()
+            }),
+            "updatetime" | "ut" => Ok(format!("updatetime={}", self.updatetime)),
             _ => Err(format!("Unknown option: {opt}")),
         }
     }
@@ -966,6 +998,8 @@ impl Settings {
             "ai_model" => self.ai_model.clone(),
             "ai_base_url" => self.ai_base_url.clone(),
             "ai_completions" => self.ai_completions.to_string(),
+            "swapfile" | "swap_file" => self.swap_file.to_string(),
+            "updatetime" | "ut" => self.updatetime.to_string(),
             _ => String::new(),
         }
     }
@@ -1045,6 +1079,12 @@ impl Settings {
             "ai_model" => self.ai_model = value.to_string(),
             "ai_base_url" => self.ai_base_url = value.to_string(),
             "ai_completions" => self.ai_completions = value == "true",
+            "swapfile" | "swap_file" => self.swap_file = value == "true",
+            "updatetime" | "ut" => {
+                self.updatetime = value
+                    .parse()
+                    .map_err(|_| format!("Invalid updatetime: {value}"))?;
+            }
             _ => return Err(format!("Unknown setting key: {key}")),
         }
         Ok(())
