@@ -2,6 +2,12 @@
 
 ## Recently Completed
 
+**Session 132 — LSP session restore + semantic tokens bug fixes (1 new test, 2303 total):**
+Three bug fixes: (1) Tree-format session restore (`restore_session_group_layout`) opened files via `buffer_manager.open_file()` but never called `lsp_did_open()`, so LSP servers were never started for session-restored files — fixed by adding `lsp_did_open()` calls after tree layout install. (2) `lsp_pending_semantic_tokens` was `Option<i64>` (single slot), so multi-file init only accepted the last request's response — changed to `HashMap<i64, PathBuf>` to track all in-flight requests. (3) `semantic_parameter` color in OneDark was identical to `variable` (#e06c75) — changed to #c8ae9d. 1 new integration test (`engine_semantic_tokens_pending_multiple_requests`).
+
+**Session 131 — LSP semantic tokens + develop branch workflow (17 new tests, 2302 total):**
+Full `textDocument/semanticTokens/full` implementation: `SemanticToken`/`SemanticTokensLegend` types, delta-decoder, `SemanticTokensResponse` event, legend caching in LspManager, `BufferState.semantic_tokens` storage, request triggers on didOpen/didChange/Initialized, `Theme::semantic_token_style()` with 8 new semantic colors (parameter/property/namespace/enumMember/interface/typeParameter/decorator/macro), binary-search overlay in `build_spans()`. Branching: version-tagged releases in `release.yml`, deleted `rust.yml`, bumped to 0.2.0, added branching docs to CLAUDE.md. 5 unit tests in lsp.rs + 12 integration tests in `tests/semantic_tokens.rs`.
+
 **Session 130 — LSP formatting enhancements (12 new tests, 2268 total):**
 Format-on-save (`format_on_save` setting, off by default), LSP capability checking (documentFormattingProvider), Shift+Alt+F keybinding (GTK+TUI). `save_with_format()` defers save when format-on-save enabled + server supports it; FormattingResponse handler applies edits then saves; `format_save_quit_ready` flag handles deferred `:wq`/`:x` quit. 12 integration tests in `tests/formatting.rs`.
 

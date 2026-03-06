@@ -11,7 +11,7 @@ There's a touch of irony here - using a cli tool to write the editor that I've w
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 2268 tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 2303 tests, zero async runtime dependency
 
 
 ## Download (Ubuntu)
@@ -698,6 +698,7 @@ Automatic language server integration — open a file and diagnostics, completio
 - **Signature help** — popup appears above cursor when typing `(` or `,` in a function call; active parameter highlighted
 - **LSP formatting** — `<leader>gf` (or `:Lformat`) formats the whole buffer; single undo step reverts
 - **LSP rename** — `<leader>rn` pre-fills `:Rename <word>` in command bar; `:Rename <newname>` renames across all files
+- **Semantic token highlighting** — overlays LSP `textDocument/semanticTokens/full` on tree-sitter; 8 distinct colors for parameters, properties, namespaces, enum members, interfaces, type parameters, decorators, and macros; bold for declarations, italic for readonly/static
 - **Diagnostic counts** — `E:N W:N` shown in status bar
 
 **Commands:**
@@ -1065,20 +1066,20 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 src/
 ├── main.rs          (~10,907 lines)  GTK4/Relm4 UI, rendering, sidebar resize, fuzzy popup, context menu, drag-and-drop
 ├── tui_main.rs      (~9,124 lines)  ratatui/crossterm TUI backend, fuzzy popup, rename/move prompts
-├── render.rs        (~4,234 lines)  Platform-agnostic ScreenLayout bridge (DebugSidebarData, SourceControlData, BottomPanelTabs)
+├── render.rs        (~4,364 lines)  Platform-agnostic ScreenLayout bridge (DebugSidebarData, SourceControlData, BottomPanelTabs)
 ├── icons.rs            (~30 lines)  Nerd Font file-type icons (GTK + TUI)
 └── core/            (~29,500 lines)  Zero GTK/rendering deps — fully testable
     ├── engine.rs    (~32,476 lines)  Orchestrator: keys, commands, git, macros, LSP, DAP, plugins, workspaces
     ├── markdown.rs     (~497 lines)  Markdown → styled plain text converter (pulldown-cmark)
     ├── plugin.rs       (~835 lines)  Lua 5.4 plugin manager (mlua vendored; vimcode.* API; async_shell)
     ├── terminal.rs     (~320 lines)  PTY-backed terminal pane (portable-pty + vt100, history ring buffer)
-    ├── lsp.rs        (~2,045 lines)  LSP protocol transport + single-server client (request ID tracking, JSON-RPC framing)
-    ├── lsp_manager.rs  (~671 lines)  Multi-server coordinator with initialization guards + built-in registry
+    ├── lsp.rs        (~2,306 lines)  LSP protocol transport + single-server client (request ID tracking, JSON-RPC framing, semantic tokens)
+    ├── lsp_manager.rs  (~830 lines)  Multi-server coordinator with initialization guards + built-in registry + semantic legends
     ├── dap.rs          (~671 lines)  DAP protocol transport + event routing + seq→command tracking + BreakpointInfo
     ├── dap_manager.rs  (~1,089 lines)  DAP multi-adapter coordinator + launch.json + tasks.json support + install scripts
     ├── ai.rs               (~336 lines)  AI provider integration (Anthropic/OpenAI/Ollama via curl subprocess)
     ├── project_search.rs (~630 lines)  Regex/case/whole-word search + replace (ignore + regex crates)
-    ├── buffer_manager.rs (~600 lines)  Buffer lifecycle, undo/redo stacks
+    ├── buffer_manager.rs (~707 lines)  Buffer lifecycle, undo/redo stacks, semantic tokens
     ├── buffer.rs       (~120 lines)  Rope-based text storage (ropey)
     ├── settings.rs   (~1,346 lines)  JSON config, :set parsing, key binding notation
     ├── session.rs      (~235 lines)  Session state persistence + per-workspace paths

@@ -1705,6 +1705,16 @@ pub struct Theme {
     pub md_heading3: Color,
     pub md_code: Color,
     pub md_link: Color,
+
+    // LSP semantic token colours (overlay on tree-sitter)
+    pub semantic_parameter: Color,
+    pub semantic_property: Color,
+    pub semantic_namespace: Color,
+    pub semantic_enum_member: Color,
+    pub semantic_interface: Color,
+    pub semantic_type_parameter: Color,
+    pub semantic_decorator: Color,
+    pub semantic_macro: Color,
 }
 
 impl Theme {
@@ -1826,6 +1836,15 @@ impl Theme {
             md_heading3: Color::from_hex("#c678dd"), // purple
             md_code: Color::from_hex("#98c379"),     // green (string-like)
             md_link: Color::from_hex("#61afef"),     // blue
+
+            semantic_parameter: Color::from_hex("#c8ae9d"), // warm sandy (distinct from variable red)
+            semantic_property: Color::from_hex("#d19a66"),  // orange
+            semantic_namespace: Color::from_hex("#e5c07b"), // gold
+            semantic_enum_member: Color::from_hex("#56b6c2"), // cyan
+            semantic_interface: Color::from_hex("#e5c07b"), // gold (like type)
+            semantic_type_parameter: Color::from_hex("#e5c07b"), // gold
+            semantic_decorator: Color::from_hex("#c678dd"), // purple (like keyword)
+            semantic_macro: Color::from_hex("#56b6c2"),     // cyan
         }
     }
 
@@ -1913,6 +1932,15 @@ impl Theme {
             md_heading3: Color::from_hex("#d3869b"),
             md_code: Color::from_hex("#b8bb26"),
             md_link: Color::from_hex("#83a598"),
+
+            semantic_parameter: Color::from_hex("#83a598"), // blue
+            semantic_property: Color::from_hex("#d3869b"),  // purple-pink
+            semantic_namespace: Color::from_hex("#fabd2f"), // yellow
+            semantic_enum_member: Color::from_hex("#8ec07c"), // aqua
+            semantic_interface: Color::from_hex("#fabd2f"), // yellow
+            semantic_type_parameter: Color::from_hex("#fabd2f"),
+            semantic_decorator: Color::from_hex("#fb4934"), // red
+            semantic_macro: Color::from_hex("#8ec07c"),     // aqua
         }
     }
 
@@ -2000,6 +2028,15 @@ impl Theme {
             md_heading3: Color::from_hex("#bb9af7"),
             md_code: Color::from_hex("#9ece6a"),
             md_link: Color::from_hex("#7aa2f7"),
+
+            semantic_parameter: Color::from_hex("#e0af68"), // orange-gold
+            semantic_property: Color::from_hex("#73daca"),  // teal
+            semantic_namespace: Color::from_hex("#2ac3de"), // cyan
+            semantic_enum_member: Color::from_hex("#ff9e64"), // orange
+            semantic_interface: Color::from_hex("#2ac3de"), // cyan
+            semantic_type_parameter: Color::from_hex("#e0af68"),
+            semantic_decorator: Color::from_hex("#bb9af7"), // purple
+            semantic_macro: Color::from_hex("#2ac3de"),     // cyan
         }
     }
 
@@ -2087,6 +2124,15 @@ impl Theme {
             md_heading3: Color::from_hex("#6c71c4"),
             md_code: Color::from_hex("#859900"),
             md_link: Color::from_hex("#268bd2"),
+
+            semantic_parameter: Color::from_hex("#268bd2"), // blue
+            semantic_property: Color::from_hex("#2aa198"),  // cyan
+            semantic_namespace: Color::from_hex("#b58900"), // yellow
+            semantic_enum_member: Color::from_hex("#cb4b16"), // orange
+            semantic_interface: Color::from_hex("#b58900"), // yellow
+            semantic_type_parameter: Color::from_hex("#b58900"),
+            semantic_decorator: Color::from_hex("#6c71c4"), // violet
+            semantic_macro: Color::from_hex("#d33682"),     // magenta
         }
     }
 
@@ -2117,6 +2163,44 @@ impl Theme {
             "number" => self.number,
             _ => self.default_fg,
         }
+    }
+
+    /// Map an LSP semantic token type + modifiers to a style.
+    /// Returns `None` for unknown/unmapped token types (preserves tree-sitter coloring).
+    pub fn semantic_token_style(&self, token_type: &str, modifiers: &[String]) -> Option<Style> {
+        let fg = match token_type {
+            "parameter" => self.semantic_parameter,
+            "property" => self.semantic_property,
+            "namespace" => self.semantic_namespace,
+            "enumMember" => self.semantic_enum_member,
+            "interface" => self.semantic_interface,
+            "typeParameter" => self.semantic_type_parameter,
+            "decorator" => self.semantic_decorator,
+            "macro" => self.semantic_macro,
+            // Reuse existing syntax colors for standard token types
+            "keyword" | "modifier" => self.keyword,
+            "function" | "method" => self.function,
+            "type" | "class" | "struct" | "enum" => self.type_name,
+            "variable" => self.variable,
+            "string" | "regexp" => self.string_lit,
+            "comment" => self.comment,
+            "number" => self.number,
+            "operator" => self.keyword,
+            _ => return None,
+        };
+        let bold = modifiers
+            .iter()
+            .any(|m| m == "declaration" || m == "definition");
+        let italic = modifiers
+            .iter()
+            .any(|m| m == "readonly" || m == "static" || m == "deprecated");
+        Some(Style {
+            fg,
+            bg: None,
+            bold,
+            italic,
+            font_scale: 1.0,
+        })
     }
 }
 
@@ -3415,6 +3499,7 @@ fn build_rendered_window(
                 engine,
                 theme,
                 visible_hl,
+                &buffer_state.semantic_tokens,
                 buffer,
                 line_idx,
                 &line_str,
@@ -3849,6 +3934,7 @@ fn build_spans(
     engine: &Engine,
     theme: &Theme,
     highlights: &[(usize, usize, String)],
+    semantic_tokens: &[crate::core::lsp::SemanticToken],
     buffer: &crate::core::buffer::Buffer,
     line_idx: usize,
     line_str: &str,
@@ -3880,6 +3966,43 @@ fn build_spans(
                 font_scale: 1.0,
             },
         });
+    }
+
+    // LSP semantic tokens overlay — these override tree-sitter spans since they're later.
+    // Tokens are sorted by line (from delta-encoding), so binary search finds the first
+    // token on this line efficiently.
+    if !semantic_tokens.is_empty() {
+        let line32 = line_idx as u32;
+        let start_idx = semantic_tokens.partition_point(|t| t.line < line32);
+        for tok in &semantic_tokens[start_idx..] {
+            if tok.line != line32 {
+                break;
+            }
+            if let Some(style) = theme.semantic_token_style(&tok.token_type, &tok.modifiers) {
+                // Convert UTF-16 positions to byte offsets within line_str.
+                let char_start = crate::core::lsp::utf16_offset_to_char(line_str, tok.start_char);
+                let char_end =
+                    crate::core::lsp::utf16_offset_to_char(line_str, tok.start_char + tok.length);
+                // Convert char positions to byte offsets.
+                let byte_start = line_str
+                    .char_indices()
+                    .nth(char_start)
+                    .map(|(i, _)| i)
+                    .unwrap_or(line_str.len());
+                let byte_end = line_str
+                    .char_indices()
+                    .nth(char_end)
+                    .map(|(i, _)| i)
+                    .unwrap_or(line_str.len());
+                if byte_start < byte_end {
+                    spans.push(StyledSpan {
+                        start_byte: byte_start,
+                        end_byte: byte_end,
+                        style,
+                    });
+                }
+            }
+        }
     }
 
     // Search match highlighting (skipped when hlsearch is disabled)

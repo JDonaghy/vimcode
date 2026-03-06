@@ -777,6 +777,9 @@ pub struct Engine {
     pub format_save_quit_ready: bool,
     /// Request ID of the pending rename request.
     pub lsp_pending_rename: Option<i64>,
+    /// Pending semantic tokens requests: maps request_id → file path.
+    /// Multiple requests can be in flight simultaneously (e.g. after LSP Initialized).
+    pub lsp_pending_semantic_tokens: HashMap<i64, PathBuf>,
     /// Currently visible signature help data (set in insert mode after `(` or `,`).
     pub lsp_signature_help: Option<SignatureHelpData>,
     /// Tracks whether we need to send didChange on next poll (debounce).
@@ -1262,6 +1265,7 @@ impl Engine {
             quit_after_format_save: false,
             format_save_quit_ready: false,
             lsp_pending_rename: None,
+            lsp_pending_semantic_tokens: HashMap::new(),
             lsp_signature_help: None,
             lsp_dirty_buffers: HashMap::new(),
             lsp_installing: std::collections::HashSet::new(),
@@ -3520,6 +3524,19 @@ impl Engine {
                         }
                     }
                 }
+            }
+        }
+
+        // Notify LSP for all restored buffers (tree restore bypasses open_file_with_mode).
+        let restored_bids: Vec<BufferId> = self.buffer_manager.list();
+        for bid in restored_bids {
+            let has_file = self
+                .buffer_manager
+                .get(bid)
+                .and_then(|s| s.file_path.as_ref())
+                .is_some();
+            if has_file {
+                self.lsp_did_open(bid);
             }
         }
 
@@ -14928,6 +14945,8 @@ impl Engine {
         } else {
             None
         };
+        // Request semantic tokens after opening a file.
+        self.lsp_request_semantic_tokens(&path);
         // Show extension hint based on VimCode extension state (independent of LSP binary
         // availability — ext_remove intentionally leaves the binary on disk).
         if let Some((bundle, manifest)) = extensions::find_for_language_id(&lang_id) {
@@ -16022,6 +16041,17 @@ impl Engine {
     }
 
     /// Flush any pending didChange notifications (called from UI poll loop).
+    /// Request semantic tokens for a file from the LSP server.
+    /// Multiple requests can be in flight simultaneously; responses are matched by request ID.
+    pub fn lsp_request_semantic_tokens(&mut self, path: &Path) {
+        if let Some(mgr) = &mut self.lsp_manager {
+            if let Some(req_id) = mgr.request_semantic_tokens(path) {
+                self.lsp_pending_semantic_tokens
+                    .insert(req_id, path.to_path_buf());
+            }
+        }
+    }
+
     pub fn lsp_flush_changes(&mut self) {
         if self.lsp_manager.is_none() {
             return;
@@ -16046,6 +16076,11 @@ impl Engine {
             if let Some(mgr) = &mut self.lsp_manager {
                 mgr.notify_did_change(&path, &text);
             }
+            // Clear stale semantic tokens on edit; re-request after the server processes the change.
+            if let Some(state) = self.buffer_manager.get_mut(buffer_id) {
+                state.semantic_tokens.clear();
+            }
+            self.lsp_request_semantic_tokens(&path);
         }
     }
 
@@ -16093,9 +16128,13 @@ impl Engine {
                         })
                         .collect();
                     if let Some(mgr) = &mut self.lsp_manager {
-                        for (path, text) in buffers {
-                            let _ = mgr.notify_did_open(&path, &text);
+                        for (path, text) in &buffers {
+                            let _ = mgr.notify_did_open(path, text);
                         }
+                    }
+                    // Request semantic tokens for all reopened buffers.
+                    for (path, _) in &buffers {
+                        self.lsp_request_semantic_tokens(path);
                     }
                 }
                 LspEvent::Diagnostics {
@@ -16418,6 +16457,31 @@ impl Engine {
                             self.message = "Rename: no changes returned by server".to_string();
                         }
                         redraw = true;
+                    }
+                }
+                LspEvent::SemanticTokensResponse {
+                    server_id,
+                    request_id,
+                    raw_data,
+                } => {
+                    if let Some(path) = self.lsp_pending_semantic_tokens.remove(&request_id) {
+                        // Decode using the cached legend for this server.
+                        let decoded = self
+                            .lsp_manager
+                            .as_ref()
+                            .and_then(|mgr| mgr.semantic_legend_for_server(server_id))
+                            .map(|legend| lsp::decode_semantic_tokens(&raw_data, legend))
+                            .unwrap_or_default();
+                        // Store on the matching buffer.
+                        for &bid in self.buffer_manager.list().iter() {
+                            if let Some(state) = self.buffer_manager.get_mut(bid) {
+                                if state.file_path.as_deref() == Some(path.as_path()) {
+                                    state.semantic_tokens = decoded;
+                                    redraw = true;
+                                    break;
+                                }
+                            }
+                        }
                     }
                 }
             }

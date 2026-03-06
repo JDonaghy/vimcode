@@ -18,6 +18,11 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
+    - name: Read version from Cargo.toml
+      run: |
+        VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+        echo "VERSION=$VERSION" >> $GITHUB_ENV
+
     - name: Install GTK4 and build dependencies
       run: |
         sudo apt-get update
@@ -72,16 +77,12 @@ jobs:
         echo "BIN_NAME=vimcode-linux-x86_64" >> $GITHUB_ENV
 
     # ── Publish to GitHub Releases ────────────────────────────────────────────
-    # This creates/updates a rolling "latest" release on every main push.
-    # The release is public — anyone can download the assets without logging in.
     - name: Publish GitHub Release
       uses: softprops/action-gh-release@v2
       with:
-        tag_name: latest
-        name: "Latest build (main)"
+        tag_name: v${{ env.VERSION }}
+        name: "VimCode v${{ env.VERSION }}"
         body: |
-          Automated build from the latest commit on `main`.
-
           ## Installation (Ubuntu 24.04+)
 
           **Option A — .deb package (recommended)**
@@ -100,8 +101,8 @@ jobs:
           ```
 
           > Requires Ubuntu 24.04 or later (GTK 4.10+).
-        prerelease: true
-        make_latest: false         # don't overwrite a real tagged release's "latest" badge
+        prerelease: false
+        make_latest: true
         files: |
           ${{ env.DEB_PATH }}
           ${{ env.BIN_NAME }}

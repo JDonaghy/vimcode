@@ -92,6 +92,83 @@ pub enum LspEvent {
         /// Error message from the server, if the response contained an error.
         error_message: Option<String>,
     },
+    /// Semantic tokens full response (textDocument/semanticTokens/full).
+    SemanticTokensResponse {
+        server_id: LspServerId,
+        request_id: i64,
+        /// Raw delta-encoded u32 data from the server.
+        raw_data: Vec<u32>,
+    },
+}
+
+/// A single semantic token with absolute (decoded) positions.
+#[derive(Debug, Clone)]
+pub struct SemanticToken {
+    /// 0-indexed line number.
+    pub line: u32,
+    /// Start column in UTF-16 code units.
+    pub start_char: u32,
+    /// Length in UTF-16 code units.
+    pub length: u32,
+    /// Resolved token type name (e.g. "parameter", "property").
+    pub token_type: String,
+    /// Resolved modifier names (e.g. "declaration", "readonly").
+    pub modifiers: Vec<String>,
+}
+
+/// Legend mapping indices to token type/modifier names, extracted from server capabilities.
+#[derive(Debug, Clone)]
+pub struct SemanticTokensLegend {
+    pub token_types: Vec<String>,
+    pub token_modifiers: Vec<String>,
+}
+
+/// Decode the flat delta-encoded `u32` array from `semanticTokens/full` into
+/// absolute-position [`SemanticToken`]s using the provided legend.
+///
+/// The LSP spec encodes tokens as groups of 5 u32s:
+///   [deltaLine, deltaStartChar, length, tokenType, tokenModifiers]
+pub fn decode_semantic_tokens(raw: &[u32], legend: &SemanticTokensLegend) -> Vec<SemanticToken> {
+    let mut tokens = Vec::with_capacity(raw.len() / 5);
+    let mut line: u32 = 0;
+    let mut start_char: u32 = 0;
+
+    for chunk in raw.chunks_exact(5) {
+        let delta_line = chunk[0];
+        let delta_start = chunk[1];
+        let length = chunk[2];
+        let type_idx = chunk[3] as usize;
+        let modifier_bits = chunk[4];
+
+        if delta_line > 0 {
+            line += delta_line;
+            start_char = delta_start;
+        } else {
+            start_char += delta_start;
+        }
+
+        let token_type = legend
+            .token_types
+            .get(type_idx)
+            .cloned()
+            .unwrap_or_default();
+
+        let mut modifiers = Vec::new();
+        for (i, mod_name) in legend.token_modifiers.iter().enumerate() {
+            if modifier_bits & (1 << i) != 0 {
+                modifiers.push(mod_name.clone());
+            }
+        }
+
+        tokens.push(SemanticToken {
+            line,
+            start_char,
+            length,
+            token_type,
+            modifiers,
+        });
+    }
+    tokens
 }
 
 /// Cached signature help data stored in engine state.
@@ -625,6 +702,23 @@ impl LspServer {
                         "didSave": true,
                         "willSave": false,
                         "willSaveWaitUntil": false
+                    },
+                    "semanticTokens": {
+                        "dynamicRegistration": false,
+                        "requests": { "full": true },
+                        "tokenTypes": [
+                            "namespace", "type", "class", "enum", "interface",
+                            "struct", "typeParameter", "parameter", "variable",
+                            "property", "enumMember", "event", "function",
+                            "method", "macro", "keyword", "modifier", "comment",
+                            "string", "number", "regexp", "operator", "decorator"
+                        ],
+                        "tokenModifiers": [
+                            "declaration", "definition", "readonly", "static",
+                            "deprecated", "abstract", "async", "modification",
+                            "documentation", "defaultLibrary"
+                        ],
+                        "formats": ["relative"]
                     }
                 }
             }
@@ -858,6 +952,47 @@ impl LspServer {
         )
     }
 
+    /// Whether the server advertises semantic tokens support.
+    pub fn supports_semantic_tokens(&self) -> bool {
+        let v = &self.capabilities["semanticTokensProvider"];
+        v.is_object()
+    }
+
+    /// Extract the semantic tokens legend from server capabilities.
+    pub fn semantic_tokens_legend(&self) -> Option<SemanticTokensLegend> {
+        let provider = self.capabilities.get("semanticTokensProvider")?;
+        let legend = provider.get("legend")?;
+        let types = legend
+            .get("tokenTypes")?
+            .as_array()?
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect();
+        let modifiers = legend
+            .get("tokenModifiers")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Some(SemanticTokensLegend {
+            token_types: types,
+            token_modifiers: modifiers,
+        })
+    }
+
+    /// Request full semantic tokens for a document.
+    pub fn request_semantic_tokens_full(&mut self, uri: &str) -> i64 {
+        self.send_request(
+            "textDocument/semanticTokens/full",
+            serde_json::json!({
+                "textDocument": { "uri": uri }
+            }),
+        )
+    }
+
     /// Send shutdown request and exit notification.
     pub fn shutdown(&mut self) {
         self.send_request("shutdown", serde_json::json!(null));
@@ -1064,6 +1199,22 @@ fn reader_thread(
                         server_id,
                         request_id: id,
                         edits,
+                    });
+                }
+                Some("textDocument/semanticTokens/full") => {
+                    let raw_data = result
+                        .and_then(|r| r.get("data"))
+                        .and_then(|d| d.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_u64().map(|n| n as u32))
+                                .collect::<Vec<u32>>()
+                        })
+                        .unwrap_or_default();
+                    let _ = tx.send(LspEvent::SemanticTokensResponse {
+                        server_id,
+                        request_id: id,
+                        raw_data,
                     });
                 }
                 Some("textDocument/rename") => {
@@ -1918,6 +2069,90 @@ bin:
             info.install_cmd,
             Some("npm install -g typescript-language-server".to_string())
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Semantic token decoding
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_decode_semantic_tokens_basic() {
+        let legend = SemanticTokensLegend {
+            token_types: vec![
+                "namespace".into(),
+                "type".into(),
+                "function".into(),
+                "parameter".into(),
+            ],
+            token_modifiers: vec!["declaration".into(), "readonly".into()],
+        };
+        // Line 0, col 5, len 3, type=function(2), mods=declaration(bit0)
+        // Line 2, col 10, len 4, type=parameter(3), mods=0
+        let raw = vec![0, 5, 3, 2, 1, 2, 10, 4, 3, 0];
+        let tokens = decode_semantic_tokens(&raw, &legend);
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0].line, 0);
+        assert_eq!(tokens[0].start_char, 5);
+        assert_eq!(tokens[0].length, 3);
+        assert_eq!(tokens[0].token_type, "function");
+        assert_eq!(tokens[0].modifiers, vec!["declaration"]);
+        assert_eq!(tokens[1].line, 2);
+        assert_eq!(tokens[1].start_char, 10);
+        assert_eq!(tokens[1].length, 4);
+        assert_eq!(tokens[1].token_type, "parameter");
+        assert!(tokens[1].modifiers.is_empty());
+    }
+
+    #[test]
+    fn test_decode_semantic_tokens_same_line() {
+        let legend = SemanticTokensLegend {
+            token_types: vec!["variable".into()],
+            token_modifiers: vec![],
+        };
+        // Two tokens on the same line: (0,2,3,0,0) then (0,5,4,0,0) → col 2 then col 7
+        let raw = vec![0, 2, 3, 0, 0, 0, 5, 4, 0, 0];
+        let tokens = decode_semantic_tokens(&raw, &legend);
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0].start_char, 2);
+        assert_eq!(tokens[1].start_char, 7); // 2 + 5
+        assert_eq!(tokens[0].line, 0);
+        assert_eq!(tokens[1].line, 0);
+    }
+
+    #[test]
+    fn test_decode_semantic_tokens_multiple_modifiers() {
+        let legend = SemanticTokensLegend {
+            token_types: vec!["variable".into()],
+            token_modifiers: vec!["declaration".into(), "readonly".into(), "static".into()],
+        };
+        // modifier_bits = 0b101 = 5 → "declaration" + "static"
+        let raw = vec![0, 0, 5, 0, 5];
+        let tokens = decode_semantic_tokens(&raw, &legend);
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].modifiers, vec!["declaration", "static"]);
+    }
+
+    #[test]
+    fn test_decode_semantic_tokens_empty() {
+        let legend = SemanticTokensLegend {
+            token_types: vec![],
+            token_modifiers: vec![],
+        };
+        let tokens = decode_semantic_tokens(&[], &legend);
+        assert!(tokens.is_empty());
+    }
+
+    #[test]
+    fn test_decode_semantic_tokens_unknown_type_index() {
+        let legend = SemanticTokensLegend {
+            token_types: vec!["keyword".into()],
+            token_modifiers: vec![],
+        };
+        // type index 99 is out of bounds → empty string
+        let raw = vec![0, 0, 3, 99, 0];
+        let tokens = decode_semantic_tokens(&raw, &legend);
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].token_type, "");
     }
 
     // -----------------------------------------------------------------------

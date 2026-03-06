@@ -56,6 +56,13 @@ cargo fmt                 # Format
 If any check fails, fix immediately and re-run. Only commit when ALL checks pass.
 This prevents CI failures and maintains code quality.
 
+## Branching & Releases
+- All work happens on `develop`; `main` is the release branch
+- Merge `develop` → `main` via GitHub PR (CI runs on the PR before release)
+- Before creating the PR: bump version in `Cargo.toml` (minor for features, patch for fixes)
+- Merging the PR to `main` triggers `release.yml` which creates a GitHub Release tagged `v$VERSION`
+- Never push directly to `main` — always merge from `develop` via PR
+
 ## Code Style
 - `rustfmt` defaults (4-space indent)
 - `PascalCase` types, `snake_case` functions/vars

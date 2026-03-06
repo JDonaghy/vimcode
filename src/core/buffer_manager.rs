@@ -87,6 +87,8 @@ pub struct BufferState {
     pub read_only: bool,
     /// Pre-rendered markdown content (set for markdown preview buffers).
     pub md_rendered: Option<crate::core::markdown::MdRendered>,
+    /// LSP semantic tokens (decoded, absolute positions). Overlays tree-sitter highlights.
+    pub semantic_tokens: Vec<crate::core::lsp::SemanticToken>,
 }
 
 impl std::fmt::Debug for BufferState {
@@ -123,6 +125,7 @@ impl BufferState {
             max_col: 0,
             read_only: false,
             md_rendered: None,
+            semantic_tokens: Vec::new(),
         };
         state.update_syntax();
         state
@@ -153,6 +156,7 @@ impl BufferState {
             max_col: 0,
             read_only: false,
             md_rendered: None,
+            semantic_tokens: Vec::new(),
         };
         state.update_syntax();
         state

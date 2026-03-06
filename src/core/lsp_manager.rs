@@ -6,6 +6,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use super::extensions;
 use super::lsp::{
     language_id_from_path, path_to_uri, LspEvent, LspServer, LspServerConfig, LspServerId,
+    SemanticTokensLegend,
 };
 
 // ---------------------------------------------------------------------------
@@ -285,6 +286,8 @@ pub struct LspManager {
     event_rx: Receiver<LspEvent>,
     /// Track which servers have completed initialization
     initialized: HashMap<LspServerId, bool>,
+    /// Cached semantic tokens legends per server (extracted on initialization).
+    semantic_legends: HashMap<LspServerId, SemanticTokensLegend>,
 }
 
 impl LspManager {
@@ -313,6 +316,7 @@ impl LspManager {
             event_tx,
             event_rx,
             initialized: HashMap::new(),
+            semantic_legends: HashMap::new(),
         }
     }
 
@@ -453,6 +457,10 @@ impl LspManager {
                             server.capabilities = capabilities.clone();
                             server.send_initialized();
                             self.initialized.insert(*server_id, true);
+                            // Cache semantic tokens legend if the server supports it.
+                            if let Some(legend) = server.semantic_tokens_legend() {
+                                self.semantic_legends.insert(*server_id, legend);
+                            }
                         }
                     }
                     events.push(event);
@@ -675,6 +683,30 @@ impl LspManager {
     ) -> Option<i64> {
         let (sid, uri) = self.server_and_uri(path)?;
         Some(self.servers[sid].request_rename(&uri, line, character, new_name))
+    }
+
+    /// Request full semantic tokens for a file. Returns the request ID if the server supports it.
+    pub fn request_semantic_tokens(&mut self, path: &Path) -> Option<i64> {
+        let (sid, uri) = self.server_and_uri(path)?;
+        if !self.servers[sid].supports_semantic_tokens() {
+            return None;
+        }
+        Some(self.servers[sid].request_semantic_tokens_full(&uri))
+    }
+
+    /// Get the cached semantic tokens legend for a server.
+    pub fn semantic_legend_for_server(
+        &self,
+        server_id: LspServerId,
+    ) -> Option<&SemanticTokensLegend> {
+        self.semantic_legends.get(&server_id)
+    }
+
+    /// Find which server is handling a given file path.
+    #[allow(dead_code)]
+    pub fn server_id_for_path(&self, path: &Path) -> Option<LspServerId> {
+        let language_id = language_id_from_path(path)?;
+        self.language_to_server.get(&language_id).copied()
     }
 
     /// Shutdown all running servers.

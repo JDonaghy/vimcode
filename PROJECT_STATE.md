@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Mar 5, 2026 (Session 130 — LSP formatting enhancements) | **Tests:** 2268
+**Last updated:** Mar 6, 2026 (Session 132 — LSP session restore + semantic tokens bug fixes) | **Tests:** 2303
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 117b are in **SESSION_HISTORY.md**.
@@ -25,6 +25,20 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 132 — LSP session restore + semantic tokens bug fixes (1 new test, 2303 total):**
+Three targeted bug fixes for LSP integration:
+- **Tree-format session restore missing `lsp_did_open()`**: The newer tree-format session restore path (`restore_session_group_layout`) opened files via `buffer_manager.open_file()` directly but never called `lsp_did_open()`, so the LSP manager was never created when session files were restored. Fixed by adding `lsp_did_open()` calls for all restored buffers after the tree layout is installed in `restore_session_from_tree`.
+- **Single pending semantic tokens request**: `lsp_pending_semantic_tokens` was `Option<i64>` (single slot). When the LSP initialized with multiple open files, only the last request's response was accepted. Changed to `HashMap<i64, PathBuf>` so all in-flight requests are tracked. New test: `engine_semantic_tokens_pending_multiple_requests`.
+- **Color fix**: `semantic_parameter` in OneDark theme was same color as `variable` (#e06c75). Changed to #c8ae9d for visual distinction.
+
+**Session 131 — LSP semantic tokens + develop branch workflow (17 new tests, 2302 total):**
+LSP semantic token highlighting and branching workflow:
+- **LSP semantic tokens**: Full `textDocument/semanticTokens/full` implementation. New types `SemanticToken`/`SemanticTokensLegend` in `lsp.rs`; delta-encoded u32 decoder (`decode_semantic_tokens`); `request_semantic_tokens_full()` method; `SemanticTokensResponse` event variant; client capability declaration in init_params; legend caching in `LspManager.semantic_legends`; `BufferState.semantic_tokens` storage; tokens requested on `didOpen`/`didChange`/`Initialized`; decoded via cached legend in `poll_lsp()`
+- **8 new theme colors**: `semantic_parameter`, `semantic_property`, `semantic_namespace`, `semantic_enum_member`, `semantic_interface`, `semantic_type_parameter`, `semantic_decorator`, `semantic_macro` — set in all 4 themes (onedark/gruvbox/tokyo-night/solarized)
+- **Render overlay**: `Theme::semantic_token_style()` maps LSP token types to styles (with bold for declaration/definition, italic for readonly/static/deprecated); `build_spans()` overlays semantic tokens after tree-sitter spans using binary search + UTF-16→byte conversion
+- **Develop branch workflow**: `release.yml` reads version from Cargo.toml, creates `v$VERSION` tagged releases (not rolling `latest`); deleted redundant `rust.yml`; bumped version to 0.2.0; added `## Branching & Releases` section to CLAUDE.md
+- **17 new tests**: 5 unit tests in `lsp.rs` (decode_semantic_tokens), 12 integration tests in `tests/semantic_tokens.rs`
 
 **Session 130 — LSP formatting enhancements + LSP/GUI fixes (12 new tests, 2268 total):**
 Format-on-save, capability tracking, Shift+Alt+F keybinding, LSP binary resolution fixes, and GUI polish:
@@ -387,6 +401,7 @@ Total: ~47,500 lines
 - [x] **Settings editor** — `:Settings` opens `settings.json` in an editor tab; TUI settings panel shows live values; auto-reload on save in both backends (session 117)
 - [x] **Named colour themes** — `:colorscheme` command with 4 built-in themes (onedark/gruvbox-dark/tokyo-night/solarized-dark); GTK live hot-reload (session 116)
 - [x] **Swap file crash recovery** — Vim-like swap files in `~/.config/vimcode/swap/`; FNV-1a path hashing; atomic writes; PID-based stale detection; `[R]ecover/[D]elete/[A]bort` dialog; `:set swapfile`/`:set updatetime=N`; periodic write via `tick_swap_files()` (session 127)
+- [x] **LSP semantic token highlighting** — `textDocument/semanticTokens/full`; delta-decoded u32 data → styled overlay on tree-sitter; 8 semantic-specific theme colors; bold/italic modifiers; all 4 themes (session 131)
 
 ### Planned / Ideas
 - [ ] More Tree-sitter grammars (HTML, YAML, Lua — await tree-sitter 0.22 migration)
