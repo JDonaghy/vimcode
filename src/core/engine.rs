@@ -783,6 +783,9 @@ pub struct Engine {
     last_change: Option<Change>,
     /// Text accumulated during insert mode for repeat
     insert_text_buffer: String,
+    /// When insert mode was entered via a change operator (cw, ce, cb, etc.),
+    /// stores (motion_char, count) so `.` can replay the full change.
+    pending_change_motion: Option<(char, usize)>,
 
     // --- Settings ---
     /// Editor settings (line numbers, etc.)
@@ -1363,6 +1366,7 @@ impl Engine {
             pending_text_object: None,
             last_change: None,
             insert_text_buffer: String::new(),
+            pending_change_motion: None,
             settings: {
                 // Ensure settings.json exists with defaults
                 Settings::ensure_exists().ok();
@@ -8085,6 +8089,11 @@ impl Engine {
             self.view_mut().cursor = end_cursor;
         }
 
+        // Record the motion so `.` can replay c{motion} properly.
+        if operator == 'c' {
+            self.pending_change_motion = Some((motion, count));
+        }
+
         self.apply_charwise_operator(operator, delete_start, delete_end, changed);
     }
 
@@ -8495,6 +8504,7 @@ impl Engine {
                     motion: None,
                 });
             }
+            self.pending_change_motion = None;
             self.mode = Mode::Normal;
             self.clamp_cursor_col();
             self.view_mut().extra_cursors.clear();
@@ -8630,13 +8640,31 @@ impl Engine {
                 // Record the insert operation for repeat and ". register
                 if !self.insert_text_buffer.is_empty() {
                     self.last_inserted_text = self.insert_text_buffer.clone();
-                    self.last_change = Some(Change {
-                        op: ChangeOp::Insert,
-                        text: self.insert_text_buffer.clone(),
-                        count: 1,
-                        motion: None,
-                    });
+                    if let Some((motion_ch, count)) = self.pending_change_motion.take() {
+                        // Insert was entered via c{motion} — record as Change so `.`
+                        // replays the delete-motion + insert, not just the insert.
+                        let motion = match motion_ch {
+                            'w' => Some(Motion::WordForward),
+                            'e' => Some(Motion::WordEnd),
+                            'b' => Some(Motion::WordBackward),
+                            _ => None,
+                        };
+                        self.last_change = Some(Change {
+                            op: ChangeOp::Change,
+                            text: self.insert_text_buffer.clone(),
+                            count,
+                            motion,
+                        });
+                    } else {
+                        self.last_change = Some(Change {
+                            op: ChangeOp::Insert,
+                            text: self.insert_text_buffer.clone(),
+                            count: 1,
+                            motion: None,
+                        });
+                    }
                 }
+                self.pending_change_motion = None;
                 // Apply visual block insert/append to remaining lines
                 if let Some((start_line, end_line, col, _is_append)) =
                     self.visual_block_insert_info.take()
@@ -10291,8 +10319,62 @@ impl Engine {
                 }
             }
             ChangeOp::Change => {
-                // Repeat change operation - for now just handle simple cases
-                // More complex handling would go here
+                // Repeat c{motion}: delete the motion range, then insert the text.
+                if let Some(motion) = &change.motion {
+                    for _ in 0..final_count {
+                        let motion_char = match motion {
+                            Motion::WordForward => 'w',
+                            Motion::WordEnd => 'e',
+                            Motion::WordBackward => 'b',
+                            _ => continue,
+                        };
+                        // Reuse the same code path as the original cw/ce/cb:
+                        // apply_operator_with_motion deletes the range and enters
+                        // insert mode.  We then immediately insert the recorded
+                        // text and return to normal mode instead.
+                        let start_cursor = self.view().cursor;
+                        let start_pos =
+                            self.buffer().line_to_char(start_cursor.line) + start_cursor.col;
+                        for _ in 0..change.count {
+                            match motion_char {
+                                'w' => self.move_word_forward(),
+                                'b' => self.move_word_backward(),
+                                'e' => self.move_word_end(),
+                                _ => {}
+                            }
+                        }
+                        let end_cursor = self.view().cursor;
+                        let end_pos = self.buffer().line_to_char(end_cursor.line) + end_cursor.col;
+                        self.view_mut().cursor = start_cursor;
+
+                        let delete_end = if motion_char == 'e' {
+                            (end_pos + 1).min(self.buffer().len_chars())
+                        } else {
+                            end_pos
+                        };
+                        if start_pos < delete_end {
+                            self.start_undo_group();
+                            self.delete_with_undo(start_pos, delete_end);
+                            if !change.text.is_empty() {
+                                self.insert_with_undo(start_pos, &change.text);
+                                let inserted_chars = change.text.chars().count();
+                                let newlines = change.text.matches('\n').count();
+                                if newlines > 0 {
+                                    self.view_mut().cursor.line += newlines;
+                                    if let Some(last_nl) = change.text.rfind('\n') {
+                                        self.view_mut().cursor.col =
+                                            change.text[last_nl + 1..].chars().count();
+                                    }
+                                } else {
+                                    self.view_mut().cursor.col += inserted_chars;
+                                }
+                            }
+                            self.clamp_cursor_col();
+                            self.finish_undo_group();
+                            *changed = true;
+                        }
+                    }
+                }
             }
             ChangeOp::Substitute => {
                 // Repeat s command
@@ -15369,13 +15451,12 @@ impl Engine {
             line += 1;
         }
 
-        // If we found an empty line, move there
-        if line < total_lines {
-            self.view_mut().cursor.line = line;
-            // Move to end of line (column 0 for empty lines)
-            self.view_mut().cursor.col = self.get_line_len_for_insert(line);
+        // Move to the empty line we found, or the last line if we hit EOF
+        if line >= total_lines {
+            line = total_lines.saturating_sub(1);
         }
-        // Otherwise stay at current position (EOF case)
+        self.view_mut().cursor.line = line;
+        self.view_mut().cursor.col = self.get_line_len_for_insert(line);
     }
 
     fn move_paragraph_backward(&mut self) {

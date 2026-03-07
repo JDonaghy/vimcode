@@ -88,6 +88,35 @@ fn test_paragraph_motion() {
     assert_eq!(e.cursor().line, 0);
 }
 
+#[test]
+fn test_paragraph_forward_reaches_last_line() {
+    // Pressing } repeatedly must eventually reach the last line of the file.
+    // Regression: previously stopped one jump short when the file ended without
+    // a trailing blank line.
+    let mut e = engine_with("aaa\n\nbbb\nccc\n");
+    // line 0: "aaa", line 1: "", line 2: "bbb", line 3: "ccc"
+    press(&mut e, '}'); // -> blank line 1
+    assert_eq!(e.cursor().line, 1);
+    press(&mut e, '}'); // -> last line (3)
+    assert_eq!(
+        e.cursor().line,
+        3,
+        "}} should reach the last line of the file"
+    );
+}
+
+#[test]
+fn test_paragraph_forward_no_blanks() {
+    // File with no blank lines: } should jump straight to the last line.
+    let mut e = engine_with("aaa\nbbb\nccc\n");
+    press(&mut e, '}');
+    assert_eq!(
+        e.cursor().line,
+        2,
+        "}} with no blank lines should go to last line"
+    );
+}
+
 // ── Operators ─────────────────────────────────────────────────────────────────
 
 #[test]
@@ -408,4 +437,41 @@ fn test_dot_repeat() {
     // '.' repeats — deletes again
     press(&mut e, '.');
     assert_eq!(get_lines(&e).len(), 1);
+}
+
+#[test]
+fn test_cw_dot_repeat_no_trailing_space() {
+    // cw should change the word without the trailing space.
+    // Repeating with . must behave identically — change word, not word+space.
+    let mut e = engine_with("foo bar baz\n");
+    // cw on "foo" → delete "foo", enter insert → type "AAA" → Escape
+    press(&mut e, 'c');
+    press(&mut e, 'w');
+    assert_eq!(e.mode, Mode::Insert);
+    type_chars(&mut e, "AAA");
+    press_key(&mut e, "Escape");
+    assert_eq!(e.mode, Mode::Normal);
+    assert_buf(&e, "AAA bar baz\n");
+
+    // Move to "bar" (w moves to start of next word)
+    press(&mut e, 'w');
+    // Repeat with . — should change "bar" to "AAA", NOT "bar " to "AAA"
+    press(&mut e, '.');
+    assert_buf(&e, "AAA AAA baz\n");
+}
+
+#[test]
+fn test_ce_dot_repeat() {
+    // ce (change to end of word) + dot repeat should also work correctly
+    let mut e = engine_with("foo bar baz\n");
+    press(&mut e, 'c');
+    press(&mut e, 'e');
+    assert_eq!(e.mode, Mode::Insert);
+    type_chars(&mut e, "XXX");
+    press_key(&mut e, "Escape");
+    assert_buf(&e, "XXX bar baz\n");
+
+    press(&mut e, 'w');
+    press(&mut e, '.');
+    assert_buf(&e, "XXX XXX baz\n");
 }
