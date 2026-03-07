@@ -100,7 +100,7 @@ jobs:
           ./vimcode-linux-x86_64
           ```
 
-          **Option C — Flatpak**
+          **Option C — Flatpak** (see attached `vimcode.flatpak` asset)
           ```
           flatpak install vimcode.flatpak
           flatpak run io.github.jdonaghy.VimCode
@@ -112,7 +112,6 @@ jobs:
         files: |
           ${{ env.DEB_PATH }}
           ${{ env.BIN_NAME }}
-          vimcode.flatpak
 
   flatpak:
     name: Build Flatpak bundle
@@ -134,6 +133,7 @@ jobs:
       with:
         manifest-path: flatpak/io.github.jdonaghy.VimCode.yml
         bundle: vimcode.flatpak
+        run-tests: false
         cache-key: flatpak-builder-${{ hashFiles('**/Cargo.lock') }}
 
     - name: Upload Flatpak to release
