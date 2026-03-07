@@ -30,8 +30,8 @@ See [README.md](README.md) for full feature documentation.
 | `CTRL-N` | Next completion match | ✅ | Auto-popup + manual completion |
 | `CTRL-P` | Previous completion match | ✅ | Auto-popup + manual completion |
 | `CTRL-O` | Execute one Normal command | ⚠️ | Switches to Normal; no auto-return to Insert |
-| `CTRL-E` | Insert character below cursor | ❌ | |
-| `CTRL-Y` | Insert character above cursor | ❌ | |
+| `CTRL-E` | Insert character below cursor | ✅ | |
+| `CTRL-Y` | Insert character above cursor | ✅ | |
 | `CTRL-A` | Insert previously inserted text | ❌ | |
 | `CTRL-@` | Insert prev text and stop insert | ❌ | |
 | `CTRL-V {char}` | Insert literal character | ❌ | |
@@ -41,7 +41,7 @@ See [README.md](README.md) for full feature documentation.
 | `CTRL-G u` | Break undo sequence | ❌ | |
 | `CTRL-G j/k` | Move cursor down/up | ❌ | |
 
-**Insert mode: 13/24 (54%)**
+**Insert mode: 15/24 (63%)**
 
 ---
 
@@ -84,10 +84,10 @@ See [README.md](README.md) for full feature documentation.
 | `M` | Screen middle | ✅ | |
 | `L` | Screen bottom | ✅ | |
 | `%` | Matching bracket | ✅ | Forward search when not on bracket |
-| `+` | First char N lines down | ❌ | |
-| `-` | First char N lines up | ❌ | |
-| `_` | First char N-1 lines down | ❌ | |
-| `\|` | Go to column N | ❌ | |
+| `+` | First char N lines down | ✅ | |
+| `-` | First char N lines up | ✅ | |
+| `_` | First char N-1 lines down | ✅ | |
+| `\|` | Go to column N | ✅ | |
 | `N%` | Go to N% of file | ❌ | |
 | `gj` | Down screen line | ✅ | Wrap mode |
 | `gk` | Up screen line | ✅ | Wrap mode |
@@ -98,7 +98,7 @@ See [README.md](README.md) for full feature documentation.
 | `CTRL-E` | Scroll down one line | ✅ | |
 | `CTRL-Y` | Scroll up one line | ✅ | |
 
-**Movement: 42/47 (89%)**
+**Movement: 46/47 (98%)**
 
 ---
 
@@ -129,8 +129,8 @@ See [README.md](README.md) for full feature documentation.
 | `P` | Paste before | ✅ | Linewise/charwise aware |
 | `]p` | Paste with indent adjust | ✅ | |
 | `[p` | Paste before with indent | ✅ | |
-| `gp` | Put, leave cursor after | ❌ | |
-| `gP` | Put before, leave cursor after | ❌ | |
+| `gp` | Put, leave cursor after | ✅ | |
+| `gP` | Put before, leave cursor after | ✅ | |
 | `r{char}` | Replace character | ✅ | Count supported |
 | `R` | Replace mode | ✅ | Overtype until Escape |
 | `J` | Join lines | ✅ | |
@@ -154,10 +154,10 @@ See [README.md](README.md) for full feature documentation.
 | `gq{motion}` | Format text | ❌ | |
 | `gw{motion}` | Format text, keep cursor | ❌ | |
 | `!{motion}{filter}` | Filter through command | ❌ | |
-| `&` | Repeat last `:s` | ❌ | |
+| `&` | Repeat last `:s` | ✅ | |
 | `g&` | Repeat last `:s` on all lines | ❌ | |
 
-**Editing: 44/50 (88%)**
+**Editing: 47/50 (94%)**
 
 ---
 
@@ -204,7 +204,7 @@ See [README.md](README.md) for full feature documentation.
 | `q` | Stop recording | ✅ | |
 | `@{a-z}` | Play macro | ✅ | Count supported |
 | `@@` | Repeat last macro | ✅ | |
-| `@:` | Repeat last ex command | ❌ | |
+| `@:` | Repeat last ex command | ✅ | |
 | `"{reg}` | Use register | ✅ | a-z, A-Z, 0-9, special |
 | `v` | Enter Visual mode | ✅ | |
 | `V` | Enter Visual Line mode | ✅ | |
@@ -234,7 +234,7 @@ See [README.md](README.md) for full feature documentation.
 | `q/` / `q?` | Search history window | ❌ | |
 | `cgn` | Change next match | ✅ | Repeat with `.` |
 
-**Other: 20/33 (61%)**
+**Other: 21/33 (64%)**
 
 ---
 
@@ -248,7 +248,7 @@ See [README.md](README.md) for full feature documentation.
 | `ip` / `ap` | Inner/around paragraph | ✅ | |
 | `i"` / `a"` | Inner/around double quotes | ✅ | |
 | `i'` / `a'` | Inner/around single quotes | ✅ | |
-| `` i` `` / `` a` `` | Inner/around backticks | ❌ | |
+| `` i` `` / `` a` `` | Inner/around backticks | ✅ | |
 | `i(` / `a(` | Inner/around parentheses | ✅ | `ib`/`ab` alias |
 | `i)` / `a)` | Inner/around parentheses | ✅ | |
 | `i{` / `a{` | Inner/around braces | ✅ | `iB`/`aB` alias |
@@ -259,7 +259,7 @@ See [README.md](README.md) for full feature documentation.
 | `i>` / `a>` | Inner/around angle brackets | ✅ | |
 | `it` / `at` | Inner/around HTML/XML tag | ✅ | Case-insensitive, nesting-aware |
 
-**Text objects: 15/16 (94%)**
+**Text objects: 16/16 (100%)**
 
 ---
 
@@ -286,7 +286,7 @@ See [README.md](README.md) for full feature documentation.
 | `gJ` | Join without space | ✅ | |
 | `g;` / `g,` | Change list nav | ✅ | |
 | `g.` | Go to last change | ✅ | |
-| `gp` / `gP` | Put, cursor after | ❌ | |
+| `gp` / `gP` | Put, cursor after | ✅ | |
 | `gq{motion}` | Format text | ❌ | |
 | `gw{motion}` | Format, keep cursor | ❌ | |
 | `gx` | Open URL externally | ❌ | |
@@ -303,7 +303,7 @@ See [README.md](README.md) for full feature documentation.
 | `g&` | Repeat `:s` all lines | ❌ | |
 | `gH` / `gV` | Select mode | N/A | No Select mode |
 
-**g-commands: 19/34 (56%)**
+**g-commands: 20/34 (59%)**
 
 ---
 
@@ -357,13 +357,13 @@ See [README.md](README.md) for full feature documentation.
 | `CTRL-W s` | Split horizontally | ✅ | |
 | `CTRL-W v` | Split vertically | ✅ | |
 | `CTRL-W e/E` | Split editor group right/down | ✅ | VimCode extension |
-| `CTRL-W +` | Increase height | ❌ | |
-| `CTRL-W -` | Decrease height | ❌ | |
-| `CTRL-W <` | Decrease width | ❌ | |
-| `CTRL-W >` | Increase width | ❌ | |
-| `CTRL-W =` | Equalize sizes | ❌ | |
-| `CTRL-W _` | Maximize height | ❌ | |
-| `CTRL-W \|` | Maximize width | ❌ | |
+| `CTRL-W +` | Increase height | ✅ | Editor group splits |
+| `CTRL-W -` | Decrease height | ✅ | Editor group splits |
+| `CTRL-W <` | Decrease width | ✅ | Editor group splits |
+| `CTRL-W >` | Increase width | ✅ | Editor group splits |
+| `CTRL-W =` | Equalize sizes | ✅ | All group splits |
+| `CTRL-W _` | Maximize height | ✅ | Editor group splits |
+| `CTRL-W \|` | Maximize width | ✅ | Editor group splits |
 | `CTRL-W H` | Move window to far left | ❌ | |
 | `CTRL-W J` | Move window to far bottom | ❌ | |
 | `CTRL-W K` | Move window to far top | ❌ | |
@@ -373,15 +373,15 @@ See [README.md](README.md) for full feature documentation.
 | `CTRL-W r` | Rotate windows downward | ❌ | |
 | `CTRL-W R` | Rotate windows upward | ❌ | |
 | `CTRL-W p` | Go to previous window | ❌ | |
-| `CTRL-W n` | New window | ❌ | `:new` command works |
+| `CTRL-W n` | New window | ✅ | Runs `:new` |
 | `CTRL-W t` | Go to top window | ❌ | |
 | `CTRL-W b` | Go to bottom window | ❌ | |
-| `CTRL-W q` | Quit window | ❌ | `CTRL-W c` works |
+| `CTRL-W q` | Quit window | ✅ | Alias for `CTRL-W c` |
 | `CTRL-W ]` | Split + tag jump | N/A | LSP `gd` instead |
 | `CTRL-W f` | Split + open file | ❌ | |
 | `CTRL-W d` | Split + go to definition | ❌ | |
 
-**Window commands: 11/31 (35%)** (excluding N/A)
+**Window commands: 20/31 (65%)** (excluding N/A)
 
 ---
 
@@ -392,19 +392,19 @@ See [README.md](README.md) for full feature documentation.
 | `]c` / `[c` | Next/prev git hunk | ✅ | Git integration |
 | `]d` / `[d` | Next/prev diagnostic | ✅ | LSP integration |
 | `]p` / `[p` | Paste with indent adjust | ✅ | |
-| `[[` / `]]` | Section backward/forward | ❌ | |
-| `[]` / `][` | Section end backward/forward | ❌ | |
-| `[m` / `]m` | Method start backward/forward | ❌ | |
-| `[M` / `]M` | Method end backward/forward | ❌ | |
-| `[{` / `]}` | Unmatched `{` / `}` | ❌ | |
-| `[(` / `])` | Unmatched `(` / `)` | ❌ | |
+| `[[` / `]]` | Section backward/forward | ✅ | `{` in column 0 |
+| `[]` / `][` | Section end backward/forward | ✅ | `}` in column 0 |
+| `[m` / `]m` | Method start backward/forward | ✅ | |
+| `[M` / `]M` | Method end backward/forward | ✅ | |
+| `[{` / `]}` | Unmatched `{` / `}` | ✅ | Depth-tracked |
+| `[(` / `])` | Unmatched `(` / `)` | ✅ | Depth-tracked |
 | `[*` / `]*` | Comment start/end | ❌ | |
 | `[/` / `]/` | C comment start/end | ❌ | |
 | `[#` / `]#` | Preprocessor directive | ❌ | |
 | `[z` / `]z` | Fold start/end | ❌ | |
 | `[s` / `]s` | Spelling errors | N/A | No spell check |
 
-**Bracket commands: 6/13 (46%)** (excluding N/A)
+**Bracket commands: 12/13 (92%)** (excluding N/A)
 
 ---
 
@@ -431,12 +431,12 @@ Operators `d`, `c`, `y`, `>`, `<`, `=`, `g~`, `gu`, `gU` all accept these motion
 | `ip`/`ap`/`is`/`as` | Paragraph/sentence | ✅ | |
 | `it`/`at` | Tag text objects | ✅ | |
 | `i<`/`a<` | Angle bracket objects | ✅ | |
-| `` i` ``/`` a` `` | Backtick text objects | ❌ | |
+| `` i` ``/`` a` `` | Backtick text objects | ✅ | |
 | `o_v` | Force charwise | ❌ | |
 | `o_V` | Force linewise | ❌ | |
 | `o_CTRL-V` | Force blockwise | ❌ | |
 
-**Operator-pending: 17/21 (81%)**
+**Operator-pending: 18/21 (86%)**
 
 ---
 
@@ -463,7 +463,7 @@ Operators `d`, `c`, `y`, `>`, `<`, `=`, `g~`, `gu`, `gU` all accept these motion
 | `J` | Join selected lines | ✅ | |
 | `gJ` | Join without space | ✅ | |
 | `%` | Jump to matching bracket | ✅ | Extends selection |
-| `r{char}` | Replace all selected chars | ❌ | |
+| `r{char}` | Replace all selected chars | ✅ | Visual/VisualLine/VisualBlock |
 | `I` (block) | Block insert | ❌ | |
 | `A` (block) | Block append | ❌ | |
 | `gq` | Format selection | ❌ | |
@@ -471,7 +471,7 @@ Operators `d`, `c`, `y`, `>`, `<`, `=`, `g~`, `gu`, `gU` all accept these motion
 | `g CTRL-X` | Sequential decrement | ❌ | |
 | Movement keys | Extend selection | ✅ | All motions work |
 
-**Visual mode: 20/26 (77%)**
+**Visual mode: 21/26 (81%)**
 
 ---
 
@@ -600,35 +600,29 @@ These are not in Vim but are part of VimCode:
 
 | Category | Implemented | Total | Coverage |
 |----------|-------------|-------|----------|
-| Insert Mode | 13 | 24 | 54% |
-| Movement | 42 | 47 | 89% |
-| Editing | 44 | 50 | 88% |
+| Insert Mode | 15 | 24 | 63% |
+| Movement | 46 | 47 | 98% |
+| Editing | 47 | 50 | 94% |
 | Search & Marks | 25 | 26 | 96% |
-| Normal — Other | 20 | 33 | 61% |
-| Text Objects | 15 | 16 | 94% |
-| g-Commands | 19 | 34 | 56% |
-| z-Commands | 7 | 22 | 32% |
-| Window (CTRL-W) | 11 | 31 | 35% |
-| Bracket ([ / ]) | 6 | 13 | 46% |
-| Operator-Pending | 17 | 21 | 81% |
-| Visual Mode | 20 | 26 | 77% |
+| Normal — Other | 21 | 33 | 64% |
+| Text Objects | 16 | 16 | 100% |
+| g-Commands | 20 | 34 | 59% |
+| z-Commands | 22 | 23 | 96% |
+| Window (CTRL-W) | 20 | 31 | 65% |
+| Bracket ([ / ]) | 12 | 13 | 92% |
+| Operator-Pending | 18 | 21 | 86% |
+| Visual Mode | 21 | 26 | 81% |
 | Ex Commands | 65 | 68 | 96% |
-| **Total** | **304** | **411** | **74%** |
+| **Total** | **348** | **411** | **85%** |
 
 N/A commands (VimScript, digraphs, spelling, etc.) are excluded from totals.
 
 ### Priority Missing Commands
 
 **Highest impact** (commonly used):
-- `CTRL-O` in insert (full implementation)
-- `+` / `-` / `_` / `|` (line/column motions)
-- `gp`/`gP` (paste and move cursor)
+- `CTRL-O` in insert (full implementation — currently switches to Normal without auto-return)
 - `gq{motion}` (format text)
-- `[[`/`]]`/`[m`/`]m` (section/method navigation)
-- `[{`/`]}`/`[(`/`])` (unmatched bracket jumps)
-- `CTRL-W +/-/</>` (window resize)
-- `CTRL-W =` (equalize windows)
-- Visual `r` (replace selection with char)
 - Visual block `I`/`A` (block insert/append)
-- `@:` (repeat last ex command)
-- Backtick text objects (`` i` ``/`` a` ``)
+- `g&` (repeat last `:s` on all lines)
+- `CTRL-W H/J/K/L` (move window to far left/bottom/top/right)
+- `N%` (go to N% of file)

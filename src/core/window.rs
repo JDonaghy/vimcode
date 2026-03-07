@@ -596,6 +596,23 @@ impl GroupLayout {
         }
     }
 
+    /// Set all split ratios in the tree to the given value (for equalize).
+    pub fn set_all_ratios(&mut self, ratio: f64) {
+        match self {
+            GroupLayout::Leaf(_) => {}
+            GroupLayout::Split {
+                ratio: r,
+                first,
+                second,
+                ..
+            } => {
+                *r = ratio.clamp(0.1, 0.9);
+                first.set_all_ratios(ratio);
+                second.set_all_ratios(ratio);
+            }
+        }
+    }
+
     /// Find the parent split of a leaf. Returns `(split_index, direction, is_first_child)`.
     pub fn parent_split_of(&self, target: GroupId) -> Option<(usize, SplitDirection, bool)> {
         self.parent_split_of_impl(target, &mut 0)

@@ -1,9 +1,12 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 139 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 140 archived here. Recent work summary in PROJECT_STATE.md.
 
 ---
+
+**Session 140 — Vim compatibility batch: 29 new commands (45 new tests, 2545 total):**
+Implemented 29 missing Vim commands in two tiers, raising VIM_COMPATIBILITY.md from 319/411 (78%) to 348/411 (85%). **Tier 1:** `+`/`-`/`_` line motions, `|` column motion, `gp`/`gP` paste with cursor after, `@:` repeat last ex command, backtick text objects (`` i` ``/`` a` ``), insert `CTRL-E`/`CTRL-Y` (char below/above), visual `r{char}`, `&` repeat last `:s`, `CTRL-W q`/`n`. **Tier 2:** `CTRL-W +`/`-`/`<`/`>`/`=`/`_`/`|` resize/equalize/maximize, `[{`/`]}`/`[(`/`])` unmatched bracket jumps, `[m`/`]m`/`[M`/`]M` method navigation, `[[`/`]]`/`[]`/`][` section navigation. Added `last_ex_command`/`last_substitute` fields to Engine, `set_all_ratios()` to GroupLayout, 45 integration tests in `tests/vim_compat_batch.rs`. Text Objects now 100%.
 
 **Session 139 — Comprehensive z-commands (33 new tests, 2494 total):**
 Implemented 15 missing z-commands to bring z-command coverage from 7/22 (32%) to 22/23 (96%). New fold commands: `zM` (close all), `zA`/`zO`/`zC` (recursive toggle/open/close), `zd`/`zD` (delete fold/recursive), `zf{motion}` (fold-create operator with j/k/G/gg/{/} motions), `zF` (fold N lines), `zv` (open to show cursor), `zx` (recompute). Scroll+first-non-blank: `z<CR>`/`z.`/`z-`. Horizontal scroll: `zh`/`zl` (with count), `zH`/`zL` (half-screen). Added 3 View helper methods (`delete_fold_at`, `delete_folds_in_range`, `open_folds_in_range`), 33 integration tests in `tests/z_commands.rs`.

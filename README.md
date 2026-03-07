@@ -11,7 +11,7 @@ There's a touch of irony here - using a cli tool to write the editor that I've w
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 2494+ tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 2545+ tests, zero async runtime dependency
 
 > **Note:** VimCode does not implement VimScript. Extension and scripting is handled via
 > the built-in Lua 5.4 plugin system. The goal is full Vim *keybinding* and *editing*
@@ -115,6 +115,7 @@ cargo fmt
 - `ip` / `ap` — inner/around paragraph (contiguous non-blank lines); `ap` includes trailing blank lines
 - `is` / `as` — inner/around sentence (`.`/`!`/`?`-terminated); `as` includes trailing whitespace
 - `it` / `at` — inner/around HTML/XML tag (`dit` deletes content, `dat` deletes element; case-insensitive, nesting-aware)
+- `` i` `` / `` a` `` — inner/around backticks
 
 **Count prefix** — prepend any number to multiply: `5j`, `3dd`, `10yy`, `2w`, etc.
 
@@ -131,6 +132,8 @@ cargo fmt
 - `Ctrl-W` — delete word backward from cursor
 - `Ctrl-T` — indent current line by shiftwidth
 - `Ctrl-D` — dedent current line by shiftwidth
+- `Ctrl-E` — insert character from line below
+- `Ctrl-Y` — insert character from line above
 
 **Visual mode**
 - `v` — character selection; `V` — line selection; `Ctrl-V` — block selection
@@ -139,6 +142,7 @@ cargo fmt
 - `o` — swap cursor to opposite end of selection (character/line visual)
 - `O` — swap cursor to opposite column corner (visual block)
 - `gv` — reselect last visual selection
+- `r{char}` — replace all selected characters with `{char}`
 
 **Search**
 - `/` — forward incremental search (real-time highlight as you type)
@@ -910,6 +914,9 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `H` / `M` / `L` | Screen top / middle / bottom |
 | `gg` / `G` | First / last line |
 | `0` / `$` | Line start / end |
+| `+` / `-` | First non-blank of next / previous line |
+| `_` | First non-blank of Nth-1 line down |
+| `\|` | Go to column N |
 | `f{c}` / `t{c}` | Find / till char (`;` `,` repeat) |
 | `%` | Jump to matching bracket |
 | `zz` / `zt` / `zb` | Scroll cursor to center / top / bottom |
@@ -937,7 +944,10 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `d`/`c`/`y` + motion | Full operator+motion support: `dj`/`dk`/`dG`/`dgg`/`d{`/`d}`/`d(`/`d)`/`dW`/`dB`/`dE`/`d^`/`dh`/`dl`/`dH`/`dM`/`dL`/`df`/`dt`/`dF`/`dT`/`d;`/`d,`/`dge` |
 | `g~`/`gu`/`gU` + motion | Case operators: all motions (`g~j`, `guw`, `gUG`, `gufx`, etc.) |
 | `>`/`<` + motion | Indent/dedent: all motions (`>j`, `>G`, `>}`, etc.) |
+| `gp` / `gP` | Paste after / before, leave cursor after pasted text |
 | `]p` / `[p` | Paste after / before with indent adjusted to current line |
+| `&` | Repeat last `:s` substitution on current line |
+| `@:` | Repeat last ex command |
 | `>>` / `<<` | Indent / dedent line(s) by `shiftwidth` |
 | `*` / `#` | Search forward / backward for word under cursor (word-bounded) |
 | `g*` / `g#` | Search forward / backward for word under cursor (partial match) |
@@ -956,6 +966,12 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `K` | Show hover info (LSP) |
 | `]c` / `[c` | Next / previous hunk |
 | `]d` / `[d` | Next / previous diagnostic (LSP) |
+| `[[` / `]]` | Section backward / forward (`{` in column 0) |
+| `[]` / `][` | Section end backward / forward (`}` in column 0) |
+| `[m` / `]m` | Method start backward / forward |
+| `[M` / `]M` | Method end backward / forward |
+| `[{` / `]}` | Jump to unmatched `{` / `}` |
+| `[(` / `])` | Jump to unmatched `(` / `)` |
 | `<leader>gf` | LSP format current buffer (Space=leader by default) |
 | `<leader>rn` | LSP rename symbol — pre-fills `:Rename <word>` |
 | `za` / `zo` / `zc` / `zR` | Fold toggle / open / close / open all |
@@ -967,7 +983,10 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `zx` | Recompute folds (open all + close all) |
 | `zj` / `zk` | Move to next / previous fold |
 | `Ctrl-W h/j/k/l` | Focus window left/down/up/right |
-| `Ctrl-W w` / `c` / `o` | Cycle / close / close-others |
+| `Ctrl-W w` / `c` / `o` / `q` / `n` | Cycle / close / close-others / quit / new |
+| `Ctrl-W +` / `-` / `>` / `<` | Resize split height/width |
+| `Ctrl-W =` | Equalize all split sizes |
+| `Ctrl-W _` / `\|` | Maximize split height / width |
 | `Ctrl-P` | Open fuzzy file finder |
 | `Ctrl-G` | Open live grep modal (search file contents) |
 | `F5` | Start debugging / continue |

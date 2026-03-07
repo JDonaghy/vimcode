@@ -5,12 +5,12 @@
 ---
 
 ## Recently Completed
+- **Session 140**: Vim compat batch — 29 new commands (78% → 85%), +/-/_/| motions, gp/gP, @:, backtick text objects, insert CTRL-E/Y, visual r{char}, &, CTRL-W resize/equalize/maximize, bracket/section/method navigation, 45 integration tests
 - **Session 139**: Comprehensive z-commands — 15 new z-commands (32% → 96%), fold create/delete/recursive, horizontal scroll, 33 integration tests
 - **Session 138**: `VIM_COMPATIBILITY.md` — systematic Vim command inventory (304/411 = 74%), VimScript scope note in README.md
 - **Session 137**: Operator+motion completeness — all operators with all motions, 56 integration tests
 - **Session 136**: Ex command abbreviation system + ~20 new commands, 71 integration tests
 - **Session 135**: `show_hidden_files` setting, LSP format undo fix
-- **Session 134**: Search highlight refresh, viewport layout fixes, 13 integration tests
 
 ## Roadmap
 
