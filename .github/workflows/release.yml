@@ -142,6 +142,12 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
+    - name: Install Flatpak and flatpak-builder
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y flatpak flatpak-builder
+        sudo flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+
     - name: Read version from Cargo.toml
       run: |
         VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
