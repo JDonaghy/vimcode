@@ -1161,7 +1161,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
                 label: "Copy",
                 shortcut: "",
                 vscode_shortcut: "Ctrl+C",
-                action: "copy",
+                action: "clipboard_copy",
                 enabled: true,
                 separator: false,
             },

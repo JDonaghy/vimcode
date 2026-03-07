@@ -3148,6 +3148,13 @@ impl SimpleComponent for App {
                     EngineAction::ToggleSidebar => {
                         sender.input(Msg::ToggleSidebar);
                     }
+                    EngineAction::QuitWithError => {
+                        let mut engine = self.engine.borrow_mut();
+                        engine.cleanup_all_swaps();
+                        engine.lsp_shutdown();
+                        drop(engine);
+                        std::process::exit(1);
+                    }
                     EngineAction::None | EngineAction::Error => {}
                 }
 
@@ -3219,6 +3226,13 @@ impl SimpleComponent for App {
                         }
                         EngineAction::ToggleSidebar => {
                             sender.input(Msg::ToggleSidebar);
+                        }
+                        EngineAction::QuitWithError => {
+                            let mut engine = self.engine.borrow_mut();
+                            engine.cleanup_all_swaps();
+                            engine.lsp_shutdown();
+                            drop(engine);
+                            std::process::exit(1);
                         }
                         EngineAction::None | EngineAction::Error => {}
                     }

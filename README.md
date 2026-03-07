@@ -11,7 +11,7 @@ There's a touch of irony here - using a cli tool to write the editor that I've w
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 2346+ tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 2461+ tests, zero async runtime dependency
 
 
 ## Download (Ubuntu)
@@ -927,7 +927,10 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `J` | Join lines (collapse next line's whitespace to one space) |
 | `gJ` | Join lines without inserting a space |
 | `Ctrl-A` / `Ctrl-X` | Increment / decrement number under cursor |
-| `=` operator | Auto-indent range (`==` current line, `gg=G` whole file) |
+| `=` operator | Auto-indent range (`==` current line, `=G` to end, `=gg` whole file) |
+| `d`/`c`/`y` + motion | Full operator+motion support: `dj`/`dk`/`dG`/`dgg`/`d{`/`d}`/`d(`/`d)`/`dW`/`dB`/`dE`/`d^`/`dh`/`dl`/`dH`/`dM`/`dL`/`df`/`dt`/`dF`/`dT`/`d;`/`d,`/`dge` |
+| `g~`/`gu`/`gU` + motion | Case operators: all motions (`g~j`, `guw`, `gUG`, `gufx`, etc.) |
+| `>`/`<` + motion | Indent/dedent: all motions (`>j`, `>G`, `>}`, etc.) |
 | `]p` / `[p` | Paste after / before with indent adjusted to current line |
 | `>>` / `<<` | Indent / dedent line(s) by `shiftwidth` |
 | `*` / `#` | Search forward / backward for word under cursor (word-bounded) |
@@ -970,6 +973,8 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 
 ### Command Mode
 
+All ex commands support Vim-style abbreviations (e.g., `:j` for `:join`, `:y` for `:yank`, `:ve` for `:version`). The shortest unambiguous prefix works.
+
 | Command | Action |
 |---------|--------|
 | `:w` / `:wq` | Save / save and quit |
@@ -991,6 +996,26 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `:m[ove] {dest}` | Move current line to after line {dest} (0-indexed) |
 | `:t {dest}` / `:co[py] {dest}` | Copy current line to after line {dest} (0-indexed) |
 | `:sort [n] [r] [u] [i]` | Sort lines: `n`=numeric, `r`=reverse, `u`=unique, `i`=ignorecase |
+| `:j[oin]` | Join current line with the next (remove newline) |
+| `:y[ank] [reg]` | Yank current line into register (default `"`) |
+| `:pu[t] [reg]` | Put register contents after current line |
+| `:>` / `:<` | Indent / dedent current line by one shiftwidth |
+| `:=` | Display current line number |
+| `:#` / `:nu[mber]` / `:p[rint]` | Print current line with line number |
+| `:ma[rk] {a-z}` / `:k{a-z}` | Set mark at current line |
+| `:pw[d]` | Print working directory |
+| `:f[ile]` | Show current file name and info |
+| `:ene[w]` | Open a new empty buffer |
+| `:new` / `:vne[w]` | Open new buffer in horizontal / vertical split |
+| `:up[date]` | Write buffer only if modified |
+| `:sav[eas] {file}` | Save buffer to a new file path |
+| `:ve[rsion]` | Show VimCode version info |
+| `:ret[ab][!] [N]` | Re-apply tabstop: convert indentation (! = retab entire buffer) |
+| `:cq[uit]` | Quit with non-zero exit code (error) |
+| `:windo {cmd}` | Execute command in every window |
+| `:bufdo {cmd}` | Execute command in every buffer |
+| `:tabdo {cmd}` | Execute command in every tab |
+| `:di[splay]` | Display register contents (alias for `:reg`) |
 | `:set [option]` | Change / query setting |
 | `:noh` / `:nohlsearch` | Clear current search highlight |
 | `:echo {text}` | Display a message in the status bar |
@@ -1071,7 +1096,7 @@ src/
 ├── render.rs        (~4,364 lines)  Platform-agnostic ScreenLayout bridge (DebugSidebarData, SourceControlData, BottomPanelTabs)
 ├── icons.rs            (~30 lines)  Nerd Font file-type icons (GTK + TUI)
 └── core/            (~29,500 lines)  Zero GTK/rendering deps — fully testable
-    ├── engine.rs    (~32,476 lines)  Orchestrator: keys, commands, git, macros, LSP, DAP, plugins, workspaces
+    ├── engine.rs    (~33,863 lines)  Orchestrator: keys, commands, git, macros, LSP, DAP, plugins, workspaces
     ├── markdown.rs     (~497 lines)  Markdown → styled plain text converter (pulldown-cmark)
     ├── plugin.rs       (~835 lines)  Lua 5.4 plugin manager (mlua vendored; vimcode.* API; async_shell)
     ├── terminal.rs     (~320 lines)  PTY-backed terminal pane (portable-pty + vt100, history ring buffer)

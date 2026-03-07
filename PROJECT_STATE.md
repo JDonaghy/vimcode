@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Mar 6, 2026 (Session 135 — show_hidden_files setting + LSP format undo fix) | **Tests:** 2346
+**Last updated:** Mar 6, 2026 (Session 137 — Operator+motion completeness) | **Tests:** 2461
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 134 are in **SESSION_HISTORY.md**.
@@ -25,6 +25,27 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 137 — Operator+motion completeness (56 new tests, 2461 total):**
+Full operator+motion support for all standard Vim motions:
+- **`pending_find_operator`**: New Engine field for `df`/`dt`/`dF`/`dT` (3-keystroke sequences requiring deferred char input)
+- **`apply_charwise_operator()`**: Generic helper handling `d`/`c`/`y`/`~`/`u`/`U`/`>`/`<`/`=` on char ranges
+- **`apply_linewise_operator()`**: Generic helper for linewise operations on line ranges
+- **New motion arms in `handle_operator_motion()`**: `h`/`l` (charwise), `j`/`k` (linewise), `G` (to line), `{`/`}` (paragraph), `(`/`)` (sentence), `W`/`B`/`E` (WORD), `^` (first non-blank), `H`/`M`/`L` (screen), `;`/`,` (repeat find), `f`/`t`/`F`/`T` (deferred find)
+- **Operator-aware `gg`/`ge`/`gE`** in `handle_pending_key`: `dgg`, `ygg`, `cgg`, `dge`, `dgE` now work
+- **Case/indent/auto-indent operators** extended to support all motions: `g~j`, `guw`, `gUG`, `>j`, `<{`, `=G`, `gufx`, etc.
+- **Refactored `apply_operator_with_motion()`** to use `apply_charwise_operator()` — all operators (including case/indent) now work with word motions
+- **56 integration tests** in `tests/operator_motions.rs` covering all new combos
+- Files changed: `src/core/engine.rs`; updated: `tests/operator_motions.rs`
+
+**Session 136 — Vim-style ex command abbreviations + ~20 new commands (71 new tests, 2405 total):**
+Comprehensive ex command normalization system and new Vim commands:
+- **`normalize_ex_command()` system**: New `EX_ABBREVS` table with 57 entries mapping abbreviated ex commands to their canonical forms (e.g., `j` -> `join`, `y` -> `yank`, `ve` -> `version`). All `execute_command()` match arms now use canonical forms; the normalizer handles abbreviation resolution before dispatch
+- **`:copy` conflict resolution**: The clipboard palette action previously bound to `:copy` was renamed to `clipboard_copy`. Bare `:copy` now shows usage message (`:copy` is Vim's line-copy command, aliased as `:t`)
+- **~20 new ex commands**: `:j[oin]`, `:y[ank]`, `:pu[t]`, `:>`, `:<`, `:=`, `:#`, `:ma[rk]`/`:k`, `:pw[d]`, `:f[ile]`, `:ene[w]`, `:up[date]`, `:ve[rsion]`, `:p[rint]`, `:nu[mber]`, `:new`, `:vne[w]`, `:ret[ab]`, `:cq[uit]`, `:sav[eas]`, `:windo`/`:bufdo`/`:tabdo`, `:di[splay]`
+- **`QuitWithError` EngineAction**: New variant for `:cquit`, handled in both GTK (`std::process::exit(1)`) and TUI backends
+- **71 integration tests** in new `tests/ex_commands.rs` covering all new commands and abbreviation normalization
+- Files changed: `src/core/engine.rs`, `src/render.rs`, `src/main.rs`, `src/tui_main.rs`; new: `tests/ex_commands.rs`
 
 **Session 135 — show_hidden_files setting + LSP format undo fix (no new tests, 2346 total):**
 New `show_hidden_files` setting and two bug fixes for LSP format-on-save:

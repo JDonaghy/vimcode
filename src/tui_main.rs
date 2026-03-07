@@ -7737,6 +7737,12 @@ fn handle_action(engine: &mut Engine, action: EngineAction) -> bool {
         | EngineAction::OpenRecentDialog => false, // handled by caller
         EngineAction::QuitWithUnsaved => false, // handled by caller (shows quit confirm overlay)
         EngineAction::ToggleSidebar => false, // handled by caller (has access to sidebar state)
+        EngineAction::QuitWithError => {
+            engine.cleanup_all_swaps();
+            engine.lsp_shutdown();
+            save_session(engine);
+            std::process::exit(1);
+        }
         EngineAction::None | EngineAction::Error => false,
     }
 }

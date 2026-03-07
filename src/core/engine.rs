@@ -27,6 +27,8 @@ use super::view::View;
 use super::window::{
     GroupDivider, GroupId, GroupLayout, SplitDirection, Window, WindowId, WindowLayout, WindowRect,
 };
+use std::borrow::Cow;
+
 use super::{Cursor, Mode};
 
 /// High bit marker for synthetic "Non-Public Members" group var_refs.
@@ -57,6 +59,128 @@ pub enum EngineAction {
     QuitWithUnsaved,
     /// Toggle the file-explorer sidebar (UI layer handles show/hide).
     ToggleSidebar,
+    /// Quit with non-zero exit code (:cquit).
+    QuitWithError,
+}
+
+// ── Ex command abbreviation table ────────────────────────────────────────────
+// Each entry is (canonical_name, min_prefix_length).
+// `normalize_ex_command("sor foo")` → `"sort foo"`.
+static EX_ABBREVS: &[(&str, usize)] = &[
+    ("bdelete", 2),
+    ("bnext", 2),
+    ("bprevious", 2),
+    ("buffer", 1),
+    ("cclose", 3),
+    ("close", 3),
+    ("cnext", 2),
+    ("colorscheme", 4),
+    ("copen", 4),
+    ("copy", 2),
+    ("cprevious", 2),
+    ("cquit", 2),
+    ("delete", 1),
+    ("display", 2),
+    ("echo", 2),
+    ("edit", 1),
+    ("enew", 3),
+    ("file", 1),
+    ("grep", 2),
+    ("help", 1),
+    ("history", 3),
+    ("join", 1),
+    ("jumps", 2),
+    ("mark", 2),
+    ("move", 1),
+    ("nohlsearch", 3),
+    ("number", 2),
+    ("only", 2),
+    ("print", 1),
+    ("put", 2),
+    ("pwd", 2),
+    ("qall", 2),
+    ("quit", 1),
+    ("read", 1),
+    ("redo", 3),
+    ("registers", 3),
+    ("retab", 3),
+    ("saveas", 3),
+    ("set", 2),
+    ("sort", 3),
+    ("split", 2),
+    ("tabclose", 4),
+    ("tabmove", 4),
+    ("tabnext", 4),
+    ("tabprevious", 4),
+    ("terminal", 2),
+    ("undo", 1),
+    ("update", 2),
+    ("version", 2),
+    ("vimgrep", 3),
+    ("vnew", 3),
+    ("vsplit", 2),
+    ("wall", 2),
+    ("wqall", 3),
+    ("write", 1),
+    ("xall", 2),
+    ("yank", 1),
+];
+
+/// Split an ex-command string into (command_word, bang, rest).
+/// Example: `"q!"` → `("q", "!", "")`, `"sor foo"` → `("sor", "", " foo")`
+fn split_ex_command(input: &str) -> (&str, &str, &str) {
+    // Find end of alphabetic command word
+    let cmd_end = input
+        .find(|c: char| !c.is_ascii_alphabetic())
+        .unwrap_or(input.len());
+    let cmd_word = &input[..cmd_end];
+    let rest = &input[cmd_end..];
+    if let Some(after_bang) = rest.strip_prefix('!') {
+        (cmd_word, "!", after_bang)
+    } else {
+        (cmd_word, "", rest)
+    }
+}
+
+/// Normalize an ex-command abbreviation to its canonical form.
+/// Returns `Cow::Borrowed` when no transformation is needed.
+pub fn normalize_ex_command(input: &str) -> Cow<'_, str> {
+    if input.is_empty() {
+        return Cow::Borrowed(input);
+    }
+    let first = input.as_bytes()[0];
+    // Skip: uppercase-starting (VimCode commands), s/, g/, v/, !, digit-starting, #
+    if first.is_ascii_uppercase()
+        || input.starts_with("s/")
+        || input.starts_with("g/")
+        || input.starts_with("v/")
+        || first == b'!'
+        || first.is_ascii_digit()
+        || first == b'#'
+    {
+        return Cow::Borrowed(input);
+    }
+
+    let (cmd_word, bang, rest) = split_ex_command(input);
+    if cmd_word.is_empty() {
+        return Cow::Borrowed(input);
+    }
+
+    // Look up in abbreviation table
+    for &(canonical, min_len) in EX_ABBREVS {
+        if cmd_word.len() >= min_len
+            && cmd_word.len() <= canonical.len()
+            && canonical.starts_with(cmd_word)
+        {
+            if cmd_word == canonical {
+                // Already canonical
+                return Cow::Borrowed(input);
+            }
+            return Cow::Owned(format!("{}{}{}", canonical, bang, rest));
+        }
+    }
+
+    Cow::Borrowed(input)
 }
 
 /// Pending swap file recovery state — the user must press R/D/A.
@@ -643,6 +767,9 @@ pub struct Engine {
     // --- Operator state ---
     /// Pending operator waiting for a motion (e.g., 'd' for dw, 'c' for cw).
     pub pending_operator: Option<char>,
+    /// Pending find operator: (operator, find_type) where find_type is f/t/F/T.
+    /// Used for dfx/dtx/dFx/dTx — deferred because we need one more keystroke.
+    pub pending_find_operator: Option<(char, char)>,
 
     // --- Text object state ---
     /// Pending text object modifier: 'i' (inner) or 'a' (around)
@@ -1209,6 +1336,7 @@ impl Engine {
             count: None,
             last_find: None,
             pending_operator: None,
+            pending_find_operator: None,
             pending_text_object: None,
             last_change: None,
             insert_text_buffer: String::new(),
@@ -1708,6 +1836,7 @@ impl Engine {
             _ => {}
         }
         self.pending_key = None;
+        self.pending_find_operator = None;
         self.count = None;
     }
 
@@ -4622,6 +4751,16 @@ impl Engine {
             }
         }
 
+        // Handle pending find operator (dfx, dtx, dFx, dTx — waiting for target char)
+        if let Some((op, find_type)) = self.pending_find_operator.take() {
+            if let Some(target) = unicode {
+                self.apply_operator_find_char(op, find_type, target, changed);
+            } else {
+                self.count = None;
+            }
+            return EngineAction::None;
+        }
+
         // Handle pending operator + motion (dw, cw, etc.)
         if let Some(op) = self.pending_operator.take() {
             return self.handle_operator_motion(op, key_name, unicode, changed);
@@ -5363,31 +5502,76 @@ impl Engine {
         match pending {
             'g' => match unicode {
                 Some('g') => {
-                    self.push_jump_location();
-                    if self.peek_count().is_some() {
-                        // Count provided: go to line N (1-indexed)
-                        let count = self.take_count();
-                        let target_line =
-                            (count - 1).min(self.buffer().len_lines().saturating_sub(1));
-                        self.view_mut().cursor.line = target_line;
+                    if let Some(op) = self.pending_operator.take() {
+                        // dgg/ygg/cgg etc: linewise operator to target line
+                        let count = self.count.take();
+                        let target_line = count
+                            .map(|n| {
+                                n.saturating_sub(1)
+                                    .min(self.buffer().len_lines().saturating_sub(1))
+                            })
+                            .unwrap_or(0);
+                        let current_line = self.view().cursor.line;
+                        let (start, end) = if target_line <= current_line {
+                            (target_line, current_line)
+                        } else {
+                            (current_line, target_line)
+                        };
+                        self.apply_linewise_operator(op, start, end, changed);
                     } else {
-                        // No count: go to first line
-                        self.view_mut().cursor.line = 0;
+                        self.push_jump_location();
+                        if self.peek_count().is_some() {
+                            let count = self.take_count();
+                            let target_line =
+                                (count - 1).min(self.buffer().len_lines().saturating_sub(1));
+                            self.view_mut().cursor.line = target_line;
+                        } else {
+                            self.view_mut().cursor.line = 0;
+                        }
+                        self.view_mut().cursor.col = 0;
                     }
-                    self.view_mut().cursor.col = 0;
                 }
                 Some('e') => {
-                    // ge: backward to end of word
-                    let count = self.take_count();
-                    for _ in 0..count {
-                        self.move_word_end_backward();
+                    if let Some(op) = self.pending_operator.take() {
+                        // dge: delete backward to end of previous word (charwise)
+                        let count = self.take_count();
+                        let start_pos = self.buffer().line_to_char(self.view().cursor.line)
+                            + self.view().cursor.col;
+                        for _ in 0..count {
+                            self.move_word_end_backward();
+                        }
+                        let end_pos = self.buffer().line_to_char(self.view().cursor.line)
+                            + self.view().cursor.col;
+                        if end_pos < start_pos {
+                            // Include the character at end_pos
+                            self.apply_charwise_operator(op, end_pos, start_pos + 1, changed);
+                        }
+                    } else {
+                        let count = self.take_count();
+                        for _ in 0..count {
+                            self.move_word_end_backward();
+                        }
                     }
                 }
                 Some('E') => {
-                    // gE: backward to end of WORD
-                    let count = self.take_count();
-                    for _ in 0..count {
-                        self.move_bigword_end_backward();
+                    if let Some(op) = self.pending_operator.take() {
+                        // dgE: delete backward to end of previous WORD (charwise)
+                        let count = self.take_count();
+                        let start_pos = self.buffer().line_to_char(self.view().cursor.line)
+                            + self.view().cursor.col;
+                        for _ in 0..count {
+                            self.move_bigword_end_backward();
+                        }
+                        let end_pos = self.buffer().line_to_char(self.view().cursor.line)
+                            + self.view().cursor.col;
+                        if end_pos < start_pos {
+                            self.apply_charwise_operator(op, end_pos, start_pos + 1, changed);
+                        }
+                    } else {
+                        let count = self.take_count();
+                        for _ in 0..count {
+                            self.move_bigword_end_backward();
+                        }
                     }
                 }
                 Some('_') => {
@@ -5875,9 +6059,9 @@ impl Engine {
         unicode: Option<char>,
         changed: &mut bool,
     ) -> EngineAction {
-        // Handle 'g' motion for cgn / dgn (operator + gn)
-        if unicode == Some('g') && (operator == 'c' || operator == 'd' || operator == 'y') {
-            // Re-set pending_key = 'g' and pending_operator = operator so next key ('n'/'N')
+        // Handle 'g' motion for operator + g{x} (cgn/dgn, dgg, dge, etc.)
+        if unicode == Some('g') {
+            // Re-set pending_key = 'g' and pending_operator = operator so next key
             // is handled by handle_pending_key('g') which checks pending_operator.
             self.pending_key = Some('g');
             self.pending_operator = Some(operator);
@@ -5915,23 +6099,43 @@ impl Engine {
                         self.apply_case_range(line_start, line_end, operator, changed);
                     }
                 }
-            } else if let Some(motion) = unicode {
-                // Apply operator to motion range
-                let count = self.take_count();
-                self.apply_case_with_motion(operator, motion, count, changed);
+            } else if unicode == Some('i') || unicode == Some('a') {
+                // Text object: g~iw, guaw, etc.
+                self.pending_text_object = unicode;
+                self.pending_operator = Some(operator);
+            } else if unicode == Some('f')
+                || unicode == Some('t')
+                || unicode == Some('F')
+                || unicode == Some('T')
+            {
+                self.pending_find_operator = Some((operator, unicode.unwrap()));
+            } else if unicode.is_some() {
+                // Fall through to common motion dispatch below
             } else {
                 self.count = None; // Cancel
+                return EngineAction::None;
             }
-            return EngineAction::None;
+            if is_doubled
+                || unicode == Some('i')
+                || unicode == Some('a')
+                || unicode == Some('f')
+                || unicode == Some('t')
+                || unicode == Some('F')
+                || unicode == Some('T')
+            {
+                return EngineAction::None;
+            }
+            // Fall through to the common motion match block below
         }
 
         // Handle indent/dedent operators (>> and <<)
         if operator == '>' || operator == '<' {
-            match unicode {
-                Some('>') if operator == '>' => {
-                    // >>: indent count lines
-                    let count = self.take_count();
-                    let line = self.view().cursor.line;
+            let is_doubled = (operator == '>' && unicode == Some('>'))
+                || (operator == '<' && unicode == Some('<'));
+            if is_doubled {
+                let count = self.take_count();
+                let line = self.view().cursor.line;
+                if operator == '>' {
                     self.indent_lines(line, count, changed);
                     self.last_change = Some(Change {
                         op: ChangeOp::Indent,
@@ -5939,11 +6143,7 @@ impl Engine {
                         count,
                         motion: None,
                     });
-                }
-                Some('<') if operator == '<' => {
-                    // <<: dedent count lines
-                    let count = self.take_count();
-                    let line = self.view().cursor.line;
+                } else {
                     self.dedent_lines(line, count, changed);
                     self.last_change = Some(Change {
                         op: ChangeOp::Dedent,
@@ -5952,29 +6152,46 @@ impl Engine {
                         motion: None,
                     });
                 }
-                _ => {
-                    // Cancel operator
-                    self.count = None;
-                }
+                return EngineAction::None;
             }
-            return EngineAction::None;
+            if unicode == Some('i') || unicode == Some('a') {
+                self.pending_text_object = unicode;
+                self.pending_operator = Some(operator);
+                return EngineAction::None;
+            }
+            if unicode == Some('f')
+                || unicode == Some('t')
+                || unicode == Some('F')
+                || unicode == Some('T')
+            {
+                self.pending_find_operator = Some((operator, unicode.unwrap()));
+                return EngineAction::None;
+            }
+            // Fall through to common motion match block below
         }
 
         // Handle auto-indent operator (=)
         if operator == '=' {
-            match unicode {
-                Some('=') => {
-                    // ==: auto-indent current line(s)
-                    let count = self.take_count();
-                    let line = self.view().cursor.line;
-                    self.auto_indent_lines(line, count, changed);
-                }
-                _ => {
-                    // Cancel operator
-                    self.count = None;
-                }
+            if unicode == Some('=') {
+                let count = self.take_count();
+                let line = self.view().cursor.line;
+                self.auto_indent_lines(line, count, changed);
+                return EngineAction::None;
             }
-            return EngineAction::None;
+            if unicode == Some('i') || unicode == Some('a') {
+                self.pending_text_object = unicode;
+                self.pending_operator = Some(operator);
+                return EngineAction::None;
+            }
+            if unicode == Some('f')
+                || unicode == Some('t')
+                || unicode == Some('F')
+                || unicode == Some('T')
+            {
+                self.pending_find_operator = Some((operator, unicode.unwrap()));
+                return EngineAction::None;
+            }
+            // Fall through to common motion match block below
         }
 
         // Check if we're waiting for a text object type (after 'i' or 'a')
@@ -6070,6 +6287,74 @@ impl Engine {
                     self.apply_operator_with_motion(operator, 'w', count, changed);
                 }
             }
+            Some('W') => {
+                // dW/cW: delete/change WORD forward
+                let count = self.take_count();
+                let start_cursor = self.view().cursor;
+                let start_pos = self.buffer().line_to_char(start_cursor.line) + start_cursor.col;
+                if operator == 'c' {
+                    // cW behaves like cE (Vim compat)
+                    for _ in 0..count {
+                        self.move_bigword_end();
+                    }
+                } else {
+                    for _ in 0..count {
+                        self.move_bigword_forward();
+                    }
+                }
+                let end_cursor = self.view().cursor;
+                let mut end_pos = self.buffer().line_to_char(end_cursor.line) + end_cursor.col;
+                self.view_mut().cursor = start_cursor;
+                // For cW (treated as cE), include the character under cursor
+                if operator == 'c' {
+                    end_pos = (end_pos + 1).min(self.buffer().len_chars());
+                }
+                // Clamp at line boundary for forward W (like w)
+                if operator != 'c' && end_cursor.line > start_cursor.line {
+                    let line_char_start = self.buffer().line_to_char(start_cursor.line);
+                    let line_len = self.buffer().line_len_chars(start_cursor.line);
+                    let has_nl =
+                        self.buffer().content.line(start_cursor.line).chars().last() == Some('\n');
+                    end_pos = if has_nl {
+                        (line_char_start + line_len - 1).min(end_pos)
+                    } else {
+                        (line_char_start + line_len).min(end_pos)
+                    };
+                }
+                if start_pos < end_pos {
+                    self.apply_charwise_operator(operator, start_pos, end_pos, changed);
+                }
+            }
+            Some('B') => {
+                // dB: delete WORD backward
+                let count = self.take_count();
+                let start_cursor = self.view().cursor;
+                let start_pos = self.buffer().line_to_char(start_cursor.line) + start_cursor.col;
+                for _ in 0..count {
+                    self.move_bigword_backward();
+                }
+                let end_pos =
+                    self.buffer().line_to_char(self.view().cursor.line) + self.view().cursor.col;
+                if end_pos < start_pos {
+                    self.apply_charwise_operator(operator, end_pos, start_pos, changed);
+                }
+            }
+            Some('E') => {
+                // dE: delete to end of WORD
+                let count = self.take_count();
+                let start_cursor = self.view().cursor;
+                let start_pos = self.buffer().line_to_char(start_cursor.line) + start_cursor.col;
+                for _ in 0..count {
+                    self.move_bigword_end();
+                }
+                let end_pos =
+                    self.buffer().line_to_char(self.view().cursor.line) + self.view().cursor.col;
+                self.view_mut().cursor = start_cursor;
+                if end_pos >= start_pos {
+                    let end = (end_pos + 1).min(self.buffer().len_chars());
+                    self.apply_charwise_operator(operator, start_pos, end, changed);
+                }
+            }
             Some('b') => {
                 // db/cb: delete/change back to start of word
                 let count = self.take_count();
@@ -6101,35 +6386,7 @@ impl Engine {
                 if start_pos >= line_end {
                     return EngineAction::None;
                 }
-                let text: String = self
-                    .buffer()
-                    .content
-                    .slice(start_pos..line_end)
-                    .chars()
-                    .collect();
-                let reg = self.active_register();
-                if operator == 'y' {
-                    let end_col = line_end.saturating_sub(line_char_start).saturating_sub(1);
-                    self.set_yank_register(reg, text, false);
-                    self.clear_selected_register();
-                    self.record_yank_highlight(
-                        Cursor { line, col },
-                        Cursor { line, col: end_col },
-                        false,
-                    );
-                } else {
-                    self.set_delete_register(reg, text, false);
-                    self.clear_selected_register();
-                    self.start_undo_group();
-                    self.delete_with_undo(start_pos, line_end);
-                    self.clamp_cursor_col();
-                    self.finish_undo_group();
-                    *changed = true;
-                    if operator == 'c' {
-                        self.mode = Mode::Insert;
-                        self.count = None;
-                    }
-                }
+                self.apply_charwise_operator(operator, start_pos, line_end, changed);
             }
             Some('0') => {
                 // y0/d0: from start of line to (not including) cursor
@@ -6140,35 +6397,225 @@ impl Engine {
                     return EngineAction::None;
                 }
                 let line_char_start = self.buffer().line_to_char(line);
-                let start_pos = line_char_start;
-                let end_pos = line_char_start + col;
-                let text: String = self
-                    .buffer()
-                    .content
-                    .slice(start_pos..end_pos)
-                    .chars()
-                    .collect();
-                let reg = self.active_register();
-                if operator == 'y' {
-                    self.set_yank_register(reg, text, false);
-                    self.clear_selected_register();
-                    self.record_yank_highlight(
-                        Cursor { line, col: 0 },
-                        Cursor {
-                            line,
-                            col: col.saturating_sub(1),
-                        },
-                        false,
-                    );
-                } else {
-                    self.set_delete_register(reg, text, false);
-                    self.clear_selected_register();
-                    self.start_undo_group();
-                    self.delete_with_undo(start_pos, end_pos);
-                    self.view_mut().cursor.col = 0;
-                    self.finish_undo_group();
-                    *changed = true;
+                self.view_mut().cursor.col = 0;
+                self.apply_charwise_operator(
+                    operator,
+                    line_char_start,
+                    line_char_start + col,
+                    changed,
+                );
+            }
+            Some('^') => {
+                // d^: delete to first non-blank char
+                let _ = self.take_count();
+                let line = self.view().cursor.line;
+                let col = self.view().cursor.col;
+                let target = self.first_non_blank_col(line);
+                if col == target {
+                    return EngineAction::None;
                 }
+                let line_char_start = self.buffer().line_to_char(line);
+                let (start, end) = if col > target {
+                    (line_char_start + target, line_char_start + col)
+                } else {
+                    (line_char_start + col, line_char_start + target)
+                };
+                self.view_mut().cursor.col = target.min(col);
+                self.apply_charwise_operator(operator, start, end, changed);
+            }
+            Some('h') => {
+                // dh: delete count chars to the left
+                let count = self.take_count();
+                let line = self.view().cursor.line;
+                let col = self.view().cursor.col;
+                let chars_to_delete = count.min(col);
+                if chars_to_delete == 0 {
+                    return EngineAction::None;
+                }
+                let line_char_start = self.buffer().line_to_char(line);
+                let start = line_char_start + col - chars_to_delete;
+                let end = line_char_start + col;
+                self.view_mut().cursor.col = col - chars_to_delete;
+                self.apply_charwise_operator(operator, start, end, changed);
+            }
+            Some('l') => {
+                // dl: delete count chars to the right
+                let count = self.take_count();
+                let line = self.view().cursor.line;
+                let col = self.view().cursor.col;
+                let line_len = self.buffer().line_len_chars(line);
+                let has_nl = self.buffer().content.line(line).chars().last() == Some('\n');
+                let max_col = if has_nl {
+                    line_len.saturating_sub(1)
+                } else {
+                    line_len
+                };
+                let chars_to_delete = count.min(max_col.saturating_sub(col));
+                if chars_to_delete == 0 {
+                    return EngineAction::None;
+                }
+                let line_char_start = self.buffer().line_to_char(line);
+                let start = line_char_start + col;
+                let end = line_char_start + col + chars_to_delete;
+                self.apply_charwise_operator(operator, start, end, changed);
+            }
+            Some('j') => {
+                // dj: delete current line + count lines below (linewise)
+                let count = self.take_count();
+                let current_line = self.view().cursor.line;
+                let last_line = self.buffer().len_lines().saturating_sub(1);
+                let end_line = (current_line + count).min(last_line);
+                self.apply_linewise_operator(operator, current_line, end_line, changed);
+            }
+            Some('k') => {
+                // dk: delete current line + count lines above (linewise)
+                let count = self.take_count();
+                let current_line = self.view().cursor.line;
+                let start_line = current_line.saturating_sub(count);
+                self.apply_linewise_operator(operator, start_line, current_line, changed);
+            }
+            Some('G') => {
+                // dG: delete from current line to end (or to line N if count given)
+                let count = self.count.take();
+                let current_line = self.view().cursor.line;
+                let target_line = count
+                    .map(|n| {
+                        n.saturating_sub(1)
+                            .min(self.buffer().len_lines().saturating_sub(1))
+                    })
+                    .unwrap_or_else(|| self.buffer().len_lines().saturating_sub(1));
+                let (start, end) = if target_line >= current_line {
+                    (current_line, target_line)
+                } else {
+                    (target_line, current_line)
+                };
+                self.apply_linewise_operator(operator, start, end, changed);
+            }
+            Some('{') => {
+                // d{: delete from current line backward to previous blank line (linewise)
+                let count = self.take_count();
+                let start_line = self.view().cursor.line;
+                for _ in 0..count {
+                    self.move_paragraph_backward();
+                }
+                let end_line = self.view().cursor.line;
+                let (s, e) = if end_line <= start_line {
+                    (end_line, start_line)
+                } else {
+                    (start_line, end_line)
+                };
+                self.apply_linewise_operator(operator, s, e, changed);
+            }
+            Some('}') => {
+                // d}: delete from current line forward to next blank line (linewise)
+                let count = self.take_count();
+                let start_line = self.view().cursor.line;
+                for _ in 0..count {
+                    self.move_paragraph_forward();
+                }
+                let end_line = self.view().cursor.line;
+                let (s, e) = if start_line <= end_line {
+                    (start_line, end_line)
+                } else {
+                    (end_line, start_line)
+                };
+                self.apply_linewise_operator(operator, s, e, changed);
+            }
+            Some('(') => {
+                // d(: delete to previous sentence start (charwise)
+                let count = self.take_count();
+                let start_pos =
+                    self.buffer().line_to_char(self.view().cursor.line) + self.view().cursor.col;
+                for _ in 0..count {
+                    self.move_sentence_backward();
+                }
+                let end_pos =
+                    self.buffer().line_to_char(self.view().cursor.line) + self.view().cursor.col;
+                if end_pos < start_pos {
+                    self.apply_charwise_operator(operator, end_pos, start_pos, changed);
+                }
+            }
+            Some(')') => {
+                // d): delete to next sentence start (charwise)
+                let count = self.take_count();
+                let start_pos =
+                    self.buffer().line_to_char(self.view().cursor.line) + self.view().cursor.col;
+                for _ in 0..count {
+                    self.move_sentence_forward();
+                }
+                let end_pos =
+                    self.buffer().line_to_char(self.view().cursor.line) + self.view().cursor.col;
+                if end_pos > start_pos {
+                    self.view_mut().cursor.col = start_pos
+                        - self
+                            .buffer()
+                            .line_to_char(self.buffer().content.char_to_line(start_pos));
+                    self.view_mut().cursor.line = self.buffer().content.char_to_line(start_pos);
+                    self.apply_charwise_operator(operator, start_pos, end_pos, changed);
+                }
+            }
+            Some('H') => {
+                // dH: delete from current line to top of screen (linewise)
+                let _ = self.take_count();
+                let current_line = self.view().cursor.line;
+                let top = self.view().scroll_top;
+                let (s, e) = if top <= current_line {
+                    (top, current_line)
+                } else {
+                    (current_line, top)
+                };
+                self.apply_linewise_operator(operator, s, e, changed);
+            }
+            Some('M') => {
+                // dM: delete from current line to middle of screen (linewise)
+                let _ = self.take_count();
+                let current_line = self.view().cursor.line;
+                let viewport_lines = self.view().viewport_lines.max(1);
+                let mid = self.view().scroll_top + viewport_lines / 2;
+                let mid = mid.min(self.buffer().len_lines().saturating_sub(1));
+                let (s, e) = if mid <= current_line {
+                    (mid, current_line)
+                } else {
+                    (current_line, mid)
+                };
+                self.apply_linewise_operator(operator, s, e, changed);
+            }
+            Some('L') => {
+                // dL: delete from current line to bottom of screen (linewise)
+                let _ = self.take_count();
+                let current_line = self.view().cursor.line;
+                let viewport_lines = self.view().viewport_lines.max(1);
+                let bot = (self.view().scroll_top + viewport_lines).saturating_sub(1);
+                let bot = bot.min(self.buffer().len_lines().saturating_sub(1));
+                let (s, e) = if bot >= current_line {
+                    (current_line, bot)
+                } else {
+                    (bot, current_line)
+                };
+                self.apply_linewise_operator(operator, s, e, changed);
+            }
+            Some(';') => {
+                // d;: delete to next find repeat
+                if let Some((find_type, target)) = self.last_find {
+                    self.apply_operator_find_char(operator, find_type, target, changed);
+                }
+            }
+            Some(',') => {
+                // d,: delete to previous find repeat (reverse direction)
+                if let Some((find_type, target)) = self.last_find {
+                    let reversed = match find_type {
+                        'f' => 'F',
+                        'F' => 'f',
+                        't' => 'T',
+                        'T' => 't',
+                        _ => find_type,
+                    };
+                    self.apply_operator_find_char(operator, reversed, target, changed);
+                }
+            }
+            Some('f') | Some('t') | Some('F') | Some('T') => {
+                // Deferred: need one more keystroke for the target char
+                self.pending_find_operator = Some((operator, unicode.unwrap()));
             }
             _ => {
                 // Invalid motion - cancel operator
@@ -6210,39 +6657,212 @@ impl Engine {
         }
     }
 
-    /// Apply a case operator over a word/motion.
-    fn apply_case_with_motion(&mut self, op: char, motion: char, count: usize, changed: &mut bool) {
-        let start_cursor = self.view().cursor;
-        let start_pos = self.buffer().line_to_char(start_cursor.line) + start_cursor.col;
-
-        for _ in 0..count {
-            match motion {
-                'w' => self.move_word_forward(),
-                'b' => self.move_word_backward(),
-                'e' => self.move_word_end(),
-                _ => {
-                    self.view_mut().cursor = start_cursor;
-                    return;
+    /// Apply a charwise operator on a byte/char range [start..end).
+    fn apply_charwise_operator(
+        &mut self,
+        operator: char,
+        start: usize,
+        end: usize,
+        changed: &mut bool,
+    ) {
+        if start >= end {
+            return;
+        }
+        match operator {
+            'y' => {
+                let text: String = self.buffer().content.slice(start..end).chars().collect();
+                let reg = self.active_register();
+                self.set_yank_register(reg, text.clone(), false);
+                self.clear_selected_register();
+                // Record yank highlight
+                let start_line = self.buffer().content.char_to_line(start);
+                let start_line_char = self.buffer().line_to_char(start_line);
+                let start_col = start - start_line_char;
+                let end_char = end.saturating_sub(1).max(start);
+                let end_line = self.buffer().content.char_to_line(end_char);
+                let end_line_char = self.buffer().line_to_char(end_line);
+                let end_col = end_char - end_line_char;
+                self.record_yank_highlight(
+                    Cursor {
+                        line: start_line,
+                        col: start_col,
+                    },
+                    Cursor {
+                        line: end_line,
+                        col: end_col,
+                    },
+                    false,
+                );
+            }
+            'd' => {
+                let text: String = self.buffer().content.slice(start..end).chars().collect();
+                let reg = self.active_register();
+                self.set_delete_register(reg, text, false);
+                self.clear_selected_register();
+                self.start_undo_group();
+                self.delete_with_undo(start, end);
+                self.clamp_cursor_col();
+                self.finish_undo_group();
+                *changed = true;
+            }
+            'c' => {
+                let text: String = self.buffer().content.slice(start..end).chars().collect();
+                let reg = self.active_register();
+                self.set_delete_register(reg, text, false);
+                self.clear_selected_register();
+                self.start_undo_group();
+                self.delete_with_undo(start, end);
+                self.clamp_cursor_col_insert();
+                self.mode = Mode::Insert;
+                self.insert_text_buffer.clear();
+                self.count = None;
+                *changed = true;
+            }
+            '~' | 'u' | 'U' => {
+                self.apply_case_range(start, end, operator, changed);
+            }
+            '>' | '<' | '=' => {
+                // Indent/dedent/auto-indent: operate on full lines containing the range
+                let start_line = self.buffer().content.char_to_line(start);
+                let end_line = self
+                    .buffer()
+                    .content
+                    .char_to_line(end.saturating_sub(1).max(start));
+                let count = end_line - start_line + 1;
+                if operator == '>' {
+                    self.indent_lines(start_line, count, changed);
+                } else if operator == '<' {
+                    self.dedent_lines(start_line, count, changed);
+                } else {
+                    self.auto_indent_lines(start_line, count, changed);
                 }
             }
+            _ => {}
+        }
+    }
+
+    /// Apply a linewise operator on a range of lines [start_line..=end_line].
+    fn apply_linewise_operator(
+        &mut self,
+        operator: char,
+        start_line: usize,
+        end_line: usize,
+        changed: &mut bool,
+    ) {
+        if start_line > end_line {
+            return;
+        }
+        let count = end_line - start_line + 1;
+        self.view_mut().cursor.line = start_line;
+        self.view_mut().cursor.col = 0;
+        match operator {
+            'y' => {
+                self.yank_lines(count);
+            }
+            'd' => {
+                self.start_undo_group();
+                self.delete_lines(count, changed);
+                self.finish_undo_group();
+            }
+            'c' => {
+                // Delete lines content, enter insert mode (like cc on range)
+                self.start_undo_group();
+                // Delete the remaining lines below (count - 1)
+                if count > 1 {
+                    let next_line = start_line + 1;
+                    let next_start = self.buffer().line_to_char(next_line);
+                    let last_line = (start_line + count).min(self.buffer().len_lines());
+                    let last_end = self.buffer().line_to_char(last_line);
+                    if next_start < last_end {
+                        let deleted: String = self
+                            .buffer()
+                            .content
+                            .slice(next_start..last_end)
+                            .chars()
+                            .collect();
+                        let reg = self.active_register();
+                        self.set_delete_register(reg, deleted, true);
+                        self.clear_selected_register();
+                        self.delete_with_undo(next_start, last_end);
+                    }
+                }
+                // Clear first line content
+                let first_line_start = self.buffer().line_to_char(start_line);
+                let first_line_len = self.buffer().line_len_chars(start_line);
+                let first_has_nl =
+                    self.buffer().content.line(start_line).chars().last() == Some('\n');
+                let first_end = if first_has_nl && first_line_len > 0 {
+                    first_line_start + first_line_len - 1
+                } else {
+                    first_line_start + first_line_len
+                };
+                if first_line_start < first_end {
+                    self.delete_with_undo(first_line_start, first_end);
+                }
+                self.view_mut().cursor.col = 0;
+                self.mode = Mode::Insert;
+                self.insert_text_buffer.clear();
+                self.count = None;
+                *changed = true;
+            }
+            '>' => {
+                self.indent_lines(start_line, count, changed);
+            }
+            '<' => {
+                self.dedent_lines(start_line, count, changed);
+            }
+            '=' => {
+                self.auto_indent_lines(start_line, count, changed);
+            }
+            '~' | 'u' | 'U' => {
+                let start = self.buffer().line_to_char(start_line);
+                let end = self
+                    .buffer()
+                    .line_to_char((end_line + 1).min(self.buffer().len_lines()));
+                self.apply_case_range(start, end, operator, changed);
+            }
+            _ => {}
+        }
+    }
+
+    /// Apply an operator with a find-char motion (dfx, dtx, dFx, dTx).
+    fn apply_operator_find_char(
+        &mut self,
+        operator: char,
+        find_type: char,
+        target: char,
+        changed: &mut bool,
+    ) {
+        let start_col = self.view().cursor.col;
+        let line = self.view().cursor.line;
+        let line_start = self.buffer().line_to_char(line);
+
+        // Execute the find motion
+        self.find_char(find_type, target);
+        self.last_find = Some((find_type, target));
+
+        let end_col = self.view().cursor.col;
+        if end_col == start_col {
+            return; // find_char didn't move — no match found
         }
 
-        let end_cursor = self.view().cursor;
-        let end_pos = self.buffer().line_to_char(end_cursor.line) + end_cursor.col;
-        self.view_mut().cursor = start_cursor;
-
-        let (range_start, range_end) = if start_pos <= end_pos {
-            let end = if motion == 'e' {
-                (end_pos + 1).min(self.buffer().len_chars())
-            } else {
-                end_pos
-            };
-            (start_pos, end)
+        // Calculate range
+        let (range_start, range_end) = if find_type == 'f' || find_type == 't' {
+            // Forward: start_col..=end_col (inclusive of end for operators)
+            (line_start + start_col, line_start + end_col + 1)
         } else {
-            (end_pos, start_pos)
+            // Backward (F/T): end_col..start_col (exclusive of start — don't delete char under cursor)
+            (line_start + end_col, line_start + start_col)
         };
 
-        self.apply_case_range(range_start, range_end, op, changed);
+        // Restore cursor to start of range for charwise operations
+        self.view_mut().cursor.col = if find_type == 'F' || find_type == 'T' {
+            end_col
+        } else {
+            start_col
+        };
+
+        self.apply_charwise_operator(operator, range_start, range_end, changed);
     }
 
     /// gn: find next (or prev if `backward`) search match, enter Visual mode selecting it.
@@ -6444,67 +7064,12 @@ impl Engine {
             return;
         }
 
-        // Save text to register
-        let deleted_text: String = self
-            .buffer()
-            .content
-            .slice(delete_start..delete_end)
-            .chars()
-            .collect();
-
-        // For yank: save to yank register and return without deleting
-        if operator == 'y' {
-            let reg = self.active_register();
-            self.set_yank_register(reg, deleted_text.clone(), false);
-            self.clear_selected_register();
-            // Record highlight region for brief visual flash
-            let end_char = delete_start + deleted_text.chars().count();
-            let end_line = if end_char > 0 {
-                self.buffer()
-                    .content
-                    .char_to_line(end_char.saturating_sub(1))
-            } else {
-                start_cursor.line
-            };
-            let end_line_start = self.buffer().line_to_char(end_line);
-            let end_col = end_char.saturating_sub(1).saturating_sub(end_line_start);
-            self.record_yank_highlight(
-                start_cursor,
-                Cursor {
-                    line: end_line,
-                    col: end_col,
-                },
-                false,
-            );
-            // Cursor is already restored to start_cursor above
-            return;
-        }
-
-        let reg = self.active_register();
-        self.set_delete_register(reg, deleted_text, false);
-        self.clear_selected_register();
-
-        // Perform deletion
-        self.start_undo_group();
-        self.delete_with_undo(delete_start, delete_end);
-
-        // For backward motion, move cursor to start of deletion
+        // For backward motion, move cursor to start of range
         if start_pos > end_pos {
             self.view_mut().cursor = end_cursor;
         }
 
-        *changed = true;
-
-        // If operator is 'c', enter insert mode
-        if operator == 'c' {
-            self.mode = Mode::Insert;
-            self.count = None;
-            self.clamp_cursor_col_insert(); // Use insert-mode clamping
-                                            // Don't finish_undo_group - let insert mode do it
-        } else {
-            self.clamp_cursor_col(); // Use normal-mode clamping
-            self.finish_undo_group();
-        }
+        self.apply_charwise_operator(operator, delete_start, delete_end, changed);
     }
 
     fn apply_operator_bracket_motion(&mut self, operator: char, changed: &mut bool) {
@@ -9776,9 +10341,11 @@ impl Engine {
         }
 
         let cmd = cmd.trim();
+        let normalized = normalize_ex_command(cmd);
+        let cmd: &str = &normalized;
 
         // Handle :term / :terminal — open integrated terminal
-        if cmd == "term" || cmd == "terminal" {
+        if cmd == "terminal" {
             return EngineAction::OpenTerminal;
         }
 
@@ -10368,8 +10935,8 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // Handle :e <filename>
-        if let Some(filename) = cmd.strip_prefix("e ") {
+        // Handle :e[dit] <filename>
+        if let Some(filename) = cmd.strip_prefix("edit ") {
             let filename = filename.trim();
             if filename.is_empty() {
                 self.message = "No file name".to_string();
@@ -10378,8 +10945,8 @@ impl Engine {
             return EngineAction::OpenFile(PathBuf::from(filename));
         }
 
-        // Handle :b <buffer>
-        if let Some(arg) = cmd.strip_prefix("b ") {
+        // Handle :b[uffer] <buffer>
+        if let Some(arg) = cmd.strip_prefix("buffer ") {
             let arg = arg.trim();
             if let Ok(num) = arg.parse::<usize>() {
                 self.goto_buffer(num);
@@ -10395,10 +10962,17 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // Handle :bd[!] [N]
-        if cmd == "bd" || cmd.starts_with("bd ") || cmd == "bd!" || cmd.starts_with("bd! ") {
+        // Handle :bd[elete][!] [N]
+        if cmd == "bdelete"
+            || cmd.starts_with("bdelete ")
+            || cmd == "bdelete!"
+            || cmd.starts_with("bdelete! ")
+        {
             let force = cmd.contains('!');
-            let arg = cmd.trim_start_matches("bd").trim_start_matches('!').trim();
+            let arg = cmd
+                .trim_start_matches("bdelete")
+                .trim_start_matches('!')
+                .trim();
 
             let id = if arg.is_empty() {
                 self.active_buffer_id()
@@ -10426,37 +11000,34 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // Handle :split / :sp [file]
-        if cmd == "split" || cmd == "sp" || cmd.starts_with("split ") || cmd.starts_with("sp ") {
+        // Handle :sp[lit] [file]
+        if cmd == "split" || cmd.starts_with("split ") {
             let file = cmd
                 .strip_prefix("split")
-                .or_else(|| cmd.strip_prefix("sp"))
                 .map(|s| s.trim())
                 .filter(|s| !s.is_empty());
             self.split_window(SplitDirection::Horizontal, file.map(Path::new));
             return EngineAction::None;
         }
 
-        // Handle :vsplit / :vsp [file]
-        if cmd == "vsplit" || cmd == "vsp" || cmd.starts_with("vsplit ") || cmd.starts_with("vsp ")
-        {
+        // Handle :vs[plit] [file]
+        if cmd == "vsplit" || cmd.starts_with("vsplit ") {
             let file = cmd
                 .strip_prefix("vsplit")
-                .or_else(|| cmd.strip_prefix("vsp"))
                 .map(|s| s.trim())
                 .filter(|s| !s.is_empty());
             self.split_window(SplitDirection::Vertical, file.map(Path::new));
             return EngineAction::None;
         }
 
-        // Handle :close / :clo
-        if cmd == "close" || cmd == "clo" {
+        // Handle :clo[se]
+        if cmd == "close" {
             self.close_window();
             return EngineAction::None;
         }
 
-        // Handle :only / :on
-        if cmd == "only" || cmd == "on" {
+        // Handle :on[ly]
+        if cmd == "only" {
             self.close_other_windows();
             return EngineAction::None;
         }
@@ -10476,20 +11047,20 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // Handle :tabclose / :tabc
-        if cmd == "tabclose" || cmd == "tabc" {
+        // Handle :tabc[lose]
+        if cmd == "tabclose" {
             self.close_tab();
             return EngineAction::None;
         }
 
-        // Handle :tabnext / :tabn
-        if cmd == "tabnext" || cmd == "tabn" {
+        // Handle :tabn[ext]
+        if cmd == "tabnext" {
             self.next_tab();
             return EngineAction::None;
         }
 
-        // Handle :tabprev / :tabp
-        if cmd == "tabprev" || cmd == "tabp" || cmd == "tabprevious" {
+        // Handle :tabp[revious]
+        if cmd == "tabprevious" {
             self.prev_tab();
             return EngineAction::None;
         }
@@ -10576,41 +11147,41 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // Handle :ls / :buffers
-        if cmd == "ls" || cmd == "buffers" {
+        // Handle :ls / :buffers / :files
+        if cmd == "ls" || cmd == "buffers" || cmd == "files" {
             self.message = self.list_buffers();
             return EngineAction::None;
         }
 
-        // Handle :bn / :bnext
-        if cmd == "bn" || cmd == "bnext" {
+        // Handle :bn[ext]
+        if cmd == "bnext" {
             self.next_buffer();
             return EngineAction::None;
         }
 
-        // Handle :bp / :bprev / :bprevious
-        if cmd == "bp" || cmd == "bprev" || cmd == "bprevious" {
+        // Handle :bp[revious]
+        if cmd == "bprevious" {
             self.prev_buffer();
             return EngineAction::None;
         }
 
-        // Handle :b# (alternate buffer)
-        if cmd == "b#" {
+        // Handle :buffer# (alternate buffer) — normalizer turns b# → buffer#
+        if cmd == "buffer#" {
             self.alternate_buffer();
             return EngineAction::None;
         }
 
         // Quickfix commands
-        if cmd == "copen" || cmd == "cope" {
+        if cmd == "copen" {
             return self.open_quickfix();
         }
-        if cmd == "cclose" || cmd == "ccl" {
+        if cmd == "cclose" {
             return self.close_quickfix();
         }
-        if cmd == "cn" || cmd == "cnext" {
+        if cmd == "cnext" {
             return self.quickfix_next();
         }
-        if cmd == "cp" || cmd == "cprev" || cmd == "cN" {
+        if cmd == "cprevious" || cmd == "cN" {
             return self.quickfix_prev();
         }
         if let Some(n_str) = cmd.strip_prefix("cc ") {
@@ -10630,11 +11201,11 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // Handle :help / :h [topic]
-        if cmd == "help" || cmd == "h" {
+        // Handle :h[elp] [topic]
+        if cmd == "help" {
             return self.cmd_help("");
         }
-        if let Some(topic) = cmd.strip_prefix("help ").or_else(|| cmd.strip_prefix("h ")) {
+        if let Some(topic) = cmd.strip_prefix("help ") {
             return self.cmd_help(topic.trim());
         }
 
@@ -10659,16 +11230,12 @@ impl Engine {
         }
 
         // :m[ove] {dest} — move current line to after dest
-        if let Some(dest) = cmd.strip_prefix("move ").or_else(|| cmd.strip_prefix("m ")) {
+        if let Some(dest) = cmd.strip_prefix("move ") {
             return self.execute_move_command(dest.trim());
         }
 
         // :t {dest} / :co[py] {dest} — copy current line to after dest
-        if let Some(dest) = cmd
-            .strip_prefix("copy ")
-            .or_else(|| cmd.strip_prefix("co "))
-            .or_else(|| cmd.strip_prefix("t "))
-        {
+        if let Some(dest) = cmd.strip_prefix("copy ").or_else(|| cmd.strip_prefix("t ")) {
             return self.execute_copy_command(dest.trim());
         }
 
@@ -10710,8 +11277,8 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // Handle :r {file} — read file and insert after cursor line
-        if let Some(file_arg) = cmd.strip_prefix("r ").map(|s| s.trim()) {
+        // Handle :r[ead] {file} — read file and insert after cursor line
+        if let Some(file_arg) = cmd.strip_prefix("read ").map(|s| s.trim()) {
             let path = if Path::new(file_arg).is_absolute() {
                 PathBuf::from(file_arg)
             } else {
@@ -10782,6 +11349,117 @@ impl Engine {
             return EngineAction::None;
         }
 
+        // Handle :sav[eas] {file} — save buffer to a new file
+        if let Some(path_str) = cmd.strip_prefix("saveas ") {
+            let path_str = path_str.trim();
+            if path_str.is_empty() {
+                self.message = "Usage: :saveas {file}".to_string();
+                return EngineAction::Error;
+            }
+            let path = if Path::new(path_str).is_absolute() {
+                PathBuf::from(path_str)
+            } else {
+                self.cwd.join(path_str)
+            };
+            self.buffer_manager
+                .get_mut(self.active_buffer_id())
+                .unwrap()
+                .file_path = Some(path);
+            let _ = self.save_with_format(false);
+            return EngineAction::None;
+        }
+
+        // Handle :ma[rk] {a-zA-Z} — set mark at cursor
+        if let Some(arg) = cmd.strip_prefix("mark ") {
+            let arg = arg.trim();
+            if let Some(ch) = arg.chars().next() {
+                if arg.len() == 1 && ch.is_ascii_alphabetic() {
+                    let cursor = self.view().cursor;
+                    if ch.is_ascii_lowercase() {
+                        let buf_id = self.active_buffer_id();
+                        self.marks.entry(buf_id).or_default().insert(ch, cursor);
+                    } else {
+                        let path = self.file_path().map(|p| p.to_path_buf());
+                        self.global_marks
+                            .insert(ch, (path, cursor.line, cursor.col));
+                    }
+                    self.message = format!("Mark '{ch}' set");
+                    return EngineAction::None;
+                }
+            }
+            self.message = "Usage: :mark {a-zA-Z}".to_string();
+            return EngineAction::Error;
+        }
+
+        // Handle :k{a-zA-Z} — shorthand for :mark (non-alphabetic prefix: normalizer skips it)
+        if cmd.starts_with('k') && cmd.len() == 2 {
+            let ch = cmd.as_bytes()[1] as char;
+            if ch.is_ascii_alphabetic() {
+                return self.execute_command(&format!("mark {ch}"));
+            }
+        }
+
+        // Handle :> — shift right
+        if cmd == ">" {
+            let line = self.view().cursor.line;
+            let mut changed = false;
+            self.indent_lines(line, 1, &mut changed);
+            return EngineAction::None;
+        }
+
+        // Handle :< — shift left
+        if cmd == "<" {
+            let line = self.view().cursor.line;
+            let mut changed = false;
+            self.dedent_lines(line, 1, &mut changed);
+            return EngineAction::None;
+        }
+
+        // Handle := — print line count
+        if cmd == "=" {
+            let count = self.buffer().len_lines();
+            self.message = format!("{count}");
+            return EngineAction::None;
+        }
+
+        // Handle :# — print current line with line number (alias for :number)
+        if cmd == "#" {
+            return self.execute_command("number");
+        }
+
+        // Handle :windo {cmd}
+        if let Some(subcmd) = cmd.strip_prefix("windo ") {
+            let subcmd = subcmd.trim().to_string();
+            let win_ids: Vec<WindowId> = self.windows.keys().copied().collect();
+            for wid in win_ids {
+                self.active_tab_mut().active_window = wid;
+                self.execute_command(&subcmd);
+            }
+            return EngineAction::None;
+        }
+
+        // Handle :bufdo {cmd}
+        if let Some(subcmd) = cmd.strip_prefix("bufdo ") {
+            let subcmd = subcmd.trim().to_string();
+            let buf_ids: Vec<_> = self.buffer_manager.list();
+            for bid in buf_ids {
+                self.switch_window_buffer(bid);
+                self.execute_command(&subcmd);
+            }
+            return EngineAction::None;
+        }
+
+        // Handle :tabdo {cmd}
+        if let Some(subcmd) = cmd.strip_prefix("tabdo ") {
+            let subcmd = subcmd.trim().to_string();
+            let num_tabs = self.active_group().tabs.len();
+            for i in 0..num_tabs {
+                self.active_group_mut().active_tab = i;
+                self.execute_command(&subcmd);
+            }
+            return EngineAction::None;
+        }
+
         // Handle :N (jump to line number)
         if let Ok(line_num) = cmd.parse::<usize>() {
             let target = if line_num > 0 { line_num - 1 } else { 0 };
@@ -10793,11 +11471,11 @@ impl Engine {
         }
 
         match cmd {
-            "w" => {
+            "write" => {
                 let _ = self.save_with_format(false);
                 EngineAction::None
             }
-            "q" => {
+            "quit" => {
                 // Block if the current buffer has unsaved changes.
                 if self.dirty() {
                     self.message = "No write since last change (add ! to override)".to_string();
@@ -10821,7 +11499,7 @@ impl Engine {
                 }
                 EngineAction::None
             }
-            "q!" => {
+            "quit!" => {
                 // If this is the very last window in the very last tab of the last group: quit.
                 let is_last = self.group_layout.is_single_group()
                     && self.active_group().tabs.len() == 1
@@ -10837,7 +11515,7 @@ impl Engine {
                 }
                 EngineAction::None
             }
-            "qa" => {
+            "qall" => {
                 // Quit all: block if any buffer is dirty.
                 let has_dirty = self
                     .buffer_manager
@@ -10851,27 +11529,27 @@ impl Engine {
                     EngineAction::Quit
                 }
             }
-            "qa!" => EngineAction::Quit,
+            "qall!" => EngineAction::Quit,
             // Write all dirty buffers
-            "wa" => {
+            "wall" => {
                 let saved = self.save_all_dirty();
                 self.message = format!("{} file(s) written", saved);
                 EngineAction::None
             }
             // Write all + quit
-            "wqa" | "xa" => {
+            "wqall" | "xall" => {
                 let _ = self.save_all_dirty();
                 EngineAction::Quit
             }
-            "wqa!" => EngineAction::Quit,
+            "wqall!" => EngineAction::Quit,
             // Clear search highlight
-            "noh" | "nohlsearch" => {
+            "nohlsearch" => {
                 self.search_matches.clear();
                 self.search_index = None;
                 EngineAction::None
             }
             // Display registers
-            "reg" | "registers" => {
+            "registers" | "display" => {
                 let mut lines: Vec<String> = Vec::new();
                 lines.push("--- Registers ---".to_string());
                 let special_regs: Vec<char> = vec![
@@ -11056,8 +11734,13 @@ impl Engine {
                 EngineAction::None
             }
             "copy" => {
-                // Yank current line to clipboard-style yank
-                self.execute_command("y")
+                // Bare :copy without address — show usage
+                self.message = "Usage: :copy {address}".to_string();
+                EngineAction::None
+            }
+            "clipboard_copy" => {
+                // Yank current line to clipboard-style yank (palette action)
+                self.execute_command("yank")
             }
             "cut" => {
                 // Cut current line
@@ -11142,7 +11825,7 @@ impl Engine {
                 EngineAction::None
             }
             "saveas" => {
-                self.message = "Use :w <path> to save to a new location".to_string();
+                self.message = "Usage: :saveas {file}".to_string();
                 EngineAction::None
             }
             "keys" => {
@@ -11151,7 +11834,7 @@ impl Engine {
                         .to_string();
                 EngineAction::None
             }
-            "d" | "delete" => {
+            "delete" => {
                 // :d — delete current line (used by :g/pat/d etc.)
                 let mut changed = false;
                 self.delete_lines(1, &mut changed);
@@ -11192,7 +11875,204 @@ impl Engine {
                 self.open_markdown_preview_linked();
                 EngineAction::None
             }
+            // ── New Vim ex commands ───────────────────────────────────────────
+            "join" => {
+                let mut changed = false;
+                self.join_lines(1, &mut changed);
+                EngineAction::None
+            }
+            "yank" => {
+                // :y[ank] [register] — yank current line
+                let line = self.view().cursor.line;
+                let text = self.buffer().content.line(line).chars().collect::<String>();
+                self.registers.insert('"', (text.clone(), true));
+                self.registers.insert('0', (text, true));
+                EngineAction::None
+            }
+            "put" => {
+                // :pu[t] — put default register after current line
+                if let Some((content, _)) = self.registers.get(&'"').cloned() {
+                    let line = self.view().cursor.line;
+                    let num_lines = self.buffer().len_lines();
+                    let insert_pos = if line + 1 < num_lines {
+                        self.buffer().line_to_char(line + 1)
+                    } else {
+                        let end = self.buffer().len_chars();
+                        if end > 0 && self.buffer().content.char(end - 1) != '\n' {
+                            self.start_undo_group();
+                            self.insert_with_undo(end, "\n");
+                            let text = if content.ends_with('\n') {
+                                content
+                            } else {
+                                format!("{content}\n")
+                            };
+                            self.insert_with_undo(end + 1, &text);
+                            self.finish_undo_group();
+                            return EngineAction::None;
+                        }
+                        end
+                    };
+                    let text = if content.ends_with('\n') {
+                        content
+                    } else {
+                        format!("{content}\n")
+                    };
+                    self.start_undo_group();
+                    self.insert_with_undo(insert_pos, &text);
+                    self.finish_undo_group();
+                    self.view_mut().cursor.line = line + 1;
+                    self.view_mut().cursor.col = 0;
+                } else {
+                    self.message = "Register is empty".to_string();
+                }
+                EngineAction::None
+            }
+            "pwd" => {
+                self.message = self.cwd.to_string_lossy().to_string();
+                EngineAction::None
+            }
+            "file" => {
+                let name = self
+                    .file_path()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "[No Name]".to_string());
+                let modified = if self.dirty() { " [Modified]" } else { "" };
+                let total = self.buffer().len_lines();
+                let cur_line = self.view().cursor.line + 1;
+                let pct = if total == 0 {
+                    0
+                } else {
+                    (cur_line * 100) / total
+                };
+                self.message = format!("\"{name}\"{modified} {total} lines --{pct}%--");
+                EngineAction::None
+            }
+            "enew" => {
+                let new_id = self.buffer_manager.create();
+                self.switch_window_buffer(new_id);
+                self.message = "New buffer".to_string();
+                EngineAction::None
+            }
+            "update" => {
+                if self.dirty() {
+                    let _ = self.save_with_format(false);
+                } else {
+                    self.message = "(no changes)".to_string();
+                }
+                EngineAction::None
+            }
+            "version" => {
+                self.message = format!("VimCode {}", env!("CARGO_PKG_VERSION"));
+                EngineAction::None
+            }
+            "print" => {
+                let line = self.view().cursor.line;
+                let text = self.buffer().content.line(line).chars().collect::<String>();
+                self.message = text.trim_end_matches('\n').to_string();
+                EngineAction::None
+            }
+            "number" => {
+                let line = self.view().cursor.line;
+                let text = self.buffer().content.line(line).chars().collect::<String>();
+                self.message = format!("{:>6}  {}", line + 1, text.trim_end_matches('\n'));
+                EngineAction::None
+            }
+            "new" => {
+                // Horizontal split + new empty buffer
+                self.split_window(SplitDirection::Horizontal, None);
+                let new_id = self.buffer_manager.create();
+                self.switch_window_buffer(new_id);
+                EngineAction::None
+            }
+            "vnew" => {
+                // Vertical split + new empty buffer
+                self.split_window(SplitDirection::Vertical, None);
+                let new_id = self.buffer_manager.create();
+                self.switch_window_buffer(new_id);
+                EngineAction::None
+            }
+            "retab" => {
+                let tab_size = self.settings.tabstop as usize;
+                let expand = self.settings.expand_tab;
+                self.start_undo_group();
+                let num_lines = self.buffer().len_lines();
+                for line_idx in 0..num_lines {
+                    let text: String = self.buffer().content.line(line_idx).chars().collect();
+                    let new_text = if expand {
+                        // tabs → spaces
+                        text.replace('\t', &" ".repeat(tab_size))
+                    } else {
+                        // Leading spaces → tabs
+                        let leading: usize = text.chars().take_while(|c| *c == ' ').count();
+                        if leading >= tab_size {
+                            let tabs = leading / tab_size;
+                            let spaces = leading % tab_size;
+                            format!(
+                                "{}{}{}",
+                                "\t".repeat(tabs),
+                                " ".repeat(spaces),
+                                &text[leading..]
+                            )
+                        } else {
+                            continue;
+                        }
+                    };
+                    if new_text != text {
+                        let start = self.buffer().line_to_char(line_idx);
+                        let end = start + text.len();
+                        self.delete_with_undo(start, end);
+                        self.insert_with_undo(start, &new_text);
+                    }
+                }
+                self.finish_undo_group();
+                self.message = "Retabbed".to_string();
+                EngineAction::None
+            }
+            "cquit" | "cquit!" => EngineAction::QuitWithError,
             _ => {
+                // Handle :y[ank] {register} and :pu[t] {register} with args
+                if let Some(arg) = cmd.strip_prefix("yank ") {
+                    let arg = arg.trim();
+                    let reg = arg.chars().next().unwrap_or('"');
+                    let line = self.view().cursor.line;
+                    let text = self.buffer().content.line(line).chars().collect::<String>();
+                    self.registers.insert(reg, (text.clone(), true));
+                    if reg != '"' {
+                        self.registers.insert('"', (text, true));
+                    }
+                    return EngineAction::None;
+                }
+                if let Some(arg) = cmd.strip_prefix("put ") {
+                    let reg = arg.trim().chars().next().unwrap_or('"');
+                    if let Some((content, _)) = self.registers.get(&reg).cloned() {
+                        let line = self.view().cursor.line;
+                        let num_lines = self.buffer().len_lines();
+                        let insert_pos = if line + 1 < num_lines {
+                            self.buffer().line_to_char(line + 1)
+                        } else {
+                            self.buffer().len_chars()
+                        };
+                        let text = if content.ends_with('\n') {
+                            content
+                        } else {
+                            format!("{content}\n")
+                        };
+                        self.start_undo_group();
+                        self.insert_with_undo(insert_pos, &text);
+                        self.finish_undo_group();
+                        self.view_mut().cursor.line = line + 1;
+                        self.view_mut().cursor.col = 0;
+                    } else {
+                        self.message = format!("Register '{reg}' is empty");
+                    }
+                    return EngineAction::None;
+                }
+                if let Some(arg) = cmd.strip_prefix("retab ") {
+                    if let Ok(ts) = arg.trim().parse::<u8>() {
+                        self.settings.tabstop = ts;
+                    }
+                    return self.execute_command("retab");
+                }
                 // Try plugin commands before giving up
                 let (cmd_name, cmd_args) = cmd.split_once(' ').unwrap_or((cmd, ""));
                 if self.plugin_run_command(cmd_name, cmd_args) {
