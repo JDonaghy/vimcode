@@ -15,6 +15,8 @@ section = "editors"
 priority = "optional"
 assets = [
   ["target/release/vimcode", "usr/bin/vimcode", "755"],
+  ["data/io.github.jdonaghy.VimCode.desktop", "usr/share/applications/io.github.jdonaghy.VimCode.desktop", "644"],
+  ["data/icons/io.github.jdonaghy.VimCode.svg", "usr/share/icons/hicolor/scalable/apps/io.github.jdonaghy.VimCode.svg", "644"],
 ]
 
 [lib]

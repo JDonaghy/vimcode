@@ -17,42 +17,59 @@ There's a touch of irony here - using a cli tool to write the editor that I've w
 > the built-in Lua 5.4 plugin system. The goal is full Vim *keybinding* and *editing*
 > compatibility, not a VimScript runtime. For a detailed Vim compatibility checklist, see [VIM_COMPATIBILITY.md](VIM_COMPATIBILITY.md).
 
-## Download (Ubuntu)
+## Download (Linux)
 
 Pre-built packages are published automatically on every push to `main`:
 
 **[→ Download latest release](../../releases/tag/latest)**
 
-**Option A — `.deb` package (recommended)**
+**Option A — `.deb` package (recommended for Ubuntu/Debian)**
 ```bash
 sudo dpkg -i vimcode_*.deb
 sudo apt -f install   # pulls in any missing GTK4 runtime libraries
 ```
+Requires **Ubuntu 24.04+** or any distro with **GTK 4.10+**. The `.deb` handles all runtime dependencies automatically.
 
 **Option B — raw binary**
 ```bash
+# First install runtime dependencies:
 sudo apt install libgtk-4-1 libglib2.0-0 libpango-1.0-0 libcairo2
+# Then run:
 chmod +x vimcode-linux-x86_64
 ./vimcode-linux-x86_64
 ```
 
-Requires **Ubuntu 22.04 or later** (GTK 4.6+). The `.deb` handles all runtime dependencies automatically.
+**Option C — Flatpak**
+```bash
+flatpak install vimcode.flatpak
+flatpak run io.github.jdonaghy.VimCode
+```
+The Flatpak bundles GTK4 and all dependencies — works on any Linux distro with Flatpak installed.
+
+> **Note:** Ubuntu 22.04 ships GTK 4.6 which is too old for the `.deb` and raw binary; use the Flatpak or upgrade to 24.04+.
 
 ---
 
 ## Building
 
-**Prerequisites (GTK backend):**
-```bash
-# Debian/Ubuntu
-sudo apt install libgtk-4-dev libpango1.0-dev
+### Prerequisites
 
-# Fedora
-sudo dnf install gtk4-devel pango-devel
+VimCode requires **GTK4 development libraries** for the GUI backend. The TUI mode (`--tui`) works without GTK4 — only a terminal emulator is needed.
 
-# Arch
-sudo pacman -S gtk4 pango
-```
+| Platform | Install command |
+|---|---|
+| Ubuntu/Debian | `sudo apt install libgtk-4-dev build-essential pkg-config` |
+| Fedora | `sudo dnf install gtk4-devel gcc pkg-config` |
+| Arch | `sudo pacman -S gtk4 base-devel pkgconf` |
+| openSUSE | `sudo zypper install gtk4-devel gcc pkg-config` |
+| macOS | `brew install gtk4 pkg-config` |
+| Windows (MSYS2) | `pacman -S mingw-w64-x86_64-gtk4 mingw-w64-x86_64-pkgconf mingw-w64-x86_64-gcc` |
+
+**Platform notes:**
+- **macOS:** GTK4 works via Homebrew; this is not a native AppKit app
+- **Windows:** Use the MSYS2 MinGW64 shell and set `rustup default stable-x86_64-pc-windows-gnu`
+
+### Build & run
 
 ```bash
 cargo build

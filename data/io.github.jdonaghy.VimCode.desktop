@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=VimCode
+GenericName=Text Editor
+Comment=Vim-like code editor with GTK4 and tree-sitter
+Exec=vimcode %F
+Icon=io.github.jdonaghy.VimCode
+Terminal=false
+Categories=Development;TextEditor;Utility;
+MimeType=text/plain;text/x-csrc;text/x-c++src;text/x-java;text/x-python;text/x-rust;application/json;application/xml;
+Keywords=Text;Editor;Vim;Code;
+StartupNotify=true

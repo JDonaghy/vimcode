@@ -83,9 +83,9 @@ jobs:
         tag_name: v${{ env.VERSION }}
         name: "VimCode v${{ env.VERSION }}"
         body: |
-          ## Installation (Ubuntu 24.04+)
+          ## Installation (Linux)
 
-          **Option A — .deb package (recommended)**
+          **Option A — .deb package (recommended for Ubuntu/Debian)**
           ```
           sudo dpkg -i ${{ env.DEB_NAME }}
           sudo apt -f install    # installs any missing GTK4 runtime libraries
@@ -100,9 +100,44 @@ jobs:
           ./vimcode-linux-x86_64
           ```
 
-          > Requires Ubuntu 24.04 or later (GTK 4.10+).
+          **Option C — Flatpak**
+          ```
+          flatpak install vimcode.flatpak
+          flatpak run io.github.jdonaghy.VimCode
+          ```
+
+          > Requires GTK 4.10+. Ubuntu 22.04 ships GTK 4.6 which is too old; Ubuntu 24.04+ recommended.
         prerelease: false
         make_latest: true
         files: |
           ${{ env.DEB_PATH }}
           ${{ env.BIN_NAME }}
+          vimcode.flatpak
+
+  flatpak:
+    name: Build Flatpak bundle
+    runs-on: ubuntu-24.04
+
+    permissions:
+      contents: write
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Read version from Cargo.toml
+      run: |
+        VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+        echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+    - name: Build Flatpak
+      uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+      with:
+        manifest-path: flatpak/io.github.jdonaghy.VimCode.yml
+        bundle: vimcode.flatpak
+        cache-key: flatpak-builder-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Upload Flatpak to release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: v${{ env.VERSION }}
+        files: vimcode.flatpak

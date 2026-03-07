@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.jdonaghy.VimCode</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>VimCode</name>
+  <summary>Vim-like code editor with GTK4 and tree-sitter</summary>
+
+  <description>
+    <p>
+      VimCode is a high-performance Vim+VSCode hybrid editor built in Rust.
+      Modal editing meets modern UX — featuring tree-sitter syntax highlighting,
+      LSP support, a built-in terminal, and a full TUI backend.
+    </p>
+    <p>
+      CPU-rendered via Cairo/Pango, VimCode works reliably in VMs, remote
+      desktops, and SSH sessions without requiring a GPU.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">io.github.jdonaghy.VimCode.desktop</launchable>
+
+  <url type="homepage">https://github.com/jdonaghy/vimcode</url>
+  <url type="bugtracker">https://github.com/jdonaghy/vimcode/issues</url>
+
+  <content_rating type="oars-1.1" />
+
+  <releases>
+    <release version="0.2.0" date="2026-03-07">
+      <description>
+        <p>Initial packaged release with Flatpak support.</p>
+      </description>
+    </release>
+  </releases>
+</component>

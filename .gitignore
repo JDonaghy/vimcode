@@ -2,3 +2,5 @@
 notes.txt
 opencode.json
 vim-index.txt
+.flatpak-builder/
+build-dir/

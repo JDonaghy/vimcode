@@ -1,0 +1,37 @@
+app-id: io.github.jdonaghy.VimCode
+runtime: org.gnome.Platform
+runtime-version: '47'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+
+command: vimcode
+
+finish-args:
+  - --share=ipc
+  - --socket=fallback-x11
+  - --socket=wayland
+  - --device=dri
+  - --share=network
+  - --filesystem=host
+
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/vimcode/cargo
+    CARGO_NET_OFFLINE: 'true'
+
+modules:
+  - name: vimcode
+    buildsystem: simple
+    build-commands:
+      - cargo --offline fetch --manifest-path Cargo.toml --verbose
+      - cargo --offline build --release --verbose
+      - install -Dm755 target/release/vimcode /app/bin/vimcode
+      - install -Dm644 data/io.github.jdonaghy.VimCode.desktop /app/share/applications/io.github.jdonaghy.VimCode.desktop
+      - install -Dm644 data/icons/io.github.jdonaghy.VimCode.svg /app/share/icons/hicolor/scalable/apps/io.github.jdonaghy.VimCode.svg
+      - install -Dm644 data/io.github.jdonaghy.VimCode.metainfo.xml /app/share/metainfo/io.github.jdonaghy.VimCode.metainfo.xml
+    sources:
+      - type: dir
+        path: ..
+      - cargo-sources.json
