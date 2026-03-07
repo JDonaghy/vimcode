@@ -1,9 +1,9 @@
 # VimCode Project State
 
-**Last updated:** Mar 6, 2026 (Session 138 — Vim compatibility inventory) | **Tests:** 2461
+**Last updated:** Mar 6, 2026 (Session 139 — comprehensive z-commands) | **Tests:** 2494
 
 > Feature documentation lives in **README.md**.
-> Per-session implementation notes through Session 134 are in **SESSION_HISTORY.md**.
+> Per-session implementation notes through Session 139 are in **SESSION_HISTORY.md**.
 
 ---
 
@@ -26,7 +26,7 @@ When implementing a new key/command, add tests covering:
 
 ## Recent Work
 
-**Session 138 — Vim compatibility inventory (documentation only, 2461 tests):**
-Created `VIM_COMPATIBILITY.md` — systematic Vim command inventory with 12 categories, 411 commands tracked, 304 implemented (74%). Added VimScript scope note + link in README.md Vision section. Memory files updated for cross-session awareness.
+**Session 139 — Comprehensive z-commands (2494 tests):**
+Implemented 15 missing z-commands to bring z-command coverage from 7/22 (32%) to 22/23 (96%). New fold commands: `zM` (close all), `zA`/`zO`/`zC` (recursive toggle/open/close), `zd`/`zD` (delete fold/recursive), `zf{motion}` (fold-create operator with j/k/G/gg/{/} motions), `zF` (fold N lines), `zv` (open to show cursor), `zx` (recompute). Scroll+first-non-blank: `z<CR>`/`z.`/`z-`. Horizontal scroll: `zh`/`zl` (with count), `zH`/`zL` (half-screen). Added 3 View helper methods (`delete_fold_at`, `delete_folds_in_range`, `open_folds_in_range`), 33 integration tests in `tests/z_commands.rs`.
 
-> Sessions 137 and earlier archived in **SESSION_HISTORY.md**.
+> Sessions 138 and earlier archived in **SESSION_HISTORY.md**.

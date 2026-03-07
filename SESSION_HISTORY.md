@@ -1,9 +1,15 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 137 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 139 archived here. Recent work summary in PROJECT_STATE.md.
 
 ---
+
+**Session 139 — Comprehensive z-commands (33 new tests, 2494 total):**
+Implemented 15 missing z-commands to bring z-command coverage from 7/22 (32%) to 22/23 (96%). New fold commands: `zM` (close all), `zA`/`zO`/`zC` (recursive toggle/open/close), `zd`/`zD` (delete fold/recursive), `zf{motion}` (fold-create operator with j/k/G/gg/{/} motions), `zF` (fold N lines), `zv` (open to show cursor), `zx` (recompute). Scroll+first-non-blank: `z<CR>`/`z.`/`z-`. Horizontal scroll: `zh`/`zl` (with count), `zH`/`zL` (half-screen). Added 3 View helper methods (`delete_fold_at`, `delete_folds_in_range`, `open_folds_in_range`), 33 integration tests in `tests/z_commands.rs`.
+
+**Session 138 — Vim compatibility inventory (documentation only, 2461 tests):**
+Created `VIM_COMPATIBILITY.md` — systematic Vim command inventory with 12 categories, 411 commands tracked, 304 implemented (74%). Added VimScript scope note + link in README.md Vision section. Memory files updated for cross-session awareness.
 
 **Session 137 — Operator+motion completeness (56 new tests, 2461 total):**
 Full operator+motion support: `pending_find_operator` for `df`/`dt`/`dF`/`dT`, generic `apply_charwise_operator()`/`apply_linewise_operator()` helpers, all motions in `handle_operator_motion()` (h/l/j/k/G/{/}/(/)/ W/B/E/^/H/M/L/;/,/f/t/F/T), operator-aware gg/ge/gE in pending_key, case/indent operators extended to all motions. 56 tests in `tests/operator_motions.rs`.

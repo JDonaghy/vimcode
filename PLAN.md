@@ -5,6 +5,7 @@
 ---
 
 ## Recently Completed
+- **Session 139**: Comprehensive z-commands — 15 new z-commands (32% → 96%), fold create/delete/recursive, horizontal scroll, 33 integration tests
 - **Session 138**: `VIM_COMPATIBILITY.md` — systematic Vim command inventory (304/411 = 74%), VimScript scope note in README.md
 - **Session 137**: Operator+motion completeness — all operators with all motions, 56 integration tests
 - **Session 136**: Ex command abbreviation system + ~20 new commands, 71 integration tests

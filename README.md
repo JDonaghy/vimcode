@@ -11,7 +11,7 @@ There's a touch of irony here - using a cli tool to write the editor that I've w
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 2461+ tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 2494+ tests, zero async runtime dependency
 
 > **Note:** VimCode does not implement VimScript. Extension and scripting is handled via
 > the built-in Lua 5.4 plugin system. The goal is full Vim *keybinding* and *editing*
@@ -913,6 +913,9 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `f{c}` / `t{c}` | Find / till char (`;` `,` repeat) |
 | `%` | Jump to matching bracket |
 | `zz` / `zt` / `zb` | Scroll cursor to center / top / bottom |
+| `z<CR>` / `z.` / `z-` | Scroll top/center/bottom + first non-blank |
+| `zh` / `zl` | Scroll horizontally left / right (with count) |
+| `zH` / `zL` | Scroll half-screen horizontally left / right |
 | `Ctrl-O` / `Ctrl-I` | Jump list back / forward |
 | `Ctrl-D` / `Ctrl-U` | Half-page down / up |
 | `Ctrl-E` / `Ctrl-Y` | Scroll one line down / up (cursor stays) |
@@ -956,6 +959,13 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `<leader>gf` | LSP format current buffer (Space=leader by default) |
 | `<leader>rn` | LSP rename symbol — pre-fills `:Rename <word>` |
 | `za` / `zo` / `zc` / `zR` | Fold toggle / open / close / open all |
+| `zA` / `zO` / `zC` | Fold toggle / open / close recursively |
+| `zM` | Close all folds |
+| `zd` / `zD` | Delete fold / delete fold recursively |
+| `zf{motion}` / `zF` | Create fold (operator) / create fold for N lines |
+| `zv` | Open folds to make cursor visible |
+| `zx` | Recompute folds (open all + close all) |
+| `zj` / `zk` | Move to next / previous fold |
 | `Ctrl-W h/j/k/l` | Focus window left/down/up/right |
 | `Ctrl-W w` / `c` / `o` | Cycle / close / close-others |
 | `Ctrl-P` | Open fuzzy file finder |

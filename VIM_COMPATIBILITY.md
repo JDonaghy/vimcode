@@ -314,31 +314,31 @@ See [README.md](README.md) for full feature documentation.
 | `zz` | Center cursor on screen | ✅ | |
 | `zt` | Cursor to top of screen | ✅ | |
 | `zb` | Cursor to bottom of screen | ✅ | |
-| `z<CR>` | Top of screen + first non-blank | ❌ | |
-| `z.` | Center + first non-blank | ❌ | |
-| `z-` | Bottom + first non-blank | ❌ | |
+| `z<CR>` | Top of screen + first non-blank | ✅ | |
+| `z.` | Center + first non-blank | ✅ | |
+| `z-` | Bottom + first non-blank | ✅ | |
 | `za` | Toggle fold | ✅ | |
 | `zo` | Open fold | ✅ | |
 | `zc` | Close fold | ✅ | |
 | `zR` | Open all folds | ✅ | |
-| `zM` | Close all folds | ❌ | |
-| `zA` | Toggle fold recursively | ❌ | |
-| `zO` | Open fold recursively | ❌ | |
-| `zC` | Close fold recursively | ❌ | |
-| `zd` | Delete fold | ❌ | |
-| `zD` | Delete fold recursively | ❌ | |
-| `zf{motion}` | Create fold | ❌ | Indentation-based folding only |
-| `zF` | Create fold for N lines | ❌ | |
-| `zv` | Open folds to show cursor | ❌ | |
-| `zx` | Recompute folds | ❌ | |
-| `zj` / `zk` | Next/prev fold | ❌ | |
-| `zh` / `zl` | Scroll horizontally | ❌ | |
-| `zH` / `zL` | Scroll half-screen horiz. | ❌ | |
+| `zM` | Close all folds | ✅ | |
+| `zA` | Toggle fold recursively | ✅ | |
+| `zO` | Open fold recursively | ✅ | |
+| `zC` | Close fold recursively | ✅ | |
+| `zd` | Delete fold | ✅ | |
+| `zD` | Delete fold recursively | ✅ | |
+| `zf{motion}` | Create fold | ✅ | Supports j/k/G/gg/{/} motions |
+| `zF` | Create fold for N lines | ✅ | |
+| `zv` | Open folds to show cursor | ✅ | |
+| `zx` | Recompute folds | ✅ | |
+| `zj` / `zk` | Next/prev fold | ✅ | |
+| `zh` / `zl` | Scroll horizontally | ✅ | With count support |
+| `zH` / `zL` | Scroll half-screen horiz. | ✅ | |
 | `ze` / `zs` | Scroll to cursor right/left | ❌ | |
 | `z=` | Spelling suggestions | N/A | No spell check |
 | `zg` / `zw` / `zG` / `zW` | Spelling word lists | N/A | No spell check |
 
-**z-commands: 7/22 (32%)** (excluding N/A)
+**z-commands: 22/23 (96%)** (excluding N/A)
 
 ---
 

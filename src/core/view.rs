@@ -83,6 +83,23 @@ impl View {
         self.folds.clear();
     }
 
+    /// Remove the fold whose header is `start`. Returns `true` if found.
+    pub fn delete_fold_at(&mut self, start: usize) -> bool {
+        let len = self.folds.len();
+        self.folds.retain(|f| f.start != start);
+        self.folds.len() < len
+    }
+
+    /// Remove all folds whose headers fall within `start..=end`.
+    pub fn delete_folds_in_range(&mut self, start: usize, end: usize) {
+        self.folds.retain(|f| !(f.start >= start && f.start <= end));
+    }
+
+    /// Open (remove) all folds whose headers fall within `start..=end`.
+    pub fn open_folds_in_range(&mut self, start: usize, end: usize) {
+        self.folds.retain(|f| !(f.start >= start && f.start <= end));
+    }
+
     /// Ensure the cursor is visible within the viewport, adjusting scroll_top.
     pub fn ensure_cursor_visible(&mut self) {
         if self.cursor.line < self.scroll_top {
@@ -176,5 +193,39 @@ mod tests {
         // Should remain sorted by start
         assert_eq!(view.folds[0].start, 1);
         assert_eq!(view.folds[1].start, 5);
+    }
+
+    #[test]
+    fn test_delete_fold_at() {
+        let mut view = View::new();
+        view.close_fold(2, 5);
+        view.close_fold(8, 12);
+        assert!(view.delete_fold_at(2));
+        assert_eq!(view.folds.len(), 1);
+        assert_eq!(view.folds[0].start, 8);
+        // Deleting non-existent fold returns false
+        assert!(!view.delete_fold_at(99));
+    }
+
+    #[test]
+    fn test_delete_folds_in_range() {
+        let mut view = View::new();
+        view.close_fold(2, 5);
+        view.close_fold(8, 12);
+        view.close_fold(15, 20);
+        view.delete_folds_in_range(2, 12);
+        assert_eq!(view.folds.len(), 1);
+        assert_eq!(view.folds[0].start, 15);
+    }
+
+    #[test]
+    fn test_open_folds_in_range() {
+        let mut view = View::new();
+        view.close_fold(2, 5);
+        view.close_fold(3, 4); // nested inside
+        view.close_fold(10, 15);
+        view.open_folds_in_range(2, 5);
+        assert_eq!(view.folds.len(), 1);
+        assert_eq!(view.folds[0].start, 10);
     }
 }

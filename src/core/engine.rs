@@ -5234,9 +5234,11 @@ impl Engine {
                 self.pending_key = Some('[');
             }
             Some('z') => {
-                // Fold commands: za, zo, zc, zR
+                // Fold + scroll commands
                 self.pending_key = Some('z');
-                self.message = "z: a=toggle  c=close  o=open  R=open all".to_string();
+                self.message =
+                    "z: a/o/c=fold  M=closeAll  R=openAll  d/D=del  f=create  j/k=nav  z/t/b=scroll  h/l=hscroll"
+                        .to_string();
             }
             Some('m') => {
                 // Set mark: m{a-z}
@@ -5503,7 +5505,7 @@ impl Engine {
             'g' => match unicode {
                 Some('g') => {
                     if let Some(op) = self.pending_operator.take() {
-                        // dgg/ygg/cgg etc: linewise operator to target line
+                        // dgg/ygg/cgg/zfgg etc: linewise operator to target line
                         let count = self.count.take();
                         let target_line = count
                             .map(|n| {
@@ -5517,7 +5519,14 @@ impl Engine {
                         } else {
                             (current_line, target_line)
                         };
-                        self.apply_linewise_operator(op, start, end, changed);
+                        if op == 'Z' {
+                            // zfgg: fold from cursor to target
+                            if end > start {
+                                self.cmd_fold_create(start, end);
+                            }
+                        } else {
+                            self.apply_linewise_operator(op, start, end, changed);
+                        }
                     } else {
                         self.push_jump_location();
                         if self.peek_count().is_some() {
@@ -6035,14 +6044,63 @@ impl Engine {
             'z' => {
                 // Scroll position + fold commands
                 match unicode {
+                    // Scroll: cursor position
                     Some('z') => self.scroll_cursor_center(),
                     Some('t') => self.scroll_cursor_top(),
                     Some('b') => self.scroll_cursor_bottom(),
+                    // Scroll + first non-blank
+                    Some('.') => self.scroll_cursor_center_first_nonblank(),
+                    Some('-') => self.scroll_cursor_bottom_first_nonblank(),
+                    // Horizontal scroll
+                    Some('h') => {
+                        let count = self.take_count();
+                        self.scroll_left_by(count);
+                    }
+                    Some('l') => {
+                        let count = self.take_count();
+                        self.scroll_right_by(count);
+                    }
+                    Some('H') => self.scroll_left_half_screen(),
+                    Some('L') => self.scroll_right_half_screen(),
+                    // Fold: basic
                     Some('a') => self.cmd_fold_toggle(),
                     Some('o') => self.cmd_fold_open(),
                     Some('c') => self.cmd_fold_close(),
                     Some('R') => self.view_mut().open_all_folds(),
-                    _ => {}
+                    Some('M') => self.cmd_fold_close_all(),
+                    // Fold: recursive
+                    Some('A') => self.cmd_fold_toggle_recursive(),
+                    Some('O') => self.cmd_fold_open_recursive(),
+                    Some('C') => self.cmd_fold_close_recursive(),
+                    // Fold: delete
+                    Some('d') => self.cmd_fold_delete(),
+                    Some('D') => self.cmd_fold_delete_recursive(),
+                    // Fold: create (zf{motion})
+                    Some('f') => {
+                        self.pending_operator = Some('Z');
+                    }
+                    Some('F') => {
+                        // zF: create fold for N lines from cursor
+                        let count = self.take_count();
+                        let line = self.view().cursor.line;
+                        let total = self.buffer().len_lines();
+                        let end = (line + count).min(total.saturating_sub(1));
+                        if end > line {
+                            self.cmd_fold_create(line, end);
+                        }
+                    }
+                    // Fold: utilities
+                    Some('v') => self.cmd_fold_open_cursor_visible(),
+                    Some('x') => self.cmd_fold_recompute(),
+                    // Fold: navigation
+                    Some('j') => self.cmd_fold_move_next(),
+                    Some('k') => self.cmd_fold_move_prev(),
+                    _ => {
+                        // z<CR> — scroll cursor to top + first non-blank
+                        if key_name == "Return" {
+                            self.scroll_cursor_top_first_nonblank();
+                        }
+                    }
                 }
             }
             _ => {}
@@ -6059,6 +6117,65 @@ impl Engine {
         unicode: Option<char>,
         changed: &mut bool,
     ) -> EngineAction {
+        // Handle 'Z' sentinel for zf{motion} — fold creation operator.
+        if operator == 'Z' {
+            let cursor_line = self.view().cursor.line;
+            let total = self.buffer().len_lines();
+            let target = match unicode {
+                Some('j') => {
+                    let count = self.take_count();
+                    Some((cursor_line + count).min(total.saturating_sub(1)))
+                }
+                Some('k') => {
+                    let count = self.take_count();
+                    Some(cursor_line.saturating_sub(count))
+                }
+                Some('G') => {
+                    let count = self.count.take();
+                    Some(
+                        count
+                            .map(|n| n.saturating_sub(1).min(total.saturating_sub(1)))
+                            .unwrap_or_else(|| total.saturating_sub(1)),
+                    )
+                }
+                Some('}') => {
+                    let count = self.take_count();
+                    let saved = self.view().cursor;
+                    for _ in 0..count {
+                        self.move_paragraph_forward();
+                    }
+                    let target = self.view().cursor.line;
+                    self.view_mut().cursor = saved;
+                    Some(target)
+                }
+                Some('{') => {
+                    let count = self.take_count();
+                    let saved = self.view().cursor;
+                    for _ in 0..count {
+                        self.move_paragraph_backward();
+                    }
+                    let target = self.view().cursor.line;
+                    self.view_mut().cursor = saved;
+                    Some(target)
+                }
+                Some('g') => {
+                    // zfg -> wait for 'g' to complete (zfgg)
+                    self.pending_key = Some('g');
+                    self.pending_operator = Some('Z');
+                    return EngineAction::None;
+                }
+                _ => None,
+            };
+            if let Some(target_line) = target {
+                let start = cursor_line.min(target_line);
+                let end = cursor_line.max(target_line);
+                if end > start {
+                    self.cmd_fold_create(start, end);
+                }
+            }
+            return EngineAction::None;
+        }
+
         // Handle 'g' motion for operator + g{x} (cgn/dgn, dgg, dge, etc.)
         if unicode == Some('g') {
             // Re-set pending_key = 'g' and pending_operator = operator so next key
@@ -15170,6 +15287,225 @@ impl Engine {
     fn cmd_fold_open(&mut self) {
         let line = self.view().cursor.line;
         self.view_mut().open_fold(line);
+    }
+
+    /// zM — close all folds in the buffer using indent-based detection.
+    fn cmd_fold_close_all(&mut self) {
+        let total = self.buffer().len_lines();
+        let mut i = 0;
+        while i < total {
+            if let Some((start, end)) = self.detect_fold_range(i) {
+                self.view_mut().close_fold(start, end);
+                i = end + 1;
+            } else {
+                i += 1;
+            }
+        }
+        // Clamp cursor if it ended up hidden.
+        let cursor_line = self.view().cursor.line;
+        if self.view().is_line_hidden(cursor_line) {
+            // Move cursor to the nearest fold header above.
+            for f in self.view().folds.iter().rev() {
+                if f.start <= cursor_line && cursor_line <= f.end {
+                    self.view_mut().cursor.line = f.start;
+                    break;
+                }
+            }
+            self.clamp_cursor_col();
+        }
+    }
+
+    /// zA — toggle fold recursively at cursor.
+    fn cmd_fold_toggle_recursive(&mut self) {
+        let line = self.view().cursor.line;
+        if let Some(fold) = self.view().fold_at(line).cloned() {
+            // Open this fold and any folds inside it.
+            self.view_mut().open_folds_in_range(fold.start, fold.end);
+        } else {
+            self.cmd_fold_close();
+        }
+    }
+
+    /// zO — open fold at cursor recursively (open all nested folds).
+    fn cmd_fold_open_recursive(&mut self) {
+        let line = self.view().cursor.line;
+        if let Some(fold) = self.view().fold_at(line).cloned() {
+            self.view_mut().open_folds_in_range(fold.start, fold.end);
+        } else {
+            // Also check if cursor is on a line that *could* fold.
+            self.view_mut().open_fold(line);
+        }
+    }
+
+    /// zC — close fold at cursor recursively. (Flat model: same as zc.)
+    fn cmd_fold_close_recursive(&mut self) {
+        self.cmd_fold_close();
+    }
+
+    /// zd — delete fold at cursor.
+    fn cmd_fold_delete(&mut self) {
+        let line = self.view().cursor.line;
+        if !self.view_mut().delete_fold_at(line) {
+            self.message = "E490: No fold found".to_string();
+        }
+    }
+
+    /// zD — delete fold at cursor recursively (including nested).
+    fn cmd_fold_delete_recursive(&mut self) {
+        let line = self.view().cursor.line;
+        if let Some(fold) = self.view().fold_at(line).cloned() {
+            self.view_mut().delete_folds_in_range(fold.start, fold.end);
+        } else if !self.view_mut().delete_fold_at(line) {
+            self.message = "E490: No fold found".to_string();
+        }
+    }
+
+    /// Used by zf{motion} and zF — create a fold for the given line range.
+    fn cmd_fold_create(&mut self, start: usize, end: usize) {
+        if end <= start {
+            return;
+        }
+        self.view_mut().close_fold(start, end);
+        let lines = end - start;
+        self.message = format!("{lines} lines folded");
+    }
+
+    /// zv — open enough folds to make cursor line visible.
+    fn cmd_fold_open_cursor_visible(&mut self) {
+        loop {
+            let cursor_line = self.view().cursor.line;
+            let fold = self
+                .view()
+                .folds
+                .iter()
+                .find(|f| cursor_line > f.start && cursor_line <= f.end)
+                .cloned();
+            if let Some(f) = fold {
+                self.view_mut().open_fold(f.start);
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// zx — recompute folds: open all, then close all.
+    fn cmd_fold_recompute(&mut self) {
+        self.view_mut().open_all_folds();
+        self.cmd_fold_close_all();
+    }
+
+    /// zj — move to the start of the next fold.
+    fn cmd_fold_move_next(&mut self) {
+        let cursor_line = self.view().cursor.line;
+        let total = self.buffer().len_lines();
+        // First check existing closed folds.
+        let next_fold = self
+            .view()
+            .folds
+            .iter()
+            .find(|f| f.start > cursor_line)
+            .map(|f| f.start);
+        // Also scan for potential fold starts (lines with children indented deeper).
+        let mut next_detectable = None;
+        for i in (cursor_line + 1)..total {
+            if self.view().is_line_hidden(i) {
+                continue;
+            }
+            if self.detect_fold_range(i).is_some() {
+                next_detectable = Some(i);
+                break;
+            }
+        }
+        let target = match (next_fold, next_detectable) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        if let Some(line) = target {
+            self.view_mut().cursor.line = line;
+            self.view_mut().cursor.col = 0;
+        }
+    }
+
+    /// zk — move to the end of the previous fold.
+    fn cmd_fold_move_prev(&mut self) {
+        let cursor_line = self.view().cursor.line;
+        // Check existing closed folds.
+        let prev_fold = self
+            .view()
+            .folds
+            .iter()
+            .rev()
+            .find(|f| f.start < cursor_line)
+            .map(|f| f.start);
+        // Also scan for potential fold starts.
+        let mut prev_detectable = None;
+        for i in (0..cursor_line).rev() {
+            if self.view().is_line_hidden(i) {
+                continue;
+            }
+            if self.detect_fold_range(i).is_some() {
+                prev_detectable = Some(i);
+                break;
+            }
+        }
+        let target = match (prev_fold, prev_detectable) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        if let Some(line) = target {
+            self.view_mut().cursor.line = line;
+            self.view_mut().cursor.col = 0;
+        }
+    }
+
+    /// z<CR> — scroll cursor line to top, then move to first non-blank.
+    fn scroll_cursor_top_first_nonblank(&mut self) {
+        self.scroll_cursor_top();
+        let line = self.view().cursor.line;
+        self.view_mut().cursor.col = self.first_non_blank_col(line);
+    }
+
+    /// z. — scroll cursor line to center, then move to first non-blank.
+    fn scroll_cursor_center_first_nonblank(&mut self) {
+        self.scroll_cursor_center();
+        let line = self.view().cursor.line;
+        self.view_mut().cursor.col = self.first_non_blank_col(line);
+    }
+
+    /// z- — scroll cursor line to bottom, then move to first non-blank.
+    fn scroll_cursor_bottom_first_nonblank(&mut self) {
+        self.scroll_cursor_bottom();
+        let line = self.view().cursor.line;
+        self.view_mut().cursor.col = self.first_non_blank_col(line);
+    }
+
+    /// zh — scroll view left by `count` columns.
+    fn scroll_left_by(&mut self, count: usize) {
+        let sl = self.view().scroll_left;
+        self.view_mut().scroll_left = sl.saturating_sub(count);
+    }
+
+    /// zl — scroll view right by `count` columns.
+    fn scroll_right_by(&mut self, count: usize) {
+        self.view_mut().scroll_left += count;
+    }
+
+    /// zH — scroll half screen width left.
+    fn scroll_left_half_screen(&mut self) {
+        let half = self.view().viewport_cols / 2;
+        let half = if half == 0 { 1 } else { half };
+        self.scroll_left_by(half);
+    }
+
+    /// zL — scroll half screen width right.
+    fn scroll_right_half_screen(&mut self) {
+        let half = self.view().viewport_cols / 2;
+        let half = if half == 0 { 1 } else { half };
+        self.scroll_right_by(half);
     }
 
     fn move_right(&mut self) {
