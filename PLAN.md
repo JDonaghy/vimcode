@@ -5,10 +5,11 @@
 ---
 
 ## Recently Completed
-- **Session 137**: Operator+motion completeness — `df`/`dt`/`dF`/`dT`/`d;`/`d,`/`dj`/`dk`/`dG`/`dgg`/`d{`/`d}`/`d(`/`d)`/`dW`/`dB`/`dE`/`d^`/`dh`/`dl`/`dH`/`dM`/`dL`/`dge` (all operators: `d`/`c`/`y`/`g~`/`gu`/`gU`/`>`/`<`/`=`), generic `apply_charwise_operator`/`apply_linewise_operator` helpers, 56 integration tests
-- **Session 136**: `normalize_ex_command()` system (57-entry abbreviation table), ~20 new ex commands (`:join`, `:yank`, `:put`, `:>/<`, `:=`, `:#`, `:mark`/`:k`, `:pwd`, `:file`, `:enew`, `:update`, `:version`, `:print`, `:number`, `:new`, `:vnew`, `:retab`, `:cquit`, `:saveas`, `:windo`/`:bufdo`/`:tabdo`, `:display`), `:copy` conflict fix, `QuitWithError` action, 71 integration tests
-- **Session 135**: `show_hidden_files` setting (explorer/fuzzy/folder picker), LSP format undo fix, stale highlighting after format fix
-- **Session 134**: Search highlight refresh after edits, Escape clears highlights, extra line number fix, markdown preview wrap, TUI/GTK viewport layout fixes, 13 integration tests
+- **Session 138**: `VIM_COMPATIBILITY.md` — systematic Vim command inventory (304/411 = 74%), VimScript scope note in README.md
+- **Session 137**: Operator+motion completeness — all operators with all motions, 56 integration tests
+- **Session 136**: Ex command abbreviation system + ~20 new commands, 71 integration tests
+- **Session 135**: `show_hidden_files` setting, LSP format undo fix
+- **Session 134**: Search highlight refresh, viewport layout fixes, 13 integration tests
 
 ## Roadmap
 

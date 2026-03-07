@@ -1,9 +1,18 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 134 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 137 archived here. Recent work summary in PROJECT_STATE.md.
 
 ---
+
+**Session 137 — Operator+motion completeness (56 new tests, 2461 total):**
+Full operator+motion support: `pending_find_operator` for `df`/`dt`/`dF`/`dT`, generic `apply_charwise_operator()`/`apply_linewise_operator()` helpers, all motions in `handle_operator_motion()` (h/l/j/k/G/{/}/(/)/ W/B/E/^/H/M/L/;/,/f/t/F/T), operator-aware gg/ge/gE in pending_key, case/indent operators extended to all motions. 56 tests in `tests/operator_motions.rs`.
+
+**Session 136 — Vim-style ex command abbreviations + ~20 new commands (71 new tests, 2405 total):**
+`normalize_ex_command()` system (57-entry abbreviation table), ~20 new ex commands (`:join`, `:yank`, `:put`, `:>/<`, `:=`, `:#`, `:mark`/`:k`, `:pwd`, `:file`, `:enew`, `:update`, `:version`, `:print`, `:number`, `:new`, `:vnew`, `:retab`, `:cquit`, `:saveas`, `:windo`/`:bufdo`/`:tabdo`, `:display`), `:copy` conflict fix, `QuitWithError` action. 71 tests in `tests/ex_commands.rs`.
+
+**Session 135 — show_hidden_files setting + LSP format undo fix (no new tests, 2346 total):**
+`show_hidden_files` setting (explorer/fuzzy/folder picker), LSP format undo fix (`record_delete`/`record_insert` in `apply_lsp_edits`), stale highlighting after format fix (mark buffer in `lsp_dirty_buffers`).
 
 **Session 134 — search highlight + viewport bug fixes (13 new tests, 2346 total):**
 Five bug fixes: search highlights refresh after edits (`run_search()` after buffer changes), Escape clears highlights, extra gutter line number fix (`buffer.len_lines()` vs raw Ropey), markdown preview always wraps, TUI viewport layout fix (double-counted tab bar row), GTK per-window viewport sync in SearchPollTick handler. 13 tests in `tests/search_highlight.rs`.

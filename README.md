@@ -13,6 +13,9 @@ There's a touch of irony here - using a cli tool to write the editor that I've w
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
 - **Clean architecture** — platform-agnostic core, 2461+ tests, zero async runtime dependency
 
+> **Note:** VimCode does not implement VimScript. Extension and scripting is handled via
+> the built-in Lua 5.4 plugin system. The goal is full Vim *keybinding* and *editing*
+> compatibility, not a VimScript runtime. For a detailed Vim compatibility checklist, see [VIM_COMPATIBILITY.md](VIM_COMPATIBILITY.md).
 
 ## Download (Ubuntu)
 
