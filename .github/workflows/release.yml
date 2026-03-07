@@ -148,18 +148,20 @@ jobs:
         sudo apt-get install -y flatpak flatpak-builder
         flatpak remote-add --user --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
 
+    - name: Install Flatpak SDK and runtime
+      run: |
+        flatpak install --user -y --noninteractive flathub org.gnome.Platform//48 org.gnome.Sdk//48
+        flatpak install --user -y --noninteractive flathub org.freedesktop.Sdk.Extension.rust-stable//24.08
+
     - name: Read version from Cargo.toml
       run: |
         VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
         echo "VERSION=$VERSION" >> $GITHUB_ENV
 
     - name: Build Flatpak
-      uses: flatpak/flatpak-github-actions/flatpak-builder@v6
-      with:
-        manifest-path: flatpak/io.github.jdonaghy.VimCode.yml
-        bundle: vimcode.flatpak
-        run-tests: false
-        cache-key: flatpak-builder-${{ hashFiles('**/Cargo.lock') }}
+      run: |
+        flatpak-builder --user --repo=repo --force-clean --disable-rofiles-fuse builddir flatpak/io.github.jdonaghy.VimCode.yml
+        flatpak build-bundle --runtime-repo=https://flathub.org/repo/flathub.flatpakrepo repo vimcode.flatpak io.github.jdonaghy.VimCode master
 
     - name: Upload Flatpak to release
       uses: softprops/action-gh-release@v2
