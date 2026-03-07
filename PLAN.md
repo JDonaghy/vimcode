@@ -5,6 +5,7 @@
 ---
 
 ## Recently Completed
+- **Session 143**: Bug fixes — `:q` dirty guard allows close when buffer visible in another split, `autoread` setting + file auto-reload detection (2s poll in GTK+TUI), `:new`/`:split` respect `splitbelow`/`splitright`, `:e!` reload from disk, 9 integration tests
 - **Session 142**: Vim compat batch 3 — 15 new commands (94% → 97%), g?{motion} ROT13, CTRL-@, CTRL-V {char}, CTRL-O auto-return, !{motion}{filter}, CTRL-W H/J/K/L/T/x, visual block I/A, o_v/o_V force motion, 29 integration tests
 - **Session 141**: Vim compat batch 2 — 27 new commands (85% → 94%), gq/gw format operators, ga/g8/go/gm/gM/gI/gx/g'/g`/g&, CTRL-^, CTRL-L, N%, zs/ze, CTRL-W p/t/b/f/d, insert CTRL-A/CTRL-G u/j/k, visual gq/g CTRL-A/g CTRL-X, :make, :b {name}, 38 integration tests
 - **Session 140**: Vim compat batch — 29 new commands (78% → 85%), +/-/_/| motions, gp/gP, @:, backtick text objects, insert CTRL-E/Y, visual r{char}, &, CTRL-W resize/equalize/maximize, bracket/section/method navigation, 45 integration tests

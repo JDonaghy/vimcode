@@ -726,6 +726,13 @@ pub static SETTING_DEFS: &[SettingDef] = &[
         setting_type: SettingType::Bool,
     },
     SettingDef {
+        key: "autoread",
+        label: "Auto Read",
+        description: "Automatically reload files when changed externally",
+        category: "Workspace",
+        setting_type: SettingType::Bool,
+    },
+    SettingDef {
         key: "splitbelow",
         label: "Split Below",
         description: "Open new horizontal splits below the current window",

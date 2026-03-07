@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use super::buffer::{Buffer, BufferId};
 use super::cursor::Cursor;
@@ -89,6 +90,12 @@ pub struct BufferState {
     pub md_rendered: Option<crate::core::markdown::MdRendered>,
     /// LSP semantic tokens (decoded, absolute positions). Overlays tree-sitter highlights.
     pub semantic_tokens: Vec<crate::core::lsp::SemanticToken>,
+    /// Last-known modification time of the file on disk.
+    /// Set on file open and save; used by `check_file_changes()` to detect external edits.
+    pub file_mtime: Option<SystemTime>,
+    /// Whether a "file changed on disk" warning has already been shown for the
+    /// current external modification.  Reset when the mtime is updated (reload / save).
+    pub file_change_warned: bool,
 }
 
 impl std::fmt::Debug for BufferState {
@@ -126,6 +133,8 @@ impl BufferState {
             read_only: false,
             md_rendered: None,
             semantic_tokens: Vec::new(),
+            file_mtime: None,
+            file_change_warned: false,
         };
         state.update_syntax();
         state
@@ -136,6 +145,7 @@ impl BufferState {
         let syntax = Syntax::new_from_path(path.to_str()).unwrap_or_default();
         let lsp_language_id = crate::core::lsp::language_id_from_path(&path);
         let canonical_path = path.canonicalize().ok();
+        let file_mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
 
         let mut state = Self {
             buffer,
@@ -157,6 +167,8 @@ impl BufferState {
             read_only: false,
             md_rendered: None,
             semantic_tokens: Vec::new(),
+            file_mtime,
+            file_change_warned: false,
         };
         state.update_syntax();
         state
@@ -176,7 +188,33 @@ impl BufferState {
             self.buffer.save_to_file(path)?;
             self.dirty = false;
             self.saved_undo_depth = Some(self.undo_stack.len());
+            self.file_mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+            self.file_change_warned = false;
             Ok(self.buffer.len_lines())
+        } else {
+            Err(io::Error::new(io::ErrorKind::NotFound, "No file name"))
+        }
+    }
+
+    /// Re-read the file from disk, replacing all buffer content.
+    /// Resets dirty flag, undo/redo stacks, and updates mtime.
+    pub fn reload_from_disk(&mut self) -> Result<(), io::Error> {
+        if let Some(ref path) = self.file_path {
+            let text = std::fs::read_to_string(path)?;
+            let char_len = self.buffer.len_chars();
+            self.buffer.delete_range(0, char_len);
+            if !text.is_empty() {
+                self.buffer.insert(0, &text);
+            }
+            self.dirty = false;
+            self.saved_undo_depth = Some(0);
+            self.undo_stack.clear();
+            self.redo_stack.clear();
+            self.current_undo_group = None;
+            self.file_mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+            self.file_change_warned = false;
+            self.update_syntax();
+            Ok(())
         } else {
             Err(io::Error::new(io::ErrorKind::NotFound, "No file name"))
         }
@@ -491,6 +529,11 @@ impl BufferManager {
     }
 
     /// Get a reference to a buffer state.
+    /// Iterate over all (BufferId, BufferState) pairs.
+    pub fn iter(&self) -> impl Iterator<Item = (&BufferId, &BufferState)> {
+        self.buffers.iter()
+    }
+
     pub fn get(&self, id: BufferId) -> Option<&BufferState> {
         self.buffers.get(&id)
     }

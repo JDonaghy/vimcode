@@ -383,3 +383,221 @@ fn test_visual_block_a_on_empty_buffer() {
     press_key(&mut e, "Escape");
     assert_buf(&e, "aZ\nbZ\ncZ\n");
 }
+
+// =============================================================================
+// Bug fix: :q on dirty buffer in split should NOT block when another window
+// still shows the same buffer.
+// =============================================================================
+
+#[test]
+fn test_quit_dirty_split_allows_close() {
+    let mut e = engine_with("hello\n");
+    // Split so the same buffer is visible in two windows
+    exec(&mut e, "split");
+    assert_eq!(e.windows.len(), 2);
+    // Make the buffer dirty
+    type_chars(&mut e, "iX");
+    press_key(&mut e, "Escape");
+    assert!(e.dirty());
+    // :q should succeed (close current split) because the other window still shows this buffer
+    let action = exec(&mut e, "quit");
+    assert_ne!(action, vimcode_core::EngineAction::Error);
+    assert_eq!(e.windows.len(), 1);
+}
+
+#[test]
+fn test_quit_dirty_last_window_blocks() {
+    let mut e = engine_with("hello\n");
+    // Make the buffer dirty
+    type_chars(&mut e, "iX");
+    press_key(&mut e, "Escape");
+    assert!(e.dirty());
+    // :q should block because this is the only window showing the dirty buffer
+    let action = exec(&mut e, "quit");
+    assert_eq!(action, vimcode_core::EngineAction::Error);
+    assert!(e.message.contains("No write since last change"));
+}
+
+// =============================================================================
+// Bug fix: file auto-reload (check_file_changes)
+// =============================================================================
+
+#[test]
+fn test_check_file_changes_reloads_clean_buffer() {
+    use std::io::Write;
+    let dir = std::env::temp_dir().join("vimcode_test_autoread");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("autoread_clean.txt");
+    std::fs::write(&path, "original\n").unwrap();
+
+    let mut e = engine_with("");
+    e.open_file_in_tab(&path);
+    assert_eq!(e.buffer().to_string(), "original\n");
+
+    // Modify the file externally (with a slight mtime bump)
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    {
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(b"modified\n").unwrap();
+    }
+
+    // Trigger check
+    e.check_file_changes();
+    assert_eq!(e.buffer().to_string(), "modified\n");
+    assert!(e.message.contains("reloaded"));
+    assert!(!e.dirty());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_check_file_changes_warns_dirty_buffer() {
+    use std::io::Write;
+    let dir = std::env::temp_dir().join("vimcode_test_autoread2");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("autoread_dirty.txt");
+    std::fs::write(&path, "original\n").unwrap();
+
+    let mut e = engine_with("");
+    e.open_file_in_tab(&path);
+    // Make the buffer dirty
+    type_chars(&mut e, "iX");
+    press_key(&mut e, "Escape");
+    assert!(e.dirty());
+
+    // Modify the file externally
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    {
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(b"modified\n").unwrap();
+    }
+
+    // Trigger check — should warn, NOT reload
+    e.check_file_changes();
+    assert!(e.message.contains("W12"));
+    assert!(e.message.contains("has changed"));
+    // Buffer should NOT have been modified
+    assert!(e.buffer().to_string().starts_with("X"));
+
+    // Second check should NOT repeat the warning
+    e.message.clear();
+    e.check_file_changes();
+    assert!(e.message.is_empty());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// =============================================================================
+// Bug fix: :new / :split respect splitbelow / splitright
+// =============================================================================
+
+#[test]
+fn test_new_default_opens_above() {
+    use vimcode_core::core::window::{SplitDirection, WindowLayout};
+    let mut e = engine_with("hello\n");
+    // Default: splitbelow=false → new window goes on top (new_first=true)
+    let old_win = e.active_window_id();
+    exec(&mut e, "new");
+    let new_win = e.active_window_id();
+    assert_ne!(old_win, new_win);
+    // The new window should be the first child (top)
+    match &e.active_tab().layout {
+        WindowLayout::Split {
+            direction, first, ..
+        } => {
+            assert!(matches!(direction, SplitDirection::Horizontal));
+            assert!(matches!(first.as_ref(), WindowLayout::Leaf(id) if *id == new_win));
+        }
+        _ => panic!("Expected split layout"),
+    }
+}
+
+#[test]
+fn test_new_splitbelow_opens_below() {
+    use vimcode_core::core::window::{SplitDirection, WindowLayout};
+    let mut e = engine_with("hello\n");
+    e.settings.splitbelow = true;
+    let old_win = e.active_window_id();
+    exec(&mut e, "new");
+    let new_win = e.active_window_id();
+    assert_ne!(old_win, new_win);
+    // The new window should be the second child (bottom)
+    match &e.active_tab().layout {
+        WindowLayout::Split {
+            direction, second, ..
+        } => {
+            assert!(matches!(direction, SplitDirection::Horizontal));
+            assert!(matches!(second.as_ref(), WindowLayout::Leaf(id) if *id == new_win));
+        }
+        _ => panic!("Expected split layout"),
+    }
+}
+
+#[test]
+fn test_vnew_default_opens_left() {
+    use vimcode_core::core::window::{SplitDirection, WindowLayout};
+    let mut e = engine_with("hello\n");
+    // Default: splitright=false → new window goes left (new_first=true)
+    exec(&mut e, "vnew");
+    let new_win = e.active_window_id();
+    match &e.active_tab().layout {
+        WindowLayout::Split {
+            direction, first, ..
+        } => {
+            assert!(matches!(direction, SplitDirection::Vertical));
+            assert!(matches!(first.as_ref(), WindowLayout::Leaf(id) if *id == new_win));
+        }
+        _ => panic!("Expected split layout"),
+    }
+}
+
+#[test]
+fn test_vnew_splitright_opens_right() {
+    use vimcode_core::core::window::{SplitDirection, WindowLayout};
+    let mut e = engine_with("hello\n");
+    e.settings.splitright = true;
+    exec(&mut e, "vnew");
+    let new_win = e.active_window_id();
+    match &e.active_tab().layout {
+        WindowLayout::Split {
+            direction, second, ..
+        } => {
+            assert!(matches!(direction, SplitDirection::Vertical));
+            assert!(matches!(second.as_ref(), WindowLayout::Leaf(id) if *id == new_win));
+        }
+        _ => panic!("Expected split layout"),
+    }
+}
+
+// =============================================================================
+// :e! — reload current file from disk
+// =============================================================================
+
+#[test]
+fn test_edit_bang_reloads_file() {
+    let dir = std::env::temp_dir().join("vimcode_test_edit_bang");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("edit_bang.txt");
+    std::fs::write(&path, "original\n").unwrap();
+
+    let mut e = engine_with("");
+    e.open_file_in_tab(&path);
+    assert_eq!(e.buffer().to_string(), "original\n");
+
+    // Make the buffer dirty
+    type_chars(&mut e, "iXXX");
+    press_key(&mut e, "Escape");
+    assert!(e.dirty());
+
+    // Modify file on disk
+    std::fs::write(&path, "from disk\n").unwrap();
+
+    // :e! should reload, discarding local changes
+    let action = exec(&mut e, "edit!");
+    assert_ne!(action, vimcode_core::EngineAction::Error);
+    assert_eq!(e.buffer().to_string(), "from disk\n");
+    assert!(!e.dirty());
+    assert!(e.message.contains("reloaded"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -1989,6 +1989,82 @@ impl Engine {
         }
     }
 
+    /// Check all open buffers for external file modifications.
+    ///
+    /// For each buffer with a file path, compare the on-disk mtime against the
+    /// stored mtime.  If the file has changed:
+    /// - Clean buffers with `autoread` enabled: silently reload.
+    /// - Dirty buffers (or `autoread` disabled): show a one-time warning.
+    ///
+    /// Call this from the UI backend on window focus gain or periodic tick.
+    /// Returns `true` if any buffer was reloaded or a warning was shown.
+    pub fn check_file_changes(&mut self) -> bool {
+        if !self.settings.autoread {
+            return false;
+        }
+        let mut any_changed = false;
+
+        // Collect buffer IDs and paths first to avoid borrow conflicts.
+        let to_check: Vec<(BufferId, PathBuf, bool, bool, Option<std::time::SystemTime>)> = self
+            .buffer_manager
+            .iter()
+            .filter_map(|(id, state)| {
+                let path = state.file_path.as_ref()?.clone();
+                Some((
+                    *id,
+                    path,
+                    state.dirty,
+                    state.file_change_warned,
+                    state.file_mtime,
+                ))
+            })
+            .collect();
+
+        for (buf_id, path, is_dirty, already_warned, stored_mtime) in to_check {
+            let disk_mtime = match std::fs::metadata(&path).and_then(|m| m.modified()) {
+                Ok(t) => t,
+                Err(_) => continue, // file deleted or inaccessible — ignore
+            };
+
+            let changed = match stored_mtime {
+                Some(prev) => disk_mtime != prev,
+                None => false, // no stored mtime (e.g. new buffer) — skip
+            };
+
+            if !changed {
+                continue;
+            }
+
+            if is_dirty {
+                // Buffer has unsaved changes — warn (once per external modification).
+                if !already_warned {
+                    if let Some(state) = self.buffer_manager.get_mut(buf_id) {
+                        state.file_change_warned = true;
+                    }
+                    let name = path.display();
+                    self.message = format!(
+                        "W12: Warning: File \"{}\" has changed since editing started. Use :e! to reload.",
+                        name
+                    );
+                    any_changed = true;
+                }
+            } else {
+                // Buffer is clean — silently reload.
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                if let Some(state) = self.buffer_manager.get_mut(buf_id) {
+                    if state.reload_from_disk().is_ok() {
+                        self.message = format!("\"{}\" reloaded", name);
+                        any_changed = true;
+                    }
+                }
+            }
+        }
+        any_changed
+    }
+
     /// Save the current buffer, optionally requesting LSP formatting first.
     ///
     /// When `format_on_save` is enabled and an LSP server supports formatting,
@@ -2833,10 +2909,15 @@ impl Engine {
 
         self.windows.insert(new_window_id, new_window);
 
-        // Update layout
+        // Update layout — respect splitbelow / splitright settings.
+        // new_first=true means the *new* window goes first (top / left).
+        let new_first = match direction {
+            SplitDirection::Horizontal => !self.settings.splitbelow,
+            SplitDirection::Vertical => !self.settings.splitright,
+        };
         let tab = self.active_tab_mut();
         tab.layout
-            .split_at(current_window_id, direction, new_window_id, false);
+            .split_at(current_window_id, direction, new_window_id, new_first);
         tab.active_window = new_window_id;
 
         if file_path.is_some() {
@@ -12189,6 +12270,31 @@ impl Engine {
             return EngineAction::None;
         }
 
+        // Handle :e[dit]! — reload current file from disk (discard changes)
+        if cmd == "edit!" {
+            let buf_id = self.active_buffer_id();
+            let state = self.buffer_manager.get_mut(buf_id).unwrap();
+            match state.reload_from_disk() {
+                Ok(()) => {
+                    let name = state.display_name();
+                    self.message = format!("\"{}\" reloaded", name);
+                }
+                Err(e) => {
+                    self.message = format!("Error: {}", e);
+                    return EngineAction::Error;
+                }
+            }
+            return EngineAction::None;
+        }
+        if let Some(filename) = cmd.strip_prefix("edit! ") {
+            let filename = filename.trim();
+            if filename.is_empty() {
+                self.message = "No file name".to_string();
+                return EngineAction::Error;
+            }
+            return EngineAction::OpenFile(PathBuf::from(filename));
+        }
+
         // Handle :e[dit] <filename>
         if let Some(filename) = cmd.strip_prefix("edit ") {
             let filename = filename.trim();
@@ -12746,10 +12852,20 @@ impl Engine {
                 EngineAction::None
             }
             "quit" => {
-                // Block if the current buffer has unsaved changes.
+                // Block if the current buffer has unsaved changes AND this is
+                // the last window showing it.  If another window still displays
+                // the same buffer the user can still save from there.
                 if self.dirty() {
-                    self.message = "No write since last change (add ! to override)".to_string();
-                    return EngineAction::Error;
+                    let buf_id = self.active_buffer_id();
+                    let current_win = self.active_window_id();
+                    let other_views = self
+                        .windows
+                        .values()
+                        .any(|w| w.buffer_id == buf_id && w.id != current_win);
+                    if !other_views {
+                        self.message = "No write since last change (add ! to override)".to_string();
+                        return EngineAction::Error;
+                    }
                 }
                 // If this is the very last window in the very last tab of the last group: quit.
                 let is_last = self.group_layout.is_single_group()

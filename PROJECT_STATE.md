@@ -1,9 +1,9 @@
 # VimCode Project State
 
-**Last updated:** Mar 6, 2026 (Session 142 — Vim compat batch 3: 15 commands) | **Tests:** 2612
+**Last updated:** Mar 7, 2026 (Session 143 — 3 bug fixes + :e! reload) | **Tests:** 2621
 
 > Feature documentation lives in **README.md**.
-> Per-session implementation notes through Session 142 are in **SESSION_HISTORY.md**.
+> Per-session implementation notes through Session 143 are in **SESSION_HISTORY.md**.
 
 ---
 
@@ -25,6 +25,9 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 143 — File management bug fixes (2621 tests):**
+Fixed 3 bugs found during Neovim comparison + added `:e!`: (1) `:q` now allows closing a dirty buffer if it's visible in another window (was blocked unconditionally), (2) File auto-reload with `autoread` setting (default true) — `file_mtime` tracking on `BufferState`, `check_file_changes()` on Engine (called every 2s from both GTK and TUI backends), `reload_from_disk()` for clean buffers, W12 warning for dirty buffers, (3) `:new`/`:split`/`:vnew`/`:vsplit` now respect `splitbelow`/`splitright` settings (was hardcoded `new_first=false`), (4) `:e!` reload current file from disk (discard changes). 9 integration tests in `tests/vim_compat_batch3.rs`.
 
 **Session 142 — Vim compatibility batch 3: 15 new commands (2612 tests):**
 Implemented 15 more missing Vim commands, raising VIM_COMPATIBILITY.md from 380/403 (94%) to 400/414 (97%). `g?{motion}` ROT13 encode (with text objects), `CTRL-@` insert previous text + exit, `CTRL-V {char}` insert literal character, `CTRL-O` auto-return to Insert after one Normal command, `!{motion}{filter}` filter through external command, `CTRL-W H/J/K/L` move window to far edge, `CTRL-W T` move window to new group, `CTRL-W x` exchange windows, visual block `I`/`A` (insert/append applied to all block lines on Escape), `o_v`/`o_V` force charwise/linewise motion mode. Added `insert_ctrl_o_active`, `insert_ctrl_v_pending`, `visual_block_insert_info`, `force_motion_mode` fields. Enhanced `apply_operator_text_object()` with case/ROT13/indent/filter support. 29 integration tests in `tests/vim_compat_batch3.rs`. Sections now at 100%: Window commands (31/31), Visual mode (26/26), Editing (51/51).

@@ -160,6 +160,8 @@ struct App {
     window: gtk4::Window,
     /// Last time sc_refresh() was called for the Git sidebar auto-refresh.
     last_sc_refresh: std::time::Instant,
+    /// Last time check_file_changes() was called for auto-reload detection.
+    last_file_check: std::time::Instant,
     /// Full-window overlay DrawingArea that draws the menu dropdown.
     /// Can-target toggles true/false with menu open/close.
     menu_dropdown_da: Rc<RefCell<Option<gtk4::DrawingArea>>>,
@@ -1825,6 +1827,7 @@ impl SimpleComponent for App {
             terminal_split_dragging: false,
             group_divider_dragging: None,
             last_sc_refresh: std::time::Instant::now(),
+            last_file_check: std::time::Instant::now(),
             menu_dropdown_da: menu_dropdown_da_ref.clone(),
             menu_dd_line_height: menu_dd_lh.clone(),
             css_provider,
@@ -4579,6 +4582,13 @@ impl SimpleComponent for App {
                         da.queue_draw();
                     }
                     self.draw_needed.set(true);
+                }
+                // Auto-reload buffers whose files changed on disk.
+                if self.last_file_check.elapsed() >= std::time::Duration::from_secs(2) {
+                    self.last_file_check = std::time::Instant::now();
+                    if self.engine.borrow_mut().check_file_changes() {
+                        self.draw_needed.set(true);
+                    }
                 }
                 // Poll for completed extension registry fetch.
                 {

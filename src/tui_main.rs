@@ -879,6 +879,8 @@ fn event_loop(
         .unwrap_or_else(Instant::now);
     // Auto-refresh sidebar to reflect external filesystem changes.
     let mut last_sidebar_refresh = Instant::now();
+    // Auto-reload buffers whose files changed on disk.
+    let mut last_file_check = Instant::now();
     // mtime of settings.json at last check — used to auto-reload when user edits the file.
     let mut settings_mtime: Option<std::time::SystemTime> = {
         let path = crate::core::settings::Settings::settings_file_path();
@@ -1087,6 +1089,13 @@ fn event_loop(
                 }
                 last_sidebar_refresh = Instant::now();
                 needs_redraw = true;
+            }
+            // Auto-reload buffers whose files changed on disk.
+            if last_file_check.elapsed() >= Duration::from_secs(2) {
+                last_file_check = Instant::now();
+                if engine.check_file_changes() {
+                    needs_redraw = true;
+                }
             }
             // Auto-reload settings.json when its mtime changes (e.g. after :w in the editor).
             {

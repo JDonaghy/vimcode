@@ -154,6 +154,11 @@ pub struct Settings {
     #[serde(default)]
     pub cursorline: bool,
 
+    /// Automatically reload files when changed externally (default true).
+    /// Vim: `autoread`.
+    #[serde(default = "default_autoread")]
+    pub autoread: bool,
+
     /// Open new horizontal splits below the current window (default false).
     #[serde(default)]
     pub splitbelow: bool,
@@ -264,6 +269,10 @@ fn default_plugins_enabled() -> bool {
 }
 
 fn default_hlsearch() -> bool {
+    true
+}
+
+fn default_autoread() -> bool {
     true
 }
 
@@ -550,6 +559,7 @@ impl Default for Settings {
             smartcase: false,
             scrolloff: 0,
             cursorline: false,
+            autoread: default_autoread(),
             splitbelow: false,
             splitright: false,
             colorcolumn: String::new(),
@@ -781,6 +791,7 @@ impl Settings {
             "ignorecase" | "ic" => self.ignorecase = enable,
             "smartcase" | "scs" => self.smartcase = enable,
             "cursorline" | "cul" => self.cursorline = enable,
+            "autoread" | "ar" => self.autoread = enable,
             "splitbelow" | "sb" => self.splitbelow = enable,
             "splitright" | "spr" => self.splitright = enable,
             "ai_completions" => self.ai_completions = enable,
@@ -1017,6 +1028,7 @@ impl Settings {
                 EditorMode::Vscode => "vscode".to_string(),
             },
             "explorer_visible_on_startup" => self.explorer_visible_on_startup.to_string(),
+            "autoread" => self.autoread.to_string(),
             "splitbelow" => self.splitbelow.to_string(),
             "splitright" => self.splitright.to_string(),
             "lsp_enabled" => self.lsp_enabled.to_string(),
@@ -1093,6 +1105,7 @@ impl Settings {
                 };
             }
             "explorer_visible_on_startup" => self.explorer_visible_on_startup = value == "true",
+            "autoread" => self.autoread = value == "true",
             "splitbelow" => self.splitbelow = value == "true",
             "splitright" => self.splitright = value == "true",
             "lsp_enabled" => self.lsp_enabled = value == "true",

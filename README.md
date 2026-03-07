@@ -11,7 +11,7 @@ There's a touch of irony here - using a cli tool to write the editor that I've w
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 2612+ tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 2621+ tests, zero async runtime dependency
 
 > **Note:** VimCode does not implement VimScript. Extension and scripting is handled via
 > the built-in Lua 5.4 plugin system. The goal is full Vim *keybinding* and *editing*
@@ -241,7 +241,7 @@ cargo fmt
 
 **Quit / Save**
 - `:w` — save; `:wq` — save and quit
-- `:q` — close tab (quits if last tab; blocked if dirty)
+- `:q` — close tab (quits if last tab; blocked if dirty unless visible in another split)
 - `:q!` — force-close tab
 - `:qa` / `:qa!` — close all tabs (blocked / force)
 - `Ctrl-S` — save in any mode without changing mode
@@ -761,6 +761,7 @@ Runtime changes are written through to `~/.config/vimcode/settings.json` immedia
 | `wrap` / `nowrap` | | off | Soft-wrap long lines at viewport edge |
 | `splitbelow` / `nosplitbelow` | `sb` | off | Horizontal splits open below current window |
 | `splitright` / `nosplitright` | `spr` | off | Vertical splits open to right of current window |
+| `autoread` / `noautoread` | `ar` | on | Automatically reload files modified on disk |
 | `lsp` / `nolsp` | | on | Enable/disable LSP language servers |
 | `formatonsave` / `noformatonsave` | `fos` | off | Auto-format buffer via LSP before saving |
 | `mode=vim` / `mode=vscode` | | vim | Editor mode (see **VSCode Mode** below) |
@@ -1042,6 +1043,7 @@ All ex commands support Vim-style abbreviations (e.g., `:j` for `:join`, `:y` fo
 | `:wqa` / `:xa` | Write all and quit |
 | `:q` / `:q!` / `:qa` / `:qa!` | Quit / force / all / force-all |
 | `:e <file>` | Open file |
+| `:e!` | Reload current file from disk (discard changes) |
 | `:split` / `:vsplit` | Horizontal / vertical split |
 | `:tabnew` / `:tabclose` | New tab / close tab |
 | `:bn` / `:bp` / `:b#` | Buffer next / prev / alternate |
