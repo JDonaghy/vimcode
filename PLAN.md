@@ -5,6 +5,7 @@
 ---
 
 ## Recently Completed
+- **Session 141**: Vim compat batch 2 — 27 new commands (85% → 94%), gq/gw format operators, ga/g8/go/gm/gM/gI/gx/g'/g`/g&, CTRL-^, CTRL-L, N%, zs/ze, CTRL-W p/t/b/f/d, insert CTRL-A/CTRL-G u/j/k, visual gq/g CTRL-A/g CTRL-X, :make, :b {name}, 38 integration tests
 - **Session 140**: Vim compat batch — 29 new commands (78% → 85%), +/-/_/| motions, gp/gP, @:, backtick text objects, insert CTRL-E/Y, visual r{char}, &, CTRL-W resize/equalize/maximize, bracket/section/method navigation, 45 integration tests
 - **Session 139**: Comprehensive z-commands — 15 new z-commands (32% → 96%), fold create/delete/recursive, horizontal scroll, 33 integration tests
 - **Session 138**: `VIM_COMPATIBILITY.md` — systematic Vim command inventory (304/411 = 74%), VimScript scope note in README.md

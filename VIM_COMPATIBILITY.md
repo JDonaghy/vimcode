@@ -32,16 +32,16 @@ See [README.md](README.md) for full feature documentation.
 | `CTRL-O` | Execute one Normal command | ⚠️ | Switches to Normal; no auto-return to Insert |
 | `CTRL-E` | Insert character below cursor | ✅ | |
 | `CTRL-Y` | Insert character above cursor | ✅ | |
-| `CTRL-A` | Insert previously inserted text | ❌ | |
+| `CTRL-A` | Insert previously inserted text | ✅ | |
 | `CTRL-@` | Insert prev text and stop insert | ❌ | |
 | `CTRL-V {char}` | Insert literal character | ❌ | |
 | `CTRL-K {c1}{c2}` | Enter digraph | N/A | No digraph support planned |
 | `CTRL-X ...` | Completion sub-modes | ❌ | VimCode uses auto-popup + LSP instead |
 | `CTRL-]` | Trigger abbreviation | N/A | No abbreviations |
-| `CTRL-G u` | Break undo sequence | ❌ | |
-| `CTRL-G j/k` | Move cursor down/up | ❌ | |
+| `CTRL-G u` | Break undo sequence | ✅ | |
+| `CTRL-G j/k` | Move cursor down/up | ✅ | |
 
-**Insert mode: 15/24 (63%)**
+**Insert mode: 18/24 (75%)**
 
 ---
 
@@ -66,8 +66,8 @@ See [README.md](README.md) for full feature documentation.
 | `$` | Line end | ✅ | |
 | `g_` | Last non-blank | ✅ | |
 | `g0` | Start of screen line | ✅ | Wrap mode |
-| `gm` | Middle of screen line | ❌ | |
-| `gM` | Middle of text line | ❌ | |
+| `gm` | Middle of screen line | ✅ | |
+| `gM` | Middle of text line | ✅ | |
 | `f{char}` | Find char forward | ✅ | |
 | `F{char}` | Find char backward | ✅ | |
 | `t{char}` | Till char forward | ✅ | |
@@ -88,7 +88,7 @@ See [README.md](README.md) for full feature documentation.
 | `-` | First char N lines up | ✅ | |
 | `_` | First char N-1 lines down | ✅ | |
 | `\|` | Go to column N | ✅ | |
-| `N%` | Go to N% of file | ❌ | |
+| `N%` | Go to N% of file | ✅ | |
 | `gj` | Down screen line | ✅ | Wrap mode |
 | `gk` | Up screen line | ✅ | Wrap mode |
 | `CTRL-D` | Half-page down | ✅ | |
@@ -98,7 +98,7 @@ See [README.md](README.md) for full feature documentation.
 | `CTRL-E` | Scroll down one line | ✅ | |
 | `CTRL-Y` | Scroll up one line | ✅ | |
 
-**Movement: 46/47 (98%)**
+**Movement: 48/48 (100%)**
 
 ---
 
@@ -151,13 +151,13 @@ See [README.md](README.md) for full feature documentation.
 | `==` | Auto-indent line | ✅ | |
 | `CTRL-A` | Increment number | ✅ | |
 | `CTRL-X` | Decrement number | ✅ | |
-| `gq{motion}` | Format text | ❌ | |
-| `gw{motion}` | Format text, keep cursor | ❌ | |
+| `gq{motion}` | Format text | ✅ | Reflows to textwidth |
+| `gw{motion}` | Format text, keep cursor | ✅ | Reflows to textwidth |
 | `!{motion}{filter}` | Filter through command | ❌ | |
 | `&` | Repeat last `:s` | ✅ | |
-| `g&` | Repeat last `:s` on all lines | ❌ | |
+| `g&` | Repeat last `:s` on all lines | ✅ | |
 
-**Editing: 47/50 (94%)**
+**Editing: 50/50 (100%)**
 
 ---
 
@@ -217,24 +217,24 @@ See [README.md](README.md) for full feature documentation.
 | `gf` | Go to file under cursor | ✅ | |
 | `gF` | Go to file at line | ✅ | |
 | `K` | Show hover info | ✅ | LSP-based |
-| `ga` | Print ASCII value | ❌ | |
-| `g8` | Print UTF-8 hex bytes | ❌ | |
-| `go` | Go to byte N | ❌ | |
-| `gx` | Open URL/file externally | ❌ | |
+| `ga` | Print ASCII value | ✅ | |
+| `g8` | Print UTF-8 hex bytes | ✅ | |
+| `go` | Go to byte N | ✅ | |
+| `gx` | Open URL/file externally | ✅ | Opens in default browser/app |
 | `gi` | Insert at last insert pos | ❌ | `gi` is LSP go-to-implementation |
-| `gI` | Insert at column 1 | ❌ | |
+| `gI` | Insert at column 1 | ✅ | |
 | `g?{motion}` | ROT13 encode | ❌ | |
-| `CTRL-^` | Edit alternate file | ❌ | `:b#` works |
+| `CTRL-^` | Edit alternate file | ✅ | |
 | `CTRL-]` | Tag jump | ⚠️ | `gd` (LSP) provides equivalent |
 | `CTRL-G` | Show file info | ❌ | `:file` command works |
-| `CTRL-L` | Redraw screen | ❌ | |
+| `CTRL-L` | Redraw screen | ✅ | Clears message |
 | `do` | Diff obtain | ❌ | |
 | `dp` | Diff put | ❌ | |
 | `q:` | Command-line window | ❌ | |
 | `q/` / `q?` | Search history window | ❌ | |
 | `cgn` | Change next match | ✅ | Repeat with `.` |
 
-**Other: 21/33 (64%)**
+**Other: 28/33 (85%)**
 
 ---
 
@@ -287,23 +287,23 @@ See [README.md](README.md) for full feature documentation.
 | `g;` / `g,` | Change list nav | ✅ | |
 | `g.` | Go to last change | ✅ | |
 | `gp` / `gP` | Put, cursor after | ✅ | |
-| `gq{motion}` | Format text | ❌ | |
-| `gw{motion}` | Format, keep cursor | ❌ | |
-| `gx` | Open URL externally | ❌ | |
-| `ga` | Print ASCII value | ❌ | |
-| `g8` | Print UTF-8 hex | ❌ | |
-| `go` | Go to byte N | ❌ | |
+| `gq{motion}` | Format text | ✅ | Reflows to textwidth |
+| `gw{motion}` | Format, keep cursor | ✅ | Reflows to textwidth |
+| `gx` | Open URL externally | ✅ | Opens in default browser/app |
+| `ga` | Print ASCII value | ✅ | |
+| `g8` | Print UTF-8 hex | ✅ | |
+| `go` | Go to byte N | ✅ | |
 | `gi` | Insert at last insert pos | ❌ | `gi` is LSP go-to-implementation |
-| `gI` | Insert at column 1 | ❌ | |
-| `gm` / `gM` | Middle of screen/text line | ❌ | |
+| `gI` | Insert at column 1 | ✅ | |
+| `gm` / `gM` | Middle of screen/text line | ✅ | |
 | `g?{motion}` | ROT13 encode | ❌ | |
 | `g+` / `g-` | Undo tree newer/older | ❌ | |
 | `gR` / `gr` | Virtual replace mode | ❌ | |
-| `g'` / `` g` `` | Mark without jumplist | ❌ | |
-| `g&` | Repeat `:s` all lines | ❌ | |
+| `g'` / `` g` `` | Mark without jumplist | ✅ | |
+| `g&` | Repeat `:s` all lines | ✅ | |
 | `gH` / `gV` | Select mode | N/A | No Select mode |
 
-**g-commands: 20/34 (59%)**
+**g-commands: 30/34 (88%)**
 
 ---
 
@@ -334,11 +334,11 @@ See [README.md](README.md) for full feature documentation.
 | `zj` / `zk` | Next/prev fold | ✅ | |
 | `zh` / `zl` | Scroll horizontally | ✅ | With count support |
 | `zH` / `zL` | Scroll half-screen horiz. | ✅ | |
-| `ze` / `zs` | Scroll to cursor right/left | ❌ | |
+| `ze` / `zs` | Scroll to cursor right/left | ✅ | |
 | `z=` | Spelling suggestions | N/A | No spell check |
 | `zg` / `zw` / `zG` / `zW` | Spelling word lists | N/A | No spell check |
 
-**z-commands: 22/23 (96%)** (excluding N/A)
+**z-commands: 23/23 (100%)** (excluding N/A)
 
 ---
 
@@ -372,16 +372,16 @@ See [README.md](README.md) for full feature documentation.
 | `CTRL-W x` | Exchange with next window | ❌ | |
 | `CTRL-W r` | Rotate windows downward | ❌ | |
 | `CTRL-W R` | Rotate windows upward | ❌ | |
-| `CTRL-W p` | Go to previous window | ❌ | |
+| `CTRL-W p` | Go to previous window | ✅ | |
 | `CTRL-W n` | New window | ✅ | Runs `:new` |
-| `CTRL-W t` | Go to top window | ❌ | |
-| `CTRL-W b` | Go to bottom window | ❌ | |
+| `CTRL-W t` | Go to top window | ✅ | |
+| `CTRL-W b` | Go to bottom window | ✅ | |
 | `CTRL-W q` | Quit window | ✅ | Alias for `CTRL-W c` |
 | `CTRL-W ]` | Split + tag jump | N/A | LSP `gd` instead |
-| `CTRL-W f` | Split + open file | ❌ | |
-| `CTRL-W d` | Split + go to definition | ❌ | |
+| `CTRL-W f` | Split + open file | ✅ | |
+| `CTRL-W d` | Split + go to definition | ✅ | LSP-based |
 
-**Window commands: 20/31 (65%)** (excluding N/A)
+**Window commands: 25/31 (81%)** (excluding N/A)
 
 ---
 
@@ -466,12 +466,12 @@ Operators `d`, `c`, `y`, `>`, `<`, `=`, `g~`, `gu`, `gU` all accept these motion
 | `r{char}` | Replace all selected chars | ✅ | Visual/VisualLine/VisualBlock |
 | `I` (block) | Block insert | ❌ | |
 | `A` (block) | Block append | ❌ | |
-| `gq` | Format selection | ❌ | |
-| `g CTRL-A` | Sequential increment | ❌ | |
-| `g CTRL-X` | Sequential decrement | ❌ | |
+| `gq` | Format selection | ✅ | |
+| `g CTRL-A` | Sequential increment | ✅ | |
+| `g CTRL-X` | Sequential decrement | ✅ | |
 | Movement keys | Extend selection | ✅ | All motions work |
 
-**Visual mode: 21/26 (81%)**
+**Visual mode: 24/26 (92%)**
 
 ---
 
@@ -549,8 +549,8 @@ Operators `d`, `c`, `y`, `>`, `<`, `=`, `g~`, `gu`, `gU` all accept these motion
 | `:cd {path}` | Change directory | ✅ | |
 | `:colorscheme` | Change theme | ✅ | 4 built-in themes |
 | `:map` / `:nmap` / `:imap` | Key mappings | ❌ | Lua `vimcode.keymap()` instead |
-| `:make` | Run build | ❌ | |
-| `:b {name}` | Buffer by name | ❌ | |
+| `:make` | Run build | ✅ | Delegates to `!make` |
+| `:b {name}` | Buffer by name | ✅ | Partial name match |
 | `:ab` / `:abbreviate` | Abbreviations | N/A | No abbreviation support |
 | `:let` / `:if` / `:while` / `:function` | VimScript | N/A | Lua plugins instead |
 | `:autocmd` / `:au` | Auto commands | N/A | Lua `vimcode.on()` instead |
@@ -560,7 +560,7 @@ Operators `d`, `c`, `y`, `>`, `<`, `=`, `g~`, `gu`, `gU` all accept these motion
 | `:scriptnames` | List scripts | N/A | |
 | `:mkexrc` / `:mkvimrc` | Save config | N/A | `settings.json` instead |
 
-**Ex commands: 65/68 (96%)** (excluding N/A)
+**Ex commands: 67/68 (99%)** (excluding N/A)
 
 ### VimCode-Specific Ex Commands
 

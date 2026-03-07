@@ -1,9 +1,12 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 140 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 141 archived here. Recent work summary in PROJECT_STATE.md.
 
 ---
+
+**Session 141 — Vim compatibility batch 2: 27 new commands (38 new tests, 2583 total):**
+Implemented 27 more missing Vim commands, raising VIM_COMPATIBILITY.md from 348/403 (85%) to 380/403 (94%). **Tier 1 (quick wins):** `ga` ASCII value, `g8` UTF-8 bytes, `go` byte offset, `gm`/`gM` middle of screen/text, `gI` insert at column 1, `gx` open URL, `g'`/`` g` `` mark without jumplist, `g&` repeat `:s` globally, `CTRL-^` alternate buffer, `CTRL-L` redraw/clear message, `N%` go to N% of file, `zs`/`ze` scroll cursor to left/right edge, `:b {name}` buffer by partial name, `:make`. **Tier 2 (medium effort):** `gq{motion}`/`gw{motion}` format operators (reflow to textwidth, with text object support), `CTRL-W p`/`t`/`b` previous/top/bottom editor group, `CTRL-W f` split+open file, `CTRL-W d` split+go to definition, insert `CTRL-A` repeat last insertion, insert `CTRL-G u`/`j`/`k` break undo/move in insert, visual `gq` format selection, visual `g CTRL-A`/`g CTRL-X` sequential increment/decrement. Added `prev_active_group`/`insert_ctrl_g_pending` Engine fields, `format_lines()` method, gq/gw handling in `apply_operator_text_object`, 38 integration tests in `tests/vim_compat_batch2.rs`. Sections now at 100%: Movement (48/48), Editing (50/50), z-commands (23/23).
 
 **Session 140 — Vim compatibility batch: 29 new commands (45 new tests, 2545 total):**
 Implemented 29 missing Vim commands in two tiers, raising VIM_COMPATIBILITY.md from 319/411 (78%) to 348/411 (85%). **Tier 1:** `+`/`-`/`_` line motions, `|` column motion, `gp`/`gP` paste with cursor after, `@:` repeat last ex command, backtick text objects (`` i` ``/`` a` ``), insert `CTRL-E`/`CTRL-Y` (char below/above), visual `r{char}`, `&` repeat last `:s`, `CTRL-W q`/`n`. **Tier 2:** `CTRL-W +`/`-`/`<`/`>`/`=`/`_`/`|` resize/equalize/maximize, `[{`/`]}`/`[(`/`])` unmatched bracket jumps, `[m`/`]m`/`[M`/`]M` method navigation, `[[`/`]]`/`[]`/`][` section navigation. Added `last_ex_command`/`last_substitute` fields to Engine, `set_all_ratios()` to GroupLayout, 45 integration tests in `tests/vim_compat_batch.rs`. Text Objects now 100%.

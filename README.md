@@ -11,7 +11,7 @@ There's a touch of irony here - using a cli tool to write the editor that I've w
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 2545+ tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 2583+ tests, zero async runtime dependency
 
 > **Note:** VimCode does not implement VimScript. Extension and scripting is handled via
 > the built-in Lua 5.4 plugin system. The goal is full Vim *keybinding* and *editing*
@@ -947,7 +947,21 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `gp` / `gP` | Paste after / before, leave cursor after pasted text |
 | `]p` / `[p` | Paste after / before with indent adjusted to current line |
 | `&` | Repeat last `:s` substitution on current line |
+| `g&` | Repeat last `:s` on all lines |
 | `@:` | Repeat last ex command |
+| `ga` | Print ASCII value of character under cursor |
+| `g8` | Print UTF-8 hex bytes of character under cursor |
+| `go` | Go to byte offset N in file |
+| `gm` | Move cursor to middle of screen line |
+| `gM` | Move cursor to middle of text line |
+| `gI` | Insert at column 1 (absolute beginning of line) |
+| `gx` | Open URL/file under cursor in default application |
+| `g'`/`` g` `` | Jump to mark without pushing to jump list |
+| `gq{motion}` | Format text (reflow to textwidth) |
+| `gw{motion}` | Format text, keep cursor position |
+| `N%` | Go to N% of file (e.g. `50%` goes to middle) |
+| `CTRL-^` | Switch to alternate (last edited) buffer |
+| `CTRL-L` | Clear message / redraw screen |
 | `>>` / `<<` | Indent / dedent line(s) by `shiftwidth` |
 | `*` / `#` | Search forward / backward for word under cursor (word-bounded) |
 | `g*` / `g#` | Search forward / backward for word under cursor (partial match) |
@@ -982,11 +996,15 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `zv` | Open folds to make cursor visible |
 | `zx` | Recompute folds (open all + close all) |
 | `zj` / `zk` | Move to next / previous fold |
+| `zs` / `ze` | Scroll cursor to left / right edge of screen |
 | `Ctrl-W h/j/k/l` | Focus window left/down/up/right |
 | `Ctrl-W w` / `c` / `o` / `q` / `n` | Cycle / close / close-others / quit / new |
 | `Ctrl-W +` / `-` / `>` / `<` | Resize split height/width |
 | `Ctrl-W =` | Equalize all split sizes |
 | `Ctrl-W _` / `\|` | Maximize split height / width |
+| `Ctrl-W p` / `t` / `b` | Previous / top / bottom editor group |
+| `Ctrl-W f` | Split and open file under cursor |
+| `Ctrl-W d` | Split and go to definition (LSP) |
 | `Ctrl-P` | Open fuzzy file finder |
 | `Ctrl-G` | Open live grep modal (search file contents) |
 | `F5` | Start debugging / continue |
@@ -1056,6 +1074,8 @@ All ex commands support Vim-style abbreviations (e.g., `:j` for `:join`, `:y` fo
 | `:jumps` | Display jump list |
 | `:changes` | Display change list |
 | `:history` | Display command history |
+| `:make [args]` | Run `make` with optional arguments |
+| `:b {name}` | Switch to buffer matching partial file name |
 | `:!{cmd}` | Execute shell command and show output |
 | `:r {file}` | Read file contents into buffer after cursor line |
 | `:tabmove [N]` | Move current tab to position N (0-based, default = end) |

@@ -90,6 +90,7 @@ static EX_ABBREVS: &[(&str, usize)] = &[
     ("history", 3),
     ("join", 1),
     ("jumps", 2),
+    ("make", 3),
     ("mark", 2),
     ("move", 1),
     ("nohlsearch", 3),
@@ -699,6 +700,8 @@ pub struct Engine {
     pub editor_groups: HashMap<GroupId, EditorGroup>,
     /// ID of the currently focused editor group.
     pub active_group: GroupId,
+    /// Previously focused editor group (for CTRL-W p).
+    pub prev_active_group: Option<GroupId>,
     /// Recursive binary tree of group splits.
     pub group_layout: GroupLayout,
     /// Counter for generating unique GroupIds.
@@ -1207,6 +1210,7 @@ pub struct Engine {
     // --- Insert mode Ctrl+r pending ---
     /// When true, the next keypress in Insert (or Replace) mode inserts a register's content.
     pub insert_ctrl_r_pending: bool,
+    pub insert_ctrl_g_pending: bool,
 
     // --- Extension system ---
     /// Which extensions are installed / dismissed (persisted to extensions.json).
@@ -1320,6 +1324,7 @@ impl Engine {
                 m
             },
             active_group: GroupId(0),
+            prev_active_group: None,
             group_layout: GroupLayout::leaf(GroupId(0)),
             next_group_id: 1,
             next_window_id: 2,
@@ -1514,6 +1519,7 @@ impl Engine {
             last_substitute: None,
             yank_highlight: None,
             insert_ctrl_r_pending: false,
+            insert_ctrl_g_pending: false,
             extension_state: ExtensionState::load(),
             prompted_extensions: HashSet::new(),
             ext_hint_pending_name: None,
@@ -2911,6 +2917,9 @@ impl Engine {
         for (&gid, group) in &self.editor_groups {
             for (ti, tab) in group.tabs.iter().enumerate() {
                 if tab.window_ids().contains(&window_id) {
+                    if gid != self.active_group {
+                        self.prev_active_group = Some(self.active_group);
+                    }
                     self.active_group = gid;
                     if let Some(g) = self.editor_groups.get_mut(&gid) {
                         g.active_tab = ti;
@@ -3080,6 +3089,7 @@ impl Engine {
         self.editor_groups.insert(new_id, EditorGroup::new(tab));
         self.group_layout
             .split_at(self.active_group, direction, new_id, false);
+        self.prev_active_group = Some(self.active_group);
         self.active_group = new_id;
         self.message = "Editor split".to_string();
     }
@@ -4705,12 +4715,23 @@ impl Engine {
                     self.increment_number_at_cursor(-(count as i64), &mut false);
                     return EngineAction::None;
                 }
+                "6" => {
+                    // Ctrl-^ (Ctrl-6): edit alternate file
+                    // Takes priority over Ctrl+6 focus group
+                    self.alternate_buffer();
+                    return EngineAction::None;
+                }
+                "l" => {
+                    // Ctrl-L: redraw screen (no-op in VimCode, just clear message)
+                    self.message.clear();
+                    return EngineAction::None;
+                }
                 "backslash" => {
                     // Ctrl+\: Split editor group to the right (VSCode style)
                     self.open_editor_group(SplitDirection::Vertical);
                     return EngineAction::None;
                 }
-                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" => {
+                "1" | "2" | "3" | "4" | "5" | "7" | "8" | "9" => {
                     // Ctrl+N: Focus group N (1-indexed)
                     let n: usize = key_name.parse().unwrap_or(1);
                     if let Some(gid) = self.group_layout.nth_leaf(n - 1) {
@@ -5460,8 +5481,23 @@ impl Engine {
                 self.visual_anchor = Some(self.view().cursor);
             }
             Some('%') => {
-                self.push_jump_location();
-                self.move_to_matching_bracket();
+                if self.peek_count().is_some() {
+                    // N% — go to N% of file
+                    let pct = self.take_count().min(100);
+                    let total = self.buffer().len_lines();
+                    let target = if total == 0 {
+                        0
+                    } else {
+                        ((total.saturating_sub(1)) * pct) / 100
+                    };
+                    self.push_jump_location();
+                    self.view_mut().cursor.line = target;
+                    let fnb = self.first_non_blank_col(target);
+                    self.view_mut().cursor.col = fnb;
+                } else {
+                    self.push_jump_location();
+                    self.move_to_matching_bracket();
+                }
             }
             Some(':') => {
                 self.mode = Mode::Command;
@@ -5810,6 +5846,99 @@ impl Engine {
                             (self.change_list_pos + 1).min(self.change_list.len());
                     }
                 }
+                Some('m') => {
+                    // gm: go to middle of screen line
+                    let vp_cols = self.view().viewport_cols;
+                    let mid = vp_cols / 2;
+                    self.view_mut().cursor.col = mid;
+                    self.clamp_cursor_col();
+                }
+                Some('M') => {
+                    // gM: go to middle of text line
+                    let line = self.view().cursor.line;
+                    let line_len = self.buffer().line_len_chars(line).saturating_sub(1); // exclude newline
+                    self.view_mut().cursor.col = line_len / 2;
+                    self.clamp_cursor_col();
+                }
+                Some('a') => {
+                    // ga: print ASCII value of character under cursor
+                    let line = self.view().cursor.line;
+                    let col = self.view().cursor.col;
+                    let char_idx = self.buffer().line_to_char(line) + col;
+                    if char_idx < self.buffer().content.len_chars() {
+                        let ch = self.buffer().content.char(char_idx);
+                        let code = ch as u32;
+                        self.message =
+                            format!("<{}>  {},  Hex {:02x},  Oct {:03o}", ch, code, code, code);
+                    }
+                }
+                Some('8') => {
+                    // g8: print UTF-8 byte sequence of character under cursor
+                    let line = self.view().cursor.line;
+                    let col = self.view().cursor.col;
+                    let char_idx = self.buffer().line_to_char(line) + col;
+                    if char_idx < self.buffer().content.len_chars() {
+                        let ch = self.buffer().content.char(char_idx);
+                        let mut buf = [0u8; 4];
+                        let encoded = ch.encode_utf8(&mut buf);
+                        let hex: Vec<String> =
+                            encoded.bytes().map(|b| format!("{:02x}", b)).collect();
+                        self.message = hex.join(" ");
+                    }
+                }
+                Some('I') => {
+                    // gI: insert at column 0 (unlike I which goes to first non-blank)
+                    self.view_mut().cursor.col = 0;
+                    self.mode = Mode::Insert;
+                    self.insert_text_buffer.clear();
+                    self.start_undo_group();
+                }
+                Some('&') => {
+                    // g&: repeat last substitution on all lines
+                    if let Some((pat, rep, flags)) = self.last_substitute.clone() {
+                        let cmd = format!("%s/{}/{}/{}", pat, rep, flags);
+                        self.execute_substitute_command(&cmd);
+                        *changed = true;
+                    } else {
+                        self.message = "No previous substitute command".to_string();
+                    }
+                }
+                Some('o') => {
+                    // go: go to byte N in the buffer (1-indexed, like Vim)
+                    let byte_n = self.take_count().saturating_sub(1);
+                    let char_offset = self.buffer().content.try_byte_to_char(byte_n).unwrap_or(0);
+                    let line = self.buffer().content.char_to_line(char_offset);
+                    let line_start = self.buffer().line_to_char(line);
+                    self.view_mut().cursor.line = line;
+                    self.view_mut().cursor.col = char_offset - line_start;
+                    self.clamp_cursor_col();
+                }
+                Some('x') => {
+                    // gx: open URL or file path under cursor externally
+                    if let Some(url) = self.word_under_cursor() {
+                        #[cfg(not(test))]
+                        {
+                            let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+                        }
+                        self.message = format!("Opening: {}", url);
+                    }
+                }
+                Some('\'') => {
+                    // g': jump to mark line WITHOUT adding to jump list
+                    self.pending_key = Some('\x07'); // sentinel for g' handler
+                }
+                Some('`') => {
+                    // g`: jump to mark position WITHOUT adding to jump list
+                    self.pending_key = Some('\x08'); // sentinel for g` handler
+                }
+                Some('q') => {
+                    // gq{motion}: format text operator
+                    self.pending_operator = Some('q');
+                }
+                Some('w') => {
+                    // gw{motion}: format text, keep cursor
+                    self.pending_operator = Some('Q');
+                }
                 _ => {}
             },
             ']' => match unicode {
@@ -5864,6 +5993,30 @@ impl Engine {
                         self.jump_unmatched_forward('(', ')');
                     }
                 }
+                Some('z') => {
+                    // ]z: move to end of current open fold
+                    let line = self.view().cursor.line;
+                    let folds = &self.view().folds;
+                    let mut best = None;
+                    for fold in folds {
+                        if fold.start <= line && fold.end >= line {
+                            match best {
+                                None => best = Some(fold.end),
+                                Some(prev) => {
+                                    // pick the innermost (smallest end)
+                                    if fold.end < prev {
+                                        best = Some(fold.end);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Some(end) = best {
+                        self.view_mut().cursor.line = end;
+                        self.view_mut().cursor.col = 0;
+                        self.clamp_cursor_col();
+                    }
+                }
                 _ => {}
             },
             '[' => match unicode {
@@ -5916,6 +6069,29 @@ impl Engine {
                     let count = self.take_count();
                     for _ in 0..count {
                         self.jump_unmatched_backward('(', ')');
+                    }
+                }
+                Some('z') => {
+                    // [z: move to start of current open fold
+                    let line = self.view().cursor.line;
+                    let folds = &self.view().folds;
+                    let mut best = None;
+                    for fold in folds {
+                        if fold.start <= line && fold.end >= line {
+                            match best {
+                                None => best = Some(fold.start),
+                                Some(prev) => {
+                                    if fold.start > prev {
+                                        best = Some(fold.start);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Some(start) = best {
+                        self.view_mut().cursor.line = start;
+                        self.view_mut().cursor.col = 0;
+                        self.clamp_cursor_col();
                     }
                 }
                 _ => {}
@@ -6068,6 +6244,55 @@ impl Engine {
                     Some('|') => {
                         // Ctrl-W |: maximize width (set vertical split to extreme)
                         self.maximize_window_split(SplitDirection::Vertical);
+                    }
+                    Some('p') => {
+                        // Ctrl-W p: go to previous (last accessed) group
+                        if let Some(prev) = self.prev_active_group {
+                            if self.editor_groups.contains_key(&prev) {
+                                let cur = self.active_group;
+                                self.active_group = prev;
+                                self.prev_active_group = Some(cur);
+                            }
+                        }
+                    }
+                    Some('t') => {
+                        // Ctrl-W t: go to top-left (first) group
+                        if let Some(first) = self.group_layout.nth_leaf(0) {
+                            if first != self.active_group {
+                                self.prev_active_group = Some(self.active_group);
+                            }
+                            self.active_group = first;
+                        }
+                    }
+                    Some('b') => {
+                        // Ctrl-W b: go to bottom-right (last) group
+                        let ids = self.group_layout.group_ids();
+                        if let Some(&last) = ids.last() {
+                            if last != self.active_group {
+                                self.prev_active_group = Some(self.active_group);
+                            }
+                            self.active_group = last;
+                        }
+                    }
+                    Some('f') => {
+                        // Ctrl-W f: split + open file under cursor (gf in new split)
+                        if let Some(path) = self.file_path_under_cursor() {
+                            let abs_path = if path.is_absolute() {
+                                path
+                            } else {
+                                self.cwd.join(&path)
+                            };
+                            self.split_window(SplitDirection::Horizontal, None);
+                            return EngineAction::OpenFile(abs_path);
+                        } else {
+                            self.message = "No file path under cursor".to_string();
+                        }
+                    }
+                    Some('d') => {
+                        // Ctrl-W d: split + go to definition
+                        self.split_window(SplitDirection::Horizontal, None);
+                        self.push_jump_location();
+                        self.lsp_request_definition();
                     }
                     _ => {
                         // Also handle by key_name for special keys
@@ -6252,6 +6477,61 @@ impl Engine {
                     }
                 }
             }
+            '\x07' => {
+                // g': jump to mark line WITHOUT adding to jump list
+                if let Some(ch) = unicode {
+                    if ch.is_ascii_lowercase() {
+                        let buffer_id = self.active_window().buffer_id;
+                        if let Some(buffer_marks) = self.marks.get(&buffer_id) {
+                            if let Some(mark_cursor) = buffer_marks.get(&ch) {
+                                self.view_mut().cursor.line = mark_cursor.line;
+                                self.view_mut().cursor.col = 0;
+                                self.clamp_cursor_col();
+                            } else {
+                                self.message = format!("Mark '{}' not set", ch);
+                            }
+                        } else {
+                            self.message = format!("Mark '{}' not set", ch);
+                        }
+                    } else if ch.is_ascii_uppercase() {
+                        if let Some(&(_, line, _)) = self.global_marks.get(&ch) {
+                            let max_line = self.buffer().len_lines().saturating_sub(1);
+                            self.view_mut().cursor.line = line.min(max_line);
+                            self.view_mut().cursor.col = 0;
+                            self.clamp_cursor_col();
+                        } else {
+                            self.message = format!("Mark '{}' not set", ch);
+                        }
+                    }
+                }
+            }
+            '\x08' => {
+                // g`: jump to mark position WITHOUT adding to jump list
+                if let Some(ch) = unicode {
+                    if ch.is_ascii_lowercase() {
+                        let buffer_id = self.active_window().buffer_id;
+                        if let Some(buffer_marks) = self.marks.get(&buffer_id) {
+                            if let Some(mark_cursor) = buffer_marks.get(&ch) {
+                                self.view_mut().cursor = *mark_cursor;
+                                self.clamp_cursor_col();
+                            } else {
+                                self.message = format!("Mark `{}` not set", ch);
+                            }
+                        } else {
+                            self.message = format!("Mark `{}` not set", ch);
+                        }
+                    } else if ch.is_ascii_uppercase() {
+                        if let Some(&(_, line, col)) = self.global_marks.get(&ch) {
+                            let max_line = self.buffer().len_lines().saturating_sub(1);
+                            self.view_mut().cursor.line = line.min(max_line);
+                            self.view_mut().cursor.col = col;
+                            self.clamp_cursor_col();
+                        } else {
+                            self.message = format!("Mark `{}` not set", ch);
+                        }
+                    }
+                }
+            }
             'z' => {
                 // Scroll position + fold commands
                 match unicode {
@@ -6273,6 +6553,17 @@ impl Engine {
                     }
                     Some('H') => self.scroll_left_half_screen(),
                     Some('L') => self.scroll_right_half_screen(),
+                    Some('e') => {
+                        // ze: scroll so cursor is at right edge of screen
+                        let col = self.view().cursor.col;
+                        let vp_cols = self.view().viewport_cols;
+                        self.view_mut().scroll_left = col.saturating_sub(vp_cols.saturating_sub(1));
+                    }
+                    Some('s') => {
+                        // zs: scroll so cursor is at left edge of screen
+                        let col = self.view().cursor.col;
+                        self.view_mut().scroll_left = col;
+                    }
                     // Fold: basic
                     Some('a') => self.cmd_fold_toggle(),
                     Some('o') => self.cmd_fold_open(),
@@ -6504,6 +6795,39 @@ impl Engine {
                 let count = self.take_count();
                 let line = self.view().cursor.line;
                 self.auto_indent_lines(line, count, changed);
+                return EngineAction::None;
+            }
+            if unicode == Some('i') || unicode == Some('a') {
+                self.pending_text_object = unicode;
+                self.pending_operator = Some(operator);
+                return EngineAction::None;
+            }
+            if unicode == Some('f')
+                || unicode == Some('t')
+                || unicode == Some('F')
+                || unicode == Some('T')
+            {
+                self.pending_find_operator = Some((operator, unicode.unwrap()));
+                return EngineAction::None;
+            }
+            // Fall through to common motion match block below
+        }
+
+        // Handle gq (format text) and gw (format text, keep cursor) operators
+        // 'q' = gq, 'Q' = gw
+        if operator == 'q' || operator == 'Q' {
+            let keep_cursor = operator == 'Q';
+            // gqq / gww = format current line(s)
+            if (operator == 'q' && unicode == Some('q'))
+                || (operator == 'Q' && unicode == Some('w'))
+            {
+                let count = self.take_count();
+                let line = self.view().cursor.line;
+                let saved_cursor = self.view().cursor;
+                self.format_lines(line, line + count.saturating_sub(1), changed);
+                if keep_cursor {
+                    self.view_mut().cursor = saved_cursor;
+                }
                 return EngineAction::None;
             }
             if unicode == Some('i') || unicode == Some('a') {
@@ -7107,6 +7431,20 @@ impl Engine {
                     self.auto_indent_lines(start_line, count, changed);
                 }
             }
+            'q' | 'Q' => {
+                // gq/gw: format lines containing the range
+                let start_line = self.buffer().content.char_to_line(start);
+                let end_line = self
+                    .buffer()
+                    .content
+                    .char_to_line(end.saturating_sub(1).max(start));
+                let saved = self.view().cursor;
+                self.format_lines(start_line, end_line, changed);
+                if operator == 'Q' {
+                    self.view_mut().cursor = saved;
+                    self.clamp_cursor_col();
+                }
+            }
             _ => {}
         }
     }
@@ -7190,6 +7528,17 @@ impl Engine {
                     .buffer()
                     .line_to_char((end_line + 1).min(self.buffer().len_lines()));
                 self.apply_case_range(start, end, operator, changed);
+            }
+            'q' => {
+                // gq: format lines
+                self.format_lines(start_line, end_line, changed);
+            }
+            'Q' => {
+                // gw: format lines, keep cursor
+                let saved = self.view().cursor;
+                self.format_lines(start_line, end_line, changed);
+                self.view_mut().cursor = saved;
+                self.clamp_cursor_col();
             }
             _ => {}
         }
@@ -7787,6 +8136,66 @@ impl Engine {
             self.insert_with_undo(line_start, &indent);
             self.view_mut().cursor.col += indent.len();
             *changed = true;
+            return;
+        }
+
+        // Ctrl+A: re-insert last inserted text
+        if ctrl && key_name == "a" {
+            if !self.last_inserted_text.is_empty() {
+                let text = self.last_inserted_text.clone();
+                let line = self.view().cursor.line;
+                let col = self.view().cursor.col;
+                let char_idx = self.buffer().line_to_char(line) + col;
+                let char_count = text.chars().count();
+                self.insert_with_undo(char_idx, &text);
+                self.insert_text_buffer.push_str(&text);
+                // Position cursor after the inserted text
+                // Handle multi-line: find the last line of the insertion
+                let lines: Vec<&str> = text.split('\n').collect();
+                if lines.len() > 1 {
+                    self.view_mut().cursor.line = line + lines.len() - 1;
+                    self.view_mut().cursor.col = lines.last().map_or(0, |l| l.len());
+                } else {
+                    self.view_mut().cursor.col = col + char_count;
+                }
+                *changed = true;
+            }
+            return;
+        }
+
+        // Ctrl+G then subcommand: u = break undo, j/k = move line in insert mode
+        if ctrl && key_name == "g" {
+            self.insert_ctrl_g_pending = true;
+            return;
+        }
+        if self.insert_ctrl_g_pending {
+            self.insert_ctrl_g_pending = false;
+            if let Some(ch) = unicode {
+                match ch {
+                    'u' => {
+                        // CTRL-G u: break undo sequence (start new undo group)
+                        self.finish_undo_group();
+                        self.start_undo_group();
+                    }
+                    'j' | 'J' => {
+                        // CTRL-G j: move cursor down one line in insert mode
+                        let line = self.view().cursor.line;
+                        if line + 1 < self.buffer().len_lines() {
+                            self.view_mut().cursor.line = line + 1;
+                            self.clamp_cursor_col();
+                        }
+                    }
+                    'k' | 'K' => {
+                        // CTRL-G k: move cursor up one line in insert mode
+                        let line = self.view().cursor.line;
+                        if line > 0 {
+                            self.view_mut().cursor.line = line - 1;
+                            self.clamp_cursor_col();
+                        }
+                    }
+                    _ => {}
+                }
+            }
             return;
         }
 
@@ -8631,10 +9040,13 @@ impl Engine {
         }
 
         // Handle text objects (iw, aw, i", a(, etc.) - set pending key
-        if let Some(ch) = unicode {
-            if ch == 'i' || ch == 'a' {
-                self.pending_key = Some(ch);
-                return EngineAction::None;
+        // Skip when ctrl is held (Ctrl-A/Ctrl-I are not text objects)
+        if !ctrl {
+            if let Some(ch) = unicode {
+                if ch == 'i' || ch == 'a' {
+                    self.pending_key = Some(ch);
+                    return EngineAction::None;
+                }
             }
         }
 
@@ -8873,6 +9285,41 @@ impl Engine {
                     self.view_mut().cursor.line = 0;
                 }
                 self.view_mut().cursor.col = 0;
+                return EngineAction::None;
+            } else if pending == 'g' && ctrl && (key_name == "a" || key_name == "x") {
+                // g Ctrl-A / g Ctrl-X in visual mode: sequential increment/decrement
+                let base_count = self.take_count().max(1) as i64;
+                let delta_sign: i64 = if key_name == "a" { 1 } else { -1 };
+                if let Some((start, end)) = self.get_visual_selection_range() {
+                    let saved_line = self.view().cursor.line;
+                    let saved_col = self.view().cursor.col;
+                    self.start_undo_group();
+                    for (i, line) in (start.line..=end.line).enumerate() {
+                        let delta = delta_sign * base_count * (i as i64 + 1);
+                        self.view_mut().cursor.line = line;
+                        self.view_mut().cursor.col = 0;
+                        self.increment_number_at_cursor(delta, changed);
+                    }
+                    self.finish_undo_group();
+                    self.view_mut().cursor.line = saved_line;
+                    self.view_mut().cursor.col = saved_col;
+                    self.mode = Mode::Normal;
+                    self.visual_anchor = None;
+                }
+                return EngineAction::None;
+            } else if pending == 'g' && (unicode == Some('q') || unicode == Some('w')) {
+                // gq / gw in visual mode: format selected lines
+                self.count = None;
+                if let Some((start, end)) = self.get_visual_selection_range() {
+                    let saved_cursor = self.view().cursor;
+                    self.mode = Mode::Normal;
+                    self.visual_anchor = None;
+                    self.format_lines(start.line, end.line, changed);
+                    if unicode == Some('w') {
+                        self.view_mut().cursor = saved_cursor;
+                        self.clamp_cursor_col();
+                    }
+                }
                 return EngineAction::None;
             }
         }
@@ -11893,6 +12340,17 @@ impl Engine {
             return EngineAction::None;
         }
 
+        // Handle :make [args] — run build command
+        if cmd == "make" || cmd.starts_with("make ") {
+            let args = cmd.strip_prefix("make").unwrap_or("").trim();
+            let shell_cmd = if args.is_empty() {
+                "make".to_string()
+            } else {
+                format!("make {}", args)
+            };
+            return self.execute_command(&format!("!{}", shell_cmd));
+        }
+
         // Handle :N (jump to line number)
         if let Ok(line_num) = cmd.parse::<usize>() {
             let target = if line_num > 0 { line_num - 1 } else { 0 };
@@ -13946,6 +14404,83 @@ impl Engine {
         *changed = true;
     }
 
+    /// Format (reflow) lines to textwidth. If textwidth is 0, uses 79 as default.
+    /// Lines are joined and re-wrapped at word boundaries.
+    fn format_lines(&mut self, start_line: usize, end_line: usize, changed: &mut bool) {
+        let total = self.buffer().len_lines();
+        let start = start_line.min(total.saturating_sub(1));
+        let end = end_line.min(total.saturating_sub(1));
+        let tw = if self.settings.textwidth > 0 {
+            self.settings.textwidth
+        } else {
+            79
+        };
+
+        // Collect the text of the range
+        let mut text = String::new();
+        for l in start..=end {
+            let line: String = self.buffer().content.line(l).chars().collect();
+            let trimmed = line.trim_end_matches(['\n', '\r']);
+            if trimmed.is_empty() {
+                // Paragraph break — preserve it
+                text.push('\n');
+            } else {
+                if !text.is_empty() && !text.ends_with('\n') {
+                    text.push(' ');
+                }
+                text.push_str(trimmed);
+            }
+        }
+
+        // Reflow: split into paragraphs, wrap each
+        let paragraphs: Vec<&str> = text.split('\n').collect();
+        let mut result = String::new();
+        for (pi, para) in paragraphs.iter().enumerate() {
+            if para.is_empty() {
+                result.push('\n');
+                continue;
+            }
+            let words: Vec<&str> = para.split_whitespace().collect();
+            let mut line_buf = String::new();
+            for word in &words {
+                if line_buf.is_empty() {
+                    line_buf.push_str(word);
+                } else if line_buf.len() + 1 + word.len() > tw {
+                    result.push_str(&line_buf);
+                    result.push('\n');
+                    line_buf = word.to_string();
+                } else {
+                    line_buf.push(' ');
+                    line_buf.push_str(word);
+                }
+            }
+            if !line_buf.is_empty() {
+                result.push_str(&line_buf);
+                if pi < paragraphs.len() - 1 || end + 1 < total {
+                    result.push('\n');
+                }
+            }
+        }
+
+        // Replace the range
+        let range_start = self.buffer().line_to_char(start);
+        let range_end = if end + 1 < total {
+            self.buffer().line_to_char(end + 1)
+        } else {
+            self.buffer().len_chars()
+        };
+
+        self.start_undo_group();
+        self.delete_with_undo(range_start, range_end);
+        self.insert_with_undo(range_start, &result);
+        self.finish_undo_group();
+
+        // Move cursor to start of formatted area
+        self.view_mut().cursor.line = start;
+        self.view_mut().cursor.col = self.first_non_blank_col(start);
+        *changed = true;
+    }
+
     // --- WORD text object (iW / aW) ---
 
     fn find_bigword_object(&self, modifier: char, cursor_pos: usize) -> Option<(usize, usize)> {
@@ -15179,6 +15714,24 @@ impl Engine {
                 } else {
                     self.clamp_cursor_col();
                     self.finish_undo_group();
+                }
+            }
+            'q' | 'Q' => {
+                // gq/gw format — convert char range to line range
+                let start_line = self.buffer().content.char_to_line(start_pos);
+                let end_line = {
+                    let l = self
+                        .buffer()
+                        .content
+                        .char_to_line(end_pos.saturating_sub(1).max(start_pos));
+                    l
+                };
+                let save_cursor = self.view().cursor;
+                self.format_lines(start_line, end_line, changed);
+                if operator == 'Q' {
+                    // gw: restore cursor position
+                    self.view_mut().cursor = save_cursor;
+                    self.clamp_cursor_col();
                 }
             }
             _ => {
