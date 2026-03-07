@@ -1211,6 +1211,16 @@ pub struct Engine {
     /// When true, the next keypress in Insert (or Replace) mode inserts a register's content.
     pub insert_ctrl_r_pending: bool,
     pub insert_ctrl_g_pending: bool,
+    /// When true, after one Normal-mode command, auto-return to Insert mode (Ctrl-O).
+    pub insert_ctrl_o_active: bool,
+    /// When true, next keypress in Insert mode is inserted literally (Ctrl-V).
+    pub insert_ctrl_v_pending: bool,
+    /// Stores visual block insert/append info: (start_line, end_line, col, is_append).
+    /// On Escape from Insert, apply insert_text_buffer to all block lines.
+    pub visual_block_insert_info: Option<(usize, usize, usize, bool)>,
+    /// Force motion mode: 'v' = charwise, 'V' = linewise.
+    /// Set by pressing v/V/CTRL-V while an operator is pending (e.g., dVj).
+    pub force_motion_mode: Option<char>,
 
     // --- Extension system ---
     /// Which extensions are installed / dismissed (persisted to extensions.json).
@@ -1520,6 +1530,10 @@ impl Engine {
             yank_highlight: None,
             insert_ctrl_r_pending: false,
             insert_ctrl_g_pending: false,
+            insert_ctrl_o_active: false,
+            insert_ctrl_v_pending: false,
+            visual_block_insert_info: None,
+            force_motion_mode: None,
             extension_state: ExtensionState::load(),
             prompted_extensions: HashSet::new(),
             ext_hint_pending_name: None,
@@ -4362,6 +4376,23 @@ impl Engine {
         match self.mode {
             Mode::Normal => {
                 action = self.handle_normal_key(key_name, unicode, ctrl, &mut changed);
+                // Ctrl-O auto-return: after one Normal command, return to Insert.
+                // Only if we're still in Normal mode (the command didn't change mode itself)
+                // and no pending key/operator is waiting for more input.
+                if self.insert_ctrl_o_active {
+                    if self.mode == Mode::Normal
+                        && self.pending_key.is_none()
+                        && self.pending_operator.is_none()
+                    {
+                        self.mode = Mode::Insert;
+                        self.start_undo_group();
+                        self.insert_ctrl_o_active = false;
+                    } else if self.mode != Mode::Normal {
+                        // Command changed mode (e.g. entered Insert via i/a/o) — clear flag
+                        self.insert_ctrl_o_active = false;
+                    }
+                    // If pending_key/operator is set, keep flag active for next iteration
+                }
             }
             Mode::Insert => {
                 self.handle_insert_key(key_name, unicode, ctrl, &mut changed);
@@ -5403,6 +5434,10 @@ impl Engine {
                 // = operator: auto-indent (== indents current line)
                 self.pending_operator = Some('=');
             }
+            Some('!') => {
+                // ! operator: filter through external command
+                self.pending_operator = Some('!');
+            }
             Some('u') => {
                 self.undo();
                 self.refresh_md_previews();
@@ -5939,6 +5974,10 @@ impl Engine {
                     // gw{motion}: format text, keep cursor
                     self.pending_operator = Some('Q');
                 }
+                Some('?') => {
+                    // g?{motion}: ROT13 encode operator
+                    self.pending_operator = Some('R');
+                }
                 _ => {}
             },
             ']' => match unicode {
@@ -6184,17 +6223,33 @@ impl Engine {
             '\x17' => {
                 // Ctrl-W prefix
                 match unicode {
-                    Some('h') | Some('H') => {
-                        self.focus_window_direction(SplitDirection::Vertical, false)
+                    Some('h') => self.focus_window_direction(SplitDirection::Vertical, false),
+                    Some('j') => self.focus_window_direction(SplitDirection::Horizontal, true),
+                    Some('k') => self.focus_window_direction(SplitDirection::Horizontal, false),
+                    Some('l') => self.focus_window_direction(SplitDirection::Vertical, true),
+                    Some('H') => {
+                        // Ctrl-W H: move window to far left (full-height vertical split)
+                        self.move_window_to_edge(SplitDirection::Vertical, false);
                     }
-                    Some('j') | Some('J') => {
-                        self.focus_window_direction(SplitDirection::Horizontal, true)
+                    Some('J') => {
+                        // Ctrl-W J: move window to far bottom (full-width horizontal split)
+                        self.move_window_to_edge(SplitDirection::Horizontal, true);
                     }
-                    Some('k') | Some('K') => {
-                        self.focus_window_direction(SplitDirection::Horizontal, false)
+                    Some('K') => {
+                        // Ctrl-W K: move window to far top (full-width horizontal split)
+                        self.move_window_to_edge(SplitDirection::Horizontal, false);
                     }
-                    Some('l') | Some('L') => {
-                        self.focus_window_direction(SplitDirection::Vertical, true)
+                    Some('L') => {
+                        // Ctrl-W L: move window to far right (full-height vertical split)
+                        self.move_window_to_edge(SplitDirection::Vertical, true);
+                    }
+                    Some('T') => {
+                        // Ctrl-W T: move current window to a new tab group
+                        self.move_window_to_new_group();
+                    }
+                    Some('x') => {
+                        // Ctrl-W x: exchange current window with next window in the same tab
+                        self.exchange_windows();
                     }
                     Some('w') | Some('W') => self.focus_next_window(),
                     Some('c') | Some('C') => {
@@ -6687,6 +6742,16 @@ impl Engine {
             return EngineAction::None;
         }
 
+        // Handle force motion mode: v/V/CTRL-V while operator is pending.
+        // Sets force_motion_mode and re-queues the operator for the next keystroke.
+        if unicode == Some('v') || unicode == Some('V') {
+            self.force_motion_mode = Some(unicode.unwrap());
+            self.pending_operator = Some(operator);
+            return EngineAction::None;
+        }
+        // CTRL-V for blockwise force (not implemented in operator-pending for now,
+        // but mark it so it doesn't fall through to other handlers).
+
         // Handle case-transform operators (~=toggle, u=lower, U=upper)
         if operator == '~' || operator == 'u' || operator == 'U' {
             // Doubled operator (g~~, guu, gUU) = apply to current line
@@ -6789,6 +6854,40 @@ impl Engine {
             // Fall through to common motion match block below
         }
 
+        // Handle filter operator (!)
+        // Vim drops into command mode with `:.,.+N!` pre-filled after resolving the motion.
+        if operator == '!' {
+            // !! = filter current line(s)
+            if unicode == Some('!') {
+                let count = self.take_count();
+                let line = self.view().cursor.line;
+                let end_line = (line + count - 1).min(self.buffer().len_lines().saturating_sub(1));
+                // Switch to command mode with range pre-filled
+                self.mode = Mode::Command;
+                if line == end_line {
+                    self.command_buffer = ".!".to_string();
+                } else {
+                    self.command_buffer = format!(".,{}!", end_line + 1);
+                }
+                self.command_cursor = self.command_buffer.chars().count();
+                return EngineAction::None;
+            }
+            if unicode == Some('i') || unicode == Some('a') {
+                self.pending_text_object = unicode;
+                self.pending_operator = Some(operator);
+                return EngineAction::None;
+            }
+            if unicode == Some('f')
+                || unicode == Some('t')
+                || unicode == Some('F')
+                || unicode == Some('T')
+            {
+                self.pending_find_operator = Some((operator, unicode.unwrap()));
+                return EngineAction::None;
+            }
+            // Fall through to common motion match block below
+        }
+
         // Handle auto-indent operator (=)
         if operator == '=' {
             if unicode == Some('=') {
@@ -6827,6 +6926,48 @@ impl Engine {
                 self.format_lines(line, line + count.saturating_sub(1), changed);
                 if keep_cursor {
                     self.view_mut().cursor = saved_cursor;
+                }
+                return EngineAction::None;
+            }
+            if unicode == Some('i') || unicode == Some('a') {
+                self.pending_text_object = unicode;
+                self.pending_operator = Some(operator);
+                return EngineAction::None;
+            }
+            if unicode == Some('f')
+                || unicode == Some('t')
+                || unicode == Some('F')
+                || unicode == Some('T')
+            {
+                self.pending_find_operator = Some((operator, unicode.unwrap()));
+                return EngineAction::None;
+            }
+            // Fall through to common motion match block below
+        }
+
+        // Handle g? (ROT13 encode) operator — sentinel 'R'
+        if operator == 'R' {
+            // g?? = ROT13 current line(s)
+            if unicode == Some('?') {
+                let count = self.take_count();
+                let line = self.view().cursor.line;
+                let num_lines = self.buffer().len_lines();
+                for i in 0..count {
+                    let ln = line + i;
+                    if ln >= num_lines {
+                        break;
+                    }
+                    let line_start = self.buffer().line_to_char(ln);
+                    let line_len = self.buffer().line_len_chars(ln);
+                    let line_end = line_start
+                        + if self.buffer().content.line(ln).chars().last() == Some('\n') {
+                            line_len.saturating_sub(1)
+                        } else {
+                            line_len
+                        };
+                    if line_start < line_end {
+                        self.apply_rot13_range(line_start, line_end, changed);
+                    }
                 }
                 return EngineAction::None;
             }
@@ -7351,6 +7492,29 @@ impl Engine {
         }
     }
 
+    /// Apply ROT13 encoding to a char range.
+    fn apply_rot13_range(&mut self, start: usize, end: usize, changed: &mut bool) {
+        if start >= end {
+            return;
+        }
+        let original: String = self.buffer().content.slice(start..end).chars().collect();
+        let transformed: String = original
+            .chars()
+            .map(|c| match c {
+                'A'..='M' | 'a'..='m' => (c as u8 + 13) as char,
+                'N'..='Z' | 'n'..='z' => (c as u8 - 13) as char,
+                _ => c,
+            })
+            .collect();
+        if transformed != original {
+            self.start_undo_group();
+            self.delete_with_undo(start, end);
+            self.insert_with_undo(start, &transformed);
+            self.finish_undo_group();
+            *changed = true;
+        }
+    }
+
     /// Apply a charwise operator on a byte/char range [start..end).
     fn apply_charwise_operator(
         &mut self,
@@ -7362,6 +7526,18 @@ impl Engine {
         if start >= end {
             return;
         }
+        // Force linewise mode: convert char range to line range and redirect
+        if self.force_motion_mode == Some('V') {
+            self.force_motion_mode = None;
+            let start_line = self.buffer().content.char_to_line(start);
+            let end_line = self
+                .buffer()
+                .content
+                .char_to_line(end.saturating_sub(1).max(start));
+            self.apply_linewise_operator(operator, start_line, end_line, changed);
+            return;
+        }
+        self.force_motion_mode = None;
         match operator {
             'y' => {
                 let text: String = self.buffer().content.slice(start..end).chars().collect();
@@ -7415,6 +7591,10 @@ impl Engine {
             '~' | 'u' | 'U' => {
                 self.apply_case_range(start, end, operator, changed);
             }
+            'R' => {
+                // g?: ROT13 encode
+                self.apply_rot13_range(start, end, changed);
+            }
             '>' | '<' | '=' => {
                 // Indent/dedent/auto-indent: operate on full lines containing the range
                 let start_line = self.buffer().content.char_to_line(start);
@@ -7445,6 +7625,17 @@ impl Engine {
                     self.clamp_cursor_col();
                 }
             }
+            '!' => {
+                // Filter: switch to command mode with range + !
+                let start_line = self.buffer().content.char_to_line(start);
+                let end_line = self
+                    .buffer()
+                    .content
+                    .char_to_line(end.saturating_sub(1).max(start));
+                self.mode = Mode::Command;
+                self.command_buffer = format!("{},{}!", start_line + 1, end_line + 1);
+                self.command_cursor = self.command_buffer.chars().count();
+            }
             _ => {}
         }
     }
@@ -7460,6 +7651,17 @@ impl Engine {
         if start_line > end_line {
             return;
         }
+        // Force charwise mode: convert line range to char range and redirect
+        if self.force_motion_mode == Some('v') {
+            self.force_motion_mode = None;
+            let start = self.buffer().line_to_char(start_line);
+            let end = self
+                .buffer()
+                .line_to_char((end_line + 1).min(self.buffer().len_lines()));
+            self.apply_charwise_operator(operator, start, end, changed);
+            return;
+        }
+        self.force_motion_mode = None;
         let count = end_line - start_line + 1;
         self.view_mut().cursor.line = start_line;
         self.view_mut().cursor.col = 0;
@@ -7529,6 +7731,14 @@ impl Engine {
                     .line_to_char((end_line + 1).min(self.buffer().len_lines()));
                 self.apply_case_range(start, end, operator, changed);
             }
+            'R' => {
+                // g?: ROT13 encode lines
+                let start = self.buffer().line_to_char(start_line);
+                let end = self
+                    .buffer()
+                    .line_to_char((end_line + 1).min(self.buffer().len_lines()));
+                self.apply_rot13_range(start, end, changed);
+            }
             'q' => {
                 // gq: format lines
                 self.format_lines(start_line, end_line, changed);
@@ -7539,6 +7749,12 @@ impl Engine {
                 self.format_lines(start_line, end_line, changed);
                 self.view_mut().cursor = saved;
                 self.clamp_cursor_col();
+            }
+            '!' => {
+                // Filter: switch to command mode with range + !
+                self.mode = Mode::Command;
+                self.command_buffer = format!("{},{}!", start_line + 1, end_line + 1);
+                self.command_cursor = self.command_buffer.chars().count();
             }
             _ => {}
         }
@@ -8077,13 +8293,43 @@ impl Engine {
 
         // Ctrl+O: execute one normal-mode command then return to insert
         if ctrl && key_name == "o" {
-            // We'll handle this via a pending state — set mode to Normal for one command
-            // After one command, the next handle_key call will restore Insert mode
-            // This is simplified: we just switch modes; full Ctrl+O would track return
             self.finish_undo_group();
             self.mode = Mode::Normal;
-            // Note: full re-entry to insert is complex; for now mode returns to Normal.
-            // The user must press i to go back to Insert. Full Ctrl+O support is deferred.
+            self.insert_ctrl_o_active = true;
+            return;
+        }
+
+        // Ctrl+V: insert next character literally (two-key sequence)
+        if ctrl && key_name == "v" {
+            self.insert_ctrl_v_pending = true;
+            return;
+        }
+        if self.insert_ctrl_v_pending {
+            self.insert_ctrl_v_pending = false;
+            // Insert the raw character regardless of what it is
+            let literal = if let Some(ch) = unicode {
+                Some(ch.to_string())
+            } else if key_name == "Tab" {
+                Some("\t".to_string())
+            } else if key_name == "Return" {
+                Some("\n".to_string())
+            } else {
+                None
+            };
+            if let Some(s) = literal {
+                let line = self.view().cursor.line;
+                let col = self.view().cursor.col;
+                let char_idx = self.buffer().line_to_char(line) + col;
+                self.insert_with_undo(char_idx, &s);
+                self.insert_text_buffer.push_str(&s);
+                if s == "\n" {
+                    self.view_mut().cursor.line += 1;
+                    self.view_mut().cursor.col = 0;
+                } else {
+                    self.view_mut().cursor.col += 1;
+                }
+                *changed = true;
+            }
             return;
         }
 
@@ -8136,6 +8382,41 @@ impl Engine {
             self.insert_with_undo(line_start, &indent);
             self.view_mut().cursor.col += indent.len();
             *changed = true;
+            return;
+        }
+
+        // Ctrl+@ (Ctrl+2 / Ctrl+Space): insert prev text and stop insert
+        if ctrl && (key_name == "2" || key_name == "space" || key_name == "at") {
+            if !self.last_inserted_text.is_empty() {
+                let text = self.last_inserted_text.clone();
+                let line = self.view().cursor.line;
+                let col = self.view().cursor.col;
+                let char_idx = self.buffer().line_to_char(line) + col;
+                self.insert_with_undo(char_idx, &text);
+                self.insert_text_buffer.push_str(&text);
+                let lines: Vec<&str> = text.split('\n').collect();
+                if lines.len() > 1 {
+                    self.view_mut().cursor.line = line + lines.len() - 1;
+                    self.view_mut().cursor.col = lines.last().map_or(0, |l| l.len());
+                } else {
+                    self.view_mut().cursor.col = col + text.chars().count();
+                }
+                *changed = true;
+            }
+            // Exit insert mode (stop insert)
+            self.finish_undo_group();
+            if !self.insert_text_buffer.is_empty() {
+                self.last_inserted_text = self.insert_text_buffer.clone();
+                self.last_change = Some(Change {
+                    op: ChangeOp::Insert,
+                    text: self.insert_text_buffer.clone(),
+                    count: 1,
+                    motion: None,
+                });
+            }
+            self.mode = Mode::Normal;
+            self.clamp_cursor_col();
+            self.view_mut().extra_cursors.clear();
             return;
         }
 
@@ -8274,6 +8555,47 @@ impl Engine {
                         count: 1,
                         motion: None,
                     });
+                }
+                // Apply visual block insert/append to remaining lines
+                if let Some((start_line, end_line, col, _is_append)) =
+                    self.visual_block_insert_info.take()
+                {
+                    let text = self.insert_text_buffer.clone();
+                    if !text.is_empty() {
+                        // The first line was already typed into; apply to remaining lines
+                        let first_typed_line = start_line;
+                        self.start_undo_group();
+                        for line in start_line..=end_line {
+                            if line == first_typed_line {
+                                continue;
+                            }
+                            if line >= self.buffer().len_lines() {
+                                break;
+                            }
+                            let line_len = self.buffer().line_len_chars(line);
+                            let line_len_no_nl = if line_len > 0
+                                && self
+                                    .buffer()
+                                    .content
+                                    .char(self.buffer().line_to_char(line) + line_len - 1)
+                                    == '\n'
+                            {
+                                line_len - 1
+                            } else {
+                                line_len
+                            };
+                            // Pad with spaces if line is shorter than insert column
+                            let insert_col = col.min(line_len_no_nl);
+                            let pad = col.saturating_sub(line_len_no_nl);
+                            let char_idx = self.buffer().line_to_char(line) + insert_col;
+                            if pad > 0 {
+                                let spaces = " ".repeat(pad);
+                                self.insert_with_undo(char_idx, &spaces);
+                            }
+                            self.insert_with_undo(self.buffer().line_to_char(line) + col, &text);
+                        }
+                        self.finish_undo_group();
+                    }
                 }
                 self.mode = Mode::Normal;
                 self.clamp_cursor_col();
@@ -9184,6 +9506,58 @@ impl Engine {
                             self.visual_anchor = Some(cursor);
                             self.view_mut().cursor = anchor;
                         }
+                    }
+                    return EngineAction::None;
+                }
+                'I' => {
+                    // Visual block I: insert at left column of block on all lines
+                    if self.mode == Mode::VisualBlock {
+                        if let Some(anchor) = self.visual_anchor {
+                            let cursor = self.view().cursor;
+                            let start_line = anchor.line.min(cursor.line);
+                            let end_line = anchor.line.max(cursor.line);
+                            let left_col = anchor.col.min(cursor.col);
+                            // Store block info for applying on Escape
+                            self.visual_block_insert_info =
+                                Some((start_line, end_line, left_col, false));
+                            // Exit visual mode and enter insert at left col of first line
+                            self.mode = Mode::Insert;
+                            self.visual_anchor = None;
+                            self.view_mut().cursor.line = start_line;
+                            self.view_mut().cursor.col = left_col;
+                            self.start_undo_group();
+                            self.insert_text_buffer.clear();
+                        }
+                    } else {
+                        // In Visual/VisualLine, I acts like normal I (go to first non-blank + insert)
+                        self.count = None;
+                        self.change_visual_selection(changed);
+                    }
+                    return EngineAction::None;
+                }
+                'A' => {
+                    // Visual block A: append at right column of block on all lines
+                    if self.mode == Mode::VisualBlock {
+                        if let Some(anchor) = self.visual_anchor {
+                            let cursor = self.view().cursor;
+                            let start_line = anchor.line.min(cursor.line);
+                            let end_line = anchor.line.max(cursor.line);
+                            let right_col = anchor.col.max(cursor.col);
+                            // Store block info for applying on Escape (is_append=true)
+                            self.visual_block_insert_info =
+                                Some((start_line, end_line, right_col + 1, true));
+                            // Exit visual mode and enter insert after right col of first line
+                            self.mode = Mode::Insert;
+                            self.visual_anchor = None;
+                            self.view_mut().cursor.line = start_line;
+                            self.view_mut().cursor.col = right_col + 1;
+                            self.start_undo_group();
+                            self.insert_text_buffer.clear();
+                        }
+                    } else {
+                        // In Visual/VisualLine, A acts like normal A (go to end of line + insert)
+                        self.count = None;
+                        self.change_visual_selection(changed);
                     }
                     return EngineAction::None;
                 }
@@ -12117,6 +12491,11 @@ impl Engine {
         // :t {dest} / :co[py] {dest} — copy current line to after dest
         if let Some(dest) = cmd.strip_prefix("copy ").or_else(|| cmd.strip_prefix("t ")) {
             return self.execute_copy_command(dest.trim());
+        }
+
+        // Handle range filter: N,M!cmd — pipe lines through external command
+        if let Some(filter_result) = self.try_execute_filter_command(cmd) {
+            return filter_result;
         }
 
         // Handle :! {command} — run a shell command and show output
@@ -15734,6 +16113,38 @@ impl Engine {
                     self.clamp_cursor_col();
                 }
             }
+            '~' | 'u' | 'U' => {
+                self.apply_case_range(start_pos, end_pos, operator, changed);
+            }
+            'R' => {
+                // g?: ROT13 encode
+                self.apply_rot13_range(start_pos, end_pos, changed);
+            }
+            '>' | '<' | '=' => {
+                let start_line = self.buffer().content.char_to_line(start_pos);
+                let end_line = self
+                    .buffer()
+                    .content
+                    .char_to_line(end_pos.saturating_sub(1).max(start_pos));
+                let count = end_line - start_line + 1;
+                if operator == '>' {
+                    self.indent_lines(start_line, count, changed);
+                } else if operator == '<' {
+                    self.dedent_lines(start_line, count, changed);
+                } else {
+                    self.auto_indent_lines(start_line, count, changed);
+                }
+            }
+            '!' => {
+                let start_line = self.buffer().content.char_to_line(start_pos);
+                let end_line = self
+                    .buffer()
+                    .content
+                    .char_to_line(end_pos.saturating_sub(1).max(start_pos));
+                self.mode = Mode::Command;
+                self.command_buffer = format!("{},{}!", start_line + 1, end_line + 1);
+                self.command_cursor = self.command_buffer.chars().count();
+            }
             _ => {
                 // Unknown operator - do nothing
             }
@@ -17255,6 +17666,265 @@ impl Engine {
                 self.group_layout.set_ratio_at_index(split_idx, ratio);
             }
         }
+    }
+
+    /// Ctrl-W H/J/K/L: move current window to far edge.
+    /// Creates a new editor group at the edge of the entire layout.
+    fn move_window_to_edge(&mut self, direction: SplitDirection, forward: bool) {
+        // Only meaningful with multiple groups
+        let groups = self.group_layout.group_ids();
+        if groups.len() <= 1 {
+            // With a single group, split the group layout at the root
+            let buf_id = self.active_buffer_id();
+            let view_clone = self.view().clone();
+            // Close current window if possible
+            let could_close = self.close_window();
+            if !could_close {
+                return; // Last window, can't move
+            }
+            // Create new group at the edge
+            let new_win_id = self.new_window_id();
+            let mut new_win = Window::new(new_win_id, buf_id);
+            new_win.view = view_clone;
+            self.windows.insert(new_win_id, new_win);
+            let tab = Tab::new(self.new_tab_id(), new_win_id);
+            let new_gid = self.new_group_id();
+            self.editor_groups.insert(new_gid, EditorGroup::new(tab));
+            // Wrap the existing layout in a split with the new group at the desired edge
+            let old_layout =
+                std::mem::replace(&mut self.group_layout, GroupLayout::leaf(GroupId(0)));
+            self.group_layout = if forward {
+                GroupLayout::Split {
+                    direction,
+                    ratio: 0.5,
+                    first: Box::new(old_layout),
+                    second: Box::new(GroupLayout::leaf(new_gid)),
+                }
+            } else {
+                GroupLayout::Split {
+                    direction,
+                    ratio: 0.5,
+                    first: Box::new(GroupLayout::leaf(new_gid)),
+                    second: Box::new(old_layout),
+                }
+            };
+            self.prev_active_group = Some(self.active_group);
+            self.active_group = new_gid;
+            return;
+        }
+        // Multiple groups: remove window, create new group at edge
+        let buf_id = self.active_buffer_id();
+        let view_clone = self.view().clone();
+        let could_close = self.close_window();
+        if !could_close {
+            return;
+        }
+        let new_win_id = self.new_window_id();
+        let mut new_win = Window::new(new_win_id, buf_id);
+        new_win.view = view_clone;
+        self.windows.insert(new_win_id, new_win);
+        let tab = Tab::new(self.new_tab_id(), new_win_id);
+        let new_gid = self.new_group_id();
+        self.editor_groups.insert(new_gid, EditorGroup::new(tab));
+        let old_layout = std::mem::replace(&mut self.group_layout, GroupLayout::leaf(GroupId(0)));
+        self.group_layout = if forward {
+            GroupLayout::Split {
+                direction,
+                ratio: 0.5,
+                first: Box::new(old_layout),
+                second: Box::new(GroupLayout::leaf(new_gid)),
+            }
+        } else {
+            GroupLayout::Split {
+                direction,
+                ratio: 0.5,
+                first: Box::new(GroupLayout::leaf(new_gid)),
+                second: Box::new(old_layout),
+            }
+        };
+        self.prev_active_group = Some(self.active_group);
+        self.active_group = new_gid;
+    }
+
+    /// Ctrl-W T: move current window to a new editor group.
+    fn move_window_to_new_group(&mut self) {
+        // Only meaningful with multiple windows in the current tab
+        let tab = self.active_tab();
+        if tab.layout.is_single_window() && self.active_group().tabs.len() == 1 {
+            self.message = "Already the only window".to_string();
+            return;
+        }
+        let buf_id = self.active_buffer_id();
+        let view_clone = self.view().clone();
+        let could_close = self.close_window();
+        if !could_close {
+            return;
+        }
+        // Open a new editor group with that buffer
+        let new_win_id = self.new_window_id();
+        let mut new_win = Window::new(new_win_id, buf_id);
+        new_win.view = view_clone;
+        self.windows.insert(new_win_id, new_win);
+        let tab = Tab::new(self.new_tab_id(), new_win_id);
+        let new_gid = self.new_group_id();
+        self.editor_groups.insert(new_gid, EditorGroup::new(tab));
+        self.group_layout
+            .split_at(self.active_group, SplitDirection::Vertical, new_gid, false);
+        self.prev_active_group = Some(self.active_group);
+        self.active_group = new_gid;
+    }
+
+    /// Ctrl-W x: exchange current window with next window in the same tab.
+    fn exchange_windows(&mut self) {
+        let tab = self.active_tab();
+        let ids = tab.layout.window_ids();
+        if ids.len() < 2 {
+            return;
+        }
+        let current_id = tab.active_window;
+        let current_idx = ids.iter().position(|&id| id == current_id).unwrap_or(0);
+        let next_idx = (current_idx + 1) % ids.len();
+        let next_id = ids[next_idx];
+        // Swap buffer_id and view between the two windows
+        let current_buf = self.windows[&current_id].buffer_id;
+        let current_view = self.windows[&current_id].view.clone();
+        let next_buf = self.windows[&next_id].buffer_id;
+        let next_view = self.windows[&next_id].view.clone();
+        if let Some(w) = self.windows.get_mut(&current_id) {
+            w.buffer_id = next_buf;
+            w.view = next_view;
+        }
+        if let Some(w) = self.windows.get_mut(&next_id) {
+            w.buffer_id = current_buf;
+            w.view = current_view;
+        }
+    }
+
+    /// Try to parse and execute a range filter command like `1,5!sort` or `.!cmd`.
+    /// Returns Some(action) if it matched, None otherwise.
+    fn try_execute_filter_command(&mut self, cmd: &str) -> Option<EngineAction> {
+        // Match patterns: N,M!cmd  or  .!cmd  or  .,.+N!cmd
+        // Split on '!' — if there's a range before and a command after, it's a filter.
+        let bang_pos = cmd.find('!')?;
+        let range_str = &cmd[..bang_pos];
+        let filter_cmd = cmd[bang_pos + 1..].trim();
+        if filter_cmd.is_empty() || range_str.is_empty() {
+            return None;
+        }
+        // Parse the range. Support: N,M  .,.+N  N  .  %
+        let (start_line, end_line) = self.parse_simple_range(range_str)?;
+        // Extract the text from the range
+        let total_lines = self.buffer().len_lines();
+        let start = start_line.min(total_lines.saturating_sub(1));
+        let end = end_line.min(total_lines.saturating_sub(1));
+        let mut lines_text = String::new();
+        for i in start..=end {
+            let line: String = self.buffer().content.line(i).chars().collect();
+            lines_text.push_str(&line);
+        }
+        // Pipe through the command
+        #[cfg(not(test))]
+        let result = {
+            use std::io::Write;
+            let mut child = match std::process::Command::new("sh")
+                .arg("-c")
+                .arg(filter_cmd)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    self.message = format!("Filter error: {}", e);
+                    return Some(EngineAction::None);
+                }
+            };
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(lines_text.as_bytes());
+            }
+            match child.wait_with_output() {
+                Ok(output) => {
+                    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    if !stderr.is_empty() && stdout.is_empty() {
+                        self.message = format!("Filter error: {}", stderr.trim());
+                        return Some(EngineAction::None);
+                    }
+                    stdout
+                }
+                Err(e) => {
+                    self.message = format!("Filter error: {}", e);
+                    return Some(EngineAction::None);
+                }
+            }
+        };
+        #[cfg(test)]
+        let result = lines_text.clone(); // No-op in tests
+
+        // Replace the range with the result
+        let range_start = self.buffer().line_to_char(start);
+        let range_end = if end + 1 < total_lines {
+            self.buffer().line_to_char(end + 1)
+        } else {
+            self.buffer().len_chars()
+        };
+        self.start_undo_group();
+        self.delete_with_undo(range_start, range_end);
+        self.insert_with_undo(range_start, &result);
+        self.finish_undo_group();
+        self.view_mut().cursor.line = start;
+        self.view_mut().cursor.col = 0;
+        let line_count = result.lines().count();
+        self.message = format!("{} lines filtered", line_count);
+        Some(EngineAction::None)
+    }
+
+    /// Parse a simple line range like "1,5", ".", ".,.+3", "%".
+    /// Returns 0-indexed (start_line, end_line).
+    fn parse_simple_range(&self, range: &str) -> Option<(usize, usize)> {
+        let current_line = self.view().cursor.line;
+        let last_line = self.buffer().len_lines().saturating_sub(1);
+
+        if range == "%" {
+            return Some((0, last_line));
+        }
+        if range == "." {
+            return Some((current_line, current_line));
+        }
+
+        if let Some((left, right)) = range.split_once(',') {
+            let start = self.parse_line_addr(left.trim(), current_line, last_line)?;
+            let end = self.parse_line_addr(right.trim(), current_line, last_line)?;
+            Some((start, end))
+        } else {
+            let line = self.parse_line_addr(range.trim(), current_line, last_line)?;
+            Some((line, line))
+        }
+    }
+
+    /// Parse a single line address: number (1-indexed), ".", "$", ".+N", ".-N".
+    fn parse_line_addr(&self, addr: &str, current: usize, last: usize) -> Option<usize> {
+        if addr == "." {
+            return Some(current);
+        }
+        if addr == "$" {
+            return Some(last);
+        }
+        if let Some(offset) = addr.strip_prefix(".+") {
+            let n: usize = offset.parse().ok()?;
+            return Some((current + n).min(last));
+        }
+        if let Some(offset) = addr.strip_prefix(".-") {
+            let n: usize = offset.parse().ok()?;
+            return Some(current.saturating_sub(n));
+        }
+        // Plain number (1-indexed)
+        let n: usize = addr.parse().ok()?;
+        if n == 0 {
+            return None;
+        }
+        Some((n - 1).min(last))
     }
 
     // =======================================================================

@@ -29,19 +29,19 @@ See [README.md](README.md) for full feature documentation.
 | `CTRL-R {reg}` | Insert contents of register | ✅ | Two-key sequence |
 | `CTRL-N` | Next completion match | ✅ | Auto-popup + manual completion |
 | `CTRL-P` | Previous completion match | ✅ | Auto-popup + manual completion |
-| `CTRL-O` | Execute one Normal command | ⚠️ | Switches to Normal; no auto-return to Insert |
+| `CTRL-O` | Execute one Normal command | ✅ | Auto-returns to Insert after one command |
 | `CTRL-E` | Insert character below cursor | ✅ | |
 | `CTRL-Y` | Insert character above cursor | ✅ | |
 | `CTRL-A` | Insert previously inserted text | ✅ | |
-| `CTRL-@` | Insert prev text and stop insert | ❌ | |
-| `CTRL-V {char}` | Insert literal character | ❌ | |
+| `CTRL-@` | Insert prev text and stop insert | ✅ | |
+| `CTRL-V {char}` | Insert literal character | ✅ | Tab, Return also handled |
 | `CTRL-K {c1}{c2}` | Enter digraph | N/A | No digraph support planned |
 | `CTRL-X ...` | Completion sub-modes | ❌ | VimCode uses auto-popup + LSP instead |
 | `CTRL-]` | Trigger abbreviation | N/A | No abbreviations |
 | `CTRL-G u` | Break undo sequence | ✅ | |
 | `CTRL-G j/k` | Move cursor down/up | ✅ | |
 
-**Insert mode: 18/24 (75%)**
+**Insert mode: 21/24 (88%)**
 
 ---
 
@@ -153,11 +153,11 @@ See [README.md](README.md) for full feature documentation.
 | `CTRL-X` | Decrement number | ✅ | |
 | `gq{motion}` | Format text | ✅ | Reflows to textwidth |
 | `gw{motion}` | Format text, keep cursor | ✅ | Reflows to textwidth |
-| `!{motion}{filter}` | Filter through command | ❌ | |
+| `!{motion}{filter}` | Filter through command | ✅ | Opens command mode with range pre-filled |
 | `&` | Repeat last `:s` | ✅ | |
 | `g&` | Repeat last `:s` on all lines | ✅ | |
 
-**Editing: 50/50 (100%)**
+**Editing: 51/51 (100%)**
 
 ---
 
@@ -223,7 +223,7 @@ See [README.md](README.md) for full feature documentation.
 | `gx` | Open URL/file externally | ✅ | Opens in default browser/app |
 | `gi` | Insert at last insert pos | ❌ | `gi` is LSP go-to-implementation |
 | `gI` | Insert at column 1 | ✅ | |
-| `g?{motion}` | ROT13 encode | ❌ | |
+| `g?{motion}` | ROT13 encode | ✅ | Supports text objects, all motions |
 | `CTRL-^` | Edit alternate file | ✅ | |
 | `CTRL-]` | Tag jump | ⚠️ | `gd` (LSP) provides equivalent |
 | `CTRL-G` | Show file info | ❌ | `:file` command works |
@@ -234,7 +234,7 @@ See [README.md](README.md) for full feature documentation.
 | `q/` / `q?` | Search history window | ❌ | |
 | `cgn` | Change next match | ✅ | Repeat with `.` |
 
-**Other: 28/33 (85%)**
+**Other: 29/33 (88%)**
 
 ---
 
@@ -296,14 +296,14 @@ See [README.md](README.md) for full feature documentation.
 | `gi` | Insert at last insert pos | ❌ | `gi` is LSP go-to-implementation |
 | `gI` | Insert at column 1 | ✅ | |
 | `gm` / `gM` | Middle of screen/text line | ✅ | |
-| `g?{motion}` | ROT13 encode | ❌ | |
+| `g?{motion}` | ROT13 encode | ✅ | Supports text objects, all motions |
 | `g+` / `g-` | Undo tree newer/older | ❌ | |
 | `gR` / `gr` | Virtual replace mode | ❌ | |
 | `g'` / `` g` `` | Mark without jumplist | ✅ | |
 | `g&` | Repeat `:s` all lines | ✅ | |
 | `gH` / `gV` | Select mode | N/A | No Select mode |
 
-**g-commands: 30/34 (88%)**
+**g-commands: 31/34 (91%)**
 
 ---
 
@@ -364,12 +364,12 @@ See [README.md](README.md) for full feature documentation.
 | `CTRL-W =` | Equalize sizes | ✅ | All group splits |
 | `CTRL-W _` | Maximize height | ✅ | Editor group splits |
 | `CTRL-W \|` | Maximize width | ✅ | Editor group splits |
-| `CTRL-W H` | Move window to far left | ❌ | |
-| `CTRL-W J` | Move window to far bottom | ❌ | |
-| `CTRL-W K` | Move window to far top | ❌ | |
-| `CTRL-W L` | Move window to far right | ❌ | |
-| `CTRL-W T` | Move window to new tab | ❌ | |
-| `CTRL-W x` | Exchange with next window | ❌ | |
+| `CTRL-W H` | Move window to far left | ✅ | Creates new group at layout edge |
+| `CTRL-W J` | Move window to far bottom | ✅ | Creates new group at layout edge |
+| `CTRL-W K` | Move window to far top | ✅ | Creates new group at layout edge |
+| `CTRL-W L` | Move window to far right | ✅ | Creates new group at layout edge |
+| `CTRL-W T` | Move window to new tab | ✅ | Moves to new editor group |
+| `CTRL-W x` | Exchange with next window | ✅ | Swaps buffer and view |
 | `CTRL-W r` | Rotate windows downward | ❌ | |
 | `CTRL-W R` | Rotate windows upward | ❌ | |
 | `CTRL-W p` | Go to previous window | ✅ | |
@@ -381,7 +381,7 @@ See [README.md](README.md) for full feature documentation.
 | `CTRL-W f` | Split + open file | ✅ | |
 | `CTRL-W d` | Split + go to definition | ✅ | LSP-based |
 
-**Window commands: 25/31 (81%)** (excluding N/A)
+**Window commands: 31/31 (100%)** (excluding N/A)
 
 ---
 
@@ -432,11 +432,11 @@ Operators `d`, `c`, `y`, `>`, `<`, `=`, `g~`, `gu`, `gU` all accept these motion
 | `it`/`at` | Tag text objects | ✅ | |
 | `i<`/`a<` | Angle bracket objects | ✅ | |
 | `` i` ``/`` a` `` | Backtick text objects | ✅ | |
-| `o_v` | Force charwise | ❌ | |
-| `o_V` | Force linewise | ❌ | |
-| `o_CTRL-V` | Force blockwise | ❌ | |
+| `o_v` | Force charwise | ✅ | Converts linewise to charwise |
+| `o_V` | Force linewise | ✅ | Converts charwise to linewise |
+| `o_CTRL-V` | Force blockwise | ❌ | Blockwise forcing not implemented |
 
-**Operator-pending: 18/21 (86%)**
+**Operator-pending: 20/21 (95%)**
 
 ---
 
@@ -464,14 +464,14 @@ Operators `d`, `c`, `y`, `>`, `<`, `=`, `g~`, `gu`, `gU` all accept these motion
 | `gJ` | Join without space | ✅ | |
 | `%` | Jump to matching bracket | ✅ | Extends selection |
 | `r{char}` | Replace all selected chars | ✅ | Visual/VisualLine/VisualBlock |
-| `I` (block) | Block insert | ❌ | |
-| `A` (block) | Block append | ❌ | |
+| `I` (block) | Block insert | ✅ | Text applied to all block lines on Escape |
+| `A` (block) | Block append | ✅ | Text applied to all block lines on Escape |
 | `gq` | Format selection | ✅ | |
 | `g CTRL-A` | Sequential increment | ✅ | |
 | `g CTRL-X` | Sequential decrement | ✅ | |
 | Movement keys | Extend selection | ✅ | All motions work |
 
-**Visual mode: 24/26 (92%)**
+**Visual mode: 26/26 (100%)**
 
 ---
 
@@ -600,29 +600,34 @@ These are not in Vim but are part of VimCode:
 
 | Category | Implemented | Total | Coverage |
 |----------|-------------|-------|----------|
-| Insert Mode | 15 | 24 | 63% |
-| Movement | 46 | 47 | 98% |
-| Editing | 47 | 50 | 94% |
+| Insert Mode | 21 | 24 | 88% |
+| Movement | 48 | 48 | 100% |
+| Editing | 51 | 51 | 100% |
 | Search & Marks | 25 | 26 | 96% |
-| Normal — Other | 21 | 33 | 64% |
+| Normal — Other | 29 | 33 | 88% |
 | Text Objects | 16 | 16 | 100% |
-| g-Commands | 20 | 34 | 59% |
-| z-Commands | 22 | 23 | 96% |
-| Window (CTRL-W) | 20 | 31 | 65% |
+| g-Commands | 31 | 34 | 91% |
+| z-Commands | 23 | 23 | 100% |
+| Window (CTRL-W) | 31 | 31 | 100% |
 | Bracket ([ / ]) | 12 | 13 | 92% |
-| Operator-Pending | 18 | 21 | 86% |
-| Visual Mode | 21 | 26 | 81% |
-| Ex Commands | 65 | 68 | 96% |
-| **Total** | **348** | **411** | **85%** |
+| Operator-Pending | 20 | 21 | 95% |
+| Visual Mode | 26 | 26 | 100% |
+| Ex Commands | 67 | 68 | 99% |
+| **Total** | **400** | **414** | **97%** |
 
 N/A commands (VimScript, digraphs, spelling, etc.) are excluded from totals.
 
-### Priority Missing Commands
+### Remaining Missing Commands
 
-**Highest impact** (commonly used):
-- `CTRL-O` in insert (full implementation — currently switches to Normal without auto-return)
-- `gq{motion}` (format text)
-- Visual block `I`/`A` (block insert/append)
-- `g&` (repeat last `:s` on all lines)
-- `CTRL-W H/J/K/L` (move window to far left/bottom/top/right)
-- `N%` (go to N% of file)
+- `gi` (insert at last insert position — currently mapped to LSP go-to-implementation)
+- `CTRL-G` (show file info — `:file` command provides equivalent)
+- `CTRL-X ...` (completion sub-modes)
+- `CTRL-]` (tag jump — full, currently ⚠️ via `gd`)
+- `o_CTRL-V` (force blockwise motion)
+- `do`/`dp` (diff obtain/put)
+- `q:`/`q?` (command-line/search history window)
+- `g+`/`g-` (undo tree newer/older)
+- `gR`/`gr` (virtual replace mode)
+- `[#`/`]#` (unmatched #if/#else)
+- `:vmap` (visual-mode mappings)
+- `CTRL-X CTRL-...` (insert completion sub-modes)

@@ -11,7 +11,7 @@ There's a touch of irony here - using a cli tool to write the editor that I've w
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 2583+ tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 2612+ tests, zero async runtime dependency
 
 > **Note:** VimCode does not implement VimScript. Extension and scripting is handled via
 > the built-in Lua 5.4 plugin system. The goal is full Vim *keybinding* and *editing*
@@ -134,11 +134,16 @@ cargo fmt
 - `Ctrl-D` — dedent current line by shiftwidth
 - `Ctrl-E` — insert character from line below
 - `Ctrl-Y` — insert character from line above
+- `Ctrl-O` — execute one Normal command, then auto-return to Insert
+- `Ctrl-@` — insert previously inserted text and exit Insert mode
+- `Ctrl-V {char}` — insert next character literally (Tab, Return, any key)
 
 **Visual mode**
 - `v` — character selection; `V` — line selection; `Ctrl-V` — block selection
 - All operators work on selection: `d`, `c`, `y`, `u`, `U`, `~`
 - Block mode: rectangular selections, change/delete/yank uniform columns
+- `I` (block) — insert text at left edge of block (applied to all lines on Escape)
+- `A` (block) — append text after right edge of block (applied to all lines on Escape)
 - `o` — swap cursor to opposite end of selection (character/line visual)
 - `O` — swap cursor to opposite column corner (visual block)
 - `gv` — reselect last visual selection
@@ -959,6 +964,8 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `g'`/`` g` `` | Jump to mark without pushing to jump list |
 | `gq{motion}` | Format text (reflow to textwidth) |
 | `gw{motion}` | Format text, keep cursor position |
+| `g?{motion}` | ROT13 encode text |
+| `!{motion}{cmd}` | Filter lines through external command |
 | `N%` | Go to N% of file (e.g. `50%` goes to middle) |
 | `CTRL-^` | Switch to alternate (last edited) buffer |
 | `CTRL-L` | Clear message / redraw screen |
@@ -1003,6 +1010,9 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `Ctrl-W =` | Equalize all split sizes |
 | `Ctrl-W _` / `\|` | Maximize split height / width |
 | `Ctrl-W p` / `t` / `b` | Previous / top / bottom editor group |
+| `Ctrl-W H` / `J` / `K` / `L` | Move window to far left/bottom/top/right |
+| `Ctrl-W T` | Move window to new editor group |
+| `Ctrl-W x` | Exchange with next window |
 | `Ctrl-W f` | Split and open file under cursor |
 | `Ctrl-W d` | Split and go to definition (LSP) |
 | `Ctrl-P` | Open fuzzy file finder |
