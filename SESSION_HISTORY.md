@@ -1,9 +1,12 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 143 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 144 archived here. Recent work summary in PROJECT_STATE.md.
 
 ---
+
+**Session 144 — Vim compatibility batch 4: 10 commands (21 new tests, 2642 total):**
+Implemented 10 more missing Vim commands, raising VIM_COMPATIBILITY.md from 400/414 (97%) to 406/414 (98%). `Ctrl-G` show file info (filename, line, col, percentage), `gi` insert at last insert position (LSP go-to-implementation remapped to `<leader>gi`, `last_insert_pos` field tracked on Insert→Normal transition), `Ctrl-W r`/`R` rotate windows (forward/backward buffer+view rotation within tab), `[*`/`]*` and `[/`/`]/` C-style comment block navigation (`/*`/`*/` search), `do`/`dp` diff obtain/put (pull/push lines between diff windows), `o_CTRL-V` force blockwise operator motion (intercepts Ctrl-V with pending operator). Also fixed doc inconsistencies: `g'`/`` g` `` mark without jumplist was already implemented, `[z`/`]z` fold navigation was already implemented. Marked `CTRL-X ...` and `:map` as N/A. 21 integration tests in `tests/vim_compat_batch4.rs`. Sections now at 100%: Search & Marks (26/26), Window (33/33), Operator-Pending (21/21), Ex Commands (67/67).
 
 **Session 143 — File management bug fixes + :e! (9 new tests, 2621 total):**
 Fixed 3 bugs found during Neovim comparison testing + added `:e!` command: (1) `:q` dirty guard now checks if the buffer is visible in another window before blocking — `execute_command("quit")` queries `self.windows` for other views of the same `buffer_id`, (2) File auto-reload system — `BufferState.file_mtime: Option<SystemTime>` captured in `with_file()` and `save()`, `BufferState.file_change_warned: bool` for one-shot warnings, `BufferState.reload_from_disk()` method (re-reads file, clears undo/redo, resets dirty), `Settings.autoread: bool` (default true, alias `ar`), `Engine.check_file_changes()` iterates all buffers and stats files (silently reloads clean, shows W12 warning for dirty), `BufferManager.iter()` public iterator, wired into both GTK (`main.rs`: `last_file_check` field, 2s interval) and TUI (`tui_main.rs`: `last_file_check` local, 2s interval), (3) `split_window()` now uses `settings.splitbelow`/`settings.splitright` to compute `new_first` instead of hardcoding `false`, (4) `:e!` (`edit!`) command reloads current file from disk discarding all changes. New `SettingDef` for `autoread` in `render.rs`. 9 integration tests in `tests/vim_compat_batch3.rs`: `:q` dirty split allows close, `:q` dirty last window blocks, `check_file_changes` reload/warn, `:new`/`:vnew` with default/custom `splitbelow`/`splitright`, `:e!` reload.

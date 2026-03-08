@@ -487,6 +487,23 @@ impl Default for CompletionKeys {
 /// Supported formats: `<C-b>`, `<C-S-e>`, `<A-x>`, `<C-A-x>`.
 /// Returns `None` if the format is not recognised.
 pub fn parse_key_binding(s: &str) -> Option<(bool, bool, bool, char)> {
+    let (ctrl, shift, alt, key_str) = parse_key_binding_named(s)?;
+    // For backward compat: named keys map to sentinel chars, single chars pass through.
+    let ch = match key_str.as_str() {
+        "Space" | "space" => ' ',
+        _ => {
+            if key_str.chars().count() != 1 {
+                return None;
+            }
+            key_str.chars().next()?
+        }
+    };
+    Some((ctrl, shift, alt, ch.to_ascii_lowercase()))
+}
+
+/// Extended key binding parser that returns the key name as a string.
+/// Supports named keys like `Tab`, `Space`, `Escape`, etc.
+pub fn parse_key_binding_named(s: &str) -> Option<(bool, bool, bool, String)> {
     let s = s.trim();
     if !s.starts_with('<') || !s.ends_with('>') {
         return None;
@@ -507,18 +524,8 @@ pub fn parse_key_binding(s: &str) -> Option<(bool, bool, bool, char)> {
             _ => return None,
         }
     }
-    let key_str = parts[parts.len() - 1];
-    // Accept named keys (e.g. "Space") in addition to single characters.
-    let ch = match key_str {
-        "Space" | "space" => ' ',
-        _ => {
-            if key_str.chars().count() != 1 {
-                return None;
-            }
-            key_str.chars().next()?
-        }
-    };
-    Some((ctrl, shift, alt, ch.to_ascii_lowercase()))
+    let key_str = parts[parts.len() - 1].to_string();
+    Some((ctrl, shift, alt, key_str))
 }
 
 fn default_font_family() -> String {

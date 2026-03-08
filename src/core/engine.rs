@@ -742,6 +742,10 @@ pub struct Engine {
 
     /// Pending key for multi-key sequences (e.g. 'g' for gg, 'd' for dd).
     pub pending_key: Option<char>,
+    /// Set by `focus_window_direction` when navigation overflows the window list.
+    /// `Some(false)` = tried to go left past first window, `Some(true)` = right past last.
+    /// Consumed by the UI backend to move focus to sidebar/toolbar.
+    pub window_nav_overflow: Option<bool>,
 
     // --- Registers (yank/delete storage) ---
     /// Named registers: 'a'-'z' plus '"' (unnamed default). Value is (content, is_linewise).
@@ -1172,6 +1176,8 @@ pub struct Engine {
     pub last_jump_pos: Option<(usize, usize)>,
     /// Position of last buffer edit (for '. and `. marks).
     pub last_edit_pos: Option<(usize, usize)>,
+    /// Position where cursor was when last leaving Insert mode (for `gi`).
+    pub last_insert_pos: Option<(usize, usize)>,
     /// Start of last visual selection (for '< and `< marks).
     pub visual_mark_start: Option<(usize, usize)>,
     /// End of last visual selection (for '> and `> marks).
@@ -1355,6 +1361,7 @@ impl Engine {
             replace_text: String::new(),
             replace_flags: String::new(),
             pending_key: None,
+            window_nav_overflow: None,
             registers: HashMap::new(),
             selected_register: None,
             marks: HashMap::new(),
@@ -1520,6 +1527,7 @@ impl Engine {
             dap_deferred_lang: None,
             last_jump_pos: None,
             last_edit_pos: None,
+            last_insert_pos: None,
             visual_mark_start: None,
             visual_mark_end: None,
             global_marks: HashMap::new(),
@@ -3002,11 +3010,22 @@ impl Engine {
     }
 
     /// Move focus to a window in the given direction.
+    /// Sets `window_nav_overflow` to `Some(false)` when trying to go left past
+    /// the first window, or `Some(true)` when trying to go right past the last.
     pub fn focus_window_direction(&mut self, _direction: SplitDirection, forward: bool) {
-        // For now, just cycle - proper directional navigation requires geometry
+        let win_ids = self.active_tab().window_ids();
+        let current = self.active_tab().active_window;
         if forward {
+            if win_ids.last() == Some(&current) && self.group_layout.leaf_count() <= 1 {
+                self.window_nav_overflow = Some(true);
+                return;
+            }
             self.focus_next_window();
         } else {
+            if win_ids.first() == Some(&current) && self.group_layout.leaf_count() <= 1 {
+                self.window_nav_overflow = Some(false);
+                return;
+            }
             self.focus_prev_window();
         }
     }
@@ -4356,8 +4375,9 @@ impl Engine {
         unicode: Option<char>,
         ctrl: bool,
     ) -> EngineAction {
-        // Clear message on any keypress (unless we're in command/search mode)
-        if self.mode != Mode::Command && self.mode != Mode::Search {
+        // Clear message on any keypress (unless we're in command/search mode
+        // or a swap recovery dialog is pending — its prompt is in self.message)
+        if self.mode != Mode::Command && self.mode != Mode::Search && self.swap_recovery.is_none() {
             self.message.clear();
         }
         // Dismiss LSP hover popup on any keypress
@@ -4380,7 +4400,7 @@ impl Engine {
 
         // Swap recovery dialog intercepts R/D/A keys.
         if self.swap_recovery.is_some() {
-            return self.handle_swap_recovery_key(key_name);
+            return self.handle_swap_recovery_key(key_name, unicode);
         }
 
         // Command palette intercepts all keys when open.
@@ -4761,6 +4781,11 @@ impl Engine {
                     return EngineAction::None;
                 }
                 "v" => {
+                    if self.pending_operator.is_some() {
+                        // Ctrl-V with pending operator: force blockwise motion
+                        self.force_motion_mode = Some('\x16');
+                        return EngineAction::None;
+                    }
                     // Ctrl-V: Enter visual block mode
                     self.mode = Mode::VisualBlock;
                     self.visual_anchor = Some(self.view().cursor);
@@ -4787,8 +4812,23 @@ impl Engine {
                     return EngineAction::None;
                 }
                 "g" => {
-                    // Ctrl-G: Open live grep modal
-                    self.open_live_grep();
+                    // Ctrl-G: show file info (Vim compat)
+                    let name = self
+                        .file_path()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "[No Name]".to_string());
+                    let modified = if self.dirty() { " [Modified]" } else { "" };
+                    let total = self.buffer().len_lines();
+                    let cur_line = self.view().cursor.line + 1;
+                    let col = self.view().cursor.col + 1;
+                    let pct = if total == 0 {
+                        0
+                    } else {
+                        (cur_line * 100) / total
+                    };
+                    self.message = format!(
+                        "\"{name}\"{modified} line {cur_line} of {total} --{pct}%-- col {col}"
+                    );
                     return EngineAction::None;
                 }
                 "e" => {
@@ -5865,8 +5905,21 @@ impl Engine {
                     self.lsp_request_references();
                 }
                 Some('i') => {
-                    self.push_jump_location();
-                    self.lsp_request_implementation();
+                    // gi: go to last insert position and enter Insert mode
+                    if let Some((line, col)) = self.last_insert_pos {
+                        let max_line = self.buffer().len_lines().saturating_sub(1);
+                        let target_line = line.min(max_line);
+                        self.view_mut().cursor.line = target_line;
+                        let line_len = self.buffer().line_len_chars(target_line);
+                        let max_col = if line_len > 0 { line_len - 1 } else { 0 };
+                        self.view_mut().cursor.col = col.min(max_col);
+                        self.mode = Mode::Insert;
+                        self.insert_text_buffer.clear();
+                    } else {
+                        // No previous insert position: just enter Insert mode
+                        self.mode = Mode::Insert;
+                        self.insert_text_buffer.clear();
+                    }
                 }
                 Some('y') => {
                     self.push_jump_location();
@@ -6141,6 +6194,13 @@ impl Engine {
                         self.clamp_cursor_col();
                     }
                 }
+                Some('*') | Some('/') => {
+                    // ]* / ]/: jump to end of comment block (/* ... */)
+                    let count = self.take_count();
+                    for _ in 0..count {
+                        self.jump_comment_end();
+                    }
+                }
                 _ => {}
             },
             '[' => match unicode {
@@ -6216,6 +6276,13 @@ impl Engine {
                         self.view_mut().cursor.line = start;
                         self.view_mut().cursor.col = 0;
                         self.clamp_cursor_col();
+                    }
+                }
+                Some('*') | Some('/') => {
+                    // [* / [/: jump to start of comment block (/* ... */)
+                    let count = self.take_count();
+                    for _ in 0..count {
+                        self.jump_comment_start();
                     }
                 }
                 _ => {}
@@ -6335,6 +6402,14 @@ impl Engine {
                     Some('x') => {
                         // Ctrl-W x: exchange current window with next window in the same tab
                         self.exchange_windows();
+                    }
+                    Some('r') => {
+                        // Ctrl-W r: rotate windows downward/rightward
+                        self.rotate_windows(true);
+                    }
+                    Some('R') => {
+                        // Ctrl-W R: rotate windows upward/leftward
+                        self.rotate_windows(false);
                     }
                     Some('w') | Some('W') => self.focus_next_window(),
                     Some('c') | Some('C') => {
@@ -6834,8 +6909,6 @@ impl Engine {
             self.pending_operator = Some(operator);
             return EngineAction::None;
         }
-        // CTRL-V for blockwise force (not implemented in operator-pending for now,
-        // but mark it so it doesn't fall through to other handlers).
 
         // Handle case-transform operators (~=toggle, u=lower, U=upper)
         if operator == '~' || operator == 'u' || operator == 'U' {
@@ -7093,6 +7166,14 @@ impl Engine {
                 // yy: yank current line(s)
                 let count = self.take_count();
                 self.yank_lines(count);
+            }
+            Some('o') if operator == 'd' => {
+                // do: diff obtain — pull line from other diff window
+                self.diff_obtain(changed);
+            }
+            Some('p') if operator == 'd' => {
+                // dp: diff put — push line to other diff window
+                self.diff_put(changed);
             }
             Some('d') if operator == 'd' => {
                 // dd: delete line
@@ -7622,6 +7703,23 @@ impl Engine {
             self.apply_linewise_operator(operator, start_line, end_line, changed);
             return;
         }
+        // Force blockwise mode: apply operator as a block (rectangle)
+        if self.force_motion_mode == Some('\x16') {
+            self.force_motion_mode = None;
+            let start_line = self.buffer().content.char_to_line(start);
+            let start_line_char = self.buffer().line_to_char(start_line);
+            let start_col = start - start_line_char;
+            let end_char = end.saturating_sub(1).max(start);
+            let end_line = self.buffer().content.char_to_line(end_char);
+            let end_line_char = self.buffer().line_to_char(end_line);
+            let end_col = end_char - end_line_char;
+            let left_col = start_col.min(end_col);
+            let right_col = start_col.max(end_col);
+            self.apply_blockwise_operator(
+                operator, start_line, end_line, left_col, right_col, changed,
+            );
+            return;
+        }
         self.force_motion_mode = None;
         match operator {
             'y' => {
@@ -7744,6 +7842,13 @@ impl Engine {
                 .buffer()
                 .line_to_char((end_line + 1).min(self.buffer().len_lines()));
             self.apply_charwise_operator(operator, start, end, changed);
+            return;
+        }
+        // Force blockwise mode: convert to block using cursor column
+        if self.force_motion_mode == Some('\x16') {
+            self.force_motion_mode = None;
+            let col = self.view().cursor.col;
+            self.apply_blockwise_operator(operator, start_line, end_line, col, col, changed);
             return;
         }
         self.force_motion_mode = None;
@@ -7972,7 +8077,7 @@ impl Engine {
         partial.push(ch);
 
         // All known leader sequences
-        const SEQUENCES: &[&str] = &["rn", "gf", "gF"];
+        const SEQUENCES: &[&str] = &["rn", "gf", "gF", "gi"];
 
         match partial.as_str() {
             "rn" => {
@@ -7985,6 +8090,11 @@ impl Engine {
             "gf" | "gF" => {
                 // LSP format whole file
                 self.lsp_format_current();
+            }
+            "gi" => {
+                // LSP go to implementation
+                self.push_jump_location();
+                self.lsp_request_implementation();
             }
             // Partial match — keep accumulating if the partial is a prefix of some sequence
             s if SEQUENCES.iter().any(|seq| seq.starts_with(s)) => {
@@ -8706,6 +8816,9 @@ impl Engine {
                         self.finish_undo_group();
                     }
                 }
+                // Track cursor pos for gi (insert at last insert position)
+                let cur = self.view().cursor;
+                self.last_insert_pos = Some((cur.line, cur.col));
                 self.mode = Mode::Normal;
                 self.clamp_cursor_col();
                 // Dismiss signature help when leaving insert mode
@@ -12531,29 +12644,28 @@ impl Engine {
 
         // Handle :colorscheme [name]
         if cmd == "colorscheme" {
-            let names = ["onedark", "gruvbox-dark", "tokyo-night", "solarized-dark"];
+            let mut names: Vec<&str> =
+                vec!["onedark", "gruvbox-dark", "tokyo-night", "solarized-dark"];
+            let custom = list_custom_theme_names();
+            let custom_strs: Vec<&str> = custom.iter().map(|s| s.as_str()).collect();
+            names.extend(custom_strs);
             self.message = format!("Available themes: {}", names.join(", "));
             return EngineAction::None;
         }
         if let Some(name) = cmd.strip_prefix("colorscheme ") {
             let name = name.trim();
-            let valid = [
-                "onedark",
-                "gruvbox-dark",
-                "gruvbox",
-                "tokyo-night",
-                "tokyonight",
-                "solarized-dark",
-                "solarized",
-            ];
-            if valid.contains(&name) {
-                // Normalize to canonical name
-                let canonical = match name {
-                    "gruvbox" => "gruvbox-dark",
-                    "tokyonight" => "tokyo-night",
-                    "solarized" => "solarized-dark",
-                    other => other,
-                };
+            // Normalize built-in aliases
+            let canonical = match name {
+                "gruvbox" => "gruvbox-dark",
+                "tokyonight" => "tokyo-night",
+                "solarized" => "solarized-dark",
+                other => other,
+            };
+            // Verify the theme exists (built-in or custom VSCode JSON)
+            let builtin = ["onedark", "gruvbox-dark", "tokyo-night", "solarized-dark"];
+            let custom = list_custom_theme_names();
+            let is_valid = builtin.contains(&canonical) || custom.iter().any(|n| n == canonical);
+            if is_valid {
                 self.settings.colorscheme = canonical.to_string();
                 if let Err(e) = self.settings.save() {
                     self.message = format!("Theme set to '{canonical}' (save failed: {e})");
@@ -12561,7 +12673,12 @@ impl Engine {
                     self.message = format!("Theme: {canonical}");
                 }
             } else {
-                self.message = format!("Unknown theme '{name}'. Available: onedark, gruvbox-dark, tokyo-night, solarized-dark");
+                let mut available: Vec<String> = builtin.iter().map(|s| s.to_string()).collect();
+                available.extend(custom);
+                self.message = format!(
+                    "Unknown theme '{name}'. Available: {}",
+                    available.join(", ")
+                );
                 return EngineAction::Error;
             }
             return EngineAction::None;
@@ -17997,6 +18114,298 @@ impl Engine {
         }
     }
 
+    /// Ctrl-W r/R: rotate windows in the current tab.
+    /// `forward=true` rotates downward/rightward, `forward=false` rotates upward/leftward.
+    fn rotate_windows(&mut self, forward: bool) {
+        let tab = self.active_tab();
+        let ids = tab.layout.window_ids();
+        if ids.len() < 2 {
+            return;
+        }
+        // Collect (buffer_id, view) for each window in layout order
+        let mut data: Vec<_> = ids
+            .iter()
+            .map(|&id| {
+                let w = &self.windows[&id];
+                (w.buffer_id, w.view.clone())
+            })
+            .collect();
+        // Rotate the data
+        if forward {
+            // Last element moves to front
+            let last = data.pop().unwrap();
+            data.insert(0, last);
+        } else {
+            // First element moves to back
+            let first = data.remove(0);
+            data.push(first);
+        }
+        // Apply rotated data back
+        for (i, &id) in ids.iter().enumerate() {
+            if let Some(w) = self.windows.get_mut(&id) {
+                w.buffer_id = data[i].0;
+                w.view = data[i].1.clone();
+            }
+        }
+    }
+
+    /// Jump to end of C-style comment block (]*  or  ]/).
+    fn jump_comment_end(&mut self) {
+        let total = self.buffer().len_lines();
+        let start = self.view().cursor.line + 1;
+        for line_idx in start..total {
+            let line: String = self.buffer().content.line(line_idx).chars().collect();
+            let trimmed = line.trim();
+            if trimmed.contains("*/") {
+                self.view_mut().cursor.line = line_idx;
+                // Position cursor at the '*' of '*/'
+                if let Some(pos) = line.find("*/") {
+                    let col = line[..pos].chars().count();
+                    self.view_mut().cursor.col = col;
+                } else {
+                    self.view_mut().cursor.col = 0;
+                }
+                self.clamp_cursor_col();
+                return;
+            }
+        }
+    }
+
+    /// Jump to start of C-style comment block ([*  or  [/).
+    fn jump_comment_start(&mut self) {
+        let cursor_line = self.view().cursor.line;
+        if cursor_line == 0 {
+            return;
+        }
+        for line_idx in (0..cursor_line).rev() {
+            let line: String = self.buffer().content.line(line_idx).chars().collect();
+            let trimmed = line.trim();
+            if trimmed.contains("/*") {
+                self.view_mut().cursor.line = line_idx;
+                // Position cursor at the '/' of '/*'
+                if let Some(pos) = line.find("/*") {
+                    let col = line[..pos].chars().count();
+                    self.view_mut().cursor.col = col;
+                } else {
+                    self.view_mut().cursor.col = 0;
+                }
+                self.clamp_cursor_col();
+                return;
+            }
+        }
+    }
+
+    /// `do` (diff obtain): in a diff view, replace the current line in the active
+    /// window with the corresponding line from the other diff window.
+    fn diff_obtain(&mut self, changed: &mut bool) {
+        let (a_win, b_win) = match self.diff_window_pair {
+            Some(pair) => pair,
+            None => {
+                self.message = "Not in diff mode".to_string();
+                return;
+            }
+        };
+        let active = self.active_window_id();
+        let other = if active == a_win {
+            b_win
+        } else if active == b_win {
+            a_win
+        } else {
+            self.message = "Current window is not part of a diff".to_string();
+            return;
+        };
+        let cursor_line = self.view().cursor.line;
+        // Get the diff status for the active window
+        let diff_status = self
+            .diff_results
+            .get(&active)
+            .and_then(|v| v.get(cursor_line))
+            .cloned();
+        match diff_status {
+            Some(DiffLine::Same) => {
+                self.message = "Line is the same in both files".to_string();
+            }
+            Some(DiffLine::Added) | Some(DiffLine::Removed) | None => {
+                // Get the corresponding line from the other window
+                // For simplicity, use the same line number from the other buffer
+                if let Some(other_win) = self.windows.get(&other) {
+                    let other_buf_id = other_win.buffer_id;
+                    if let Some(other_state) = self.buffer_manager.get(other_buf_id) {
+                        if cursor_line < other_state.buffer.len_lines() {
+                            let other_line: String = other_state
+                                .buffer
+                                .content
+                                .line(cursor_line)
+                                .chars()
+                                .collect();
+                            // Replace the current line
+                            let line_start = self.buffer().line_to_char(cursor_line);
+                            let line_end = if cursor_line + 1 < self.buffer().len_lines() {
+                                self.buffer().line_to_char(cursor_line + 1)
+                            } else {
+                                self.buffer().len_chars()
+                            };
+                            self.start_undo_group();
+                            self.delete_with_undo(line_start, line_end);
+                            self.insert_with_undo(line_start, &other_line);
+                            self.finish_undo_group();
+                            self.view_mut().cursor.col = 0;
+                            self.clamp_cursor_col();
+                            *changed = true;
+                            self.compute_diff();
+                        } else {
+                            self.message = "No corresponding line in other file".to_string();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// `dp` (diff put): in a diff view, replace the corresponding line in the
+    /// other diff window with the current line from the active window.
+    fn diff_put(&mut self, changed: &mut bool) {
+        let (a_win, b_win) = match self.diff_window_pair {
+            Some(pair) => pair,
+            None => {
+                self.message = "Not in diff mode".to_string();
+                return;
+            }
+        };
+        let active = self.active_window_id();
+        let other = if active == a_win {
+            b_win
+        } else if active == b_win {
+            a_win
+        } else {
+            self.message = "Current window is not part of a diff".to_string();
+            return;
+        };
+        let cursor_line = self.view().cursor.line;
+        // Get the current line from the active buffer
+        let current_line: String = self.buffer().content.line(cursor_line).chars().collect();
+        // Replace the corresponding line in the other buffer
+        if let Some(other_win) = self.windows.get(&other) {
+            let other_buf_id = other_win.buffer_id;
+            if let Some(other_state) = self.buffer_manager.get_mut(other_buf_id) {
+                if cursor_line < other_state.buffer.len_lines() {
+                    let line_start = other_state.buffer.line_to_char(cursor_line);
+                    let line_end = if cursor_line + 1 < other_state.buffer.len_lines() {
+                        other_state.buffer.line_to_char(cursor_line + 1)
+                    } else {
+                        other_state.buffer.len_chars()
+                    };
+                    other_state.buffer.delete_range(line_start, line_end);
+                    other_state.buffer.insert(line_start, &current_line);
+                    other_state.dirty = true;
+                    *changed = true;
+                    self.compute_diff();
+                } else {
+                    // Other buffer is shorter — append the line
+                    let end = other_state.buffer.len_chars();
+                    let needs_newline = end > 0 && other_state.buffer.content.char(end - 1) != '\n';
+                    if needs_newline {
+                        other_state.buffer.insert(end, "\n");
+                    }
+                    let end = other_state.buffer.len_chars();
+                    other_state.buffer.insert(end, &current_line);
+                    other_state.dirty = true;
+                    *changed = true;
+                    self.compute_diff();
+                }
+            }
+        }
+    }
+
+    /// Apply an operator in blockwise mode (rectangle region).
+    #[allow(clippy::too_many_arguments)]
+    fn apply_blockwise_operator(
+        &mut self,
+        operator: char,
+        start_line: usize,
+        end_line: usize,
+        left_col: usize,
+        right_col: usize,
+        changed: &mut bool,
+    ) {
+        match operator {
+            'd' => {
+                // Delete the block region
+                self.start_undo_group();
+                let mut deleted_text = String::new();
+                // Process lines in reverse to keep indices stable
+                for line_idx in (start_line..=end_line).rev() {
+                    let line_start = self.buffer().line_to_char(line_idx);
+                    let line_len = self.buffer().line_len_chars(line_idx);
+                    let text_len = if line_len > 0
+                        && self.buffer().content.char(line_start + line_len - 1) == '\n'
+                    {
+                        line_len - 1
+                    } else {
+                        line_len
+                    };
+                    let from = left_col.min(text_len);
+                    let to = (right_col + 1).min(text_len);
+                    if from < to {
+                        let del: String = self
+                            .buffer()
+                            .content
+                            .slice((line_start + from)..(line_start + to))
+                            .chars()
+                            .collect();
+                        deleted_text = del + "\n" + &deleted_text;
+                        self.delete_with_undo(line_start + from, line_start + to);
+                    }
+                }
+                let reg = self.active_register();
+                self.set_delete_register(reg, deleted_text, false);
+                self.clear_selected_register();
+                self.view_mut().cursor.line = start_line;
+                self.view_mut().cursor.col = left_col;
+                self.clamp_cursor_col();
+                self.finish_undo_group();
+                *changed = true;
+            }
+            'y' => {
+                // Yank the block region
+                let mut yanked = String::new();
+                for line_idx in start_line..=end_line {
+                    let line_start = self.buffer().line_to_char(line_idx);
+                    let line_len = self.buffer().line_len_chars(line_idx);
+                    let text_len = if line_len > 0
+                        && self.buffer().content.char(line_start + line_len - 1) == '\n'
+                    {
+                        line_len - 1
+                    } else {
+                        line_len
+                    };
+                    let from = left_col.min(text_len);
+                    let to = (right_col + 1).min(text_len);
+                    if from < to {
+                        let chunk: String = self
+                            .buffer()
+                            .content
+                            .slice((line_start + from)..(line_start + to))
+                            .chars()
+                            .collect();
+                        yanked.push_str(&chunk);
+                    }
+                    yanked.push('\n');
+                }
+                let reg = self.active_register();
+                self.set_yank_register(reg, yanked, false);
+                self.clear_selected_register();
+            }
+            _ => {
+                // For other operators (c, ~, u, U, etc.), fall back to charwise
+                let start = self.buffer().line_to_char(start_line) + left_col;
+                let end_char = self.buffer().line_to_char(end_line) + right_col + 1;
+                let max = self.buffer().len_chars();
+                self.apply_charwise_operator(operator, start, end_char.min(max), changed);
+            }
+        }
+    }
+
     /// Try to parse and execute a range filter command like `1,5!sort` or `.!cmd`.
     /// Returns Some(action) if it matched, None otherwise.
     fn try_execute_filter_command(&mut self, cmd: &str) -> Option<EngineAction> {
@@ -19186,12 +19595,18 @@ impl Engine {
 
     /// Handle a key press when a swap recovery dialog is pending.
     /// Returns `true` if the key was consumed.
-    fn handle_swap_recovery_key(&mut self, key_name: &str) -> EngineAction {
+    fn handle_swap_recovery_key(&mut self, key_name: &str, unicode: Option<char>) -> EngineAction {
         let recovery = match self.swap_recovery.take() {
             Some(r) => r,
             None => return EngineAction::None,
         };
-        match key_name {
+        // TUI sends key_name="" with the char in unicode; GTK sends key_name="r".
+        let effective = if !key_name.is_empty() {
+            key_name.to_string()
+        } else {
+            unicode.map(|c| c.to_string()).unwrap_or_default()
+        };
+        match effective.as_str() {
             "r" | "R" => {
                 // Replace buffer content with recovered content.
                 let state = self.buffer_manager.get_mut(recovery.buffer_id);
@@ -22281,6 +22696,26 @@ impl Engine {
 /// Returns true if `binary` is found anywhere on the current process PATH.
 /// Walks PATH directories directly (no subprocess) so it works even when
 /// the user's shell aliases or profile scripts are not sourced.
+/// List custom VSCode theme names from `~/.config/vimcode/themes/*.json`.
+fn list_custom_theme_names() -> Vec<String> {
+    let mut names = Vec::new();
+    if let Ok(home) = std::env::var("HOME") {
+        let dir = std::path::PathBuf::from(home).join(".config/vimcode/themes");
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|e| e == "json") {
+                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                        names.push(stem.to_string());
+                    }
+                }
+            }
+        }
+    }
+    names.sort();
+    names
+}
+
 fn binary_on_path(binary: &str) -> bool {
     let path_var = std::env::var("PATH").unwrap_or_default();
     for dir in path_var.split(':') {
@@ -33180,13 +33615,17 @@ mod tests {
     }
 
     #[test]
-    fn test_ctrl_g_opens_grep() {
+    fn test_ctrl_g_shows_file_info() {
         let mut engine = Engine::new();
-        assert!(!engine.grep_open);
+        engine.buffer_mut().insert(0, "hello\nworld\n");
 
         press_ctrl(&mut engine, 'g');
 
-        assert!(engine.grep_open);
+        assert!(
+            engine.message.contains("line 1 of 2"),
+            "msg: {}",
+            engine.message
+        );
     }
 
     // ─── Quickfix tests ──────────────────────────────────────────────────────

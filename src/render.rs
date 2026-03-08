@@ -49,6 +49,48 @@ impl Color {
         Self { r, g, b }
     }
 
+    /// Try to parse a hex colour string. Accepts `#rrggbb`, `#rrggbbaa`
+    /// (alpha is discarded), and `#rgb` shorthand. Returns `None` on failure.
+    pub fn try_from_hex(s: &str) -> Option<Self> {
+        let s = s.trim_start_matches('#');
+        let (r, g, b) = match s.len() {
+            6 | 8 => {
+                let r = u8::from_str_radix(&s[0..2], 16).ok()?;
+                let g = u8::from_str_radix(&s[2..4], 16).ok()?;
+                let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+                (r, g, b)
+            }
+            3 => {
+                let r = u8::from_str_radix(&s[0..1], 16).ok()?;
+                let g = u8::from_str_radix(&s[1..2], 16).ok()?;
+                let b = u8::from_str_radix(&s[2..3], 16).ok()?;
+                (r * 17, g * 17, b * 17)
+            }
+            _ => return None,
+        };
+        Some(Self { r, g, b })
+    }
+
+    /// Blend this colour toward white by `amount` (0.0 = unchanged, 1.0 = white).
+    pub fn lighten(self, amount: f64) -> Self {
+        let f = amount.clamp(0.0, 1.0);
+        Self {
+            r: (self.r as f64 + (255.0 - self.r as f64) * f) as u8,
+            g: (self.g as f64 + (255.0 - self.g as f64) * f) as u8,
+            b: (self.b as f64 + (255.0 - self.b as f64) * f) as u8,
+        }
+    }
+
+    /// Blend this colour toward black by `amount` (0.0 = unchanged, 1.0 = black).
+    pub fn darken(self, amount: f64) -> Self {
+        let f = 1.0 - amount.clamp(0.0, 1.0);
+        Self {
+            r: (self.r as f64 * f) as u8,
+            g: (self.g as f64 * f) as u8,
+            b: (self.b as f64 * f) as u8,
+        }
+    }
+
     /// Normalise to the (0.0..=1.0, 0.0..=1.0, 0.0..=1.0) triple expected by
     /// Cairo's `set_source_rgb` / `set_source_rgba`.
     pub fn to_cairo(self) -> (f64, f64, f64) {
@@ -73,6 +115,56 @@ impl Color {
             self.b as u16 * 257,
         )
     }
+}
+
+/// Strip `//` and `/* */` comments from JSON-with-comments (JSONC), as used
+/// by VSCode theme files. Preserves newlines so error positions stay valid.
+fn strip_json_comments(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    while i < len {
+        if bytes[i] == b'"' {
+            // String literal — copy verbatim until closing quote
+            out.push('"');
+            i += 1;
+            while i < len {
+                if bytes[i] == b'\\' && i + 1 < len {
+                    out.push(bytes[i] as char);
+                    out.push(bytes[i + 1] as char);
+                    i += 2;
+                } else if bytes[i] == b'"' {
+                    out.push('"');
+                    i += 1;
+                    break;
+                } else {
+                    out.push(bytes[i] as char);
+                    i += 1;
+                }
+            }
+        } else if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'/' {
+            // Line comment — skip until newline
+            i += 2;
+            while i < len && bytes[i] != b'\n' {
+                i += 1;
+            }
+        } else if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            // Block comment — skip until */
+            i += 2;
+            while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                if bytes[i] == b'\n' {
+                    out.push('\n');
+                }
+                i += 1;
+            }
+            i += 2; // skip */
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    out
 }
 
 // ─── Style / StyledSpan ──────────────────────────────────────────────────────
@@ -1721,6 +1813,12 @@ pub struct Theme {
     pub md_code: Color,
     pub md_link: Color,
 
+    // Sidebar selection
+    /// Background for the selected row when the sidebar has keyboard focus.
+    pub sidebar_sel_bg: Color,
+    /// Background for the selected row when the sidebar does NOT have focus.
+    pub sidebar_sel_bg_inactive: Color,
+
     // LSP semantic token colours (overlay on tree-sitter)
     pub semantic_parameter: Color,
     pub semantic_property: Color,
@@ -1852,6 +1950,8 @@ impl Theme {
             md_code: Color::from_hex("#98c379"),     // green (string-like)
             md_link: Color::from_hex("#61afef"),     // blue
 
+            sidebar_sel_bg: Color::from_hex("#2c313a"), // focused: subtle highlight
+            sidebar_sel_bg_inactive: Color::from_hex("#21252b"), // unfocused: very faint
             semantic_parameter: Color::from_hex("#c8ae9d"), // warm sandy (distinct from variable red)
             semantic_property: Color::from_hex("#d19a66"),  // orange
             semantic_namespace: Color::from_hex("#e5c07b"), // gold
@@ -1948,8 +2048,10 @@ impl Theme {
             md_code: Color::from_hex("#b8bb26"),
             md_link: Color::from_hex("#83a598"),
 
+            sidebar_sel_bg: Color::from_hex("#3c3836"), // focused
+            sidebar_sel_bg_inactive: Color::from_hex("#32302f"), // unfocused
             semantic_parameter: Color::from_hex("#83a598"), // blue
-            semantic_property: Color::from_hex("#d3869b"),  // purple-pink
+            semantic_property: Color::from_hex("#d3869b"), // purple-pink
             semantic_namespace: Color::from_hex("#fabd2f"), // yellow
             semantic_enum_member: Color::from_hex("#8ec07c"), // aqua
             semantic_interface: Color::from_hex("#fabd2f"), // yellow
@@ -2044,8 +2146,10 @@ impl Theme {
             md_code: Color::from_hex("#9ece6a"),
             md_link: Color::from_hex("#7aa2f7"),
 
+            sidebar_sel_bg: Color::from_hex("#292e42"), // focused
+            sidebar_sel_bg_inactive: Color::from_hex("#1f2335"), // unfocused
             semantic_parameter: Color::from_hex("#e0af68"), // orange-gold
-            semantic_property: Color::from_hex("#73daca"),  // teal
+            semantic_property: Color::from_hex("#73daca"), // teal
             semantic_namespace: Color::from_hex("#2ac3de"), // cyan
             semantic_enum_member: Color::from_hex("#ff9e64"), // orange
             semantic_interface: Color::from_hex("#2ac3de"), // cyan
@@ -2140,8 +2244,10 @@ impl Theme {
             md_code: Color::from_hex("#859900"),
             md_link: Color::from_hex("#268bd2"),
 
+            sidebar_sel_bg: Color::from_hex("#073642"), // focused
+            sidebar_sel_bg_inactive: Color::from_hex("#002b36"), // unfocused (base03)
             semantic_parameter: Color::from_hex("#268bd2"), // blue
-            semantic_property: Color::from_hex("#2aa198"),  // cyan
+            semantic_property: Color::from_hex("#2aa198"), // cyan
             semantic_namespace: Color::from_hex("#b58900"), // yellow
             semantic_enum_member: Color::from_hex("#cb4b16"), // orange
             semantic_interface: Color::from_hex("#b58900"), // yellow
@@ -2157,13 +2263,301 @@ impl Theme {
             "gruvbox" | "gruvbox-dark" => Self::gruvbox_dark(),
             "tokyo-night" | "tokyonight" => Self::tokyo_night(),
             "solarized" | "solarized-dark" => Self::solarized_dark(),
-            _ => Self::onedark(),
+            "onedark" => Self::onedark(),
+            _ => {
+                // Try loading a VSCode theme from ~/.config/vimcode/themes/
+                if let Some(theme) = Self::load_vscode_theme(name) {
+                    theme
+                } else {
+                    Self::onedark()
+                }
+            }
         }
     }
 
     /// Return the list of all built-in theme names.
-    pub fn available_names() -> &'static [&'static str] {
-        &["onedark", "gruvbox-dark", "tokyo-night", "solarized-dark"]
+    pub fn available_names() -> Vec<String> {
+        let mut names: Vec<String> = vec![
+            "onedark".into(),
+            "gruvbox-dark".into(),
+            "tokyo-night".into(),
+            "solarized-dark".into(),
+        ];
+        // Append custom VSCode themes from ~/.config/vimcode/themes/
+        if let Some(dir) = Self::themes_dir() {
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().is_some_and(|e| e == "json") {
+                        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                            names.push(stem.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        names
+    }
+
+    /// The directory where custom VSCode theme JSON files are stored.
+    fn themes_dir() -> Option<std::path::PathBuf> {
+        std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config/vimcode/themes"))
+    }
+
+    /// Try to load a VSCode-format `.json` theme file by name.
+    /// Looks in `~/.config/vimcode/themes/<name>.json`.
+    pub fn load_vscode_theme(name: &str) -> Option<Self> {
+        let dir = Self::themes_dir()?;
+        let path = dir.join(format!("{name}.json"));
+        Self::from_vscode_json(&path)
+    }
+
+    /// Parse a VSCode theme JSON file and map its colours to a `Theme`.
+    /// Falls back to OneDark defaults for any missing keys.
+    pub fn from_vscode_json(path: &std::path::Path) -> Option<Self> {
+        let data = std::fs::read_to_string(path).ok()?;
+        // VSCode themes often have comments — strip them
+        let data = strip_json_comments(&data);
+        let val: serde_json::Value = serde_json::from_str(&data).ok()?;
+        let colors = val.get("colors");
+        let token_colors = val.get("tokenColors");
+
+        // Start from OneDark and override what the theme provides
+        let mut theme = Self::onedark();
+
+        // Helper: get a color from the "colors" object
+        let color = |key: &str| -> Option<Color> {
+            colors?.get(key)?.as_str().and_then(Color::try_from_hex)
+        };
+
+        // ── Editor core ───────────────────────────────────────────────────
+        if let Some(c) = color("editor.background") {
+            theme.background = c;
+            theme.active_background = c.lighten(0.02);
+            theme.command_bg = c;
+        }
+        if let Some(c) = color("editor.foreground") {
+            theme.foreground = c;
+            theme.default_fg = c;
+            theme.command_fg = c;
+        }
+
+        // ── Selection / cursor ────────────────────────────────────────────
+        if let Some(c) = color("editor.selectionBackground") {
+            theme.selection = c;
+        }
+        if let Some(c) = color("editorCursor.foreground") {
+            theme.cursor = c;
+        }
+
+        // ── Search ────────────────────────────────────────────────────────
+        if let Some(c) = color("editor.findMatchBackground") {
+            theme.search_current_match_bg = c;
+        }
+        if let Some(c) = color("editor.findMatchHighlightBackground") {
+            theme.search_match_bg = c;
+        }
+
+        // ── Line numbers ──────────────────────────────────────────────────
+        if let Some(c) = color("editorLineNumber.foreground") {
+            theme.line_number_fg = c;
+        }
+        if let Some(c) = color("editorLineNumber.activeForeground") {
+            theme.line_number_active_fg = c;
+        }
+
+        // ── Tab bar ───────────────────────────────────────────────────────
+        if let Some(c) = color("editorGroupHeader.tabsBackground") {
+            theme.tab_bar_bg = c;
+        }
+        if let Some(c) = color("tab.activeBackground") {
+            theme.tab_active_bg = c;
+        }
+        if let Some(c) = color("tab.activeForeground") {
+            theme.tab_active_fg = c;
+        }
+        if let Some(c) = color("tab.inactiveForeground") {
+            theme.tab_inactive_fg = c;
+            theme.tab_preview_inactive_fg = c.darken(0.3);
+            theme.tab_preview_active_fg = c.lighten(0.2);
+        }
+
+        // ── Status bar ────────────────────────────────────────────────────
+        if let Some(c) = color("statusBar.background") {
+            theme.status_bg = c;
+        }
+        if let Some(c) = color("statusBar.foreground") {
+            theme.status_fg = c;
+        }
+
+        // ── Separator ─────────────────────────────────────────────────────
+        if let Some(c) = color("editorGroup.border") {
+            theme.separator = c;
+        }
+
+        // ── Widgets (completion, hover, fuzzy) ────────────────────────────
+        if let Some(c) = color("editorWidget.background") {
+            theme.completion_bg = c;
+            theme.hover_bg = c;
+            theme.fuzzy_bg = c;
+        }
+        if let Some(c) = color("editorWidget.border") {
+            theme.completion_border = c;
+            theme.hover_border = c;
+            theme.fuzzy_border = c;
+        }
+        if let Some(c) = color("editorSuggestWidget.selectedBackground") {
+            theme.completion_selected_bg = c;
+            theme.fuzzy_selected_bg = c;
+        }
+        if let Some(c) = color("editorWidget.foreground").or_else(|| color("editor.foreground")) {
+            theme.completion_fg = c;
+            theme.hover_fg = c;
+            theme.fuzzy_fg = c;
+        }
+
+        // ── Sidebar ──────────────────────────────────────────────────────
+        if let Some(c) = color("list.activeSelectionBackground") {
+            theme.sidebar_sel_bg = c;
+        }
+        if let Some(c) = color("list.inactiveSelectionBackground") {
+            theme.sidebar_sel_bg_inactive = c;
+        }
+
+        // ── Git gutter ────────────────────────────────────────────────────
+        if let Some(c) = color("editorGutter.addedBackground")
+            .or_else(|| color("gitDecoration.addedResourceForeground"))
+        {
+            theme.git_added = c;
+        }
+        if let Some(c) = color("editorGutter.modifiedBackground")
+            .or_else(|| color("gitDecoration.modifiedResourceForeground"))
+        {
+            theme.git_modified = c;
+        }
+
+        // ── Diagnostics ──────────────────────────────────────────────────
+        if let Some(c) = color("editorError.foreground") {
+            theme.diagnostic_error = c;
+        }
+        if let Some(c) = color("editorWarning.foreground") {
+            theme.diagnostic_warning = c;
+        }
+        if let Some(c) = color("editorInfo.foreground") {
+            theme.diagnostic_info = c;
+        }
+        if let Some(c) = color("editorHint.foreground") {
+            theme.diagnostic_hint = c;
+        }
+
+        // ── Diff ─────────────────────────────────────────────────────────
+        if let Some(c) = color("diffEditor.insertedTextBackground") {
+            theme.diff_added_bg = c;
+        }
+        if let Some(c) = color("diffEditor.removedTextBackground") {
+            theme.diff_removed_bg = c;
+        }
+
+        // ── Annotations / ghost text ─────────────────────────────────────
+        if let Some(c) = color("editorGhostText.foreground") {
+            theme.ghost_text_fg = c;
+        }
+
+        // ── Token colours (syntax highlighting) ──────────────────────────
+        if let Some(tc) = token_colors.and_then(|v| v.as_array()) {
+            for entry in tc {
+                let settings = match entry.get("settings") {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let fg = settings
+                    .get("foreground")
+                    .and_then(|v| v.as_str())
+                    .and_then(Color::try_from_hex);
+                let fg = match fg {
+                    Some(c) => c,
+                    None => continue,
+                };
+                let scopes = match entry.get("scope") {
+                    Some(serde_json::Value::String(s)) => {
+                        s.split(',').map(|s| s.trim()).collect::<Vec<_>>()
+                    }
+                    Some(serde_json::Value::Array(arr)) => {
+                        arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>()
+                    }
+                    _ => continue,
+                };
+                for scope in &scopes {
+                    match *scope {
+                        "keyword" | "keyword.control" | "keyword.operator" | "storage"
+                        | "storage.type" | "storage.modifier" => {
+                            theme.keyword = fg;
+                        }
+                        "string"
+                        | "string.quoted"
+                        | "string.quoted.double"
+                        | "string.quoted.single" => {
+                            theme.string_lit = fg;
+                        }
+                        "comment" | "comment.line" | "comment.block" => {
+                            theme.comment = fg;
+                            theme.annotation_fg = fg;
+                        }
+                        "entity.name.function" | "support.function" | "meta.function-call" => {
+                            theme.function = fg;
+                        }
+                        "entity.name.type"
+                        | "support.type"
+                        | "support.class"
+                        | "entity.name.class"
+                        | "entity.name.type.class" => {
+                            theme.type_name = fg;
+                            theme.semantic_namespace = fg;
+                            theme.semantic_interface = fg;
+                            theme.semantic_type_parameter = fg;
+                        }
+                        "variable" | "variable.other" | "variable.language" => {
+                            theme.variable = fg;
+                        }
+                        "constant.numeric"
+                        | "constant.numeric.integer"
+                        | "constant.numeric.float" => {
+                            theme.number = fg;
+                        }
+                        "entity.name.tag" => {
+                            theme.semantic_decorator = fg;
+                        }
+                        "variable.parameter" | "variable.parameter.function" => {
+                            theme.semantic_parameter = fg;
+                        }
+                        "variable.other.property" | "support.type.property-name" => {
+                            theme.semantic_property = fg;
+                        }
+                        "variable.other.enummember" | "constant.other.enum" => {
+                            theme.semantic_enum_member = fg;
+                        }
+                        "entity.name.function.macro" | "support.function.macro" => {
+                            theme.semantic_macro = fg;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // ── Derive remaining colours from the base palette ───────────────
+        // Fuzzy finder query/title inherit from syntax colours if not set
+        theme.fuzzy_query_fg = theme.function;
+        theme.fuzzy_title_fg = theme.type_name;
+
+        // Markdown headings from syntax palette
+        theme.md_heading1 = theme.type_name;
+        theme.md_heading2 = theme.function;
+        theme.md_heading3 = theme.keyword;
+        theme.md_code = theme.string_lit;
+        theme.md_link = theme.function;
+
+        Some(theme)
     }
 
     /// Return the foreground colour for a Tree-sitter scope name.
@@ -4378,5 +4772,107 @@ fn build_command_line(engine: &Engine) -> CommandLineData {
         right_align,
         show_cursor,
         cursor_anchor_text,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_try_from_hex() {
+        assert_eq!(
+            Color::try_from_hex("#ff0000"),
+            Some(Color::from_rgb(255, 0, 0))
+        );
+        assert_eq!(
+            Color::try_from_hex("00ff00"),
+            Some(Color::from_rgb(0, 255, 0))
+        );
+        assert_eq!(
+            Color::try_from_hex("#abc"),
+            Some(Color::from_rgb(0xaa, 0xbb, 0xcc))
+        );
+        // 8-digit hex (alpha discarded)
+        assert_eq!(
+            Color::try_from_hex("#ff000080"),
+            Some(Color::from_rgb(255, 0, 0))
+        );
+        assert_eq!(Color::try_from_hex("xyz"), None);
+        assert_eq!(Color::try_from_hex(""), None);
+    }
+
+    #[test]
+    fn test_strip_json_comments() {
+        let input = r#"{
+  // line comment
+  "key": "value", /* block */
+  "str": "has // no comment"
+}"#;
+        let stripped = strip_json_comments(input);
+        let val: serde_json::Value = serde_json::from_str(&stripped).unwrap();
+        assert_eq!(val["key"], "value");
+        assert_eq!(val["str"], "has // no comment");
+    }
+
+    #[test]
+    fn test_lighten_darken() {
+        let c = Color::from_rgb(100, 100, 100);
+        let lighter = c.lighten(0.5);
+        assert!(lighter.r > 100 && lighter.r < 255);
+        let darker = c.darken(0.5);
+        assert!(darker.r < 100 && darker.r > 0);
+        // Extremes
+        assert_eq!(c.lighten(1.0), Color::from_rgb(255, 255, 255));
+        assert_eq!(c.darken(1.0), Color::from_rgb(0, 0, 0));
+    }
+
+    #[test]
+    fn test_from_vscode_json() {
+        let dir = std::env::temp_dir().join("vimcode_test_theme");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test-theme.json");
+        std::fs::write(
+            &path,
+            r##"{
+            // Test VSCode theme
+            "name": "Test Theme",
+            "colors": {
+                "editor.background": "#1e1e2e",
+                "editor.foreground": "#cdd6f4",
+                "editorCursor.foreground": "#f5e0dc",
+                "editor.selectionBackground": "#585b7066",
+                "editorLineNumber.foreground": "#6c7086",
+                "statusBar.background": "#181825",
+                "statusBar.foreground": "#cdd6f4"
+            },
+            "tokenColors": [
+                {
+                    "scope": ["keyword", "keyword.control"],
+                    "settings": { "foreground": "#cba6f7" }
+                },
+                {
+                    "scope": "string",
+                    "settings": { "foreground": "#a6e3a1" }
+                },
+                {
+                    "scope": "comment",
+                    "settings": { "foreground": "#6c7086" }
+                }
+            ]
+        }"##,
+        )
+        .unwrap();
+
+        let theme = Theme::from_vscode_json(&path).unwrap();
+        assert_eq!(theme.background, Color::try_from_hex("#1e1e2e").unwrap());
+        assert_eq!(theme.foreground, Color::try_from_hex("#cdd6f4").unwrap());
+        assert_eq!(theme.cursor, Color::try_from_hex("#f5e0dc").unwrap());
+        assert_eq!(theme.keyword, Color::try_from_hex("#cba6f7").unwrap());
+        assert_eq!(theme.string_lit, Color::try_from_hex("#a6e3a1").unwrap());
+        assert_eq!(theme.comment, Color::try_from_hex("#6c7086").unwrap());
+        assert_eq!(theme.status_bg, Color::try_from_hex("#181825").unwrap());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

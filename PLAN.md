@@ -5,6 +5,8 @@
 ---
 
 ## Recently Completed
+- **Session 145**: VSCode theme loader (drop `.json` in `~/.config/vimcode/themes/`, `:colorscheme name`), TUI crash fix (`byte_to_char_idx` multi-byte UTF-8 panic), swap recovery R/D/A fix for TUI, sidebar keyboard nav (`Ctrl-W h/l` toolbar↔sidebar↔editor), editor click clears sidebar focus, 4 theme tests
+- **Session 144**: Vim compat batch 4 — 10 new commands (97% → 98%), Ctrl-G file info, gi insert at last pos, Ctrl-W r/R rotate windows, [*/]* comment nav, do/dp diff obtain/put, o_CTRL-V force blockwise, 21 integration tests
 - **Session 143**: Bug fixes — `:q` dirty guard allows close when buffer visible in another split, `autoread` setting + file auto-reload detection (2s poll in GTK+TUI), `:new`/`:split` respect `splitbelow`/`splitright`, `:e!` reload from disk, 9 integration tests
 - **Session 142**: Vim compat batch 3 — 15 new commands (94% → 97%), g?{motion} ROT13, CTRL-@, CTRL-V {char}, CTRL-O auto-return, !{motion}{filter}, CTRL-W H/J/K/L/T/x, visual block I/A, o_v/o_V force motion, 29 integration tests
 - **Session 141**: Vim compat batch 2 — 27 new commands (85% → 94%), gq/gw format operators, ga/g8/go/gm/gM/gI/gx/g'/g`/g&, CTRL-^, CTRL-L, N%, zs/ze, CTRL-W p/t/b/f/d, insert CTRL-A/CTRL-G u/j/k, visual gq/g CTRL-A/g CTRL-X, :make, :b {name}, 38 integration tests
@@ -37,7 +39,7 @@
 - [x] **`:norm`** — execute normal command on a range of lines
 - [x] **Fuzzy finder / Telescope-style** — Ctrl-P opens centered file-picker modal with subsequence scoring (session 53)
 - [x] **Multiple cursors** — `Alt-D` (configurable) adds cursor at next match of word under cursor; all cursors receive identical keystrokes; Escape collapses to one
-- [x] **Themes / plugin system** — named color themes selectable via `:colorscheme`; 4 built-in themes: onedark (default), gruvbox-dark, tokyo-night, solarized-dark (session 116)
+- [x] **Themes / plugin system** — named color themes selectable via `:colorscheme`; 4 built-in themes + VSCode `.json` theme import from `~/.config/vimcode/themes/` (sessions 116, 145)
 - [x] **LSP semantic tokens** — `textDocument/semanticTokens/full` overlay on tree-sitter; 8 semantic theme colors; binary-search span overlay; legend caching (sessions 131–132)
 
 ### Enhanced Editor

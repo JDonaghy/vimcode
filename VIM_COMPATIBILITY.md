@@ -36,12 +36,12 @@ See [README.md](README.md) for full feature documentation.
 | `CTRL-@` | Insert prev text and stop insert | ✅ | |
 | `CTRL-V {char}` | Insert literal character | ✅ | Tab, Return also handled |
 | `CTRL-K {c1}{c2}` | Enter digraph | N/A | No digraph support planned |
-| `CTRL-X ...` | Completion sub-modes | ❌ | VimCode uses auto-popup + LSP instead |
+| `CTRL-X ...` | Completion sub-modes | N/A | VimCode uses auto-popup + LSP instead |
 | `CTRL-]` | Trigger abbreviation | N/A | No abbreviations |
 | `CTRL-G u` | Break undo sequence | ✅ | |
 | `CTRL-G j/k` | Move cursor down/up | ✅ | |
 
-**Insert mode: 21/24 (88%)**
+**Insert mode: 21/23 (91%)**
 
 ---
 
@@ -190,9 +190,9 @@ See [README.md](README.md) for full feature documentation.
 | `CTRL-I` | Jump list forward | ✅ | |
 | `g;` | Older change position | ✅ | |
 | `g,` | Newer change position | ✅ | |
-| `g'` / `` g` `` | Mark jump without jumplist | ❌ | |
+| `g'` / `` g` `` | Mark jump without jumplist | ✅ | |
 
-**Search & Marks: 25/26 (96%)**
+**Search & Marks: 26/26 (100%)**
 
 ---
 
@@ -221,20 +221,20 @@ See [README.md](README.md) for full feature documentation.
 | `g8` | Print UTF-8 hex bytes | ✅ | |
 | `go` | Go to byte N | ✅ | |
 | `gx` | Open URL/file externally | ✅ | Opens in default browser/app |
-| `gi` | Insert at last insert pos | ❌ | `gi` is LSP go-to-implementation |
+| `gi` | Insert at last insert pos | ✅ | LSP implementation moved to `<leader>gi` |
 | `gI` | Insert at column 1 | ✅ | |
 | `g?{motion}` | ROT13 encode | ✅ | Supports text objects, all motions |
 | `CTRL-^` | Edit alternate file | ✅ | |
 | `CTRL-]` | Tag jump | ⚠️ | `gd` (LSP) provides equivalent |
-| `CTRL-G` | Show file info | ❌ | `:file` command works |
+| `CTRL-G` | Show file info | ✅ | Shows filename, line, col, percentage |
 | `CTRL-L` | Redraw screen | ✅ | Clears message |
-| `do` | Diff obtain | ❌ | |
-| `dp` | Diff put | ❌ | |
-| `q:` | Command-line window | ❌ | |
-| `q/` / `q?` | Search history window | ❌ | |
+| `do` | Diff obtain | ✅ | Pull line from other diff window |
+| `dp` | Diff put | ✅ | Push line to other diff window |
+| `q:` | Command-line window | ❌ | Complex UI feature |
+| `q/` / `q?` | Search history window | ❌ | Complex UI feature |
 | `cgn` | Change next match | ✅ | Repeat with `.` |
 
-**Other: 29/33 (88%)**
+**Other: 30/33 (91%)**
 
 ---
 
@@ -293,7 +293,7 @@ See [README.md](README.md) for full feature documentation.
 | `ga` | Print ASCII value | ✅ | |
 | `g8` | Print UTF-8 hex | ✅ | |
 | `go` | Go to byte N | ✅ | |
-| `gi` | Insert at last insert pos | ❌ | `gi` is LSP go-to-implementation |
+| `gi` | Insert at last insert pos | ✅ | LSP implementation moved to `<leader>gi` |
 | `gI` | Insert at column 1 | ✅ | |
 | `gm` / `gM` | Middle of screen/text line | ✅ | |
 | `g?{motion}` | ROT13 encode | ✅ | Supports text objects, all motions |
@@ -303,7 +303,7 @@ See [README.md](README.md) for full feature documentation.
 | `g&` | Repeat `:s` all lines | ✅ | |
 | `gH` / `gV` | Select mode | N/A | No Select mode |
 
-**g-commands: 31/34 (91%)**
+**g-commands: 32/34 (94%)**
 
 ---
 
@@ -370,8 +370,8 @@ See [README.md](README.md) for full feature documentation.
 | `CTRL-W L` | Move window to far right | ✅ | Creates new group at layout edge |
 | `CTRL-W T` | Move window to new tab | ✅ | Moves to new editor group |
 | `CTRL-W x` | Exchange with next window | ✅ | Swaps buffer and view |
-| `CTRL-W r` | Rotate windows downward | ❌ | |
-| `CTRL-W R` | Rotate windows upward | ❌ | |
+| `CTRL-W r` | Rotate windows downward | ✅ | Rotates buffer/view assignments |
+| `CTRL-W R` | Rotate windows upward | ✅ | Rotates buffer/view assignments |
 | `CTRL-W p` | Go to previous window | ✅ | |
 | `CTRL-W n` | New window | ✅ | Runs `:new` |
 | `CTRL-W t` | Go to top window | ✅ | |
@@ -381,7 +381,7 @@ See [README.md](README.md) for full feature documentation.
 | `CTRL-W f` | Split + open file | ✅ | |
 | `CTRL-W d` | Split + go to definition | ✅ | LSP-based |
 
-**Window commands: 31/31 (100%)** (excluding N/A)
+**Window commands: 33/33 (100%)** (excluding N/A)
 
 ---
 
@@ -398,10 +398,10 @@ See [README.md](README.md) for full feature documentation.
 | `[M` / `]M` | Method end backward/forward | ✅ | |
 | `[{` / `]}` | Unmatched `{` / `}` | ✅ | Depth-tracked |
 | `[(` / `])` | Unmatched `(` / `)` | ✅ | Depth-tracked |
-| `[*` / `]*` | Comment start/end | ❌ | |
-| `[/` / `]/` | C comment start/end | ❌ | |
+| `[*` / `]*` | Comment start/end | ✅ | Finds `/*` and `*/` |
+| `[/` / `]/` | C comment start/end | ✅ | Alias for `[*`/`]*` |
 | `[#` / `]#` | Preprocessor directive | ❌ | |
-| `[z` / `]z` | Fold start/end | ❌ | |
+| `[z` / `]z` | Fold start/end | ✅ | Navigate within fold |
 | `[s` / `]s` | Spelling errors | N/A | No spell check |
 
 **Bracket commands: 12/13 (92%)** (excluding N/A)
@@ -434,9 +434,9 @@ Operators `d`, `c`, `y`, `>`, `<`, `=`, `g~`, `gu`, `gU` all accept these motion
 | `` i` ``/`` a` `` | Backtick text objects | ✅ | |
 | `o_v` | Force charwise | ✅ | Converts linewise to charwise |
 | `o_V` | Force linewise | ✅ | Converts charwise to linewise |
-| `o_CTRL-V` | Force blockwise | ❌ | Blockwise forcing not implemented |
+| `o_CTRL-V` | Force blockwise | ✅ | Applies operator as block rectangle |
 
-**Operator-pending: 20/21 (95%)**
+**Operator-pending: 21/21 (100%)**
 
 ---
 
@@ -548,7 +548,7 @@ Operators `d`, `c`, `y`, `>`, `<`, `=`, `g~`, `gu`, `gU` all accept these motion
 | `:cn` / `:cp` / `:cc` | Quickfix navigation | ✅ | |
 | `:cd {path}` | Change directory | ✅ | |
 | `:colorscheme` | Change theme | ✅ | 4 built-in themes |
-| `:map` / `:nmap` / `:imap` | Key mappings | ❌ | Lua `vimcode.keymap()` instead |
+| `:map` / `:nmap` / `:imap` | Key mappings | N/A | Lua `vimcode.keymap()` instead |
 | `:make` | Run build | ✅ | Delegates to `!make` |
 | `:b {name}` | Buffer by name | ✅ | Partial name match |
 | `:ab` / `:abbreviate` | Abbreviations | N/A | No abbreviation support |
@@ -560,7 +560,7 @@ Operators `d`, `c`, `y`, `>`, `<`, `=`, `g~`, `gu`, `gU` all accept these motion
 | `:scriptnames` | List scripts | N/A | |
 | `:mkexrc` / `:mkvimrc` | Save config | N/A | `settings.json` instead |
 
-**Ex commands: 67/68 (99%)** (excluding N/A)
+**Ex commands: 67/67 (100%)** (excluding N/A)
 
 ### VimCode-Specific Ex Commands
 
@@ -600,34 +600,27 @@ These are not in Vim but are part of VimCode:
 
 | Category | Implemented | Total | Coverage |
 |----------|-------------|-------|----------|
-| Insert Mode | 21 | 24 | 88% |
+| Insert Mode | 21 | 23 | 91% |
 | Movement | 48 | 48 | 100% |
 | Editing | 51 | 51 | 100% |
-| Search & Marks | 25 | 26 | 96% |
-| Normal — Other | 29 | 33 | 88% |
+| Search & Marks | 26 | 26 | 100% |
+| Normal — Other | 30 | 33 | 91% |
 | Text Objects | 16 | 16 | 100% |
-| g-Commands | 31 | 34 | 91% |
+| g-Commands | 32 | 34 | 94% |
 | z-Commands | 23 | 23 | 100% |
-| Window (CTRL-W) | 31 | 31 | 100% |
+| Window (CTRL-W) | 33 | 33 | 100% |
 | Bracket ([ / ]) | 12 | 13 | 92% |
-| Operator-Pending | 20 | 21 | 95% |
+| Operator-Pending | 21 | 21 | 100% |
 | Visual Mode | 26 | 26 | 100% |
-| Ex Commands | 67 | 68 | 99% |
-| **Total** | **400** | **414** | **97%** |
+| Ex Commands | 67 | 67 | 100% |
+| **Total** | **406** | **414** | **98%** |
 
 N/A commands (VimScript, digraphs, spelling, etc.) are excluded from totals.
 
 ### Remaining Missing Commands
 
-- `gi` (insert at last insert position — currently mapped to LSP go-to-implementation)
-- `CTRL-G` (show file info — `:file` command provides equivalent)
-- `CTRL-X ...` (completion sub-modes)
-- `CTRL-]` (tag jump — full, currently ⚠️ via `gd`)
-- `o_CTRL-V` (force blockwise motion)
-- `do`/`dp` (diff obtain/put)
+- `CTRL-]` (tag jump — ⚠️ partial via `gd`)
 - `q:`/`q?` (command-line/search history window)
 - `g+`/`g-` (undo tree newer/older)
 - `gR`/`gr` (virtual replace mode)
 - `[#`/`]#` (unmatched #if/#else)
-- `:vmap` (visual-mode mappings)
-- `CTRL-X CTRL-...` (insert completion sub-modes)

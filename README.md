@@ -11,7 +11,7 @@ There's a touch of irony here - using a cli tool to write the editor that I've w
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 2621+ tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 2650+ tests, zero async runtime dependency
 
 > **Note:** VimCode does not implement VimScript. Extension and scripting is handled via
 > the built-in Lua 5.4 plugin system. The goal is full Vim *keybinding* and *editing*
@@ -299,7 +299,7 @@ cargo fmt
 
 ### Live Grep
 
-- `Ctrl-G` (Normal mode) — open the Telescope-style live grep modal
+- `Ctrl-G` (Normal mode) — show file info (Vim compat); live grep is available via `:grep` or configurable panel key `<C-g>`
 - A centered floating two-column modal appears over the editor
 - Type to instantly search file *contents* across the entire project (live-as-you-type, query ≥ 2 chars)
 - Left pane shows results in `filename.rs:N: snippet` format; right pane shows ±5 context lines around the match
@@ -803,7 +803,7 @@ Additional options (set directly in `settings.json`):
 - `:set option!` — toggle a boolean option (e.g. `:set wrap!`); `no<option>!` explicitly disables (e.g. `:set nowrap!`)
 - `:set` (no args) — show one-line summary of all settings
 - `:config reload` — reload settings file from disk
-- `:colorscheme <name>` — switch colour theme live (aliases: `gruvbox`, `tokyonight`, `solarized`); `:colorscheme` lists available themes. Themes: `onedark` (default), `gruvbox-dark`, `tokyo-night`, `solarized-dark`.
+- `:colorscheme <name>` — switch colour theme live (aliases: `gruvbox`, `tokyonight`, `solarized`); `:colorscheme` lists available themes. Built-in: `onedark` (default), `gruvbox-dark`, `tokyo-night`, `solarized-dark`. Also loads VSCode `.json` theme files from `~/.config/vimcode/themes/`.
 - `:Settings` — open `settings.json` in a new editor tab for direct editing; saved changes reload automatically in both GTK and TUI backends.
 - **Settings sidebar (GTK)** — click the gear icon in the activity bar to open a VSCode-style settings form: searchable list of all settings grouped by category (Appearance, Editor, Search, Workspace, LSP, Terminal, Plugins) with native widgets (Toggle switch, spinner, dropdown, text entry); changes apply and save immediately.
 
@@ -999,7 +999,8 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `gt` / `gT` | Next / previous tab |
 | `gd` | Go to definition (LSP) |
 | `gr` | Find references (LSP) — multiple results open quickfix |
-| `gi` | Go to implementation (LSP) |
+| `gi` | Insert at last insert position |
+| `<leader>gi` | Go to implementation (LSP) |
 | `gy` | Go to type definition (LSP) |
 | `gs` | Stage hunk (in `:Gdiff` buffer) |
 | `K` | Show hover info (LSP) |
@@ -1011,6 +1012,10 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `[M` / `]M` | Method end backward / forward |
 | `[{` / `]}` | Jump to unmatched `{` / `}` |
 | `[(` / `])` | Jump to unmatched `(` / `)` |
+| `[*` / `]*` | Jump to comment block start / end (`/*`/`*/`) |
+| `[z` / `]z` | Jump to fold start / end |
+| `do` | Diff obtain (pull line from other diff window) |
+| `dp` | Diff put (push line to other diff window) |
 | `<leader>gf` | LSP format current buffer (Space=leader by default) |
 | `<leader>rn` | LSP rename symbol — pre-fills `:Rename <word>` |
 | `za` / `zo` / `zc` / `zR` | Fold toggle / open / close / open all |
@@ -1031,10 +1036,11 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `Ctrl-W H` / `J` / `K` / `L` | Move window to far left/bottom/top/right |
 | `Ctrl-W T` | Move window to new editor group |
 | `Ctrl-W x` | Exchange with next window |
+| `Ctrl-W r` / `R` | Rotate windows forward / backward |
 | `Ctrl-W f` | Split and open file under cursor |
 | `Ctrl-W d` | Split and go to definition (LSP) |
 | `Ctrl-P` | Open fuzzy file finder |
-| `Ctrl-G` | Open live grep modal (search file contents) |
+| `Ctrl-G` | Show file info (name, line, col, %) |
 | `F5` | Start debugging / continue |
 | `Shift+F5` | Stop debugging |
 | `F6` | Pause debugger |

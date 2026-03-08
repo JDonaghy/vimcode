@@ -67,7 +67,7 @@ use ratatui::Terminal;
 
 use crate::core::engine::{DiffLine, EngineAction};
 use crate::core::lsp::DiagnosticSeverity;
-use crate::core::settings::{parse_key_binding, ExplorerAction, LineNumberMode};
+use crate::core::settings::{ExplorerAction, LineNumberMode};
 use crate::core::window::SplitDirection;
 use crate::core::{Engine, GitLineStatus, Mode, OpenMode, WindowRect};
 use crate::render::{
@@ -80,7 +80,9 @@ use crate::render::{
 /// Returns true if the given crossterm key event matches a panel_keys binding string.
 /// Binding strings use Vim notation: `<C-b>`, `<C-S-e>`, `<A-x>`.
 fn matches_tui_key(binding: &str, code: KeyCode, mods: KeyModifiers) -> bool {
-    let Some((ctrl, shift, alt, key_char)) = parse_key_binding(binding) else {
+    let Some((ctrl, shift, alt, key_name)) =
+        crate::core::settings::parse_key_binding_named(binding)
+    else {
         return false;
     };
     if ctrl != mods.contains(KeyModifiers::CONTROL) {
@@ -92,8 +94,14 @@ fn matches_tui_key(binding: &str, code: KeyCode, mods: KeyModifiers) -> bool {
     if alt != mods.contains(KeyModifiers::ALT) {
         return false;
     }
-    match code {
-        KeyCode::Char(c) => c.to_ascii_lowercase() == key_char,
+    match key_name.as_str() {
+        "Tab" | "tab" => matches!(code, KeyCode::Tab),
+        "Space" | "space" => matches!(code, KeyCode::Char(' ')),
+        "Escape" | "Esc" => matches!(code, KeyCode::Esc),
+        s if s.chars().count() == 1 => {
+            let ch = s.chars().next().unwrap().to_ascii_lowercase();
+            matches!(code, KeyCode::Char(c) if c.to_ascii_lowercase() == ch)
+        }
         _ => false,
     }
 }
@@ -147,6 +155,12 @@ struct TuiSidebar {
     search_scroll_top: usize,
     /// Whether to show dotfiles in the explorer (mirrors Settings.show_hidden_files).
     show_hidden_files: bool,
+    /// When true, the activity bar (toolbar) has keyboard focus.
+    toolbar_focused: bool,
+    /// Currently highlighted row in the activity bar (0=hamburger, 1-6=panels, 7=settings).
+    toolbar_selected: u16,
+    /// True after Ctrl-W is pressed in a sidebar panel, waiting for h/j/k/l.
+    pending_ctrl_w: bool,
 }
 
 impl TuiSidebar {
@@ -167,6 +181,9 @@ impl TuiSidebar {
             replace_input_focused: false,
             search_scroll_top: 0,
             show_hidden_files: false,
+            toolbar_focused: false,
+            toolbar_selected: 1, // Start on Explorer
+            pending_ctrl_w: false,
         };
         sb.build_rows();
         sb
@@ -1373,6 +1390,92 @@ fn event_loop(
                     continue;
                 }
 
+                // ── Activity bar (toolbar) focused ────────────────────────────
+                if sidebar.toolbar_focused
+                    && !engine.fuzzy_open
+                    && !engine.grep_open
+                    && key_event.kind != KeyEventKind::Release
+                {
+                    match key_event.code {
+                        KeyCode::Char('j') | KeyCode::Down => {
+                            // Move down: 0→1→2→3→4→5→6→7 (settings)
+                            if sidebar.toolbar_selected < 7 {
+                                sidebar.toolbar_selected += 1;
+                            }
+                        }
+                        KeyCode::Char('k') | KeyCode::Up => {
+                            // Move up
+                            sidebar.toolbar_selected = sidebar.toolbar_selected.saturating_sub(1);
+                        }
+                        KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => {
+                            // Activate the selected panel
+                            let panel = match sidebar.toolbar_selected {
+                                0 => {
+                                    engine.toggle_menu_bar();
+                                    sidebar.toolbar_focused = false;
+                                    needs_redraw = true;
+                                    continue;
+                                }
+                                1 => TuiPanel::Explorer,
+                                2 => TuiPanel::Search,
+                                3 => TuiPanel::Debug,
+                                4 => TuiPanel::Git,
+                                5 => TuiPanel::Extensions,
+                                6 => TuiPanel::Ai,
+                                7 => TuiPanel::Settings,
+                                _ => {
+                                    needs_redraw = true;
+                                    continue;
+                                }
+                            };
+                            sidebar.toolbar_focused = false;
+                            sidebar.active_panel = panel;
+                            sidebar.visible = true;
+                            sidebar.has_focus = true;
+                            engine.session.explorer_visible = true;
+                            let _ = engine.session.save();
+                            if panel == TuiPanel::Search {
+                                sidebar.search_input_mode = true;
+                                sidebar.replace_input_focused = false;
+                            }
+                            if panel == TuiPanel::Git {
+                                engine.sc_has_focus = true;
+                                engine.sc_refresh();
+                            }
+                            if panel == TuiPanel::Debug {
+                                engine.dap_sidebar_has_focus = true;
+                            }
+                            if panel == TuiPanel::Extensions {
+                                engine.ext_sidebar_has_focus = true;
+                                if engine.ext_registry.is_none() && !engine.ext_registry_fetching {
+                                    engine.ext_refresh();
+                                }
+                            }
+                            if panel == TuiPanel::Ai {
+                                engine.ai_has_focus = true;
+                            }
+                            if panel == TuiPanel::Settings {
+                                engine.execute_command("Settings");
+                            }
+                        }
+                        KeyCode::Char('h') | KeyCode::Left | KeyCode::Esc => {
+                            // Leave toolbar, return focus to editor
+                            sidebar.toolbar_focused = false;
+                        }
+                        KeyCode::Char('q') => {
+                            // Collapse sidebar from toolbar
+                            sidebar.toolbar_focused = false;
+                            sidebar.visible = false;
+                            sidebar.has_focus = false;
+                            engine.session.explorer_visible = false;
+                            let _ = engine.session.save();
+                        }
+                        _ => {}
+                    }
+                    needs_redraw = true;
+                    continue;
+                }
+
                 // ── Sidebar focused ─────────────────────────────────────────
                 // Note: sidebar key handling is suppressed when fuzzy modal is open.
                 if sidebar.has_focus
@@ -1417,6 +1520,49 @@ fn event_loop(
                             needs_redraw = true;
                             continue;
                         }
+                        // Ctrl-W prefix: set pending state for window navigation
+                        if mods.contains(KeyModifiers::CONTROL)
+                            && matches!(code, KeyCode::Char('w') | KeyCode::Char('W'))
+                        {
+                            sidebar.pending_ctrl_w = true;
+                            needs_redraw = true;
+                            continue;
+                        }
+                    }
+                    // Ctrl-W {h,l,Left,Right}: navigate between toolbar/panel/editor
+                    if sidebar.pending_ctrl_w {
+                        sidebar.pending_ctrl_w = false;
+                        match key_event.code {
+                            KeyCode::Char('h') | KeyCode::Left => {
+                                // Panel → toolbar
+                                sidebar.has_focus = false;
+                                engine.sc_has_focus = false;
+                                engine.dap_sidebar_has_focus = false;
+                                engine.ext_sidebar_has_focus = false;
+                                engine.ai_has_focus = false;
+                                sidebar.toolbar_focused = true;
+                                sidebar.toolbar_selected = match sidebar.active_panel {
+                                    TuiPanel::Explorer => 1,
+                                    TuiPanel::Search => 2,
+                                    TuiPanel::Debug => 3,
+                                    TuiPanel::Git => 4,
+                                    TuiPanel::Extensions => 5,
+                                    TuiPanel::Ai => 6,
+                                    TuiPanel::Settings => 7,
+                                };
+                            }
+                            KeyCode::Char('l') | KeyCode::Right => {
+                                // Panel → editor
+                                sidebar.has_focus = false;
+                                engine.sc_has_focus = false;
+                                engine.dap_sidebar_has_focus = false;
+                                engine.ext_sidebar_has_focus = false;
+                                engine.ai_has_focus = false;
+                            }
+                            _ => {} // Unknown Ctrl-W combo in sidebar, ignore
+                        }
+                        needs_redraw = true;
+                        continue;
                     }
 
                     // ── Search panel keyboard handling ──────────────────────
@@ -1529,6 +1675,12 @@ fn event_loop(
                                             sidebar.has_focus = false;
                                         }
                                     }
+                                    // h/Left: switch focus to toolbar
+                                    KeyCode::Char('h') | KeyCode::Left => {
+                                        sidebar.has_focus = false;
+                                        sidebar.toolbar_focused = true;
+                                        sidebar.toolbar_selected = 2; // Search row
+                                    }
                                     // Any printable char: switch back to input mode
                                     KeyCode::Char(c)
                                         if !key_event.modifiers.contains(KeyModifiers::CONTROL) =>
@@ -1547,6 +1699,17 @@ fn event_loop(
 
                     // ── Debug panel keyboard handling ──────────────────────
                     if sidebar.active_panel == TuiPanel::Debug {
+                        // h/Left: switch focus to toolbar
+                        if matches!(key_event.code, KeyCode::Char('h') | KeyCode::Left)
+                            && !key_event.modifiers.contains(KeyModifiers::CONTROL)
+                        {
+                            sidebar.has_focus = false;
+                            engine.dap_sidebar_has_focus = false;
+                            sidebar.toolbar_focused = true;
+                            sidebar.toolbar_selected = 3; // Debug row
+                            needs_redraw = true;
+                            continue;
+                        }
                         // Compute section heights before key handling so
                         // ensure_visible has valid dimensions.
                         if let Ok(size) = terminal.size() {
@@ -1611,6 +1774,18 @@ fn event_loop(
 
                     // ── Extensions panel keyboard handling ──────────────────
                     if sidebar.active_panel == TuiPanel::Extensions {
+                        // h/Left: switch focus to toolbar
+                        if matches!(key_event.code, KeyCode::Char('h') | KeyCode::Left)
+                            && !key_event.modifiers.contains(KeyModifiers::CONTROL)
+                            && !engine.ext_sidebar_input_active
+                        {
+                            sidebar.has_focus = false;
+                            engine.ext_sidebar_has_focus = false;
+                            sidebar.toolbar_focused = true;
+                            sidebar.toolbar_selected = 5; // Extensions row
+                            needs_redraw = true;
+                            continue;
+                        }
                         let (key_name, unicode): (&str, Option<char>) = match key_event.code {
                             KeyCode::Char('j') | KeyCode::Down => ("j", None),
                             KeyCode::Char('k') | KeyCode::Up => ("k", None),
@@ -1641,6 +1816,18 @@ fn event_loop(
 
                     // ── AI assistant panel keyboard handling ─────────────────
                     if sidebar.active_panel == TuiPanel::Ai {
+                        // h/Left: switch focus to toolbar (only when not typing)
+                        if matches!(key_event.code, KeyCode::Char('h') | KeyCode::Left)
+                            && !key_event.modifiers.contains(KeyModifiers::CONTROL)
+                            && !engine.ai_input_active
+                        {
+                            sidebar.has_focus = false;
+                            engine.ai_has_focus = false;
+                            sidebar.toolbar_focused = true;
+                            sidebar.toolbar_selected = 6; // AI row
+                            needs_redraw = true;
+                            continue;
+                        }
                         // Ctrl-V paste
                         if ctrl && key_event.code == KeyCode::Char('v') {
                             let text = match engine.clipboard_read {
@@ -1698,6 +1885,19 @@ fn event_loop(
 
                     // ── Source Control panel keyboard handling ──────────────
                     if sidebar.active_panel == TuiPanel::Git {
+                        // h/Left: switch focus to toolbar (when not in commit input or button mode)
+                        if matches!(key_event.code, KeyCode::Char('h') | KeyCode::Left)
+                            && !key_event.modifiers.contains(KeyModifiers::CONTROL)
+                            && !engine.sc_commit_input_active
+                            && engine.sc_button_focused.is_none()
+                        {
+                            sidebar.has_focus = false;
+                            engine.sc_has_focus = false;
+                            sidebar.toolbar_focused = true;
+                            sidebar.toolbar_selected = 4; // Git row
+                            needs_redraw = true;
+                            continue;
+                        }
                         if engine.sc_commit_input_active {
                             // In commit input mode, route all keys to commit handler.
                             let (key_str, unicode): (&str, Option<char>) = match key_event.code {
@@ -1794,7 +1994,7 @@ fn event_loop(
                                 }
                             }
                         }
-                        // Collapse dir / go to parent
+                        // Collapse dir / go to parent / switch to toolbar
                         KeyCode::Char('h') | KeyCode::Left => {
                             let idx = sidebar.selected;
                             if idx < sidebar.rows.len() {
@@ -1811,8 +2011,18 @@ fn event_loop(
                                         if let Some(pi) = parent_idx {
                                             sidebar.selected = pi;
                                         }
+                                    } else {
+                                        // At root level — switch focus to toolbar
+                                        sidebar.has_focus = false;
+                                        sidebar.toolbar_focused = true;
+                                        sidebar.toolbar_selected = 1; // Explorer row
                                     }
                                 }
+                            } else {
+                                // Empty explorer — switch to toolbar
+                                sidebar.has_focus = false;
+                                sidebar.toolbar_focused = true;
+                                sidebar.toolbar_selected = 1;
                             }
                         }
                         // Explorer CRUD keys — resolved from settings
@@ -2459,6 +2669,28 @@ fn event_loop(
                             break;
                         }
                     }
+                    // Ctrl-W h/l overflow: move focus to sidebar/toolbar
+                    if let Some(direction) = engine.window_nav_overflow.take() {
+                        if !direction {
+                            // Left overflow → sidebar panel (if visible) or toolbar
+                            if sidebar.visible {
+                                sidebar.has_focus = true;
+                                match sidebar.active_panel {
+                                    TuiPanel::Git => engine.sc_has_focus = true,
+                                    TuiPanel::Debug => engine.dap_sidebar_has_focus = true,
+                                    TuiPanel::Extensions => {
+                                        engine.ext_sidebar_has_focus = true;
+                                    }
+                                    TuiPanel::Ai => engine.ai_has_focus = true,
+                                    _ => {}
+                                }
+                            } else {
+                                sidebar.toolbar_focused = true;
+                            }
+                        }
+                        // Right overflow: no action for now (nothing to the right of editor)
+                    }
+
                     // Any keypress warrants a redraw (e.g. :set wrap returns None but
                     // must still trigger a re-render to show the new wrapping).
                     needs_redraw = true;
@@ -3668,6 +3900,11 @@ fn handle_mouse(
 
     // ── Editor area ───────────────────────────────────────────────────────────
     sidebar.has_focus = false;
+    sidebar.toolbar_focused = false;
+    engine.sc_has_focus = false;
+    engine.dap_sidebar_has_focus = false;
+    engine.ext_sidebar_has_focus = false;
+    engine.ai_has_focus = false;
     if col < editor_left {
         return sidebar_width; // separator column
     }
@@ -6669,6 +6906,7 @@ fn render_activity_bar(
     let active_bg = rc(theme.status_bg);
     let icon_fg = rc(theme.status_fg);
     let inactive_fg = rc(theme.line_number_fg);
+    let toolbar_sel_bg = rc(theme.cursor); // highlight for toolbar-focused selection
 
     // Fill entire activity bar background
     for y in area.y..area.y + area.height {
@@ -6680,7 +6918,9 @@ fn render_activity_bar(
     // Row 0: Hamburger icon (menu bar toggle)
     if area.height >= 1 {
         let y = area.y;
-        let (fg, bg) = if menu_bar_visible {
+        let (fg, bg) = if sidebar.toolbar_focused && sidebar.toolbar_selected == 0 {
+            (icon_fg, toolbar_sel_bg)
+        } else if menu_bar_visible {
             (icon_fg, active_bg)
         } else {
             (inactive_fg, bar_bg)
@@ -6709,7 +6949,9 @@ fn render_activity_bar(
             break;
         }
         let is_active = sidebar.visible && sidebar.active_panel == panel;
-        let (fg, bg) = if is_active {
+        let (fg, bg) = if sidebar.toolbar_focused && sidebar.toolbar_selected == row_off {
+            (icon_fg, toolbar_sel_bg)
+        } else if is_active {
             (icon_fg, active_bg)
         } else {
             (inactive_fg, bar_bg)
@@ -6726,7 +6968,9 @@ fn render_activity_bar(
     if area.height >= 1 {
         let y = area.y + area.height - 1;
         let is_active = sidebar.visible && sidebar.active_panel == TuiPanel::Settings;
-        let (fg, bg) = if is_active {
+        let (fg, bg) = if sidebar.toolbar_focused && sidebar.toolbar_selected == 7 {
+            (icon_fg, toolbar_sel_bg)
+        } else if is_active {
             (icon_fg, active_bg)
         } else {
             (inactive_fg, bar_bg)
@@ -6754,8 +6998,12 @@ fn render_sidebar(
     let default_fg = rc(theme.foreground);
     let row_bg = rc(theme.tab_bar_bg);
     let active_file_fg = rc(theme.keyword);
-    let sel_fg = row_bg;
-    let sel_bg = default_fg;
+    let sel_bg = if sidebar.has_focus {
+        rc(theme.sidebar_sel_bg)
+    } else {
+        rc(theme.sidebar_sel_bg_inactive)
+    };
+    let sel_fg = default_fg;
 
     // Settings panel
     if sidebar.active_panel == TuiPanel::Settings {
@@ -9171,5 +9419,7 @@ fn rc(c: Color) -> RColor {
 /// Return the character index that corresponds to a byte offset in a UTF-8
 /// string. Returns the total char count if `byte_offset` is past the end.
 fn byte_to_char_idx(text: &str, byte_offset: usize) -> usize {
-    text[..byte_offset.min(text.len())].chars().count()
+    let clamped = byte_offset.min(text.len());
+    let safe = text.floor_char_boundary(clamped);
+    text[..safe].chars().count()
 }

@@ -23,7 +23,7 @@ mod tui_main;
 
 use core::engine::EngineAction;
 use core::lsp::DiagnosticSeverity;
-use core::settings::{parse_key_binding, LineNumberMode};
+use core::settings::LineNumberMode;
 use core::{Engine, GitLineStatus, OpenMode, WindowRect};
 use render::{
     build_screen_layout, CommandLineData, CursorShape, RenderedWindow, SelectionKind,
@@ -49,7 +49,9 @@ use copypasta_ext::ClipboardProviderExt;
 
 /// Returns true if `key` + `state` match a panel_keys binding string like `<C-b>`, `<C-S-e>`.
 fn matches_gtk_key(binding: &str, key: gdk::Key, state: gdk::ModifierType) -> bool {
-    let Some((ctrl, shift, alt, key_char)) = parse_key_binding(binding) else {
+    let Some((ctrl, shift, alt, key_name)) =
+        crate::core::settings::parse_key_binding_named(binding)
+    else {
         return false;
     };
     if ctrl != state.contains(gdk::ModifierType::CONTROL_MASK) {
@@ -61,9 +63,18 @@ fn matches_gtk_key(binding: &str, key: gdk::Key, state: gdk::ModifierType) -> bo
     if alt != state.contains(gdk::ModifierType::ALT_MASK) {
         return false;
     }
-    key.to_unicode()
-        .map(|c| c.to_ascii_lowercase() == key_char)
-        .unwrap_or(false)
+    match key_name.as_str() {
+        "Tab" | "tab" => key == gdk::Key::Tab || key == gdk::Key::ISO_Left_Tab,
+        "Space" | "space" => key.to_unicode() == Some(' '),
+        "Escape" | "Esc" => key == gdk::Key::Escape,
+        s if s.chars().count() == 1 => {
+            let ch = s.chars().next().unwrap().to_ascii_lowercase();
+            key.to_unicode()
+                .map(|c| c.to_ascii_lowercase() == ch)
+                .unwrap_or(false)
+        }
+        _ => false,
+    }
 }
 
 struct App {
@@ -911,7 +922,6 @@ impl SimpleComponent for App {
                                             sender.input(Msg::ToggleFocusSearch);
                                             return gtk4::glib::Propagation::Stop;
                                         }
-
                                         // Arrow keys for navigation - let TreeView handle them
                                         if matches!(key_name.as_str(), "Up" | "Down" | "Left" | "Right" | "Return" | "space") {
                                             return gtk4::glib::Propagation::Proceed;
@@ -4155,10 +4165,10 @@ impl SimpleComponent for App {
                 self.draw_needed.set(true);
             }
             Msg::ToggleFocusSearch => {
-                // Same pattern as ToggleFocusExplorer: toggle between showing the search
-                // panel and returning to the editor.  When "exiting" we keep the sidebar
-                // visible (don't touch sidebar_visible) to avoid a white-area artifact
-                // from the Revealer animation — Ctrl+B closes the sidebar entirely.
+                // Toggle between showing the search panel and returning to the editor.
+                // When "exiting" we keep the sidebar visible (don't touch sidebar_visible)
+                // to avoid a white-area artifact from the Revealer animation — Ctrl+B
+                // closes the sidebar entirely.
                 self.tree_has_focus = false;
                 if self.active_panel == SidebarPanel::Search && self.sidebar_visible {
                     // Already showing search — return keyboard focus to editor, keep panel open.
@@ -10710,7 +10720,7 @@ fn build_file_tree(
         let is_dir = path.is_dir();
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         let icon = if is_dir {
-            ""
+            "\u{f07b}" // nf-fa-folder
         } else {
             crate::icons::file_icon(ext)
         };
