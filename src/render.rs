@@ -424,6 +424,17 @@ pub struct CommandLineData {
     pub cursor_anchor_text: String,
 }
 
+// ─── WildmenuData ─────────────────────────────────────────────────────────────
+
+/// Data for the command-line wildmenu (Tab completion bar above the status line).
+#[derive(Debug, Clone)]
+pub struct WildmenuData {
+    /// Display labels shown in the bar (may be shortened, e.g. just the argument).
+    pub items: Vec<String>,
+    /// Currently highlighted item index, or `None` for common-prefix mode.
+    pub selected: Option<usize>,
+}
+
 // ─── CompletionMenu ────────────────────────────────────────────────────────────
 
 /// Data needed to render the word-completion popup in insert mode.
@@ -512,6 +523,17 @@ pub struct CommandPalettePanel {
     pub selected_idx: usize,
     /// Scroll offset into the filtered list.
     pub scroll_top: usize,
+}
+
+// ─── TabSwitcherPanel ─────────────────────────────────────────────────────
+
+/// Data needed to render the tab switcher popup (Ctrl+Tab MRU list).
+#[derive(Debug, Clone)]
+pub struct TabSwitcherPanel {
+    /// MRU-ordered items: (filename, full_path, is_dirty).
+    pub items: Vec<(String, String, bool)>,
+    /// Index of the currently highlighted item.
+    pub selected_idx: usize,
 }
 
 // ─── QuickfixPanel ────────────────────────────────────────────────────────────
@@ -1403,6 +1425,8 @@ pub struct ScreenLayout {
     pub status_left: String,
     pub status_right: String,
     pub command: CommandLineData,
+    /// Wildmenu bar (Tab completion in command mode), or `None` when inactive.
+    pub wildmenu: Option<WildmenuData>,
     pub active_window_id: WindowId,
     /// Completion popup to show, or `None` when inactive.
     pub completion: Option<CompletionMenu>,
@@ -1428,6 +1452,8 @@ pub struct ScreenLayout {
     pub source_control: Option<SourceControlData>,
     /// Command palette modal — `Some` when open.
     pub command_palette: Option<CommandPalettePanel>,
+    /// Tab switcher popup (Ctrl+Tab MRU list) — `Some` when open.
+    pub tab_switcher: Option<TabSwitcherPanel>,
     /// When the editor is split into two groups, this carries group 1's tab bar
     /// and split geometry. `None` in the default single-group mode.
     pub editor_group_split: Option<EditorGroupSplitData>,
@@ -1496,6 +1522,12 @@ pub struct Theme {
     // Status line
     pub status_bg: Color,
     pub status_fg: Color,
+
+    // Wildmenu (command Tab completion bar)
+    pub wildmenu_bg: Color,
+    pub wildmenu_fg: Color,
+    pub wildmenu_sel_bg: Color,
+    pub wildmenu_sel_fg: Color,
 
     // Command / message line
     pub command_bg: Color,
@@ -1627,6 +1659,11 @@ impl Theme {
             // (0.9, 0.9, 0.9)
             status_fg: Color::from_hex("#e5e5e5"),
 
+            wildmenu_bg: Color::from_hex("#33334c"),
+            wildmenu_fg: Color::from_hex("#abb2bf"),
+            wildmenu_sel_bg: Color::from_hex("#e5c07b"),
+            wildmenu_sel_fg: Color::from_hex("#282c34"),
+
             // (0.1, 0.1, 0.1)
             command_bg: Color::from_hex("#1a1a1a"),
             // (0.9, 0.9, 0.9)
@@ -1746,6 +1783,11 @@ impl Theme {
             status_bg: Color::from_hex("#504945"),
             status_fg: Color::from_hex("#ebdbb2"),
 
+            wildmenu_bg: Color::from_hex("#504945"),
+            wildmenu_fg: Color::from_hex("#ebdbb2"),
+            wildmenu_sel_bg: Color::from_hex("#fabd2f"),
+            wildmenu_sel_fg: Color::from_hex("#282828"),
+
             command_bg: Color::from_hex("#282828"),
             command_fg: Color::from_hex("#ebdbb2"),
 
@@ -1848,6 +1890,11 @@ impl Theme {
             status_bg: Color::from_hex("#292e42"),
             status_fg: Color::from_hex("#c0caf5"),
 
+            wildmenu_bg: Color::from_hex("#292e42"),
+            wildmenu_fg: Color::from_hex("#c0caf5"),
+            wildmenu_sel_bg: Color::from_hex("#e0af68"),
+            wildmenu_sel_fg: Color::from_hex("#1a1b26"),
+
             command_bg: Color::from_hex("#1a1b26"),
             command_fg: Color::from_hex("#c0caf5"),
 
@@ -1949,6 +1996,11 @@ impl Theme {
 
             status_bg: Color::from_hex("#073642"),
             status_fg: Color::from_hex("#93a1a1"),
+
+            wildmenu_bg: Color::from_hex("#073642"),
+            wildmenu_fg: Color::from_hex("#93a1a1"),
+            wildmenu_sel_bg: Color::from_hex("#b58900"),
+            wildmenu_sel_fg: Color::from_hex("#002b36"),
 
             command_bg: Color::from_hex("#002b36"),
             command_fg: Color::from_hex("#839496"),
@@ -2147,6 +2199,14 @@ impl Theme {
         }
         if let Some(c) = color("statusBar.foreground") {
             theme.status_fg = c;
+        }
+
+        // ── Wildmenu (derive from status bar) ─────────────────────────────
+        if let Some(c) = color("statusBar.background") {
+            theme.wildmenu_bg = c;
+        }
+        if let Some(c) = color("statusBar.foreground") {
+            theme.wildmenu_fg = c;
         }
 
         // ── Separator ─────────────────────────────────────────────────────
@@ -2433,6 +2493,25 @@ pub fn build_screen_layout(
 
     let (status_left, status_right) = build_status_line(engine);
     let command = build_command_line(engine);
+
+    let wildmenu = if engine.wildmenu_items.is_empty() {
+        None
+    } else {
+        // For argument completions (e.g. "set wrap"), display only the last word
+        let display_items: Vec<String> = engine
+            .wildmenu_items
+            .iter()
+            .map(|item| {
+                item.rsplit_once(' ')
+                    .map(|(_, arg)| arg.to_string())
+                    .unwrap_or_else(|| item.clone())
+            })
+            .collect();
+        Some(WildmenuData {
+            items: display_items,
+            selected: engine.wildmenu_selected,
+        })
+    };
 
     let completion = engine.completion_idx.map(|idx| {
         let max_width = engine
@@ -2837,6 +2916,11 @@ pub fn build_screen_layout(
         }
     });
 
+    let tab_switcher = engine.tab_switcher_open.then(|| TabSwitcherPanel {
+        items: engine.tab_switcher_items(),
+        selected_idx: engine.tab_switcher_selected,
+    });
+
     let n = engine.group_layout.leaf_count();
     let editor_group_split = if n >= 2 {
         // Build group rects using a dummy content_bounds — backends will compute
@@ -2954,6 +3038,7 @@ pub fn build_screen_layout(
         status_left,
         status_right,
         command,
+        wildmenu,
         active_window_id,
         completion,
         hover,
@@ -2967,6 +3052,7 @@ pub fn build_screen_layout(
         debug_sidebar,
         source_control,
         command_palette,
+        tab_switcher,
         editor_group_split,
         ext_sidebar,
         ai_panel,

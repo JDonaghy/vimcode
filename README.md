@@ -11,7 +11,7 @@ There's a touch of irony here - using a cli tool to write the editor that I've w
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 2677+ tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 2728+ tests, zero async runtime dependency
 
 > **Note:** VimCode does not implement VimScript. Extension and scripting is handled via
 > the built-in Lua 5.4 plugin system. The goal is full Vim *keybinding* and *editing*
@@ -245,6 +245,8 @@ cargo fmt
 **Tabs**
 - `:tabnew` — new tab; `:tabclose` — close tab
 - `gt` / `gT` or `g` + `t` / `T` — next/previous tab
+- `Ctrl+Tab` / `Ctrl+Shift+Tab` — MRU tab switcher popup (cycles most-recently-used tabs; Enter confirms, Escape cancels); release modifier to auto-confirm (GTK)
+- `Alt+t` — MRU tab switcher (works in both TUI and GTK; hold Alt and press `t` to cycle; release Alt or wait 500ms to confirm in TUI)
 
 **Editor Groups (VSCode-style split panes, recursive)**
 - `Ctrl+\` — split editor right (any group can be split again for nested layouts)
@@ -799,6 +801,7 @@ Additional options (set directly in `settings.json`):
 | `swap_file` | `true` | Write swap files for crash recovery (`:set swapfile` / `:set noswapfile`) |
 | `updatetime` | `4000` | Milliseconds between swap file writes for dirty buffers (`:set updatetime=N`) |
 | `breadcrumbs` | `true` | Show file path + symbol hierarchy bar below the tab bar (`:set breadcrumbs` / `:set nobreadcrumbs`) |
+| `autohide_panels` | `false` | TUI only: hide sidebar + activity bar at startup; `Ctrl-W h` reveals them, focus returns to editor auto-hides (`:set autohidepanels` / `:set noautohidepanels`) |
 
 - `:set option?` — query current value (e.g. `:set ts?` → `tabstop=4`)
 - `:set option!` — toggle a boolean option (e.g. `:set wrap!`); `no<option>!` explicitly disables (e.g. `:set nowrap!`)
@@ -998,6 +1001,8 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `m{a-z}` / `'{a-z}` | Set mark / jump to mark |
 | `q{a-z}` / `@{a-z}` | Record macro / play macro |
 | `gt` / `gT` | Next / previous tab |
+| `Ctrl+Tab` / `Ctrl+Shift+Tab` | MRU tab switcher (forward / backward) |
+| `Alt+t` | MRU tab switcher (TUI + GTK compatible) |
 | `gd` | Go to definition (LSP) |
 | `gr` | Find references (LSP) — multiple results open quickfix |
 | `gi` | Insert at last insert position |
@@ -1070,6 +1075,7 @@ All ex commands support Vim-style abbreviations (e.g., `:j` for `:join`, `:y` fo
 | `:e!` | Reload current file from disk (discard changes) |
 | `:split` / `:vsplit` | Horizontal / vertical split |
 | `:tabnew` / `:tabclose` | New tab / close tab |
+| `:tabs` / `:TabSwitcher` | Open MRU tab switcher popup |
 | `:bn` / `:bp` / `:b#` | Buffer next / prev / alternate |
 | `:ls` / `:bd` | List buffers / delete buffer |
 | `:s/pat/rep/[gi]` | Substitute on line |
@@ -1171,6 +1177,9 @@ All ex commands support Vim-style abbreviations (e.g., `:j` for `:join`, `:y` fo
 | `:AI <message>` | Send a message to the AI assistant |
 | `:AiClear` | Clear the AI conversation history |
 | `:MarkdownPreview` / `:MdPreview` | Open side-by-side styled markdown preview (live-updates on edit, scroll sync, scaled headings in GTK) |
+| `:Explore [dir]` / `:Ex [dir]` | Open netrw-style in-buffer directory listing |
+| `:Sexplore [dir]` / `:Sex [dir]` | Horizontal split + netrw directory listing |
+| `:Vexplore [dir]` / `:Vex [dir]` | Vertical split + netrw directory listing |
 | `:help [topic]` / `:h [topic]` | Show help (topics: explorer, keys, commands) |
 
 ---

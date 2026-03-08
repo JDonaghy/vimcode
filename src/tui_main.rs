@@ -72,7 +72,7 @@ use crate::core::window::SplitDirection;
 use crate::core::{Engine, GitLineStatus, Mode, OpenMode, WindowRect};
 use crate::render::{
     self, build_screen_layout, Color, CompletionMenu, CursorShape, RenderedLine, RenderedWindow,
-    SelectionKind, Theme,
+    SelectionKind, Theme, WildmenuData,
 };
 
 // ─── Key binding helpers ──────────────────────────────────────────────────────
@@ -754,6 +754,7 @@ pub fn run(file_path: Option<PathBuf>, debug_log_path: Option<String>) {
             PushKeyboardEnhancementFlags(
                 KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                     | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
             )
         );
     }
@@ -829,8 +830,11 @@ fn event_loop(
     let mut theme = Theme::from_name(&engine.settings.colorscheme);
 
     // Initialise sidebar from session/settings
-    let initial_visible =
-        engine.session.explorer_visible || engine.settings.explorer_visible_on_startup;
+    let initial_visible = if engine.settings.autohide_panels {
+        false
+    } else {
+        engine.session.explorer_visible || engine.settings.explorer_visible_on_startup
+    };
     let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut sidebar = TuiSidebar::new(root, initial_visible);
     sidebar.show_hidden_files = engine.settings.show_hidden_files;
@@ -905,6 +909,8 @@ fn event_loop(
     };
     // Deadline to clear the yank highlight flash.
     let mut yank_hl_deadline: Option<Instant> = None;
+    // Timestamp of the last Alt+t press (for tab switcher auto-confirm on timeout).
+    let mut tab_switcher_last_cycle: Option<Instant> = None;
 
     loop {
         // Refresh theme in case :colorscheme was run.
@@ -931,9 +937,14 @@ fn event_loop(
             } else {
                 0
             };
+            let ab_w = if engine.settings.autohide_panels && !sidebar.visible {
+                0
+            } else {
+                ACTIVITY_BAR_WIDTH
+            };
             let content_cols = size
                 .width
-                .saturating_sub(ACTIVITY_BAR_WIDTH + sidebar_cols + gutter_approx);
+                .saturating_sub(ab_w + sidebar_cols + gutter_approx);
             engine.set_viewport_lines(content_rows.saturating_sub(1).max(1) as usize); // -1 for tab bar row inside content_rows
             engine.set_viewport_cols(content_cols.max(1) as usize);
         }
@@ -1062,7 +1073,10 @@ fn event_loop(
         // When a redraw is pending but rate-limited, wait only until the next frame is due.
         // When idle, poll slowly to keep CPU near zero.
         // If a yank highlight is active, cap the wait so we clear it on time.
-        let poll_timeout = if needs_redraw {
+        let poll_timeout = if engine.tab_switcher_open {
+            // Short poll when tab switcher is open so we can auto-confirm quickly
+            Duration::from_millis(10)
+        } else if needs_redraw {
             min_frame
                 .saturating_sub(last_draw.elapsed())
                 .max(Duration::from_millis(1))
@@ -1073,6 +1087,17 @@ fn event_loop(
             Duration::from_millis(50)
         };
         if !ct_event::poll(poll_timeout).expect("poll") {
+            // Tab switcher auto-confirm: if open and no Alt+t press for 400ms, confirm.
+            if engine.tab_switcher_open {
+                if let Some(last) = tab_switcher_last_cycle {
+                    if last.elapsed() >= Duration::from_millis(500) {
+                        engine.tab_switcher_confirm();
+                        tab_switcher_last_cycle = None;
+                        needs_redraw = true;
+                    }
+                }
+                continue;
+            }
             // No input — good time to do background work without blocking typing.
             // Flush LSP didChange (may block briefly on pipe write for large buffers).
             engine.lsp_flush_changes();
@@ -1221,6 +1246,107 @@ fn event_loop(
                     }
                     needs_redraw = true;
                     continue;
+                }
+
+                // ── MRU tab switcher ──────────────────────────────────────
+                // When open, intercept all press events. Alt+t / Ctrl+Tab
+                // cycle; release events and non-cycling keys are swallowed.
+                // Auto-confirm happens via poll timeout (400ms with no input).
+                if engine.tab_switcher_open && key_event.kind != KeyEventKind::Release {
+                    let alt = key_event.modifiers.contains(KeyModifiers::ALT);
+                    let ctrl = key_event.modifiers.contains(KeyModifiers::CONTROL);
+                    match key_event.code {
+                        // Alt+t or Ctrl+Tab or plain Tab: cycle forward
+                        KeyCode::Char('t') if alt => {
+                            let len = engine.tab_mru.len();
+                            if len > 0 {
+                                engine.tab_switcher_selected =
+                                    (engine.tab_switcher_selected + 1) % len;
+                            }
+                            tab_switcher_last_cycle = Some(Instant::now());
+                        }
+                        KeyCode::Tab if ctrl => {
+                            let len = engine.tab_mru.len();
+                            if len > 0 {
+                                engine.tab_switcher_selected =
+                                    (engine.tab_switcher_selected + 1) % len;
+                            }
+                            tab_switcher_last_cycle = Some(Instant::now());
+                        }
+                        KeyCode::Tab => {
+                            let len = engine.tab_mru.len();
+                            if len > 0 {
+                                engine.tab_switcher_selected =
+                                    (engine.tab_switcher_selected + 1) % len;
+                            }
+                            tab_switcher_last_cycle = Some(Instant::now());
+                        }
+                        // Shift+Tab or Ctrl+Shift+Tab: cycle backward
+                        KeyCode::BackTab => {
+                            let len = engine.tab_mru.len();
+                            if len > 0 {
+                                engine.tab_switcher_selected = if engine.tab_switcher_selected == 0
+                                {
+                                    len - 1
+                                } else {
+                                    engine.tab_switcher_selected - 1
+                                };
+                            }
+                            tab_switcher_last_cycle = Some(Instant::now());
+                        }
+                        KeyCode::Esc => {
+                            engine.tab_switcher_open = false;
+                            tab_switcher_last_cycle = None;
+                        }
+                        KeyCode::Enter => {
+                            engine.tab_switcher_confirm();
+                            tab_switcher_last_cycle = None;
+                        }
+                        _ => {
+                            // Any other press confirms immediately
+                            engine.tab_switcher_confirm();
+                            tab_switcher_last_cycle = None;
+                        }
+                    }
+                    needs_redraw = true;
+                    continue;
+                }
+                // Swallow release events while tab switcher is open
+                if engine.tab_switcher_open && key_event.kind == KeyEventKind::Release {
+                    continue;
+                }
+
+                // Tab switcher openers (only on Press, not Release)
+                if key_event.kind != KeyEventKind::Release {
+                    let ctrl_held = key_event.modifiers.contains(KeyModifiers::CONTROL);
+                    let alt_held = key_event.modifiers.contains(KeyModifiers::ALT);
+                    // Ctrl+Tab
+                    if ctrl_held && key_event.code == KeyCode::Tab {
+                        engine.open_tab_switcher();
+                        tab_switcher_last_cycle = Some(Instant::now());
+                        needs_redraw = true;
+                        continue;
+                    }
+                    // Ctrl+Shift+Tab
+                    if ctrl_held && key_event.code == KeyCode::BackTab {
+                        engine.open_tab_switcher();
+                        if engine.tab_switcher_open {
+                            let len = engine.tab_mru.len();
+                            if len > 0 {
+                                engine.tab_switcher_selected = len - 1;
+                            }
+                        }
+                        tab_switcher_last_cycle = Some(Instant::now());
+                        needs_redraw = true;
+                        continue;
+                    }
+                    // Alt+t (handled here for the initial open; cycling handled above)
+                    if alt_held && !ctrl_held && key_event.code == KeyCode::Char('t') {
+                        engine.open_tab_switcher();
+                        tab_switcher_last_cycle = Some(Instant::now());
+                        needs_redraw = true;
+                        continue;
+                    }
                 }
 
                 // ── Prompt mode (sidebar CRUD) ──────────────────────────────
@@ -2612,6 +2738,7 @@ fn event_loop(
                                     continue;
                                 }
                             }
+                            // Alt+t is handled earlier (tab switcher)
                             _ => {}
                         }
                     }
@@ -2747,6 +2874,10 @@ fn event_loop(
                     // Ctrl-W h/l overflow: move focus to sidebar/toolbar
                     if let Some(direction) = engine.window_nav_overflow.take() {
                         if !direction {
+                            // Left overflow (Ctrl-W h): show sidebar if autohide
+                            if !sidebar.visible && engine.settings.autohide_panels {
+                                sidebar.visible = true;
+                            }
                             // Left overflow → sidebar panel (if visible) or toolbar
                             if sidebar.visible {
                                 sidebar.has_focus = true;
@@ -2766,7 +2897,16 @@ fn event_loop(
                                 sidebar.toolbar_focused = true;
                             }
                         }
-                        // Right overflow: no action for now (nothing to the right of editor)
+                        // Right overflow: no action (nothing to the right of editor)
+                    }
+
+                    // Auto-hide sidebar when focus returns to editor
+                    if engine.settings.autohide_panels
+                        && sidebar.visible
+                        && !sidebar.has_focus
+                        && !sidebar.toolbar_focused
+                    {
+                        sidebar.visible = false;
                     }
 
                     // Any keypress warrants a redraw (e.g. :set wrap returns None but
@@ -3016,7 +3156,12 @@ fn handle_mouse(
     let row = ev.row;
     let term_height = terminal_size.map(|s| s.height).unwrap_or(24);
 
-    let editor_left = ACTIVITY_BAR_WIDTH
+    let ab_width = if engine.settings.autohide_panels && !sidebar.visible {
+        0
+    } else {
+        ACTIVITY_BAR_WIDTH
+    };
+    let editor_left = ab_width
         + if sidebar.visible {
             sidebar_width + 1
         } else {
@@ -3024,14 +3169,14 @@ fn handle_mouse(
         };
 
     // ── Sidebar separator drag (works anywhere, regardless of row) ────────────
-    let sep_col = ACTIVITY_BAR_WIDTH + if sidebar.visible { sidebar_width } else { 0 };
+    let sep_col = ab_width + if sidebar.visible { sidebar_width } else { 0 };
     match ev.kind {
         MouseEventKind::Down(MouseButton::Left) if sidebar.visible && col == sep_col => {
             *dragging_sidebar = true;
             return sidebar_width;
         }
         MouseEventKind::Drag(MouseButton::Left) if *dragging_sidebar => {
-            let new_w = col.saturating_sub(ACTIVITY_BAR_WIDTH);
+            let new_w = col.saturating_sub(ab_width);
             return new_w.clamp(15, 150);
         }
         MouseEventKind::Drag(MouseButton::Left) => {
@@ -3228,10 +3373,7 @@ fn handle_mouse(
         // Scroll wheel — sidebar or editor
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
             // Sidebar scroll wheel
-            if sidebar.visible
-                && col >= ACTIVITY_BAR_WIDTH
-                && col < ACTIVITY_BAR_WIDTH + sidebar_width
-            {
+            if sidebar.visible && col >= ab_width && col < ab_width + sidebar_width {
                 if sidebar.active_panel == TuiPanel::Explorer {
                     let tree_height = term_height.saturating_sub(3) as usize;
                     let total = sidebar.rows.len();
@@ -3636,7 +3778,7 @@ fn handle_mouse(
     engine.terminal_has_focus = false;
 
     // ── Activity bar ──────────────────────────────────────────────────────────
-    if col < ACTIVITY_BAR_WIDTH {
+    if col < ab_width {
         // Activity bar is in the main content area, below the menu bar row (if visible)
         // and above the debug toolbar row (if visible).
         let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
@@ -3706,9 +3848,9 @@ fn handle_mouse(
     }
 
     // ── Sidebar panel area ────────────────────────────────────────────────────
-    if sidebar.visible && col < ACTIVITY_BAR_WIDTH + sidebar_width {
+    if sidebar.visible && col < ab_width + sidebar_width {
         // Rightmost column of the sidebar is the scrollbar column.
-        let sb_col = ACTIVITY_BAR_WIDTH + sidebar_width - 1;
+        let sb_col = ab_width + sidebar_width - 1;
         // Account for menu bar: when visible it occupies absolute row 0, so the
         // sidebar's logical row 0 is at absolute terminal row `menu_rows`.
         let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
@@ -3731,7 +3873,7 @@ fn handle_mouse(
             if sidebar_row == 0 {
                 // Header row: check if a toolbar button was clicked.
                 // Toolbar is right-aligned: 5 NF icons × 3 cols = 15.
-                let toolbar_start = ACTIVITY_BAR_WIDTH + sidebar_width - EXPLORER_TOOLBAR_LEN;
+                let toolbar_start = ab_width + sidebar_width - EXPLORER_TOOLBAR_LEN;
                 if col >= toolbar_start {
                     let btn = (col - toolbar_start) / 3; // 0=new-file 1=new-folder 2=delete
                     let idx = sidebar.selected;
@@ -3830,7 +3972,7 @@ fn handle_mouse(
                     } else if sidebar_row >= items_start && sidebar_row < items_end {
                         let item_count = engine.dap_sidebar_section_item_count(*section);
                         let height = sec_height as usize;
-                        let sb_col = ACTIVITY_BAR_WIDTH + sidebar_width - 1;
+                        let sb_col = ab_width + sidebar_width - 1;
                         // Scrollbar click: rightmost column when items overflow.
                         if col == sb_col && item_count > height && height > 0 {
                             let rel_row = (sidebar_row - items_start) as usize;
@@ -3876,7 +4018,7 @@ fn handle_mouse(
             } else if sidebar_row == 2 {
                 // Button row: Commit (~50%), Push/Pull/Sync (~17% each, icon-only).
                 // Use column relative to the sidebar content area start.
-                let rel_col = col.saturating_sub(ACTIVITY_BAR_WIDTH);
+                let rel_col = col.saturating_sub(ab_width);
                 let commit_w = sidebar_width / 2;
                 let btn_idx = if rel_col < commit_w {
                     0
@@ -4313,7 +4455,12 @@ fn build_screen_for_tui(
     } else {
         0
     }; // +1 sep
-    let content_cols = area.width.saturating_sub(ACTIVITY_BAR_WIDTH + sidebar_cols);
+    let ab_width = if engine.settings.autohide_panels && !sidebar.visible {
+        0
+    } else {
+        ACTIVITY_BAR_WIDTH
+    };
+    let content_cols = area.width.saturating_sub(ab_width + sidebar_cols);
     let content_bounds = WindowRect::new(0.0, 0.0, content_cols as f64, content_rows as f64);
     let tui_tab_bar_height = if engine.settings.breadcrumbs {
         2.0
@@ -4380,6 +4527,7 @@ fn draw_frame(
     };
     let menu_bar_height: u16 = if screen.menu_bar.is_some() { 1 } else { 0 };
     let debug_toolbar_height: u16 = if screen.debug_toolbar.is_some() { 1 } else { 0 };
+    let wildmenu_height: u16 = if screen.wildmenu.is_some() { 1 } else { 0 };
     let v_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -4388,6 +4536,7 @@ fn draw_frame(
             Constraint::Length(qf_height),
             Constraint::Length(bottom_panel_height),
             Constraint::Length(debug_toolbar_height),
+            Constraint::Length(wildmenu_height),
             Constraint::Length(1),
             Constraint::Length(1),
         ])
@@ -4397,10 +4546,16 @@ fn draw_frame(
     let quickfix_area = v_chunks[2];
     let bottom_panel_area = v_chunks[3];
     let debug_toolbar_area = v_chunks[4];
-    let status_area = v_chunks[5];
-    let cmd_area = v_chunks[6];
+    let wildmenu_area = v_chunks[5];
+    let status_area = v_chunks[6];
+    let cmd_area = v_chunks[7];
 
     // ── Horizontal split of main_area: [activity_bar] [sidebar?] [editor_col] ─
+    let ab_width = if engine.settings.autohide_panels && !sidebar.visible {
+        0
+    } else {
+        ACTIVITY_BAR_WIDTH
+    };
     let sidebar_constraint = if sidebar.visible {
         Constraint::Length(sidebar_width + 1) // +1 for separator
     } else {
@@ -4409,7 +4564,7 @@ fn draw_frame(
     let h_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Length(ACTIVITY_BAR_WIDTH),
+            Constraint::Length(ab_width),
             sidebar_constraint,
             Constraint::Min(0),
         ])
@@ -4639,6 +4794,11 @@ fn draw_frame(
         render_command_palette_popup(frame, palette, area, theme);
     }
 
+    // ── Tab switcher popup ───────────────────────────────────────────────────
+    if let Some(ref ts) = screen.tab_switcher {
+        render_tab_switcher_popup(frame.buffer_mut(), area, ts, theme);
+    }
+
     // ── Quickfix panel (persistent bottom strip) ──────────────────────────────
     if let Some(ref qf) = screen.quickfix {
         render_quickfix_panel(
@@ -4692,6 +4852,11 @@ fn draw_frame(
     // ── Debug toolbar strip (if visible) ────────────────────────────────────
     if let Some(ref toolbar) = screen.debug_toolbar {
         render_debug_toolbar(frame.buffer_mut(), debug_toolbar_area, toolbar, theme);
+    }
+
+    // ── Wildmenu bar (command Tab completion) ─────────────────────────────────
+    if let Some(ref wm) = screen.wildmenu {
+        render_wildmenu(frame.buffer_mut(), wildmenu_area, wm, theme);
     }
 
     // ── Status / command ──────────────────────────────────────────────────────
@@ -5949,6 +6114,157 @@ fn render_command_palette_popup(
                     '─'
                 };
                 set_cell(buf, cx, bottom, ch, border_fg, bg_color);
+            }
+        }
+    }
+}
+
+fn render_tab_switcher_popup(
+    buf: &mut ratatui::buffer::Buffer,
+    term_area: Rect,
+    ts: &render::TabSwitcherPanel,
+    theme: &Theme,
+) {
+    if ts.items.is_empty() {
+        return;
+    }
+    let item_count = ts.items.len();
+    // Size: 45% width (min 40, max 80), height = items + 2 (borders)
+    let width = (term_area.width * 45 / 100).clamp(40, 80);
+    let max_visible = (term_area.height as usize).saturating_sub(4).min(20);
+    let visible = item_count.min(max_visible);
+    let height = visible as u16 + 2; // top + bottom border
+
+    // Centered
+    let x = (term_area.width.saturating_sub(width)) / 2;
+    let y = (term_area.height.saturating_sub(height)) / 2;
+
+    let bg = rc(theme.fuzzy_bg);
+    let fg = rc(theme.fuzzy_fg);
+    let sel_bg = rc(theme.fuzzy_selected_bg);
+    let border_fg = rc(theme.fuzzy_border);
+    let title_fg = rc(theme.fuzzy_title_fg);
+
+    // Top border
+    if y < term_area.height {
+        for col in 0..width {
+            let cx = x + col;
+            if cx < term_area.width {
+                let ch = if col == 0 {
+                    '╭'
+                } else if col == width - 1 {
+                    '╮'
+                } else {
+                    '─'
+                };
+                set_cell(buf, cx, y, ch, border_fg, bg);
+            }
+        }
+        // Title overlay
+        let title = " Open Tabs ";
+        for (i, ch) in title.chars().enumerate() {
+            let cx = x + 2 + i as u16;
+            if cx + 1 < x + width && cx < term_area.width {
+                set_cell(buf, cx, y, ch, title_fg, bg);
+            }
+        }
+    }
+
+    // Scroll offset so selected item is always visible
+    let scroll = if ts.selected_idx >= visible {
+        ts.selected_idx - visible + 1
+    } else {
+        0
+    };
+
+    // Items
+    let inner_w = (width - 2) as usize;
+    for i in 0..visible {
+        let item_idx = scroll + i;
+        if item_idx >= item_count {
+            break;
+        }
+        let ry = y + 1 + i as u16;
+        if ry >= term_area.height {
+            break;
+        }
+        let is_selected = item_idx == ts.selected_idx;
+        let row_bg = if is_selected { sel_bg } else { bg };
+
+        // Clear row
+        for col in 0..width {
+            let cx = x + col;
+            if cx < term_area.width {
+                let ch = if col == 0 || col == width - 1 {
+                    '│'
+                } else {
+                    ' '
+                };
+                let c = if col == 0 || col == width - 1 {
+                    border_fg
+                } else {
+                    fg
+                };
+                set_cell(
+                    buf,
+                    cx,
+                    ry,
+                    ch,
+                    c,
+                    if col == 0 || col == width - 1 {
+                        bg
+                    } else {
+                        row_bg
+                    },
+                );
+            }
+        }
+
+        let (name, path, dirty) = &ts.items[item_idx];
+        let dirty_mark = if *dirty { " ●" } else { "" };
+        let prefix = if is_selected { "▶ " } else { "  " };
+        let label = format!("{}{}{}", prefix, name, dirty_mark);
+
+        // Draw label
+        for (j, ch) in label.chars().enumerate() {
+            let cx = x + 1 + j as u16;
+            if cx + 1 < x + width && cx < term_area.width {
+                set_cell(buf, cx, ry, ch, fg, row_bg);
+            }
+        }
+
+        // Draw path right-aligned (dimmed)
+        if !path.is_empty() && inner_w > label.chars().count() + 4 {
+            let available = inner_w - label.chars().count() - 2;
+            let display_path = if path.len() > available {
+                &path[path.len() - available..]
+            } else {
+                path.as_str()
+            };
+            let path_start = inner_w - display_path.len();
+            for (j, ch) in display_path.chars().enumerate() {
+                let cx = x + 1 + (path_start + j) as u16;
+                if cx + 1 < x + width && cx < term_area.width {
+                    set_cell(buf, cx, ry, ch, border_fg, row_bg);
+                }
+            }
+        }
+    }
+
+    // Bottom border
+    let bottom = y + height - 1;
+    if bottom < term_area.height {
+        for col in 0..width {
+            let cx = x + col;
+            if cx < term_area.width {
+                let ch = if col == 0 {
+                    '╰'
+                } else if col == width - 1 {
+                    '╯'
+                } else {
+                    '─'
+                };
+                set_cell(buf, cx, bottom, ch, border_fg, bg);
             }
         }
     }
@@ -8059,6 +8375,69 @@ fn render_prompt_line(
     }
 }
 
+// ─── Wildmenu (command Tab completion bar) ───────────────────────────────────
+
+fn render_wildmenu(
+    buf: &mut ratatui::buffer::Buffer,
+    area: Rect,
+    wm: &WildmenuData,
+    theme: &Theme,
+) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let bg = rc(theme.wildmenu_bg);
+    let fg = rc(theme.wildmenu_fg);
+    let sel_bg = rc(theme.wildmenu_sel_bg);
+    let sel_fg = rc(theme.wildmenu_sel_fg);
+
+    // Fill background
+    for x in area.x..area.x + area.width {
+        let cell = buf.get_mut(x, area.y);
+        cell.set_char(' ').set_fg(fg).set_bg(bg);
+    }
+
+    // Draw items separated by spaces
+    let mut col = area.x;
+    for (i, item) in wm.items.iter().enumerate() {
+        if col >= area.x + area.width {
+            break;
+        }
+        let is_selected = wm.selected == Some(i);
+        let item_fg = if is_selected { sel_fg } else { fg };
+        let item_bg = if is_selected { sel_bg } else { bg };
+
+        // Leading space
+        if col < area.x + area.width {
+            buf.get_mut(col, area.y)
+                .set_char(' ')
+                .set_fg(item_fg)
+                .set_bg(item_bg);
+            col += 1;
+        }
+
+        for ch in item.chars() {
+            if col >= area.x + area.width {
+                break;
+            }
+            buf.get_mut(col, area.y)
+                .set_char(ch)
+                .set_fg(item_fg)
+                .set_bg(item_bg);
+            col += 1;
+        }
+
+        // Trailing space for selected item padding
+        if is_selected && col < area.x + area.width {
+            buf.get_mut(col, area.y)
+                .set_char(' ')
+                .set_fg(item_fg)
+                .set_bg(item_bg);
+            col += 1;
+        }
+    }
+}
+
 // ─── Status / command line ────────────────────────────────────────────────────
 
 fn render_status_line(
@@ -8201,8 +8580,8 @@ fn translate_key(event: KeyEvent, keyboard_enhanced: bool) -> Option<(String, Op
         KeyCode::Enter => Some(("Return".to_string(), None, false)),
         KeyCode::Backspace => Some(("BackSpace".to_string(), None, false)),
         KeyCode::Delete => Some(("Delete".to_string(), None, false)),
-        KeyCode::Tab => Some(("Tab".to_string(), None, false)),
-        KeyCode::BackTab => Some(("ISO_Left_Tab".to_string(), None, false)),
+        KeyCode::Tab => Some(("Tab".to_string(), None, ctrl)),
+        KeyCode::BackTab => Some(("ISO_Left_Tab".to_string(), None, ctrl)),
         // Shift+Arrow (no ctrl): emit as "Shift_X" for VSCode selection extension.
         KeyCode::Up if shift && !ctrl => Some(("Shift_Up".to_string(), None, false)),
         KeyCode::Down if shift && !ctrl => Some(("Shift_Down".to_string(), None, false)),

@@ -1,9 +1,18 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 146 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 149 archived here. Recent work summary in PROJECT_STATE.md.
 
 ---
+
+**Session 149 — Ctrl+Tab MRU tab switcher + autohide panels (2728 tests):**
+VSCode-style MRU tab switcher: Ctrl+Tab opens a popup showing recently accessed tabs in most-recently-used order; Ctrl+Tab cycles forward, Ctrl+Shift+Tab cycles backward, Enter or any non-modifier key confirms selection, Escape cancels. New `autohide_panels` boolean setting (default false, TUI only): when enabled, hides sidebar and activity bar at startup; Ctrl-W h reveals them, and they auto-hide when focus returns to the editor. 11 integration tests in `tests/tab_switcher.rs`.
+
+**Session 148 — Netrw in-buffer file browser (2693 tests):**
+Vim-style netrw directory browser. `:Explore [dir]` / `:Ex` opens directory listing in buffer; `:Sexplore` / `:Sex` horizontal split; `:Vexplore` / `:Vex` vertical split. Header line shows current directory. Enter on directory navigates; Enter on file opens. `-` key navigates to parent. Respects `show_hidden_files` setting. `netrw_dir` field on `BufferState`. 16 integration tests in `tests/netrw.rs`.
+
+**Session 147 — TUI interactive settings panel (2677 tests):**
+Replaced read-only TUI settings panel with full interactive form. Moved `SettingType`/`SettingDef`/`SETTING_DEFS` from `render.rs` to `settings.rs`. New `DynamicEnum` variant for runtime-computed options. Engine fields: `settings_has_focus`, `settings_selected`, `settings_scroll_top`, `settings_query`, `settings_input_active`, `settings_editing`, `settings_edit_buf`, `settings_collapsed`. `handle_settings_key()`: search filter, inline string/int edit, j/k nav, Space/Enter toggle, Enter/l/h enum cycle. `settings_paste()` for Ctrl+V. TUI renders: header, `/` search bar, scrollable categorized form, inline editing, scrollbar. 10 integration tests in `tests/settings_panel.rs`.
 
 **Session 146 — Breadcrumbs bar (14 new tests, 2667 total):**
 VSCode-like breadcrumbs bar showing file path segments + tree-sitter symbol hierarchy (e.g. `src › core › engine.rs › Engine › handle_key`) below the tab bar. `BreadcrumbSymbol` struct + `Syntax::enclosing_scopes()` walks parent chain for 10 languages (Rust/Python/JS/TS/Go/C/C++/Java/C#/Ruby). `BreadcrumbSegment`/`BreadcrumbBar` render structs. `breadcrumb_bg/fg/active_fg` theme colors in all 4 built-in themes + VSCode theme loader. `Settings.breadcrumbs: bool` (default true, `:set breadcrumbs`/`:set nobreadcrumbs`). Each editor group gets its own breadcrumb bar. Space reserved via doubled `tab_bar_height` when enabled. GTK `draw_breadcrumb_bar()` + TUI `render_breadcrumb_bar()`. 14 new tests (11 integration + 3 unit).

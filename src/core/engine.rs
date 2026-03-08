@@ -719,6 +719,12 @@ pub struct Engine {
     pub command_buffer: String,
     /// Cursor position within `command_buffer` (char index, 0 = before first char).
     pub command_cursor: usize,
+    /// Wildmenu (command-line Tab completion) state.
+    pub wildmenu_items: Vec<String>,
+    /// Currently selected wildmenu item index, or `None` for common-prefix state.
+    pub wildmenu_selected: Option<usize>,
+    /// Original command buffer before wildmenu was opened (for cycling back).
+    pub wildmenu_original: String,
     /// Status message shown in the command line area (e.g. "written", errors).
     pub message: String,
     /// Current search query (from last `/` or `?` search).
@@ -980,6 +986,15 @@ pub struct Engine {
     /// Project root directory for the fuzzy finder.
     pub cwd: PathBuf,
     /// Whether the fuzzy finder modal is open.
+    // --- Tab switcher (Alt+Tab MRU popup) ---
+    /// Whether the tab switcher popup is open.
+    pub tab_switcher_open: bool,
+    /// Index of the currently highlighted item in the MRU list.
+    pub tab_switcher_selected: usize,
+    /// MRU-ordered list of (group_id, tab_index) pairs.
+    /// Most recently used is at index 0.
+    pub tab_mru: Vec<(GroupId, usize)>,
+
     pub fuzzy_open: bool,
     /// Current query typed in the fuzzy finder.
     pub fuzzy_query: String,
@@ -1370,6 +1385,9 @@ impl Engine {
             mode: Mode::Normal,
             command_buffer: String::new(),
             command_cursor: 0,
+            wildmenu_items: Vec::new(),
+            wildmenu_selected: None,
+            wildmenu_original: String::new(),
             message: String::new(),
             search_query: String::new(),
             search_matches: Vec::new(),
@@ -1470,6 +1488,9 @@ impl Engine {
             sc_button_focused: None,
             plugin_manager: None,
             cwd,
+            tab_switcher_open: false,
+            tab_switcher_selected: 0,
+            tab_mru: vec![(GroupId(0), 0)],
             fuzzy_open: false,
             fuzzy_query: String::new(),
             fuzzy_all_files: Vec::new(),
@@ -2260,6 +2281,174 @@ impl Engine {
                 state.md_rendered = Some(rendered.clone());
             }
         }
+    }
+
+    // =========================================================================
+    // Netrw — in-buffer directory browser
+    // =========================================================================
+
+    /// Build a directory listing string for netrw.
+    fn netrw_build_listing(dir: &Path, show_hidden: bool) -> String {
+        let mut lines = Vec::new();
+        lines.push(format!("\" {}/", dir.display()));
+        lines.push("../".to_string());
+
+        let entries = match std::fs::read_dir(dir) {
+            Ok(rd) => rd,
+            Err(e) => {
+                lines.push(format!("Error reading directory: {}", e));
+                return lines.join("\n") + "\n";
+            }
+        };
+
+        let mut dirs = Vec::new();
+        let mut files = Vec::new();
+
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !show_hidden && name.starts_with('.') {
+                continue;
+            }
+            if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                dirs.push(format!("{}/", name));
+            } else {
+                files.push(name);
+            }
+        }
+
+        dirs.sort();
+        files.sort();
+
+        for d in dirs {
+            lines.push(d);
+        }
+        for f in files {
+            lines.push(f);
+        }
+
+        lines.join("\n") + "\n"
+    }
+
+    /// Open a netrw directory listing. Optionally split first.
+    fn cmd_explore(&mut self, arg: Option<&str>, split: Option<SplitDirection>) -> EngineAction {
+        // Resolve target directory
+        let dir = if let Some(a) = arg {
+            let p = Path::new(a);
+            if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                self.cwd.join(p)
+            }
+        } else if let Some(fp) = self.file_path().map(|p| p.to_path_buf()) {
+            fp.parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| self.cwd.clone())
+        } else {
+            self.cwd.clone()
+        };
+
+        if !dir.is_dir() {
+            self.message = format!("Not a directory: {}", dir.display());
+            return EngineAction::Error;
+        }
+
+        // Split first if requested
+        if let Some(direction) = split {
+            self.split_window(direction, None);
+        }
+
+        // Create netrw buffer
+        let listing = Self::netrw_build_listing(&dir, self.settings.show_hidden_files);
+        let buf_id = self.buffer_manager.create();
+        if let Some(state) = self.buffer_manager.get_mut(buf_id) {
+            state.buffer.content = ropey::Rope::from_str(&listing);
+            state.read_only = true;
+            state.netrw_dir = Some(dir);
+        }
+
+        // Point active window at the netrw buffer
+        self.active_window_mut().buffer_id = buf_id;
+        self.view_mut().cursor.line = 1; // skip header, land on ../
+        self.view_mut().cursor.col = 0;
+
+        EngineAction::None
+    }
+
+    /// Get the filesystem path for the entry at the cursor in a netrw buffer.
+    fn netrw_entry_at_cursor(&self) -> Option<PathBuf> {
+        let netrw_dir = self.active_buffer_state().netrw_dir.as_ref()?;
+        let line_idx = self.cursor().line;
+        if line_idx == 0 {
+            return None; // header line
+        }
+        let line_text: String = self.buffer().content.line(line_idx).chars().collect();
+        let entry = line_text.trim_end_matches('\n').trim();
+        if entry.is_empty() {
+            return None;
+        }
+        if entry == "../" {
+            netrw_dir.parent().map(|p| p.to_path_buf())
+        } else {
+            Some(netrw_dir.join(entry))
+        }
+    }
+
+    /// Activate (open) the netrw entry at cursor.
+    fn netrw_activate_entry(&mut self) -> EngineAction {
+        let path = match self.netrw_entry_at_cursor() {
+            Some(p) => p,
+            None => return EngineAction::None, // header line — no-op
+        };
+
+        if path.is_dir() {
+            // Navigate into directory — reuse current buffer
+            let listing = Self::netrw_build_listing(&path, self.settings.show_hidden_files);
+            let buf_id = self.active_buffer_id();
+            if let Some(state) = self.buffer_manager.get_mut(buf_id) {
+                state.read_only = false; // temporarily allow write
+                state.buffer.content = ropey::Rope::from_str(&listing);
+                state.read_only = true;
+                state.netrw_dir = Some(path);
+            }
+            self.view_mut().cursor.line = 1;
+            self.view_mut().cursor.col = 0;
+            self.view_mut().scroll_top = 0;
+            EngineAction::None
+        } else {
+            // File — delete netrw buffer and open the file
+            let netrw_buf_id = self.active_buffer_id();
+            self.open_file_in_tab(&path);
+            // Remove the netrw buffer if it's no longer shown in any window
+            let still_used = self.windows.values().any(|w| w.buffer_id == netrw_buf_id);
+            if !still_used {
+                self.buffer_manager.remove(netrw_buf_id);
+            }
+            EngineAction::None
+        }
+    }
+
+    /// Navigate to parent directory in netrw.
+    fn netrw_go_parent(&mut self) -> EngineAction {
+        let netrw_dir = match self.active_buffer_state().netrw_dir.clone() {
+            Some(d) => d,
+            None => return EngineAction::None,
+        };
+        let parent = match netrw_dir.parent() {
+            Some(p) => p.to_path_buf(),
+            None => return EngineAction::None, // already at root
+        };
+        let listing = Self::netrw_build_listing(&parent, self.settings.show_hidden_files);
+        let buf_id = self.active_buffer_id();
+        if let Some(state) = self.buffer_manager.get_mut(buf_id) {
+            state.read_only = false;
+            state.buffer.content = ropey::Rope::from_str(&listing);
+            state.read_only = true;
+            state.netrw_dir = Some(parent);
+        }
+        self.view_mut().cursor.line = 1;
+        self.view_mut().cursor.col = 0;
+        self.view_mut().scroll_top = 0;
+        EngineAction::None
     }
 
     /// Open the git diff for the current file in a vertical split.
@@ -3123,6 +3312,7 @@ impl Engine {
         let tab = Tab::new(tab_id, window_id);
         self.active_group_mut().tabs.push(tab);
         self.active_group_mut().active_tab = self.active_group().tabs.len() - 1;
+        self.tab_mru_touch();
 
         if file_path.is_some() {
             self.message = String::new();
@@ -3157,13 +3347,24 @@ impl Engine {
             self.windows.remove(window_id);
         }
 
+        let closed_group = self.active_group;
         self.active_group_mut().tabs.remove(active_tab_idx);
+
+        // Remove the closed tab from MRU and adjust indices
+        self.tab_mru
+            .retain(|&(g, idx)| !(g == closed_group && idx == active_tab_idx));
+        for entry in &mut self.tab_mru {
+            if entry.0 == closed_group && entry.1 > active_tab_idx {
+                entry.1 -= 1;
+            }
+        }
 
         // Adjust active tab index
         let tabs_len = self.active_group().tabs.len();
         if self.active_group().active_tab >= tabs_len {
             self.active_group_mut().active_tab = tabs_len - 1;
         }
+        self.tab_mru_touch();
 
         // Remove any buffers that are no longer referenced by any window.
         // This prevents orphaned dirty buffers from falsely triggering `:qa`
@@ -3184,12 +3385,20 @@ impl Engine {
         true
     }
 
+    /// Record the current (group, tab_index) as the most recently used tab.
+    pub fn tab_mru_touch(&mut self) {
+        let entry = (self.active_group, self.active_group().active_tab);
+        self.tab_mru.retain(|e| *e != entry);
+        self.tab_mru.insert(0, entry);
+    }
+
     /// Switch to the next tab.
     pub fn next_tab(&mut self) {
         let tabs_len = self.active_group().tabs.len();
         if !self.active_group().tabs.is_empty() {
             self.active_group_mut().active_tab = (self.active_group().active_tab + 1) % tabs_len;
             self.line_annotations.clear();
+            self.tab_mru_touch();
         }
     }
 
@@ -3200,7 +3409,75 @@ impl Engine {
             let tabs_len = self.active_group().tabs.len();
             self.active_group_mut().active_tab = if at == 0 { tabs_len - 1 } else { at - 1 };
             self.line_annotations.clear();
+            self.tab_mru_touch();
         }
+    }
+
+    /// Open the tab switcher popup, pre-selecting the second MRU entry.
+    pub fn open_tab_switcher(&mut self) {
+        // Build a clean MRU list: only include entries that still exist
+        self.tab_mru.retain(|&(g, idx)| {
+            self.editor_groups
+                .get(&g)
+                .is_some_and(|grp| idx < grp.tabs.len())
+        });
+        // Ensure the current tab is at index 0
+        let current = (self.active_group, self.active_group().active_tab);
+        if self.tab_mru.first() != Some(&current) {
+            self.tab_mru.retain(|e| *e != current);
+            self.tab_mru.insert(0, current);
+        }
+        // Also add any tabs not yet in MRU (e.g. from before MRU tracking started)
+        for (&gid, group) in &self.editor_groups {
+            for idx in 0..group.tabs.len() {
+                if !self.tab_mru.contains(&(gid, idx)) {
+                    self.tab_mru.push((gid, idx));
+                }
+            }
+        }
+
+        if self.tab_mru.len() <= 1 {
+            return; // Nothing to switch to
+        }
+        self.tab_switcher_open = true;
+        self.tab_switcher_selected = 1; // Start on the second item (previous tab)
+    }
+
+    /// Confirm the tab switcher selection and close the popup.
+    pub fn tab_switcher_confirm(&mut self) {
+        if !self.tab_switcher_open {
+            return;
+        }
+        let idx = self.tab_switcher_selected;
+        if let Some(&(group_id, tab_idx)) = self.tab_mru.get(idx) {
+            if self.editor_groups.contains_key(&group_id) {
+                self.active_group = group_id;
+                self.active_group_mut().active_tab = tab_idx;
+                self.tab_mru_touch();
+                self.line_annotations.clear();
+            }
+        }
+        self.tab_switcher_open = false;
+    }
+
+    /// Get display info for each MRU entry: (filename, path, is_dirty).
+    pub fn tab_switcher_items(&self) -> Vec<(String, String, bool)> {
+        self.tab_mru
+            .iter()
+            .filter_map(|&(gid, tab_idx)| {
+                let group = self.editor_groups.get(&gid)?;
+                let tab = group.tabs.get(tab_idx)?;
+                let win = self.windows.get(&tab.active_window)?;
+                let state = self.buffer_manager.get(win.buffer_id)?;
+                let name = state.display_name();
+                let path = state
+                    .file_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                Some((name, path, state.dirty))
+            })
+            .collect()
     }
 
     /// Switch to a specific tab (0-indexed).
@@ -3209,6 +3486,7 @@ impl Engine {
         if index < self.active_group().tabs.len() {
             self.active_group_mut().active_tab = index;
             self.line_annotations.clear();
+            self.tab_mru_touch();
         }
     }
 
@@ -3367,6 +3645,7 @@ impl Engine {
             .map(|(idx, _)| idx);
         if let Some(tab_idx) = found {
             self.active_group_mut().active_tab = tab_idx;
+            self.tab_mru_touch();
             self.refresh_git_diff(buffer_id);
             self.message = format!("\"{}\"", path.display());
             self.lsp_did_open(buffer_id);
@@ -3382,6 +3661,7 @@ impl Engine {
         let tab = Tab::new(tab_id, window_id);
         self.active_group_mut().tabs.push(tab);
         self.active_group_mut().active_tab = self.active_group().tabs.len() - 1;
+        self.tab_mru_touch();
 
         // Restore saved cursor/scroll position.
         let view = self.restore_file_position(buffer_id);
@@ -4429,6 +4709,78 @@ impl Engine {
             return self.handle_swap_recovery_key(key_name, unicode);
         }
 
+        // Ctrl+Tab opens the tab switcher (or cycles forward if already open).
+        if ctrl && key_name == "Tab" {
+            if self.tab_switcher_open {
+                let len = self.tab_mru.len();
+                if len > 0 {
+                    self.tab_switcher_selected = (self.tab_switcher_selected + 1) % len;
+                }
+            } else {
+                self.open_tab_switcher();
+            }
+            return EngineAction::None;
+        }
+        // Ctrl+Shift+Tab cycles backward.
+        if ctrl && key_name == "ISO_Left_Tab" {
+            if self.tab_switcher_open {
+                let len = self.tab_mru.len();
+                if len > 0 {
+                    self.tab_switcher_selected = if self.tab_switcher_selected == 0 {
+                        len - 1
+                    } else {
+                        self.tab_switcher_selected - 1
+                    };
+                }
+            } else {
+                self.open_tab_switcher();
+                let len = self.tab_mru.len();
+                if len > 0 {
+                    self.tab_switcher_selected = len - 1;
+                }
+            }
+            return EngineAction::None;
+        }
+
+        // Tab switcher intercepts all keys when open.
+        if self.tab_switcher_open {
+            match key_name {
+                "Tab" => {
+                    // Tab (no ctrl): cycle forward
+                    let len = self.tab_mru.len();
+                    if len > 0 {
+                        self.tab_switcher_selected = (self.tab_switcher_selected + 1) % len;
+                    }
+                    return EngineAction::None;
+                }
+                "ISO_Left_Tab" => {
+                    // Shift-Tab: cycle backward
+                    let len = self.tab_mru.len();
+                    if len > 0 {
+                        self.tab_switcher_selected = if self.tab_switcher_selected == 0 {
+                            len - 1
+                        } else {
+                            self.tab_switcher_selected - 1
+                        };
+                    }
+                    return EngineAction::None;
+                }
+                "Escape" => {
+                    self.tab_switcher_open = false;
+                    return EngineAction::None;
+                }
+                "Return" => {
+                    self.tab_switcher_confirm();
+                    return EngineAction::None;
+                }
+                _ => {
+                    // Any other key confirms and is consumed
+                    self.tab_switcher_confirm();
+                    return EngineAction::None;
+                }
+            }
+        }
+
         // Command palette intercepts all keys when open.
         if self.palette_open {
             return self.handle_palette_key(key_name, unicode, ctrl);
@@ -4742,6 +5094,17 @@ impl Engine {
             if blocked && self.pending_key.is_none() && self.pending_operator.is_none() {
                 self.message = "Buffer is read-only".to_string();
                 return EngineAction::None;
+            }
+        }
+
+        // Netrw: Enter opens entry, - goes to parent directory
+        if self.active_buffer_state().netrw_dir.is_some() {
+            if key_name == "Return" || key_name == "KP_Enter" {
+                return self.netrw_activate_entry();
+            }
+            if unicode == Some('-') && self.pending_key.is_none() && self.pending_operator.is_none()
+            {
+                return self.netrw_go_parent();
             }
         }
 
@@ -9025,6 +9388,13 @@ impl Engine {
         self.command_cursor += text.chars().count();
     }
 
+    /// Clear the wildmenu completion state.
+    fn wildmenu_clear(&mut self) {
+        self.wildmenu_items.clear();
+        self.wildmenu_selected = None;
+        self.wildmenu_original.clear();
+    }
+
     fn handle_command_key(
         &mut self,
         key_name: &str,
@@ -9077,6 +9447,7 @@ impl Engine {
 
         match key_name {
             "Escape" => {
+                self.wildmenu_clear();
                 if self.history_search_active {
                     // Cancel history search, restore original buffer
                     self.history_search_active = false;
@@ -9099,6 +9470,7 @@ impl Engine {
                 EngineAction::None
             }
             "Return" => {
+                self.wildmenu_clear();
                 self.mode = Mode::Normal;
                 // If in history search, the matched command is already in command_buffer
                 self.history_search_active = false;
@@ -9209,30 +9581,76 @@ impl Engine {
                 }
                 EngineAction::None
             }
-            "Tab" => {
+            "Tab" | "ISO_Left_Tab" => {
                 // Exit history search, then complete
                 self.history_search_active = false;
                 self.history_search_query.clear();
                 self.history_search_index = None;
 
-                let completions = self.complete_command(&self.command_buffer);
-                if completions.is_empty() {
-                    return EngineAction::None;
-                } else if completions.len() == 1 {
-                    self.command_buffer = completions[0].clone();
-                    self.command_cursor = self.command_buffer.chars().count();
+                let is_backtab = key_name == "ISO_Left_Tab";
+
+                if !self.wildmenu_items.is_empty() {
+                    // Wildmenu already open — cycle through items
+                    if is_backtab {
+                        // Shift-Tab: cycle backwards
+                        match self.wildmenu_selected {
+                            None | Some(0) => {
+                                self.wildmenu_selected = Some(self.wildmenu_items.len() - 1);
+                            }
+                            Some(i) => {
+                                self.wildmenu_selected = Some(i - 1);
+                            }
+                        }
+                    } else {
+                        // Tab: cycle forwards
+                        match self.wildmenu_selected {
+                            None => {
+                                self.wildmenu_selected = Some(0);
+                            }
+                            Some(i) if i + 1 >= self.wildmenu_items.len() => {
+                                self.wildmenu_selected = Some(0);
+                            }
+                            Some(i) => {
+                                self.wildmenu_selected = Some(i + 1);
+                            }
+                        }
+                    }
+                    // Update command buffer to selected item
+                    if let Some(idx) = self.wildmenu_selected {
+                        self.command_buffer = self.wildmenu_items[idx].clone();
+                        self.command_cursor = self.command_buffer.chars().count();
+                        // If selected item ends with space, it takes an argument —
+                        // clear wildmenu so next Tab triggers argument completion.
+                        if self.command_buffer.ends_with(' ') {
+                            self.wildmenu_clear();
+                        }
+                    }
                 } else {
-                    let common = Self::find_common_prefix(&completions);
-                    if common.len() > self.command_buffer.len() {
-                        self.command_buffer = common;
+                    // First Tab press — compute completions
+                    let partial = self.command_buffer.clone();
+                    let completions = self.complete_command(&partial);
+                    if completions.is_empty() {
+                        return EngineAction::None;
+                    } else if completions.len() == 1 {
+                        // Single match: auto-complete, no wildmenu
+                        self.command_buffer = completions[0].clone();
                         self.command_cursor = self.command_buffer.chars().count();
                     } else {
-                        self.message = format!("Completions: {}", completions.join(", "));
+                        // Multiple matches: expand common prefix & show wildmenu
+                        let common = Self::find_common_prefix(&completions);
+                        self.wildmenu_original = partial;
+                        self.wildmenu_items = completions;
+                        self.wildmenu_selected = None;
+                        if common.len() > self.command_buffer.len() {
+                            self.command_buffer = common;
+                            self.command_cursor = self.command_buffer.chars().count();
+                        }
                     }
                 }
                 EngineAction::None
             }
             "BackSpace" => {
+                self.wildmenu_clear();
                 if self.history_search_active {
                     // Remove last char from search query and re-search
                     self.history_search_query.pop();
@@ -9259,6 +9677,7 @@ impl Engine {
                 EngineAction::None
             }
             _ => {
+                self.wildmenu_clear();
                 if self.history_search_active {
                     // Append char to search query and find match
                     if let Some(ch) = unicode {
@@ -10594,32 +11013,46 @@ impl Engine {
     /// Available commands for auto-completion
     fn available_commands() -> &'static [&'static str] {
         &[
+            // File operations
             "w",
             "q",
             "q!",
             "wq",
             "wq!",
             "wa",
+            "wqa",
             "qa",
             "qa!",
             "e ",
             "e!",
             "enew",
+            // Buffers
             "bn",
             "bp",
             "bd",
             "b#",
             "ls",
+            "buffers",
+            "files",
+            // Splits & tabs
             "split",
             "vsplit",
             "tabnew",
             "tabnext",
             "tabprev",
             "tabclose",
+            "tabmove",
+            // Search & replace
             "s/",
             "%s/",
+            "noh",
+            "nohlsearch",
+            // Settings & config
+            "set ",
             "config reload",
             "Settings",
+            "colorscheme ",
+            // Editor groups
             "EditorGroupSplit",
             "EditorGroupSplitDown",
             "EditorGroupClose",
@@ -10630,17 +11063,216 @@ impl Engine {
             "egc",
             "egf",
             "egmt",
+            // Netrw / file browser
+            "Explore",
+            "Ex",
+            "Sexplore",
+            "Sex",
+            "Vexplore",
+            "Vex",
+            // Git
+            "Gdiff",
+            "Gd",
+            "Gstatus",
+            "Gs",
+            "Gadd",
+            "Ga",
+            "Gcommit",
+            "Gc",
+            "Gpush",
+            "Gp",
+            "Gblame",
+            "Gb",
+            "Ghs",
+            "Ghunk",
+            "Gpull",
+            "Gfetch",
+            "GWorktreeAdd",
+            "GWorktreeRemove",
+            // LSP
+            "LspInfo",
+            "LspRestart",
+            "LspStop",
+            "LspInstall",
+            "Lformat",
+            "Rename",
+            // DAP / Debug
+            "DapInfo",
+            "DapInstall",
+            "DapCondition",
+            "DapHitCondition",
+            "DapLogMessage",
+            "DapWatch",
+            "DapBottomPanel",
+            "DapEval",
+            "DapExpand",
+            "debug",
+            "continue",
+            "pause",
+            "stop",
+            "restart",
+            "stepover",
+            "stepin",
+            "stepout",
+            "brkpt",
+            // Extensions
+            "ExtInstall",
+            "ExtList",
+            "ExtEnable",
+            "ExtDisable",
+            "ExtRemove",
+            "ExtRefresh",
+            // AI
+            "AI ",
+            "AiClear",
+            // Markdown
             "MarkdownPreview",
             "MdPreview",
+            // Display / info
+            "registers",
+            "display",
+            "marks",
+            "jumps",
+            "changes",
+            "history",
+            "echo ",
+            // Diff
+            "diffthis",
+            "diffoff",
+            "diffsplit",
+            // Misc ex commands
+            "sort",
+            "terminal",
+            "cd ",
+            "make",
+            "copen",
+            "cn",
+            "cp",
+            "cc",
+            "r ",
+            "norm ",
+            "Plugin",
         ]
     }
 
-    /// Find completions for partial command
+    /// All setting names recognized by `:set`.
+    fn setting_names() -> &'static [&'static str] {
+        &[
+            // Boolean options (full names + aliases)
+            "number",
+            "nu",
+            "relativenumber",
+            "rnu",
+            "expandtab",
+            "et",
+            "autoindent",
+            "ai",
+            "incsearch",
+            "is",
+            "lsp",
+            "wrap",
+            "hlsearch",
+            "hls",
+            "ignorecase",
+            "ic",
+            "smartcase",
+            "scs",
+            "cursorline",
+            "cul",
+            "autoread",
+            "ar",
+            "splitbelow",
+            "sb",
+            "splitright",
+            "spr",
+            "ai_completions",
+            "formatonsave",
+            "fos",
+            "showhiddenfiles",
+            "shf",
+            "swapfile",
+            "breadcrumbs",
+            "autohidepanels",
+            // Value options
+            "tabstop",
+            "ts",
+            "shiftwidth",
+            "sw",
+            "scrolloff",
+            "so",
+            "colorcolumn",
+            "cc",
+            "textwidth",
+            "tw",
+            "updatetime",
+            "ut",
+            "mode",
+        ]
+    }
+
+    /// Find completions for partial command, including argument completion.
     fn complete_command(&self, partial: &str) -> Vec<String> {
         if partial.is_empty() {
             return Vec::new();
         }
 
+        // Check if we're completing an argument (text after a space)
+        if let Some(space_pos) = partial.find(' ') {
+            let cmd_prefix = &partial[..space_pos];
+            let arg_partial = partial[space_pos + 1..].trim_start();
+
+            return match cmd_prefix {
+                "set" => {
+                    // Complete setting names, including "no" prefixed variants
+                    let mut results: Vec<String> = Self::setting_names()
+                        .iter()
+                        .filter(|name| name.starts_with(arg_partial))
+                        .map(|name| format!("set {name}"))
+                        .collect();
+                    // Also offer "no" prefixed boolean disable variants
+                    for name in Self::setting_names() {
+                        let no_name = format!("no{name}");
+                        if no_name.starts_with(arg_partial) && !arg_partial.is_empty() {
+                            results.push(format!("set {no_name}"));
+                        }
+                    }
+                    results.sort();
+                    results.dedup();
+                    results
+                }
+                "colorscheme" => {
+                    // Complete theme names
+                    let mut names = vec![
+                        "onedark".to_string(),
+                        "gruvbox-dark".to_string(),
+                        "tokyo-night".to_string(),
+                        "solarized-dark".to_string(),
+                        "gruvbox".to_string(),
+                        "tokyonight".to_string(),
+                        "solarized".to_string(),
+                    ];
+                    names.extend(list_custom_theme_names());
+                    names.sort();
+                    names.dedup();
+                    names
+                        .into_iter()
+                        .filter(|name| name.starts_with(arg_partial))
+                        .map(|name| format!("colorscheme {name}"))
+                        .collect()
+                }
+                _ => {
+                    // For other commands with trailing space in available_commands,
+                    // fall through to prefix matching
+                    Self::available_commands()
+                        .iter()
+                        .filter(|cmd| cmd.starts_with(partial))
+                        .map(|s| s.to_string())
+                        .collect()
+                }
+            };
+        }
+
+        // First-word completion
         Self::available_commands()
             .iter()
             .filter(|cmd| cmd.starts_with(partial))
@@ -12311,6 +12943,37 @@ impl Engine {
             return EngineAction::None;
         }
 
+        // Handle :Explore / :Ex — netrw-style in-buffer file browser
+        if cmd == "Explore" || cmd == "Ex" {
+            return self.cmd_explore(None, None);
+        }
+        if let Some(arg) = cmd
+            .strip_prefix("Explore ")
+            .or_else(|| cmd.strip_prefix("Ex "))
+        {
+            return self.cmd_explore(Some(arg.trim()), None);
+        }
+        // Handle :Sexplore / :Sex — horizontal split + netrw
+        if cmd == "Sexplore" || cmd == "Sex" {
+            return self.cmd_explore(None, Some(SplitDirection::Horizontal));
+        }
+        if let Some(arg) = cmd
+            .strip_prefix("Sexplore ")
+            .or_else(|| cmd.strip_prefix("Sex "))
+        {
+            return self.cmd_explore(Some(arg.trim()), Some(SplitDirection::Horizontal));
+        }
+        // Handle :Vexplore / :Vex — vertical split + netrw
+        if cmd == "Vexplore" || cmd == "Vex" {
+            return self.cmd_explore(None, Some(SplitDirection::Vertical));
+        }
+        if let Some(arg) = cmd
+            .strip_prefix("Vexplore ")
+            .or_else(|| cmd.strip_prefix("Vex "))
+        {
+            return self.cmd_explore(Some(arg.trim()), Some(SplitDirection::Vertical));
+        }
+
         // Handle :Gpull — git pull
         if cmd == "Gpull" {
             self.sc_pull();
@@ -12649,6 +13312,12 @@ impl Engine {
         // Handle :tabp[revious]
         if cmd == "tabprevious" {
             self.prev_tab();
+            return EngineAction::None;
+        }
+
+        // Handle :TabSwitcher / :tabs — open MRU tab switcher popup
+        if cmd == "TabSwitcher" || cmd == "tabswitcher" || cmd == "tabs" {
+            self.open_tab_switcher();
             return EngineAction::None;
         }
 

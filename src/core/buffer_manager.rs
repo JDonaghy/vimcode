@@ -90,6 +90,8 @@ pub struct BufferState {
     pub md_rendered: Option<crate::core::markdown::MdRendered>,
     /// LSP semantic tokens (decoded, absolute positions). Overlays tree-sitter highlights.
     pub semantic_tokens: Vec<crate::core::lsp::SemanticToken>,
+    /// For netrw buffers: the directory currently being listed.
+    pub netrw_dir: Option<PathBuf>,
     /// Last-known modification time of the file on disk.
     /// Set on file open and save; used by `check_file_changes()` to detect external edits.
     pub file_mtime: Option<SystemTime>,
@@ -133,6 +135,7 @@ impl BufferState {
             read_only: false,
             md_rendered: None,
             semantic_tokens: Vec::new(),
+            netrw_dir: None,
             file_mtime: None,
             file_change_warned: false,
         };
@@ -167,6 +170,7 @@ impl BufferState {
             read_only: false,
             md_rendered: None,
             semantic_tokens: Vec::new(),
+            netrw_dir: None,
             file_mtime,
             file_change_warned: false,
         };
@@ -484,6 +488,11 @@ impl BufferManager {
             recent_files: Vec::new(),
             recent_files_limit: 100,
         }
+    }
+
+    /// Remove a buffer by ID.
+    pub fn remove(&mut self, id: BufferId) {
+        self.buffers.remove(&id);
     }
 
     /// Create a new empty buffer and return its ID.

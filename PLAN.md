@@ -5,6 +5,9 @@
 ---
 
 ## Recently Completed
+- **Session 150**: Tab switcher polish — Alt+t binding (TUI+GTK), modifier-release auto-confirm (GTK polling + TUI timeout), sans-serif UI font for tabs/popup, tab click fix (breadcrumbs y-offset, Pango-measured hit zones, deferred tree highlight)
+- **Session 149**: Ctrl+Tab MRU tab switcher (VSCode-style popup, forward/backward cycling, Enter confirms, Escape cancels) + `autohide_panels` TUI setting (auto-hide sidebar/activity bar, Ctrl-W h reveals)
+- **Session 148**: Netrw in-buffer file browser — `:Explore`/`:Sexplore`/`:Vexplore` (and `:Ex`/`:Sex`/`:Vex` aliases), Enter opens files/dirs, `-` navigates to parent, header shows current dir, respects `show_hidden_files`, 16 tests
 - **Session 147**: TUI interactive settings panel — replaced read-only list with full interactive form (filterable categories, bool toggles, enum cycling, inline string/int editing, Ctrl+V paste, DynamicEnum for colorscheme with custom themes), 10 tests
 - **Session 146**: Breadcrumbs bar — file path + tree-sitter symbol hierarchy below tab bar, 10-language scope walking, `breadcrumbs` setting, per-group bars, GTK+TUI rendering, 14 tests
 - **Session 145**: VSCode theme loader (drop `.json` in `~/.config/vimcode/themes/`, `:colorscheme name`), TUI crash fix (`byte_to_char_idx` multi-byte UTF-8 panic), swap recovery R/D/A fix for TUI, sidebar keyboard nav (`Ctrl-W h/l` toolbar↔sidebar↔editor), editor click clears sidebar focus, 4 theme tests

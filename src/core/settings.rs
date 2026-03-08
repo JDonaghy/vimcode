@@ -230,6 +230,11 @@ pub struct Settings {
     /// Show breadcrumbs bar (file path + symbol hierarchy) below the tab bar.
     #[serde(default = "default_breadcrumbs")]
     pub breadcrumbs: bool,
+
+    /// Hide toolbar and sidebar panels at startup (TUI only).
+    /// When true, panels appear on demand via Ctrl-W l and hide again when unfocused.
+    #[serde(default)]
+    pub autohide_panels: bool,
 }
 
 fn default_swap_file() -> bool {
@@ -590,6 +595,7 @@ impl Default for Settings {
             swap_file: default_swap_file(),
             updatetime: default_updatetime(),
             breadcrumbs: default_breadcrumbs(),
+            autohide_panels: false,
         }
     }
 }
@@ -815,6 +821,7 @@ impl Settings {
             "showhiddenfiles" | "shf" => self.show_hidden_files = enable,
             "swapfile" => self.swap_file = enable,
             "breadcrumbs" => self.breadcrumbs = enable,
+            "autohidepanels" => self.autohide_panels = enable,
             _ => return Err(format!("Unknown option: {opt}")),
         }
         Ok(())
@@ -980,6 +987,11 @@ impl Settings {
             } else {
                 "nobreadcrumbs".to_string()
             }),
+            "autohidepanels" => Ok(if self.autohide_panels {
+                "autohidepanels".to_string()
+            } else {
+                "noautohidepanels".to_string()
+            }),
             _ => Err(format!("Unknown option: {opt}")),
         }
     }
@@ -1066,6 +1078,7 @@ impl Settings {
             "swapfile" | "swap_file" => self.swap_file.to_string(),
             "updatetime" | "ut" => self.updatetime.to_string(),
             "breadcrumbs" => self.breadcrumbs.to_string(),
+            "autohide_panels" | "autohidepanels" => self.autohide_panels.to_string(),
             _ => String::new(),
         }
     }
@@ -1157,6 +1170,7 @@ impl Settings {
                     .map_err(|_| format!("Invalid updatetime: {value}"))?;
             }
             "breadcrumbs" => self.breadcrumbs = value == "true",
+            "autohide_panels" | "autohidepanels" => self.autohide_panels = value == "true",
             _ => return Err(format!("Unknown setting key: {key}")),
         }
         Ok(())
@@ -1496,6 +1510,14 @@ pub static SETTING_DEFS: &[SettingDef] = &[
         label: "Inline Completions",
         description: "Show AI ghost-text completions at the cursor in insert mode (Tab to accept, Alt+]/Alt+[ to cycle alternatives)",
         category: "AI",
+        setting_type: SettingType::Bool,
+    },
+    // ── TUI ─────────────────────────────────────────────────────────────────
+    SettingDef {
+        key: "autohide_panels",
+        label: "Auto-Hide Panels",
+        description: "Hide toolbar and sidebar at startup; they appear on Ctrl-W l (TUI only)",
+        category: "Appearance",
         setting_type: SettingType::Bool,
     },
 ];

@@ -560,7 +560,11 @@ Operators `d`, `c`, `y`, `>`, `<`, `=`, `g~`, `gu`, `gU` all accept these motion
 | `:scriptnames` | List scripts | N/A | |
 | `:mkexrc` / `:mkvimrc` | Save config | N/A | `settings.json` instead |
 
-**Ex commands: 67/67 (100%)** (excluding N/A)
+| `:Explore` / `:Ex` | Netrw in-buffer file browser | ✅ | Enter opens, `-` parent dir |
+| `:Sexplore` / `:Sex` | Horizontal split + netrw | ✅ | |
+| `:Vexplore` / `:Vex` | Vertical split + netrw | ✅ | |
+
+**Ex commands: 70/70 (100%)** (excluding N/A)
 
 ### VimCode-Specific Ex Commands
 
@@ -612,8 +616,8 @@ These are not in Vim but are part of VimCode:
 | Bracket ([ / ]) | 12 | 13 | 92% |
 | Operator-Pending | 21 | 21 | 100% |
 | Visual Mode | 26 | 26 | 100% |
-| Ex Commands | 67 | 67 | 100% |
-| **Total** | **406** | **414** | **98%** |
+| Ex Commands | 70 | 70 | 100% |
+| **Total** | **409** | **417** | **98%** |
 
 N/A commands (VimScript, digraphs, spelling, etc.) are excluded from totals.
 
