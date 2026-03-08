@@ -1260,6 +1260,24 @@ pub struct Engine {
     /// Whether the sidebar search input field is active.
     pub ext_sidebar_input_active: bool,
 
+    // --- Settings sidebar panel state ---
+    /// Whether the Settings sidebar panel has keyboard focus.
+    pub settings_has_focus: bool,
+    /// Flat selection index into visible settings rows.
+    pub settings_selected: usize,
+    /// Scroll offset for the settings panel content.
+    pub settings_scroll_top: usize,
+    /// Search/filter query typed in the settings panel.
+    pub settings_query: String,
+    /// Whether the search input is active (user typing a filter).
+    pub settings_input_active: bool,
+    /// Index into SETTING_DEFS being edited inline (for string/int fields).
+    pub settings_editing: Option<usize>,
+    /// Buffer for inline string/int editing.
+    pub settings_edit_buf: String,
+    /// Per-category collapsed state.
+    pub settings_collapsed: Vec<bool>,
+
     // --- Virtual text / line annotations ---
     /// Inline annotation text indexed by 0-based buffer line number.
     /// Cleared when the active buffer changes.
@@ -1557,6 +1575,14 @@ impl Engine {
             ext_sidebar_query: String::new(),
             ext_sidebar_sections_expanded: [true, true],
             ext_sidebar_input_active: false,
+            settings_has_focus: false,
+            settings_selected: 0,
+            settings_scroll_top: 0,
+            settings_query: String::new(),
+            settings_input_active: false,
+            settings_editing: None,
+            settings_edit_buf: String::new(),
+            settings_collapsed: vec![false; super::settings::setting_categories().len()],
             line_annotations: HashMap::new(),
             async_shell_tasks: HashMap::new(),
             ai_ghost_text: None,
@@ -4431,6 +4457,12 @@ impl Engine {
         // Source Control panel intercepts all keys when it has focus.
         if self.sc_has_focus {
             self.handle_sc_key(key_name, ctrl, unicode);
+            return EngineAction::None;
+        }
+
+        // Settings panel intercepts all keys when it has focus.
+        if self.settings_has_focus {
+            self.handle_settings_key(key_name, ctrl, unicode);
             return EngineAction::None;
         }
 
@@ -19151,6 +19183,232 @@ impl Engine {
             0
         };
         installed + available
+    }
+
+    // ── Settings sidebar panel ──────────────────────────────────────────────────
+
+    /// Row types for the settings flat list.
+    /// Category(cat_idx) = a collapsible category header.
+    /// Setting(def_idx) = a setting from SETTING_DEFS.
+    pub fn settings_flat_list(&self) -> Vec<(bool, usize)> {
+        // Returns Vec<(is_category, index)>
+        // is_category=true → index is into setting_categories()
+        // is_category=false → index is into SETTING_DEFS
+        use super::settings::{setting_categories, SETTING_DEFS};
+        let cats = setting_categories();
+        let query = self.settings_query.to_lowercase();
+        let mut rows = Vec::new();
+
+        for (cat_idx, &cat) in cats.iter().enumerate() {
+            // Collect settings in this category that match the query
+            let matching: Vec<usize> = SETTING_DEFS
+                .iter()
+                .enumerate()
+                .filter(|(_, d)| d.category == cat)
+                .filter(|(_, d)| {
+                    query.is_empty()
+                        || d.label.to_lowercase().contains(&query)
+                        || d.key.to_lowercase().contains(&query)
+                        || d.description.to_lowercase().contains(&query)
+                })
+                .map(|(i, _)| i)
+                .collect();
+
+            if matching.is_empty() {
+                continue;
+            }
+
+            rows.push((true, cat_idx)); // Category header
+
+            let collapsed =
+                cat_idx < self.settings_collapsed.len() && self.settings_collapsed[cat_idx];
+            if !collapsed {
+                for def_idx in matching {
+                    rows.push((false, def_idx));
+                }
+            }
+        }
+        rows
+    }
+
+    /// Handle a key press while the settings panel has focus.
+    pub fn handle_settings_key(&mut self, key: &str, _ctrl: bool, unicode: Option<char>) {
+        use super::settings::{SettingType, SETTING_DEFS};
+
+        // Search input active — route printable chars to query
+        if self.settings_input_active {
+            match key {
+                "Escape" | "Return" => {
+                    self.settings_input_active = false;
+                }
+                "BackSpace" => {
+                    self.settings_query.pop();
+                    self.settings_selected = 0;
+                    self.settings_scroll_top = 0;
+                }
+                _ => {
+                    if let Some(ch) = unicode {
+                        if !ch.is_control() {
+                            self.settings_query.push(ch);
+                            self.settings_selected = 0;
+                            self.settings_scroll_top = 0;
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        // Inline editing active (string/int)
+        if let Some(def_idx) = self.settings_editing {
+            match key {
+                "Escape" => {
+                    self.settings_editing = None;
+                    self.settings_edit_buf.clear();
+                }
+                "Return" => {
+                    let def = &SETTING_DEFS[def_idx];
+                    let val = self.settings_edit_buf.clone();
+                    if self.settings.set_value_str(def.key, &val).is_ok() {
+                        let _ = self.settings.save();
+                    }
+                    self.settings_editing = None;
+                    self.settings_edit_buf.clear();
+                }
+                "BackSpace" => {
+                    self.settings_edit_buf.pop();
+                }
+                _ => {
+                    if let Some(ch) = unicode {
+                        if !ch.is_control() {
+                            let def = &SETTING_DEFS[def_idx];
+                            // For integers, only accept digits
+                            if matches!(def.setting_type, SettingType::Integer { .. }) {
+                                if ch.is_ascii_digit() {
+                                    self.settings_edit_buf.push(ch);
+                                }
+                            } else {
+                                self.settings_edit_buf.push(ch);
+                            }
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        // Normal navigation
+        let flat = self.settings_flat_list();
+        let total = flat.len();
+
+        match key {
+            "q" | "Escape" => {
+                self.settings_has_focus = false;
+            }
+            "/" => {
+                self.settings_input_active = true;
+            }
+            "j" | "Down" => {
+                if total > 0 {
+                    self.settings_selected = (self.settings_selected + 1).min(total - 1);
+                }
+            }
+            "k" | "Up" => {
+                self.settings_selected = self.settings_selected.saturating_sub(1);
+            }
+            "Tab" | "Return" | "Space" | "l" | "Right" | "h" | "Left" => {
+                if self.settings_selected < total {
+                    let (is_cat, idx) = flat[self.settings_selected];
+                    if is_cat {
+                        // Category header: toggle collapse on Tab/Enter/Space
+                        if matches!(key, "Tab" | "Return" | "Space")
+                            && idx < self.settings_collapsed.len()
+                        {
+                            self.settings_collapsed[idx] = !self.settings_collapsed[idx];
+                        }
+                    } else {
+                        // Setting row
+                        let def = &SETTING_DEFS[idx];
+                        match &def.setting_type {
+                            SettingType::Bool => {
+                                if matches!(key, "Return" | "Space") {
+                                    let cur = self.settings.get_value_str(def.key);
+                                    let new_val = if cur == "true" { "false" } else { "true" };
+                                    if self.settings.set_value_str(def.key, new_val).is_ok() {
+                                        let _ = self.settings.save();
+                                    }
+                                }
+                            }
+                            SettingType::Enum(options) => {
+                                let forward = matches!(key, "Return" | "Space" | "l" | "Right");
+                                let backward = matches!(key, "h" | "Left");
+                                if forward || backward {
+                                    let cur = self.settings.get_value_str(def.key);
+                                    if let Some(pos) =
+                                        options.iter().position(|&o| o == cur.as_str())
+                                    {
+                                        let next = if forward {
+                                            (pos + 1) % options.len()
+                                        } else {
+                                            (pos + options.len() - 1) % options.len()
+                                        };
+                                        if self
+                                            .settings
+                                            .set_value_str(def.key, options[next])
+                                            .is_ok()
+                                        {
+                                            let _ = self.settings.save();
+                                        }
+                                    }
+                                }
+                            }
+                            SettingType::DynamicEnum(options_fn) => {
+                                let forward = matches!(key, "Return" | "Space" | "l" | "Right");
+                                let backward = matches!(key, "h" | "Left");
+                                if forward || backward {
+                                    let options = options_fn();
+                                    let cur = self.settings.get_value_str(def.key);
+                                    if let Some(pos) = options.iter().position(|o| o == &cur) {
+                                        let next = if forward {
+                                            (pos + 1) % options.len()
+                                        } else {
+                                            (pos + options.len() - 1) % options.len()
+                                        };
+                                        if self
+                                            .settings
+                                            .set_value_str(def.key, &options[next])
+                                            .is_ok()
+                                        {
+                                            let _ = self.settings.save();
+                                        }
+                                    }
+                                }
+                            }
+                            SettingType::Integer { .. } | SettingType::StringVal => {
+                                if matches!(key, "Return") {
+                                    self.settings_editing = Some(idx);
+                                    self.settings_edit_buf = self.settings.get_value_str(def.key);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Paste clipboard text into the active settings input (search query or inline edit buffer).
+    pub fn settings_paste(&mut self, text: &str) {
+        // Strip newlines — settings values are single-line.
+        let clean: String = text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
+        if self.settings_input_active {
+            self.settings_query.push_str(&clean);
+            self.settings_selected = 0;
+            self.settings_scroll_top = 0;
+        } else if self.settings_editing.is_some() {
+            self.settings_edit_buf.push_str(&clean);
+        }
     }
 
     // ── AI assistant panel ─────────────────────────────────────────────────────

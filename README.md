@@ -11,7 +11,7 @@ There's a touch of irony here - using a cli tool to write the editor that I've w
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 2650+ tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 2677+ tests, zero async runtime dependency
 
 > **Note:** VimCode does not implement VimScript. Extension and scripting is handled via
 > the built-in Lua 5.4 plugin system. The goal is full Vim *keybinding* and *editing*
@@ -798,6 +798,7 @@ Additional options (set directly in `settings.json`):
 | `show_hidden_files` | `false` | Show dotfiles in file explorer (`:set showhiddenfiles` / `:set shf`) |
 | `swap_file` | `true` | Write swap files for crash recovery (`:set swapfile` / `:set noswapfile`) |
 | `updatetime` | `4000` | Milliseconds between swap file writes for dirty buffers (`:set updatetime=N`) |
+| `breadcrumbs` | `true` | Show file path + symbol hierarchy bar below the tab bar (`:set breadcrumbs` / `:set nobreadcrumbs`) |
 
 - `:set option?` — query current value (e.g. `:set ts?` → `tabstop=4`)
 - `:set option!` — toggle a boolean option (e.g. `:set wrap!`); `no<option>!` explicitly disables (e.g. `:set nowrap!`)
@@ -805,7 +806,7 @@ Additional options (set directly in `settings.json`):
 - `:config reload` — reload settings file from disk
 - `:colorscheme <name>` — switch colour theme live (aliases: `gruvbox`, `tokyonight`, `solarized`); `:colorscheme` lists available themes. Built-in: `onedark` (default), `gruvbox-dark`, `tokyo-night`, `solarized-dark`. Also loads VSCode `.json` theme files from `~/.config/vimcode/themes/`.
 - `:Settings` — open `settings.json` in a new editor tab for direct editing; saved changes reload automatically in both GTK and TUI backends.
-- **Settings sidebar (GTK)** — click the gear icon in the activity bar to open a VSCode-style settings form: searchable list of all settings grouped by category (Appearance, Editor, Search, Workspace, LSP, Terminal, Plugins) with native widgets (Toggle switch, spinner, dropdown, text entry); changes apply and save immediately.
+- **Settings sidebar (GTK + TUI)** — click the gear icon in the activity bar to open a VSCode-style settings form: searchable list of all settings grouped by category (Appearance, Editor, Search, Workspace, LSP, Terminal, Plugins, AI) with interactive controls; GTK uses native widgets (Switch, SpinButton, DropDown, Entry), TUI renders `[✓]`/`[ ]` toggles, `value ▸` cycling enums, and inline text/number editing with Ctrl+V paste; changes apply and save immediately; colorscheme picker includes custom VSCode themes from `~/.config/vimcode/themes/`.
 
 **Panel navigation key bindings** — configurable in `settings.json` under `"panel_keys"`:
 
@@ -1179,11 +1180,11 @@ All ex commands support Vim-style abbreviations (e.g., `:j` for `:join`, `:y` fo
 ```
 src/
 ├── main.rs          (~10,907 lines)  GTK4/Relm4 UI, rendering, sidebar resize, fuzzy popup, context menu, drag-and-drop
-├── tui_main.rs      (~9,124 lines)  ratatui/crossterm TUI backend, fuzzy popup, rename/move prompts
-├── render.rs        (~4,364 lines)  Platform-agnostic ScreenLayout bridge (DebugSidebarData, SourceControlData, BottomPanelTabs)
+├── tui_main.rs      (~9,726 lines)  ratatui/crossterm TUI backend, fuzzy popup, rename/move prompts
+├── render.rs        (~4,747 lines)  Platform-agnostic ScreenLayout bridge (DebugSidebarData, SourceControlData, BottomPanelTabs)
 ├── icons.rs            (~30 lines)  Nerd Font file-type icons (GTK + TUI)
 └── core/            (~29,500 lines)  Zero GTK/rendering deps — fully testable
-    ├── engine.rs    (~33,863 lines)  Orchestrator: keys, commands, git, macros, LSP, DAP, plugins, workspaces
+    ├── engine.rs    (~37,037 lines)  Orchestrator: keys, commands, git, macros, LSP, DAP, plugins, workspaces
     ├── markdown.rs     (~497 lines)  Markdown → styled plain text converter (pulldown-cmark)
     ├── plugin.rs       (~835 lines)  Lua 5.4 plugin manager (mlua vendored; vimcode.* API; async_shell)
     ├── terminal.rs     (~320 lines)  PTY-backed terminal pane (portable-pty + vt100, history ring buffer)
@@ -1195,7 +1196,7 @@ src/
     ├── project_search.rs (~630 lines)  Regex/case/whole-word search + replace (ignore + regex crates)
     ├── buffer_manager.rs (~707 lines)  Buffer lifecycle, undo/redo stacks, semantic tokens
     ├── buffer.rs       (~120 lines)  Rope-based text storage (ropey)
-    ├── settings.rs   (~1,346 lines)  JSON config, :set parsing, key binding notation
+    ├── settings.rs   (~1,973 lines)  JSON config, :set parsing, key binding notation, SETTING_DEFS
     ├── session.rs      (~235 lines)  Session state persistence + per-workspace paths
     ├── git.rs        (~1,000 lines)  Git subprocesses: diff, blame, stage_hunk, SC panel, worktrees, git log
     └── window.rs, tab.rs, view.rs, cursor.rs, mode.rs, syntax.rs (~984 lines)

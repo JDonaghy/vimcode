@@ -18,6 +18,7 @@ pub use crate::core::engine::{BottomPanelKind, DebugSidebarSection};
 use crate::core::engine::{DiffLine, Engine, SearchDirection};
 use crate::core::lsp::SignatureHelpData;
 use crate::core::settings::LineNumberMode;
+pub use crate::core::settings::{SettingDef, SettingType, SETTING_DEFS};
 use crate::core::terminal::TermSelection as CoreTermSelection;
 use crate::core::view::View;
 use crate::core::window::{GroupDivider, GroupId};
@@ -329,6 +330,22 @@ pub struct GroupTabBar {
     pub group_id: GroupId,
     pub tabs: Vec<TabInfo>,
     /// Content area of this group (tab bar drawn at top edge).
+    pub bounds: WindowRect,
+}
+
+/// One segment in the breadcrumb bar (either a path component or a symbol).
+#[derive(Debug, Clone)]
+pub struct BreadcrumbSegment {
+    pub label: String,
+    pub is_last: bool,
+    pub is_symbol: bool,
+}
+
+/// Breadcrumb bar data for one editor group.
+#[derive(Debug, Clone)]
+pub struct BreadcrumbBar {
+    pub group_id: GroupId,
+    pub segments: Vec<BreadcrumbSegment>,
     pub bounds: WindowRect,
 }
 
@@ -652,289 +669,8 @@ pub struct AiPanelData {
 
 // ─── SettingDef ───────────────────────────────────────────────────────────────
 
-/// The type of a user-configurable setting, used to generate appropriate form widgets.
-#[derive(Debug, Clone)]
-pub enum SettingType {
-    Bool,
-    Integer { min: i32, max: i32 },
-    StringVal,
-    Enum(&'static [&'static str]),
-}
-
-/// Metadata for a single user-configurable setting.
-pub struct SettingDef {
-    pub key: &'static str,
-    pub label: &'static str,
-    pub description: &'static str,
-    pub category: &'static str,
-    pub setting_type: SettingType,
-}
-
-/// All user-configurable settings exposed in the Settings sidebar form.
-///
-/// When adding a new field to `Settings` struct, add a corresponding entry here
-/// so it appears in the UI form.
-pub static SETTING_DEFS: &[SettingDef] = &[
-    // ── Appearance ───────────────────────────────────────────────────────────
-    SettingDef {
-        key: "colorscheme",
-        label: "Color Scheme",
-        description: "Editor color theme",
-        category: "Appearance",
-        setting_type: SettingType::Enum(&[
-            "onedark",
-            "gruvbox-dark",
-            "tokyo-night",
-            "solarized-dark",
-        ]),
-    },
-    SettingDef {
-        key: "font_family",
-        label: "Font Family",
-        description: "Editor font family (e.g. \"JetBrains Mono\")",
-        category: "Appearance",
-        setting_type: SettingType::StringVal,
-    },
-    SettingDef {
-        key: "font_size",
-        label: "Font Size",
-        description: "Editor font size in points",
-        category: "Appearance",
-        setting_type: SettingType::Integer { min: 6, max: 48 },
-    },
-    SettingDef {
-        key: "line_numbers",
-        label: "Line Numbers",
-        description: "How line numbers are displayed in the gutter",
-        category: "Appearance",
-        setting_type: SettingType::Enum(&["none", "absolute", "relative", "hybrid"]),
-    },
-    SettingDef {
-        key: "cursorline",
-        label: "Cursor Line",
-        description: "Highlight the line containing the cursor",
-        category: "Appearance",
-        setting_type: SettingType::Bool,
-    },
-    // ── Editor ───────────────────────────────────────────────────────────────
-    SettingDef {
-        key: "tabstop",
-        label: "Tab Size",
-        description: "Number of spaces a Tab key inserts (or tab display width)",
-        category: "Editor",
-        setting_type: SettingType::Integer { min: 1, max: 16 },
-    },
-    SettingDef {
-        key: "shift_width",
-        label: "Indent Width",
-        description: "Spaces added/removed by indent operators (<< / >>)",
-        category: "Editor",
-        setting_type: SettingType::Integer { min: 1, max: 16 },
-    },
-    SettingDef {
-        key: "expand_tab",
-        label: "Expand Tabs",
-        description: "Insert spaces instead of a literal tab character",
-        category: "Editor",
-        setting_type: SettingType::Bool,
-    },
-    SettingDef {
-        key: "auto_indent",
-        label: "Auto Indent",
-        description: "Automatically indent new lines to match current indent",
-        category: "Editor",
-        setting_type: SettingType::Bool,
-    },
-    SettingDef {
-        key: "wrap",
-        label: "Word Wrap",
-        description: "Wrap long lines at the viewport width instead of scrolling",
-        category: "Editor",
-        setting_type: SettingType::Bool,
-    },
-    SettingDef {
-        key: "scrolloff",
-        label: "Scroll Offset",
-        description: "Minimum lines to keep visible above and below the cursor",
-        category: "Editor",
-        setting_type: SettingType::Integer { min: 0, max: 30 },
-    },
-    SettingDef {
-        key: "colorcolumn",
-        label: "Color Column",
-        description: "Columns to highlight as rulers (e.g. \"80,120\")",
-        category: "Editor",
-        setting_type: SettingType::StringVal,
-    },
-    SettingDef {
-        key: "textwidth",
-        label: "Text Width",
-        description: "Auto-wrap inserted text at this column (0 = disabled)",
-        category: "Editor",
-        setting_type: SettingType::Integer { min: 0, max: 200 },
-    },
-    // ── Search ───────────────────────────────────────────────────────────────
-    SettingDef {
-        key: "hlsearch",
-        label: "Highlight Search",
-        description: "Highlight all matches of the last search pattern",
-        category: "Search",
-        setting_type: SettingType::Bool,
-    },
-    SettingDef {
-        key: "ignorecase",
-        label: "Ignore Case",
-        description: "Case-insensitive search by default",
-        category: "Search",
-        setting_type: SettingType::Bool,
-    },
-    SettingDef {
-        key: "smartcase",
-        label: "Smart Case",
-        description: "Override Ignore Case when the pattern has an uppercase letter",
-        category: "Search",
-        setting_type: SettingType::Bool,
-    },
-    SettingDef {
-        key: "incremental_search",
-        label: "Incremental Search",
-        description: "Move the cursor as you type the search pattern",
-        category: "Search",
-        setting_type: SettingType::Bool,
-    },
-    // ── Workspace ────────────────────────────────────────────────────────────
-    SettingDef {
-        key: "editor_mode",
-        label: "Editor Mode",
-        description: "Vim (modal) or VSCode (always-insert) key bindings",
-        category: "Workspace",
-        setting_type: SettingType::Enum(&["vim", "vscode"]),
-    },
-    SettingDef {
-        key: "explorer_visible_on_startup",
-        label: "Show Explorer on Start",
-        description: "Open the file explorer sidebar automatically on startup",
-        category: "Workspace",
-        setting_type: SettingType::Bool,
-    },
-    SettingDef {
-        key: "autoread",
-        label: "Auto Read",
-        description: "Automatically reload files when changed externally",
-        category: "Workspace",
-        setting_type: SettingType::Bool,
-    },
-    SettingDef {
-        key: "splitbelow",
-        label: "Split Below",
-        description: "Open new horizontal splits below the current window",
-        category: "Workspace",
-        setting_type: SettingType::Bool,
-    },
-    SettingDef {
-        key: "splitright",
-        label: "Split Right",
-        description: "Open new vertical splits to the right of the current window",
-        category: "Workspace",
-        setting_type: SettingType::Bool,
-    },
-    // ── LSP ──────────────────────────────────────────────────────────────────
-    SettingDef {
-        key: "lsp_enabled",
-        label: "Enable LSP",
-        description: "Enable Language Server Protocol support",
-        category: "LSP",
-        setting_type: SettingType::Bool,
-    },
-    SettingDef {
-        key: "format_on_save",
-        label: "Format on Save",
-        description: "Automatically format the buffer via LSP before saving",
-        category: "LSP",
-        setting_type: SettingType::Bool,
-    },
-    // ── Terminal ─────────────────────────────────────────────────────────────
-    SettingDef {
-        key: "terminal_scrollback_lines",
-        label: "Terminal Scrollback",
-        description: "Maximum scrollback history lines in the integrated terminal",
-        category: "Terminal",
-        setting_type: SettingType::Integer {
-            min: 100,
-            max: 100000,
-        },
-    },
-    // ── Plugins ──────────────────────────────────────────────────────────────
-    SettingDef {
-        key: "plugins_enabled",
-        label: "Enable Plugins",
-        description: "Enable the Lua plugin system (requires restart)",
-        category: "Plugins",
-        setting_type: SettingType::Bool,
-    },
-    // ── Workspace ─────────────────────────────────────────────────────────────
-    SettingDef {
-        key: "show_hidden_files",
-        label: "Show Hidden Files",
-        description: "Display dotfiles and hidden directories in the file explorer",
-        category: "Workspace",
-        setting_type: SettingType::Bool,
-    },
-    // ── Recovery ──────────────────────────────────────────────────────────────
-    SettingDef {
-        key: "swap_file",
-        label: "Swap Files",
-        description: "Write swap files for crash recovery (like Vim's swapfile option)",
-        category: "Editor",
-        setting_type: SettingType::Bool,
-    },
-    SettingDef {
-        key: "updatetime",
-        label: "Update Time",
-        description: "Milliseconds between swap file writes for dirty buffers",
-        category: "Editor",
-        setting_type: SettingType::Integer {
-            min: 100,
-            max: 60000,
-        },
-    },
-    // ── AI ────────────────────────────────────────────────────────────────────
-    SettingDef {
-        key: "ai_provider",
-        label: "AI Provider",
-        description: "AI backend: anthropic, openai (or compatible), or ollama (local)",
-        category: "AI",
-        setting_type: SettingType::Enum(&["anthropic", "openai", "ollama"]),
-    },
-    SettingDef {
-        key: "ai_api_key",
-        label: "API Key",
-        description: "API key (or leave empty and set ANTHROPIC_API_KEY / OPENAI_API_KEY env var)",
-        category: "AI",
-        setting_type: SettingType::StringVal,
-    },
-    SettingDef {
-        key: "ai_model",
-        label: "Model",
-        description: "Model name override (leave empty to use the provider default)",
-        category: "AI",
-        setting_type: SettingType::StringVal,
-    },
-    SettingDef {
-        key: "ai_base_url",
-        label: "Base URL",
-        description: "Custom API endpoint URL (leave empty for provider default)",
-        category: "AI",
-        setting_type: SettingType::StringVal,
-    },
-    SettingDef {
-        key: "ai_completions",
-        label: "Inline Completions",
-        description: "Show AI ghost-text completions at the cursor in insert mode (Tab to accept, Alt+]/Alt+[ to cycle alternatives)",
-        category: "AI",
-        setting_type: SettingType::Bool,
-    },
-];
+// SettingType, SettingDef, and SETTING_DEFS are defined in settings.rs and
+// re-exported at the top of this file for backward compatibility.
 
 /// Always present in `ScreenLayout`; each section may be empty.
 #[derive(Debug, Clone)]
@@ -1699,6 +1435,8 @@ pub struct ScreenLayout {
     pub ext_sidebar: Option<ExtSidebarData>,
     /// AI assistant panel data — `Some` when the AI panel is the active sidebar panel.
     pub ai_panel: Option<AiPanelData>,
+    /// Breadcrumb bars for each editor group (empty when breadcrumbs are disabled).
+    pub breadcrumbs: Vec<BreadcrumbBar>,
 }
 
 // ─── Theme ────────────────────────────────────────────────────────────────────
@@ -1828,6 +1566,11 @@ pub struct Theme {
     pub semantic_type_parameter: Color,
     pub semantic_decorator: Color,
     pub semantic_macro: Color,
+
+    // Breadcrumb bar
+    pub breadcrumb_bg: Color,
+    pub breadcrumb_fg: Color,
+    pub breadcrumb_active_fg: Color,
 }
 
 impl Theme {
@@ -1960,6 +1703,10 @@ impl Theme {
             semantic_type_parameter: Color::from_hex("#e5c07b"), // gold
             semantic_decorator: Color::from_hex("#c678dd"), // purple (like keyword)
             semantic_macro: Color::from_hex("#56b6c2"),     // cyan
+
+            breadcrumb_bg: Color::from_hex("#21252b"),
+            breadcrumb_fg: Color::from_hex("#7f848e"),
+            breadcrumb_active_fg: Color::from_hex("#abb2bf"),
         }
     }
 
@@ -2058,6 +1805,10 @@ impl Theme {
             semantic_type_parameter: Color::from_hex("#fabd2f"),
             semantic_decorator: Color::from_hex("#fb4934"), // red
             semantic_macro: Color::from_hex("#8ec07c"),     // aqua
+
+            breadcrumb_bg: Color::from_hex("#32302f"),
+            breadcrumb_fg: Color::from_hex("#a89984"),
+            breadcrumb_active_fg: Color::from_hex("#ebdbb2"),
         }
     }
 
@@ -2156,6 +1907,10 @@ impl Theme {
             semantic_type_parameter: Color::from_hex("#e0af68"),
             semantic_decorator: Color::from_hex("#bb9af7"), // purple
             semantic_macro: Color::from_hex("#2ac3de"),     // cyan
+
+            breadcrumb_bg: Color::from_hex("#1f2335"),
+            breadcrumb_fg: Color::from_hex("#565f89"),
+            breadcrumb_active_fg: Color::from_hex("#c0caf5"),
         }
     }
 
@@ -2254,6 +2009,10 @@ impl Theme {
             semantic_type_parameter: Color::from_hex("#b58900"),
             semantic_decorator: Color::from_hex("#6c71c4"), // violet
             semantic_macro: Color::from_hex("#d33682"),     // magenta
+
+            breadcrumb_bg: Color::from_hex("#073642"),
+            breadcrumb_fg: Color::from_hex("#586e75"),
+            breadcrumb_active_fg: Color::from_hex("#93a1a1"),
         }
     }
 
@@ -2422,6 +2181,19 @@ impl Theme {
         }
         if let Some(c) = color("list.inactiveSelectionBackground") {
             theme.sidebar_sel_bg_inactive = c;
+        }
+
+        // ── Breadcrumbs ──────────────────────────────────────────────────
+        if let Some(c) = color("breadcrumb.background") {
+            theme.breadcrumb_bg = c;
+        }
+        if let Some(c) = color("breadcrumb.foreground") {
+            theme.breadcrumb_fg = c;
+        }
+        if let Some(c) = color("breadcrumb.focusForeground")
+            .or_else(|| color("breadcrumb.activeSelectionForeground"))
+        {
+            theme.breadcrumb_active_fg = c;
         }
 
         // ── Git gutter ────────────────────────────────────────────────────
@@ -3139,6 +2911,43 @@ pub fn build_screen_layout(
     let ext_sidebar = build_ext_sidebar_data(engine);
     let ai_panel = build_ai_panel_data(engine);
 
+    // Build breadcrumbs for each editor group
+    let breadcrumbs = if engine.settings.breadcrumbs {
+        let group_ids = engine.group_layout.group_ids();
+        group_ids
+            .iter()
+            .map(|&gid| {
+                let segments = build_breadcrumbs_for_group(engine, gid);
+                // Compute bounds from the group's windows
+                let mut min_x = f64::MAX;
+                let mut min_y = f64::MAX;
+                let mut max_x = f64::MIN;
+                if let Some(group) = engine.editor_groups.get(&gid) {
+                    for wr in window_rects {
+                        if group.active_tab().layout.window_ids().contains(&wr.0) {
+                            min_x = min_x.min(wr.1.x);
+                            min_y = min_y.min(wr.1.y);
+                            max_x = max_x.max(wr.1.x + wr.1.width);
+                        }
+                    }
+                }
+                if min_x == f64::MAX {
+                    min_x = 0.0;
+                    min_y = 0.0;
+                    max_x = 0.0;
+                }
+                let bounds = WindowRect::new(min_x, min_y, max_x - min_x, line_height);
+                BreadcrumbBar {
+                    group_id: gid,
+                    segments,
+                    bounds,
+                }
+            })
+            .collect()
+    } else {
+        vec![]
+    };
+
     ScreenLayout {
         tab_bar,
         windows,
@@ -3161,6 +2970,7 @@ pub fn build_screen_layout(
         editor_group_split,
         ext_sidebar,
         ai_panel,
+        breadcrumbs,
     }
 }
 
@@ -3626,6 +3436,65 @@ fn build_terminal_panel(engine: &Engine) -> Option<TerminalPanel> {
         split_left_cols: 0,
         split_focus: 0,
     })
+}
+
+/// Build breadcrumb segments for a single editor group.
+fn build_breadcrumbs_for_group(engine: &Engine, group_id: GroupId) -> Vec<BreadcrumbSegment> {
+    let group = match engine.editor_groups.get(&group_id) {
+        Some(g) => g,
+        None => return vec![],
+    };
+    let window_id = group.tabs[group.active_tab].active_window;
+    let window = match engine.windows.get(&window_id) {
+        Some(w) => w,
+        None => return vec![],
+    };
+    let buf_state = match engine.buffer_manager.get(window.buffer_id) {
+        Some(s) => s,
+        None => return vec![],
+    };
+
+    let mut segments = Vec::new();
+
+    // Path segments (relative to cwd)
+    if let Some(ref file_path) = buf_state.file_path {
+        let display = if let Ok(rel) = file_path.strip_prefix(&engine.cwd) {
+            rel.to_string_lossy().to_string()
+        } else {
+            file_path.to_string_lossy().to_string()
+        };
+        let parts: Vec<&str> = display.split(std::path::MAIN_SEPARATOR).collect();
+        for part in &parts {
+            segments.push(BreadcrumbSegment {
+                label: part.to_string(),
+                is_last: false,
+                is_symbol: false,
+            });
+        }
+    }
+
+    // Symbol segments from tree-sitter
+    {
+        let cursor = &window.view.cursor;
+        let text = buf_state.buffer.to_string();
+        let scopes = buf_state
+            .syntax
+            .enclosing_scopes(&text, cursor.line, cursor.col);
+        for scope in scopes {
+            segments.push(BreadcrumbSegment {
+                label: scope.name,
+                is_last: false,
+                is_symbol: true,
+            });
+        }
+    }
+
+    // Mark the last segment
+    if let Some(last) = segments.last_mut() {
+        last.is_last = true;
+    }
+
+    segments
 }
 
 // ─── Private builder helpers ──────────────────────────────────────────────────

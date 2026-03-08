@@ -1,9 +1,15 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 144 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 146 archived here. Recent work summary in PROJECT_STATE.md.
 
 ---
+
+**Session 146 — Breadcrumbs bar (14 new tests, 2667 total):**
+VSCode-like breadcrumbs bar showing file path segments + tree-sitter symbol hierarchy (e.g. `src › core › engine.rs › Engine › handle_key`) below the tab bar. `BreadcrumbSymbol` struct + `Syntax::enclosing_scopes()` walks parent chain for 10 languages (Rust/Python/JS/TS/Go/C/C++/Java/C#/Ruby). `BreadcrumbSegment`/`BreadcrumbBar` render structs. `breadcrumb_bg/fg/active_fg` theme colors in all 4 built-in themes + VSCode theme loader. `Settings.breadcrumbs: bool` (default true, `:set breadcrumbs`/`:set nobreadcrumbs`). Each editor group gets its own breadcrumb bar. Space reserved via doubled `tab_bar_height` when enabled. GTK `draw_breadcrumb_bar()` + TUI `render_breadcrumb_bar()`. 14 new tests (11 integration + 3 unit).
+
+**Session 145 — VSCode theme loader, TUI crash fix, sidebar navigation (8 new tests, 2650 total):**
+VSCode theme support: drop `.json` theme files into `~/.config/vimcode/themes/`, apply with `:colorscheme <name>`. `Theme::from_vscode_json(path)` parses VSCode `colors` (~25 UI keys) + `tokenColors` (~15 TextMate scopes), maps to our 55-field Theme struct. `Color::try_from_hex()` (non-panicking, supports #rrggbb/#rrggbbaa/#rgb), `Color::lighten()`/`darken()` for deriving missing colors, `strip_json_comments()` for JSONC. `Theme::available_names()` now returns built-in + custom themes from disk. `:colorscheme` command updated to accept/list custom themes. 4 unit tests for theme loader. Crash fix: `byte_to_char_idx` in TUI panicked on multi-byte UTF-8 chars; now uses `floor_char_boundary()`. Swap recovery fix: R/D/A keys in TUI. TUI sidebar navigation: `Ctrl-W h/l` toolbar↔sidebar↔editor.
 
 **Session 144 — Vim compatibility batch 4: 10 commands (21 new tests, 2642 total):**
 Implemented 10 more missing Vim commands, raising VIM_COMPATIBILITY.md from 400/414 (97%) to 406/414 (98%). `Ctrl-G` show file info (filename, line, col, percentage), `gi` insert at last insert position (LSP go-to-implementation remapped to `<leader>gi`, `last_insert_pos` field tracked on Insert→Normal transition), `Ctrl-W r`/`R` rotate windows (forward/backward buffer+view rotation within tab), `[*`/`]*` and `[/`/`]/` C-style comment block navigation (`/*`/`*/` search), `do`/`dp` diff obtain/put (pull/push lines between diff windows), `o_CTRL-V` force blockwise operator motion (intercepts Ctrl-V with pending operator). Also fixed doc inconsistencies: `g'`/`` g` `` mark without jumplist was already implemented, `[z`/`]z` fold navigation was already implemented. Marked `CTRL-X ...` and `:map` as N/A. 21 integration tests in `tests/vim_compat_batch4.rs`. Sections now at 100%: Search & Marks (26/26), Window (33/33), Operator-Pending (21/21), Ex Commands (67/67).

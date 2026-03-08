@@ -67,7 +67,7 @@ use ratatui::Terminal;
 
 use crate::core::engine::{DiffLine, EngineAction};
 use crate::core::lsp::DiagnosticSeverity;
-use crate::core::settings::{ExplorerAction, LineNumberMode};
+use crate::core::settings::ExplorerAction;
 use crate::core::window::SplitDirection;
 use crate::core::{Engine, GitLineStatus, Mode, OpenMode, WindowRect};
 use crate::render::{
@@ -1455,7 +1455,7 @@ fn event_loop(
                                 engine.ai_has_focus = true;
                             }
                             if panel == TuiPanel::Settings {
-                                engine.execute_command("Settings");
+                                engine.settings_has_focus = true;
                             }
                         }
                         KeyCode::Char('h') | KeyCode::Left | KeyCode::Esc => {
@@ -1540,6 +1540,7 @@ fn event_loop(
                                 engine.dap_sidebar_has_focus = false;
                                 engine.ext_sidebar_has_focus = false;
                                 engine.ai_has_focus = false;
+                                engine.settings_has_focus = false;
                                 sidebar.toolbar_focused = true;
                                 sidebar.toolbar_selected = match sidebar.active_panel {
                                     TuiPanel::Explorer => 1,
@@ -1558,6 +1559,7 @@ fn event_loop(
                                 engine.dap_sidebar_has_focus = false;
                                 engine.ext_sidebar_has_focus = false;
                                 engine.ai_has_focus = false;
+                                engine.settings_has_focus = false;
                             }
                             _ => {} // Unknown Ctrl-W combo in sidebar, ignore
                         }
@@ -1807,6 +1809,79 @@ fn event_loop(
                                 ch,
                             );
                             if !engine.ext_sidebar_has_focus {
+                                sidebar.has_focus = false;
+                            }
+                        }
+                        needs_redraw = true;
+                        continue;
+                    }
+
+                    // ── Settings panel keyboard handling ──────────────────────
+                    if sidebar.active_panel == TuiPanel::Settings {
+                        // h/Left: switch focus to toolbar (only when not editing/searching)
+                        if matches!(key_event.code, KeyCode::Char('h') | KeyCode::Left)
+                            && !key_event.modifiers.contains(KeyModifiers::CONTROL)
+                            && !engine.settings_input_active
+                            && engine.settings_editing.is_none()
+                        {
+                            // Only if the selected row is not an enum (h/Left cycles enums)
+                            let flat = engine.settings_flat_list();
+                            let is_enum = if engine.settings_selected < flat.len() {
+                                let (is_cat, idx) = flat[engine.settings_selected];
+                                !is_cat
+                                    && matches!(
+                                        crate::core::settings::SETTING_DEFS[idx].setting_type,
+                                        crate::core::settings::SettingType::Enum(_)
+                                            | crate::core::settings::SettingType::DynamicEnum(_)
+                                    )
+                            } else {
+                                false
+                            };
+                            if !is_enum {
+                                sidebar.has_focus = false;
+                                engine.settings_has_focus = false;
+                                sidebar.toolbar_focused = true;
+                                sidebar.toolbar_selected = 7; // Settings row
+                                needs_redraw = true;
+                                continue;
+                            }
+                        }
+                        // Ctrl-V paste into search input or inline edit
+                        if ctrl && key_event.code == KeyCode::Char('v') {
+                            if engine.settings_input_active || engine.settings_editing.is_some() {
+                                let text = match engine.clipboard_read {
+                                    Some(ref cb) => cb().ok(),
+                                    None => None,
+                                };
+                                if let Some(t) = text {
+                                    engine.settings_paste(&t);
+                                }
+                            }
+                            needs_redraw = true;
+                            continue;
+                        }
+                        let (key_name, unicode): (&str, Option<char>) = match key_event.code {
+                            KeyCode::Char('j') | KeyCode::Down => ("j", None),
+                            KeyCode::Char('k') | KeyCode::Up => ("k", None),
+                            KeyCode::Tab => ("Tab", None),
+                            KeyCode::Enter => ("Return", None),
+                            KeyCode::Char(' ') => ("Space", None),
+                            KeyCode::Char('l') | KeyCode::Right => ("l", None),
+                            KeyCode::Char('h') | KeyCode::Left => ("h", None),
+                            KeyCode::Char('/') => ("/", None),
+                            KeyCode::Char('q') | KeyCode::Esc => ("Escape", None),
+                            KeyCode::Backspace => ("BackSpace", None),
+                            KeyCode::Char(ch) => ("char", Some(ch)),
+                            _ => ("", None),
+                        };
+                        if !key_name.is_empty() {
+                            let ch = if key_name == "char" { unicode } else { None };
+                            engine.handle_settings_key(
+                                if key_name == "char" { "" } else { key_name },
+                                ctrl,
+                                ch,
+                            );
+                            if !engine.settings_has_focus {
                                 sidebar.has_focus = false;
                             }
                         }
@@ -2682,6 +2757,9 @@ fn event_loop(
                                         engine.ext_sidebar_has_focus = true;
                                     }
                                     TuiPanel::Ai => engine.ai_has_focus = true,
+                                    TuiPanel::Settings => {
+                                        engine.settings_has_focus = true;
+                                    }
                                     _ => {}
                                 }
                             } else {
@@ -3617,8 +3695,8 @@ fn handle_mouse(
                     sidebar.has_focus = true;
                 }
                 if panel == TuiPanel::Settings {
-                    // Opening Settings panel also opens settings.json in the editor
-                    engine.execute_command("Settings");
+                    engine.settings_has_focus = true;
+                    sidebar.has_focus = true;
                 }
             }
             engine.session.explorer_visible = sidebar.visible;
@@ -3905,6 +3983,7 @@ fn handle_mouse(
     engine.dap_sidebar_has_focus = false;
     engine.ext_sidebar_has_focus = false;
     engine.ai_has_focus = false;
+    engine.settings_has_focus = false;
     if col < editor_left {
         return sidebar_width; // separator column
     }
@@ -4236,7 +4315,13 @@ fn build_screen_for_tui(
     }; // +1 sep
     let content_cols = area.width.saturating_sub(ACTIVITY_BAR_WIDTH + sidebar_cols);
     let content_bounds = WindowRect::new(0.0, 0.0, content_cols as f64, content_rows as f64);
-    let (window_rects, _dividers) = engine.calculate_group_window_rects(content_bounds, 1.0);
+    let tui_tab_bar_height = if engine.settings.breadcrumbs {
+        2.0
+    } else {
+        1.0
+    };
+    let (window_rects, _dividers) =
+        engine.calculate_group_window_rects(content_bounds, tui_tab_bar_height);
     debug_log!(
         "build_screen: content_rows={} content_cols={} groups={} window_rects={}",
         content_rows,
@@ -4416,6 +4501,30 @@ fn draw_frame(
                 render_tab_bar(frame.buffer_mut(), g_tab, &gtb.tabs, theme, is_active);
             }
         }
+        // Draw breadcrumb bars (below each group's tab bar).
+        for bc in &screen.breadcrumbs {
+            if bc.segments.is_empty() {
+                continue;
+            }
+            let bc_x = bc.bounds.x as u16 + editor_area.x;
+            let bc_w = bc.bounds.width as u16;
+            // Breadcrumb bar is one row above the window content (bounds.y - 1 in
+            // breadcrumb coordinates, which is one row below the tab bar).
+            let bc_y = editor_area.y + bc.bounds.y as u16;
+            // In multi-group with breadcrumbs, bounds.y points to the breadcrumb row
+            // (tab_bar_height=2 means row 0=tab, row 1=breadcrumb, row 2+=windows).
+            // The breadcrumb bounds.y is window min_y, so the bc sits 1 above.
+            let bc_y = bc_y.saturating_sub(1);
+            if bc_w > 0 {
+                let bc_rect = Rect {
+                    x: bc_x,
+                    y: bc_y,
+                    width: bc_w,
+                    height: 1,
+                };
+                render_breadcrumb_bar(frame.buffer_mut(), bc_rect, &bc.segments, theme);
+            }
+        }
         // Draw divider lines (vertical only — horizontal splits use the tab bar as divider).
         let sep_fg = rc(theme.separator);
         let sep_bg = rc(theme.background);
@@ -4440,6 +4549,18 @@ fn draw_frame(
             height: 1,
         };
         render_tab_bar(frame.buffer_mut(), tab_rect, &screen.tab_bar, theme, true);
+        // Draw breadcrumb bar for the single group.
+        if let Some(bc) = screen.breadcrumbs.first() {
+            if !bc.segments.is_empty() {
+                let bc_rect = Rect {
+                    x: editor_area.x,
+                    y: editor_area.y + 1,
+                    width: editor_area.width,
+                    height: 1,
+                };
+                render_breadcrumb_bar(frame.buffer_mut(), bc_rect, &bc.segments, theme);
+            }
+        }
         render_all_windows(frame, editor_area, &screen.windows, theme);
     }
 
@@ -4854,6 +4975,50 @@ fn render_tab_bar(
         for ch in TAB_BTN_SPLIT_DOWN.chars() {
             set_cell(buf, bx, area.y, ch, btn_fg, bar_bg);
             bx += 1;
+        }
+    }
+}
+
+fn render_breadcrumb_bar(
+    buf: &mut ratatui::buffer::Buffer,
+    area: Rect,
+    segments: &[render::BreadcrumbSegment],
+    theme: &Theme,
+) {
+    let bg = rc(theme.breadcrumb_bg);
+    // Fill the row with breadcrumb bg
+    for x in area.x..area.x + area.width {
+        set_cell(buf, x, area.y, ' ', bg, bg);
+    }
+
+    let separator = " \u{203A} "; // " › "
+    let mut x = area.x + 1; // small left padding
+
+    for seg in segments {
+        // Separator before all but the first
+        if x > area.x + 2 {
+            let sep_fg = rc(theme.breadcrumb_fg);
+            for ch in separator.chars() {
+                if x >= area.x + area.width {
+                    return;
+                }
+                set_cell(buf, x, area.y, ch, sep_fg, bg);
+                x += 1;
+            }
+        }
+
+        // Segment label
+        let fg = if seg.is_last {
+            rc(theme.breadcrumb_active_fg)
+        } else {
+            rc(theme.breadcrumb_fg)
+        };
+        for ch in seg.label.chars() {
+            if x >= area.x + area.width {
+                return;
+            }
+            set_cell(buf, x, area.y, ch, fg, bg);
+            x += 1;
         }
     }
 }
@@ -7240,12 +7405,20 @@ fn render_settings_panel(
     theme: &Theme,
     engine: &Engine,
 ) {
+    use crate::core::settings::{setting_categories, SettingType, SETTING_DEFS};
+
     let header_fg = rc(theme.status_fg);
     let header_bg = rc(theme.status_bg);
     let fg = rc(theme.foreground);
     let bg = rc(theme.tab_bar_bg);
     let dim_fg = rc(theme.line_number_fg);
     let key_fg = rc(theme.keyword);
+    let sel_bg = if engine.settings_has_focus {
+        rc(theme.sidebar_sel_bg)
+    } else {
+        rc(theme.sidebar_sel_bg_inactive)
+    };
+    let cat_fg = rc(theme.keyword);
 
     if area.height == 0 {
         return;
@@ -7258,7 +7431,7 @@ fn render_settings_panel(
         }
     }
 
-    // Header
+    // Row 0: Header " SETTINGS"
     let header_y = area.y;
     for x in area.x..area.x + area.width {
         set_cell(buf, x, header_y, ' ', header_fg, header_bg);
@@ -7272,64 +7445,192 @@ fn render_settings_panel(
         x += 1;
     }
 
-    let s = &engine.settings;
-    let ln = match s.line_numbers {
-        LineNumberMode::None => "none",
-        LineNumberMode::Absolute => "absolute",
-        LineNumberMode::Relative => "relative",
-        LineNumberMode::Hybrid => "hybrid",
-    };
-
-    // Build rows: (label, value)
-    let rows: &[(&str, String)] = &[
-        ("", String::new()),
-        ("  File:", "~/.config/vimcode/settings.json".into()),
-        ("  :Settings to open   :config reload", String::new()),
-        ("", String::new()),
-        ("  — Current settings —", String::new()),
-        ("  colorscheme", s.colorscheme.clone()),
-        ("  line_numbers", ln.into()),
-        ("  tabstop", s.tabstop.to_string()),
-        ("  shiftwidth", s.shift_width.to_string()),
-        ("  expandtab", s.expand_tab.to_string()),
-        ("  wrap", s.wrap.to_string()),
-        ("  hlsearch", s.hlsearch.to_string()),
-        ("  ignorecase", s.ignorecase.to_string()),
-        ("  smartcase", s.smartcase.to_string()),
-        ("  cursorline", s.cursorline.to_string()),
-        ("  scrolloff", s.scrolloff.to_string()),
-        ("  lsp", s.lsp_enabled.to_string()),
-        ("  autoindent", s.auto_indent.to_string()),
-    ];
-
-    for (i, (label, value)) in rows.iter().enumerate() {
-        let y = area.y + 1 + i as u16;
-        if y >= area.y + area.height {
-            break;
+    // Row 1: Search input
+    let search_y = area.y + 1;
+    if search_y < area.y + area.height {
+        let search_bg = if engine.settings_input_active {
+            rc(theme.sidebar_sel_bg)
+        } else {
+            bg
+        };
+        for x in area.x..area.x + area.width {
+            set_cell(buf, x, search_y, ' ', fg, search_bg);
         }
-        // Write label in dim colour
         let mut x = area.x;
-        for ch in label.chars() {
+        set_cell(buf, x, search_y, ' ', dim_fg, search_bg);
+        x += 1;
+        set_cell(buf, x, search_y, '/', dim_fg, search_bg);
+        x += 1;
+        set_cell(buf, x, search_y, ' ', dim_fg, search_bg);
+        x += 1;
+        for ch in engine.settings_query.chars() {
             if x >= area.x + area.width {
                 break;
             }
-            set_cell(buf, x, y, ch, dim_fg, bg);
+            set_cell(buf, x, search_y, ch, fg, search_bg);
             x += 1;
         }
-        // Write value in keyword colour if non-empty
-        if !value.is_empty() {
-            // Right-align the value
-            let val_len = value.chars().count() as u16;
-            let right_edge = area.x + area.width;
-            let val_x = right_edge.saturating_sub(val_len + 1);
-            let mut vx = val_x.max(x);
-            for ch in value.chars() {
-                if vx >= right_edge {
+        if engine.settings_input_active && x < area.x + area.width {
+            set_cell(buf, x, search_y, '█', fg, search_bg);
+        }
+    }
+
+    // Rows 2+: scrollable form content
+    let content_start = area.y + 2;
+    let content_height = area.height.saturating_sub(2) as usize;
+    if content_height == 0 {
+        return;
+    }
+
+    let flat = engine.settings_flat_list();
+    let cats = setting_categories();
+    let total = flat.len();
+
+    // Scrollbar column is the rightmost
+    let sb_col = area.x + area.width - 1;
+    let content_width = area.width.saturating_sub(1); // leave room for scrollbar
+
+    let scroll = engine.settings_scroll_top;
+
+    for vi in 0..content_height {
+        let fi = scroll + vi;
+        let y = content_start + vi as u16;
+        if fi >= total {
+            break;
+        }
+
+        let (is_cat, idx) = flat[fi];
+        let is_selected = fi == engine.settings_selected && engine.settings_has_focus;
+        let row_bg = if is_selected { sel_bg } else { bg };
+
+        // Fill row background
+        for x in area.x..area.x + content_width {
+            set_cell(buf, x, y, ' ', fg, row_bg);
+        }
+
+        if is_cat {
+            // Category header
+            let collapsed = idx < engine.settings_collapsed.len() && engine.settings_collapsed[idx];
+            let arrow = if collapsed { '▶' } else { '▼' };
+            let cat_name = if idx < cats.len() { cats[idx] } else { "?" };
+            let mut x = area.x + 1;
+            set_cell(buf, x, y, arrow, cat_fg, row_bg);
+            x += 2;
+            for ch in cat_name.chars() {
+                if x >= area.x + content_width {
                     break;
                 }
-                set_cell(buf, vx, y, ch, key_fg, bg);
-                vx += 1;
+                set_cell(buf, x, y, ch, cat_fg, row_bg);
+                x += 1;
             }
+        } else {
+            // Setting row
+            let def = &SETTING_DEFS[idx];
+            // Label (indented)
+            let mut x = area.x + 3;
+            for ch in def.label.chars() {
+                if x >= area.x + content_width {
+                    break;
+                }
+                set_cell(buf, x, y, ch, fg, row_bg);
+                x += 1;
+            }
+
+            // Value (right-aligned)
+            let right_edge = area.x + content_width;
+
+            // Check if we're editing this setting inline
+            let editing_this = engine.settings_editing == Some(idx);
+
+            match &def.setting_type {
+                SettingType::Bool => {
+                    let val = engine.settings.get_value_str(def.key);
+                    let display = if val == "true" { "[✓]" } else { "[ ]" };
+                    let val_len = 3u16;
+                    let vx = right_edge.saturating_sub(val_len + 1);
+                    let mut cx = vx;
+                    for ch in display.chars() {
+                        if cx >= right_edge {
+                            break;
+                        }
+                        set_cell(buf, cx, y, ch, key_fg, row_bg);
+                        cx += 1;
+                    }
+                }
+                SettingType::Integer { .. } => {
+                    let display = if editing_this {
+                        format!("{}█", engine.settings_edit_buf)
+                    } else {
+                        engine.settings.get_value_str(def.key)
+                    };
+                    let val_len = display.chars().count() as u16;
+                    let vx = right_edge.saturating_sub(val_len + 1);
+                    let mut cx = vx.max(x);
+                    for ch in display.chars() {
+                        if cx >= right_edge {
+                            break;
+                        }
+                        set_cell(buf, cx, y, ch, key_fg, row_bg);
+                        cx += 1;
+                    }
+                }
+                SettingType::Enum(_) | SettingType::DynamicEnum(_) => {
+                    let val = engine.settings.get_value_str(def.key);
+                    let display = format!("{} ▸", val);
+                    let val_len = display.chars().count() as u16;
+                    let vx = right_edge.saturating_sub(val_len + 1);
+                    let mut cx = vx.max(x);
+                    for ch in display.chars() {
+                        if cx >= right_edge {
+                            break;
+                        }
+                        set_cell(buf, cx, y, ch, key_fg, row_bg);
+                        cx += 1;
+                    }
+                }
+                SettingType::StringVal => {
+                    let display = if editing_this {
+                        format!("{}█", engine.settings_edit_buf)
+                    } else {
+                        let val = engine.settings.get_value_str(def.key);
+                        if val.is_empty() {
+                            "(empty)".to_string()
+                        } else {
+                            val
+                        }
+                    };
+                    // Truncate to fit
+                    let max_val_width = content_width.saturating_sub(x - area.x + 2) as usize;
+                    let truncated: String = display.chars().take(max_val_width).collect();
+                    let val_len = truncated.chars().count() as u16;
+                    let vx = right_edge.saturating_sub(val_len + 1);
+                    let mut cx = vx.max(x);
+                    let val_fg = if editing_this { fg } else { dim_fg };
+                    for ch in truncated.chars() {
+                        if cx >= right_edge {
+                            break;
+                        }
+                        set_cell(buf, cx, y, ch, val_fg, row_bg);
+                        cx += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // Scrollbar
+    if total > content_height && content_height > 0 {
+        let track_len = content_height;
+        let thumb_len = (content_height * content_height / total).max(1);
+        let thumb_start = scroll * track_len / total;
+        for i in 0..track_len {
+            let y = content_start + i as u16;
+            let ch = if i >= thumb_start && i < thumb_start + thumb_len {
+                '█'
+            } else {
+                '░'
+            };
+            set_cell(buf, sb_col, y, ch, dim_fg, bg);
         }
     }
 }

@@ -1,4 +1,4 @@
-use tree_sitter::{Language, Parser, Query, QueryCursor, Tree};
+use tree_sitter::{Language, Parser, Point, Query, QueryCursor, Tree};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyntaxLanguage {
@@ -623,6 +623,130 @@ impl Syntax {
         self.last_tree = Some(tree);
         highlights
     }
+
+    /// Walk the tree-sitter parse tree upward from the given cursor position
+    /// and return the chain of enclosing scope-defining nodes (outermost first).
+    pub fn enclosing_scopes(&self, text: &str, line: usize, col: usize) -> Vec<BreadcrumbSymbol> {
+        let tree = match self.last_tree.as_ref() {
+            Some(t) => t,
+            None => return vec![],
+        };
+        let point = Point::new(line, col);
+        let node = match tree.root_node().descendant_for_point_range(point, point) {
+            Some(n) => n,
+            None => return vec![],
+        };
+
+        let scope_kinds = Self::scope_kinds_for(self.language);
+        if scope_kinds.is_empty() {
+            return vec![];
+        }
+
+        let mut result = Vec::new();
+        let mut cur = Some(node);
+        while let Some(n) = cur {
+            let kind = n.kind();
+            if scope_kinds.contains(&kind) {
+                let name = Self::extract_node_name(&n, text);
+                if !name.is_empty() {
+                    result.push(BreadcrumbSymbol {
+                        name,
+                        kind: kind.to_string(),
+                    });
+                }
+            }
+            cur = n.parent();
+        }
+        result.reverse();
+        result
+    }
+
+    /// Return the set of tree-sitter node kinds that define scopes for breadcrumbs.
+    fn scope_kinds_for(lang: SyntaxLanguage) -> &'static [&'static str] {
+        match lang {
+            SyntaxLanguage::Rust => &[
+                "mod_item",
+                "function_item",
+                "impl_item",
+                "struct_item",
+                "enum_item",
+                "trait_item",
+            ],
+            SyntaxLanguage::Python => &["class_definition", "function_definition"],
+            SyntaxLanguage::JavaScript => &[
+                "class_declaration",
+                "function_declaration",
+                "method_definition",
+            ],
+            SyntaxLanguage::TypeScript | SyntaxLanguage::TypeScriptReact => &[
+                "class_declaration",
+                "function_declaration",
+                "method_definition",
+                "interface_declaration",
+            ],
+            SyntaxLanguage::Go => &[
+                "function_declaration",
+                "method_declaration",
+                "type_declaration",
+            ],
+            SyntaxLanguage::Cpp => &[
+                "function_definition",
+                "struct_specifier",
+                "class_specifier",
+                "namespace_definition",
+            ],
+            SyntaxLanguage::C => &["function_definition", "struct_specifier"],
+            SyntaxLanguage::Java => &[
+                "class_declaration",
+                "method_declaration",
+                "interface_declaration",
+            ],
+            SyntaxLanguage::CSharp => &[
+                "class_declaration",
+                "method_declaration",
+                "interface_declaration",
+                "namespace_declaration",
+            ],
+            SyntaxLanguage::Ruby => &["class", "module", "method", "singleton_method"],
+            _ => &[],
+        }
+    }
+
+    /// Extract a human-readable name from a scope node.
+    fn extract_node_name(node: &tree_sitter::Node, text: &str) -> String {
+        // Try `name` field first (works for most node kinds)
+        if let Some(name_node) = node.child_by_field_name("name") {
+            return text[name_node.byte_range()].to_string();
+        }
+        // For impl_item: look for a type child (the type being implemented)
+        if node.kind() == "impl_item" {
+            if let Some(type_node) = node.child_by_field_name("type") {
+                return text[type_node.byte_range()].to_string();
+            }
+        }
+        // Fallback: scan children for an identifier-like node
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i) {
+                let k = child.kind();
+                if k == "identifier"
+                    || k == "type_identifier"
+                    || k == "field_identifier"
+                    || k == "constant"
+                    || k == "property_identifier"
+                {
+                    return text[child.byte_range()].to_string();
+                }
+            }
+        }
+        String::new()
+    }
+}
+
+/// A symbol in the breadcrumb hierarchy (e.g. a function, struct, class).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BreadcrumbSymbol {
+    pub name: String,
+    pub kind: String,
 }
 
 #[cfg(test)]
@@ -980,5 +1104,33 @@ mod tests {
 
         let syntax_unknown = Syntax::new_from_path(Some("file.txt"));
         assert!(syntax_unknown.is_none());
+    }
+
+    #[test]
+    fn test_enclosing_scopes_rust_fn() {
+        let mut syntax = Syntax::new_for_language(SyntaxLanguage::Rust);
+        let code = "fn hello() {\n    let x = 1;\n}\n";
+        syntax.parse(code);
+        let scopes = syntax.enclosing_scopes(code, 1, 8);
+        assert_eq!(scopes.len(), 1);
+        assert_eq!(scopes[0].name, "hello");
+        assert_eq!(scopes[0].kind, "function_item");
+    }
+
+    #[test]
+    fn test_enclosing_scopes_empty_without_parse() {
+        let syntax = Syntax::new_for_language(SyntaxLanguage::Rust);
+        let scopes = syntax.enclosing_scopes("fn main() {}", 0, 5);
+        assert!(scopes.is_empty());
+    }
+
+    #[test]
+    fn test_enclosing_scopes_go() {
+        let mut syntax = Syntax::new_for_language(SyntaxLanguage::Go);
+        let code = "package main\nfunc hello() {\n\tx := 1\n}\n";
+        syntax.parse(code);
+        let scopes = syntax.enclosing_scopes(code, 2, 1);
+        assert_eq!(scopes.len(), 1);
+        assert_eq!(scopes[0].name, "hello");
     }
 }

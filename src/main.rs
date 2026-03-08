@@ -555,6 +555,31 @@ fn build_setting_row(
             });
             row.append(&dropdown);
         }
+        render::SettingType::DynamicEnum(options_fn) => {
+            let options_vec = options_fn();
+            let strs: Vec<&str> = options_vec.iter().map(|s| s.as_str()).collect();
+            let current_idx = options_vec
+                .iter()
+                .position(|o| o == &current_val)
+                .unwrap_or(0) as u32;
+            let dropdown = gtk4::DropDown::from_strings(&strs);
+            dropdown.set_selected(current_idx);
+            dropdown.set_valign(gtk4::Align::Center);
+            let sender_c = sender.clone();
+            let key_c = key.clone();
+            dropdown.connect_selected_notify(move |dd| {
+                let idx = dd.selected() as usize;
+                if let Some(opt) = options_vec.get(idx) {
+                    sender_c
+                        .send(Msg::SettingChanged {
+                            key: key_c.clone(),
+                            value: opt.clone(),
+                        })
+                        .ok();
+                }
+            });
+            row.append(&dropdown);
+        }
     }
 
     row
@@ -5696,7 +5721,11 @@ fn sync_scrollbar_positions(
     if da_width < 20.0 || da_height < 20.0 || line_height < 1.0 {
         return;
     }
-    let tab_bar_height = line_height;
+    let tab_bar_height = if engine.settings.breadcrumbs {
+        line_height * 2.0
+    } else {
+        line_height
+    };
     let status_bar_height = line_height * 2.0;
     let debug_toolbar_px = if engine.debug_toolbar_visible {
         line_height
@@ -5923,7 +5952,11 @@ impl App {
         }
 
         let line_height = self.cached_line_height;
-        let tab_bar_height = line_height;
+        let tab_bar_height = if engine.settings.breadcrumbs {
+            line_height * 2.0
+        } else {
+            line_height
+        };
         let status_bar_height = line_height * 2.0;
         let debug_toolbar_px = if engine.debug_toolbar_visible {
             line_height
@@ -6198,7 +6231,11 @@ fn draw_editor(
     }
 
     // Calculate layout regions
-    let tab_bar_height = line_height; // Always show tab bar
+    let tab_bar_height = if engine.settings.breadcrumbs {
+        line_height * 2.0
+    } else {
+        line_height
+    };
     let status_bar_height = line_height * 2.0; // status + command line
 
     // Reserve space for the quickfix panel when open
@@ -6317,6 +6354,22 @@ fn draw_editor(
             true,
             hover_idx,
         );
+    }
+
+    // 3c. Draw breadcrumb bar(s) below tab bar(s)
+    for bc in &screen.breadcrumbs {
+        if bc.segments.is_empty() {
+            continue;
+        }
+        // Breadcrumb bar sits one line_height above the window content (bc.bounds.y)
+        // and one line_height below the tab bar.
+        let bc_y = bc.bounds.y - line_height;
+        let bc_x = bc.bounds.x;
+        let bc_w = bc.bounds.width;
+        cr.save().ok();
+        cr.translate(bc_x, 0.0);
+        draw_breadcrumb_bar(cr, &layout, &theme, &bc.segments, bc_w, line_height, bc_y);
+        cr.restore().ok();
     }
 
     // 4. Draw each window
@@ -6505,7 +6558,11 @@ fn compute_editor_window_rects(
     da_height: f64,
     line_height: f64,
 ) -> Vec<(core::WindowId, core::WindowRect)> {
-    let tab_bar_height = line_height;
+    let tab_bar_height = if engine.settings.breadcrumbs {
+        line_height * 2.0
+    } else {
+        line_height
+    };
     let status_bar_height = line_height * 2.0;
     let debug_toolbar_px = if engine.debug_toolbar_visible {
         line_height
@@ -6626,7 +6683,11 @@ fn tab_close_hit_test(
     line_height: f64,
     char_width: f64,
 ) -> Option<(usize, usize)> {
-    let tab_bar_height = line_height;
+    let tab_bar_height = if engine.settings.breadcrumbs {
+        line_height * 2.0
+    } else {
+        line_height
+    };
     let status_bar_height = line_height * 2.0;
     let editor_bottom = da_h - status_bar_height;
     let content_bounds = core::WindowRect::new(0.0, 0.0, da_w, editor_bottom);
@@ -6898,6 +6959,56 @@ fn draw_tab_bar(
 
     // Restore normal font for subsequent rendering
     layout.set_font_description(Some(&normal_font));
+}
+
+fn draw_breadcrumb_bar(
+    cr: &Context,
+    layout: &pango::Layout,
+    theme: &Theme,
+    segments: &[render::BreadcrumbSegment],
+    width: f64,
+    line_height: f64,
+    y_offset: f64,
+) {
+    // Background
+    let (r, g, b) = theme.breadcrumb_bg.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    cr.rectangle(0.0, y_offset, width, line_height);
+    cr.fill().unwrap();
+
+    let separator = " \u{203A} "; // " › "
+    let mut x = 4.0; // small left padding
+
+    for seg in segments {
+        // Separator before all but the first
+        if x > 5.0 {
+            let (sr, sg, sb) = theme.breadcrumb_fg.to_cairo();
+            cr.set_source_rgb(sr, sg, sb);
+            layout.set_text(separator);
+            cr.move_to(x, y_offset);
+            pangocairo::show_layout(cr, layout);
+            let (sw, _) = layout.pixel_size();
+            x += sw as f64;
+        }
+
+        // Segment label
+        let fg = if seg.is_last {
+            theme.breadcrumb_active_fg
+        } else {
+            theme.breadcrumb_fg
+        };
+        let (fr, fg_g, fb) = fg.to_cairo();
+        cr.set_source_rgb(fr, fg_g, fb);
+        layout.set_text(&seg.label);
+        cr.move_to(x, y_offset);
+        pangocairo::show_layout(cr, layout);
+        let (lw, _) = layout.pixel_size();
+        x += lw as f64;
+
+        if x > width {
+            break;
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9879,7 +9990,11 @@ fn pixel_to_click_target(
     line_height: f64,
     char_width: f64,
 ) -> ClickTarget {
-    let tab_bar_height = line_height;
+    let tab_bar_height = if engine.settings.breadcrumbs {
+        line_height * 2.0
+    } else {
+        line_height
+    };
 
     // Check if click is in a group's tab bar region.
     // Use the group layout tree to find group bounds.

@@ -5,8 +5,9 @@
 ---
 
 ## Recently Completed
+- **Session 147**: TUI interactive settings panel — replaced read-only list with full interactive form (filterable categories, bool toggles, enum cycling, inline string/int editing, Ctrl+V paste, DynamicEnum for colorscheme with custom themes), 10 tests
+- **Session 146**: Breadcrumbs bar — file path + tree-sitter symbol hierarchy below tab bar, 10-language scope walking, `breadcrumbs` setting, per-group bars, GTK+TUI rendering, 14 tests
 - **Session 145**: VSCode theme loader (drop `.json` in `~/.config/vimcode/themes/`, `:colorscheme name`), TUI crash fix (`byte_to_char_idx` multi-byte UTF-8 panic), swap recovery R/D/A fix for TUI, sidebar keyboard nav (`Ctrl-W h/l` toolbar↔sidebar↔editor), editor click clears sidebar focus, 4 theme tests
-- **Session 144**: Vim compat batch 4 — 10 new commands (97% → 98%), Ctrl-G file info, gi insert at last pos, Ctrl-W r/R rotate windows, [*/]* comment nav, do/dp diff obtain/put, o_CTRL-V force blockwise, 21 integration tests
 - **Session 143**: Bug fixes — `:q` dirty guard allows close when buffer visible in another split, `autoread` setting + file auto-reload detection (2s poll in GTK+TUI), `:new`/`:split` respect `splitbelow`/`splitright`, `:e!` reload from disk, 9 integration tests
 - **Session 142**: Vim compat batch 3 — 15 new commands (94% → 97%), g?{motion} ROT13, CTRL-@, CTRL-V {char}, CTRL-O auto-return, !{motion}{filter}, CTRL-W H/J/K/L/T/x, visual block I/A, o_v/o_V force motion, 29 integration tests
 - **Session 141**: Vim compat batch 2 — 27 new commands (85% → 94%), gq/gw format operators, ga/g8/go/gm/gM/gI/gx/g'/g`/g&, CTRL-^, CTRL-L, N%, zs/ze, CTRL-W p/t/b/f/d, insert CTRL-A/CTRL-G u/j/k, visual gq/g CTRL-A/g CTRL-X, :make, :b {name}, 38 integration tests
@@ -60,7 +61,7 @@
 - [x] **VSCode-style menus** — application menu bar (File / Edit / View / Go / Run / Terminal / Help) in GTK; command palette (`Ctrl-Shift-P`) lists all commands + key bindings; fuzzy-searchable; both GTK native menus and TUI pop-up menu overlay (sessions 81–82, 100–101)
 - [x] **Command palette** — `Ctrl-Shift-P` floating modal; lists named commands with descriptions and current keybindings; typing filters; Enter executes; shared GTK + TUI (session 101)
 - [x] **Settings editor** — `:Settings` opens `settings.json` in an editor tab; Settings sidebar panel shows live values; auto-reload on save in both backends (session 117)
-- [x] **Settings sidebar (GTK)** — native GTK form with 30 settings in 7 categories, search, Adwaita dark theme (session 117b/117c)
+- [x] **Settings sidebar (GTK + TUI)** — interactive form with 32 settings in 8 categories, search, live controls; GTK native widgets (session 117b/117c), TUI interactive form with keyboard nav + inline editing (session 147)
 
 ### Extension System
 - [x] **Extension mechanism** — Lua 5.4 plugin sandbox; plugins register commands/keymaps/hooks, read/write buffer text, show messages; `~/.config/vimcode/plugins/` auto-loaded; bundled language-pack extensions + GitHub registry; `:ExtInstall/:ExtList/:ExtEnable/:ExtDisable/:ExtRemove` (sessions 98, 113–114)
