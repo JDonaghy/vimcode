@@ -261,6 +261,20 @@ impl WindowLayout {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GroupId(pub usize);
 
+/// Where a dragged tab should be dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropZone {
+    /// Move tab into an existing group (merge).
+    Center(GroupId),
+    /// Create a new split adjacent to `GroupId`.
+    /// `bool` = new_first (true → new group goes left/top).
+    Split(GroupId, SplitDirection, bool),
+    /// Reorder within a group: insert before the given tab index.
+    TabReorder(GroupId, usize),
+    /// No valid drop target.
+    None,
+}
+
 /// Description of a single split divider in the group layout tree.
 /// Used by backends for hit-testing and drawing divider lines.
 #[derive(Debug, Clone)]

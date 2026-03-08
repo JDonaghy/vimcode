@@ -173,6 +173,10 @@ struct App {
     terminal_split_dragging: bool,
     /// Split index being dragged (None if not dragging a group divider).
     group_divider_dragging: Option<usize>,
+    /// True while the user is dragging a tab between groups.
+    tab_dragging: bool,
+    /// Start position of a potential tab drag (set on MouseClick in tab bar).
+    tab_drag_start: Option<(f64, f64)>,
     /// Reference to the root GTK window used for minimize / maximize / close actions.
     window: gtk4::Window,
     /// Last time sc_refresh() was called for the Git sidebar auto-refresh.
@@ -1929,6 +1933,8 @@ impl SimpleComponent for App {
             terminal_resize_dragging: false,
             terminal_split_dragging: false,
             group_divider_dragging: None,
+            tab_dragging: false,
+            tab_drag_start: None,
             last_sc_refresh: std::time::Instant::now(),
             last_file_check: std::time::Instant::now(),
             menu_dropdown_da: menu_dropdown_da_ref.clone(),
@@ -3691,6 +3697,8 @@ impl SimpleComponent for App {
                                 }
                                 None => {
                                     // Tab bar / split button click — skip hooks.
+                                    // Record drag start position for tab drag-and-drop.
+                                    self.tab_drag_start = Some((x, y));
                                     // Defer sidebar tree highlight so tab switch renders instantly.
                                     let new_file_path = engine.file_path().cloned();
                                     drop(engine);
@@ -3780,6 +3788,65 @@ impl SimpleComponent for App {
                 width,
                 height,
             } => {
+                // Tab drag-and-drop handling.
+                if self.tab_dragging {
+                    // Update drop zone while dragging.
+                    let mut engine = self.engine.borrow_mut();
+                    engine.tab_drag_mouse = Some((x, y));
+                    let zone = compute_tab_drop_zone(
+                        &engine,
+                        x,
+                        y,
+                        width,
+                        height,
+                        self.cached_line_height,
+                        self.cached_char_width,
+                        &self.tab_slot_positions.borrow(),
+                    );
+                    engine.tab_drop_zone = zone;
+                    self.draw_needed.set(true);
+                    return;
+                }
+                // Check if a tab drag should start (mouse moved far enough from tab click).
+                if let Some((sx, sy)) = self.tab_drag_start {
+                    let dx = x - sx;
+                    let dy = y - sy;
+                    if dx * dx + dy * dy > 64.0 {
+                        // Determine which tab was clicked using pixel_to_click_target.
+                        let mut engine = self.engine.borrow_mut();
+                        let target = pixel_to_click_target(
+                            &mut engine,
+                            sx,
+                            sy,
+                            width,
+                            height,
+                            self.cached_line_height,
+                            self.cached_char_width,
+                            &self.tab_slot_positions.borrow(),
+                        );
+                        if let ClickTarget::TabBar = target {
+                            // The tab was already switched by pixel_to_click_target.
+                            // Use the active group + active tab as the drag source.
+                            let gid = engine.active_group;
+                            let tidx = engine
+                                .editor_groups
+                                .get(&gid)
+                                .map(|g| g.active_tab)
+                                .unwrap_or(0);
+                            engine.tab_drag_begin(gid, tidx);
+                            engine.tab_drag_mouse = Some((x, y));
+                            self.tab_dragging = true;
+                            self.tab_drag_start = None;
+                            self.draw_needed.set(true);
+                            return;
+                        }
+                        // Not a tab — clear drag start and fall through.
+                        self.tab_drag_start = None;
+                    } else {
+                        // Haven't moved enough yet, don't start any drag.
+                        return;
+                    }
+                }
                 // H scrollbar thumb drag — convert pointer delta to scroll_left.
                 if let Some(ref state) = self.h_sb_dragging {
                     if state.px_per_col > 0.0 {
@@ -3928,6 +3995,15 @@ impl SimpleComponent for App {
                 }
             }
             Msg::MouseUp => {
+                // Tab drag drop.
+                if self.tab_dragging {
+                    self.tab_dragging = false;
+                    let mut engine = self.engine.borrow_mut();
+                    let zone = engine.tab_drop_zone;
+                    engine.tab_drag_drop(zone);
+                    self.draw_needed.set(true);
+                }
+                self.tab_drag_start = None;
                 if self.terminal_split_dragging {
                     self.terminal_split_dragging = false;
                     if self.cached_char_width > 0.0 {
@@ -6431,15 +6507,50 @@ fn draw_editor(
         false,
     );
 
-    // 3b. Draw tab bar(s) — one per editor group
+    // 3b. Draw each window (before tab bars so tabs paint on top)
+    for rendered_window in &screen.windows {
+        draw_window(
+            cr,
+            &layout,
+            &font_metrics,
+            &theme,
+            rendered_window,
+            char_width,
+            line_height,
+        );
+    }
+
+    // 3c. Draw window separators
+    draw_window_separators(cr, &window_rects, &theme);
+
+    // 4. Draw tab bar(s) ON TOP of windows — one per editor group.
+    // (Drawn after windows so tab bars are never overwritten by window backgrounds.)
     {
         let mut slots = tab_slot_positions_out.borrow_mut();
         slots.clear();
     }
     if let Some(ref split) = screen.editor_group_split {
-        // Draw each group's tab bar at the top of its bounds.
+        // Draw divider lines first (behind tab bars).
+        let (sr, sg, sb) = theme.separator.to_cairo();
+        cr.set_source_rgb(sr, sg, sb);
+        cr.set_line_width(1.0);
+        for div in &split.dividers {
+            match div.direction {
+                crate::core::window::SplitDirection::Vertical => {
+                    cr.move_to(div.position, div.cross_start);
+                    cr.line_to(div.position, div.cross_start + div.cross_size);
+                    cr.stroke().ok();
+                }
+                crate::core::window::SplitDirection::Horizontal => {
+                    cr.move_to(div.cross_start, div.position);
+                    cr.line_to(div.cross_start + div.cross_size, div.position);
+                    cr.stroke().ok();
+                }
+            }
+        }
+        // Draw each group's tab bar ON TOP of dividers.
         for gtb in &split.group_tab_bars {
-            let tab_y = gtb.bounds.y - line_height;
+            let tab_y = gtb.bounds.y - tab_bar_height;
             let tab_x = gtb.bounds.x;
             let tab_w = gtb.bounds.width;
             let is_active = gtb.group_id == split.active_group;
@@ -6479,24 +6590,6 @@ fn draw_editor(
                 cr.stroke().ok();
             }
         }
-        // Draw divider lines.
-        let (sr, sg, sb) = theme.separator.to_cairo();
-        cr.set_source_rgb(sr, sg, sb);
-        cr.set_line_width(1.0);
-        for div in &split.dividers {
-            match div.direction {
-                crate::core::window::SplitDirection::Vertical => {
-                    cr.move_to(div.position, div.cross_start);
-                    cr.line_to(div.position, div.cross_start + div.cross_size);
-                    cr.stroke().ok();
-                }
-                crate::core::window::SplitDirection::Horizontal => {
-                    cr.move_to(div.cross_start, div.position);
-                    cr.line_to(div.cross_start + div.cross_size, div.position);
-                    cr.stroke().ok();
-                }
-            }
-        }
     } else {
         // Single group: draw tab bar at full width with split buttons.
         let hover_idx = tab_close_hover.map(|(_gid, tidx)| tidx);
@@ -6517,7 +6610,7 @@ fn draw_editor(
             .insert(engine.active_group.0, positions);
     }
 
-    // 3c. Draw breadcrumb bar(s) below tab bar(s)
+    // 4b. Draw breadcrumb bar(s) below tab bar(s)
     for bc in &screen.breadcrumbs {
         if bc.segments.is_empty() {
             continue;
@@ -6533,21 +6626,18 @@ fn draw_editor(
         cr.restore().ok();
     }
 
-    // 4. Draw each window
-    for rendered_window in &screen.windows {
-        draw_window(
+    // 5. Draw tab drag overlay (drop zone highlight + ghost label).
+    if engine.tab_drag.is_some() {
+        draw_tab_drag_overlay(
             cr,
-            &layout,
-            &font_metrics,
-            &theme,
-            rendered_window,
-            char_width,
+            engine,
+            width as f64,
+            height as f64,
             line_height,
+            char_width,
+            &layout,
         );
     }
-
-    // 5. Draw window separators
-    draw_window_separators(cr, &window_rects, &theme);
 
     // 5b. Draw completion popup (on top of everything else)
     draw_completion_popup(cr, &layout, &screen, &theme, line_height, char_width);
@@ -6963,6 +7053,122 @@ fn draw_h_scrollbars(
         cr.set_source_rgba(0.65, 0.65, 0.65, thumb_alpha);
         cr.rectangle(thumb_x, track_y, thumb_w, sb_height);
         cr.fill().ok();
+    }
+}
+
+/// Draw the tab drag overlay: a semi-transparent highlight over the drop zone
+/// and a ghost label near the cursor.
+#[allow(clippy::too_many_arguments)]
+fn draw_tab_drag_overlay(
+    cr: &Context,
+    engine: &Engine,
+    width: f64,
+    height: f64,
+    line_height: f64,
+    _char_width: f64,
+    layout: &pango::Layout,
+) {
+    use crate::core::window::{DropZone, SplitDirection, WindowRect};
+
+    let tab_bar_height = if engine.settings.breadcrumbs {
+        line_height * 2.0
+    } else {
+        line_height
+    };
+    let wildmenu_px = if engine.wildmenu_items.is_empty() {
+        0.0
+    } else {
+        line_height
+    };
+    let status_bar_height = line_height * 2.0 + wildmenu_px;
+    let qf_px = if engine.quickfix_open {
+        let n = engine.quickfix_items.len().clamp(1, 10) as f64;
+        (n + 1.0) * line_height
+    } else {
+        0.0
+    };
+    let term_px = if engine.terminal_open || engine.bottom_panel_open {
+        (engine.session.terminal_panel_rows as usize + 1) as f64 * line_height
+    } else {
+        0.0
+    };
+    let debug_toolbar_px = if engine.debug_toolbar_visible {
+        line_height
+    } else {
+        0.0
+    };
+    let editor_bottom = height - status_bar_height - debug_toolbar_px - qf_px - term_px;
+    let content_bounds = WindowRect::new(0.0, 0.0, width, editor_bottom);
+    let group_rects = engine
+        .group_layout
+        .calculate_group_rects(content_bounds, tab_bar_height);
+
+    // Compute highlight rect from the drop zone.
+    let zone = engine.tab_drop_zone;
+    let highlight: Option<(f64, f64, f64, f64)> = match zone {
+        DropZone::Center(gid) => group_rects.iter().find(|(g, _)| *g == gid).map(|(_, r)| {
+            (
+                r.x,
+                r.y - tab_bar_height,
+                r.width,
+                r.height + tab_bar_height,
+            )
+        }),
+        DropZone::Split(gid, dir, new_first) => {
+            group_rects.iter().find(|(g, _)| *g == gid).map(|(_, r)| {
+                let full_y = r.y - tab_bar_height;
+                let full_h = r.height + tab_bar_height;
+                match (dir, new_first) {
+                    (SplitDirection::Vertical, true) => (r.x, full_y, r.width / 2.0, full_h),
+                    (SplitDirection::Vertical, false) => {
+                        (r.x + r.width / 2.0, full_y, r.width / 2.0, full_h)
+                    }
+                    (SplitDirection::Horizontal, true) => (r.x, full_y, r.width, full_h / 2.0),
+                    (SplitDirection::Horizontal, false) => {
+                        (r.x, full_y + full_h / 2.0, r.width, full_h / 2.0)
+                    }
+                }
+            })
+        }
+        DropZone::TabReorder(gid, _idx) => group_rects
+            .iter()
+            .find(|(g, _)| *g == gid)
+            .map(|(_, r)| (r.x, r.y - tab_bar_height, r.width, line_height)),
+        DropZone::None => None,
+    };
+
+    // Draw the highlight rectangle.
+    if let Some((hx, hy, hw, hh)) = highlight {
+        cr.set_source_rgba(0.3, 0.5, 0.9, 0.15);
+        cr.rectangle(hx, hy, hw, hh);
+        cr.fill().ok();
+        cr.set_source_rgba(0.3, 0.5, 0.9, 0.5);
+        cr.set_line_width(2.0);
+        cr.rectangle(hx, hy, hw, hh);
+        cr.stroke().ok();
+    }
+
+    // Draw a small ghost label near the cursor.
+    if let (Some((mx, my)), Some(ref drag)) = (engine.tab_drag_mouse, &engine.tab_drag) {
+        let label = &drag.tab_name;
+        if !label.is_empty() {
+            layout.set_text(label);
+            let (tw, th) = layout.pixel_size();
+            let gx = mx + 12.0;
+            let gy = my - th as f64 / 2.0;
+            let pad = 4.0;
+            cr.set_source_rgba(0.15, 0.15, 0.15, 0.85);
+            cr.rectangle(
+                gx - pad,
+                gy - pad,
+                tw as f64 + pad * 2.0,
+                th as f64 + pad * 2.0,
+            );
+            cr.fill().ok();
+            cr.set_source_rgba(0.9, 0.9, 0.9, 0.9);
+            cr.move_to(gx, gy);
+            pangocairo::show_layout(cr, layout);
+        }
     }
 }
 
@@ -10624,6 +10830,109 @@ fn handle_mouse_click(
     }
 }
 
+/// Compute the drop zone for a tab drag based on cursor position.
+#[allow(clippy::too_many_arguments)]
+fn compute_tab_drop_zone(
+    engine: &Engine,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    line_height: f64,
+    char_width: f64,
+    tab_slot_positions: &TabSlotMap,
+) -> crate::core::window::DropZone {
+    use crate::core::window::{DropZone, SplitDirection, WindowRect};
+
+    let tab_bar_height = if engine.settings.breadcrumbs {
+        line_height * 2.0
+    } else {
+        line_height
+    };
+    let wildmenu_px = if engine.wildmenu_items.is_empty() {
+        0.0
+    } else {
+        line_height
+    };
+    let status_bar_height = line_height * 2.0 + wildmenu_px;
+    let qf_px = if engine.quickfix_open {
+        let n = engine.quickfix_items.len().clamp(1, 10) as f64;
+        (n + 1.0) * line_height
+    } else {
+        0.0
+    };
+    let term_px = if engine.terminal_open || engine.bottom_panel_open {
+        (engine.session.terminal_panel_rows as usize + 1) as f64 * line_height
+    } else {
+        0.0
+    };
+    let debug_toolbar_px = if engine.debug_toolbar_visible {
+        line_height
+    } else {
+        0.0
+    };
+    let editor_bottom = height - status_bar_height - debug_toolbar_px - qf_px - term_px;
+    let content_bounds = WindowRect::new(0.0, 0.0, width, editor_bottom);
+    let group_rects = engine
+        .group_layout
+        .calculate_group_rects(content_bounds, tab_bar_height);
+
+    for (gid, grect) in &group_rects {
+        let tab_y = grect.y - tab_bar_height;
+        let tab_x = grect.x;
+        let group_id = *gid;
+
+        // Check tab bar region (for reorder/center drop)
+        if y >= tab_y && y < tab_y + line_height && x >= tab_x && x < tab_x + grect.width {
+            // Determine insertion index from tab slot positions
+            let local_x = x - tab_x;
+            if let Some(slots) = tab_slot_positions.get(&group_id.0) {
+                for (i, &(slot_start, slot_end)) in slots.iter().enumerate() {
+                    let mid = (slot_start + slot_end) / 2.0;
+                    if local_x < mid {
+                        return DropZone::TabReorder(group_id, i);
+                    }
+                }
+                return DropZone::TabReorder(group_id, slots.len());
+            }
+            return DropZone::Center(group_id);
+        }
+
+        // Check content area with edge margins
+        let content_top = grect.y;
+        let content_left = grect.x;
+        let content_right = grect.x + grect.width;
+        let content_bottom = grect.y + grect.height;
+        if x >= content_left && x < content_right && y >= content_top && y < content_bottom {
+            let w = grect.width;
+            let h = grect.height;
+            let rel_x = x - content_left;
+            let rel_y = y - content_top;
+            let margin = 0.2;
+
+            // Minimum 40px or char_width*5 for edge zones
+            let edge_w = (w * margin).min(char_width * 10.0).max(40.0);
+            let edge_h = (h * margin).min(line_height * 3.0).max(40.0);
+
+            if rel_x < edge_w {
+                return DropZone::Split(group_id, SplitDirection::Vertical, true);
+            }
+            if rel_x > w - edge_w {
+                return DropZone::Split(group_id, SplitDirection::Vertical, false);
+            }
+            if rel_y < edge_h {
+                return DropZone::Split(group_id, SplitDirection::Horizontal, true);
+            }
+            if rel_y > h - edge_h {
+                return DropZone::Split(group_id, SplitDirection::Horizontal, false);
+            }
+            return DropZone::Center(group_id);
+        }
+    }
+
+    DropZone::None
+}
+
 /// Handle mouse double-click — select word at position.
 #[allow(clippy::too_many_arguments)]
 fn handle_mouse_double_click(
@@ -11409,18 +11718,10 @@ fn install_icon_and_desktop() {
     };
     let data_dir = home.join(".local/share");
 
-    // Icon — 256×256 PNG embedded at compile time.
-    let icon_dir = data_dir.join("icons/hicolor/256x256/apps");
-    let icon_path = icon_dir.join("vimcode.png");
-    let icon_bytes: &[u8] = include_bytes!("../vimcode-color.png");
-    if fs::create_dir_all(&icon_dir).is_ok() {
-        let _ = fs::write(&icon_path, icon_bytes);
-    }
-
-    // SVG icon for scalable size.
+    // SVG icon for scalable size (GTK/GNOME renders SVGs natively).
     let svg_dir = data_dir.join("icons/hicolor/scalable/apps");
     let svg_path = svg_dir.join("vimcode.svg");
-    let svg_bytes: &[u8] = include_bytes!("../vimcode-color.svg");
+    let svg_bytes: &[u8] = include_bytes!("../vim-code.svg");
     if fs::create_dir_all(&svg_dir).is_ok() {
         let _ = fs::write(&svg_path, svg_bytes);
     }

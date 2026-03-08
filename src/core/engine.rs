@@ -25,7 +25,8 @@ use super::tab::{Tab, TabId};
 use super::terminal::{default_shell, TerminalPane};
 use super::view::View;
 use super::window::{
-    GroupDivider, GroupId, GroupLayout, SplitDirection, Window, WindowId, WindowLayout, WindowRect,
+    DropZone, GroupDivider, GroupId, GroupLayout, SplitDirection, Window, WindowId, WindowLayout,
+    WindowRect,
 };
 use std::borrow::Cow;
 
@@ -666,6 +667,14 @@ pub enum BottomPanelKind {
     DebugOutput,
 }
 
+/// State of an in-progress tab drag operation.
+#[derive(Debug, Clone)]
+pub struct TabDragState {
+    pub source_group: GroupId,
+    pub source_tab_index: usize,
+    pub tab_name: String,
+}
+
 /// One panel in a VSCode-style editor-group split.
 /// Each group owns its own tab bar and independent tab navigation.
 /// Single-group mode (the default) is identical to the previous behaviour.
@@ -708,6 +717,12 @@ pub struct Engine {
     next_group_id: usize,
     next_window_id: usize,
     next_tab_id: usize,
+    /// Active tab drag-and-drop operation (set by UI on drag start).
+    pub tab_drag: Option<TabDragState>,
+    /// Current mouse position during a tab drag (for rendering ghost/overlay).
+    pub tab_drag_mouse: Option<(f64, f64)>,
+    /// Computed drop zone for the current tab drag (updated each frame).
+    pub tab_drop_zone: DropZone,
 
     // --- Preview mode ---
     /// The buffer currently in preview mode (at most one at a time).
@@ -1381,6 +1396,9 @@ impl Engine {
             next_group_id: 1,
             next_window_id: 2,
             next_tab_id: 2,
+            tab_drag: None,
+            tab_drag_mouse: None,
+            tab_drop_zone: DropZone::None,
             preview_buffer_id: None,
             mode: Mode::Normal,
             command_buffer: String::new(),
@@ -3581,6 +3599,195 @@ impl Engine {
             let adjusted = if is_first { delta } else { -delta };
             self.group_layout
                 .adjust_ratio_at_index(split_index, adjusted);
+        }
+    }
+
+    // --- Tab drag-and-drop ---
+
+    /// Begin dragging a tab from the given group.
+    pub fn tab_drag_begin(&mut self, group_id: GroupId, tab_index: usize) {
+        let name = self
+            .editor_groups
+            .get(&group_id)
+            .and_then(|g| g.tabs.get(tab_index))
+            .and_then(|t| self.windows.get(&t.active_window))
+            .and_then(|w| self.buffer_manager.get(w.buffer_id))
+            .map(|s| s.display_name())
+            .unwrap_or_default();
+        self.tab_drag = Some(TabDragState {
+            source_group: group_id,
+            source_tab_index: tab_index,
+            tab_name: name,
+        });
+        self.tab_drop_zone = DropZone::None;
+    }
+
+    /// Cancel an in-progress tab drag.
+    #[allow(dead_code)]
+    pub fn tab_drag_cancel(&mut self) {
+        self.tab_drag = None;
+        self.tab_drag_mouse = None;
+        self.tab_drop_zone = DropZone::None;
+    }
+
+    /// Execute the drop for the current tab drag.
+    pub fn tab_drag_drop(&mut self, zone: DropZone) {
+        let drag = match self.tab_drag.take() {
+            Some(d) => d,
+            None => return,
+        };
+        self.tab_drag_mouse = None;
+        self.tab_drop_zone = DropZone::None;
+
+        match zone {
+            DropZone::Center(target) => {
+                if target != drag.source_group {
+                    self.move_tab_to_target_group(drag.source_group, drag.source_tab_index, target);
+                }
+            }
+            DropZone::Split(target, direction, new_first) => {
+                self.move_tab_to_new_split(
+                    drag.source_group,
+                    drag.source_tab_index,
+                    target,
+                    direction,
+                    new_first,
+                );
+            }
+            DropZone::TabReorder(group_id, to_idx) => {
+                if group_id == drag.source_group {
+                    self.reorder_tab_in_group(group_id, drag.source_tab_index, to_idx);
+                } else {
+                    // Drag to a specific position in another group
+                    self.move_tab_to_target_group_at(
+                        drag.source_group,
+                        drag.source_tab_index,
+                        group_id,
+                        to_idx,
+                    );
+                }
+            }
+            DropZone::None => {}
+        }
+    }
+
+    /// Move a tab from one group to another (appends at end).
+    pub fn move_tab_to_target_group(
+        &mut self,
+        src_group: GroupId,
+        tab_idx: usize,
+        target_group: GroupId,
+    ) {
+        self.move_tab_to_target_group_at(src_group, tab_idx, target_group, usize::MAX);
+    }
+
+    /// Move a tab from one group to another at a specific insertion index.
+    fn move_tab_to_target_group_at(
+        &mut self,
+        src_group: GroupId,
+        tab_idx: usize,
+        target_group: GroupId,
+        insert_at: usize,
+    ) {
+        if src_group == target_group {
+            return;
+        }
+        let tab = match self.editor_groups.get_mut(&src_group) {
+            Some(g) if tab_idx < g.tabs.len() => {
+                let t = g.tabs.remove(tab_idx);
+                if g.active_tab >= g.tabs.len() && !g.tabs.is_empty() {
+                    g.active_tab = g.tabs.len() - 1;
+                }
+                t
+            }
+            _ => return,
+        };
+        // Insert into target
+        if let Some(tg) = self.editor_groups.get_mut(&target_group) {
+            let idx = insert_at.min(tg.tabs.len());
+            tg.tabs.insert(idx, tab);
+            tg.active_tab = idx;
+        }
+        self.active_group = target_group;
+        // If source group is now empty, close it
+        if self
+            .editor_groups
+            .get(&src_group)
+            .is_some_and(|g| g.tabs.is_empty())
+        {
+            self.close_group_by_id(src_group);
+        }
+    }
+
+    /// Move a tab out of its group into a new split adjacent to `target_group`.
+    fn move_tab_to_new_split(
+        &mut self,
+        src_group: GroupId,
+        tab_idx: usize,
+        target_group: GroupId,
+        direction: SplitDirection,
+        new_first: bool,
+    ) {
+        // Remove tab from source
+        let tab = match self.editor_groups.get_mut(&src_group) {
+            Some(g) if tab_idx < g.tabs.len() => {
+                let t = g.tabs.remove(tab_idx);
+                if g.active_tab >= g.tabs.len() && !g.tabs.is_empty() {
+                    g.active_tab = g.tabs.len() - 1;
+                }
+                t
+            }
+            _ => return,
+        };
+        // Create new group with the removed tab
+        let new_id = self.new_group_id();
+        self.editor_groups.insert(new_id, EditorGroup::new(tab));
+        self.group_layout
+            .split_at(target_group, direction, new_id, new_first);
+        self.prev_active_group = Some(self.active_group);
+        self.active_group = new_id;
+        // If source group is now empty, close it
+        if self
+            .editor_groups
+            .get(&src_group)
+            .is_some_and(|g| g.tabs.is_empty())
+        {
+            self.close_group_by_id(src_group);
+        }
+    }
+
+    /// Reorder a tab within its group.
+    pub fn reorder_tab_in_group(&mut self, group_id: GroupId, from_idx: usize, to_idx: usize) {
+        if let Some(g) = self.editor_groups.get_mut(&group_id) {
+            if from_idx >= g.tabs.len() {
+                return;
+            }
+            let to = to_idx.min(g.tabs.len().saturating_sub(1));
+            if from_idx == to {
+                return;
+            }
+            let tab = g.tabs.remove(from_idx);
+            g.tabs.insert(to, tab);
+            g.active_tab = to;
+        }
+    }
+
+    /// Close a specific editor group by ID (removes windows, promotes sibling).
+    pub fn close_group_by_id(&mut self, group_id: GroupId) {
+        if self.group_layout.is_single_group() {
+            return;
+        }
+        if let Some(group) = self.editor_groups.get(&group_id) {
+            let window_ids: Vec<WindowId> =
+                group.tabs.iter().flat_map(|t| t.window_ids()).collect();
+            for wid in window_ids {
+                self.windows.remove(&wid);
+            }
+        }
+        self.editor_groups.remove(&group_id);
+        self.group_layout.remove(group_id);
+        if self.active_group == group_id {
+            self.active_group = self.group_layout.group_ids()[0];
         }
     }
 
