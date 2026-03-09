@@ -11,7 +11,7 @@ There's a touch of irony here - using a cli tool to write the editor that I've w
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 2822+ tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 2908+ tests, zero async runtime dependency
 
 > **Note:** VimCode does not implement VimScript. Extension and scripting is handled via
 > the built-in Lua 5.4 plugin system. The goal is full Vim *keybinding* and *editing*
@@ -622,9 +622,9 @@ Then `:Hello world` shows "Hello from Lua! world" in the status bar.
 | `:Plugin reload` | Reload all plugins from disk |
 | `:Plugin enable <name>` | Enable a previously disabled plugin |
 | `:Plugin disable <name>` | Disable a plugin (persisted in settings) |
-| `:Commentary [N]` | Toggle comment on N lines from cursor (Commentary plugin) |
+| `:Comment [N]` | Toggle comment on N lines from cursor (core feature, 46+ languages; `:Commentary` alias) |
 | `:map` | List all user-defined key mappings |
-| `:map n <C-/> :Commentary` | Add a key mapping (persisted to settings.json) |
+| `:map n <C-/> :Comment` | Add a key mapping (persisted to settings.json) |
 | `:unmap n <C-/>` | Remove a key mapping |
 
 Plugins are loaded in alphabetical order on startup. Security: plugins have unrestricted file and process access (same trust model as Neovim).
@@ -658,7 +658,7 @@ No C# Language Support extension — :ExtInstall csharp  (N to dismiss)
 | `yaml` | YAML | yaml-language-server | — |
 | `markdown` | Markdown | marksman | — |
 | `git-insights` | (all files) | — | — |
-| `commentary` | (all files) | — | — |
+| `commentary` | (all files, dormant — core handles comment toggling) | — | — |
 
 **Extensions sidebar panel** — click the extensions icon (󱧅) in the activity bar to open a VSCode-style panel with two sections:
 - **INSTALLED** — extensions currently installed; press `Enter` to view info, `d` to remove
@@ -876,9 +876,9 @@ Only specify keys you want to change — unspecified keys keep their defaults.
 
 ```json
 "keymaps": [
-  "n <C-/> :Commentary",
-  "v <C-/> :Commentary",
-  "n gcc :Commentary {count}",
+  "n <C-/> :Comment",
+  "v <C-/> :Comment",
+  "n gcc :Comment {count}",
   "n <leader>f :Lformat"
 ]
 ```
@@ -907,14 +907,16 @@ Switch the editor into a **non-modal editing** mode that works like a standard t
 - `Ctrl-Z` / `Ctrl-Y` — undo / redo
 - `Ctrl-A` — select all
 - `Ctrl-S` — save
-- `Ctrl-/` — toggle line comment (`// `)
+- `Ctrl-/` — toggle line comment (language-aware, 46+ languages)
 - `Shift+Arrow` — extend selection one character/line at a time
 - `Ctrl+Arrow` — move by word
 - `Ctrl+Shift+Arrow` — extend selection by word
 - `Home` — smart home (first non-whitespace; again → col 0)
 - `Shift+Home` / `Shift+End` — extend selection to line start/end
 - `Escape` — clear selection (stays in insert)
+- `Ctrl-Q` — quit
 - `F1` — open the command bar (run any `:` command, then returns to EDIT mode)
+- `F10` — toggle menu bar visibility
 - Typing while a selection is active **replaces** the selection
 - Status bar shows `EDIT  F1:cmd  Alt-M:vim` (or `SELECT` when text is selected, `COMMAND` in command bar)
 
@@ -1016,7 +1018,7 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `=` operator | Auto-indent range (`==` current line, `=G` to end, `=gg` whole file) |
 | `d`/`c`/`y` + motion | Full operator+motion support: `dj`/`dk`/`dG`/`dgg`/`d{`/`d}`/`d(`/`d)`/`dW`/`dB`/`dE`/`d^`/`dh`/`dl`/`dH`/`dM`/`dL`/`df`/`dt`/`dF`/`dT`/`d;`/`d,`/`dge` |
 | `g~`/`gu`/`gU` + motion | Case operators: all motions (`g~j`, `guw`, `gUG`, `gufx`, etc.) |
-| `gcc` / `gc` (visual) | Toggle line comments (Commentary plugin — 40+ languages) |
+| `gcc` / `gc` (visual) | Toggle line comments (core feature — 46+ languages, block comments for HTML/CSS/XML) |
 | `>`/`<` + motion | Indent/dedent: all motions (`>j`, `>G`, `>}`, etc.) |
 | `gp` / `gP` | Paste after / before, leave cursor after pasted text |
 | `]p` / `[p` | Paste after / before with indent adjusted to current line |
@@ -1196,6 +1198,7 @@ All ex commands support Vim-style abbreviations (e.g., `:j` for `:join`, `:y` fo
 | `:LspInstall <lang>` | Install LSP server for language via Mason |
 | `:Lformat` | Format buffer via LSP |
 | `:Rename <newname>` | Rename symbol under cursor across workspace |
+| `:Comment [N]` | Toggle comment on N lines (46+ languages; `:Commentary` alias) |
 | `:DapInstall <lang>` | Install debug adapter for language |
 | `:DapInfo` | Show detected DAP adapters |
 | `:DapEval <expr>` | Evaluate expression in current debug frame |

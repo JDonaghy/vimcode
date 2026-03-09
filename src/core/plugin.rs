@@ -101,6 +101,8 @@ pub struct PluginCallContext {
     pub delete_lines: Vec<usize>,
     /// Registers to set: `(char, content, is_linewise)`.
     pub set_registers: Vec<(char, String, bool)>,
+    /// Comment style overrides: `(lang_id, line, block_open, block_close)`.
+    pub comment_style_overrides: Vec<(String, String, String, String)>,
 }
 
 // ─── Internal registration accumulator ───────────────────────────────────────
@@ -765,6 +767,21 @@ impl PluginManager {
         )?;
 
         vimcode.set("git", git_tbl)?;
+
+        // ── vimcode.set_comment_style(lang_id, opts) ────────────────────────
+        vimcode.set(
+            "set_comment_style",
+            lua.create_function(|lua, (lang_id, opts): (String, LuaTable)| {
+                let line: String = opts.get("line").unwrap_or_default();
+                let block_open: String = opts.get("block_open").unwrap_or_default();
+                let block_close: String = opts.get("block_close").unwrap_or_default();
+                if let Some(mut ctx) = lua.app_data_mut::<PluginCallContext>() {
+                    ctx.comment_style_overrides
+                        .push((lang_id, line, block_open, block_close));
+                }
+                Ok(())
+            })?,
+        )?;
 
         lua.globals().set("vimcode", vimcode)?;
         Ok(())

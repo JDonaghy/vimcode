@@ -8642,6 +8642,11 @@ fn translate_key(event: KeyEvent, keyboard_enhanced: bool) -> Option<(String, Op
                     // 0x1C as KeyCode::Char('4')+CONTROL (formula: 0x1C-0x1C+'4'='4').
                     // Map both to "backslash" so Ctrl+\ works in all terminals.
                     "backslash".to_string()
+                } else if lower == '/' || (!keyboard_enhanced && lower == '7') {
+                    // Ctrl+/ sends byte 0x1F; without keyboard enhancement crossterm
+                    // decodes 0x1F as KeyCode::Char('7')+CONTROL (formula: 0x1F-0x1C+'4'='7').
+                    // Map both to "slash" so Ctrl+/ works in all terminals.
+                    "slash".to_string()
                 } else if c.is_uppercase() || shift {
                     lower.to_ascii_uppercase().to_string()
                 } else {

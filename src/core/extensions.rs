@@ -157,6 +157,20 @@ pub struct ExtensionManifest {
     /// E.g. `["Cargo.toml"]` for Rust, `["go.mod"]` for Go.
     #[serde(default)]
     pub workspace_markers: Vec<String>,
+    /// Optional comment style override for languages handled by this extension.
+    #[serde(default)]
+    pub comment: Option<CommentConfig>,
+}
+
+/// Comment style override specified in an extension manifest `[comment]` section.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct CommentConfig {
+    #[serde(default)]
+    pub line: String,
+    #[serde(default)]
+    pub block_open: String,
+    #[serde(default)]
+    pub block_close: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

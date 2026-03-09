@@ -1,9 +1,9 @@
 # VimCode Project State
 
-**Last updated:** Mar 8, 2026 (Session 154b — Keymaps Editor + toggle_comment_range undo fix) | **Tests:** 2822
+**Last updated:** Mar 9, 2026 (Session 155 — Core Commentary Feature) | **Tests:** 2908
 
 > Feature documentation lives in **README.md**.
-> Per-session implementation notes through Session 152 are in **SESSION_HISTORY.md**.
+> Per-session implementation notes through Session 154 are in **SESSION_HISTORY.md**.
 
 ---
 
@@ -26,7 +26,7 @@ When implementing a new key/command, add tests covering:
 
 ## Recent Work
 
-**Session 154 — Keymaps Editor in Settings Panel + toggle_comment_range undo fix (2822 tests):**
-"User Keymaps" row in the Settings sidebar panel (new `BufferEditor` setting type) — pressing Enter (or `:Keymaps` command) opens a scratch buffer pre-filled with current keymaps (one per line, `mode keys :command` format). `:w` validates each line, rejects invalid entries with line-specific errors, updates `settings.keymaps`, calls `rebuild_user_keymaps()`, and saves. Tab title shows `[Keymaps]`. Buffer reuse on re-open. GTK "Edit…" button + count label; TUI "N defined ▸" display. 11 integration tests in `tests/keymaps_editor.rs`. **Bug fix:** `toggle_comment_range()` (used by visual `gc`) was mutating the buffer directly (`buffer_mut().delete_range()`/`insert()`) without recording undo operations — replaced with `delete_with_undo()`/`insert_with_undo()`. 2 new undo tests in `tests/extensions.rs`.
+**Session 155 — Core Commentary Feature (2908 tests):**
+Unified comment toggling from three separate implementations (Lua plugin, Rust `toggle_comment_range()`, Rust `vscode_toggle_line_comment()`) into a single core module `src/core/comment.rs`. New `CommentStyle`/`CommentStyleOwned` types, `comment_style_for_language()` table covering 46+ languages (including block comments for HTML/CSS/XML), two-pass `compute_toggle_edits()` algorithm, `resolve_comment_style()` override chain (plugin → extension manifest → built-in → fallback `#`). Added `CommentConfig` to `ExtensionManifest` in `extensions.rs`. New `toggle_comment()` method on Engine replaces old `toggle_comment_range()` and `vscode_toggle_line_comment()`. Rewired `gcc`, visual `gc`, and VSCode `Ctrl+/` to use the new core. Added `:Comment` command (`:Commentary` kept as alias). Plugin API: `vimcode.set_comment_style(lang_id, {line, block_open, block_close})`. Fixed Ctrl+/ in GTK (key name `"slash"` not `"/"`) and TUI (crossterm byte 0x1F → `Char('7')` mapping). VSCode mode: added Ctrl+Q quit, F10 menu toggle, menu visible by default. 19 unit tests in `comment.rs`, 31 integration tests in `tests/commentary.rs`.
 
-> Sessions 153 and earlier archived in **SESSION_HISTORY.md**.
+> Sessions 154 and earlier archived in **SESSION_HISTORY.md**.

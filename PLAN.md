@@ -5,6 +5,7 @@
 ---
 
 ## Recently Completed
+- **Session 155**: Core Commentary Feature — unified comment toggling into `src/core/comment.rs` (46+ language table, two-pass algorithm, override chain), `:Comment`/`:Commentary` commands, `vimcode.set_comment_style()` plugin API, Ctrl+/ fix for GTK+TUI, VSCode Ctrl+Q/F10, 19+31 tests
 - **Session 154**: Keymaps editor in settings panel — `BufferEditor` setting type, scratch buffer with validation, `:Keymaps` command, GTK button + TUI display, 11 tests
 - **Session 153**: Richer Lua Plugin API + VimCode Commentary + User Keymaps — Extended plugin API (cursor write, settings access, state queries, buffer insert/delete, register write, 7 new autocmd events, `set_mode()` refactor, visual/command keymap fallbacks); VimCode Commentary bundled extension (gcc/gc/`:Commentary`, 40+ language comment strings, undo support); plugin `set_lines` undo fix; user-configurable keymaps in settings.json (`"mode keys :command"` format, multi-key sequences, override built-in keys, `{count}` substitution); 22 + 17 + 13 = 52 new tests (2801 total)
 - **Session 152**: Visual paste — `p`/`P` in visual mode replaces selection with register content; `"x` register selection in visual mode; `Ctrl+Shift+V` clipboard paste in Normal/Visual (TUI+GTK); TUI tab bar fix (breadcrumbs y-offset); multi-group `Ctrl-W h/l` navigates between groups before overflowing to sidebar; pre-existing test fix (`swap_scan_stale`); 8 tests

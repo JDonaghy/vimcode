@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use super::ai::AiMessage;
 use super::buffer::{Buffer, BufferId};
 use super::buffer_manager::{BufferManager, BufferState, UndoEntry};
+use super::comment;
 use super::dap::{BreakpointInfo, DapEvent, DapVariable, StackFrame};
 use super::dap_manager::{
     generate_launch_json, parse_launch_json, parse_tasks_json, task_to_shell_command,
@@ -1127,6 +1128,11 @@ pub struct Engine {
     /// Manages loaded Lua plugins. `None` if no plugins dir or plugins disabled.
     pub plugin_manager: Option<plugin::PluginManager>,
 
+    // --- Comment toggling ---
+    /// Runtime overrides for comment styles, keyed by LSP language ID.
+    /// Populated from extension manifests and `vimcode.set_comment_style()` Lua API.
+    pub comment_overrides: HashMap<String, comment::CommentStyleOwned>,
+
     // --- Fuzzy file finder ---
     /// Project root directory for the fuzzy finder.
     pub cwd: PathBuf,
@@ -1638,6 +1644,7 @@ impl Engine {
             sc_commit_input_active: false,
             sc_button_focused: None,
             plugin_manager: None,
+            comment_overrides: HashMap::new(),
             cwd,
             tab_switcher_open: false,
             tab_switcher_selected: 0,
@@ -1776,9 +1783,10 @@ impl Engine {
             swap_last_write: std::time::Instant::now(),
             swap_recovery: None,
         };
-        // If vscode mode is configured, start in Insert mode (no Normal mode)
+        // If vscode mode is configured, start in Insert mode with menu visible
         if engine.is_vscode_mode() {
             engine.mode = Mode::Insert;
+            engine.menu_bar_visible = true;
         }
         engine.rebuild_user_keymaps();
         engine
@@ -6896,8 +6904,8 @@ impl Engine {
             '\x03' => {
                 if let Some('c') = unicode {
                     let count = self.take_count().max(1);
-                    let cmd = format!("Commentary {count}");
-                    let _ = self.execute_command(&cmd);
+                    let line = self.view().cursor.line + 1; // 1-indexed
+                    self.toggle_comment(line, line + count - 1);
                     *changed = true;
                 }
             }
@@ -10776,11 +10784,11 @@ impl Engine {
                 // gc in visual mode: toggle comment on selected lines
                 self.count = None;
                 if let Some((start, end)) = self.get_visual_selection_range() {
-                    let start_line = start.line + 1; // 1-indexed for :Commentary
+                    let start_line = start.line + 1; // 1-indexed
                     let end_line = end.line + 1;
                     self.mode = Mode::Normal;
                     self.visual_anchor = None;
-                    self.toggle_comment_range(start_line, end_line);
+                    self.toggle_comment(start_line, end_line);
                     *changed = true;
                 }
                 return EngineAction::None;
@@ -12810,6 +12818,8 @@ impl Engine {
                     }
                 }
                 self.plugin_manager = Some(mgr);
+                // Populate comment style overrides from installed extension manifests
+                self.populate_comment_overrides();
                 // Fire VimEnter event after plugin initialization is complete
                 self.plugin_event("VimEnter", "");
             }
@@ -13102,6 +13112,17 @@ impl Engine {
                     }
                 }
             });
+        }
+        // Apply comment style overrides (highest priority — from plugin runtime)
+        for (lang_id, line, block_open, block_close) in ctx.comment_style_overrides {
+            self.comment_overrides.insert(
+                lang_id,
+                comment::CommentStyleOwned {
+                    line,
+                    block_open,
+                    block_close,
+                },
+            );
         }
     }
 
@@ -15230,6 +15251,22 @@ impl Engine {
                     }
                     return self.execute_command("retab");
                 }
+                // Built-in :Comment / :Commentary command
+                if cmd == "Comment"
+                    || cmd.starts_with("Comment ")
+                    || cmd == "Commentary"
+                    || cmd.starts_with("Commentary ")
+                {
+                    let args = if let Some(rest) = cmd.strip_prefix("Commentary") {
+                        rest.trim()
+                    } else {
+                        cmd.strip_prefix("Comment").unwrap().trim()
+                    };
+                    let count: usize = args.parse().unwrap_or(1).max(1);
+                    let line = self.view().cursor.line + 1; // 1-indexed
+                    self.toggle_comment(line, line + count - 1);
+                    return EngineAction::None;
+                }
                 // Try plugin commands before giving up
                 let (cmd_name, cmd_args) = cmd.split_once(' ').unwrap_or((cmd, ""));
                 if self.plugin_run_command(cmd_name, cmd_args) {
@@ -16670,105 +16707,91 @@ impl Engine {
         *changed = true;
     }
 
-    /// Format (reflow) lines to textwidth. If textwidth is 0, uses 79 as default.
-    /// Lines are joined and re-wrapped at word boundaries.
-    /// Toggle line comments on a range of lines (1-indexed).
-    /// The comment string is determined by the active buffer's language ID.
-    /// If all non-blank lines are already commented, they are uncommented;
-    /// otherwise all lines receive the comment prefix.
-    pub fn toggle_comment_range(&mut self, start_1: usize, end_1: usize) {
+    /// Toggle comments on a range of lines (1-indexed, inclusive).
+    ///
+    /// Resolves comment style from overrides → built-in table → fallback `#`.
+    /// Uses line comments when available, block comments otherwise.
+    /// All non-blank lines are toggled: if all are already commented, uncomment;
+    /// otherwise add comment markers.
+    pub fn toggle_comment(&mut self, start_1: usize, end_1: usize) {
         let buf_id = self.active_buffer_id();
         let lang_id = self
             .buffer_manager
             .get(buf_id)
-            .and_then(|s| s.lsp_language_id.clone())
+            .and_then(|s| {
+                s.lsp_language_id.clone().or_else(|| {
+                    s.file_path
+                        .as_ref()
+                        .and_then(|p| lsp::language_id_from_path(p))
+                })
+            })
             .unwrap_or_default();
 
-        let cs = match lang_id.as_str() {
-            "rust" | "go" | "c" | "cpp" | "csharp" | "java" | "javascript" | "typescript"
-            | "typescriptreact" | "javascriptreact" | "php" | "swift" | "kotlin" | "scala"
-            | "dart" | "jsonc" => "//",
-            "python" | "ruby" | "shellscript" | "bash" | "yaml" | "toml" | "dockerfile"
-            | "perl" | "r" => "#",
-            "lua" | "sql" | "haskell" => "--",
-            "tex" | "latex" => "%",
-            "lisp" | "scheme" | "clojure" => ";",
-            "vim" => "\"",
-            _ => "#",
-        };
+        let style = comment::resolve_comment_style(&lang_id, &self.comment_overrides);
 
         let total = self.buffer().len_lines();
         let start = (start_1.saturating_sub(1)).min(total.saturating_sub(1));
         let end = (end_1.saturating_sub(1)).min(total.saturating_sub(1));
 
         // Collect line texts
-        let mut lines: Vec<String> = Vec::new();
-        for i in start..=end {
-            lines.push(self.buffer().content.line(i).to_string());
-        }
+        let lines_owned: Vec<String> = (start..=end)
+            .map(|i| self.buffer().content.line(i).to_string())
+            .collect();
+        let lines_ref: Vec<&str> = lines_owned.iter().map(|s| s.as_str()).collect();
 
-        // Determine if all non-blank lines are commented
-        let mut all_commented = true;
-        let mut has_content = false;
-        for line in &lines {
-            let trimmed = line.trim_start();
-            let trimmed = trimmed.trim_end_matches('\n').trim_end_matches('\r');
-            if trimmed.is_empty() {
-                continue;
-            }
-            has_content = true;
-            if !trimmed.starts_with(&format!("{cs} ")) && !trimmed.starts_with(cs) {
-                all_commented = false;
-                break;
-            }
-        }
-
-        if !has_content {
-            return;
-        }
+        let edits = match comment::compute_toggle_edits(
+            &lines_ref,
+            &style.line,
+            &style.block_open,
+            &style.block_close,
+        ) {
+            Some(e) => e,
+            None => return,
+        };
 
         self.start_undo_group();
-        for (i, line) in lines.iter().enumerate() {
-            let line_idx = start + i;
+        // Apply edits in reverse order so char offsets remain valid
+        for edit in edits.iter().rev() {
+            let line_idx = start + edit.line_idx;
             let line_start = self.buffer().line_to_char(line_idx);
             let line_end = if line_idx + 1 < self.buffer().len_lines() {
                 self.buffer().line_to_char(line_idx + 1)
             } else {
                 self.buffer().len_chars()
             };
-
-            // Parse indent and rest
-            let trimmed_start = line.len() - line.trim_start().len();
-            let indent = &line[..trimmed_start];
-            let rest = line[trimmed_start..]
-                .trim_end_matches('\n')
-                .trim_end_matches('\r');
-
-            if rest.is_empty() {
-                continue; // skip blank lines
-            }
-
-            let cs_space = format!("{cs} ");
-            let new_rest = if all_commented {
-                // Uncomment
-                if let Some(stripped) = rest.strip_prefix(&cs_space) {
-                    stripped.to_string()
-                } else if let Some(stripped) = rest.strip_prefix(cs) {
-                    stripped.to_string()
-                } else {
-                    rest.to_string()
-                }
-            } else {
-                // Comment
-                format!("{cs} {rest}")
-            };
-
-            let new_line = format!("{indent}{new_rest}\n");
+            let new_line = format!("{}\n", edit.new_text);
             self.delete_with_undo(line_start, line_end);
             self.insert_with_undo(line_start, &new_line);
         }
         self.finish_undo_group();
         self.set_dirty(true);
+    }
+
+    /// Populate `comment_overrides` from installed extension manifests.
+    /// Called once at plugin init time; manifest `[comment]` sections with
+    /// non-empty `line` or `block_open` are applied for each `language_id`.
+    fn populate_comment_overrides(&mut self) {
+        for manifest in self.ext_available_manifests() {
+            if !self.extension_state.is_installed(&manifest.name) {
+                continue;
+            }
+            if let Some(cc) = &manifest.comment {
+                if cc.line.is_empty() && cc.block_open.is_empty() {
+                    continue;
+                }
+                let style = comment::CommentStyleOwned {
+                    line: cc.line.clone(),
+                    block_open: cc.block_open.clone(),
+                    block_close: cc.block_close.clone(),
+                };
+                for lang_id in &manifest.language_ids {
+                    // Don't overwrite runtime (plugin) overrides
+                    self.comment_overrides
+                        .entry(lang_id.clone())
+                        .or_insert_with(|| style.clone());
+                }
+            }
+        }
     }
 
     fn format_lines(&mut self, start_line: usize, end_line: usize, changed: &mut bool) {
@@ -26550,11 +26573,12 @@ impl Engine {
         // Clear any selection
         self.visual_anchor = None;
         // Set appropriate base mode
-        self.mode = if self.is_vscode_mode() {
-            Mode::Insert
+        if self.is_vscode_mode() {
+            self.mode = Mode::Insert;
+            self.menu_bar_visible = true;
         } else {
-            Mode::Normal
-        };
+            self.mode = Mode::Normal;
+        }
         let _ = self.settings.save();
     }
 
@@ -26874,63 +26898,6 @@ impl Engine {
         }
     }
 
-    // ── Comment toggle ───────────────────────────────────────────────────────
-
-    /// Ctrl-/: toggle `// ` line comment on the current line (or visual range).
-    fn vscode_toggle_line_comment(&mut self, changed: &mut bool) {
-        let (start_line, end_line) = if self.visual_anchor.is_some() {
-            match self.get_visual_selection_range() {
-                Some((start, end)) => (start.line, end.line),
-                None => {
-                    let l = self.view().cursor.line;
-                    (l, l)
-                }
-            }
-        } else {
-            let l = self.view().cursor.line;
-            (l, l)
-        };
-
-        // Check if every line in the range already starts with `// ` (after whitespace).
-        let all_commented = (start_line..=end_line).all(|ln| {
-            let line_str = self.buffer().content.line(ln).to_string();
-            let trimmed = line_str.trim_start_matches([' ', '\t']);
-            trimmed.starts_with("// ")
-        });
-
-        if all_commented {
-            // Remove `// ` from each line (reverse to keep indices valid).
-            for ln in (start_line..=end_line).rev() {
-                let line_str = self.buffer().content.line(ln).to_string();
-                let ws_len: usize = line_str
-                    .chars()
-                    .take_while(|&c| c == ' ' || c == '\t')
-                    .count();
-                let rest = &line_str[ws_len..];
-                if rest.starts_with("// ") {
-                    let start_char = self.buffer().line_to_char(ln) + ws_len;
-                    self.delete_with_undo(start_char, start_char + 3);
-                }
-            }
-        } else {
-            // Prepend `// ` after leading whitespace (reverse to keep indices valid).
-            for ln in (start_line..=end_line).rev() {
-                let line_str = self.buffer().content.line(ln).to_string();
-                let ws_len: usize = line_str
-                    .chars()
-                    .take_while(|&c| c == ' ' || c == '\t')
-                    .count();
-                // Don't comment empty / whitespace-only lines.
-                if ws_len < line_str.trim_end_matches('\n').len() {
-                    let insert_char = self.buffer().line_to_char(ln) + ws_len;
-                    self.insert_with_undo(insert_char, "// ");
-                }
-            }
-        }
-
-        *changed = true;
-    }
-
     // ── Main VSCode key dispatcher ───────────────────────────────────────────
 
     fn handle_vscode_key(
@@ -26949,7 +26916,7 @@ impl Engine {
 
         // Start an undo group for this keystroke.  Each sub-helper that
         // manages its own undo group (vscode_cut line-cut, vscode_paste,
-        // vscode_toggle_line_comment) relies on this outer group; helpers
+        // toggle_comment) relies on this outer group; helpers
         // that used to have inner calls have had them removed.
         self.start_undo_group();
 
@@ -27011,8 +26978,27 @@ impl Engine {
                 "BackSpace" => {
                     self.vscode_delete_word_backward(&mut changed);
                 }
-                "/" => {
-                    self.vscode_toggle_line_comment(&mut changed);
+                "q" => {
+                    // Ctrl+Q: quit (like VSCode)
+                    self.finish_undo_group();
+                    return self.execute_command("quit_menu");
+                }
+                "/" | "slash" => {
+                    // Toggle line comment using unified comment system
+                    let (start_line, end_line) = if self.visual_anchor.is_some() {
+                        match self.get_visual_selection_range() {
+                            Some((start, end)) => (start.line, end.line),
+                            None => {
+                                let l = self.view().cursor.line;
+                                (l, l)
+                            }
+                        }
+                    } else {
+                        let l = self.view().cursor.line;
+                        (l, l)
+                    };
+                    self.toggle_comment(start_line + 1, end_line + 1);
+                    changed = true;
                 }
                 _ => {}
             }
@@ -27078,6 +27064,10 @@ impl Engine {
                     self.mode = Mode::Command;
                     self.command_buffer.clear();
                     self.message.clear();
+                }
+                "F10" => {
+                    // Toggle menu bar visibility
+                    self.toggle_menu_bar();
                 }
                 "BackSpace" => {
                     if self.visual_anchor.is_some() {
@@ -36447,6 +36437,13 @@ mod tests {
     #[test]
     fn test_vscode_mode_comment_toggle() {
         let mut engine = make_vscode_engine("hello");
+        // Set language so comment style is // (not fallback #)
+        let buf_id = engine.active_buffer_id();
+        engine
+            .buffer_manager
+            .get_mut(buf_id)
+            .unwrap()
+            .lsp_language_id = Some("rust".to_string());
         // Ctrl+/ should add "// " prefix
         vscode_key(&mut engine, "/", Some('/'), true);
         let text = engine.buffer().to_string();
@@ -36462,6 +36459,14 @@ mod tests {
             text2.starts_with("hello"),
             "Expected 'hello', got {:?}",
             text2
+        );
+        // Also test with "slash" key_name (GTK/TUI send this)
+        vscode_key(&mut engine, "slash", None, true);
+        let text3 = engine.buffer().to_string();
+        assert!(
+            text3.starts_with("// hello"),
+            "Expected '// hello' via slash key_name, got {:?}",
+            text3
         );
     }
 

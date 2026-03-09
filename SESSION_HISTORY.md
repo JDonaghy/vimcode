@@ -1,9 +1,12 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 153 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 154 archived here. Recent work summary in PROJECT_STATE.md.
 
 ---
+
+**Session 154 — Keymaps Editor in Settings Panel + toggle_comment_range undo fix (2822 tests):**
+"User Keymaps" row in the Settings sidebar panel (new `BufferEditor` setting type) — pressing Enter (or `:Keymaps` command) opens a scratch buffer pre-filled with current keymaps (one per line, `mode keys :command` format). `:w` validates each line, rejects invalid entries with line-specific errors, updates `settings.keymaps`, calls `rebuild_user_keymaps()`, and saves. Tab title shows `[Keymaps]`. Buffer reuse on re-open. GTK "Edit…" button + count label; TUI "N defined ▸" display. 11 integration tests in `tests/keymaps_editor.rs`. **Bug fix:** `toggle_comment_range()` (used by visual `gc`) was mutating the buffer directly (`buffer_mut().delete_range()`/`insert()`) without recording undo operations — replaced with `delete_with_undo()`/`insert_with_undo()`. 2 new undo tests in `tests/extensions.rs`.
 
 **Session 153 — Richer Lua Plugin API + VimCode Commentary + User Keymaps (2809 tests):**
 Plugin API expansion: Extended `PluginCallContext` with new input/output fields. New Lua APIs: `vimcode.buf.set_cursor(line,col)`, `vimcode.buf.insert_line(n,text)`, `vimcode.buf.delete_line(n)`, `vimcode.opt.get(key)`/`vimcode.opt.set(key,value)`, `vimcode.state.mode()`/`register(char)`/`set_register(char,content,linewise)`/`mark(char)`/`filetype()`. New autocmd events: `BufWrite`, `BufNew`, `BufEnter`, `InsertEnter`, `InsertLeave`, `ModeChanged`, `VimEnter`. Centralized `set_mode()` method fires mode-change events. Visual/command mode keymap fallbacks. Plugin `set_lines` now records undo operations. VimCode Commentary: bundled extension (`extensions/commentary/`) inspired by tpope's vim-commentary — `gcc` toggles comment (count-aware), `gc` in visual mode toggles selection, `:Commentary [N]` command, 40+ language comment strings, engine-level `toggle_comment_range()` with undo group. User-configurable keymaps: `keymaps: Vec<String>` in settings.json, `UserKeymap` struct, multi-key sequence support with replay, `{count}` substitution, `:map`/`:unmap` commands. 22 + 17 + 13 = 52 new tests.

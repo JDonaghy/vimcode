@@ -971,7 +971,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
             MenuItemData {
                 label: "Quit",
                 shortcut: "",
-                vscode_shortcut: "",
+                vscode_shortcut: "Ctrl+Q",
                 action: "quit_menu",
                 enabled: true,
                 separator: false,

@@ -1,6 +1,7 @@
 pub mod ai;
 pub mod buffer;
 pub mod buffer_manager;
+pub mod comment;
 pub mod cursor;
 pub mod dap;
 pub mod dap_manager;
