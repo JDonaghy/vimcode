@@ -243,6 +243,30 @@ pub struct Settings {
     /// When true, panels appear on demand via Ctrl-W l and hide again when unfocused.
     #[serde(default)]
     pub autohide_panels: bool,
+
+    /// Show indent guide lines at each indentation level.
+    #[serde(default = "default_indent_guides")]
+    pub indent_guides: bool,
+
+    /// Highlight matching brackets when cursor is on one.
+    #[serde(default = "default_match_brackets")]
+    pub match_brackets: bool,
+
+    /// Auto-close brackets and quotes in Insert mode.
+    #[serde(default = "default_auto_pairs")]
+    pub auto_pairs: bool,
+}
+
+fn default_indent_guides() -> bool {
+    true
+}
+
+fn default_match_brackets() -> bool {
+    true
+}
+
+fn default_auto_pairs() -> bool {
+    true
 }
 
 fn default_swap_file() -> bool {
@@ -605,6 +629,9 @@ impl Default for Settings {
             updatetime: default_updatetime(),
             breadcrumbs: default_breadcrumbs(),
             autohide_panels: false,
+            indent_guides: default_indent_guides(),
+            match_brackets: default_match_brackets(),
+            auto_pairs: default_auto_pairs(),
         }
     }
 }
@@ -831,6 +858,9 @@ impl Settings {
             "swapfile" => self.swap_file = enable,
             "breadcrumbs" => self.breadcrumbs = enable,
             "autohidepanels" => self.autohide_panels = enable,
+            "indentguides" => self.indent_guides = enable,
+            "matchbrackets" => self.match_brackets = enable,
+            "autopairs" => self.auto_pairs = enable,
             _ => return Err(format!("Unknown option: {opt}")),
         }
         Ok(())
@@ -1001,6 +1031,21 @@ impl Settings {
             } else {
                 "noautohidepanels".to_string()
             }),
+            "indentguides" => Ok(if self.indent_guides {
+                "indentguides".to_string()
+            } else {
+                "noindentguides".to_string()
+            }),
+            "matchbrackets" => Ok(if self.match_brackets {
+                "matchbrackets".to_string()
+            } else {
+                "nomatchbrackets".to_string()
+            }),
+            "autopairs" => Ok(if self.auto_pairs {
+                "autopairs".to_string()
+            } else {
+                "noautopairs".to_string()
+            }),
             _ => Err(format!("Unknown option: {opt}")),
         }
     }
@@ -1088,6 +1133,9 @@ impl Settings {
             "updatetime" | "ut" => self.updatetime.to_string(),
             "breadcrumbs" => self.breadcrumbs.to_string(),
             "autohide_panels" | "autohidepanels" => self.autohide_panels.to_string(),
+            "indent_guides" | "indentguides" => self.indent_guides.to_string(),
+            "match_brackets" | "matchbrackets" => self.match_brackets.to_string(),
+            "auto_pairs" | "autopairs" => self.auto_pairs.to_string(),
             _ => String::new(),
         }
     }
@@ -1180,6 +1228,9 @@ impl Settings {
             }
             "breadcrumbs" => self.breadcrumbs = value == "true",
             "autohide_panels" | "autohidepanels" => self.autohide_panels = value == "true",
+            "indent_guides" | "indentguides" => self.indent_guides = value == "true",
+            "match_brackets" | "matchbrackets" => self.match_brackets = value == "true",
+            "auto_pairs" | "autopairs" => self.auto_pairs = value == "true",
             _ => return Err(format!("Unknown setting key: {key}")),
         }
         Ok(())
@@ -1528,6 +1579,27 @@ pub static SETTING_DEFS: &[SettingDef] = &[
         label: "Inline Completions",
         description: "Show AI ghost-text completions at the cursor in insert mode (Tab to accept, Alt+]/Alt+[ to cycle alternatives)",
         category: "AI",
+        setting_type: SettingType::Bool,
+    },
+    SettingDef {
+        key: "indent_guides",
+        label: "Indent Guides",
+        description: "Show vertical lines at each indentation level",
+        category: "Editor",
+        setting_type: SettingType::Bool,
+    },
+    SettingDef {
+        key: "match_brackets",
+        label: "Match Brackets",
+        description: "Highlight matching bracket when cursor is on a bracket character",
+        category: "Editor",
+        setting_type: SettingType::Bool,
+    },
+    SettingDef {
+        key: "auto_pairs",
+        label: "Auto Pairs",
+        description: "Auto-close brackets and quotes in Insert mode",
+        category: "Editor",
         setting_type: SettingType::Bool,
     },
     // ── TUI ─────────────────────────────────────────────────────────────────

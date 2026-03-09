@@ -7658,6 +7658,35 @@ fn draw_window(
             pangocairo::show_layout(cr, layout);
         }
 
+        // Indent guides: thin vertical lines at each guide column
+        if !rl.indent_guides.is_empty() {
+            cr.set_line_width(1.0);
+            for &guide_col in &rl.indent_guides {
+                let is_active = rw.active_indent_col == Some(guide_col);
+                let (gr, gg, gb) = if is_active {
+                    theme.indent_guide_active_fg.to_cairo()
+                } else {
+                    theme.indent_guide_fg.to_cairo()
+                };
+                cr.set_source_rgb(gr, gg, gb);
+                let gx = text_x_offset + guide_col as f64 * char_width;
+                cr.move_to(gx, y);
+                cr.line_to(gx, y + line_height);
+                cr.stroke().ok();
+            }
+        }
+
+        // Bracket match highlighting
+        for &(bm_view_line, bm_col) in &rw.bracket_match_positions {
+            if bm_view_line == view_idx {
+                let (br, bg_c, bb) = theme.bracket_match_bg.to_cairo();
+                cr.set_source_rgba(br, bg_c, bb, 0.6);
+                let bx = text_x_offset + bm_col as f64 * char_width;
+                cr.rectangle(bx, y, char_width, line_height);
+                cr.fill().ok();
+            }
+        }
+
         // Diagnostic underlines (wavy squiggles)
         for dm in &rl.diagnostics {
             let diag_color = match dm.severity {
@@ -10727,11 +10756,14 @@ fn pixel_to_click_target(
             .as_ref()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
-        !engine
-            .dap_breakpoints
-            .get(&key)
-            .is_none_or(|v| v.is_empty())
-            || engine.dap_session_active
+        #[allow(clippy::unnecessary_map_or)] // is_none_or requires Rust 1.82+
+        {
+            !engine
+                .dap_breakpoints
+                .get(&key)
+                .map_or(true, |v| v.is_empty())
+                || engine.dap_session_active
+        }
     };
     let gutter_char_width = render::calculate_gutter_cols(
         engine.settings.line_numbers,

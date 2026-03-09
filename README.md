@@ -11,7 +11,7 @@ There's a touch of irony here - using a cli tool to write the editor that I've w
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 2908+ tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 2937+ tests, zero async runtime dependency
 
 > **Note:** VimCode does not implement VimScript. Extension and scripting is handled via
 > the built-in Lua 5.4 plugin system. The goal is full Vim *keybinding* and *editing*
@@ -830,6 +830,9 @@ Additional options (set directly in `settings.json`):
 | `updatetime` | `4000` | Milliseconds between swap file writes for dirty buffers (`:set updatetime=N`) |
 | `breadcrumbs` | `true` | Show file path + symbol hierarchy bar below the tab bar (`:set breadcrumbs` / `:set nobreadcrumbs`) |
 | `autohide_panels` | `false` | TUI only: hide sidebar + activity bar at startup; `Ctrl-W h` reveals them, focus returns to editor auto-hides (`:set autohidepanels` / `:set noautohidepanels`) |
+| `indent_guides` | `true` | Show vertical indent guide lines at each tabstop level (`:set indentguides` / `:set noindentguides`) |
+| `match_brackets` | `true` | Highlight matching `(){}[]` bracket pair when cursor is on a bracket (`:set matchbrackets` / `:set nomatchbrackets`) |
+| `auto_pairs` | `true` | Auto-close brackets and quotes in Insert mode; typing closer skips over it; Backspace between pair deletes both (`:set autopairs` / `:set noautopairs`) |
 
 - `:set option?` — query current value (e.g. `:set ts?` → `tabstop=4`)
 - `:set option!` — toggle a boolean option (e.g. `:set wrap!`); `no<option>!` explicitly disables (e.g. `:set nowrap!`)

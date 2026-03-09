@@ -6703,6 +6703,32 @@ fn render_window(frame: &mut ratatui::Frame, area: Rect, window: &RenderedWindow
             line_bg,
         );
 
+        // Indent guides: draw │ at guide columns where the cell is a space
+        if !line.indent_guides.is_empty() {
+            let guide_fg = rc(theme.indent_guide_fg);
+            let active_fg = rc(theme.indent_guide_active_fg);
+            for &guide_col in &line.indent_guides {
+                if guide_col < window.scroll_left {
+                    continue;
+                }
+                let vis_col = (guide_col - window.scroll_left) as u16;
+                if vis_col >= text_width {
+                    break;
+                }
+                let cx = text_area_x + vis_col;
+                if cx < area.x + area.width && screen_y < area.y + area.height {
+                    let cell = frame.buffer_mut().get_mut(cx, screen_y);
+                    // Only draw guide if the cell is a space (don't overwrite text)
+                    if cell.symbol() == " " {
+                        let is_active = window.active_indent_col == Some(guide_col);
+                        let fg = if is_active { active_fg } else { guide_fg };
+                        cell.set_char('│');
+                        cell.set_fg(fg);
+                    }
+                }
+            }
+        }
+
         // Ghost continuation lines — draw full line in ghost colour.
         if line.is_ghost_continuation {
             if let Some(ghost) = &line.ghost_suffix {
@@ -6738,6 +6764,25 @@ fn render_window(frame: &mut ratatui::Frame, area: Rect, window: &RenderedWindow
                     let cell = frame.buffer_mut().get_mut(cx, screen_y);
                     cell.set_fg(diag_fg);
                     cell.modifier |= Modifier::UNDERLINED;
+                }
+            }
+        }
+
+        // Bracket match highlighting
+        let bracket_bg = rc(theme.bracket_match_bg);
+        for &(view_line, col) in &window.bracket_match_positions {
+            if view_line == row_idx {
+                if col < window.scroll_left {
+                    continue;
+                }
+                let vis_col = (col - window.scroll_left) as u16;
+                if vis_col >= text_width {
+                    continue;
+                }
+                let cx = text_area_x + vis_col;
+                if cx < area.x + area.width && screen_y < area.y + area.height {
+                    let cell = frame.buffer_mut().get_mut(cx, screen_y);
+                    cell.set_bg(bracket_bg);
                 }
             }
         }
@@ -10182,6 +10227,11 @@ fn rc(c: Color) -> RColor {
 /// string. Returns the total char count if `byte_offset` is past the end.
 fn byte_to_char_idx(text: &str, byte_offset: usize) -> usize {
     let clamped = byte_offset.min(text.len());
-    let safe = text.floor_char_boundary(clamped);
+    // Walk back from clamped to find a char boundary (avoids unstable
+    // `floor_char_boundary` which older Rust toolchains lack).
+    let mut safe = clamped;
+    while safe > 0 && !text.is_char_boundary(safe) {
+        safe -= 1;
+    }
     text[..safe].chars().count()
 }

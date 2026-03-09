@@ -1382,6 +1382,10 @@ pub struct Engine {
     /// Cleared by the UI backend after ~200 ms.
     pub yank_highlight: Option<(Cursor, Cursor, bool)>,
 
+    /// Matching bracket position (line, col) when cursor is on a bracket char.
+    /// Updated at the end of `handle_key()`.
+    pub bracket_match: Option<(usize, usize)>,
+
     // --- Insert mode Ctrl+r pending ---
     /// When true, the next keypress in Insert (or Replace) mode inserts a register's content.
     pub insert_ctrl_r_pending: bool,
@@ -1737,6 +1741,7 @@ impl Engine {
             last_ex_command: None,
             last_substitute: None,
             yank_highlight: None,
+            bracket_match: None,
             insert_ctrl_r_pending: false,
             insert_ctrl_g_pending: false,
             insert_ctrl_o_active: false,
@@ -5339,6 +5344,7 @@ impl Engine {
 
         self.ensure_cursor_visible();
         self.sync_scroll_binds();
+        self.update_bracket_match();
 
         // Fire cursor_move plugin hook when the cursor position changed.
         // Excluded from Insert mode: cursor moves caused by typing call git blame
@@ -9634,7 +9640,21 @@ impl Engine {
                     let col = self.view().cursor.col;
                     let char_idx = self.buffer().line_to_char(line) + col;
                     if col > 0 {
-                        self.delete_with_undo(char_idx - 1, char_idx);
+                        // Auto-pair backspace: delete both opener and closer
+                        let prev_char = self.buffer().content.char(char_idx - 1);
+                        let next_char_matches =
+                            if self.settings.auto_pairs && char_idx < self.buffer().len_chars() {
+                                let next = self.buffer().content.char(char_idx);
+                                auto_pair_closer(prev_char) == Some(next)
+                            } else {
+                                false
+                            };
+                        if next_char_matches {
+                            // Delete both the opener (before cursor) and closer (after cursor)
+                            self.delete_with_undo(char_idx - 1, char_idx + 1);
+                        } else {
+                            self.delete_with_undo(char_idx - 1, char_idx);
+                        }
                         self.view_mut().cursor.col -= 1;
                         *changed = true;
                     } else if line > 0 {
@@ -9756,12 +9776,59 @@ impl Engine {
                         let line = self.view().cursor.line;
                         let col = self.view().cursor.col;
                         let char_idx = self.buffer().line_to_char(line) + col;
-                        let mut buf = [0u8; 4];
-                        let s = ch.encode_utf8(&mut buf);
-                        self.insert_with_undo(char_idx, s);
-                        self.insert_text_buffer.push(ch);
-                        self.view_mut().cursor.col += 1;
-                        *changed = true;
+
+                        // Auto-pairs: skip-over closing bracket/quote
+                        let closing_pair = auto_pair_closer(ch);
+                        if self.settings.auto_pairs
+                            && is_closing_pair(ch)
+                            && char_idx < self.buffer().len_chars()
+                            && self.buffer().content.char(char_idx) == ch
+                        {
+                            // Skip over the existing closing char
+                            self.view_mut().cursor.col += 1;
+                            self.insert_text_buffer.push(ch);
+                            *changed = true;
+                        } else if self.settings.auto_pairs && closing_pair.is_some() {
+                            let closer = closing_pair.unwrap();
+                            // Smart context for quotes: only auto-pair if preceded by
+                            // whitespace, bracket, or BOL
+                            let should_pair = if is_quote_char(ch) {
+                                if char_idx == 0 {
+                                    true
+                                } else {
+                                    let prev = self.buffer().content.char(char_idx - 1);
+                                    prev.is_whitespace()
+                                        || matches!(prev, '(' | '[' | '{' | ',' | ';' | ':')
+                                }
+                            } else {
+                                true
+                            };
+                            if should_pair {
+                                let mut buf = [0u8; 4];
+                                let open_s = ch.encode_utf8(&mut buf).to_string();
+                                let mut buf2 = [0u8; 4];
+                                let close_s = closer.encode_utf8(&mut buf2).to_string();
+                                let pair = format!("{}{}", open_s, close_s);
+                                self.insert_with_undo(char_idx, &pair);
+                                self.insert_text_buffer.push(ch);
+                                self.view_mut().cursor.col += 1;
+                                *changed = true;
+                            } else {
+                                let mut buf = [0u8; 4];
+                                let s = ch.encode_utf8(&mut buf);
+                                self.insert_with_undo(char_idx, s);
+                                self.insert_text_buffer.push(ch);
+                                self.view_mut().cursor.col += 1;
+                                *changed = true;
+                            }
+                        } else {
+                            let mut buf = [0u8; 4];
+                            let s = ch.encode_utf8(&mut buf);
+                            self.insert_with_undo(char_idx, s);
+                            self.insert_text_buffer.push(ch);
+                            self.view_mut().cursor.col += 1;
+                            *changed = true;
+                        }
                     }
                     // Trigger signature help after '(' or ','
                     if ch == '(' || ch == ',' {
@@ -17514,6 +17581,45 @@ impl Engine {
         None
     }
 
+    /// Update `self.bracket_match` based on the character under the cursor.
+    /// Called at the end of `handle_key()` when `match_brackets` is enabled.
+    pub fn update_bracket_match(&mut self) {
+        if !self.settings.match_brackets {
+            self.bracket_match = None;
+            return;
+        }
+        let line = self.view().cursor.line;
+        let col = self.view().cursor.col;
+        let line_start = self.buffer().line_to_char(line);
+        let char_pos = line_start + col;
+        if char_pos >= self.buffer().len_chars() {
+            self.bracket_match = None;
+            return;
+        }
+        let current_char = self.buffer().content.char(char_pos);
+        let (is_opening, open_char, close_char) = match current_char {
+            '(' => (true, '(', ')'),
+            ')' => (false, '(', ')'),
+            '{' => (true, '{', '}'),
+            '}' => (false, '{', '}'),
+            '[' => (true, '[', ']'),
+            ']' => (false, '[', ']'),
+            _ => {
+                self.bracket_match = None;
+                return;
+            }
+        };
+        if let Some(match_pos) =
+            self.find_matching_bracket(char_pos, open_char, close_char, is_opening)
+        {
+            let match_line = self.buffer().content.char_to_line(match_pos);
+            let match_line_start = self.buffer().line_to_char(match_line);
+            self.bracket_match = Some((match_line, match_pos - match_line_start));
+        } else {
+            self.bracket_match = None;
+        }
+    }
+
     /// Find the range for a text object.
     /// Returns (start_pos, end_pos) if found, None otherwise.
     fn find_text_object_range(
@@ -23564,10 +23670,10 @@ impl Engine {
             let file = self.active_buffer_state().file_path.clone();
             let line = self.view().cursor.line;
             let col = self.view().cursor.col;
-            let should_push = self
-                .jump_list
-                .last()
-                .is_none_or(|last| last.0 != file || last.1 != line || last.2 != col);
+            #[allow(clippy::unnecessary_map_or)] // is_none_or requires Rust 1.82+
+            let should_push = self.jump_list.last().map_or(true, |last| {
+                last.0 != file || last.1 != line || last.2 != col
+            });
             if should_push {
                 self.jump_list.push((file, line, col));
                 if self.jump_list.len() > 100 {
@@ -24758,6 +24864,31 @@ fn binary_on_path(binary: &str) -> bool {
         path_var
     ));
     false
+}
+
+// ── Auto-pair helpers ────────────────────────────────────────────────────────
+
+/// Return the closing character for an auto-pair opener, or `None`.
+fn auto_pair_closer(ch: char) -> Option<char> {
+    match ch {
+        '(' => Some(')'),
+        '[' => Some(']'),
+        '{' => Some('}'),
+        '"' => Some('"'),
+        '\'' => Some('\''),
+        '`' => Some('`'),
+        _ => None,
+    }
+}
+
+/// Return true if `ch` is a closing bracket/quote that can be skipped over.
+fn is_closing_pair(ch: char) -> bool {
+    matches!(ch, ')' | ']' | '}' | '"' | '\'' | '`')
+}
+
+/// Return true if `ch` is a quote character (needs smart context check).
+fn is_quote_char(ch: char) -> bool {
+    matches!(ch, '"' | '\'' | '`')
 }
 
 /// Convert a char index in `s` to a byte offset.
@@ -27077,7 +27208,21 @@ impl Engine {
                         let col = self.view().cursor.col;
                         let char_idx = self.buffer().line_to_char(line) + col;
                         if col > 0 {
-                            self.delete_with_undo(char_idx - 1, char_idx);
+                            // Auto-pair backspace: delete both opener and closer
+                            let prev_char = self.buffer().content.char(char_idx - 1);
+                            let next_char_matches = if self.settings.auto_pairs
+                                && char_idx < self.buffer().len_chars()
+                            {
+                                let next = self.buffer().content.char(char_idx);
+                                auto_pair_closer(prev_char) == Some(next)
+                            } else {
+                                false
+                            };
+                            if next_char_matches {
+                                self.delete_with_undo(char_idx - 1, char_idx + 1);
+                            } else {
+                                self.delete_with_undo(char_idx - 1, char_idx);
+                            }
                             self.view_mut().cursor.col -= 1;
                             changed = true;
                         } else if line > 0 {
@@ -27152,11 +27297,52 @@ impl Engine {
                         let line = self.view().cursor.line;
                         let col = self.view().cursor.col;
                         let char_idx = self.buffer().line_to_char(line) + col;
-                        let mut buf = [0u8; 4];
-                        let s = ch.encode_utf8(&mut buf);
-                        self.insert_with_undo(char_idx, s);
-                        self.view_mut().cursor.col += 1;
-                        changed = true;
+
+                        // Auto-pairs: skip-over closing bracket/quote
+                        let closing_pair = auto_pair_closer(ch);
+                        if self.settings.auto_pairs
+                            && is_closing_pair(ch)
+                            && char_idx < self.buffer().len_chars()
+                            && self.buffer().content.char(char_idx) == ch
+                        {
+                            self.view_mut().cursor.col += 1;
+                            changed = true;
+                        } else if self.settings.auto_pairs && closing_pair.is_some() {
+                            let closer = closing_pair.unwrap();
+                            let should_pair = if is_quote_char(ch) {
+                                if char_idx == 0 {
+                                    true
+                                } else {
+                                    let prev = self.buffer().content.char(char_idx - 1);
+                                    prev.is_whitespace()
+                                        || matches!(prev, '(' | '[' | '{' | ',' | ';' | ':')
+                                }
+                            } else {
+                                true
+                            };
+                            if should_pair {
+                                let mut buf = [0u8; 4];
+                                let open_s = ch.encode_utf8(&mut buf).to_string();
+                                let mut buf2 = [0u8; 4];
+                                let close_s = closer.encode_utf8(&mut buf2).to_string();
+                                let pair = format!("{}{}", open_s, close_s);
+                                self.insert_with_undo(char_idx, &pair);
+                                self.view_mut().cursor.col += 1;
+                                changed = true;
+                            } else {
+                                let mut buf = [0u8; 4];
+                                let s = ch.encode_utf8(&mut buf);
+                                self.insert_with_undo(char_idx, s);
+                                self.view_mut().cursor.col += 1;
+                                changed = true;
+                            }
+                        } else {
+                            let mut buf = [0u8; 4];
+                            let s = ch.encode_utf8(&mut buf);
+                            self.insert_with_undo(char_idx, s);
+                            self.view_mut().cursor.col += 1;
+                            changed = true;
+                        }
                         self.trigger_auto_completion();
                     }
                 }
@@ -27181,6 +27367,7 @@ impl Engine {
 
         self.ensure_cursor_visible();
         self.sync_scroll_binds();
+        self.update_bracket_match();
         EngineAction::None
     }
 }

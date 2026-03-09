@@ -34,6 +34,11 @@ jobs:
 
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: x86_64-unknown-linux-musl
+
+    - name: Install musl toolchain
+      run: sudo apt-get install -y musl-tools
 
     - name: Cache cargo registry
       uses: actions/cache@v4
@@ -54,12 +59,12 @@ jobs:
     - name: Build release binaries
       run: |
         cargo build --release --bin vimcode
-        cargo build --release --bin vcd --no-default-features
+        cargo build --release --bin vcd --no-default-features --target x86_64-unknown-linux-musl
 
     - name: Strip binaries
       run: |
         strip target/release/vimcode
-        strip target/release/vcd
+        strip target/x86_64-unknown-linux-musl/release/vcd
 
     # ── .deb package ──────────────────────────────────────────────────────────
     - name: Install cargo-deb
@@ -78,7 +83,7 @@ jobs:
     - name: Prepare raw binary artifacts
       run: |
         cp target/release/vimcode vimcode-linux-x86_64
-        cp target/release/vcd vcd-linux-x86_64
+        cp target/x86_64-unknown-linux-musl/release/vcd vcd-linux-x86_64
         echo "BIN_NAME=vimcode-linux-x86_64" >> $GITHUB_ENV
         echo "TUI_BIN_NAME=vcd-linux-x86_64" >> $GITHUB_ENV
 
@@ -106,12 +111,12 @@ jobs:
           ./vimcode-linux-x86_64
           ```
 
-          **Option C — TUI-only binary (no GTK required)**
+          **Option C — TUI-only binary (no GTK required, statically linked)**
           ```
           chmod +x vcd-linux-x86_64
           ./vcd-linux-x86_64
           ```
-          No GTK4 or other GUI libraries needed — works on headless servers.
+          Statically linked with musl — runs on any Linux (Ubuntu 20.04+, CentOS 7+, Alpine, etc.). No GTK4 or other libraries needed.
 
           **Option D — Flatpak** (see attached `vimcode.flatpak` asset)
           ```
