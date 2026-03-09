@@ -51,11 +51,15 @@ jobs:
         key: ${{ runner.os }}-release-target-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: ${{ runner.os }}-release-target-
 
-    - name: Build release binary
-      run: cargo build --release
+    - name: Build release binaries
+      run: |
+        cargo build --release --bin vimcode
+        cargo build --release --bin vcd --no-default-features
 
-    - name: Strip binary
-      run: strip target/release/vimcode
+    - name: Strip binaries
+      run: |
+        strip target/release/vimcode
+        strip target/release/vcd
 
     # ── .deb package ──────────────────────────────────────────────────────────
     - name: Install cargo-deb
@@ -70,11 +74,13 @@ jobs:
         echo "DEB_PATH=$DEB" >> $GITHUB_ENV
         echo "DEB_NAME=$(basename $DEB)" >> $GITHUB_ENV
 
-    # ── Rename raw binary ─────────────────────────────────────────────────────
-    - name: Prepare raw binary artifact
+    # ── Rename raw binaries ────────────────────────────────────────────────────
+    - name: Prepare raw binary artifacts
       run: |
         cp target/release/vimcode vimcode-linux-x86_64
+        cp target/release/vcd vcd-linux-x86_64
         echo "BIN_NAME=vimcode-linux-x86_64" >> $GITHUB_ENV
+        echo "TUI_BIN_NAME=vcd-linux-x86_64" >> $GITHUB_ENV
 
     # ── Publish to GitHub Releases ────────────────────────────────────────────
     - name: Publish GitHub Release
@@ -91,7 +97,7 @@ jobs:
           sudo apt -f install    # installs any missing GTK4 runtime libraries
           ```
 
-          **Option B — raw binary**
+          **Option B — raw binary (GUI)**
           ```
           # First install runtime dependencies:
           sudo apt install libgtk-4-1 libglib2.0-0 libpango-1.0-0 libcairo2
@@ -100,18 +106,26 @@ jobs:
           ./vimcode-linux-x86_64
           ```
 
-          **Option C — Flatpak** (see attached `vimcode.flatpak` asset)
+          **Option C — TUI-only binary (no GTK required)**
+          ```
+          chmod +x vcd-linux-x86_64
+          ./vcd-linux-x86_64
+          ```
+          No GTK4 or other GUI libraries needed — works on headless servers.
+
+          **Option D — Flatpak** (see attached `vimcode.flatpak` asset)
           ```
           flatpak install vimcode.flatpak
           flatpak run io.github.jdonaghy.VimCode
           ```
 
-          > Requires GTK 4.10+. Ubuntu 22.04 ships GTK 4.6 which is too old; Ubuntu 24.04+ recommended.
+          > GUI binary requires GTK 4.10+. Ubuntu 22.04 ships GTK 4.6 which is too old; Ubuntu 24.04+ recommended.
         prerelease: false
         make_latest: true
         files: |
           ${{ env.DEB_PATH }}
           ${{ env.BIN_NAME }}
+          ${{ env.TUI_BIN_NAME }}
 
   flatpak:
     name: Build Flatpak bundle
