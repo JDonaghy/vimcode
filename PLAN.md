@@ -5,6 +5,7 @@
 ---
 
 ## Recently Completed
+- **Session 157**: VSCode mode fixes (auto-pairs, bracket matching, update_bracket_match in handle_vscode_key), build portability (vcd musl static linking, Flatpak Rust 1.80 compat), v0.3.1 release
 - **Session 156**: IDE Polish — indent guides (vertical lines at tabstops, active guide highlight, blank line bridging), bracket pair highlighting (matching `(){}[]` background color), auto-close brackets/quotes (skip-over, pair backspace, smart quote context), 3 new settings + theme colors across all 4 themes, GTK+TUI rendering, 29 tests
 - **Session 155**: Core Commentary Feature — unified comment toggling into `src/core/comment.rs` (46+ language table, two-pass algorithm, override chain), `:Comment`/`:Commentary` commands, `vimcode.set_comment_style()` plugin API, Ctrl+/ fix for GTK+TUI, VSCode Ctrl+Q/F10, 19+31 tests
 - **Session 154**: Keymaps editor in settings panel — `BufferEditor` setting type, scratch buffer with validation, `:Keymaps` command, GTK button + TUI display, 11 tests

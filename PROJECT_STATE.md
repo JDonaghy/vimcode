@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Mar 9, 2026 (Session 156 — IDE Polish: Indent Guides, Bracket Matching, Auto-Pairs) | **Tests:** 2937
+**Last updated:** Mar 9, 2026 (Session 157 — VSCode Mode Fixes + Build Portability) | **Tests:** 2941
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 154 are in **SESSION_HISTORY.md**.
@@ -26,10 +26,10 @@ When implementing a new key/command, add tests covering:
 
 ## Recent Work
 
+**Session 157 — VSCode Mode Fixes + Build Portability (2941 tests):**
+Fixed auto-pairs, bracket matching, and `update_bracket_match()` not running in VSCode mode (early return in `handle_key()` bypassed all three). Added auto-pair insert/skip-over/backspace-delete logic to `handle_vscode_key()`. Added `update_bracket_match()` call at end of `handle_vscode_key()`. 4 new VSCode-mode auto-pair tests. **Build portability**: `vcd` TUI binary now statically linked with musl (`--target x86_64-unknown-linux-musl`) — runs on any Linux without glibc version issues (Ubuntu 22.04+, CentOS 7+, Alpine). Fixed Flatpak build: replaced `floor_char_boundary` (Rust 1.82+) with `is_char_boundary` loop, replaced `is_none_or` (Rust 1.82+) with `map_or(true, ...)` for GNOME SDK 47 Rust ~1.80 compat. Updated `release.yml` workflow. Released v0.3.1.
+
 **Session 156 — IDE Polish: Indent Guides, Bracket Matching, Auto-Pairs (2937 tests):**
 Three visual/editing polish features: (1) **Indent guides** — vertical `│` lines at each tabstop in TUI, thin Cairo lines in GTK; controlled by `indent_guides` setting (default on); active guide at cursor scope highlighted brighter; blank lines bridge surrounding indent levels. (2) **Bracket pair highlighting** — when cursor is on `(){}[]`, both brackets get a distinct background (`bracket_match_bg` theme color); `bracket_match` field on Engine updated at end of `handle_key()`; `match_brackets` setting (default on). (3) **Auto-close brackets/quotes** — typing `([{"'\`` in Insert mode inserts matching closer with cursor between; typing closer when next char matches skips over it; Backspace between a pair deletes both; smart context for quotes (only pair after whitespace/brackets/BOL); `auto_pairs` setting (default on). All three features have `:set` toggle support, settings UI entries, and theme colors across all 4 built-in themes. 29 integration tests in `tests/ide_polish.rs`.
 
-**Session 155 — Core Commentary Feature (2908 tests):**
-Unified comment toggling from three separate implementations (Lua plugin, Rust `toggle_comment_range()`, Rust `vscode_toggle_line_comment()`) into a single core module `src/core/comment.rs`. New `CommentStyle`/`CommentStyleOwned` types, `comment_style_for_language()` table covering 46+ languages (including block comments for HTML/CSS/XML), two-pass `compute_toggle_edits()` algorithm, `resolve_comment_style()` override chain (plugin → extension manifest → built-in → fallback `#`). Added `CommentConfig` to `ExtensionManifest` in `extensions.rs`. New `toggle_comment()` method on Engine replaces old `toggle_comment_range()` and `vscode_toggle_line_comment()`. Rewired `gcc`, visual `gc`, and VSCode `Ctrl+/` to use the new core. Added `:Comment` command (`:Commentary` kept as alias). Plugin API: `vimcode.set_comment_style(lang_id, {line, block_open, block_close})`. Fixed Ctrl+/ in GTK (key name `"slash"` not `"/"`) and TUI (crossterm byte 0x1F → `Char('7')` mapping). VSCode mode: added Ctrl+Q quit, F10 menu toggle, menu visible by default. 19 unit tests in `comment.rs`, 31 integration tests in `tests/commentary.rs`.
-
-> Sessions 154 and earlier archived in **SESSION_HISTORY.md**.
+> Sessions 155 and earlier archived in **SESSION_HISTORY.md**.

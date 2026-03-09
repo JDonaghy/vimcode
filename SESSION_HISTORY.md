@@ -381,3 +381,9 @@ Ctrl+F while terminal has focus opens inline find bar replacing tab strip; case-
 **Sessions 15–20:** GTK UI foundations — activity bar, sidebar, file tree CRUD, preview mode, focus+highlighting, scrollbars, explorer button, settings auto-init, visual block mode (Ctrl-V). 232 → 256 tests.
 
 **Sessions 11–12:** High-priority motions + line numbers + config. 146 → 214 tests.
+
+**Session 155:** Core Commentary Feature — unified 3 comment implementations into `src/core/comment.rs`; `CommentStyle`/`CommentStyleOwned` types; `comment_style_for_language()` 46+ lang table; `compute_toggle_edits()` two-pass algorithm; `resolve_comment_style()` override chain (plugin→manifest→built-in→fallback `#`); `CommentConfig` on `ExtensionManifest`; engine `toggle_comment()` replaces `toggle_comment_range()`+`vscode_toggle_line_comment()`; `:Comment`/`:Commentary` commands; `vimcode.set_comment_style()` plugin API; Ctrl+/ fix (GTK `"slash"`, TUI `'7'`); VSCode Ctrl+Q quit, F10 menu toggle; 19+31 tests. 2908 total.
+
+**Session 156:** IDE Polish — indent guides (vertical `│` lines at tabstops, active guide highlight, blank line bridging, TUI+GTK), bracket pair highlighting (`bracket_match_bg` theme color, `match_brackets` setting), auto-close brackets/quotes (skip-over, pair backspace, smart quote context, `auto_pairs` setting); 3 new settings + theme colors across all 4 themes; 29 tests in `tests/ide_polish.rs`. 2937 total.
+
+**Session 157:** VSCode mode fixes + build portability — auto-pairs/bracket matching/`update_bracket_match()` added to `handle_vscode_key()` (was bypassed by early return); vcd musl static linking for Linux portability; Flatpak compat (`floor_char_boundary`→`is_char_boundary` loop, `is_none_or`→`map_or`); 4 new VSCode auto-pair tests; v0.3.1 release. 2941 total.
