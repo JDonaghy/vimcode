@@ -1221,6 +1221,8 @@ pub enum SettingType {
     Enum(&'static [&'static str]),
     /// Like Enum but options are computed at runtime (e.g. colorscheme includes custom themes).
     DynamicEnum(fn() -> Vec<String>),
+    /// Opens a scratch buffer editor (e.g. keymaps editor). Enter to open.
+    BufferEditor,
 }
 
 /// Returns available colorscheme names: built-in + custom themes from ~/.config/vimcode/themes/.
@@ -1483,6 +1485,13 @@ pub static SETTING_DEFS: &[SettingDef] = &[
         description: "Enable the Lua plugin system (requires restart)",
         category: "Plugins",
         setting_type: SettingType::Bool,
+    },
+    SettingDef {
+        key: "keymaps",
+        label: "User Keymaps",
+        description: "Press Enter to edit keymaps (one per line: mode keys :command)",
+        category: "Plugins",
+        setting_type: SettingType::BufferEditor,
     },
     // ── AI ────────────────────────────────────────────────────────────────────
     SettingDef {

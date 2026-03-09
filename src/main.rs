@@ -450,6 +450,8 @@ enum Msg {
     CloseTabConfirmed { save: bool },
     /// A setting was changed via the Settings sidebar form widget.
     SettingChanged { key: String, value: String },
+    /// Open the keymaps editor scratch buffer.
+    OpenKeymapsEditor,
     /// Alt key released — confirm tab switcher if open.
     TabSwitcherRelease,
 }
@@ -591,6 +593,21 @@ fn build_setting_row(
                 }
             });
             row.append(&dropdown);
+        }
+        render::SettingType::BufferEditor => {
+            let count_label =
+                gtk4::Label::new(Some(&format!("{} defined", settings.keymaps.len())));
+            count_label.set_valign(gtk4::Align::Center);
+            count_label.set_css_classes(&["dim-label"]);
+            row.append(&count_label);
+
+            let button = gtk4::Button::with_label("Edit…");
+            button.set_valign(gtk4::Align::Center);
+            let sender_c = sender.clone();
+            button.connect_clicked(move |_| {
+                sender_c.send(Msg::OpenKeymapsEditor).ok();
+            });
+            row.append(&button);
         }
     }
 
@@ -4565,6 +4582,10 @@ impl SimpleComponent for App {
                 if key == "show_hidden_files" {
                     sender.input(Msg::RefreshFileTree);
                 }
+                self.draw_needed.set(true);
+            }
+            Msg::OpenKeymapsEditor => {
+                self.engine.borrow_mut().open_keymaps_editor();
                 self.draw_needed.set(true);
             }
             Msg::ToggleFindDialog => {

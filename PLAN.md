@@ -5,6 +5,7 @@
 ---
 
 ## Recently Completed
+- **Session 154**: Keymaps editor in settings panel — `BufferEditor` setting type, scratch buffer with validation, `:Keymaps` command, GTK button + TUI display, 11 tests
 - **Session 153**: Richer Lua Plugin API + VimCode Commentary + User Keymaps — Extended plugin API (cursor write, settings access, state queries, buffer insert/delete, register write, 7 new autocmd events, `set_mode()` refactor, visual/command keymap fallbacks); VimCode Commentary bundled extension (gcc/gc/`:Commentary`, 40+ language comment strings, undo support); plugin `set_lines` undo fix; user-configurable keymaps in settings.json (`"mode keys :command"` format, multi-key sequences, override built-in keys, `{count}` substitution); 22 + 17 + 13 = 52 new tests (2801 total)
 - **Session 152**: Visual paste — `p`/`P` in visual mode replaces selection with register content; `"x` register selection in visual mode; `Ctrl+Shift+V` clipboard paste in Normal/Visual (TUI+GTK); TUI tab bar fix (breadcrumbs y-offset); multi-group `Ctrl-W h/l` navigates between groups before overflowing to sidebar; pre-existing test fix (`swap_scan_stale`); 8 tests
 - **Session 151**: Tab drag-to-split — VSCode-style drag tab to edge for new split, drag to center to move between groups, drag within tab bar to reorder; `DropZone`/`TabDragState` core types, 7 engine methods, GTK overlay rendering; tab bar draw order fix (windows before tab bars, dividers before tab bars); new `vim-code.svg` gradient logo, removed old icon files; 15 tests
@@ -71,7 +72,7 @@
 
 ### Extension System
 - [x] **Extension mechanism** — Lua 5.4 plugin sandbox; plugins register commands/keymaps/hooks, read/write buffer text, show messages; `~/.config/vimcode/plugins/` auto-loaded; bundled language-pack extensions + GitHub registry; `:ExtInstall/:ExtList/:ExtEnable/:ExtDisable/:ExtRemove` (sessions 98, 113–114)
-- [ ] **Keymap editor in settings panel** — "Edit keymaps" entry in the Settings sidebar that opens a scratch buffer (one keymap per line, format `mode keys :command`). Saving the buffer parses lines → updates `settings.keymaps` → calls `rebuild_user_keymaps()`. Reuses the existing editor infrastructure (syntax highlighting, undo, multi-cursor) instead of building a new List widget type. The settings panel row shows a summary like `"Keymaps: 3 defined"` with Enter to open the editor buffer.
+- [x] **Keymap editor in settings panel** — "User Keymaps" row in the Settings sidebar opens a scratch buffer (one keymap per line, format `mode keys :command`). `:w` validates, updates `settings.keymaps`, calls `rebuild_user_keymaps()`. Also accessible via `:Keymaps` command. Tab shows `[Keymaps]`. GTK button + TUI "N defined ▸". 11 tests. (session 154)
 
 ### AI Integration
 - [x] **AI assistant panel** — sidebar chat panel; configurable provider (Anthropic Claude, OpenAI, Ollama local); `ai_provider`/`ai_api_key`/`ai_model`/`ai_base_url` in settings; activity bar chat icon opens panel; multi-turn conversation; `:AI <msg>` and `:AiClear` commands (session 118)

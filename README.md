@@ -11,7 +11,7 @@ There's a touch of irony here - using a cli tool to write the editor that I've w
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 2809+ tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 2820+ tests, zero async runtime dependency
 
 > **Note:** VimCode does not implement VimScript. Extension and scripting is handled via
 > the built-in Lua 5.4 plugin system. The goal is full Vim *keybinding* and *editing*
@@ -837,7 +837,7 @@ Additional options (set directly in `settings.json`):
 - `:config reload` — reload settings file from disk
 - `:colorscheme <name>` — switch colour theme live (aliases: `gruvbox`, `tokyonight`, `solarized`); `:colorscheme` lists available themes. Built-in: `onedark` (default), `gruvbox-dark`, `tokyo-night`, `solarized-dark`. Also loads VSCode `.json` theme files from `~/.config/vimcode/themes/`.
 - `:Settings` — open `settings.json` in a new editor tab for direct editing; saved changes reload automatically in both GTK and TUI backends.
-- **Settings sidebar (GTK + TUI)** — click the gear icon in the activity bar to open a VSCode-style settings form: searchable list of all settings grouped by category (Appearance, Editor, Search, Workspace, LSP, Terminal, Plugins, AI) with interactive controls; GTK uses native widgets (Switch, SpinButton, DropDown, Entry), TUI renders `[✓]`/`[ ]` toggles, `value ▸` cycling enums, and inline text/number editing with Ctrl+V paste; changes apply and save immediately; colorscheme picker includes custom VSCode themes from `~/.config/vimcode/themes/`.
+- **Settings sidebar (GTK + TUI)** — click the gear icon in the activity bar to open a VSCode-style settings form: searchable list of all settings grouped by category (Appearance, Editor, Search, Workspace, LSP, Terminal, Plugins, AI) with interactive controls; GTK uses native widgets (Switch, SpinButton, DropDown, Entry), TUI renders `[✓]`/`[ ]` toggles, `value ▸` cycling enums, and inline text/number editing with Ctrl+V paste; changes apply and save immediately; colorscheme picker includes custom VSCode themes from `~/.config/vimcode/themes/`. **User Keymaps** row opens a scratch buffer editor (`:Keymaps`) — one keymap per line in `mode keys :command` format; `:w` validates and saves back to `settings.keymaps`.
 
 **Panel navigation key bindings** — configurable in `settings.json` under `"panel_keys"`:
 
@@ -1218,6 +1218,7 @@ All ex commands support Vim-style abbreviations (e.g., `:j` for `:join`, `:y` fo
 | `:Plugin disable <name>` | Disable a plugin |
 | `:map` / `:map n K :cmd` | List keymaps / add a key mapping |
 | `:unmap n K` | Remove a key mapping |
+| `:Keymaps` | Open keymaps editor (scratch buffer, one per line, `:w` saves to settings) |
 | `:ExtInstall <name>` | Install a language extension (LSP + DAP + Lua scripts) |
 | `:ExtList` | List available extensions and their install status |
 | `:ExtEnable <name>` | Re-enable a disabled extension |

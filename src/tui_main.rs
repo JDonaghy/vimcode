@@ -7993,6 +7993,20 @@ fn render_settings_panel(
                         cx += 1;
                     }
                 }
+                SettingType::BufferEditor => {
+                    let count = engine.settings.keymaps.len();
+                    let display = format!("{} defined ▸", count);
+                    let val_len = display.chars().count() as u16;
+                    let vx = right_edge.saturating_sub(val_len + 1);
+                    let mut cx = vx.max(x);
+                    for ch in display.chars() {
+                        if cx >= right_edge {
+                            break;
+                        }
+                        set_cell(buf, cx, y, ch, key_fg, row_bg);
+                        cx += 1;
+                    }
+                }
             }
         }
     }

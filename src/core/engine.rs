@@ -2168,6 +2168,11 @@ impl Engine {
 
     /// Save the active buffer to its file.
     pub fn save(&mut self) -> Result<(), String> {
+        // Keymaps scratch buffer: save content back to settings instead of disk
+        if self.active_buffer_state().is_keymaps_buf {
+            return self.save_keymaps_buffer();
+        }
+
         // Promote preview on save
         let active_id = self.active_buffer_id();
         if self.preview_buffer_id == Some(active_id) {
@@ -14253,6 +14258,12 @@ impl Engine {
             return EngineAction::None;
         }
 
+        // Handle :Keymaps — open keymaps editor scratch buffer
+        if cmd == "Keymaps" || cmd == "keymaps" {
+            self.open_keymaps_editor();
+            return EngineAction::None;
+        }
+
         if cmd == "config reload" {
             match Settings::load_with_validation() {
                 Ok(new_settings) => {
@@ -21020,6 +21031,13 @@ impl Engine {
                                     self.settings_edit_buf = self.settings.get_value_str(def.key);
                                 }
                             }
+                            SettingType::BufferEditor => {
+                                if matches!(key, "Return" | "Space" | "l" | "Right")
+                                    && def.key == "keymaps"
+                                {
+                                    self.open_keymaps_editor();
+                                }
+                            }
                         }
                     }
                 }
@@ -21039,6 +21057,102 @@ impl Engine {
         } else if self.settings_editing.is_some() {
             self.settings_edit_buf.push_str(&clean);
         }
+    }
+
+    /// Open a scratch buffer for editing user keymaps (one per line).
+    pub fn open_keymaps_editor(&mut self) {
+        // If a keymaps buffer already exists, switch to it
+        let existing_buf_id = self
+            .buffer_manager
+            .iter()
+            .find(|(_, state)| state.is_keymaps_buf)
+            .map(|(id, _)| *id);
+
+        if let Some(buf_id) = existing_buf_id {
+            // Find a tab showing this buffer
+            let tab_idx = self
+                .active_group()
+                .tabs
+                .iter()
+                .enumerate()
+                .find(|(_, tab)| {
+                    self.windows
+                        .get(&tab.active_window)
+                        .is_some_and(|w| w.buffer_id == buf_id)
+                })
+                .map(|(i, _)| i);
+
+            if let Some(idx) = tab_idx {
+                self.active_group_mut().active_tab = idx;
+            } else {
+                // Buffer exists but not shown — point current window at it
+                self.active_window_mut().buffer_id = buf_id;
+                self.view_mut().cursor.line = 0;
+                self.view_mut().cursor.col = 0;
+            }
+            self.settings_has_focus = false;
+            return;
+        }
+
+        // Build content: one keymap per line
+        let content = if self.settings.keymaps.is_empty() {
+            String::new()
+        } else {
+            format!("{}\n", self.settings.keymaps.join("\n"))
+        };
+        let buf_id = self.buffer_manager.create();
+        if let Some(state) = self.buffer_manager.get_mut(buf_id) {
+            state.buffer.content = ropey::Rope::from_str(&content);
+            state.is_keymaps_buf = true;
+            state.dirty = false;
+        }
+
+        // Open in a new tab (same pattern as open_file_in_tab)
+        let window_id = self.new_window_id();
+        let window = Window::new(window_id, buf_id);
+        self.windows.insert(window_id, window);
+        let tab_id = self.new_tab_id();
+        let tab = Tab::new(tab_id, window_id);
+        self.active_group_mut().tabs.push(tab);
+        self.active_group_mut().active_tab = self.active_group().tabs.len() - 1;
+
+        self.settings_has_focus = false;
+        self.message = "Edit keymaps (one per line: mode keys :command). :w to save.".to_string();
+    }
+
+    /// Save keymaps buffer content back to settings.
+    pub fn save_keymaps_buffer(&mut self) -> Result<(), String> {
+        let state = self.active_buffer_state();
+        let rope = &state.buffer.content;
+        let mut keymaps = Vec::new();
+        for line_idx in 0..rope.len_lines() {
+            let line: String = rope.line(line_idx).chars().collect();
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            // Validate the keymap definition
+            if parse_keymap_def(trimmed).is_none() {
+                return Err(format!(
+                    "Invalid keymap on line {}: \"{}\" (expected: mode keys :command)",
+                    line_idx + 1,
+                    trimmed
+                ));
+            }
+            keymaps.push(trimmed.to_string());
+        }
+
+        self.settings.keymaps = keymaps;
+        self.rebuild_user_keymaps();
+        let _ = self.settings.save();
+        let count = self.settings.keymaps.len();
+        self.active_buffer_state_mut().dirty = false;
+        self.message = format!(
+            "{} keymap{} saved to settings",
+            count,
+            if count == 1 { "" } else { "s" }
+        );
+        Ok(())
     }
 
     // ── AI assistant panel ─────────────────────────────────────────────────────

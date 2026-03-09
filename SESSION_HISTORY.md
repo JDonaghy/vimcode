@@ -1,9 +1,12 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 152 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 153 archived here. Recent work summary in PROJECT_STATE.md.
 
 ---
+
+**Session 153 — Richer Lua Plugin API + VimCode Commentary + User Keymaps (2809 tests):**
+Plugin API expansion: Extended `PluginCallContext` with new input/output fields. New Lua APIs: `vimcode.buf.set_cursor(line,col)`, `vimcode.buf.insert_line(n,text)`, `vimcode.buf.delete_line(n)`, `vimcode.opt.get(key)`/`vimcode.opt.set(key,value)`, `vimcode.state.mode()`/`register(char)`/`set_register(char,content,linewise)`/`mark(char)`/`filetype()`. New autocmd events: `BufWrite`, `BufNew`, `BufEnter`, `InsertEnter`, `InsertLeave`, `ModeChanged`, `VimEnter`. Centralized `set_mode()` method fires mode-change events. Visual/command mode keymap fallbacks. Plugin `set_lines` now records undo operations. VimCode Commentary: bundled extension (`extensions/commentary/`) inspired by tpope's vim-commentary — `gcc` toggles comment (count-aware), `gc` in visual mode toggles selection, `:Commentary [N]` command, 40+ language comment strings, engine-level `toggle_comment_range()` with undo group. User-configurable keymaps: `keymaps: Vec<String>` in settings.json, `UserKeymap` struct, multi-key sequence support with replay, `{count}` substitution, `:map`/`:unmap` commands. 22 + 17 + 13 = 52 new tests.
 
 **Session 152 — Visual paste + TUI bug fixes (2768 tests):**
 Visual paste: `p`/`P` in Visual/VisualLine/VisualBlock mode replaces selection with register content via `paste_visual_selection()` in engine.rs; `"x` register selection in visual mode via `pending_key`; `p`/`P` in `handle_visual_key()` guarded by `pending_key.is_none()`. `Ctrl+Shift+V` system clipboard paste extended to Normal/Visual modes (TUI+GTK). TUI tab bar fix: multi-group tab bar y-coordinate uses `bounds.y - tab_bar_height` instead of `bounds.y - 1` to account for breadcrumbs offset. Multi-group `Ctrl-W h/l` navigation: `focus_window_direction()` now navigates between adjacent editor groups before setting `window_nav_overflow` to reach sidebar. Pre-existing test fix: `test_restore_session_files` — `swap_scan_stale()` opened stale swaps as extra tabs, fixed with `settings.swap_file = false`. 8 integration tests in `tests/visual_mode.rs`.

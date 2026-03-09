@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Mar 8, 2026 (Session 153 — Richer Lua Plugin API + Commentary + User Keymaps) | **Tests:** 2809
+**Last updated:** Mar 8, 2026 (Session 154 — Keymaps Editor in Settings Panel) | **Tests:** 2820
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 152 are in **SESSION_HISTORY.md**.
@@ -26,7 +26,7 @@ When implementing a new key/command, add tests covering:
 
 ## Recent Work
 
-**Session 153 — Richer Lua Plugin API + VimCode Commentary + User Keymaps (2809 tests):**
-**Plugin API expansion (Phase 1+2):** Extended `PluginCallContext` with new input/output fields. New Lua APIs: `vimcode.buf.set_cursor(line,col)`, `vimcode.buf.insert_line(n,text)`, `vimcode.buf.delete_line(n)`, `vimcode.opt.get(key)`/`vimcode.opt.set(key,value)`, `vimcode.state.mode()`/`register(char)`/`set_register(char,content,linewise)`/`mark(char)`/`filetype()`. New autocmd events: `BufWrite`, `BufNew`, `BufEnter`, `InsertEnter`, `InsertLeave`, `ModeChanged`, `VimEnter`. Centralized `set_mode()` method fires mode-change events. Visual/command mode keymap fallbacks. Plugin `set_lines` now records undo operations for proper undo support. **VimCode Commentary plugin**: Bundled extension (`extensions/commentary/`) inspired by tpope's vim-commentary. `gcc` toggles comment on current line (count-aware), `gc` in visual mode toggles comment on selection, `:Commentary [N]` command. Comment string auto-detected from 40+ language IDs. Engine-level `toggle_comment_range()` for visual mode with undo group support. 22 plugin API tests + 17 commentary tests in `tests/extensions.rs`. **User-configurable keymaps**: `keymaps: Vec<String>` in settings.json, format `"mode keys :command"`; `UserKeymap` struct parsed at engine init; multi-key sequence support with replay; checked before built-in handlers in `handle_key()`; supports `{count}` substitution; `:map`/`:unmap` runtime commands. 13 tests in `tests/user_keymaps.rs`.
+**Session 154 — Keymaps Editor in Settings Panel (2820 tests):**
+"User Keymaps" row in the Settings sidebar panel (new `BufferEditor` setting type) — pressing Enter (or `:Keymaps` command) opens a scratch buffer pre-filled with current keymaps (one per line, `mode keys :command` format). `:w` validates each line, rejects invalid entries with line-specific errors, updates `settings.keymaps`, calls `rebuild_user_keymaps()`, and saves. Tab title shows `[Keymaps]`. Buffer reuse on re-open. GTK "Edit…" button + count label; TUI "N defined ▸" display. 11 integration tests in `tests/keymaps_editor.rs`.
 
-> Sessions 152 and earlier archived in **SESSION_HISTORY.md**.
+> Sessions 153 and earlier archived in **SESSION_HISTORY.md**.
