@@ -1897,6 +1897,50 @@ fn gcc_with_count_comments_multiple_lines() {
     assert_eq!(lines[3], "ddd", "fourth line untouched");
 }
 
+#[test]
+fn gcc_undo_restores_original_line() {
+    let mut e = engine_with_commentary("let x = 1;\nlet y = 2;\n", "rust");
+    press(&mut e, 'g');
+    press(&mut e, 'c');
+    press(&mut e, 'c');
+    let lines = get_lines(&e);
+    assert_eq!(lines[0], "// let x = 1;", "gcc should comment");
+
+    // Undo
+    press(&mut e, 'u');
+    let lines2 = get_lines(&e);
+    assert_eq!(lines2[0], "let x = 1;", "undo should restore original");
+    assert!(
+        !e.message.contains("oldest change"),
+        "should not say 'oldest change': {}",
+        e.message
+    );
+}
+
+#[test]
+fn gc_visual_undo_restores_original_lines() {
+    let mut e = engine_with_commentary("aaa\nbbb\nccc\n", "rust");
+    // Select two lines with V, then gc
+    press(&mut e, 'V');
+    press(&mut e, 'j');
+    press(&mut e, 'g');
+    press(&mut e, 'c');
+    let lines = get_lines(&e);
+    assert_eq!(lines[0], "// aaa");
+    assert_eq!(lines[1], "// bbb");
+
+    // Undo
+    press(&mut e, 'u');
+    let lines2 = get_lines(&e);
+    assert_eq!(lines2[0], "aaa", "undo should restore first line");
+    assert_eq!(lines2[1], "bbb", "undo should restore second line");
+    assert!(
+        !e.message.contains("oldest change"),
+        "should not say 'oldest change': {}",
+        e.message
+    );
+}
+
 // ── gc in visual mode ──────────────────────────────────────────────────────
 
 #[test]

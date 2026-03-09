@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Mar 8, 2026 (Session 154 — Keymaps Editor in Settings Panel) | **Tests:** 2820
+**Last updated:** Mar 8, 2026 (Session 154b — Keymaps Editor + toggle_comment_range undo fix) | **Tests:** 2822
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 152 are in **SESSION_HISTORY.md**.
@@ -26,7 +26,7 @@ When implementing a new key/command, add tests covering:
 
 ## Recent Work
 
-**Session 154 — Keymaps Editor in Settings Panel (2820 tests):**
-"User Keymaps" row in the Settings sidebar panel (new `BufferEditor` setting type) — pressing Enter (or `:Keymaps` command) opens a scratch buffer pre-filled with current keymaps (one per line, `mode keys :command` format). `:w` validates each line, rejects invalid entries with line-specific errors, updates `settings.keymaps`, calls `rebuild_user_keymaps()`, and saves. Tab title shows `[Keymaps]`. Buffer reuse on re-open. GTK "Edit…" button + count label; TUI "N defined ▸" display. 11 integration tests in `tests/keymaps_editor.rs`.
+**Session 154 — Keymaps Editor in Settings Panel + toggle_comment_range undo fix (2822 tests):**
+"User Keymaps" row in the Settings sidebar panel (new `BufferEditor` setting type) — pressing Enter (or `:Keymaps` command) opens a scratch buffer pre-filled with current keymaps (one per line, `mode keys :command` format). `:w` validates each line, rejects invalid entries with line-specific errors, updates `settings.keymaps`, calls `rebuild_user_keymaps()`, and saves. Tab title shows `[Keymaps]`. Buffer reuse on re-open. GTK "Edit…" button + count label; TUI "N defined ▸" display. 11 integration tests in `tests/keymaps_editor.rs`. **Bug fix:** `toggle_comment_range()` (used by visual `gc`) was mutating the buffer directly (`buffer_mut().delete_range()`/`insert()`) without recording undo operations — replaced with `delete_with_undo()`/`insert_with_undo()`. 2 new undo tests in `tests/extensions.rs`.
 
 > Sessions 153 and earlier archived in **SESSION_HISTORY.md**.

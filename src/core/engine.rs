@@ -16764,8 +16764,8 @@ impl Engine {
             };
 
             let new_line = format!("{indent}{new_rest}\n");
-            self.buffer_mut().delete_range(line_start, line_end);
-            self.buffer_mut().insert(line_start, &new_line);
+            self.delete_with_undo(line_start, line_end);
+            self.insert_with_undo(line_start, &new_line);
         }
         self.finish_undo_group();
         self.set_dirty(true);
