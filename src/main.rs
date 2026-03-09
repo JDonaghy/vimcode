@@ -4979,14 +4979,14 @@ impl SimpleComponent for App {
                 self.draw_needed.set(true);
             }
             Msg::ClipboardPasteToInput { text } => {
-                // GDK clipboard text arrived for Ctrl-Shift-V paste into command/search/insert.
+                // GDK clipboard text arrived for Ctrl-Shift-V paste.
                 use core::Mode;
                 let mut engine = self.engine.borrow_mut();
                 match engine.mode {
                     Mode::Command | Mode::Search => {
                         engine.paste_text_to_input(&text);
                     }
-                    Mode::Insert => {
+                    Mode::Insert | Mode::Replace => {
                         for ch in text.chars() {
                             if ch == '\n' || ch == '\r' {
                                 engine.handle_key("Return", None, false);
@@ -4995,7 +4995,12 @@ impl SimpleComponent for App {
                             }
                         }
                     }
-                    _ => {}
+                    Mode::Normal | Mode::Visual | Mode::VisualLine | Mode::VisualBlock => {
+                        if !text.is_empty() {
+                            engine.load_clipboard_for_paste(text);
+                            engine.handle_key("", Some('p'), false);
+                        }
+                    }
                 }
                 self.draw_needed.set(true);
             }

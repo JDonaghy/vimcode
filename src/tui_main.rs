@@ -678,8 +678,11 @@ fn sync_tui_clipboard(engine: &mut Engine, last: &mut Option<String>) {
 /// Returns true if the key was intercepted and processed.
 fn intercept_paste_key(engine: &mut Engine, before: bool) -> bool {
     use crate::core::Mode;
-    // Only intercept in Normal mode with a default/clipboard register.
-    if engine.mode != Mode::Normal {
+    // Intercept in Normal and Visual modes with a default/clipboard register.
+    if !matches!(
+        engine.mode,
+        Mode::Normal | Mode::Visual | Mode::VisualLine | Mode::VisualBlock
+    ) {
         return false;
     }
     if !matches!(
@@ -921,16 +924,21 @@ fn event_loop(
         // editor_col: [tab(1)] / [editor] then global [status(1)] [cmd(1)]
         if let Ok(size) = terminal.size() {
             let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
-            let trm_rows: u16 = if engine.terminal_open {
-                engine.session.terminal_panel_rows + 1
+            let trm_rows: u16 = if engine.terminal_open || engine.bottom_panel_open {
+                engine.session.terminal_panel_rows + 2 // match draw_frame: tab bar + header + content
             } else {
                 0
             };
             let menu_row: u16 = if engine.menu_bar_visible { 1 } else { 0 };
             let dbg_row: u16 = if engine.debug_toolbar_visible { 1 } else { 0 };
+            let wm_row: u16 = if !engine.wildmenu_items.is_empty() {
+                1
+            } else {
+                0
+            };
             let content_rows = size
                 .height
-                .saturating_sub(2 + qf_rows + trm_rows + menu_row + dbg_row); // status + cmd + panels (tab bar inside content bounds)
+                .saturating_sub(2 + qf_rows + trm_rows + menu_row + dbg_row + wm_row); // status + cmd + panels (tab bar inside content bounds)
             let gutter_approx = 4u16;
             let sidebar_cols = if sidebar.visible {
                 sidebar_width + 1
@@ -2755,6 +2763,51 @@ fn event_loop(
                         // Fall through to handle_key which calls vscode_paste().
                     }
 
+                    // Ctrl+Shift+V: paste system clipboard into editor buffer.
+                    // With keyboard enhancement, this event is captured by the app
+                    // instead of the terminal emulator.  In Vim mode, load clipboard
+                    // into registers and trigger paste; in insert mode, insert text.
+                    if ctrl && key_name == "V" && !engine.is_vscode_mode() {
+                        use crate::core::Mode;
+                        if let Some(ref cb_read) = engine.clipboard_read {
+                            if let Ok(text) = cb_read() {
+                                if !text.is_empty() {
+                                    engine.load_clipboard_for_paste(text);
+                                    match engine.mode {
+                                        Mode::Normal => {
+                                            engine.handle_key("", Some('p'), false);
+                                        }
+                                        Mode::Visual | Mode::VisualLine | Mode::VisualBlock => {
+                                            engine.handle_key("", Some('p'), false);
+                                        }
+                                        Mode::Insert | Mode::Replace => {
+                                            // Insert clipboard text at cursor
+                                            if let Some((content, _)) =
+                                                engine.get_register_content('"')
+                                            {
+                                                let mut changed = false;
+                                                for ch in content.chars() {
+                                                    engine.handle_key(
+                                                        &ch.to_string(),
+                                                        Some(ch),
+                                                        false,
+                                                    );
+                                                    changed = true;
+                                                }
+                                                if changed {
+                                                    needs_redraw = true;
+                                                }
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                        needs_redraw = true;
+                        continue;
+                    }
+
                     // Shift+F5 → stop, Shift+F11 → stepout (debug shortcuts)
                     if key_event.modifiers.contains(KeyModifiers::SHIFT)
                         && key_event.kind != KeyEventKind::Release
@@ -3278,7 +3331,7 @@ fn handle_mouse(
             if col >= editor_left {
                 if let Some(layout) = last_layout {
                     let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
-                    let editor_row = row.saturating_sub(1 + menu_rows);
+                    let editor_row = row.saturating_sub(menu_rows);
                     for rw in &layout.windows {
                         let wx = rw.rect.x as u16;
                         let wy = rw.rect.y as u16;
@@ -3487,7 +3540,7 @@ fn handle_mouse(
             if col >= editor_left && row + 2 < term_height {
                 let rel_col = col - editor_left;
                 let scroll_menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
-                let editor_row = row.saturating_sub(1 + scroll_menu_rows);
+                let editor_row = row.saturating_sub(scroll_menu_rows);
                 // Find which window the mouse is over; scroll that window
                 let scrolled = last_layout.and_then(|layout| {
                     layout.windows.iter().find(|rw| {
@@ -4141,10 +4194,11 @@ fn handle_mouse(
 
         if let Some(ref split) = layout.editor_group_split {
             // Find which group's tab bar row matches the clicked row.
-            // Tab bar sits 1 row above the group's window content (bounds.y - 1).
+            // Tab bar sits tab_bar_height rows above the group's window content.
+            let click_tbh: u16 = if engine.settings.breadcrumbs { 2 } else { 1 };
             let mut matched_group = None;
             for gtb in split.group_tab_bars.iter() {
-                let tab_bar_row = menu_rows + (gtb.bounds.y as u16).saturating_sub(1);
+                let tab_bar_row = menu_rows + (gtb.bounds.y as u16).saturating_sub(click_tbh);
                 let gx = gtb.bounds.x as u16;
                 let gw = gtb.bounds.width as u16;
                 if row == tab_bar_row && rel_col >= gx && rel_col < gx + gw {
@@ -4299,9 +4353,10 @@ fn handle_mouse(
     }
 
     let rel_col = col - editor_left;
-    // Subtract tab bar row (1) and menu bar rows so editor_row is 0-indexed
-    // relative to the editor content area (matching window rect y coords).
-    let editor_row = row.saturating_sub(1 + menu_rows);
+    // editor_row is 0-indexed relative to the editor content area.
+    // Window rects already include the tab_bar_height offset (y >= 1),
+    // so we only subtract menu_rows here (not the tab bar row).
+    let editor_row = row.saturating_sub(menu_rows);
 
     if let Some(layout) = last_layout {
         for rw in &layout.windows {
@@ -4320,8 +4375,8 @@ fn handle_mouse(
 
                 // Vertical scrollbar click/drag-start (rightmost column)
                 if has_v_scrollbar && rel_col == wx + ww - 1 {
-                    // 1 = tab bar row, menu_rows = menu bar offset; wy = window top in editor area
-                    let track_abs_start = 1 + menu_rows + wy;
+                    // menu_rows = menu bar offset; wy already includes tab_bar_height
+                    let track_abs_start = menu_rows + wy;
                     // If there's also a h-scrollbar, v-track is 1 row shorter
                     let track_len = if has_h_scrollbar {
                         wh.saturating_sub(1)
@@ -4439,17 +4494,24 @@ fn build_screen_for_tui(
 ) -> render::ScreenLayout {
     // Global bottom rows: status(1) + cmd(1).  The tab bar row is included in
     // content_bounds and handled by calculate_group_window_rects (tab_bar_height=1).
+    // Must match draw_frame's vertical layout exactly.
     let qf_height: u16 = if engine.quickfix_open { 6 } else { 0 };
-    let term_height: u16 = if engine.terminal_open || engine.bottom_panel_open {
-        engine.session.terminal_panel_rows + 1
+    let bottom_panel_open = engine.terminal_open || engine.bottom_panel_open;
+    let term_height: u16 = if bottom_panel_open {
+        engine.session.terminal_panel_rows + 2 // 1 tab bar row + 1 header row + content
     } else {
         0
     };
     let menu_height: u16 = if engine.menu_bar_visible { 1 } else { 0 };
     let dbg_height: u16 = if engine.debug_toolbar_visible { 1 } else { 0 };
+    let wildmenu_height: u16 = if !engine.wildmenu_items.is_empty() {
+        1
+    } else {
+        0
+    };
     let content_rows = area
         .height
-        .saturating_sub(2 + qf_height + term_height + menu_height + dbg_height); // status + cmd + panels
+        .saturating_sub(2 + qf_height + term_height + menu_height + dbg_height + wildmenu_height); // status + cmd + panels
     let sidebar_cols = if sidebar.visible {
         sidebar_width + 1
     } else {
@@ -4639,14 +4701,15 @@ fn draw_frame(
         // Render windows first so tab bars draw on top (prevents window content
         // from overwriting an adjacent group's tab bar in horizontal splits).
         render_all_windows(frame, editor_area, &screen.windows, theme);
-        // Draw each group's tab bar.  Tab bar sits 1 row above the group's
-        // window content (bounds.y - 1).
+        // Draw each group's tab bar.  Tab bar sits tab_bar_height rows above
+        // the group's window content (bounds.y - tab_bar_height).
+        let tui_tbh: u16 = if engine.settings.breadcrumbs { 2 } else { 1 };
         for gtb in split.group_tab_bars.iter() {
             let tab_x = gtb.bounds.x as u16 + editor_area.x;
             let tab_w = gtb.bounds.width as u16;
             let is_active = gtb.group_id == split.active_group;
             if tab_w > 0 {
-                let bar_y = editor_area.y + (gtb.bounds.y as u16).saturating_sub(1);
+                let bar_y = editor_area.y + (gtb.bounds.y as u16).saturating_sub(tui_tbh);
                 let g_tab = Rect {
                     x: tab_x,
                     y: bar_y,

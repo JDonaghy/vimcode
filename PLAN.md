@@ -5,6 +5,7 @@
 ---
 
 ## Recently Completed
+- **Session 152**: Visual paste — `p`/`P` in visual mode replaces selection with register content; `"x` register selection in visual mode; `Ctrl+Shift+V` clipboard paste in Normal/Visual (TUI+GTK); TUI tab bar fix (breadcrumbs y-offset); multi-group `Ctrl-W h/l` navigates between groups before overflowing to sidebar; pre-existing test fix (`swap_scan_stale`); 8 tests
 - **Session 151**: Tab drag-to-split — VSCode-style drag tab to edge for new split, drag to center to move between groups, drag within tab bar to reorder; `DropZone`/`TabDragState` core types, 7 engine methods, GTK overlay rendering; tab bar draw order fix (windows before tab bars, dividers before tab bars); new `vim-code.svg` gradient logo, removed old icon files; 15 tests
 - **Session 150**: Tab switcher polish — Alt+t binding (TUI+GTK), modifier-release auto-confirm (GTK polling + TUI timeout), sans-serif UI font for tabs/popup, tab click fix (breadcrumbs y-offset, Pango-measured hit zones, deferred tree highlight)
 - **Session 149**: Ctrl+Tab MRU tab switcher (VSCode-style popup, forward/backward cycling, Enter confirms, Escape cancels) + `autohide_panels` TUI setting (auto-hide sidebar/activity bar, Ctrl-W h reveals)

@@ -1,9 +1,12 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 150 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 151 archived here. Recent work summary in PROJECT_STATE.md.
 
 ---
+
+**Session 151 — Tab drag-to-split + tab bar draw fix + new logo (2760 tests):**
+VSCode-style tab drag-and-drop: drag a tab to the edge of a group to create a new editor group split; drag to center to move tab between groups; drag within tab bar to reorder. New core types: `DropZone` enum (Center/Split/TabReorder/None) in `window.rs`, `TabDragState` struct in `engine.rs`. 7 new engine methods: `tab_drag_begin`, `tab_drag_cancel`, `tab_drag_drop`, `move_tab_to_target_group`, `move_tab_to_new_split`, `reorder_tab_in_group`, `close_group_by_id`. GTK: 8px dead-zone drag detection from tab clicks, `compute_tab_drop_zone()` with 20% edge margins for split zones, `draw_tab_drag_overlay()` with blue highlight + ghost label. Tab bar draw order fix: moved tab bar + breadcrumb drawing AFTER window drawing so tab bars are never overwritten by window backgrounds in multi-group layouts; dividers draw before tab bars so vertical dividers don't bleed through tab bar backgrounds. New logo: `vim-code.svg` gradient VC logo replaces old icon files; removed `vimcode-color.png`, `vimcode-color.svg`, `vimcode.png`, `vimcode.svg`, `asset-pack.jpg`; updated Flatpak icon. 15 integration tests in `tests/tab_drag.rs`.
 
 **Session 150 — Tab switcher polish + tab click fix (2728 tests):**
 Alt+t as universal tab switcher binding (works in both TUI and GTK where Ctrl+Tab is often intercepted). GTK modifier-release detection via 100ms polling of `keyboard.modifier_state()` — releasing Ctrl/Alt auto-confirms selection. TUI uses 500ms timeout after last cycle. Sans-serif UI font (`UI_FONT`) applied to tab bar and tab switcher popup in GTK (matching VSCode style). **Tab click fix**: clicking tabs in GUI mode now works correctly — fixed three bugs: (1) breadcrumbs offset caused click y-region to hit breadcrumb row instead of tab row (`grect.y - line_height` → `grect.y - tab_bar_height`); (2) monospace `char_width` tab measurement replaced with Pango-measured slot positions cached during draw; (3) `editor_bottom` calculation now matches draw layout (accounts for quickfix/terminal/debug toolbar). Tab bar clicks skip expensive `fire_cursor_move_hook()` (git blame subprocess) and defer `highlight_file_in_tree` DFS via 50ms timeout for instant visual response.

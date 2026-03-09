@@ -3248,17 +3248,33 @@ impl Engine {
     pub fn focus_window_direction(&mut self, _direction: SplitDirection, forward: bool) {
         let win_ids = self.active_tab().window_ids();
         let current = self.active_tab().active_window;
-        if forward {
-            if win_ids.last() == Some(&current) && self.group_layout.leaf_count() <= 1 {
-                self.window_nav_overflow = Some(true);
-                return;
+        let at_boundary = if forward {
+            win_ids.last() == Some(&current)
+        } else {
+            win_ids.first() == Some(&current)
+        };
+
+        if at_boundary {
+            // Try to move to adjacent editor group
+            let group_ids = self.group_layout.group_ids();
+            let cur_idx = group_ids.iter().position(|&id| id == self.active_group);
+            let adjacent = cur_idx.and_then(|idx| {
+                if forward {
+                    group_ids.get(idx + 1).copied()
+                } else {
+                    idx.checked_sub(1).map(|i| group_ids[i])
+                }
+            });
+            if let Some(next_group) = adjacent {
+                self.prev_active_group = Some(self.active_group);
+                self.active_group = next_group;
+            } else {
+                // No adjacent group → signal overflow to TUI/GTK
+                self.window_nav_overflow = Some(forward);
             }
+        } else if forward {
             self.focus_next_window();
         } else {
-            if win_ids.first() == Some(&current) && self.group_layout.leaf_count() <= 1 {
-                self.window_nav_overflow = Some(false);
-                return;
-            }
             self.focus_prev_window();
         }
     }
@@ -10241,9 +10257,17 @@ impl Engine {
             }
         }
 
+        // Register selection: "x sets selected_register for next operation
+        // Only trigger when no pending_key is active (i" / a" are text objects, not register)
+        if !ctrl && unicode == Some('"') && self.pending_key.is_none() {
+            self.pending_key = Some('"');
+            return EngineAction::None;
+        }
+
         // Handle text objects (iw, aw, i", a(, etc.) - set pending key
         // Skip when ctrl is held (Ctrl-A/Ctrl-I are not text objects)
-        if !ctrl {
+        // Skip when pending_key is already set (e.g. "x register selection in progress)
+        if !ctrl && self.pending_key.is_none() {
             if let Some(ch) = unicode {
                 if ch == 'i' || ch == 'a' {
                     self.pending_key = Some(ch);
@@ -10256,6 +10280,11 @@ impl Engine {
         // Note: count is NOT applied to visual operators - they operate on the selection
         if let Some(ch) = unicode {
             match ch {
+                'p' | 'P' if self.pending_key.is_none() => {
+                    self.count = None;
+                    self.paste_visual_selection(changed);
+                    return EngineAction::None;
+                }
                 'd' => {
                     self.count = None; // Clear count (not used for visual operators)
                     self.delete_visual_selection(changed);
@@ -10487,8 +10516,22 @@ impl Engine {
             }
         }
 
-        // Handle multi-key sequences (gg, {, }, text objects)
+        // Handle multi-key sequences (gg, {, }, text objects, register selection)
         if let Some(pending) = self.pending_key.take() {
+            if pending == '"' {
+                // Register selection: "x
+                if let Some(ch) = unicode {
+                    if ch.is_ascii_lowercase()
+                        || ch.is_ascii_digit()
+                        || ch == '"'
+                        || ch == '+'
+                        || ch == '*'
+                    {
+                        self.selected_register = Some(ch);
+                    }
+                }
+                return EngineAction::None;
+            }
             if pending == 'i' || pending == 'a' {
                 // Text object selection
                 if let Some(obj_type) = unicode {
@@ -10895,6 +10938,80 @@ impl Engine {
         // Exit visual mode
         self.mode = Mode::Normal;
         self.visual_anchor = None;
+    }
+
+    /// Paste over visual selection: replace selected text with register content.
+    /// The deleted selection goes into the unnamed register (Vim behavior).
+    fn paste_visual_selection(&mut self, changed: &mut bool) {
+        // 1. Read the register content BEFORE deleting (delete overwrites unnamed reg)
+        let paste_reg = self.active_register();
+        let (paste_content, paste_linewise) = match self.get_register_content(paste_reg) {
+            Some(pair) => pair,
+            None => {
+                self.clear_selected_register();
+                // Still delete selection even if register is empty
+                self.delete_visual_selection(changed);
+                return;
+            }
+        };
+
+        // 2. Get the selection text and range before deleting
+        let sel_linewise = matches!(self.mode, Mode::VisualLine);
+        let sel_range = self.get_visual_selection_range();
+
+        // 3. Delete the visual selection (stores deleted text in unnamed reg)
+        self.delete_visual_selection(changed);
+
+        // 4. Now paste the saved register content at the cursor position
+        let start = if let Some((s, _)) = sel_range {
+            s
+        } else {
+            return;
+        };
+
+        self.start_undo_group();
+
+        if sel_linewise || paste_linewise {
+            // Linewise paste: insert on its own line
+            let line = self.view().cursor.line;
+            let line_start = self.buffer().line_to_char(line);
+            // Ensure paste content ends with newline
+            let content = if paste_content.ends_with('\n') {
+                paste_content
+            } else {
+                format!("{}\n", paste_content)
+            };
+            self.insert_with_undo(line_start, &content);
+            self.view_mut().cursor.line = line;
+            self.view_mut().cursor.col = 0;
+        } else {
+            // Characterwise paste: insert at the start of the deleted selection
+            // (not cursor, which may have been clamped by delete_visual_selection)
+            let line = start.line;
+            let col = start.col;
+            let char_idx = self.buffer().line_to_char(line) + col;
+            self.insert_with_undo(char_idx, &paste_content);
+            // Position cursor at end of pasted text
+            let paste_len = paste_content.chars().count();
+            if paste_len > 0 {
+                if paste_content.contains('\n') {
+                    let lines: Vec<&str> = paste_content.split('\n').collect();
+                    let last_line = lines.last().unwrap_or(&"");
+                    self.view_mut().cursor.line = start.line + lines.len() - 1;
+                    if lines.len() > 1 {
+                        self.view_mut().cursor.col = last_line.chars().count().saturating_sub(1);
+                    } else {
+                        self.view_mut().cursor.col = col + paste_len - 1;
+                    }
+                } else {
+                    self.view_mut().cursor.col = col + paste_len - 1;
+                }
+            }
+        }
+
+        self.finish_undo_group();
+        self.clamp_cursor_col();
+        self.clear_selected_register();
     }
 
     fn change_visual_selection(&mut self, changed: &mut bool) {
@@ -26710,6 +26827,8 @@ mod tests {
 
         let mut engine = Engine::new();
         engine.cwd = workspace_dir.clone();
+        // Disable swap files so swap_scan_stale doesn't open extra files.
+        engine.settings.swap_file = false;
         engine.restore_session_files();
 
         // Three files → three tabs.

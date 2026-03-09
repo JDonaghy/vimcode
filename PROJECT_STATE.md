@@ -1,9 +1,9 @@
 # VimCode Project State
 
-**Last updated:** Mar 8, 2026 (Session 151 — Tab drag-to-split + tab bar draw fix + new logo) | **Tests:** 2760
+**Last updated:** Mar 8, 2026 (Session 152 — Visual paste, TUI bug fixes) | **Tests:** 2768
 
 > Feature documentation lives in **README.md**.
-> Per-session implementation notes through Session 150 are in **SESSION_HISTORY.md**.
+> Per-session implementation notes through Session 151 are in **SESSION_HISTORY.md**.
 
 ---
 
@@ -26,7 +26,7 @@ When implementing a new key/command, add tests covering:
 
 ## Recent Work
 
-**Session 151 — Tab drag-to-split + tab bar draw fix + new logo (2760 tests):**
-VSCode-style tab drag-and-drop: drag a tab to the edge of a group to create a new editor group split; drag to center to move tab between groups; drag within tab bar to reorder. New core types: `DropZone` enum (Center/Split/TabReorder/None) in `window.rs`, `TabDragState` struct in `engine.rs`. 7 new engine methods: `tab_drag_begin`, `tab_drag_cancel`, `tab_drag_drop`, `move_tab_to_target_group`, `move_tab_to_new_split`, `reorder_tab_in_group`, `close_group_by_id`. GTK: 8px dead-zone drag detection from tab clicks, `compute_tab_drop_zone()` with 20% edge margins for split zones, `draw_tab_drag_overlay()` with blue highlight + ghost label. **Tab bar draw order fix**: moved tab bar + breadcrumb drawing AFTER window drawing so tab bars are never overwritten by window backgrounds in multi-group layouts; dividers draw before tab bars so vertical dividers don't bleed through tab bar backgrounds. **New logo**: `vim-code.svg` gradient VC logo replaces old icon files; removed `vimcode-color.png`, `vimcode-color.svg`, `vimcode.png`, `vimcode.svg`, `asset-pack.jpg`; updated Flatpak icon. 15 integration tests in `tests/tab_drag.rs`.
+**Session 152 — Visual paste + TUI bug fixes (2768 tests):**
+**Visual paste**: `p`/`P` in Visual/VisualLine/VisualBlock mode replaces selection with register content (deleted text stored in unnamed register); `"x` register selection in visual mode; named register paste (`"ap`); `Ctrl+Shift+V` system clipboard paste in Normal/Visual modes for both TUI (keyboard enhancement) and GTK. **TUI tab bar fix**: multi-group tab bar y-coordinate used `bounds.y - 1` which was wrong when breadcrumbs enabled (`tab_bar_height=2`); fixed to use `bounds.y - tab_bar_height`; same fix for mouse click handler. **TUI sidebar reveal fix**: `focus_window_direction()` only set `window_nav_overflow` for single-group layouts; with multiple editor groups, Ctrl-W h/l now navigates between adjacent groups first, and only signals overflow (sidebar reveal) when at the leftmost/rightmost group. **Test fix**: `test_restore_session_files_opens_separate_tabs` failed because `swap_scan_stale()` opened stale swap files as extra tabs; fixed by disabling swap files in test. 8 integration tests in `tests/visual_mode.rs`.
 
-> Sessions 150 and earlier archived in **SESSION_HISTORY.md**.
+> Sessions 151 and earlier archived in **SESSION_HISTORY.md**.

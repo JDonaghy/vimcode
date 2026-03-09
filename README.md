@@ -11,7 +11,7 @@ There's a touch of irony here - using a cli tool to write the editor that I've w
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 2760+ tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 2768+ tests, zero async runtime dependency
 
 > **Note:** VimCode does not implement VimScript. Extension and scripting is handled via
 > the built-in Lua 5.4 plugin system. The goal is full Vim *keybinding* and *editing*
@@ -157,7 +157,8 @@ cargo fmt
 
 **Visual mode**
 - `v` — character selection; `V` — line selection; `Ctrl-V` — block selection
-- All operators work on selection: `d`, `c`, `y`, `u`, `U`, `~`
+- All operators work on selection: `d`, `c`, `y`, `u`, `U`, `~`, `p`/`P` (paste replaces selection)
+- `"{reg}p` — paste from named register over selection (deleted text goes to unnamed register)
 - Block mode: rectangular selections, change/delete/yank uniform columns
 - `I` (block) — insert text at left edge of block (applied to all lines on Escape)
 - `A` (block) — append text after right edge of block (applied to all lines on Escape)
@@ -198,7 +199,7 @@ cargo fmt
 - `".` — last inserted text (read-only)
 - `"_` — black hole register (discard without affecting other registers)
 - Registers preserve linewise/characterwise type
-- `Ctrl-Shift-V` — paste clipboard in Command/Search/Insert mode (GTK); bracketed paste in TUI
+- `Ctrl-Shift-V` — paste system clipboard in Normal/Visual/Insert/Command/Search mode (GTK + TUI with keyboard enhancement)
 
 **Find/Replace**
 - `:s/pattern/replacement/[flags]` — substitute on current line
