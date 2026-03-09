@@ -11,7 +11,7 @@ There's a touch of irony here - using a cli tool to write the editor that I've w
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 2768+ tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 2809+ tests, zero async runtime dependency
 
 > **Note:** VimCode does not implement VimScript. Extension and scripting is handled via
 > the built-in Lua 5.4 plugin system. The goal is full Vim *keybinding* and *editing*
@@ -548,14 +548,22 @@ VimCode embeds Lua 5.4 (via `mlua`, fully vendored — no system Lua required). 
 
 ```lua
 -- Event hooks
-vimcode.on("save",        function(path) end)     -- fired after :w
+vimcode.on("save",        function(path) end)     -- fired after :w (also "BufWrite")
 vimcode.on("open",        function(path) end)     -- fired on file open
 vimcode.on("cursor_move", function(line_col) end) -- fired when cursor moves (arg: "line,col")
+vimcode.on("BufEnter",    function() end)          -- fired when switching to a buffer
+vimcode.on("BufNew",      function() end)          -- fired when a new buffer is created
+vimcode.on("InsertEnter", function() end)          -- fired on entering insert mode
+vimcode.on("InsertLeave", function() end)          -- fired on leaving insert mode
+vimcode.on("ModeChanged", function(change) end)    -- arg: "Old:New" (e.g. "Normal:Insert")
+vimcode.on("VimEnter",    function() end)          -- fired once after startup
 
 -- Custom commands / key mappings
 vimcode.command("MyCmd", function(args) end)
 vimcode.keymap("n", "<leader>x", function() end)   -- normal mode
 vimcode.keymap("i", "<C-Space>", function() end)   -- insert mode
+vimcode.keymap("v", "X", function() end)            -- visual mode
+vimcode.keymap("c", "Y", function() end)            -- command mode
 
 -- Editor API
 vimcode.message(text)         -- show in status bar
@@ -568,12 +576,26 @@ vimcode.async_shell(cmd, event [, opts])  -- run shell command in background thr
 -- Buffer API (current active buffer)
 vimcode.buf.lines()              -- all lines as table
 vimcode.buf.line(n)              -- line n (1-indexed) or nil
-vimcode.buf.set_line(n, text)    -- replace line n
+vimcode.buf.set_line(n, text)    -- replace line n (undoable)
+vimcode.buf.insert_line(n, text) -- insert text before line n
+vimcode.buf.delete_line(n)       -- delete line n
+vimcode.buf.set_cursor(line,col) -- move cursor (1-indexed, clamped)
 vimcode.buf.path()               -- file path string or nil
 vimcode.buf.line_count()         -- integer
 vimcode.buf.cursor()             -- {line, col} (1-indexed)
 vimcode.buf.annotate_line(n, s)  -- show virtual text after line n
 vimcode.buf.clear_annotations()  -- remove all virtual text
+
+-- Settings API
+vimcode.opt.get(key)             -- get setting value as string
+vimcode.opt.set(key, value)      -- set setting (applied after callback)
+
+-- State API (read-only queries)
+vimcode.state.mode()             -- "Normal", "Insert", "Visual", etc.
+vimcode.state.filetype()         -- language ID string (e.g. "rust")
+vimcode.state.register(char)     -- {content, linewise} or nil
+vimcode.state.set_register(char, content, linewise)  -- write register
+vimcode.state.mark(char)         -- {line, col} (1-indexed) or nil
 
 -- Git API (synchronous subprocess calls)
 vimcode.git.blame_line(n)        -- {hash,author,date,relative_date,message} or nil
@@ -600,6 +622,10 @@ Then `:Hello world` shows "Hello from Lua! world" in the status bar.
 | `:Plugin reload` | Reload all plugins from disk |
 | `:Plugin enable <name>` | Enable a previously disabled plugin |
 | `:Plugin disable <name>` | Disable a plugin (persisted in settings) |
+| `:Commentary [N]` | Toggle comment on N lines from cursor (Commentary plugin) |
+| `:map` | List all user-defined key mappings |
+| `:map n <C-/> :Commentary` | Add a key mapping (persisted to settings.json) |
+| `:unmap n <C-/>` | Remove a key mapping |
 
 Plugins are loaded in alphabetical order on startup. Security: plugins have unrestricted file and process access (same trust model as Neovim).
 
@@ -632,6 +658,7 @@ No C# Language Support extension — :ExtInstall csharp  (N to dismiss)
 | `yaml` | YAML | yaml-language-server | — |
 | `markdown` | Markdown | marksman | — |
 | `git-insights` | (all files) | — | — |
+| `commentary` | (all files) | — | — |
 
 **Extensions sidebar panel** — click the extensions icon (󱧅) in the activity bar to open a VSCode-style panel with two sections:
 - **INSTALLED** — extensions currently installed; press `Enter` to view info, `d` to remove
@@ -845,6 +872,24 @@ Key notation: `<C-x>` = Ctrl+x, `<A-x>` = Alt+x, `<C-S-x>` = Ctrl+Shift+x.
 
 Only specify keys you want to change — unspecified keys keep their defaults.
 
+**User key mappings** — define custom key → command bindings in `settings.json` under `"keymaps"`:
+
+```json
+"keymaps": [
+  "n <C-/> :Commentary",
+  "v <C-/> :Commentary",
+  "n gcc :Commentary {count}",
+  "n <leader>f :Lformat"
+]
+```
+
+Format: `"mode keys :command"` where:
+- **mode**: `n` (normal), `v` (visual), `i` (insert), `c` (command)
+- **keys**: single char (`J`), modifier (`<C-/>`, `<A-c>`), or multi-key sequence (`gcc`, `gc`)
+- **action**: ex command prefixed with `:`. Use `{count}` to substitute the count prefix.
+
+User keymaps are checked **before** built-in keys, so they can override defaults. Multi-key sequences (e.g. `gcc`) are supported — intermediate keys are buffered until an exact match or fallthrough.
+
 ---
 
 ### VSCode Mode
@@ -971,6 +1016,7 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `=` operator | Auto-indent range (`==` current line, `=G` to end, `=gg` whole file) |
 | `d`/`c`/`y` + motion | Full operator+motion support: `dj`/`dk`/`dG`/`dgg`/`d{`/`d}`/`d(`/`d)`/`dW`/`dB`/`dE`/`d^`/`dh`/`dl`/`dH`/`dM`/`dL`/`df`/`dt`/`dF`/`dT`/`d;`/`d,`/`dge` |
 | `g~`/`gu`/`gU` + motion | Case operators: all motions (`g~j`, `guw`, `gUG`, `gufx`, etc.) |
+| `gcc` / `gc` (visual) | Toggle line comments (Commentary plugin — 40+ languages) |
 | `>`/`<` + motion | Indent/dedent: all motions (`>j`, `>G`, `>}`, etc.) |
 | `gp` / `gP` | Paste after / before, leave cursor after pasted text |
 | `]p` / `[p` | Paste after / before with indent adjusted to current line |
@@ -1170,6 +1216,8 @@ All ex commands support Vim-style abbreviations (e.g., `:j` for `:join`, `:y` fo
 | `:Plugin reload` | Reload plugins from disk |
 | `:Plugin enable <name>` | Enable a plugin |
 | `:Plugin disable <name>` | Disable a plugin |
+| `:map` / `:map n K :cmd` | List keymaps / add a key mapping |
+| `:unmap n K` | Remove a key mapping |
 | `:ExtInstall <name>` | Install a language extension (LSP + DAP + Lua scripts) |
 | `:ExtList` | List available extensions and their install status |
 | `:ExtEnable <name>` | Re-enable a disabled extension |

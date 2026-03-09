@@ -133,6 +133,14 @@ pub struct Settings {
     #[serde(default)]
     pub disabled_plugins: Vec<String>,
 
+    /// User-defined key mappings. Each entry is `"mode keys :command"`.
+    /// Mode: `n` (normal), `v` (visual), `i` (insert), `c` (command).
+    /// Keys: single char (`x`), modifier (`<C-/>`, `<A-c>`), or sequence (`gcc`, `gc`).
+    /// Action: ex command prefixed with `:`.
+    /// Example: `["n <C-/> :Commentary", "v <C-/> :Commentary"]`
+    #[serde(default)]
+    pub keymaps: Vec<String>,
+
     /// Highlight all search matches (default true). Disable with `:set nohlsearch`.
     #[serde(default = "default_hlsearch")]
     pub hlsearch: bool,
@@ -574,6 +582,7 @@ impl Default for Settings {
             wrap: false,
             plugins_enabled: default_plugins_enabled(),
             disabled_plugins: Vec::new(),
+            keymaps: Vec::new(),
             hlsearch: default_hlsearch(),
             ignorecase: false,
             smartcase: false,

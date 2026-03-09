@@ -701,6 +701,130 @@ impl EditorGroup {
     }
 }
 
+// ─── User keymaps ────────────────────────────────────────────────────────────
+
+/// A parsed user-defined key mapping from settings.json.
+#[derive(Debug, Clone)]
+pub struct UserKeymap {
+    /// Mode: "n", "v", "i", "c".
+    pub mode: String,
+    /// Parsed key sequence, e.g. `["g", "c", "c"]` or `["<C-/>"]`.
+    pub keys: Vec<String>,
+    /// The ex command to run (without leading `:`), e.g. `"Commentary"`.
+    pub action: String,
+}
+
+/// Parse a key notation string into individual key specs.
+/// `"gcc"` → `["g", "c", "c"]`; `"<C-/>x"` → `["<C-/>", "x"]`.
+fn parse_key_sequence(s: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '<' {
+            // Find matching '>'
+            if let Some(end) = chars[i..].iter().position(|&c| c == '>') {
+                let token: String = chars[i..=i + end].iter().collect();
+                keys.push(token);
+                i += end + 1;
+            } else {
+                keys.push(chars[i].to_string());
+                i += 1;
+            }
+        } else {
+            keys.push(chars[i].to_string());
+            i += 1;
+        }
+    }
+    keys
+}
+
+/// Parse a keymap definition string: `"n gcc :Commentary"` → `UserKeymap`.
+fn parse_keymap_def(s: &str) -> Option<UserKeymap> {
+    let s = s.trim();
+    // Split: mode (first char or token), keys, :action
+    let mut parts = s.splitn(3, ' ');
+    let mode = parts.next()?.to_string();
+    if !matches!(mode.as_str(), "n" | "v" | "i" | "c") {
+        return None;
+    }
+    let keys_str = parts.next()?;
+    let action_str = parts.next()?.trim();
+    if !action_str.starts_with(':') {
+        return None;
+    }
+    let action = action_str[1..].to_string();
+    if action.is_empty() {
+        return None;
+    }
+    let keys = parse_key_sequence(keys_str);
+    if keys.is_empty() {
+        return None;
+    }
+    Some(UserKeymap { mode, keys, action })
+}
+
+/// Encode a keypress into the canonical string used for keymap matching.
+/// Must produce the same format as `parse_key_sequence` output.
+fn encode_keypress(key_name: &str, unicode: Option<char>, ctrl: bool) -> String {
+    if ctrl {
+        // Ctrl combinations: <C-x>
+        let base = if let Some(ch) = unicode {
+            ch.to_lowercase().to_string()
+        } else {
+            // Special keys with Ctrl: <C-Space>, <C-Tab>, etc.
+            match key_name {
+                "space" | "Space" => "Space".to_string(),
+                "Tab" => "Tab".to_string(),
+                _ => key_name.to_lowercase(),
+            }
+        };
+        format!("<C-{base}>")
+    } else if let Some(ch) = unicode {
+        ch.to_string()
+    } else {
+        // Special keys: <Escape>, <Return>, <Space>, etc.
+        match key_name {
+            "Escape" => "<Escape>".to_string(),
+            "Return" => "<Return>".to_string(),
+            "BackSpace" => "<BS>".to_string(),
+            "space" | "Space" => "<Space>".to_string(),
+            "Tab" => "<Tab>".to_string(),
+            other => format!("<{other}>"),
+        }
+    }
+}
+
+/// Decode an encoded keypress string back into (key_name, unicode, ctrl).
+fn decode_keypress(encoded: &str) -> (String, Option<char>, bool) {
+    if encoded.starts_with("<C-") && encoded.ends_with('>') {
+        let inner = &encoded[3..encoded.len() - 1];
+        match inner {
+            "Space" => ("space".to_string(), Some(' '), true),
+            "Tab" => ("Tab".to_string(), None, true),
+            s => {
+                let ch = s.chars().next();
+                let key = ch.map(|c| c.to_string()).unwrap_or_default();
+                (key.clone(), ch, true)
+            }
+        }
+    } else if encoded.starts_with('<') && encoded.ends_with('>') {
+        let inner = &encoded[1..encoded.len() - 1];
+        match inner {
+            "Escape" => ("Escape".to_string(), None, false),
+            "Return" => ("Return".to_string(), None, false),
+            "BS" => ("BackSpace".to_string(), None, false),
+            "Space" => ("space".to_string(), Some(' '), false),
+            "Tab" => ("Tab".to_string(), None, false),
+            other => (other.to_string(), None, false),
+        }
+    } else {
+        let ch = encoded.chars().next();
+        let key = ch.map(|c| c.to_string()).unwrap_or_default();
+        (key, ch, false)
+    }
+}
+
 pub struct Engine {
     // --- Multi-buffer/window state ---
     pub buffer_manager: BufferManager,
@@ -763,6 +887,12 @@ pub struct Engine {
 
     /// Pending key for multi-key sequences (e.g. 'g' for gg, 'd' for dd).
     pub pending_key: Option<char>,
+    /// Parsed user keymaps from settings (rebuilt on settings change).
+    pub user_keymaps: Vec<UserKeymap>,
+    /// Accumulated keypress buffer for multi-key user keymap matching.
+    pub keymap_buf: Vec<String>,
+    /// Guard: true while replaying buffered keys through handle_key.
+    pub keymap_replaying: bool,
     /// Set by `focus_window_direction` when navigation overflows the window list.
     /// `Some(false)` = tried to go left past first window, `Some(true)` = right past last.
     /// Consumed by the UI backend to move focus to sidebar/toolbar.
@@ -1415,6 +1545,9 @@ impl Engine {
             replace_text: String::new(),
             replace_flags: String::new(),
             pending_key: None,
+            user_keymaps: Vec::new(),
+            keymap_buf: Vec::new(),
+            keymap_replaying: false,
             window_nav_overflow: None,
             registers: HashMap::new(),
             selected_register: None,
@@ -1647,6 +1780,7 @@ impl Engine {
         if engine.is_vscode_mode() {
             engine.mode = Mode::Insert;
         }
+        engine.rebuild_user_keymaps();
         engine
     }
 
@@ -2053,6 +2187,7 @@ impl Engine {
                     self.swap_write_needed.remove(&id);
                     let path_str = path.to_string_lossy().into_owned();
                     self.plugin_event("save", &path_str);
+                    self.plugin_event("BufWrite", &path_str);
                     Ok(())
                 }
                 Err(e) => {
@@ -5060,6 +5195,18 @@ impl Engine {
         let mut action = EngineAction::None;
         let was_normal = matches!(self.mode, Mode::Normal);
 
+        // User-defined keymaps from settings (checked before built-in handlers).
+        // Skip in Command/Search modes where input goes to the command line,
+        // and skip when a panel has focus (those already intercepted above).
+        if !matches!(self.mode, Mode::Command | Mode::Search) && !self.user_keymaps.is_empty() {
+            if let Some(km_action) = self.try_user_keymap(key_name, unicode, ctrl, &mut changed) {
+                if changed {
+                    self.set_dirty(true);
+                }
+                return km_action;
+            }
+        }
+
         // N-to-dismiss extension hint: intercept 'N' in Normal mode when a hint is visible.
         // Only active while the hint is still the current status message (cleared on any edit).
         if let Some(ref name) = self.ext_hint_pending_name.clone() {
@@ -5600,7 +5747,7 @@ impl Engine {
             Some('i') => {
                 self.start_undo_group();
                 self.insert_text_buffer.clear();
-                self.mode = Mode::Insert;
+                self.set_mode(Mode::Insert);
                 self.count = None; // Clear count when entering insert mode
             }
             Some('a') => {
@@ -5614,7 +5761,7 @@ impl Engine {
                     let insert_max = self.get_line_len_for_insert(line);
                     self.view_mut().cursor.col = insert_max;
                 }
-                self.mode = Mode::Insert;
+                self.set_mode(Mode::Insert);
                 self.count = None; // Clear count when entering insert mode
             }
             Some('A') => {
@@ -5622,7 +5769,7 @@ impl Engine {
                 self.insert_text_buffer.clear();
                 let line = self.view().cursor.line;
                 self.view_mut().cursor.col = self.get_line_len_for_insert(line);
-                self.mode = Mode::Insert;
+                self.set_mode(Mode::Insert);
                 self.count = None; // Clear count when entering insert mode
             }
             Some('I') => {
@@ -6251,11 +6398,11 @@ impl Engine {
                 }
             }
             Some('v') => {
-                self.mode = Mode::Visual;
+                self.set_mode(Mode::Visual);
                 self.visual_anchor = Some(self.view().cursor);
             }
             Some('V') => {
-                self.mode = Mode::VisualLine;
+                self.set_mode(Mode::VisualLine);
                 self.visual_anchor = Some(self.view().cursor);
             }
             Some('%') => {
@@ -6734,8 +6881,21 @@ impl Engine {
                     // g?{motion}: ROT13 encode operator
                     self.pending_operator = Some('R');
                 }
+                Some('c') => {
+                    // gc: commentary — wait for next key (gcc = current line)
+                    self.pending_key = Some('\x03'); // sentinel for gc handler
+                }
                 _ => {}
             },
+            // gc pending: gcc toggles comment on current line (count-aware)
+            '\x03' => {
+                if let Some('c') = unicode {
+                    let count = self.take_count().max(1);
+                    let cmd = format!("Commentary {count}");
+                    let _ = self.execute_command(&cmd);
+                    *changed = true;
+                }
+            }
             ']' => match unicode {
                 Some('c') => self.jump_next_hunk(),
                 Some('d') => self.jump_next_diagnostic(),
@@ -9437,7 +9597,7 @@ impl Engine {
                 // Track cursor pos for gi (insert at last insert position)
                 let cur = self.view().cursor;
                 self.last_insert_pos = Some((cur.line, cur.col));
-                self.mode = Mode::Normal;
+                self.set_mode(Mode::Normal);
                 self.clamp_cursor_col();
                 // Dismiss signature help when leaving insert mode
                 self.lsp_signature_help = None;
@@ -9920,6 +10080,9 @@ impl Engine {
                             self.command_buffer.insert(byte_off, ch);
                             self.command_cursor += 1;
                         }
+                    } else {
+                        // Try plugin command-mode keymaps for unhandled special keys
+                        self.plugin_run_keymap("c", key_name);
                     }
                 }
                 EngineAction::None
@@ -10295,17 +10458,17 @@ impl Engine {
                     self.yank_visual_selection();
                     return EngineAction::None;
                 }
-                'c' => {
+                'c' if self.pending_key.is_none() => {
                     self.count = None; // Clear count (not used for visual operators)
                     self.change_visual_selection(changed);
                     return EngineAction::None;
                 }
-                'u' => {
+                'u' if self.pending_key.is_none() => {
                     self.count = None; // Clear count (not used for visual operators)
                     self.lowercase_visual_selection(changed);
                     return EngineAction::None;
                 }
-                'U' => {
+                'U' if self.pending_key.is_none() => {
                     self.count = None; // Clear count (not used for visual operators)
                     self.uppercase_visual_selection(changed);
                     return EngineAction::None;
@@ -10604,6 +10767,18 @@ impl Engine {
                     self.visual_anchor = None;
                 }
                 return EngineAction::None;
+            } else if pending == 'g' && unicode == Some('c') {
+                // gc in visual mode: toggle comment on selected lines
+                self.count = None;
+                if let Some((start, end)) = self.get_visual_selection_range() {
+                    let start_line = start.line + 1; // 1-indexed for :Commentary
+                    let end_line = end.line + 1;
+                    self.mode = Mode::Normal;
+                    self.visual_anchor = None;
+                    self.toggle_comment_range(start_line, end_line);
+                    *changed = true;
+                }
+                return EngineAction::None;
             } else if pending == 'g' && (unicode == Some('q') || unicode == Some('w')) {
                 // gq / gw in visual mode: format selected lines
                 self.count = None;
@@ -10727,6 +10902,8 @@ impl Engine {
             },
         }
 
+        // Try plugin visual-mode keymaps as a fallback
+        self.plugin_run_keymap("v", key_name);
         EngineAction::None
     }
 
@@ -11476,6 +11653,8 @@ impl Engine {
             "r ",
             "norm ",
             "Plugin",
+            "map",
+            "unmap",
         ]
     }
 
@@ -12626,6 +12805,8 @@ impl Engine {
                     }
                 }
                 self.plugin_manager = Some(mgr);
+                // Fire VimEnter event after plugin initialization is complete
+                self.plugin_event("VimEnter", "");
             }
             Err(e) => {
                 self.message = format!("Plugin init error: {e}");
@@ -12639,7 +12820,8 @@ impl Engine {
     /// no plugin actually needs the line contents).
     fn make_plugin_ctx(&self, skip_buf_lines: bool) -> plugin::PluginCallContext {
         let cwd = self.cwd.to_string_lossy().into_owned();
-        let buf_state = self.buffer_manager.get(self.active_buffer_id());
+        let buf_id = self.active_buffer_id();
+        let buf_state = self.buffer_manager.get(buf_id);
         let buf_path_os = buf_state.as_ref().and_then(|s| s.file_path.clone());
         let buf_path = buf_path_os
             .as_ref()
@@ -12657,6 +12839,44 @@ impl Engine {
                 .unwrap_or_default()
         };
         let cursor = self.cursor();
+
+        // Mode name
+        let mode_name = match self.mode {
+            Mode::Normal => "Normal",
+            Mode::Insert => "Insert",
+            Mode::Replace => "Replace",
+            Mode::Command => "Command",
+            Mode::Search => "Search",
+            Mode::Visual => "Visual",
+            Mode::VisualLine => "VisualLine",
+            Mode::VisualBlock => "VisualBlock",
+        }
+        .to_string();
+
+        // Registers snapshot
+        let registers_snapshot = self.registers.clone();
+
+        // Marks snapshot for the active buffer (1-indexed)
+        let marks_snapshot = self
+            .marks
+            .get(&buf_id)
+            .map(|m| {
+                m.iter()
+                    .map(|(&ch, c)| (ch, (c.line + 1, c.col + 1)))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Filetype from active buffer's language ID
+        let filetype = self
+            .buffer_manager
+            .get(buf_id)
+            .and_then(|s| s.lsp_language_id.clone())
+            .unwrap_or_default();
+
+        // Settings snapshot
+        let settings_snapshot = self.settings_snapshot();
+
         plugin::PluginCallContext {
             cwd,
             buf_path,
@@ -12666,8 +12886,60 @@ impl Engine {
             cursor_col: cursor.col + 1,
             cwd_path: Some(self.cwd.clone()),
             buf_path_os,
+            mode_name,
+            registers_snapshot,
+            marks_snapshot,
+            filetype,
+            settings_snapshot,
             ..Default::default()
         }
+    }
+
+    /// Build a snapshot of all settings as string key-value pairs.
+    fn settings_snapshot(&self) -> HashMap<String, String> {
+        let keys = [
+            "colorscheme",
+            "font_family",
+            "font_size",
+            "line_numbers",
+            "cursorline",
+            "tabstop",
+            "shift_width",
+            "expand_tab",
+            "auto_indent",
+            "wrap",
+            "scrolloff",
+            "colorcolumn",
+            "textwidth",
+            "hlsearch",
+            "ignorecase",
+            "smartcase",
+            "incremental_search",
+            "editor_mode",
+            "explorer_visible_on_startup",
+            "autoread",
+            "splitbelow",
+            "splitright",
+            "lsp_enabled",
+            "format_on_save",
+            "terminal_scrollback_lines",
+            "plugins_enabled",
+            "ai_provider",
+            "ai_model",
+            "ai_base_url",
+            "ai_completions",
+            "swapfile",
+            "updatetime",
+            "breadcrumbs",
+        ];
+        let mut map = HashMap::new();
+        for key in &keys {
+            let val = self.settings.get_value_str(key);
+            if !val.is_empty() {
+                map.insert(key.to_string(), val);
+            }
+        }
+        map
     }
 
     /// Apply the output side of a `PluginCallContext` back to the engine.
@@ -12676,6 +12948,7 @@ impl Engine {
             self.message = msg;
         }
         if !ctx.set_lines.is_empty() {
+            self.start_undo_group();
             let buf_id = self.active_buffer_id();
             for (line_idx, text) in ctx.set_lines {
                 if let Some(state) = self.buffer_manager.get_mut(buf_id) {
@@ -12692,12 +12965,17 @@ impl Engine {
                         } else {
                             format!("{text}\n")
                         };
+                        // Record for undo before mutating
+                        let old_text: String = state.buffer.content.slice(start..end).to_string();
+                        state.record_delete(start, &old_text);
                         state.buffer.delete_range(start, end);
+                        state.record_insert(start, &new_text);
                         state.buffer.insert(start, &new_text);
                         state.dirty = true;
                     }
                 }
             }
+            self.finish_undo_group();
         }
         // Apply virtual-text line annotations
         if ctx.clear_annotations {
@@ -12706,6 +12984,74 @@ impl Engine {
         for (line_1indexed, text) in ctx.annotate_lines {
             if line_1indexed > 0 {
                 self.line_annotations.insert(line_1indexed - 1, text);
+            }
+        }
+        // Apply cursor position
+        if let Some((line_1, col_1)) = ctx.set_cursor {
+            let line = line_1.saturating_sub(1);
+            let col = col_1.saturating_sub(1);
+            let max_line = self.buffer().len_lines().saturating_sub(1);
+            let clamped_line = line.min(max_line);
+            self.view_mut().cursor.line = clamped_line;
+            let max_col = self.get_max_cursor_col(clamped_line);
+            self.view_mut().cursor.col = col.min(max_col);
+        }
+        // Apply settings changes
+        for (key, value) in ctx.set_settings {
+            let _ = self.settings.set_value_str(&key, &value);
+        }
+        // Apply register writes
+        for (ch, content, linewise) in ctx.set_registers {
+            self.registers.insert(ch, (content, linewise));
+        }
+        // Apply line insertions (process in reverse to keep indices stable)
+        if !ctx.insert_lines.is_empty() {
+            let buf_id = self.active_buffer_id();
+            let mut insertions = ctx.insert_lines;
+            insertions.sort_by(|a, b| b.0.cmp(&a.0));
+            for (line_1, text) in insertions {
+                let line_idx = line_1.saturating_sub(1);
+                if let Some(state) = self.buffer_manager.get_mut(buf_id) {
+                    let line_count = state.buffer.len_lines();
+                    let insert_at = if line_idx >= line_count {
+                        state.buffer.len_chars()
+                    } else {
+                        state.buffer.line_to_char(line_idx)
+                    };
+                    let new_text = if text.ends_with('\n') {
+                        text
+                    } else {
+                        format!("{text}\n")
+                    };
+                    state.buffer.insert(insert_at, &new_text);
+                    state.dirty = true;
+                }
+            }
+        }
+        // Apply line deletions (process in reverse to keep indices stable)
+        if !ctx.delete_lines.is_empty() {
+            let buf_id = self.active_buffer_id();
+            let mut deletions = ctx.delete_lines;
+            deletions.sort_unstable();
+            deletions.dedup();
+            deletions.reverse();
+            for line_1 in deletions {
+                let line_idx = line_1.saturating_sub(1);
+                if let Some(state) = self.buffer_manager.get_mut(buf_id) {
+                    let line_count = state.buffer.len_lines();
+                    if line_idx < line_count {
+                        let start = state.buffer.line_to_char(line_idx);
+                        let end = if line_idx + 1 < line_count {
+                            state.buffer.line_to_char(line_idx + 1)
+                        } else {
+                            state.buffer.len_chars()
+                        };
+                        if start < end {
+                            state.buffer.delete_range(start, end);
+                            state.dirty = true;
+                        }
+                    }
+                }
             }
         }
         for cmd in ctx.run_commands {
@@ -12773,6 +13119,49 @@ impl Engine {
         true
     }
 
+    /// Set the editor mode with autocmd event firing.
+    /// Fires `ModeChanged` (arg: "OldMode:NewMode"), plus `InsertEnter`/`InsertLeave`
+    /// when transitioning to/from Insert mode.
+    pub fn set_mode(&mut self, new_mode: Mode) {
+        let old_mode = self.mode;
+        if old_mode == new_mode {
+            return;
+        }
+        self.mode = new_mode;
+
+        // Build mode name strings for events
+        let old_name = Self::mode_event_name(old_mode);
+        let new_name = Self::mode_event_name(new_mode);
+
+        // Fire InsertLeave when leaving Insert or Replace mode
+        if old_mode == Mode::Insert || old_mode == Mode::Replace {
+            self.plugin_event("InsertLeave", old_name);
+        }
+
+        // Fire InsertEnter when entering Insert or Replace mode
+        if new_mode == Mode::Insert || new_mode == Mode::Replace {
+            self.plugin_event("InsertEnter", new_name);
+        }
+
+        // Fire ModeChanged with "OldMode:NewMode" argument
+        let arg = format!("{old_name}:{new_name}");
+        self.plugin_event("ModeChanged", &arg);
+    }
+
+    /// Get a short event name for a mode (used in ModeChanged events).
+    fn mode_event_name(mode: Mode) -> &'static str {
+        match mode {
+            Mode::Normal => "Normal",
+            Mode::Insert => "Insert",
+            Mode::Replace => "Replace",
+            Mode::Command => "Command",
+            Mode::Search => "Search",
+            Mode::Visual => "Visual",
+            Mode::VisualLine => "VisualLine",
+            Mode::VisualBlock => "VisualBlock",
+        }
+    }
+
     /// Fire an event hook (e.g. "save", "open") for all registered listeners.
     pub fn plugin_event(&mut self, event: &str, arg: &str) {
         if !self.settings.plugins_enabled {
@@ -12812,6 +13201,98 @@ impl Engine {
         let cursor = self.cursor();
         let arg = format!("{},{}", cursor.line + 1, cursor.col + 1);
         self.plugin_event("cursor_move", &arg);
+    }
+
+    // ─── User keymaps ────────────────────────────────────────────────────────
+
+    /// Rebuild the parsed user_keymaps cache from settings.keymaps.
+    /// Call after loading or changing settings.
+    pub fn rebuild_user_keymaps(&mut self) {
+        self.user_keymaps = self
+            .settings
+            .keymaps
+            .iter()
+            .filter_map(|s| parse_keymap_def(s))
+            .collect();
+    }
+
+    /// Check user keymaps for the current keypress. Returns `Some(action)` if
+    /// an exact match was found, `None` to fall through to built-in handling.
+    /// Handles multi-key sequences by buffering keypresses.
+    fn try_user_keymap(
+        &mut self,
+        key_name: &str,
+        unicode: Option<char>,
+        ctrl: bool,
+        changed: &mut bool,
+    ) -> Option<EngineAction> {
+        if self.keymap_replaying || self.user_keymaps.is_empty() {
+            return None;
+        }
+
+        let mode_str = match self.mode {
+            Mode::Normal => "n",
+            Mode::Visual | Mode::VisualLine | Mode::VisualBlock => "v",
+            Mode::Insert => "i",
+            Mode::Command => "c",
+            _ => return None,
+        };
+
+        let encoded = encode_keypress(key_name, unicode, ctrl);
+        self.keymap_buf.push(encoded);
+
+        let mut exact_match_action = None;
+        let mut has_prefix = false;
+
+        for km in &self.user_keymaps {
+            if km.mode != mode_str {
+                continue;
+            }
+            if km.keys == self.keymap_buf {
+                exact_match_action = Some(km.action.clone());
+            } else if km.keys.len() > self.keymap_buf.len()
+                && km.keys[..self.keymap_buf.len()] == self.keymap_buf[..]
+            {
+                has_prefix = true;
+            }
+        }
+
+        if let Some(action) = exact_match_action {
+            self.keymap_buf.clear();
+            let count = self.take_count();
+            // Substitute {count} in the action, or append count as argument
+            let cmd = if action.contains("{count}") {
+                action.replace("{count}", &count.to_string())
+            } else if count > 1 {
+                format!("{action} {count}")
+            } else {
+                action
+            };
+            *changed = true;
+            return Some(self.execute_command(&cmd));
+        }
+
+        if has_prefix {
+            // More keys needed — consume this keypress
+            return Some(EngineAction::None);
+        }
+
+        // No match and no prefix. Replay buffered keys.
+        let buf: Vec<String> = self.keymap_buf.drain(..).collect();
+        if buf.len() <= 1 {
+            // Single key, no match — fall through to built-in handling
+            return None;
+        }
+
+        // Multi-key sequence that didn't match any keymap: replay all keys
+        self.keymap_replaying = true;
+        let mut last_action = EngineAction::None;
+        for encoded_key in buf {
+            let (rk_name, rk_unicode, rk_ctrl) = decode_keypress(&encoded_key);
+            last_action = self.handle_key(&rk_name, rk_unicode, rk_ctrl);
+        }
+        self.keymap_replaying = false;
+        Some(last_action)
     }
 
     /// Try to run a named plugin command. Returns `true` if the command was found.
@@ -13365,6 +13846,61 @@ impl Engine {
                     self.message =
                         "Usage: :Plugin list|reload|enable <name>|disable <name>".to_string();
                 }
+            }
+            return EngineAction::None;
+        }
+
+        // ── :map / :unmap — user-defined key mappings ────────────────────────────
+        if cmd == "map" {
+            // :map — list all user keymaps
+            if self.settings.keymaps.is_empty() {
+                self.message = "No user keymaps defined".to_string();
+            } else {
+                self.message = self.settings.keymaps.join("  |  ");
+            }
+            return EngineAction::None;
+        }
+        if let Some(rest) = cmd.strip_prefix("map ") {
+            let rest = rest.trim();
+            // :map n <C-/> :Commentary → add keymap
+            if parse_keymap_def(rest).is_some() {
+                let entry = rest.to_string();
+                if !self.settings.keymaps.contains(&entry) {
+                    self.settings.keymaps.push(entry.clone());
+                    let _ = self.settings.save();
+                    self.rebuild_user_keymaps();
+                }
+                self.message = format!("Mapped: {entry}");
+            } else {
+                self.message =
+                    "Usage: :map <mode> <keys> :<command>  (e.g. :map n <C-/> :Commentary)"
+                        .to_string();
+            }
+            return EngineAction::None;
+        }
+        if cmd == "unmap" {
+            self.message = "Usage: :unmap <mode> <keys>  (e.g. :unmap n <C-/>)".to_string();
+            return EngineAction::None;
+        }
+        if let Some(rest) = cmd.strip_prefix("unmap ") {
+            let rest = rest.trim();
+            // Parse "n <C-/>" → find and remove matching keymap
+            let parts: Vec<&str> = rest.splitn(2, ' ').collect();
+            if parts.len() == 2 {
+                let mode = parts[0];
+                let keys = parts[1];
+                let prefix = format!("{mode} {keys} ");
+                let before = self.settings.keymaps.len();
+                self.settings.keymaps.retain(|s| !s.starts_with(&prefix));
+                if self.settings.keymaps.len() < before {
+                    let _ = self.settings.save();
+                    self.rebuild_user_keymaps();
+                    self.message = format!("Unmapped: {mode} {keys}");
+                } else {
+                    self.message = format!("No mapping found for: {mode} {keys}");
+                }
+            } else {
+                self.message = "Usage: :unmap <mode> <keys>  (e.g. :unmap n <C-/>)".to_string();
             }
             return EngineAction::None;
         }
@@ -16125,6 +16661,105 @@ impl Engine {
 
     /// Format (reflow) lines to textwidth. If textwidth is 0, uses 79 as default.
     /// Lines are joined and re-wrapped at word boundaries.
+    /// Toggle line comments on a range of lines (1-indexed).
+    /// The comment string is determined by the active buffer's language ID.
+    /// If all non-blank lines are already commented, they are uncommented;
+    /// otherwise all lines receive the comment prefix.
+    pub fn toggle_comment_range(&mut self, start_1: usize, end_1: usize) {
+        let buf_id = self.active_buffer_id();
+        let lang_id = self
+            .buffer_manager
+            .get(buf_id)
+            .and_then(|s| s.lsp_language_id.clone())
+            .unwrap_or_default();
+
+        let cs = match lang_id.as_str() {
+            "rust" | "go" | "c" | "cpp" | "csharp" | "java" | "javascript" | "typescript"
+            | "typescriptreact" | "javascriptreact" | "php" | "swift" | "kotlin" | "scala"
+            | "dart" | "jsonc" => "//",
+            "python" | "ruby" | "shellscript" | "bash" | "yaml" | "toml" | "dockerfile"
+            | "perl" | "r" => "#",
+            "lua" | "sql" | "haskell" => "--",
+            "tex" | "latex" => "%",
+            "lisp" | "scheme" | "clojure" => ";",
+            "vim" => "\"",
+            _ => "#",
+        };
+
+        let total = self.buffer().len_lines();
+        let start = (start_1.saturating_sub(1)).min(total.saturating_sub(1));
+        let end = (end_1.saturating_sub(1)).min(total.saturating_sub(1));
+
+        // Collect line texts
+        let mut lines: Vec<String> = Vec::new();
+        for i in start..=end {
+            lines.push(self.buffer().content.line(i).to_string());
+        }
+
+        // Determine if all non-blank lines are commented
+        let mut all_commented = true;
+        let mut has_content = false;
+        for line in &lines {
+            let trimmed = line.trim_start();
+            let trimmed = trimmed.trim_end_matches('\n').trim_end_matches('\r');
+            if trimmed.is_empty() {
+                continue;
+            }
+            has_content = true;
+            if !trimmed.starts_with(&format!("{cs} ")) && !trimmed.starts_with(cs) {
+                all_commented = false;
+                break;
+            }
+        }
+
+        if !has_content {
+            return;
+        }
+
+        self.start_undo_group();
+        for (i, line) in lines.iter().enumerate() {
+            let line_idx = start + i;
+            let line_start = self.buffer().line_to_char(line_idx);
+            let line_end = if line_idx + 1 < self.buffer().len_lines() {
+                self.buffer().line_to_char(line_idx + 1)
+            } else {
+                self.buffer().len_chars()
+            };
+
+            // Parse indent and rest
+            let trimmed_start = line.len() - line.trim_start().len();
+            let indent = &line[..trimmed_start];
+            let rest = line[trimmed_start..]
+                .trim_end_matches('\n')
+                .trim_end_matches('\r');
+
+            if rest.is_empty() {
+                continue; // skip blank lines
+            }
+
+            let cs_space = format!("{cs} ");
+            let new_rest = if all_commented {
+                // Uncomment
+                if let Some(stripped) = rest.strip_prefix(&cs_space) {
+                    stripped.to_string()
+                } else if let Some(stripped) = rest.strip_prefix(cs) {
+                    stripped.to_string()
+                } else {
+                    rest.to_string()
+                }
+            } else {
+                // Comment
+                format!("{cs} {rest}")
+            };
+
+            let new_line = format!("{indent}{new_rest}\n");
+            self.buffer_mut().delete_range(line_start, line_end);
+            self.buffer_mut().insert(line_start, &new_line);
+        }
+        self.finish_undo_group();
+        self.set_dirty(true);
+    }
+
     fn format_lines(&mut self, start_line: usize, end_line: usize, changed: &mut bool) {
         let total = self.buffer().len_lines();
         let start = start_line.min(total.saturating_sub(1));
@@ -19751,6 +20386,8 @@ impl Engine {
             if let Some(path) = state.file_path.clone() {
                 let path_str = path.to_string_lossy().into_owned();
                 self.plugin_event("open", &path_str);
+                self.plugin_event("BufNew", &path_str);
+                self.plugin_event("BufEnter", &path_str);
             }
         }
         // Fire cursor_move so position-aware plugins (e.g. git-insights blame) annotate

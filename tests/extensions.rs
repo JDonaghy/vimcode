@@ -439,8 +439,8 @@ fn ext_refresh_sets_fetching_flag() {
 fn all_language_extensions_have_file_extensions() {
     use vimcode_core::core::extensions::{ExtensionManifest, BUNDLED};
     for bundle in BUNDLED {
-        if bundle.name == "git-insights" {
-            continue; // tooling extension — no file extensions expected
+        if bundle.name == "git-insights" || bundle.name == "commentary" {
+            continue; // tooling/utility extensions — no file extensions expected
         }
         let m = ExtensionManifest::parse(bundle.manifest_toml)
             .unwrap_or_else(|| panic!("manifest for '{}' should parse", bundle.name));
@@ -456,7 +456,7 @@ fn all_language_extensions_have_file_extensions() {
 fn all_language_extensions_have_language_ids() {
     use vimcode_core::core::extensions::{ExtensionManifest, BUNDLED};
     for bundle in BUNDLED {
-        if bundle.name == "git-insights" {
+        if bundle.name == "git-insights" || bundle.name == "commentary" {
             continue;
         }
         let m = ExtensionManifest::parse(bundle.manifest_toml)
@@ -1259,4 +1259,745 @@ fn ext_delete_last_installed_expands_available_if_collapsed() {
 
     // Clean up
     e.extension_state.installed.clear();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Plugin API — Phase 1: Autocmd events, keymap modes, cursor set, settings,
+// state queries
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Helper: create an engine with a PluginManager loaded from a temp dir.
+fn engine_with_plugin(text: &str, plugin_name: &str, lua_code: &str) -> vimcode_core::Engine {
+    let dir = std::env::temp_dir().join(format!("vc_plugin_api_{}", plugin_name));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(format!("{plugin_name}.lua")), lua_code).unwrap();
+
+    let mut e = engine_with(text);
+    match vimcode_core::core::plugin::PluginManager::new() {
+        Ok(mut mgr) => {
+            mgr.load_plugins_dir(&dir, &[]);
+            e.plugin_manager = Some(mgr);
+        }
+        Err(_) => panic!("failed to create PluginManager"),
+    }
+    e
+}
+
+// ── vimcode.buf.set_cursor ─────────────────────────────────────────────────
+
+#[test]
+fn plugin_set_cursor_moves_cursor() {
+    let mut e = engine_with_plugin(
+        "line one\nline two\nline three\n",
+        "set_cursor",
+        r#"
+        vimcode.command("GoTo", function(_)
+            vimcode.buf.set_cursor(2, 3)
+        end)
+        "#,
+    );
+    exec(&mut e, "GoTo");
+    assert_eq!(e.cursor().line, 1, "cursor line should be 1 (0-indexed)");
+    assert_eq!(e.cursor().col, 2, "cursor col should be 2 (0-indexed)");
+}
+
+#[test]
+fn plugin_set_cursor_clamps_to_bounds() {
+    let mut e = engine_with_plugin(
+        "short\n",
+        "set_cursor_clamp",
+        r#"
+        vimcode.command("GoFar", function(_)
+            vimcode.buf.set_cursor(999, 999)
+        end)
+        "#,
+    );
+    exec(&mut e, "GoFar");
+    // Should be clamped to last line, last col
+    let max_line = e.buffer().len_lines().saturating_sub(1);
+    assert!(
+        e.cursor().line <= max_line,
+        "cursor line {} should be <= {}",
+        e.cursor().line,
+        max_line
+    );
+}
+
+// ── vimcode.opt.get / vimcode.opt.set ──────────────────────────────────────
+
+#[test]
+fn plugin_opt_get_reads_settings() {
+    let mut e = engine_with_plugin(
+        "",
+        "opt_get",
+        r#"
+        vimcode.command("GetTabstop", function(_)
+            local ts = vimcode.opt.get("tabstop")
+            vimcode.message("tabstop=" .. ts)
+        end)
+        "#,
+    );
+    let expected_ts = e.settings.tabstop;
+    exec(&mut e, "GetTabstop");
+    assert_eq!(
+        e.message,
+        format!("tabstop={expected_ts}"),
+        "opt.get should return current tabstop"
+    );
+}
+
+#[test]
+fn plugin_opt_set_modifies_settings() {
+    let mut e = engine_with_plugin(
+        "",
+        "opt_set",
+        r#"
+        vimcode.command("SetWrap", function(_)
+            vimcode.opt.set("wrap", "true")
+        end)
+        "#,
+    );
+    assert!(!e.settings.wrap, "wrap should be false initially");
+    exec(&mut e, "SetWrap");
+    assert!(e.settings.wrap, "wrap should be true after opt.set");
+}
+
+// ── vimcode.state.mode ─────────────────────────────────────────────────────
+
+#[test]
+fn plugin_state_mode_returns_current_mode() {
+    let mut e = engine_with_plugin(
+        "hello\n",
+        "state_mode",
+        r#"
+        vimcode.command("ShowMode", function(_)
+            local m = vimcode.state.mode()
+            vimcode.message("mode=" .. m)
+        end)
+        "#,
+    );
+    // In normal mode
+    exec(&mut e, "ShowMode");
+    assert_eq!(e.message, "mode=Normal");
+
+    // Enter insert mode and check via command (command runs in normal context,
+    // but the ctx is built at call time)
+    press(&mut e, 'i');
+    // Can't easily exec commands in insert mode, so just verify mode changed
+    assert_eq!(e.mode, vimcode_core::Mode::Insert);
+}
+
+// ── vimcode.state.register ─────────────────────────────────────────────────
+
+#[test]
+fn plugin_state_register_reads_register_content() {
+    let mut e = engine_with_plugin(
+        "hello world\n",
+        "state_register",
+        r#"
+        vimcode.command("ShowReg", function(_)
+            local r = vimcode.state.register("a")
+            if r then
+                vimcode.message("reg_a=" .. r.content)
+            else
+                vimcode.message("reg_a=nil")
+            end
+        end)
+        "#,
+    );
+    // Set register a
+    e.registers.insert('a', ("test content".to_string(), false));
+    exec(&mut e, "ShowReg");
+    assert_eq!(e.message, "reg_a=test content");
+}
+
+#[test]
+fn plugin_state_register_returns_nil_for_empty() {
+    let mut e = engine_with_plugin(
+        "",
+        "state_register_nil",
+        r#"
+        vimcode.command("ShowReg", function(_)
+            local r = vimcode.state.register("z")
+            if r then
+                vimcode.message("reg_z=" .. r.content)
+            else
+                vimcode.message("reg_z=nil")
+            end
+        end)
+        "#,
+    );
+    exec(&mut e, "ShowReg");
+    assert_eq!(e.message, "reg_z=nil");
+}
+
+// ── vimcode.state.set_register ─────────────────────────────────────────────
+
+#[test]
+fn plugin_state_set_register_writes_register() {
+    let mut e = engine_with_plugin(
+        "",
+        "set_register",
+        r#"
+        vimcode.command("SetReg", function(_)
+            vimcode.state.set_register("b", "plugin text", true)
+        end)
+        "#,
+    );
+    exec(&mut e, "SetReg");
+    let (content, linewise) = e.registers.get(&'b').expect("register b should be set");
+    assert_eq!(content, "plugin text");
+    assert!(linewise, "register should be linewise");
+}
+
+// ── vimcode.state.filetype ─────────────────────────────────────────────────
+
+#[test]
+fn plugin_state_filetype_returns_language() {
+    let mut e = engine_with_plugin(
+        "",
+        "state_filetype",
+        r#"
+        vimcode.command("ShowFT", function(_)
+            local ft = vimcode.state.filetype()
+            vimcode.message("ft=" .. ft)
+        end)
+        "#,
+    );
+    // Set up a buffer with a known language ID
+    let buf_id = e.active_buffer_id();
+    if let Some(state) = e.buffer_manager.get_mut(buf_id) {
+        state.lsp_language_id = Some("rust".to_string());
+    }
+    exec(&mut e, "ShowFT");
+    assert_eq!(e.message, "ft=rust");
+}
+
+// ── vimcode.state.mark ─────────────────────────────────────────────────────
+
+#[test]
+fn plugin_state_mark_reads_buffer_marks() {
+    let mut e = engine_with_plugin(
+        "line one\nline two\nline three\n",
+        "state_mark",
+        r#"
+        vimcode.command("ShowMark", function(_)
+            local m = vimcode.state.mark("a")
+            if m then
+                vimcode.message("mark_a=" .. m.line .. "," .. m.col)
+            else
+                vimcode.message("mark_a=nil")
+            end
+        end)
+        "#,
+    );
+    // Set mark 'a' at line 1, col 4 (0-indexed)
+    let buf_id = e.active_buffer_id();
+    e.marks
+        .entry(buf_id)
+        .or_default()
+        .insert('a', vimcode_core::Cursor { line: 1, col: 4 });
+    exec(&mut e, "ShowMark");
+    // Marks are returned 1-indexed
+    assert_eq!(e.message, "mark_a=2,5");
+}
+
+// ── vimcode.buf.insert_line / delete_line ──────────────────────────────────
+
+#[test]
+fn plugin_buf_insert_line_adds_line() {
+    let mut e = engine_with_plugin(
+        "line one\nline two\n",
+        "insert_line",
+        r#"
+        vimcode.command("InsLine", function(_)
+            vimcode.buf.insert_line(2, "inserted")
+        end)
+        "#,
+    );
+    exec(&mut e, "InsLine");
+    let content = e.buffer().to_string();
+    assert!(
+        content.contains("inserted"),
+        "buffer should contain inserted line: {content}"
+    );
+    let lines: Vec<&str> = content.lines().collect();
+    assert_eq!(lines[0], "line one", "first line unchanged");
+    assert_eq!(lines[1], "inserted", "inserted line at position 2");
+    assert_eq!(lines[2], "line two", "original line two shifted down");
+}
+
+#[test]
+fn plugin_buf_delete_line_removes_line() {
+    let mut e = engine_with_plugin(
+        "line one\nline two\nline three\n",
+        "delete_line",
+        r#"
+        vimcode.command("DelLine", function(_)
+            vimcode.buf.delete_line(2)
+        end)
+        "#,
+    );
+    exec(&mut e, "DelLine");
+    let content = e.buffer().to_string();
+    let lines: Vec<&str> = content.lines().collect();
+    assert_eq!(lines.len(), 2, "should have 2 lines after deletion");
+    assert_eq!(lines[0], "line one");
+    assert_eq!(lines[1], "line three");
+}
+
+// ── Visual mode keymap fallback ────────────────────────────────────────────
+
+#[test]
+fn plugin_visual_mode_keymap_fires() {
+    let mut e = engine_with_plugin(
+        "hello world\n",
+        "visual_keymap",
+        r#"
+        vimcode.keymap("v", "Q", function()
+            vimcode.message("visual Q fired")
+        end)
+        "#,
+    );
+    // Enter visual mode
+    press(&mut e, 'v');
+    assert_eq!(e.mode, vimcode_core::Mode::Visual);
+    // Press Q (should trigger plugin keymap)
+    press(&mut e, 'Q');
+    assert_eq!(
+        e.message, "visual Q fired",
+        "visual mode keymap should fire"
+    );
+}
+
+// ── ModeChanged event ──────────────────────────────────────────────────────
+
+#[test]
+fn plugin_mode_changed_event_fires_on_insert() {
+    let mut e = engine_with_plugin(
+        "hello\n",
+        "mode_changed",
+        r#"
+        vimcode.on("ModeChanged", function(arg)
+            vimcode.message("mode_changed:" .. arg)
+        end)
+        "#,
+    );
+    // Enter insert mode with 'i'
+    press(&mut e, 'i');
+    assert!(
+        e.message.contains("Normal:Insert"),
+        "ModeChanged should fire with Normal:Insert, got: {}",
+        e.message
+    );
+}
+
+#[test]
+fn plugin_insert_leave_event_fires() {
+    let mut e = engine_with_plugin(
+        "hello\n",
+        "insert_leave",
+        r#"
+        vimcode.on("InsertLeave", function(arg)
+            vimcode.message("left_insert:" .. arg)
+        end)
+        "#,
+    );
+    press(&mut e, 'i'); // Enter insert mode
+    press_key(&mut e, "Escape"); // Leave insert mode
+    assert!(
+        e.message.contains("left_insert:Insert"),
+        "InsertLeave should fire, got: {}",
+        e.message
+    );
+}
+
+#[test]
+fn plugin_insert_enter_event_fires() {
+    let mut e = engine_with_plugin(
+        "hello\n",
+        "insert_enter",
+        r#"
+        vimcode.on("InsertEnter", function(arg)
+            vimcode.message("entered_insert:" .. arg)
+        end)
+        "#,
+    );
+    press(&mut e, 'i');
+    assert!(
+        e.message.contains("entered_insert:Insert"),
+        "InsertEnter should fire, got: {}",
+        e.message
+    );
+}
+
+// ── BufWrite event ─────────────────────────────────────────────────────────
+
+#[test]
+fn plugin_buf_write_event_fires_on_save() {
+    let tmp = std::env::temp_dir().join("vc_plugin_bufwrite_test.txt");
+    std::fs::write(&tmp, "content\n").ok();
+
+    let mut e = engine_with_plugin(
+        "",
+        "buf_write",
+        r#"
+        vimcode.on("BufWrite", function(path)
+            vimcode.message("bufwrite:" .. path)
+        end)
+        "#,
+    );
+    e.open_file_in_tab(&tmp);
+    let _ = e.save();
+    assert!(
+        e.message.contains("bufwrite:"),
+        "BufWrite should fire on save, got: {}",
+        e.message
+    );
+
+    let _ = std::fs::remove_file(&tmp);
+}
+
+// ── VimEnter event ─────────────────────────────────────────────────────────
+
+#[test]
+fn plugin_vim_enter_fires_on_init() {
+    // VimEnter fires when init_plugins is called.
+    // We test it by creating a plugin manager manually with a VimEnter hook.
+    let dir = std::env::temp_dir().join("vc_plugin_api_vimenter");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("vimenter.lua"),
+        r#"
+        vimcode.on("VimEnter", function(_)
+            vimcode.message("vim_started")
+        end)
+        "#,
+    )
+    .unwrap();
+
+    let mut e = engine_with("");
+    // Manually set up plugin loading to trigger VimEnter
+    match vimcode_core::core::plugin::PluginManager::new() {
+        Ok(mut mgr) => {
+            mgr.load_plugins_dir(&dir, &[]);
+            e.plugin_manager = Some(mgr);
+            // Fire VimEnter like init_plugins does
+            e.plugin_event("VimEnter", "");
+        }
+        Err(_) => panic!("failed to create PluginManager"),
+    }
+    assert_eq!(e.message, "vim_started", "VimEnter should fire after init");
+}
+
+// ── BufNew / BufEnter events ───────────────────────────────────────────────
+
+#[test]
+fn plugin_buf_new_fires_on_open_file() {
+    let tmp = std::env::temp_dir().join("vc_plugin_bufnew_test.txt");
+    std::fs::write(&tmp, "new content\n").ok();
+
+    let mut e = engine_with_plugin(
+        "",
+        "buf_new",
+        r#"
+        vimcode.on("BufNew", function(path)
+            vimcode.message("bufnew:" .. path)
+        end)
+        "#,
+    );
+    e.open_file_in_tab(&tmp);
+    assert!(
+        e.message.contains("bufnew:"),
+        "BufNew should fire on open, got: {}",
+        e.message
+    );
+
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[test]
+fn plugin_buf_enter_fires_on_open_file() {
+    let tmp = std::env::temp_dir().join("vc_plugin_bufenter_test.txt");
+    std::fs::write(&tmp, "enter content\n").ok();
+
+    let mut e = engine_with_plugin(
+        "",
+        "buf_enter",
+        r#"
+        vimcode.on("BufEnter", function(path)
+            vimcode.message("bufenter:" .. path)
+        end)
+        "#,
+    );
+    e.open_file_in_tab(&tmp);
+    assert!(
+        e.message.contains("bufenter:"),
+        "BufEnter should fire on open, got: {}",
+        e.message
+    );
+
+    let _ = std::fs::remove_file(&tmp);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// VimCode Commentary — gcc, gc (visual), :Commentary
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Helper: engine with commentary plugin loaded and a known filetype.
+fn engine_with_commentary(text: &str, lang: &str) -> vimcode_core::Engine {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("vc_commentary_test_{id}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Copy the real commentary.lua bundled in the extension
+    use vimcode_core::core::extensions::BUNDLED;
+    let commentary = BUNDLED
+        .iter()
+        .find(|b| b.name == "commentary")
+        .expect("commentary should be bundled");
+    let script = commentary
+        .scripts
+        .iter()
+        .find(|s| s.0 == "commentary.lua")
+        .expect("commentary.lua script");
+    std::fs::write(dir.join("commentary.lua"), script.1).unwrap();
+
+    let mut e = engine_with(text);
+    // Set language ID for comment string detection
+    let buf_id = e.active_buffer_id();
+    if let Some(state) = e.buffer_manager.get_mut(buf_id) {
+        state.lsp_language_id = Some(lang.to_string());
+    }
+    match vimcode_core::core::plugin::PluginManager::new() {
+        Ok(mut mgr) => {
+            mgr.load_plugins_dir(&dir, &[]);
+            e.plugin_manager = Some(mgr);
+        }
+        Err(_) => panic!("failed to create PluginManager"),
+    }
+    e
+}
+
+// ── :Commentary command ────────────────────────────────────────────────────
+
+#[test]
+fn commentary_command_comments_single_line_rust() {
+    let mut e = engine_with_commentary("let x = 1;\nlet y = 2;\n", "rust");
+    exec(&mut e, "Commentary");
+    let lines = get_lines(&e);
+    assert_eq!(lines[0], "// let x = 1;", "line should be commented");
+    assert_eq!(lines[1], "let y = 2;", "second line untouched");
+}
+
+#[test]
+fn commentary_command_uncomments_single_line_rust() {
+    let mut e = engine_with_commentary("// let x = 1;\nlet y = 2;\n", "rust");
+    exec(&mut e, "Commentary");
+    let lines = get_lines(&e);
+    assert_eq!(lines[0], "let x = 1;", "line should be uncommented");
+}
+
+#[test]
+fn commentary_command_with_count_comments_multiple_lines() {
+    let mut e = engine_with_commentary("aaa\nbbb\nccc\n", "python");
+    exec(&mut e, "Commentary 2");
+    let lines = get_lines(&e);
+    assert_eq!(lines[0], "# aaa");
+    assert_eq!(lines[1], "# bbb");
+    assert_eq!(lines[2], "ccc", "third line untouched");
+}
+
+#[test]
+fn commentary_preserves_indentation() {
+    let mut e = engine_with_commentary("    let x = 1;\n", "rust");
+    exec(&mut e, "Commentary");
+    let lines = get_lines(&e);
+    assert_eq!(lines[0], "    // let x = 1;", "indent should be preserved");
+}
+
+#[test]
+fn commentary_uncomments_with_indent() {
+    let mut e = engine_with_commentary("    // let x = 1;\n", "rust");
+    exec(&mut e, "Commentary");
+    let lines = get_lines(&e);
+    assert_eq!(
+        lines[0], "    let x = 1;",
+        "uncomment should preserve indent"
+    );
+}
+
+#[test]
+fn commentary_skips_blank_lines() {
+    let mut e = engine_with_commentary("aaa\n\nbbb\n", "python");
+    exec(&mut e, "Commentary 3");
+    let lines = get_lines(&e);
+    assert_eq!(lines[0], "# aaa");
+    assert_eq!(lines[1], "", "blank line stays blank");
+    assert_eq!(lines[2], "# bbb");
+}
+
+#[test]
+fn commentary_python_uses_hash() {
+    let mut e = engine_with_commentary("x = 1\n", "python");
+    exec(&mut e, "Commentary");
+    let lines = get_lines(&e);
+    assert_eq!(lines[0], "# x = 1");
+}
+
+#[test]
+fn commentary_lua_uses_double_dash() {
+    let mut e = engine_with_commentary("local x = 1\n", "lua");
+    exec(&mut e, "Commentary");
+    let lines = get_lines(&e);
+    assert_eq!(lines[0], "-- local x = 1");
+}
+
+// ── gcc key binding ────────────────────────────────────────────────────────
+
+#[test]
+fn gcc_comments_current_line() {
+    let mut e = engine_with_commentary("let x = 1;\nlet y = 2;\n", "rust");
+    // gcc = g, c, c
+    press(&mut e, 'g');
+    press(&mut e, 'c');
+    press(&mut e, 'c');
+    let lines = get_lines(&e);
+    assert_eq!(lines[0], "// let x = 1;", "gcc should comment current line");
+    assert_eq!(lines[1], "let y = 2;", "second line untouched");
+}
+
+#[test]
+fn gcc_uncomments_commented_line() {
+    let mut e = engine_with_commentary("// let x = 1;\n", "rust");
+    press(&mut e, 'g');
+    press(&mut e, 'c');
+    press(&mut e, 'c');
+    let lines = get_lines(&e);
+    assert_eq!(lines[0], "let x = 1;", "gcc should uncomment");
+}
+
+#[test]
+fn gcc_with_count_comments_multiple_lines() {
+    let mut e = engine_with_commentary("aaa\nbbb\nccc\nddd\n", "python");
+    // 3gcc
+    press(&mut e, '3');
+    press(&mut e, 'g');
+    press(&mut e, 'c');
+    press(&mut e, 'c');
+    let lines = get_lines(&e);
+    assert_eq!(lines[0], "# aaa");
+    assert_eq!(lines[1], "# bbb");
+    assert_eq!(lines[2], "# ccc");
+    assert_eq!(lines[3], "ddd", "fourth line untouched");
+}
+
+// ── gc in visual mode ──────────────────────────────────────────────────────
+
+#[test]
+fn gc_visual_comments_selection() {
+    let mut e = engine_with_commentary("aaa\nbbb\nccc\nddd\n", "rust");
+    // Set language ID on buffer for engine-level toggle_comment_range
+    let buf_id = e.active_buffer_id();
+    if let Some(state) = e.buffer_manager.get_mut(buf_id) {
+        state.lsp_language_id = Some("rust".to_string());
+    }
+    // Select lines 1-3 with V (visual line mode)
+    press(&mut e, 'V');
+    press(&mut e, 'j');
+    press(&mut e, 'j');
+    // gc
+    press(&mut e, 'g');
+    press(&mut e, 'c');
+    let lines = get_lines(&e);
+    assert_eq!(lines[0], "// aaa");
+    assert_eq!(lines[1], "// bbb");
+    assert_eq!(lines[2], "// ccc");
+    assert_eq!(lines[3], "ddd", "line 4 untouched");
+    // Should be back in normal mode
+    assert_eq!(e.mode, vimcode_core::Mode::Normal);
+}
+
+#[test]
+fn gc_visual_uncomments_all_commented_lines() {
+    let mut e = engine_with_commentary("// aaa\n// bbb\nccc\n", "rust");
+    let buf_id = e.active_buffer_id();
+    if let Some(state) = e.buffer_manager.get_mut(buf_id) {
+        state.lsp_language_id = Some("rust".to_string());
+    }
+    // Select first two lines
+    press(&mut e, 'V');
+    press(&mut e, 'j');
+    // gc
+    press(&mut e, 'g');
+    press(&mut e, 'c');
+    let lines = get_lines(&e);
+    assert_eq!(lines[0], "aaa", "should be uncommented");
+    assert_eq!(lines[1], "bbb", "should be uncommented");
+    assert_eq!(lines[2], "ccc", "untouched");
+}
+
+#[test]
+fn gc_visual_mixed_comments_all() {
+    let mut e = engine_with_commentary("// aaa\nbbb\n", "rust");
+    let buf_id = e.active_buffer_id();
+    if let Some(state) = e.buffer_manager.get_mut(buf_id) {
+        state.lsp_language_id = Some("rust".to_string());
+    }
+    // Select both lines
+    press(&mut e, 'V');
+    press(&mut e, 'j');
+    press(&mut e, 'g');
+    press(&mut e, 'c');
+    let lines = get_lines(&e);
+    // Mixed (one commented, one not) → all get commented
+    assert_eq!(
+        lines[0], "// // aaa",
+        "already-commented gets double prefix"
+    );
+    assert_eq!(lines[1], "// bbb", "uncommented gets prefix");
+}
+
+// ── Commentary is undoable ─────────────────────────────────────────────────
+
+#[test]
+fn gcc_is_undoable() {
+    let mut e = engine_with_commentary("let x = 1;\n", "rust");
+    press(&mut e, 'g');
+    press(&mut e, 'c');
+    press(&mut e, 'c');
+    assert_eq!(get_lines(&e)[0], "// let x = 1;");
+    // Undo
+    press(&mut e, 'u');
+    assert_eq!(get_lines(&e)[0], "let x = 1;", "undo should restore");
+}
+
+// ── Commentary bundled extension manifest ──────────────────────────────────
+
+#[test]
+fn commentary_extension_is_bundled() {
+    use vimcode_core::core::extensions::BUNDLED;
+    let commentary = BUNDLED.iter().find(|b| b.name == "commentary");
+    assert!(commentary.is_some(), "commentary should be in BUNDLED");
+    let c = commentary.unwrap();
+    assert_eq!(c.scripts.len(), 1);
+    assert_eq!(c.scripts[0].0, "commentary.lua");
+}
+
+#[test]
+fn commentary_manifest_parses_correctly() {
+    use vimcode_core::core::extensions::{ExtensionManifest, BUNDLED};
+    let bundle = BUNDLED
+        .iter()
+        .find(|b| b.name == "commentary")
+        .expect("commentary bundled");
+    let m = ExtensionManifest::parse(bundle.manifest_toml).expect("should parse");
+    assert_eq!(m.name, "commentary");
+    assert_eq!(m.display_name, "VimCode Commentary");
+    assert!(m.scripts.contains(&"commentary.lua".to_string()));
 }

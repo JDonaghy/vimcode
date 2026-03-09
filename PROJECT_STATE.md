@@ -1,9 +1,9 @@
 # VimCode Project State
 
-**Last updated:** Mar 8, 2026 (Session 152 — Visual paste, TUI bug fixes) | **Tests:** 2768
+**Last updated:** Mar 8, 2026 (Session 153 — Richer Lua Plugin API + Commentary + User Keymaps) | **Tests:** 2809
 
 > Feature documentation lives in **README.md**.
-> Per-session implementation notes through Session 151 are in **SESSION_HISTORY.md**.
+> Per-session implementation notes through Session 152 are in **SESSION_HISTORY.md**.
 
 ---
 
@@ -26,7 +26,7 @@ When implementing a new key/command, add tests covering:
 
 ## Recent Work
 
-**Session 152 — Visual paste + TUI bug fixes (2768 tests):**
-**Visual paste**: `p`/`P` in Visual/VisualLine/VisualBlock mode replaces selection with register content (deleted text stored in unnamed register); `"x` register selection in visual mode; named register paste (`"ap`); `Ctrl+Shift+V` system clipboard paste in Normal/Visual modes for both TUI (keyboard enhancement) and GTK. **TUI tab bar fix**: multi-group tab bar y-coordinate used `bounds.y - 1` which was wrong when breadcrumbs enabled (`tab_bar_height=2`); fixed to use `bounds.y - tab_bar_height`; same fix for mouse click handler. **TUI sidebar reveal fix**: `focus_window_direction()` only set `window_nav_overflow` for single-group layouts; with multiple editor groups, Ctrl-W h/l now navigates between adjacent groups first, and only signals overflow (sidebar reveal) when at the leftmost/rightmost group. **Test fix**: `test_restore_session_files_opens_separate_tabs` failed because `swap_scan_stale()` opened stale swap files as extra tabs; fixed by disabling swap files in test. 8 integration tests in `tests/visual_mode.rs`.
+**Session 153 — Richer Lua Plugin API + VimCode Commentary + User Keymaps (2809 tests):**
+**Plugin API expansion (Phase 1+2):** Extended `PluginCallContext` with new input/output fields. New Lua APIs: `vimcode.buf.set_cursor(line,col)`, `vimcode.buf.insert_line(n,text)`, `vimcode.buf.delete_line(n)`, `vimcode.opt.get(key)`/`vimcode.opt.set(key,value)`, `vimcode.state.mode()`/`register(char)`/`set_register(char,content,linewise)`/`mark(char)`/`filetype()`. New autocmd events: `BufWrite`, `BufNew`, `BufEnter`, `InsertEnter`, `InsertLeave`, `ModeChanged`, `VimEnter`. Centralized `set_mode()` method fires mode-change events. Visual/command mode keymap fallbacks. Plugin `set_lines` now records undo operations for proper undo support. **VimCode Commentary plugin**: Bundled extension (`extensions/commentary/`) inspired by tpope's vim-commentary. `gcc` toggles comment on current line (count-aware), `gc` in visual mode toggles comment on selection, `:Commentary [N]` command. Comment string auto-detected from 40+ language IDs. Engine-level `toggle_comment_range()` for visual mode with undo group support. 22 plugin API tests + 17 commentary tests in `tests/extensions.rs`. **User-configurable keymaps**: `keymaps: Vec<String>` in settings.json, format `"mode keys :command"`; `UserKeymap` struct parsed at engine init; multi-key sequence support with replay; checked before built-in handlers in `handle_key()`; supports `{count}` substitution; `:map`/`:unmap` runtime commands. 13 tests in `tests/user_keymaps.rs`.
 
-> Sessions 151 and earlier archived in **SESSION_HISTORY.md**.
+> Sessions 152 and earlier archived in **SESSION_HISTORY.md**.
