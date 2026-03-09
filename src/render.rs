@@ -246,6 +246,9 @@ pub struct RenderedLine {
     /// These rows have empty `raw_text`; the full continuation text is in
     /// `ghost_suffix` and backends draw it at the left edge of the content area.
     pub is_ghost_continuation: bool,
+    /// Column positions where indent guide lines should be drawn.
+    /// Empty when `indent_guides` setting is off.
+    pub indent_guides: Vec<usize>,
 }
 
 /// A single diagnostic mark on a rendered line (for inline underlines/squiggles).
@@ -406,6 +409,11 @@ pub struct RenderedWindow {
     pub diagnostic_gutter: std::collections::HashMap<usize, crate::core::lsp::DiagnosticSeverity>,
     /// Transient yank-highlight region (flashes briefly after a yank). `None` if no active highlight.
     pub yank_highlight: Option<SelectionRange>,
+    /// Bracket pair positions to highlight (cursor bracket + matching bracket).
+    /// Each entry is (view_line, col). Up to 2 entries.
+    pub bracket_match_positions: Vec<(usize, usize)>,
+    /// The indent guide column that should be highlighted as "active" (cursor's scope).
+    pub active_indent_col: Option<usize>,
 }
 
 // ─── CommandLineData ──────────────────────────────────────────────────────────
@@ -1603,6 +1611,13 @@ pub struct Theme {
     pub breadcrumb_bg: Color,
     pub breadcrumb_fg: Color,
     pub breadcrumb_active_fg: Color,
+
+    // Indent guides
+    pub indent_guide_fg: Color,
+    pub indent_guide_active_fg: Color,
+
+    // Bracket match highlight
+    pub bracket_match_bg: Color,
 }
 
 impl Theme {
@@ -1744,6 +1759,10 @@ impl Theme {
             breadcrumb_bg: Color::from_hex("#21252b"),
             breadcrumb_fg: Color::from_hex("#7f848e"),
             breadcrumb_active_fg: Color::from_hex("#abb2bf"),
+
+            indent_guide_fg: Color::from_hex("#404040"),
+            indent_guide_active_fg: Color::from_hex("#606060"),
+            bracket_match_bg: Color::from_hex("#3a3d41"),
         }
     }
 
@@ -1851,6 +1870,10 @@ impl Theme {
             breadcrumb_bg: Color::from_hex("#32302f"),
             breadcrumb_fg: Color::from_hex("#a89984"),
             breadcrumb_active_fg: Color::from_hex("#ebdbb2"),
+
+            indent_guide_fg: Color::from_hex("#3c3836"),
+            indent_guide_active_fg: Color::from_hex("#504945"),
+            bracket_match_bg: Color::from_hex("#504945"),
         }
     }
 
@@ -1958,6 +1981,10 @@ impl Theme {
             breadcrumb_bg: Color::from_hex("#1f2335"),
             breadcrumb_fg: Color::from_hex("#565f89"),
             breadcrumb_active_fg: Color::from_hex("#c0caf5"),
+
+            indent_guide_fg: Color::from_hex("#292e42"),
+            indent_guide_active_fg: Color::from_hex("#3b4261"),
+            bracket_match_bg: Color::from_hex("#364a82"),
         }
     }
 
@@ -2065,6 +2092,10 @@ impl Theme {
             breadcrumb_bg: Color::from_hex("#073642"),
             breadcrumb_fg: Color::from_hex("#586e75"),
             breadcrumb_active_fg: Color::from_hex("#93a1a1"),
+
+            indent_guide_fg: Color::from_hex("#073642"),
+            indent_guide_active_fg: Color::from_hex("#0d4a5a"),
+            bracket_match_bg: Color::from_hex("#0d4a5a"),
         }
     }
 
@@ -3702,6 +3733,8 @@ fn build_rendered_window(
         has_breakpoints: false,
         max_col: 0,
         diagnostic_gutter: std::collections::HashMap::new(),
+        bracket_match_positions: Vec::new(),
+        active_indent_col: None,
     };
 
     let window = match engine.windows.get(&window_id) {
@@ -4032,6 +4065,7 @@ fn build_rendered_window(
                         None
                     },
                     is_ghost_continuation: false,
+                    indent_guides: Vec::new(), // filled below
                 });
 
                 // After the cursor segment, insert ghost continuation rows.
@@ -4059,6 +4093,7 @@ fn build_rendered_window(
                             annotation: None,
                             ghost_suffix: Some(cont.clone()),
                             is_ghost_continuation: true,
+                            indent_guides: Vec::new(),
                         });
                     }
                 }
@@ -4091,6 +4126,7 @@ fn build_rendered_window(
                     None
                 },
                 is_ghost_continuation: false,
+                indent_guides: Vec::new(), // filled below
             });
 
             // After the cursor line, insert ghost continuation rows.
@@ -4119,6 +4155,7 @@ fn build_rendered_window(
                         annotation: None,
                         ghost_suffix: Some(cont.clone()),
                         is_ghost_continuation: true,
+                        indent_guides: Vec::new(),
                     });
                 }
             }
@@ -4213,6 +4250,103 @@ fn build_rendered_window(
 
     // diagnostic_gutter is already built in the single-pass pre-indexing above.
 
+    // ── Indent guides ──────────────────────────────────────────────────────
+    let tabstop = engine.settings.tabstop.max(1) as usize;
+    let mut active_indent_col: Option<usize> = None;
+    if engine.settings.indent_guides {
+        // Compute the indent level for each visible line (in columns).
+        let line_indents: Vec<Option<usize>> = lines
+            .iter()
+            .map(|l| {
+                if l.is_ghost_continuation || l.is_wrap_continuation {
+                    return None; // not a real line for indent purposes
+                }
+                let text = &l.raw_text;
+                let mut cols = 0usize;
+                for ch in text.chars() {
+                    match ch {
+                        ' ' => cols += 1,
+                        '\t' => cols += tabstop - (cols % tabstop),
+                        _ => break,
+                    }
+                }
+                // Blank lines (only whitespace/newline) return None so guides bridge
+                let trimmed = text.trim_start();
+                let non_ws = !trimmed.is_empty() && trimmed != "\n" && trimmed != "\r\n";
+                if non_ws {
+                    Some(cols)
+                } else {
+                    None // blank line — will be bridged
+                }
+            })
+            .collect();
+
+        // Determine active guide column from cursor line indent
+        if let Some(cursor_pos) = &cursor {
+            let cursor_view_line = cursor_pos.0.view_line;
+            if cursor_view_line < line_indents.len() {
+                if let Some(indent) = line_indents[cursor_view_line] {
+                    // Active guide is the highest tabstop ≤ cursor indent
+                    if indent >= tabstop {
+                        let guide_col = (indent / tabstop) * tabstop;
+                        // Use the guide one level below if cursor indent is exact multiple
+                        active_indent_col = Some(guide_col - tabstop);
+                    }
+                }
+            }
+        }
+
+        // Assign indent guides per line, bridging blank lines
+        for (i, line) in lines.iter_mut().enumerate() {
+            if line.is_ghost_continuation {
+                continue;
+            }
+            let indent = match line_indents[i] {
+                Some(ind) => ind,
+                None => {
+                    // Blank line: bridge using min indent of surrounding non-blank lines
+                    let above = line_indents[..i].iter().rev().find_map(|x| *x).unwrap_or(0);
+                    let below = line_indents[i + 1..].iter().find_map(|x| *x).unwrap_or(0);
+                    above.min(below)
+                }
+            };
+            let mut guides = Vec::new();
+            let mut col = tabstop;
+            while col <= indent {
+                guides.push(col - tabstop); // guide at the start of each tabstop level
+                col += tabstop;
+            }
+            line.indent_guides = guides;
+        }
+    }
+
+    // ── Bracket match positions ────────────────────────────────────────────
+    let bracket_match_positions = if engine.settings.match_brackets && is_active {
+        if let Some((match_line, match_col)) = engine.bracket_match {
+            let mut positions = Vec::with_capacity(2);
+            // Cursor bracket position
+            let cursor_line_idx = view.cursor.line;
+            let cursor_col_idx = view.cursor.col;
+            for (vi, l) in lines.iter().enumerate() {
+                if l.line_idx == cursor_line_idx
+                    && !l.is_ghost_continuation
+                    && !l.is_wrap_continuation
+                {
+                    positions.push((vi, cursor_col_idx.saturating_sub(l.segment_col_offset)));
+                }
+                if l.line_idx == match_line && !l.is_ghost_continuation && !l.is_wrap_continuation {
+                    positions.push((vi, match_col.saturating_sub(l.segment_col_offset)));
+                }
+            }
+            positions.dedup();
+            positions
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+
     RenderedWindow {
         window_id,
         rect: *rect,
@@ -4231,6 +4365,8 @@ fn build_rendered_window(
         has_breakpoints: has_bp,
         max_col,
         diagnostic_gutter,
+        bracket_match_positions,
+        active_indent_col,
     }
 }
 
