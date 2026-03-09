@@ -90,6 +90,10 @@ pub struct BufferState {
     pub md_rendered: Option<crate::core::markdown::MdRendered>,
     /// LSP semantic tokens (decoded, absolute positions). Overlays tree-sitter highlights.
     pub semantic_tokens: Vec<crate::core::lsp::SemanticToken>,
+    /// For netrw buffers: the directory currently being listed.
+    pub netrw_dir: Option<PathBuf>,
+    /// Whether this buffer is a keymaps editor scratch buffer.
+    pub is_keymaps_buf: bool,
     /// Last-known modification time of the file on disk.
     /// Set on file open and save; used by `check_file_changes()` to detect external edits.
     pub file_mtime: Option<SystemTime>,
@@ -133,6 +137,8 @@ impl BufferState {
             read_only: false,
             md_rendered: None,
             semantic_tokens: Vec::new(),
+            netrw_dir: None,
+            is_keymaps_buf: false,
             file_mtime: None,
             file_change_warned: false,
         };
@@ -167,6 +173,8 @@ impl BufferState {
             read_only: false,
             md_rendered: None,
             semantic_tokens: Vec::new(),
+            netrw_dir: None,
+            is_keymaps_buf: false,
             file_mtime,
             file_change_warned: false,
         };
@@ -222,6 +230,9 @@ impl BufferState {
 
     /// Get the display name for this buffer (filename or "[No Name]").
     pub fn display_name(&self) -> String {
+        if self.is_keymaps_buf {
+            return "[Keymaps]".to_string();
+        }
         self.file_path
             .as_ref()
             .and_then(|p| p.file_name())
@@ -484,6 +495,11 @@ impl BufferManager {
             recent_files: Vec::new(),
             recent_files_limit: 100,
         }
+    }
+
+    /// Remove a buffer by ID.
+    pub fn remove(&mut self, id: BufferId) {
+        self.buffers.remove(&id);
     }
 
     /// Create a new empty buffer and return its ID.

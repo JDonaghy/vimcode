@@ -23,7 +23,7 @@ mod tui_main;
 
 use core::engine::EngineAction;
 use core::lsp::DiagnosticSeverity;
-use core::settings::{parse_key_binding, LineNumberMode};
+use core::settings::LineNumberMode;
 use core::{Engine, GitLineStatus, OpenMode, WindowRect};
 use render::{
     build_screen_layout, CommandLineData, CursorShape, RenderedWindow, SelectionKind,
@@ -49,7 +49,9 @@ use copypasta_ext::ClipboardProviderExt;
 
 /// Returns true if `key` + `state` match a panel_keys binding string like `<C-b>`, `<C-S-e>`.
 fn matches_gtk_key(binding: &str, key: gdk::Key, state: gdk::ModifierType) -> bool {
-    let Some((ctrl, shift, alt, key_char)) = parse_key_binding(binding) else {
+    let Some((ctrl, shift, alt, key_name)) =
+        crate::core::settings::parse_key_binding_named(binding)
+    else {
         return false;
     };
     if ctrl != state.contains(gdk::ModifierType::CONTROL_MASK) {
@@ -61,10 +63,22 @@ fn matches_gtk_key(binding: &str, key: gdk::Key, state: gdk::ModifierType) -> bo
     if alt != state.contains(gdk::ModifierType::ALT_MASK) {
         return false;
     }
-    key.to_unicode()
-        .map(|c| c.to_ascii_lowercase() == key_char)
-        .unwrap_or(false)
+    match key_name.as_str() {
+        "Tab" | "tab" => key == gdk::Key::Tab || key == gdk::Key::ISO_Left_Tab,
+        "Space" | "space" => key.to_unicode() == Some(' '),
+        "Escape" | "Esc" => key == gdk::Key::Escape,
+        s if s.chars().count() == 1 => {
+            let ch = s.chars().next().unwrap().to_ascii_lowercase();
+            key.to_unicode()
+                .map(|c| c.to_ascii_lowercase() == ch)
+                .unwrap_or(false)
+        }
+        _ => false,
+    }
 }
+
+/// Cached tab slot positions (x_start, x_end) per group, populated during draw.
+type TabSlotMap = HashMap<usize, Vec<(f64, f64)>>;
 
 struct App {
     engine: Rc<RefCell<Engine>>,
@@ -148,6 +162,9 @@ struct App {
     h_sb_hovered: bool,
     /// Which tab close button (×) the mouse is over: (group_id.0, tab_idx).
     tab_close_hover: Option<(usize, usize)>,
+    /// Cached tab slot widths per group, populated during draw_tab_bar for click hit-testing.
+    /// Key = group_id.0 (or usize::MAX for single-group mode), Value = cumulative x positions.
+    tab_slot_positions: Rc<RefCell<TabSlotMap>>,
     /// True while the user is dragging the terminal panel's scrollbar thumb.
     terminal_sb_dragging: bool,
     /// True while the user drags the terminal header row to resize the panel.
@@ -156,6 +173,10 @@ struct App {
     terminal_split_dragging: bool,
     /// Split index being dragged (None if not dragging a group divider).
     group_divider_dragging: Option<usize>,
+    /// True while the user is dragging a tab between groups.
+    tab_dragging: bool,
+    /// Start position of a potential tab drag (set on MouseClick in tab bar).
+    tab_drag_start: Option<(f64, f64)>,
     /// Reference to the root GTK window used for minimize / maximize / close actions.
     window: gtk4::Window,
     /// Last time sc_refresh() was called for the Git sidebar auto-refresh.
@@ -429,6 +450,10 @@ enum Msg {
     CloseTabConfirmed { save: bool },
     /// A setting was changed via the Settings sidebar form widget.
     SettingChanged { key: String, value: String },
+    /// Open the keymaps editor scratch buffer.
+    OpenKeymapsEditor,
+    /// Alt key released — confirm tab switcher if open.
+    TabSwitcherRelease,
 }
 
 /// Build a single setting row widget (label+description on left, control widget on right).
@@ -543,6 +568,46 @@ fn build_setting_row(
                 }
             });
             row.append(&dropdown);
+        }
+        render::SettingType::DynamicEnum(options_fn) => {
+            let options_vec = options_fn();
+            let strs: Vec<&str> = options_vec.iter().map(|s| s.as_str()).collect();
+            let current_idx = options_vec
+                .iter()
+                .position(|o| o == &current_val)
+                .unwrap_or(0) as u32;
+            let dropdown = gtk4::DropDown::from_strings(&strs);
+            dropdown.set_selected(current_idx);
+            dropdown.set_valign(gtk4::Align::Center);
+            let sender_c = sender.clone();
+            let key_c = key.clone();
+            dropdown.connect_selected_notify(move |dd| {
+                let idx = dd.selected() as usize;
+                if let Some(opt) = options_vec.get(idx) {
+                    sender_c
+                        .send(Msg::SettingChanged {
+                            key: key_c.clone(),
+                            value: opt.clone(),
+                        })
+                        .ok();
+                }
+            });
+            row.append(&dropdown);
+        }
+        render::SettingType::BufferEditor => {
+            let count_label =
+                gtk4::Label::new(Some(&format!("{} defined", settings.keymaps.len())));
+            count_label.set_valign(gtk4::Align::Center);
+            count_label.set_css_classes(&["dim-label"]);
+            row.append(&count_label);
+
+            let button = gtk4::Button::with_label("Edit…");
+            button.set_valign(gtk4::Align::Center);
+            let sender_c = sender.clone();
+            button.connect_clicked(move |_| {
+                sender_c.send(Msg::OpenKeymapsEditor).ok();
+            });
+            row.append(&button);
         }
     }
 
@@ -911,7 +976,6 @@ impl SimpleComponent for App {
                                             sender.input(Msg::ToggleFocusSearch);
                                             return gtk4::glib::Propagation::Stop;
                                         }
-
                                         // Arrow keys for navigation - let TreeView handle them
                                         if matches!(key_name.as_str(), "Up" | "Down" | "Left" | "Right" | "Return" | "space") {
                                             return gtk4::glib::Propagation::Proceed;
@@ -1228,6 +1292,63 @@ impl SimpleComponent for App {
                                                 }
                                             }
                                         }
+                                    }
+
+                                    // Ctrl+Tab / Ctrl+Shift+Tab: MRU tab switcher
+                                    if ctrl && !alt && key_name == "Tab" {
+                                        let mut eng = engine.borrow_mut();
+                                        if eng.tab_switcher_open {
+                                            let len = eng.tab_mru.len();
+                                            if len > 0 {
+                                                eng.tab_switcher_selected =
+                                                    (eng.tab_switcher_selected + 1) % len;
+                                            }
+                                        } else {
+                                            eng.open_tab_switcher();
+                                        }
+                                        drop(eng);
+                                        sender.input(Msg::Resize);
+                                        return gtk4::glib::Propagation::Stop;
+                                    }
+                                    if ctrl && !alt && key_name == "ISO_Left_Tab" {
+                                        let mut eng = engine.borrow_mut();
+                                        if eng.tab_switcher_open {
+                                            let len = eng.tab_mru.len();
+                                            if len > 0 {
+                                                eng.tab_switcher_selected =
+                                                    if eng.tab_switcher_selected == 0 {
+                                                        len - 1
+                                                    } else {
+                                                        eng.tab_switcher_selected - 1
+                                                    };
+                                            }
+                                        } else {
+                                            eng.open_tab_switcher();
+                                            let len = eng.tab_mru.len();
+                                            if len > 0 {
+                                                eng.tab_switcher_selected = len - 1;
+                                            }
+                                        }
+                                        drop(eng);
+                                        sender.input(Msg::Resize);
+                                        return gtk4::glib::Propagation::Stop;
+                                    }
+
+                                    // Alt+t: MRU tab switcher (open or cycle forward)
+                                    if alt && !ctrl && !shift && unicode == Some('t') {
+                                        let mut eng = engine.borrow_mut();
+                                        if eng.tab_switcher_open {
+                                            let len = eng.tab_mru.len();
+                                            if len > 0 {
+                                                eng.tab_switcher_selected =
+                                                    (eng.tab_switcher_selected + 1) % len;
+                                            }
+                                        } else {
+                                            eng.open_tab_switcher();
+                                        }
+                                        drop(eng);
+                                        sender.input(Msg::Resize);
+                                        return gtk4::glib::Propagation::Stop;
                                     }
 
                                     // Alt-M: toggle Vim ↔ VSCode editing mode
@@ -1720,6 +1841,8 @@ impl SimpleComponent for App {
         let h_sb_hovered_cell: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let tab_close_hover_cell: Rc<Cell<Option<(usize, usize)>>> = Rc::new(Cell::new(None));
         let h_sb_drag_cell: Rc<Cell<Option<core::WindowId>>> = Rc::new(Cell::new(None));
+        let tab_slot_positions_cell: Rc<RefCell<TabSlotMap>> =
+            Rc::new(RefCell::new(HashMap::new()));
         let sidebar_inner_sw_ref: Rc<RefCell<Option<gtk4::ScrolledWindow>>> =
             Rc::new(RefCell::new(None));
         let sidebar_revealer_ref: Rc<RefCell<Option<gtk4::Revealer>>> = Rc::new(RefCell::new(None));
@@ -1822,10 +1945,13 @@ impl SimpleComponent for App {
             h_sb_dragging: None,
             h_sb_hovered: false,
             tab_close_hover: None,
+            tab_slot_positions: tab_slot_positions_cell.clone(),
             terminal_sb_dragging: false,
             terminal_resize_dragging: false,
             terminal_split_dragging: false,
             group_divider_dragging: None,
+            tab_dragging: false,
+            tab_drag_start: None,
             last_sc_refresh: std::time::Instant::now(),
             last_file_check: std::time::Instant::now(),
             menu_dropdown_da: menu_dropdown_da_ref.clone(),
@@ -2946,6 +3072,7 @@ impl SimpleComponent for App {
         let tab_close_hover_for_draw = tab_close_hover_cell.clone();
         let h_sb_drag_for_draw = h_sb_drag_cell.clone();
         let last_metrics_for_draw = last_metrics_cell.clone();
+        let tab_slots_for_draw = tab_slot_positions_cell.clone();
         widgets
             .drawing_area
             .set_draw_func(move |_, cr, width, height| {
@@ -2960,6 +3087,7 @@ impl SimpleComponent for App {
                     tab_close_hover_for_draw.get(),
                     h_sb_drag_for_draw.get(),
                     &last_metrics_for_draw,
+                    &tab_slots_for_draw,
                 );
             });
 
@@ -2977,6 +3105,35 @@ impl SimpleComponent for App {
                 pos_cell_leave.set((-1.0, -1.0));
             });
             widgets.drawing_area.add_controller(mc);
+        }
+
+        // Tab switcher auto-confirm: poll modifier state every 50ms while open.
+        // When neither Ctrl nor Alt is held, confirm immediately.
+        {
+            let engine_ref = engine.clone();
+            let da = widgets.drawing_area.clone();
+            let root_ref = root.clone();
+            gtk4::glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
+                if !engine_ref.borrow().tab_switcher_open {
+                    return gtk4::glib::ControlFlow::Continue;
+                }
+                // Query the current keyboard modifier state from GDK
+                {
+                    let display = gtk4::prelude::WidgetExt::display(&root_ref);
+                    if let Some(seat) = display.default_seat() {
+                        if let Some(keyboard) = seat.keyboard() {
+                            let mods: gdk::ModifierType = keyboard.modifier_state();
+                            let ctrl = mods.contains(gdk::ModifierType::CONTROL_MASK);
+                            let alt = mods.contains(gdk::ModifierType::ALT_MASK);
+                            if !ctrl && !alt {
+                                engine_ref.borrow_mut().tab_switcher_confirm();
+                                da.queue_draw();
+                            }
+                        }
+                    }
+                }
+                gtk4::glib::ControlFlow::Continue
+            });
         }
 
         // Ensure drawing area has keyboard focus on startup.
@@ -3280,6 +3437,10 @@ impl SimpleComponent for App {
                 self.engine.borrow_mut().clear_yank_highlight();
                 self.draw_needed.set(true);
             }
+            Msg::TabSwitcherRelease => {
+                // Handled directly by the root EventControllerKey release handler.
+                // Kept as a no-op for exhaustive match.
+            }
             Msg::Resize => {
                 // Propagate window resize to open terminal panes.
                 if !self.engine.borrow().terminal_panes.is_empty() {
@@ -3530,7 +3691,7 @@ impl SimpleComponent for App {
                             if engine.is_vscode_mode() {
                                 engine.vscode_clear_selection();
                             }
-                            if handle_mouse_click(
+                            let click_result = handle_mouse_click(
                                 &mut engine,
                                 x,
                                 y,
@@ -3539,11 +3700,41 @@ impl SimpleComponent for App {
                                 alt,
                                 self.cached_line_height,
                                 self.cached_char_width,
-                            ) {
-                                drop(engine);
-                                sender.input(Msg::ShowCloseTabConfirm);
-                                self.draw_needed.set(true);
-                                return;
+                                &self.tab_slot_positions.borrow(),
+                            );
+                            match click_result {
+                                Some(true) => {
+                                    drop(engine);
+                                    sender.input(Msg::ShowCloseTabConfirm);
+                                    self.draw_needed.set(true);
+                                    return;
+                                }
+                                Some(false) => {
+                                    // Buffer click — fire hooks and reveal file
+                                }
+                                None => {
+                                    // Tab bar / split button click — skip hooks.
+                                    // Record drag start position for tab drag-and-drop.
+                                    self.tab_drag_start = Some((x, y));
+                                    // Defer sidebar tree highlight so tab switch renders instantly.
+                                    let new_file_path = engine.file_path().cloned();
+                                    drop(engine);
+                                    if new_file_path != file_before_click {
+                                        if let Some(path) = new_file_path {
+                                            let tree_ref = self.file_tree_view.clone();
+                                            gtk4::glib::timeout_add_local_once(
+                                                std::time::Duration::from_millis(50),
+                                                move || {
+                                                    if let Some(ref tree) = *tree_ref.borrow() {
+                                                        highlight_file_in_tree(tree, &path);
+                                                    }
+                                                },
+                                            );
+                                        }
+                                    }
+                                    self.draw_needed.set(true);
+                                    return;
+                                }
                             }
                         }
 
@@ -3583,6 +3774,7 @@ impl SimpleComponent for App {
                     height,
                     self.cached_line_height,
                     self.cached_char_width,
+                    &self.tab_slot_positions.borrow(),
                 ) {
                     engine.add_cursor_at_pos(line, col);
                 }
@@ -3603,6 +3795,7 @@ impl SimpleComponent for App {
                     height,
                     self.cached_line_height,
                     self.cached_char_width,
+                    &self.tab_slot_positions.borrow(),
                 );
                 self.draw_needed.set(true);
             }
@@ -3612,6 +3805,65 @@ impl SimpleComponent for App {
                 width,
                 height,
             } => {
+                // Tab drag-and-drop handling.
+                if self.tab_dragging {
+                    // Update drop zone while dragging.
+                    let mut engine = self.engine.borrow_mut();
+                    engine.tab_drag_mouse = Some((x, y));
+                    let zone = compute_tab_drop_zone(
+                        &engine,
+                        x,
+                        y,
+                        width,
+                        height,
+                        self.cached_line_height,
+                        self.cached_char_width,
+                        &self.tab_slot_positions.borrow(),
+                    );
+                    engine.tab_drop_zone = zone;
+                    self.draw_needed.set(true);
+                    return;
+                }
+                // Check if a tab drag should start (mouse moved far enough from tab click).
+                if let Some((sx, sy)) = self.tab_drag_start {
+                    let dx = x - sx;
+                    let dy = y - sy;
+                    if dx * dx + dy * dy > 64.0 {
+                        // Determine which tab was clicked using pixel_to_click_target.
+                        let mut engine = self.engine.borrow_mut();
+                        let target = pixel_to_click_target(
+                            &mut engine,
+                            sx,
+                            sy,
+                            width,
+                            height,
+                            self.cached_line_height,
+                            self.cached_char_width,
+                            &self.tab_slot_positions.borrow(),
+                        );
+                        if let ClickTarget::TabBar = target {
+                            // The tab was already switched by pixel_to_click_target.
+                            // Use the active group + active tab as the drag source.
+                            let gid = engine.active_group;
+                            let tidx = engine
+                                .editor_groups
+                                .get(&gid)
+                                .map(|g| g.active_tab)
+                                .unwrap_or(0);
+                            engine.tab_drag_begin(gid, tidx);
+                            engine.tab_drag_mouse = Some((x, y));
+                            self.tab_dragging = true;
+                            self.tab_drag_start = None;
+                            self.draw_needed.set(true);
+                            return;
+                        }
+                        // Not a tab — clear drag start and fall through.
+                        self.tab_drag_start = None;
+                    } else {
+                        // Haven't moved enough yet, don't start any drag.
+                        return;
+                    }
+                }
                 // H scrollbar thumb drag — convert pointer delta to scroll_left.
                 if let Some(ref state) = self.h_sb_dragging {
                     if state.px_per_col > 0.0 {
@@ -3753,12 +4005,22 @@ impl SimpleComponent for App {
                             height,
                             self.cached_line_height,
                             self.cached_char_width,
+                            &self.tab_slot_positions.borrow(),
                         );
                         self.draw_needed.set(true);
                     }
                 }
             }
             Msg::MouseUp => {
+                // Tab drag drop.
+                if self.tab_dragging {
+                    self.tab_dragging = false;
+                    let mut engine = self.engine.borrow_mut();
+                    let zone = engine.tab_drop_zone;
+                    engine.tab_drag_drop(zone);
+                    self.draw_needed.set(true);
+                }
+                self.tab_drag_start = None;
                 if self.terminal_split_dragging {
                     self.terminal_split_dragging = false;
                     if self.cached_char_width > 0.0 {
@@ -4155,10 +4417,10 @@ impl SimpleComponent for App {
                 self.draw_needed.set(true);
             }
             Msg::ToggleFocusSearch => {
-                // Same pattern as ToggleFocusExplorer: toggle between showing the search
-                // panel and returning to the editor.  When "exiting" we keep the sidebar
-                // visible (don't touch sidebar_visible) to avoid a white-area artifact
-                // from the Revealer animation — Ctrl+B closes the sidebar entirely.
+                // Toggle between showing the search panel and returning to the editor.
+                // When "exiting" we keep the sidebar visible (don't touch sidebar_visible)
+                // to avoid a white-area artifact from the Revealer animation — Ctrl+B
+                // closes the sidebar entirely.
                 self.tree_has_focus = false;
                 if self.active_panel == SidebarPanel::Search && self.sidebar_visible {
                     // Already showing search — return keyboard focus to editor, keep panel open.
@@ -4320,6 +4582,10 @@ impl SimpleComponent for App {
                 if key == "show_hidden_files" {
                     sender.input(Msg::RefreshFileTree);
                 }
+                self.draw_needed.set(true);
+            }
+            Msg::OpenKeymapsEditor => {
+                self.engine.borrow_mut().open_keymaps_editor();
                 self.draw_needed.set(true);
             }
             Msg::ToggleFindDialog => {
@@ -4734,14 +5000,14 @@ impl SimpleComponent for App {
                 self.draw_needed.set(true);
             }
             Msg::ClipboardPasteToInput { text } => {
-                // GDK clipboard text arrived for Ctrl-Shift-V paste into command/search/insert.
+                // GDK clipboard text arrived for Ctrl-Shift-V paste.
                 use core::Mode;
                 let mut engine = self.engine.borrow_mut();
                 match engine.mode {
                     Mode::Command | Mode::Search => {
                         engine.paste_text_to_input(&text);
                     }
-                    Mode::Insert => {
+                    Mode::Insert | Mode::Replace => {
                         for ch in text.chars() {
                             if ch == '\n' || ch == '\r' {
                                 engine.handle_key("Return", None, false);
@@ -4750,7 +5016,12 @@ impl SimpleComponent for App {
                             }
                         }
                     }
-                    _ => {}
+                    Mode::Normal | Mode::Visual | Mode::VisualLine | Mode::VisualBlock => {
+                        if !text.is_empty() {
+                            engine.load_clipboard_for_paste(text);
+                            engine.handle_key("", Some('p'), false);
+                        }
+                    }
                 }
                 self.draw_needed.set(true);
             }
@@ -5686,8 +5957,17 @@ fn sync_scrollbar_positions(
     if da_width < 20.0 || da_height < 20.0 || line_height < 1.0 {
         return;
     }
-    let tab_bar_height = line_height;
-    let status_bar_height = line_height * 2.0;
+    let tab_bar_height = if engine.settings.breadcrumbs {
+        line_height * 2.0
+    } else {
+        line_height
+    };
+    let wildmenu_px = if engine.wildmenu_items.is_empty() {
+        0.0
+    } else {
+        line_height
+    };
+    let status_bar_height = line_height * 2.0 + wildmenu_px;
     let debug_toolbar_px = if engine.debug_toolbar_visible {
         line_height
     } else {
@@ -5913,8 +6193,17 @@ impl App {
         }
 
         let line_height = self.cached_line_height;
-        let tab_bar_height = line_height;
-        let status_bar_height = line_height * 2.0;
+        let tab_bar_height = if engine.settings.breadcrumbs {
+            line_height * 2.0
+        } else {
+            line_height
+        };
+        let wildmenu_px = if engine.wildmenu_items.is_empty() {
+            0.0
+        } else {
+            line_height
+        };
+        let status_bar_height = line_height * 2.0 + wildmenu_px;
         let debug_toolbar_px = if engine.debug_toolbar_visible {
             line_height
         } else {
@@ -6141,7 +6430,7 @@ fn calculate_gutter_width(mode: LineNumberMode, total_lines: usize, char_width: 
 /// Matches VSCode's Linux font stack at 11pt ≈ 13px @ 96 dpi.
 const UI_FONT: &str = "Segoe UI, Ubuntu, Droid Sans, Sans 10";
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn draw_editor(
     cr: &Context,
     engine: &Engine,
@@ -6152,6 +6441,7 @@ fn draw_editor(
     tab_close_hover: Option<(usize, usize)>,
     h_sb_dragging_window: Option<core::WindowId>,
     last_metrics: &std::rc::Rc<std::cell::Cell<(f64, f64)>>,
+    tab_slot_positions_out: &Rc<RefCell<TabSlotMap>>,
 ) {
     let theme = Theme::from_name(&engine.settings.colorscheme);
 
@@ -6188,8 +6478,17 @@ fn draw_editor(
     }
 
     // Calculate layout regions
-    let tab_bar_height = line_height; // Always show tab bar
-    let status_bar_height = line_height * 2.0; // status + command line
+    let tab_bar_height = if engine.settings.breadcrumbs {
+        line_height * 2.0
+    } else {
+        line_height
+    };
+    let wildmenu_px = if engine.wildmenu_items.is_empty() {
+        0.0
+    } else {
+        line_height
+    };
+    let status_bar_height = line_height * 2.0 + wildmenu_px;
 
     // Reserve space for the quickfix panel when open
     const QUICKFIX_ROWS: usize = 6; // 1 header + 5 result rows
@@ -6234,48 +6533,30 @@ fn draw_editor(
         false,
     );
 
-    // 3b. Draw tab bar(s) — one per editor group
+    // 3b. Draw each window (before tab bars so tabs paint on top)
+    for rendered_window in &screen.windows {
+        draw_window(
+            cr,
+            &layout,
+            &font_metrics,
+            &theme,
+            rendered_window,
+            char_width,
+            line_height,
+        );
+    }
+
+    // 3c. Draw window separators
+    draw_window_separators(cr, &window_rects, &theme);
+
+    // 4. Draw tab bar(s) ON TOP of windows — one per editor group.
+    // (Drawn after windows so tab bars are never overwritten by window backgrounds.)
+    {
+        let mut slots = tab_slot_positions_out.borrow_mut();
+        slots.clear();
+    }
     if let Some(ref split) = screen.editor_group_split {
-        // Draw each group's tab bar at the top of its bounds.
-        for gtb in &split.group_tab_bars {
-            let tab_y = gtb.bounds.y - line_height;
-            let tab_x = gtb.bounds.x;
-            let tab_w = gtb.bounds.width;
-            let is_active = gtb.group_id == split.active_group;
-            cr.save().ok();
-            cr.rectangle(tab_x, tab_y, tab_w, line_height);
-            cr.clip();
-            cr.translate(tab_x, tab_y);
-            let hover_idx = tab_close_hover.and_then(|(gid, tidx)| {
-                if gid == gtb.group_id.0 {
-                    Some(tidx)
-                } else {
-                    None
-                }
-            });
-            draw_tab_bar(
-                cr,
-                &layout,
-                &theme,
-                &gtb.tabs,
-                tab_w,
-                line_height,
-                0.0,
-                is_active,
-                hover_idx,
-            );
-            cr.restore().ok();
-            // Active-group indicator: bright bottom border.
-            if is_active {
-                let (ar, ag, ab) = theme.tab_active_bg.to_cairo();
-                cr.set_source_rgb(ar, ag, ab);
-                cr.set_line_width(2.0);
-                cr.move_to(tab_x, tab_y + line_height - 1.0);
-                cr.line_to(tab_x + tab_w, tab_y + line_height - 1.0);
-                cr.stroke().ok();
-            }
-        }
-        // Draw divider lines.
+        // Draw divider lines first (behind tab bars).
         let (sr, sg, sb) = theme.separator.to_cairo();
         cr.set_source_rgb(sr, sg, sb);
         cr.set_line_width(1.0);
@@ -6293,10 +6574,52 @@ fn draw_editor(
                 }
             }
         }
+        // Draw each group's tab bar ON TOP of dividers.
+        for gtb in &split.group_tab_bars {
+            let tab_y = gtb.bounds.y - tab_bar_height;
+            let tab_x = gtb.bounds.x;
+            let tab_w = gtb.bounds.width;
+            let is_active = gtb.group_id == split.active_group;
+            cr.save().ok();
+            cr.rectangle(tab_x, tab_y, tab_w, line_height);
+            cr.clip();
+            cr.translate(tab_x, tab_y);
+            let hover_idx = tab_close_hover.and_then(|(gid, tidx)| {
+                if gid == gtb.group_id.0 {
+                    Some(tidx)
+                } else {
+                    None
+                }
+            });
+            let positions = draw_tab_bar(
+                cr,
+                &layout,
+                &theme,
+                &gtb.tabs,
+                tab_w,
+                line_height,
+                0.0,
+                is_active,
+                hover_idx,
+            );
+            tab_slot_positions_out
+                .borrow_mut()
+                .insert(gtb.group_id.0, positions);
+            cr.restore().ok();
+            // Active-group indicator: bright bottom border.
+            if is_active {
+                let (ar, ag, ab) = theme.tab_active_bg.to_cairo();
+                cr.set_source_rgb(ar, ag, ab);
+                cr.set_line_width(2.0);
+                cr.move_to(tab_x, tab_y + line_height - 1.0);
+                cr.line_to(tab_x + tab_w, tab_y + line_height - 1.0);
+                cr.stroke().ok();
+            }
+        }
     } else {
         // Single group: draw tab bar at full width with split buttons.
         let hover_idx = tab_close_hover.map(|(_gid, tidx)| tidx);
-        draw_tab_bar(
+        let positions = draw_tab_bar(
             cr,
             &layout,
             &theme,
@@ -6307,23 +6630,40 @@ fn draw_editor(
             true,
             hover_idx,
         );
+        // Use group_id 0 for single-group mode
+        tab_slot_positions_out
+            .borrow_mut()
+            .insert(engine.active_group.0, positions);
     }
 
-    // 4. Draw each window
-    for rendered_window in &screen.windows {
-        draw_window(
+    // 4b. Draw breadcrumb bar(s) below tab bar(s)
+    for bc in &screen.breadcrumbs {
+        if bc.segments.is_empty() {
+            continue;
+        }
+        // Breadcrumb bar sits one line_height above the window content (bc.bounds.y)
+        // and one line_height below the tab bar.
+        let bc_y = bc.bounds.y - line_height;
+        let bc_x = bc.bounds.x;
+        let bc_w = bc.bounds.width;
+        cr.save().ok();
+        cr.translate(bc_x, 0.0);
+        draw_breadcrumb_bar(cr, &layout, &theme, &bc.segments, bc_w, line_height, bc_y);
+        cr.restore().ok();
+    }
+
+    // 5. Draw tab drag overlay (drop zone highlight + ghost label).
+    if engine.tab_drag.is_some() {
+        draw_tab_drag_overlay(
             cr,
-            &layout,
-            &font_metrics,
-            &theme,
-            rendered_window,
-            char_width,
+            engine,
+            width as f64,
+            height as f64,
             line_height,
+            char_width,
+            &layout,
         );
     }
-
-    // 5. Draw window separators
-    draw_window_separators(cr, &window_rects, &theme);
 
     // 5b. Draw completion popup (on top of everything else)
     draw_completion_popup(cr, &layout, &screen, &theme, line_height, char_width);
@@ -6361,6 +6701,16 @@ fn draw_editor(
     draw_command_palette_popup(
         cr,
         &layout,
+        &screen,
+        &theme,
+        width as f64,
+        height as f64,
+        line_height,
+    );
+
+    // 5e3. Draw tab switcher popup
+    draw_tab_switcher_popup(
+        cr,
         &screen,
         &theme,
         width as f64,
@@ -6457,7 +6807,7 @@ fn draw_editor(
         h_sb_dragging_window,
     );
 
-    // 6. Status Line (second-to-last line)
+    // 6. Status Line
     let status_y = height as f64 - status_bar_height;
     draw_status_line(
         cr,
@@ -6470,15 +6820,21 @@ fn draw_editor(
         line_height,
     );
 
+    // 6b. Wildmenu bar (between status and command line)
+    let mut next_y = status_y + line_height;
+    if let Some(ref wm) = screen.wildmenu {
+        draw_wildmenu(cr, &layout, &theme, wm, width as f64, next_y, line_height);
+        next_y += line_height;
+    }
+
     // 7. Command Line (last line)
-    let cmd_y = status_y + line_height;
     draw_command_line(
         cr,
         &layout,
         &theme,
         &screen.command,
         width as f64,
-        cmd_y,
+        next_y,
         line_height,
     );
 }
@@ -6495,8 +6851,17 @@ fn compute_editor_window_rects(
     da_height: f64,
     line_height: f64,
 ) -> Vec<(core::WindowId, core::WindowRect)> {
-    let tab_bar_height = line_height;
-    let status_bar_height = line_height * 2.0;
+    let tab_bar_height = if engine.settings.breadcrumbs {
+        line_height * 2.0
+    } else {
+        line_height
+    };
+    let wildmenu_px = if engine.wildmenu_items.is_empty() {
+        0.0
+    } else {
+        line_height
+    };
+    let status_bar_height = line_height * 2.0 + wildmenu_px;
     let debug_toolbar_px = if engine.debug_toolbar_visible {
         line_height
     } else {
@@ -6616,8 +6981,17 @@ fn tab_close_hit_test(
     line_height: f64,
     char_width: f64,
 ) -> Option<(usize, usize)> {
-    let tab_bar_height = line_height;
-    let status_bar_height = line_height * 2.0;
+    let tab_bar_height = if engine.settings.breadcrumbs {
+        line_height * 2.0
+    } else {
+        line_height
+    };
+    let wildmenu_px = if engine.wildmenu_items.is_empty() {
+        0.0
+    } else {
+        line_height
+    };
+    let status_bar_height = line_height * 2.0 + wildmenu_px;
     let editor_bottom = da_h - status_bar_height;
     let content_bounds = core::WindowRect::new(0.0, 0.0, da_w, editor_bottom);
     let group_rects = engine
@@ -6708,6 +7082,122 @@ fn draw_h_scrollbars(
     }
 }
 
+/// Draw the tab drag overlay: a semi-transparent highlight over the drop zone
+/// and a ghost label near the cursor.
+#[allow(clippy::too_many_arguments)]
+fn draw_tab_drag_overlay(
+    cr: &Context,
+    engine: &Engine,
+    width: f64,
+    height: f64,
+    line_height: f64,
+    _char_width: f64,
+    layout: &pango::Layout,
+) {
+    use crate::core::window::{DropZone, SplitDirection, WindowRect};
+
+    let tab_bar_height = if engine.settings.breadcrumbs {
+        line_height * 2.0
+    } else {
+        line_height
+    };
+    let wildmenu_px = if engine.wildmenu_items.is_empty() {
+        0.0
+    } else {
+        line_height
+    };
+    let status_bar_height = line_height * 2.0 + wildmenu_px;
+    let qf_px = if engine.quickfix_open {
+        let n = engine.quickfix_items.len().clamp(1, 10) as f64;
+        (n + 1.0) * line_height
+    } else {
+        0.0
+    };
+    let term_px = if engine.terminal_open || engine.bottom_panel_open {
+        (engine.session.terminal_panel_rows as usize + 1) as f64 * line_height
+    } else {
+        0.0
+    };
+    let debug_toolbar_px = if engine.debug_toolbar_visible {
+        line_height
+    } else {
+        0.0
+    };
+    let editor_bottom = height - status_bar_height - debug_toolbar_px - qf_px - term_px;
+    let content_bounds = WindowRect::new(0.0, 0.0, width, editor_bottom);
+    let group_rects = engine
+        .group_layout
+        .calculate_group_rects(content_bounds, tab_bar_height);
+
+    // Compute highlight rect from the drop zone.
+    let zone = engine.tab_drop_zone;
+    let highlight: Option<(f64, f64, f64, f64)> = match zone {
+        DropZone::Center(gid) => group_rects.iter().find(|(g, _)| *g == gid).map(|(_, r)| {
+            (
+                r.x,
+                r.y - tab_bar_height,
+                r.width,
+                r.height + tab_bar_height,
+            )
+        }),
+        DropZone::Split(gid, dir, new_first) => {
+            group_rects.iter().find(|(g, _)| *g == gid).map(|(_, r)| {
+                let full_y = r.y - tab_bar_height;
+                let full_h = r.height + tab_bar_height;
+                match (dir, new_first) {
+                    (SplitDirection::Vertical, true) => (r.x, full_y, r.width / 2.0, full_h),
+                    (SplitDirection::Vertical, false) => {
+                        (r.x + r.width / 2.0, full_y, r.width / 2.0, full_h)
+                    }
+                    (SplitDirection::Horizontal, true) => (r.x, full_y, r.width, full_h / 2.0),
+                    (SplitDirection::Horizontal, false) => {
+                        (r.x, full_y + full_h / 2.0, r.width, full_h / 2.0)
+                    }
+                }
+            })
+        }
+        DropZone::TabReorder(gid, _idx) => group_rects
+            .iter()
+            .find(|(g, _)| *g == gid)
+            .map(|(_, r)| (r.x, r.y - tab_bar_height, r.width, line_height)),
+        DropZone::None => None,
+    };
+
+    // Draw the highlight rectangle.
+    if let Some((hx, hy, hw, hh)) = highlight {
+        cr.set_source_rgba(0.3, 0.5, 0.9, 0.15);
+        cr.rectangle(hx, hy, hw, hh);
+        cr.fill().ok();
+        cr.set_source_rgba(0.3, 0.5, 0.9, 0.5);
+        cr.set_line_width(2.0);
+        cr.rectangle(hx, hy, hw, hh);
+        cr.stroke().ok();
+    }
+
+    // Draw a small ghost label near the cursor.
+    if let (Some((mx, my)), Some(ref drag)) = (engine.tab_drag_mouse, &engine.tab_drag) {
+        let label = &drag.tab_name;
+        if !label.is_empty() {
+            layout.set_text(label);
+            let (tw, th) = layout.pixel_size();
+            let gx = mx + 12.0;
+            let gy = my - th as f64 / 2.0;
+            let pad = 4.0;
+            cr.set_source_rgba(0.15, 0.15, 0.15, 0.85);
+            cr.rectangle(
+                gx - pad,
+                gy - pad,
+                tw as f64 + pad * 2.0,
+                th as f64 + pad * 2.0,
+            );
+            cr.fill().ok();
+            cr.set_source_rgba(0.9, 0.9, 0.9, 0.9);
+            cr.move_to(gx, gy);
+            pangocairo::show_layout(cr, layout);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_tab_bar(
     cr: &Context,
@@ -6719,15 +7209,19 @@ fn draw_tab_bar(
     y_offset: f64,
     show_split_btn: bool,
     hovered_close_tab: Option<usize>,
-) {
+) -> Vec<(f64, f64)> {
     // Tab bar background
     let (r, g, b) = theme.tab_bar_bg.to_cairo();
     cr.set_source_rgb(r, g, b);
     cr.rectangle(0.0, y_offset, width, line_height);
     cr.fill().unwrap();
 
-    // Save current font description so we can restore after rendering previews
-    let normal_font = layout.font_description().unwrap_or_default();
+    // Use sans-serif UI font for tabs (like VSCode)
+    let saved_font = layout.font_description().unwrap_or_default();
+    let ui_font_desc = FontDescription::from_string(UI_FONT);
+    layout.set_font_description(Some(&ui_font_desc));
+
+    let normal_font = ui_font_desc.clone();
     let mut italic_font = normal_font.clone();
     italic_font.set_style(pango::Style::Italic);
 
@@ -6756,6 +7250,7 @@ fn draw_tab_bar(
     let tab_outer_gap = 4.0; // space between tabs
 
     let mut x = 0.0;
+    let mut slot_positions: Vec<(f64, f64)> = Vec::with_capacity(tabs.len());
     for (tab_idx, tab) in tabs.iter().enumerate() {
         // Use italic font for preview tabs
         if tab.preview {
@@ -6774,6 +7269,7 @@ fn draw_tab_bar(
         if x + slot_w > tab_area_width {
             break;
         }
+        slot_positions.push((x, x + slot_w));
 
         // Tab background (covers name + gap + ×)
         let bg = if tab.active {
@@ -6886,8 +7382,59 @@ fn draw_tab_bar(
         pangocairo::show_layout(cr, layout);
     }
 
-    // Restore normal font for subsequent rendering
-    layout.set_font_description(Some(&normal_font));
+    // Restore original editor font for subsequent rendering
+    layout.set_font_description(Some(&saved_font));
+    slot_positions
+}
+
+fn draw_breadcrumb_bar(
+    cr: &Context,
+    layout: &pango::Layout,
+    theme: &Theme,
+    segments: &[render::BreadcrumbSegment],
+    width: f64,
+    line_height: f64,
+    y_offset: f64,
+) {
+    // Background
+    let (r, g, b) = theme.breadcrumb_bg.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    cr.rectangle(0.0, y_offset, width, line_height);
+    cr.fill().unwrap();
+
+    let separator = " \u{203A} "; // " › "
+    let mut x = 4.0; // small left padding
+
+    for seg in segments {
+        // Separator before all but the first
+        if x > 5.0 {
+            let (sr, sg, sb) = theme.breadcrumb_fg.to_cairo();
+            cr.set_source_rgb(sr, sg, sb);
+            layout.set_text(separator);
+            cr.move_to(x, y_offset);
+            pangocairo::show_layout(cr, layout);
+            let (sw, _) = layout.pixel_size();
+            x += sw as f64;
+        }
+
+        // Segment label
+        let fg = if seg.is_last {
+            theme.breadcrumb_active_fg
+        } else {
+            theme.breadcrumb_fg
+        };
+        let (fr, fg_g, fb) = fg.to_cairo();
+        cr.set_source_rgb(fr, fg_g, fb);
+        layout.set_text(&seg.label);
+        cr.move_to(x, y_offset);
+        pangocairo::show_layout(cr, layout);
+        let (lw, _) = layout.pixel_size();
+        x += lw as f64;
+
+        if x > width {
+            break;
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8088,6 +8635,108 @@ fn draw_command_palette_popup(
     }
 }
 
+/// Draw the tab switcher popup (Ctrl+Tab MRU list).
+fn draw_tab_switcher_popup(
+    cr: &Context,
+    screen: &render::ScreenLayout,
+    theme: &Theme,
+    editor_width: f64,
+    editor_height: f64,
+    line_height: f64,
+) {
+    let Some(ts) = &screen.tab_switcher else {
+        return;
+    };
+    if ts.items.is_empty() {
+        return;
+    }
+
+    let item_count = ts.items.len();
+    let max_visible = ((editor_height * 0.6) / line_height) as usize;
+    let visible = item_count.min(max_visible).min(20);
+
+    let popup_w = (editor_width * 0.40).clamp(350.0, 600.0);
+    let popup_h = (visible as f64 + 1.5) * line_height; // items + title
+
+    let popup_x = (editor_width - popup_w) / 2.0;
+    let popup_y = (editor_height - popup_h) / 2.0;
+
+    // Background
+    let (r, g, b) = theme.fuzzy_bg.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
+    cr.fill().ok();
+
+    // Border
+    let (r, g, b) = theme.fuzzy_border.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    cr.set_line_width(1.0);
+    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
+    cr.stroke().ok();
+
+    // Use sans-serif UI font (same as VSCode tabs)
+    let pango_ctx = pangocairo::create_context(cr);
+    let ui_font_desc = FontDescription::from_string(UI_FONT);
+    let layout = pango::Layout::new(&pango_ctx);
+    layout.set_font_description(Some(&ui_font_desc));
+
+    // Title
+    let title = " Open Tabs";
+    let (r, g, b) = theme.fuzzy_title_fg.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    layout.set_text(title);
+    layout.set_attributes(None);
+    cr.move_to(popup_x + 4.0, popup_y);
+    pangocairo::show_layout(cr, &layout);
+
+    // Scroll offset
+    let scroll = if ts.selected_idx >= visible {
+        ts.selected_idx - visible + 1
+    } else {
+        0
+    };
+
+    let items_y = popup_y + line_height * 1.2;
+    for i in 0..visible {
+        let item_idx = scroll + i;
+        if item_idx >= item_count {
+            break;
+        }
+        let item_y = items_y + i as f64 * line_height;
+        let is_selected = item_idx == ts.selected_idx;
+
+        if is_selected {
+            let (r, g, b) = theme.fuzzy_selected_bg.to_cairo();
+            cr.set_source_rgb(r, g, b);
+            cr.rectangle(popup_x + 1.0, item_y, popup_w - 2.0, line_height);
+            cr.fill().ok();
+        }
+
+        let (name, path, dirty) = &ts.items[item_idx];
+        let dirty_mark = if *dirty { " \u{25cf}" } else { "" }; // ●
+        let prefix = if is_selected { "\u{25b6} " } else { "  " }; // ▶
+        let label = format!("{}{}{}", prefix, name, dirty_mark);
+
+        let (r, g, b) = theme.fuzzy_fg.to_cairo();
+        cr.set_source_rgb(r, g, b);
+        layout.set_text(&label);
+        layout.set_attributes(None);
+        cr.move_to(popup_x + 4.0, item_y);
+        pangocairo::show_layout(cr, &layout);
+
+        // Path right-aligned (dimmed)
+        if !path.is_empty() {
+            let (r, g, b) = theme.fuzzy_border.to_cairo();
+            cr.set_source_rgb(r, g, b);
+            layout.set_text(path);
+            layout.set_attributes(None);
+            let (pw, _) = layout.pixel_size();
+            cr.move_to(popup_x + popup_w - pw as f64 - 8.0, item_y);
+            pangocairo::show_layout(cr, &layout);
+        }
+    }
+}
+
 /// Draw the tab bar for the bottom panel (Terminal / Debug Output).
 /// One row high at `(x, y)`, full width `w`.
 #[allow(clippy::too_many_arguments)]
@@ -8832,6 +9481,55 @@ fn draw_status_line(
     layout.set_text(right);
     cr.move_to(width - right_w as f64, y);
     pangocairo::show_layout(cr, layout);
+}
+
+fn draw_wildmenu(
+    cr: &Context,
+    layout: &pango::Layout,
+    theme: &Theme,
+    wm: &render::WildmenuData,
+    width: f64,
+    y: f64,
+    line_height: f64,
+) {
+    // Fill background
+    let (br, bg, bb) = theme.wildmenu_bg.to_cairo();
+    cr.set_source_rgb(br, bg, bb);
+    cr.rectangle(0.0, y, width, line_height);
+    cr.fill().unwrap();
+
+    layout.set_attributes(None);
+    layout.set_width(-1);
+    layout.set_ellipsize(pango::EllipsizeMode::None);
+
+    let mut x = 0.0;
+    for (i, item) in wm.items.iter().enumerate() {
+        if x >= width {
+            break;
+        }
+        let is_selected = wm.selected == Some(i);
+        let label = format!(" {} ", item);
+        layout.set_text(&label);
+        let (item_w, _) = layout.pixel_size();
+
+        if is_selected {
+            // Draw selected item background
+            let (sbr, sbg, sbb) = theme.wildmenu_sel_bg.to_cairo();
+            cr.set_source_rgb(sbr, sbg, sbb);
+            cr.rectangle(x, y, item_w as f64, line_height);
+            cr.fill().unwrap();
+            // Selected item foreground
+            let (sfr, sfg, sfb) = theme.wildmenu_sel_fg.to_cairo();
+            cr.set_source_rgb(sfr, sfg, sfb);
+        } else {
+            let (fr, fg, fb) = theme.wildmenu_fg.to_cairo();
+            cr.set_source_rgb(fr, fg, fb);
+        }
+
+        cr.move_to(x, y);
+        pangocairo::show_layout(cr, layout);
+        x += item_w as f64;
+    }
 }
 
 fn draw_command_line(
@@ -9860,6 +10558,7 @@ enum ClickTarget {
 
 /// Convert pixel (x, y) to a buffer position (window_id, line, col).
 /// Also handles tab-bar clicks and gutter fold toggles.
+#[allow(clippy::too_many_arguments)]
 fn pixel_to_click_target(
     engine: &mut Engine,
     x: f64,
@@ -9868,21 +10567,48 @@ fn pixel_to_click_target(
     height: f64,
     line_height: f64,
     char_width: f64,
+    tab_slot_positions: &TabSlotMap,
 ) -> ClickTarget {
-    let tab_bar_height = line_height;
+    let tab_bar_height = if engine.settings.breadcrumbs {
+        line_height * 2.0
+    } else {
+        line_height
+    };
 
     // Check if click is in a group's tab bar region.
-    // Use the group layout tree to find group bounds.
+    // Use the group layout tree to find group bounds (must match draw_editor layout).
     {
-        let editor_bottom = height - line_height * 2.0;
+        let wildmenu_px = if engine.wildmenu_items.is_empty() {
+            0.0
+        } else {
+            line_height
+        };
+        let status_bar_height = line_height * 2.0 + wildmenu_px;
+        let qf_px = if engine.quickfix_open {
+            let n = engine.quickfix_items.len().clamp(1, 10) as f64;
+            (n + 1.0) * line_height
+        } else {
+            0.0
+        };
+        let term_px = if engine.terminal_open || engine.bottom_panel_open {
+            (engine.session.terminal_panel_rows as usize + 1) as f64 * line_height
+        } else {
+            0.0
+        };
+        let debug_toolbar_px = if engine.debug_toolbar_visible {
+            line_height
+        } else {
+            0.0
+        };
+        let editor_bottom = height - status_bar_height - debug_toolbar_px - qf_px - term_px;
         let content_bounds = WindowRect::new(0.0, 0.0, width, editor_bottom);
         let group_rects = engine
             .group_layout
             .calculate_group_rects(content_bounds, tab_bar_height);
 
-        // Check if click is in any group's tab bar (the line_height above each group's bounds).
+        // Check if click is in any group's tab bar (the first line_height of the tab_bar_height region).
         for (gid, grect) in &group_rects {
-            let tab_y = grect.y - line_height;
+            let tab_y = grect.y - tab_bar_height;
             let tab_x_start = grect.x;
             let bar_width = grect.width;
             if y >= tab_y
@@ -9911,51 +10637,32 @@ fn pixel_to_click_target(
                     );
                 }
 
-                // Hit-test tabs.
-                // Use a wider close button hit zone (char_width + inner gap
-                // on each side) to compensate for the approximate tab-name
-                // width calculation that can drift from the Pango-measured
-                // widths used during drawing.
-                let close_w = char_width;
-                let tab_inner_gap = 4.0_f64;
-                let tab_outer_gap = 4.0_f64;
-                let close_pad = char_width; // extra padding on each side of ×
-                let mut tab_x = 0.0;
-                // Collect tab hit info from immutable borrow, then apply mutably.
-                let hit = engine.editor_groups.get(&group_id).and_then(|group| {
-                    for (i, tab) in group.tabs.iter().enumerate() {
-                        let wid = tab.active_window;
-                        let name = if let Some(window) = engine.windows.get(&wid) {
-                            if let Some(state) = engine.buffer_manager.get(window.buffer_id) {
-                                let dirty = if state.dirty { "*" } else { "" };
-                                format!(" {}: {}{} ", i + 1, state.display_name(), dirty)
-                            } else {
-                                format!(" {}: [No Name] ", i + 1)
+                // Hit-test tabs using cached Pango-measured positions from draw_tab_bar.
+                let hit =
+                    tab_slot_positions
+                        .get(&group_id.0)
+                        .and_then(|slots: &Vec<(f64, f64)>| {
+                            for (i, &(slot_start, slot_end)) in slots.iter().enumerate() {
+                                if local_x >= slot_start && local_x < slot_end {
+                                    // Close button is in the last ~20% of the slot
+                                    let close_zone = (slot_end - slot_start) * 0.2;
+                                    let is_close = local_x >= slot_end - close_zone;
+                                    return Some((i, is_close));
+                                }
                             }
-                        } else {
-                            format!(" {}: [No Name] ", i + 1)
-                        };
-                        let tab_w = name.chars().count() as f64 * char_width;
-                        let slot_w = tab_w + tab_inner_gap + close_w + tab_outer_gap;
-                        if local_x >= tab_x && local_x < tab_x + slot_w {
-                            // Widen the close-button hit zone to make it easier to click.
-                            let close_x_start = tab_x + tab_w + tab_inner_gap - close_pad;
-                            let close_x_end = tab_x + slot_w;
-                            let is_close = local_x >= close_x_start && local_x < close_x_end;
-                            return Some((i, is_close));
-                        }
-                        tab_x += slot_w;
-                    }
-                    None
-                });
+                            None
+                        });
                 if let Some((tab_idx, is_close)) = hit {
-                    if let Some(g) = engine.editor_groups.get_mut(&group_id) {
-                        g.active_tab = tab_idx;
-                    }
-                    engine.line_annotations.clear();
                     if is_close {
+                        // For close, just set active_tab directly (tab will be removed)
+                        if let Some(g) = engine.editor_groups.get_mut(&group_id) {
+                            g.active_tab = tab_idx;
+                        }
+                        engine.line_annotations.clear();
                         return ClickTarget::CloseTab(group_id, tab_idx);
                     }
+                    // For tab switch, use goto_tab which also updates MRU
+                    engine.goto_tab(tab_idx);
                     return ClickTarget::TabBar;
                 }
                 return ClickTarget::TabBar;
@@ -9963,7 +10670,12 @@ fn pixel_to_click_target(
         }
     }
 
-    let status_bar_height = line_height * 2.0;
+    let wildmenu_px = if engine.wildmenu_items.is_empty() {
+        0.0
+    } else {
+        line_height
+    };
+    let status_bar_height = line_height * 2.0 + wildmenu_px;
     let editor_bottom = height - status_bar_height;
 
     if y >= editor_bottom {
@@ -10094,8 +10806,9 @@ fn pixel_to_click_target(
 }
 
 /// Handle mouse click by converting coordinates to buffer position.
-/// Returns `true` if the click hit a tab-close button on a dirty buffer
-/// (caller should show the close-tab confirm dialog instead of closing).
+/// Returns: `None` = non-buffer click (tab bar, split button, etc.);
+/// `Some(true)` = close-tab on dirty buffer (show confirm dialog);
+/// `Some(false)` = normal buffer click.
 #[allow(clippy::too_many_arguments)]
 fn handle_mouse_click(
     engine: &mut Engine,
@@ -10106,12 +10819,26 @@ fn handle_mouse_click(
     _alt: bool,
     line_height: f64,
     char_width: f64,
-) -> bool {
-    match pixel_to_click_target(engine, x, y, width, height, line_height, char_width) {
-        ClickTarget::BufferPos(wid, line, col) => engine.mouse_click(wid, line, col),
+    tab_slot_positions: &TabSlotMap,
+) -> Option<bool> {
+    match pixel_to_click_target(
+        engine,
+        x,
+        y,
+        width,
+        height,
+        line_height,
+        char_width,
+        tab_slot_positions,
+    ) {
+        ClickTarget::BufferPos(wid, line, col) => {
+            engine.mouse_click(wid, line, col);
+            Some(false)
+        }
         ClickTarget::SplitButton(group_id, dir) => {
             engine.active_group = group_id;
             engine.open_editor_group(dir);
+            None
         }
         ClickTarget::CloseTab(group_id, tab_idx) => {
             if let Some(g) = engine.editor_groups.get_mut(&group_id) {
@@ -10120,16 +10847,120 @@ fn handle_mouse_click(
             engine.active_group = group_id;
             engine.line_annotations.clear();
             if engine.dirty() {
-                return true;
+                return Some(true);
             }
             engine.close_tab();
+            None
         }
-        _ => {}
+        _ => None,
     }
-    false
+}
+
+/// Compute the drop zone for a tab drag based on cursor position.
+#[allow(clippy::too_many_arguments)]
+fn compute_tab_drop_zone(
+    engine: &Engine,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    line_height: f64,
+    char_width: f64,
+    tab_slot_positions: &TabSlotMap,
+) -> crate::core::window::DropZone {
+    use crate::core::window::{DropZone, SplitDirection, WindowRect};
+
+    let tab_bar_height = if engine.settings.breadcrumbs {
+        line_height * 2.0
+    } else {
+        line_height
+    };
+    let wildmenu_px = if engine.wildmenu_items.is_empty() {
+        0.0
+    } else {
+        line_height
+    };
+    let status_bar_height = line_height * 2.0 + wildmenu_px;
+    let qf_px = if engine.quickfix_open {
+        let n = engine.quickfix_items.len().clamp(1, 10) as f64;
+        (n + 1.0) * line_height
+    } else {
+        0.0
+    };
+    let term_px = if engine.terminal_open || engine.bottom_panel_open {
+        (engine.session.terminal_panel_rows as usize + 1) as f64 * line_height
+    } else {
+        0.0
+    };
+    let debug_toolbar_px = if engine.debug_toolbar_visible {
+        line_height
+    } else {
+        0.0
+    };
+    let editor_bottom = height - status_bar_height - debug_toolbar_px - qf_px - term_px;
+    let content_bounds = WindowRect::new(0.0, 0.0, width, editor_bottom);
+    let group_rects = engine
+        .group_layout
+        .calculate_group_rects(content_bounds, tab_bar_height);
+
+    for (gid, grect) in &group_rects {
+        let tab_y = grect.y - tab_bar_height;
+        let tab_x = grect.x;
+        let group_id = *gid;
+
+        // Check tab bar region (for reorder/center drop)
+        if y >= tab_y && y < tab_y + line_height && x >= tab_x && x < tab_x + grect.width {
+            // Determine insertion index from tab slot positions
+            let local_x = x - tab_x;
+            if let Some(slots) = tab_slot_positions.get(&group_id.0) {
+                for (i, &(slot_start, slot_end)) in slots.iter().enumerate() {
+                    let mid = (slot_start + slot_end) / 2.0;
+                    if local_x < mid {
+                        return DropZone::TabReorder(group_id, i);
+                    }
+                }
+                return DropZone::TabReorder(group_id, slots.len());
+            }
+            return DropZone::Center(group_id);
+        }
+
+        // Check content area with edge margins
+        let content_top = grect.y;
+        let content_left = grect.x;
+        let content_right = grect.x + grect.width;
+        let content_bottom = grect.y + grect.height;
+        if x >= content_left && x < content_right && y >= content_top && y < content_bottom {
+            let w = grect.width;
+            let h = grect.height;
+            let rel_x = x - content_left;
+            let rel_y = y - content_top;
+            let margin = 0.2;
+
+            // Minimum 40px or char_width*5 for edge zones
+            let edge_w = (w * margin).min(char_width * 10.0).max(40.0);
+            let edge_h = (h * margin).min(line_height * 3.0).max(40.0);
+
+            if rel_x < edge_w {
+                return DropZone::Split(group_id, SplitDirection::Vertical, true);
+            }
+            if rel_x > w - edge_w {
+                return DropZone::Split(group_id, SplitDirection::Vertical, false);
+            }
+            if rel_y < edge_h {
+                return DropZone::Split(group_id, SplitDirection::Horizontal, true);
+            }
+            if rel_y > h - edge_h {
+                return DropZone::Split(group_id, SplitDirection::Horizontal, false);
+            }
+            return DropZone::Center(group_id);
+        }
+    }
+
+    DropZone::None
 }
 
 /// Handle mouse double-click — select word at position.
+#[allow(clippy::too_many_arguments)]
 fn handle_mouse_double_click(
     engine: &mut Engine,
     x: f64,
@@ -10138,15 +10969,24 @@ fn handle_mouse_double_click(
     height: f64,
     line_height: f64,
     char_width: f64,
+    tab_slot_positions: &TabSlotMap,
 ) {
-    if let ClickTarget::BufferPos(wid, line, col) =
-        pixel_to_click_target(engine, x, y, width, height, line_height, char_width)
-    {
+    if let ClickTarget::BufferPos(wid, line, col) = pixel_to_click_target(
+        engine,
+        x,
+        y,
+        width,
+        height,
+        line_height,
+        char_width,
+        tab_slot_positions,
+    ) {
         engine.mouse_double_click(wid, line, col);
     }
 }
 
 /// Handle mouse drag — extend visual selection.
+#[allow(clippy::too_many_arguments)]
 fn handle_mouse_drag(
     engine: &mut Engine,
     x: f64,
@@ -10155,10 +10995,18 @@ fn handle_mouse_drag(
     height: f64,
     line_height: f64,
     char_width: f64,
+    tab_slot_positions: &TabSlotMap,
 ) {
-    if let ClickTarget::BufferPos(wid, line, col) =
-        pixel_to_click_target(engine, x, y, width, height, line_height, char_width)
-    {
+    if let ClickTarget::BufferPos(wid, line, col) = pixel_to_click_target(
+        engine,
+        x,
+        y,
+        width,
+        height,
+        line_height,
+        char_width,
+        tab_slot_positions,
+    ) {
         engine.mouse_drag(wid, line, col);
     }
 }
@@ -10710,7 +11558,7 @@ fn build_file_tree(
         let is_dir = path.is_dir();
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         let icon = if is_dir {
-            ""
+            "\u{f07b}" // nf-fa-folder
         } else {
             crate::icons::file_icon(ext)
         };
@@ -10896,18 +11744,10 @@ fn install_icon_and_desktop() {
     };
     let data_dir = home.join(".local/share");
 
-    // Icon — 256×256 PNG embedded at compile time.
-    let icon_dir = data_dir.join("icons/hicolor/256x256/apps");
-    let icon_path = icon_dir.join("vimcode.png");
-    let icon_bytes: &[u8] = include_bytes!("../vimcode-color.png");
-    if fs::create_dir_all(&icon_dir).is_ok() {
-        let _ = fs::write(&icon_path, icon_bytes);
-    }
-
-    // SVG icon for scalable size.
+    // SVG icon for scalable size (GTK/GNOME renders SVGs natively).
     let svg_dir = data_dir.join("icons/hicolor/scalable/apps");
     let svg_path = svg_dir.join("vimcode.svg");
-    let svg_bytes: &[u8] = include_bytes!("../vimcode-color.svg");
+    let svg_bytes: &[u8] = include_bytes!("../vim-code.svg");
     if fs::create_dir_all(&svg_dir).is_ok() {
         let _ = fs::write(&svg_path, svg_bytes);
     }

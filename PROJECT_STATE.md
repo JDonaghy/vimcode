@@ -1,9 +1,9 @@
 # VimCode Project State
 
-**Last updated:** Mar 7, 2026 (Session 143 — 3 bug fixes + :e! reload) | **Tests:** 2621
+**Last updated:** Mar 9, 2026 (Session 155 — Core Commentary Feature) | **Tests:** 2908
 
 > Feature documentation lives in **README.md**.
-> Per-session implementation notes through Session 143 are in **SESSION_HISTORY.md**.
+> Per-session implementation notes through Session 154 are in **SESSION_HISTORY.md**.
 
 ---
 
@@ -26,13 +26,7 @@ When implementing a new key/command, add tests covering:
 
 ## Recent Work
 
-**Session 143 — File management bug fixes (2621 tests):**
-Fixed 3 bugs found during Neovim comparison + added `:e!`: (1) `:q` now allows closing a dirty buffer if it's visible in another window (was blocked unconditionally), (2) File auto-reload with `autoread` setting (default true) — `file_mtime` tracking on `BufferState`, `check_file_changes()` on Engine (called every 2s from both GTK and TUI backends), `reload_from_disk()` for clean buffers, W12 warning for dirty buffers, (3) `:new`/`:split`/`:vnew`/`:vsplit` now respect `splitbelow`/`splitright` settings (was hardcoded `new_first=false`), (4) `:e!` reload current file from disk (discard changes). 9 integration tests in `tests/vim_compat_batch3.rs`.
+**Session 155 — Core Commentary Feature (2908 tests):**
+Unified comment toggling from three separate implementations (Lua plugin, Rust `toggle_comment_range()`, Rust `vscode_toggle_line_comment()`) into a single core module `src/core/comment.rs`. New `CommentStyle`/`CommentStyleOwned` types, `comment_style_for_language()` table covering 46+ languages (including block comments for HTML/CSS/XML), two-pass `compute_toggle_edits()` algorithm, `resolve_comment_style()` override chain (plugin → extension manifest → built-in → fallback `#`). Added `CommentConfig` to `ExtensionManifest` in `extensions.rs`. New `toggle_comment()` method on Engine replaces old `toggle_comment_range()` and `vscode_toggle_line_comment()`. Rewired `gcc`, visual `gc`, and VSCode `Ctrl+/` to use the new core. Added `:Comment` command (`:Commentary` kept as alias). Plugin API: `vimcode.set_comment_style(lang_id, {line, block_open, block_close})`. Fixed Ctrl+/ in GTK (key name `"slash"` not `"/"`) and TUI (crossterm byte 0x1F → `Char('7')` mapping). VSCode mode: added Ctrl+Q quit, F10 menu toggle, menu visible by default. 19 unit tests in `comment.rs`, 31 integration tests in `tests/commentary.rs`.
 
-**Session 142 — Vim compatibility batch 3: 15 new commands (2612 tests):**
-Implemented 15 more missing Vim commands, raising VIM_COMPATIBILITY.md from 380/403 (94%) to 400/414 (97%). `g?{motion}` ROT13 encode (with text objects), `CTRL-@` insert previous text + exit, `CTRL-V {char}` insert literal character, `CTRL-O` auto-return to Insert after one Normal command, `!{motion}{filter}` filter through external command, `CTRL-W H/J/K/L` move window to far edge, `CTRL-W T` move window to new group, `CTRL-W x` exchange windows, visual block `I`/`A` (insert/append applied to all block lines on Escape), `o_v`/`o_V` force charwise/linewise motion mode. Added `insert_ctrl_o_active`, `insert_ctrl_v_pending`, `visual_block_insert_info`, `force_motion_mode` fields. Enhanced `apply_operator_text_object()` with case/ROT13/indent/filter support. 29 integration tests in `tests/vim_compat_batch3.rs`. Sections now at 100%: Window commands (31/31), Visual mode (26/26), Editing (51/51).
-
-**Session 141 — Vim compatibility batch 2: 27 new commands (2583 tests):**
-Implemented 27 more missing Vim commands, raising VIM_COMPATIBILITY.md from 348/403 (85%) to 380/403 (94%). **Tier 1 (quick wins):** `ga` ASCII value, `g8` UTF-8 bytes, `go` byte offset, `gm`/`gM` middle of screen/text, `gI` insert at column 1, `gx` open URL, `g'`/`` g` `` mark without jumplist, `g&` repeat `:s` globally, `CTRL-^` alternate buffer, `CTRL-L` redraw, `N%` go to N% of file, `zs`/`ze` scroll cursor to left/right edge, `:b {name}` buffer by name, `:make`. **Tier 2 (medium effort):** `gq{motion}`/`gw{motion}` format operators (with text object support), `CTRL-W p`/`t`/`b` window navigation, `CTRL-W f`/`d` split+open/definition, insert `CTRL-A` repeat last insertion, insert `CTRL-G u`/`j`/`k` break undo/move, visual `gq`/`g CTRL-A`/`g CTRL-X`. Added `prev_active_group`/`insert_ctrl_g_pending` fields, `format_lines()` method, 38 integration tests in `tests/vim_compat_batch2.rs`. Sections now at 100%: Movement (48/48), Editing (50/50), z-commands (23/23).
-
-> Sessions 140 and earlier archived in **SESSION_HISTORY.md**.
+> Sessions 154 and earlier archived in **SESSION_HISTORY.md**.

@@ -67,12 +67,12 @@ use ratatui::Terminal;
 
 use crate::core::engine::{DiffLine, EngineAction};
 use crate::core::lsp::DiagnosticSeverity;
-use crate::core::settings::{parse_key_binding, ExplorerAction, LineNumberMode};
+use crate::core::settings::ExplorerAction;
 use crate::core::window::SplitDirection;
 use crate::core::{Engine, GitLineStatus, Mode, OpenMode, WindowRect};
 use crate::render::{
     self, build_screen_layout, Color, CompletionMenu, CursorShape, RenderedLine, RenderedWindow,
-    SelectionKind, Theme,
+    SelectionKind, Theme, WildmenuData,
 };
 
 // ─── Key binding helpers ──────────────────────────────────────────────────────
@@ -80,7 +80,9 @@ use crate::render::{
 /// Returns true if the given crossterm key event matches a panel_keys binding string.
 /// Binding strings use Vim notation: `<C-b>`, `<C-S-e>`, `<A-x>`.
 fn matches_tui_key(binding: &str, code: KeyCode, mods: KeyModifiers) -> bool {
-    let Some((ctrl, shift, alt, key_char)) = parse_key_binding(binding) else {
+    let Some((ctrl, shift, alt, key_name)) =
+        crate::core::settings::parse_key_binding_named(binding)
+    else {
         return false;
     };
     if ctrl != mods.contains(KeyModifiers::CONTROL) {
@@ -92,8 +94,14 @@ fn matches_tui_key(binding: &str, code: KeyCode, mods: KeyModifiers) -> bool {
     if alt != mods.contains(KeyModifiers::ALT) {
         return false;
     }
-    match code {
-        KeyCode::Char(c) => c.to_ascii_lowercase() == key_char,
+    match key_name.as_str() {
+        "Tab" | "tab" => matches!(code, KeyCode::Tab),
+        "Space" | "space" => matches!(code, KeyCode::Char(' ')),
+        "Escape" | "Esc" => matches!(code, KeyCode::Esc),
+        s if s.chars().count() == 1 => {
+            let ch = s.chars().next().unwrap().to_ascii_lowercase();
+            matches!(code, KeyCode::Char(c) if c.to_ascii_lowercase() == ch)
+        }
         _ => false,
     }
 }
@@ -147,6 +155,12 @@ struct TuiSidebar {
     search_scroll_top: usize,
     /// Whether to show dotfiles in the explorer (mirrors Settings.show_hidden_files).
     show_hidden_files: bool,
+    /// When true, the activity bar (toolbar) has keyboard focus.
+    toolbar_focused: bool,
+    /// Currently highlighted row in the activity bar (0=hamburger, 1-6=panels, 7=settings).
+    toolbar_selected: u16,
+    /// True after Ctrl-W is pressed in a sidebar panel, waiting for h/j/k/l.
+    pending_ctrl_w: bool,
 }
 
 impl TuiSidebar {
@@ -167,6 +181,9 @@ impl TuiSidebar {
             replace_input_focused: false,
             search_scroll_top: 0,
             show_hidden_files: false,
+            toolbar_focused: false,
+            toolbar_selected: 1, // Start on Explorer
+            pending_ctrl_w: false,
         };
         sb.build_rows();
         sb
@@ -661,8 +678,11 @@ fn sync_tui_clipboard(engine: &mut Engine, last: &mut Option<String>) {
 /// Returns true if the key was intercepted and processed.
 fn intercept_paste_key(engine: &mut Engine, before: bool) -> bool {
     use crate::core::Mode;
-    // Only intercept in Normal mode with a default/clipboard register.
-    if engine.mode != Mode::Normal {
+    // Intercept in Normal and Visual modes with a default/clipboard register.
+    if !matches!(
+        engine.mode,
+        Mode::Normal | Mode::Visual | Mode::VisualLine | Mode::VisualBlock
+    ) {
         return false;
     }
     if !matches!(
@@ -737,6 +757,7 @@ pub fn run(file_path: Option<PathBuf>, debug_log_path: Option<String>) {
             PushKeyboardEnhancementFlags(
                 KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                     | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
             )
         );
     }
@@ -812,8 +833,11 @@ fn event_loop(
     let mut theme = Theme::from_name(&engine.settings.colorscheme);
 
     // Initialise sidebar from session/settings
-    let initial_visible =
-        engine.session.explorer_visible || engine.settings.explorer_visible_on_startup;
+    let initial_visible = if engine.settings.autohide_panels {
+        false
+    } else {
+        engine.session.explorer_visible || engine.settings.explorer_visible_on_startup
+    };
     let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut sidebar = TuiSidebar::new(root, initial_visible);
     sidebar.show_hidden_files = engine.settings.show_hidden_files;
@@ -888,6 +912,8 @@ fn event_loop(
     };
     // Deadline to clear the yank highlight flash.
     let mut yank_hl_deadline: Option<Instant> = None;
+    // Timestamp of the last Alt+t press (for tab switcher auto-confirm on timeout).
+    let mut tab_switcher_last_cycle: Option<Instant> = None;
 
     loop {
         // Refresh theme in case :colorscheme was run.
@@ -898,25 +924,35 @@ fn event_loop(
         // editor_col: [tab(1)] / [editor] then global [status(1)] [cmd(1)]
         if let Ok(size) = terminal.size() {
             let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
-            let trm_rows: u16 = if engine.terminal_open {
-                engine.session.terminal_panel_rows + 1
+            let trm_rows: u16 = if engine.terminal_open || engine.bottom_panel_open {
+                engine.session.terminal_panel_rows + 2 // match draw_frame: tab bar + header + content
             } else {
                 0
             };
             let menu_row: u16 = if engine.menu_bar_visible { 1 } else { 0 };
             let dbg_row: u16 = if engine.debug_toolbar_visible { 1 } else { 0 };
+            let wm_row: u16 = if !engine.wildmenu_items.is_empty() {
+                1
+            } else {
+                0
+            };
             let content_rows = size
                 .height
-                .saturating_sub(2 + qf_rows + trm_rows + menu_row + dbg_row); // status + cmd + panels (tab bar inside content bounds)
+                .saturating_sub(2 + qf_rows + trm_rows + menu_row + dbg_row + wm_row); // status + cmd + panels (tab bar inside content bounds)
             let gutter_approx = 4u16;
             let sidebar_cols = if sidebar.visible {
                 sidebar_width + 1
             } else {
                 0
             };
+            let ab_w = if engine.settings.autohide_panels && !sidebar.visible {
+                0
+            } else {
+                ACTIVITY_BAR_WIDTH
+            };
             let content_cols = size
                 .width
-                .saturating_sub(ACTIVITY_BAR_WIDTH + sidebar_cols + gutter_approx);
+                .saturating_sub(ab_w + sidebar_cols + gutter_approx);
             engine.set_viewport_lines(content_rows.saturating_sub(1).max(1) as usize); // -1 for tab bar row inside content_rows
             engine.set_viewport_cols(content_cols.max(1) as usize);
         }
@@ -1045,7 +1081,10 @@ fn event_loop(
         // When a redraw is pending but rate-limited, wait only until the next frame is due.
         // When idle, poll slowly to keep CPU near zero.
         // If a yank highlight is active, cap the wait so we clear it on time.
-        let poll_timeout = if needs_redraw {
+        let poll_timeout = if engine.tab_switcher_open {
+            // Short poll when tab switcher is open so we can auto-confirm quickly
+            Duration::from_millis(10)
+        } else if needs_redraw {
             min_frame
                 .saturating_sub(last_draw.elapsed())
                 .max(Duration::from_millis(1))
@@ -1056,6 +1095,17 @@ fn event_loop(
             Duration::from_millis(50)
         };
         if !ct_event::poll(poll_timeout).expect("poll") {
+            // Tab switcher auto-confirm: if open and no Alt+t press for 400ms, confirm.
+            if engine.tab_switcher_open {
+                if let Some(last) = tab_switcher_last_cycle {
+                    if last.elapsed() >= Duration::from_millis(500) {
+                        engine.tab_switcher_confirm();
+                        tab_switcher_last_cycle = None;
+                        needs_redraw = true;
+                    }
+                }
+                continue;
+            }
             // No input — good time to do background work without blocking typing.
             // Flush LSP didChange (may block briefly on pipe write for large buffers).
             engine.lsp_flush_changes();
@@ -1204,6 +1254,107 @@ fn event_loop(
                     }
                     needs_redraw = true;
                     continue;
+                }
+
+                // ── MRU tab switcher ──────────────────────────────────────
+                // When open, intercept all press events. Alt+t / Ctrl+Tab
+                // cycle; release events and non-cycling keys are swallowed.
+                // Auto-confirm happens via poll timeout (400ms with no input).
+                if engine.tab_switcher_open && key_event.kind != KeyEventKind::Release {
+                    let alt = key_event.modifiers.contains(KeyModifiers::ALT);
+                    let ctrl = key_event.modifiers.contains(KeyModifiers::CONTROL);
+                    match key_event.code {
+                        // Alt+t or Ctrl+Tab or plain Tab: cycle forward
+                        KeyCode::Char('t') if alt => {
+                            let len = engine.tab_mru.len();
+                            if len > 0 {
+                                engine.tab_switcher_selected =
+                                    (engine.tab_switcher_selected + 1) % len;
+                            }
+                            tab_switcher_last_cycle = Some(Instant::now());
+                        }
+                        KeyCode::Tab if ctrl => {
+                            let len = engine.tab_mru.len();
+                            if len > 0 {
+                                engine.tab_switcher_selected =
+                                    (engine.tab_switcher_selected + 1) % len;
+                            }
+                            tab_switcher_last_cycle = Some(Instant::now());
+                        }
+                        KeyCode::Tab => {
+                            let len = engine.tab_mru.len();
+                            if len > 0 {
+                                engine.tab_switcher_selected =
+                                    (engine.tab_switcher_selected + 1) % len;
+                            }
+                            tab_switcher_last_cycle = Some(Instant::now());
+                        }
+                        // Shift+Tab or Ctrl+Shift+Tab: cycle backward
+                        KeyCode::BackTab => {
+                            let len = engine.tab_mru.len();
+                            if len > 0 {
+                                engine.tab_switcher_selected = if engine.tab_switcher_selected == 0
+                                {
+                                    len - 1
+                                } else {
+                                    engine.tab_switcher_selected - 1
+                                };
+                            }
+                            tab_switcher_last_cycle = Some(Instant::now());
+                        }
+                        KeyCode::Esc => {
+                            engine.tab_switcher_open = false;
+                            tab_switcher_last_cycle = None;
+                        }
+                        KeyCode::Enter => {
+                            engine.tab_switcher_confirm();
+                            tab_switcher_last_cycle = None;
+                        }
+                        _ => {
+                            // Any other press confirms immediately
+                            engine.tab_switcher_confirm();
+                            tab_switcher_last_cycle = None;
+                        }
+                    }
+                    needs_redraw = true;
+                    continue;
+                }
+                // Swallow release events while tab switcher is open
+                if engine.tab_switcher_open && key_event.kind == KeyEventKind::Release {
+                    continue;
+                }
+
+                // Tab switcher openers (only on Press, not Release)
+                if key_event.kind != KeyEventKind::Release {
+                    let ctrl_held = key_event.modifiers.contains(KeyModifiers::CONTROL);
+                    let alt_held = key_event.modifiers.contains(KeyModifiers::ALT);
+                    // Ctrl+Tab
+                    if ctrl_held && key_event.code == KeyCode::Tab {
+                        engine.open_tab_switcher();
+                        tab_switcher_last_cycle = Some(Instant::now());
+                        needs_redraw = true;
+                        continue;
+                    }
+                    // Ctrl+Shift+Tab
+                    if ctrl_held && key_event.code == KeyCode::BackTab {
+                        engine.open_tab_switcher();
+                        if engine.tab_switcher_open {
+                            let len = engine.tab_mru.len();
+                            if len > 0 {
+                                engine.tab_switcher_selected = len - 1;
+                            }
+                        }
+                        tab_switcher_last_cycle = Some(Instant::now());
+                        needs_redraw = true;
+                        continue;
+                    }
+                    // Alt+t (handled here for the initial open; cycling handled above)
+                    if alt_held && !ctrl_held && key_event.code == KeyCode::Char('t') {
+                        engine.open_tab_switcher();
+                        tab_switcher_last_cycle = Some(Instant::now());
+                        needs_redraw = true;
+                        continue;
+                    }
                 }
 
                 // ── Prompt mode (sidebar CRUD) ──────────────────────────────
@@ -1373,6 +1524,92 @@ fn event_loop(
                     continue;
                 }
 
+                // ── Activity bar (toolbar) focused ────────────────────────────
+                if sidebar.toolbar_focused
+                    && !engine.fuzzy_open
+                    && !engine.grep_open
+                    && key_event.kind != KeyEventKind::Release
+                {
+                    match key_event.code {
+                        KeyCode::Char('j') | KeyCode::Down => {
+                            // Move down: 0→1→2→3→4→5→6→7 (settings)
+                            if sidebar.toolbar_selected < 7 {
+                                sidebar.toolbar_selected += 1;
+                            }
+                        }
+                        KeyCode::Char('k') | KeyCode::Up => {
+                            // Move up
+                            sidebar.toolbar_selected = sidebar.toolbar_selected.saturating_sub(1);
+                        }
+                        KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => {
+                            // Activate the selected panel
+                            let panel = match sidebar.toolbar_selected {
+                                0 => {
+                                    engine.toggle_menu_bar();
+                                    sidebar.toolbar_focused = false;
+                                    needs_redraw = true;
+                                    continue;
+                                }
+                                1 => TuiPanel::Explorer,
+                                2 => TuiPanel::Search,
+                                3 => TuiPanel::Debug,
+                                4 => TuiPanel::Git,
+                                5 => TuiPanel::Extensions,
+                                6 => TuiPanel::Ai,
+                                7 => TuiPanel::Settings,
+                                _ => {
+                                    needs_redraw = true;
+                                    continue;
+                                }
+                            };
+                            sidebar.toolbar_focused = false;
+                            sidebar.active_panel = panel;
+                            sidebar.visible = true;
+                            sidebar.has_focus = true;
+                            engine.session.explorer_visible = true;
+                            let _ = engine.session.save();
+                            if panel == TuiPanel::Search {
+                                sidebar.search_input_mode = true;
+                                sidebar.replace_input_focused = false;
+                            }
+                            if panel == TuiPanel::Git {
+                                engine.sc_has_focus = true;
+                                engine.sc_refresh();
+                            }
+                            if panel == TuiPanel::Debug {
+                                engine.dap_sidebar_has_focus = true;
+                            }
+                            if panel == TuiPanel::Extensions {
+                                engine.ext_sidebar_has_focus = true;
+                                if engine.ext_registry.is_none() && !engine.ext_registry_fetching {
+                                    engine.ext_refresh();
+                                }
+                            }
+                            if panel == TuiPanel::Ai {
+                                engine.ai_has_focus = true;
+                            }
+                            if panel == TuiPanel::Settings {
+                                engine.settings_has_focus = true;
+                            }
+                        }
+                        KeyCode::Char('h') | KeyCode::Left | KeyCode::Esc => {
+                            // Leave toolbar, return focus to editor
+                            sidebar.toolbar_focused = false;
+                        }
+                        KeyCode::Char('q') => {
+                            // Collapse sidebar from toolbar
+                            sidebar.toolbar_focused = false;
+                            sidebar.visible = false;
+                            sidebar.has_focus = false;
+                            engine.session.explorer_visible = false;
+                            let _ = engine.session.save();
+                        }
+                        _ => {}
+                    }
+                    needs_redraw = true;
+                    continue;
+                }
+
                 // ── Sidebar focused ─────────────────────────────────────────
                 // Note: sidebar key handling is suppressed when fuzzy modal is open.
                 if sidebar.has_focus
@@ -1417,6 +1654,51 @@ fn event_loop(
                             needs_redraw = true;
                             continue;
                         }
+                        // Ctrl-W prefix: set pending state for window navigation
+                        if mods.contains(KeyModifiers::CONTROL)
+                            && matches!(code, KeyCode::Char('w') | KeyCode::Char('W'))
+                        {
+                            sidebar.pending_ctrl_w = true;
+                            needs_redraw = true;
+                            continue;
+                        }
+                    }
+                    // Ctrl-W {h,l,Left,Right}: navigate between toolbar/panel/editor
+                    if sidebar.pending_ctrl_w {
+                        sidebar.pending_ctrl_w = false;
+                        match key_event.code {
+                            KeyCode::Char('h') | KeyCode::Left => {
+                                // Panel → toolbar
+                                sidebar.has_focus = false;
+                                engine.sc_has_focus = false;
+                                engine.dap_sidebar_has_focus = false;
+                                engine.ext_sidebar_has_focus = false;
+                                engine.ai_has_focus = false;
+                                engine.settings_has_focus = false;
+                                sidebar.toolbar_focused = true;
+                                sidebar.toolbar_selected = match sidebar.active_panel {
+                                    TuiPanel::Explorer => 1,
+                                    TuiPanel::Search => 2,
+                                    TuiPanel::Debug => 3,
+                                    TuiPanel::Git => 4,
+                                    TuiPanel::Extensions => 5,
+                                    TuiPanel::Ai => 6,
+                                    TuiPanel::Settings => 7,
+                                };
+                            }
+                            KeyCode::Char('l') | KeyCode::Right => {
+                                // Panel → editor
+                                sidebar.has_focus = false;
+                                engine.sc_has_focus = false;
+                                engine.dap_sidebar_has_focus = false;
+                                engine.ext_sidebar_has_focus = false;
+                                engine.ai_has_focus = false;
+                                engine.settings_has_focus = false;
+                            }
+                            _ => {} // Unknown Ctrl-W combo in sidebar, ignore
+                        }
+                        needs_redraw = true;
+                        continue;
                     }
 
                     // ── Search panel keyboard handling ──────────────────────
@@ -1529,6 +1811,12 @@ fn event_loop(
                                             sidebar.has_focus = false;
                                         }
                                     }
+                                    // h/Left: switch focus to toolbar
+                                    KeyCode::Char('h') | KeyCode::Left => {
+                                        sidebar.has_focus = false;
+                                        sidebar.toolbar_focused = true;
+                                        sidebar.toolbar_selected = 2; // Search row
+                                    }
                                     // Any printable char: switch back to input mode
                                     KeyCode::Char(c)
                                         if !key_event.modifiers.contains(KeyModifiers::CONTROL) =>
@@ -1547,6 +1835,17 @@ fn event_loop(
 
                     // ── Debug panel keyboard handling ──────────────────────
                     if sidebar.active_panel == TuiPanel::Debug {
+                        // h/Left: switch focus to toolbar
+                        if matches!(key_event.code, KeyCode::Char('h') | KeyCode::Left)
+                            && !key_event.modifiers.contains(KeyModifiers::CONTROL)
+                        {
+                            sidebar.has_focus = false;
+                            engine.dap_sidebar_has_focus = false;
+                            sidebar.toolbar_focused = true;
+                            sidebar.toolbar_selected = 3; // Debug row
+                            needs_redraw = true;
+                            continue;
+                        }
                         // Compute section heights before key handling so
                         // ensure_visible has valid dimensions.
                         if let Ok(size) = terminal.size() {
@@ -1611,6 +1910,18 @@ fn event_loop(
 
                     // ── Extensions panel keyboard handling ──────────────────
                     if sidebar.active_panel == TuiPanel::Extensions {
+                        // h/Left: switch focus to toolbar
+                        if matches!(key_event.code, KeyCode::Char('h') | KeyCode::Left)
+                            && !key_event.modifiers.contains(KeyModifiers::CONTROL)
+                            && !engine.ext_sidebar_input_active
+                        {
+                            sidebar.has_focus = false;
+                            engine.ext_sidebar_has_focus = false;
+                            sidebar.toolbar_focused = true;
+                            sidebar.toolbar_selected = 5; // Extensions row
+                            needs_redraw = true;
+                            continue;
+                        }
                         let (key_name, unicode): (&str, Option<char>) = match key_event.code {
                             KeyCode::Char('j') | KeyCode::Down => ("j", None),
                             KeyCode::Char('k') | KeyCode::Up => ("k", None),
@@ -1639,8 +1950,93 @@ fn event_loop(
                         continue;
                     }
 
+                    // ── Settings panel keyboard handling ──────────────────────
+                    if sidebar.active_panel == TuiPanel::Settings {
+                        // h/Left: switch focus to toolbar (only when not editing/searching)
+                        if matches!(key_event.code, KeyCode::Char('h') | KeyCode::Left)
+                            && !key_event.modifiers.contains(KeyModifiers::CONTROL)
+                            && !engine.settings_input_active
+                            && engine.settings_editing.is_none()
+                        {
+                            // Only if the selected row is not an enum (h/Left cycles enums)
+                            let flat = engine.settings_flat_list();
+                            let is_enum = if engine.settings_selected < flat.len() {
+                                let (is_cat, idx) = flat[engine.settings_selected];
+                                !is_cat
+                                    && matches!(
+                                        crate::core::settings::SETTING_DEFS[idx].setting_type,
+                                        crate::core::settings::SettingType::Enum(_)
+                                            | crate::core::settings::SettingType::DynamicEnum(_)
+                                    )
+                            } else {
+                                false
+                            };
+                            if !is_enum {
+                                sidebar.has_focus = false;
+                                engine.settings_has_focus = false;
+                                sidebar.toolbar_focused = true;
+                                sidebar.toolbar_selected = 7; // Settings row
+                                needs_redraw = true;
+                                continue;
+                            }
+                        }
+                        // Ctrl-V paste into search input or inline edit
+                        if ctrl && key_event.code == KeyCode::Char('v') {
+                            if engine.settings_input_active || engine.settings_editing.is_some() {
+                                let text = match engine.clipboard_read {
+                                    Some(ref cb) => cb().ok(),
+                                    None => None,
+                                };
+                                if let Some(t) = text {
+                                    engine.settings_paste(&t);
+                                }
+                            }
+                            needs_redraw = true;
+                            continue;
+                        }
+                        let (key_name, unicode): (&str, Option<char>) = match key_event.code {
+                            KeyCode::Char('j') | KeyCode::Down => ("j", None),
+                            KeyCode::Char('k') | KeyCode::Up => ("k", None),
+                            KeyCode::Tab => ("Tab", None),
+                            KeyCode::Enter => ("Return", None),
+                            KeyCode::Char(' ') => ("Space", None),
+                            KeyCode::Char('l') | KeyCode::Right => ("l", None),
+                            KeyCode::Char('h') | KeyCode::Left => ("h", None),
+                            KeyCode::Char('/') => ("/", None),
+                            KeyCode::Char('q') | KeyCode::Esc => ("Escape", None),
+                            KeyCode::Backspace => ("BackSpace", None),
+                            KeyCode::Char(ch) => ("char", Some(ch)),
+                            _ => ("", None),
+                        };
+                        if !key_name.is_empty() {
+                            let ch = if key_name == "char" { unicode } else { None };
+                            engine.handle_settings_key(
+                                if key_name == "char" { "" } else { key_name },
+                                ctrl,
+                                ch,
+                            );
+                            if !engine.settings_has_focus {
+                                sidebar.has_focus = false;
+                            }
+                        }
+                        needs_redraw = true;
+                        continue;
+                    }
+
                     // ── AI assistant panel keyboard handling ─────────────────
                     if sidebar.active_panel == TuiPanel::Ai {
+                        // h/Left: switch focus to toolbar (only when not typing)
+                        if matches!(key_event.code, KeyCode::Char('h') | KeyCode::Left)
+                            && !key_event.modifiers.contains(KeyModifiers::CONTROL)
+                            && !engine.ai_input_active
+                        {
+                            sidebar.has_focus = false;
+                            engine.ai_has_focus = false;
+                            sidebar.toolbar_focused = true;
+                            sidebar.toolbar_selected = 6; // AI row
+                            needs_redraw = true;
+                            continue;
+                        }
                         // Ctrl-V paste
                         if ctrl && key_event.code == KeyCode::Char('v') {
                             let text = match engine.clipboard_read {
@@ -1698,6 +2094,19 @@ fn event_loop(
 
                     // ── Source Control panel keyboard handling ──────────────
                     if sidebar.active_panel == TuiPanel::Git {
+                        // h/Left: switch focus to toolbar (when not in commit input or button mode)
+                        if matches!(key_event.code, KeyCode::Char('h') | KeyCode::Left)
+                            && !key_event.modifiers.contains(KeyModifiers::CONTROL)
+                            && !engine.sc_commit_input_active
+                            && engine.sc_button_focused.is_none()
+                        {
+                            sidebar.has_focus = false;
+                            engine.sc_has_focus = false;
+                            sidebar.toolbar_focused = true;
+                            sidebar.toolbar_selected = 4; // Git row
+                            needs_redraw = true;
+                            continue;
+                        }
                         if engine.sc_commit_input_active {
                             // In commit input mode, route all keys to commit handler.
                             let (key_str, unicode): (&str, Option<char>) = match key_event.code {
@@ -1794,7 +2203,7 @@ fn event_loop(
                                 }
                             }
                         }
-                        // Collapse dir / go to parent
+                        // Collapse dir / go to parent / switch to toolbar
                         KeyCode::Char('h') | KeyCode::Left => {
                             let idx = sidebar.selected;
                             if idx < sidebar.rows.len() {
@@ -1811,8 +2220,18 @@ fn event_loop(
                                         if let Some(pi) = parent_idx {
                                             sidebar.selected = pi;
                                         }
+                                    } else {
+                                        // At root level — switch focus to toolbar
+                                        sidebar.has_focus = false;
+                                        sidebar.toolbar_focused = true;
+                                        sidebar.toolbar_selected = 1; // Explorer row
                                     }
                                 }
+                            } else {
+                                // Empty explorer — switch to toolbar
+                                sidebar.has_focus = false;
+                                sidebar.toolbar_focused = true;
+                                sidebar.toolbar_selected = 1;
                             }
                         }
                         // Explorer CRUD keys — resolved from settings
@@ -2327,6 +2746,7 @@ fn event_loop(
                                     continue;
                                 }
                             }
+                            // Alt+t is handled earlier (tab switcher)
                             _ => {}
                         }
                     }
@@ -2341,6 +2761,51 @@ fn event_loop(
                             }
                         }
                         // Fall through to handle_key which calls vscode_paste().
+                    }
+
+                    // Ctrl+Shift+V: paste system clipboard into editor buffer.
+                    // With keyboard enhancement, this event is captured by the app
+                    // instead of the terminal emulator.  In Vim mode, load clipboard
+                    // into registers and trigger paste; in insert mode, insert text.
+                    if ctrl && key_name == "V" && !engine.is_vscode_mode() {
+                        use crate::core::Mode;
+                        if let Some(ref cb_read) = engine.clipboard_read {
+                            if let Ok(text) = cb_read() {
+                                if !text.is_empty() {
+                                    engine.load_clipboard_for_paste(text);
+                                    match engine.mode {
+                                        Mode::Normal => {
+                                            engine.handle_key("", Some('p'), false);
+                                        }
+                                        Mode::Visual | Mode::VisualLine | Mode::VisualBlock => {
+                                            engine.handle_key("", Some('p'), false);
+                                        }
+                                        Mode::Insert | Mode::Replace => {
+                                            // Insert clipboard text at cursor
+                                            if let Some((content, _)) =
+                                                engine.get_register_content('"')
+                                            {
+                                                let mut changed = false;
+                                                for ch in content.chars() {
+                                                    engine.handle_key(
+                                                        &ch.to_string(),
+                                                        Some(ch),
+                                                        false,
+                                                    );
+                                                    changed = true;
+                                                }
+                                                if changed {
+                                                    needs_redraw = true;
+                                                }
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                        needs_redraw = true;
+                        continue;
                     }
 
                     // Shift+F5 → stop, Shift+F11 → stepout (debug shortcuts)
@@ -2459,6 +2924,44 @@ fn event_loop(
                             break;
                         }
                     }
+                    // Ctrl-W h/l overflow: move focus to sidebar/toolbar
+                    if let Some(direction) = engine.window_nav_overflow.take() {
+                        if !direction {
+                            // Left overflow (Ctrl-W h): show sidebar if autohide
+                            if !sidebar.visible && engine.settings.autohide_panels {
+                                sidebar.visible = true;
+                            }
+                            // Left overflow → sidebar panel (if visible) or toolbar
+                            if sidebar.visible {
+                                sidebar.has_focus = true;
+                                match sidebar.active_panel {
+                                    TuiPanel::Git => engine.sc_has_focus = true,
+                                    TuiPanel::Debug => engine.dap_sidebar_has_focus = true,
+                                    TuiPanel::Extensions => {
+                                        engine.ext_sidebar_has_focus = true;
+                                    }
+                                    TuiPanel::Ai => engine.ai_has_focus = true,
+                                    TuiPanel::Settings => {
+                                        engine.settings_has_focus = true;
+                                    }
+                                    _ => {}
+                                }
+                            } else {
+                                sidebar.toolbar_focused = true;
+                            }
+                        }
+                        // Right overflow: no action (nothing to the right of editor)
+                    }
+
+                    // Auto-hide sidebar when focus returns to editor
+                    if engine.settings.autohide_panels
+                        && sidebar.visible
+                        && !sidebar.has_focus
+                        && !sidebar.toolbar_focused
+                    {
+                        sidebar.visible = false;
+                    }
+
                     // Any keypress warrants a redraw (e.g. :set wrap returns None but
                     // must still trigger a re-render to show the new wrapping).
                     needs_redraw = true;
@@ -2706,7 +3209,12 @@ fn handle_mouse(
     let row = ev.row;
     let term_height = terminal_size.map(|s| s.height).unwrap_or(24);
 
-    let editor_left = ACTIVITY_BAR_WIDTH
+    let ab_width = if engine.settings.autohide_panels && !sidebar.visible {
+        0
+    } else {
+        ACTIVITY_BAR_WIDTH
+    };
+    let editor_left = ab_width
         + if sidebar.visible {
             sidebar_width + 1
         } else {
@@ -2714,14 +3222,14 @@ fn handle_mouse(
         };
 
     // ── Sidebar separator drag (works anywhere, regardless of row) ────────────
-    let sep_col = ACTIVITY_BAR_WIDTH + if sidebar.visible { sidebar_width } else { 0 };
+    let sep_col = ab_width + if sidebar.visible { sidebar_width } else { 0 };
     match ev.kind {
         MouseEventKind::Down(MouseButton::Left) if sidebar.visible && col == sep_col => {
             *dragging_sidebar = true;
             return sidebar_width;
         }
         MouseEventKind::Drag(MouseButton::Left) if *dragging_sidebar => {
-            let new_w = col.saturating_sub(ACTIVITY_BAR_WIDTH);
+            let new_w = col.saturating_sub(ab_width);
             return new_w.clamp(15, 150);
         }
         MouseEventKind::Drag(MouseButton::Left) => {
@@ -2823,7 +3331,7 @@ fn handle_mouse(
             if col >= editor_left {
                 if let Some(layout) = last_layout {
                     let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
-                    let editor_row = row.saturating_sub(1 + menu_rows);
+                    let editor_row = row.saturating_sub(menu_rows);
                     for rw in &layout.windows {
                         let wx = rw.rect.x as u16;
                         let wy = rw.rect.y as u16;
@@ -2918,10 +3426,7 @@ fn handle_mouse(
         // Scroll wheel — sidebar or editor
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
             // Sidebar scroll wheel
-            if sidebar.visible
-                && col >= ACTIVITY_BAR_WIDTH
-                && col < ACTIVITY_BAR_WIDTH + sidebar_width
-            {
+            if sidebar.visible && col >= ab_width && col < ab_width + sidebar_width {
                 if sidebar.active_panel == TuiPanel::Explorer {
                     let tree_height = term_height.saturating_sub(3) as usize;
                     let total = sidebar.rows.len();
@@ -3035,7 +3540,7 @@ fn handle_mouse(
             if col >= editor_left && row + 2 < term_height {
                 let rel_col = col - editor_left;
                 let scroll_menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
-                let editor_row = row.saturating_sub(1 + scroll_menu_rows);
+                let editor_row = row.saturating_sub(scroll_menu_rows);
                 // Find which window the mouse is over; scroll that window
                 let scrolled = last_layout.and_then(|layout| {
                     layout.windows.iter().find(|rw| {
@@ -3326,7 +3831,7 @@ fn handle_mouse(
     engine.terminal_has_focus = false;
 
     // ── Activity bar ──────────────────────────────────────────────────────────
-    if col < ACTIVITY_BAR_WIDTH {
+    if col < ab_width {
         // Activity bar is in the main content area, below the menu bar row (if visible)
         // and above the debug toolbar row (if visible).
         let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
@@ -3385,8 +3890,8 @@ fn handle_mouse(
                     sidebar.has_focus = true;
                 }
                 if panel == TuiPanel::Settings {
-                    // Opening Settings panel also opens settings.json in the editor
-                    engine.execute_command("Settings");
+                    engine.settings_has_focus = true;
+                    sidebar.has_focus = true;
                 }
             }
             engine.session.explorer_visible = sidebar.visible;
@@ -3396,9 +3901,9 @@ fn handle_mouse(
     }
 
     // ── Sidebar panel area ────────────────────────────────────────────────────
-    if sidebar.visible && col < ACTIVITY_BAR_WIDTH + sidebar_width {
+    if sidebar.visible && col < ab_width + sidebar_width {
         // Rightmost column of the sidebar is the scrollbar column.
-        let sb_col = ACTIVITY_BAR_WIDTH + sidebar_width - 1;
+        let sb_col = ab_width + sidebar_width - 1;
         // Account for menu bar: when visible it occupies absolute row 0, so the
         // sidebar's logical row 0 is at absolute terminal row `menu_rows`.
         let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
@@ -3421,7 +3926,7 @@ fn handle_mouse(
             if sidebar_row == 0 {
                 // Header row: check if a toolbar button was clicked.
                 // Toolbar is right-aligned: 5 NF icons × 3 cols = 15.
-                let toolbar_start = ACTIVITY_BAR_WIDTH + sidebar_width - EXPLORER_TOOLBAR_LEN;
+                let toolbar_start = ab_width + sidebar_width - EXPLORER_TOOLBAR_LEN;
                 if col >= toolbar_start {
                     let btn = (col - toolbar_start) / 3; // 0=new-file 1=new-folder 2=delete
                     let idx = sidebar.selected;
@@ -3520,7 +4025,7 @@ fn handle_mouse(
                     } else if sidebar_row >= items_start && sidebar_row < items_end {
                         let item_count = engine.dap_sidebar_section_item_count(*section);
                         let height = sec_height as usize;
-                        let sb_col = ACTIVITY_BAR_WIDTH + sidebar_width - 1;
+                        let sb_col = ab_width + sidebar_width - 1;
                         // Scrollbar click: rightmost column when items overflow.
                         if col == sb_col && item_count > height && height > 0 {
                             let rel_row = (sidebar_row - items_start) as usize;
@@ -3566,7 +4071,7 @@ fn handle_mouse(
             } else if sidebar_row == 2 {
                 // Button row: Commit (~50%), Push/Pull/Sync (~17% each, icon-only).
                 // Use column relative to the sidebar content area start.
-                let rel_col = col.saturating_sub(ACTIVITY_BAR_WIDTH);
+                let rel_col = col.saturating_sub(ab_width);
                 let commit_w = sidebar_width / 2;
                 let btn_idx = if rel_col < commit_w {
                     0
@@ -3668,6 +4173,12 @@ fn handle_mouse(
 
     // ── Editor area ───────────────────────────────────────────────────────────
     sidebar.has_focus = false;
+    sidebar.toolbar_focused = false;
+    engine.sc_has_focus = false;
+    engine.dap_sidebar_has_focus = false;
+    engine.ext_sidebar_has_focus = false;
+    engine.ai_has_focus = false;
+    engine.settings_has_focus = false;
     if col < editor_left {
         return sidebar_width; // separator column
     }
@@ -3683,10 +4194,11 @@ fn handle_mouse(
 
         if let Some(ref split) = layout.editor_group_split {
             // Find which group's tab bar row matches the clicked row.
-            // Tab bar sits 1 row above the group's window content (bounds.y - 1).
+            // Tab bar sits tab_bar_height rows above the group's window content.
+            let click_tbh: u16 = if engine.settings.breadcrumbs { 2 } else { 1 };
             let mut matched_group = None;
             for gtb in split.group_tab_bars.iter() {
-                let tab_bar_row = menu_rows + (gtb.bounds.y as u16).saturating_sub(1);
+                let tab_bar_row = menu_rows + (gtb.bounds.y as u16).saturating_sub(click_tbh);
                 let gx = gtb.bounds.x as u16;
                 let gw = gtb.bounds.width as u16;
                 if row == tab_bar_row && rel_col >= gx && rel_col < gx + gw {
@@ -3841,9 +4353,10 @@ fn handle_mouse(
     }
 
     let rel_col = col - editor_left;
-    // Subtract tab bar row (1) and menu bar rows so editor_row is 0-indexed
-    // relative to the editor content area (matching window rect y coords).
-    let editor_row = row.saturating_sub(1 + menu_rows);
+    // editor_row is 0-indexed relative to the editor content area.
+    // Window rects already include the tab_bar_height offset (y >= 1),
+    // so we only subtract menu_rows here (not the tab bar row).
+    let editor_row = row.saturating_sub(menu_rows);
 
     if let Some(layout) = last_layout {
         for rw in &layout.windows {
@@ -3862,8 +4375,8 @@ fn handle_mouse(
 
                 // Vertical scrollbar click/drag-start (rightmost column)
                 if has_v_scrollbar && rel_col == wx + ww - 1 {
-                    // 1 = tab bar row, menu_rows = menu bar offset; wy = window top in editor area
-                    let track_abs_start = 1 + menu_rows + wy;
+                    // menu_rows = menu bar offset; wy already includes tab_bar_height
+                    let track_abs_start = menu_rows + wy;
                     // If there's also a h-scrollbar, v-track is 1 row shorter
                     let track_len = if has_h_scrollbar {
                         wh.saturating_sub(1)
@@ -3981,25 +4494,43 @@ fn build_screen_for_tui(
 ) -> render::ScreenLayout {
     // Global bottom rows: status(1) + cmd(1).  The tab bar row is included in
     // content_bounds and handled by calculate_group_window_rects (tab_bar_height=1).
+    // Must match draw_frame's vertical layout exactly.
     let qf_height: u16 = if engine.quickfix_open { 6 } else { 0 };
-    let term_height: u16 = if engine.terminal_open || engine.bottom_panel_open {
-        engine.session.terminal_panel_rows + 1
+    let bottom_panel_open = engine.terminal_open || engine.bottom_panel_open;
+    let term_height: u16 = if bottom_panel_open {
+        engine.session.terminal_panel_rows + 2 // 1 tab bar row + 1 header row + content
     } else {
         0
     };
     let menu_height: u16 = if engine.menu_bar_visible { 1 } else { 0 };
     let dbg_height: u16 = if engine.debug_toolbar_visible { 1 } else { 0 };
+    let wildmenu_height: u16 = if !engine.wildmenu_items.is_empty() {
+        1
+    } else {
+        0
+    };
     let content_rows = area
         .height
-        .saturating_sub(2 + qf_height + term_height + menu_height + dbg_height); // status + cmd + panels
+        .saturating_sub(2 + qf_height + term_height + menu_height + dbg_height + wildmenu_height); // status + cmd + panels
     let sidebar_cols = if sidebar.visible {
         sidebar_width + 1
     } else {
         0
     }; // +1 sep
-    let content_cols = area.width.saturating_sub(ACTIVITY_BAR_WIDTH + sidebar_cols);
+    let ab_width = if engine.settings.autohide_panels && !sidebar.visible {
+        0
+    } else {
+        ACTIVITY_BAR_WIDTH
+    };
+    let content_cols = area.width.saturating_sub(ab_width + sidebar_cols);
     let content_bounds = WindowRect::new(0.0, 0.0, content_cols as f64, content_rows as f64);
-    let (window_rects, _dividers) = engine.calculate_group_window_rects(content_bounds, 1.0);
+    let tui_tab_bar_height = if engine.settings.breadcrumbs {
+        2.0
+    } else {
+        1.0
+    };
+    let (window_rects, _dividers) =
+        engine.calculate_group_window_rects(content_bounds, tui_tab_bar_height);
     debug_log!(
         "build_screen: content_rows={} content_cols={} groups={} window_rects={}",
         content_rows,
@@ -4058,6 +4589,7 @@ fn draw_frame(
     };
     let menu_bar_height: u16 = if screen.menu_bar.is_some() { 1 } else { 0 };
     let debug_toolbar_height: u16 = if screen.debug_toolbar.is_some() { 1 } else { 0 };
+    let wildmenu_height: u16 = if screen.wildmenu.is_some() { 1 } else { 0 };
     let v_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -4066,6 +4598,7 @@ fn draw_frame(
             Constraint::Length(qf_height),
             Constraint::Length(bottom_panel_height),
             Constraint::Length(debug_toolbar_height),
+            Constraint::Length(wildmenu_height),
             Constraint::Length(1),
             Constraint::Length(1),
         ])
@@ -4075,10 +4608,16 @@ fn draw_frame(
     let quickfix_area = v_chunks[2];
     let bottom_panel_area = v_chunks[3];
     let debug_toolbar_area = v_chunks[4];
-    let status_area = v_chunks[5];
-    let cmd_area = v_chunks[6];
+    let wildmenu_area = v_chunks[5];
+    let status_area = v_chunks[6];
+    let cmd_area = v_chunks[7];
 
     // ── Horizontal split of main_area: [activity_bar] [sidebar?] [editor_col] ─
+    let ab_width = if engine.settings.autohide_panels && !sidebar.visible {
+        0
+    } else {
+        ACTIVITY_BAR_WIDTH
+    };
     let sidebar_constraint = if sidebar.visible {
         Constraint::Length(sidebar_width + 1) // +1 for separator
     } else {
@@ -4087,7 +4626,7 @@ fn draw_frame(
     let h_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Length(ACTIVITY_BAR_WIDTH),
+            Constraint::Length(ab_width),
             sidebar_constraint,
             Constraint::Min(0),
         ])
@@ -4162,14 +4701,15 @@ fn draw_frame(
         // Render windows first so tab bars draw on top (prevents window content
         // from overwriting an adjacent group's tab bar in horizontal splits).
         render_all_windows(frame, editor_area, &screen.windows, theme);
-        // Draw each group's tab bar.  Tab bar sits 1 row above the group's
-        // window content (bounds.y - 1).
+        // Draw each group's tab bar.  Tab bar sits tab_bar_height rows above
+        // the group's window content (bounds.y - tab_bar_height).
+        let tui_tbh: u16 = if engine.settings.breadcrumbs { 2 } else { 1 };
         for gtb in split.group_tab_bars.iter() {
             let tab_x = gtb.bounds.x as u16 + editor_area.x;
             let tab_w = gtb.bounds.width as u16;
             let is_active = gtb.group_id == split.active_group;
             if tab_w > 0 {
-                let bar_y = editor_area.y + (gtb.bounds.y as u16).saturating_sub(1);
+                let bar_y = editor_area.y + (gtb.bounds.y as u16).saturating_sub(tui_tbh);
                 let g_tab = Rect {
                     x: tab_x,
                     y: bar_y,
@@ -4177,6 +4717,30 @@ fn draw_frame(
                     height: 1,
                 };
                 render_tab_bar(frame.buffer_mut(), g_tab, &gtb.tabs, theme, is_active);
+            }
+        }
+        // Draw breadcrumb bars (below each group's tab bar).
+        for bc in &screen.breadcrumbs {
+            if bc.segments.is_empty() {
+                continue;
+            }
+            let bc_x = bc.bounds.x as u16 + editor_area.x;
+            let bc_w = bc.bounds.width as u16;
+            // Breadcrumb bar is one row above the window content (bounds.y - 1 in
+            // breadcrumb coordinates, which is one row below the tab bar).
+            let bc_y = editor_area.y + bc.bounds.y as u16;
+            // In multi-group with breadcrumbs, bounds.y points to the breadcrumb row
+            // (tab_bar_height=2 means row 0=tab, row 1=breadcrumb, row 2+=windows).
+            // The breadcrumb bounds.y is window min_y, so the bc sits 1 above.
+            let bc_y = bc_y.saturating_sub(1);
+            if bc_w > 0 {
+                let bc_rect = Rect {
+                    x: bc_x,
+                    y: bc_y,
+                    width: bc_w,
+                    height: 1,
+                };
+                render_breadcrumb_bar(frame.buffer_mut(), bc_rect, &bc.segments, theme);
             }
         }
         // Draw divider lines (vertical only — horizontal splits use the tab bar as divider).
@@ -4203,6 +4767,18 @@ fn draw_frame(
             height: 1,
         };
         render_tab_bar(frame.buffer_mut(), tab_rect, &screen.tab_bar, theme, true);
+        // Draw breadcrumb bar for the single group.
+        if let Some(bc) = screen.breadcrumbs.first() {
+            if !bc.segments.is_empty() {
+                let bc_rect = Rect {
+                    x: editor_area.x,
+                    y: editor_area.y + 1,
+                    width: editor_area.width,
+                    height: 1,
+                };
+                render_breadcrumb_bar(frame.buffer_mut(), bc_rect, &bc.segments, theme);
+            }
+        }
         render_all_windows(frame, editor_area, &screen.windows, theme);
     }
 
@@ -4281,6 +4857,11 @@ fn draw_frame(
         render_command_palette_popup(frame, palette, area, theme);
     }
 
+    // ── Tab switcher popup ───────────────────────────────────────────────────
+    if let Some(ref ts) = screen.tab_switcher {
+        render_tab_switcher_popup(frame.buffer_mut(), area, ts, theme);
+    }
+
     // ── Quickfix panel (persistent bottom strip) ──────────────────────────────
     if let Some(ref qf) = screen.quickfix {
         render_quickfix_panel(
@@ -4334,6 +4915,11 @@ fn draw_frame(
     // ── Debug toolbar strip (if visible) ────────────────────────────────────
     if let Some(ref toolbar) = screen.debug_toolbar {
         render_debug_toolbar(frame.buffer_mut(), debug_toolbar_area, toolbar, theme);
+    }
+
+    // ── Wildmenu bar (command Tab completion) ─────────────────────────────────
+    if let Some(ref wm) = screen.wildmenu {
+        render_wildmenu(frame.buffer_mut(), wildmenu_area, wm, theme);
     }
 
     // ── Status / command ──────────────────────────────────────────────────────
@@ -4617,6 +5203,50 @@ fn render_tab_bar(
         for ch in TAB_BTN_SPLIT_DOWN.chars() {
             set_cell(buf, bx, area.y, ch, btn_fg, bar_bg);
             bx += 1;
+        }
+    }
+}
+
+fn render_breadcrumb_bar(
+    buf: &mut ratatui::buffer::Buffer,
+    area: Rect,
+    segments: &[render::BreadcrumbSegment],
+    theme: &Theme,
+) {
+    let bg = rc(theme.breadcrumb_bg);
+    // Fill the row with breadcrumb bg
+    for x in area.x..area.x + area.width {
+        set_cell(buf, x, area.y, ' ', bg, bg);
+    }
+
+    let separator = " \u{203A} "; // " › "
+    let mut x = area.x + 1; // small left padding
+
+    for seg in segments {
+        // Separator before all but the first
+        if x > area.x + 2 {
+            let sep_fg = rc(theme.breadcrumb_fg);
+            for ch in separator.chars() {
+                if x >= area.x + area.width {
+                    return;
+                }
+                set_cell(buf, x, area.y, ch, sep_fg, bg);
+                x += 1;
+            }
+        }
+
+        // Segment label
+        let fg = if seg.is_last {
+            rc(theme.breadcrumb_active_fg)
+        } else {
+            rc(theme.breadcrumb_fg)
+        };
+        for ch in seg.label.chars() {
+            if x >= area.x + area.width {
+                return;
+            }
+            set_cell(buf, x, area.y, ch, fg, bg);
+            x += 1;
         }
     }
 }
@@ -5547,6 +6177,157 @@ fn render_command_palette_popup(
                     '─'
                 };
                 set_cell(buf, cx, bottom, ch, border_fg, bg_color);
+            }
+        }
+    }
+}
+
+fn render_tab_switcher_popup(
+    buf: &mut ratatui::buffer::Buffer,
+    term_area: Rect,
+    ts: &render::TabSwitcherPanel,
+    theme: &Theme,
+) {
+    if ts.items.is_empty() {
+        return;
+    }
+    let item_count = ts.items.len();
+    // Size: 45% width (min 40, max 80), height = items + 2 (borders)
+    let width = (term_area.width * 45 / 100).clamp(40, 80);
+    let max_visible = (term_area.height as usize).saturating_sub(4).min(20);
+    let visible = item_count.min(max_visible);
+    let height = visible as u16 + 2; // top + bottom border
+
+    // Centered
+    let x = (term_area.width.saturating_sub(width)) / 2;
+    let y = (term_area.height.saturating_sub(height)) / 2;
+
+    let bg = rc(theme.fuzzy_bg);
+    let fg = rc(theme.fuzzy_fg);
+    let sel_bg = rc(theme.fuzzy_selected_bg);
+    let border_fg = rc(theme.fuzzy_border);
+    let title_fg = rc(theme.fuzzy_title_fg);
+
+    // Top border
+    if y < term_area.height {
+        for col in 0..width {
+            let cx = x + col;
+            if cx < term_area.width {
+                let ch = if col == 0 {
+                    '╭'
+                } else if col == width - 1 {
+                    '╮'
+                } else {
+                    '─'
+                };
+                set_cell(buf, cx, y, ch, border_fg, bg);
+            }
+        }
+        // Title overlay
+        let title = " Open Tabs ";
+        for (i, ch) in title.chars().enumerate() {
+            let cx = x + 2 + i as u16;
+            if cx + 1 < x + width && cx < term_area.width {
+                set_cell(buf, cx, y, ch, title_fg, bg);
+            }
+        }
+    }
+
+    // Scroll offset so selected item is always visible
+    let scroll = if ts.selected_idx >= visible {
+        ts.selected_idx - visible + 1
+    } else {
+        0
+    };
+
+    // Items
+    let inner_w = (width - 2) as usize;
+    for i in 0..visible {
+        let item_idx = scroll + i;
+        if item_idx >= item_count {
+            break;
+        }
+        let ry = y + 1 + i as u16;
+        if ry >= term_area.height {
+            break;
+        }
+        let is_selected = item_idx == ts.selected_idx;
+        let row_bg = if is_selected { sel_bg } else { bg };
+
+        // Clear row
+        for col in 0..width {
+            let cx = x + col;
+            if cx < term_area.width {
+                let ch = if col == 0 || col == width - 1 {
+                    '│'
+                } else {
+                    ' '
+                };
+                let c = if col == 0 || col == width - 1 {
+                    border_fg
+                } else {
+                    fg
+                };
+                set_cell(
+                    buf,
+                    cx,
+                    ry,
+                    ch,
+                    c,
+                    if col == 0 || col == width - 1 {
+                        bg
+                    } else {
+                        row_bg
+                    },
+                );
+            }
+        }
+
+        let (name, path, dirty) = &ts.items[item_idx];
+        let dirty_mark = if *dirty { " ●" } else { "" };
+        let prefix = if is_selected { "▶ " } else { "  " };
+        let label = format!("{}{}{}", prefix, name, dirty_mark);
+
+        // Draw label
+        for (j, ch) in label.chars().enumerate() {
+            let cx = x + 1 + j as u16;
+            if cx + 1 < x + width && cx < term_area.width {
+                set_cell(buf, cx, ry, ch, fg, row_bg);
+            }
+        }
+
+        // Draw path right-aligned (dimmed)
+        if !path.is_empty() && inner_w > label.chars().count() + 4 {
+            let available = inner_w - label.chars().count() - 2;
+            let display_path = if path.len() > available {
+                &path[path.len() - available..]
+            } else {
+                path.as_str()
+            };
+            let path_start = inner_w - display_path.len();
+            for (j, ch) in display_path.chars().enumerate() {
+                let cx = x + 1 + (path_start + j) as u16;
+                if cx + 1 < x + width && cx < term_area.width {
+                    set_cell(buf, cx, ry, ch, border_fg, row_bg);
+                }
+            }
+        }
+    }
+
+    // Bottom border
+    let bottom = y + height - 1;
+    if bottom < term_area.height {
+        for col in 0..width {
+            let cx = x + col;
+            if cx < term_area.width {
+                let ch = if col == 0 {
+                    '╰'
+                } else if col == width - 1 {
+                    '╯'
+                } else {
+                    '─'
+                };
+                set_cell(buf, cx, bottom, ch, border_fg, bg);
             }
         }
     }
@@ -6669,6 +7450,7 @@ fn render_activity_bar(
     let active_bg = rc(theme.status_bg);
     let icon_fg = rc(theme.status_fg);
     let inactive_fg = rc(theme.line_number_fg);
+    let toolbar_sel_bg = rc(theme.cursor); // highlight for toolbar-focused selection
 
     // Fill entire activity bar background
     for y in area.y..area.y + area.height {
@@ -6680,7 +7462,9 @@ fn render_activity_bar(
     // Row 0: Hamburger icon (menu bar toggle)
     if area.height >= 1 {
         let y = area.y;
-        let (fg, bg) = if menu_bar_visible {
+        let (fg, bg) = if sidebar.toolbar_focused && sidebar.toolbar_selected == 0 {
+            (icon_fg, toolbar_sel_bg)
+        } else if menu_bar_visible {
             (icon_fg, active_bg)
         } else {
             (inactive_fg, bar_bg)
@@ -6709,7 +7493,9 @@ fn render_activity_bar(
             break;
         }
         let is_active = sidebar.visible && sidebar.active_panel == panel;
-        let (fg, bg) = if is_active {
+        let (fg, bg) = if sidebar.toolbar_focused && sidebar.toolbar_selected == row_off {
+            (icon_fg, toolbar_sel_bg)
+        } else if is_active {
             (icon_fg, active_bg)
         } else {
             (inactive_fg, bar_bg)
@@ -6726,7 +7512,9 @@ fn render_activity_bar(
     if area.height >= 1 {
         let y = area.y + area.height - 1;
         let is_active = sidebar.visible && sidebar.active_panel == TuiPanel::Settings;
-        let (fg, bg) = if is_active {
+        let (fg, bg) = if sidebar.toolbar_focused && sidebar.toolbar_selected == 7 {
+            (icon_fg, toolbar_sel_bg)
+        } else if is_active {
             (icon_fg, active_bg)
         } else {
             (inactive_fg, bar_bg)
@@ -6754,8 +7542,12 @@ fn render_sidebar(
     let default_fg = rc(theme.foreground);
     let row_bg = rc(theme.tab_bar_bg);
     let active_file_fg = rc(theme.keyword);
-    let sel_fg = row_bg;
-    let sel_bg = default_fg;
+    let sel_bg = if sidebar.has_focus {
+        rc(theme.sidebar_sel_bg)
+    } else {
+        rc(theme.sidebar_sel_bg_inactive)
+    };
+    let sel_fg = default_fg;
 
     // Settings panel
     if sidebar.active_panel == TuiPanel::Settings {
@@ -6992,12 +7784,20 @@ fn render_settings_panel(
     theme: &Theme,
     engine: &Engine,
 ) {
+    use crate::core::settings::{setting_categories, SettingType, SETTING_DEFS};
+
     let header_fg = rc(theme.status_fg);
     let header_bg = rc(theme.status_bg);
     let fg = rc(theme.foreground);
     let bg = rc(theme.tab_bar_bg);
     let dim_fg = rc(theme.line_number_fg);
     let key_fg = rc(theme.keyword);
+    let sel_bg = if engine.settings_has_focus {
+        rc(theme.sidebar_sel_bg)
+    } else {
+        rc(theme.sidebar_sel_bg_inactive)
+    };
+    let cat_fg = rc(theme.keyword);
 
     if area.height == 0 {
         return;
@@ -7010,7 +7810,7 @@ fn render_settings_panel(
         }
     }
 
-    // Header
+    // Row 0: Header " SETTINGS"
     let header_y = area.y;
     for x in area.x..area.x + area.width {
         set_cell(buf, x, header_y, ' ', header_fg, header_bg);
@@ -7024,64 +7824,206 @@ fn render_settings_panel(
         x += 1;
     }
 
-    let s = &engine.settings;
-    let ln = match s.line_numbers {
-        LineNumberMode::None => "none",
-        LineNumberMode::Absolute => "absolute",
-        LineNumberMode::Relative => "relative",
-        LineNumberMode::Hybrid => "hybrid",
-    };
-
-    // Build rows: (label, value)
-    let rows: &[(&str, String)] = &[
-        ("", String::new()),
-        ("  File:", "~/.config/vimcode/settings.json".into()),
-        ("  :Settings to open   :config reload", String::new()),
-        ("", String::new()),
-        ("  — Current settings —", String::new()),
-        ("  colorscheme", s.colorscheme.clone()),
-        ("  line_numbers", ln.into()),
-        ("  tabstop", s.tabstop.to_string()),
-        ("  shiftwidth", s.shift_width.to_string()),
-        ("  expandtab", s.expand_tab.to_string()),
-        ("  wrap", s.wrap.to_string()),
-        ("  hlsearch", s.hlsearch.to_string()),
-        ("  ignorecase", s.ignorecase.to_string()),
-        ("  smartcase", s.smartcase.to_string()),
-        ("  cursorline", s.cursorline.to_string()),
-        ("  scrolloff", s.scrolloff.to_string()),
-        ("  lsp", s.lsp_enabled.to_string()),
-        ("  autoindent", s.auto_indent.to_string()),
-    ];
-
-    for (i, (label, value)) in rows.iter().enumerate() {
-        let y = area.y + 1 + i as u16;
-        if y >= area.y + area.height {
-            break;
+    // Row 1: Search input
+    let search_y = area.y + 1;
+    if search_y < area.y + area.height {
+        let search_bg = if engine.settings_input_active {
+            rc(theme.sidebar_sel_bg)
+        } else {
+            bg
+        };
+        for x in area.x..area.x + area.width {
+            set_cell(buf, x, search_y, ' ', fg, search_bg);
         }
-        // Write label in dim colour
         let mut x = area.x;
-        for ch in label.chars() {
+        set_cell(buf, x, search_y, ' ', dim_fg, search_bg);
+        x += 1;
+        set_cell(buf, x, search_y, '/', dim_fg, search_bg);
+        x += 1;
+        set_cell(buf, x, search_y, ' ', dim_fg, search_bg);
+        x += 1;
+        for ch in engine.settings_query.chars() {
             if x >= area.x + area.width {
                 break;
             }
-            set_cell(buf, x, y, ch, dim_fg, bg);
+            set_cell(buf, x, search_y, ch, fg, search_bg);
             x += 1;
         }
-        // Write value in keyword colour if non-empty
-        if !value.is_empty() {
-            // Right-align the value
-            let val_len = value.chars().count() as u16;
-            let right_edge = area.x + area.width;
-            let val_x = right_edge.saturating_sub(val_len + 1);
-            let mut vx = val_x.max(x);
-            for ch in value.chars() {
-                if vx >= right_edge {
+        if engine.settings_input_active && x < area.x + area.width {
+            set_cell(buf, x, search_y, '█', fg, search_bg);
+        }
+    }
+
+    // Rows 2+: scrollable form content
+    let content_start = area.y + 2;
+    let content_height = area.height.saturating_sub(2) as usize;
+    if content_height == 0 {
+        return;
+    }
+
+    let flat = engine.settings_flat_list();
+    let cats = setting_categories();
+    let total = flat.len();
+
+    // Scrollbar column is the rightmost
+    let sb_col = area.x + area.width - 1;
+    let content_width = area.width.saturating_sub(1); // leave room for scrollbar
+
+    let scroll = engine.settings_scroll_top;
+
+    for vi in 0..content_height {
+        let fi = scroll + vi;
+        let y = content_start + vi as u16;
+        if fi >= total {
+            break;
+        }
+
+        let (is_cat, idx) = flat[fi];
+        let is_selected = fi == engine.settings_selected && engine.settings_has_focus;
+        let row_bg = if is_selected { sel_bg } else { bg };
+
+        // Fill row background
+        for x in area.x..area.x + content_width {
+            set_cell(buf, x, y, ' ', fg, row_bg);
+        }
+
+        if is_cat {
+            // Category header
+            let collapsed = idx < engine.settings_collapsed.len() && engine.settings_collapsed[idx];
+            let arrow = if collapsed { '▶' } else { '▼' };
+            let cat_name = if idx < cats.len() { cats[idx] } else { "?" };
+            let mut x = area.x + 1;
+            set_cell(buf, x, y, arrow, cat_fg, row_bg);
+            x += 2;
+            for ch in cat_name.chars() {
+                if x >= area.x + content_width {
                     break;
                 }
-                set_cell(buf, vx, y, ch, key_fg, bg);
-                vx += 1;
+                set_cell(buf, x, y, ch, cat_fg, row_bg);
+                x += 1;
             }
+        } else {
+            // Setting row
+            let def = &SETTING_DEFS[idx];
+            // Label (indented)
+            let mut x = area.x + 3;
+            for ch in def.label.chars() {
+                if x >= area.x + content_width {
+                    break;
+                }
+                set_cell(buf, x, y, ch, fg, row_bg);
+                x += 1;
+            }
+
+            // Value (right-aligned)
+            let right_edge = area.x + content_width;
+
+            // Check if we're editing this setting inline
+            let editing_this = engine.settings_editing == Some(idx);
+
+            match &def.setting_type {
+                SettingType::Bool => {
+                    let val = engine.settings.get_value_str(def.key);
+                    let display = if val == "true" { "[✓]" } else { "[ ]" };
+                    let val_len = 3u16;
+                    let vx = right_edge.saturating_sub(val_len + 1);
+                    let mut cx = vx;
+                    for ch in display.chars() {
+                        if cx >= right_edge {
+                            break;
+                        }
+                        set_cell(buf, cx, y, ch, key_fg, row_bg);
+                        cx += 1;
+                    }
+                }
+                SettingType::Integer { .. } => {
+                    let display = if editing_this {
+                        format!("{}█", engine.settings_edit_buf)
+                    } else {
+                        engine.settings.get_value_str(def.key)
+                    };
+                    let val_len = display.chars().count() as u16;
+                    let vx = right_edge.saturating_sub(val_len + 1);
+                    let mut cx = vx.max(x);
+                    for ch in display.chars() {
+                        if cx >= right_edge {
+                            break;
+                        }
+                        set_cell(buf, cx, y, ch, key_fg, row_bg);
+                        cx += 1;
+                    }
+                }
+                SettingType::Enum(_) | SettingType::DynamicEnum(_) => {
+                    let val = engine.settings.get_value_str(def.key);
+                    let display = format!("{} ▸", val);
+                    let val_len = display.chars().count() as u16;
+                    let vx = right_edge.saturating_sub(val_len + 1);
+                    let mut cx = vx.max(x);
+                    for ch in display.chars() {
+                        if cx >= right_edge {
+                            break;
+                        }
+                        set_cell(buf, cx, y, ch, key_fg, row_bg);
+                        cx += 1;
+                    }
+                }
+                SettingType::StringVal => {
+                    let display = if editing_this {
+                        format!("{}█", engine.settings_edit_buf)
+                    } else {
+                        let val = engine.settings.get_value_str(def.key);
+                        if val.is_empty() {
+                            "(empty)".to_string()
+                        } else {
+                            val
+                        }
+                    };
+                    // Truncate to fit
+                    let max_val_width = content_width.saturating_sub(x - area.x + 2) as usize;
+                    let truncated: String = display.chars().take(max_val_width).collect();
+                    let val_len = truncated.chars().count() as u16;
+                    let vx = right_edge.saturating_sub(val_len + 1);
+                    let mut cx = vx.max(x);
+                    let val_fg = if editing_this { fg } else { dim_fg };
+                    for ch in truncated.chars() {
+                        if cx >= right_edge {
+                            break;
+                        }
+                        set_cell(buf, cx, y, ch, val_fg, row_bg);
+                        cx += 1;
+                    }
+                }
+                SettingType::BufferEditor => {
+                    let count = engine.settings.keymaps.len();
+                    let display = format!("{} defined ▸", count);
+                    let val_len = display.chars().count() as u16;
+                    let vx = right_edge.saturating_sub(val_len + 1);
+                    let mut cx = vx.max(x);
+                    for ch in display.chars() {
+                        if cx >= right_edge {
+                            break;
+                        }
+                        set_cell(buf, cx, y, ch, key_fg, row_bg);
+                        cx += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // Scrollbar
+    if total > content_height && content_height > 0 {
+        let track_len = content_height;
+        let thumb_len = (content_height * content_height / total).max(1);
+        let thumb_start = scroll * track_len / total;
+        for i in 0..track_len {
+            let y = content_start + i as u16;
+            let ch = if i >= thumb_start && i < thumb_start + thumb_len {
+                '█'
+            } else {
+                '░'
+            };
+            set_cell(buf, sb_col, y, ch, dim_fg, bg);
         }
     }
 }
@@ -7510,6 +8452,69 @@ fn render_prompt_line(
     }
 }
 
+// ─── Wildmenu (command Tab completion bar) ───────────────────────────────────
+
+fn render_wildmenu(
+    buf: &mut ratatui::buffer::Buffer,
+    area: Rect,
+    wm: &WildmenuData,
+    theme: &Theme,
+) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let bg = rc(theme.wildmenu_bg);
+    let fg = rc(theme.wildmenu_fg);
+    let sel_bg = rc(theme.wildmenu_sel_bg);
+    let sel_fg = rc(theme.wildmenu_sel_fg);
+
+    // Fill background
+    for x in area.x..area.x + area.width {
+        let cell = buf.get_mut(x, area.y);
+        cell.set_char(' ').set_fg(fg).set_bg(bg);
+    }
+
+    // Draw items separated by spaces
+    let mut col = area.x;
+    for (i, item) in wm.items.iter().enumerate() {
+        if col >= area.x + area.width {
+            break;
+        }
+        let is_selected = wm.selected == Some(i);
+        let item_fg = if is_selected { sel_fg } else { fg };
+        let item_bg = if is_selected { sel_bg } else { bg };
+
+        // Leading space
+        if col < area.x + area.width {
+            buf.get_mut(col, area.y)
+                .set_char(' ')
+                .set_fg(item_fg)
+                .set_bg(item_bg);
+            col += 1;
+        }
+
+        for ch in item.chars() {
+            if col >= area.x + area.width {
+                break;
+            }
+            buf.get_mut(col, area.y)
+                .set_char(ch)
+                .set_fg(item_fg)
+                .set_bg(item_bg);
+            col += 1;
+        }
+
+        // Trailing space for selected item padding
+        if is_selected && col < area.x + area.width {
+            buf.get_mut(col, area.y)
+                .set_char(' ')
+                .set_fg(item_fg)
+                .set_bg(item_bg);
+            col += 1;
+        }
+    }
+}
+
 // ─── Status / command line ────────────────────────────────────────────────────
 
 fn render_status_line(
@@ -7637,6 +8642,11 @@ fn translate_key(event: KeyEvent, keyboard_enhanced: bool) -> Option<(String, Op
                     // 0x1C as KeyCode::Char('4')+CONTROL (formula: 0x1C-0x1C+'4'='4').
                     // Map both to "backslash" so Ctrl+\ works in all terminals.
                     "backslash".to_string()
+                } else if lower == '/' || (!keyboard_enhanced && lower == '7') {
+                    // Ctrl+/ sends byte 0x1F; without keyboard enhancement crossterm
+                    // decodes 0x1F as KeyCode::Char('7')+CONTROL (formula: 0x1F-0x1C+'4'='7').
+                    // Map both to "slash" so Ctrl+/ works in all terminals.
+                    "slash".to_string()
                 } else if c.is_uppercase() || shift {
                     lower.to_ascii_uppercase().to_string()
                 } else {
@@ -7652,8 +8662,8 @@ fn translate_key(event: KeyEvent, keyboard_enhanced: bool) -> Option<(String, Op
         KeyCode::Enter => Some(("Return".to_string(), None, false)),
         KeyCode::Backspace => Some(("BackSpace".to_string(), None, false)),
         KeyCode::Delete => Some(("Delete".to_string(), None, false)),
-        KeyCode::Tab => Some(("Tab".to_string(), None, false)),
-        KeyCode::BackTab => Some(("ISO_Left_Tab".to_string(), None, false)),
+        KeyCode::Tab => Some(("Tab".to_string(), None, ctrl)),
+        KeyCode::BackTab => Some(("ISO_Left_Tab".to_string(), None, ctrl)),
         // Shift+Arrow (no ctrl): emit as "Shift_X" for VSCode selection extension.
         KeyCode::Up if shift && !ctrl => Some(("Shift_Up".to_string(), None, false)),
         KeyCode::Down if shift && !ctrl => Some(("Shift_Down".to_string(), None, false)),
@@ -9171,5 +10181,7 @@ fn rc(c: Color) -> RColor {
 /// Return the character index that corresponds to a byte offset in a UTF-8
 /// string. Returns the total char count if `byte_offset` is past the end.
 fn byte_to_char_idx(text: &str, byte_offset: usize) -> usize {
-    text[..byte_offset.min(text.len())].chars().count()
+    let clamped = byte_offset.min(text.len());
+    let safe = text.floor_char_boundary(clamped);
+    text[..safe].chars().count()
 }

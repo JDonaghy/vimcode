@@ -1,6 +1,6 @@
 [package]
 name = "vimcode"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Vim-like code editor with GTK4 and tree-sitter"
 license = "MIT"
@@ -26,11 +26,20 @@ path = "src/lib.rs"
 [[bin]]
 name = "vimcode"
 path = "src/main.rs"
+required-features = ["gui"]
+
+[[bin]]
+name = "vcd"
+path = "src/tui_bin.rs"
+
+[features]
+default = ["gui"]
+gui = ["gtk4", "relm4", "pangocairo", "gio"]
 
 [dependencies]
-gtk4 = { version = "0.7", features = ["v4_10"] }
-relm4 = "0.7"
-pangocairo = "0.18"
+gtk4 = { version = "0.7", features = ["v4_10"], optional = true }
+relm4 = { version = "0.7", optional = true }
+pangocairo = { version = "0.18", optional = true }
 ropey = "1.6.1"
 tree-sitter = "0.20"
 tree-sitter-rust = "0.20"
@@ -52,7 +61,7 @@ tree-sitter-toml = "0.20"
 # TODO: tree-sitter-kotlin (no 0.20.x release on crates.io)
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-gio = "0.17"
+gio = { version = "0.17", optional = true }
 ratatui = "0.27"
 ignore = "0.4"
 regex = "1"

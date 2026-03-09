@@ -308,3 +308,15 @@ fn test_settings_file_path_ends_with_settings_json() {
         path.display()
     );
 }
+
+#[test]
+fn set_autohidepanels() {
+    let mut e = engine_with("hello\n");
+    assert!(!e.settings.autohide_panels);
+    exec(&mut e, "set autohidepanels");
+    assert!(e.settings.autohide_panels);
+    exec(&mut e, "set noautohidepanels");
+    assert!(!e.settings.autohide_panels);
+    exec(&mut e, "set autohidepanels?");
+    assert_msg_contains(&e, "noautohidepanels");
+}

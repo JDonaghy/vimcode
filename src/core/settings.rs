@@ -133,6 +133,14 @@ pub struct Settings {
     #[serde(default)]
     pub disabled_plugins: Vec<String>,
 
+    /// User-defined key mappings. Each entry is `"mode keys :command"`.
+    /// Mode: `n` (normal), `v` (visual), `i` (insert), `c` (command).
+    /// Keys: single char (`x`), modifier (`<C-/>`, `<A-c>`), or sequence (`gcc`, `gc`).
+    /// Action: ex command prefixed with `:`.
+    /// Example: `["n <C-/> :Commentary", "v <C-/> :Commentary"]`
+    #[serde(default)]
+    pub keymaps: Vec<String>,
+
     /// Highlight all search matches (default true). Disable with `:set nohlsearch`.
     #[serde(default = "default_hlsearch")]
     pub hlsearch: bool,
@@ -226,9 +234,22 @@ pub struct Settings {
     /// Milliseconds between swap file writes for dirty buffers (default: 4000).
     #[serde(default = "default_updatetime")]
     pub updatetime: u32,
+
+    /// Show breadcrumbs bar (file path + symbol hierarchy) below the tab bar.
+    #[serde(default = "default_breadcrumbs")]
+    pub breadcrumbs: bool,
+
+    /// Hide toolbar and sidebar panels at startup (TUI only).
+    /// When true, panels appear on demand via Ctrl-W l and hide again when unfocused.
+    #[serde(default)]
+    pub autohide_panels: bool,
 }
 
 fn default_swap_file() -> bool {
+    true
+}
+
+fn default_breadcrumbs() -> bool {
     true
 }
 
@@ -487,6 +508,23 @@ impl Default for CompletionKeys {
 /// Supported formats: `<C-b>`, `<C-S-e>`, `<A-x>`, `<C-A-x>`.
 /// Returns `None` if the format is not recognised.
 pub fn parse_key_binding(s: &str) -> Option<(bool, bool, bool, char)> {
+    let (ctrl, shift, alt, key_str) = parse_key_binding_named(s)?;
+    // For backward compat: named keys map to sentinel chars, single chars pass through.
+    let ch = match key_str.as_str() {
+        "Space" | "space" => ' ',
+        _ => {
+            if key_str.chars().count() != 1 {
+                return None;
+            }
+            key_str.chars().next()?
+        }
+    };
+    Some((ctrl, shift, alt, ch.to_ascii_lowercase()))
+}
+
+/// Extended key binding parser that returns the key name as a string.
+/// Supports named keys like `Tab`, `Space`, `Escape`, etc.
+pub fn parse_key_binding_named(s: &str) -> Option<(bool, bool, bool, String)> {
     let s = s.trim();
     if !s.starts_with('<') || !s.ends_with('>') {
         return None;
@@ -507,18 +545,8 @@ pub fn parse_key_binding(s: &str) -> Option<(bool, bool, bool, char)> {
             _ => return None,
         }
     }
-    let key_str = parts[parts.len() - 1];
-    // Accept named keys (e.g. "Space") in addition to single characters.
-    let ch = match key_str {
-        "Space" | "space" => ' ',
-        _ => {
-            if key_str.chars().count() != 1 {
-                return None;
-            }
-            key_str.chars().next()?
-        }
-    };
-    Some((ctrl, shift, alt, ch.to_ascii_lowercase()))
+    let key_str = parts[parts.len() - 1].to_string();
+    Some((ctrl, shift, alt, key_str))
 }
 
 fn default_font_family() -> String {
@@ -554,6 +582,7 @@ impl Default for Settings {
             wrap: false,
             plugins_enabled: default_plugins_enabled(),
             disabled_plugins: Vec::new(),
+            keymaps: Vec::new(),
             hlsearch: default_hlsearch(),
             ignorecase: false,
             smartcase: false,
@@ -574,6 +603,8 @@ impl Default for Settings {
             show_hidden_files: false,
             swap_file: default_swap_file(),
             updatetime: default_updatetime(),
+            breadcrumbs: default_breadcrumbs(),
+            autohide_panels: false,
         }
     }
 }
@@ -798,6 +829,8 @@ impl Settings {
             "formatonsave" | "fos" => self.format_on_save = enable,
             "showhiddenfiles" | "shf" => self.show_hidden_files = enable,
             "swapfile" => self.swap_file = enable,
+            "breadcrumbs" => self.breadcrumbs = enable,
+            "autohidepanels" => self.autohide_panels = enable,
             _ => return Err(format!("Unknown option: {opt}")),
         }
         Ok(())
@@ -958,6 +991,16 @@ impl Settings {
                 "noswapfile".to_string()
             }),
             "updatetime" | "ut" => Ok(format!("updatetime={}", self.updatetime)),
+            "breadcrumbs" => Ok(if self.breadcrumbs {
+                "breadcrumbs".to_string()
+            } else {
+                "nobreadcrumbs".to_string()
+            }),
+            "autohidepanels" => Ok(if self.autohide_panels {
+                "autohidepanels".to_string()
+            } else {
+                "noautohidepanels".to_string()
+            }),
             _ => Err(format!("Unknown option: {opt}")),
         }
     }
@@ -1043,6 +1086,8 @@ impl Settings {
             "showhiddenfiles" | "shf" | "show_hidden_files" => self.show_hidden_files.to_string(),
             "swapfile" | "swap_file" => self.swap_file.to_string(),
             "updatetime" | "ut" => self.updatetime.to_string(),
+            "breadcrumbs" => self.breadcrumbs.to_string(),
+            "autohide_panels" | "autohidepanels" => self.autohide_panels.to_string(),
             _ => String::new(),
         }
     }
@@ -1133,6 +1178,8 @@ impl Settings {
                     .parse()
                     .map_err(|_| format!("Invalid updatetime: {value}"))?;
             }
+            "breadcrumbs" => self.breadcrumbs = value == "true",
+            "autohide_panels" | "autohidepanels" => self.autohide_panels = value == "true",
             _ => return Err(format!("Unknown setting key: {key}")),
         }
         Ok(())
@@ -1158,6 +1205,350 @@ impl Settings {
 
         Ok(())
     }
+}
+
+// ─── Setting definitions (UI metadata) ───────────────────────────────────────
+
+/// The type of a user-configurable setting, used to generate appropriate form widgets.
+#[derive(Debug, Clone)]
+pub enum SettingType {
+    Bool,
+    Integer {
+        min: i32,
+        max: i32,
+    },
+    StringVal,
+    Enum(&'static [&'static str]),
+    /// Like Enum but options are computed at runtime (e.g. colorscheme includes custom themes).
+    DynamicEnum(fn() -> Vec<String>),
+    /// Opens a scratch buffer editor (e.g. keymaps editor). Enter to open.
+    BufferEditor,
+}
+
+/// Returns available colorscheme names: built-in + custom themes from ~/.config/vimcode/themes/.
+pub fn available_colorschemes() -> Vec<String> {
+    let mut names: Vec<String> = vec![
+        "onedark".into(),
+        "gruvbox-dark".into(),
+        "tokyo-night".into(),
+        "solarized-dark".into(),
+    ];
+    if let Some(home) = std::env::var_os("HOME") {
+        let dir = std::path::PathBuf::from(home).join(".config/vimcode/themes");
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|e| e == "json") {
+                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                        names.push(stem.to_string());
+                    }
+                }
+            }
+        }
+    }
+    names
+}
+
+/// Metadata for a single user-configurable setting.
+pub struct SettingDef {
+    pub key: &'static str,
+    pub label: &'static str,
+    pub description: &'static str,
+    pub category: &'static str,
+    pub setting_type: SettingType,
+}
+
+/// All user-configurable settings exposed in the Settings sidebar form.
+///
+/// When adding a new field to `Settings` struct, add a corresponding entry here
+/// so it appears in the UI form.
+pub static SETTING_DEFS: &[SettingDef] = &[
+    // ── Appearance ───────────────────────────────────────────────────────────
+    SettingDef {
+        key: "colorscheme",
+        label: "Color Scheme",
+        description: "Editor color theme",
+        category: "Appearance",
+        setting_type: SettingType::DynamicEnum(available_colorschemes),
+    },
+    SettingDef {
+        key: "font_family",
+        label: "Font Family",
+        description: "Editor font family (e.g. \"JetBrains Mono\")",
+        category: "Appearance",
+        setting_type: SettingType::StringVal,
+    },
+    SettingDef {
+        key: "font_size",
+        label: "Font Size",
+        description: "Editor font size in points",
+        category: "Appearance",
+        setting_type: SettingType::Integer { min: 6, max: 48 },
+    },
+    SettingDef {
+        key: "line_numbers",
+        label: "Line Numbers",
+        description: "How line numbers are displayed in the gutter",
+        category: "Appearance",
+        setting_type: SettingType::Enum(&["none", "absolute", "relative", "hybrid"]),
+    },
+    SettingDef {
+        key: "cursorline",
+        label: "Cursor Line",
+        description: "Highlight the line containing the cursor",
+        category: "Appearance",
+        setting_type: SettingType::Bool,
+    },
+    SettingDef {
+        key: "breadcrumbs",
+        label: "Breadcrumbs",
+        description: "Show file path and symbol hierarchy below the tab bar",
+        category: "Appearance",
+        setting_type: SettingType::Bool,
+    },
+    // ── Editor ───────────────────────────────────────────────────────────────
+    SettingDef {
+        key: "tabstop",
+        label: "Tab Size",
+        description: "Number of spaces a Tab key inserts (or tab display width)",
+        category: "Editor",
+        setting_type: SettingType::Integer { min: 1, max: 16 },
+    },
+    SettingDef {
+        key: "shift_width",
+        label: "Indent Width",
+        description: "Spaces added/removed by indent operators (<< / >>)",
+        category: "Editor",
+        setting_type: SettingType::Integer { min: 1, max: 16 },
+    },
+    SettingDef {
+        key: "expand_tab",
+        label: "Expand Tabs",
+        description: "Insert spaces instead of a literal tab character",
+        category: "Editor",
+        setting_type: SettingType::Bool,
+    },
+    SettingDef {
+        key: "auto_indent",
+        label: "Auto Indent",
+        description: "Automatically indent new lines to match current indent",
+        category: "Editor",
+        setting_type: SettingType::Bool,
+    },
+    SettingDef {
+        key: "wrap",
+        label: "Word Wrap",
+        description: "Wrap long lines at the viewport width instead of scrolling",
+        category: "Editor",
+        setting_type: SettingType::Bool,
+    },
+    SettingDef {
+        key: "scrolloff",
+        label: "Scroll Offset",
+        description: "Minimum lines to keep visible above and below the cursor",
+        category: "Editor",
+        setting_type: SettingType::Integer { min: 0, max: 30 },
+    },
+    SettingDef {
+        key: "colorcolumn",
+        label: "Color Column",
+        description: "Columns to highlight as rulers (e.g. \"80,120\")",
+        category: "Editor",
+        setting_type: SettingType::StringVal,
+    },
+    SettingDef {
+        key: "textwidth",
+        label: "Text Width",
+        description: "Auto-wrap inserted text at this column (0 = disabled)",
+        category: "Editor",
+        setting_type: SettingType::Integer { min: 0, max: 200 },
+    },
+    SettingDef {
+        key: "swap_file",
+        label: "Swap Files",
+        description: "Write swap files for crash recovery (like Vim's swapfile option)",
+        category: "Editor",
+        setting_type: SettingType::Bool,
+    },
+    SettingDef {
+        key: "updatetime",
+        label: "Update Time",
+        description: "Milliseconds between swap file writes for dirty buffers",
+        category: "Editor",
+        setting_type: SettingType::Integer {
+            min: 100,
+            max: 60000,
+        },
+    },
+    // ── Search ───────────────────────────────────────────────────────────────
+    SettingDef {
+        key: "hlsearch",
+        label: "Highlight Search",
+        description: "Highlight all matches of the last search pattern",
+        category: "Search",
+        setting_type: SettingType::Bool,
+    },
+    SettingDef {
+        key: "ignorecase",
+        label: "Ignore Case",
+        description: "Case-insensitive search by default",
+        category: "Search",
+        setting_type: SettingType::Bool,
+    },
+    SettingDef {
+        key: "smartcase",
+        label: "Smart Case",
+        description: "Override Ignore Case when the pattern has an uppercase letter",
+        category: "Search",
+        setting_type: SettingType::Bool,
+    },
+    SettingDef {
+        key: "incremental_search",
+        label: "Incremental Search",
+        description: "Move the cursor as you type the search pattern",
+        category: "Search",
+        setting_type: SettingType::Bool,
+    },
+    // ── Workspace ────────────────────────────────────────────────────────────
+    SettingDef {
+        key: "editor_mode",
+        label: "Editor Mode",
+        description: "Vim (modal) or VSCode (always-insert) key bindings",
+        category: "Workspace",
+        setting_type: SettingType::Enum(&["vim", "vscode"]),
+    },
+    SettingDef {
+        key: "explorer_visible_on_startup",
+        label: "Show Explorer on Start",
+        description: "Open the file explorer sidebar automatically on startup",
+        category: "Workspace",
+        setting_type: SettingType::Bool,
+    },
+    SettingDef {
+        key: "autoread",
+        label: "Auto Read",
+        description: "Automatically reload files when changed externally",
+        category: "Workspace",
+        setting_type: SettingType::Bool,
+    },
+    SettingDef {
+        key: "splitbelow",
+        label: "Split Below",
+        description: "Open new horizontal splits below the current window",
+        category: "Workspace",
+        setting_type: SettingType::Bool,
+    },
+    SettingDef {
+        key: "splitright",
+        label: "Split Right",
+        description: "Open new vertical splits to the right of the current window",
+        category: "Workspace",
+        setting_type: SettingType::Bool,
+    },
+    SettingDef {
+        key: "show_hidden_files",
+        label: "Show Hidden Files",
+        description: "Display dotfiles and hidden directories in the file explorer",
+        category: "Workspace",
+        setting_type: SettingType::Bool,
+    },
+    // ── LSP ──────────────────────────────────────────────────────────────────
+    SettingDef {
+        key: "lsp_enabled",
+        label: "Enable LSP",
+        description: "Enable Language Server Protocol support",
+        category: "LSP",
+        setting_type: SettingType::Bool,
+    },
+    SettingDef {
+        key: "format_on_save",
+        label: "Format on Save",
+        description: "Automatically format the buffer via LSP before saving",
+        category: "LSP",
+        setting_type: SettingType::Bool,
+    },
+    // ── Terminal ─────────────────────────────────────────────────────────────
+    SettingDef {
+        key: "terminal_scrollback_lines",
+        label: "Terminal Scrollback",
+        description: "Maximum scrollback history lines in the integrated terminal",
+        category: "Terminal",
+        setting_type: SettingType::Integer {
+            min: 100,
+            max: 100000,
+        },
+    },
+    // ── Plugins ──────────────────────────────────────────────────────────────
+    SettingDef {
+        key: "plugins_enabled",
+        label: "Enable Plugins",
+        description: "Enable the Lua plugin system (requires restart)",
+        category: "Plugins",
+        setting_type: SettingType::Bool,
+    },
+    SettingDef {
+        key: "keymaps",
+        label: "User Keymaps",
+        description: "Press Enter to edit keymaps (one per line: mode keys :command)",
+        category: "Plugins",
+        setting_type: SettingType::BufferEditor,
+    },
+    // ── AI ────────────────────────────────────────────────────────────────────
+    SettingDef {
+        key: "ai_provider",
+        label: "AI Provider",
+        description: "AI backend: anthropic, openai (or compatible), or ollama (local)",
+        category: "AI",
+        setting_type: SettingType::Enum(&["anthropic", "openai", "ollama"]),
+    },
+    SettingDef {
+        key: "ai_api_key",
+        label: "API Key",
+        description:
+            "API key (or leave empty and set ANTHROPIC_API_KEY / OPENAI_API_KEY env var)",
+        category: "AI",
+        setting_type: SettingType::StringVal,
+    },
+    SettingDef {
+        key: "ai_model",
+        label: "Model",
+        description: "Model name override (leave empty to use the provider default)",
+        category: "AI",
+        setting_type: SettingType::StringVal,
+    },
+    SettingDef {
+        key: "ai_base_url",
+        label: "Base URL",
+        description: "Custom API endpoint URL (leave empty for provider default)",
+        category: "AI",
+        setting_type: SettingType::StringVal,
+    },
+    SettingDef {
+        key: "ai_completions",
+        label: "Inline Completions",
+        description: "Show AI ghost-text completions at the cursor in insert mode (Tab to accept, Alt+]/Alt+[ to cycle alternatives)",
+        category: "AI",
+        setting_type: SettingType::Bool,
+    },
+    // ── TUI ─────────────────────────────────────────────────────────────────
+    SettingDef {
+        key: "autohide_panels",
+        label: "Auto-Hide Panels",
+        description: "Hide toolbar and sidebar at startup; they appear on Ctrl-W l (TUI only)",
+        category: "Appearance",
+        setting_type: SettingType::Bool,
+    },
+];
+
+/// Returns the unique ordered list of category names used in `SETTING_DEFS`.
+pub fn setting_categories() -> Vec<&'static str> {
+    let mut cats = Vec::new();
+    for def in SETTING_DEFS {
+        if !cats.contains(&def.category) {
+            cats.push(def.category);
+        }
+    }
+    cats
 }
 
 #[cfg(test)]

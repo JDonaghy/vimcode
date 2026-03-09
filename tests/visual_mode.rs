@@ -146,3 +146,119 @@ fn test_visual_change_enters_insert() {
         "expected 'bye' in buffer, got: {content:?}"
     );
 }
+
+// ── Visual paste (p/P) ──────────────────────────────────────────────────────
+
+#[test]
+fn test_visual_paste_replaces_selection() {
+    // Yank "hello", select "world", paste → replaces "world" with "hello"
+    let mut e = engine_with("hello world\n");
+    // yank "hello" (yiw)
+    type_chars(&mut e, "yiw");
+    // move to "world"
+    type_chars(&mut e, "w");
+    // select "world" (viw)
+    type_chars(&mut e, "viw");
+    // paste
+    press(&mut e, 'p');
+    assert_mode(&e, Mode::Normal);
+    assert_buf(&e, "hello hello\n");
+}
+
+#[test]
+fn test_visual_paste_stores_deleted_text_in_unnamed_register() {
+    let mut e = engine_with("hello world\n");
+    // yank "hello"
+    type_chars(&mut e, "yiw");
+    // select "world" and paste
+    type_chars(&mut e, "w");
+    type_chars(&mut e, "viw");
+    press(&mut e, 'p');
+    // unnamed register should now have "world" (the deleted selection)
+    assert_register(&e, '"', "world", false);
+}
+
+#[test]
+fn test_visual_line_paste_replaces_lines() {
+    let mut e = engine_with("aaa\nbbb\nccc\n");
+    // yank first line (yy)
+    type_chars(&mut e, "yy");
+    // move to second line, select it linewise
+    press(&mut e, 'j');
+    press(&mut e, 'V');
+    // paste
+    press(&mut e, 'p');
+    assert_mode(&e, Mode::Normal);
+    assert_buf(&e, "aaa\naaa\nccc\n");
+}
+
+#[test]
+fn test_visual_paste_with_uppercase_p() {
+    // P in visual mode should also replace (same as p in Vim)
+    let mut e = engine_with("hello world\n");
+    type_chars(&mut e, "yiw");
+    type_chars(&mut e, "w");
+    type_chars(&mut e, "viw");
+    press(&mut e, 'P');
+    assert_mode(&e, Mode::Normal);
+    assert_buf(&e, "hello hello\n");
+}
+
+#[test]
+fn test_visual_paste_multichar_selection() {
+    // Yank "xx" from register, select "cd" and replace
+    let mut e = engine_with("xxcdef\n");
+    // yiw yanks "xxcdef" — use yy + specific register instead
+    // Just yank "xx" using visual (cols 0-1)
+    type_chars(&mut e, "vly");
+    // After visual yank, cursor stays at col 1. Move to col 2 ('c').
+    press(&mut e, 'l');
+    // select "cd" (cols 2-3)
+    press(&mut e, 'v');
+    press(&mut e, 'l');
+    press(&mut e, 'p');
+    assert_mode(&e, Mode::Normal);
+    assert_buf(&e, "xxxxef\n");
+}
+
+#[test]
+fn test_visual_paste_with_named_register() {
+    let mut e = engine_with("aaa bbb\n");
+    // yank "aaa" into register a
+    type_chars(&mut e, "\"ayiw");
+    // select "bbb"
+    type_chars(&mut e, "w");
+    type_chars(&mut e, "viw");
+    // paste from register a
+    type_chars(&mut e, "\"a");
+    press(&mut e, 'p');
+    assert_mode(&e, Mode::Normal);
+    assert_buf(&e, "aaa aaa\n");
+}
+
+#[test]
+fn test_visual_paste_empty_register_still_deletes() {
+    // If register is empty, selection should still be deleted
+    let mut e = engine_with("hello\n");
+    // Don't yank anything — registers are empty
+    // Select "ell"
+    type_chars(&mut e, "l");
+    press(&mut e, 'v');
+    type_chars(&mut e, "ll");
+    press(&mut e, 'p');
+    assert_mode(&e, Mode::Normal);
+    assert_buf(&e, "ho\n");
+}
+
+#[test]
+fn test_visual_paste_preserves_ip_text_object() {
+    // Ensure "ip" still works as inner-paragraph text object, not paste
+    let mut e = engine_with("aaa\nbbb\n\nccc\n");
+    press(&mut e, 'v');
+    type_chars(&mut e, "ip");
+    assert_mode(&e, Mode::Visual);
+    // Selection should span lines 0-1 (inner paragraph)
+    let anchor = e.visual_anchor.unwrap();
+    assert_eq!(anchor.line, 0);
+    assert_eq!(e.cursor().line, 1);
+}

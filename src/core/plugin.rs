@@ -69,6 +69,16 @@ pub struct PluginCallContext {
     /// When false, `vimcode.git.blame_line()` skips piping the in-memory
     /// contents via `--contents -` and uses the faster committed-content path.
     pub buf_dirty: bool,
+    /// Current mode name (e.g. "Normal", "Insert", "Visual").
+    pub mode_name: String,
+    /// Snapshot of registers: `char -> (content, is_linewise)`.
+    pub registers_snapshot: HashMap<char, (String, bool)>,
+    /// Snapshot of marks for the active buffer: `char -> (line, col)` (1-indexed).
+    pub marks_snapshot: HashMap<char, (usize, usize)>,
+    /// Filetype / language ID of the active buffer (e.g. "rust", "python").
+    pub filetype: String,
+    /// Snapshot of all settings as key-value string pairs.
+    pub settings_snapshot: HashMap<String, String>,
     // ── Outputs written by callbacks ────────────────────────────────────────
     pub message: Option<String>,
     /// `(0-based line index, new text)` — applied by the engine after the call.
@@ -81,6 +91,18 @@ pub struct PluginCallContext {
     pub clear_annotations: bool,
     /// Requests to run shell commands in background threads.
     pub async_shell_requests: Vec<AsyncShellRequest>,
+    /// Set cursor position: `(line, col)` (1-indexed). Applied with bounds clamping.
+    pub set_cursor: Option<(usize, usize)>,
+    /// Settings to apply: `(key, value)` pairs processed via `Settings::set_value_str()`.
+    pub set_settings: Vec<(String, String)>,
+    /// Lines to insert: `(1-indexed line, text)`. Inserted before the given line.
+    pub insert_lines: Vec<(usize, String)>,
+    /// Lines to delete: 1-indexed line numbers (processed in reverse order).
+    pub delete_lines: Vec<usize>,
+    /// Registers to set: `(char, content, is_linewise)`.
+    pub set_registers: Vec<(char, String, bool)>,
+    /// Comment style overrides: `(lang_id, line, block_open, block_close)`.
+    pub comment_style_overrides: Vec<(String, String, String, String)>,
 }
 
 // ─── Internal registration accumulator ───────────────────────────────────────
@@ -474,6 +496,45 @@ impl PluginManager {
             })?,
         )?;
 
+        // vimcode.buf.set_cursor(line, col)  (1-indexed)
+        buf.set(
+            "set_cursor",
+            lua.create_function(|lua, (line, col): (usize, usize)| {
+                if let Some(mut ctx) = lua.app_data_mut::<PluginCallContext>() {
+                    if line > 0 && col > 0 {
+                        ctx.set_cursor = Some((line, col));
+                    }
+                }
+                Ok(())
+            })?,
+        )?;
+
+        // vimcode.buf.insert_line(n, text)  (1-indexed, inserts before line n)
+        buf.set(
+            "insert_line",
+            lua.create_function(|lua, (n, text): (usize, String)| {
+                if let Some(mut ctx) = lua.app_data_mut::<PluginCallContext>() {
+                    if n > 0 {
+                        ctx.insert_lines.push((n, text));
+                    }
+                }
+                Ok(())
+            })?,
+        )?;
+
+        // vimcode.buf.delete_line(n)  (1-indexed)
+        buf.set(
+            "delete_line",
+            lua.create_function(|lua, n: usize| {
+                if let Some(mut ctx) = lua.app_data_mut::<PluginCallContext>() {
+                    if n > 0 {
+                        ctx.delete_lines.push(n);
+                    }
+                }
+                Ok(())
+            })?,
+        )?;
+
         // vimcode.buf.annotate_line(n, text)  (1-indexed)
         buf.set(
             "annotate_line",
@@ -500,6 +561,128 @@ impl PluginManager {
         )?;
 
         vimcode.set("buf", buf)?;
+
+        // ── vimcode.opt subtable ────────────────────────────────────────────
+        let opt = lua.create_table()?;
+
+        // vimcode.opt.get(key) → string
+        opt.set(
+            "get",
+            lua.create_function(|lua, key: String| {
+                Ok(lua
+                    .app_data_ref::<PluginCallContext>()
+                    .and_then(|ctx| {
+                        let v = ctx.settings_snapshot.get(&key)?;
+                        if v.is_empty() {
+                            None
+                        } else {
+                            Some(v.clone())
+                        }
+                    })
+                    .unwrap_or_default())
+            })?,
+        )?;
+
+        // vimcode.opt.set(key, value) — applied after callback returns
+        opt.set(
+            "set",
+            lua.create_function(|lua, (key, value): (String, String)| {
+                if let Some(mut ctx) = lua.app_data_mut::<PluginCallContext>() {
+                    ctx.set_settings.push((key, value));
+                }
+                Ok(())
+            })?,
+        )?;
+
+        vimcode.set("opt", opt)?;
+
+        // ── vimcode.state subtable ──────────────────────────────────────────
+        let state = lua.create_table()?;
+
+        // vimcode.state.mode() → string (e.g. "Normal", "Insert", "Visual")
+        state.set(
+            "mode",
+            lua.create_function(|lua, ()| {
+                Ok(lua
+                    .app_data_ref::<PluginCallContext>()
+                    .map(|ctx| ctx.mode_name.clone())
+                    .unwrap_or_default())
+            })?,
+        )?;
+
+        // vimcode.state.register(char) → {content, linewise} or nil
+        state.set(
+            "register",
+            lua.create_function(|lua, reg: String| {
+                let ch = match reg.chars().next() {
+                    Some(c) => c,
+                    None => return Ok(LuaValue::Nil),
+                };
+                let ctx = match lua.app_data_ref::<PluginCallContext>() {
+                    Some(c) => c,
+                    None => return Ok(LuaValue::Nil),
+                };
+                match ctx.registers_snapshot.get(&ch) {
+                    Some((content, linewise)) => {
+                        let t = lua.create_table()?;
+                        t.set("content", content.clone())?;
+                        t.set("linewise", *linewise)?;
+                        Ok(LuaValue::Table(t))
+                    }
+                    None => Ok(LuaValue::Nil),
+                }
+            })?,
+        )?;
+
+        // vimcode.state.set_register(char, content, linewise)
+        state.set(
+            "set_register",
+            lua.create_function(|lua, (reg, content, linewise): (String, String, bool)| {
+                if let Some(ch) = reg.chars().next() {
+                    if let Some(mut ctx) = lua.app_data_mut::<PluginCallContext>() {
+                        ctx.set_registers.push((ch, content, linewise));
+                    }
+                }
+                Ok(())
+            })?,
+        )?;
+
+        // vimcode.state.mark(char) → {line, col} (1-indexed) or nil
+        state.set(
+            "mark",
+            lua.create_function(|lua, mark: String| {
+                let ch = match mark.chars().next() {
+                    Some(c) => c,
+                    None => return Ok(LuaValue::Nil),
+                };
+                let ctx = match lua.app_data_ref::<PluginCallContext>() {
+                    Some(c) => c,
+                    None => return Ok(LuaValue::Nil),
+                };
+                match ctx.marks_snapshot.get(&ch) {
+                    Some((line, col)) => {
+                        let t = lua.create_table()?;
+                        t.set("line", *line)?;
+                        t.set("col", *col)?;
+                        Ok(LuaValue::Table(t))
+                    }
+                    None => Ok(LuaValue::Nil),
+                }
+            })?,
+        )?;
+
+        // vimcode.state.filetype() → string (e.g. "rust", "python") or ""
+        state.set(
+            "filetype",
+            lua.create_function(|lua, ()| {
+                Ok(lua
+                    .app_data_ref::<PluginCallContext>()
+                    .map(|ctx| ctx.filetype.clone())
+                    .unwrap_or_default())
+            })?,
+        )?;
+
+        vimcode.set("state", state)?;
 
         // ── vimcode.git subtable ────────────────────────────────────────────
         let git_tbl = lua.create_table()?;
@@ -584,6 +767,21 @@ impl PluginManager {
         )?;
 
         vimcode.set("git", git_tbl)?;
+
+        // ── vimcode.set_comment_style(lang_id, opts) ────────────────────────
+        vimcode.set(
+            "set_comment_style",
+            lua.create_function(|lua, (lang_id, opts): (String, LuaTable)| {
+                let line: String = opts.get("line").unwrap_or_default();
+                let block_open: String = opts.get("block_open").unwrap_or_default();
+                let block_close: String = opts.get("block_close").unwrap_or_default();
+                if let Some(mut ctx) = lua.app_data_mut::<PluginCallContext>() {
+                    ctx.comment_style_overrides
+                        .push((lang_id, line, block_open, block_close));
+                }
+                Ok(())
+            })?,
+        )?;
 
         lua.globals().set("vimcode", vimcode)?;
         Ok(())

@@ -118,6 +118,15 @@ pub static BUNDLED: &[BundledExtension] = &[
         )],
         readme: include_str!("../../extensions/git-insights/README.md"),
     },
+    BundledExtension {
+        name: "commentary",
+        manifest_toml: include_str!("../../extensions/commentary/manifest.toml"),
+        scripts: &[(
+            "commentary.lua",
+            include_str!("../../extensions/commentary/commentary.lua"),
+        )],
+        readme: include_str!("../../extensions/commentary/README.md"),
+    },
 ];
 
 // ─── Manifest deserialization ─────────────────────────────────────────────────
@@ -148,6 +157,20 @@ pub struct ExtensionManifest {
     /// E.g. `["Cargo.toml"]` for Rust, `["go.mod"]` for Go.
     #[serde(default)]
     pub workspace_markers: Vec<String>,
+    /// Optional comment style override for languages handled by this extension.
+    #[serde(default)]
+    pub comment: Option<CommentConfig>,
+}
+
+/// Comment style override specified in an extension manifest `[comment]` section.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct CommentConfig {
+    #[serde(default)]
+    pub line: String,
+    #[serde(default)]
+    pub block_open: String,
+    #[serde(default)]
+    pub block_close: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

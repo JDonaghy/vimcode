@@ -11,7 +11,7 @@ There's a touch of irony here - using a cli tool to write the editor that I've w
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 2621+ tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 2908+ tests, zero async runtime dependency
 
 > **Note:** VimCode does not implement VimScript. Extension and scripting is handled via
 > the built-in Lua 5.4 plugin system. The goal is full Vim *keybinding* and *editing*
@@ -157,7 +157,8 @@ cargo fmt
 
 **Visual mode**
 - `v` — character selection; `V` — line selection; `Ctrl-V` — block selection
-- All operators work on selection: `d`, `c`, `y`, `u`, `U`, `~`
+- All operators work on selection: `d`, `c`, `y`, `u`, `U`, `~`, `p`/`P` (paste replaces selection)
+- `"{reg}p` — paste from named register over selection (deleted text goes to unnamed register)
 - Block mode: rectangular selections, change/delete/yank uniform columns
 - `I` (block) — insert text at left edge of block (applied to all lines on Escape)
 - `A` (block) — append text after right edge of block (applied to all lines on Escape)
@@ -198,7 +199,7 @@ cargo fmt
 - `".` — last inserted text (read-only)
 - `"_` — black hole register (discard without affecting other registers)
 - Registers preserve linewise/characterwise type
-- `Ctrl-Shift-V` — paste clipboard in Command/Search/Insert mode (GTK); bracketed paste in TUI
+- `Ctrl-Shift-V` — paste system clipboard in Normal/Visual/Insert/Command/Search mode (GTK + TUI with keyboard enhancement)
 
 **Find/Replace**
 - `:s/pattern/replacement/[flags]` — substitute on current line
@@ -245,6 +246,8 @@ cargo fmt
 **Tabs**
 - `:tabnew` — new tab; `:tabclose` — close tab
 - `gt` / `gT` or `g` + `t` / `T` — next/previous tab
+- `Ctrl+Tab` / `Ctrl+Shift+Tab` — MRU tab switcher popup (cycles most-recently-used tabs; Enter confirms, Escape cancels); release modifier to auto-confirm (GTK)
+- `Alt+t` — MRU tab switcher (works in both TUI and GTK; hold Alt and press `t` to cycle; release Alt or wait 500ms to confirm in TUI)
 
 **Editor Groups (VSCode-style split panes, recursive)**
 - `Ctrl+\` — split editor right (any group can be split again for nested layouts)
@@ -299,7 +302,7 @@ cargo fmt
 
 ### Live Grep
 
-- `Ctrl-G` (Normal mode) — open the Telescope-style live grep modal
+- `Ctrl-G` (Normal mode) — show file info (Vim compat); live grep is available via `:grep` or configurable panel key `<C-g>`
 - A centered floating two-column modal appears over the editor
 - Type to instantly search file *contents* across the entire project (live-as-you-type, query ≥ 2 chars)
 - Left pane shows results in `filename.rs:N: snippet` format; right pane shows ±5 context lines around the match
@@ -545,14 +548,22 @@ VimCode embeds Lua 5.4 (via `mlua`, fully vendored — no system Lua required). 
 
 ```lua
 -- Event hooks
-vimcode.on("save",        function(path) end)     -- fired after :w
+vimcode.on("save",        function(path) end)     -- fired after :w (also "BufWrite")
 vimcode.on("open",        function(path) end)     -- fired on file open
 vimcode.on("cursor_move", function(line_col) end) -- fired when cursor moves (arg: "line,col")
+vimcode.on("BufEnter",    function() end)          -- fired when switching to a buffer
+vimcode.on("BufNew",      function() end)          -- fired when a new buffer is created
+vimcode.on("InsertEnter", function() end)          -- fired on entering insert mode
+vimcode.on("InsertLeave", function() end)          -- fired on leaving insert mode
+vimcode.on("ModeChanged", function(change) end)    -- arg: "Old:New" (e.g. "Normal:Insert")
+vimcode.on("VimEnter",    function() end)          -- fired once after startup
 
 -- Custom commands / key mappings
 vimcode.command("MyCmd", function(args) end)
 vimcode.keymap("n", "<leader>x", function() end)   -- normal mode
 vimcode.keymap("i", "<C-Space>", function() end)   -- insert mode
+vimcode.keymap("v", "X", function() end)            -- visual mode
+vimcode.keymap("c", "Y", function() end)            -- command mode
 
 -- Editor API
 vimcode.message(text)         -- show in status bar
@@ -565,12 +576,26 @@ vimcode.async_shell(cmd, event [, opts])  -- run shell command in background thr
 -- Buffer API (current active buffer)
 vimcode.buf.lines()              -- all lines as table
 vimcode.buf.line(n)              -- line n (1-indexed) or nil
-vimcode.buf.set_line(n, text)    -- replace line n
+vimcode.buf.set_line(n, text)    -- replace line n (undoable)
+vimcode.buf.insert_line(n, text) -- insert text before line n
+vimcode.buf.delete_line(n)       -- delete line n
+vimcode.buf.set_cursor(line,col) -- move cursor (1-indexed, clamped)
 vimcode.buf.path()               -- file path string or nil
 vimcode.buf.line_count()         -- integer
 vimcode.buf.cursor()             -- {line, col} (1-indexed)
 vimcode.buf.annotate_line(n, s)  -- show virtual text after line n
 vimcode.buf.clear_annotations()  -- remove all virtual text
+
+-- Settings API
+vimcode.opt.get(key)             -- get setting value as string
+vimcode.opt.set(key, value)      -- set setting (applied after callback)
+
+-- State API (read-only queries)
+vimcode.state.mode()             -- "Normal", "Insert", "Visual", etc.
+vimcode.state.filetype()         -- language ID string (e.g. "rust")
+vimcode.state.register(char)     -- {content, linewise} or nil
+vimcode.state.set_register(char, content, linewise)  -- write register
+vimcode.state.mark(char)         -- {line, col} (1-indexed) or nil
 
 -- Git API (synchronous subprocess calls)
 vimcode.git.blame_line(n)        -- {hash,author,date,relative_date,message} or nil
@@ -597,6 +622,10 @@ Then `:Hello world` shows "Hello from Lua! world" in the status bar.
 | `:Plugin reload` | Reload all plugins from disk |
 | `:Plugin enable <name>` | Enable a previously disabled plugin |
 | `:Plugin disable <name>` | Disable a plugin (persisted in settings) |
+| `:Comment [N]` | Toggle comment on N lines from cursor (core feature, 46+ languages; `:Commentary` alias) |
+| `:map` | List all user-defined key mappings |
+| `:map n <C-/> :Comment` | Add a key mapping (persisted to settings.json) |
+| `:unmap n <C-/>` | Remove a key mapping |
 
 Plugins are loaded in alphabetical order on startup. Security: plugins have unrestricted file and process access (same trust model as Neovim).
 
@@ -629,6 +658,7 @@ No C# Language Support extension — :ExtInstall csharp  (N to dismiss)
 | `yaml` | YAML | yaml-language-server | — |
 | `markdown` | Markdown | marksman | — |
 | `git-insights` | (all files) | — | — |
+| `commentary` | (all files, dormant — core handles comment toggling) | — | — |
 
 **Extensions sidebar panel** — click the extensions icon (󱧅) in the activity bar to open a VSCode-style panel with two sections:
 - **INSTALLED** — extensions currently installed; press `Enter` to view info, `d` to remove
@@ -798,14 +828,16 @@ Additional options (set directly in `settings.json`):
 | `show_hidden_files` | `false` | Show dotfiles in file explorer (`:set showhiddenfiles` / `:set shf`) |
 | `swap_file` | `true` | Write swap files for crash recovery (`:set swapfile` / `:set noswapfile`) |
 | `updatetime` | `4000` | Milliseconds between swap file writes for dirty buffers (`:set updatetime=N`) |
+| `breadcrumbs` | `true` | Show file path + symbol hierarchy bar below the tab bar (`:set breadcrumbs` / `:set nobreadcrumbs`) |
+| `autohide_panels` | `false` | TUI only: hide sidebar + activity bar at startup; `Ctrl-W h` reveals them, focus returns to editor auto-hides (`:set autohidepanels` / `:set noautohidepanels`) |
 
 - `:set option?` — query current value (e.g. `:set ts?` → `tabstop=4`)
 - `:set option!` — toggle a boolean option (e.g. `:set wrap!`); `no<option>!` explicitly disables (e.g. `:set nowrap!`)
 - `:set` (no args) — show one-line summary of all settings
 - `:config reload` — reload settings file from disk
-- `:colorscheme <name>` — switch colour theme live (aliases: `gruvbox`, `tokyonight`, `solarized`); `:colorscheme` lists available themes. Themes: `onedark` (default), `gruvbox-dark`, `tokyo-night`, `solarized-dark`.
+- `:colorscheme <name>` — switch colour theme live (aliases: `gruvbox`, `tokyonight`, `solarized`); `:colorscheme` lists available themes. Built-in: `onedark` (default), `gruvbox-dark`, `tokyo-night`, `solarized-dark`. Also loads VSCode `.json` theme files from `~/.config/vimcode/themes/`.
 - `:Settings` — open `settings.json` in a new editor tab for direct editing; saved changes reload automatically in both GTK and TUI backends.
-- **Settings sidebar (GTK)** — click the gear icon in the activity bar to open a VSCode-style settings form: searchable list of all settings grouped by category (Appearance, Editor, Search, Workspace, LSP, Terminal, Plugins) with native widgets (Toggle switch, spinner, dropdown, text entry); changes apply and save immediately.
+- **Settings sidebar (GTK + TUI)** — click the gear icon in the activity bar to open a VSCode-style settings form: searchable list of all settings grouped by category (Appearance, Editor, Search, Workspace, LSP, Terminal, Plugins, AI) with interactive controls; GTK uses native widgets (Switch, SpinButton, DropDown, Entry), TUI renders `[✓]`/`[ ]` toggles, `value ▸` cycling enums, and inline text/number editing with Ctrl+V paste; changes apply and save immediately; colorscheme picker includes custom VSCode themes from `~/.config/vimcode/themes/`. **User Keymaps** row opens a scratch buffer editor (`:Keymaps`) — one keymap per line in `mode keys :command` format; `:w` validates and saves back to `settings.keymaps`.
 
 **Panel navigation key bindings** — configurable in `settings.json` under `"panel_keys"`:
 
@@ -840,6 +872,24 @@ Key notation: `<C-x>` = Ctrl+x, `<A-x>` = Alt+x, `<C-S-x>` = Ctrl+Shift+x.
 
 Only specify keys you want to change — unspecified keys keep their defaults.
 
+**User key mappings** — define custom key → command bindings in `settings.json` under `"keymaps"`:
+
+```json
+"keymaps": [
+  "n <C-/> :Comment",
+  "v <C-/> :Comment",
+  "n gcc :Comment {count}",
+  "n <leader>f :Lformat"
+]
+```
+
+Format: `"mode keys :command"` where:
+- **mode**: `n` (normal), `v` (visual), `i` (insert), `c` (command)
+- **keys**: single char (`J`), modifier (`<C-/>`, `<A-c>`), or multi-key sequence (`gcc`, `gc`)
+- **action**: ex command prefixed with `:`. Use `{count}` to substitute the count prefix.
+
+User keymaps are checked **before** built-in keys, so they can override defaults. Multi-key sequences (e.g. `gcc`) are supported — intermediate keys are buffered until an exact match or fallthrough.
+
 ---
 
 ### VSCode Mode
@@ -857,14 +907,16 @@ Switch the editor into a **non-modal editing** mode that works like a standard t
 - `Ctrl-Z` / `Ctrl-Y` — undo / redo
 - `Ctrl-A` — select all
 - `Ctrl-S` — save
-- `Ctrl-/` — toggle line comment (`// `)
+- `Ctrl-/` — toggle line comment (language-aware, 46+ languages)
 - `Shift+Arrow` — extend selection one character/line at a time
 - `Ctrl+Arrow` — move by word
 - `Ctrl+Shift+Arrow` — extend selection by word
 - `Home` — smart home (first non-whitespace; again → col 0)
 - `Shift+Home` / `Shift+End` — extend selection to line start/end
 - `Escape` — clear selection (stays in insert)
+- `Ctrl-Q` — quit
 - `F1` — open the command bar (run any `:` command, then returns to EDIT mode)
+- `F10` — toggle menu bar visibility
 - Typing while a selection is active **replaces** the selection
 - Status bar shows `EDIT  F1:cmd  Alt-M:vim` (or `SELECT` when text is selected, `COMMAND` in command bar)
 
@@ -966,6 +1018,7 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `=` operator | Auto-indent range (`==` current line, `=G` to end, `=gg` whole file) |
 | `d`/`c`/`y` + motion | Full operator+motion support: `dj`/`dk`/`dG`/`dgg`/`d{`/`d}`/`d(`/`d)`/`dW`/`dB`/`dE`/`d^`/`dh`/`dl`/`dH`/`dM`/`dL`/`df`/`dt`/`dF`/`dT`/`d;`/`d,`/`dge` |
 | `g~`/`gu`/`gU` + motion | Case operators: all motions (`g~j`, `guw`, `gUG`, `gufx`, etc.) |
+| `gcc` / `gc` (visual) | Toggle line comments (core feature — 46+ languages, block comments for HTML/CSS/XML) |
 | `>`/`<` + motion | Indent/dedent: all motions (`>j`, `>G`, `>}`, etc.) |
 | `gp` / `gP` | Paste after / before, leave cursor after pasted text |
 | `]p` / `[p` | Paste after / before with indent adjusted to current line |
@@ -997,9 +1050,12 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `m{a-z}` / `'{a-z}` | Set mark / jump to mark |
 | `q{a-z}` / `@{a-z}` | Record macro / play macro |
 | `gt` / `gT` | Next / previous tab |
+| `Ctrl+Tab` / `Ctrl+Shift+Tab` | MRU tab switcher (forward / backward) |
+| `Alt+t` | MRU tab switcher (TUI + GTK compatible) |
 | `gd` | Go to definition (LSP) |
 | `gr` | Find references (LSP) — multiple results open quickfix |
-| `gi` | Go to implementation (LSP) |
+| `gi` | Insert at last insert position |
+| `<leader>gi` | Go to implementation (LSP) |
 | `gy` | Go to type definition (LSP) |
 | `gs` | Stage hunk (in `:Gdiff` buffer) |
 | `K` | Show hover info (LSP) |
@@ -1011,6 +1067,10 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `[M` / `]M` | Method end backward / forward |
 | `[{` / `]}` | Jump to unmatched `{` / `}` |
 | `[(` / `])` | Jump to unmatched `(` / `)` |
+| `[*` / `]*` | Jump to comment block start / end (`/*`/`*/`) |
+| `[z` / `]z` | Jump to fold start / end |
+| `do` | Diff obtain (pull line from other diff window) |
+| `dp` | Diff put (push line to other diff window) |
 | `<leader>gf` | LSP format current buffer (Space=leader by default) |
 | `<leader>rn` | LSP rename symbol — pre-fills `:Rename <word>` |
 | `za` / `zo` / `zc` / `zR` | Fold toggle / open / close / open all |
@@ -1031,10 +1091,11 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `Ctrl-W H` / `J` / `K` / `L` | Move window to far left/bottom/top/right |
 | `Ctrl-W T` | Move window to new editor group |
 | `Ctrl-W x` | Exchange with next window |
+| `Ctrl-W r` / `R` | Rotate windows forward / backward |
 | `Ctrl-W f` | Split and open file under cursor |
 | `Ctrl-W d` | Split and go to definition (LSP) |
 | `Ctrl-P` | Open fuzzy file finder |
-| `Ctrl-G` | Open live grep modal (search file contents) |
+| `Ctrl-G` | Show file info (name, line, col, %) |
 | `F5` | Start debugging / continue |
 | `Shift+F5` | Stop debugging |
 | `F6` | Pause debugger |
@@ -1063,6 +1124,7 @@ All ex commands support Vim-style abbreviations (e.g., `:j` for `:join`, `:y` fo
 | `:e!` | Reload current file from disk (discard changes) |
 | `:split` / `:vsplit` | Horizontal / vertical split |
 | `:tabnew` / `:tabclose` | New tab / close tab |
+| `:tabs` / `:TabSwitcher` | Open MRU tab switcher popup |
 | `:bn` / `:bp` / `:b#` | Buffer next / prev / alternate |
 | `:ls` / `:bd` | List buffers / delete buffer |
 | `:s/pat/rep/[gi]` | Substitute on line |
@@ -1136,6 +1198,7 @@ All ex commands support Vim-style abbreviations (e.g., `:j` for `:join`, `:y` fo
 | `:LspInstall <lang>` | Install LSP server for language via Mason |
 | `:Lformat` | Format buffer via LSP |
 | `:Rename <newname>` | Rename symbol under cursor across workspace |
+| `:Comment [N]` | Toggle comment on N lines (46+ languages; `:Commentary` alias) |
 | `:DapInstall <lang>` | Install debug adapter for language |
 | `:DapInfo` | Show detected DAP adapters |
 | `:DapEval <expr>` | Evaluate expression in current debug frame |
@@ -1156,6 +1219,9 @@ All ex commands support Vim-style abbreviations (e.g., `:j` for `:join`, `:y` fo
 | `:Plugin reload` | Reload plugins from disk |
 | `:Plugin enable <name>` | Enable a plugin |
 | `:Plugin disable <name>` | Disable a plugin |
+| `:map` / `:map n K :cmd` | List keymaps / add a key mapping |
+| `:unmap n K` | Remove a key mapping |
+| `:Keymaps` | Open keymaps editor (scratch buffer, one per line, `:w` saves to settings) |
 | `:ExtInstall <name>` | Install a language extension (LSP + DAP + Lua scripts) |
 | `:ExtList` | List available extensions and their install status |
 | `:ExtEnable <name>` | Re-enable a disabled extension |
@@ -1164,6 +1230,9 @@ All ex commands support Vim-style abbreviations (e.g., `:j` for `:join`, `:y` fo
 | `:AI <message>` | Send a message to the AI assistant |
 | `:AiClear` | Clear the AI conversation history |
 | `:MarkdownPreview` / `:MdPreview` | Open side-by-side styled markdown preview (live-updates on edit, scroll sync, scaled headings in GTK) |
+| `:Explore [dir]` / `:Ex [dir]` | Open netrw-style in-buffer directory listing |
+| `:Sexplore [dir]` / `:Sex [dir]` | Horizontal split + netrw directory listing |
+| `:Vexplore [dir]` / `:Vex [dir]` | Vertical split + netrw directory listing |
 | `:help [topic]` / `:h [topic]` | Show help (topics: explorer, keys, commands) |
 
 ---
@@ -1172,12 +1241,12 @@ All ex commands support Vim-style abbreviations (e.g., `:j` for `:join`, `:y` fo
 
 ```
 src/
-├── main.rs          (~10,907 lines)  GTK4/Relm4 UI, rendering, sidebar resize, fuzzy popup, context menu, drag-and-drop
-├── tui_main.rs      (~9,124 lines)  ratatui/crossterm TUI backend, fuzzy popup, rename/move prompts
-├── render.rs        (~4,364 lines)  Platform-agnostic ScreenLayout bridge (DebugSidebarData, SourceControlData, BottomPanelTabs)
+├── main.rs         (~11,805 lines)  GTK4/Relm4 UI, rendering, sidebar resize, fuzzy popup, context menu, drag-and-drop
+├── tui_main.rs     (~10,105 lines)  ratatui/crossterm TUI backend, fuzzy popup, rename/move prompts
+├── render.rs        (~4,833 lines)  Platform-agnostic ScreenLayout bridge (DebugSidebarData, SourceControlData, BottomPanelTabs)
 ├── icons.rs            (~30 lines)  Nerd Font file-type icons (GTK + TUI)
 └── core/            (~29,500 lines)  Zero GTK/rendering deps — fully testable
-    ├── engine.rs    (~33,863 lines)  Orchestrator: keys, commands, git, macros, LSP, DAP, plugins, workspaces
+    ├── engine.rs    (~37,913 lines)  Orchestrator: keys, commands, git, macros, LSP, DAP, plugins, workspaces
     ├── markdown.rs     (~497 lines)  Markdown → styled plain text converter (pulldown-cmark)
     ├── plugin.rs       (~835 lines)  Lua 5.4 plugin manager (mlua vendored; vimcode.* API; async_shell)
     ├── terminal.rs     (~320 lines)  PTY-backed terminal pane (portable-pty + vt100, history ring buffer)
@@ -1189,7 +1258,7 @@ src/
     ├── project_search.rs (~630 lines)  Regex/case/whole-word search + replace (ignore + regex crates)
     ├── buffer_manager.rs (~707 lines)  Buffer lifecycle, undo/redo stacks, semantic tokens
     ├── buffer.rs       (~120 lines)  Rope-based text storage (ropey)
-    ├── settings.rs   (~1,346 lines)  JSON config, :set parsing, key binding notation
+    ├── settings.rs   (~1,973 lines)  JSON config, :set parsing, key binding notation, SETTING_DEFS
     ├── session.rs      (~235 lines)  Session state persistence + per-workspace paths
     ├── git.rs        (~1,000 lines)  Git subprocesses: diff, blame, stage_hunk, SC panel, worktrees, git log
     └── window.rs, tab.rs, view.rs, cursor.rs, mode.rs, syntax.rs (~984 lines)

@@ -18,6 +18,7 @@ pub use crate::core::engine::{BottomPanelKind, DebugSidebarSection};
 use crate::core::engine::{DiffLine, Engine, SearchDirection};
 use crate::core::lsp::SignatureHelpData;
 use crate::core::settings::LineNumberMode;
+pub use crate::core::settings::{SettingDef, SettingType, SETTING_DEFS};
 use crate::core::terminal::TermSelection as CoreTermSelection;
 use crate::core::view::View;
 use crate::core::window::{GroupDivider, GroupId};
@@ -49,6 +50,48 @@ impl Color {
         Self { r, g, b }
     }
 
+    /// Try to parse a hex colour string. Accepts `#rrggbb`, `#rrggbbaa`
+    /// (alpha is discarded), and `#rgb` shorthand. Returns `None` on failure.
+    pub fn try_from_hex(s: &str) -> Option<Self> {
+        let s = s.trim_start_matches('#');
+        let (r, g, b) = match s.len() {
+            6 | 8 => {
+                let r = u8::from_str_radix(&s[0..2], 16).ok()?;
+                let g = u8::from_str_radix(&s[2..4], 16).ok()?;
+                let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+                (r, g, b)
+            }
+            3 => {
+                let r = u8::from_str_radix(&s[0..1], 16).ok()?;
+                let g = u8::from_str_radix(&s[1..2], 16).ok()?;
+                let b = u8::from_str_radix(&s[2..3], 16).ok()?;
+                (r * 17, g * 17, b * 17)
+            }
+            _ => return None,
+        };
+        Some(Self { r, g, b })
+    }
+
+    /// Blend this colour toward white by `amount` (0.0 = unchanged, 1.0 = white).
+    pub fn lighten(self, amount: f64) -> Self {
+        let f = amount.clamp(0.0, 1.0);
+        Self {
+            r: (self.r as f64 + (255.0 - self.r as f64) * f) as u8,
+            g: (self.g as f64 + (255.0 - self.g as f64) * f) as u8,
+            b: (self.b as f64 + (255.0 - self.b as f64) * f) as u8,
+        }
+    }
+
+    /// Blend this colour toward black by `amount` (0.0 = unchanged, 1.0 = black).
+    pub fn darken(self, amount: f64) -> Self {
+        let f = 1.0 - amount.clamp(0.0, 1.0);
+        Self {
+            r: (self.r as f64 * f) as u8,
+            g: (self.g as f64 * f) as u8,
+            b: (self.b as f64 * f) as u8,
+        }
+    }
+
     /// Normalise to the (0.0..=1.0, 0.0..=1.0, 0.0..=1.0) triple expected by
     /// Cairo's `set_source_rgb` / `set_source_rgba`.
     pub fn to_cairo(self) -> (f64, f64, f64) {
@@ -73,6 +116,56 @@ impl Color {
             self.b as u16 * 257,
         )
     }
+}
+
+/// Strip `//` and `/* */` comments from JSON-with-comments (JSONC), as used
+/// by VSCode theme files. Preserves newlines so error positions stay valid.
+fn strip_json_comments(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    while i < len {
+        if bytes[i] == b'"' {
+            // String literal — copy verbatim until closing quote
+            out.push('"');
+            i += 1;
+            while i < len {
+                if bytes[i] == b'\\' && i + 1 < len {
+                    out.push(bytes[i] as char);
+                    out.push(bytes[i + 1] as char);
+                    i += 2;
+                } else if bytes[i] == b'"' {
+                    out.push('"');
+                    i += 1;
+                    break;
+                } else {
+                    out.push(bytes[i] as char);
+                    i += 1;
+                }
+            }
+        } else if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'/' {
+            // Line comment — skip until newline
+            i += 2;
+            while i < len && bytes[i] != b'\n' {
+                i += 1;
+            }
+        } else if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            // Block comment — skip until */
+            i += 2;
+            while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                if bytes[i] == b'\n' {
+                    out.push('\n');
+                }
+                i += 1;
+            }
+            i += 2; // skip */
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    out
 }
 
 // ─── Style / StyledSpan ──────────────────────────────────────────────────────
@@ -240,6 +333,22 @@ pub struct GroupTabBar {
     pub bounds: WindowRect,
 }
 
+/// One segment in the breadcrumb bar (either a path component or a symbol).
+#[derive(Debug, Clone)]
+pub struct BreadcrumbSegment {
+    pub label: String,
+    pub is_last: bool,
+    pub is_symbol: bool,
+}
+
+/// Breadcrumb bar data for one editor group.
+#[derive(Debug, Clone)]
+pub struct BreadcrumbBar {
+    pub group_id: GroupId,
+    pub segments: Vec<BreadcrumbSegment>,
+    pub bounds: WindowRect,
+}
+
 /// Present when the editor area is split into two or more independent groups.
 /// `ScreenLayout.tab_bar` always contains the first group's tab bar for
 /// backward compat in single-group mode.
@@ -313,6 +422,17 @@ pub struct CommandLineData {
     /// Text whose rendered pixel-width determines the cursor's x position.
     /// Often equal to `text`, but may differ (e.g. history-search display).
     pub cursor_anchor_text: String,
+}
+
+// ─── WildmenuData ─────────────────────────────────────────────────────────────
+
+/// Data for the command-line wildmenu (Tab completion bar above the status line).
+#[derive(Debug, Clone)]
+pub struct WildmenuData {
+    /// Display labels shown in the bar (may be shortened, e.g. just the argument).
+    pub items: Vec<String>,
+    /// Currently highlighted item index, or `None` for common-prefix mode.
+    pub selected: Option<usize>,
 }
 
 // ─── CompletionMenu ────────────────────────────────────────────────────────────
@@ -403,6 +523,17 @@ pub struct CommandPalettePanel {
     pub selected_idx: usize,
     /// Scroll offset into the filtered list.
     pub scroll_top: usize,
+}
+
+// ─── TabSwitcherPanel ─────────────────────────────────────────────────────
+
+/// Data needed to render the tab switcher popup (Ctrl+Tab MRU list).
+#[derive(Debug, Clone)]
+pub struct TabSwitcherPanel {
+    /// MRU-ordered items: (filename, full_path, is_dirty).
+    pub items: Vec<(String, String, bool)>,
+    /// Index of the currently highlighted item.
+    pub selected_idx: usize,
 }
 
 // ─── QuickfixPanel ────────────────────────────────────────────────────────────
@@ -560,289 +691,8 @@ pub struct AiPanelData {
 
 // ─── SettingDef ───────────────────────────────────────────────────────────────
 
-/// The type of a user-configurable setting, used to generate appropriate form widgets.
-#[derive(Debug, Clone)]
-pub enum SettingType {
-    Bool,
-    Integer { min: i32, max: i32 },
-    StringVal,
-    Enum(&'static [&'static str]),
-}
-
-/// Metadata for a single user-configurable setting.
-pub struct SettingDef {
-    pub key: &'static str,
-    pub label: &'static str,
-    pub description: &'static str,
-    pub category: &'static str,
-    pub setting_type: SettingType,
-}
-
-/// All user-configurable settings exposed in the Settings sidebar form.
-///
-/// When adding a new field to `Settings` struct, add a corresponding entry here
-/// so it appears in the UI form.
-pub static SETTING_DEFS: &[SettingDef] = &[
-    // ── Appearance ───────────────────────────────────────────────────────────
-    SettingDef {
-        key: "colorscheme",
-        label: "Color Scheme",
-        description: "Editor color theme",
-        category: "Appearance",
-        setting_type: SettingType::Enum(&[
-            "onedark",
-            "gruvbox-dark",
-            "tokyo-night",
-            "solarized-dark",
-        ]),
-    },
-    SettingDef {
-        key: "font_family",
-        label: "Font Family",
-        description: "Editor font family (e.g. \"JetBrains Mono\")",
-        category: "Appearance",
-        setting_type: SettingType::StringVal,
-    },
-    SettingDef {
-        key: "font_size",
-        label: "Font Size",
-        description: "Editor font size in points",
-        category: "Appearance",
-        setting_type: SettingType::Integer { min: 6, max: 48 },
-    },
-    SettingDef {
-        key: "line_numbers",
-        label: "Line Numbers",
-        description: "How line numbers are displayed in the gutter",
-        category: "Appearance",
-        setting_type: SettingType::Enum(&["none", "absolute", "relative", "hybrid"]),
-    },
-    SettingDef {
-        key: "cursorline",
-        label: "Cursor Line",
-        description: "Highlight the line containing the cursor",
-        category: "Appearance",
-        setting_type: SettingType::Bool,
-    },
-    // ── Editor ───────────────────────────────────────────────────────────────
-    SettingDef {
-        key: "tabstop",
-        label: "Tab Size",
-        description: "Number of spaces a Tab key inserts (or tab display width)",
-        category: "Editor",
-        setting_type: SettingType::Integer { min: 1, max: 16 },
-    },
-    SettingDef {
-        key: "shift_width",
-        label: "Indent Width",
-        description: "Spaces added/removed by indent operators (<< / >>)",
-        category: "Editor",
-        setting_type: SettingType::Integer { min: 1, max: 16 },
-    },
-    SettingDef {
-        key: "expand_tab",
-        label: "Expand Tabs",
-        description: "Insert spaces instead of a literal tab character",
-        category: "Editor",
-        setting_type: SettingType::Bool,
-    },
-    SettingDef {
-        key: "auto_indent",
-        label: "Auto Indent",
-        description: "Automatically indent new lines to match current indent",
-        category: "Editor",
-        setting_type: SettingType::Bool,
-    },
-    SettingDef {
-        key: "wrap",
-        label: "Word Wrap",
-        description: "Wrap long lines at the viewport width instead of scrolling",
-        category: "Editor",
-        setting_type: SettingType::Bool,
-    },
-    SettingDef {
-        key: "scrolloff",
-        label: "Scroll Offset",
-        description: "Minimum lines to keep visible above and below the cursor",
-        category: "Editor",
-        setting_type: SettingType::Integer { min: 0, max: 30 },
-    },
-    SettingDef {
-        key: "colorcolumn",
-        label: "Color Column",
-        description: "Columns to highlight as rulers (e.g. \"80,120\")",
-        category: "Editor",
-        setting_type: SettingType::StringVal,
-    },
-    SettingDef {
-        key: "textwidth",
-        label: "Text Width",
-        description: "Auto-wrap inserted text at this column (0 = disabled)",
-        category: "Editor",
-        setting_type: SettingType::Integer { min: 0, max: 200 },
-    },
-    // ── Search ───────────────────────────────────────────────────────────────
-    SettingDef {
-        key: "hlsearch",
-        label: "Highlight Search",
-        description: "Highlight all matches of the last search pattern",
-        category: "Search",
-        setting_type: SettingType::Bool,
-    },
-    SettingDef {
-        key: "ignorecase",
-        label: "Ignore Case",
-        description: "Case-insensitive search by default",
-        category: "Search",
-        setting_type: SettingType::Bool,
-    },
-    SettingDef {
-        key: "smartcase",
-        label: "Smart Case",
-        description: "Override Ignore Case when the pattern has an uppercase letter",
-        category: "Search",
-        setting_type: SettingType::Bool,
-    },
-    SettingDef {
-        key: "incremental_search",
-        label: "Incremental Search",
-        description: "Move the cursor as you type the search pattern",
-        category: "Search",
-        setting_type: SettingType::Bool,
-    },
-    // ── Workspace ────────────────────────────────────────────────────────────
-    SettingDef {
-        key: "editor_mode",
-        label: "Editor Mode",
-        description: "Vim (modal) or VSCode (always-insert) key bindings",
-        category: "Workspace",
-        setting_type: SettingType::Enum(&["vim", "vscode"]),
-    },
-    SettingDef {
-        key: "explorer_visible_on_startup",
-        label: "Show Explorer on Start",
-        description: "Open the file explorer sidebar automatically on startup",
-        category: "Workspace",
-        setting_type: SettingType::Bool,
-    },
-    SettingDef {
-        key: "autoread",
-        label: "Auto Read",
-        description: "Automatically reload files when changed externally",
-        category: "Workspace",
-        setting_type: SettingType::Bool,
-    },
-    SettingDef {
-        key: "splitbelow",
-        label: "Split Below",
-        description: "Open new horizontal splits below the current window",
-        category: "Workspace",
-        setting_type: SettingType::Bool,
-    },
-    SettingDef {
-        key: "splitright",
-        label: "Split Right",
-        description: "Open new vertical splits to the right of the current window",
-        category: "Workspace",
-        setting_type: SettingType::Bool,
-    },
-    // ── LSP ──────────────────────────────────────────────────────────────────
-    SettingDef {
-        key: "lsp_enabled",
-        label: "Enable LSP",
-        description: "Enable Language Server Protocol support",
-        category: "LSP",
-        setting_type: SettingType::Bool,
-    },
-    SettingDef {
-        key: "format_on_save",
-        label: "Format on Save",
-        description: "Automatically format the buffer via LSP before saving",
-        category: "LSP",
-        setting_type: SettingType::Bool,
-    },
-    // ── Terminal ─────────────────────────────────────────────────────────────
-    SettingDef {
-        key: "terminal_scrollback_lines",
-        label: "Terminal Scrollback",
-        description: "Maximum scrollback history lines in the integrated terminal",
-        category: "Terminal",
-        setting_type: SettingType::Integer {
-            min: 100,
-            max: 100000,
-        },
-    },
-    // ── Plugins ──────────────────────────────────────────────────────────────
-    SettingDef {
-        key: "plugins_enabled",
-        label: "Enable Plugins",
-        description: "Enable the Lua plugin system (requires restart)",
-        category: "Plugins",
-        setting_type: SettingType::Bool,
-    },
-    // ── Workspace ─────────────────────────────────────────────────────────────
-    SettingDef {
-        key: "show_hidden_files",
-        label: "Show Hidden Files",
-        description: "Display dotfiles and hidden directories in the file explorer",
-        category: "Workspace",
-        setting_type: SettingType::Bool,
-    },
-    // ── Recovery ──────────────────────────────────────────────────────────────
-    SettingDef {
-        key: "swap_file",
-        label: "Swap Files",
-        description: "Write swap files for crash recovery (like Vim's swapfile option)",
-        category: "Editor",
-        setting_type: SettingType::Bool,
-    },
-    SettingDef {
-        key: "updatetime",
-        label: "Update Time",
-        description: "Milliseconds between swap file writes for dirty buffers",
-        category: "Editor",
-        setting_type: SettingType::Integer {
-            min: 100,
-            max: 60000,
-        },
-    },
-    // ── AI ────────────────────────────────────────────────────────────────────
-    SettingDef {
-        key: "ai_provider",
-        label: "AI Provider",
-        description: "AI backend: anthropic, openai (or compatible), or ollama (local)",
-        category: "AI",
-        setting_type: SettingType::Enum(&["anthropic", "openai", "ollama"]),
-    },
-    SettingDef {
-        key: "ai_api_key",
-        label: "API Key",
-        description: "API key (or leave empty and set ANTHROPIC_API_KEY / OPENAI_API_KEY env var)",
-        category: "AI",
-        setting_type: SettingType::StringVal,
-    },
-    SettingDef {
-        key: "ai_model",
-        label: "Model",
-        description: "Model name override (leave empty to use the provider default)",
-        category: "AI",
-        setting_type: SettingType::StringVal,
-    },
-    SettingDef {
-        key: "ai_base_url",
-        label: "Base URL",
-        description: "Custom API endpoint URL (leave empty for provider default)",
-        category: "AI",
-        setting_type: SettingType::StringVal,
-    },
-    SettingDef {
-        key: "ai_completions",
-        label: "Inline Completions",
-        description: "Show AI ghost-text completions at the cursor in insert mode (Tab to accept, Alt+]/Alt+[ to cycle alternatives)",
-        category: "AI",
-        setting_type: SettingType::Bool,
-    },
-];
+// SettingType, SettingDef, and SETTING_DEFS are defined in settings.rs and
+// re-exported at the top of this file for backward compatibility.
 
 /// Always present in `ScreenLayout`; each section may be empty.
 #[derive(Debug, Clone)]
@@ -1121,7 +971,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
             MenuItemData {
                 label: "Quit",
                 shortcut: "",
-                vscode_shortcut: "",
+                vscode_shortcut: "Ctrl+Q",
                 action: "quit_menu",
                 enabled: true,
                 separator: false,
@@ -1575,6 +1425,8 @@ pub struct ScreenLayout {
     pub status_left: String,
     pub status_right: String,
     pub command: CommandLineData,
+    /// Wildmenu bar (Tab completion in command mode), or `None` when inactive.
+    pub wildmenu: Option<WildmenuData>,
     pub active_window_id: WindowId,
     /// Completion popup to show, or `None` when inactive.
     pub completion: Option<CompletionMenu>,
@@ -1600,6 +1452,8 @@ pub struct ScreenLayout {
     pub source_control: Option<SourceControlData>,
     /// Command palette modal — `Some` when open.
     pub command_palette: Option<CommandPalettePanel>,
+    /// Tab switcher popup (Ctrl+Tab MRU list) — `Some` when open.
+    pub tab_switcher: Option<TabSwitcherPanel>,
     /// When the editor is split into two groups, this carries group 1's tab bar
     /// and split geometry. `None` in the default single-group mode.
     pub editor_group_split: Option<EditorGroupSplitData>,
@@ -1607,6 +1461,8 @@ pub struct ScreenLayout {
     pub ext_sidebar: Option<ExtSidebarData>,
     /// AI assistant panel data — `Some` when the AI panel is the active sidebar panel.
     pub ai_panel: Option<AiPanelData>,
+    /// Breadcrumb bars for each editor group (empty when breadcrumbs are disabled).
+    pub breadcrumbs: Vec<BreadcrumbBar>,
 }
 
 // ─── Theme ────────────────────────────────────────────────────────────────────
@@ -1667,6 +1523,12 @@ pub struct Theme {
     pub status_bg: Color,
     pub status_fg: Color,
 
+    // Wildmenu (command Tab completion bar)
+    pub wildmenu_bg: Color,
+    pub wildmenu_fg: Color,
+    pub wildmenu_sel_bg: Color,
+    pub wildmenu_sel_fg: Color,
+
     // Command / message line
     pub command_bg: Color,
     pub command_fg: Color,
@@ -1721,6 +1583,12 @@ pub struct Theme {
     pub md_code: Color,
     pub md_link: Color,
 
+    // Sidebar selection
+    /// Background for the selected row when the sidebar has keyboard focus.
+    pub sidebar_sel_bg: Color,
+    /// Background for the selected row when the sidebar does NOT have focus.
+    pub sidebar_sel_bg_inactive: Color,
+
     // LSP semantic token colours (overlay on tree-sitter)
     pub semantic_parameter: Color,
     pub semantic_property: Color,
@@ -1730,6 +1598,11 @@ pub struct Theme {
     pub semantic_type_parameter: Color,
     pub semantic_decorator: Color,
     pub semantic_macro: Color,
+
+    // Breadcrumb bar
+    pub breadcrumb_bg: Color,
+    pub breadcrumb_fg: Color,
+    pub breadcrumb_active_fg: Color,
 }
 
 impl Theme {
@@ -1785,6 +1658,11 @@ impl Theme {
             status_bg: Color::from_hex("#33334c"),
             // (0.9, 0.9, 0.9)
             status_fg: Color::from_hex("#e5e5e5"),
+
+            wildmenu_bg: Color::from_hex("#33334c"),
+            wildmenu_fg: Color::from_hex("#abb2bf"),
+            wildmenu_sel_bg: Color::from_hex("#e5c07b"),
+            wildmenu_sel_fg: Color::from_hex("#282c34"),
 
             // (0.1, 0.1, 0.1)
             command_bg: Color::from_hex("#1a1a1a"),
@@ -1852,6 +1730,8 @@ impl Theme {
             md_code: Color::from_hex("#98c379"),     // green (string-like)
             md_link: Color::from_hex("#61afef"),     // blue
 
+            sidebar_sel_bg: Color::from_hex("#2c313a"), // focused: subtle highlight
+            sidebar_sel_bg_inactive: Color::from_hex("#21252b"), // unfocused: very faint
             semantic_parameter: Color::from_hex("#c8ae9d"), // warm sandy (distinct from variable red)
             semantic_property: Color::from_hex("#d19a66"),  // orange
             semantic_namespace: Color::from_hex("#e5c07b"), // gold
@@ -1860,6 +1740,10 @@ impl Theme {
             semantic_type_parameter: Color::from_hex("#e5c07b"), // gold
             semantic_decorator: Color::from_hex("#c678dd"), // purple (like keyword)
             semantic_macro: Color::from_hex("#56b6c2"),     // cyan
+
+            breadcrumb_bg: Color::from_hex("#21252b"),
+            breadcrumb_fg: Color::from_hex("#7f848e"),
+            breadcrumb_active_fg: Color::from_hex("#abb2bf"),
         }
     }
 
@@ -1898,6 +1782,11 @@ impl Theme {
 
             status_bg: Color::from_hex("#504945"),
             status_fg: Color::from_hex("#ebdbb2"),
+
+            wildmenu_bg: Color::from_hex("#504945"),
+            wildmenu_fg: Color::from_hex("#ebdbb2"),
+            wildmenu_sel_bg: Color::from_hex("#fabd2f"),
+            wildmenu_sel_fg: Color::from_hex("#282828"),
 
             command_bg: Color::from_hex("#282828"),
             command_fg: Color::from_hex("#ebdbb2"),
@@ -1948,14 +1837,20 @@ impl Theme {
             md_code: Color::from_hex("#b8bb26"),
             md_link: Color::from_hex("#83a598"),
 
+            sidebar_sel_bg: Color::from_hex("#3c3836"), // focused
+            sidebar_sel_bg_inactive: Color::from_hex("#32302f"), // unfocused
             semantic_parameter: Color::from_hex("#83a598"), // blue
-            semantic_property: Color::from_hex("#d3869b"),  // purple-pink
+            semantic_property: Color::from_hex("#d3869b"), // purple-pink
             semantic_namespace: Color::from_hex("#fabd2f"), // yellow
             semantic_enum_member: Color::from_hex("#8ec07c"), // aqua
             semantic_interface: Color::from_hex("#fabd2f"), // yellow
             semantic_type_parameter: Color::from_hex("#fabd2f"),
             semantic_decorator: Color::from_hex("#fb4934"), // red
             semantic_macro: Color::from_hex("#8ec07c"),     // aqua
+
+            breadcrumb_bg: Color::from_hex("#32302f"),
+            breadcrumb_fg: Color::from_hex("#a89984"),
+            breadcrumb_active_fg: Color::from_hex("#ebdbb2"),
         }
     }
 
@@ -1994,6 +1889,11 @@ impl Theme {
 
             status_bg: Color::from_hex("#292e42"),
             status_fg: Color::from_hex("#c0caf5"),
+
+            wildmenu_bg: Color::from_hex("#292e42"),
+            wildmenu_fg: Color::from_hex("#c0caf5"),
+            wildmenu_sel_bg: Color::from_hex("#e0af68"),
+            wildmenu_sel_fg: Color::from_hex("#1a1b26"),
 
             command_bg: Color::from_hex("#1a1b26"),
             command_fg: Color::from_hex("#c0caf5"),
@@ -2044,14 +1944,20 @@ impl Theme {
             md_code: Color::from_hex("#9ece6a"),
             md_link: Color::from_hex("#7aa2f7"),
 
+            sidebar_sel_bg: Color::from_hex("#292e42"), // focused
+            sidebar_sel_bg_inactive: Color::from_hex("#1f2335"), // unfocused
             semantic_parameter: Color::from_hex("#e0af68"), // orange-gold
-            semantic_property: Color::from_hex("#73daca"),  // teal
+            semantic_property: Color::from_hex("#73daca"), // teal
             semantic_namespace: Color::from_hex("#2ac3de"), // cyan
             semantic_enum_member: Color::from_hex("#ff9e64"), // orange
             semantic_interface: Color::from_hex("#2ac3de"), // cyan
             semantic_type_parameter: Color::from_hex("#e0af68"),
             semantic_decorator: Color::from_hex("#bb9af7"), // purple
             semantic_macro: Color::from_hex("#2ac3de"),     // cyan
+
+            breadcrumb_bg: Color::from_hex("#1f2335"),
+            breadcrumb_fg: Color::from_hex("#565f89"),
+            breadcrumb_active_fg: Color::from_hex("#c0caf5"),
         }
     }
 
@@ -2090,6 +1996,11 @@ impl Theme {
 
             status_bg: Color::from_hex("#073642"),
             status_fg: Color::from_hex("#93a1a1"),
+
+            wildmenu_bg: Color::from_hex("#073642"),
+            wildmenu_fg: Color::from_hex("#93a1a1"),
+            wildmenu_sel_bg: Color::from_hex("#b58900"),
+            wildmenu_sel_fg: Color::from_hex("#002b36"),
 
             command_bg: Color::from_hex("#002b36"),
             command_fg: Color::from_hex("#839496"),
@@ -2140,14 +2051,20 @@ impl Theme {
             md_code: Color::from_hex("#859900"),
             md_link: Color::from_hex("#268bd2"),
 
+            sidebar_sel_bg: Color::from_hex("#073642"), // focused
+            sidebar_sel_bg_inactive: Color::from_hex("#002b36"), // unfocused (base03)
             semantic_parameter: Color::from_hex("#268bd2"), // blue
-            semantic_property: Color::from_hex("#2aa198"),  // cyan
+            semantic_property: Color::from_hex("#2aa198"), // cyan
             semantic_namespace: Color::from_hex("#b58900"), // yellow
             semantic_enum_member: Color::from_hex("#cb4b16"), // orange
             semantic_interface: Color::from_hex("#b58900"), // yellow
             semantic_type_parameter: Color::from_hex("#b58900"),
             semantic_decorator: Color::from_hex("#6c71c4"), // violet
             semantic_macro: Color::from_hex("#d33682"),     // magenta
+
+            breadcrumb_bg: Color::from_hex("#073642"),
+            breadcrumb_fg: Color::from_hex("#586e75"),
+            breadcrumb_active_fg: Color::from_hex("#93a1a1"),
         }
     }
 
@@ -2157,13 +2074,322 @@ impl Theme {
             "gruvbox" | "gruvbox-dark" => Self::gruvbox_dark(),
             "tokyo-night" | "tokyonight" => Self::tokyo_night(),
             "solarized" | "solarized-dark" => Self::solarized_dark(),
-            _ => Self::onedark(),
+            "onedark" => Self::onedark(),
+            _ => {
+                // Try loading a VSCode theme from ~/.config/vimcode/themes/
+                if let Some(theme) = Self::load_vscode_theme(name) {
+                    theme
+                } else {
+                    Self::onedark()
+                }
+            }
         }
     }
 
     /// Return the list of all built-in theme names.
-    pub fn available_names() -> &'static [&'static str] {
-        &["onedark", "gruvbox-dark", "tokyo-night", "solarized-dark"]
+    pub fn available_names() -> Vec<String> {
+        let mut names: Vec<String> = vec![
+            "onedark".into(),
+            "gruvbox-dark".into(),
+            "tokyo-night".into(),
+            "solarized-dark".into(),
+        ];
+        // Append custom VSCode themes from ~/.config/vimcode/themes/
+        if let Some(dir) = Self::themes_dir() {
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().is_some_and(|e| e == "json") {
+                        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                            names.push(stem.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        names
+    }
+
+    /// The directory where custom VSCode theme JSON files are stored.
+    fn themes_dir() -> Option<std::path::PathBuf> {
+        std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config/vimcode/themes"))
+    }
+
+    /// Try to load a VSCode-format `.json` theme file by name.
+    /// Looks in `~/.config/vimcode/themes/<name>.json`.
+    pub fn load_vscode_theme(name: &str) -> Option<Self> {
+        let dir = Self::themes_dir()?;
+        let path = dir.join(format!("{name}.json"));
+        Self::from_vscode_json(&path)
+    }
+
+    /// Parse a VSCode theme JSON file and map its colours to a `Theme`.
+    /// Falls back to OneDark defaults for any missing keys.
+    pub fn from_vscode_json(path: &std::path::Path) -> Option<Self> {
+        let data = std::fs::read_to_string(path).ok()?;
+        // VSCode themes often have comments — strip them
+        let data = strip_json_comments(&data);
+        let val: serde_json::Value = serde_json::from_str(&data).ok()?;
+        let colors = val.get("colors");
+        let token_colors = val.get("tokenColors");
+
+        // Start from OneDark and override what the theme provides
+        let mut theme = Self::onedark();
+
+        // Helper: get a color from the "colors" object
+        let color = |key: &str| -> Option<Color> {
+            colors?.get(key)?.as_str().and_then(Color::try_from_hex)
+        };
+
+        // ── Editor core ───────────────────────────────────────────────────
+        if let Some(c) = color("editor.background") {
+            theme.background = c;
+            theme.active_background = c.lighten(0.02);
+            theme.command_bg = c;
+        }
+        if let Some(c) = color("editor.foreground") {
+            theme.foreground = c;
+            theme.default_fg = c;
+            theme.command_fg = c;
+        }
+
+        // ── Selection / cursor ────────────────────────────────────────────
+        if let Some(c) = color("editor.selectionBackground") {
+            theme.selection = c;
+        }
+        if let Some(c) = color("editorCursor.foreground") {
+            theme.cursor = c;
+        }
+
+        // ── Search ────────────────────────────────────────────────────────
+        if let Some(c) = color("editor.findMatchBackground") {
+            theme.search_current_match_bg = c;
+        }
+        if let Some(c) = color("editor.findMatchHighlightBackground") {
+            theme.search_match_bg = c;
+        }
+
+        // ── Line numbers ──────────────────────────────────────────────────
+        if let Some(c) = color("editorLineNumber.foreground") {
+            theme.line_number_fg = c;
+        }
+        if let Some(c) = color("editorLineNumber.activeForeground") {
+            theme.line_number_active_fg = c;
+        }
+
+        // ── Tab bar ───────────────────────────────────────────────────────
+        if let Some(c) = color("editorGroupHeader.tabsBackground") {
+            theme.tab_bar_bg = c;
+        }
+        if let Some(c) = color("tab.activeBackground") {
+            theme.tab_active_bg = c;
+        }
+        if let Some(c) = color("tab.activeForeground") {
+            theme.tab_active_fg = c;
+        }
+        if let Some(c) = color("tab.inactiveForeground") {
+            theme.tab_inactive_fg = c;
+            theme.tab_preview_inactive_fg = c.darken(0.3);
+            theme.tab_preview_active_fg = c.lighten(0.2);
+        }
+
+        // ── Status bar ────────────────────────────────────────────────────
+        if let Some(c) = color("statusBar.background") {
+            theme.status_bg = c;
+        }
+        if let Some(c) = color("statusBar.foreground") {
+            theme.status_fg = c;
+        }
+
+        // ── Wildmenu (derive from status bar) ─────────────────────────────
+        if let Some(c) = color("statusBar.background") {
+            theme.wildmenu_bg = c;
+        }
+        if let Some(c) = color("statusBar.foreground") {
+            theme.wildmenu_fg = c;
+        }
+
+        // ── Separator ─────────────────────────────────────────────────────
+        if let Some(c) = color("editorGroup.border") {
+            theme.separator = c;
+        }
+
+        // ── Widgets (completion, hover, fuzzy) ────────────────────────────
+        if let Some(c) = color("editorWidget.background") {
+            theme.completion_bg = c;
+            theme.hover_bg = c;
+            theme.fuzzy_bg = c;
+        }
+        if let Some(c) = color("editorWidget.border") {
+            theme.completion_border = c;
+            theme.hover_border = c;
+            theme.fuzzy_border = c;
+        }
+        if let Some(c) = color("editorSuggestWidget.selectedBackground") {
+            theme.completion_selected_bg = c;
+            theme.fuzzy_selected_bg = c;
+        }
+        if let Some(c) = color("editorWidget.foreground").or_else(|| color("editor.foreground")) {
+            theme.completion_fg = c;
+            theme.hover_fg = c;
+            theme.fuzzy_fg = c;
+        }
+
+        // ── Sidebar ──────────────────────────────────────────────────────
+        if let Some(c) = color("list.activeSelectionBackground") {
+            theme.sidebar_sel_bg = c;
+        }
+        if let Some(c) = color("list.inactiveSelectionBackground") {
+            theme.sidebar_sel_bg_inactive = c;
+        }
+
+        // ── Breadcrumbs ──────────────────────────────────────────────────
+        if let Some(c) = color("breadcrumb.background") {
+            theme.breadcrumb_bg = c;
+        }
+        if let Some(c) = color("breadcrumb.foreground") {
+            theme.breadcrumb_fg = c;
+        }
+        if let Some(c) = color("breadcrumb.focusForeground")
+            .or_else(|| color("breadcrumb.activeSelectionForeground"))
+        {
+            theme.breadcrumb_active_fg = c;
+        }
+
+        // ── Git gutter ────────────────────────────────────────────────────
+        if let Some(c) = color("editorGutter.addedBackground")
+            .or_else(|| color("gitDecoration.addedResourceForeground"))
+        {
+            theme.git_added = c;
+        }
+        if let Some(c) = color("editorGutter.modifiedBackground")
+            .or_else(|| color("gitDecoration.modifiedResourceForeground"))
+        {
+            theme.git_modified = c;
+        }
+
+        // ── Diagnostics ──────────────────────────────────────────────────
+        if let Some(c) = color("editorError.foreground") {
+            theme.diagnostic_error = c;
+        }
+        if let Some(c) = color("editorWarning.foreground") {
+            theme.diagnostic_warning = c;
+        }
+        if let Some(c) = color("editorInfo.foreground") {
+            theme.diagnostic_info = c;
+        }
+        if let Some(c) = color("editorHint.foreground") {
+            theme.diagnostic_hint = c;
+        }
+
+        // ── Diff ─────────────────────────────────────────────────────────
+        if let Some(c) = color("diffEditor.insertedTextBackground") {
+            theme.diff_added_bg = c;
+        }
+        if let Some(c) = color("diffEditor.removedTextBackground") {
+            theme.diff_removed_bg = c;
+        }
+
+        // ── Annotations / ghost text ─────────────────────────────────────
+        if let Some(c) = color("editorGhostText.foreground") {
+            theme.ghost_text_fg = c;
+        }
+
+        // ── Token colours (syntax highlighting) ──────────────────────────
+        if let Some(tc) = token_colors.and_then(|v| v.as_array()) {
+            for entry in tc {
+                let settings = match entry.get("settings") {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let fg = settings
+                    .get("foreground")
+                    .and_then(|v| v.as_str())
+                    .and_then(Color::try_from_hex);
+                let fg = match fg {
+                    Some(c) => c,
+                    None => continue,
+                };
+                let scopes = match entry.get("scope") {
+                    Some(serde_json::Value::String(s)) => {
+                        s.split(',').map(|s| s.trim()).collect::<Vec<_>>()
+                    }
+                    Some(serde_json::Value::Array(arr)) => {
+                        arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>()
+                    }
+                    _ => continue,
+                };
+                for scope in &scopes {
+                    match *scope {
+                        "keyword" | "keyword.control" | "keyword.operator" | "storage"
+                        | "storage.type" | "storage.modifier" => {
+                            theme.keyword = fg;
+                        }
+                        "string"
+                        | "string.quoted"
+                        | "string.quoted.double"
+                        | "string.quoted.single" => {
+                            theme.string_lit = fg;
+                        }
+                        "comment" | "comment.line" | "comment.block" => {
+                            theme.comment = fg;
+                            theme.annotation_fg = fg;
+                        }
+                        "entity.name.function" | "support.function" | "meta.function-call" => {
+                            theme.function = fg;
+                        }
+                        "entity.name.type"
+                        | "support.type"
+                        | "support.class"
+                        | "entity.name.class"
+                        | "entity.name.type.class" => {
+                            theme.type_name = fg;
+                            theme.semantic_namespace = fg;
+                            theme.semantic_interface = fg;
+                            theme.semantic_type_parameter = fg;
+                        }
+                        "variable" | "variable.other" | "variable.language" => {
+                            theme.variable = fg;
+                        }
+                        "constant.numeric"
+                        | "constant.numeric.integer"
+                        | "constant.numeric.float" => {
+                            theme.number = fg;
+                        }
+                        "entity.name.tag" => {
+                            theme.semantic_decorator = fg;
+                        }
+                        "variable.parameter" | "variable.parameter.function" => {
+                            theme.semantic_parameter = fg;
+                        }
+                        "variable.other.property" | "support.type.property-name" => {
+                            theme.semantic_property = fg;
+                        }
+                        "variable.other.enummember" | "constant.other.enum" => {
+                            theme.semantic_enum_member = fg;
+                        }
+                        "entity.name.function.macro" | "support.function.macro" => {
+                            theme.semantic_macro = fg;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // ── Derive remaining colours from the base palette ───────────────
+        // Fuzzy finder query/title inherit from syntax colours if not set
+        theme.fuzzy_query_fg = theme.function;
+        theme.fuzzy_title_fg = theme.type_name;
+
+        // Markdown headings from syntax palette
+        theme.md_heading1 = theme.type_name;
+        theme.md_heading2 = theme.function;
+        theme.md_heading3 = theme.keyword;
+        theme.md_code = theme.string_lit;
+        theme.md_link = theme.function;
+
+        Some(theme)
     }
 
     /// Return the foreground colour for a Tree-sitter scope name.
@@ -2267,6 +2493,25 @@ pub fn build_screen_layout(
 
     let (status_left, status_right) = build_status_line(engine);
     let command = build_command_line(engine);
+
+    let wildmenu = if engine.wildmenu_items.is_empty() {
+        None
+    } else {
+        // For argument completions (e.g. "set wrap"), display only the last word
+        let display_items: Vec<String> = engine
+            .wildmenu_items
+            .iter()
+            .map(|item| {
+                item.rsplit_once(' ')
+                    .map(|(_, arg)| arg.to_string())
+                    .unwrap_or_else(|| item.clone())
+            })
+            .collect();
+        Some(WildmenuData {
+            items: display_items,
+            selected: engine.wildmenu_selected,
+        })
+    };
 
     let completion = engine.completion_idx.map(|idx| {
         let max_width = engine
@@ -2671,6 +2916,11 @@ pub fn build_screen_layout(
         }
     });
 
+    let tab_switcher = engine.tab_switcher_open.then(|| TabSwitcherPanel {
+        items: engine.tab_switcher_items(),
+        selected_idx: engine.tab_switcher_selected,
+    });
+
     let n = engine.group_layout.leaf_count();
     let editor_group_split = if n >= 2 {
         // Build group rects using a dummy content_bounds — backends will compute
@@ -2745,12 +2995,50 @@ pub fn build_screen_layout(
     let ext_sidebar = build_ext_sidebar_data(engine);
     let ai_panel = build_ai_panel_data(engine);
 
+    // Build breadcrumbs for each editor group
+    let breadcrumbs = if engine.settings.breadcrumbs {
+        let group_ids = engine.group_layout.group_ids();
+        group_ids
+            .iter()
+            .map(|&gid| {
+                let segments = build_breadcrumbs_for_group(engine, gid);
+                // Compute bounds from the group's windows
+                let mut min_x = f64::MAX;
+                let mut min_y = f64::MAX;
+                let mut max_x = f64::MIN;
+                if let Some(group) = engine.editor_groups.get(&gid) {
+                    for wr in window_rects {
+                        if group.active_tab().layout.window_ids().contains(&wr.0) {
+                            min_x = min_x.min(wr.1.x);
+                            min_y = min_y.min(wr.1.y);
+                            max_x = max_x.max(wr.1.x + wr.1.width);
+                        }
+                    }
+                }
+                if min_x == f64::MAX {
+                    min_x = 0.0;
+                    min_y = 0.0;
+                    max_x = 0.0;
+                }
+                let bounds = WindowRect::new(min_x, min_y, max_x - min_x, line_height);
+                BreadcrumbBar {
+                    group_id: gid,
+                    segments,
+                    bounds,
+                }
+            })
+            .collect()
+    } else {
+        vec![]
+    };
+
     ScreenLayout {
         tab_bar,
         windows,
         status_left,
         status_right,
         command,
+        wildmenu,
         active_window_id,
         completion,
         hover,
@@ -2764,9 +3052,11 @@ pub fn build_screen_layout(
         debug_sidebar,
         source_control,
         command_palette,
+        tab_switcher,
         editor_group_split,
         ext_sidebar,
         ai_panel,
+        breadcrumbs,
     }
 }
 
@@ -3232,6 +3522,65 @@ fn build_terminal_panel(engine: &Engine) -> Option<TerminalPanel> {
         split_left_cols: 0,
         split_focus: 0,
     })
+}
+
+/// Build breadcrumb segments for a single editor group.
+fn build_breadcrumbs_for_group(engine: &Engine, group_id: GroupId) -> Vec<BreadcrumbSegment> {
+    let group = match engine.editor_groups.get(&group_id) {
+        Some(g) => g,
+        None => return vec![],
+    };
+    let window_id = group.tabs[group.active_tab].active_window;
+    let window = match engine.windows.get(&window_id) {
+        Some(w) => w,
+        None => return vec![],
+    };
+    let buf_state = match engine.buffer_manager.get(window.buffer_id) {
+        Some(s) => s,
+        None => return vec![],
+    };
+
+    let mut segments = Vec::new();
+
+    // Path segments (relative to cwd)
+    if let Some(ref file_path) = buf_state.file_path {
+        let display = if let Ok(rel) = file_path.strip_prefix(&engine.cwd) {
+            rel.to_string_lossy().to_string()
+        } else {
+            file_path.to_string_lossy().to_string()
+        };
+        let parts: Vec<&str> = display.split(std::path::MAIN_SEPARATOR).collect();
+        for part in &parts {
+            segments.push(BreadcrumbSegment {
+                label: part.to_string(),
+                is_last: false,
+                is_symbol: false,
+            });
+        }
+    }
+
+    // Symbol segments from tree-sitter
+    {
+        let cursor = &window.view.cursor;
+        let text = buf_state.buffer.to_string();
+        let scopes = buf_state
+            .syntax
+            .enclosing_scopes(&text, cursor.line, cursor.col);
+        for scope in scopes {
+            segments.push(BreadcrumbSegment {
+                label: scope.name,
+                is_last: false,
+                is_symbol: true,
+            });
+        }
+    }
+
+    // Mark the last segment
+    if let Some(last) = segments.last_mut() {
+        last.is_last = true;
+    }
+
+    segments
 }
 
 // ─── Private builder helpers ──────────────────────────────────────────────────
@@ -4378,5 +4727,107 @@ fn build_command_line(engine: &Engine) -> CommandLineData {
         right_align,
         show_cursor,
         cursor_anchor_text,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_try_from_hex() {
+        assert_eq!(
+            Color::try_from_hex("#ff0000"),
+            Some(Color::from_rgb(255, 0, 0))
+        );
+        assert_eq!(
+            Color::try_from_hex("00ff00"),
+            Some(Color::from_rgb(0, 255, 0))
+        );
+        assert_eq!(
+            Color::try_from_hex("#abc"),
+            Some(Color::from_rgb(0xaa, 0xbb, 0xcc))
+        );
+        // 8-digit hex (alpha discarded)
+        assert_eq!(
+            Color::try_from_hex("#ff000080"),
+            Some(Color::from_rgb(255, 0, 0))
+        );
+        assert_eq!(Color::try_from_hex("xyz"), None);
+        assert_eq!(Color::try_from_hex(""), None);
+    }
+
+    #[test]
+    fn test_strip_json_comments() {
+        let input = r#"{
+  // line comment
+  "key": "value", /* block */
+  "str": "has // no comment"
+}"#;
+        let stripped = strip_json_comments(input);
+        let val: serde_json::Value = serde_json::from_str(&stripped).unwrap();
+        assert_eq!(val["key"], "value");
+        assert_eq!(val["str"], "has // no comment");
+    }
+
+    #[test]
+    fn test_lighten_darken() {
+        let c = Color::from_rgb(100, 100, 100);
+        let lighter = c.lighten(0.5);
+        assert!(lighter.r > 100 && lighter.r < 255);
+        let darker = c.darken(0.5);
+        assert!(darker.r < 100 && darker.r > 0);
+        // Extremes
+        assert_eq!(c.lighten(1.0), Color::from_rgb(255, 255, 255));
+        assert_eq!(c.darken(1.0), Color::from_rgb(0, 0, 0));
+    }
+
+    #[test]
+    fn test_from_vscode_json() {
+        let dir = std::env::temp_dir().join("vimcode_test_theme");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test-theme.json");
+        std::fs::write(
+            &path,
+            r##"{
+            // Test VSCode theme
+            "name": "Test Theme",
+            "colors": {
+                "editor.background": "#1e1e2e",
+                "editor.foreground": "#cdd6f4",
+                "editorCursor.foreground": "#f5e0dc",
+                "editor.selectionBackground": "#585b7066",
+                "editorLineNumber.foreground": "#6c7086",
+                "statusBar.background": "#181825",
+                "statusBar.foreground": "#cdd6f4"
+            },
+            "tokenColors": [
+                {
+                    "scope": ["keyword", "keyword.control"],
+                    "settings": { "foreground": "#cba6f7" }
+                },
+                {
+                    "scope": "string",
+                    "settings": { "foreground": "#a6e3a1" }
+                },
+                {
+                    "scope": "comment",
+                    "settings": { "foreground": "#6c7086" }
+                }
+            ]
+        }"##,
+        )
+        .unwrap();
+
+        let theme = Theme::from_vscode_json(&path).unwrap();
+        assert_eq!(theme.background, Color::try_from_hex("#1e1e2e").unwrap());
+        assert_eq!(theme.foreground, Color::try_from_hex("#cdd6f4").unwrap());
+        assert_eq!(theme.cursor, Color::try_from_hex("#f5e0dc").unwrap());
+        assert_eq!(theme.keyword, Color::try_from_hex("#cba6f7").unwrap());
+        assert_eq!(theme.string_lit, Color::try_from_hex("#a6e3a1").unwrap());
+        assert_eq!(theme.comment, Color::try_from_hex("#6c7086").unwrap());
+        assert_eq!(theme.status_bg, Color::try_from_hex("#181825").unwrap());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -5,6 +5,17 @@
 ---
 
 ## Recently Completed
+- **Session 155**: Core Commentary Feature — unified comment toggling into `src/core/comment.rs` (46+ language table, two-pass algorithm, override chain), `:Comment`/`:Commentary` commands, `vimcode.set_comment_style()` plugin API, Ctrl+/ fix for GTK+TUI, VSCode Ctrl+Q/F10, 19+31 tests
+- **Session 154**: Keymaps editor in settings panel — `BufferEditor` setting type, scratch buffer with validation, `:Keymaps` command, GTK button + TUI display, 11 tests
+- **Session 153**: Richer Lua Plugin API + VimCode Commentary + User Keymaps — Extended plugin API (cursor write, settings access, state queries, buffer insert/delete, register write, 7 new autocmd events, `set_mode()` refactor, visual/command keymap fallbacks); VimCode Commentary bundled extension (gcc/gc/`:Commentary`, 40+ language comment strings, undo support); plugin `set_lines` undo fix; user-configurable keymaps in settings.json (`"mode keys :command"` format, multi-key sequences, override built-in keys, `{count}` substitution); 22 + 17 + 13 = 52 new tests (2801 total)
+- **Session 152**: Visual paste — `p`/`P` in visual mode replaces selection with register content; `"x` register selection in visual mode; `Ctrl+Shift+V` clipboard paste in Normal/Visual (TUI+GTK); TUI tab bar fix (breadcrumbs y-offset); multi-group `Ctrl-W h/l` navigates between groups before overflowing to sidebar; pre-existing test fix (`swap_scan_stale`); 8 tests
+- **Session 151**: Tab drag-to-split — VSCode-style drag tab to edge for new split, drag to center to move between groups, drag within tab bar to reorder; `DropZone`/`TabDragState` core types, 7 engine methods, GTK overlay rendering; tab bar draw order fix (windows before tab bars, dividers before tab bars); new `vim-code.svg` gradient logo, removed old icon files; 15 tests
+- **Session 150**: Tab switcher polish — Alt+t binding (TUI+GTK), modifier-release auto-confirm (GTK polling + TUI timeout), sans-serif UI font for tabs/popup, tab click fix (breadcrumbs y-offset, Pango-measured hit zones, deferred tree highlight)
+- **Session 149**: Ctrl+Tab MRU tab switcher (VSCode-style popup, forward/backward cycling, Enter confirms, Escape cancels) + `autohide_panels` TUI setting (auto-hide sidebar/activity bar, Ctrl-W h reveals)
+- **Session 148**: Netrw in-buffer file browser — `:Explore`/`:Sexplore`/`:Vexplore` (and `:Ex`/`:Sex`/`:Vex` aliases), Enter opens files/dirs, `-` navigates to parent, header shows current dir, respects `show_hidden_files`, 16 tests
+- **Session 147**: TUI interactive settings panel — replaced read-only list with full interactive form (filterable categories, bool toggles, enum cycling, inline string/int editing, Ctrl+V paste, DynamicEnum for colorscheme with custom themes), 10 tests
+- **Session 146**: Breadcrumbs bar — file path + tree-sitter symbol hierarchy below tab bar, 10-language scope walking, `breadcrumbs` setting, per-group bars, GTK+TUI rendering, 14 tests
+- **Session 145**: VSCode theme loader (drop `.json` in `~/.config/vimcode/themes/`, `:colorscheme name`), TUI crash fix (`byte_to_char_idx` multi-byte UTF-8 panic), swap recovery R/D/A fix for TUI, sidebar keyboard nav (`Ctrl-W h/l` toolbar↔sidebar↔editor), editor click clears sidebar focus, 4 theme tests
 - **Session 143**: Bug fixes — `:q` dirty guard allows close when buffer visible in another split, `autoread` setting + file auto-reload detection (2s poll in GTK+TUI), `:new`/`:split` respect `splitbelow`/`splitright`, `:e!` reload from disk, 9 integration tests
 - **Session 142**: Vim compat batch 3 — 15 new commands (94% → 97%), g?{motion} ROT13, CTRL-@, CTRL-V {char}, CTRL-O auto-return, !{motion}{filter}, CTRL-W H/J/K/L/T/x, visual block I/A, o_v/o_V force motion, 29 integration tests
 - **Session 141**: Vim compat batch 2 — 27 new commands (85% → 94%), gq/gw format operators, ga/g8/go/gm/gM/gI/gx/g'/g`/g&, CTRL-^, CTRL-L, N%, zs/ze, CTRL-W p/t/b/f/d, insert CTRL-A/CTRL-G u/j/k, visual gq/g CTRL-A/g CTRL-X, :make, :b {name}, 38 integration tests
@@ -37,7 +48,7 @@
 - [x] **`:norm`** — execute normal command on a range of lines
 - [x] **Fuzzy finder / Telescope-style** — Ctrl-P opens centered file-picker modal with subsequence scoring (session 53)
 - [x] **Multiple cursors** — `Alt-D` (configurable) adds cursor at next match of word under cursor; all cursors receive identical keystrokes; Escape collapses to one
-- [x] **Themes / plugin system** — named color themes selectable via `:colorscheme`; 4 built-in themes: onedark (default), gruvbox-dark, tokyo-night, solarized-dark (session 116)
+- [x] **Themes / plugin system** — named color themes selectable via `:colorscheme`; 4 built-in themes + VSCode `.json` theme import from `~/.config/vimcode/themes/` (sessions 116, 145)
 - [x] **LSP semantic tokens** — `textDocument/semanticTokens/full` overlay on tree-sitter; 8 semantic theme colors; binary-search span overlay; legend caching (sessions 131–132)
 
 ### Enhanced Editor
@@ -58,10 +69,11 @@
 - [x] **VSCode-style menus** — application menu bar (File / Edit / View / Go / Run / Terminal / Help) in GTK; command palette (`Ctrl-Shift-P`) lists all commands + key bindings; fuzzy-searchable; both GTK native menus and TUI pop-up menu overlay (sessions 81–82, 100–101)
 - [x] **Command palette** — `Ctrl-Shift-P` floating modal; lists named commands with descriptions and current keybindings; typing filters; Enter executes; shared GTK + TUI (session 101)
 - [x] **Settings editor** — `:Settings` opens `settings.json` in an editor tab; Settings sidebar panel shows live values; auto-reload on save in both backends (session 117)
-- [x] **Settings sidebar (GTK)** — native GTK form with 30 settings in 7 categories, search, Adwaita dark theme (session 117b/117c)
+- [x] **Settings sidebar (GTK + TUI)** — interactive form with 32 settings in 8 categories, search, live controls; GTK native widgets (session 117b/117c), TUI interactive form with keyboard nav + inline editing (session 147)
 
 ### Extension System
 - [x] **Extension mechanism** — Lua 5.4 plugin sandbox; plugins register commands/keymaps/hooks, read/write buffer text, show messages; `~/.config/vimcode/plugins/` auto-loaded; bundled language-pack extensions + GitHub registry; `:ExtInstall/:ExtList/:ExtEnable/:ExtDisable/:ExtRemove` (sessions 98, 113–114)
+- [x] **Keymap editor in settings panel** — "User Keymaps" row in the Settings sidebar opens a scratch buffer (one keymap per line, format `mode keys :command`). `:w` validates, updates `settings.keymaps`, calls `rebuild_user_keymaps()`. Also accessible via `:Keymaps` command. Tab shows `[Keymaps]`. GTK button + TUI "N defined ▸". 11 tests. (session 154)
 
 ### AI Integration
 - [x] **AI assistant panel** — sidebar chat panel; configurable provider (Anthropic Claude, OpenAI, Ollama local); `ai_provider`/`ai_api_key`/`ai_model`/`ai_base_url` in settings; activity bar chat icon opens panel; multi-turn conversation; `:AI <msg>` and `:AiClear` commands (session 118)

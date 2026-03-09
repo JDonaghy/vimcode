@@ -1,0 +1,7 @@
+name = "commentary"
+display_name = "VimCode Commentary"
+description = "Toggle line comments with gcc (normal) and gc (visual). Inspired by tpope's vim-commentary."
+version = "1.0.0"
+file_extensions = []
+language_ids = []
+scripts = ["commentary.lua"]

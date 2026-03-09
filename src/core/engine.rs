@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use super::ai::AiMessage;
 use super::buffer::{Buffer, BufferId};
 use super::buffer_manager::{BufferManager, BufferState, UndoEntry};
+use super::comment;
 use super::dap::{BreakpointInfo, DapEvent, DapVariable, StackFrame};
 use super::dap_manager::{
     generate_launch_json, parse_launch_json, parse_tasks_json, task_to_shell_command,
@@ -25,7 +26,8 @@ use super::tab::{Tab, TabId};
 use super::terminal::{default_shell, TerminalPane};
 use super::view::View;
 use super::window::{
-    GroupDivider, GroupId, GroupLayout, SplitDirection, Window, WindowId, WindowLayout, WindowRect,
+    DropZone, GroupDivider, GroupId, GroupLayout, SplitDirection, Window, WindowId, WindowLayout,
+    WindowRect,
 };
 use std::borrow::Cow;
 
@@ -666,6 +668,14 @@ pub enum BottomPanelKind {
     DebugOutput,
 }
 
+/// State of an in-progress tab drag operation.
+#[derive(Debug, Clone)]
+pub struct TabDragState {
+    pub source_group: GroupId,
+    pub source_tab_index: usize,
+    pub tab_name: String,
+}
+
 /// One panel in a VSCode-style editor-group split.
 /// Each group owns its own tab bar and independent tab navigation.
 /// Single-group mode (the default) is identical to the previous behaviour.
@@ -692,6 +702,130 @@ impl EditorGroup {
     }
 }
 
+// ─── User keymaps ────────────────────────────────────────────────────────────
+
+/// A parsed user-defined key mapping from settings.json.
+#[derive(Debug, Clone)]
+pub struct UserKeymap {
+    /// Mode: "n", "v", "i", "c".
+    pub mode: String,
+    /// Parsed key sequence, e.g. `["g", "c", "c"]` or `["<C-/>"]`.
+    pub keys: Vec<String>,
+    /// The ex command to run (without leading `:`), e.g. `"Commentary"`.
+    pub action: String,
+}
+
+/// Parse a key notation string into individual key specs.
+/// `"gcc"` → `["g", "c", "c"]`; `"<C-/>x"` → `["<C-/>", "x"]`.
+fn parse_key_sequence(s: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '<' {
+            // Find matching '>'
+            if let Some(end) = chars[i..].iter().position(|&c| c == '>') {
+                let token: String = chars[i..=i + end].iter().collect();
+                keys.push(token);
+                i += end + 1;
+            } else {
+                keys.push(chars[i].to_string());
+                i += 1;
+            }
+        } else {
+            keys.push(chars[i].to_string());
+            i += 1;
+        }
+    }
+    keys
+}
+
+/// Parse a keymap definition string: `"n gcc :Commentary"` → `UserKeymap`.
+fn parse_keymap_def(s: &str) -> Option<UserKeymap> {
+    let s = s.trim();
+    // Split: mode (first char or token), keys, :action
+    let mut parts = s.splitn(3, ' ');
+    let mode = parts.next()?.to_string();
+    if !matches!(mode.as_str(), "n" | "v" | "i" | "c") {
+        return None;
+    }
+    let keys_str = parts.next()?;
+    let action_str = parts.next()?.trim();
+    if !action_str.starts_with(':') {
+        return None;
+    }
+    let action = action_str[1..].to_string();
+    if action.is_empty() {
+        return None;
+    }
+    let keys = parse_key_sequence(keys_str);
+    if keys.is_empty() {
+        return None;
+    }
+    Some(UserKeymap { mode, keys, action })
+}
+
+/// Encode a keypress into the canonical string used for keymap matching.
+/// Must produce the same format as `parse_key_sequence` output.
+fn encode_keypress(key_name: &str, unicode: Option<char>, ctrl: bool) -> String {
+    if ctrl {
+        // Ctrl combinations: <C-x>
+        let base = if let Some(ch) = unicode {
+            ch.to_lowercase().to_string()
+        } else {
+            // Special keys with Ctrl: <C-Space>, <C-Tab>, etc.
+            match key_name {
+                "space" | "Space" => "Space".to_string(),
+                "Tab" => "Tab".to_string(),
+                _ => key_name.to_lowercase(),
+            }
+        };
+        format!("<C-{base}>")
+    } else if let Some(ch) = unicode {
+        ch.to_string()
+    } else {
+        // Special keys: <Escape>, <Return>, <Space>, etc.
+        match key_name {
+            "Escape" => "<Escape>".to_string(),
+            "Return" => "<Return>".to_string(),
+            "BackSpace" => "<BS>".to_string(),
+            "space" | "Space" => "<Space>".to_string(),
+            "Tab" => "<Tab>".to_string(),
+            other => format!("<{other}>"),
+        }
+    }
+}
+
+/// Decode an encoded keypress string back into (key_name, unicode, ctrl).
+fn decode_keypress(encoded: &str) -> (String, Option<char>, bool) {
+    if encoded.starts_with("<C-") && encoded.ends_with('>') {
+        let inner = &encoded[3..encoded.len() - 1];
+        match inner {
+            "Space" => ("space".to_string(), Some(' '), true),
+            "Tab" => ("Tab".to_string(), None, true),
+            s => {
+                let ch = s.chars().next();
+                let key = ch.map(|c| c.to_string()).unwrap_or_default();
+                (key.clone(), ch, true)
+            }
+        }
+    } else if encoded.starts_with('<') && encoded.ends_with('>') {
+        let inner = &encoded[1..encoded.len() - 1];
+        match inner {
+            "Escape" => ("Escape".to_string(), None, false),
+            "Return" => ("Return".to_string(), None, false),
+            "BS" => ("BackSpace".to_string(), None, false),
+            "Space" => ("space".to_string(), Some(' '), false),
+            "Tab" => ("Tab".to_string(), None, false),
+            other => (other.to_string(), None, false),
+        }
+    } else {
+        let ch = encoded.chars().next();
+        let key = ch.map(|c| c.to_string()).unwrap_or_default();
+        (key, ch, false)
+    }
+}
+
 pub struct Engine {
     // --- Multi-buffer/window state ---
     pub buffer_manager: BufferManager,
@@ -708,6 +842,12 @@ pub struct Engine {
     next_group_id: usize,
     next_window_id: usize,
     next_tab_id: usize,
+    /// Active tab drag-and-drop operation (set by UI on drag start).
+    pub tab_drag: Option<TabDragState>,
+    /// Current mouse position during a tab drag (for rendering ghost/overlay).
+    pub tab_drag_mouse: Option<(f64, f64)>,
+    /// Computed drop zone for the current tab drag (updated each frame).
+    pub tab_drop_zone: DropZone,
 
     // --- Preview mode ---
     /// The buffer currently in preview mode (at most one at a time).
@@ -719,6 +859,12 @@ pub struct Engine {
     pub command_buffer: String,
     /// Cursor position within `command_buffer` (char index, 0 = before first char).
     pub command_cursor: usize,
+    /// Wildmenu (command-line Tab completion) state.
+    pub wildmenu_items: Vec<String>,
+    /// Currently selected wildmenu item index, or `None` for common-prefix state.
+    pub wildmenu_selected: Option<usize>,
+    /// Original command buffer before wildmenu was opened (for cycling back).
+    pub wildmenu_original: String,
     /// Status message shown in the command line area (e.g. "written", errors).
     pub message: String,
     /// Current search query (from last `/` or `?` search).
@@ -742,6 +888,16 @@ pub struct Engine {
 
     /// Pending key for multi-key sequences (e.g. 'g' for gg, 'd' for dd).
     pub pending_key: Option<char>,
+    /// Parsed user keymaps from settings (rebuilt on settings change).
+    pub user_keymaps: Vec<UserKeymap>,
+    /// Accumulated keypress buffer for multi-key user keymap matching.
+    pub keymap_buf: Vec<String>,
+    /// Guard: true while replaying buffered keys through handle_key.
+    pub keymap_replaying: bool,
+    /// Set by `focus_window_direction` when navigation overflows the window list.
+    /// `Some(false)` = tried to go left past first window, `Some(true)` = right past last.
+    /// Consumed by the UI backend to move focus to sidebar/toolbar.
+    pub window_nav_overflow: Option<bool>,
 
     // --- Registers (yank/delete storage) ---
     /// Named registers: 'a'-'z' plus '"' (unnamed default). Value is (content, is_linewise).
@@ -972,10 +1128,24 @@ pub struct Engine {
     /// Manages loaded Lua plugins. `None` if no plugins dir or plugins disabled.
     pub plugin_manager: Option<plugin::PluginManager>,
 
+    // --- Comment toggling ---
+    /// Runtime overrides for comment styles, keyed by LSP language ID.
+    /// Populated from extension manifests and `vimcode.set_comment_style()` Lua API.
+    pub comment_overrides: HashMap<String, comment::CommentStyleOwned>,
+
     // --- Fuzzy file finder ---
     /// Project root directory for the fuzzy finder.
     pub cwd: PathBuf,
     /// Whether the fuzzy finder modal is open.
+    // --- Tab switcher (Alt+Tab MRU popup) ---
+    /// Whether the tab switcher popup is open.
+    pub tab_switcher_open: bool,
+    /// Index of the currently highlighted item in the MRU list.
+    pub tab_switcher_selected: usize,
+    /// MRU-ordered list of (group_id, tab_index) pairs.
+    /// Most recently used is at index 0.
+    pub tab_mru: Vec<(GroupId, usize)>,
+
     pub fuzzy_open: bool,
     /// Current query typed in the fuzzy finder.
     pub fuzzy_query: String,
@@ -1172,6 +1342,8 @@ pub struct Engine {
     pub last_jump_pos: Option<(usize, usize)>,
     /// Position of last buffer edit (for '. and `. marks).
     pub last_edit_pos: Option<(usize, usize)>,
+    /// Position where cursor was when last leaving Insert mode (for `gi`).
+    pub last_insert_pos: Option<(usize, usize)>,
     /// Start of last visual selection (for '< and `< marks).
     pub visual_mark_start: Option<(usize, usize)>,
     /// End of last visual selection (for '> and `> marks).
@@ -1253,6 +1425,24 @@ pub struct Engine {
     pub ext_sidebar_sections_expanded: [bool; 2],
     /// Whether the sidebar search input field is active.
     pub ext_sidebar_input_active: bool,
+
+    // --- Settings sidebar panel state ---
+    /// Whether the Settings sidebar panel has keyboard focus.
+    pub settings_has_focus: bool,
+    /// Flat selection index into visible settings rows.
+    pub settings_selected: usize,
+    /// Scroll offset for the settings panel content.
+    pub settings_scroll_top: usize,
+    /// Search/filter query typed in the settings panel.
+    pub settings_query: String,
+    /// Whether the search input is active (user typing a filter).
+    pub settings_input_active: bool,
+    /// Index into SETTING_DEFS being edited inline (for string/int fields).
+    pub settings_editing: Option<usize>,
+    /// Buffer for inline string/int editing.
+    pub settings_edit_buf: String,
+    /// Per-category collapsed state.
+    pub settings_collapsed: Vec<bool>,
 
     // --- Virtual text / line annotations ---
     /// Inline annotation text indexed by 0-based buffer line number.
@@ -1342,10 +1532,16 @@ impl Engine {
             next_group_id: 1,
             next_window_id: 2,
             next_tab_id: 2,
+            tab_drag: None,
+            tab_drag_mouse: None,
+            tab_drop_zone: DropZone::None,
             preview_buffer_id: None,
             mode: Mode::Normal,
             command_buffer: String::new(),
             command_cursor: 0,
+            wildmenu_items: Vec::new(),
+            wildmenu_selected: None,
+            wildmenu_original: String::new(),
             message: String::new(),
             search_query: String::new(),
             search_matches: Vec::new(),
@@ -1355,6 +1551,10 @@ impl Engine {
             replace_text: String::new(),
             replace_flags: String::new(),
             pending_key: None,
+            user_keymaps: Vec::new(),
+            keymap_buf: Vec::new(),
+            keymap_replaying: false,
+            window_nav_overflow: None,
             registers: HashMap::new(),
             selected_register: None,
             marks: HashMap::new(),
@@ -1444,7 +1644,11 @@ impl Engine {
             sc_commit_input_active: false,
             sc_button_focused: None,
             plugin_manager: None,
+            comment_overrides: HashMap::new(),
             cwd,
+            tab_switcher_open: false,
+            tab_switcher_selected: 0,
+            tab_mru: vec![(GroupId(0), 0)],
             fuzzy_open: false,
             fuzzy_query: String::new(),
             fuzzy_all_files: Vec::new(),
@@ -1520,6 +1724,7 @@ impl Engine {
             dap_deferred_lang: None,
             last_jump_pos: None,
             last_edit_pos: None,
+            last_insert_pos: None,
             visual_mark_start: None,
             visual_mark_end: None,
             global_marks: HashMap::new(),
@@ -1549,6 +1754,14 @@ impl Engine {
             ext_sidebar_query: String::new(),
             ext_sidebar_sections_expanded: [true, true],
             ext_sidebar_input_active: false,
+            settings_has_focus: false,
+            settings_selected: 0,
+            settings_scroll_top: 0,
+            settings_query: String::new(),
+            settings_input_active: false,
+            settings_editing: None,
+            settings_edit_buf: String::new(),
+            settings_collapsed: vec![false; super::settings::setting_categories().len()],
             line_annotations: HashMap::new(),
             async_shell_tasks: HashMap::new(),
             ai_ghost_text: None,
@@ -1570,10 +1783,12 @@ impl Engine {
             swap_last_write: std::time::Instant::now(),
             swap_recovery: None,
         };
-        // If vscode mode is configured, start in Insert mode (no Normal mode)
+        // If vscode mode is configured, start in Insert mode with menu visible
         if engine.is_vscode_mode() {
             engine.mode = Mode::Insert;
+            engine.menu_bar_visible = true;
         }
+        engine.rebuild_user_keymaps();
         engine
     }
 
@@ -1961,6 +2176,11 @@ impl Engine {
 
     /// Save the active buffer to its file.
     pub fn save(&mut self) -> Result<(), String> {
+        // Keymaps scratch buffer: save content back to settings instead of disk
+        if self.active_buffer_state().is_keymaps_buf {
+            return self.save_keymaps_buffer();
+        }
+
         // Promote preview on save
         let active_id = self.active_buffer_id();
         if self.preview_buffer_id == Some(active_id) {
@@ -1980,6 +2200,7 @@ impl Engine {
                     self.swap_write_needed.remove(&id);
                     let path_str = path.to_string_lossy().into_owned();
                     self.plugin_event("save", &path_str);
+                    self.plugin_event("BufWrite", &path_str);
                     Ok(())
                 }
                 Err(e) => {
@@ -2226,6 +2447,174 @@ impl Engine {
                 state.md_rendered = Some(rendered.clone());
             }
         }
+    }
+
+    // =========================================================================
+    // Netrw — in-buffer directory browser
+    // =========================================================================
+
+    /// Build a directory listing string for netrw.
+    fn netrw_build_listing(dir: &Path, show_hidden: bool) -> String {
+        let mut lines = Vec::new();
+        lines.push(format!("\" {}/", dir.display()));
+        lines.push("../".to_string());
+
+        let entries = match std::fs::read_dir(dir) {
+            Ok(rd) => rd,
+            Err(e) => {
+                lines.push(format!("Error reading directory: {}", e));
+                return lines.join("\n") + "\n";
+            }
+        };
+
+        let mut dirs = Vec::new();
+        let mut files = Vec::new();
+
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !show_hidden && name.starts_with('.') {
+                continue;
+            }
+            if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                dirs.push(format!("{}/", name));
+            } else {
+                files.push(name);
+            }
+        }
+
+        dirs.sort();
+        files.sort();
+
+        for d in dirs {
+            lines.push(d);
+        }
+        for f in files {
+            lines.push(f);
+        }
+
+        lines.join("\n") + "\n"
+    }
+
+    /// Open a netrw directory listing. Optionally split first.
+    fn cmd_explore(&mut self, arg: Option<&str>, split: Option<SplitDirection>) -> EngineAction {
+        // Resolve target directory
+        let dir = if let Some(a) = arg {
+            let p = Path::new(a);
+            if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                self.cwd.join(p)
+            }
+        } else if let Some(fp) = self.file_path().map(|p| p.to_path_buf()) {
+            fp.parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| self.cwd.clone())
+        } else {
+            self.cwd.clone()
+        };
+
+        if !dir.is_dir() {
+            self.message = format!("Not a directory: {}", dir.display());
+            return EngineAction::Error;
+        }
+
+        // Split first if requested
+        if let Some(direction) = split {
+            self.split_window(direction, None);
+        }
+
+        // Create netrw buffer
+        let listing = Self::netrw_build_listing(&dir, self.settings.show_hidden_files);
+        let buf_id = self.buffer_manager.create();
+        if let Some(state) = self.buffer_manager.get_mut(buf_id) {
+            state.buffer.content = ropey::Rope::from_str(&listing);
+            state.read_only = true;
+            state.netrw_dir = Some(dir);
+        }
+
+        // Point active window at the netrw buffer
+        self.active_window_mut().buffer_id = buf_id;
+        self.view_mut().cursor.line = 1; // skip header, land on ../
+        self.view_mut().cursor.col = 0;
+
+        EngineAction::None
+    }
+
+    /// Get the filesystem path for the entry at the cursor in a netrw buffer.
+    fn netrw_entry_at_cursor(&self) -> Option<PathBuf> {
+        let netrw_dir = self.active_buffer_state().netrw_dir.as_ref()?;
+        let line_idx = self.cursor().line;
+        if line_idx == 0 {
+            return None; // header line
+        }
+        let line_text: String = self.buffer().content.line(line_idx).chars().collect();
+        let entry = line_text.trim_end_matches('\n').trim();
+        if entry.is_empty() {
+            return None;
+        }
+        if entry == "../" {
+            netrw_dir.parent().map(|p| p.to_path_buf())
+        } else {
+            Some(netrw_dir.join(entry))
+        }
+    }
+
+    /// Activate (open) the netrw entry at cursor.
+    fn netrw_activate_entry(&mut self) -> EngineAction {
+        let path = match self.netrw_entry_at_cursor() {
+            Some(p) => p,
+            None => return EngineAction::None, // header line — no-op
+        };
+
+        if path.is_dir() {
+            // Navigate into directory — reuse current buffer
+            let listing = Self::netrw_build_listing(&path, self.settings.show_hidden_files);
+            let buf_id = self.active_buffer_id();
+            if let Some(state) = self.buffer_manager.get_mut(buf_id) {
+                state.read_only = false; // temporarily allow write
+                state.buffer.content = ropey::Rope::from_str(&listing);
+                state.read_only = true;
+                state.netrw_dir = Some(path);
+            }
+            self.view_mut().cursor.line = 1;
+            self.view_mut().cursor.col = 0;
+            self.view_mut().scroll_top = 0;
+            EngineAction::None
+        } else {
+            // File — delete netrw buffer and open the file
+            let netrw_buf_id = self.active_buffer_id();
+            self.open_file_in_tab(&path);
+            // Remove the netrw buffer if it's no longer shown in any window
+            let still_used = self.windows.values().any(|w| w.buffer_id == netrw_buf_id);
+            if !still_used {
+                self.buffer_manager.remove(netrw_buf_id);
+            }
+            EngineAction::None
+        }
+    }
+
+    /// Navigate to parent directory in netrw.
+    fn netrw_go_parent(&mut self) -> EngineAction {
+        let netrw_dir = match self.active_buffer_state().netrw_dir.clone() {
+            Some(d) => d,
+            None => return EngineAction::None,
+        };
+        let parent = match netrw_dir.parent() {
+            Some(p) => p.to_path_buf(),
+            None => return EngineAction::None, // already at root
+        };
+        let listing = Self::netrw_build_listing(&parent, self.settings.show_hidden_files);
+        let buf_id = self.active_buffer_id();
+        if let Some(state) = self.buffer_manager.get_mut(buf_id) {
+            state.read_only = false;
+            state.buffer.content = ropey::Rope::from_str(&listing);
+            state.read_only = true;
+            state.netrw_dir = Some(parent);
+        }
+        self.view_mut().cursor.line = 1;
+        self.view_mut().cursor.col = 0;
+        self.view_mut().scroll_top = 0;
+        EngineAction::None
     }
 
     /// Open the git diff for the current file in a vertical split.
@@ -3002,9 +3391,36 @@ impl Engine {
     }
 
     /// Move focus to a window in the given direction.
+    /// Sets `window_nav_overflow` to `Some(false)` when trying to go left past
+    /// the first window, or `Some(true)` when trying to go right past the last.
     pub fn focus_window_direction(&mut self, _direction: SplitDirection, forward: bool) {
-        // For now, just cycle - proper directional navigation requires geometry
-        if forward {
+        let win_ids = self.active_tab().window_ids();
+        let current = self.active_tab().active_window;
+        let at_boundary = if forward {
+            win_ids.last() == Some(&current)
+        } else {
+            win_ids.first() == Some(&current)
+        };
+
+        if at_boundary {
+            // Try to move to adjacent editor group
+            let group_ids = self.group_layout.group_ids();
+            let cur_idx = group_ids.iter().position(|&id| id == self.active_group);
+            let adjacent = cur_idx.and_then(|idx| {
+                if forward {
+                    group_ids.get(idx + 1).copied()
+                } else {
+                    idx.checked_sub(1).map(|i| group_ids[i])
+                }
+            });
+            if let Some(next_group) = adjacent {
+                self.prev_active_group = Some(self.active_group);
+                self.active_group = next_group;
+            } else {
+                // No adjacent group → signal overflow to TUI/GTK
+                self.window_nav_overflow = Some(forward);
+            }
+        } else if forward {
             self.focus_next_window();
         } else {
             self.focus_prev_window();
@@ -3078,6 +3494,7 @@ impl Engine {
         let tab = Tab::new(tab_id, window_id);
         self.active_group_mut().tabs.push(tab);
         self.active_group_mut().active_tab = self.active_group().tabs.len() - 1;
+        self.tab_mru_touch();
 
         if file_path.is_some() {
             self.message = String::new();
@@ -3112,13 +3529,24 @@ impl Engine {
             self.windows.remove(window_id);
         }
 
+        let closed_group = self.active_group;
         self.active_group_mut().tabs.remove(active_tab_idx);
+
+        // Remove the closed tab from MRU and adjust indices
+        self.tab_mru
+            .retain(|&(g, idx)| !(g == closed_group && idx == active_tab_idx));
+        for entry in &mut self.tab_mru {
+            if entry.0 == closed_group && entry.1 > active_tab_idx {
+                entry.1 -= 1;
+            }
+        }
 
         // Adjust active tab index
         let tabs_len = self.active_group().tabs.len();
         if self.active_group().active_tab >= tabs_len {
             self.active_group_mut().active_tab = tabs_len - 1;
         }
+        self.tab_mru_touch();
 
         // Remove any buffers that are no longer referenced by any window.
         // This prevents orphaned dirty buffers from falsely triggering `:qa`
@@ -3139,12 +3567,20 @@ impl Engine {
         true
     }
 
+    /// Record the current (group, tab_index) as the most recently used tab.
+    pub fn tab_mru_touch(&mut self) {
+        let entry = (self.active_group, self.active_group().active_tab);
+        self.tab_mru.retain(|e| *e != entry);
+        self.tab_mru.insert(0, entry);
+    }
+
     /// Switch to the next tab.
     pub fn next_tab(&mut self) {
         let tabs_len = self.active_group().tabs.len();
         if !self.active_group().tabs.is_empty() {
             self.active_group_mut().active_tab = (self.active_group().active_tab + 1) % tabs_len;
             self.line_annotations.clear();
+            self.tab_mru_touch();
         }
     }
 
@@ -3155,7 +3591,75 @@ impl Engine {
             let tabs_len = self.active_group().tabs.len();
             self.active_group_mut().active_tab = if at == 0 { tabs_len - 1 } else { at - 1 };
             self.line_annotations.clear();
+            self.tab_mru_touch();
         }
+    }
+
+    /// Open the tab switcher popup, pre-selecting the second MRU entry.
+    pub fn open_tab_switcher(&mut self) {
+        // Build a clean MRU list: only include entries that still exist
+        self.tab_mru.retain(|&(g, idx)| {
+            self.editor_groups
+                .get(&g)
+                .is_some_and(|grp| idx < grp.tabs.len())
+        });
+        // Ensure the current tab is at index 0
+        let current = (self.active_group, self.active_group().active_tab);
+        if self.tab_mru.first() != Some(&current) {
+            self.tab_mru.retain(|e| *e != current);
+            self.tab_mru.insert(0, current);
+        }
+        // Also add any tabs not yet in MRU (e.g. from before MRU tracking started)
+        for (&gid, group) in &self.editor_groups {
+            for idx in 0..group.tabs.len() {
+                if !self.tab_mru.contains(&(gid, idx)) {
+                    self.tab_mru.push((gid, idx));
+                }
+            }
+        }
+
+        if self.tab_mru.len() <= 1 {
+            return; // Nothing to switch to
+        }
+        self.tab_switcher_open = true;
+        self.tab_switcher_selected = 1; // Start on the second item (previous tab)
+    }
+
+    /// Confirm the tab switcher selection and close the popup.
+    pub fn tab_switcher_confirm(&mut self) {
+        if !self.tab_switcher_open {
+            return;
+        }
+        let idx = self.tab_switcher_selected;
+        if let Some(&(group_id, tab_idx)) = self.tab_mru.get(idx) {
+            if self.editor_groups.contains_key(&group_id) {
+                self.active_group = group_id;
+                self.active_group_mut().active_tab = tab_idx;
+                self.tab_mru_touch();
+                self.line_annotations.clear();
+            }
+        }
+        self.tab_switcher_open = false;
+    }
+
+    /// Get display info for each MRU entry: (filename, path, is_dirty).
+    pub fn tab_switcher_items(&self) -> Vec<(String, String, bool)> {
+        self.tab_mru
+            .iter()
+            .filter_map(|&(gid, tab_idx)| {
+                let group = self.editor_groups.get(&gid)?;
+                let tab = group.tabs.get(tab_idx)?;
+                let win = self.windows.get(&tab.active_window)?;
+                let state = self.buffer_manager.get(win.buffer_id)?;
+                let name = state.display_name();
+                let path = state
+                    .file_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                Some((name, path, state.dirty))
+            })
+            .collect()
     }
 
     /// Switch to a specific tab (0-indexed).
@@ -3164,6 +3668,7 @@ impl Engine {
         if index < self.active_group().tabs.len() {
             self.active_group_mut().active_tab = index;
             self.line_annotations.clear();
+            self.tab_mru_touch();
         }
     }
 
@@ -3261,6 +3766,195 @@ impl Engine {
         }
     }
 
+    // --- Tab drag-and-drop ---
+
+    /// Begin dragging a tab from the given group.
+    pub fn tab_drag_begin(&mut self, group_id: GroupId, tab_index: usize) {
+        let name = self
+            .editor_groups
+            .get(&group_id)
+            .and_then(|g| g.tabs.get(tab_index))
+            .and_then(|t| self.windows.get(&t.active_window))
+            .and_then(|w| self.buffer_manager.get(w.buffer_id))
+            .map(|s| s.display_name())
+            .unwrap_or_default();
+        self.tab_drag = Some(TabDragState {
+            source_group: group_id,
+            source_tab_index: tab_index,
+            tab_name: name,
+        });
+        self.tab_drop_zone = DropZone::None;
+    }
+
+    /// Cancel an in-progress tab drag.
+    #[allow(dead_code)]
+    pub fn tab_drag_cancel(&mut self) {
+        self.tab_drag = None;
+        self.tab_drag_mouse = None;
+        self.tab_drop_zone = DropZone::None;
+    }
+
+    /// Execute the drop for the current tab drag.
+    pub fn tab_drag_drop(&mut self, zone: DropZone) {
+        let drag = match self.tab_drag.take() {
+            Some(d) => d,
+            None => return,
+        };
+        self.tab_drag_mouse = None;
+        self.tab_drop_zone = DropZone::None;
+
+        match zone {
+            DropZone::Center(target) => {
+                if target != drag.source_group {
+                    self.move_tab_to_target_group(drag.source_group, drag.source_tab_index, target);
+                }
+            }
+            DropZone::Split(target, direction, new_first) => {
+                self.move_tab_to_new_split(
+                    drag.source_group,
+                    drag.source_tab_index,
+                    target,
+                    direction,
+                    new_first,
+                );
+            }
+            DropZone::TabReorder(group_id, to_idx) => {
+                if group_id == drag.source_group {
+                    self.reorder_tab_in_group(group_id, drag.source_tab_index, to_idx);
+                } else {
+                    // Drag to a specific position in another group
+                    self.move_tab_to_target_group_at(
+                        drag.source_group,
+                        drag.source_tab_index,
+                        group_id,
+                        to_idx,
+                    );
+                }
+            }
+            DropZone::None => {}
+        }
+    }
+
+    /// Move a tab from one group to another (appends at end).
+    pub fn move_tab_to_target_group(
+        &mut self,
+        src_group: GroupId,
+        tab_idx: usize,
+        target_group: GroupId,
+    ) {
+        self.move_tab_to_target_group_at(src_group, tab_idx, target_group, usize::MAX);
+    }
+
+    /// Move a tab from one group to another at a specific insertion index.
+    fn move_tab_to_target_group_at(
+        &mut self,
+        src_group: GroupId,
+        tab_idx: usize,
+        target_group: GroupId,
+        insert_at: usize,
+    ) {
+        if src_group == target_group {
+            return;
+        }
+        let tab = match self.editor_groups.get_mut(&src_group) {
+            Some(g) if tab_idx < g.tabs.len() => {
+                let t = g.tabs.remove(tab_idx);
+                if g.active_tab >= g.tabs.len() && !g.tabs.is_empty() {
+                    g.active_tab = g.tabs.len() - 1;
+                }
+                t
+            }
+            _ => return,
+        };
+        // Insert into target
+        if let Some(tg) = self.editor_groups.get_mut(&target_group) {
+            let idx = insert_at.min(tg.tabs.len());
+            tg.tabs.insert(idx, tab);
+            tg.active_tab = idx;
+        }
+        self.active_group = target_group;
+        // If source group is now empty, close it
+        if self
+            .editor_groups
+            .get(&src_group)
+            .is_some_and(|g| g.tabs.is_empty())
+        {
+            self.close_group_by_id(src_group);
+        }
+    }
+
+    /// Move a tab out of its group into a new split adjacent to `target_group`.
+    fn move_tab_to_new_split(
+        &mut self,
+        src_group: GroupId,
+        tab_idx: usize,
+        target_group: GroupId,
+        direction: SplitDirection,
+        new_first: bool,
+    ) {
+        // Remove tab from source
+        let tab = match self.editor_groups.get_mut(&src_group) {
+            Some(g) if tab_idx < g.tabs.len() => {
+                let t = g.tabs.remove(tab_idx);
+                if g.active_tab >= g.tabs.len() && !g.tabs.is_empty() {
+                    g.active_tab = g.tabs.len() - 1;
+                }
+                t
+            }
+            _ => return,
+        };
+        // Create new group with the removed tab
+        let new_id = self.new_group_id();
+        self.editor_groups.insert(new_id, EditorGroup::new(tab));
+        self.group_layout
+            .split_at(target_group, direction, new_id, new_first);
+        self.prev_active_group = Some(self.active_group);
+        self.active_group = new_id;
+        // If source group is now empty, close it
+        if self
+            .editor_groups
+            .get(&src_group)
+            .is_some_and(|g| g.tabs.is_empty())
+        {
+            self.close_group_by_id(src_group);
+        }
+    }
+
+    /// Reorder a tab within its group.
+    pub fn reorder_tab_in_group(&mut self, group_id: GroupId, from_idx: usize, to_idx: usize) {
+        if let Some(g) = self.editor_groups.get_mut(&group_id) {
+            if from_idx >= g.tabs.len() {
+                return;
+            }
+            let to = to_idx.min(g.tabs.len().saturating_sub(1));
+            if from_idx == to {
+                return;
+            }
+            let tab = g.tabs.remove(from_idx);
+            g.tabs.insert(to, tab);
+            g.active_tab = to;
+        }
+    }
+
+    /// Close a specific editor group by ID (removes windows, promotes sibling).
+    pub fn close_group_by_id(&mut self, group_id: GroupId) {
+        if self.group_layout.is_single_group() {
+            return;
+        }
+        if let Some(group) = self.editor_groups.get(&group_id) {
+            let window_ids: Vec<WindowId> =
+                group.tabs.iter().flat_map(|t| t.window_ids()).collect();
+            for wid in window_ids {
+                self.windows.remove(&wid);
+            }
+        }
+        self.editor_groups.remove(&group_id);
+        self.group_layout.remove(group_id);
+        if self.active_group == group_id {
+            self.active_group = self.group_layout.group_ids()[0];
+        }
+    }
+
     /// Compute window rectangles for all editor groups, and return group dividers.
     ///
     /// `content_bounds` is the full editor content area (excluding status/command bars).
@@ -3322,6 +4016,7 @@ impl Engine {
             .map(|(idx, _)| idx);
         if let Some(tab_idx) = found {
             self.active_group_mut().active_tab = tab_idx;
+            self.tab_mru_touch();
             self.refresh_git_diff(buffer_id);
             self.message = format!("\"{}\"", path.display());
             self.lsp_did_open(buffer_id);
@@ -3337,6 +4032,7 @@ impl Engine {
         let tab = Tab::new(tab_id, window_id);
         self.active_group_mut().tabs.push(tab);
         self.active_group_mut().active_tab = self.active_group().tabs.len() - 1;
+        self.tab_mru_touch();
 
         // Restore saved cursor/scroll position.
         let view = self.restore_file_position(buffer_id);
@@ -4356,8 +5052,9 @@ impl Engine {
         unicode: Option<char>,
         ctrl: bool,
     ) -> EngineAction {
-        // Clear message on any keypress (unless we're in command/search mode)
-        if self.mode != Mode::Command && self.mode != Mode::Search {
+        // Clear message on any keypress (unless we're in command/search mode
+        // or a swap recovery dialog is pending — its prompt is in self.message)
+        if self.mode != Mode::Command && self.mode != Mode::Search && self.swap_recovery.is_none() {
             self.message.clear();
         }
         // Dismiss LSP hover popup on any keypress
@@ -4380,7 +5077,79 @@ impl Engine {
 
         // Swap recovery dialog intercepts R/D/A keys.
         if self.swap_recovery.is_some() {
-            return self.handle_swap_recovery_key(key_name);
+            return self.handle_swap_recovery_key(key_name, unicode);
+        }
+
+        // Ctrl+Tab opens the tab switcher (or cycles forward if already open).
+        if ctrl && key_name == "Tab" {
+            if self.tab_switcher_open {
+                let len = self.tab_mru.len();
+                if len > 0 {
+                    self.tab_switcher_selected = (self.tab_switcher_selected + 1) % len;
+                }
+            } else {
+                self.open_tab_switcher();
+            }
+            return EngineAction::None;
+        }
+        // Ctrl+Shift+Tab cycles backward.
+        if ctrl && key_name == "ISO_Left_Tab" {
+            if self.tab_switcher_open {
+                let len = self.tab_mru.len();
+                if len > 0 {
+                    self.tab_switcher_selected = if self.tab_switcher_selected == 0 {
+                        len - 1
+                    } else {
+                        self.tab_switcher_selected - 1
+                    };
+                }
+            } else {
+                self.open_tab_switcher();
+                let len = self.tab_mru.len();
+                if len > 0 {
+                    self.tab_switcher_selected = len - 1;
+                }
+            }
+            return EngineAction::None;
+        }
+
+        // Tab switcher intercepts all keys when open.
+        if self.tab_switcher_open {
+            match key_name {
+                "Tab" => {
+                    // Tab (no ctrl): cycle forward
+                    let len = self.tab_mru.len();
+                    if len > 0 {
+                        self.tab_switcher_selected = (self.tab_switcher_selected + 1) % len;
+                    }
+                    return EngineAction::None;
+                }
+                "ISO_Left_Tab" => {
+                    // Shift-Tab: cycle backward
+                    let len = self.tab_mru.len();
+                    if len > 0 {
+                        self.tab_switcher_selected = if self.tab_switcher_selected == 0 {
+                            len - 1
+                        } else {
+                            self.tab_switcher_selected - 1
+                        };
+                    }
+                    return EngineAction::None;
+                }
+                "Escape" => {
+                    self.tab_switcher_open = false;
+                    return EngineAction::None;
+                }
+                "Return" => {
+                    self.tab_switcher_confirm();
+                    return EngineAction::None;
+                }
+                _ => {
+                    // Any other key confirms and is consumed
+                    self.tab_switcher_confirm();
+                    return EngineAction::None;
+                }
+            }
         }
 
         // Command palette intercepts all keys when open.
@@ -4414,6 +5183,12 @@ impl Engine {
             return EngineAction::None;
         }
 
+        // Settings panel intercepts all keys when it has focus.
+        if self.settings_has_focus {
+            self.handle_settings_key(key_name, ctrl, unicode);
+            return EngineAction::None;
+        }
+
         // Ctrl-S: save in any mode (does not change mode).
         if ctrl && key_name == "s" {
             if let Err(e) = self.save_with_format(false) {
@@ -4432,6 +5207,18 @@ impl Engine {
         let mut changed = false;
         let mut action = EngineAction::None;
         let was_normal = matches!(self.mode, Mode::Normal);
+
+        // User-defined keymaps from settings (checked before built-in handlers).
+        // Skip in Command/Search modes where input goes to the command line,
+        // and skip when a panel has focus (those already intercepted above).
+        if !matches!(self.mode, Mode::Command | Mode::Search) && !self.user_keymaps.is_empty() {
+            if let Some(km_action) = self.try_user_keymap(key_name, unicode, ctrl, &mut changed) {
+                if changed {
+                    self.set_dirty(true);
+                }
+                return km_action;
+            }
+        }
 
         // N-to-dismiss extension hint: intercept 'N' in Normal mode when a hint is visible.
         // Only active while the hint is still the current status message (cleared on any edit).
@@ -4693,6 +5480,17 @@ impl Engine {
             }
         }
 
+        // Netrw: Enter opens entry, - goes to parent directory
+        if self.active_buffer_state().netrw_dir.is_some() {
+            if key_name == "Return" || key_name == "KP_Enter" {
+                return self.netrw_activate_entry();
+            }
+            if unicode == Some('-') && self.pending_key.is_none() && self.pending_operator.is_none()
+            {
+                return self.netrw_go_parent();
+            }
+        }
+
         // If leader mode is active, route all keypresses there first.
         if self.leader_partial.is_some() {
             return self.handle_leader_key(unicode);
@@ -4761,6 +5559,11 @@ impl Engine {
                     return EngineAction::None;
                 }
                 "v" => {
+                    if self.pending_operator.is_some() {
+                        // Ctrl-V with pending operator: force blockwise motion
+                        self.force_motion_mode = Some('\x16');
+                        return EngineAction::None;
+                    }
                     // Ctrl-V: Enter visual block mode
                     self.mode = Mode::VisualBlock;
                     self.visual_anchor = Some(self.view().cursor);
@@ -4787,8 +5590,23 @@ impl Engine {
                     return EngineAction::None;
                 }
                 "g" => {
-                    // Ctrl-G: Open live grep modal
-                    self.open_live_grep();
+                    // Ctrl-G: show file info (Vim compat)
+                    let name = self
+                        .file_path()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "[No Name]".to_string());
+                    let modified = if self.dirty() { " [Modified]" } else { "" };
+                    let total = self.buffer().len_lines();
+                    let cur_line = self.view().cursor.line + 1;
+                    let col = self.view().cursor.col + 1;
+                    let pct = if total == 0 {
+                        0
+                    } else {
+                        (cur_line * 100) / total
+                    };
+                    self.message = format!(
+                        "\"{name}\"{modified} line {cur_line} of {total} --{pct}%-- col {col}"
+                    );
                     return EngineAction::None;
                 }
                 "e" => {
@@ -4942,7 +5760,7 @@ impl Engine {
             Some('i') => {
                 self.start_undo_group();
                 self.insert_text_buffer.clear();
-                self.mode = Mode::Insert;
+                self.set_mode(Mode::Insert);
                 self.count = None; // Clear count when entering insert mode
             }
             Some('a') => {
@@ -4956,7 +5774,7 @@ impl Engine {
                     let insert_max = self.get_line_len_for_insert(line);
                     self.view_mut().cursor.col = insert_max;
                 }
-                self.mode = Mode::Insert;
+                self.set_mode(Mode::Insert);
                 self.count = None; // Clear count when entering insert mode
             }
             Some('A') => {
@@ -4964,7 +5782,7 @@ impl Engine {
                 self.insert_text_buffer.clear();
                 let line = self.view().cursor.line;
                 self.view_mut().cursor.col = self.get_line_len_for_insert(line);
-                self.mode = Mode::Insert;
+                self.set_mode(Mode::Insert);
                 self.count = None; // Clear count when entering insert mode
             }
             Some('I') => {
@@ -5593,11 +6411,11 @@ impl Engine {
                 }
             }
             Some('v') => {
-                self.mode = Mode::Visual;
+                self.set_mode(Mode::Visual);
                 self.visual_anchor = Some(self.view().cursor);
             }
             Some('V') => {
-                self.mode = Mode::VisualLine;
+                self.set_mode(Mode::VisualLine);
                 self.visual_anchor = Some(self.view().cursor);
             }
             Some('%') => {
@@ -5865,8 +6683,21 @@ impl Engine {
                     self.lsp_request_references();
                 }
                 Some('i') => {
-                    self.push_jump_location();
-                    self.lsp_request_implementation();
+                    // gi: go to last insert position and enter Insert mode
+                    if let Some((line, col)) = self.last_insert_pos {
+                        let max_line = self.buffer().len_lines().saturating_sub(1);
+                        let target_line = line.min(max_line);
+                        self.view_mut().cursor.line = target_line;
+                        let line_len = self.buffer().line_len_chars(target_line);
+                        let max_col = if line_len > 0 { line_len - 1 } else { 0 };
+                        self.view_mut().cursor.col = col.min(max_col);
+                        self.mode = Mode::Insert;
+                        self.insert_text_buffer.clear();
+                    } else {
+                        // No previous insert position: just enter Insert mode
+                        self.mode = Mode::Insert;
+                        self.insert_text_buffer.clear();
+                    }
                 }
                 Some('y') => {
                     self.push_jump_location();
@@ -6063,8 +6894,21 @@ impl Engine {
                     // g?{motion}: ROT13 encode operator
                     self.pending_operator = Some('R');
                 }
+                Some('c') => {
+                    // gc: commentary — wait for next key (gcc = current line)
+                    self.pending_key = Some('\x03'); // sentinel for gc handler
+                }
                 _ => {}
             },
+            // gc pending: gcc toggles comment on current line (count-aware)
+            '\x03' => {
+                if let Some('c') = unicode {
+                    let count = self.take_count().max(1);
+                    let line = self.view().cursor.line + 1; // 1-indexed
+                    self.toggle_comment(line, line + count - 1);
+                    *changed = true;
+                }
+            }
             ']' => match unicode {
                 Some('c') => self.jump_next_hunk(),
                 Some('d') => self.jump_next_diagnostic(),
@@ -6139,6 +6983,13 @@ impl Engine {
                         self.view_mut().cursor.line = end;
                         self.view_mut().cursor.col = 0;
                         self.clamp_cursor_col();
+                    }
+                }
+                Some('*') | Some('/') => {
+                    // ]* / ]/: jump to end of comment block (/* ... */)
+                    let count = self.take_count();
+                    for _ in 0..count {
+                        self.jump_comment_end();
                     }
                 }
                 _ => {}
@@ -6216,6 +7067,13 @@ impl Engine {
                         self.view_mut().cursor.line = start;
                         self.view_mut().cursor.col = 0;
                         self.clamp_cursor_col();
+                    }
+                }
+                Some('*') | Some('/') => {
+                    // [* / [/: jump to start of comment block (/* ... */)
+                    let count = self.take_count();
+                    for _ in 0..count {
+                        self.jump_comment_start();
                     }
                 }
                 _ => {}
@@ -6335,6 +7193,14 @@ impl Engine {
                     Some('x') => {
                         // Ctrl-W x: exchange current window with next window in the same tab
                         self.exchange_windows();
+                    }
+                    Some('r') => {
+                        // Ctrl-W r: rotate windows downward/rightward
+                        self.rotate_windows(true);
+                    }
+                    Some('R') => {
+                        // Ctrl-W R: rotate windows upward/leftward
+                        self.rotate_windows(false);
                     }
                     Some('w') | Some('W') => self.focus_next_window(),
                     Some('c') | Some('C') => {
@@ -6834,8 +7700,6 @@ impl Engine {
             self.pending_operator = Some(operator);
             return EngineAction::None;
         }
-        // CTRL-V for blockwise force (not implemented in operator-pending for now,
-        // but mark it so it doesn't fall through to other handlers).
 
         // Handle case-transform operators (~=toggle, u=lower, U=upper)
         if operator == '~' || operator == 'u' || operator == 'U' {
@@ -7093,6 +7957,14 @@ impl Engine {
                 // yy: yank current line(s)
                 let count = self.take_count();
                 self.yank_lines(count);
+            }
+            Some('o') if operator == 'd' => {
+                // do: diff obtain — pull line from other diff window
+                self.diff_obtain(changed);
+            }
+            Some('p') if operator == 'd' => {
+                // dp: diff put — push line to other diff window
+                self.diff_put(changed);
             }
             Some('d') if operator == 'd' => {
                 // dd: delete line
@@ -7622,6 +8494,23 @@ impl Engine {
             self.apply_linewise_operator(operator, start_line, end_line, changed);
             return;
         }
+        // Force blockwise mode: apply operator as a block (rectangle)
+        if self.force_motion_mode == Some('\x16') {
+            self.force_motion_mode = None;
+            let start_line = self.buffer().content.char_to_line(start);
+            let start_line_char = self.buffer().line_to_char(start_line);
+            let start_col = start - start_line_char;
+            let end_char = end.saturating_sub(1).max(start);
+            let end_line = self.buffer().content.char_to_line(end_char);
+            let end_line_char = self.buffer().line_to_char(end_line);
+            let end_col = end_char - end_line_char;
+            let left_col = start_col.min(end_col);
+            let right_col = start_col.max(end_col);
+            self.apply_blockwise_operator(
+                operator, start_line, end_line, left_col, right_col, changed,
+            );
+            return;
+        }
         self.force_motion_mode = None;
         match operator {
             'y' => {
@@ -7744,6 +8633,13 @@ impl Engine {
                 .buffer()
                 .line_to_char((end_line + 1).min(self.buffer().len_lines()));
             self.apply_charwise_operator(operator, start, end, changed);
+            return;
+        }
+        // Force blockwise mode: convert to block using cursor column
+        if self.force_motion_mode == Some('\x16') {
+            self.force_motion_mode = None;
+            let col = self.view().cursor.col;
+            self.apply_blockwise_operator(operator, start_line, end_line, col, col, changed);
             return;
         }
         self.force_motion_mode = None;
@@ -7972,7 +8868,7 @@ impl Engine {
         partial.push(ch);
 
         // All known leader sequences
-        const SEQUENCES: &[&str] = &["rn", "gf", "gF"];
+        const SEQUENCES: &[&str] = &["rn", "gf", "gF", "gi"];
 
         match partial.as_str() {
             "rn" => {
@@ -7985,6 +8881,11 @@ impl Engine {
             "gf" | "gF" => {
                 // LSP format whole file
                 self.lsp_format_current();
+            }
+            "gi" => {
+                // LSP go to implementation
+                self.push_jump_location();
+                self.lsp_request_implementation();
             }
             // Partial match — keep accumulating if the partial is a prefix of some sequence
             s if SEQUENCES.iter().any(|seq| seq.starts_with(s)) => {
@@ -8706,7 +9607,10 @@ impl Engine {
                         self.finish_undo_group();
                     }
                 }
-                self.mode = Mode::Normal;
+                // Track cursor pos for gi (insert at last insert position)
+                let cur = self.view().cursor;
+                self.last_insert_pos = Some((cur.line, cur.col));
+                self.set_mode(Mode::Normal);
                 self.clamp_cursor_col();
                 // Dismiss signature help when leaving insert mode
                 self.lsp_signature_help = None;
@@ -8880,6 +9784,13 @@ impl Engine {
         self.command_cursor += text.chars().count();
     }
 
+    /// Clear the wildmenu completion state.
+    fn wildmenu_clear(&mut self) {
+        self.wildmenu_items.clear();
+        self.wildmenu_selected = None;
+        self.wildmenu_original.clear();
+    }
+
     fn handle_command_key(
         &mut self,
         key_name: &str,
@@ -8932,6 +9843,7 @@ impl Engine {
 
         match key_name {
             "Escape" => {
+                self.wildmenu_clear();
                 if self.history_search_active {
                     // Cancel history search, restore original buffer
                     self.history_search_active = false;
@@ -8954,6 +9866,7 @@ impl Engine {
                 EngineAction::None
             }
             "Return" => {
+                self.wildmenu_clear();
                 self.mode = Mode::Normal;
                 // If in history search, the matched command is already in command_buffer
                 self.history_search_active = false;
@@ -9064,30 +9977,76 @@ impl Engine {
                 }
                 EngineAction::None
             }
-            "Tab" => {
+            "Tab" | "ISO_Left_Tab" => {
                 // Exit history search, then complete
                 self.history_search_active = false;
                 self.history_search_query.clear();
                 self.history_search_index = None;
 
-                let completions = self.complete_command(&self.command_buffer);
-                if completions.is_empty() {
-                    return EngineAction::None;
-                } else if completions.len() == 1 {
-                    self.command_buffer = completions[0].clone();
-                    self.command_cursor = self.command_buffer.chars().count();
+                let is_backtab = key_name == "ISO_Left_Tab";
+
+                if !self.wildmenu_items.is_empty() {
+                    // Wildmenu already open — cycle through items
+                    if is_backtab {
+                        // Shift-Tab: cycle backwards
+                        match self.wildmenu_selected {
+                            None | Some(0) => {
+                                self.wildmenu_selected = Some(self.wildmenu_items.len() - 1);
+                            }
+                            Some(i) => {
+                                self.wildmenu_selected = Some(i - 1);
+                            }
+                        }
+                    } else {
+                        // Tab: cycle forwards
+                        match self.wildmenu_selected {
+                            None => {
+                                self.wildmenu_selected = Some(0);
+                            }
+                            Some(i) if i + 1 >= self.wildmenu_items.len() => {
+                                self.wildmenu_selected = Some(0);
+                            }
+                            Some(i) => {
+                                self.wildmenu_selected = Some(i + 1);
+                            }
+                        }
+                    }
+                    // Update command buffer to selected item
+                    if let Some(idx) = self.wildmenu_selected {
+                        self.command_buffer = self.wildmenu_items[idx].clone();
+                        self.command_cursor = self.command_buffer.chars().count();
+                        // If selected item ends with space, it takes an argument —
+                        // clear wildmenu so next Tab triggers argument completion.
+                        if self.command_buffer.ends_with(' ') {
+                            self.wildmenu_clear();
+                        }
+                    }
                 } else {
-                    let common = Self::find_common_prefix(&completions);
-                    if common.len() > self.command_buffer.len() {
-                        self.command_buffer = common;
+                    // First Tab press — compute completions
+                    let partial = self.command_buffer.clone();
+                    let completions = self.complete_command(&partial);
+                    if completions.is_empty() {
+                        return EngineAction::None;
+                    } else if completions.len() == 1 {
+                        // Single match: auto-complete, no wildmenu
+                        self.command_buffer = completions[0].clone();
                         self.command_cursor = self.command_buffer.chars().count();
                     } else {
-                        self.message = format!("Completions: {}", completions.join(", "));
+                        // Multiple matches: expand common prefix & show wildmenu
+                        let common = Self::find_common_prefix(&completions);
+                        self.wildmenu_original = partial;
+                        self.wildmenu_items = completions;
+                        self.wildmenu_selected = None;
+                        if common.len() > self.command_buffer.len() {
+                            self.command_buffer = common;
+                            self.command_cursor = self.command_buffer.chars().count();
+                        }
                     }
                 }
                 EngineAction::None
             }
             "BackSpace" => {
+                self.wildmenu_clear();
                 if self.history_search_active {
                     // Remove last char from search query and re-search
                     self.history_search_query.pop();
@@ -9114,6 +10073,7 @@ impl Engine {
                 EngineAction::None
             }
             _ => {
+                self.wildmenu_clear();
                 if self.history_search_active {
                     // Append char to search query and find match
                     if let Some(ch) = unicode {
@@ -9133,6 +10093,9 @@ impl Engine {
                             self.command_buffer.insert(byte_off, ch);
                             self.command_cursor += 1;
                         }
+                    } else {
+                        // Try plugin command-mode keymaps for unhandled special keys
+                        self.plugin_run_keymap("c", key_name);
                     }
                 }
                 EngineAction::None
@@ -9470,9 +10433,17 @@ impl Engine {
             }
         }
 
+        // Register selection: "x sets selected_register for next operation
+        // Only trigger when no pending_key is active (i" / a" are text objects, not register)
+        if !ctrl && unicode == Some('"') && self.pending_key.is_none() {
+            self.pending_key = Some('"');
+            return EngineAction::None;
+        }
+
         // Handle text objects (iw, aw, i", a(, etc.) - set pending key
         // Skip when ctrl is held (Ctrl-A/Ctrl-I are not text objects)
-        if !ctrl {
+        // Skip when pending_key is already set (e.g. "x register selection in progress)
+        if !ctrl && self.pending_key.is_none() {
             if let Some(ch) = unicode {
                 if ch == 'i' || ch == 'a' {
                     self.pending_key = Some(ch);
@@ -9485,6 +10456,11 @@ impl Engine {
         // Note: count is NOT applied to visual operators - they operate on the selection
         if let Some(ch) = unicode {
             match ch {
+                'p' | 'P' if self.pending_key.is_none() => {
+                    self.count = None;
+                    self.paste_visual_selection(changed);
+                    return EngineAction::None;
+                }
                 'd' => {
                     self.count = None; // Clear count (not used for visual operators)
                     self.delete_visual_selection(changed);
@@ -9495,17 +10471,17 @@ impl Engine {
                     self.yank_visual_selection();
                     return EngineAction::None;
                 }
-                'c' => {
+                'c' if self.pending_key.is_none() => {
                     self.count = None; // Clear count (not used for visual operators)
                     self.change_visual_selection(changed);
                     return EngineAction::None;
                 }
-                'u' => {
+                'u' if self.pending_key.is_none() => {
                     self.count = None; // Clear count (not used for visual operators)
                     self.lowercase_visual_selection(changed);
                     return EngineAction::None;
                 }
-                'U' => {
+                'U' if self.pending_key.is_none() => {
                     self.count = None; // Clear count (not used for visual operators)
                     self.uppercase_visual_selection(changed);
                     return EngineAction::None;
@@ -9716,8 +10692,22 @@ impl Engine {
             }
         }
 
-        // Handle multi-key sequences (gg, {, }, text objects)
+        // Handle multi-key sequences (gg, {, }, text objects, register selection)
         if let Some(pending) = self.pending_key.take() {
+            if pending == '"' {
+                // Register selection: "x
+                if let Some(ch) = unicode {
+                    if ch.is_ascii_lowercase()
+                        || ch.is_ascii_digit()
+                        || ch == '"'
+                        || ch == '+'
+                        || ch == '*'
+                    {
+                        self.selected_register = Some(ch);
+                    }
+                }
+                return EngineAction::None;
+            }
             if pending == 'i' || pending == 'a' {
                 // Text object selection
                 if let Some(obj_type) = unicode {
@@ -9788,6 +10778,18 @@ impl Engine {
                     self.view_mut().cursor.col = saved_col;
                     self.mode = Mode::Normal;
                     self.visual_anchor = None;
+                }
+                return EngineAction::None;
+            } else if pending == 'g' && unicode == Some('c') {
+                // gc in visual mode: toggle comment on selected lines
+                self.count = None;
+                if let Some((start, end)) = self.get_visual_selection_range() {
+                    let start_line = start.line + 1; // 1-indexed
+                    let end_line = end.line + 1;
+                    self.mode = Mode::Normal;
+                    self.visual_anchor = None;
+                    self.toggle_comment(start_line, end_line);
+                    *changed = true;
                 }
                 return EngineAction::None;
             } else if pending == 'g' && (unicode == Some('q') || unicode == Some('w')) {
@@ -9913,6 +10915,8 @@ impl Engine {
             },
         }
 
+        // Try plugin visual-mode keymaps as a fallback
+        self.plugin_run_keymap("v", key_name);
         EngineAction::None
     }
 
@@ -10124,6 +11128,80 @@ impl Engine {
         // Exit visual mode
         self.mode = Mode::Normal;
         self.visual_anchor = None;
+    }
+
+    /// Paste over visual selection: replace selected text with register content.
+    /// The deleted selection goes into the unnamed register (Vim behavior).
+    fn paste_visual_selection(&mut self, changed: &mut bool) {
+        // 1. Read the register content BEFORE deleting (delete overwrites unnamed reg)
+        let paste_reg = self.active_register();
+        let (paste_content, paste_linewise) = match self.get_register_content(paste_reg) {
+            Some(pair) => pair,
+            None => {
+                self.clear_selected_register();
+                // Still delete selection even if register is empty
+                self.delete_visual_selection(changed);
+                return;
+            }
+        };
+
+        // 2. Get the selection text and range before deleting
+        let sel_linewise = matches!(self.mode, Mode::VisualLine);
+        let sel_range = self.get_visual_selection_range();
+
+        // 3. Delete the visual selection (stores deleted text in unnamed reg)
+        self.delete_visual_selection(changed);
+
+        // 4. Now paste the saved register content at the cursor position
+        let start = if let Some((s, _)) = sel_range {
+            s
+        } else {
+            return;
+        };
+
+        self.start_undo_group();
+
+        if sel_linewise || paste_linewise {
+            // Linewise paste: insert on its own line
+            let line = self.view().cursor.line;
+            let line_start = self.buffer().line_to_char(line);
+            // Ensure paste content ends with newline
+            let content = if paste_content.ends_with('\n') {
+                paste_content
+            } else {
+                format!("{}\n", paste_content)
+            };
+            self.insert_with_undo(line_start, &content);
+            self.view_mut().cursor.line = line;
+            self.view_mut().cursor.col = 0;
+        } else {
+            // Characterwise paste: insert at the start of the deleted selection
+            // (not cursor, which may have been clamped by delete_visual_selection)
+            let line = start.line;
+            let col = start.col;
+            let char_idx = self.buffer().line_to_char(line) + col;
+            self.insert_with_undo(char_idx, &paste_content);
+            // Position cursor at end of pasted text
+            let paste_len = paste_content.chars().count();
+            if paste_len > 0 {
+                if paste_content.contains('\n') {
+                    let lines: Vec<&str> = paste_content.split('\n').collect();
+                    let last_line = lines.last().unwrap_or(&"");
+                    self.view_mut().cursor.line = start.line + lines.len() - 1;
+                    if lines.len() > 1 {
+                        self.view_mut().cursor.col = last_line.chars().count().saturating_sub(1);
+                    } else {
+                        self.view_mut().cursor.col = col + paste_len - 1;
+                    }
+                } else {
+                    self.view_mut().cursor.col = col + paste_len - 1;
+                }
+            }
+        }
+
+        self.finish_undo_group();
+        self.clamp_cursor_col();
+        self.clear_selected_register();
     }
 
     fn change_visual_selection(&mut self, changed: &mut bool) {
@@ -10449,32 +11527,46 @@ impl Engine {
     /// Available commands for auto-completion
     fn available_commands() -> &'static [&'static str] {
         &[
+            // File operations
             "w",
             "q",
             "q!",
             "wq",
             "wq!",
             "wa",
+            "wqa",
             "qa",
             "qa!",
             "e ",
             "e!",
             "enew",
+            // Buffers
             "bn",
             "bp",
             "bd",
             "b#",
             "ls",
+            "buffers",
+            "files",
+            // Splits & tabs
             "split",
             "vsplit",
             "tabnew",
             "tabnext",
             "tabprev",
             "tabclose",
+            "tabmove",
+            // Search & replace
             "s/",
             "%s/",
+            "noh",
+            "nohlsearch",
+            // Settings & config
+            "set ",
             "config reload",
             "Settings",
+            "colorscheme ",
+            // Editor groups
             "EditorGroupSplit",
             "EditorGroupSplitDown",
             "EditorGroupClose",
@@ -10485,17 +11577,218 @@ impl Engine {
             "egc",
             "egf",
             "egmt",
+            // Netrw / file browser
+            "Explore",
+            "Ex",
+            "Sexplore",
+            "Sex",
+            "Vexplore",
+            "Vex",
+            // Git
+            "Gdiff",
+            "Gd",
+            "Gstatus",
+            "Gs",
+            "Gadd",
+            "Ga",
+            "Gcommit",
+            "Gc",
+            "Gpush",
+            "Gp",
+            "Gblame",
+            "Gb",
+            "Ghs",
+            "Ghunk",
+            "Gpull",
+            "Gfetch",
+            "GWorktreeAdd",
+            "GWorktreeRemove",
+            // LSP
+            "LspInfo",
+            "LspRestart",
+            "LspStop",
+            "LspInstall",
+            "Lformat",
+            "Rename",
+            // DAP / Debug
+            "DapInfo",
+            "DapInstall",
+            "DapCondition",
+            "DapHitCondition",
+            "DapLogMessage",
+            "DapWatch",
+            "DapBottomPanel",
+            "DapEval",
+            "DapExpand",
+            "debug",
+            "continue",
+            "pause",
+            "stop",
+            "restart",
+            "stepover",
+            "stepin",
+            "stepout",
+            "brkpt",
+            // Extensions
+            "ExtInstall",
+            "ExtList",
+            "ExtEnable",
+            "ExtDisable",
+            "ExtRemove",
+            "ExtRefresh",
+            // AI
+            "AI ",
+            "AiClear",
+            // Markdown
             "MarkdownPreview",
             "MdPreview",
+            // Display / info
+            "registers",
+            "display",
+            "marks",
+            "jumps",
+            "changes",
+            "history",
+            "echo ",
+            // Diff
+            "diffthis",
+            "diffoff",
+            "diffsplit",
+            // Misc ex commands
+            "sort",
+            "terminal",
+            "cd ",
+            "make",
+            "copen",
+            "cn",
+            "cp",
+            "cc",
+            "r ",
+            "norm ",
+            "Plugin",
+            "map",
+            "unmap",
         ]
     }
 
-    /// Find completions for partial command
+    /// All setting names recognized by `:set`.
+    fn setting_names() -> &'static [&'static str] {
+        &[
+            // Boolean options (full names + aliases)
+            "number",
+            "nu",
+            "relativenumber",
+            "rnu",
+            "expandtab",
+            "et",
+            "autoindent",
+            "ai",
+            "incsearch",
+            "is",
+            "lsp",
+            "wrap",
+            "hlsearch",
+            "hls",
+            "ignorecase",
+            "ic",
+            "smartcase",
+            "scs",
+            "cursorline",
+            "cul",
+            "autoread",
+            "ar",
+            "splitbelow",
+            "sb",
+            "splitright",
+            "spr",
+            "ai_completions",
+            "formatonsave",
+            "fos",
+            "showhiddenfiles",
+            "shf",
+            "swapfile",
+            "breadcrumbs",
+            "autohidepanels",
+            // Value options
+            "tabstop",
+            "ts",
+            "shiftwidth",
+            "sw",
+            "scrolloff",
+            "so",
+            "colorcolumn",
+            "cc",
+            "textwidth",
+            "tw",
+            "updatetime",
+            "ut",
+            "mode",
+        ]
+    }
+
+    /// Find completions for partial command, including argument completion.
     fn complete_command(&self, partial: &str) -> Vec<String> {
         if partial.is_empty() {
             return Vec::new();
         }
 
+        // Check if we're completing an argument (text after a space)
+        if let Some(space_pos) = partial.find(' ') {
+            let cmd_prefix = &partial[..space_pos];
+            let arg_partial = partial[space_pos + 1..].trim_start();
+
+            return match cmd_prefix {
+                "set" => {
+                    // Complete setting names, including "no" prefixed variants
+                    let mut results: Vec<String> = Self::setting_names()
+                        .iter()
+                        .filter(|name| name.starts_with(arg_partial))
+                        .map(|name| format!("set {name}"))
+                        .collect();
+                    // Also offer "no" prefixed boolean disable variants
+                    for name in Self::setting_names() {
+                        let no_name = format!("no{name}");
+                        if no_name.starts_with(arg_partial) && !arg_partial.is_empty() {
+                            results.push(format!("set {no_name}"));
+                        }
+                    }
+                    results.sort();
+                    results.dedup();
+                    results
+                }
+                "colorscheme" => {
+                    // Complete theme names
+                    let mut names = vec![
+                        "onedark".to_string(),
+                        "gruvbox-dark".to_string(),
+                        "tokyo-night".to_string(),
+                        "solarized-dark".to_string(),
+                        "gruvbox".to_string(),
+                        "tokyonight".to_string(),
+                        "solarized".to_string(),
+                    ];
+                    names.extend(list_custom_theme_names());
+                    names.sort();
+                    names.dedup();
+                    names
+                        .into_iter()
+                        .filter(|name| name.starts_with(arg_partial))
+                        .map(|name| format!("colorscheme {name}"))
+                        .collect()
+                }
+                _ => {
+                    // For other commands with trailing space in available_commands,
+                    // fall through to prefix matching
+                    Self::available_commands()
+                        .iter()
+                        .filter(|cmd| cmd.starts_with(partial))
+                        .map(|s| s.to_string())
+                        .collect()
+                }
+            };
+        }
+
+        // First-word completion
         Self::available_commands()
             .iter()
             .filter(|cmd| cmd.starts_with(partial))
@@ -11525,6 +12818,10 @@ impl Engine {
                     }
                 }
                 self.plugin_manager = Some(mgr);
+                // Populate comment style overrides from installed extension manifests
+                self.populate_comment_overrides();
+                // Fire VimEnter event after plugin initialization is complete
+                self.plugin_event("VimEnter", "");
             }
             Err(e) => {
                 self.message = format!("Plugin init error: {e}");
@@ -11538,7 +12835,8 @@ impl Engine {
     /// no plugin actually needs the line contents).
     fn make_plugin_ctx(&self, skip_buf_lines: bool) -> plugin::PluginCallContext {
         let cwd = self.cwd.to_string_lossy().into_owned();
-        let buf_state = self.buffer_manager.get(self.active_buffer_id());
+        let buf_id = self.active_buffer_id();
+        let buf_state = self.buffer_manager.get(buf_id);
         let buf_path_os = buf_state.as_ref().and_then(|s| s.file_path.clone());
         let buf_path = buf_path_os
             .as_ref()
@@ -11556,6 +12854,44 @@ impl Engine {
                 .unwrap_or_default()
         };
         let cursor = self.cursor();
+
+        // Mode name
+        let mode_name = match self.mode {
+            Mode::Normal => "Normal",
+            Mode::Insert => "Insert",
+            Mode::Replace => "Replace",
+            Mode::Command => "Command",
+            Mode::Search => "Search",
+            Mode::Visual => "Visual",
+            Mode::VisualLine => "VisualLine",
+            Mode::VisualBlock => "VisualBlock",
+        }
+        .to_string();
+
+        // Registers snapshot
+        let registers_snapshot = self.registers.clone();
+
+        // Marks snapshot for the active buffer (1-indexed)
+        let marks_snapshot = self
+            .marks
+            .get(&buf_id)
+            .map(|m| {
+                m.iter()
+                    .map(|(&ch, c)| (ch, (c.line + 1, c.col + 1)))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Filetype from active buffer's language ID
+        let filetype = self
+            .buffer_manager
+            .get(buf_id)
+            .and_then(|s| s.lsp_language_id.clone())
+            .unwrap_or_default();
+
+        // Settings snapshot
+        let settings_snapshot = self.settings_snapshot();
+
         plugin::PluginCallContext {
             cwd,
             buf_path,
@@ -11565,8 +12901,60 @@ impl Engine {
             cursor_col: cursor.col + 1,
             cwd_path: Some(self.cwd.clone()),
             buf_path_os,
+            mode_name,
+            registers_snapshot,
+            marks_snapshot,
+            filetype,
+            settings_snapshot,
             ..Default::default()
         }
+    }
+
+    /// Build a snapshot of all settings as string key-value pairs.
+    fn settings_snapshot(&self) -> HashMap<String, String> {
+        let keys = [
+            "colorscheme",
+            "font_family",
+            "font_size",
+            "line_numbers",
+            "cursorline",
+            "tabstop",
+            "shift_width",
+            "expand_tab",
+            "auto_indent",
+            "wrap",
+            "scrolloff",
+            "colorcolumn",
+            "textwidth",
+            "hlsearch",
+            "ignorecase",
+            "smartcase",
+            "incremental_search",
+            "editor_mode",
+            "explorer_visible_on_startup",
+            "autoread",
+            "splitbelow",
+            "splitright",
+            "lsp_enabled",
+            "format_on_save",
+            "terminal_scrollback_lines",
+            "plugins_enabled",
+            "ai_provider",
+            "ai_model",
+            "ai_base_url",
+            "ai_completions",
+            "swapfile",
+            "updatetime",
+            "breadcrumbs",
+        ];
+        let mut map = HashMap::new();
+        for key in &keys {
+            let val = self.settings.get_value_str(key);
+            if !val.is_empty() {
+                map.insert(key.to_string(), val);
+            }
+        }
+        map
     }
 
     /// Apply the output side of a `PluginCallContext` back to the engine.
@@ -11575,6 +12963,7 @@ impl Engine {
             self.message = msg;
         }
         if !ctx.set_lines.is_empty() {
+            self.start_undo_group();
             let buf_id = self.active_buffer_id();
             for (line_idx, text) in ctx.set_lines {
                 if let Some(state) = self.buffer_manager.get_mut(buf_id) {
@@ -11591,12 +12980,17 @@ impl Engine {
                         } else {
                             format!("{text}\n")
                         };
+                        // Record for undo before mutating
+                        let old_text: String = state.buffer.content.slice(start..end).to_string();
+                        state.record_delete(start, &old_text);
                         state.buffer.delete_range(start, end);
+                        state.record_insert(start, &new_text);
                         state.buffer.insert(start, &new_text);
                         state.dirty = true;
                     }
                 }
             }
+            self.finish_undo_group();
         }
         // Apply virtual-text line annotations
         if ctx.clear_annotations {
@@ -11605,6 +12999,74 @@ impl Engine {
         for (line_1indexed, text) in ctx.annotate_lines {
             if line_1indexed > 0 {
                 self.line_annotations.insert(line_1indexed - 1, text);
+            }
+        }
+        // Apply cursor position
+        if let Some((line_1, col_1)) = ctx.set_cursor {
+            let line = line_1.saturating_sub(1);
+            let col = col_1.saturating_sub(1);
+            let max_line = self.buffer().len_lines().saturating_sub(1);
+            let clamped_line = line.min(max_line);
+            self.view_mut().cursor.line = clamped_line;
+            let max_col = self.get_max_cursor_col(clamped_line);
+            self.view_mut().cursor.col = col.min(max_col);
+        }
+        // Apply settings changes
+        for (key, value) in ctx.set_settings {
+            let _ = self.settings.set_value_str(&key, &value);
+        }
+        // Apply register writes
+        for (ch, content, linewise) in ctx.set_registers {
+            self.registers.insert(ch, (content, linewise));
+        }
+        // Apply line insertions (process in reverse to keep indices stable)
+        if !ctx.insert_lines.is_empty() {
+            let buf_id = self.active_buffer_id();
+            let mut insertions = ctx.insert_lines;
+            insertions.sort_by(|a, b| b.0.cmp(&a.0));
+            for (line_1, text) in insertions {
+                let line_idx = line_1.saturating_sub(1);
+                if let Some(state) = self.buffer_manager.get_mut(buf_id) {
+                    let line_count = state.buffer.len_lines();
+                    let insert_at = if line_idx >= line_count {
+                        state.buffer.len_chars()
+                    } else {
+                        state.buffer.line_to_char(line_idx)
+                    };
+                    let new_text = if text.ends_with('\n') {
+                        text
+                    } else {
+                        format!("{text}\n")
+                    };
+                    state.buffer.insert(insert_at, &new_text);
+                    state.dirty = true;
+                }
+            }
+        }
+        // Apply line deletions (process in reverse to keep indices stable)
+        if !ctx.delete_lines.is_empty() {
+            let buf_id = self.active_buffer_id();
+            let mut deletions = ctx.delete_lines;
+            deletions.sort_unstable();
+            deletions.dedup();
+            deletions.reverse();
+            for line_1 in deletions {
+                let line_idx = line_1.saturating_sub(1);
+                if let Some(state) = self.buffer_manager.get_mut(buf_id) {
+                    let line_count = state.buffer.len_lines();
+                    if line_idx < line_count {
+                        let start = state.buffer.line_to_char(line_idx);
+                        let end = if line_idx + 1 < line_count {
+                            state.buffer.line_to_char(line_idx + 1)
+                        } else {
+                            state.buffer.len_chars()
+                        };
+                        if start < end {
+                            state.buffer.delete_range(start, end);
+                            state.dirty = true;
+                        }
+                    }
+                }
             }
         }
         for cmd in ctx.run_commands {
@@ -11651,6 +13113,17 @@ impl Engine {
                 }
             });
         }
+        // Apply comment style overrides (highest priority — from plugin runtime)
+        for (lang_id, line, block_open, block_close) in ctx.comment_style_overrides {
+            self.comment_overrides.insert(
+                lang_id,
+                comment::CommentStyleOwned {
+                    line,
+                    block_open,
+                    block_close,
+                },
+            );
+        }
     }
 
     /// Poll for completed async shell tasks spawned by plugins.
@@ -11670,6 +13143,49 @@ impl Engine {
             self.plugin_event(event, output);
         }
         true
+    }
+
+    /// Set the editor mode with autocmd event firing.
+    /// Fires `ModeChanged` (arg: "OldMode:NewMode"), plus `InsertEnter`/`InsertLeave`
+    /// when transitioning to/from Insert mode.
+    pub fn set_mode(&mut self, new_mode: Mode) {
+        let old_mode = self.mode;
+        if old_mode == new_mode {
+            return;
+        }
+        self.mode = new_mode;
+
+        // Build mode name strings for events
+        let old_name = Self::mode_event_name(old_mode);
+        let new_name = Self::mode_event_name(new_mode);
+
+        // Fire InsertLeave when leaving Insert or Replace mode
+        if old_mode == Mode::Insert || old_mode == Mode::Replace {
+            self.plugin_event("InsertLeave", old_name);
+        }
+
+        // Fire InsertEnter when entering Insert or Replace mode
+        if new_mode == Mode::Insert || new_mode == Mode::Replace {
+            self.plugin_event("InsertEnter", new_name);
+        }
+
+        // Fire ModeChanged with "OldMode:NewMode" argument
+        let arg = format!("{old_name}:{new_name}");
+        self.plugin_event("ModeChanged", &arg);
+    }
+
+    /// Get a short event name for a mode (used in ModeChanged events).
+    fn mode_event_name(mode: Mode) -> &'static str {
+        match mode {
+            Mode::Normal => "Normal",
+            Mode::Insert => "Insert",
+            Mode::Replace => "Replace",
+            Mode::Command => "Command",
+            Mode::Search => "Search",
+            Mode::Visual => "Visual",
+            Mode::VisualLine => "VisualLine",
+            Mode::VisualBlock => "VisualBlock",
+        }
     }
 
     /// Fire an event hook (e.g. "save", "open") for all registered listeners.
@@ -11711,6 +13227,98 @@ impl Engine {
         let cursor = self.cursor();
         let arg = format!("{},{}", cursor.line + 1, cursor.col + 1);
         self.plugin_event("cursor_move", &arg);
+    }
+
+    // ─── User keymaps ────────────────────────────────────────────────────────
+
+    /// Rebuild the parsed user_keymaps cache from settings.keymaps.
+    /// Call after loading or changing settings.
+    pub fn rebuild_user_keymaps(&mut self) {
+        self.user_keymaps = self
+            .settings
+            .keymaps
+            .iter()
+            .filter_map(|s| parse_keymap_def(s))
+            .collect();
+    }
+
+    /// Check user keymaps for the current keypress. Returns `Some(action)` if
+    /// an exact match was found, `None` to fall through to built-in handling.
+    /// Handles multi-key sequences by buffering keypresses.
+    fn try_user_keymap(
+        &mut self,
+        key_name: &str,
+        unicode: Option<char>,
+        ctrl: bool,
+        changed: &mut bool,
+    ) -> Option<EngineAction> {
+        if self.keymap_replaying || self.user_keymaps.is_empty() {
+            return None;
+        }
+
+        let mode_str = match self.mode {
+            Mode::Normal => "n",
+            Mode::Visual | Mode::VisualLine | Mode::VisualBlock => "v",
+            Mode::Insert => "i",
+            Mode::Command => "c",
+            _ => return None,
+        };
+
+        let encoded = encode_keypress(key_name, unicode, ctrl);
+        self.keymap_buf.push(encoded);
+
+        let mut exact_match_action = None;
+        let mut has_prefix = false;
+
+        for km in &self.user_keymaps {
+            if km.mode != mode_str {
+                continue;
+            }
+            if km.keys == self.keymap_buf {
+                exact_match_action = Some(km.action.clone());
+            } else if km.keys.len() > self.keymap_buf.len()
+                && km.keys[..self.keymap_buf.len()] == self.keymap_buf[..]
+            {
+                has_prefix = true;
+            }
+        }
+
+        if let Some(action) = exact_match_action {
+            self.keymap_buf.clear();
+            let count = self.take_count();
+            // Substitute {count} in the action, or append count as argument
+            let cmd = if action.contains("{count}") {
+                action.replace("{count}", &count.to_string())
+            } else if count > 1 {
+                format!("{action} {count}")
+            } else {
+                action
+            };
+            *changed = true;
+            return Some(self.execute_command(&cmd));
+        }
+
+        if has_prefix {
+            // More keys needed — consume this keypress
+            return Some(EngineAction::None);
+        }
+
+        // No match and no prefix. Replay buffered keys.
+        let buf: Vec<String> = self.keymap_buf.drain(..).collect();
+        if buf.len() <= 1 {
+            // Single key, no match — fall through to built-in handling
+            return None;
+        }
+
+        // Multi-key sequence that didn't match any keymap: replay all keys
+        self.keymap_replaying = true;
+        let mut last_action = EngineAction::None;
+        for encoded_key in buf {
+            let (rk_name, rk_unicode, rk_ctrl) = decode_keypress(&encoded_key);
+            last_action = self.handle_key(&rk_name, rk_unicode, rk_ctrl);
+        }
+        self.keymap_replaying = false;
+        Some(last_action)
     }
 
     /// Try to run a named plugin command. Returns `true` if the command was found.
@@ -12166,6 +13774,37 @@ impl Engine {
             return EngineAction::None;
         }
 
+        // Handle :Explore / :Ex — netrw-style in-buffer file browser
+        if cmd == "Explore" || cmd == "Ex" {
+            return self.cmd_explore(None, None);
+        }
+        if let Some(arg) = cmd
+            .strip_prefix("Explore ")
+            .or_else(|| cmd.strip_prefix("Ex "))
+        {
+            return self.cmd_explore(Some(arg.trim()), None);
+        }
+        // Handle :Sexplore / :Sex — horizontal split + netrw
+        if cmd == "Sexplore" || cmd == "Sex" {
+            return self.cmd_explore(None, Some(SplitDirection::Horizontal));
+        }
+        if let Some(arg) = cmd
+            .strip_prefix("Sexplore ")
+            .or_else(|| cmd.strip_prefix("Sex "))
+        {
+            return self.cmd_explore(Some(arg.trim()), Some(SplitDirection::Horizontal));
+        }
+        // Handle :Vexplore / :Vex — vertical split + netrw
+        if cmd == "Vexplore" || cmd == "Vex" {
+            return self.cmd_explore(None, Some(SplitDirection::Vertical));
+        }
+        if let Some(arg) = cmd
+            .strip_prefix("Vexplore ")
+            .or_else(|| cmd.strip_prefix("Vex "))
+        {
+            return self.cmd_explore(Some(arg.trim()), Some(SplitDirection::Vertical));
+        }
+
         // Handle :Gpull — git pull
         if cmd == "Gpull" {
             self.sc_pull();
@@ -12233,6 +13872,61 @@ impl Engine {
                     self.message =
                         "Usage: :Plugin list|reload|enable <name>|disable <name>".to_string();
                 }
+            }
+            return EngineAction::None;
+        }
+
+        // ── :map / :unmap — user-defined key mappings ────────────────────────────
+        if cmd == "map" {
+            // :map — list all user keymaps
+            if self.settings.keymaps.is_empty() {
+                self.message = "No user keymaps defined".to_string();
+            } else {
+                self.message = self.settings.keymaps.join("  |  ");
+            }
+            return EngineAction::None;
+        }
+        if let Some(rest) = cmd.strip_prefix("map ") {
+            let rest = rest.trim();
+            // :map n <C-/> :Commentary → add keymap
+            if parse_keymap_def(rest).is_some() {
+                let entry = rest.to_string();
+                if !self.settings.keymaps.contains(&entry) {
+                    self.settings.keymaps.push(entry.clone());
+                    let _ = self.settings.save();
+                    self.rebuild_user_keymaps();
+                }
+                self.message = format!("Mapped: {entry}");
+            } else {
+                self.message =
+                    "Usage: :map <mode> <keys> :<command>  (e.g. :map n <C-/> :Commentary)"
+                        .to_string();
+            }
+            return EngineAction::None;
+        }
+        if cmd == "unmap" {
+            self.message = "Usage: :unmap <mode> <keys>  (e.g. :unmap n <C-/>)".to_string();
+            return EngineAction::None;
+        }
+        if let Some(rest) = cmd.strip_prefix("unmap ") {
+            let rest = rest.trim();
+            // Parse "n <C-/>" → find and remove matching keymap
+            let parts: Vec<&str> = rest.splitn(2, ' ').collect();
+            if parts.len() == 2 {
+                let mode = parts[0];
+                let keys = parts[1];
+                let prefix = format!("{mode} {keys} ");
+                let before = self.settings.keymaps.len();
+                self.settings.keymaps.retain(|s| !s.starts_with(&prefix));
+                if self.settings.keymaps.len() < before {
+                    let _ = self.settings.save();
+                    self.rebuild_user_keymaps();
+                    self.message = format!("Unmapped: {mode} {keys}");
+                } else {
+                    self.message = format!("No mapping found for: {mode} {keys}");
+                }
+            } else {
+                self.message = "Usage: :unmap <mode> <keys>  (e.g. :unmap n <C-/>)".to_string();
             }
             return EngineAction::None;
         }
@@ -12507,6 +14201,12 @@ impl Engine {
             return EngineAction::None;
         }
 
+        // Handle :TabSwitcher / :tabs — open MRU tab switcher popup
+        if cmd == "TabSwitcher" || cmd == "tabswitcher" || cmd == "tabs" {
+            self.open_tab_switcher();
+            return EngineAction::None;
+        }
+
         // Handle :set [option]
         if cmd == "set" {
             self.message = self.settings.display_all();
@@ -12531,29 +14231,28 @@ impl Engine {
 
         // Handle :colorscheme [name]
         if cmd == "colorscheme" {
-            let names = ["onedark", "gruvbox-dark", "tokyo-night", "solarized-dark"];
+            let mut names: Vec<&str> =
+                vec!["onedark", "gruvbox-dark", "tokyo-night", "solarized-dark"];
+            let custom = list_custom_theme_names();
+            let custom_strs: Vec<&str> = custom.iter().map(|s| s.as_str()).collect();
+            names.extend(custom_strs);
             self.message = format!("Available themes: {}", names.join(", "));
             return EngineAction::None;
         }
         if let Some(name) = cmd.strip_prefix("colorscheme ") {
             let name = name.trim();
-            let valid = [
-                "onedark",
-                "gruvbox-dark",
-                "gruvbox",
-                "tokyo-night",
-                "tokyonight",
-                "solarized-dark",
-                "solarized",
-            ];
-            if valid.contains(&name) {
-                // Normalize to canonical name
-                let canonical = match name {
-                    "gruvbox" => "gruvbox-dark",
-                    "tokyonight" => "tokyo-night",
-                    "solarized" => "solarized-dark",
-                    other => other,
-                };
+            // Normalize built-in aliases
+            let canonical = match name {
+                "gruvbox" => "gruvbox-dark",
+                "tokyonight" => "tokyo-night",
+                "solarized" => "solarized-dark",
+                other => other,
+            };
+            // Verify the theme exists (built-in or custom VSCode JSON)
+            let builtin = ["onedark", "gruvbox-dark", "tokyo-night", "solarized-dark"];
+            let custom = list_custom_theme_names();
+            let is_valid = builtin.contains(&canonical) || custom.iter().any(|n| n == canonical);
+            if is_valid {
                 self.settings.colorscheme = canonical.to_string();
                 if let Err(e) = self.settings.save() {
                     self.message = format!("Theme set to '{canonical}' (save failed: {e})");
@@ -12561,7 +14260,12 @@ impl Engine {
                     self.message = format!("Theme: {canonical}");
                 }
             } else {
-                self.message = format!("Unknown theme '{name}'. Available: onedark, gruvbox-dark, tokyo-night, solarized-dark");
+                let mut available: Vec<String> = builtin.iter().map(|s| s.to_string()).collect();
+                available.extend(custom);
+                self.message = format!(
+                    "Unknown theme '{name}'. Available: {}",
+                    available.join(", ")
+                );
                 return EngineAction::Error;
             }
             return EngineAction::None;
@@ -12572,6 +14276,12 @@ impl Engine {
         if cmd == "Settings" || cmd == "settings" {
             let path = Settings::settings_file_path();
             self.open_file_in_tab(&path);
+            return EngineAction::None;
+        }
+
+        // Handle :Keymaps — open keymaps editor scratch buffer
+        if cmd == "Keymaps" || cmd == "keymaps" {
+            self.open_keymaps_editor();
             return EngineAction::None;
         }
 
@@ -13540,6 +15250,22 @@ impl Engine {
                         self.settings.tabstop = ts;
                     }
                     return self.execute_command("retab");
+                }
+                // Built-in :Comment / :Commentary command
+                if cmd == "Comment"
+                    || cmd.starts_with("Comment ")
+                    || cmd == "Commentary"
+                    || cmd.starts_with("Commentary ")
+                {
+                    let args = if let Some(rest) = cmd.strip_prefix("Commentary") {
+                        rest.trim()
+                    } else {
+                        cmd.strip_prefix("Comment").unwrap().trim()
+                    };
+                    let count: usize = args.parse().unwrap_or(1).max(1);
+                    let line = self.view().cursor.line + 1; // 1-indexed
+                    self.toggle_comment(line, line + count - 1);
+                    return EngineAction::None;
                 }
                 // Try plugin commands before giving up
                 let (cmd_name, cmd_args) = cmd.split_once(' ').unwrap_or((cmd, ""));
@@ -14981,8 +16707,93 @@ impl Engine {
         *changed = true;
     }
 
-    /// Format (reflow) lines to textwidth. If textwidth is 0, uses 79 as default.
-    /// Lines are joined and re-wrapped at word boundaries.
+    /// Toggle comments on a range of lines (1-indexed, inclusive).
+    ///
+    /// Resolves comment style from overrides → built-in table → fallback `#`.
+    /// Uses line comments when available, block comments otherwise.
+    /// All non-blank lines are toggled: if all are already commented, uncomment;
+    /// otherwise add comment markers.
+    pub fn toggle_comment(&mut self, start_1: usize, end_1: usize) {
+        let buf_id = self.active_buffer_id();
+        let lang_id = self
+            .buffer_manager
+            .get(buf_id)
+            .and_then(|s| {
+                s.lsp_language_id.clone().or_else(|| {
+                    s.file_path
+                        .as_ref()
+                        .and_then(|p| lsp::language_id_from_path(p))
+                })
+            })
+            .unwrap_or_default();
+
+        let style = comment::resolve_comment_style(&lang_id, &self.comment_overrides);
+
+        let total = self.buffer().len_lines();
+        let start = (start_1.saturating_sub(1)).min(total.saturating_sub(1));
+        let end = (end_1.saturating_sub(1)).min(total.saturating_sub(1));
+
+        // Collect line texts
+        let lines_owned: Vec<String> = (start..=end)
+            .map(|i| self.buffer().content.line(i).to_string())
+            .collect();
+        let lines_ref: Vec<&str> = lines_owned.iter().map(|s| s.as_str()).collect();
+
+        let edits = match comment::compute_toggle_edits(
+            &lines_ref,
+            &style.line,
+            &style.block_open,
+            &style.block_close,
+        ) {
+            Some(e) => e,
+            None => return,
+        };
+
+        self.start_undo_group();
+        // Apply edits in reverse order so char offsets remain valid
+        for edit in edits.iter().rev() {
+            let line_idx = start + edit.line_idx;
+            let line_start = self.buffer().line_to_char(line_idx);
+            let line_end = if line_idx + 1 < self.buffer().len_lines() {
+                self.buffer().line_to_char(line_idx + 1)
+            } else {
+                self.buffer().len_chars()
+            };
+            let new_line = format!("{}\n", edit.new_text);
+            self.delete_with_undo(line_start, line_end);
+            self.insert_with_undo(line_start, &new_line);
+        }
+        self.finish_undo_group();
+        self.set_dirty(true);
+    }
+
+    /// Populate `comment_overrides` from installed extension manifests.
+    /// Called once at plugin init time; manifest `[comment]` sections with
+    /// non-empty `line` or `block_open` are applied for each `language_id`.
+    fn populate_comment_overrides(&mut self) {
+        for manifest in self.ext_available_manifests() {
+            if !self.extension_state.is_installed(&manifest.name) {
+                continue;
+            }
+            if let Some(cc) = &manifest.comment {
+                if cc.line.is_empty() && cc.block_open.is_empty() {
+                    continue;
+                }
+                let style = comment::CommentStyleOwned {
+                    line: cc.line.clone(),
+                    block_open: cc.block_open.clone(),
+                    block_close: cc.block_close.clone(),
+                };
+                for lang_id in &manifest.language_ids {
+                    // Don't overwrite runtime (plugin) overrides
+                    self.comment_overrides
+                        .entry(lang_id.clone())
+                        .or_insert_with(|| style.clone());
+                }
+            }
+        }
+    }
+
     fn format_lines(&mut self, start_line: usize, end_line: usize, changed: &mut bool) {
         let total = self.buffer().len_lines();
         let start = start_line.min(total.saturating_sub(1));
@@ -17997,6 +19808,298 @@ impl Engine {
         }
     }
 
+    /// Ctrl-W r/R: rotate windows in the current tab.
+    /// `forward=true` rotates downward/rightward, `forward=false` rotates upward/leftward.
+    fn rotate_windows(&mut self, forward: bool) {
+        let tab = self.active_tab();
+        let ids = tab.layout.window_ids();
+        if ids.len() < 2 {
+            return;
+        }
+        // Collect (buffer_id, view) for each window in layout order
+        let mut data: Vec<_> = ids
+            .iter()
+            .map(|&id| {
+                let w = &self.windows[&id];
+                (w.buffer_id, w.view.clone())
+            })
+            .collect();
+        // Rotate the data
+        if forward {
+            // Last element moves to front
+            let last = data.pop().unwrap();
+            data.insert(0, last);
+        } else {
+            // First element moves to back
+            let first = data.remove(0);
+            data.push(first);
+        }
+        // Apply rotated data back
+        for (i, &id) in ids.iter().enumerate() {
+            if let Some(w) = self.windows.get_mut(&id) {
+                w.buffer_id = data[i].0;
+                w.view = data[i].1.clone();
+            }
+        }
+    }
+
+    /// Jump to end of C-style comment block (]*  or  ]/).
+    fn jump_comment_end(&mut self) {
+        let total = self.buffer().len_lines();
+        let start = self.view().cursor.line + 1;
+        for line_idx in start..total {
+            let line: String = self.buffer().content.line(line_idx).chars().collect();
+            let trimmed = line.trim();
+            if trimmed.contains("*/") {
+                self.view_mut().cursor.line = line_idx;
+                // Position cursor at the '*' of '*/'
+                if let Some(pos) = line.find("*/") {
+                    let col = line[..pos].chars().count();
+                    self.view_mut().cursor.col = col;
+                } else {
+                    self.view_mut().cursor.col = 0;
+                }
+                self.clamp_cursor_col();
+                return;
+            }
+        }
+    }
+
+    /// Jump to start of C-style comment block ([*  or  [/).
+    fn jump_comment_start(&mut self) {
+        let cursor_line = self.view().cursor.line;
+        if cursor_line == 0 {
+            return;
+        }
+        for line_idx in (0..cursor_line).rev() {
+            let line: String = self.buffer().content.line(line_idx).chars().collect();
+            let trimmed = line.trim();
+            if trimmed.contains("/*") {
+                self.view_mut().cursor.line = line_idx;
+                // Position cursor at the '/' of '/*'
+                if let Some(pos) = line.find("/*") {
+                    let col = line[..pos].chars().count();
+                    self.view_mut().cursor.col = col;
+                } else {
+                    self.view_mut().cursor.col = 0;
+                }
+                self.clamp_cursor_col();
+                return;
+            }
+        }
+    }
+
+    /// `do` (diff obtain): in a diff view, replace the current line in the active
+    /// window with the corresponding line from the other diff window.
+    fn diff_obtain(&mut self, changed: &mut bool) {
+        let (a_win, b_win) = match self.diff_window_pair {
+            Some(pair) => pair,
+            None => {
+                self.message = "Not in diff mode".to_string();
+                return;
+            }
+        };
+        let active = self.active_window_id();
+        let other = if active == a_win {
+            b_win
+        } else if active == b_win {
+            a_win
+        } else {
+            self.message = "Current window is not part of a diff".to_string();
+            return;
+        };
+        let cursor_line = self.view().cursor.line;
+        // Get the diff status for the active window
+        let diff_status = self
+            .diff_results
+            .get(&active)
+            .and_then(|v| v.get(cursor_line))
+            .cloned();
+        match diff_status {
+            Some(DiffLine::Same) => {
+                self.message = "Line is the same in both files".to_string();
+            }
+            Some(DiffLine::Added) | Some(DiffLine::Removed) | None => {
+                // Get the corresponding line from the other window
+                // For simplicity, use the same line number from the other buffer
+                if let Some(other_win) = self.windows.get(&other) {
+                    let other_buf_id = other_win.buffer_id;
+                    if let Some(other_state) = self.buffer_manager.get(other_buf_id) {
+                        if cursor_line < other_state.buffer.len_lines() {
+                            let other_line: String = other_state
+                                .buffer
+                                .content
+                                .line(cursor_line)
+                                .chars()
+                                .collect();
+                            // Replace the current line
+                            let line_start = self.buffer().line_to_char(cursor_line);
+                            let line_end = if cursor_line + 1 < self.buffer().len_lines() {
+                                self.buffer().line_to_char(cursor_line + 1)
+                            } else {
+                                self.buffer().len_chars()
+                            };
+                            self.start_undo_group();
+                            self.delete_with_undo(line_start, line_end);
+                            self.insert_with_undo(line_start, &other_line);
+                            self.finish_undo_group();
+                            self.view_mut().cursor.col = 0;
+                            self.clamp_cursor_col();
+                            *changed = true;
+                            self.compute_diff();
+                        } else {
+                            self.message = "No corresponding line in other file".to_string();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// `dp` (diff put): in a diff view, replace the corresponding line in the
+    /// other diff window with the current line from the active window.
+    fn diff_put(&mut self, changed: &mut bool) {
+        let (a_win, b_win) = match self.diff_window_pair {
+            Some(pair) => pair,
+            None => {
+                self.message = "Not in diff mode".to_string();
+                return;
+            }
+        };
+        let active = self.active_window_id();
+        let other = if active == a_win {
+            b_win
+        } else if active == b_win {
+            a_win
+        } else {
+            self.message = "Current window is not part of a diff".to_string();
+            return;
+        };
+        let cursor_line = self.view().cursor.line;
+        // Get the current line from the active buffer
+        let current_line: String = self.buffer().content.line(cursor_line).chars().collect();
+        // Replace the corresponding line in the other buffer
+        if let Some(other_win) = self.windows.get(&other) {
+            let other_buf_id = other_win.buffer_id;
+            if let Some(other_state) = self.buffer_manager.get_mut(other_buf_id) {
+                if cursor_line < other_state.buffer.len_lines() {
+                    let line_start = other_state.buffer.line_to_char(cursor_line);
+                    let line_end = if cursor_line + 1 < other_state.buffer.len_lines() {
+                        other_state.buffer.line_to_char(cursor_line + 1)
+                    } else {
+                        other_state.buffer.len_chars()
+                    };
+                    other_state.buffer.delete_range(line_start, line_end);
+                    other_state.buffer.insert(line_start, &current_line);
+                    other_state.dirty = true;
+                    *changed = true;
+                    self.compute_diff();
+                } else {
+                    // Other buffer is shorter — append the line
+                    let end = other_state.buffer.len_chars();
+                    let needs_newline = end > 0 && other_state.buffer.content.char(end - 1) != '\n';
+                    if needs_newline {
+                        other_state.buffer.insert(end, "\n");
+                    }
+                    let end = other_state.buffer.len_chars();
+                    other_state.buffer.insert(end, &current_line);
+                    other_state.dirty = true;
+                    *changed = true;
+                    self.compute_diff();
+                }
+            }
+        }
+    }
+
+    /// Apply an operator in blockwise mode (rectangle region).
+    #[allow(clippy::too_many_arguments)]
+    fn apply_blockwise_operator(
+        &mut self,
+        operator: char,
+        start_line: usize,
+        end_line: usize,
+        left_col: usize,
+        right_col: usize,
+        changed: &mut bool,
+    ) {
+        match operator {
+            'd' => {
+                // Delete the block region
+                self.start_undo_group();
+                let mut deleted_text = String::new();
+                // Process lines in reverse to keep indices stable
+                for line_idx in (start_line..=end_line).rev() {
+                    let line_start = self.buffer().line_to_char(line_idx);
+                    let line_len = self.buffer().line_len_chars(line_idx);
+                    let text_len = if line_len > 0
+                        && self.buffer().content.char(line_start + line_len - 1) == '\n'
+                    {
+                        line_len - 1
+                    } else {
+                        line_len
+                    };
+                    let from = left_col.min(text_len);
+                    let to = (right_col + 1).min(text_len);
+                    if from < to {
+                        let del: String = self
+                            .buffer()
+                            .content
+                            .slice((line_start + from)..(line_start + to))
+                            .chars()
+                            .collect();
+                        deleted_text = del + "\n" + &deleted_text;
+                        self.delete_with_undo(line_start + from, line_start + to);
+                    }
+                }
+                let reg = self.active_register();
+                self.set_delete_register(reg, deleted_text, false);
+                self.clear_selected_register();
+                self.view_mut().cursor.line = start_line;
+                self.view_mut().cursor.col = left_col;
+                self.clamp_cursor_col();
+                self.finish_undo_group();
+                *changed = true;
+            }
+            'y' => {
+                // Yank the block region
+                let mut yanked = String::new();
+                for line_idx in start_line..=end_line {
+                    let line_start = self.buffer().line_to_char(line_idx);
+                    let line_len = self.buffer().line_len_chars(line_idx);
+                    let text_len = if line_len > 0
+                        && self.buffer().content.char(line_start + line_len - 1) == '\n'
+                    {
+                        line_len - 1
+                    } else {
+                        line_len
+                    };
+                    let from = left_col.min(text_len);
+                    let to = (right_col + 1).min(text_len);
+                    if from < to {
+                        let chunk: String = self
+                            .buffer()
+                            .content
+                            .slice((line_start + from)..(line_start + to))
+                            .chars()
+                            .collect();
+                        yanked.push_str(&chunk);
+                    }
+                    yanked.push('\n');
+                }
+                let reg = self.active_register();
+                self.set_yank_register(reg, yanked, false);
+                self.clear_selected_register();
+            }
+            _ => {
+                // For other operators (c, ~, u, U, etc.), fall back to charwise
+                let start = self.buffer().line_to_char(start_line) + left_col;
+                let end_char = self.buffer().line_to_char(end_line) + right_col + 1;
+                let max = self.buffer().len_chars();
+                self.apply_charwise_operator(operator, start, end_char.min(max), changed);
+            }
+        }
+    }
+
     /// Try to parse and execute a range filter command like `1,5!sort` or `.!cmd`.
     /// Returns Some(action) if it matched, None otherwise.
     fn try_execute_filter_command(&mut self, cmd: &str) -> Option<EngineAction> {
@@ -18317,6 +20420,8 @@ impl Engine {
             if let Some(path) = state.file_path.clone() {
                 let path_str = path.to_string_lossy().into_owned();
                 self.plugin_event("open", &path_str);
+                self.plugin_event("BufNew", &path_str);
+                self.plugin_event("BufEnter", &path_str);
             }
         }
         // Fire cursor_move so position-aware plugins (e.g. git-insights blame) annotate
@@ -18742,6 +20847,335 @@ impl Engine {
             0
         };
         installed + available
+    }
+
+    // ── Settings sidebar panel ──────────────────────────────────────────────────
+
+    /// Row types for the settings flat list.
+    /// Category(cat_idx) = a collapsible category header.
+    /// Setting(def_idx) = a setting from SETTING_DEFS.
+    pub fn settings_flat_list(&self) -> Vec<(bool, usize)> {
+        // Returns Vec<(is_category, index)>
+        // is_category=true → index is into setting_categories()
+        // is_category=false → index is into SETTING_DEFS
+        use super::settings::{setting_categories, SETTING_DEFS};
+        let cats = setting_categories();
+        let query = self.settings_query.to_lowercase();
+        let mut rows = Vec::new();
+
+        for (cat_idx, &cat) in cats.iter().enumerate() {
+            // Collect settings in this category that match the query
+            let matching: Vec<usize> = SETTING_DEFS
+                .iter()
+                .enumerate()
+                .filter(|(_, d)| d.category == cat)
+                .filter(|(_, d)| {
+                    query.is_empty()
+                        || d.label.to_lowercase().contains(&query)
+                        || d.key.to_lowercase().contains(&query)
+                        || d.description.to_lowercase().contains(&query)
+                })
+                .map(|(i, _)| i)
+                .collect();
+
+            if matching.is_empty() {
+                continue;
+            }
+
+            rows.push((true, cat_idx)); // Category header
+
+            let collapsed =
+                cat_idx < self.settings_collapsed.len() && self.settings_collapsed[cat_idx];
+            if !collapsed {
+                for def_idx in matching {
+                    rows.push((false, def_idx));
+                }
+            }
+        }
+        rows
+    }
+
+    /// Handle a key press while the settings panel has focus.
+    pub fn handle_settings_key(&mut self, key: &str, _ctrl: bool, unicode: Option<char>) {
+        use super::settings::{SettingType, SETTING_DEFS};
+
+        // Search input active — route printable chars to query
+        if self.settings_input_active {
+            match key {
+                "Escape" | "Return" => {
+                    self.settings_input_active = false;
+                }
+                "BackSpace" => {
+                    self.settings_query.pop();
+                    self.settings_selected = 0;
+                    self.settings_scroll_top = 0;
+                }
+                _ => {
+                    if let Some(ch) = unicode {
+                        if !ch.is_control() {
+                            self.settings_query.push(ch);
+                            self.settings_selected = 0;
+                            self.settings_scroll_top = 0;
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        // Inline editing active (string/int)
+        if let Some(def_idx) = self.settings_editing {
+            match key {
+                "Escape" => {
+                    self.settings_editing = None;
+                    self.settings_edit_buf.clear();
+                }
+                "Return" => {
+                    let def = &SETTING_DEFS[def_idx];
+                    let val = self.settings_edit_buf.clone();
+                    if self.settings.set_value_str(def.key, &val).is_ok() {
+                        let _ = self.settings.save();
+                    }
+                    self.settings_editing = None;
+                    self.settings_edit_buf.clear();
+                }
+                "BackSpace" => {
+                    self.settings_edit_buf.pop();
+                }
+                _ => {
+                    if let Some(ch) = unicode {
+                        if !ch.is_control() {
+                            let def = &SETTING_DEFS[def_idx];
+                            // For integers, only accept digits
+                            if matches!(def.setting_type, SettingType::Integer { .. }) {
+                                if ch.is_ascii_digit() {
+                                    self.settings_edit_buf.push(ch);
+                                }
+                            } else {
+                                self.settings_edit_buf.push(ch);
+                            }
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        // Normal navigation
+        let flat = self.settings_flat_list();
+        let total = flat.len();
+
+        match key {
+            "q" | "Escape" => {
+                self.settings_has_focus = false;
+            }
+            "/" => {
+                self.settings_input_active = true;
+            }
+            "j" | "Down" => {
+                if total > 0 {
+                    self.settings_selected = (self.settings_selected + 1).min(total - 1);
+                }
+            }
+            "k" | "Up" => {
+                self.settings_selected = self.settings_selected.saturating_sub(1);
+            }
+            "Tab" | "Return" | "Space" | "l" | "Right" | "h" | "Left" => {
+                if self.settings_selected < total {
+                    let (is_cat, idx) = flat[self.settings_selected];
+                    if is_cat {
+                        // Category header: toggle collapse on Tab/Enter/Space
+                        if matches!(key, "Tab" | "Return" | "Space")
+                            && idx < self.settings_collapsed.len()
+                        {
+                            self.settings_collapsed[idx] = !self.settings_collapsed[idx];
+                        }
+                    } else {
+                        // Setting row
+                        let def = &SETTING_DEFS[idx];
+                        match &def.setting_type {
+                            SettingType::Bool => {
+                                if matches!(key, "Return" | "Space") {
+                                    let cur = self.settings.get_value_str(def.key);
+                                    let new_val = if cur == "true" { "false" } else { "true" };
+                                    if self.settings.set_value_str(def.key, new_val).is_ok() {
+                                        let _ = self.settings.save();
+                                    }
+                                }
+                            }
+                            SettingType::Enum(options) => {
+                                let forward = matches!(key, "Return" | "Space" | "l" | "Right");
+                                let backward = matches!(key, "h" | "Left");
+                                if forward || backward {
+                                    let cur = self.settings.get_value_str(def.key);
+                                    if let Some(pos) =
+                                        options.iter().position(|&o| o == cur.as_str())
+                                    {
+                                        let next = if forward {
+                                            (pos + 1) % options.len()
+                                        } else {
+                                            (pos + options.len() - 1) % options.len()
+                                        };
+                                        if self
+                                            .settings
+                                            .set_value_str(def.key, options[next])
+                                            .is_ok()
+                                        {
+                                            let _ = self.settings.save();
+                                        }
+                                    }
+                                }
+                            }
+                            SettingType::DynamicEnum(options_fn) => {
+                                let forward = matches!(key, "Return" | "Space" | "l" | "Right");
+                                let backward = matches!(key, "h" | "Left");
+                                if forward || backward {
+                                    let options = options_fn();
+                                    let cur = self.settings.get_value_str(def.key);
+                                    if let Some(pos) = options.iter().position(|o| o == &cur) {
+                                        let next = if forward {
+                                            (pos + 1) % options.len()
+                                        } else {
+                                            (pos + options.len() - 1) % options.len()
+                                        };
+                                        if self
+                                            .settings
+                                            .set_value_str(def.key, &options[next])
+                                            .is_ok()
+                                        {
+                                            let _ = self.settings.save();
+                                        }
+                                    }
+                                }
+                            }
+                            SettingType::Integer { .. } | SettingType::StringVal => {
+                                if matches!(key, "Return") {
+                                    self.settings_editing = Some(idx);
+                                    self.settings_edit_buf = self.settings.get_value_str(def.key);
+                                }
+                            }
+                            SettingType::BufferEditor => {
+                                if matches!(key, "Return" | "Space" | "l" | "Right")
+                                    && def.key == "keymaps"
+                                {
+                                    self.open_keymaps_editor();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Paste clipboard text into the active settings input (search query or inline edit buffer).
+    pub fn settings_paste(&mut self, text: &str) {
+        // Strip newlines — settings values are single-line.
+        let clean: String = text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
+        if self.settings_input_active {
+            self.settings_query.push_str(&clean);
+            self.settings_selected = 0;
+            self.settings_scroll_top = 0;
+        } else if self.settings_editing.is_some() {
+            self.settings_edit_buf.push_str(&clean);
+        }
+    }
+
+    /// Open a scratch buffer for editing user keymaps (one per line).
+    pub fn open_keymaps_editor(&mut self) {
+        // If a keymaps buffer already exists, switch to it
+        let existing_buf_id = self
+            .buffer_manager
+            .iter()
+            .find(|(_, state)| state.is_keymaps_buf)
+            .map(|(id, _)| *id);
+
+        if let Some(buf_id) = existing_buf_id {
+            // Find a tab showing this buffer
+            let tab_idx = self
+                .active_group()
+                .tabs
+                .iter()
+                .enumerate()
+                .find(|(_, tab)| {
+                    self.windows
+                        .get(&tab.active_window)
+                        .is_some_and(|w| w.buffer_id == buf_id)
+                })
+                .map(|(i, _)| i);
+
+            if let Some(idx) = tab_idx {
+                self.active_group_mut().active_tab = idx;
+            } else {
+                // Buffer exists but not shown — point current window at it
+                self.active_window_mut().buffer_id = buf_id;
+                self.view_mut().cursor.line = 0;
+                self.view_mut().cursor.col = 0;
+            }
+            self.settings_has_focus = false;
+            return;
+        }
+
+        // Build content: one keymap per line
+        let content = if self.settings.keymaps.is_empty() {
+            String::new()
+        } else {
+            format!("{}\n", self.settings.keymaps.join("\n"))
+        };
+        let buf_id = self.buffer_manager.create();
+        if let Some(state) = self.buffer_manager.get_mut(buf_id) {
+            state.buffer.content = ropey::Rope::from_str(&content);
+            state.is_keymaps_buf = true;
+            state.dirty = false;
+        }
+
+        // Open in a new tab (same pattern as open_file_in_tab)
+        let window_id = self.new_window_id();
+        let window = Window::new(window_id, buf_id);
+        self.windows.insert(window_id, window);
+        let tab_id = self.new_tab_id();
+        let tab = Tab::new(tab_id, window_id);
+        self.active_group_mut().tabs.push(tab);
+        self.active_group_mut().active_tab = self.active_group().tabs.len() - 1;
+
+        self.settings_has_focus = false;
+        self.message = "Edit keymaps (one per line: mode keys :command). :w to save.".to_string();
+    }
+
+    /// Save keymaps buffer content back to settings.
+    pub fn save_keymaps_buffer(&mut self) -> Result<(), String> {
+        let state = self.active_buffer_state();
+        let rope = &state.buffer.content;
+        let mut keymaps = Vec::new();
+        for line_idx in 0..rope.len_lines() {
+            let line: String = rope.line(line_idx).chars().collect();
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            // Validate the keymap definition
+            if parse_keymap_def(trimmed).is_none() {
+                return Err(format!(
+                    "Invalid keymap on line {}: \"{}\" (expected: mode keys :command)",
+                    line_idx + 1,
+                    trimmed
+                ));
+            }
+            keymaps.push(trimmed.to_string());
+        }
+
+        self.settings.keymaps = keymaps;
+        self.rebuild_user_keymaps();
+        let _ = self.settings.save();
+        let count = self.settings.keymaps.len();
+        self.active_buffer_state_mut().dirty = false;
+        self.message = format!(
+            "{} keymap{} saved to settings",
+            count,
+            if count == 1 { "" } else { "s" }
+        );
+        Ok(())
     }
 
     // ── AI assistant panel ─────────────────────────────────────────────────────
@@ -19186,12 +21620,18 @@ impl Engine {
 
     /// Handle a key press when a swap recovery dialog is pending.
     /// Returns `true` if the key was consumed.
-    fn handle_swap_recovery_key(&mut self, key_name: &str) -> EngineAction {
+    fn handle_swap_recovery_key(&mut self, key_name: &str, unicode: Option<char>) -> EngineAction {
         let recovery = match self.swap_recovery.take() {
             Some(r) => r,
             None => return EngineAction::None,
         };
-        match key_name {
+        // TUI sends key_name="" with the char in unicode; GTK sends key_name="r".
+        let effective = if !key_name.is_empty() {
+            key_name.to_string()
+        } else {
+            unicode.map(|c| c.to_string()).unwrap_or_default()
+        };
+        match effective.as_str() {
             "r" | "R" => {
                 // Replace buffer content with recovered content.
                 let state = self.buffer_manager.get_mut(recovery.buffer_id);
@@ -22281,6 +24721,26 @@ impl Engine {
 /// Returns true if `binary` is found anywhere on the current process PATH.
 /// Walks PATH directories directly (no subprocess) so it works even when
 /// the user's shell aliases or profile scripts are not sourced.
+/// List custom VSCode theme names from `~/.config/vimcode/themes/*.json`.
+fn list_custom_theme_names() -> Vec<String> {
+    let mut names = Vec::new();
+    if let Ok(home) = std::env::var("HOME") {
+        let dir = std::path::PathBuf::from(home).join(".config/vimcode/themes");
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|e| e == "json") {
+                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                        names.push(stem.to_string());
+                    }
+                }
+            }
+        }
+    }
+    names.sort();
+    names
+}
+
 fn binary_on_path(binary: &str) -> bool {
     let path_var = std::env::var("PATH").unwrap_or_default();
     for dir in path_var.split(':') {
@@ -24113,11 +26573,12 @@ impl Engine {
         // Clear any selection
         self.visual_anchor = None;
         // Set appropriate base mode
-        self.mode = if self.is_vscode_mode() {
-            Mode::Insert
+        if self.is_vscode_mode() {
+            self.mode = Mode::Insert;
+            self.menu_bar_visible = true;
         } else {
-            Mode::Normal
-        };
+            self.mode = Mode::Normal;
+        }
         let _ = self.settings.save();
     }
 
@@ -24437,63 +26898,6 @@ impl Engine {
         }
     }
 
-    // ── Comment toggle ───────────────────────────────────────────────────────
-
-    /// Ctrl-/: toggle `// ` line comment on the current line (or visual range).
-    fn vscode_toggle_line_comment(&mut self, changed: &mut bool) {
-        let (start_line, end_line) = if self.visual_anchor.is_some() {
-            match self.get_visual_selection_range() {
-                Some((start, end)) => (start.line, end.line),
-                None => {
-                    let l = self.view().cursor.line;
-                    (l, l)
-                }
-            }
-        } else {
-            let l = self.view().cursor.line;
-            (l, l)
-        };
-
-        // Check if every line in the range already starts with `// ` (after whitespace).
-        let all_commented = (start_line..=end_line).all(|ln| {
-            let line_str = self.buffer().content.line(ln).to_string();
-            let trimmed = line_str.trim_start_matches([' ', '\t']);
-            trimmed.starts_with("// ")
-        });
-
-        if all_commented {
-            // Remove `// ` from each line (reverse to keep indices valid).
-            for ln in (start_line..=end_line).rev() {
-                let line_str = self.buffer().content.line(ln).to_string();
-                let ws_len: usize = line_str
-                    .chars()
-                    .take_while(|&c| c == ' ' || c == '\t')
-                    .count();
-                let rest = &line_str[ws_len..];
-                if rest.starts_with("// ") {
-                    let start_char = self.buffer().line_to_char(ln) + ws_len;
-                    self.delete_with_undo(start_char, start_char + 3);
-                }
-            }
-        } else {
-            // Prepend `// ` after leading whitespace (reverse to keep indices valid).
-            for ln in (start_line..=end_line).rev() {
-                let line_str = self.buffer().content.line(ln).to_string();
-                let ws_len: usize = line_str
-                    .chars()
-                    .take_while(|&c| c == ' ' || c == '\t')
-                    .count();
-                // Don't comment empty / whitespace-only lines.
-                if ws_len < line_str.trim_end_matches('\n').len() {
-                    let insert_char = self.buffer().line_to_char(ln) + ws_len;
-                    self.insert_with_undo(insert_char, "// ");
-                }
-            }
-        }
-
-        *changed = true;
-    }
-
     // ── Main VSCode key dispatcher ───────────────────────────────────────────
 
     fn handle_vscode_key(
@@ -24512,7 +26916,7 @@ impl Engine {
 
         // Start an undo group for this keystroke.  Each sub-helper that
         // manages its own undo group (vscode_cut line-cut, vscode_paste,
-        // vscode_toggle_line_comment) relies on this outer group; helpers
+        // toggle_comment) relies on this outer group; helpers
         // that used to have inner calls have had them removed.
         self.start_undo_group();
 
@@ -24574,8 +26978,27 @@ impl Engine {
                 "BackSpace" => {
                     self.vscode_delete_word_backward(&mut changed);
                 }
-                "/" => {
-                    self.vscode_toggle_line_comment(&mut changed);
+                "q" => {
+                    // Ctrl+Q: quit (like VSCode)
+                    self.finish_undo_group();
+                    return self.execute_command("quit_menu");
+                }
+                "/" | "slash" => {
+                    // Toggle line comment using unified comment system
+                    let (start_line, end_line) = if self.visual_anchor.is_some() {
+                        match self.get_visual_selection_range() {
+                            Some((start, end)) => (start.line, end.line),
+                            None => {
+                                let l = self.view().cursor.line;
+                                (l, l)
+                            }
+                        }
+                    } else {
+                        let l = self.view().cursor.line;
+                        (l, l)
+                    };
+                    self.toggle_comment(start_line + 1, end_line + 1);
+                    changed = true;
                 }
                 _ => {}
             }
@@ -24641,6 +27064,10 @@ impl Engine {
                     self.mode = Mode::Command;
                     self.command_buffer.clear();
                     self.message.clear();
+                }
+                "F10" => {
+                    // Toggle menu bar visibility
+                    self.toggle_menu_bar();
                 }
                 "BackSpace" => {
                     if self.visual_anchor.is_some() {
@@ -25141,6 +27568,8 @@ mod tests {
 
         let mut engine = Engine::new();
         engine.cwd = workspace_dir.clone();
+        // Disable swap files so swap_scan_stale doesn't open extra files.
+        engine.settings.swap_file = false;
         engine.restore_session_files();
 
         // Three files → three tabs.
@@ -33180,13 +35609,17 @@ mod tests {
     }
 
     #[test]
-    fn test_ctrl_g_opens_grep() {
+    fn test_ctrl_g_shows_file_info() {
         let mut engine = Engine::new();
-        assert!(!engine.grep_open);
+        engine.buffer_mut().insert(0, "hello\nworld\n");
 
         press_ctrl(&mut engine, 'g');
 
-        assert!(engine.grep_open);
+        assert!(
+            engine.message.contains("line 1 of 2"),
+            "msg: {}",
+            engine.message
+        );
     }
 
     // ─── Quickfix tests ──────────────────────────────────────────────────────
@@ -34004,6 +36437,13 @@ mod tests {
     #[test]
     fn test_vscode_mode_comment_toggle() {
         let mut engine = make_vscode_engine("hello");
+        // Set language so comment style is // (not fallback #)
+        let buf_id = engine.active_buffer_id();
+        engine
+            .buffer_manager
+            .get_mut(buf_id)
+            .unwrap()
+            .lsp_language_id = Some("rust".to_string());
         // Ctrl+/ should add "// " prefix
         vscode_key(&mut engine, "/", Some('/'), true);
         let text = engine.buffer().to_string();
@@ -34019,6 +36459,14 @@ mod tests {
             text2.starts_with("hello"),
             "Expected 'hello', got {:?}",
             text2
+        );
+        // Also test with "slash" key_name (GTK/TUI send this)
+        vscode_key(&mut engine, "slash", None, true);
+        let text3 = engine.buffer().to_string();
+        assert!(
+            text3.starts_with("// hello"),
+            "Expected '// hello' via slash key_name, got {:?}",
+            text3
         );
     }
 
