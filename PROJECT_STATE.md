@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Mar 9, 2026 (Session 158 — VSCode Mode Gap Closure Phases 1–3) | **Tests:** 2985
+**Last updated:** Mar 10, 2026 (Session 159 — Tree-sitter upgrade + TUI fixes, v0.3.2) | **Tests:** 2985
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 157 are in **SESSION_HISTORY.md**.
@@ -25,6 +25,9 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 159 — Tree-sitter upgrade + TUI fixes, v0.3.2 (2985 tests):**
+Upgraded tree-sitter from 0.20→0.24 with all grammar crates. Added YAML and HTML syntax highlighting (17 languages total). Fixed YAML key/value color distinction (query overlap). TUI tab rendering fix (expand literal tabs to spaces, visual-column positioning for cursor/ghost text/selections/brackets). TUI activity bar icons: off-white color + `▎` accent bar for active panel. C# query fixes for updated grammar (void_keyword, foreach_statement, method returns field).
 
 **Session 158 — VSCode Mode Gap Closure Phases 1–3 (2985 tests):**
 Implemented ~20 missing VSCode shortcuts across 3 phases. **Phase 1 — Line Operations + Alt Key Routing:** Alt encoding in TUI/GTK backends (Alt+key → `"Alt_Up"` etc. in VSCode mode); `Alt+Up/Down` move line, `Alt+Shift+Up/Down` duplicate line, `Ctrl+Shift+K` delete line, `Ctrl+Enter`/`Ctrl+Shift+Enter` insert blank line below/above, `Ctrl+L` select line (extends on repeat). **Phase 2 — Multi-Cursor + Indentation:** `Ctrl+D` progressive word select + add cursor at next occurrence, `Ctrl+Shift+L` select all occurrences (new `vscode_select_all_occurrences()` with proper visual mode + extra cursors at word end), multi-cursor typing/backspace/delete using char-index descending sort for same-line correctness, extra selections rendering in both backends, `Ctrl+]/[` indent/outdent with multi-cursor support, `Shift+Tab` outdent. **Phase 3 — Panels + Navigation:** `Ctrl+G` go to line (with `ensure_cursor_visible()`), `Ctrl+P` fuzzy finder, `Ctrl+Shift+P` command palette, `Ctrl+B` toggle sidebar, `Ctrl+J`/`` Ctrl+` `` toggle terminal (returns `EngineAction::OpenTerminal` to create pane), `Ctrl+,` open settings, `Ctrl+K` chord prefix (Ctrl+K,Ctrl+F format; Ctrl+K,Ctrl+W close all). **Bug fixes:** GTK terminal panel mouse off-by-one (all `term_px` calculations used `+1` instead of `+2` for tab bar row), GTK terminal + button not working (toolbar row misidentified), GTK `:N` go-to-line not scrolling (missing `ensure_cursor_visible()`). **UI polish:** Bottom panel tab bar and terminal toolbar now use sans-serif `UI_FONT` with uppercase labels ("TERMINAL", "DEBUG CONSOLE") matching VSCode style. 55 integration tests in `tests/vscode_mode.rs`.

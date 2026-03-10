@@ -359,7 +359,9 @@ pub fn language_id_from_path(path: &Path) -> Option<String> {
         "hs" | "lhs" => "haskell",
         "ml" | "mli" => "ocaml",
         "nix" => "nix",
-        "tf" | "tfvars" => "terraform",
+        "tf" | "hcl" => "terraform",
+        "tfvars" => "terraform-vars",
+        "bicep" | "bicepparam" => "bicep",
         "scala" | "sc" => "scala",
         "graphql" | "gql" => "graphql",
         "sql" => "sql",
@@ -2200,6 +2202,27 @@ bin:
         assert_eq!(
             language_id_from_path(Path::new("main.tf")),
             Some("terraform".to_string())
+        );
+        assert_eq!(
+            language_id_from_path(Path::new("vars.tfvars")),
+            Some("terraform-vars".to_string())
+        );
+        assert_eq!(
+            language_id_from_path(Path::new("config.hcl")),
+            Some("terraform".to_string())
+        );
+    }
+
+    #[test]
+    fn test_language_id_bicep() {
+        use std::path::Path;
+        assert_eq!(
+            language_id_from_path(Path::new("main.bicep")),
+            Some("bicep".to_string())
+        );
+        assert_eq!(
+            language_id_from_path(Path::new("params.bicepparam")),
+            Some("bicep".to_string())
         );
     }
 

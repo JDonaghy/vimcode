@@ -416,6 +416,8 @@ pub struct RenderedWindow {
     pub bracket_match_positions: Vec<(usize, usize)>,
     /// The indent guide column that should be highlighted as "active" (cursor's scope).
     pub active_indent_col: Option<usize>,
+    /// Tab stop width for expanding `\t` to spaces in TUI rendering.
+    pub tabstop: usize,
 }
 
 // ─── CommandLineData ──────────────────────────────────────────────────────────
@@ -1155,6 +1157,22 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
                 shortcut: "",
                 vscode_shortcut: "",
                 action: "EditorGroupClose",
+                enabled: true,
+                separator: false,
+            },
+            MenuItemData {
+                label: "",
+                shortcut: "",
+                vscode_shortcut: "",
+                action: "",
+                enabled: false,
+                separator: true,
+            },
+            MenuItemData {
+                label: "Word Wrap",
+                shortcut: "",
+                vscode_shortcut: "Alt+Z",
+                action: "set_wrap_toggle",
                 enabled: true,
                 separator: false,
             },
@@ -3632,9 +3650,8 @@ fn build_tab_bar_for_group_by_id(engine: &Engine, group_id: GroupId) -> Vec<TabI
             let window_id = tab.active_window;
             let (name, dirty, preview) = if let Some(window) = engine.windows.get(&window_id) {
                 if let Some(state) = engine.buffer_manager.get(window.buffer_id) {
-                    let dirty_marker = if state.dirty { "*" } else { "" };
                     (
-                        format!(" {}: {}{} ", i + 1, state.display_name(), dirty_marker),
+                        format!(" {}: {} ", i + 1, state.display_name()),
                         state.dirty,
                         state.preview,
                     )
@@ -3738,6 +3755,7 @@ fn build_rendered_window(
         diagnostic_gutter: std::collections::HashMap::new(),
         bracket_match_positions: Vec::new(),
         active_indent_col: None,
+        tabstop: engine.settings.tabstop.max(1) as usize,
     };
 
     let window = match engine.windows.get(&window_id) {
@@ -4399,6 +4417,7 @@ fn build_rendered_window(
         diagnostic_gutter,
         bracket_match_positions,
         active_indent_col,
+        tabstop: engine.settings.tabstop.max(1) as usize,
     }
 }
 

@@ -4006,7 +4006,7 @@ fn handle_mouse(
                 } else {
                     sidebar.selected = tree_row;
                     let path = sidebar.rows[tree_row].path.clone();
-                    engine.open_file_in_tab(&path);
+                    engine.open_file_preview(&path);
                 }
             }
         } else if sidebar.active_panel == TuiPanel::Debug {
@@ -4190,6 +4190,60 @@ fn handle_mouse(
                     }
                 }
             }
+        } else if sidebar.active_panel == TuiPanel::Extensions {
+            sidebar.has_focus = true;
+            engine.ext_sidebar_has_focus = true;
+
+            // Row layout: 0=header, 1=search, 2=INSTALLED header, 3..=items/headers
+            if sidebar_row == 0 {
+                // Header — no-op
+            } else if sidebar_row == 1 {
+                // Search box — activate search input
+                engine.ext_sidebar_input_active = true;
+            } else {
+                let installed = engine.ext_installed_items();
+                let installed_len = if engine.ext_sidebar_sections_expanded[0] {
+                    installed.len()
+                } else {
+                    0
+                };
+                let installed_header_row: u16 = 2;
+                let installed_display =
+                    installed_len.max(if engine.ext_sidebar_sections_expanded[0] {
+                        1
+                    } else {
+                        0
+                    });
+                let available_header_row = installed_header_row + 1 + installed_display as u16;
+
+                if sidebar_row == installed_header_row {
+                    engine.ext_sidebar_sections_expanded[0] =
+                        !engine.ext_sidebar_sections_expanded[0];
+                } else if sidebar_row > installed_header_row
+                    && sidebar_row < available_header_row
+                    && installed_len > 0
+                {
+                    let idx = (sidebar_row - installed_header_row - 1) as usize;
+                    if idx < installed_len {
+                        engine.ext_sidebar_selected = idx;
+                        engine.handle_ext_sidebar_key("Return", false, None);
+                    }
+                } else if sidebar_row == available_header_row {
+                    engine.ext_sidebar_sections_expanded[1] =
+                        !engine.ext_sidebar_sections_expanded[1];
+                } else if sidebar_row > available_header_row {
+                    let avail_len = if engine.ext_sidebar_sections_expanded[1] {
+                        engine.ext_available_items().len()
+                    } else {
+                        0
+                    };
+                    let avail_idx = (sidebar_row - available_header_row - 1) as usize;
+                    if avail_idx < avail_len {
+                        engine.ext_sidebar_selected = installed_len + avail_idx;
+                        engine.handle_ext_sidebar_key("Return", false, None);
+                    }
+                }
+            }
         }
         return sidebar_width;
     }
@@ -4265,8 +4319,11 @@ fn handle_mouse(
                         } else {
                             engine.close_tab();
                         }
-                    } else if let Some(path) = engine.file_path().cloned() {
-                        sidebar.reveal_path(&path, term_height.saturating_sub(4) as usize);
+                    } else {
+                        engine.lsp_ensure_active_buffer();
+                        if let Some(path) = engine.file_path().cloned() {
+                            sidebar.reveal_path(&path, term_height.saturating_sub(4) as usize);
+                        }
                     }
                 }
                 if !tab_matched {
@@ -4332,6 +4389,7 @@ fn handle_mouse(
                         } else {
                             engine.active_group_mut().active_tab = i;
                             engine.line_annotations.clear();
+                            engine.lsp_ensure_active_buffer();
                             if let Some(path) = engine.file_path().cloned() {
                                 sidebar.reveal_path(&path, term_height.saturating_sub(4) as usize);
                             }
@@ -4818,7 +4876,13 @@ fn draw_frame(
                 let gutter_w = active_win.gutter_char_width as u16;
                 let win_x = editor_area.x + active_win.rect.x as u16;
                 let win_y = editor_area.y + active_win.rect.y as u16;
-                let vis_col = cursor_pos.col.saturating_sub(active_win.scroll_left) as u16;
+                let raw = active_win
+                    .lines
+                    .get(cursor_pos.view_line)
+                    .map(|l| l.raw_text.as_str())
+                    .unwrap_or("");
+                let vis_col = char_col_to_visual(raw, cursor_pos.col, active_win.tabstop)
+                    .saturating_sub(active_win.scroll_left) as u16;
                 let popup_x = win_x + gutter_w + vis_col;
                 let popup_y = win_y + cursor_pos.view_line as u16 + 1;
                 render_completion_popup(frame, menu, popup_x, popup_y, frame.size(), theme);
@@ -5200,14 +5264,16 @@ fn render_tab_bar(
             set_cell_styled(buf, x, area.y, ch, fg, bg, modifier);
             x += 1;
         }
-        // Close (×) button — dim on inactive tabs, slightly brighter on active.
+        // Show ● (modified dot) when dirty, × otherwise (VSCode style).
         if x < tab_end {
-            let close_fg = if tab.active {
-                rc(theme.tab_active_fg)
+            let (close_ch, close_fg) = if tab.dirty {
+                ('●', rc(theme.foreground))
+            } else if tab.active {
+                (TAB_CLOSE_CHAR, rc(theme.tab_active_fg))
             } else {
-                rc(theme.separator)
+                (TAB_CLOSE_CHAR, rc(theme.separator))
             };
-            set_cell(buf, x, area.y, TAB_CLOSE_CHAR, close_fg, bg);
+            set_cell(buf, x, area.y, close_ch, close_fg, bg);
             x += 1;
         }
         // Trailing separator space.
@@ -6726,6 +6792,7 @@ fn render_window(frame: &mut ratatui::Frame, area: Rect, window: &RenderedWindow
             window.scroll_left,
             theme,
             line_bg,
+            window.tabstop,
         );
 
         // Indent guides: draw │ at guide columns where the cell is a space
@@ -6797,10 +6864,11 @@ fn render_window(frame: &mut ratatui::Frame, area: Rect, window: &RenderedWindow
         let bracket_bg = rc(theme.bracket_match_bg);
         for &(view_line, col) in &window.bracket_match_positions {
             if view_line == row_idx {
-                if col < window.scroll_left {
+                let vis = char_col_to_visual(&line.raw_text, col, window.tabstop);
+                if vis < window.scroll_left {
                     continue;
                 }
-                let vis_col = (col - window.scroll_left) as u16;
+                let vis_col = (vis - window.scroll_left) as u16;
                 if vis_col >= text_width {
                     continue;
                 }
@@ -6882,7 +6950,13 @@ fn render_window(frame: &mut ratatui::Frame, area: Rect, window: &RenderedWindow
     // Cursor
     if let Some((cursor_pos, cursor_shape)) = &window.cursor {
         let cursor_screen_y = area.y + cursor_pos.view_line as u16;
-        let vis_col = cursor_pos.col.saturating_sub(window.scroll_left) as u16;
+        let raw = window
+            .lines
+            .get(cursor_pos.view_line)
+            .map(|l| l.raw_text.as_str())
+            .unwrap_or("");
+        let vis_col = char_col_to_visual(raw, cursor_pos.col, window.tabstop)
+            .saturating_sub(window.scroll_left) as u16;
         let cursor_screen_x = area.x + gutter_w + vis_col;
 
         let buf = frame.buffer_mut();
@@ -6910,7 +6984,8 @@ fn render_window(frame: &mut ratatui::Frame, area: Rect, window: &RenderedWindow
         if let Some(rl) = window.lines.get(cursor_pos.view_line) {
             if let Some(ghost) = &rl.ghost_suffix {
                 let ghost_screen_y = area.y + cursor_pos.view_line as u16;
-                let vis_col = cursor_pos.col.saturating_sub(window.scroll_left) as u16;
+                let vis_col = char_col_to_visual(&rl.raw_text, cursor_pos.col, window.tabstop)
+                    .saturating_sub(window.scroll_left) as u16;
                 let ghost_start_x = area.x + gutter_w + vis_col;
                 let ghost_fg = rc(theme.ghost_text_fg);
                 let buf = frame.buffer_mut();
@@ -6936,7 +7011,13 @@ fn render_window(frame: &mut ratatui::Frame, area: Rect, window: &RenderedWindow
         } else {
             extra_pos.col
         };
-        let vis_col = col.saturating_sub(window.scroll_left) as u16;
+        let raw = window
+            .lines
+            .get(extra_pos.view_line)
+            .map(|l| l.raw_text.as_str())
+            .unwrap_or("");
+        let vis_col =
+            char_col_to_visual(raw, col, window.tabstop).saturating_sub(window.scroll_left) as u16;
         let sx = area.x + gutter_w + vis_col;
         let buf = frame.buffer_mut();
         if sx < buf.area.x + buf.area.width && sy < buf.area.y + buf.area.height {
@@ -7037,6 +7118,26 @@ fn render_h_scrollbar(
     }
 }
 
+/// Convert a character-index column to a visual column, expanding tabs.
+fn char_col_to_visual(raw_text: &str, char_col: usize, tabstop: usize) -> usize {
+    let tabstop = tabstop.max(1);
+    let mut vis = 0usize;
+    for (i, ch) in raw_text.chars().enumerate() {
+        if ch == '\n' || ch == '\r' {
+            break;
+        }
+        if i >= char_col {
+            break;
+        }
+        if ch == '\t' {
+            vis = ((vis / tabstop) + 1) * tabstop;
+        } else {
+            vis += 1;
+        }
+    }
+    vis
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_text_line(
     buf: &mut ratatui::buffer::Buffer,
@@ -7047,6 +7148,7 @@ fn render_text_line(
     scroll_left: usize,
     theme: &Theme,
     window_bg: RColor,
+    tabstop: usize,
 ) {
     let raw = &line.raw_text;
     let chars: Vec<char> = raw.chars().filter(|&c| c != '\n' && c != '\r').collect();
@@ -7072,24 +7174,48 @@ fn render_text_line(
         }
     }
 
-    for i in scroll_left..chars.len() {
-        let col = (i - scroll_left) as u16;
+    // Expand characters to visual columns, handling tabs.
+    // Each entry: (visual_col, char_idx) for non-tab chars, or multiple
+    // space entries for a single tab.
+    let tabstop = tabstop.max(1);
+    let mut vis_col: usize = 0;
+    // Build a flat list of (visual_column, char_to_draw, char_index_for_style)
+    let mut cells: Vec<(usize, char, usize)> = Vec::with_capacity(chars.len());
+    for (i, &ch) in chars.iter().enumerate() {
+        if ch == '\t' {
+            let next_stop = ((vis_col / tabstop) + 1) * tabstop;
+            while vis_col < next_stop {
+                cells.push((vis_col, ' ', i));
+                vis_col += 1;
+            }
+        } else {
+            cells.push((vis_col, ch, i));
+            vis_col += 1;
+        }
+    }
+    let total_vis_cols = vis_col;
+
+    for &(vcol, ch, ci) in &cells {
+        if vcol < scroll_left {
+            continue;
+        }
+        let col = (vcol - scroll_left) as u16;
         if col >= max_width {
             break;
         }
-        let fg = rc(char_fgs[i]);
-        let bg = char_bgs[i].map(rc).unwrap_or(window_bg);
-        if char_mods[i].is_empty() {
-            set_cell(buf, x_start + col, y, chars[i], fg, bg);
+        let fg = rc(char_fgs[ci]);
+        let bg = char_bgs[ci].map(rc).unwrap_or(window_bg);
+        if char_mods[ci].is_empty() {
+            set_cell(buf, x_start + col, y, ch, fg, bg);
         } else {
-            set_cell_styled(buf, x_start + col, y, chars[i], fg, bg, char_mods[i]);
+            set_cell_styled(buf, x_start + col, y, ch, fg, bg, char_mods[ci]);
         }
     }
 
     // Inline annotation / virtual text (e.g. git blame)
     if let Some(ann) = &line.annotation {
-        let visible_chars = chars.len().saturating_sub(scroll_left);
-        let ann_start = x_start + visible_chars.min(max_width as usize) as u16;
+        let visible_cols = total_vis_cols.saturating_sub(scroll_left);
+        let ann_start = x_start + visible_cols.min(max_width as usize) as u16;
         let ann_fg = rc(theme.annotation_fg);
         for (i, ch) in ann.chars().enumerate() {
             let col = ann_start + i as u16;
@@ -7148,11 +7274,15 @@ fn render_selection(
         let char_count = line.raw_text.chars().filter(|&c| c != '\n').count().max(1);
         let effective_end = col_end.min(char_count);
 
-        for col in col_start..effective_end {
-            if col < window.scroll_left {
+        // Convert char-index column range to visual columns accounting for tabs.
+        let vis_start = char_col_to_visual(&line.raw_text, col_start, window.tabstop);
+        let vis_end = char_col_to_visual(&line.raw_text, effective_end, window.tabstop);
+
+        for vis in vis_start..vis_end {
+            if vis < window.scroll_left {
                 continue;
             }
-            let screen_col = (col - window.scroll_left) as u16;
+            let screen_col = (vis - window.scroll_left) as u16;
             if screen_col >= text_width as u16 {
                 break;
             }
@@ -7537,36 +7667,32 @@ fn render_activity_bar(
     area: Rect,
     sidebar: &TuiSidebar,
     theme: &Theme,
-    menu_bar_visible: bool,
+    _menu_bar_visible: bool,
 ) {
     let bar_bg = rc(theme.tab_bar_bg);
-    let active_bg = rc(theme.status_bg);
-    let icon_fg = rc(theme.status_fg);
-    let inactive_fg = rc(theme.line_number_fg);
+    // All icons rendered in off-white for readability; active indicated by left accent bar.
+    let icon_fg = RColor::Rgb(200, 200, 210);
+    let accent_fg = rc(theme.cursor); // left-edge accent bar for active panel
     let toolbar_sel_bg = rc(theme.cursor); // highlight for toolbar-focused selection
 
     // Fill entire activity bar background
     for y in area.y..area.y + area.height {
         for x in area.x..area.x + area.width {
-            set_cell(buf, x, y, ' ', inactive_fg, bar_bg);
+            set_cell(buf, x, y, ' ', icon_fg, bar_bg);
         }
     }
 
     // Row 0: Hamburger icon (menu bar toggle)
     if area.height >= 1 {
         let y = area.y;
-        let (fg, bg) = if sidebar.toolbar_focused && sidebar.toolbar_selected == 0 {
-            (icon_fg, toolbar_sel_bg)
-        } else if menu_bar_visible {
-            (icon_fg, active_bg)
-        } else {
-            (inactive_fg, bar_bg)
-        };
+        let is_kbd_sel = sidebar.toolbar_focused && sidebar.toolbar_selected == 0;
+        let row_bg = if is_kbd_sel { toolbar_sel_bg } else { bar_bg };
+        let fg = icon_fg;
         for x in area.x..area.x + area.width {
-            set_cell(buf, x, y, ' ', fg, bg);
+            set_cell(buf, x, y, ' ', fg, row_bg);
         }
         if area.width >= 3 {
-            set_cell(buf, area.x + 1, y, '\u{f035c}', fg, bg); // hamburger
+            set_cell(buf, area.x + 1, y, '\u{f035c}', fg, row_bg); // hamburger
         }
     }
 
@@ -7586,18 +7712,18 @@ fn render_activity_bar(
             break;
         }
         let is_active = sidebar.visible && sidebar.active_panel == panel;
-        let (fg, bg) = if sidebar.toolbar_focused && sidebar.toolbar_selected == row_off {
-            (icon_fg, toolbar_sel_bg)
-        } else if is_active {
-            (icon_fg, active_bg)
-        } else {
-            (inactive_fg, bar_bg)
-        };
+        let is_kbd_sel = sidebar.toolbar_focused && sidebar.toolbar_selected == row_off;
+        let row_bg = if is_kbd_sel { toolbar_sel_bg } else { bar_bg };
+        let fg = icon_fg;
         for x in area.x..area.x + area.width {
-            set_cell(buf, x, y, ' ', fg, bg);
+            set_cell(buf, x, y, ' ', fg, row_bg);
         }
         if area.width >= 3 {
-            set_cell(buf, area.x + 1, y, icon, fg, bg);
+            set_cell(buf, area.x + 1, y, icon, fg, row_bg);
+        }
+        if is_active && !is_kbd_sel {
+            // Left accent bar for active panel
+            set_cell(buf, area.x, y, '▎', accent_fg, bar_bg);
         }
     }
 
@@ -7605,18 +7731,17 @@ fn render_activity_bar(
     if area.height >= 1 {
         let y = area.y + area.height - 1;
         let is_active = sidebar.visible && sidebar.active_panel == TuiPanel::Settings;
-        let (fg, bg) = if sidebar.toolbar_focused && sidebar.toolbar_selected == 7 {
-            (icon_fg, toolbar_sel_bg)
-        } else if is_active {
-            (icon_fg, active_bg)
-        } else {
-            (inactive_fg, bar_bg)
-        };
+        let is_kbd_sel = sidebar.toolbar_focused && sidebar.toolbar_selected == 7;
+        let row_bg = if is_kbd_sel { toolbar_sel_bg } else { bar_bg };
+        let fg = icon_fg;
         for x in area.x..area.x + area.width {
-            set_cell(buf, x, y, ' ', fg, bg);
+            set_cell(buf, x, y, ' ', fg, row_bg);
         }
         if area.width >= 3 {
-            set_cell(buf, area.x + 1, y, '\u{f013}', fg, bg); // nf-fa-cog
+            set_cell(buf, area.x + 1, y, '\u{f013}', fg, row_bg); // nf-fa-cog
+        }
+        if is_active && !is_kbd_sel {
+            set_cell(buf, area.x, y, '▎', accent_fg, bar_bg);
         }
     }
 }
@@ -8744,9 +8869,19 @@ fn translate_key(event: KeyEvent, keyboard_enhanced: bool) -> Option<(String, Op
                     "grave".to_string()
                 } else if lower == ',' {
                     "comma".to_string()
-                } else if (lower == ']' || (!keyboard_enhanced && lower == '5')) && shift {
+                } else if (lower == ']' || lower == '}' || (!keyboard_enhanced && lower == '5'))
+                    && shift
+                {
                     "Shift_bracketright".to_string()
-                } else if (lower == '[' || (!keyboard_enhanced && lower == '3')) && shift {
+                } else if (lower == '[' || lower == '{' || (!keyboard_enhanced && lower == '3'))
+                    && shift
+                {
+                    "Shift_bracketleft".to_string()
+                } else if lower == '}' {
+                    // Ctrl+Shift+] without keyboard enhancement: terminal sends '}'
+                    "Shift_bracketright".to_string()
+                } else if lower == '{' {
+                    // Ctrl+Shift+[ without keyboard enhancement: terminal sends '{'
                     "Shift_bracketleft".to_string()
                 } else if lower == ']' || (!keyboard_enhanced && lower == '5') {
                     "bracketright".to_string()

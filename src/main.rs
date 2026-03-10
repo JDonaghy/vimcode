@@ -1557,6 +1557,31 @@ impl SimpleComponent for App {
                                             || key == gdk::Key::bracketright;
                                         let is_bracket_left = key_name == "bracketleft"
                                             || key == gdk::Key::bracketleft;
+                                        // Shift+[ → braceleft/{, Shift+] → braceright/}
+                                        let is_brace_left = key_name == "braceleft"
+                                            || key_name == "{"
+                                            || key == gdk::Key::braceleft;
+                                        let is_brace_right = key_name == "braceright"
+                                            || key_name == "}"
+                                            || key == gdk::Key::braceright;
+                                        // Ctrl+Shift+[ → fold, Ctrl+Shift+] → unfold
+                                        if shift && (is_bracket_left || is_brace_left) {
+                                            sender.input(Msg::KeyPress {
+                                                key_name: "Shift_bracketleft".to_string(),
+                                                unicode: None,
+                                                ctrl: true,
+                                            });
+                                            return gtk4::glib::Propagation::Stop;
+                                        }
+                                        if shift && (is_bracket_right || is_brace_right) {
+                                            sender.input(Msg::KeyPress {
+                                                key_name: "Shift_bracketright".to_string(),
+                                                unicode: None,
+                                                ctrl: true,
+                                            });
+                                            return gtk4::glib::Propagation::Stop;
+                                        }
+                                        // Ctrl+[ → outdent, Ctrl+] → indent (no shift)
                                         if is_bracket_right && !shift {
                                             sender.input(Msg::KeyPress {
                                                 key_name: "bracketright".to_string(),
@@ -1828,6 +1853,16 @@ impl SimpleComponent for App {
         // colours automatically when the GTK theme supports it (e.g. Adwaita).
         if let Some(gtk_settings) = gtk4::Settings::default() {
             gtk_settings.set_gtk_application_prefer_dark_theme(true);
+        }
+
+        // Ensure GTK finds our installed SVG icon by adding
+        // ~/.local/share/icons to the icon theme search path.
+        if let Some(home) = std::env::var_os("HOME") {
+            let icon_dir = std::path::PathBuf::from(home).join(".local/share/icons");
+            if let Some(display) = gdk::Display::default() {
+                let icon_theme = gtk4::IconTheme::for_display(&display);
+                icon_theme.add_search_path(&icon_dir);
+            }
         }
 
         let engine = {
@@ -7448,7 +7483,16 @@ fn draw_tab_bar(
             cr.close_path();
             cr.fill().ok();
         }
-        let (xr, xg, xb) = if is_close_hovered {
+        // Show ● (modified dot) when dirty and not hovered, × otherwise (VSCode style).
+        let close_glyph = if tab.dirty && !is_close_hovered {
+            "●"
+        } else {
+            "×"
+        };
+        let (xr, xg, xb) = if tab.dirty && !is_close_hovered {
+            // White/foreground dot for modified indicator
+            theme.foreground.to_cairo()
+        } else if is_close_hovered {
             theme.foreground.to_cairo()
         } else if tab.active {
             theme.tab_inactive_fg.to_cairo()
@@ -7457,7 +7501,7 @@ fn draw_tab_bar(
         };
         cr.set_source_rgb(xr, xg, xb);
         layout.set_font_description(Some(&normal_font));
-        layout.set_text("×");
+        layout.set_text(close_glyph);
         cr.move_to(close_x, y_offset);
         pangocairo::show_layout(cr, layout);
 
@@ -11944,14 +11988,42 @@ fn install_icon_and_desktop() {
         return;
     };
     let data_dir = home.join(".local/share");
+    let hicolor = data_dir.join("icons/hicolor");
 
     // SVG icon for scalable size (GTK/GNOME renders SVGs natively).
-    let svg_dir = data_dir.join("icons/hicolor/scalable/apps");
+    let svg_dir = hicolor.join("scalable/apps");
     let svg_path = svg_dir.join("vimcode.svg");
     let svg_bytes: &[u8] = include_bytes!("../vim-code.svg");
     if fs::create_dir_all(&svg_dir).is_ok() {
         let _ = fs::write(&svg_path, svg_bytes);
     }
+
+    // Render the SVG to PNG at multiple sizes so compositors and window
+    // managers that don't support SVG lookup (or only read _NET_WM_ICON
+    // pixel data at a fixed size) get a crisp icon in alt-tab / taskbar.
+    if svg_path.exists() {
+        for size in [48, 64, 128, 256, 512] {
+            let png_dir = hicolor.join(format!("{size}x{size}/apps"));
+            let png_path = png_dir.join("vimcode.png");
+            if png_path.exists() {
+                continue; // already rendered
+            }
+            if fs::create_dir_all(&png_dir).is_ok() {
+                if let Ok(pixbuf) =
+                    gtk4::gdk_pixbuf::Pixbuf::from_file_at_size(&svg_path, size, size)
+                {
+                    let _ = pixbuf.savev(&png_path, "png", &[]);
+                }
+            }
+        }
+    }
+
+    // Refresh icon theme cache so the new icons are picked up immediately.
+    let _ = std::process::Command::new("gtk-update-icon-cache")
+        .arg("--force")
+        .arg("--quiet")
+        .arg(&hicolor)
+        .output();
 
     // .desktop file
     let app_dir = data_dir.join("applications");

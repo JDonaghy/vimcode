@@ -11,7 +11,7 @@ There's a touch of irony here - using a cli tool to write the editor that I've w
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 2985+ tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 2985 tests, zero async runtime dependency
 
 > **Note:** VimCode does not implement VimScript. Extension and scripting is handled via
 > the built-in Lua 5.4 plugin system. The goal is full Vim *keybinding* and *editing*
@@ -973,7 +973,7 @@ All state lives in `~/.config/vimcode/`:
 ### Rendering
 
 **Syntax highlighting** (Tree-sitter, auto-detected by extension)
-- Rust, Python, JavaScript, TypeScript/TSX, Go, C, C++, C#, Java, Ruby, Bash, JSON, TOML, CSS
+- Rust, Python, JavaScript, TypeScript/TSX, Go, C, C++, C#, Java, Ruby, Bash, JSON, TOML, CSS, YAML, HTML
 
 **Line numbers** — absolute / relative / hybrid (both on = hybrid)
 

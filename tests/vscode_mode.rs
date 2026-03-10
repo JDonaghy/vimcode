@@ -709,3 +709,125 @@ fn test_vscode_multi_cursor_escape_clears() {
     e.handle_key("Escape", None, false);
     assert_eq!(e.view().extra_cursors.len(), 0);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Phase 4: Fold operations + Tab indicators + Menu
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_vscode_ctrl_shift_bracket_left_folds_from_header() {
+    // Cursor on fold header line — should fold the block.
+    let mut e = engine_with("fn main() {\n    let x = 1;\n    let y = 2;\n}\n");
+    vscode_mode(&mut e);
+    e.view_mut().cursor = Cursor { line: 0, col: 0 };
+    e.handle_key("Shift_bracketleft", None, true);
+    assert!(e.view().fold_at(0).is_some(), "fold should exist at line 0");
+    assert!(e.view().is_line_hidden(1));
+    assert!(e.view().is_line_hidden(2));
+}
+
+#[test]
+fn test_vscode_ctrl_shift_bracket_left_folds_from_body() {
+    // Cursor inside the body — should find enclosing block and fold it.
+    let mut e = engine_with("fn main() {\n    let x = 1;\n    let y = 2;\n}\n");
+    vscode_mode(&mut e);
+    e.view_mut().cursor = Cursor { line: 1, col: 4 };
+    e.handle_key("Shift_bracketleft", None, true);
+    assert!(e.view().fold_at(0).is_some(), "fold should exist at line 0");
+    assert!(e.view().is_line_hidden(1));
+    assert!(e.view().is_line_hidden(2));
+    // Cursor should move to the fold header
+    assert_eq!(e.cursor().line, 0);
+}
+
+#[test]
+fn test_vscode_ctrl_shift_bracket_right_unfolds_region() {
+    let mut e = engine_with("fn main() {\n    let x = 1;\n    let y = 2;\n}\n");
+    vscode_mode(&mut e);
+    e.view_mut().cursor = Cursor { line: 0, col: 0 };
+    // Fold first
+    e.handle_key("Shift_bracketleft", None, true);
+    assert!(e.view().fold_at(0).is_some());
+    // Unfold
+    e.handle_key("Shift_bracketright", None, true);
+    assert!(e.view().fold_at(0).is_none(), "fold should be removed");
+    assert!(!e.view().is_line_hidden(1));
+}
+
+#[test]
+fn test_vscode_progressive_fold_parent() {
+    // Nested indentation: first fold inner block, then fold parent.
+    let src = "fn outer() {\n    fn inner() {\n        let x = 1;\n    }\n}\n";
+    let mut e = engine_with(src);
+    vscode_mode(&mut e);
+    // Cursor on inner function
+    e.view_mut().cursor = Cursor { line: 1, col: 0 };
+    // First Ctrl+Shift+[ folds the inner block
+    e.handle_key("Shift_bracketleft", None, true);
+    assert!(e.view().fold_at(1).is_some(), "inner fold should exist");
+    assert!(!e.view().is_line_hidden(0), "outer line 0 still visible");
+    // Second press: cursor is now on fold header (line 1), should fold parent (line 0)
+    e.handle_key("Shift_bracketleft", None, true);
+    assert!(e.view().fold_at(0).is_some(), "outer fold should now exist");
+    // Cursor should move to the parent fold header
+    assert_eq!(e.cursor().line, 0);
+}
+
+#[test]
+fn test_vscode_progressive_unfold() {
+    // Fold a region, then unfold it. The flat fold model merges nested folds
+    // into one, so unfolding the outer fold reveals all nested content.
+    let src = "fn outer() {\n    fn inner() {\n        let x = 1;\n    }\n}\n";
+    let mut e = engine_with(src);
+    vscode_mode(&mut e);
+    // Fold inner first
+    e.view_mut().cursor = Cursor { line: 1, col: 0 };
+    e.handle_key("Shift_bracketleft", None, true);
+    assert!(e.view().fold_at(1).is_some(), "inner fold exists");
+    // Progressive fold: now fold outer (cursor is on fold header line 1)
+    e.handle_key("Shift_bracketleft", None, true);
+    assert_eq!(e.cursor().line, 0);
+    assert!(e.view().fold_at(0).is_some(), "outer fold exists");
+    // The inner fold was absorbed by the outer fold
+    assert!(e.view().fold_at(1).is_none(), "inner fold absorbed");
+    // Unfold the outer fold — all lines become visible
+    e.handle_key("Shift_bracketright", None, true);
+    assert!(e.view().fold_at(0).is_none(), "outer fold removed");
+    assert!(!e.view().is_line_hidden(1), "line 1 visible");
+    assert!(!e.view().is_line_hidden(2), "line 2 visible");
+    assert!(!e.view().is_line_hidden(3), "line 3 visible");
+}
+
+#[test]
+fn test_tab_dirty_marker_no_asterisk() {
+    // Tab display_name() should not contain asterisk — the modified dot
+    // indicator is rendered separately by the backends.
+    let mut e = engine_with("hello\n");
+    // Make buffer dirty
+    e.handle_key("i", None, false);
+    e.handle_key("x", Some('x'), false);
+    e.handle_key("Escape", None, false);
+    let win_id = e.active_window_id();
+    let buf_id = e.windows[&win_id].buffer_id;
+    let state = e.buffer_manager.get(buf_id).unwrap();
+    assert!(state.dirty, "buffer should be dirty");
+    let name = state.display_name();
+    // The display_name itself never had an asterisk; we verify the dirty
+    // flag is set so that backends can show the ● indicator.
+    assert!(
+        !name.contains('*'),
+        "display_name should not contain asterisk: {}",
+        name
+    );
+}
+
+#[test]
+fn test_word_wrap_toggle_via_menu_action() {
+    let mut e = engine_with("hello\n");
+    assert!(!e.settings.wrap, "wrap should default to false");
+    // The menu dispatches "set_wrap_toggle" through execute_command.
+    e.execute_command("set_wrap_toggle");
+    assert!(e.settings.wrap, "wrap should be true after toggle");
+    e.execute_command("set_wrap_toggle");
+    assert!(!e.settings.wrap, "wrap should be false after second toggle");
+}

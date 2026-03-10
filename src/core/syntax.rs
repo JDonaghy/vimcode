@@ -1,3 +1,4 @@
+use streaming_iterator::StreamingIterator;
 use tree_sitter::{Language, Parser, Point, Query, QueryCursor, Tree};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -10,7 +11,7 @@ pub enum SyntaxLanguage {
     C,
     TypeScript,
     TypeScriptReact,
-    // TODO: Html — tree-sitter-html 0.20.4 depends on tree-sitter 0.22, incompatible
+    Html,
     Css,
     Json,
     Bash,
@@ -18,8 +19,8 @@ pub enum SyntaxLanguage {
     CSharp,
     Java,
     Toml,
-    // TODO: Lua (tree-sitter-lua has no 0.20.x release on crates.io)
-    // TODO: Kotlin (tree-sitter-kotlin has no 0.20.x release on crates.io)
+    Yaml,
+    // TODO: Lua (tree-sitter-lua 0.4 requires tree-sitter 0.25+, language version 15)
 }
 
 impl SyntaxLanguage {
@@ -71,6 +72,10 @@ impl SyntaxLanguage {
             Some(Self::Java)
         } else if path_lower.ends_with(".toml") {
             Some(Self::Toml)
+        } else if path_lower.ends_with(".yaml") || path_lower.ends_with(".yml") {
+            Some(Self::Yaml)
+        } else if path_lower.ends_with(".html") || path_lower.ends_with(".htm") {
+            Some(Self::Html)
         } else {
             None
         }
@@ -78,21 +83,23 @@ impl SyntaxLanguage {
 
     fn language(&self) -> Language {
         match self {
-            Self::Rust => tree_sitter_rust::language(),
-            Self::Python => tree_sitter_python::language(),
-            Self::JavaScript => tree_sitter_javascript::language(),
-            Self::Go => tree_sitter_go::language(),
-            Self::Cpp => tree_sitter_cpp::language(),
-            Self::C => tree_sitter_c::language(),
-            Self::TypeScript => tree_sitter_typescript::language_typescript(),
-            Self::TypeScriptReact => tree_sitter_typescript::language_tsx(),
-            Self::Css => tree_sitter_css::language(),
-            Self::Json => tree_sitter_json::language(),
-            Self::Bash => tree_sitter_bash::language(),
-            Self::Ruby => tree_sitter_ruby::language(),
-            Self::CSharp => tree_sitter_c_sharp::language(),
-            Self::Java => tree_sitter_java::language(),
-            Self::Toml => tree_sitter_toml::language(),
+            Self::Rust => tree_sitter_rust::LANGUAGE.into(),
+            Self::Python => tree_sitter_python::LANGUAGE.into(),
+            Self::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
+            Self::Go => tree_sitter_go::LANGUAGE.into(),
+            Self::Cpp => tree_sitter_cpp::LANGUAGE.into(),
+            Self::C => tree_sitter_c::LANGUAGE.into(),
+            Self::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            Self::TypeScriptReact => tree_sitter_typescript::LANGUAGE_TSX.into(),
+            Self::Html => tree_sitter_html::LANGUAGE.into(),
+            Self::Css => tree_sitter_css::LANGUAGE.into(),
+            Self::Json => tree_sitter_json::LANGUAGE.into(),
+            Self::Bash => tree_sitter_bash::LANGUAGE.into(),
+            Self::Ruby => tree_sitter_ruby::LANGUAGE.into(),
+            Self::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
+            Self::Java => tree_sitter_java::LANGUAGE.into(),
+            Self::Toml => tree_sitter_toml_ng::LANGUAGE.into(),
+            Self::Yaml => tree_sitter_yaml::LANGUAGE.into(),
         }
     }
 
@@ -410,18 +417,15 @@ impl SyntaxLanguage {
                 (enum_declaration name: (identifier) @type)
                 (delegate_declaration name: (identifier) @type)
                 (generic_name (identifier) @type)
-                (void_keyword) @type
                 (implicit_type) @keyword
 
                 (variable_declaration type: (identifier) @type)
                 (parameter type: (identifier) @type)
                 (object_creation_expression type: (identifier) @type)
-                (method_declaration type: (identifier) @type)
-                (local_function_statement type: (identifier) @type)
                 (property_declaration type: (identifier) @type)
                 (event_declaration type: (identifier) @type)
                 (cast_expression type: (identifier) @type)
-                (for_each_statement type: (identifier) @type)
+                (foreach_statement type: (identifier) @type)
                 (catch_declaration type: (identifier) @type)
                 (base_list (identifier) @type)
 
@@ -536,6 +540,30 @@ impl SyntaxLanguage {
                 (boolean) @keyword
                 (comment) @comment
             ",
+            Self::Yaml => "
+                (block_mapping_pair key: (flow_node) @type)
+                (flow_mapping (_ key: (flow_node) @type))
+                (double_quote_scalar) @string
+                (single_quote_scalar) @string
+                (block_scalar) @string
+                (integer_scalar) @number
+                (float_scalar) @number
+                (boolean_scalar) @keyword
+                (null_scalar) @keyword
+                (comment) @comment
+                (anchor_name) @function
+                (alias_name) @function
+                (tag) @function
+            ",
+            Self::Html => "
+                (tag_name) @keyword
+                (attribute_name) @type
+                (attribute_value) @string
+                (quoted_attribute_value) @string
+                (comment) @comment
+                (doctype) @keyword
+                (raw_text) @string
+            ",
         }
     }
 }
@@ -559,11 +587,11 @@ impl Syntax {
         let mut parser = Parser::new();
         let ts_language = language.language();
         parser
-            .set_language(ts_language)
+            .set_language(&ts_language)
             .expect("Error loading grammar");
 
         let query_source = language.query_source();
-        let query = Query::new(ts_language, query_source).expect("Error compiling query");
+        let query = Query::new(&ts_language, query_source).expect("Error compiling query");
 
         Self {
             parser,
@@ -609,13 +637,13 @@ impl Syntax {
         let mut cursor = QueryCursor::new();
         let mut highlights = Vec::new();
 
-        let matches = cursor.matches(&self.query, tree.root_node(), text.as_bytes());
+        let mut matches = cursor.matches(&self.query, tree.root_node(), text.as_bytes());
 
-        for m in matches {
+        while let Some(m) = matches.next() {
             for capture in m.captures {
                 let start = capture.node.start_byte();
                 let end = capture.node.end_byte();
-                let capture_name = self.query.capture_names()[capture.index as usize].clone();
+                let capture_name = self.query.capture_names()[capture.index as usize].to_string();
                 highlights.push((start, end, capture_name));
             }
         }
@@ -876,9 +904,36 @@ mod tests {
 
     #[test]
     fn test_language_detection_html() {
-        // HTML is not yet supported (tree-sitter-html 0.20.x depends on tree-sitter 0.22)
-        assert_eq!(SyntaxLanguage::from_path("index.html"), None);
-        assert_eq!(SyntaxLanguage::from_path("page.htm"), None);
+        assert_eq!(
+            SyntaxLanguage::from_path("index.html"),
+            Some(SyntaxLanguage::Html)
+        );
+        assert_eq!(
+            SyntaxLanguage::from_path("page.htm"),
+            Some(SyntaxLanguage::Html)
+        );
+    }
+
+    #[test]
+    fn test_language_detection_yaml() {
+        assert_eq!(
+            SyntaxLanguage::from_path("config.yaml"),
+            Some(SyntaxLanguage::Yaml)
+        );
+        assert_eq!(
+            SyntaxLanguage::from_path("config.yml"),
+            Some(SyntaxLanguage::Yaml)
+        );
+        assert_eq!(
+            SyntaxLanguage::from_path("CONFIG.YAML"),
+            Some(SyntaxLanguage::Yaml)
+        );
+    }
+
+    #[test]
+    fn test_language_detection_lua() {
+        // Lua not yet supported (tree-sitter-lua requires tree-sitter 0.25+)
+        assert_eq!(SyntaxLanguage::from_path("init.lua"), None);
     }
 
     #[test]
@@ -1084,6 +1139,44 @@ mod tests {
     fn test_syntax_toml_basic() {
         let mut syntax = Syntax::new_for_language(SyntaxLanguage::Toml);
         let code = "[package]\nname = \"vimcode\"\nversion = \"0.1.0\"";
+        let highlights = syntax.parse(code);
+        assert!(!highlights.is_empty());
+    }
+
+    #[test]
+    fn test_syntax_yaml_basic() {
+        let mut syntax = Syntax::new_for_language(SyntaxLanguage::Yaml);
+        let code = "# comment\napp_name: \"MyApp\"\nversion: 1.0\nenabled: true\n";
+        let highlights = syntax.parse(code);
+        assert!(!highlights.is_empty());
+        let kinds: Vec<&str> = highlights.iter().map(|(_, _, k)| k.as_str()).collect();
+        assert!(kinds.contains(&"comment"), "should highlight comments");
+        assert!(kinds.contains(&"string"), "should highlight quoted strings");
+        assert!(kinds.contains(&"type"), "should highlight keys as type");
+        assert!(kinds.contains(&"number"), "should highlight numbers");
+        assert!(
+            kinds.contains(&"keyword"),
+            "should highlight booleans as keyword"
+        );
+        // Keys must not be overridden by string — check that key byte range has type, not string
+        let key_highlights: Vec<_> = highlights
+            .iter()
+            .filter(|(s, e, _)| *s == 10 && *e == 18)
+            .collect();
+        assert!(
+            key_highlights.iter().any(|(_, _, k)| k == "type"),
+            "key should be type"
+        );
+        assert!(
+            !key_highlights.iter().any(|(_, _, k)| k == "string"),
+            "key should NOT be string"
+        );
+    }
+
+    #[test]
+    fn test_syntax_html_basic() {
+        let mut syntax = Syntax::new_for_language(SyntaxLanguage::Html);
+        let code = "<html><body class=\"main\">Hello</body></html>";
         let highlights = syntax.parse(code);
         assert!(!highlights.is_empty());
     }

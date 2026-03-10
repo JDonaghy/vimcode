@@ -1813,6 +1813,9 @@ impl Engine {
 
         match engine.buffer_manager.open_file(path) {
             Ok(buffer_id) => {
+                engine
+                    .buffer_manager
+                    .apply_language_map(buffer_id, &engine.settings.language_map);
                 // Update the window to point to the new buffer
                 if let Some(window) = engine.windows.get_mut(&engine.active_window_id()) {
                     window.buffer_id = buffer_id;
@@ -3211,6 +3214,8 @@ impl Engine {
             .buffer_manager
             .open_file(path)
             .map_err(|e| format!("Error: {}", e))?;
+        self.buffer_manager
+            .apply_language_map(buffer_id, &self.settings.language_map);
 
         let already_existed = existing_ids.contains(&buffer_id);
         let is_already_permanent = already_existed
@@ -3290,7 +3295,11 @@ impl Engine {
         // Determine which buffer the new window should show
         let new_buffer_id = if let Some(path) = file_path {
             match self.buffer_manager.open_file(path) {
-                Ok(id) => id,
+                Ok(id) => {
+                    self.buffer_manager
+                        .apply_language_map(id, &self.settings.language_map);
+                    id
+                }
                 Err(e) => {
                     self.message = format!("Error: {}", e);
                     return;
@@ -3486,7 +3495,11 @@ impl Engine {
     pub fn new_tab(&mut self, file_path: Option<&Path>) {
         let buffer_id = if let Some(path) = file_path {
             match self.buffer_manager.open_file(path) {
-                Ok(id) => id,
+                Ok(id) => {
+                    self.buffer_manager
+                        .apply_language_map(id, &self.settings.language_map);
+                    id
+                }
                 Err(e) => {
                     self.message = format!("Error: {}", e);
                     return;
@@ -3591,6 +3604,7 @@ impl Engine {
             self.active_group_mut().active_tab = (self.active_group().active_tab + 1) % tabs_len;
             self.line_annotations.clear();
             self.tab_mru_touch();
+            self.lsp_ensure_active_buffer();
         }
     }
 
@@ -3602,6 +3616,7 @@ impl Engine {
             self.active_group_mut().active_tab = if at == 0 { tabs_len - 1 } else { at - 1 };
             self.line_annotations.clear();
             self.tab_mru_touch();
+            self.lsp_ensure_active_buffer();
         }
     }
 
@@ -3647,6 +3662,7 @@ impl Engine {
                 self.active_group_mut().active_tab = tab_idx;
                 self.tab_mru_touch();
                 self.line_annotations.clear();
+                self.lsp_ensure_active_buffer();
             }
         }
         self.tab_switcher_open = false;
@@ -3679,6 +3695,7 @@ impl Engine {
             self.active_group_mut().active_tab = index;
             self.line_annotations.clear();
             self.tab_mru_touch();
+            self.lsp_ensure_active_buffer();
         }
     }
 
@@ -4002,6 +4019,8 @@ impl Engine {
                 return;
             }
         };
+        self.buffer_manager
+            .apply_language_map(buffer_id, &self.settings.language_map);
 
         // If this buffer is the current preview, just promote it in-place.
         if self.preview_buffer_id == Some(buffer_id) {
@@ -4079,6 +4098,8 @@ impl Engine {
                 return;
             }
         };
+        self.buffer_manager
+            .apply_language_map(buffer_id, &self.settings.language_map);
 
         // Already shown in any tab? Just switch to it (permanent or current preview).
         let found = self
@@ -4481,17 +4502,16 @@ impl Engine {
             }
         }
 
-        // Notify LSP for all restored buffers (tree restore bypasses open_file_with_mode).
-        let restored_bids: Vec<BufferId> = self.buffer_manager.list();
-        for bid in restored_bids {
-            let has_file = self
-                .buffer_manager
-                .get(bid)
-                .and_then(|s| s.file_path.as_ref())
-                .is_some();
-            if has_file {
-                self.lsp_did_open(bid);
-            }
+        // Notify LSP only for the active buffer — other buffers will get
+        // lsp_did_open when the user actually switches to their tab.
+        let active_bid = self.active_buffer_id();
+        let has_file = self
+            .buffer_manager
+            .get(active_bid)
+            .and_then(|s| s.file_path.as_ref())
+            .is_some();
+        if has_file {
+            self.lsp_did_open(active_bid);
         }
 
         // Check all restored buffers for stale swap files.
@@ -11795,6 +11815,8 @@ impl Engine {
             "updatetime",
             "ut",
             "mode",
+            "filetype",
+            "ft",
         ]
     }
 
@@ -13643,20 +13665,18 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // Handle :LspInfo — show running LSP servers
+        // Handle :LspInfo — show running LSP servers (● marks active for current buffer)
         if cmd == "LspInfo" {
             let buf_lang = self
                 .buffer_manager
                 .get(self.active_buffer_id())
-                .and_then(|s| s.lsp_language_id.clone())
-                .unwrap_or_else(|| "none".to_string());
-            let mut parts = vec![format!("buf_lang={buf_lang}")];
+                .and_then(|s| s.lsp_language_id.clone());
             if let Some(mgr) = &self.lsp_manager {
-                parts.extend(mgr.server_info());
+                let servers = mgr.server_info(buf_lang.as_deref());
+                self.message = servers.join(" | ");
             } else {
-                parts.push("manager=not started".to_string());
+                self.message = "LSP manager not started".to_string();
             }
-            self.message = parts.join("; ");
             return EngineAction::None;
         }
 
@@ -14285,7 +14305,50 @@ impl Engine {
             return EngineAction::None;
         }
         if let Some(args) = cmd.strip_prefix("set ") {
-            match self.settings.parse_set_option(args.trim()) {
+            let trimmed = args.trim();
+
+            // Handle :set filetype=<lang> / :set ft=<lang> — per-buffer language override
+            let ft_val = trimmed
+                .strip_prefix("filetype=")
+                .or_else(|| trimmed.strip_prefix("ft="));
+            if let Some(lang) = ft_val {
+                let lang = lang.trim().to_string();
+                if lang.is_empty() {
+                    self.message = "filetype: value required".to_string();
+                    return EngineAction::Error;
+                }
+                let buf_id = self.active_buffer_id();
+                // Update buffer's language ID
+                if let Some(state) = self.buffer_manager.get_mut(buf_id) {
+                    state.lsp_language_id = Some(lang.clone());
+                    // Persist to settings.language_map if buffer has a file extension
+                    if let Some(ext) = state
+                        .file_path
+                        .as_ref()
+                        .and_then(|p| p.extension())
+                        .and_then(|e| e.to_str())
+                        .map(|e| e.to_string())
+                    {
+                        self.settings.language_map.insert(ext, lang.clone());
+                        let _ = self.settings.save();
+                    }
+                }
+                self.message = format!("filetype={lang}");
+                return EngineAction::None;
+            }
+
+            // Handle :set filetype? / :set ft? — query current filetype
+            if trimmed == "filetype?" || trimmed == "ft?" {
+                let ft = self
+                    .buffer_manager
+                    .get(self.active_buffer_id())
+                    .and_then(|s| s.lsp_language_id.clone())
+                    .unwrap_or_else(|| "none".to_string());
+                self.message = format!("filetype={ft}");
+                return EngineAction::None;
+            }
+
+            match self.settings.parse_set_option(trimmed) {
                 Ok(msg) => {
                     if let Err(e) = self.settings.save() {
                         self.message = format!("Setting changed but failed to save: {e}");
@@ -15053,6 +15116,13 @@ impl Engine {
             "zoomout" => {
                 self.settings.font_size = (self.settings.font_size - 1).max(6);
                 let _ = self.settings.save();
+                EngineAction::None
+            }
+            "set_wrap_toggle" => {
+                self.settings.wrap = !self.settings.wrap;
+                let _ = self.settings.save();
+                let state = if self.settings.wrap { "wrap" } else { "nowrap" };
+                self.message = format!("set {}", state);
                 EngineAction::None
             }
             "goto" => {
@@ -18692,6 +18762,89 @@ impl Engine {
         }
     }
 
+    /// Find the enclosing foldable block for `line` by walking upward to find
+    /// a line with strictly less indentation, then using `detect_fold_range`.
+    fn find_enclosing_fold_range(&self, line: usize) -> Option<(usize, usize)> {
+        let cur_indent = self.line_indent(line);
+        // Walk upward to find a line with strictly less indentation.
+        for idx in (0..line).rev() {
+            let text: String = self.buffer().content.line(idx).chars().collect();
+            if text.trim().is_empty() {
+                continue;
+            }
+            if self.line_indent(idx) < cur_indent {
+                // Found a candidate header — verify it can fold over our line.
+                if let Some((start, end)) = self.detect_fold_range(idx) {
+                    if end >= line {
+                        return Some((start, end));
+                    }
+                }
+                // Keep walking — this line's fold range didn't cover us.
+            }
+        }
+        None
+    }
+
+    /// Progressive fold (VSCode Ctrl+Shift+[): fold the enclosing block around
+    /// the cursor.  If the cursor is already on a fold header, fold the parent
+    /// block instead.  This makes repeated presses fold progressively larger
+    /// regions.
+    fn cmd_fold_close_progressive(&mut self) {
+        let line = self.view().cursor.line;
+
+        // If cursor is on a fold header, look for a parent fold.
+        if self.view().fold_at(line).is_some() {
+            if let Some((start, end)) = self.find_enclosing_fold_range(line) {
+                self.view_mut().close_fold(start, end);
+                self.view_mut().cursor.line = start;
+                self.clamp_cursor_col();
+            }
+            return;
+        }
+
+        // First try: fold starting at cursor line (cursor is on a header).
+        if let Some((start, end)) = self.detect_fold_range(line) {
+            self.view_mut().close_fold(start, end);
+            if self.view().is_line_hidden(self.view().cursor.line) {
+                self.view_mut().cursor.line = start;
+                self.clamp_cursor_col();
+            }
+            return;
+        }
+
+        // Second try: cursor is inside a block body — find enclosing fold.
+        if let Some((start, end)) = self.find_enclosing_fold_range(line) {
+            self.view_mut().close_fold(start, end);
+            self.view_mut().cursor.line = start;
+            self.clamp_cursor_col();
+        }
+    }
+
+    /// Progressive unfold: if cursor is on a fold header, open it.  If cursor
+    /// is NOT on a fold header but is inside a visible region that contains
+    /// nested folds, open the nearest inner fold. This makes repeated
+    /// Ctrl+Shift+] unfold progressively (VSCode behavior).
+    fn cmd_fold_open_progressive(&mut self) {
+        let line = self.view().cursor.line;
+        if self.view().fold_at(line).is_some() {
+            // Cursor is on a fold header — open just this fold.
+            self.view_mut().open_fold(line);
+        } else {
+            // Check if there are any folds whose header is at or after cursor
+            // line (the nearest fold below cursor).  This handles the case where
+            // the user pressed unfold on a parent line after folding children.
+            let nearest = self
+                .view()
+                .folds
+                .iter()
+                .find(|f| f.start >= line)
+                .map(|f| f.start);
+            if let Some(fold_line) = nearest {
+                self.view_mut().open_fold(fold_line);
+            }
+        }
+    }
+
     fn cmd_fold_open(&mut self) {
         let line = self.view().cursor.line;
         self.view_mut().open_fold(line);
@@ -20525,6 +20678,20 @@ impl Engine {
         self.lsp_manager = Some(LspManager::new(root, &self.settings.lsp_servers));
     }
 
+    /// Ensure LSP is started for the active buffer (lazy — called on tab switch).
+    /// This is idempotent: if the server is already running, didOpen is a no-op.
+    pub fn lsp_ensure_active_buffer(&mut self) {
+        let bid = self.active_buffer_id();
+        let has_file = self
+            .buffer_manager
+            .get(bid)
+            .and_then(|s| s.file_path.as_ref())
+            .is_some();
+        if has_file {
+            self.lsp_did_open(bid);
+        }
+    }
+
     /// Notify LSP that a file was opened.
     fn lsp_did_open(&mut self, buffer_id: BufferId) {
         // Fire plugin "open" hook regardless of LSP enabled state
@@ -20933,7 +21100,7 @@ impl Engine {
     }
 
     /// Returns the filtered list of available (not yet installed) extension manifests.
-    fn ext_available_items(&self) -> Vec<extensions::ExtensionManifest> {
+    pub fn ext_available_items(&self) -> Vec<extensions::ExtensionManifest> {
         let q = self.ext_sidebar_query.to_lowercase();
         self.ext_available_manifests()
             .into_iter()
@@ -27792,13 +27959,15 @@ impl Engine {
                     self.vscode_pending_ctrl_k = true;
                     self.message = "Ctrl+K ...".to_string();
                 }
-                // Phase 4: Ctrl+Shift+[ → fold region
+                // Phase 4: Ctrl+Shift+[ → fold region (progressive — repeated
+                // presses fold increasingly larger parent blocks)
                 "Shift_bracketleft" => {
-                    self.cmd_fold_close();
+                    self.cmd_fold_close_progressive();
                 }
-                // Phase 4: Ctrl+Shift+] → unfold region
+                // Phase 4: Ctrl+Shift+] → unfold region (progressive — repeated
+                // presses unfold nested folds)
                 "Shift_bracketright" => {
-                    self.cmd_fold_open();
+                    self.cmd_fold_open_progressive();
                 }
                 _ => {}
             }
@@ -35577,7 +35746,7 @@ mod tests {
         // :LspInfo with no servers running
         engine.execute_command("LspInfo");
         assert!(
-            engine.message.contains("manager=not started"),
+            engine.message.contains("LSP manager not started"),
             "unexpected LspInfo: {}",
             engine.message
         );
@@ -35593,6 +35762,89 @@ mod tests {
         let state = engine.active_buffer_state();
         assert_eq!(state.lsp_language_id, Some("rust".to_string()));
         let _ = std::fs::remove_file(&rs_path);
+    }
+
+    #[test]
+    fn test_set_filetype() {
+        let tf_path = std::env::temp_dir().join("vimcode_ft_test.tf");
+        std::fs::write(&tf_path, "resource \"null\" {}\n").unwrap();
+
+        let mut engine = Engine::new();
+        let _ = engine.open_file_with_mode(&tf_path, OpenMode::Permanent);
+        // Should auto-detect terraform
+        assert_eq!(
+            engine.active_buffer_state().lsp_language_id,
+            Some("terraform".to_string())
+        );
+
+        // Query filetype
+        engine.execute_command("set ft?");
+        assert!(engine.message.contains("filetype=terraform"));
+
+        // Override filetype
+        engine.execute_command("set filetype=hcl");
+        assert_eq!(
+            engine.active_buffer_state().lsp_language_id,
+            Some("hcl".to_string())
+        );
+        assert_eq!(engine.message, "filetype=hcl");
+
+        // Override should persist in language_map
+        assert_eq!(
+            engine.settings.language_map.get("tf"),
+            Some(&"hcl".to_string())
+        );
+
+        let _ = std::fs::remove_file(&tf_path);
+    }
+
+    #[test]
+    fn test_set_filetype_bicep() {
+        let bp_path = std::env::temp_dir().join("vimcode_ft_test.bicepparam");
+        std::fs::write(&bp_path, "param env = 'dev'\n").unwrap();
+
+        let mut engine = Engine::new();
+        let _ = engine.open_file_with_mode(&bp_path, OpenMode::Permanent);
+        assert_eq!(
+            engine.active_buffer_state().lsp_language_id,
+            Some("bicep".to_string())
+        );
+
+        let _ = std::fs::remove_file(&bp_path);
+    }
+
+    #[test]
+    fn test_language_map_override_on_open() {
+        let path = std::env::temp_dir().join("vimcode_langmap_test.h");
+        std::fs::write(&path, "// header\n").unwrap();
+
+        let mut engine = Engine::new();
+        // Default: .h → "c"
+        let _ = engine.open_file_with_mode(&path, OpenMode::Permanent);
+        assert_eq!(
+            engine.active_buffer_state().lsp_language_id,
+            Some("c".to_string())
+        );
+
+        // Close and reopen with language_map override
+        engine
+            .settings
+            .language_map
+            .insert("h".to_string(), "cpp".to_string());
+        // Open in a new tab to get a fresh buffer
+        engine.new_tab(Some(&path));
+        // The existing buffer is reused, but language_map was applied
+        // Let's test with a truly new file
+        let path2 = std::env::temp_dir().join("vimcode_langmap_test2.h");
+        std::fs::write(&path2, "// header2\n").unwrap();
+        engine.new_tab(Some(&path2));
+        assert_eq!(
+            engine.active_buffer_state().lsp_language_id,
+            Some("cpp".to_string())
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&path2);
     }
 
     #[test]
