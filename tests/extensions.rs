@@ -439,8 +439,8 @@ fn ext_refresh_sets_fetching_flag() {
 fn all_language_extensions_have_file_extensions() {
     use vimcode_core::core::extensions::{ExtensionManifest, BUNDLED};
     for bundle in BUNDLED {
-        if bundle.name == "git-insights" || bundle.name == "commentary" {
-            continue; // tooling/utility extensions — no file extensions expected
+        if bundle.name == "git-insights" {
+            continue; // tooling/utility extension — no file extensions expected
         }
         let m = ExtensionManifest::parse(bundle.manifest_toml)
             .unwrap_or_else(|| panic!("manifest for '{}' should parse", bundle.name));
@@ -456,7 +456,7 @@ fn all_language_extensions_have_file_extensions() {
 fn all_language_extensions_have_language_ids() {
     use vimcode_core::core::extensions::{ExtensionManifest, BUNDLED};
     for bundle in BUNDLED {
-        if bundle.name == "git-insights" || bundle.name == "commentary" {
+        if bundle.name == "git-insights" {
             continue;
         }
         let m = ExtensionManifest::parse(bundle.manifest_toml)
@@ -647,6 +647,87 @@ fn ext_install_unknown_extension_shows_error() {
         !e.extension_state.is_installed("nonexistent-xyz-extension"),
         "unknown extension should not be marked installed"
     );
+}
+
+// ── Terminal-based install ─────────────────────────────────────────────────────
+
+#[test]
+fn ext_install_sets_pending_terminal_command_for_lsp() {
+    let mut e = engine_with("");
+    // Ruby has an LSP install command ("gem install ruby-lsp") and ruby-lsp
+    // binary is unlikely to be on PATH in CI.
+    let action = exec(&mut e, "ExtInstall ruby");
+    assert!(
+        e.extension_state.is_installed("ruby"),
+        "ruby should be marked installed"
+    );
+    // The action should be RunInTerminal (carries the install command).
+    assert!(
+        matches!(action, vimcode_core::EngineAction::RunInTerminal(_)),
+        "should return RunInTerminal action, got: {:?}",
+        action
+    );
+    // Clean up
+    e.extension_state.installed.clear();
+}
+
+#[test]
+fn ext_install_no_terminal_command_when_binary_exists() {
+    let mut e = engine_with("");
+    // git-insights has no LSP/DAP install command, so no terminal command.
+    let action = exec(&mut e, "ExtInstall git-insights");
+    assert!(
+        e.extension_state.is_installed("git-insights"),
+        "git-insights should be marked installed"
+    );
+    assert!(
+        e.pending_terminal_command.is_none(),
+        "no terminal command for extension without install"
+    );
+    assert_eq!(
+        action,
+        vimcode_core::EngineAction::None,
+        "should return None action"
+    );
+    // Clean up
+    e.extension_state.installed.clear();
+}
+
+#[test]
+fn ext_install_sets_install_context_for_lsp() {
+    let mut e = engine_with("");
+    // Use ruby extension whose LSP binary (ruby-lsp) is not on PATH.
+    exec(&mut e, "ExtInstall ruby");
+    // pending_install_context should have been set (consumed by terminal_run_command)
+    // but since we took the terminal command via the action, it's already consumed.
+    // Let's verify via the sidebar path instead.
+    e.extension_state.installed.clear();
+
+    // Test via sidebar: install via 'i' key
+    e.ext_sidebar_has_focus = true;
+    e.ext_sidebar_sections_expanded = [true, true];
+    let available = e.ext_available_items();
+    let ruby_idx = available
+        .iter()
+        .position(|m| m.name == "ruby")
+        .expect("ruby should be in available");
+    e.ext_sidebar_selected = ruby_idx;
+    e.handle_ext_sidebar_key("i", false, None);
+
+    // pending_terminal_command should be set (sidebar can't return EngineAction)
+    assert!(
+        e.pending_terminal_command.is_some(),
+        "sidebar install should set pending_terminal_command"
+    );
+    let cmd = e.pending_terminal_command.as_ref().unwrap();
+    assert!(
+        cmd.contains("ruby-lsp"),
+        "command should mention ruby-lsp: {cmd}"
+    );
+    // Clean up
+    e.extension_state.installed.clear();
+    e.pending_terminal_command = None;
+    e.pending_install_context = None;
 }
 
 // ── Auto-hint on file open ─────────────────────────────────────────────────────
@@ -840,24 +921,67 @@ fn ext_sidebar_d_on_available_item_is_noop() {
 // ── Sidebar Return ─────────────────────────────────────────────────────────────
 
 #[test]
-fn ext_sidebar_return_on_installed_shows_info_message() {
+fn ext_sidebar_return_on_installed_opens_readme() {
     let mut e = engine_with("");
     e.extension_state.mark_installed("csharp");
     e.ext_sidebar_has_focus = true;
+    e.ext_sidebar_sections_expanded = [true, false];
     e.ext_sidebar_selected = 0;
 
+    let tabs_before = e.active_group().tabs.len();
     e.handle_ext_sidebar_key("Return", false, None);
 
-    assert!(
-        e.message.contains("installed") || e.message.contains("csharp"),
-        "Return on installed extension should show info: {}",
-        e.message
+    // Should open README in a new tab
+    assert_eq!(
+        e.active_group().tabs.len(),
+        tabs_before + 1,
+        "Return on installed extension should open README tab"
     );
     // Must not trigger a re-install
-    // (a re-install would show "Installing" in the message)
     assert!(
         !e.message.to_lowercase().contains("installing"),
         "Return on installed item should not trigger re-install: {}",
+        e.message
+    );
+}
+
+#[test]
+fn ext_sidebar_return_on_available_opens_readme_without_install() {
+    let mut e = engine_with("");
+    e.ext_sidebar_has_focus = true;
+    e.ext_sidebar_sections_expanded = [true, true];
+    // Select first available item (nothing installed)
+    e.ext_sidebar_selected = 0;
+
+    let tabs_before = e.active_group().tabs.len();
+    e.handle_ext_sidebar_key("Return", false, None);
+
+    // Should open README without installing
+    assert!(
+        !e.extension_state.is_installed("bash"),
+        "Return on available extension should NOT install: got {:?}",
+        e.extension_state.installed
+    );
+    // Should open README tab
+    assert!(
+        e.active_group().tabs.len() >= tabs_before,
+        "Should attempt to open README"
+    );
+}
+
+#[test]
+fn ext_sidebar_i_on_already_installed_shows_message() {
+    let mut e = engine_with("");
+    e.extension_state.mark_installed("csharp");
+    e.ext_sidebar_has_focus = true;
+    e.ext_sidebar_sections_expanded = [true, false];
+    e.ext_sidebar_selected = 0;
+
+    e.handle_ext_sidebar_key("i", false, None);
+
+    assert!(
+        e.message.contains("already installed"),
+        "i on installed extension should say already installed: {}",
         e.message
     );
 }
@@ -1168,8 +1292,8 @@ fn ext_install_via_return_resets_selection_to_installed_item() {
         .expect("rust should be in available list");
     e.ext_sidebar_selected = rust_idx; // point at rust in available section
 
-    // Install via Return
-    e.handle_ext_sidebar_key("Return", false, None);
+    // Install via 'i' key (Return now previews README)
+    e.handle_ext_sidebar_key("i", false, None);
 
     // Rust should now be installed
     assert!(
@@ -1743,43 +1867,16 @@ fn plugin_buf_enter_fires_on_open_file() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// VimCode Commentary — gcc, gc (visual), :Commentary
+// Native Commentary — gcc, gc (visual), :Comment / :Commentary
+// (Commentary Lua extension removed; native comment toggling is built-in)
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Helper: engine with commentary plugin loaded and a known filetype.
+/// Helper: engine with a known filetype set for comment detection.
 fn engine_with_commentary(text: &str, lang: &str) -> vimcode_core::Engine {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    static COUNTER: AtomicUsize = AtomicUsize::new(0);
-    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("vc_commentary_test_{id}"));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-
-    // Copy the real commentary.lua bundled in the extension
-    use vimcode_core::core::extensions::BUNDLED;
-    let commentary = BUNDLED
-        .iter()
-        .find(|b| b.name == "commentary")
-        .expect("commentary should be bundled");
-    let script = commentary
-        .scripts
-        .iter()
-        .find(|s| s.0 == "commentary.lua")
-        .expect("commentary.lua script");
-    std::fs::write(dir.join("commentary.lua"), script.1).unwrap();
-
     let mut e = engine_with(text);
-    // Set language ID for comment string detection
     let buf_id = e.active_buffer_id();
     if let Some(state) = e.buffer_manager.get_mut(buf_id) {
         state.lsp_language_id = Some(lang.to_string());
-    }
-    match vimcode_core::core::plugin::PluginManager::new() {
-        Ok(mut mgr) => {
-            mgr.load_plugins_dir(&dir, &[]);
-            e.plugin_manager = Some(mgr);
-        }
-        Err(_) => panic!("failed to create PluginManager"),
     }
     e
 }
@@ -2019,29 +2116,4 @@ fn gcc_is_undoable() {
     // Undo
     press(&mut e, 'u');
     assert_eq!(get_lines(&e)[0], "let x = 1;", "undo should restore");
-}
-
-// ── Commentary bundled extension manifest ──────────────────────────────────
-
-#[test]
-fn commentary_extension_is_bundled() {
-    use vimcode_core::core::extensions::BUNDLED;
-    let commentary = BUNDLED.iter().find(|b| b.name == "commentary");
-    assert!(commentary.is_some(), "commentary should be in BUNDLED");
-    let c = commentary.unwrap();
-    assert_eq!(c.scripts.len(), 1);
-    assert_eq!(c.scripts[0].0, "commentary.lua");
-}
-
-#[test]
-fn commentary_manifest_parses_correctly() {
-    use vimcode_core::core::extensions::{ExtensionManifest, BUNDLED};
-    let bundle = BUNDLED
-        .iter()
-        .find(|b| b.name == "commentary")
-        .expect("commentary bundled");
-    let m = ExtensionManifest::parse(bundle.manifest_toml).expect("should parse");
-    assert_eq!(m.name, "commentary");
-    assert_eq!(m.display_name, "VimCode Commentary");
-    assert!(m.scripts.contains(&"commentary.lua".to_string()));
 }

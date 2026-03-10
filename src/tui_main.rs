@@ -1170,6 +1170,12 @@ fn event_loop(
             if engine.poll_terminal() {
                 needs_redraw = true;
             }
+            // Run pending terminal commands (e.g. extension installs).
+            if let Some(cmd) = engine.pending_terminal_command.take() {
+                let cols = terminal.size().ok().map(|s| s.width).unwrap_or(80);
+                engine.terminal_run_command(&cmd, cols, engine.session.terminal_panel_rows);
+                needs_redraw = true;
+            }
             // DAP: drain adapter events (breakpoint hits, stops, output)
             if engine.poll_dap() {
                 needs_redraw = true;
@@ -1928,6 +1934,7 @@ fn event_loop(
                             KeyCode::Tab => ("Tab", None),
                             KeyCode::Enter => ("Return", None),
                             KeyCode::Char('d') => ("d", None),
+                            KeyCode::Char('i') => ("i", None),
                             KeyCode::Char('r') => ("r", None),
                             KeyCode::Char('/') => ("/", None),
                             KeyCode::Char('q') | KeyCode::Esc => ("Escape", None),
@@ -2633,6 +2640,18 @@ fn event_loop(
                                                         cols,
                                                         engine.session.terminal_panel_rows,
                                                     );
+                                                } else if let EngineAction::RunInTerminal(cmd) = act
+                                                {
+                                                    let cols = terminal
+                                                        .size()
+                                                        .ok()
+                                                        .map(|s| s.width)
+                                                        .unwrap_or(80);
+                                                    engine.terminal_run_command(
+                                                        &cmd,
+                                                        cols,
+                                                        engine.session.terminal_panel_rows,
+                                                    );
                                                 } else if act == EngineAction::OpenFolderDialog {
                                                     folder_picker = Some(FolderPickerState::new(
                                                         &engine.cwd.clone(),
@@ -2917,6 +2936,14 @@ fn event_loop(
                         if action == EngineAction::OpenTerminal {
                             let cols = terminal.size().ok().map(|s| s.width).unwrap_or(80);
                             engine.terminal_new_tab(cols, engine.session.terminal_panel_rows);
+                            needs_redraw = true;
+                        } else if let EngineAction::RunInTerminal(cmd) = action {
+                            let cols = terminal.size().ok().map(|s| s.width).unwrap_or(80);
+                            engine.terminal_run_command(
+                                &cmd,
+                                cols,
+                                engine.session.terminal_panel_rows,
+                            );
                             needs_redraw = true;
                         } else if action == EngineAction::OpenFolderDialog {
                             folder_picker = Some(FolderPickerState::new(
@@ -3677,6 +3704,13 @@ fn handle_mouse(
                         if act == EngineAction::OpenTerminal {
                             let cols = terminal_size.map(|s| s.width).unwrap_or(80);
                             engine.terminal_new_tab(cols, engine.session.terminal_panel_rows);
+                        } else if let EngineAction::RunInTerminal(cmd) = act {
+                            let cols = terminal_size.map(|s| s.width).unwrap_or(80);
+                            engine.terminal_run_command(
+                                &cmd,
+                                cols,
+                                engine.session.terminal_panel_rows,
+                            );
                         } else if act == EngineAction::OpenFolderDialog {
                             *folder_picker = Some(FolderPickerState::new(
                                 &engine.cwd.clone(),
@@ -4006,7 +4040,17 @@ fn handle_mouse(
                 } else {
                     sidebar.selected = tree_row;
                     let path = sidebar.rows[tree_row].path.clone();
-                    engine.open_file_preview(&path);
+                    let now = Instant::now();
+                    let is_double = now.duration_since(*last_click_time)
+                        < Duration::from_millis(400)
+                        && *last_click_pos == (col, row);
+                    *last_click_time = now;
+                    *last_click_pos = (col, row);
+                    if is_double {
+                        engine.open_file_in_tab(&path);
+                    } else {
+                        engine.open_file_preview(&path);
+                    }
                 }
             }
         } else if sidebar.active_panel == TuiPanel::Debug {
@@ -4239,8 +4283,18 @@ fn handle_mouse(
                     };
                     let avail_idx = (sidebar_row - available_header_row - 1) as usize;
                     if avail_idx < avail_len {
+                        let now = Instant::now();
+                        let is_double = now.duration_since(*last_click_time)
+                            < Duration::from_millis(400)
+                            && *last_click_pos == (col, row);
+                        *last_click_time = now;
+                        *last_click_pos = (col, row);
                         engine.ext_sidebar_selected = installed_len + avail_idx;
-                        engine.handle_ext_sidebar_key("Return", false, None);
+                        if is_double {
+                            // Double-click installs
+                            engine.handle_ext_sidebar_key("Return", false, None);
+                        }
+                        // Single-click just selects
                     }
                 }
             }
@@ -8991,13 +9045,13 @@ fn handle_action(engine: &mut Engine, action: EngineAction) -> bool {
             }
             false
         }
-        EngineAction::OpenTerminal => false, // TUI handles terminal open in main event loop
+        EngineAction::OpenTerminal | EngineAction::RunInTerminal(_) => false, // TUI handles terminal open in main event loop
         EngineAction::OpenFolderDialog
         | EngineAction::OpenWorkspaceDialog
         | EngineAction::SaveWorkspaceAsDialog
         | EngineAction::OpenRecentDialog => false, // handled by caller
         EngineAction::QuitWithUnsaved => false, // handled by caller (shows quit confirm overlay)
-        EngineAction::ToggleSidebar => false, // handled by caller (has access to sidebar state)
+        EngineAction::ToggleSidebar => false,   // handled by caller (has access to sidebar state)
         EngineAction::QuitWithError => {
             engine.cleanup_all_swaps();
             engine.lsp_shutdown();
@@ -9546,7 +9600,7 @@ fn render_ext_sidebar(
             };
             write_row(buf, y, &format!("  ○ {}", item.display_name), fg, bg);
             // Right-aligned hint
-            let hint = "[Enter] install";
+            let hint = "[i] install";
             let hint_start = area.x + area.width.saturating_sub(hint.len() as u16 + 1);
             for (i, ch) in hint.chars().enumerate() {
                 let cx = hint_start + i as u16;

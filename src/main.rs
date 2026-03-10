@@ -362,6 +362,8 @@ enum Msg {
     ToggleTerminal,
     /// Open a new terminal tab.
     NewTerminalTab,
+    /// Run a command in a visible terminal pane (for installs).
+    RunCommandInTerminal(String),
     /// Switch to a specific terminal tab by index.
     TerminalSwitchTab(usize),
     /// Close the active terminal tab (closes panel if last tab).
@@ -3415,6 +3417,9 @@ impl SimpleComponent for App {
                     EngineAction::OpenTerminal => {
                         sender.input(Msg::NewTerminalTab);
                     }
+                    EngineAction::RunInTerminal(cmd) => {
+                        sender.input(Msg::RunCommandInTerminal(cmd));
+                    }
                     EngineAction::OpenFolderDialog => {
                         sender.input(Msg::OpenFolderDialog);
                     }
@@ -3499,6 +3504,9 @@ impl SimpleComponent for App {
                         }
                         EngineAction::OpenTerminal => {
                             sender.input(Msg::ToggleTerminal);
+                        }
+                        EngineAction::RunInTerminal(cmd) => {
+                            sender.input(Msg::RunCommandInTerminal(cmd));
                         }
                         EngineAction::OpenFolderDialog
                         | EngineAction::OpenWorkspaceDialog
@@ -4948,6 +4956,16 @@ impl SimpleComponent for App {
                 if self.engine.borrow_mut().poll_terminal() {
                     self.draw_needed.set(true);
                 }
+                // Run pending terminal commands (e.g. extension installs).
+                if self.engine.borrow().pending_terminal_command.is_some() {
+                    let cmd = self
+                        .engine
+                        .borrow_mut()
+                        .pending_terminal_command
+                        .take()
+                        .unwrap();
+                    sender.input(Msg::RunCommandInTerminal(cmd));
+                }
                 // DAP: drain adapter events (breakpoint hits, stops, output)
                 {
                     let mut engine = self.engine.borrow_mut();
@@ -5225,6 +5243,23 @@ impl SimpleComponent for App {
                 .max(40);
                 let rows = self.engine.borrow().session.terminal_panel_rows;
                 self.engine.borrow_mut().terminal_new_tab(cols, rows);
+                self.draw_needed.set(true);
+            }
+            Msg::RunCommandInTerminal(cmd) => {
+                let cols = if let Some(da) = self.drawing_area.borrow().as_ref() {
+                    if self.cached_char_width > 0.0 {
+                        (da.width() as f64 / self.cached_char_width) as u16
+                    } else {
+                        80
+                    }
+                } else {
+                    80
+                }
+                .max(40);
+                let rows = self.engine.borrow().session.terminal_panel_rows;
+                self.engine
+                    .borrow_mut()
+                    .terminal_run_command(&cmd, cols, rows);
                 self.draw_needed.set(true);
             }
             Msg::TerminalSwitchTab(idx) => {
@@ -10467,7 +10502,7 @@ fn draw_ext_sidebar(
             );
             pangocairo::show_layout(cr, layout);
             // Right-aligned hint
-            let hint = "  [Enter] install";
+            let hint = "  [i] install";
             cr.set_source_rgb(dim_r, dim_g, dim_b);
             layout.set_text(hint);
             let (hint_w, _) = layout.pixel_size();

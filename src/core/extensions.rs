@@ -130,15 +130,6 @@ pub static BUNDLED: &[BundledExtension] = &[
         )],
         readme: include_str!("../../extensions/git-insights/README.md"),
     },
-    BundledExtension {
-        name: "commentary",
-        manifest_toml: include_str!("../../extensions/commentary/manifest.toml"),
-        scripts: &[(
-            "commentary.lua",
-            include_str!("../../extensions/commentary/commentary.lua"),
-        )],
-        readme: include_str!("../../extensions/commentary/README.md"),
-    },
 ];
 
 // ─── Manifest deserialization ─────────────────────────────────────────────────

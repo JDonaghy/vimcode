@@ -1,14 +1,18 @@
 # Git Insights
 
-Inline git blame annotations and per-line blame, file history — powered by a Lua script that hooks into VimCode's cursor-move event.
+Inline git blame annotations — see who last changed each line, when, and why.
 
-**Scripts**: `blame.lua`
 **Requires**: `git` on PATH
 
-## Install
+## How It Works
 
-```
-:ExtInstall git-insights
-```
+Move the cursor to any line in a git-tracked file and the blame annotation appears inline at the end of the line, showing the author, relative date, and commit message.
 
-After installing, move the cursor to any line in a file tracked by git and the blame annotation appears inline at the end of the line.
+Annotations are suppressed in Insert mode to avoid distraction while editing.
+
+## Features
+
+- Inline blame annotations on the current line
+- Automatic update as you navigate
+- Clean display: uncommitted changes show no annotation
+- Works with unsaved buffers (uses `--contents -` to blame working copy)

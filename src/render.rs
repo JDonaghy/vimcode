@@ -3690,6 +3690,49 @@ pub fn visual_rows_for_line(line_char_len: usize, viewport_cols: usize) -> usize
     line_char_len.div_ceil(viewport_cols).max(1)
 }
 
+/// Compute word-aware wrap segment boundaries for a line.
+/// Returns a list of `(start_char, end_char)` pairs. Breaks prefer word boundaries
+/// (spaces, hyphens, punctuation) so words are not split mid-way.
+pub fn compute_word_wrap_segments(line: &str, viewport_cols: usize) -> Vec<(usize, usize)> {
+    let chars: Vec<char> = line.chars().collect();
+    let total = chars.len();
+    if viewport_cols == 0 || total <= viewport_cols {
+        return vec![(0, total)];
+    }
+    let mut segments = Vec::new();
+    let mut pos = 0;
+    while pos < total {
+        let remaining = total - pos;
+        if remaining <= viewport_cols {
+            segments.push((pos, total));
+            break;
+        }
+        let end = pos + viewport_cols;
+        // Scan backwards from the break point to find a word boundary (space or after punctuation).
+        let mut break_at = end;
+        for i in (pos + 1..=end).rev() {
+            if chars[i - 1] == ' ' || chars[i - 1] == '-' || chars[i - 1] == '/' {
+                break_at = i;
+                break;
+            }
+        }
+        // If no boundary found within the segment, hard-break at viewport width.
+        if break_at == end && !chars[end - 1].is_whitespace() {
+            // Check if we found a boundary at all (break_at didn't change means
+            // the for loop completed without breaking).
+            let found = (pos + 1..=end)
+                .rev()
+                .any(|i| chars[i - 1] == ' ' || chars[i - 1] == '-' || chars[i - 1] == '/');
+            if !found {
+                break_at = end;
+            }
+        }
+        segments.push((pos, break_at));
+        pos = break_at;
+    }
+    segments
+}
+
 /// Slice `spans` to cover only the byte range `[seg_start_byte, seg_end_byte)`,
 /// adjusting `start_byte`/`end_byte` to be relative to `seg_start_byte`.
 /// Used when splitting a wrapped line into per-segment `RenderedLine` entries.
@@ -4030,22 +4073,26 @@ fn build_rendered_window(
         let line_char_len = line_str.chars().count();
 
         if wrap_on && line_char_len > render_viewport_cols {
-            // Split long line into viewport-width segments.
+            // Split long line into viewport-width segments with word-boundary wrapping.
             let vp = render_viewport_cols;
-            let num_segments = visual_rows_for_line(line_char_len, vp);
+            // Build segment boundaries using word-aware splitting.
+            let segment_boundaries = compute_word_wrap_segments(&line_str, vp);
+            let num_segments = segment_boundaries.len();
             let cursor_seg = if line_idx == cursor_line {
-                view.cursor.col / vp
+                // Find which segment contains the cursor column.
+                segment_boundaries
+                    .iter()
+                    .position(|&(start, end)| view.cursor.col >= start && view.cursor.col < end)
+                    .unwrap_or(num_segments.saturating_sub(1))
             } else {
                 usize::MAX // won't match any segment
             };
             // Blank gutter for continuation rows (same width as normal gutter).
             let blank_gutter = " ".repeat(gutter_char_width);
-            for seg in 0..num_segments {
+            for (seg, &(seg_start_char, seg_end_char)) in segment_boundaries.iter().enumerate() {
                 if lines.len() >= visible_lines {
                     break;
                 }
-                let seg_start_char = seg * vp;
-                let seg_end_char = ((seg + 1) * vp).min(line_char_len);
                 let seg_start_byte = char_to_byte_offset(&line_str, seg_start_char);
                 let seg_end_byte = char_to_byte_offset(&line_str, seg_end_char);
                 let seg_text = line_str[seg_start_byte..seg_end_byte].to_string();

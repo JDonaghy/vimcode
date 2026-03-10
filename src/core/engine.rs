@@ -23,7 +23,7 @@ use super::registry;
 use super::session::{ExtensionState, HistoryState, SessionGroupLayout, SessionState};
 use super::settings::{EditorMode, Settings};
 use super::tab::{Tab, TabId};
-use super::terminal::{default_shell, TerminalPane};
+use super::terminal::{default_shell, InstallContext, TerminalPane};
 use super::view::View;
 use super::window::{
     DropZone, GroupDivider, GroupId, GroupLayout, SplitDirection, Window, WindowId, WindowLayout,
@@ -49,6 +49,9 @@ pub enum EngineAction {
     Error,
     /// Open the integrated terminal panel (UI layer provides correct cols/rows)
     OpenTerminal,
+    /// Run a command in a visible terminal pane (UI layer provides cols/rows).
+    /// The string is the shell command to execute.
+    RunInTerminal(String),
     /// Open Folder dialog requested (UI layer shows the native picker)
     OpenFolderDialog,
     /// Open Workspace dialog requested (UI layer shows the native picker)
@@ -318,8 +321,8 @@ pub static PALETTE_COMMANDS: &[PaletteCommand] = &[
     },
     PaletteCommand {
         label: "View: Command Palette",
-        shortcut: "Ctrl+Shift+P",
-        vscode_shortcut: "",
+        shortcut: "F1",
+        vscode_shortcut: "F1",
         action: "palette",
     },
     // Go
@@ -1314,6 +1317,11 @@ pub struct Engine {
     // --- Integrated terminal ---
     /// All open terminal panes (PTY + VT100 parser). Empty until first open.
     pub terminal_panes: Vec<TerminalPane>,
+    /// Pending install context for the next `terminal_run_command()` call.
+    pub pending_install_context: Option<InstallContext>,
+    /// Command that should be run in a visible terminal pane (set by ext_install).
+    /// Consumed by the UI layer on the next event loop iteration.
+    pub pending_terminal_command: Option<String>,
     /// Index of the currently active terminal pane.
     pub terminal_active: usize,
     /// Whether the terminal panel is visible.
@@ -1683,6 +1691,8 @@ impl Engine {
             clipboard_write: None,
             mouse_drag_active: false,
             terminal_panes: Vec::new(),
+            pending_install_context: None,
+            pending_terminal_command: None,
             terminal_active: 0,
             terminal_open: false,
             terminal_has_focus: false,
@@ -4294,6 +4304,7 @@ impl Engine {
     /// Return the absolute paths of buffers currently shown in at least one window.
     /// Orphaned buffers (closed via :q but not yet freed) are intentionally excluded so
     /// that files the user explicitly closed are not restored on the next startup.
+    #[allow(dead_code)]
     pub fn open_file_paths(&self) -> Vec<std::path::PathBuf> {
         let in_window: std::collections::HashSet<BufferId> =
             self.windows.values().map(|w| w.buffer_id).collect();
@@ -4310,8 +4321,13 @@ impl Engine {
     }
 
     /// Snapshot the current open-file list and active file into session state, ready for saving.
+    /// Only populates `session.active_file` (for file_positions); open_files are saved
+    /// exclusively in per-workspace sessions to prevent cross-workspace bleed.
     pub fn collect_session_open_files(&mut self) {
-        self.session.open_files = self.open_file_paths();
+        // Do NOT write open_files to the global session — they belong in the
+        // per-workspace session only. This prevents files from workspace A
+        // appearing in workspace B.
+        self.session.open_files.clear();
         self.session.active_file = self
             .buffer_manager
             .get(self.active_buffer_id())
@@ -6535,6 +6551,11 @@ impl Engine {
                 }
                 // Tab = Ctrl-I in terminals (same byte 0x09); both advance the jump list
                 "Tab" => self.jump_list_forward(),
+                // F1: open command palette
+                "F1" => {
+                    self.open_command_palette();
+                    return EngineAction::None;
+                }
                 // Debug / DAP function keys
                 "F5" => {
                     let cmd = if self.dap_session_active {
@@ -14034,6 +14055,9 @@ impl Engine {
                     return EngineAction::None;
                 }
                 self.ext_install_from_registry(name);
+                if let Some(cmd) = self.pending_terminal_command.take() {
+                    return EngineAction::RunInTerminal(cmd);
+                }
                 return EngineAction::None;
             }
 
@@ -20864,6 +20888,7 @@ impl Engine {
         }
 
         let mut status_parts: Vec<String> = Vec::new();
+        let mut install_commands: Vec<String> = Vec::new();
 
         // ── LSP ──────────────────────────────────────────────────────────────
         // Check if any LSP binary is already on PATH (idempotent: skip install
@@ -20878,13 +20903,12 @@ impl Engine {
                 status_parts.push(format!("LSP: {bin} ✓"));
             } else if !manifest.lsp.install.is_empty() {
                 let lsp_key = format!("ext:{ext_name}:lsp");
-                if !self.lsp_installing.contains(&lsp_key) {
-                    self.ensure_lsp_manager();
-                    if let Some(mgr) = &self.lsp_manager {
-                        mgr.run_install_command(&lsp_key, &manifest.lsp.install);
-                    }
-                    self.lsp_installing.insert(lsp_key);
-                }
+                self.lsp_installing.insert(lsp_key.clone());
+                install_commands.push(manifest.lsp.install.clone());
+                self.pending_install_context = Some(InstallContext {
+                    ext_name: ext_name.clone(),
+                    install_key: lsp_key,
+                });
                 status_parts.push(format!("LSP: installing {}…", manifest.lsp.binary));
             }
         }
@@ -20900,14 +20924,15 @@ impl Engine {
             if already_on_path {
                 status_parts.push(format!("DAP: {dap_binary} ✓"));
             } else if !manifest.dap.install.is_empty() {
-                // Manifest provides a simple install command (e.g. `go install …`).
                 let dap_key = format!("dap:{}", manifest.dap.adapter);
-                if !self.lsp_installing.contains(&dap_key) {
-                    self.ensure_lsp_manager();
-                    if let Some(mgr) = &self.lsp_manager {
-                        mgr.run_install_command(&dap_key, &manifest.dap.install);
-                    }
-                    self.lsp_installing.insert(dap_key);
+                self.lsp_installing.insert(dap_key.clone());
+                install_commands.push(manifest.dap.install.clone());
+                // Only set install context if LSP didn't already set it.
+                if self.pending_install_context.is_none() {
+                    self.pending_install_context = Some(InstallContext {
+                        ext_name: ext_name.clone(),
+                        install_key: dap_key,
+                    });
                 }
                 status_parts.push(format!("DAP: installing {}…", manifest.dap.adapter));
             } else if !dap_binary.is_empty() {
@@ -20918,6 +20943,14 @@ impl Engine {
             }
         }
 
+        // If there are install commands, combine them and store for the UI to run
+        // in a visible terminal pane.
+        if !install_commands.is_empty() {
+            let combined = install_commands.join(" && ");
+            let header = format!("echo '── Installing {ext_name} ──'");
+            self.pending_terminal_command = Some(format!("{header} && {combined}"));
+        }
+
         // Mark installed and persist
         self.extension_state.mark_installed(&ext_name);
         let _ = self.extension_state.save();
@@ -20925,6 +20958,24 @@ impl Engine {
         // Reload plugins so newly extracted scripts are active
         self.plugin_manager = None;
         self.plugin_init();
+
+        // Kick-start LSP for the current buffer if it matches this extension's languages.
+        // Without this, the user would have to re-open the file to get LSP support.
+        let active_bid = self.active_buffer_id();
+        if let Some(state) = self.buffer_manager.get(active_bid) {
+            let buf_lang = state.lsp_language_id.clone().or_else(|| {
+                state
+                    .file_path
+                    .as_ref()
+                    .and_then(|p| lsp::language_id_from_path(p))
+            });
+            let matches = buf_lang
+                .as_ref()
+                .is_some_and(|lang| manifest.language_ids.iter().any(|l| l == lang));
+            if matches {
+                self.lsp_did_open(active_bid);
+            }
+        }
 
         self.message = if status_parts.is_empty() {
             format!("Extension '{ext_name}' installed")
@@ -21021,12 +21072,18 @@ impl Engine {
                 self.ext_sidebar_selected = self.ext_sidebar_selected.saturating_sub(1);
                 true
             }
-            "Return" | "i" => {
+            "Return" => {
+                // Open README for any extension (installed or available)
                 let installed = self.ext_installed_items();
                 let sel = self.ext_sidebar_selected;
-                if sel < installed.len() {
-                    // Already installed — open README in its own tab
-                    let name = installed[sel].name.clone();
+                let name = if sel < installed.len() {
+                    Some(installed[sel].name.clone())
+                } else {
+                    let available = self.ext_available_items();
+                    let avail_idx = sel.saturating_sub(installed.len());
+                    available.get(avail_idx).map(|m| m.name.clone())
+                };
+                if let Some(name) = name {
                     let readme = crate::core::extensions::BUNDLED
                         .iter()
                         .find(|b| b.name == name)
@@ -21034,15 +21091,27 @@ impl Engine {
                     if let Some(content) = readme {
                         self.open_markdown_preview_in_tab(content, &name);
                     } else {
-                        self.message = format!("Extension '{name}' is installed. Use d to remove.");
+                        self.message =
+                            format!("No README available for '{name}'. Press i to install.");
                     }
+                }
+                true
+            }
+            "i" => {
+                // Install the selected extension
+                let installed = self.ext_installed_items();
+                let sel = self.ext_sidebar_selected;
+                if sel < installed.len() {
+                    let name = &installed[sel].name;
+                    self.message =
+                        format!("Extension '{name}' is already installed. Use d to remove.");
                 } else {
                     let available = self.ext_available_items();
                     let avail_idx = sel.saturating_sub(installed.len());
                     if avail_idx < available.len() {
                         let name = available[avail_idx].name.clone();
                         self.ext_install_from_registry(&name);
-                        // Open README after install in its own tab.
+                        // Open README after install.
                         let readme = crate::core::extensions::BUNDLED
                             .iter()
                             .find(|b| b.name == name)
@@ -21050,8 +21119,7 @@ impl Engine {
                         if let Some(content) = readme {
                             self.open_markdown_preview_in_tab(content, &name);
                         }
-                        // Move cursor to the newly installed item so the user can see
-                        // it's installed and can press 'd' immediately if needed.
+                        // Move cursor to the newly installed item.
                         self.ext_sidebar_sections_expanded[0] = true;
                         let new_installed = self.ext_installed_items();
                         self.ext_sidebar_selected = new_installed
@@ -22396,7 +22464,15 @@ impl Engine {
                             .map(|m| m.lsp.binary.clone())
                             .unwrap_or_default();
                         if !binary.is_empty() {
-                            // Register the binary so future files auto-start the server
+                            // Register the binary so future files auto-start the server.
+                            // Use the manifest's args (e.g. ["--stdio"]) so the
+                            // server actually communicates correctly.
+                            let manifest_args = self
+                                .ext_available_manifests()
+                                .into_iter()
+                                .find(|m| m.name == ext_name)
+                                .map(|m| m.lsp.args.clone())
+                                .unwrap_or_default();
                             for lsp_lang in self
                                 .ext_available_manifests()
                                 .into_iter()
@@ -22406,7 +22482,7 @@ impl Engine {
                             {
                                 let config = lsp::LspServerConfig {
                                     command: binary.clone(),
-                                    args: vec![],
+                                    args: manifest_args.clone(),
                                     languages: vec![lsp_lang.clone()],
                                 };
                                 if let Some(mgr) = &mut self.lsp_manager {
@@ -24641,6 +24717,25 @@ impl Engine {
         }
     }
 
+    /// Run a command in a new terminal pane (visible to the user).
+    /// Used for extension installs so the user can see progress, errors, and enter
+    /// sudo passwords. The pane waits for Enter after the command finishes.
+    pub fn terminal_run_command(&mut self, command: &str, cols: u16, rows: u16) {
+        let cwd = self.cwd.clone();
+        let history_cap = self.settings.terminal_scrollback_lines;
+        // Extract install context from pending_install_context (set by ext_install_from_registry).
+        let ctx = self.pending_install_context.take();
+        match TerminalPane::new_command(cols, rows, command, &cwd, history_cap, ctx) {
+            Ok(pane) => {
+                self.terminal_panes.push(pane);
+                self.terminal_active = self.terminal_panes.len() - 1;
+                self.terminal_open = true;
+                self.terminal_has_focus = true;
+            }
+            Err(e) => self.message = format!("terminal: failed to run command: {e}"),
+        }
+    }
+
     /// Close the active terminal tab. If it was the last tab, close the panel.
     /// Closing either pane while in split mode also exits split view.
     pub fn terminal_close_active_tab(&mut self) {
@@ -24783,10 +24878,14 @@ impl Engine {
             got_data |= pane.poll();
         }
         // Remove exited panes in reverse order (preserves earlier indices during removal).
+        // For install panes, finalize the install (check binary, register LSP) before removing.
         let mut i = self.terminal_panes.len();
         while i > 0 {
             i -= 1;
             if self.terminal_panes[i].exited {
+                if let Some(ctx) = self.terminal_panes[i].install_context.take() {
+                    self.finalize_install_from_terminal(&ctx);
+                }
                 self.terminal_panes.remove(i);
                 if self.terminal_active > i {
                     self.terminal_active = self.terminal_active.saturating_sub(1);
@@ -24810,6 +24909,59 @@ impl Engine {
             self.terminal_find_update_matches();
         }
         got_data
+    }
+
+    /// Called when an install terminal pane exits. Checks if the binary is now
+    /// available on PATH and registers the LSP/DAP server if so.
+    fn finalize_install_from_terminal(&mut self, ctx: &InstallContext) {
+        self.lsp_installing.remove(&ctx.install_key);
+
+        let ext_name = &ctx.ext_name;
+        let manifest = self
+            .ext_available_manifests()
+            .into_iter()
+            .find(|m| m.name == *ext_name);
+        let manifest = match manifest {
+            Some(m) => m,
+            None => return,
+        };
+
+        // Check if LSP binary is now on PATH and register it.
+        if !manifest.lsp.binary.is_empty() {
+            let all_lsp: Vec<&str> = std::iter::once(manifest.lsp.binary.as_str())
+                .chain(manifest.lsp.fallback_binaries.iter().map(|s| s.as_str()))
+                .filter(|b| !b.is_empty())
+                .collect();
+            if let Some(bin) = all_lsp.iter().copied().find(|b| binary_on_path(b)) {
+                self.ensure_lsp_manager();
+                for lsp_lang in &manifest.language_ids {
+                    let config = lsp::LspServerConfig {
+                        command: bin.to_string(),
+                        args: manifest.lsp.args.clone(),
+                        languages: vec![lsp_lang.clone()],
+                    };
+                    if let Some(mgr) = &mut self.lsp_manager {
+                        mgr.add_registry_entry(config);
+                        mgr.ensure_server_for_language(lsp_lang);
+                    }
+                    self.lsp_reopen_buffers_for_language(lsp_lang);
+                }
+                self.message = format!("LSP server for '{ext_name}' installed and started ({bin})");
+            } else {
+                self.message = format!(
+                    "Install for '{ext_name}' finished — LSP binary '{}' not found on PATH",
+                    manifest.lsp.binary
+                );
+            }
+        }
+
+        // Check if DAP binary is now on PATH.
+        if !manifest.dap.adapter.is_empty()
+            && !manifest.dap.binary.is_empty()
+            && binary_on_path(&manifest.dap.binary)
+        {
+            self.message = format!("DAP adapter for '{ext_name}' installed — press F5 to debug");
+        }
     }
 
     /// Send raw bytes to the active pane's PTY stdin.
@@ -28040,11 +28192,8 @@ impl Engine {
                     self.clamp_cursor_col_insert();
                 }
                 "F1" => {
-                    // Open the command bar (analogous to VSCode's command palette / Vim's ':').
-                    // handle_command_key() will return to Insert mode when done.
-                    self.mode = Mode::Command;
-                    self.command_buffer.clear();
-                    self.message.clear();
+                    // F1 opens the command palette (matches VSCode).
+                    self.open_command_palette();
                 }
                 "F10" => {
                     // Toggle menu bar visibility
@@ -37738,37 +37887,32 @@ mod tests {
     }
 
     #[test]
-    fn test_vscode_mode_f1_opens_command() {
+    fn test_vscode_mode_f1_opens_palette() {
         let mut engine = make_vscode_engine("hello");
-        // F1 should switch to Command mode so the user can type a ':' command.
+        // F1 should open the command palette (matches real VSCode).
         vscode_key(&mut engine, "F1", None, false);
-        assert_eq!(engine.mode, Mode::Command);
-        assert!(engine.command_buffer.is_empty());
+        assert!(engine.palette_open, "F1 should open the command palette");
+        assert_eq!(engine.mode, Mode::Insert, "mode should stay Insert");
     }
 
     #[test]
-    fn test_vscode_mode_command_returns_to_insert() {
+    fn test_vscode_mode_execute_command_returns_to_insert() {
         let mut engine = make_vscode_engine("hello");
-        // F1 → Command mode
-        vscode_key(&mut engine, "F1", None, false);
-        assert_eq!(engine.mode, Mode::Command);
-        // Type `:set number` and press Enter
-        for ch in "set number".chars() {
-            engine.handle_key(&ch.to_string(), Some(ch), false);
-        }
-        engine.handle_key("Return", None, false);
-        // Should return to Insert (EDIT) mode, not Normal mode.
+        // Execute a command directly (like via the command palette).
+        engine.execute_command("set number");
+        // Should stay in Insert (EDIT) mode.
         assert_eq!(engine.mode, Mode::Insert);
         assert!(engine.is_vscode_mode());
     }
 
     #[test]
-    fn test_vscode_mode_f1_escape_returns_to_insert() {
+    fn test_vscode_mode_f1_escape_closes_palette() {
         let mut engine = make_vscode_engine("hello");
-        // F1 → Command mode, then Escape → back to EDIT (Insert) mode.
+        // F1 → palette, then Escape → closes palette, stays in EDIT mode.
         vscode_key(&mut engine, "F1", None, false);
-        assert_eq!(engine.mode, Mode::Command);
+        assert!(engine.palette_open);
         engine.handle_key("Escape", None, false);
+        assert!(!engine.palette_open, "Escape should close palette");
         assert_eq!(engine.mode, Mode::Insert);
         assert!(engine.is_vscode_mode());
     }

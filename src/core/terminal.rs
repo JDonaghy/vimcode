@@ -38,6 +38,16 @@ pub struct TermSelection {
     pub end_col: u16,
 }
 
+/// Context for a terminal pane running an install command.
+/// Stored on the pane so we can register the LSP/DAP server after the command finishes.
+#[derive(Clone, Debug)]
+pub struct InstallContext {
+    /// Extension name (e.g. "bicep", "rust").
+    pub ext_name: String,
+    /// The `lang_id` key used to track in-progress installs (e.g. "ext:bicep:lsp").
+    pub install_key: String,
+}
+
 /// A single integrated terminal pane backed by a real PTY.
 pub struct TerminalPane {
     /// VT100 screen parser — holds current cell grid with colors/attrs.
@@ -68,6 +78,9 @@ pub struct TerminalPane {
     pub history: VecDeque<Vec<HistCell>>,
     /// Maximum number of rows kept in `history` (from settings).
     history_capacity: usize,
+    /// If set, this pane is running an install command (not an interactive shell).
+    /// When the process exits, the engine checks whether the binary is now on PATH.
+    pub install_context: Option<InstallContext>,
 }
 
 impl TerminalPane {
@@ -136,6 +149,82 @@ impl TerminalPane {
             scroll_offset: 0,
             history: VecDeque::new(),
             history_capacity,
+            install_context: None,
+        })
+    }
+
+    /// Spawn a terminal pane that runs a single command instead of an interactive shell.
+    /// The command runs via `sh -c "..."` and when it finishes, a status line is printed
+    /// and the pane waits for the user to press Enter before exiting.
+    pub fn new_command(
+        cols: u16,
+        rows: u16,
+        command: &str,
+        cwd: &Path,
+        history_capacity: usize,
+        install_ctx: Option<InstallContext>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        // Wrap the command so:
+        // 1. It runs in a login shell (picks up user PATH for sudo, dotnet, etc.)
+        // 2. Exit code is captured and displayed
+        // 3. The pane stays open until the user presses Enter
+        let wrapped = format!(
+            "{cmd}\n__exit_code=$?\necho ''\nif [ $__exit_code -eq 0 ]; then echo '\\033[32m✓ Command completed successfully\\033[0m'; else echo \"\\033[31m✗ Command failed (exit code $__exit_code)\\033[0m\"; fi\necho ''\necho 'Press Enter to close…'\nread __dummy",
+            cmd = command
+        );
+        let shell = default_shell();
+        let pty_system = native_pty_system();
+        let pair = pty_system.openpty(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })?;
+
+        let mut cmd = CommandBuilder::new(&shell);
+        cmd.args(["-c", &wrapped]);
+        cmd.env("TERM", "xterm-256color");
+        cmd.cwd(cwd);
+        let child = pair.slave.spawn_command(cmd)?;
+
+        let writer = pair.master.take_writer()?;
+        let reader = pair.master.try_clone_reader()?;
+        let master = pair.master;
+
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        std::thread::spawn(move || {
+            let mut reader = reader;
+            let mut buf = [0u8; 4096];
+            loop {
+                use std::io::Read;
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if tx.send(buf[..n].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let parser = vt100::Parser::new(rows, cols, 1000);
+
+        Ok(TerminalPane {
+            parser,
+            writer,
+            master,
+            child,
+            rx,
+            cols,
+            rows,
+            selection: None,
+            exited: false,
+            scroll_offset: 0,
+            history: VecDeque::new(),
+            history_capacity,
+            install_context: install_ctx,
         })
     }
 

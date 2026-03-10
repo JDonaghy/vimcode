@@ -2,11 +2,22 @@
 
 Language support for Ruby — diagnostics, completions, go-to-definition.
 
-**LSP**: `ruby-lsp` — `gem install ruby-lsp`
+**LSP**: `ruby-lsp`
 **File types**: `.rb`, `.rake`, `.gemspec`
 
-## Install
+## Prerequisites
+
+- **Ruby** and gem must be installed.
+
+The LSP server is installed automatically when you install this extension. If you need to install it manually:
 
 ```
-:ExtInstall ruby
+gem install ruby-lsp
 ```
+
+## Features
+
+- Diagnostics and linting
+- Completion with YARD documentation
+- Go-to-definition, find references
+- Works with Bundler projects (`Gemfile`)
