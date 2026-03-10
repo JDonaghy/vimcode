@@ -3194,13 +3194,7 @@ fn event_loop(
                         engine.paste_text_to_input(&text);
                     }
                     Mode::Insert => {
-                        for ch in text.chars() {
-                            if ch == '\n' || ch == '\r' {
-                                engine.handle_key("Return", None, false);
-                            } else {
-                                engine.handle_key("", Some(ch), false);
-                            }
-                        }
+                        engine.paste_in_insert_mode(&text);
                     }
                     Mode::Normal | Mode::Visual => {
                         // Load into `"` register then paste after cursor.

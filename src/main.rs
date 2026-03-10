@@ -5158,13 +5158,7 @@ impl SimpleComponent for App {
                         engine.paste_text_to_input(&text);
                     }
                     Mode::Insert | Mode::Replace => {
-                        for ch in text.chars() {
-                            if ch == '\n' || ch == '\r' {
-                                engine.handle_key("Return", None, false);
-                            } else {
-                                engine.handle_key("", Some(ch), false);
-                            }
-                        }
+                        engine.paste_in_insert_mode(&text);
                     }
                     Mode::Normal | Mode::Visual | Mode::VisualLine | Mode::VisualBlock => {
                         if !text.is_empty() {

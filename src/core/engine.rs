@@ -9889,6 +9889,92 @@ impl Engine {
         }
     }
 
+    /// Bulk-insert `text` at the cursor in Insert mode.
+    /// Unlike feeding each character through `handle_key()`, this inserts the
+    /// entire string in one `insert_with_undo()` call and runs expensive
+    /// post-processing (syntax reparse, bracket match, auto-completion, etc.)
+    /// only once at the end.  This makes pasting large text instant instead of
+    /// O(n) tree-sitter reparses.
+    pub fn paste_in_insert_mode(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+
+        // Dismiss AI ghost text and completion popup (same as regular insert keys).
+        if self.ai_ghost_text.is_some() {
+            self.ai_ghost_clear();
+        }
+        if self.completion_idx.is_some() {
+            self.completion_candidates.clear();
+            self.completion_idx = None;
+            self.completion_display_only = false;
+        }
+
+        let line = self.view().cursor.line;
+        let col = self.view().cursor.col;
+        let char_idx = self.buffer().line_to_char(line) + col;
+
+        // Handle auto-indent: split on newlines and add indent after each.
+        let indent = if self.settings.auto_indent {
+            self.get_line_indent_str(line)
+        } else {
+            String::new()
+        };
+
+        // Build the final string to insert.
+        // Replace \r\n and \r with \n, then auto-indent after each newline.
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        let to_insert = if indent.is_empty() {
+            normalized
+        } else {
+            // Add indent after every newline except at the very end.
+            let mut result = String::with_capacity(normalized.len() * 2);
+            let parts: Vec<&str> = normalized.split('\n').collect();
+            for (i, part) in parts.iter().enumerate() {
+                if i > 0 {
+                    result.push('\n');
+                    result.push_str(&indent);
+                }
+                result.push_str(part);
+            }
+            result
+        };
+
+        self.insert_with_undo(char_idx, &to_insert);
+        self.insert_text_buffer.push_str(&to_insert);
+
+        // Update cursor position: count newlines and find final line/col.
+        let newlines = to_insert.chars().filter(|&c| c == '\n').count();
+        if newlines > 0 {
+            self.view_mut().cursor.line = line + newlines;
+            let last_nl = to_insert.rfind('\n').unwrap();
+            self.view_mut().cursor.col = to_insert[last_nl + 1..].chars().count();
+        } else {
+            self.view_mut().cursor.col = col + to_insert.chars().count();
+        }
+
+        // Run post-change bookkeeping once (normally done per-char in handle_key).
+        let cur = self.view().cursor;
+        self.last_edit_pos = Some((cur.line, cur.col));
+        self.push_change_location(cur.line, cur.col);
+        self.set_dirty(true);
+        self.update_syntax();
+        let active_id = self.active_buffer_id();
+        if self.preview_buffer_id == Some(active_id) {
+            self.promote_preview(active_id);
+        }
+        self.lsp_dirty_buffers.insert(active_id, true);
+        self.refresh_md_previews();
+        self.swap_mark_dirty();
+        if !self.search_matches.is_empty() {
+            self.run_search();
+        }
+        self.ensure_cursor_visible();
+        self.sync_scroll_binds();
+        self.update_bracket_match();
+        self.trigger_auto_completion();
+    }
+
     /// Insert `text` at the current command-line cursor position and advance the cursor.
     /// Used by backends to paste clipboard content into the command line.
     pub fn command_insert_str(&mut self, text: &str) {

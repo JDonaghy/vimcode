@@ -3728,7 +3728,8 @@ pub fn compute_word_wrap_segments(line: &str, viewport_cols: usize) -> Vec<(usiz
             }
         }
         segments.push((pos, break_at));
-        pos = break_at;
+        // Safety: guarantee forward progress to prevent infinite loops.
+        pos = break_at.max(pos + 1);
     }
     segments
 }

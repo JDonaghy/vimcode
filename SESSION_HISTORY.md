@@ -1,9 +1,21 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 157 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 161 archived here. Recent work summary in PROJECT_STATE.md.
 
 ---
+
+**Session 161 — Terminal install + F1 palette (3995 tests):**
+Extension install scripts now run in a visible terminal pane (TerminalPane::new_command) instead of silently in the background — users see real-time output, errors, and can enter sudo passwords. InstallContext struct tracks extension name/install key for post-install LSP/DAP registration. EngineAction::RunInTerminal bridges engine→UI. F1 opens Command Palette in both Vim and VSCode modes (fixes Ctrl+Shift+P not working in many terminals). 3 new extension install tests.
+
+**Session 160 — Extensions UX + workspace isolation + word wrap (3992 tests):**
+Extension sidebar UX overhaul: Enter shows README preview for any extension (installed or available), `i` key installs (was Enter). Double-click in TUI Explorer fixed (last_click_time/pos updated at all click sites). Word-boundary wrapping (`compute_word_wrap_segments()` in render.rs). Workspace session isolation fix (global session `open_files` cleared to prevent cross-workspace bleed). LSP kickstart after extension install (`lsp_did_open` called on active buffer). LSP args fix (`InstallComplete` handler uses manifest args instead of empty vec). Bicep LSP install command rewritten (curl+unzip from Azure/bicep GitHub releases, not NuGet). Removed commentary Lua extension (native `:Comment` replaces it). All 16 extension READMEs rewritten with prerequisites and auto-install info. New `EXTENSIONS.md` extension development guide.
+
+**Session 159 — Tree-sitter 0.24 + YAML/HTML highlighting (3989 tests):**
+Tree-sitter upgrade (0.20→0.24) + YAML/HTML syntax highlighting (17 languages), TUI tab expansion fix, TUI activity bar icon readability, YAML key/value color fix, C# query fixes, v0.3.2.
+
+**Session 158 — VSCode Mode Gap Closure Phases 1–3 (3934 tests):**
+Alt key routing (TUI+GTK encode Alt+key→`"Alt_Up"` etc.), line operations (move/duplicate/delete/insert line), multi-cursor (Ctrl+D progressive select + `vscode_select_all_occurrences()`, extra selections rendering, same-line char-index descending sort), indentation (Ctrl+]/[ multi-cursor aware), panel toggles (Ctrl+J/Ctrl+`→`EngineAction::OpenTerminal`, Ctrl+B sidebar, Ctrl+, settings), quick nav (Ctrl+G with `ensure_cursor_visible()`, Ctrl+P/Shift+P), Ctrl+K chord prefix, GTK terminal mouse off-by-one fix (`term_px` +1→+2 for tab bar row, 9 locations), bottom panel sans-serif UI font, 55 tests.
 
 **Session 157 — VSCode Mode Fixes + Build Portability (2941 tests):**
 Fixed auto-pairs, bracket matching, and `update_bracket_match()` not running in VSCode mode (early return in `handle_key()` bypassed all three). Added auto-pair insert/skip-over/backspace-delete logic to `handle_vscode_key()`. Added `update_bracket_match()` call at end of `handle_vscode_key()`. 4 new VSCode-mode auto-pair tests. **Build portability**: `vcd` TUI binary now statically linked with musl (`--target x86_64-unknown-linux-musl`). Fixed Flatpak build: replaced `floor_char_boundary` with `is_char_boundary` loop, replaced `is_none_or` with `map_or(true, ...)` for GNOME SDK 47 Rust ~1.80 compat. Released v0.3.1.

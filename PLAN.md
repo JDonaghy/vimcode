@@ -5,6 +5,7 @@
 ---
 
 ## Recently Completed
+- **Session 162**: Bulk paste performance fix — `Engine::paste_in_insert_mode()` replaces per-character `handle_key()` loop, safety guard in `compute_word_wrap_segments()`, 8 tests
 - **Session 161**: Terminal-based extension install (TerminalPane::new_command, InstallContext, EngineAction::RunInTerminal, finalize_install_from_terminal), F1 opens Command Palette in both Vim and VSCode modes, 3 new tests
 - **Session 160**: Extensions UX overhaul (Enter=README preview, i=install), TUI double-click fix, word-boundary wrapping, workspace session isolation, LSP kickstart after ext install, bicep LSP install rewrite, commentary extension removed (native `:Comment`), all extension READMEs rewritten, `EXTENSIONS.md` guide
 - **Session 159**: Tree-sitter upgrade (0.20→0.24) + YAML/HTML syntax highlighting (17 languages), TUI tab expansion fix, TUI activity bar icon readability, YAML key/value color fix, C# query fixes, v0.3.2
