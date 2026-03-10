@@ -1,9 +1,18 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 154 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 157 archived here. Recent work summary in PROJECT_STATE.md.
 
 ---
+
+**Session 157 — VSCode Mode Fixes + Build Portability (2941 tests):**
+Fixed auto-pairs, bracket matching, and `update_bracket_match()` not running in VSCode mode (early return in `handle_key()` bypassed all three). Added auto-pair insert/skip-over/backspace-delete logic to `handle_vscode_key()`. Added `update_bracket_match()` call at end of `handle_vscode_key()`. 4 new VSCode-mode auto-pair tests. **Build portability**: `vcd` TUI binary now statically linked with musl (`--target x86_64-unknown-linux-musl`). Fixed Flatpak build: replaced `floor_char_boundary` with `is_char_boundary` loop, replaced `is_none_or` with `map_or(true, ...)` for GNOME SDK 47 Rust ~1.80 compat. Released v0.3.1.
+
+**Session 156 — IDE Polish: Indent Guides, Bracket Matching, Auto-Pairs (2937 tests):**
+Three visual/editing polish features: (1) Indent guides — vertical `│` lines at each tabstop, `indent_guides` setting. (2) Bracket pair highlighting — `bracket_match_bg` theme color, `match_brackets` setting. (3) Auto-close brackets/quotes — insert/skip-over/backspace-delete, smart quote context, `auto_pairs` setting. All three with `:set` toggle, settings UI entries, theme colors. 29 tests in `tests/ide_polish.rs`.
+
+**Session 155 — Core Commentary Feature (2908 tests):**
+Unified 3 comment implementations into `src/core/comment.rs`. `CommentStyle`/`CommentStyleOwned` types, `comment_style_for_language()` 46+ lang table, `compute_toggle_edits()` two-pass algorithm, `resolve_comment_style()` override chain, `CommentConfig` on `ExtensionManifest`, engine `comment_overrides: HashMap`, `toggle_comment()` replaces old methods, `:Comment`/`:Commentary` commands, `vimcode.set_comment_style()` plugin API, Ctrl+/ fix (GTK `"slash"`, TUI `'7'` for byte 0x1F), VSCode Ctrl+Q quit, F10 menu toggle. 19+31 tests.
 
 **Session 154 — Keymaps Editor in Settings Panel + toggle_comment_range undo fix (2822 tests):**
 "User Keymaps" row in the Settings sidebar panel (new `BufferEditor` setting type) — pressing Enter (or `:Keymaps` command) opens a scratch buffer pre-filled with current keymaps (one per line, `mode keys :command` format). `:w` validates each line, rejects invalid entries with line-specific errors, updates `settings.keymaps`, calls `rebuild_user_keymaps()`, and saves. Tab title shows `[Keymaps]`. Buffer reuse on re-open. GTK "Edit…" button + count label; TUI "N defined ▸" display. 11 integration tests in `tests/keymaps_editor.rs`. **Bug fix:** `toggle_comment_range()` (used by visual `gc`) was mutating the buffer directly (`buffer_mut().delete_range()`/`insert()`) without recording undo operations — replaced with `delete_with_undo()`/`insert_with_undo()`. 2 new undo tests in `tests/extensions.rs`.

@@ -11,7 +11,7 @@ There's a touch of irony here - using a cli tool to write the editor that I've w
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 2941+ tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 2985+ tests, zero async runtime dependency
 
 > **Note:** VimCode does not implement VimScript. Extension and scripting is handled via
 > the built-in Lua 5.4 plugin system. The goal is full Vim *keybinding* and *editing*
@@ -922,6 +922,30 @@ Switch the editor into a **non-modal editing** mode that works like a standard t
 - `F10` — toggle menu bar visibility
 - Typing while a selection is active **replaces** the selection
 - Status bar shows `EDIT  F1:cmd  Alt-M:vim` (or `SELECT` when text is selected, `COMMAND` in command bar)
+
+**Line Operations (Phase 1):**
+- `Alt+Up` / `Alt+Down` — move line or selection up/down
+- `Alt+Shift+Up` / `Alt+Shift+Down` — duplicate line or selection up/down
+- `Ctrl+Shift+K` — delete entire line
+- `Ctrl+Enter` — insert blank line below (cursor stays)
+- `Ctrl+Shift+Enter` — insert blank line above (cursor stays)
+- `Ctrl+L` — select current line (repeat to extend)
+
+**Multi-Cursor + Indentation (Phase 2):**
+- `Ctrl+D` — select word under cursor; repeat to add next occurrence
+- `Ctrl+Shift+L` — select all occurrences of the current word
+- `Ctrl+]` — indent line/selection
+- `Ctrl+[` — outdent line/selection
+- `Shift+Tab` — outdent
+
+**Quick Navigation + Panels (Phase 3):**
+- `Ctrl+G` — go to line number
+- `Ctrl+P` — quick file open (fuzzy finder)
+- `Ctrl+Shift+P` — command palette
+- `Ctrl+B` — toggle sidebar
+- `Ctrl+J` — toggle terminal panel
+- `` Ctrl+` `` — toggle terminal panel
+- `Ctrl+,` — open settings
 
 The `editor_mode` setting is persisted in `settings.json`.
 

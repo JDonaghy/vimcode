@@ -383,6 +383,8 @@ pub struct RenderedWindow {
     pub extra_cursors: Vec<CursorPos>,
     /// Active visual selection, or `None`.
     pub selection: Option<SelectionRange>,
+    /// Extra selections for Ctrl+D multi-cursor word selections.
+    pub extra_selections: Vec<SelectionRange>,
     /// Index of the first visible buffer line.
     pub scroll_top: usize,
     /// Number of character columns scrolled horizontally.
@@ -3722,6 +3724,7 @@ fn build_rendered_window(
         cursor: None,
         extra_cursors: vec![],
         selection: None,
+        extra_selections: vec![],
         yank_highlight: None,
         scroll_top: 0,
         scroll_left: 0,
@@ -4178,6 +4181,8 @@ fn build_rendered_window(
             .map(|(view_line, l)| {
                 let shape = if engine.pending_key == Some('r') {
                     CursorShape::Underline
+                } else if engine.is_vscode_mode() {
+                    CursorShape::Bar
                 } else {
                     match engine.mode {
                         Mode::Insert => CursorShape::Bar,
@@ -4347,6 +4352,32 @@ fn build_rendered_window(
         Vec::new()
     };
 
+    // Extra selections for Ctrl+D multi-cursor word selections.
+    // Each extra cursor sits at the END of a word; derive selection start
+    // from the primary selection length.
+    let extra_selections = if is_active && !view.extra_cursors.is_empty() {
+        if let Some(sel) = selection
+            .as_ref()
+            .filter(|s| s.kind == SelectionKind::Char && s.start_line == s.end_line)
+        {
+            let sel_len = sel.end_col + 1 - sel.start_col; // inclusive
+            view.extra_cursors
+                .iter()
+                .map(|ec| SelectionRange {
+                    kind: SelectionKind::Char,
+                    start_line: ec.line,
+                    start_col: ec.col + 1 - sel_len,
+                    end_line: ec.line,
+                    end_col: ec.col,
+                })
+                .collect()
+        } else {
+            vec![]
+        }
+    } else {
+        vec![]
+    };
+
     RenderedWindow {
         window_id,
         rect: *rect,
@@ -4354,6 +4385,7 @@ fn build_rendered_window(
         cursor,
         extra_cursors,
         selection,
+        extra_selections,
         yank_highlight,
         scroll_top,
         scroll_left: view.scroll_left,

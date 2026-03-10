@@ -5,6 +5,7 @@
 ---
 
 ## Recently Completed
+- **Session 158**: VSCode Mode Gap Closure Phases 1–3 — Alt key routing, line operations (move/duplicate/delete/insert), multi-cursor (Ctrl+D/Ctrl+Shift+L with extra selections rendering, same-line char-index correctness), indentation (Ctrl+]/[, Shift+Tab, multi-cursor aware), panel toggles (Ctrl+J/Ctrl+`/Ctrl+B/Ctrl+,), quick navigation (Ctrl+G/P/Shift+P), Ctrl+K chord prefix, GTK terminal mouse fix (+1→+2 for tab bar row), bottom panel sans-serif UI font, 55 tests
 - **Session 157**: VSCode mode fixes (auto-pairs, bracket matching, update_bracket_match in handle_vscode_key), build portability (vcd musl static linking, Flatpak Rust 1.80 compat), v0.3.1 release
 - **Session 156**: IDE Polish — indent guides (vertical lines at tabstops, active guide highlight, blank line bridging), bracket pair highlighting (matching `(){}[]` background color), auto-close brackets/quotes (skip-over, pair backspace, smart quote context), 3 new settings + theme colors across all 4 themes, GTK+TUI rendering, 29 tests
 - **Session 155**: Core Commentary Feature — unified comment toggling into `src/core/comment.rs` (46+ language table, two-pass algorithm, override chain), `:Comment`/`:Commentary` commands, `vimcode.set_comment_style()` plugin API, Ctrl+/ fix for GTK+TUI, VSCode Ctrl+Q/F10, 19+31 tests

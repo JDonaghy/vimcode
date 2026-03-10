@@ -1,9 +1,9 @@
 # VimCode Project State
 
-**Last updated:** Mar 9, 2026 (Session 157 — VSCode Mode Fixes + Build Portability) | **Tests:** 2941
+**Last updated:** Mar 9, 2026 (Session 158 — VSCode Mode Gap Closure Phases 1–3) | **Tests:** 2985
 
 > Feature documentation lives in **README.md**.
-> Per-session implementation notes through Session 154 are in **SESSION_HISTORY.md**.
+> Per-session implementation notes through Session 157 are in **SESSION_HISTORY.md**.
 
 ---
 
@@ -26,10 +26,7 @@ When implementing a new key/command, add tests covering:
 
 ## Recent Work
 
-**Session 157 — VSCode Mode Fixes + Build Portability (2941 tests):**
-Fixed auto-pairs, bracket matching, and `update_bracket_match()` not running in VSCode mode (early return in `handle_key()` bypassed all three). Added auto-pair insert/skip-over/backspace-delete logic to `handle_vscode_key()`. Added `update_bracket_match()` call at end of `handle_vscode_key()`. 4 new VSCode-mode auto-pair tests. **Build portability**: `vcd` TUI binary now statically linked with musl (`--target x86_64-unknown-linux-musl`) — runs on any Linux without glibc version issues (Ubuntu 22.04+, CentOS 7+, Alpine). Fixed Flatpak build: replaced `floor_char_boundary` (Rust 1.82+) with `is_char_boundary` loop, replaced `is_none_or` (Rust 1.82+) with `map_or(true, ...)` for GNOME SDK 47 Rust ~1.80 compat. Updated `release.yml` workflow. Released v0.3.1.
+**Session 158 — VSCode Mode Gap Closure Phases 1–3 (2985 tests):**
+Implemented ~20 missing VSCode shortcuts across 3 phases. **Phase 1 — Line Operations + Alt Key Routing:** Alt encoding in TUI/GTK backends (Alt+key → `"Alt_Up"` etc. in VSCode mode); `Alt+Up/Down` move line, `Alt+Shift+Up/Down` duplicate line, `Ctrl+Shift+K` delete line, `Ctrl+Enter`/`Ctrl+Shift+Enter` insert blank line below/above, `Ctrl+L` select line (extends on repeat). **Phase 2 — Multi-Cursor + Indentation:** `Ctrl+D` progressive word select + add cursor at next occurrence, `Ctrl+Shift+L` select all occurrences (new `vscode_select_all_occurrences()` with proper visual mode + extra cursors at word end), multi-cursor typing/backspace/delete using char-index descending sort for same-line correctness, extra selections rendering in both backends, `Ctrl+]/[` indent/outdent with multi-cursor support, `Shift+Tab` outdent. **Phase 3 — Panels + Navigation:** `Ctrl+G` go to line (with `ensure_cursor_visible()`), `Ctrl+P` fuzzy finder, `Ctrl+Shift+P` command palette, `Ctrl+B` toggle sidebar, `Ctrl+J`/`` Ctrl+` `` toggle terminal (returns `EngineAction::OpenTerminal` to create pane), `Ctrl+,` open settings, `Ctrl+K` chord prefix (Ctrl+K,Ctrl+F format; Ctrl+K,Ctrl+W close all). **Bug fixes:** GTK terminal panel mouse off-by-one (all `term_px` calculations used `+1` instead of `+2` for tab bar row), GTK terminal + button not working (toolbar row misidentified), GTK `:N` go-to-line not scrolling (missing `ensure_cursor_visible()`). **UI polish:** Bottom panel tab bar and terminal toolbar now use sans-serif `UI_FONT` with uppercase labels ("TERMINAL", "DEBUG CONSOLE") matching VSCode style. 55 integration tests in `tests/vscode_mode.rs`.
 
-**Session 156 — IDE Polish: Indent Guides, Bracket Matching, Auto-Pairs (2937 tests):**
-Three visual/editing polish features: (1) **Indent guides** — vertical `│` lines at each tabstop in TUI, thin Cairo lines in GTK; controlled by `indent_guides` setting (default on); active guide at cursor scope highlighted brighter; blank lines bridge surrounding indent levels. (2) **Bracket pair highlighting** — when cursor is on `(){}[]`, both brackets get a distinct background (`bracket_match_bg` theme color); `bracket_match` field on Engine updated at end of `handle_key()`; `match_brackets` setting (default on). (3) **Auto-close brackets/quotes** — typing `([{"'\`` in Insert mode inserts matching closer with cursor between; typing closer when next char matches skips over it; Backspace between a pair deletes both; smart context for quotes (only pair after whitespace/brackets/BOL); `auto_pairs` setting (default on). All three features have `:set` toggle support, settings UI entries, and theme colors across all 4 built-in themes. 29 integration tests in `tests/ide_polish.rs`.
-
-> Sessions 155 and earlier archived in **SESSION_HISTORY.md**.
+> Sessions 157 and earlier archived in **SESSION_HISTORY.md**.

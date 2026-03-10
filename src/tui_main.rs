@@ -2505,7 +2505,11 @@ fn event_loop(
                             continue;
                         }
                         if matches_tui_key(&pk.select_all_matches, code, mods) {
-                            engine.select_all_word_occurrences();
+                            if engine.is_vscode_mode() {
+                                engine.vscode_select_all_occurrences();
+                            } else {
+                                engine.select_all_word_occurrences();
+                            }
                             needs_redraw = true;
                             continue;
                         }
@@ -2748,6 +2752,25 @@ fn event_loop(
                             }
                             // Alt+t is handled earlier (tab switcher)
                             _ => {}
+                        }
+                        // VSCode mode: encode Alt+key into key_name for engine dispatch
+                        if engine.is_vscode_mode()
+                            && key_event.modifiers.contains(KeyModifiers::ALT)
+                        {
+                            let shift = key_event.modifiers.contains(KeyModifiers::SHIFT);
+                            let alt_key_name = match key_event.code {
+                                KeyCode::Up if shift => Some("Alt_Shift_Up"),
+                                KeyCode::Down if shift => Some("Alt_Shift_Down"),
+                                KeyCode::Up => Some("Alt_Up"),
+                                KeyCode::Down => Some("Alt_Down"),
+                                KeyCode::Char('z') | KeyCode::Char('Z') if !shift => Some("Alt_z"),
+                                _ => None,
+                            };
+                            if let Some(name) = alt_key_name {
+                                engine.handle_key(name, None, false);
+                                needs_redraw = true;
+                                continue;
+                            }
                         }
                     }
 
@@ -4461,7 +4484,9 @@ fn handle_mouse(
                 *last_click_time = now;
                 *last_click_pos = (col, row);
 
-                if ev.modifiers.contains(KeyModifiers::CONTROL) {
+                if ev.modifiers.contains(KeyModifiers::CONTROL)
+                    || (ev.modifiers.contains(KeyModifiers::ALT) && engine.is_vscode_mode())
+                {
                     engine.add_cursor_at_pos(buf_line, col_in_text);
                 } else if is_double {
                     engine.mouse_double_click(rw.window_id, buf_line, col_in_text);
@@ -6801,6 +6826,19 @@ fn render_window(frame: &mut ratatui::Frame, area: Rect, window: &RenderedWindow
         );
     }
 
+    // Extra selections (Ctrl+D multi-cursor word highlights)
+    for esel in &window.extra_selections {
+        render_selection(
+            frame.buffer_mut(),
+            area,
+            window,
+            esel,
+            window_bg,
+            theme.selection,
+            rc(theme.foreground),
+        );
+    }
+
     // Yank highlight overlay (brief flash after yank)
     if let Some(yh) = &window.yank_highlight {
         render_selection(
@@ -6887,17 +6925,27 @@ fn render_window(frame: &mut ratatui::Frame, area: Rect, window: &RenderedWindow
         }
     }
 
-    // Secondary cursors (multi-cursor Alt-D) — invert fg/bg like a block cursor.
+    // Secondary cursors (multi-cursor) — render with cursor color background.
+    let cursor_color = ratatui::style::Color::Rgb(theme.cursor.r, theme.cursor.g, theme.cursor.b);
+    let has_extra_sels = !window.extra_selections.is_empty();
     for extra_pos in &window.extra_cursors {
         let sy = area.y + extra_pos.view_line as u16;
-        let vis_col = extra_pos.col.saturating_sub(window.scroll_left) as u16;
+        // When Ctrl+D selections are active, show cursor at col+1 (right of selection)
+        let col = if has_extra_sels {
+            extra_pos.col + 1
+        } else {
+            extra_pos.col
+        };
+        let vis_col = col.saturating_sub(window.scroll_left) as u16;
         let sx = area.x + gutter_w + vis_col;
         let buf = frame.buffer_mut();
         if sx < buf.area.x + buf.area.width && sy < buf.area.y + buf.area.height {
             let cell = buf.get_mut(sx, sy);
-            let old_fg = cell.fg;
-            let old_bg = cell.bg;
-            cell.set_fg(old_bg).set_bg(old_fg);
+            cell.set_bg(cursor_color).set_fg(ratatui::style::Color::Rgb(
+                theme.background.r,
+                theme.background.g,
+                theme.background.b,
+            ));
         }
     }
 }
@@ -8692,6 +8740,18 @@ fn translate_key(event: KeyEvent, keyboard_enhanced: bool) -> Option<(String, Op
                     // decodes 0x1F as KeyCode::Char('7')+CONTROL (formula: 0x1F-0x1C+'4'='7').
                     // Map both to "slash" so Ctrl+/ works in all terminals.
                     "slash".to_string()
+                } else if lower == '`' {
+                    "grave".to_string()
+                } else if lower == ',' {
+                    "comma".to_string()
+                } else if (lower == ']' || (!keyboard_enhanced && lower == '5')) && shift {
+                    "Shift_bracketright".to_string()
+                } else if (lower == '[' || (!keyboard_enhanced && lower == '3')) && shift {
+                    "Shift_bracketleft".to_string()
+                } else if lower == ']' || (!keyboard_enhanced && lower == '5') {
+                    "bracketright".to_string()
+                } else if lower == '[' || (!keyboard_enhanced && lower == '3') {
+                    "bracketleft".to_string()
                 } else if c.is_uppercase() || shift {
                     lower.to_ascii_uppercase().to_string()
                 } else {
@@ -8704,6 +8764,8 @@ fn translate_key(event: KeyEvent, keyboard_enhanced: bool) -> Option<(String, Op
             Some((key_name, unicode, ctrl))
         }
         KeyCode::Esc => Some(("Escape".to_string(), None, false)),
+        KeyCode::Enter if shift && ctrl => Some(("Shift_Return".to_string(), None, true)),
+        KeyCode::Enter if ctrl => Some(("Return".to_string(), None, true)),
         KeyCode::Enter => Some(("Return".to_string(), None, false)),
         KeyCode::Backspace => Some(("BackSpace".to_string(), None, false)),
         KeyCode::Delete => Some(("Delete".to_string(), None, false)),
