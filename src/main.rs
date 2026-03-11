@@ -30,7 +30,7 @@ use render::{
     SelectionRange, StyledSpan, TabInfo, Theme,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)] // Variants used in later phases
 enum SidebarPanel {
     Explorer,
@@ -40,6 +40,7 @@ enum SidebarPanel {
     Extensions,
     Settings,
     Ai,
+    ExtPanel(String),
     None,
 }
 
@@ -4219,7 +4220,7 @@ impl SimpleComponent for App {
 
                 // Directly control the revealer and panel visibility.
                 let show = self.sidebar_visible;
-                let p = self.active_panel;
+                let p = self.active_panel.clone();
                 if let Some(ref r) = *self.sidebar_revealer.borrow() {
                     r.set_reveal_child(show);
                 }
@@ -4295,7 +4296,7 @@ impl SimpleComponent for App {
                     }
                 }
                 // Directly set visibility on the revealer and each panel box.
-                let p = self.active_panel;
+                let p = self.active_panel.clone();
                 let show_sidebar = self.sidebar_visible;
                 if let Some(ref r) = *self.sidebar_revealer.borrow() {
                     r.set_reveal_child(show_sidebar);

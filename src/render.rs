@@ -672,6 +672,27 @@ pub struct ExtSidebarData {
     pub fetching: bool,
 }
 
+// ─── ExtPanelData (extension-provided sidebar panels) ────────────────────────
+
+/// Rendering data for a single extension-provided sidebar panel.
+#[derive(Debug, Clone)]
+pub struct ExtPanelData {
+    pub name: String,
+    pub title: String,
+    pub sections: Vec<ExtPanelSectionData>,
+    pub selected: usize,
+    pub has_focus: bool,
+    pub scroll_top: usize,
+}
+
+/// A single section within an extension panel.
+#[derive(Debug, Clone)]
+pub struct ExtPanelSectionData {
+    pub name: String,
+    pub items: Vec<crate::core::plugin::ExtPanelItem>,
+    pub expanded: bool,
+}
+
 // ─── AiPanelData ─────────────────────────────────────────────────────────────
 
 /// A single message in the AI conversation history, pre-formatted for rendering.
@@ -1489,6 +1510,8 @@ pub struct ScreenLayout {
     pub ext_sidebar: Option<ExtSidebarData>,
     /// AI assistant panel data — `Some` when the AI panel is the active sidebar panel.
     pub ai_panel: Option<AiPanelData>,
+    /// Extension-provided panel data — `Some` when an extension panel is the active sidebar panel.
+    pub ext_panel: Option<ExtPanelData>,
     /// Breadcrumb bars for each editor group (empty when breadcrumbs are disabled).
     pub breadcrumbs: Vec<BreadcrumbBar>,
 }
@@ -3107,6 +3130,7 @@ pub fn build_screen_layout(
         editor_group_split,
         ext_sidebar,
         ai_panel,
+        ext_panel: build_ext_panel_data(engine),
         breadcrumbs,
     }
 }
@@ -3234,6 +3258,39 @@ fn build_ext_sidebar_data(engine: &Engine) -> Option<ExtSidebarData> {
         query: engine.ext_sidebar_query.clone(),
         input_active: engine.ext_sidebar_input_active,
         fetching: engine.ext_registry_fetching,
+    })
+}
+
+fn build_ext_panel_data(engine: &Engine) -> Option<ExtPanelData> {
+    let panel_name = engine.ext_panel_active.as_ref()?;
+    let reg = engine.ext_panels.get(panel_name)?;
+    let expanded_vec = engine.ext_panel_sections_expanded.get(panel_name);
+    let sections: Vec<ExtPanelSectionData> = reg
+        .sections
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let expanded = expanded_vec.and_then(|v| v.get(i)).copied().unwrap_or(true);
+            let key = (panel_name.clone(), name.clone());
+            let items = engine
+                .ext_panel_items
+                .get(&key)
+                .cloned()
+                .unwrap_or_default();
+            ExtPanelSectionData {
+                name: name.clone(),
+                items,
+                expanded,
+            }
+        })
+        .collect();
+    Some(ExtPanelData {
+        name: panel_name.clone(),
+        title: reg.title.clone(),
+        sections,
+        selected: engine.ext_panel_selected,
+        has_focus: engine.ext_panel_has_focus,
+        scroll_top: engine.ext_panel_scroll_top,
     })
 }
 

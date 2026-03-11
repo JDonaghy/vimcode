@@ -288,6 +288,8 @@ pub struct LspManager {
     initialized: HashMap<LspServerId, bool>,
     /// Cached semantic tokens legends per server (extracted on initialization).
     semantic_legends: HashMap<LspServerId, SemanticTokensLegend>,
+    /// Extension manifests from the registry (updated by engine when registry changes).
+    ext_manifests: Vec<extensions::ExtensionManifest>,
 }
 
 impl LspManager {
@@ -317,7 +319,13 @@ impl LspManager {
             event_rx,
             initialized: HashMap::new(),
             semantic_legends: HashMap::new(),
+            ext_manifests: Vec::new(),
         }
+    }
+
+    /// Update the cached extension manifests (called by engine when registry changes).
+    pub fn set_ext_manifests(&mut self, manifests: Vec<extensions::ExtensionManifest>) {
+        self.ext_manifests = manifests;
     }
 
     /// Ensure a server is running for the given language. Returns the server ID
@@ -332,8 +340,10 @@ impl LspManager {
         // Build candidate list: extension manifest entries first (primary + fallbacks),
         // then the built-in registry.  First candidate with a resolvable binary wins.
         let mut candidates: Vec<LspServerConfig> = Vec::new();
-        if let Some((_, manifest)) = extensions::find_for_language_id(language_id) {
-            candidates.extend(server_configs_from_manifest(&manifest, language_id));
+        if let Some(manifest) =
+            extensions::find_manifest_for_language_id(&self.ext_manifests, language_id)
+        {
+            candidates.extend(server_configs_from_manifest(manifest, language_id));
         }
         candidates.extend(
             self.registry
@@ -731,8 +741,10 @@ impl LspManager {
 
         // Find config and restart: manifest first, then registry.
         let mut candidates: Vec<LspServerConfig> = Vec::new();
-        if let Some((_, manifest)) = extensions::find_for_language_id(language_id) {
-            candidates.extend(server_configs_from_manifest(&manifest, language_id));
+        if let Some(manifest) =
+            extensions::find_manifest_for_language_id(&self.ext_manifests, language_id)
+        {
+            candidates.extend(server_configs_from_manifest(manifest, language_id));
         }
         candidates.extend(
             self.registry
@@ -819,10 +831,10 @@ impl LspManager {
 
 /// Diagnostic helper: try to resolve binaries for all servers matching `lang_id`.
 /// Checks extension manifests first, then the default registry.
-pub fn debug_resolve(lang_id: &str) -> String {
+pub fn debug_resolve(lang_id: &str, ext_manifests: &[extensions::ExtensionManifest]) -> String {
     let mut candidates: Vec<LspServerConfig> = Vec::new();
-    if let Some((_, manifest)) = extensions::find_for_language_id(lang_id) {
-        candidates.extend(server_configs_from_manifest(&manifest, lang_id));
+    if let Some(manifest) = extensions::find_manifest_for_language_id(ext_manifests, lang_id) {
+        candidates.extend(server_configs_from_manifest(manifest, lang_id));
     }
     let registry = default_server_registry();
     candidates.extend(

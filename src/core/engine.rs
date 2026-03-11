@@ -22,6 +22,7 @@ use super::project_search::{self, ProjectMatch, ReplaceResult, SearchError, Sear
 use super::registry;
 use super::session::{ExtensionState, HistoryState, SessionGroupLayout, SessionState};
 use super::settings::{EditorMode, Settings};
+use super::syntax::Syntax;
 use super::tab::{Tab, TabId};
 use super::terminal::{default_shell, InstallContext, TerminalPane};
 use super::view::View;
@@ -1518,6 +1519,22 @@ pub struct Engine {
     // --- VSCode mode state ---
     /// Ctrl+K chord pending: waiting for the second key of a Ctrl+K combo.
     pub vscode_pending_ctrl_k: bool,
+
+    // --- Extension panels ---
+    /// Registered extension panels (name → registration).
+    pub ext_panels: HashMap<String, plugin::PanelRegistration>,
+    /// Extension panel items: (panel_name, section_name) → items.
+    pub ext_panel_items: HashMap<(String, String), Vec<plugin::ExtPanelItem>>,
+    /// Which extension panel is currently showing (if any).
+    pub ext_panel_active: Option<String>,
+    /// Whether the extension panel has keyboard focus.
+    pub ext_panel_has_focus: bool,
+    /// Flat selection index across all sections.
+    pub ext_panel_selected: usize,
+    /// Scroll offset for the extension panel.
+    pub ext_panel_scroll_top: usize,
+    /// Per-panel section expanded state.
+    pub ext_panel_sections_expanded: HashMap<String, Vec<bool>>,
 }
 
 impl Engine {
@@ -1765,7 +1782,7 @@ impl Engine {
             extension_state: ExtensionState::load(),
             prompted_extensions: HashSet::new(),
             ext_hint_pending_name: None,
-            ext_registry: None,
+            ext_registry: registry::load_cache(),
             ext_registry_fetching: false,
             ext_registry_rx: None,
             ext_sidebar_has_focus: false,
@@ -1802,6 +1819,13 @@ impl Engine {
             swap_last_write: std::time::Instant::now(),
             swap_recovery: None,
             vscode_pending_ctrl_k: false,
+            ext_panels: HashMap::new(),
+            ext_panel_items: HashMap::new(),
+            ext_panel_active: None,
+            ext_panel_has_focus: false,
+            ext_panel_selected: 0,
+            ext_panel_scroll_top: 0,
+            ext_panel_sections_expanded: HashMap::new(),
         };
         // If vscode mode is configured, start in Insert mode with menu visible
         if engine.is_vscode_mode() {
@@ -5221,6 +5245,12 @@ impl Engine {
         // Debug sidebar intercepts all keys when it has focus.
         if self.dap_sidebar_has_focus {
             return self.handle_debug_sidebar_key(key_name, ctrl);
+        }
+
+        // Extension panel intercepts all keys when it has focus.
+        if self.ext_panel_has_focus {
+            self.handle_ext_panel_key(key_name, ctrl, unicode);
+            return EngineAction::None;
         }
 
         // Source Control panel intercepts all keys when it has focus.
@@ -13018,6 +13048,14 @@ impl Engine {
                         }
                     }
                 }
+                // Harvest panel registrations from plugin scripts
+                for (name, panel) in &mgr.panels {
+                    if !self.ext_panel_sections_expanded.contains_key(name) {
+                        self.ext_panel_sections_expanded
+                            .insert(name.clone(), vec![true; panel.sections.len()]);
+                    }
+                    self.ext_panels.insert(name.clone(), panel.clone());
+                }
                 self.plugin_manager = Some(mgr);
                 // Populate comment style overrides from installed extension manifests
                 self.populate_comment_overrides();
@@ -13314,6 +13352,62 @@ impl Engine {
                 }
             });
         }
+        // Open scratch buffers requested by plugins
+        for req in ctx.scratch_buffers {
+            let buf_id = self.buffer_manager.create();
+            if let Some(state) = self.buffer_manager.get_mut(buf_id) {
+                state.buffer.content = ropey::Rope::from_str(&req.content);
+                state.dirty = false;
+                // Set a display name for the tab (e.g. "[GitFileHistory]")
+                state.file_path = None;
+                // Store the name in a way the tab bar can use it:
+                // we set the scratch_name field if available, otherwise use file_path
+                state.scratch_name = Some(req.name.clone());
+                if req.read_only {
+                    state.read_only = true;
+                }
+                if let Some(ref ft) = req.filetype {
+                    // Map filetype to a fake path extension for syntax detection
+                    let ext = match ft.as_str() {
+                        "rust" => "rs",
+                        "python" => "py",
+                        "javascript" => "js",
+                        "typescript" => "ts",
+                        "diff" => "diff",
+                        other => other,
+                    };
+                    let fake_path = format!("scratch.{ext}");
+                    if let Some(syn) = Syntax::new_from_path(Some(&fake_path)) {
+                        state.syntax = syn;
+                        state.update_syntax();
+                    }
+                    state.lsp_language_id = Some(ft.clone());
+                }
+            }
+            match req.split.as_deref() {
+                Some("vertical") => {
+                    self.split_window(SplitDirection::Vertical, None);
+                    let win = self.active_window_mut();
+                    win.buffer_id = buf_id;
+                    win.view.cursor = crate::core::cursor::Cursor::default();
+                    win.view.scroll_top = 0;
+                }
+                Some("horizontal") => {
+                    self.split_window(SplitDirection::Horizontal, None);
+                    let win = self.active_window_mut();
+                    win.buffer_id = buf_id;
+                    win.view.cursor = crate::core::cursor::Cursor::default();
+                    win.view.scroll_top = 0;
+                }
+                _ => {
+                    // Replace current window's buffer
+                    let win = self.active_window_mut();
+                    win.buffer_id = buf_id;
+                    win.view.cursor = crate::core::cursor::Cursor::default();
+                    win.view.scroll_top = 0;
+                }
+            }
+        }
         // Apply comment style overrides (highest priority — from plugin runtime)
         for (lang_id, line, block_open, block_close) in ctx.comment_style_overrides {
             self.comment_overrides.insert(
@@ -13324,6 +13418,20 @@ impl Engine {
                     block_close,
                 },
             );
+        }
+        // Apply extension panel registrations
+        for reg in ctx.panel_registrations {
+            let name = reg.name.clone();
+            // Initialize expanded state for new panels
+            if !self.ext_panel_sections_expanded.contains_key(&name) {
+                self.ext_panel_sections_expanded
+                    .insert(name.clone(), vec![true; reg.sections.len()]);
+            }
+            self.ext_panels.insert(name, reg);
+        }
+        // Apply extension panel item updates
+        for (panel, section, items) in ctx.panel_set_items {
+            self.ext_panel_items.insert((panel, section), items);
         }
     }
 
@@ -13749,9 +13857,10 @@ impl Engine {
                         let dap_key = format!("dap:{adapter_name}");
                         if self.lsp_installing.contains(&dap_key) {
                             self.message = format!("Install already running for {adapter_name}");
-                        } else if let Some(cmd_str) =
-                            super::dap_manager::install_cmd_for_adapter(adapter_name)
-                        {
+                        } else if let Some(cmd_str) = super::dap_manager::install_cmd_for_adapter(
+                            adapter_name,
+                            &self.ext_available_manifests(),
+                        ) {
                             self.ensure_lsp_manager();
                             self.lsp_installing.insert(dap_key.clone());
                             if let Some(mgr) = &self.lsp_manager {
@@ -13798,7 +13907,8 @@ impl Engine {
                     self.message = "LspDebug: buffer has no language ID".to_string();
                 }
                 Some(lang) => {
-                    self.message = super::lsp_manager::debug_resolve(&lang);
+                    let manifests = self.ext_available_manifests();
+                    self.message = super::lsp_manager::debug_resolve(&lang, &manifests);
                 }
             }
             return EngineAction::None;
@@ -20785,7 +20895,9 @@ impl Engine {
             return;
         }
         let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        self.lsp_manager = Some(LspManager::new(root, &self.settings.lsp_servers));
+        let mut mgr = LspManager::new(root, &self.settings.lsp_servers);
+        mgr.set_ext_manifests(self.ext_available_manifests());
+        self.lsp_manager = Some(mgr);
     }
 
     /// Ensure LSP is started for the active buffer (lazy — called on tab switch).
@@ -20847,11 +20959,12 @@ impl Engine {
         self.lsp_request_semantic_tokens(&path);
         // Show extension hint based on VimCode extension state (independent of LSP binary
         // availability — ext_remove intentionally leaves the binary on disk).
-        if let Some((bundle, manifest)) = extensions::find_for_language_id(&lang_id) {
-            let name = bundle.name;
+        let manifests = self.ext_available_manifests();
+        if let Some(manifest) = extensions::find_manifest_for_language_id(&manifests, &lang_id) {
+            let name = &manifest.name;
             if !self.extension_state.is_installed(name)
                 && !self.extension_state.is_dismissed(name)
-                && !self.prompted_extensions.contains(name)
+                && !self.prompted_extensions.contains(name.as_str())
             {
                 self.prompted_extensions.insert(name.to_string());
                 self.ext_hint_pending_name = Some(name.to_string());
@@ -20868,23 +20981,32 @@ impl Engine {
 
     // ── Extension registry + sidebar ──────────────────────────────────────────
 
-    /// Build the merged list of available extensions.
-    /// Registry entries (fetched from GitHub) override BUNDLED entries on name conflict.
+    /// Return the list of available extensions from the cached registry.
     pub fn ext_available_manifests(&self) -> Vec<extensions::ExtensionManifest> {
-        use std::collections::HashMap as StdMap;
-        let mut map: StdMap<String, extensions::ExtensionManifest> = extensions::BUNDLED
-            .iter()
-            .filter_map(|b| {
-                extensions::ExtensionManifest::parse(b.manifest_toml)
-                    .map(|m| (b.name.to_string(), m))
-            })
-            .collect();
-        if let Some(reg) = &self.ext_registry {
-            for m in reg {
-                map.insert(m.name.clone(), m.clone());
+        let mut result: Vec<extensions::ExtensionManifest> =
+            self.ext_registry.clone().unwrap_or_default();
+
+        // Merge local extensions: scan ~/.config/vimcode/extensions/*/manifest.toml
+        // so developers can test extensions locally before publishing to the registry.
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        let ext_base = std::path::PathBuf::from(&home).join(".config/vimcode/extensions");
+        if let Ok(entries) = std::fs::read_dir(&ext_base) {
+            for entry in entries.filter_map(|e| e.ok()) {
+                let dir = entry.path();
+                if !dir.is_dir() {
+                    continue;
+                }
+                let manifest_path = dir.join("manifest.toml");
+                if let Ok(toml_str) = std::fs::read_to_string(&manifest_path) {
+                    if let Some(manifest) = extensions::ExtensionManifest::parse(&toml_str) {
+                        // Local manifest overrides registry entry with same name
+                        result.retain(|m| !m.name.eq_ignore_ascii_case(&manifest.name));
+                        result.push(manifest);
+                    }
+                }
             }
         }
-        let mut result: Vec<extensions::ExtensionManifest> = map.into_values().collect();
+
         result.sort_by(|a, b| a.name.cmp(&b.name));
         result
     }
@@ -20920,11 +21042,12 @@ impl Engine {
             match maybe_reg {
                 Some(entries) => {
                     let count = entries.len();
+                    registry::save_cache(&entries);
                     self.ext_registry = Some(entries);
                     self.message = format!("Extension registry updated ({count} extensions)");
                 }
                 None => {
-                    self.message = "Registry fetch failed — using bundled extensions".to_string();
+                    self.message = "Registry fetch failed — try again later".to_string();
                 }
             }
             true
@@ -20935,7 +21058,6 @@ impl Engine {
 
     /// Install an extension by name: download scripts, run LSP/DAP install, mark installed.
     pub fn ext_install_from_registry(&mut self, name: &str) {
-        // Find manifest (registry takes priority over BUNDLED)
         let manifest = self
             .ext_available_manifests()
             .into_iter()
@@ -20950,24 +21072,16 @@ impl Engine {
         };
         let ext_name = manifest.name.clone();
 
-        // Try BUNDLED scripts first (offline fallback), then download if registry has entries.
+        // Download scripts from the registry (skip files already on disk for local dev)
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
         let ext_dir = std::path::PathBuf::from(&home)
             .join(".config/vimcode/extensions")
             .join(&ext_name);
-        if let Some(bundle) = extensions::find_by_name(&ext_name) {
-            if !bundle.scripts.is_empty() && std::fs::create_dir_all(&ext_dir).is_ok() {
-                for (filename, source) in bundle.scripts {
-                    let dest = ext_dir.join(filename);
-                    let _ = std::fs::write(&dest, source);
-                }
-            }
-        } else if !manifest.scripts.is_empty() && self.ext_registry.is_some() {
-            // Download scripts from the registry base URL
-            if std::fs::create_dir_all(&ext_dir).is_ok() {
-                for script in &manifest.scripts {
+        if !manifest.scripts.is_empty() && std::fs::create_dir_all(&ext_dir).is_ok() {
+            for script in &manifest.scripts {
+                let dest = ext_dir.join(script);
+                if !dest.exists() {
                     let url = format!("{}/{}/{}", registry::FILES_BASE_URL, ext_name, script);
-                    let dest = ext_dir.join(script);
                     let _ = registry::download_script(&url, &dest);
                 }
             }
@@ -21093,6 +21207,161 @@ impl Engine {
         self.message = format!("Extension '{name}' removed (LSP binary untouched)");
     }
 
+    // ─── Extension Panel helpers ────────────────────────────────────────────
+
+    /// Compute the total number of flat items across all sections of the active extension panel.
+    pub fn ext_panel_flat_len(&self) -> usize {
+        let panel_name = match &self.ext_panel_active {
+            Some(n) => n.clone(),
+            None => return 0,
+        };
+        let reg = match self.ext_panels.get(&panel_name) {
+            Some(r) => r,
+            None => return 0,
+        };
+        let expanded = self.ext_panel_sections_expanded.get(&panel_name);
+        let mut count = 0;
+        for (si, section) in reg.sections.iter().enumerate() {
+            count += 1; // section header
+            let is_expanded = expanded.and_then(|v| v.get(si)).copied().unwrap_or(true);
+            if is_expanded {
+                let key = (panel_name.clone(), section.clone());
+                if let Some(items) = self.ext_panel_items.get(&key) {
+                    count += items.len();
+                }
+            }
+        }
+        count
+    }
+
+    /// Given a flat index, return (section_index, item_index_within_section).
+    /// If the flat index lands on a section header, item_index is `usize::MAX`.
+    pub fn ext_panel_flat_to_section(&self, flat: usize) -> Option<(usize, usize)> {
+        let panel_name = self.ext_panel_active.clone()?;
+        let reg = self.ext_panels.get(&panel_name)?;
+        let expanded = self.ext_panel_sections_expanded.get(&panel_name);
+        let mut pos = 0;
+        for (si, section) in reg.sections.iter().enumerate() {
+            if pos == flat {
+                return Some((si, usize::MAX));
+            }
+            pos += 1;
+            let is_expanded = expanded.and_then(|v| v.get(si)).copied().unwrap_or(true);
+            if is_expanded {
+                let key = (panel_name.clone(), section.clone());
+                let item_count = self.ext_panel_items.get(&key).map(|v| v.len()).unwrap_or(0);
+                if flat < pos + item_count {
+                    return Some((si, flat - pos));
+                }
+                pos += item_count;
+            }
+        }
+        None
+    }
+
+    /// Handle keyboard input for an extension panel.
+    /// Returns `true` if the key was consumed.
+    pub fn handle_ext_panel_key(&mut self, key: &str, _ctrl: bool, _unicode: Option<char>) -> bool {
+        let panel_name = match &self.ext_panel_active {
+            Some(n) => n.clone(),
+            None => {
+                self.ext_panel_has_focus = false;
+                return true;
+            }
+        };
+
+        match key {
+            "q" | "Escape" => {
+                self.ext_panel_has_focus = false;
+            }
+            "j" | "Down" => {
+                let max = self.ext_panel_flat_len();
+                if max > 0 && self.ext_panel_selected + 1 < max {
+                    self.ext_panel_selected += 1;
+                }
+            }
+            "k" | "Up" => {
+                if self.ext_panel_selected > 0 {
+                    self.ext_panel_selected -= 1;
+                }
+            }
+            "g" => {
+                self.ext_panel_selected = 0;
+            }
+            "G" => {
+                let max = self.ext_panel_flat_len();
+                if max > 0 {
+                    self.ext_panel_selected = max - 1;
+                }
+            }
+            "Tab" => {
+                // Toggle expand/collapse the section under cursor
+                if let Some((si, _)) = self.ext_panel_flat_to_section(self.ext_panel_selected) {
+                    let expanded = self
+                        .ext_panel_sections_expanded
+                        .entry(panel_name)
+                        .or_default();
+                    while expanded.len() <= si {
+                        expanded.push(true);
+                    }
+                    expanded[si] = !expanded[si];
+                }
+            }
+            "Return" => {
+                // Fire panel_select event
+                if let Some((si, item_idx)) =
+                    self.ext_panel_flat_to_section(self.ext_panel_selected)
+                {
+                    if item_idx != usize::MAX {
+                        let reg = self.ext_panels.get(&panel_name).cloned();
+                        if let Some(reg) = reg {
+                            if let Some(section) = reg.sections.get(si) {
+                                let key = (panel_name.clone(), section.clone());
+                                let id = self
+                                    .ext_panel_items
+                                    .get(&key)
+                                    .and_then(|items| items.get(item_idx))
+                                    .map(|item| item.id.clone())
+                                    .unwrap_or_default();
+                                let arg =
+                                    format!("{}|{}|{}||{}", panel_name, section, id, item_idx);
+                                self.plugin_event("panel_select", &arg);
+                            }
+                        }
+                    }
+                }
+            }
+            other => {
+                // Fire panel_action event for unhandled keys
+                if let Some((si, item_idx)) =
+                    self.ext_panel_flat_to_section(self.ext_panel_selected)
+                {
+                    let reg = self.ext_panels.get(&panel_name).cloned();
+                    if let Some(reg) = reg {
+                        if let Some(section) = reg.sections.get(si) {
+                            let key = (panel_name.clone(), section.clone());
+                            let id = if item_idx != usize::MAX {
+                                self.ext_panel_items
+                                    .get(&key)
+                                    .and_then(|items| items.get(item_idx))
+                                    .map(|item| item.id.clone())
+                                    .unwrap_or_default()
+                            } else {
+                                String::new()
+                            };
+                            let arg = format!(
+                                "{}|{}|{}|{}|{}",
+                                panel_name, section, id, other, self.ext_panel_selected
+                            );
+                            self.plugin_event("panel_action", &arg);
+                        }
+                    }
+                }
+            }
+        }
+        true
+    }
+
     /// Handle keyboard input for the Extensions sidebar panel.
     /// Returns `true` if the key was consumed.
     pub fn handle_ext_sidebar_key(
@@ -21170,12 +21439,17 @@ impl Engine {
                     available.get(avail_idx).map(|m| m.name.clone())
                 };
                 if let Some(name) = name {
-                    let readme = crate::core::extensions::BUNDLED
-                        .iter()
-                        .find(|b| b.name == name)
-                        .map(|b| b.readme);
-                    if let Some(content) = readme {
-                        self.open_markdown_preview_in_tab(content, &name);
+                    // Try to load README from installed extension dir, otherwise fetch from registry
+                    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+                    let readme_path = std::path::PathBuf::from(&home)
+                        .join(".config/vimcode/extensions")
+                        .join(&name)
+                        .join("README.md");
+                    let content = std::fs::read_to_string(&readme_path)
+                        .ok()
+                        .or_else(|| registry::fetch_readme(&name));
+                    if let Some(content) = content {
+                        self.open_markdown_preview_in_tab(&content, &name);
                     } else {
                         self.message =
                             format!("No README available for '{name}'. Press i to install.");
@@ -21197,13 +21471,17 @@ impl Engine {
                     if avail_idx < available.len() {
                         let name = available[avail_idx].name.clone();
                         self.ext_install_from_registry(&name);
-                        // Open README after install.
-                        let readme = crate::core::extensions::BUNDLED
-                            .iter()
-                            .find(|b| b.name == name)
-                            .map(|b| b.readme);
-                        if let Some(content) = readme {
-                            self.open_markdown_preview_in_tab(content, &name);
+                        // Try to open README after install
+                        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+                        let readme_path = std::path::PathBuf::from(&home)
+                            .join(".config/vimcode/extensions")
+                            .join(&name)
+                            .join("README.md");
+                        let content = std::fs::read_to_string(&readme_path)
+                            .ok()
+                            .or_else(|| registry::fetch_readme(&name));
+                        if let Some(content) = content {
+                            self.open_markdown_preview_in_tab(&content, &name);
                         }
                         // Move cursor to the newly installed item.
                         self.ext_sidebar_sections_expanded[0] = true;
@@ -25696,7 +25974,8 @@ impl Engine {
     pub fn dap_start_debug(&mut self, lang: &str) {
         // Determine the workspace root — walk up from cwd until a project
         // manifest (Cargo.toml, package.json, .git, …) is found.
-        let workspace_root = super::dap_manager::find_workspace_root(&self.cwd);
+        let manifests = self.ext_available_manifests();
+        let workspace_root = super::dap_manager::find_workspace_root(&self.cwd, &manifests);
         let cwd = workspace_root.to_string_lossy().into_owned();
         let vimcode_dir = workspace_root.join(".vimcode");
         let launch_json_path = vimcode_dir.join("launch.json");
@@ -25833,9 +26112,10 @@ impl Engine {
         if self.dap_manager.is_none() {
             self.dap_manager = Some(DapManager::new());
         }
+        let manifests = self.ext_available_manifests();
         let mgr = self.dap_manager.as_mut().unwrap();
 
-        if let Err(e) = mgr.start_adapter(adapter_lang) {
+        if let Err(e) = mgr.start_adapter(adapter_lang, &manifests) {
             self.message = format!("DAP: {e}");
             return;
         }
@@ -38250,7 +38530,7 @@ mod tests {
     #[test]
     fn test_dap_install_known_language_no_lsp_message() {
         // DapInstall must NEVER show "No LSP for ..." messages.
-        // It now redirects to the extension system.
+        // Without registry manifests, it falls through to direct adapter install.
         let mut engine = Engine::new();
         engine.execute_command("DapInstall rust");
         assert!(
@@ -38258,10 +38538,13 @@ mod tests {
             "DapInstall should not emit LSP messages: {}",
             engine.message
         );
-        // The message should redirect to :ExtInstall
+        // Should either redirect to ExtInstall, mention rust/codelldb, or start installing
         assert!(
-            engine.message.contains("ExtInstall") || engine.message.contains("rust"),
-            "DapInstall should redirect to ExtInstall or mention rust: {}",
+            engine.message.contains("ExtInstall")
+                || engine.message.contains("rust")
+                || engine.message.contains("codelldb")
+                || engine.message.contains("Install"),
+            "DapInstall should produce a relevant message: {}",
             engine.message
         );
     }

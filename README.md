@@ -6,7 +6,7 @@ High-performance Vim+VSCode hybrid editor in Rust. Modal editing meets modern UX
 
 If you like Vim and you like VSCode, but Vim isn't VSCode-enough and VSCode isn't Vim-enough for you, then this might be the editor for you. It can run in a terminal and look like Vim but behave like VSCode when you need it. Alternatively, it can run in a window and look like VSCode but behave like Vim when you need it. Easily switch from Vim-mode to VSCode-mode at any time simply by pressing `Alt-m`. 
 
-**Extensions** are available, but note that these are not VSCode extensions or Vim plugins. VimCode takes a "batteries-included" approach, so many features just work out of the box. Both **LSP** and **DAP** protocols are supported, and extensions for several popular languages are already available. 
+**Extensions** are available, but note that these are not VSCode extensions or Vim plugins. VimCode takes a "batteries-included" approach, so many features just work out of the box. Both **LSP** and **DAP** protocols are supported, and extensions for 17 languages are available from the [vimcode-ext](https://github.com/JDonaghy/vimcode-ext) registry. New extensions can be added to the registry without updating VimCode itself.
 
 There is no VimScript or TypeScript support for extensions. Instead, like Neovim, VimCode supports **Lua** for writing extensions. However, the API is very different from Neovim’s, so its plugins will not work. There is also no GPU acceleration (like Zed), as the goal was for VimCode to work everywhere.
 
@@ -22,7 +22,7 @@ Bug reports are welcome and will be fed to Claude—as long as there is enough d
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 3995 tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 4053 tests, zero async runtime dependency
 
 > **Note:** VimCode does not implement VimScript. Extension and scripting is handled via
 > the built-in Lua 5.4 plugin system. The goal is full Vim *keybinding* and *editing*
@@ -568,6 +568,9 @@ vimcode.on("InsertEnter", function() end)          -- fired on entering insert m
 vimcode.on("InsertLeave", function() end)          -- fired on leaving insert mode
 vimcode.on("ModeChanged", function(change) end)    -- arg: "Old:New" (e.g. "Normal:Insert")
 vimcode.on("VimEnter",    function() end)          -- fired once after startup
+vimcode.on("panel_focus", function(name) end)      -- custom panel gained focus
+vimcode.on("panel_select",function(arg) end)       -- Enter pressed on panel item
+vimcode.on("panel_action",function(arg) end)       -- other key pressed on panel item
 
 -- Custom commands / key mappings
 vimcode.command("MyCmd", function(args) end)
@@ -610,7 +613,27 @@ vimcode.state.mark(char)         -- {line, col} (1-indexed) or nil
 
 -- Git API (synchronous subprocess calls)
 vimcode.git.blame_line(n)        -- {hash,author,date,relative_date,message} or nil
+vimcode.git.blame_file()         -- [{hash,author,...}, ...] for entire buffer
 vimcode.git.log_file(limit)      -- [{hash,message}, ...] for current file
+vimcode.git.file_log_detailed(n) -- [{hash,author,date,message,stat}, ...]
+vimcode.git.line_log(s, e, n)    -- commits touching line range [s,e]
+vimcode.git.log(limit)           -- repo-wide commit log
+vimcode.git.show(hash)           -- full git show output (string or nil)
+vimcode.git.diff_ref(ref)        -- diff against branch/tag/ref (string or nil)
+vimcode.git.repo_root()          -- repository root path (string or nil)
+vimcode.git.branch()             -- current branch name (string or nil)
+vimcode.git.stash_list()         -- [{index,message,branch}, ...]
+vimcode.git.stash_push(msg)      -- push to stash
+vimcode.git.stash_pop(index)     -- pop stash entry
+vimcode.git.stash_show(index)    -- stash diff (string or nil)
+vimcode.git.branches()           -- [{name,tracking,is_current}, ...] branch list
+
+-- Panel API (register custom sidebar panels from extensions)
+vimcode.panel.register(name, opts)         -- register a new sidebar panel
+  -- opts: { icon = "X", sections = {"Sec1", "Sec2"}, on_focus = fn }
+vimcode.panel.set_items(name, section, items) -- populate section with items
+  -- items: {{label="...", hint="...", icon="X", style="normal|dim|bold"}, ...}
+vimcode.panel.parse_event(arg)             -- parse "key:context" event argument
 ```
 
 **Example plugin** (`~/.config/vimcode/plugins/hello.lua`):
@@ -650,7 +673,7 @@ Language extensions bundle an LSP server, optional DAP debugger, and Lua scripts
 No C# Language Support extension — :ExtInstall csharp  (N to dismiss)
 ```
 
-**Bundled extensions:**
+**Available extensions** (fetched from the [vimcode-ext](https://github.com/JDonaghy/vimcode-ext) registry):
 
 | Extension | Language | LSP | DAP |
 |-----------|----------|-----|-----|
@@ -668,12 +691,15 @@ No C# Language Support extension — :ExtInstall csharp  (N to dismiss)
 | `xml` | XML | lemminx | — |
 | `yaml` | YAML | yaml-language-server | — |
 | `markdown` | Markdown | marksman | — |
+| `terraform` | Terraform | terraform-ls | — |
+| `bicep` | Bicep | bicep-langserver | — |
 | `git-insights` | (all files) | — | — |
-| `commentary` | (all files, dormant — core handles comment toggling) | — | — |
+
+Extensions are fetched from a remote GitHub registry on startup and cached locally at `~/.config/vimcode/registry_cache.json` for offline/instant startup. You can also develop and test extensions locally — see [Writing a Local Extension](#writing-a-local-extension) below.
 
 **Extensions sidebar panel** — click the extensions icon (󱧅) in the activity bar to open a VSCode-style panel with two sections:
 - **INSTALLED** — extensions currently installed; press `Enter` to view info, `d` to remove
-- **AVAILABLE** — all bundled and registry extensions; press `Enter` or `i` to install
+- **AVAILABLE** — all registry and local extensions; press `Enter` or `i` to install
 - `/` — activate search input to filter both sections; `Escape` exits search, `q`/`Escape` unfocuses panel
 - `j` / `k` — navigate items; `r` — refresh registry from GitHub; `Tab` — collapse/expand section
 
@@ -694,7 +720,39 @@ No C# Language Support extension — :ExtInstall csharp  (N to dismiss)
 42  let result = compute();   Alice • 3 days ago • fix off-by-one
 ```
 
-Also adds `:GitLog` command to display recent commits for the current file in the status bar.
+Also provides these commands (all open results in scratch buffers):
+
+| Command | Action |
+|---------|--------|
+| `:GitLog` | Show recent commits for the current file in status bar |
+| `:GitFileHistory` | File commit history with author, date, stats in vertical split |
+| `:GitShow [hash]` | Show commit details (reads hash from cursor line if omitted) |
+| `:GitLineHistory` | Log of commits touching the current line |
+| `:GitDiff [ref]` | Diff against a ref (default: HEAD) |
+| `:GitRepoLog` | Repository-wide commit log (last 200 commits) |
+| `:GitStash [msg]` | Push changes to stash |
+| `:GitStashPop [n]` | Pop stash entry (default: 0) |
+| `:GitStashList` | Show all stash entries |
+| `:GitStashShow [n]` | Show stash diff |
+
+**Git Log panel** — the git-insights extension also registers a custom sidebar panel (via `vimcode.panel.register()`) with three sections: **Branches**, **Log**, and **Stash**. Click the git log icon in the activity bar to browse branches, recent commits, and stash entries interactively. Press `Enter` on a commit to view it, or on a stash entry to show its diff.
+
+#### Writing a Local Extension
+
+You can develop and test extensions locally without publishing to the registry. Create a directory under `~/.config/vimcode/extensions/` with a `manifest.toml`:
+
+```
+~/.config/vimcode/extensions/my-extension/
+├── manifest.toml        # Required: extension metadata
+├── my_script.lua        # Optional: Lua plugin script(s)
+└── README.md            # Optional: shown when pressing Enter in Extensions panel
+```
+
+Local extensions appear automatically in the Extensions sidebar alongside registry extensions. Install with `:ExtInstall my-extension` to activate. Scripts already on disk are not re-downloaded.
+
+For the full manifest schema and Lua API reference, see the [Extension Development Guide](https://github.com/JDonaghy/vimcode-ext/blob/main/EXTENSIONS.md).
+
+**Self-hosted registry:** Set `extension_registry_url` in settings to point to your own `registry.json` URL (same format as the official registry).
 
 ---
 
@@ -1280,14 +1338,14 @@ All ex commands support Vim-style abbreviations (e.g., `:j` for `:join`, `:y` fo
 
 ```
 src/
-├── main.rs         (~11,805 lines)  GTK4/Relm4 UI, rendering, sidebar resize, fuzzy popup, context menu, drag-and-drop
-├── tui_main.rs     (~10,105 lines)  ratatui/crossterm TUI backend, fuzzy popup, rename/move prompts
-├── render.rs        (~4,833 lines)  Platform-agnostic ScreenLayout bridge (DebugSidebarData, SourceControlData, BottomPanelTabs)
+├── main.rs         (~12,134 lines)  GTK4/Relm4 UI, rendering, sidebar resize, fuzzy popup, context menu, drag-and-drop
+├── tui_main.rs     (~10,778 lines)  ratatui/crossterm TUI backend, fuzzy popup, rename/move prompts
+├── render.rs        (~5,125 lines)  Platform-agnostic ScreenLayout bridge (DebugSidebarData, SourceControlData, ExtPanelData, BottomPanelTabs)
 ├── icons.rs            (~30 lines)  Nerd Font file-type icons (GTK + TUI)
 └── core/            (~29,500 lines)  Zero GTK/rendering deps — fully testable
-    ├── engine.rs    (~37,913 lines)  Orchestrator: keys, commands, git, macros, LSP, DAP, plugins, workspaces
+    ├── engine.rs    (~40,548 lines)  Orchestrator: keys, commands, git, macros, LSP, DAP, plugins, workspaces
     ├── markdown.rs     (~497 lines)  Markdown → styled plain text converter (pulldown-cmark)
-    ├── plugin.rs       (~835 lines)  Lua 5.4 plugin manager (mlua vendored; vimcode.* API; async_shell)
+    ├── plugin.rs     (~1,534 lines)  Lua 5.4 plugin manager (mlua vendored; vimcode.* API; async_shell; panel API)
     ├── terminal.rs     (~320 lines)  PTY-backed terminal pane (portable-pty + vt100, history ring buffer)
     ├── lsp.rs        (~2,306 lines)  LSP protocol transport + single-server client (request ID tracking, JSON-RPC framing, semantic tokens)
     ├── lsp_manager.rs  (~830 lines)  Multi-server coordinator with initialization guards + built-in registry + semantic legends
@@ -1299,7 +1357,7 @@ src/
     ├── buffer.rs       (~120 lines)  Rope-based text storage (ropey)
     ├── settings.rs   (~1,973 lines)  JSON config, :set parsing, key binding notation, SETTING_DEFS
     ├── session.rs      (~235 lines)  Session state persistence + per-workspace paths
-    ├── git.rs        (~1,000 lines)  Git subprocesses: diff, blame, stage_hunk, SC panel, worktrees, git log
+    ├── git.rs        (~1,821 lines)  Git subprocesses: diff, blame, stage_hunk, SC panel, worktrees, git log, branches
     └── window.rs, tab.rs, view.rs, cursor.rs, mode.rs, syntax.rs (~984 lines)
 ```
 

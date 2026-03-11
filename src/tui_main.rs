@@ -161,6 +161,8 @@ struct TuiSidebar {
     toolbar_selected: u16,
     /// True after Ctrl-W is pressed in a sidebar panel, waiting for h/j/k/l.
     pending_ctrl_w: bool,
+    /// When set, sidebar renders an extension panel instead of the fixed panels.
+    ext_panel_name: Option<String>,
 }
 
 impl TuiSidebar {
@@ -184,6 +186,7 @@ impl TuiSidebar {
             toolbar_focused: false,
             toolbar_selected: 1, // Start on Explorer
             pending_ctrl_w: false,
+            ext_panel_name: None,
         };
         sb.build_rows();
         sb
@@ -1538,14 +1541,39 @@ fn event_loop(
                 {
                     match key_event.code {
                         KeyCode::Char('j') | KeyCode::Down => {
-                            // Move down: 0→1→2→3→4→5→6→7 (settings)
-                            if sidebar.toolbar_selected < 7 {
-                                sidebar.toolbar_selected += 1;
+                            // Move down: 0→1→…→6→8→9→…→(8+N-1)→7 (settings at end)
+                            let ext_count = engine.ext_panels.len() as u16;
+                            let max_ext = if ext_count > 0 { 7 + ext_count } else { 0 };
+                            let sel = sidebar.toolbar_selected;
+                            if sel < 6 {
+                                sidebar.toolbar_selected = sel + 1;
+                            } else if sel == 6 && ext_count > 0 {
+                                sidebar.toolbar_selected = 8; // first ext panel
+                            } else if sel == 6 && ext_count == 0 {
+                                sidebar.toolbar_selected = 7; // settings
+                            } else if sel >= 8 && sel < max_ext {
+                                sidebar.toolbar_selected = sel + 1;
+                            } else if sel >= 8 && sel == max_ext {
+                                sidebar.toolbar_selected = 7; // settings
                             }
+                            // sel == 7 (settings) → no movement (bottom)
                         }
                         KeyCode::Char('k') | KeyCode::Up => {
-                            // Move up
-                            sidebar.toolbar_selected = sidebar.toolbar_selected.saturating_sub(1);
+                            // Move up: 7→max_ext→…→8→6→5→…→0
+                            let ext_count = engine.ext_panels.len() as u16;
+                            let max_ext = if ext_count > 0 { 7 + ext_count } else { 0 };
+                            let sel = sidebar.toolbar_selected;
+                            if sel == 7 && ext_count > 0 {
+                                sidebar.toolbar_selected = max_ext; // settings → last ext
+                            } else if sel == 7 && ext_count == 0 {
+                                sidebar.toolbar_selected = 6; // settings → AI
+                            } else if sel == 8 {
+                                sidebar.toolbar_selected = 6; // first ext → AI
+                            } else if sel > 8 {
+                                sidebar.toolbar_selected = sel - 1;
+                            } else {
+                                sidebar.toolbar_selected = sel.saturating_sub(1);
+                            }
                         }
                         KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => {
                             // Activate the selected panel
@@ -1563,12 +1591,37 @@ fn event_loop(
                                 5 => TuiPanel::Extensions,
                                 6 => TuiPanel::Ai,
                                 7 => TuiPanel::Settings,
+                                idx if idx >= 8 => {
+                                    // Extension panel activation
+                                    let ext_idx = (idx - 8) as usize;
+                                    let mut ext_names: Vec<_> =
+                                        engine.ext_panels.keys().cloned().collect();
+                                    ext_names.sort();
+                                    if ext_idx < ext_names.len() {
+                                        let name = ext_names[ext_idx].clone();
+                                        sidebar.toolbar_focused = false;
+                                        sidebar.ext_panel_name = Some(name.clone());
+                                        sidebar.visible = true;
+                                        sidebar.has_focus = true;
+                                        engine.ext_panel_active = Some(name.clone());
+                                        engine.ext_panel_has_focus = true;
+                                        engine.ext_panel_selected = 0;
+                                        engine.session.explorer_visible = true;
+                                        let _ = engine.session.save();
+                                        engine.plugin_event("panel_focus", &name);
+                                    }
+                                    needs_redraw = true;
+                                    continue;
+                                }
                                 _ => {
                                     needs_redraw = true;
                                     continue;
                                 }
                             };
                             sidebar.toolbar_focused = false;
+                            sidebar.ext_panel_name = None;
+                            engine.ext_panel_has_focus = false;
+                            engine.ext_panel_active = None;
                             sidebar.active_panel = panel;
                             sidebar.visible = true;
                             sidebar.has_focus = true;
@@ -1681,6 +1734,7 @@ fn event_loop(
                                 engine.ext_sidebar_has_focus = false;
                                 engine.ai_has_focus = false;
                                 engine.settings_has_focus = false;
+                                engine.ext_panel_has_focus = false;
                                 sidebar.toolbar_focused = true;
                                 sidebar.toolbar_selected = match sidebar.active_panel {
                                     TuiPanel::Explorer => 1,
@@ -1700,6 +1754,7 @@ fn event_loop(
                                 engine.ext_sidebar_has_focus = false;
                                 engine.ai_has_focus = false;
                                 engine.settings_has_focus = false;
+                                engine.ext_panel_has_focus = false;
                             }
                             _ => {} // Unknown Ctrl-W combo in sidebar, ignore
                         }
@@ -1908,6 +1963,54 @@ fn event_loop(
                             engine.handle_debug_sidebar_key(name, ctrl);
                             if !engine.dap_sidebar_has_focus {
                                 sidebar.has_focus = false;
+                            }
+                        }
+                        needs_redraw = true;
+                        continue;
+                    }
+
+                    // ── Extension panel (plugin-provided) keyboard handling ─
+                    if engine.ext_panel_has_focus && sidebar.ext_panel_name.is_some() {
+                        // h/Left: switch focus to toolbar
+                        if matches!(key_event.code, KeyCode::Char('h') | KeyCode::Left)
+                            && !key_event.modifiers.contains(KeyModifiers::CONTROL)
+                        {
+                            sidebar.has_focus = false;
+                            engine.ext_panel_has_focus = false;
+                            sidebar.toolbar_focused = true;
+                            // Find the toolbar row for this ext panel
+                            let mut ext_names: Vec<_> = engine.ext_panels.keys().cloned().collect();
+                            ext_names.sort();
+                            let idx = ext_names
+                                .iter()
+                                .position(|n| Some(n) == sidebar.ext_panel_name.as_ref())
+                                .unwrap_or(0);
+                            sidebar.toolbar_selected = 8 + idx as u16;
+                            needs_redraw = true;
+                            continue;
+                        }
+                        let (key_name, unicode): (&str, Option<char>) = match key_event.code {
+                            KeyCode::Char('j') | KeyCode::Down => ("j", None),
+                            KeyCode::Char('k') | KeyCode::Up => ("k", None),
+                            KeyCode::Char('g') => ("g", None),
+                            KeyCode::Char('G') => ("G", None),
+                            KeyCode::Tab => ("Tab", None),
+                            KeyCode::Enter => ("Return", None),
+                            KeyCode::Char('q') | KeyCode::Esc => ("Escape", None),
+                            KeyCode::Char(ch) => ("char", Some(ch)),
+                            _ => ("", None),
+                        };
+                        if !key_name.is_empty() {
+                            let ch = if key_name == "char" { unicode } else { None };
+                            let name = if key_name == "char" {
+                                ch.map(|c| c.to_string()).unwrap_or_default()
+                            } else {
+                                key_name.to_string()
+                            };
+                            engine.handle_ext_panel_key(&name, ctrl, ch);
+                            if !engine.ext_panel_has_focus {
+                                sidebar.has_focus = false;
+                                sidebar.ext_panel_name = None;
                             }
                         }
                         needs_redraw = true;
@@ -3916,7 +4019,37 @@ fn handle_mouse(
             r if r == settings_row && settings_row >= 7 => Some(TuiPanel::Settings),
             _ => None,
         };
+        // Check if click is on an extension panel icon (rows 7+)
+        if target_panel.is_none() && bar_row >= 7 {
+            let ext_idx = (bar_row - 7) as usize;
+            let mut ext_names: Vec<_> = engine.ext_panels.keys().cloned().collect();
+            ext_names.sort();
+            if ext_idx < ext_names.len() {
+                let name = ext_names[ext_idx].clone();
+                if sidebar.ext_panel_name.as_deref() == Some(&name) && sidebar.visible {
+                    sidebar.visible = false;
+                    sidebar.ext_panel_name = None;
+                    engine.ext_panel_has_focus = false;
+                    engine.ext_panel_active = None;
+                } else {
+                    sidebar.ext_panel_name = Some(name.clone());
+                    sidebar.visible = true;
+                    sidebar.has_focus = true;
+                    engine.ext_panel_active = Some(name.clone());
+                    engine.ext_panel_has_focus = true;
+                    engine.ext_panel_selected = 0;
+                    engine.plugin_event("panel_focus", &name);
+                }
+                engine.session.explorer_visible = sidebar.visible;
+                let _ = engine.session.save();
+                return sidebar_width;
+            }
+        }
         if let Some(panel) = target_panel {
+            // Clear extension panel state when switching to a built-in panel
+            sidebar.ext_panel_name = None;
+            engine.ext_panel_has_focus = false;
+            engine.ext_panel_active = None;
             if sidebar.active_panel == panel && sidebar.visible {
                 sidebar.visible = false;
             } else {
@@ -4292,6 +4425,31 @@ fn handle_mouse(
                     }
                 }
             }
+        // Extension panel (plugin-provided) click handling
+        } else if sidebar.ext_panel_name.is_some() {
+            sidebar.has_focus = true;
+            engine.ext_panel_has_focus = true;
+
+            if sidebar_row == 0 {
+                // Header — no-op
+            } else if sidebar_row >= 1 {
+                // Map sidebar_row to flat index (row 1 = flat 0 + scroll_top)
+                let flat_idx = engine.ext_panel_scroll_top + (sidebar_row - 1) as usize;
+                let flat_len = engine.ext_panel_flat_len();
+                if flat_idx < flat_len {
+                    engine.ext_panel_selected = flat_idx;
+                    // Check for double-click → trigger Enter
+                    let now = Instant::now();
+                    let is_double = now.duration_since(*last_click_time)
+                        < Duration::from_millis(400)
+                        && *last_click_pos == (col, row);
+                    *last_click_time = now;
+                    *last_click_pos = (col, row);
+                    if is_double {
+                        engine.handle_ext_panel_key("Return", false, None);
+                    }
+                }
+            }
         }
         return sidebar_width;
     }
@@ -4304,6 +4462,7 @@ fn handle_mouse(
     engine.ext_sidebar_has_focus = false;
     engine.ai_has_focus = false;
     engine.settings_has_focus = false;
+    engine.ext_panel_has_focus = false;
     if col < editor_left {
         return sidebar_width; // separator column
     }
@@ -4784,6 +4943,7 @@ fn draw_frame(
         sidebar,
         theme,
         engine.menu_bar_visible,
+        engine,
     );
 
     // ── Render sidebar + separator ────────────────────────────────────────────
@@ -7716,6 +7876,7 @@ fn render_activity_bar(
     sidebar: &TuiSidebar,
     theme: &Theme,
     _menu_bar_visible: bool,
+    engine: &Engine,
 ) {
     let bar_bg = rc(theme.tab_bar_bg);
     // All icons rendered in off-white for readability; active indicated by left accent bar.
@@ -7775,6 +7936,34 @@ fn render_activity_bar(
         }
     }
 
+    // Extension panel icons (after the fixed 6 panels, starting at row 7)
+    {
+        let mut ext_panels: Vec<_> = engine.ext_panels.values().collect();
+        ext_panels.sort_by(|a, b| a.name.cmp(&b.name));
+        for (i, panel) in ext_panels.iter().enumerate() {
+            let row_off = 7 + i as u16;
+            let y = area.y + row_off;
+            if y >= area.y + area.height.saturating_sub(1) {
+                break; // leave room for settings at bottom
+            }
+            let is_active =
+                sidebar.ext_panel_name.as_deref() == Some(&panel.name) && sidebar.visible;
+            let toolbar_idx = 8 + i as u16; // 0=hamburger, 1-6=panels, 7=settings, 8+=ext
+            let is_kbd_sel = sidebar.toolbar_focused && sidebar.toolbar_selected == toolbar_idx;
+            let row_bg = if is_kbd_sel { toolbar_sel_bg } else { bar_bg };
+            let fg = icon_fg;
+            for x in area.x..area.x + area.width {
+                set_cell(buf, x, y, ' ', fg, row_bg);
+            }
+            if area.width >= 3 {
+                set_cell(buf, area.x + 1, y, panel.icon, fg, row_bg);
+            }
+            if is_active && !is_kbd_sel {
+                set_cell(buf, area.x, y, '▎', accent_fg, bar_bg);
+            }
+        }
+    }
+
     // Settings button pinned to the bottom row (like VSCode)
     if area.height >= 1 {
         let y = area.y + area.height - 1;
@@ -7814,6 +8003,12 @@ fn render_sidebar(
         rc(theme.sidebar_sel_bg_inactive)
     };
     let sel_fg = default_fg;
+
+    // Extension panel (plugin-provided)
+    if sidebar.ext_panel_name.is_some() {
+        render_ext_panel(buf, area, engine, theme);
+        return;
+    }
 
     // Settings panel
     if sidebar.active_panel == TuiPanel::Settings {
@@ -9450,6 +9645,157 @@ fn render_source_control(
         }
     }
     let _ = (row_y, flat_row); // consumed by rendering loop
+}
+
+// ─── Extension panel (plugin-provided) ───────────────────────────────────────
+
+/// Render an extension-provided sidebar panel.
+fn render_ext_panel(buf: &mut ratatui::buffer::Buffer, area: Rect, engine: &Engine, theme: &Theme) {
+    use crate::core::plugin::ExtPanelStyle;
+
+    if area.height == 0 {
+        return;
+    }
+    let screen = render::build_screen_layout(engine, theme, &[], 1.0, 1.0, true);
+    let Some(ref panel) = screen.ext_panel else {
+        return;
+    };
+
+    let hdr_fg = rc(theme.status_fg);
+    let hdr_bg = rc(theme.status_bg);
+    let item_fg = rc(theme.foreground);
+    let dim_fg = rc(theme.line_number_fg);
+    let accent_fg = rc(theme.keyword);
+    let sel_bg = rc(theme.fuzzy_selected_bg);
+    let row_bg = rc(theme.tab_bar_bg);
+
+    // Clear area
+    for cy in area.y..area.y + area.height {
+        for cx in area.x..area.x + area.width {
+            set_cell(buf, cx, cy, ' ', item_fg, row_bg);
+        }
+    }
+
+    // Row 0: header
+    for x in area.x..area.x + area.width {
+        set_cell(buf, x, area.y, ' ', hdr_fg, hdr_bg);
+    }
+    let title = format!("  {}", panel.title);
+    for (i, ch) in title.chars().enumerate().take(area.width as usize) {
+        set_cell(buf, area.x + i as u16, area.y, ch, hdr_fg, hdr_bg);
+    }
+
+    if area.height < 2 {
+        return;
+    }
+
+    // Build flat list of rows
+    let content_area_height = (area.height - 1) as usize;
+    let mut flat_rows: Vec<(String, String, bool, bool)> = Vec::new(); // (text, hint, is_header, is_selected)
+    let mut flat_idx = 0usize;
+    for section in &panel.sections {
+        let is_sel = flat_idx == panel.selected;
+        let arrow = if section.expanded { "▼" } else { "▶" };
+        flat_rows.push((
+            format!(" {} {}", arrow, section.name),
+            String::new(),
+            true,
+            is_sel,
+        ));
+        flat_idx += 1;
+        if section.expanded {
+            for item in &section.items {
+                let is_sel = flat_idx == panel.selected;
+                let indent = "  ".repeat(item.indent as usize + 1);
+                let icon_part = if item.icon.is_empty() {
+                    String::new()
+                } else {
+                    format!("{} ", item.icon)
+                };
+                let fg_marker = match item.style {
+                    ExtPanelStyle::Header => 'H',
+                    ExtPanelStyle::Dim => 'D',
+                    ExtPanelStyle::Accent => 'A',
+                    ExtPanelStyle::Normal => 'N',
+                };
+                flat_rows.push((
+                    format!("{}{}{}", indent, icon_part, item.text),
+                    format!("{}|{}", fg_marker, item.hint),
+                    false,
+                    is_sel,
+                ));
+                flat_idx += 1;
+            }
+        }
+    }
+
+    // Apply scroll
+    let scroll = panel.scroll_top;
+    let visible_rows = &flat_rows[scroll.min(flat_rows.len())..];
+
+    for (ri, (text, hint_raw, is_header, is_sel)) in
+        visible_rows.iter().enumerate().take(content_area_height)
+    {
+        let y = area.y + 1 + ri as u16;
+        let bg = if *is_sel && panel.has_focus {
+            sel_bg
+        } else {
+            row_bg
+        };
+        let fg = if *is_header {
+            hdr_fg
+        } else if hint_raw.starts_with('D') {
+            dim_fg
+        } else if hint_raw.starts_with('A') {
+            accent_fg
+        } else {
+            item_fg
+        };
+
+        for x in area.x..area.x + area.width {
+            set_cell(buf, x, y, ' ', fg, bg);
+        }
+
+        let w = area.width as usize;
+        for (i, ch) in text.chars().enumerate().take(w) {
+            set_cell(buf, area.x + i as u16, y, ch, fg, bg);
+        }
+
+        // Right-aligned hint (skip the style marker char and pipe)
+        let hint = if hint_raw.len() > 2 {
+            &hint_raw[2..]
+        } else {
+            ""
+        };
+        if !hint.is_empty() {
+            let hint_len = hint.chars().count();
+            let start = w.saturating_sub(hint_len + 1);
+            for (i, ch) in hint.chars().enumerate() {
+                let x = area.x + (start + i) as u16;
+                if x < area.x + area.width {
+                    set_cell(buf, x, y, ch, dim_fg, bg);
+                }
+            }
+        }
+    }
+
+    // Scrollbar
+    let total = flat_rows.len();
+    if total > content_area_height && content_area_height > 0 {
+        let sb_x = area.x + area.width - 1;
+        let track_h = content_area_height;
+        let thumb_h = (track_h * content_area_height / total).max(1);
+        let thumb_top = scroll * track_h / total;
+        for i in 0..track_h {
+            let y = area.y + 1 + i as u16;
+            let ch = if i >= thumb_top && i < thumb_top + thumb_h {
+                '█'
+            } else {
+                '░'
+            };
+            set_cell(buf, sb_x, y, ch, dim_fg, row_bg);
+        }
+    }
 }
 
 // ─── Extensions sidebar panel ─────────────────────────────────────────────────
