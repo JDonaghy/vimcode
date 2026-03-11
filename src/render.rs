@@ -383,6 +383,8 @@ pub struct RenderedWindow {
     pub extra_cursors: Vec<CursorPos>,
     /// Active visual selection, or `None`.
     pub selection: Option<SelectionRange>,
+    /// Extra selections for Ctrl+D multi-cursor word selections.
+    pub extra_selections: Vec<SelectionRange>,
     /// Index of the first visible buffer line.
     pub scroll_top: usize,
     /// Number of character columns scrolled horizontally.
@@ -414,6 +416,8 @@ pub struct RenderedWindow {
     pub bracket_match_positions: Vec<(usize, usize)>,
     /// The indent guide column that should be highlighted as "active" (cursor's scope).
     pub active_indent_col: Option<usize>,
+    /// Tab stop width for expanding `\t` to spaces in TUI rendering.
+    pub tabstop: usize,
 }
 
 // ─── CommandLineData ──────────────────────────────────────────────────────────
@@ -1153,6 +1157,22 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
                 shortcut: "",
                 vscode_shortcut: "",
                 action: "EditorGroupClose",
+                enabled: true,
+                separator: false,
+            },
+            MenuItemData {
+                label: "",
+                shortcut: "",
+                vscode_shortcut: "",
+                action: "",
+                enabled: false,
+                separator: true,
+            },
+            MenuItemData {
+                label: "Word Wrap",
+                shortcut: "",
+                vscode_shortcut: "Alt+Z",
+                action: "set_wrap_toggle",
                 enabled: true,
                 separator: false,
             },
@@ -3630,9 +3650,8 @@ fn build_tab_bar_for_group_by_id(engine: &Engine, group_id: GroupId) -> Vec<TabI
             let window_id = tab.active_window;
             let (name, dirty, preview) = if let Some(window) = engine.windows.get(&window_id) {
                 if let Some(state) = engine.buffer_manager.get(window.buffer_id) {
-                    let dirty_marker = if state.dirty { "*" } else { "" };
                     (
-                        format!(" {}: {}{} ", i + 1, state.display_name(), dirty_marker),
+                        format!(" {}: {} ", i + 1, state.display_name()),
                         state.dirty,
                         state.preview,
                     )
@@ -3669,6 +3688,50 @@ pub fn visual_rows_for_line(line_char_len: usize, viewport_cols: usize) -> usize
         return 1;
     }
     line_char_len.div_ceil(viewport_cols).max(1)
+}
+
+/// Compute word-aware wrap segment boundaries for a line.
+/// Returns a list of `(start_char, end_char)` pairs. Breaks prefer word boundaries
+/// (spaces, hyphens, punctuation) so words are not split mid-way.
+pub fn compute_word_wrap_segments(line: &str, viewport_cols: usize) -> Vec<(usize, usize)> {
+    let chars: Vec<char> = line.chars().collect();
+    let total = chars.len();
+    if viewport_cols == 0 || total <= viewport_cols {
+        return vec![(0, total)];
+    }
+    let mut segments = Vec::new();
+    let mut pos = 0;
+    while pos < total {
+        let remaining = total - pos;
+        if remaining <= viewport_cols {
+            segments.push((pos, total));
+            break;
+        }
+        let end = pos + viewport_cols;
+        // Scan backwards from the break point to find a word boundary (space or after punctuation).
+        let mut break_at = end;
+        for i in (pos + 1..=end).rev() {
+            if chars[i - 1] == ' ' || chars[i - 1] == '-' || chars[i - 1] == '/' {
+                break_at = i;
+                break;
+            }
+        }
+        // If no boundary found within the segment, hard-break at viewport width.
+        if break_at == end && !chars[end - 1].is_whitespace() {
+            // Check if we found a boundary at all (break_at didn't change means
+            // the for loop completed without breaking).
+            let found = (pos + 1..=end)
+                .rev()
+                .any(|i| chars[i - 1] == ' ' || chars[i - 1] == '-' || chars[i - 1] == '/');
+            if !found {
+                break_at = end;
+            }
+        }
+        segments.push((pos, break_at));
+        // Safety: guarantee forward progress to prevent infinite loops.
+        pos = break_at.max(pos + 1);
+    }
+    segments
 }
 
 /// Slice `spans` to cover only the byte range `[seg_start_byte, seg_end_byte)`,
@@ -3722,6 +3785,7 @@ fn build_rendered_window(
         cursor: None,
         extra_cursors: vec![],
         selection: None,
+        extra_selections: vec![],
         yank_highlight: None,
         scroll_top: 0,
         scroll_left: 0,
@@ -3735,6 +3799,7 @@ fn build_rendered_window(
         diagnostic_gutter: std::collections::HashMap::new(),
         bracket_match_positions: Vec::new(),
         active_indent_col: None,
+        tabstop: engine.settings.tabstop.max(1) as usize,
     };
 
     let window = match engine.windows.get(&window_id) {
@@ -4009,22 +4074,26 @@ fn build_rendered_window(
         let line_char_len = line_str.chars().count();
 
         if wrap_on && line_char_len > render_viewport_cols {
-            // Split long line into viewport-width segments.
+            // Split long line into viewport-width segments with word-boundary wrapping.
             let vp = render_viewport_cols;
-            let num_segments = visual_rows_for_line(line_char_len, vp);
+            // Build segment boundaries using word-aware splitting.
+            let segment_boundaries = compute_word_wrap_segments(&line_str, vp);
+            let num_segments = segment_boundaries.len();
             let cursor_seg = if line_idx == cursor_line {
-                view.cursor.col / vp
+                // Find which segment contains the cursor column.
+                segment_boundaries
+                    .iter()
+                    .position(|&(start, end)| view.cursor.col >= start && view.cursor.col < end)
+                    .unwrap_or(num_segments.saturating_sub(1))
             } else {
                 usize::MAX // won't match any segment
             };
             // Blank gutter for continuation rows (same width as normal gutter).
             let blank_gutter = " ".repeat(gutter_char_width);
-            for seg in 0..num_segments {
+            for (seg, &(seg_start_char, seg_end_char)) in segment_boundaries.iter().enumerate() {
                 if lines.len() >= visible_lines {
                     break;
                 }
-                let seg_start_char = seg * vp;
-                let seg_end_char = ((seg + 1) * vp).min(line_char_len);
                 let seg_start_byte = char_to_byte_offset(&line_str, seg_start_char);
                 let seg_end_byte = char_to_byte_offset(&line_str, seg_end_char);
                 let seg_text = line_str[seg_start_byte..seg_end_byte].to_string();
@@ -4178,6 +4247,8 @@ fn build_rendered_window(
             .map(|(view_line, l)| {
                 let shape = if engine.pending_key == Some('r') {
                     CursorShape::Underline
+                } else if engine.is_vscode_mode() {
+                    CursorShape::Bar
                 } else {
                     match engine.mode {
                         Mode::Insert => CursorShape::Bar,
@@ -4347,6 +4418,32 @@ fn build_rendered_window(
         Vec::new()
     };
 
+    // Extra selections for Ctrl+D multi-cursor word selections.
+    // Each extra cursor sits at the END of a word; derive selection start
+    // from the primary selection length.
+    let extra_selections = if is_active && !view.extra_cursors.is_empty() {
+        if let Some(sel) = selection
+            .as_ref()
+            .filter(|s| s.kind == SelectionKind::Char && s.start_line == s.end_line)
+        {
+            let sel_len = sel.end_col + 1 - sel.start_col; // inclusive
+            view.extra_cursors
+                .iter()
+                .map(|ec| SelectionRange {
+                    kind: SelectionKind::Char,
+                    start_line: ec.line,
+                    start_col: ec.col + 1 - sel_len,
+                    end_line: ec.line,
+                    end_col: ec.col,
+                })
+                .collect()
+        } else {
+            vec![]
+        }
+    } else {
+        vec![]
+    };
+
     RenderedWindow {
         window_id,
         rect: *rect,
@@ -4354,6 +4451,7 @@ fn build_rendered_window(
         cursor,
         extra_cursors,
         selection,
+        extra_selections,
         yank_highlight,
         scroll_top,
         scroll_left: view.scroll_left,
@@ -4367,6 +4465,7 @@ fn build_rendered_window(
         diagnostic_gutter,
         bracket_match_positions,
         active_indent_col,
+        tabstop: engine.settings.tabstop.max(1) as usize,
     }
 }
 

@@ -771,24 +771,44 @@ impl LspManager {
     }
 
     /// Get status information about running servers.
-    pub fn server_info(&self) -> Vec<String> {
+    /// Get status information about running servers.
+    /// If `current_lang` is provided, marks the server handling that language with ●.
+    pub fn server_info(&self, current_lang: Option<&str>) -> Vec<String> {
         let mut info = Vec::new();
-        let mut seen = std::collections::HashSet::new();
+        // Group languages by server ID
+        let mut server_langs: std::collections::HashMap<usize, Vec<&str>> =
+            std::collections::HashMap::new();
         for (lang, &server_id) in &self.language_to_server {
-            if seen.insert(server_id) {
-                let status = if self.initialized.get(&server_id).copied().unwrap_or(false) {
-                    "running"
-                } else {
-                    "initializing"
-                };
-                let cmd = &self
-                    .registry
-                    .iter()
-                    .find(|c| c.languages.iter().any(|l| l == lang))
-                    .map(|c| c.command.as_str())
-                    .unwrap_or("unknown");
-                info.push(format!("{}: {} ({})", cmd, status, lang));
-            }
+            server_langs.entry(server_id).or_default().push(lang);
+        }
+        let mut server_ids: Vec<usize> = server_langs.keys().copied().collect();
+        server_ids.sort();
+        let active_server_id = current_lang.and_then(|l| self.language_to_server.get(l).copied());
+        for server_id in server_ids {
+            let langs = &server_langs[&server_id];
+            let status = if self.initialized.get(&server_id).copied().unwrap_or(false) {
+                "running"
+            } else {
+                "initializing"
+            };
+            let cmd = langs
+                .first()
+                .and_then(|lang| {
+                    self.registry
+                        .iter()
+                        .find(|c| c.languages.iter().any(|l| l == *lang))
+                        .map(|c| c.command.as_str())
+                })
+                .unwrap_or("unknown");
+            let mut sorted_langs: Vec<&str> = langs.to_vec();
+            sorted_langs.sort();
+            let lang_list = sorted_langs.join(", ");
+            let marker = if active_server_id == Some(server_id) {
+                "● "
+            } else {
+                "  "
+            };
+            info.push(format!("{marker}{cmd}: {status} ({lang_list})"));
         }
         if info.is_empty() {
             info.push("No LSP servers running".to_string());

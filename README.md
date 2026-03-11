@@ -2,16 +2,27 @@
 
 High-performance Vim+VSCode hybrid editor in Rust. Modal editing meets modern UX, no GPU required.
 
-I started this project to see how far I could get with vibe-coding alone using Claude Code. I'm not going to read the code and I'm not going to review it either because I'd never have had the time for that. I wanted to find out what Claude could do if I just gave it the spec, or a description of a bug, and let it handle the rest. This is an experiment! The jury is still out. So far, however, I'm blown away. 
+### Who's this for?
 
-There's a touch of irony here - using a cli tool to write the editor that I've wanted for years and may never use because editors might not matter anymore. It is not ready for daily use. I'm still not using it for anything. Neovim is my daily driver and that will likely be the case for a while yet. We shall see!
+If you like Vim and you like VSCode, but Vim isn't VSCode-enough and VSCode isn't Vim-enough for you, then this might be the editor for you. It can run in a terminal and look like Vim but behave like VSCode when you need it. Alternatively, it can run in a window and look like VSCode but behave like Vim when you need it. Easily switch from Vim-mode to VSCode-mode at any time simply by pressing `Alt-m`. 
+
+**Extensions** are available, but note that these are not VSCode extensions or Vim plugins. VimCode takes a "batteries-included" approach, so many features just work out of the box. Both **LSP** and **DAP** protocols are supported, and extensions for several popular languages are already available. 
+
+There is no VimScript or TypeScript support for extensions. Instead, like Neovim, VimCode supports **Lua** for writing extensions. However, the API is very different from Neovim’s, so its plugins will not work. There is also no GPU acceleration (like Zed), as the goal was for VimCode to work everywhere.
+
+### Status
+VimCode has been shamelessly "vibe-coded" using **Claude Code**, and development has proceeded very quickly as a result. I am beginning to use it on a daily basis, but at this stage, it is still very much **alpha software**. Use at your own risk. 
+
+Bug reports are welcome and will be fed to Claude—as long as there is enough detail to recreate the problem and describe the expected behavior. I am also open to feature requests that are well-described and align with the project's vision.
+
+---
 
 ## Vision
 
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 2937+ tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 3995 tests, zero async runtime dependency
 
 > **Note:** VimCode does not implement VimScript. Extension and scripting is handled via
 > the built-in Lua 5.4 plugin system. The goal is full Vim *keybinding* and *editing*
@@ -918,10 +929,34 @@ Switch the editor into a **non-modal editing** mode that works like a standard t
 - `Shift+Home` / `Shift+End` — extend selection to line start/end
 - `Escape` — clear selection (stays in insert)
 - `Ctrl-Q` — quit
-- `F1` — open the command bar (run any `:` command, then returns to EDIT mode)
+- `F1` — command palette (search and run any command)
 - `F10` — toggle menu bar visibility
 - Typing while a selection is active **replaces** the selection
-- Status bar shows `EDIT  F1:cmd  Alt-M:vim` (or `SELECT` when text is selected, `COMMAND` in command bar)
+- Status bar shows `EDIT  F1:palette  Alt-M:vim` (or `SELECT` when text is selected, `COMMAND` in command bar)
+
+**Line Operations (Phase 1):**
+- `Alt+Up` / `Alt+Down` — move line or selection up/down
+- `Alt+Shift+Up` / `Alt+Shift+Down` — duplicate line or selection up/down
+- `Ctrl+Shift+K` — delete entire line
+- `Ctrl+Enter` — insert blank line below (cursor stays)
+- `Ctrl+Shift+Enter` — insert blank line above (cursor stays)
+- `Ctrl+L` — select current line (repeat to extend)
+
+**Multi-Cursor + Indentation (Phase 2):**
+- `Ctrl+D` — select word under cursor; repeat to add next occurrence
+- `Ctrl+Shift+L` — select all occurrences of the current word
+- `Ctrl+]` — indent line/selection
+- `Ctrl+[` — outdent line/selection
+- `Shift+Tab` — outdent
+
+**Quick Navigation + Panels (Phase 3):**
+- `Ctrl+G` — go to line number
+- `Ctrl+P` — quick file open (fuzzy finder)
+- `Ctrl+Shift+P` / `F1` — command palette
+- `Ctrl+B` — toggle sidebar
+- `Ctrl+J` — toggle terminal panel
+- `` Ctrl+` `` — toggle terminal panel
+- `Ctrl+,` — open settings
 
 The `editor_mode` setting is persisted in `settings.json`.
 
@@ -949,7 +984,7 @@ All state lives in `~/.config/vimcode/`:
 ### Rendering
 
 **Syntax highlighting** (Tree-sitter, auto-detected by extension)
-- Rust, Python, JavaScript, TypeScript/TSX, Go, C, C++, C#, Java, Ruby, Bash, JSON, TOML, CSS
+- Rust, Python, JavaScript, TypeScript/TSX, Go, C, C++, C#, Java, Ruby, Bash, JSON, TOML, CSS, YAML, HTML
 
 **Line numbers** — absolute / relative / hybrid (both on = hybrid)
 
@@ -1099,6 +1134,7 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `Ctrl-W d` | Split and go to definition (LSP) |
 | `Ctrl-P` | Open fuzzy file finder |
 | `Ctrl-G` | Show file info (name, line, col, %) |
+| `F1` | Command palette |
 | `F5` | Start debugging / continue |
 | `Shift+F5` | Stop debugging |
 | `F6` | Pause debugger |
@@ -1268,6 +1304,17 @@ src/
 ```
 
 **Design rule:** `src/core/` has zero GTK/rendering dependencies and is testable in isolation.
+
+
+## Acknowledgements
+VimCode is built on the shoulders of giants, and I take very little credit for it. Credit belongs instead to the following people and teams:
+
+*   **Bram Moolenaar (RIP):** The original author of Vim. If you use VimCode and want to give something back, you can honor his legacy by donating to a charity of your choice. See [moolenaar.net/Charityware.html](https://www.moolenaar.net). I personally believe in the mission of UNICEF. No pressure!
+*   **The VSCode Team:** Obviously.
+*   **Bill Joy:** The creator of the original vi editor.
+*   **LLM Pioneers:** I also feel the need to begrudgingly acknowledge the work done by those who helped create LLMs (too many to mention). I say "begrudgingly" because of the horrors of "AI Slop" unleashed on the world, not to mention the environmental concerns regarding power-hungry data centers. That said, I remain hopeful that AI will be a catalyst for generating unlimited clean energy and many other benefits as well. I just hope that too many people won't suffer because of the incredible pace of the disruption.
+*   **Boris Cherny:** The creator of **Claude Code**, who is probably putting all of us developers out of a job any day now.
+
 
 ## Tech Stack
 

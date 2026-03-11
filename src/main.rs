@@ -362,6 +362,8 @@ enum Msg {
     ToggleTerminal,
     /// Open a new terminal tab.
     NewTerminalTab,
+    /// Run a command in a visible terminal pane (for installs).
+    RunCommandInTerminal(String),
     /// Switch to a specific terminal tab by index.
     TerminalSwitchTab(usize),
     /// Close the active terminal tab (closes panel if last tab).
@@ -1266,6 +1268,7 @@ impl SimpleComponent for App {
                             grab_focus: (),
 
                             add_controller = gtk4::EventControllerKey {
+                                set_propagation_phase: gtk4::PropagationPhase::Capture,
                                 connect_key_pressed[sender, engine] => move |_, key, _, modifier| {
                                     let key_name = key.name().map(|s| s.to_string()).unwrap_or_default();
                                     let unicode = key.to_unicode().filter(|c| !c.is_control());
@@ -1487,7 +1490,13 @@ impl SimpleComponent for App {
                                         return gtk4::glib::Propagation::Stop;
                                     }
                                     if matches_gtk_key(&pk.select_all_matches, key, modifier) {
-                                        engine.borrow_mut().select_all_word_occurrences();
+                                        let mut eng = engine.borrow_mut();
+                                        if eng.is_vscode_mode() {
+                                            eng.vscode_select_all_occurrences();
+                                        } else {
+                                            eng.select_all_word_occurrences();
+                                        }
+                                        drop(eng);
                                         sender.input(Msg::Resize);
                                         return gtk4::glib::Propagation::Stop;
                                     }
@@ -1542,17 +1551,102 @@ impl SimpleComponent for App {
                                         }
                                     }
 
-                                    // In VSCode mode, transform Shift+Arrow to "Shift_" prefixed
-                                    // key names so the engine's vscode handler can distinguish them.
-                                    let effective_key = if engine.borrow().is_vscode_mode() && shift {
+                                    // VSCode mode: Ctrl+] indent / Ctrl+[ outdent.
+                                    // GDK may report bracket keys as "bracketright"/"bracketleft"
+                                    // OR as control characters, so handle both.
+                                    if engine.borrow().is_vscode_mode() && ctrl && !alt {
+                                        let is_bracket_right = key_name == "bracketright"
+                                            || key == gdk::Key::bracketright;
+                                        let is_bracket_left = key_name == "bracketleft"
+                                            || key == gdk::Key::bracketleft;
+                                        // Shift+[ → braceleft/{, Shift+] → braceright/}
+                                        let is_brace_left = key_name == "braceleft"
+                                            || key_name == "{"
+                                            || key == gdk::Key::braceleft;
+                                        let is_brace_right = key_name == "braceright"
+                                            || key_name == "}"
+                                            || key == gdk::Key::braceright;
+                                        // Ctrl+Shift+[ → fold, Ctrl+Shift+] → unfold
+                                        if shift && (is_bracket_left || is_brace_left) {
+                                            sender.input(Msg::KeyPress {
+                                                key_name: "Shift_bracketleft".to_string(),
+                                                unicode: None,
+                                                ctrl: true,
+                                            });
+                                            return gtk4::glib::Propagation::Stop;
+                                        }
+                                        if shift && (is_bracket_right || is_brace_right) {
+                                            sender.input(Msg::KeyPress {
+                                                key_name: "Shift_bracketright".to_string(),
+                                                unicode: None,
+                                                ctrl: true,
+                                            });
+                                            return gtk4::glib::Propagation::Stop;
+                                        }
+                                        // Ctrl+[ → outdent, Ctrl+] → indent (no shift)
+                                        if is_bracket_right && !shift {
+                                            sender.input(Msg::KeyPress {
+                                                key_name: "bracketright".to_string(),
+                                                unicode: None,
+                                                ctrl: true,
+                                            });
+                                            return gtk4::glib::Propagation::Stop;
+                                        }
+                                        if is_bracket_left && !shift {
+                                            sender.input(Msg::KeyPress {
+                                                key_name: "bracketleft".to_string(),
+                                                unicode: None,
+                                                ctrl: true,
+                                            });
+                                            return gtk4::glib::Propagation::Stop;
+                                        }
+                                    }
+
+                                    // In VSCode mode, encode Alt+key and Shift+key into
+                                    // prefixed key names for the engine's vscode handler.
+                                    let is_vscode = engine.borrow().is_vscode_mode();
+
+                                    // Alt+key → "Alt_" encoded key for VSCode mode
+                                    if is_vscode && alt && !ctrl {
+                                        let alt_key_name = if shift {
+                                            match key_name.as_str() {
+                                                "Up"   => Some("Alt_Shift_Up"),
+                                                "Down" => Some("Alt_Shift_Down"),
+                                                _      => None,
+                                            }
+                                        } else {
+                                            match key_name.as_str() {
+                                                "Up"   => Some("Alt_Up"),
+                                                "Down" => Some("Alt_Down"),
+                                                "z"    => Some("Alt_z"),
+                                                _      => None,
+                                            }
+                                        };
+                                        if let Some(name) = alt_key_name {
+                                            sender.input(Msg::KeyPress {
+                                                key_name: name.to_string(),
+                                                unicode: None,
+                                                ctrl: false,
+                                            });
+                                            return gtk4::glib::Propagation::Stop;
+                                        }
+                                    }
+
+                                    let effective_key = if is_vscode && shift {
                                         match key_name.as_str() {
-                                            "Right" => "Shift_Right".to_string(),
-                                            "Left"  => "Shift_Left".to_string(),
-                                            "Up"    => "Shift_Up".to_string(),
-                                            "Down"  => "Shift_Down".to_string(),
-                                            "Home"  => "Shift_Home".to_string(),
-                                            "End"   => "Shift_End".to_string(),
-                                            _       => key_name,
+                                            "Right"        => "Shift_Right".to_string(),
+                                            "Left"         => "Shift_Left".to_string(),
+                                            "Up"           => "Shift_Up".to_string(),
+                                            "Down"         => "Shift_Down".to_string(),
+                                            "Home"         => "Shift_Home".to_string(),
+                                            "End"          => "Shift_End".to_string(),
+                                            "Return" if ctrl => "Shift_Return".to_string(),
+                                            "bracketleft" if ctrl  => "Shift_bracketleft".to_string(),
+                                            "bracketright" if ctrl => "Shift_bracketright".to_string(),
+                                            // Ctrl+Shift+letter: uppercase single-letter key names
+                                            // so engine can distinguish Ctrl+L from Ctrl+Shift+L
+                                            s if ctrl && s.len() == 1 => s.to_ascii_uppercase(),
+                                            _              => key_name,
                                         }
                                     } else {
                                         key_name
@@ -1761,6 +1855,16 @@ impl SimpleComponent for App {
         // colours automatically when the GTK theme supports it (e.g. Adwaita).
         if let Some(gtk_settings) = gtk4::Settings::default() {
             gtk_settings.set_gtk_application_prefer_dark_theme(true);
+        }
+
+        // Ensure GTK finds our installed SVG icon by adding
+        // ~/.local/share/icons to the icon theme search path.
+        if let Some(home) = std::env::var_os("HOME") {
+            let icon_dir = std::path::PathBuf::from(home).join(".local/share/icons");
+            if let Some(display) = gdk::Display::default() {
+                let icon_theme = gtk4::IconTheme::for_display(&display);
+                icon_theme.add_search_path(&icon_dir);
+            }
         }
 
         let engine = {
@@ -3155,6 +3259,29 @@ impl SimpleComponent for App {
             gtk4::glib::ControlFlow::Continue
         });
 
+        // ── Disable GTK mnemonic Alt interception ─────────────────────────────
+        // GTK4 has a built-in ShortcutController on the window that intercepts
+        // Alt key events for mnemonic activation *during* the capture phase,
+        // before any user-added EventControllerKey can see them.  We don't use
+        // mnemonics, so reassign the trigger to HYPER_MASK (never pressed) so
+        // Alt keys reach our regular key handler for VSCode-mode shortcuts.
+        {
+            use gtk4::prelude::*;
+            let controllers = root.observe_controllers();
+            for i in 0..controllers.n_items() {
+                if let Some(obj) = controllers.item(i) {
+                    if let Ok(sc) = obj.downcast::<gtk4::ShortcutController>() {
+                        if sc
+                            .mnemonics_modifiers()
+                            .contains(gdk::ModifierType::ALT_MASK)
+                        {
+                            sc.set_mnemonics_modifiers(gdk::ModifierType::HYPER_MASK);
+                        }
+                    }
+                }
+            }
+        }
+
         ComponentParts { model, widgets }
     }
 
@@ -3290,6 +3417,9 @@ impl SimpleComponent for App {
                     EngineAction::OpenTerminal => {
                         sender.input(Msg::NewTerminalTab);
                     }
+                    EngineAction::RunInTerminal(cmd) => {
+                        sender.input(Msg::RunCommandInTerminal(cmd));
+                    }
                     EngineAction::OpenFolderDialog => {
                         sender.input(Msg::OpenFolderDialog);
                     }
@@ -3374,6 +3504,9 @@ impl SimpleComponent for App {
                         }
                         EngineAction::OpenTerminal => {
                             sender.input(Msg::ToggleTerminal);
+                        }
+                        EngineAction::RunInTerminal(cmd) => {
+                            sender.input(Msg::RunCommandInTerminal(cmd));
                         }
                         EngineAction::OpenFolderDialog
                         | EngineAction::OpenWorkspaceDialog
@@ -3469,7 +3602,7 @@ impl SimpleComponent for App {
                 let in_terminal = if self.cached_line_height > 0.0 {
                     let engine = self.engine.borrow();
                     if engine.terminal_open || engine.bottom_panel_open {
-                        let term_px = (engine.session.terminal_panel_rows as f64 + 1.0)
+                        let term_px = (engine.session.terminal_panel_rows as f64 + 2.0)
                             * self.cached_line_height;
                         let status_h = 2.0 * self.cached_line_height;
                         let toolbar_px = if engine.debug_toolbar_visible {
@@ -3479,7 +3612,15 @@ impl SimpleComponent for App {
                         };
                         let term_y = height - status_h - toolbar_px - term_px;
                         if y >= term_y {
-                            Some((term_y, y >= term_y + self.cached_line_height))
+                            // 0 = tab bar, 1 = toolbar, 2 = content
+                            let zone = if y >= term_y + 2.0 * self.cached_line_height {
+                                2
+                            } else if y >= term_y + self.cached_line_height {
+                                1
+                            } else {
+                                0
+                            };
+                            Some((term_y, zone))
                         } else {
                             None
                         }
@@ -3489,20 +3630,19 @@ impl SimpleComponent for App {
                 } else {
                     None
                 };
-                if let Some((term_y, in_content)) = in_terminal {
-                    // Click on the tab bar row: switch active bottom panel tab.
-                    if !in_content {
-                        // Determine which tab was clicked by measuring label widths.
-                        // Labels mirror draw_bottom_panel_tabs: Terminal then Debug Output.
-                        // Use a simple fixed-width estimate (label char count × char_width).
-                        let cw = self.cached_char_width.max(1.0);
-                        let terminal_label = "  \u{f489}  Terminal  ";
-                        let debug_label = "  \u{f188}  Debug Output  ";
-                        let terminal_w = terminal_label.chars().count() as f64 * cw;
-                        let tab_x = x - 4.0; // offset matches draw_bottom_panel_tabs cursor_x start
+                if let Some((term_y, zone)) = in_terminal {
+                    if zone == 0 {
+                        // Click on the tab bar row: switch active bottom panel tab.
+                        // Sans-serif chars are ~60% of monospace width; use that estimate.
+                        let cw = self.cached_char_width.max(1.0) * 0.6;
+                        let padding = 12.0;
+                        let terminal_label = "TERMINAL";
+                        let debug_label = "DEBUG CONSOLE";
+                        let terminal_w = padding + terminal_label.len() as f64 * cw + padding;
+                        let tab_x = x - padding; // offset matches cursor_x start
                         let new_kind = if tab_x < terminal_w {
                             render::BottomPanelKind::Terminal
-                        } else if tab_x < terminal_w + 8.0 + debug_label.chars().count() as f64 * cw
+                        } else if tab_x < terminal_w + debug_label.len() as f64 * cw + padding * 2.0
                         {
                             render::BottomPanelKind::DebugOutput
                         } else {
@@ -3513,7 +3653,7 @@ impl SimpleComponent for App {
                         return;
                     }
                     self.engine.borrow_mut().terminal_has_focus = true;
-                    if in_content {
+                    if zone == 2 {
                         const SB_W: f64 = 6.0;
                         // In split mode: detect a click on the divider (start drag)
                         // or set keyboard focus to the appropriate pane.
@@ -3547,7 +3687,7 @@ impl SimpleComponent for App {
                             } else {
                                 self.terminal_sb_dragging = false;
                                 self.terminal_resize_dragging = false;
-                                let row = ((y - term_y - self.cached_line_height)
+                                let row = ((y - term_y - 2.0 * self.cached_line_height)
                                     / self.cached_line_height)
                                     as u16;
                                 let col = (x / self.cached_char_width.max(1.0)) as u16;
@@ -3921,7 +4061,7 @@ impl SimpleComponent for App {
                         let status_h = 2.0 * self.cached_line_height;
                         let available = (height - y - status_h).max(0.0);
                         let new_rows = ((available / self.cached_line_height) as u16)
-                            .saturating_sub(1)
+                            .saturating_sub(2)
                             .clamp(5, 30);
                         self.engine.borrow_mut().session.terminal_panel_rows = new_rows;
                         self.draw_needed.set(true);
@@ -3937,7 +4077,7 @@ impl SimpleComponent for App {
                     };
                     if term_rows > 0 {
                         let term_px = (self.engine.borrow().session.terminal_panel_rows as f64
-                            + 1.0)
+                            + 2.0)
                             * self.cached_line_height;
                         let status_h = 2.0 * self.cached_line_height;
                         let toolbar_px = if self.engine.borrow().debug_toolbar_visible {
@@ -3946,8 +4086,8 @@ impl SimpleComponent for App {
                             0.0
                         };
                         let term_y = height - status_h - toolbar_px - term_px;
-                        let content_y = term_y + self.cached_line_height;
-                        let content_h = term_px - self.cached_line_height;
+                        let content_y = term_y + 2.0 * self.cached_line_height;
+                        let content_h = term_px - 2.0 * self.cached_line_height;
                         if scrollback_rows > 0 && content_h > 0.0 {
                             let y_rel = (y - content_y).clamp(0.0, content_h);
                             let frac = y_rel / content_h;
@@ -3964,7 +4104,7 @@ impl SimpleComponent for App {
                     let in_terminal = if self.cached_line_height > 0.0 {
                         let engine = self.engine.borrow();
                         if engine.terminal_open || engine.bottom_panel_open {
-                            let term_px = (engine.session.terminal_panel_rows as f64 + 1.0)
+                            let term_px = (engine.session.terminal_panel_rows as f64 + 2.0)
                                 * self.cached_line_height;
                             let status_h = 2.0 * self.cached_line_height;
                             let toolbar_px = if engine.debug_toolbar_visible {
@@ -3973,7 +4113,7 @@ impl SimpleComponent for App {
                                 0.0
                             };
                             let term_y = height - status_h - toolbar_px - term_px;
-                            if y >= term_y + self.cached_line_height {
+                            if y >= term_y + 2.0 * self.cached_line_height {
                                 Some(term_y)
                             } else {
                                 None
@@ -3985,8 +4125,8 @@ impl SimpleComponent for App {
                         None
                     };
                     if let Some(term_y) = in_terminal {
-                        let row = ((y - term_y - self.cached_line_height) / self.cached_line_height)
-                            as u16;
+                        let row = ((y - term_y - 2.0 * self.cached_line_height)
+                            / self.cached_line_height) as u16;
                         let col = (x / self.cached_char_width.max(1.0)) as u16;
                         if let Some(term) = self.engine.borrow_mut().active_terminal_mut() {
                             if let Some(ref mut sel) = term.selection {
@@ -4816,6 +4956,16 @@ impl SimpleComponent for App {
                 if self.engine.borrow_mut().poll_terminal() {
                     self.draw_needed.set(true);
                 }
+                // Run pending terminal commands (e.g. extension installs).
+                if self.engine.borrow().pending_terminal_command.is_some() {
+                    let cmd = self
+                        .engine
+                        .borrow_mut()
+                        .pending_terminal_command
+                        .take()
+                        .unwrap();
+                    sender.input(Msg::RunCommandInTerminal(cmd));
+                }
                 // DAP: drain adapter events (breakpoint hits, stops, output)
                 {
                     let mut engine = self.engine.borrow_mut();
@@ -5008,13 +5158,7 @@ impl SimpleComponent for App {
                         engine.paste_text_to_input(&text);
                     }
                     Mode::Insert | Mode::Replace => {
-                        for ch in text.chars() {
-                            if ch == '\n' || ch == '\r' {
-                                engine.handle_key("Return", None, false);
-                            } else {
-                                engine.handle_key("", Some(ch), false);
-                            }
-                        }
+                        engine.paste_in_insert_mode(&text);
                     }
                     Mode::Normal | Mode::Visual | Mode::VisualLine | Mode::VisualBlock => {
                         if !text.is_empty() {
@@ -5093,6 +5237,23 @@ impl SimpleComponent for App {
                 .max(40);
                 let rows = self.engine.borrow().session.terminal_panel_rows;
                 self.engine.borrow_mut().terminal_new_tab(cols, rows);
+                self.draw_needed.set(true);
+            }
+            Msg::RunCommandInTerminal(cmd) => {
+                let cols = if let Some(da) = self.drawing_area.borrow().as_ref() {
+                    if self.cached_char_width > 0.0 {
+                        (da.width() as f64 / self.cached_char_width) as u16
+                    } else {
+                        80
+                    }
+                } else {
+                    80
+                }
+                .max(40);
+                let rows = self.engine.borrow().session.terminal_panel_rows;
+                self.engine
+                    .borrow_mut()
+                    .terminal_run_command(&cmd, cols, rows);
                 self.draw_needed.set(true);
             }
             Msg::TerminalSwitchTab(idx) => {
@@ -5979,7 +6140,7 @@ fn sync_scrollbar_positions(
         0.0
     };
     let term_px = if engine.terminal_open || engine.bottom_panel_open {
-        (engine.session.terminal_panel_rows as f64 + 1.0) * line_height
+        (engine.session.terminal_panel_rows as f64 + 2.0) * line_height
     } else {
         0.0
     };
@@ -6215,7 +6376,7 @@ impl App {
             0.0
         };
         let term_px = if engine.terminal_open || engine.bottom_panel_open {
-            (engine.session.terminal_panel_rows as f64 + 1.0) * line_height
+            (engine.session.terminal_panel_rows as f64 + 2.0) * line_height
         } else {
             0.0
         };
@@ -6501,7 +6662,7 @@ fn draw_editor(
     // Reserve space for the bottom panel when open (1 tab-bar row + content rows).
     // Triggered by either a live terminal OR the debug output panel being shown.
     let term_px = if engine.terminal_open || engine.bottom_panel_open {
-        (engine.session.terminal_panel_rows as usize + 1) as f64 * line_height
+        (engine.session.terminal_panel_rows as usize + 2) as f64 * line_height
     } else {
         0.0
     };
@@ -6873,7 +7034,7 @@ fn compute_editor_window_rects(
         0.0
     };
     let term_px = if engine.terminal_open || engine.bottom_panel_open {
-        (engine.session.terminal_panel_rows as f64 + 1.0) * line_height
+        (engine.session.terminal_panel_rows as f64 + 2.0) * line_height
     } else {
         0.0
     };
@@ -7114,7 +7275,7 @@ fn draw_tab_drag_overlay(
         0.0
     };
     let term_px = if engine.terminal_open || engine.bottom_panel_open {
-        (engine.session.terminal_panel_rows as usize + 1) as f64 * line_height
+        (engine.session.terminal_panel_rows as usize + 2) as f64 * line_height
     } else {
         0.0
     };
@@ -7351,7 +7512,16 @@ fn draw_tab_bar(
             cr.close_path();
             cr.fill().ok();
         }
-        let (xr, xg, xb) = if is_close_hovered {
+        // Show ● (modified dot) when dirty and not hovered, × otherwise (VSCode style).
+        let close_glyph = if tab.dirty && !is_close_hovered {
+            "●"
+        } else {
+            "×"
+        };
+        let (xr, xg, xb) = if tab.dirty && !is_close_hovered {
+            // White/foreground dot for modified indicator
+            theme.foreground.to_cairo()
+        } else if is_close_hovered {
             theme.foreground.to_cairo()
         } else if tab.active {
             theme.tab_inactive_fg.to_cairo()
@@ -7360,7 +7530,7 @@ fn draw_tab_bar(
         };
         cr.set_source_rgb(xr, xg, xb);
         layout.set_font_description(Some(&normal_font));
-        layout.set_text("×");
+        layout.set_text(close_glyph);
         cr.move_to(close_x, y_offset);
         pangocairo::show_layout(cr, layout);
 
@@ -7496,6 +7666,22 @@ fn draw_window(
             cr,
             layout,
             sel,
+            &rw.lines,
+            rect,
+            line_height,
+            rw.scroll_top,
+            text_x_offset,
+            theme.selection,
+            theme.selection_alpha,
+        );
+    }
+
+    // Extra selections (Ctrl+D multi-cursor word highlights)
+    for esel in &rw.extra_selections {
+        draw_visual_selection(
+            cr,
+            layout,
+            esel,
             &rw.lines,
             rect,
             line_height,
@@ -7756,10 +7942,17 @@ fn draw_window(
             layout.set_text(&rl.raw_text);
             layout.set_attributes(None);
 
+            // When Ctrl+D selections are active, draw bar at right edge (col+1)
+            let render_col = if !rw.extra_selections.is_empty() && *cursor_shape == CursorShape::Bar
+            {
+                cursor_pos.col + 1
+            } else {
+                cursor_pos.col
+            };
             let byte_offset: usize = rl
                 .raw_text
                 .char_indices()
-                .nth(cursor_pos.col)
+                .nth(render_col)
                 .map(|(i, _)| i)
                 .unwrap_or(rl.raw_text.len());
 
@@ -7820,17 +8013,29 @@ fn draw_window(
         }
     }
 
-    // Secondary cursors (multi-cursor Alt-D) — dimmed block at each extra position.
+    // Secondary cursors — same shape as primary cursor (bar in Insert/VSCode, block in Normal).
+    let extra_cursor_shape = rw
+        .cursor
+        .as_ref()
+        .map(|(_, s)| *s)
+        .unwrap_or(CursorShape::Bar);
+    let has_extra_sels = !rw.extra_selections.is_empty();
     let fallback_char_w = font_metrics.approximate_char_width() as f64 / pango::SCALE as f64;
     let (cr_r, cr_g, cr_b) = theme.cursor.to_cairo();
     for extra_pos in &rw.extra_cursors {
         if let Some(rl) = rw.lines.get(extra_pos.view_line) {
             layout.set_text(&rl.raw_text);
             layout.set_attributes(None);
+            // When Ctrl+D selections are active, draw bar at right edge (col+1)
+            let render_col = if has_extra_sels && extra_cursor_shape == CursorShape::Bar {
+                extra_pos.col + 1
+            } else {
+                extra_pos.col
+            };
             let byte_offset: usize = rl
                 .raw_text
                 .char_indices()
-                .nth(extra_pos.col)
+                .nth(render_col)
                 .map(|(i, _)| i)
                 .unwrap_or(rl.raw_text.len());
             let pos = layout.index_to_pos(byte_offset as i32);
@@ -7844,9 +8049,24 @@ fn draw_window(
                 }
             };
             let ey = rect.y + extra_pos.view_line as f64 * line_height;
-            cr.set_source_rgba(cr_r, cr_g, cr_b, theme.cursor_normal_alpha * 0.5);
-            cr.rectangle(ex, ey, ew, line_height);
-            cr.fill().unwrap();
+            match extra_cursor_shape {
+                CursorShape::Bar => {
+                    cr.set_source_rgb(cr_r, cr_g, cr_b);
+                    cr.rectangle(ex, ey, 2.0, line_height);
+                    cr.fill().unwrap();
+                }
+                CursorShape::Block => {
+                    cr.set_source_rgba(cr_r, cr_g, cr_b, theme.cursor_normal_alpha);
+                    cr.rectangle(ex, ey, ew, line_height);
+                    cr.fill().unwrap();
+                }
+                CursorShape::Underline => {
+                    cr.set_source_rgb(cr_r, cr_g, cr_b);
+                    let bar_h = (line_height * 0.12).max(2.0);
+                    cr.rectangle(ex, ey + line_height - bar_h, ew, bar_h);
+                    cr.fill().unwrap();
+                }
+            }
         }
     }
 }
@@ -8779,48 +8999,58 @@ fn draw_bottom_panel_tabs(
     w: f64,
     line_height: f64,
 ) {
-    let (hr, hg, hb) = theme.status_bg.to_cairo();
-    let (fr, fg, fb) = theme.status_fg.to_cairo();
+    let (br, bg, bb) = theme.tab_bar_bg.to_cairo();
+    let (fr, fg2, fb) = theme.status_fg.to_cairo();
     let (ar, ag, ab) = theme.tab_active_fg.to_cairo();
 
-    // Background.
-    cr.set_source_rgb(hr, hg, hb);
+    // Background — use tab bar bg to match the editor tab bar.
+    cr.set_source_rgb(br, bg, bb);
     cr.rectangle(x, y, w, line_height);
     cr.fill().ok();
 
+    // Thin separator line at the top.
+    let (sr, sg, sb) = theme.separator.to_cairo();
+    cr.set_source_rgb(sr, sg, sb);
+    cr.rectangle(x, y, w, 1.0);
+    cr.fill().ok();
+
+    // Use sans-serif UI font (like VSCode panel tabs).
+    let saved_font = layout.font_description().unwrap_or_default();
+    let ui_font_desc = FontDescription::from_string(UI_FONT);
+    layout.set_font_description(Some(&ui_font_desc));
     layout.set_attributes(None);
 
-    let tabs = [
-        ("  \u{f489}  Terminal  ", render::BottomPanelKind::Terminal), // nf-md-console
-        (
-            "  \u{f188}  Debug Output  ",
-            render::BottomPanelKind::DebugOutput,
-        ), // nf-fa-bug
+    let tabs: &[(&str, render::BottomPanelKind)] = &[
+        ("TERMINAL", render::BottomPanelKind::Terminal),
+        ("DEBUG CONSOLE", render::BottomPanelKind::DebugOutput),
     ];
 
-    let mut cursor_x = x + 4.0;
-    for (label, kind) in &tabs {
+    let padding = 12.0;
+    let mut cursor_x = x + padding;
+    for (label, kind) in tabs {
         let is_active = screen.bottom_tabs.active == *kind;
         let (lr, lg, lb) = if is_active {
             (ar, ag, ab)
         } else {
-            (fr, fg, fb)
+            (fr, fg2, fb)
         };
         cr.set_source_rgb(lr, lg, lb);
         layout.set_text(label);
         cr.move_to(cursor_x, y);
         pangocairo::show_layout(cr, layout);
+        let extents = layout.pixel_extents().1;
+        let tab_w = extents.width() as f64;
         // Underline the active tab.
         if is_active {
-            let extents = layout.pixel_extents().1;
-            let tab_w = extents.width() as f64;
             cr.set_source_rgb(ar, ag, ab);
             cr.rectangle(cursor_x, y + line_height - 2.0, tab_w, 2.0);
             cr.fill().ok();
         }
-        let extents = layout.pixel_extents().1;
-        cursor_x += extents.width() as f64 + 8.0;
+        cursor_x += tab_w + padding * 2.0;
     }
+
+    // Restore the original monospace font.
+    layout.set_font_description(Some(&saved_font));
 }
 
 /// Draw debug output lines (read-only scrolling log).
@@ -9144,13 +9374,17 @@ fn draw_terminal_panel(
     char_width: f64,
     sender: &relm4::Sender<Msg>,
 ) {
-    // Toolbar row (header)
+    // Toolbar row (header) — use sans-serif UI font like VSCode.
+    let saved_font = layout.font_description().unwrap_or_default();
+    let ui_font_desc = FontDescription::from_string(UI_FONT);
+
     let (hr, hg, hb) = theme.status_bg.to_cairo();
     cr.set_source_rgb(hr, hg, hb);
     cr.rectangle(x, y, w, line_height);
     cr.fill().ok();
 
     let (fr, fg2, fb) = theme.status_fg.to_cairo();
+    layout.set_font_description(Some(&ui_font_desc));
     layout.set_attributes(None);
 
     if panel.find_active {
@@ -9220,6 +9454,9 @@ fn draw_terminal_panel(
 
     // close_x / split_x used by click detection in MouseClick handler
     let _ = sender; // click detection handled in MouseClick
+
+    // Restore monospace font for terminal content rendering.
+    layout.set_font_description(Some(&saved_font));
 
     // Scrollbar geometry
     const SB_W: f64 = 6.0;
@@ -10259,7 +10496,7 @@ fn draw_ext_sidebar(
             );
             pangocairo::show_layout(cr, layout);
             // Right-aligned hint
-            let hint = "  [Enter] install";
+            let hint = "  [i] install";
             cr.set_source_rgb(dim_r, dim_g, dim_b);
             layout.set_text(hint);
             let (hint_w, _) = layout.pixel_size();
@@ -10620,7 +10857,7 @@ fn pixel_to_click_target(
             0.0
         };
         let term_px = if engine.terminal_open || engine.bottom_panel_open {
-            (engine.session.terminal_panel_rows as usize + 1) as f64 * line_height
+            (engine.session.terminal_panel_rows as usize + 2) as f64 * line_height
         } else {
             0.0
         };
@@ -10848,7 +11085,7 @@ fn handle_mouse_click(
     y: f64,
     width: f64,
     height: f64,
-    _alt: bool,
+    alt: bool,
     line_height: f64,
     char_width: f64,
     tab_slot_positions: &TabSlotMap,
@@ -10864,7 +11101,12 @@ fn handle_mouse_click(
         tab_slot_positions,
     ) {
         ClickTarget::BufferPos(wid, line, col) => {
-            engine.mouse_click(wid, line, col);
+            // Alt+Click in VSCode mode → add cursor at position
+            if alt && engine.is_vscode_mode() {
+                engine.add_cursor_at_pos(line, col);
+            } else {
+                engine.mouse_click(wid, line, col);
+            }
             Some(false)
         }
         ClickTarget::SplitButton(group_id, dir) => {
@@ -10920,7 +11162,7 @@ fn compute_tab_drop_zone(
         0.0
     };
     let term_px = if engine.terminal_open || engine.bottom_panel_open {
-        (engine.session.terminal_panel_rows as usize + 1) as f64 * line_height
+        (engine.session.terminal_panel_rows as usize + 2) as f64 * line_height
     } else {
         0.0
     };
@@ -11775,14 +12017,42 @@ fn install_icon_and_desktop() {
         return;
     };
     let data_dir = home.join(".local/share");
+    let hicolor = data_dir.join("icons/hicolor");
 
     // SVG icon for scalable size (GTK/GNOME renders SVGs natively).
-    let svg_dir = data_dir.join("icons/hicolor/scalable/apps");
+    let svg_dir = hicolor.join("scalable/apps");
     let svg_path = svg_dir.join("vimcode.svg");
     let svg_bytes: &[u8] = include_bytes!("../vim-code.svg");
     if fs::create_dir_all(&svg_dir).is_ok() {
         let _ = fs::write(&svg_path, svg_bytes);
     }
+
+    // Render the SVG to PNG at multiple sizes so compositors and window
+    // managers that don't support SVG lookup (or only read _NET_WM_ICON
+    // pixel data at a fixed size) get a crisp icon in alt-tab / taskbar.
+    if svg_path.exists() {
+        for size in [48, 64, 128, 256, 512] {
+            let png_dir = hicolor.join(format!("{size}x{size}/apps"));
+            let png_path = png_dir.join("vimcode.png");
+            if png_path.exists() {
+                continue; // already rendered
+            }
+            if fs::create_dir_all(&png_dir).is_ok() {
+                if let Ok(pixbuf) =
+                    gtk4::gdk_pixbuf::Pixbuf::from_file_at_size(&svg_path, size, size)
+                {
+                    let _ = pixbuf.savev(&png_path, "png", &[]);
+                }
+            }
+        }
+    }
+
+    // Refresh icon theme cache so the new icons are picked up immediately.
+    let _ = std::process::Command::new("gtk-update-icon-cache")
+        .arg("--force")
+        .arg("--quiet")
+        .arg(&hicolor)
+        .output();
 
     // .desktop file
     let app_dir = data_dir.join("applications");

@@ -5,6 +5,12 @@
 ---
 
 ## Recently Completed
+- **Session 162**: Bulk paste performance fix — `Engine::paste_in_insert_mode()` replaces per-character `handle_key()` loop, safety guard in `compute_word_wrap_segments()`, 8 tests
+- **Session 161**: Terminal-based extension install (TerminalPane::new_command, InstallContext, EngineAction::RunInTerminal, finalize_install_from_terminal), F1 opens Command Palette in both Vim and VSCode modes, 3 new tests
+- **Session 160**: Extensions UX overhaul (Enter=README preview, i=install), TUI double-click fix, word-boundary wrapping, workspace session isolation, LSP kickstart after ext install, bicep LSP install rewrite, commentary extension removed (native `:Comment`), all extension READMEs rewritten, `EXTENSIONS.md` guide
+- **Session 159**: Tree-sitter upgrade (0.20→0.24) + YAML/HTML syntax highlighting (17 languages), TUI tab expansion fix, TUI activity bar icon readability, YAML key/value color fix, C# query fixes, v0.3.2
+- **Session 158**: VSCode Mode Gap Closure Phases 1–3 — Alt key routing, line operations (move/duplicate/delete/insert), multi-cursor (Ctrl+D/Ctrl+Shift+L with extra selections rendering, same-line char-index correctness), indentation (Ctrl+]/[, Shift+Tab, multi-cursor aware), panel toggles (Ctrl+J/Ctrl+`/Ctrl+B/Ctrl+,), quick navigation (Ctrl+G/P/Shift+P), Ctrl+K chord prefix, GTK terminal mouse fix (+1→+2 for tab bar row), bottom panel sans-serif UI font, 55 tests
+- **Session 157**: VSCode mode fixes (auto-pairs, bracket matching, update_bracket_match in handle_vscode_key), build portability (vcd musl static linking, Flatpak Rust 1.80 compat), v0.3.1 release
 - **Session 156**: IDE Polish — indent guides (vertical lines at tabstops, active guide highlight, blank line bridging), bracket pair highlighting (matching `(){}[]` background color), auto-close brackets/quotes (skip-over, pair backspace, smart quote context), 3 new settings + theme colors across all 4 themes, GTK+TUI rendering, 29 tests
 - **Session 155**: Core Commentary Feature — unified comment toggling into `src/core/comment.rs` (46+ language table, two-pass algorithm, override chain), `:Comment`/`:Commentary` commands, `vimcode.set_comment_style()` plugin API, Ctrl+/ fix for GTK+TUI, VSCode Ctrl+Q/F10, 19+31 tests
 - **Session 154**: Keymaps editor in settings panel — `BufferEditor` setting type, scratch buffer with validation, `:Keymaps` command, GTK button + TUI display, 11 tests

@@ -511,6 +511,29 @@ impl BufferManager {
         id
     }
 
+    /// Apply user language_map overrides to a buffer's lsp_language_id.
+    pub fn apply_language_map(
+        &mut self,
+        id: BufferId,
+        language_map: &std::collections::HashMap<String, String>,
+    ) {
+        if language_map.is_empty() {
+            return;
+        }
+        if let Some(state) = self.buffers.get_mut(&id) {
+            if let Some(ext) = state
+                .file_path
+                .as_ref()
+                .and_then(|p| p.extension())
+                .and_then(|e| e.to_str())
+            {
+                if let Some(lang) = language_map.get(ext) {
+                    state.lsp_language_id = Some(lang.clone());
+                }
+            }
+        }
+    }
+
     /// Create a buffer from a file. Reuses existing buffer if file is already open.
     pub fn open_file(&mut self, path: &Path) -> Result<BufferId, io::Error> {
         // Check if file is already open

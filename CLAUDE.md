@@ -8,6 +8,7 @@ After completing any feature or significant change, update ALL of these files:
 - **`README.md`** — the primary user-facing reference; keep the feature tables, key reference, and command list accurate and complete; update the test count in the intro line
 - **`PROJECT_STATE.md`** — internal progress tracker; update session date, test counts, file sizes, recent work entry, and roadmap checkboxes
 - **`PLAN.md`** — update recently completed section at top; tick off roadmap items
+- **`EXTENSIONS.md`** — extension development guide; update if any Lua API functions, events, manifest fields, or plugin loading behavior change
 
 **README.md update rules:**
 - Add new keys/commands to the appropriate Key Reference table

@@ -110,6 +110,18 @@ pub static BUNDLED: &[BundledExtension] = &[
         readme: include_str!("../../extensions/markdown/README.md"),
     },
     BundledExtension {
+        name: "bicep",
+        manifest_toml: include_str!("../../extensions/bicep/manifest.toml"),
+        scripts: &[],
+        readme: include_str!("../../extensions/bicep/README.md"),
+    },
+    BundledExtension {
+        name: "terraform",
+        manifest_toml: include_str!("../../extensions/terraform/manifest.toml"),
+        scripts: &[],
+        readme: include_str!("../../extensions/terraform/README.md"),
+    },
+    BundledExtension {
         name: "git-insights",
         manifest_toml: include_str!("../../extensions/git-insights/manifest.toml"),
         scripts: &[(
@@ -117,15 +129,6 @@ pub static BUNDLED: &[BundledExtension] = &[
             include_str!("../../extensions/git-insights/blame.lua"),
         )],
         readme: include_str!("../../extensions/git-insights/README.md"),
-    },
-    BundledExtension {
-        name: "commentary",
-        manifest_toml: include_str!("../../extensions/commentary/manifest.toml"),
-        scripts: &[(
-            "commentary.lua",
-            include_str!("../../extensions/commentary/commentary.lua"),
-        )],
-        readme: include_str!("../../extensions/commentary/README.md"),
     },
 ];
 

@@ -23,7 +23,7 @@ use super::registry;
 use super::session::{ExtensionState, HistoryState, SessionGroupLayout, SessionState};
 use super::settings::{EditorMode, Settings};
 use super::tab::{Tab, TabId};
-use super::terminal::{default_shell, TerminalPane};
+use super::terminal::{default_shell, InstallContext, TerminalPane};
 use super::view::View;
 use super::window::{
     DropZone, GroupDivider, GroupId, GroupLayout, SplitDirection, Window, WindowId, WindowLayout,
@@ -49,6 +49,9 @@ pub enum EngineAction {
     Error,
     /// Open the integrated terminal panel (UI layer provides correct cols/rows)
     OpenTerminal,
+    /// Run a command in a visible terminal pane (UI layer provides cols/rows).
+    /// The string is the shell command to execute.
+    RunInTerminal(String),
     /// Open Folder dialog requested (UI layer shows the native picker)
     OpenFolderDialog,
     /// Open Workspace dialog requested (UI layer shows the native picker)
@@ -318,8 +321,8 @@ pub static PALETTE_COMMANDS: &[PaletteCommand] = &[
     },
     PaletteCommand {
         label: "View: Command Palette",
-        shortcut: "Ctrl+Shift+P",
-        vscode_shortcut: "",
+        shortcut: "F1",
+        vscode_shortcut: "F1",
         action: "palette",
     },
     // Go
@@ -1314,6 +1317,11 @@ pub struct Engine {
     // --- Integrated terminal ---
     /// All open terminal panes (PTY + VT100 parser). Empty until first open.
     pub terminal_panes: Vec<TerminalPane>,
+    /// Pending install context for the next `terminal_run_command()` call.
+    pub pending_install_context: Option<InstallContext>,
+    /// Command that should be run in a visible terminal pane (set by ext_install).
+    /// Consumed by the UI layer on the next event loop iteration.
+    pub pending_terminal_command: Option<String>,
     /// Index of the currently active terminal pane.
     pub terminal_active: usize,
     /// Whether the terminal panel is visible.
@@ -1506,6 +1514,10 @@ pub struct Engine {
     swap_last_write: std::time::Instant,
     /// Pending recovery dialog (user must press R/D/A).
     pub swap_recovery: Option<SwapRecovery>,
+
+    // --- VSCode mode state ---
+    /// Ctrl+K chord pending: waiting for the second key of a Ctrl+K combo.
+    pub vscode_pending_ctrl_k: bool,
 }
 
 impl Engine {
@@ -1679,6 +1691,8 @@ impl Engine {
             clipboard_write: None,
             mouse_drag_active: false,
             terminal_panes: Vec::new(),
+            pending_install_context: None,
+            pending_terminal_command: None,
             terminal_active: 0,
             terminal_open: false,
             terminal_has_focus: false,
@@ -1787,6 +1801,7 @@ impl Engine {
             swap_write_needed: HashSet::new(),
             swap_last_write: std::time::Instant::now(),
             swap_recovery: None,
+            vscode_pending_ctrl_k: false,
         };
         // If vscode mode is configured, start in Insert mode with menu visible
         if engine.is_vscode_mode() {
@@ -1808,6 +1823,9 @@ impl Engine {
 
         match engine.buffer_manager.open_file(path) {
             Ok(buffer_id) => {
+                engine
+                    .buffer_manager
+                    .apply_language_map(buffer_id, &engine.settings.language_map);
                 // Update the window to point to the new buffer
                 if let Some(window) = engine.windows.get_mut(&engine.active_window_id()) {
                     window.buffer_id = buffer_id;
@@ -3206,6 +3224,8 @@ impl Engine {
             .buffer_manager
             .open_file(path)
             .map_err(|e| format!("Error: {}", e))?;
+        self.buffer_manager
+            .apply_language_map(buffer_id, &self.settings.language_map);
 
         let already_existed = existing_ids.contains(&buffer_id);
         let is_already_permanent = already_existed
@@ -3285,7 +3305,11 @@ impl Engine {
         // Determine which buffer the new window should show
         let new_buffer_id = if let Some(path) = file_path {
             match self.buffer_manager.open_file(path) {
-                Ok(id) => id,
+                Ok(id) => {
+                    self.buffer_manager
+                        .apply_language_map(id, &self.settings.language_map);
+                    id
+                }
                 Err(e) => {
                     self.message = format!("Error: {}", e);
                     return;
@@ -3481,7 +3505,11 @@ impl Engine {
     pub fn new_tab(&mut self, file_path: Option<&Path>) {
         let buffer_id = if let Some(path) = file_path {
             match self.buffer_manager.open_file(path) {
-                Ok(id) => id,
+                Ok(id) => {
+                    self.buffer_manager
+                        .apply_language_map(id, &self.settings.language_map);
+                    id
+                }
                 Err(e) => {
                     self.message = format!("Error: {}", e);
                     return;
@@ -3586,6 +3614,7 @@ impl Engine {
             self.active_group_mut().active_tab = (self.active_group().active_tab + 1) % tabs_len;
             self.line_annotations.clear();
             self.tab_mru_touch();
+            self.lsp_ensure_active_buffer();
         }
     }
 
@@ -3597,6 +3626,7 @@ impl Engine {
             self.active_group_mut().active_tab = if at == 0 { tabs_len - 1 } else { at - 1 };
             self.line_annotations.clear();
             self.tab_mru_touch();
+            self.lsp_ensure_active_buffer();
         }
     }
 
@@ -3642,6 +3672,7 @@ impl Engine {
                 self.active_group_mut().active_tab = tab_idx;
                 self.tab_mru_touch();
                 self.line_annotations.clear();
+                self.lsp_ensure_active_buffer();
             }
         }
         self.tab_switcher_open = false;
@@ -3674,6 +3705,7 @@ impl Engine {
             self.active_group_mut().active_tab = index;
             self.line_annotations.clear();
             self.tab_mru_touch();
+            self.lsp_ensure_active_buffer();
         }
     }
 
@@ -3997,6 +4029,8 @@ impl Engine {
                 return;
             }
         };
+        self.buffer_manager
+            .apply_language_map(buffer_id, &self.settings.language_map);
 
         // If this buffer is the current preview, just promote it in-place.
         if self.preview_buffer_id == Some(buffer_id) {
@@ -4074,6 +4108,8 @@ impl Engine {
                 return;
             }
         };
+        self.buffer_manager
+            .apply_language_map(buffer_id, &self.settings.language_map);
 
         // Already shown in any tab? Just switch to it (permanent or current preview).
         let found = self
@@ -4268,6 +4304,7 @@ impl Engine {
     /// Return the absolute paths of buffers currently shown in at least one window.
     /// Orphaned buffers (closed via :q but not yet freed) are intentionally excluded so
     /// that files the user explicitly closed are not restored on the next startup.
+    #[allow(dead_code)]
     pub fn open_file_paths(&self) -> Vec<std::path::PathBuf> {
         let in_window: std::collections::HashSet<BufferId> =
             self.windows.values().map(|w| w.buffer_id).collect();
@@ -4284,8 +4321,13 @@ impl Engine {
     }
 
     /// Snapshot the current open-file list and active file into session state, ready for saving.
+    /// Only populates `session.active_file` (for file_positions); open_files are saved
+    /// exclusively in per-workspace sessions to prevent cross-workspace bleed.
     pub fn collect_session_open_files(&mut self) {
-        self.session.open_files = self.open_file_paths();
+        // Do NOT write open_files to the global session — they belong in the
+        // per-workspace session only. This prevents files from workspace A
+        // appearing in workspace B.
+        self.session.open_files.clear();
         self.session.active_file = self
             .buffer_manager
             .get(self.active_buffer_id())
@@ -4476,17 +4518,16 @@ impl Engine {
             }
         }
 
-        // Notify LSP for all restored buffers (tree restore bypasses open_file_with_mode).
-        let restored_bids: Vec<BufferId> = self.buffer_manager.list();
-        for bid in restored_bids {
-            let has_file = self
-                .buffer_manager
-                .get(bid)
-                .and_then(|s| s.file_path.as_ref())
-                .is_some();
-            if has_file {
-                self.lsp_did_open(bid);
-            }
+        // Notify LSP only for the active buffer — other buffers will get
+        // lsp_did_open when the user actually switches to their tab.
+        let active_bid = self.active_buffer_id();
+        let has_file = self
+            .buffer_manager
+            .get(active_bid)
+            .and_then(|s| s.file_path.as_ref())
+            .is_some();
+        if has_file {
+            self.lsp_did_open(active_bid);
         }
 
         // Check all restored buffers for stale swap files.
@@ -6510,6 +6551,11 @@ impl Engine {
                 }
                 // Tab = Ctrl-I in terminals (same byte 0x09); both advance the jump list
                 "Tab" => self.jump_list_forward(),
+                // F1: open command palette
+                "F1" => {
+                    self.open_command_palette();
+                    return EngineAction::None;
+                }
                 // Debug / DAP function keys
                 "F5" => {
                     let cmd = if self.dap_session_active {
@@ -9843,6 +9889,92 @@ impl Engine {
         }
     }
 
+    /// Bulk-insert `text` at the cursor in Insert mode.
+    /// Unlike feeding each character through `handle_key()`, this inserts the
+    /// entire string in one `insert_with_undo()` call and runs expensive
+    /// post-processing (syntax reparse, bracket match, auto-completion, etc.)
+    /// only once at the end.  This makes pasting large text instant instead of
+    /// O(n) tree-sitter reparses.
+    pub fn paste_in_insert_mode(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+
+        // Dismiss AI ghost text and completion popup (same as regular insert keys).
+        if self.ai_ghost_text.is_some() {
+            self.ai_ghost_clear();
+        }
+        if self.completion_idx.is_some() {
+            self.completion_candidates.clear();
+            self.completion_idx = None;
+            self.completion_display_only = false;
+        }
+
+        let line = self.view().cursor.line;
+        let col = self.view().cursor.col;
+        let char_idx = self.buffer().line_to_char(line) + col;
+
+        // Handle auto-indent: split on newlines and add indent after each.
+        let indent = if self.settings.auto_indent {
+            self.get_line_indent_str(line)
+        } else {
+            String::new()
+        };
+
+        // Build the final string to insert.
+        // Replace \r\n and \r with \n, then auto-indent after each newline.
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        let to_insert = if indent.is_empty() {
+            normalized
+        } else {
+            // Add indent after every newline except at the very end.
+            let mut result = String::with_capacity(normalized.len() * 2);
+            let parts: Vec<&str> = normalized.split('\n').collect();
+            for (i, part) in parts.iter().enumerate() {
+                if i > 0 {
+                    result.push('\n');
+                    result.push_str(&indent);
+                }
+                result.push_str(part);
+            }
+            result
+        };
+
+        self.insert_with_undo(char_idx, &to_insert);
+        self.insert_text_buffer.push_str(&to_insert);
+
+        // Update cursor position: count newlines and find final line/col.
+        let newlines = to_insert.chars().filter(|&c| c == '\n').count();
+        if newlines > 0 {
+            self.view_mut().cursor.line = line + newlines;
+            let last_nl = to_insert.rfind('\n').unwrap();
+            self.view_mut().cursor.col = to_insert[last_nl + 1..].chars().count();
+        } else {
+            self.view_mut().cursor.col = col + to_insert.chars().count();
+        }
+
+        // Run post-change bookkeeping once (normally done per-char in handle_key).
+        let cur = self.view().cursor;
+        self.last_edit_pos = Some((cur.line, cur.col));
+        self.push_change_location(cur.line, cur.col);
+        self.set_dirty(true);
+        self.update_syntax();
+        let active_id = self.active_buffer_id();
+        if self.preview_buffer_id == Some(active_id) {
+            self.promote_preview(active_id);
+        }
+        self.lsp_dirty_buffers.insert(active_id, true);
+        self.refresh_md_previews();
+        self.swap_mark_dirty();
+        if !self.search_matches.is_empty() {
+            self.run_search();
+        }
+        self.ensure_cursor_visible();
+        self.sync_scroll_binds();
+        self.update_bracket_match();
+        self.trigger_auto_completion();
+    }
+
     /// Insert `text` at the current command-line cursor position and advance the cursor.
     /// Used by backends to paste clipboard content into the command line.
     pub fn command_insert_str(&mut self, text: &str) {
@@ -11790,6 +11922,8 @@ impl Engine {
             "updatetime",
             "ut",
             "mode",
+            "filetype",
+            "ft",
         ]
     }
 
@@ -13638,20 +13772,18 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // Handle :LspInfo — show running LSP servers
+        // Handle :LspInfo — show running LSP servers (● marks active for current buffer)
         if cmd == "LspInfo" {
             let buf_lang = self
                 .buffer_manager
                 .get(self.active_buffer_id())
-                .and_then(|s| s.lsp_language_id.clone())
-                .unwrap_or_else(|| "none".to_string());
-            let mut parts = vec![format!("buf_lang={buf_lang}")];
+                .and_then(|s| s.lsp_language_id.clone());
             if let Some(mgr) = &self.lsp_manager {
-                parts.extend(mgr.server_info());
+                let servers = mgr.server_info(buf_lang.as_deref());
+                self.message = servers.join(" | ");
             } else {
-                parts.push("manager=not started".to_string());
+                self.message = "LSP manager not started".to_string();
             }
-            self.message = parts.join("; ");
             return EngineAction::None;
         }
 
@@ -14009,6 +14141,9 @@ impl Engine {
                     return EngineAction::None;
                 }
                 self.ext_install_from_registry(name);
+                if let Some(cmd) = self.pending_terminal_command.take() {
+                    return EngineAction::RunInTerminal(cmd);
+                }
                 return EngineAction::None;
             }
 
@@ -14280,7 +14415,50 @@ impl Engine {
             return EngineAction::None;
         }
         if let Some(args) = cmd.strip_prefix("set ") {
-            match self.settings.parse_set_option(args.trim()) {
+            let trimmed = args.trim();
+
+            // Handle :set filetype=<lang> / :set ft=<lang> — per-buffer language override
+            let ft_val = trimmed
+                .strip_prefix("filetype=")
+                .or_else(|| trimmed.strip_prefix("ft="));
+            if let Some(lang) = ft_val {
+                let lang = lang.trim().to_string();
+                if lang.is_empty() {
+                    self.message = "filetype: value required".to_string();
+                    return EngineAction::Error;
+                }
+                let buf_id = self.active_buffer_id();
+                // Update buffer's language ID
+                if let Some(state) = self.buffer_manager.get_mut(buf_id) {
+                    state.lsp_language_id = Some(lang.clone());
+                    // Persist to settings.language_map if buffer has a file extension
+                    if let Some(ext) = state
+                        .file_path
+                        .as_ref()
+                        .and_then(|p| p.extension())
+                        .and_then(|e| e.to_str())
+                        .map(|e| e.to_string())
+                    {
+                        self.settings.language_map.insert(ext, lang.clone());
+                        let _ = self.settings.save();
+                    }
+                }
+                self.message = format!("filetype={lang}");
+                return EngineAction::None;
+            }
+
+            // Handle :set filetype? / :set ft? — query current filetype
+            if trimmed == "filetype?" || trimmed == "ft?" {
+                let ft = self
+                    .buffer_manager
+                    .get(self.active_buffer_id())
+                    .and_then(|s| s.lsp_language_id.clone())
+                    .unwrap_or_else(|| "none".to_string());
+                self.message = format!("filetype={ft}");
+                return EngineAction::None;
+            }
+
+            match self.settings.parse_set_option(trimmed) {
                 Ok(msg) => {
                     if let Err(e) = self.settings.save() {
                         self.message = format!("Setting changed but failed to save: {e}");
@@ -14702,6 +14880,7 @@ impl Engine {
             self.view_mut().cursor.line = target.min(max);
             self.view_mut().cursor.col = 0;
             self.clamp_cursor_col();
+            self.ensure_cursor_visible();
             return EngineAction::None;
         }
 
@@ -15047,6 +15226,13 @@ impl Engine {
             "zoomout" => {
                 self.settings.font_size = (self.settings.font_size - 1).max(6);
                 let _ = self.settings.save();
+                EngineAction::None
+            }
+            "set_wrap_toggle" => {
+                self.settings.wrap = !self.settings.wrap;
+                let _ = self.settings.save();
+                let state = if self.settings.wrap { "wrap" } else { "nowrap" };
+                self.message = format!("set {}", state);
                 EngineAction::None
             }
             "goto" => {
@@ -18686,6 +18872,89 @@ impl Engine {
         }
     }
 
+    /// Find the enclosing foldable block for `line` by walking upward to find
+    /// a line with strictly less indentation, then using `detect_fold_range`.
+    fn find_enclosing_fold_range(&self, line: usize) -> Option<(usize, usize)> {
+        let cur_indent = self.line_indent(line);
+        // Walk upward to find a line with strictly less indentation.
+        for idx in (0..line).rev() {
+            let text: String = self.buffer().content.line(idx).chars().collect();
+            if text.trim().is_empty() {
+                continue;
+            }
+            if self.line_indent(idx) < cur_indent {
+                // Found a candidate header — verify it can fold over our line.
+                if let Some((start, end)) = self.detect_fold_range(idx) {
+                    if end >= line {
+                        return Some((start, end));
+                    }
+                }
+                // Keep walking — this line's fold range didn't cover us.
+            }
+        }
+        None
+    }
+
+    /// Progressive fold (VSCode Ctrl+Shift+[): fold the enclosing block around
+    /// the cursor.  If the cursor is already on a fold header, fold the parent
+    /// block instead.  This makes repeated presses fold progressively larger
+    /// regions.
+    fn cmd_fold_close_progressive(&mut self) {
+        let line = self.view().cursor.line;
+
+        // If cursor is on a fold header, look for a parent fold.
+        if self.view().fold_at(line).is_some() {
+            if let Some((start, end)) = self.find_enclosing_fold_range(line) {
+                self.view_mut().close_fold(start, end);
+                self.view_mut().cursor.line = start;
+                self.clamp_cursor_col();
+            }
+            return;
+        }
+
+        // First try: fold starting at cursor line (cursor is on a header).
+        if let Some((start, end)) = self.detect_fold_range(line) {
+            self.view_mut().close_fold(start, end);
+            if self.view().is_line_hidden(self.view().cursor.line) {
+                self.view_mut().cursor.line = start;
+                self.clamp_cursor_col();
+            }
+            return;
+        }
+
+        // Second try: cursor is inside a block body — find enclosing fold.
+        if let Some((start, end)) = self.find_enclosing_fold_range(line) {
+            self.view_mut().close_fold(start, end);
+            self.view_mut().cursor.line = start;
+            self.clamp_cursor_col();
+        }
+    }
+
+    /// Progressive unfold: if cursor is on a fold header, open it.  If cursor
+    /// is NOT on a fold header but is inside a visible region that contains
+    /// nested folds, open the nearest inner fold. This makes repeated
+    /// Ctrl+Shift+] unfold progressively (VSCode behavior).
+    fn cmd_fold_open_progressive(&mut self) {
+        let line = self.view().cursor.line;
+        if self.view().fold_at(line).is_some() {
+            // Cursor is on a fold header — open just this fold.
+            self.view_mut().open_fold(line);
+        } else {
+            // Check if there are any folds whose header is at or after cursor
+            // line (the nearest fold below cursor).  This handles the case where
+            // the user pressed unfold on a parent line after folding children.
+            let nearest = self
+                .view()
+                .folds
+                .iter()
+                .find(|f| f.start >= line)
+                .map(|f| f.start);
+            if let Some(fold_line) = nearest {
+                self.view_mut().open_fold(fold_line);
+            }
+        }
+    }
+
     fn cmd_fold_open(&mut self) {
         let line = self.view().cursor.line;
         self.view_mut().open_fold(line);
@@ -20519,6 +20788,20 @@ impl Engine {
         self.lsp_manager = Some(LspManager::new(root, &self.settings.lsp_servers));
     }
 
+    /// Ensure LSP is started for the active buffer (lazy — called on tab switch).
+    /// This is idempotent: if the server is already running, didOpen is a no-op.
+    pub fn lsp_ensure_active_buffer(&mut self) {
+        let bid = self.active_buffer_id();
+        let has_file = self
+            .buffer_manager
+            .get(bid)
+            .and_then(|s| s.file_path.as_ref())
+            .is_some();
+        if has_file {
+            self.lsp_did_open(bid);
+        }
+    }
+
     /// Notify LSP that a file was opened.
     fn lsp_did_open(&mut self, buffer_id: BufferId) {
         // Fire plugin "open" hook regardless of LSP enabled state
@@ -20691,6 +20974,7 @@ impl Engine {
         }
 
         let mut status_parts: Vec<String> = Vec::new();
+        let mut install_commands: Vec<String> = Vec::new();
 
         // ── LSP ──────────────────────────────────────────────────────────────
         // Check if any LSP binary is already on PATH (idempotent: skip install
@@ -20705,13 +20989,12 @@ impl Engine {
                 status_parts.push(format!("LSP: {bin} ✓"));
             } else if !manifest.lsp.install.is_empty() {
                 let lsp_key = format!("ext:{ext_name}:lsp");
-                if !self.lsp_installing.contains(&lsp_key) {
-                    self.ensure_lsp_manager();
-                    if let Some(mgr) = &self.lsp_manager {
-                        mgr.run_install_command(&lsp_key, &manifest.lsp.install);
-                    }
-                    self.lsp_installing.insert(lsp_key);
-                }
+                self.lsp_installing.insert(lsp_key.clone());
+                install_commands.push(manifest.lsp.install.clone());
+                self.pending_install_context = Some(InstallContext {
+                    ext_name: ext_name.clone(),
+                    install_key: lsp_key,
+                });
                 status_parts.push(format!("LSP: installing {}…", manifest.lsp.binary));
             }
         }
@@ -20727,14 +21010,15 @@ impl Engine {
             if already_on_path {
                 status_parts.push(format!("DAP: {dap_binary} ✓"));
             } else if !manifest.dap.install.is_empty() {
-                // Manifest provides a simple install command (e.g. `go install …`).
                 let dap_key = format!("dap:{}", manifest.dap.adapter);
-                if !self.lsp_installing.contains(&dap_key) {
-                    self.ensure_lsp_manager();
-                    if let Some(mgr) = &self.lsp_manager {
-                        mgr.run_install_command(&dap_key, &manifest.dap.install);
-                    }
-                    self.lsp_installing.insert(dap_key);
+                self.lsp_installing.insert(dap_key.clone());
+                install_commands.push(manifest.dap.install.clone());
+                // Only set install context if LSP didn't already set it.
+                if self.pending_install_context.is_none() {
+                    self.pending_install_context = Some(InstallContext {
+                        ext_name: ext_name.clone(),
+                        install_key: dap_key,
+                    });
                 }
                 status_parts.push(format!("DAP: installing {}…", manifest.dap.adapter));
             } else if !dap_binary.is_empty() {
@@ -20745,6 +21029,14 @@ impl Engine {
             }
         }
 
+        // If there are install commands, combine them and store for the UI to run
+        // in a visible terminal pane.
+        if !install_commands.is_empty() {
+            let combined = install_commands.join(" && ");
+            let header = format!("echo '── Installing {ext_name} ──'");
+            self.pending_terminal_command = Some(format!("{header} && {combined}"));
+        }
+
         // Mark installed and persist
         self.extension_state.mark_installed(&ext_name);
         let _ = self.extension_state.save();
@@ -20752,6 +21044,24 @@ impl Engine {
         // Reload plugins so newly extracted scripts are active
         self.plugin_manager = None;
         self.plugin_init();
+
+        // Kick-start LSP for the current buffer if it matches this extension's languages.
+        // Without this, the user would have to re-open the file to get LSP support.
+        let active_bid = self.active_buffer_id();
+        if let Some(state) = self.buffer_manager.get(active_bid) {
+            let buf_lang = state.lsp_language_id.clone().or_else(|| {
+                state
+                    .file_path
+                    .as_ref()
+                    .and_then(|p| lsp::language_id_from_path(p))
+            });
+            let matches = buf_lang
+                .as_ref()
+                .is_some_and(|lang| manifest.language_ids.iter().any(|l| l == lang));
+            if matches {
+                self.lsp_did_open(active_bid);
+            }
+        }
 
         self.message = if status_parts.is_empty() {
             format!("Extension '{ext_name}' installed")
@@ -20848,12 +21158,18 @@ impl Engine {
                 self.ext_sidebar_selected = self.ext_sidebar_selected.saturating_sub(1);
                 true
             }
-            "Return" | "i" => {
+            "Return" => {
+                // Open README for any extension (installed or available)
                 let installed = self.ext_installed_items();
                 let sel = self.ext_sidebar_selected;
-                if sel < installed.len() {
-                    // Already installed — open README in its own tab
-                    let name = installed[sel].name.clone();
+                let name = if sel < installed.len() {
+                    Some(installed[sel].name.clone())
+                } else {
+                    let available = self.ext_available_items();
+                    let avail_idx = sel.saturating_sub(installed.len());
+                    available.get(avail_idx).map(|m| m.name.clone())
+                };
+                if let Some(name) = name {
                     let readme = crate::core::extensions::BUNDLED
                         .iter()
                         .find(|b| b.name == name)
@@ -20861,15 +21177,27 @@ impl Engine {
                     if let Some(content) = readme {
                         self.open_markdown_preview_in_tab(content, &name);
                     } else {
-                        self.message = format!("Extension '{name}' is installed. Use d to remove.");
+                        self.message =
+                            format!("No README available for '{name}'. Press i to install.");
                     }
+                }
+                true
+            }
+            "i" => {
+                // Install the selected extension
+                let installed = self.ext_installed_items();
+                let sel = self.ext_sidebar_selected;
+                if sel < installed.len() {
+                    let name = &installed[sel].name;
+                    self.message =
+                        format!("Extension '{name}' is already installed. Use d to remove.");
                 } else {
                     let available = self.ext_available_items();
                     let avail_idx = sel.saturating_sub(installed.len());
                     if avail_idx < available.len() {
                         let name = available[avail_idx].name.clone();
                         self.ext_install_from_registry(&name);
-                        // Open README after install in its own tab.
+                        // Open README after install.
                         let readme = crate::core::extensions::BUNDLED
                             .iter()
                             .find(|b| b.name == name)
@@ -20877,8 +21205,7 @@ impl Engine {
                         if let Some(content) = readme {
                             self.open_markdown_preview_in_tab(content, &name);
                         }
-                        // Move cursor to the newly installed item so the user can see
-                        // it's installed and can press 'd' immediately if needed.
+                        // Move cursor to the newly installed item.
                         self.ext_sidebar_sections_expanded[0] = true;
                         let new_installed = self.ext_installed_items();
                         self.ext_sidebar_selected = new_installed
@@ -20927,7 +21254,7 @@ impl Engine {
     }
 
     /// Returns the filtered list of available (not yet installed) extension manifests.
-    fn ext_available_items(&self) -> Vec<extensions::ExtensionManifest> {
+    pub fn ext_available_items(&self) -> Vec<extensions::ExtensionManifest> {
         let q = self.ext_sidebar_query.to_lowercase();
         self.ext_available_manifests()
             .into_iter()
@@ -22223,7 +22550,15 @@ impl Engine {
                             .map(|m| m.lsp.binary.clone())
                             .unwrap_or_default();
                         if !binary.is_empty() {
-                            // Register the binary so future files auto-start the server
+                            // Register the binary so future files auto-start the server.
+                            // Use the manifest's args (e.g. ["--stdio"]) so the
+                            // server actually communicates correctly.
+                            let manifest_args = self
+                                .ext_available_manifests()
+                                .into_iter()
+                                .find(|m| m.name == ext_name)
+                                .map(|m| m.lsp.args.clone())
+                                .unwrap_or_default();
                             for lsp_lang in self
                                 .ext_available_manifests()
                                 .into_iter()
@@ -22233,7 +22568,7 @@ impl Engine {
                             {
                                 let config = lsp::LspServerConfig {
                                     command: binary.clone(),
-                                    args: vec![],
+                                    args: manifest_args.clone(),
                                     languages: vec![lsp_lang.clone()],
                                 };
                                 if let Some(mgr) = &mut self.lsp_manager {
@@ -24468,6 +24803,25 @@ impl Engine {
         }
     }
 
+    /// Run a command in a new terminal pane (visible to the user).
+    /// Used for extension installs so the user can see progress, errors, and enter
+    /// sudo passwords. The pane waits for Enter after the command finishes.
+    pub fn terminal_run_command(&mut self, command: &str, cols: u16, rows: u16) {
+        let cwd = self.cwd.clone();
+        let history_cap = self.settings.terminal_scrollback_lines;
+        // Extract install context from pending_install_context (set by ext_install_from_registry).
+        let ctx = self.pending_install_context.take();
+        match TerminalPane::new_command(cols, rows, command, &cwd, history_cap, ctx) {
+            Ok(pane) => {
+                self.terminal_panes.push(pane);
+                self.terminal_active = self.terminal_panes.len() - 1;
+                self.terminal_open = true;
+                self.terminal_has_focus = true;
+            }
+            Err(e) => self.message = format!("terminal: failed to run command: {e}"),
+        }
+    }
+
     /// Close the active terminal tab. If it was the last tab, close the panel.
     /// Closing either pane while in split mode also exits split view.
     pub fn terminal_close_active_tab(&mut self) {
@@ -24610,10 +24964,14 @@ impl Engine {
             got_data |= pane.poll();
         }
         // Remove exited panes in reverse order (preserves earlier indices during removal).
+        // For install panes, finalize the install (check binary, register LSP) before removing.
         let mut i = self.terminal_panes.len();
         while i > 0 {
             i -= 1;
             if self.terminal_panes[i].exited {
+                if let Some(ctx) = self.terminal_panes[i].install_context.take() {
+                    self.finalize_install_from_terminal(&ctx);
+                }
                 self.terminal_panes.remove(i);
                 if self.terminal_active > i {
                     self.terminal_active = self.terminal_active.saturating_sub(1);
@@ -24637,6 +24995,59 @@ impl Engine {
             self.terminal_find_update_matches();
         }
         got_data
+    }
+
+    /// Called when an install terminal pane exits. Checks if the binary is now
+    /// available on PATH and registers the LSP/DAP server if so.
+    fn finalize_install_from_terminal(&mut self, ctx: &InstallContext) {
+        self.lsp_installing.remove(&ctx.install_key);
+
+        let ext_name = &ctx.ext_name;
+        let manifest = self
+            .ext_available_manifests()
+            .into_iter()
+            .find(|m| m.name == *ext_name);
+        let manifest = match manifest {
+            Some(m) => m,
+            None => return,
+        };
+
+        // Check if LSP binary is now on PATH and register it.
+        if !manifest.lsp.binary.is_empty() {
+            let all_lsp: Vec<&str> = std::iter::once(manifest.lsp.binary.as_str())
+                .chain(manifest.lsp.fallback_binaries.iter().map(|s| s.as_str()))
+                .filter(|b| !b.is_empty())
+                .collect();
+            if let Some(bin) = all_lsp.iter().copied().find(|b| binary_on_path(b)) {
+                self.ensure_lsp_manager();
+                for lsp_lang in &manifest.language_ids {
+                    let config = lsp::LspServerConfig {
+                        command: bin.to_string(),
+                        args: manifest.lsp.args.clone(),
+                        languages: vec![lsp_lang.clone()],
+                    };
+                    if let Some(mgr) = &mut self.lsp_manager {
+                        mgr.add_registry_entry(config);
+                        mgr.ensure_server_for_language(lsp_lang);
+                    }
+                    self.lsp_reopen_buffers_for_language(lsp_lang);
+                }
+                self.message = format!("LSP server for '{ext_name}' installed and started ({bin})");
+            } else {
+                self.message = format!(
+                    "Install for '{ext_name}' finished — LSP binary '{}' not found on PATH",
+                    manifest.lsp.binary
+                );
+            }
+        }
+
+        // Check if DAP binary is now on PATH.
+        if !manifest.dap.adapter.is_empty()
+            && !manifest.dap.binary.is_empty()
+            && binary_on_path(&manifest.dap.binary)
+        {
+            self.message = format!("DAP adapter for '{ext_name}' installed — press F5 to debug");
+        }
     }
 
     /// Send raw bytes to the active pane's PTY stdin.
@@ -26807,6 +27218,57 @@ impl Engine {
         self.mode = Mode::Insert;
     }
 
+    /// Delete selected word at every cursor (primary + extras) for Ctrl+D
+    /// multi-cursor selections.  All selections are the same length.
+    fn vscode_mc_delete_selections(&mut self, changed: &mut bool) {
+        let anchor = match self.visual_anchor {
+            Some(a) => a,
+            None => return,
+        };
+        let cursor = self.view().cursor;
+        let (sel_start, sel_end) = if (anchor.line, anchor.col) <= (cursor.line, cursor.col) {
+            (anchor, cursor)
+        } else {
+            (cursor, anchor)
+        };
+        let sel_start_ci = self.buffer().line_to_char(sel_start.line) + sel_start.col;
+        let sel_end_ci = self.buffer().line_to_char(sel_end.line) + sel_end.col + 1;
+        let sel_len = sel_end_ci - sel_start_ci;
+
+        // Collect char indices for start of each selection
+        let extras = self.view().extra_cursors.clone();
+        let mut char_indices: Vec<usize> = Vec::new();
+        char_indices.push(sel_start_ci);
+        for ec in &extras {
+            let ec_start_col = ec.col + 1 - sel_len;
+            let ci = self.buffer().line_to_char(ec.line) + ec_start_col;
+            char_indices.push(ci);
+        }
+        // Sort descending — process rightmost/bottommost first
+        char_indices.sort_unstable_by(|a, b| b.cmp(a));
+
+        for &ci in &char_indices {
+            self.delete_with_undo(ci, ci + sel_len);
+        }
+
+        // Recompute cursor positions after all deletions.
+        char_indices.sort_unstable();
+        let mut new_cursors: Vec<Cursor> = Vec::new();
+        for (i, &ci) in char_indices.iter().enumerate() {
+            // After i deletions before this one, offset is i * sel_len
+            let adjusted_ci = ci - i * sel_len;
+            let line = self.buffer().content.char_to_line(adjusted_ci);
+            let line_start = self.buffer().line_to_char(line);
+            let col = adjusted_ci - line_start;
+            new_cursors.push(Cursor { line, col });
+        }
+        self.view_mut().cursor = new_cursors[0];
+        self.view_mut().extra_cursors = new_cursors[1..].to_vec();
+        self.visual_anchor = None;
+        self.mode = Mode::Insert;
+        *changed = true;
+    }
+
     // ── Movement helpers ─────────────────────────────────────────────────────
 
     /// Smart Home: move to first non-whitespace; if already there, move to col 0.
@@ -27029,6 +27491,456 @@ impl Engine {
         }
     }
 
+    // ── Line operations (VSCode mode) ──────────────────────────────────────
+
+    /// Alt+Up: move current line (or selected lines) up by one.
+    fn vscode_move_line_up(&mut self, changed: &mut bool) {
+        let (start_line, end_line) = self.vscode_affected_lines();
+        if start_line == 0 {
+            return;
+        }
+        self.start_undo_group();
+        // Grab the line above and remove it
+        let above = start_line - 1;
+        let above_start = self.buffer().line_to_char(above);
+        let above_end = self.buffer().line_to_char(above + 1);
+        let above_text: String = self
+            .buffer()
+            .content
+            .slice(above_start..above_end)
+            .chars()
+            .collect();
+        self.delete_with_undo(above_start, above_end);
+        // Insert it after the (now shifted) block
+        let new_end_line = end_line - 1; // shifted because we deleted a line above
+        let insert_pos = if new_end_line + 1 < self.buffer().len_lines() {
+            self.buffer().line_to_char(new_end_line + 1)
+        } else {
+            let pos = self.buffer().len_chars();
+            // Ensure there's a newline before we append
+            if pos > 0 {
+                let last_char_idx = pos - 1;
+                let last_ch: char = self.buffer().content.char(last_char_idx);
+                if last_ch != '\n' {
+                    self.insert_with_undo(pos, "\n");
+                }
+            }
+            self.buffer().len_chars()
+        };
+        self.insert_with_undo(insert_pos, &above_text);
+        self.finish_undo_group();
+        // Move cursor and visual anchor up by one
+        self.view_mut().cursor.line = self.view().cursor.line.saturating_sub(1);
+        if let Some(ref mut anc) = self.visual_anchor {
+            anc.line = anc.line.saturating_sub(1);
+        }
+        *changed = true;
+    }
+
+    /// Alt+Down: move current line (or selected lines) down by one.
+    fn vscode_move_line_down(&mut self, changed: &mut bool) {
+        let (start_line, end_line) = self.vscode_affected_lines();
+        let num_lines = self.buffer().len_lines();
+        if end_line + 1 >= num_lines {
+            return;
+        }
+        self.start_undo_group();
+        // Grab the line below the block and remove it
+        let below = end_line + 1;
+        let below_start = self.buffer().line_to_char(below);
+        let below_end = if below + 1 < self.buffer().len_lines() {
+            self.buffer().line_to_char(below + 1)
+        } else {
+            self.buffer().len_chars()
+        };
+        let below_text: String = self
+            .buffer()
+            .content
+            .slice(below_start..below_end)
+            .chars()
+            .collect();
+        let below_text = if below_text.ends_with('\n') {
+            below_text
+        } else {
+            format!("{}\n", below_text)
+        };
+        self.delete_with_undo(below_start, below_end);
+        // Insert it before start_line
+        let insert_pos = self.buffer().line_to_char(start_line);
+        self.insert_with_undo(insert_pos, &below_text);
+        self.finish_undo_group();
+        // Move cursor and visual anchor down by one
+        let max_line = self.buffer().len_lines().saturating_sub(1);
+        self.view_mut().cursor.line = (self.view().cursor.line + 1).min(max_line);
+        if let Some(ref mut anc) = self.visual_anchor {
+            anc.line = (anc.line + 1).min(max_line);
+        }
+        *changed = true;
+    }
+
+    /// Ctrl+Shift+K: delete current line.
+    fn vscode_delete_line(&mut self, changed: &mut bool) {
+        let num_lines = self.buffer().len_lines();
+        if num_lines == 0 {
+            return;
+        }
+        let line = self.view().cursor.line;
+        let start = self.buffer().line_to_char(line);
+        let end = if line + 1 < num_lines {
+            self.buffer().line_to_char(line + 1)
+        } else {
+            self.buffer().len_chars()
+        };
+        if start < end {
+            // If last line and there's a preceding newline, remove it too
+            let actual_start = if line + 1 >= num_lines && start > 0 {
+                start - 1
+            } else {
+                start
+            };
+            self.delete_with_undo(actual_start, end);
+            let new_line = line.min(self.buffer().len_lines().saturating_sub(1));
+            self.view_mut().cursor.line = new_line;
+            self.clamp_cursor_col_insert();
+            *changed = true;
+        }
+        self.visual_anchor = None;
+    }
+
+    /// Ctrl+Enter: insert blank line below, cursor stays on current line.
+    fn vscode_insert_line_below(&mut self, changed: &mut bool) {
+        let line = self.view().cursor.line;
+        let insert_pos = if line + 1 < self.buffer().len_lines() {
+            self.buffer().line_to_char(line + 1)
+        } else {
+            let pos = self.buffer().len_chars();
+            // Ensure newline at end
+            if pos > 0 {
+                let last_ch: char = self.buffer().content.char(pos - 1);
+                if last_ch != '\n' {
+                    self.insert_with_undo(pos, "\n");
+                }
+            }
+            self.buffer().len_chars()
+        };
+        self.insert_with_undo(insert_pos, "\n");
+        *changed = true;
+    }
+
+    /// Ctrl+Shift+Enter: insert blank line above, cursor stays on current line.
+    fn vscode_insert_line_above(&mut self, changed: &mut bool) {
+        let line = self.view().cursor.line;
+        let insert_pos = self.buffer().line_to_char(line);
+        self.insert_with_undo(insert_pos, "\n");
+        // Cursor is now pushed down by one, keep it there (on the original line).
+        self.view_mut().cursor.line += 1;
+        *changed = true;
+    }
+
+    /// Ctrl+L: select entire current line; repeat extends selection by one line.
+    /// First press: anchor at line start, cursor at start of next line (selects
+    /// the whole line including newline, matching VSCode).  Repeat: extend cursor
+    /// down by one more line.
+    fn vscode_select_line(&mut self) {
+        let line = self.view().cursor.line;
+        let max_line = self.buffer().len_lines().saturating_sub(1);
+        if self.visual_anchor.is_some() {
+            // Extend: move cursor to start of the line after the current one.
+            let next = (line + 1).min(max_line);
+            self.view_mut().cursor = Cursor { line: next, col: 0 };
+        } else {
+            // First press: anchor at line start, cursor at start of next line.
+            self.visual_anchor = Some(Cursor { line, col: 0 });
+            self.mode = Mode::Visual;
+            if line < max_line {
+                self.view_mut().cursor = Cursor {
+                    line: line + 1,
+                    col: 0,
+                };
+            } else {
+                // Last line: select to end of line
+                let end_col = self.get_line_len_for_insert(line);
+                self.view_mut().cursor = Cursor { line, col: end_col };
+            }
+        }
+    }
+
+    /// Helper: get the range of lines affected by current selection or cursor.
+    fn vscode_affected_lines(&self) -> (usize, usize) {
+        if let Some(anchor) = self.visual_anchor {
+            let cursor = self.view().cursor;
+            let start = anchor.line.min(cursor.line);
+            let end = anchor.line.max(cursor.line);
+            (start, end)
+        } else {
+            let line = self.view().cursor.line;
+            (line, line)
+        }
+    }
+
+    // ── Multi-cursor (VSCode mode) ──────────────────────────────────────────
+
+    /// Ctrl+D: first press selects word under cursor; subsequent presses add
+    /// the next occurrence as an extra cursor.
+    fn vscode_ctrl_d(&mut self) {
+        if self.visual_anchor.is_none() {
+            // First press: select the word under cursor (no trailing space/punctuation).
+            let cursor = self.view().cursor;
+            let line_chars: Vec<char> = self.buffer().content.line(cursor.line).chars().collect();
+            let col = cursor.col;
+            if col >= line_chars.len() {
+                return;
+            }
+            let is_w = |c: &char| c.is_alphanumeric() || *c == '_';
+            if !is_w(&line_chars[col]) {
+                return;
+            }
+            let mut ws = col;
+            while ws > 0 && line_chars.get(ws - 1).is_some_and(is_w) {
+                ws -= 1;
+            }
+            let mut we = col;
+            while we < line_chars.len() && line_chars.get(we).is_some_and(is_w) {
+                we += 1;
+            }
+            if we > ws {
+                self.visual_anchor = Some(Cursor {
+                    line: cursor.line,
+                    col: ws,
+                });
+                self.mode = Mode::Visual;
+                // Cursor at last char of word (inclusive), not one past end
+                self.view_mut().cursor.col = we - 1;
+            }
+        } else {
+            // Subsequent press: extract selected text and find next occurrence.
+            let anchor = match self.visual_anchor {
+                Some(a) => a,
+                None => return,
+            };
+            let cursor = self.view().cursor;
+            let (start, end) = if (anchor.line, anchor.col) <= (cursor.line, cursor.col) {
+                (anchor, cursor)
+            } else {
+                (cursor, anchor)
+            };
+            // Extract selected text (inclusive of end position)
+            let start_idx = self.buffer().line_to_char(start.line) + start.col;
+            let end_idx = self.buffer().line_to_char(end.line) + end.col + 1;
+            let selected: String = self
+                .buffer()
+                .content
+                .slice(start_idx..end_idx)
+                .chars()
+                .collect();
+            if selected.is_empty() {
+                return;
+            }
+            let word_len = selected.chars().count();
+            // Search after the last extra cursor.  Extra cursors point at the
+            // END of their match, so subtract word_len to get the match start
+            // for find_next_occurrence's "after" parameter.
+            let search_after = if let Some(last_ec) = self.view().extra_cursors.last().copied() {
+                Cursor {
+                    line: last_ec.line,
+                    col: last_ec.col.saturating_sub(word_len.saturating_sub(1)),
+                }
+            } else {
+                // First subsequent press: search after primary selection start
+                start
+            };
+            if let Some(match_start) = self.find_next_occurrence(&selected, search_after, true) {
+                // Place extra cursor at END of match (same position as primary cursor)
+                let match_end = Cursor {
+                    line: match_start.line,
+                    col: match_start.col + word_len - 1,
+                };
+                let is_primary = match_end == *self.cursor();
+                let already_extra = self.view().extra_cursors.contains(&match_end);
+                if !is_primary && !already_extra {
+                    self.view_mut().extra_cursors.push(match_end);
+                    let total = self.view().extra_cursors.len() + 1;
+                    self.message = format!("{} cursors ('{}')", total, selected);
+                } else {
+                    self.message = format!("No more occurrences of '{}'", selected);
+                }
+            } else {
+                self.message = format!("No more occurrences of '{}'", selected);
+            }
+        }
+    }
+
+    /// VSCode Ctrl+Shift+L → select all occurrences of word under cursor.
+    /// Like vscode_ctrl_d but selects all at once: visual_anchor at word start,
+    /// primary cursor at word end, extra cursors at end of every other occurrence.
+    pub fn vscode_select_all_occurrences(&mut self) {
+        let cursor = self.view().cursor;
+        let line_chars: Vec<char> = self.buffer().content.line(cursor.line).chars().collect();
+        let col = cursor.col;
+        if col >= line_chars.len() {
+            return;
+        }
+        let is_w = |c: &char| c.is_alphanumeric() || *c == '_';
+        if !is_w(&line_chars[col]) {
+            return;
+        }
+        let mut ws = col;
+        while ws > 0 && line_chars.get(ws - 1).is_some_and(is_w) {
+            ws -= 1;
+        }
+        let mut we = col;
+        while we < line_chars.len() && line_chars.get(we).is_some_and(is_w) {
+            we += 1;
+        }
+        if we <= ws {
+            return;
+        }
+        let word: String = line_chars[ws..we].iter().collect();
+        let word_len = word.chars().count();
+
+        // Set primary selection on current word
+        self.visual_anchor = Some(Cursor {
+            line: cursor.line,
+            col: ws,
+        });
+        self.mode = Mode::Visual;
+        self.view_mut().cursor.col = we - 1;
+
+        // Find all occurrences and place extra cursors at word END
+        let all_starts = self.collect_all_occurrences(&word, true);
+        let primary_start = Cursor {
+            line: cursor.line,
+            col: ws,
+        };
+        let extras: Vec<Cursor> = all_starts
+            .into_iter()
+            .filter(|&c| c != primary_start)
+            .map(|c| Cursor {
+                line: c.line,
+                col: c.col + word_len - 1,
+            })
+            .collect();
+        let n = extras.len();
+        self.view_mut().extra_cursors = extras;
+        self.message = format!("{} cursors (all occurrences of '{}')", n + 1, word);
+    }
+
+    /// VSCode Ctrl+] → indent current line or selection.
+    fn vscode_indent(&mut self, changed: &mut bool) {
+        if !self.view().extra_cursors.is_empty() {
+            // Collect all unique lines from primary + extra cursors
+            let mut lines: Vec<usize> = vec![self.view().cursor.line];
+            for ec in &self.view().extra_cursors {
+                if !lines.contains(&ec.line) {
+                    lines.push(ec.line);
+                }
+            }
+            lines.sort_unstable();
+            for &line in &lines {
+                self.indent_lines(line, 1, changed);
+            }
+            // Adjust cursor columns for indent
+            let indent_size = if self.settings.expand_tab {
+                self.settings.shift_width as usize
+            } else {
+                1
+            };
+            self.view_mut().cursor.col += indent_size;
+            for ec in self.view_mut().extra_cursors.iter_mut() {
+                ec.col += indent_size;
+            }
+        } else {
+            let (start_line, end_line) = self.vscode_affected_lines();
+            let count = end_line - start_line + 1;
+            self.indent_lines(start_line, count, changed);
+        }
+    }
+
+    /// VSCode Ctrl+[ → outdent current line or selection.
+    fn vscode_outdent(&mut self, changed: &mut bool) {
+        if !self.view().extra_cursors.is_empty() {
+            let mut lines: Vec<usize> = vec![self.view().cursor.line];
+            for ec in &self.view().extra_cursors {
+                if !lines.contains(&ec.line) {
+                    lines.push(ec.line);
+                }
+            }
+            lines.sort_unstable();
+            // Check indent size before dedenting
+            let indent_size = if self.settings.expand_tab {
+                self.settings.shift_width as usize
+            } else {
+                1
+            };
+            for &line in &lines {
+                self.dedent_lines(line, 1, changed);
+            }
+            // Adjust cursor columns
+            self.view_mut().cursor.col = self.view().cursor.col.saturating_sub(indent_size);
+            for ec in self.view_mut().extra_cursors.iter_mut() {
+                ec.col = ec.col.saturating_sub(indent_size);
+            }
+        } else {
+            let (start_line, end_line) = self.vscode_affected_lines();
+            let count = end_line - start_line + 1;
+            self.dedent_lines(start_line, count, changed);
+        }
+    }
+
+    // ── Panel + navigation (VSCode mode) ────────────────────────────────────
+
+    /// Ctrl+G: go to line number. Enters command mode pre-filled with ":".
+    fn vscode_goto_line(&mut self) -> EngineAction {
+        self.mode = Mode::Command;
+        self.command_buffer.clear();
+        self.message.clear();
+        EngineAction::None
+    }
+
+    // ── Ctrl+K chord (VSCode mode) ──────────────────────────────────────────
+
+    /// Process the second key of a Ctrl+K chord. Returns true if handled.
+    fn vscode_ctrl_k_dispatch(&mut self, key_name: &str, ctrl: bool, changed: &mut bool) -> bool {
+        self.vscode_pending_ctrl_k = false;
+        self.message.clear();
+        if ctrl {
+            match key_name {
+                // Ctrl+K, Ctrl+C → add line comment
+                "c" => {
+                    let (start_line, end_line) = self.vscode_affected_lines();
+                    self.toggle_comment(start_line + 1, end_line + 1);
+                    *changed = true;
+                    true
+                }
+                // Ctrl+K, Ctrl+U → remove line comment
+                "u" => {
+                    let (start_line, end_line) = self.vscode_affected_lines();
+                    self.toggle_comment(start_line + 1, end_line + 1);
+                    *changed = true;
+                    true
+                }
+                // Ctrl+K, Ctrl+W → close all editors in group
+                "w" => {
+                    // Close all tabs in current group
+                    let group = self.active_group;
+                    let tab_count = self.editor_groups.get(&group).map_or(0, |g| g.tabs.len());
+                    for _ in 0..tab_count {
+                        self.close_tab();
+                    }
+                    true
+                }
+                // Ctrl+K, Ctrl+F → format document
+                "f" => {
+                    self.lsp_format_current();
+                    true
+                }
+                _ => false,
+            }
+        } else {
+            false
+        }
+    }
+
     // ── Main VSCode key dispatcher ───────────────────────────────────────────
 
     fn handle_vscode_key(
@@ -27050,6 +27962,87 @@ impl Engine {
         // toggle_comment) relies on this outer group; helpers
         // that used to have inner calls have had them removed.
         self.start_undo_group();
+
+        // ── Ctrl+K chord: second key dispatch ────────────────────────────
+        if self.vscode_pending_ctrl_k && self.vscode_ctrl_k_dispatch(key_name, ctrl, &mut changed) {
+            if changed {
+                self.finish_undo_group();
+                self.set_dirty(true);
+                self.update_syntax();
+                let active_id = self.active_buffer_id();
+                self.lsp_dirty_buffers.insert(active_id, true);
+                self.swap_mark_dirty();
+            }
+            self.ensure_cursor_visible();
+            return EngineAction::None;
+        }
+
+        // ── Alt-encoded keys (sent from backends when in VSCode mode) ────
+        if key_name.starts_with("Alt_") {
+            match key_name {
+                "Alt_Up" => self.vscode_move_line_up(&mut changed),
+                "Alt_Down" => self.vscode_move_line_down(&mut changed),
+                "Alt_Shift_Up" => {
+                    let col = self.view().cursor.col;
+                    let min_line = self
+                        .view()
+                        .extra_cursors
+                        .iter()
+                        .map(|c| c.line)
+                        .min()
+                        .unwrap_or(self.view().cursor.line)
+                        .min(self.view().cursor.line);
+                    if min_line > 0 {
+                        self.add_cursor_at_pos(min_line - 1, col);
+                        let n = self.view().extra_cursors.len() + 1;
+                        self.message = format!("{n} cursors");
+                    }
+                }
+                "Alt_Shift_Down" => {
+                    let col = self.view().cursor.col;
+                    let max_line = self.buffer().len_lines().saturating_sub(1);
+                    let max_cursor_line = self
+                        .view()
+                        .extra_cursors
+                        .iter()
+                        .map(|c| c.line)
+                        .max()
+                        .unwrap_or(self.view().cursor.line)
+                        .max(self.view().cursor.line);
+                    if max_cursor_line < max_line {
+                        self.add_cursor_at_pos(max_cursor_line + 1, col);
+                        let n = self.view().extra_cursors.len() + 1;
+                        self.message = format!("{n} cursors");
+                    }
+                }
+                "Alt_z" => {
+                    self.settings.wrap = !self.settings.wrap;
+                    self.message = format!(
+                        "Word wrap {}",
+                        if self.settings.wrap { "on" } else { "off" }
+                    );
+                }
+                _ => {}
+            }
+            if changed {
+                self.finish_undo_group();
+                self.set_dirty(true);
+                self.update_syntax();
+                let active_id = self.active_buffer_id();
+                if self.preview_buffer_id == Some(active_id) {
+                    self.promote_preview(active_id);
+                }
+                self.lsp_dirty_buffers.insert(active_id, true);
+                self.swap_mark_dirty();
+                if !self.search_matches.is_empty() {
+                    self.run_search();
+                }
+            }
+            self.ensure_cursor_visible();
+            self.sync_scroll_binds();
+            self.update_bracket_match();
+            return EngineAction::None;
+        }
 
         if ctrl {
             match key_name {
@@ -27131,6 +28124,89 @@ impl Engine {
                     self.toggle_comment(start_line + 1, end_line + 1);
                     changed = true;
                 }
+                // Phase 1: Ctrl+Shift+K → delete line
+                "K" => {
+                    self.vscode_delete_line(&mut changed);
+                }
+                // Phase 1: Ctrl+Enter → insert blank line below
+                "Return" => {
+                    self.vscode_insert_line_below(&mut changed);
+                }
+                // Phase 1: Ctrl+Shift+Enter → insert blank line above
+                "Shift_Return" => {
+                    self.vscode_insert_line_above(&mut changed);
+                }
+                // Phase 1: Ctrl+L → select line
+                "l" => {
+                    self.vscode_select_line();
+                }
+                // Phase 2: Ctrl+D → select word / add next occurrence
+                "d" => {
+                    self.vscode_ctrl_d();
+                }
+                // Phase 2: Ctrl+Shift+L → select all occurrences
+                "L" => {
+                    self.vscode_select_all_occurrences();
+                }
+                // Phase 2: Ctrl+] → indent
+                "bracketright" | "]" => {
+                    self.vscode_indent(&mut changed);
+                }
+                // Phase 2: Ctrl+[ → outdent
+                "bracketleft" | "[" => {
+                    self.vscode_outdent(&mut changed);
+                }
+                // Phase 3: Ctrl+G → go to line
+                "g" => {
+                    self.finish_undo_group();
+                    return self.vscode_goto_line();
+                }
+                // Phase 3: Ctrl+P → quick file open (fuzzy finder)
+                "p" => {
+                    self.open_fuzzy_finder();
+                }
+                // Phase 3: Ctrl+Shift+P → command palette
+                "P" => {
+                    self.open_command_palette();
+                }
+                // Phase 3: Ctrl+B → toggle sidebar
+                "b" => {
+                    self.finish_undo_group();
+                    return EngineAction::ToggleSidebar;
+                }
+                // Phase 3: Ctrl+J → toggle bottom panel (terminal)
+                "j" => {
+                    if self.terminal_panes.is_empty() {
+                        return EngineAction::OpenTerminal;
+                    }
+                    self.toggle_terminal();
+                }
+                // Phase 3: Ctrl+` (backtick) → toggle terminal
+                "grave" | "`" => {
+                    if self.terminal_panes.is_empty() {
+                        return EngineAction::OpenTerminal;
+                    }
+                    self.toggle_terminal();
+                }
+                // Phase 3: Ctrl+, → open settings
+                "comma" | "," => {
+                    self.settings_has_focus = true;
+                }
+                // Phase 3: Ctrl+K → chord prefix
+                "k" => {
+                    self.vscode_pending_ctrl_k = true;
+                    self.message = "Ctrl+K ...".to_string();
+                }
+                // Phase 4: Ctrl+Shift+[ → fold region (progressive — repeated
+                // presses fold increasingly larger parent blocks)
+                "Shift_bracketleft" => {
+                    self.cmd_fold_close_progressive();
+                }
+                // Phase 4: Ctrl+Shift+] → unfold region (progressive — repeated
+                // presses unfold nested folds)
+                "Shift_bracketright" => {
+                    self.cmd_fold_open_progressive();
+                }
                 _ => {}
             }
         } else if key_name.starts_with("Shift_") {
@@ -27148,7 +28224,19 @@ impl Engine {
             // Regular (non-ctrl, non-shift) key.
             match key_name {
                 "Escape" => {
-                    self.vscode_clear_selection();
+                    // Dismiss completion popup if open
+                    if self.completion_idx.is_some() {
+                        self.completion_candidates.clear();
+                        self.completion_idx = None;
+                        self.completion_display_only = false;
+                    } else if self.lsp_completion_active {
+                        self.lsp_completion_active = false;
+                    } else if !self.view().extra_cursors.is_empty() {
+                        // Clear multi-cursors
+                        self.view_mut().extra_cursors.clear();
+                    } else {
+                        self.vscode_clear_selection();
+                    }
                 }
                 "Right" => {
                     self.vscode_clear_selection();
@@ -27190,19 +28278,54 @@ impl Engine {
                     self.clamp_cursor_col_insert();
                 }
                 "F1" => {
-                    // Open the command bar (analogous to VSCode's command palette / Vim's ':').
-                    // handle_command_key() will return to Insert mode when done.
-                    self.mode = Mode::Command;
-                    self.command_buffer.clear();
-                    self.message.clear();
+                    // F1 opens the command palette (matches VSCode).
+                    self.open_command_palette();
                 }
                 "F10" => {
                     // Toggle menu bar visibility
                     self.toggle_menu_bar();
                 }
                 "BackSpace" => {
-                    if self.visual_anchor.is_some() {
+                    if self.visual_anchor.is_some() && !self.view().extra_cursors.is_empty() {
+                        // Multi-cursor with selection (Ctrl+D): delete selected word
+                        // at every cursor position.
+                        self.vscode_mc_delete_selections(&mut changed);
+                    } else if self.visual_anchor.is_some() {
                         self.vscode_delete_selection(&mut changed);
+                    } else if !self.view().extra_cursors.is_empty() {
+                        // Multi-cursor backspace: delete one char before each cursor.
+                        // Use char indices for correct same-line handling.
+                        let primary = *self.cursor();
+                        let extras = self.view().extra_cursors.clone();
+                        let primary_ci = self.buffer().line_to_char(primary.line) + primary.col;
+                        let mut char_indices: Vec<usize> = Vec::new();
+                        char_indices.push(primary_ci);
+                        for ec in &extras {
+                            char_indices.push(self.buffer().line_to_char(ec.line) + ec.col);
+                        }
+                        // Filter out col==0 cursors and sort descending
+                        char_indices.retain(|&ci| ci > 0);
+                        char_indices.sort_unstable_by(|a, b| b.cmp(a));
+                        for &ci in &char_indices {
+                            self.delete_with_undo(ci - 1, ci);
+                        }
+                        // Recompute positions
+                        char_indices.sort_unstable();
+                        let mut new_extras: Vec<Cursor> = Vec::new();
+                        for (i, &ci) in char_indices.iter().enumerate() {
+                            let adjusted = ci - 1 - i; // each prior deletion shifts by 1
+                            let line = self.buffer().content.char_to_line(adjusted);
+                            let line_start = self.buffer().line_to_char(line);
+                            let col = adjusted - line_start;
+                            let cur = Cursor { line, col };
+                            if ci == primary_ci {
+                                self.view_mut().cursor = cur;
+                            } else {
+                                new_extras.push(cur);
+                            }
+                        }
+                        self.view_mut().extra_cursors = new_extras;
+                        changed = true;
                     } else {
                         let line = self.view().cursor.line;
                         let col = self.view().cursor.col;
@@ -27288,47 +28411,162 @@ impl Engine {
                     }
                     changed = true;
                 }
+                // Phase 2: Shift+Tab → outdent
+                "ISO_Left_Tab" => {
+                    self.vscode_outdent(&mut changed);
+                }
                 _ => {
-                    // Printable character.
                     if let Some(ch) = unicode {
-                        if self.visual_anchor.is_some() {
-                            self.vscode_delete_selection(&mut changed);
-                        }
-                        let line = self.view().cursor.line;
-                        let col = self.view().cursor.col;
-                        let char_idx = self.buffer().line_to_char(line) + col;
+                        if self.visual_anchor.is_some() && !self.view().extra_cursors.is_empty() {
+                            // Multi-cursor with selection (Ctrl+D/Ctrl+Shift+L):
+                            // delete selected word at every cursor, then insert typed char.
+                            // Uses char indices sorted descending so edits don't shift
+                            // positions of earlier occurrences (critical for same-line matches).
+                            let anchor = self.visual_anchor.unwrap();
+                            let cursor = self.view().cursor;
+                            let (sel_start, sel_end) =
+                                if (anchor.line, anchor.col) <= (cursor.line, cursor.col) {
+                                    (anchor, cursor)
+                                } else {
+                                    (cursor, anchor)
+                                };
+                            let sel_start_ci =
+                                self.buffer().line_to_char(sel_start.line) + sel_start.col;
+                            let sel_end_ci =
+                                self.buffer().line_to_char(sel_end.line) + sel_end.col + 1;
+                            let sel_len = sel_end_ci - sel_start_ci;
 
-                        // Auto-pairs: skip-over closing bracket/quote
-                        let closing_pair = auto_pair_closer(ch);
-                        if self.settings.auto_pairs
-                            && is_closing_pair(ch)
-                            && char_idx < self.buffer().len_chars()
-                            && self.buffer().content.char(char_idx) == ch
-                        {
+                            // Collect char indices for start of each selection
+                            let extras = self.view().extra_cursors.clone();
+                            let mut char_indices: Vec<usize> = Vec::new();
+                            char_indices.push(sel_start_ci);
+                            for ec in &extras {
+                                let ec_start_col = ec.col + 1 - sel_len;
+                                let ci = self.buffer().line_to_char(ec.line) + ec_start_col;
+                                char_indices.push(ci);
+                            }
+                            // Sort descending — process rightmost/bottommost first
+                            char_indices.sort_unstable_by(|a, b| b.cmp(a));
+
+                            let mut buf = [0u8; 4];
+                            let s = ch.encode_utf8(&mut buf);
+                            let insert_len = s.len();
+                            for &ci in &char_indices {
+                                self.delete_with_undo(ci, ci + sel_len);
+                                self.insert_with_undo(ci, s);
+                            }
+
+                            // Recompute cursor positions after all edits.
+                            // Each replacement changes length by (insert_len - sel_len).
+                            // Sort ascending to compute cumulative offset.
+                            char_indices.sort_unstable();
+                            let delta = insert_len as isize - sel_len as isize;
+                            let mut new_cursors: Vec<Cursor> = Vec::new();
+                            for (i, &ci) in char_indices.iter().enumerate() {
+                                // After i replacements before this one, offset is i * delta
+                                let adjusted_ci =
+                                    (ci as isize + i as isize * delta) as usize + insert_len;
+                                let line = self.buffer().content.char_to_line(adjusted_ci);
+                                let line_start = self.buffer().line_to_char(line);
+                                let col = adjusted_ci - line_start;
+                                new_cursors.push(Cursor { line, col });
+                            }
+                            // First cursor is the primary
+                            self.view_mut().cursor = new_cursors[0];
+                            self.view_mut().extra_cursors = new_cursors[1..].to_vec();
+                            self.visual_anchor = None;
+                            self.mode = Mode::Insert;
+                            changed = true;
+                        } else if self.visual_anchor.is_some() {
+                            // Single-cursor selection: delete then fall through to insert
+                            self.vscode_delete_selection(&mut changed);
+                            // Fall through to single-cursor insert below
+                            let line = self.view().cursor.line;
+                            let col = self.view().cursor.col;
+                            let char_idx = self.buffer().line_to_char(line) + col;
+                            let mut buf = [0u8; 4];
+                            let s = ch.encode_utf8(&mut buf);
+                            self.insert_with_undo(char_idx, s);
                             self.view_mut().cursor.col += 1;
                             changed = true;
-                        } else if self.settings.auto_pairs && closing_pair.is_some() {
-                            let closer = closing_pair.unwrap();
-                            let should_pair = if is_quote_char(ch) {
-                                if char_idx == 0 {
-                                    true
+                        } else if !self.view().extra_cursors.is_empty() {
+                            // Multi-cursor without selection: insert at all positions.
+                            // Use char indices to handle same-line shifts correctly.
+                            let primary = *self.cursor();
+                            let extras = self.view().extra_cursors.clone();
+                            let mut char_indices: Vec<usize> = Vec::new();
+                            char_indices
+                                .push(self.buffer().line_to_char(primary.line) + primary.col);
+                            for ec in &extras {
+                                char_indices.push(self.buffer().line_to_char(ec.line) + ec.col);
+                            }
+                            char_indices.sort_unstable_by(|a, b| b.cmp(a));
+                            let mut buf = [0u8; 4];
+                            let s = ch.encode_utf8(&mut buf);
+                            let insert_len = s.len();
+                            for &ci in &char_indices {
+                                self.insert_with_undo(ci, s);
+                            }
+                            // Recompute positions accounting for cumulative shifts
+                            char_indices.sort_unstable();
+                            let primary_ci = self.buffer().line_to_char(primary.line) + primary.col;
+                            let mut new_extras: Vec<Cursor> = Vec::new();
+                            for (i, &ci) in char_indices.iter().enumerate() {
+                                let adjusted = ci + (i + 1) * insert_len;
+                                let line = self.buffer().content.char_to_line(adjusted);
+                                let line_start = self.buffer().line_to_char(line);
+                                let col = adjusted - line_start;
+                                let cur = Cursor { line, col };
+                                if ci == primary_ci {
+                                    self.view_mut().cursor = cur;
                                 } else {
-                                    let prev = self.buffer().content.char(char_idx - 1);
-                                    prev.is_whitespace()
-                                        || matches!(prev, '(' | '[' | '{' | ',' | ';' | ':')
+                                    new_extras.push(cur);
                                 }
-                            } else {
-                                true
-                            };
-                            if should_pair {
-                                let mut buf = [0u8; 4];
-                                let open_s = ch.encode_utf8(&mut buf).to_string();
-                                let mut buf2 = [0u8; 4];
-                                let close_s = closer.encode_utf8(&mut buf2).to_string();
-                                let pair = format!("{}{}", open_s, close_s);
-                                self.insert_with_undo(char_idx, &pair);
+                            }
+                            self.view_mut().extra_cursors = new_extras;
+                            changed = true;
+                        } else {
+                            // Single cursor: full auto-pairs support.
+                            let line = self.view().cursor.line;
+                            let col = self.view().cursor.col;
+                            let char_idx = self.buffer().line_to_char(line) + col;
+                            let closing_pair = auto_pair_closer(ch);
+                            if self.settings.auto_pairs
+                                && is_closing_pair(ch)
+                                && char_idx < self.buffer().len_chars()
+                                && self.buffer().content.char(char_idx) == ch
+                            {
                                 self.view_mut().cursor.col += 1;
                                 changed = true;
+                            } else if self.settings.auto_pairs && closing_pair.is_some() {
+                                let closer = closing_pair.unwrap();
+                                let should_pair = if is_quote_char(ch) {
+                                    if char_idx == 0 {
+                                        true
+                                    } else {
+                                        let prev = self.buffer().content.char(char_idx - 1);
+                                        prev.is_whitespace()
+                                            || matches!(prev, '(' | '[' | '{' | ',' | ';' | ':')
+                                    }
+                                } else {
+                                    true
+                                };
+                                if should_pair {
+                                    let mut buf = [0u8; 4];
+                                    let open_s = ch.encode_utf8(&mut buf).to_string();
+                                    let mut buf2 = [0u8; 4];
+                                    let close_s = closer.encode_utf8(&mut buf2).to_string();
+                                    let pair = format!("{}{}", open_s, close_s);
+                                    self.insert_with_undo(char_idx, &pair);
+                                    self.view_mut().cursor.col += 1;
+                                    changed = true;
+                                } else {
+                                    let mut buf = [0u8; 4];
+                                    let s = ch.encode_utf8(&mut buf);
+                                    self.insert_with_undo(char_idx, s);
+                                    self.view_mut().cursor.col += 1;
+                                    changed = true;
+                                }
                             } else {
                                 let mut buf = [0u8; 4];
                                 let s = ch.encode_utf8(&mut buf);
@@ -27336,12 +28574,6 @@ impl Engine {
                                 self.view_mut().cursor.col += 1;
                                 changed = true;
                             }
-                        } else {
-                            let mut buf = [0u8; 4];
-                            let s = ch.encode_utf8(&mut buf);
-                            self.insert_with_undo(char_idx, s);
-                            self.view_mut().cursor.col += 1;
-                            changed = true;
                         }
                         self.trigger_auto_completion();
                     }
@@ -34749,7 +35981,7 @@ mod tests {
         // :LspInfo with no servers running
         engine.execute_command("LspInfo");
         assert!(
-            engine.message.contains("manager=not started"),
+            engine.message.contains("LSP manager not started"),
             "unexpected LspInfo: {}",
             engine.message
         );
@@ -34765,6 +35997,89 @@ mod tests {
         let state = engine.active_buffer_state();
         assert_eq!(state.lsp_language_id, Some("rust".to_string()));
         let _ = std::fs::remove_file(&rs_path);
+    }
+
+    #[test]
+    fn test_set_filetype() {
+        let tf_path = std::env::temp_dir().join("vimcode_ft_test.tf");
+        std::fs::write(&tf_path, "resource \"null\" {}\n").unwrap();
+
+        let mut engine = Engine::new();
+        let _ = engine.open_file_with_mode(&tf_path, OpenMode::Permanent);
+        // Should auto-detect terraform
+        assert_eq!(
+            engine.active_buffer_state().lsp_language_id,
+            Some("terraform".to_string())
+        );
+
+        // Query filetype
+        engine.execute_command("set ft?");
+        assert!(engine.message.contains("filetype=terraform"));
+
+        // Override filetype
+        engine.execute_command("set filetype=hcl");
+        assert_eq!(
+            engine.active_buffer_state().lsp_language_id,
+            Some("hcl".to_string())
+        );
+        assert_eq!(engine.message, "filetype=hcl");
+
+        // Override should persist in language_map
+        assert_eq!(
+            engine.settings.language_map.get("tf"),
+            Some(&"hcl".to_string())
+        );
+
+        let _ = std::fs::remove_file(&tf_path);
+    }
+
+    #[test]
+    fn test_set_filetype_bicep() {
+        let bp_path = std::env::temp_dir().join("vimcode_ft_test.bicepparam");
+        std::fs::write(&bp_path, "param env = 'dev'\n").unwrap();
+
+        let mut engine = Engine::new();
+        let _ = engine.open_file_with_mode(&bp_path, OpenMode::Permanent);
+        assert_eq!(
+            engine.active_buffer_state().lsp_language_id,
+            Some("bicep".to_string())
+        );
+
+        let _ = std::fs::remove_file(&bp_path);
+    }
+
+    #[test]
+    fn test_language_map_override_on_open() {
+        let path = std::env::temp_dir().join("vimcode_langmap_test.h");
+        std::fs::write(&path, "// header\n").unwrap();
+
+        let mut engine = Engine::new();
+        // Default: .h → "c"
+        let _ = engine.open_file_with_mode(&path, OpenMode::Permanent);
+        assert_eq!(
+            engine.active_buffer_state().lsp_language_id,
+            Some("c".to_string())
+        );
+
+        // Close and reopen with language_map override
+        engine
+            .settings
+            .language_map
+            .insert("h".to_string(), "cpp".to_string());
+        // Open in a new tab to get a fresh buffer
+        engine.new_tab(Some(&path));
+        // The existing buffer is reused, but language_map was applied
+        // Let's test with a truly new file
+        let path2 = std::env::temp_dir().join("vimcode_langmap_test2.h");
+        std::fs::write(&path2, "// header2\n").unwrap();
+        engine.new_tab(Some(&path2));
+        assert_eq!(
+            engine.active_buffer_state().lsp_language_id,
+            Some("cpp".to_string())
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&path2);
     }
 
     #[test]
@@ -36658,37 +37973,32 @@ mod tests {
     }
 
     #[test]
-    fn test_vscode_mode_f1_opens_command() {
+    fn test_vscode_mode_f1_opens_palette() {
         let mut engine = make_vscode_engine("hello");
-        // F1 should switch to Command mode so the user can type a ':' command.
+        // F1 should open the command palette (matches real VSCode).
         vscode_key(&mut engine, "F1", None, false);
-        assert_eq!(engine.mode, Mode::Command);
-        assert!(engine.command_buffer.is_empty());
+        assert!(engine.palette_open, "F1 should open the command palette");
+        assert_eq!(engine.mode, Mode::Insert, "mode should stay Insert");
     }
 
     #[test]
-    fn test_vscode_mode_command_returns_to_insert() {
+    fn test_vscode_mode_execute_command_returns_to_insert() {
         let mut engine = make_vscode_engine("hello");
-        // F1 → Command mode
-        vscode_key(&mut engine, "F1", None, false);
-        assert_eq!(engine.mode, Mode::Command);
-        // Type `:set number` and press Enter
-        for ch in "set number".chars() {
-            engine.handle_key(&ch.to_string(), Some(ch), false);
-        }
-        engine.handle_key("Return", None, false);
-        // Should return to Insert (EDIT) mode, not Normal mode.
+        // Execute a command directly (like via the command palette).
+        engine.execute_command("set number");
+        // Should stay in Insert (EDIT) mode.
         assert_eq!(engine.mode, Mode::Insert);
         assert!(engine.is_vscode_mode());
     }
 
     #[test]
-    fn test_vscode_mode_f1_escape_returns_to_insert() {
+    fn test_vscode_mode_f1_escape_closes_palette() {
         let mut engine = make_vscode_engine("hello");
-        // F1 → Command mode, then Escape → back to EDIT (Insert) mode.
+        // F1 → palette, then Escape → closes palette, stays in EDIT mode.
         vscode_key(&mut engine, "F1", None, false);
-        assert_eq!(engine.mode, Mode::Command);
+        assert!(engine.palette_open);
         engine.handle_key("Escape", None, false);
+        assert!(!engine.palette_open, "Escape should close palette");
         assert_eq!(engine.mode, Mode::Insert);
         assert!(engine.is_vscode_mode());
     }

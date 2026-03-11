@@ -82,31 +82,12 @@ fn keymap_with_count() {
 #[test]
 fn keymap_with_count_placeholder() {
     let mut e = engine_with_keymaps("let x = 1;\nlet y = 2;\n", &["n gcc :Commentary {count}"]);
-    // Load commentary plugin
-    let dir = std::env::temp_dir().join("vc_keymap_commentary_test");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    use vimcode_core::core::extensions::BUNDLED;
-    let commentary = BUNDLED.iter().find(|b| b.name == "commentary").unwrap();
-    let script = commentary
-        .scripts
-        .iter()
-        .find(|s| s.0 == "commentary.lua")
-        .unwrap();
-    std::fs::write(dir.join("commentary.lua"), script.1).unwrap();
     let buf_id = e.active_buffer_id();
     if let Some(state) = e.buffer_manager.get_mut(buf_id) {
         state.lsp_language_id = Some("rust".to_string());
     }
-    match vimcode_core::core::plugin::PluginManager::new() {
-        Ok(mut mgr) => {
-            mgr.load_plugins_dir(&dir, &[]);
-            e.plugin_manager = Some(mgr);
-        }
-        Err(_) => panic!("failed to create PluginManager"),
-    }
 
-    // gcc with count 2 should comment 2 lines
+    // gcc with count 2 should comment 2 lines (native :Commentary)
     press(&mut e, '2');
     press(&mut e, 'g');
     press(&mut e, 'c');
@@ -114,7 +95,6 @@ fn keymap_with_count_placeholder() {
     let lines = get_lines(&e);
     assert_eq!(lines[0], "// let x = 1;", "line 1 should be commented");
     assert_eq!(lines[1], "// let y = 2;", "line 2 should be commented");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
