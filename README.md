@@ -17,6 +17,19 @@ Bug reports are welcome and will be fed to Claude—as long as there is enough d
 
 ---
 
+## Documentation
+
+For detailed how-to guides and configuration references, see the **[VimCode Wiki](https://github.com/JDonaghy/vimcode/wiki)**:
+
+- [Getting Started](https://github.com/JDonaghy/vimcode/wiki/Getting-Started) — installation, first launch, essential keys
+- [Key Remapping](https://github.com/JDonaghy/vimcode/wiki/Key-Remapping) — customize keybindings in Vim and VSCode modes
+- [Settings Reference](https://github.com/JDonaghy/vimcode/wiki/Settings-Reference) — all configurable options
+- [Extension Development](https://github.com/JDonaghy/vimcode/wiki/Extension-Development) — write extensions with manifest.toml and Lua scripts
+- [Lua Plugin API](https://github.com/JDonaghy/vimcode/wiki/Lua-Plugin-API) — full `vimcode.*` API reference
+- [Theme Customization](https://github.com/JDonaghy/vimcode/wiki/Theme-Customization) — built-in themes and VSCode theme import
+- [DAP Debugger Setup](https://github.com/JDonaghy/vimcode/wiki/DAP-Debugger-Setup) — configure and use the debugger
+- [LSP Configuration](https://github.com/JDonaghy/vimcode/wiki/LSP-Configuration) — language server setup and custom servers
+
 ## Vision
 
 - **First-class Vim mode** — deeply integrated, not a plugin
@@ -371,68 +384,19 @@ cargo fmt
 
 ### Debugger (DAP)
 
-Built-in Debug Adapter Protocol support with a VSCode-like UI. Open the debug sidebar (click the bug icon in the activity bar), set breakpoints with `F9`, and press `F5` to start debugging.
+Built-in Debug Adapter Protocol support with a VSCode-like UI. Open the debug sidebar (click the bug icon), set breakpoints with `F9`, and press `F5` to start debugging. Supports 6 adapters: codelldb (Rust/C/C++), debugpy (Python), delve (Go), js-debug (JS/TS), java-debug (Java), netcoredbg (C#). Install with `:DapInstall <lang>`.
 
-**Supported adapters** (installed via `:DapInstall <lang>`):
-
-| Language | Adapter | Type |
-|----------|---------|------|
-| Rust / C / C++ | codelldb | lldb |
-| Python | debugpy | debugpy |
-| Go | delve | go |
-| JavaScript / TypeScript | js-debug | node |
-| Java | java-debug | java |
-| C# | netcoredbg | coreclr |
-
-**Debug sidebar** — four interactive sections (Tab to switch, j/k to navigate, Enter to act, q/Escape to unfocus):
-- **Variables** — local/scope variables with additional scope groups (e.g. Statics, Registers) as expandable headers; Enter expands/collapses nested children (recursive); C# private fields (`_name`, backing fields) automatically grouped under a collapsible **Non-Public Members** node
-- **Watch** — user-defined watch expressions (`:DapWatch <expr>`); `x`/`d` removes selected
-- **Call Stack** — all stack frames; Enter selects frame and navigates to source; active frame marked with `▶`
-- **Breakpoints** — all set breakpoints with conditions shown; Enter jumps to location; `x`/`d` removes selected
-- **Mouse** — click a section header to switch; click an item to select and activate it
-
-**Conditional breakpoints** — breakpoints can have expression conditions, hit counts, or log messages:
-- `:DapCondition <expr>` — stop only when `<expr>` is truthy (e.g. `:DapCondition x > 10`)
-- `:DapHitCondition <count>` — stop after N hits (e.g. `:DapHitCondition >= 5`)
-- `:DapLogMessage <msg>` — print message instead of stopping (logpoint)
-- Run any command without arguments to clear the condition on the current line's breakpoint
-
-**Bottom panel tabs** — `Terminal` and `Debug Output` tabs; debug output shows adapter diagnostics and program output with a scrollable history (mouse wheel + drag scrollbar; newest output shown at bottom by default).
-
-**launch.json** — generated automatically in `.vimcode/launch.json` on first debug run; supports `${workspaceFolder}` substitution; existing `.vscode/launch.json` files are auto-migrated.
-
-**tasks.json + preLaunchTask** — if a launch configuration has `"preLaunchTask": "build"`, VimCode loads `.vimcode/tasks.json` (auto-migrated from `.vscode/tasks.json`) and runs the matching task before starting the debug adapter. Task output appears in the Debug Output panel; if the task fails the debug session is aborted.
-
-**Gutter indicators:**
-- `●` — breakpoint set
-- `◆` — conditional breakpoint (has condition or hit count)
-- `▶` — current execution line (stopped)
-- `◉` — breakpoint + current line
-
-**Keys:**
+The debug sidebar has four sections: Variables, Watch, Call Stack, and Breakpoints. Breakpoints support conditions, hit counts, and logpoints. A `launch.json` is auto-generated on first run.
 
 | Key | Action |
 |-----|--------|
-| `F5` | Start debugging / continue |
-| `Shift+F5` | Stop debugging |
-| `F9` | Toggle breakpoint on current line |
-| `F10` | Step over |
-| `F11` | Step into |
+| `F5` | Start / continue |
+| `Shift+F5` | Stop |
+| `F9` | Toggle breakpoint |
+| `F10` / `F11` | Step over / into |
 | `Shift+F11` | Step out |
-| `F6` | Pause |
 
-**Commands:**
-
-| Command | Action |
-|---------|--------|
-| `:DapInstall <lang>` | Install debug adapter for language |
-| `:DapInfo` | Show detected DAP adapters |
-| `:DapEval <expr>` | Evaluate expression in current frame |
-| `:DapWatch <expr>` | Add watch expression |
-| `:DapCondition [expr]` | Set/clear condition on breakpoint at cursor |
-| `:DapHitCondition [count]` | Set/clear hit-count condition on breakpoint |
-| `:DapLogMessage [msg]` | Set/clear logpoint on breakpoint at cursor |
-| `:DapBottomPanel terminal\|output` | Switch bottom panel tab |
+For full details on adapters, launch.json, conditional breakpoints, and the debug sidebar, see the **[DAP Debugger Setup](https://github.com/JDonaghy/vimcode/wiki/DAP-Debugger-Setup)** wiki page.
 
 ---
 
@@ -529,115 +493,19 @@ Click the git branch icon in the activity bar to open the Source Control panel �
 
 ### Workspaces
 
-A `.vimcode-workspace` file at the project root captures folder settings and enables per-project session restoration.
+A `.vimcode-workspace` file at the project root captures per-project settings and enables session restoration. Workspace settings overlay your global `settings.json`. Sessions (open files, cursor positions) are stored per-directory and restored automatically.
 
-**Opening a folder or workspace:**
-- **GTK:** File → "Open Folder…" / "Open Workspace…" / "Open Recent…" → native file dialog or recent-workspaces picker
-- **TUI:** same menu actions open a fuzzy directory picker or recent-workspaces list modal
-- **Commands:** `:OpenFolder <path>`, `:OpenWorkspace <path>`, `:SaveWorkspaceAs <path>`, `:cd <path>`, `:OpenRecent`
+**Commands:** `:OpenFolder <path>`, `:OpenWorkspace <path>`, `:SaveWorkspaceAs <path>`, `:cd <path>`, `:OpenRecent`
 
-**Workspace file format** (`.vimcode-workspace`):
-```json
-{
-  "version": 1,
-  "folders": [{"path": "."}],
-  "settings": { "tabstop": 2, "expandtab": true }
-}
-```
-Settings in the workspace file overlay your global `settings.json`.
-
-**Per-project sessions** — the session (open files, cursor/scroll positions) is stored per-directory using a stable hash of the workspace root path (`~/.config/vimcode/sessions/<hash>.json`). The session is saved on quit and restored automatically the next time you open the same folder. Opening a new or different directory always starts with a clean editor — files from other projects are never carried over.
-
-**Settings overlay** — workspace settings in `.vimcode-workspace` are applied on top of your global `settings.json`. When you switch to a different folder, the overlay is reverted so your global settings are restored. Per-folder `.vimcode/settings.json` files work the same way.
+See the **[Settings Reference](https://github.com/JDonaghy/vimcode/wiki/Settings-Reference)** wiki page for workspace file format and session details.
 
 ---
 
 ### Lua Plugin Extensions
 
-VimCode embeds Lua 5.4 (via `mlua`, fully vendored — no system Lua required). Plugins live in `~/.config/vimcode/plugins/` as `.lua` files or directories with `init.lua`.
+VimCode embeds Lua 5.4 (fully vendored — no system Lua required). Plugins live in `~/.config/vimcode/plugins/` as `.lua` files or directories with `init.lua`. The `vimcode.*` global provides APIs for buffer manipulation, event hooks, custom commands, keymaps, settings, git operations, and custom sidebar panels.
 
-**API surface** (`vimcode.*` global):
-
-```lua
--- Event hooks
-vimcode.on("save",        function(path) end)     -- fired after :w (also "BufWrite")
-vimcode.on("open",        function(path) end)     -- fired on file open
-vimcode.on("cursor_move", function(line_col) end) -- fired when cursor moves (arg: "line,col")
-vimcode.on("BufEnter",    function() end)          -- fired when switching to a buffer
-vimcode.on("BufNew",      function() end)          -- fired when a new buffer is created
-vimcode.on("InsertEnter", function() end)          -- fired on entering insert mode
-vimcode.on("InsertLeave", function() end)          -- fired on leaving insert mode
-vimcode.on("ModeChanged", function(change) end)    -- arg: "Old:New" (e.g. "Normal:Insert")
-vimcode.on("VimEnter",    function() end)          -- fired once after startup
-vimcode.on("panel_focus", function(name) end)      -- custom panel gained focus
-vimcode.on("panel_select",function(arg) end)       -- Enter pressed on panel item
-vimcode.on("panel_action",function(arg) end)       -- other key pressed on panel item
-
--- Custom commands / key mappings
-vimcode.command("MyCmd", function(args) end)
-vimcode.keymap("n", "<leader>x", function() end)   -- normal mode
-vimcode.keymap("i", "<C-Space>", function() end)   -- insert mode
-vimcode.keymap("v", "X", function() end)            -- visual mode
-vimcode.keymap("c", "Y", function() end)            -- command mode
-
--- Editor API
-vimcode.message(text)         -- show in status bar
-vimcode.cwd()                 -- current working directory string
-vimcode.command_run(cmd)      -- execute a VimCode : command
-vimcode.async_shell(cmd, event [, opts])  -- run shell command in background thread;
-                              -- result delivered as plugin event(event, stdout)
-                              -- opts: { stdin = "...", cwd = "..." }
-
--- Buffer API (current active buffer)
-vimcode.buf.lines()              -- all lines as table
-vimcode.buf.line(n)              -- line n (1-indexed) or nil
-vimcode.buf.set_line(n, text)    -- replace line n (undoable)
-vimcode.buf.insert_line(n, text) -- insert text before line n
-vimcode.buf.delete_line(n)       -- delete line n
-vimcode.buf.set_cursor(line,col) -- move cursor (1-indexed, clamped)
-vimcode.buf.path()               -- file path string or nil
-vimcode.buf.line_count()         -- integer
-vimcode.buf.cursor()             -- {line, col} (1-indexed)
-vimcode.buf.annotate_line(n, s)  -- show virtual text after line n
-vimcode.buf.clear_annotations()  -- remove all virtual text
-
--- Settings API
-vimcode.opt.get(key)             -- get setting value as string
-vimcode.opt.set(key, value)      -- set setting (applied after callback)
-
--- State API (read-only queries)
-vimcode.state.mode()             -- "Normal", "Insert", "Visual", etc.
-vimcode.state.filetype()         -- language ID string (e.g. "rust")
-vimcode.state.register(char)     -- {content, linewise} or nil
-vimcode.state.set_register(char, content, linewise)  -- write register
-vimcode.state.mark(char)         -- {line, col} (1-indexed) or nil
-
--- Git API (synchronous subprocess calls)
-vimcode.git.blame_line(n)        -- {hash,author,date,relative_date,message} or nil
-vimcode.git.blame_file()         -- [{hash,author,...}, ...] for entire buffer
-vimcode.git.log_file(limit)      -- [{hash,message}, ...] for current file
-vimcode.git.file_log_detailed(n) -- [{hash,author,date,message,stat}, ...]
-vimcode.git.line_log(s, e, n)    -- commits touching line range [s,e]
-vimcode.git.log(limit)           -- repo-wide commit log
-vimcode.git.show(hash)           -- full git show output (string or nil)
-vimcode.git.diff_ref(ref)        -- diff against branch/tag/ref (string or nil)
-vimcode.git.repo_root()          -- repository root path (string or nil)
-vimcode.git.branch()             -- current branch name (string or nil)
-vimcode.git.stash_list()         -- [{index,message,branch}, ...]
-vimcode.git.stash_push(msg)      -- push to stash
-vimcode.git.stash_pop(index)     -- pop stash entry
-vimcode.git.stash_show(index)    -- stash diff (string or nil)
-vimcode.git.branches()           -- [{name,tracking,is_current}, ...] branch list
-
--- Panel API (register custom sidebar panels from extensions)
-vimcode.panel.register(name, opts)         -- register a new sidebar panel
-  -- opts: { icon = "X", sections = {"Sec1", "Sec2"}, on_focus = fn }
-vimcode.panel.set_items(name, section, items) -- populate section with items
-  -- items: {{label="...", hint="...", icon="X", style="normal|dim|bold"}, ...}
-vimcode.panel.parse_event(arg)             -- parse "key:context" event argument
-```
-
-**Example plugin** (`~/.config/vimcode/plugins/hello.lua`):
+**Example** (`~/.config/vimcode/plugins/hello.lua`):
 ```lua
 vimcode.command("Hello", function(args)
   vimcode.message("Hello from Lua! " .. args)
@@ -647,44 +515,26 @@ vimcode.on("save", function(path)
   vimcode.message("Saved: " .. path)
 end)
 ```
-Then `:Hello world` shows "Hello from Lua! world" in the status bar.
 
-**Plugin management commands:**
+**Commands:** `:Plugin list` | `:Plugin reload` | `:Plugin enable <name>` | `:Plugin disable <name>`
 
-| Command | Action |
-|---------|--------|
-| `:Plugin list` | Show all loaded plugins and their status |
-| `:Plugin reload` | Reload all plugins from disk |
-| `:Plugin enable <name>` | Enable a previously disabled plugin |
-| `:Plugin disable <name>` | Disable a plugin (persisted in settings) |
-| `:Comment [N]` | Toggle comment on N lines from cursor (core feature, 46+ languages; `:Commentary` alias) |
-| `:map` | List all user-defined key mappings |
-| `:map n <C-/> :Comment` | Add a key mapping (persisted to settings.json) |
-| `:unmap n <C-/>` | Remove a key mapping |
-
-Plugins are loaded in alphabetical order on startup. Security: plugins have unrestricted file and process access (same trust model as Neovim).
+For the full API reference, see the **[Lua Plugin API](https://github.com/JDonaghy/vimcode/wiki/Lua-Plugin-API)** wiki page.
 
 ---
 
 ### Language Extensions
 
-Language extensions bundle an LSP server, optional DAP debugger, and Lua scripts into a single named package. When you open a file for a language that has a known extension but no LSP server installed, the status bar shows a one-line hint:
-
-```
-No C# Language Support extension — :ExtInstall csharp  (N to dismiss)
-```
-
-**Available extensions** (fetched from the [vimcode-ext](https://github.com/JDonaghy/vimcode-ext) registry):
+Language extensions bundle an LSP server, optional DAP debugger, and Lua scripts into a single package. Install with `:ExtInstall <name>`. Extensions are fetched from the [vimcode-ext](https://github.com/JDonaghy/vimcode-ext) registry and cached locally.
 
 | Extension | Language | LSP | DAP |
 |-----------|----------|-----|-----|
-| `csharp` | C# / .NET | csharp-ls | netcoredbg |
-| `python` | Python | pyright | debugpy |
 | `rust` | Rust | rust-analyzer | codelldb |
+| `python` | Python | pyright | debugpy |
 | `javascript` | JS / TypeScript | typescript-language-server | — |
 | `go` | Go | gopls | delve |
-| `java` | Java | jdtls | — |
 | `cpp` | C / C++ | clangd | codelldb |
+| `csharp` | C# / .NET | csharp-ls | netcoredbg |
+| `java` | Java | jdtls | — |
 | `php` | PHP | intelephense | — |
 | `ruby` | Ruby | ruby-lsp | — |
 | `bash` | Bash | bash-language-server | — |
@@ -696,162 +546,31 @@ No C# Language Support extension — :ExtInstall csharp  (N to dismiss)
 | `bicep` | Bicep | bicep-langserver | — |
 | `git-insights` | (all files) | — | — |
 
-Extensions are fetched from a remote GitHub registry on startup and cached locally at `~/.config/vimcode/registry_cache.json` for offline/instant startup. You can also develop and test extensions locally — see [Writing a Local Extension](#writing-a-local-extension) below.
+**Commands:** `:ExtInstall <name>` | `:ExtRemove <name>` | `:ExtList` | `:ExtEnable <name>` | `:ExtDisable <name>` | `:ExtRefresh`
 
-**Extensions sidebar panel** — click the extensions icon (󱧅) in the activity bar to open a VSCode-style panel with two sections:
-- **INSTALLED** — extensions currently installed; press `Enter` to view info, `d` to remove
-- **AVAILABLE** — all registry and local extensions; press `Enter` or `i` to install
-- `/` — activate search input to filter both sections; `Escape` exits search, `q`/`Escape` unfocuses panel
-- `j` / `k` — navigate items; `r` — refresh registry from GitHub; `Tab` — collapse/expand section
-
-**Extension commands:**
-
-| Command | Action |
-|---------|--------|
-| `:ExtInstall <name>` | Install LSP + DAP + extract Lua scripts |
-| `:ExtRemove <name>` | Unmark extension as installed + delete its Lua scripts (LSP binary untouched) |
-| `:ExtList` | Show all extensions and their install status |
-| `:ExtEnable <name>` | Re-enable a disabled extension |
-| `:ExtDisable <name>` | Suppress install prompts for this extension |
-| `:ExtRefresh` | Fetch the latest extension list from the GitHub registry |
-
-**Git Insights extension** — when installed, shows inline blame annotations as dim virtual text at the end of the cursor's current line (runs `git blame` asynchronously via `vimcode.async_shell()` so the UI never blocks):
-
-```
-42  let result = compute();   Alice • 3 days ago • fix off-by-one
-```
-
-Also provides these commands (all open results in scratch buffers):
-
-| Command | Action |
-|---------|--------|
-| `:GitLog` | Show recent commits for the current file in status bar |
-| `:GitFileHistory` | File commit history with author, date, stats in vertical split |
-| `:GitShow [hash]` | Show commit details (reads hash from cursor line if omitted) |
-| `:GitLineHistory` | Log of commits touching the current line |
-| `:GitDiff [ref]` | Diff against a ref (default: HEAD) |
-| `:GitRepoLog` | Repository-wide commit log (last 200 commits) |
-| `:GitStash [msg]` | Push changes to stash |
-| `:GitStashPop [n]` | Pop stash entry (default: 0) |
-| `:GitStashList` | Show all stash entries |
-| `:GitStashShow [n]` | Show stash diff |
-
-**Git Log panel** — the git-insights extension also registers a custom sidebar panel (via `vimcode.panel.register()`) with three sections: **Branches**, **Log**, and **Stash**. Click the git log icon in the activity bar to browse branches, recent commits, and stash entries interactively. Press `Enter` on a commit to view it, or on a stash entry to show its diff.
-
-#### Writing a Local Extension
-
-You can develop and test extensions locally without publishing to the registry. Create a directory under `~/.config/vimcode/extensions/` with a `manifest.toml`:
-
-```
-~/.config/vimcode/extensions/my-extension/
-├── manifest.toml        # Required: extension metadata
-├── my_script.lua        # Optional: Lua plugin script(s)
-└── README.md            # Optional: shown when pressing Enter in Extensions panel
-```
-
-Local extensions appear automatically in the Extensions sidebar alongside registry extensions. Install with `:ExtInstall my-extension` to activate. Scripts already on disk are not re-downloaded.
-
-For the full manifest schema and Lua API reference, see the [Extension Development Guide](https://github.com/JDonaghy/vimcode-ext/blob/main/EXTENSIONS.md).
-
-**Self-hosted registry:** Set `extension_registry_url` in settings to point to your own `registry.json` URL (same format as the official registry).
+Browse extensions in the sidebar (click the extensions icon in the activity bar). You can also develop and test extensions locally — see the **[Extension Development](https://github.com/JDonaghy/vimcode/wiki/Extension-Development)** wiki page.
 
 ---
 
 ### AI Assistant
 
-Built-in AI chat panel powered by Anthropic Claude, OpenAI, or a local Ollama model. Click the chat icon in the activity bar (or configure a keybinding) to open the panel.
+Built-in AI chat panel supporting Anthropic Claude, OpenAI, or local Ollama. Click the chat icon in the activity bar to open. Configure `ai_provider` and `ai_api_key` in `settings.json` (or set `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` env vars).
 
-**Supported providers** (configured in `settings.json`):
-
-| Provider | Default model | Notes |
-|----------|--------------|-------|
-| `anthropic` | `claude-opus-4-5` | Requires `ANTHROPIC_API_KEY` or `ai_api_key` in settings |
-| `openai` | `gpt-4o` | Requires `OPENAI_API_KEY` or `ai_api_key` in settings |
-| `ollama` | `llama3` | Runs locally; `ai_base_url` defaults to `http://localhost:11434` |
-
-**Usage:**
-- Click the chat icon (``) in the activity bar to open the AI sidebar panel
-- `i` — enter input mode; type a message and press `Enter` to send
-- `j` / `k` — scroll conversation history
-- `Escape` / `q` — exit input mode / unfocus panel
-- `:AI <message>` — send a message directly from command mode
-- `:AiClear` — clear the conversation history
-
-**Settings** (in `settings.json`):
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `ai_provider` | `"anthropic"` | AI provider: `"anthropic"`, `"openai"`, or `"ollama"` |
-| `ai_api_key` | `""` | API key (falls back to `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` env vars) |
-| `ai_model` | `""` | Model override (leave empty for provider default) |
-| `ai_base_url` | `""` | Base URL override (used for Ollama; defaults to `http://localhost:11434`) |
-| `ai_completions` | `false` | Enable AI inline completions (ghost text) in insert mode |
-
-Responses are fetched asynchronously via a background `curl` subprocess — no async runtime required. The conversation is kept in memory for the session and cleared with `:AiClear`.
-
-#### AI Inline Completions
-
-When `ai_completions` is enabled, VimCode shows ghost text at the cursor while you type in insert mode. After ~250 ms of idle time a fill-in-the-middle request is sent to the configured AI provider; the suggestion appears as dimmed text. Multi-line suggestions show all continuation lines as ghost text beneath the cursor line.
-
-| Key | Action |
-|-----|--------|
-| `Tab` | Accept the ghost-text suggestion |
-| `Alt-]` | Cycle to next alternative suggestion |
-| `Alt-[` | Cycle to previous alternative suggestion |
-| Any other key | Dismiss the suggestion |
+- `i` — enter input mode; type and press `Enter` to send
+- `:AI <message>` — send from command mode; `:AiClear` — clear history
+- **AI inline completions** — set `ai_completions: true` for ghost-text suggestions in insert mode (`Tab` accepts, `Alt-]`/`Alt-[` cycle alternatives)
 
 ---
 
 ### LSP Support (Language Server Protocol)
 
-Automatic language server integration — open a file and diagnostics, completions, go-to-definition, and hover just work if the appropriate server is on `PATH`. LSP initializes on every file-opening path: `:e`, sidebar click, fuzzy finder (Ctrl-P), live grep confirm, `:split`/`:vsplit`, and `:tabnew`.
+Automatic language server integration — open a file and diagnostics, completions, go-to-definition, and hover just work if the server is on `PATH`. Install language support via `:ExtInstall <lang>`.
 
-**Built-in server registry** (auto-detected on `PATH`):
+**Features:** inline diagnostics, `]d`/`[d` navigation, auto-popup completions (`Ctrl-Space` manual trigger), `gd` definition, `gr` references, `gi` implementation, `gy` type definition, `K` hover, signature help, `<leader>gf` format, `<leader>rn` rename, semantic token highlighting.
 
-| Language | Server(s) tried in order |
-|----------|--------------------------|
-| Rust | `rust-analyzer` |
-| Python | `pyright-langserver` → `basedpyright-langserver` → `pylsp` → `jedi-language-server` |
-| JavaScript / TypeScript | `typescript-language-server` |
-| Go | `gopls` |
-| C / C++ | `clangd` |
+**Commands:** `:LspInfo` | `:LspRestart` | `:LspStop` | `:Lformat` | `:Rename <name>`
 
-**Features:**
-- **Inline diagnostics** — wavy underlines (GTK) / colored underlines (TUI) with severity-colored gutter icons
-- **Diagnostic navigation** — `]d` / `[d` jump to next/previous diagnostic
-- **LSP completions** — async source for the auto-popup (appears as you type); `Ctrl-Space` manually triggers
-- **Go-to-definition** — `gd` jumps to the definition of the symbol under the cursor
-- **Find references** — `gr` populates quickfix list with all usage sites; single result jumps directly
-- **Go-to-implementation** — `gi` jumps to the implementation of the symbol
-- **Go-to-type-definition** — `gy` jumps to the type definition
-- **Hover info** — `K` shows type/documentation popup above the cursor
-- **Signature help** — popup appears above cursor when typing `(` or `,` in a function call; active parameter highlighted
-- **LSP formatting** — `<leader>gf` (or `:Lformat`) formats the whole buffer; single undo step reverts
-- **LSP rename** — `<leader>rn` pre-fills `:Rename <word>` in command bar; `:Rename <newname>` renames across all files
-- **Semantic token highlighting** — overlays LSP `textDocument/semanticTokens/full` on tree-sitter; 8 distinct colors for parameters, properties, namespaces, enum members, interfaces, type parameters, decorators, and macros; bold for declarations, italic for readonly/static
-- **Diagnostic counts** — `E:N W:N` shown in status bar
-
-**Commands:**
-
-| Command | Action |
-|---------|--------|
-| `:LspInfo` | Show running servers and their status |
-| `:LspRestart` | Restart server for current file type |
-| `:LspStop` | Stop server for current file type |
-| `:LspInstall <lang>` | Redirect to `:ExtInstall <name>` (use `:ExtInstall` directly) |
-| `:Lformat` | Format current buffer via LSP |
-| `:Rename <name>` | Rename symbol under cursor across all files |
-
-**Settings:**
-- `:set lsp` / `:set nolsp` — enable/disable LSP (default: enabled)
-- Custom servers in `settings.json`:
-```json
-{
-    "lsp_servers": [
-        { "command": "lua-language-server", "args": [], "languages": ["lua"] }
-    ]
-}
-```
+For custom server configuration and troubleshooting, see the **[LSP Configuration](https://github.com/JDonaghy/vimcode/wiki/LSP-Configuration)** wiki page.
 
 ---
 
@@ -883,91 +602,12 @@ Runtime changes are written through to `~/.config/vimcode/settings.json` immedia
 | `formatonsave` / `noformatonsave` | `fos` | off | Auto-format buffer via LSP before saving |
 | `mode=vim` / `mode=vscode` | | vim | Editor mode (see **VSCode Mode** below) |
 
-Additional options (set directly in `settings.json`):
+- `:set option?` — query current value; `:set option!` — toggle boolean; `:set` — show all
+- `:Settings` — open `settings.json` for direct editing
+- `:colorscheme <name>` — switch theme (`onedark`, `gruvbox-dark`, `tokyo-night`, `solarized-dark`, or custom VSCode `.json` themes from `~/.config/vimcode/themes/`)
+- **Settings sidebar** — click the gear icon for a VSCode-style interactive form
 
-| Key | Default | Description |
-|-----|---------|-------------|
-| `terminal_scrollback_lines` | `5000` | Rows kept in terminal scrollback history (0 = unlimited) |
-| `leader` | `" "` (Space) | Leader key character for `<leader>gf` / `<leader>rn` sequences |
-| `extension_registry_url` | GitHub raw URL | URL for the remote extension registry JSON (override for self-hosted) |
-| `ai_provider` | `"anthropic"` | AI provider: `"anthropic"`, `"openai"`, or `"ollama"` |
-| `ai_api_key` | `""` | API key (falls back to `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` env vars) |
-| `ai_model` | `""` | Model override (leave empty for provider default) |
-| `ai_base_url` | `""` | Base URL override (used for Ollama; defaults to `http://localhost:11434`) |
-| `ai_completions` | `false` | Enable AI inline completions (ghost text) in insert mode |
-| `show_hidden_files` | `false` | Show dotfiles in file explorer (`:set showhiddenfiles` / `:set shf`) |
-| `swap_file` | `true` | Write swap files for crash recovery (`:set swapfile` / `:set noswapfile`) |
-| `updatetime` | `4000` | Milliseconds between swap file writes for dirty buffers (`:set updatetime=N`) |
-| `breadcrumbs` | `true` | Show file path + symbol hierarchy bar below the tab bar (`:set breadcrumbs` / `:set nobreadcrumbs`) |
-| `autohide_panels` | `false` | TUI only: hide sidebar + activity bar at startup; `Ctrl-W h` reveals them, focus returns to editor auto-hides (`:set autohidepanels` / `:set noautohidepanels`) |
-| `indent_guides` | `true` | Show vertical indent guide lines at each tabstop level (`:set indentguides` / `:set noindentguides`) |
-| `match_brackets` | `true` | Highlight matching `(){}[]` bracket pair when cursor is on a bracket (`:set matchbrackets` / `:set nomatchbrackets`) |
-| `auto_pairs` | `true` | Auto-close brackets and quotes in Insert mode; typing closer skips over it; Backspace between pair deletes both (`:set autopairs` / `:set noautopairs`) |
-
-- `:set option?` — query current value (e.g. `:set ts?` → `tabstop=4`)
-- `:set option!` — toggle a boolean option (e.g. `:set wrap!`); `no<option>!` explicitly disables (e.g. `:set nowrap!`)
-- `:set` (no args) — show one-line summary of all settings
-- `:config reload` — reload settings file from disk
-- `:colorscheme <name>` — switch colour theme live (aliases: `gruvbox`, `tokyonight`, `solarized`); `:colorscheme` lists available themes. Built-in: `onedark` (default), `gruvbox-dark`, `tokyo-night`, `solarized-dark`. Also loads VSCode `.json` theme files from `~/.config/vimcode/themes/`.
-- `:Settings` — open `settings.json` in a new editor tab for direct editing; saved changes reload automatically in both GTK and TUI backends.
-- **Settings sidebar (GTK + TUI)** — click the gear icon in the activity bar to open a VSCode-style settings form: searchable list of all settings grouped by category (Appearance, Editor, Search, Workspace, LSP, Terminal, Plugins, AI) with interactive controls; GTK uses native widgets (Switch, SpinButton, DropDown, Entry), TUI renders `[✓]`/`[ ]` toggles, `value ▸` cycling enums, and inline text/number editing with Ctrl+V paste; changes apply and save immediately; colorscheme picker includes custom VSCode themes from `~/.config/vimcode/themes/`. **User Keymaps** row opens a scratch buffer editor (`:Keymaps`) — one keymap per line in `mode keys :command` format; `:w` validates and saves back to `settings.keymaps`.
-
-**Panel navigation key bindings** — configurable in `settings.json` under `"panel_keys"`:
-
-| Field | Default | Action |
-|-------|---------|--------|
-| `toggle_sidebar` | `<C-b>` | Toggle sidebar visibility |
-| `focus_explorer` | `<A-e>` | Focus explorer (press again to return to editor) |
-| `focus_search` | `<A-f>` | Focus search panel (press again to return to editor) |
-| `fuzzy_finder` | `<C-p>` | Open fuzzy file finder |
-| `live_grep` | `<C-g>` | Open live grep modal |
-| `open_terminal` | `<C-t>` | Toggle integrated terminal panel |
-| `add_cursor` | `<A-d>` | Add cursor at next occurrence of word under cursor |
-
-Key notation: `<C-x>` = Ctrl+x, `<A-x>` = Alt+x, `<C-S-x>` = Ctrl+Shift+x.
-
-**Explorer key bindings** — configurable in `settings.json` under `"explorer_keys"`:
-
-| Field | Default | Action |
-|-------|---------|--------|
-| `new_file` | `a` | New file prompt |
-| `new_folder` | `A` | New folder prompt |
-| `delete` | `D` | Delete prompt |
-| `rename` | `r` | Rename prompt |
-| `move_file` | `M` | Move file prompt |
-
-**Completion key bindings** — configurable in `settings.json` under `"completion_keys"`:
-
-| Field | Default | Action |
-|-------|---------|--------|
-| `trigger` | `<C-Space>` | Manually trigger the completion popup |
-| `accept` | `Tab` | Accept the highlighted completion item |
-
-Only specify keys you want to change — unspecified keys keep their defaults.
-
-**User key mappings** — define custom key → command bindings. Works in both Vim and VSCode modes.
-
-**Discovering command names:** Run `:Keybindings` (or press F1 → "Open Keybinding Reference") to see all keybindings. Remappable bindings show their command name on the right — e.g. `gd → :def`, `F12 → :def`, `Ctrl+P → :fuzzy`.
-
-**Adding a mapping:**
-- `:map n <key> :command` — add from the command line
-- `:Keymaps` (or F1 → "Open Keyboard Shortcuts") — open a persistent editor, one mapping per line, `:w` to save
-
-```json
-"keymaps": [
-  "n <C-/> :Comment",
-  "v <C-/> :Comment",
-  "n gcc :Comment {count}",
-  "n <leader>f :Lformat"
-]
-```
-
-Format: `"mode keys :command"` where:
-- **mode**: `n` (normal), `v` (visual), `i` (insert), `c` (command). In VSCode mode, use `n`.
-- **keys**: single char (`J`), modifier (`<C-/>`, `<A-c>`), or multi-key sequence (`gcc`, `gc`)
-- **action**: ex command prefixed with `:`. Use `{count}` to substitute the count prefix.
-
-User keymaps are checked **before** built-in keys, so they can override defaults. Multi-key sequences (e.g. `gcc`) are supported — intermediate keys are buffered until an exact match or fallthrough.
+Additional settings (AI, terminal, swap files, indent guides, etc.), configurable key bindings (`panel_keys`, `explorer_keys`, `completion_keys`), and user key mappings are documented in the **[Settings Reference](https://github.com/JDonaghy/vimcode/wiki/Settings-Reference)** and **[Key Remapping](https://github.com/JDonaghy/vimcode/wiki/Key-Remapping)** wiki pages.
 
 ---
 
@@ -1023,34 +663,13 @@ Switch the editor into a **non-modal editing** mode that works like a standard t
 - `` Ctrl+` `` — toggle terminal panel
 - `Ctrl+,` — open settings
 
-**Custom keybindings:**
-VSCode mode supports the same `:map` remapping system as Vim mode. To remap a key:
-1. Press **F1** → type "keybinding" → select **"Open Keybinding Reference"** to see all bindings with their command names
-2. Press **F1** → type "keyboard" → select **"Open Keyboard Shortcuts"** to add custom mappings
-3. Add a line like `n <C-H> :hover` or `n <F7> :def`, then save
-
-Use modifier keys (`<C-x>`, `<A-x>`, `<F5>`) to avoid intercepting normal typing. The mode is always `n` for VSCode keymaps.
-
-The `editor_mode` setting is persisted in `settings.json`.
+VSCode mode supports the same `:map` remapping system as Vim mode — see the **[Key Remapping](https://github.com/JDonaghy/vimcode/wiki/Key-Remapping)** wiki page. The `editor_mode` setting is persisted in `settings.json`.
 
 ---
 
 ### Session Persistence
 
-All state lives in `~/.config/vimcode/`:
-
-| File | Contents |
-|------|----------|
-| `settings.json` | Editor options |
-| `session.json` | Open files, cursor/scroll positions, history, window geometry |
-
-- **Open files restored on startup** — each file reopened in its own tab; files closed via `:q` are excluded next session
-- **Cursor + scroll position** — restored per file on reopen
-- **Command history** — Up/Down arrows in command mode; max 100 entries; `Ctrl-R` reverse incremental search
-- **Search history** — Up/Down arrows in search mode; max 100 entries
-- **Tab auto-completion** in command mode
-- **Window geometry** — size saved on close, restored on startup
-- **Explorer visibility** — open/closed state persisted
+All state lives in `~/.config/vimcode/`. Open files, cursor positions, command/search history, window geometry, and explorer state are restored on startup. Per-project sessions are stored separately when using workspaces. See the **[Settings Reference](https://github.com/JDonaghy/vimcode/wiki/Settings-Reference)** wiki page for details.
 
 ---
 

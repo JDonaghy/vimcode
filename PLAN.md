@@ -5,6 +5,7 @@
 ---
 
 ## Recently Completed
+- **Session 169**: GitHub Wiki — 9 pages (Home, Getting Started, Key Remapping, Settings Reference, Extension Development, Lua Plugin API, Theme Customization, DAP Debugger Setup, LSP Configuration); Documentation section added to README with wiki links
 - **Session 168**: Keybinding discoverability + VSCode remapping — 7 new ex command aliases (`:hover`/`:LspImpl`/`:LspTypedef`/`:nextdiag`/`:prevdiag`/`:nexthunk`/`:prevhunk`), command names in `:Keybindings` reference (Vim + VSCode), `:map` works in VSCode mode, "Open Keyboard Shortcuts" palette entry, test hermiticity fix, 17 tests
 - **Session 167**: `:wincmd` ex command — `:wincmd {char} [count]` (abbreviation `:winc`) executes window commands programmatically, shared `execute_wincmd()` method (Ctrl-W handler refactored), `:Keybindings` shows command names, `:close`/`:only`/`:new`/`:wincmd` tab completion, 23 tests
 - **Session 166**: Extension Registry Decoupling — removed `BUNDLED` static array + all `include_str!()`, extensions now fetched from remote GitHub registry (`vimcode-ext`) + cached locally, `ext_available_manifests()` merges registry + local `~/.config/vimcode/extensions/*/manifest.toml`, `LspManager.set_ext_manifests()`, `DapManager` functions accept manifests, removed `extensions/` directory from repo, generated `registry.json`, local extension dev workflow in EXTENSIONS.md
@@ -94,4 +95,4 @@
 - [x] **Swap file crash recovery** — Vim-like swap files (`~/.config/vimcode/swap/`); FNV-1a path hashing; atomic writes (`.tmp` + rename); PID-based stale detection; `[R]ecover/[D]elete/[A]bort` recovery dialog; `:set swapfile`/`:set updatetime=N`; periodic writes via `tick_swap_files()`; cleanup on shutdown
 
 ### Documentation
-- [ ] **GitHub Wiki** — create a wiki with pages for: Getting Started, Key Remapping (Vim & VSCode modes), Settings Reference, Extension Development, Lua Plugin API, Theme Customization, DAP/Debugger Setup, LSP Configuration. Move detailed how-to content out of README into wiki pages; README links to wiki for details.
+- [x] **GitHub Wiki** — 9 pages: Home, Getting Started, Key Remapping, Settings Reference, Extension Development, Lua Plugin API, Theme Customization, DAP Debugger Setup, LSP Configuration; README Documentation section links to wiki
