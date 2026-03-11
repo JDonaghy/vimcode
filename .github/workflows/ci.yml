@@ -11,7 +11,7 @@ env:
 
 jobs:
   test:
-    name: Test
+    name: Test (Linux)
     runs-on: ubuntu-24.04   # GTK 4.14 — satisfies features = ["v4_10"] in Cargo.toml
 
     steps:
@@ -53,6 +53,59 @@ jobs:
       run: cargo clippy -- -D warnings
 
     - name: Build
+      run: cargo build --verbose
+
+    - name: Run tests
+      run: cargo test --verbose
+
+  test-windows:
+    name: Test (Windows)
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache GTK4 (gvsbuild)
+      uses: actions/cache@v4
+      id: cache-gtk
+      with:
+        path: C:\gtk-build\gtk\x64\release
+        key: ${{ runner.os }}-gtk4-gvsbuild
+
+    - name: Build GTK4 with gvsbuild
+      if: steps.cache-gtk.outputs.cache-hit != 'true'
+      run: |
+        pipx install gvsbuild
+        gvsbuild build gtk4 librsvg
+
+    - name: Configure GTK4 environment
+      run: |
+        Add-Content $env:GITHUB_ENV "PKG_CONFIG_PATH=C:\gtk-build\gtk\x64\release\lib\pkgconfig"
+        Add-Content $env:GITHUB_ENV ("LIB=" + $env:LIB + ";" + "C:\gtk-build\gtk\x64\release\lib")
+        Add-Content $env:GITHUB_PATH "C:\gtk-build\gtk\x64\release\bin"
+
+    - name: Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/registry
+        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Cache cargo index
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/git
+        key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Cache cargo build
+      uses: actions/cache@v4
+      with:
+        path: target
+        key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Build (full GUI + TUI)
       run: cargo build --verbose
 
     - name: Run tests

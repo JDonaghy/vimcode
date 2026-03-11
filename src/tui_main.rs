@@ -874,6 +874,8 @@ fn event_loop(
     // Non-None while user is dragging the debug output panel's scrollbar thumb.
     // Stores (track_start_row, track_len, total_lines).
     let mut dragging_debug_output_sb: Option<(u16, u16, usize)> = None;
+    // Non-None while user is dragging the settings panel scrollbar.
+    let mut dragging_settings_sb: Option<SidebarScrollDrag> = None;
     // True while user drags the terminal header row to resize the panel.
     let mut dragging_terminal_resize: bool = false;
     // True while user drags the terminal split divider left/right.
@@ -2128,6 +2130,19 @@ fn event_loop(
                             if !engine.settings_has_focus {
                                 sidebar.has_focus = false;
                             }
+                            // Keep selected item visible after j/k navigation.
+                            let th = terminal.size().map(|s| s.height).unwrap_or(24);
+                            let content_h = th.saturating_sub(4) as usize;
+                            if content_h > 0 {
+                                if engine.settings_selected
+                                    >= engine.settings_scroll_top + content_h
+                                {
+                                    engine.settings_scroll_top =
+                                        engine.settings_selected - content_h + 1;
+                                } else if engine.settings_selected < engine.settings_scroll_top {
+                                    engine.settings_scroll_top = engine.settings_selected;
+                                }
+                            }
                         }
                         needs_redraw = true;
                         continue;
@@ -3229,6 +3244,7 @@ fn event_loop(
                                 &mut dragging_debug_output_sb,
                                 &mut dragging_terminal_resize,
                                 &mut dragging_terminal_split,
+                                &mut dragging_settings_sb,
                                 last_layout.as_ref(),
                                 &mut sidebar_prompt,
                                 &mut last_click_time,
@@ -3267,6 +3283,7 @@ fn event_loop(
                     &mut dragging_debug_output_sb,
                     &mut dragging_terminal_resize,
                     &mut dragging_terminal_split,
+                    &mut dragging_settings_sb,
                     last_layout.as_ref(),
                     &mut sidebar_prompt,
                     &mut last_click_time,
@@ -3340,6 +3357,7 @@ fn handle_mouse(
     dragging_debug_output_sb: &mut Option<(u16, u16, usize)>,
     dragging_terminal_resize: &mut bool,
     dragging_terminal_split: &mut bool,
+    dragging_settings_sb: &mut Option<SidebarScrollDrag>,
     last_layout: Option<&render::ScreenLayout>,
     sidebar_prompt: &mut Option<SidebarPrompt>,
     last_click_time: &mut Instant,
@@ -3408,6 +3426,17 @@ fn handle_mouse(
                     let new_scroll = (ratio * drag.total as f64) as usize;
                     sidebar.search_scroll_top =
                         new_scroll.min(drag.total.saturating_sub(drag.track_len as usize));
+                }
+                return sidebar_width;
+            }
+            // Settings panel scrollbar drag
+            if let Some(ref drag) = *dragging_settings_sb {
+                if drag.track_len > 0 && drag.total > 0 {
+                    let end = drag.track_abs_start + drag.track_len - 1;
+                    let clamped = row.clamp(drag.track_abs_start, end);
+                    let ratio = (clamped - drag.track_abs_start) as f64 / drag.track_len as f64;
+                    let max_scroll = drag.total.saturating_sub(drag.track_len as usize);
+                    engine.settings_scroll_top = (ratio * max_scroll as f64).round() as usize;
                 }
                 return sidebar_width;
             }
@@ -3538,6 +3567,7 @@ fn handle_mouse(
             *dragging_debug_sb = None;
             *dragging_terminal_sb = None;
             *dragging_debug_output_sb = None;
+            *dragging_settings_sb = None;
             *cmd_dragging = false;
             if *dragging_terminal_resize {
                 *dragging_terminal_resize = false;
@@ -3634,6 +3664,25 @@ fn handle_mouse(
                             engine.dap_sidebar_scroll[sec_idx] =
                                 (engine.dap_sidebar_scroll[sec_idx] + 3).min(max_scroll);
                         }
+                    }
+                } else if sidebar.active_panel == TuiPanel::Settings {
+                    let flat = engine.settings_flat_list();
+                    let content_height = term_height.saturating_sub(4) as usize; // header+search+status+cmd
+                    let max_scroll = flat.len().saturating_sub(content_height);
+                    if matches!(ev.kind, MouseEventKind::ScrollUp) {
+                        engine.settings_scroll_top = engine.settings_scroll_top.saturating_sub(3);
+                    } else {
+                        engine.settings_scroll_top =
+                            (engine.settings_scroll_top + 3).min(max_scroll);
+                    }
+                } else if sidebar.active_panel == TuiPanel::Extensions {
+                    // Scroll selection up/down
+                    let total = engine.ext_available_manifests().len();
+                    if matches!(ev.kind, MouseEventKind::ScrollUp) {
+                        engine.ext_sidebar_selected = engine.ext_sidebar_selected.saturating_sub(3);
+                    } else {
+                        engine.ext_sidebar_selected =
+                            (engine.ext_sidebar_selected + 3).min(total.saturating_sub(1));
                     }
                 }
                 return sidebar_width;
@@ -4422,6 +4471,49 @@ fn handle_mouse(
                             engine.handle_ext_sidebar_key("Return", false, None);
                         }
                         // Single-click just selects
+                    }
+                }
+            }
+        } else if sidebar.active_panel == TuiPanel::Settings {
+            sidebar.has_focus = true;
+            engine.settings_has_focus = true;
+
+            // Row 0: header, Row 1: search input, Row 2+: scrollable content
+            let content_height = term_height.saturating_sub(4) as usize; // header+search+status+cmd
+            let flat_total = engine.settings_flat_list().len();
+
+            // Scrollbar column → jump-scroll + start drag
+            if col == sb_col && sidebar_row >= 2 && flat_total > content_height {
+                let track_start = row - (sidebar_row - 2);
+                let track_len = content_height as u16;
+                let rel = (sidebar_row - 2) as f64;
+                let ratio = rel / track_len as f64;
+                let max_scroll = flat_total.saturating_sub(content_height);
+                engine.settings_scroll_top = (ratio * max_scroll as f64).round() as usize;
+                *dragging_settings_sb = Some(SidebarScrollDrag {
+                    track_abs_start: track_start,
+                    track_len,
+                    total: flat_total,
+                });
+            } else if sidebar_row == 0 {
+                // Header — no-op
+            } else if sidebar_row == 1 {
+                // Search box — activate search input
+                engine.settings_input_active = true;
+            } else {
+                let content_row = sidebar_row.saturating_sub(2) as usize;
+                let fi = engine.settings_scroll_top + content_row;
+                if fi < flat_total {
+                    engine.settings_selected = fi;
+                    // Double-click toggles bools / expands categories
+                    let now = Instant::now();
+                    let is_double = now.duration_since(*last_click_time)
+                        < Duration::from_millis(400)
+                        && *last_click_pos == (col, row);
+                    *last_click_time = now;
+                    *last_click_pos = (col, row);
+                    if is_double {
+                        engine.handle_settings_key("Return", false, None);
                     }
                 }
             }
@@ -8455,8 +8547,16 @@ fn render_settings_panel(
                     }
                 }
                 SettingType::BufferEditor => {
-                    let count = engine.settings.keymaps.len();
-                    let display = format!("{} defined ▸", count);
+                    let display = match def.key {
+                        "keymaps" => format!("{} defined ▸", engine.settings.keymaps.len()),
+                        "extension_registries" => {
+                            format!(
+                                "{} configured ▸",
+                                engine.settings.extension_registries.len()
+                            )
+                        }
+                        _ => "▸".to_string(),
+                    };
                     let val_len = display.chars().count() as u16;
                     let vx = right_edge.saturating_sub(val_len + 1);
                     let mut cx = vx.max(x);
@@ -9895,9 +9995,18 @@ fn render_ext_sidebar(
             } else {
                 (default_fg, panel_bg)
             };
-            write_row(buf, y, &format!("  ● {}", item.display_name), fg, bg);
+            let label = if item.update_available {
+                format!("  ● {} \u{2191}", item.display_name) // ↑ update indicator
+            } else {
+                format!("  ● {}", item.display_name)
+            };
+            write_row(buf, y, &label, fg, bg);
             // Right-aligned hint
-            let hint = "[d] remove";
+            let hint = if item.update_available {
+                "[u] update"
+            } else {
+                "[d] remove"
+            };
             let hint_start = area.x + area.width.saturating_sub(hint.len() as u16 + 1);
             for (i, ch) in hint.chars().enumerate() {
                 let cx = hint_start + i as u16;

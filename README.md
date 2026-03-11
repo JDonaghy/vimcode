@@ -22,7 +22,7 @@ Bug reports are welcome and will be fed to Claude—as long as there is enough d
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 4053 tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 4088 tests, zero async runtime dependency
 
 > **Note:** VimCode does not implement VimScript. Extension and scripting is handled via
 > the built-in Lua 5.4 plugin system. The goal is full Vim *keybinding* and *editing*
@@ -250,7 +250,8 @@ cargo fmt
 
 **Windows**
 - `:split` / `:vsplit` — horizontal/vertical split
-- `Ctrl-W h/j/k/l` — move focus between panes
+- `:close` — close window; `:only` — close all other windows
+- `Ctrl-W h/j/k/l` — move focus between panes (or `:wincmd h/j/k/l`)
 - `Ctrl-W w` — cycle focus; `Ctrl-W c` — close; `Ctrl-W o` — close others
 - `Ctrl-W s/v` — split (same as `:split`/`:vsplit`)
 
@@ -944,7 +945,13 @@ Key notation: `<C-x>` = Ctrl+x, `<A-x>` = Alt+x, `<C-S-x>` = Ctrl+Shift+x.
 
 Only specify keys you want to change — unspecified keys keep their defaults.
 
-**User key mappings** — define custom key → command bindings in `settings.json` under `"keymaps"`:
+**User key mappings** — define custom key → command bindings. Works in both Vim and VSCode modes.
+
+**Discovering command names:** Run `:Keybindings` (or press F1 → "Open Keybinding Reference") to see all keybindings. Remappable bindings show their command name on the right — e.g. `gd → :def`, `F12 → :def`, `Ctrl+P → :fuzzy`.
+
+**Adding a mapping:**
+- `:map n <key> :command` — add from the command line
+- `:Keymaps` (or F1 → "Open Keyboard Shortcuts") — open a persistent editor, one mapping per line, `:w` to save
 
 ```json
 "keymaps": [
@@ -956,7 +963,7 @@ Only specify keys you want to change — unspecified keys keep their defaults.
 ```
 
 Format: `"mode keys :command"` where:
-- **mode**: `n` (normal), `v` (visual), `i` (insert), `c` (command)
+- **mode**: `n` (normal), `v` (visual), `i` (insert), `c` (command). In VSCode mode, use `n`.
 - **keys**: single char (`J`), modifier (`<C-/>`, `<A-c>`), or multi-key sequence (`gcc`, `gc`)
 - **action**: ex command prefixed with `:`. Use `{count}` to substitute the count prefix.
 
@@ -1015,6 +1022,14 @@ Switch the editor into a **non-modal editing** mode that works like a standard t
 - `Ctrl+J` — toggle terminal panel
 - `` Ctrl+` `` — toggle terminal panel
 - `Ctrl+,` — open settings
+
+**Custom keybindings:**
+VSCode mode supports the same `:map` remapping system as Vim mode. To remap a key:
+1. Press **F1** → type "keybinding" → select **"Open Keybinding Reference"** to see all bindings with their command names
+2. Press **F1** → type "keyboard" → select **"Open Keyboard Shortcuts"** to add custom mappings
+3. Add a line like `n <C-H> :hover` or `n <F7> :def`, then save
+
+Use modifier keys (`<C-x>`, `<A-x>`, `<F5>`) to avoid intercepting normal typing. The mode is always `n` for VSCode keymaps.
 
 The `editor_mode` setting is persisted in `settings.json`.
 
@@ -1178,18 +1193,18 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `zx` | Recompute folds (open all + close all) |
 | `zj` / `zk` | Move to next / previous fold |
 | `zs` / `ze` | Scroll cursor to left / right edge of screen |
-| `Ctrl-W h/j/k/l` | Focus window left/down/up/right |
-| `Ctrl-W w` / `c` / `o` / `q` / `n` | Cycle / close / close-others / quit / new |
-| `Ctrl-W +` / `-` / `>` / `<` | Resize split height/width |
-| `Ctrl-W =` | Equalize all split sizes |
-| `Ctrl-W _` / `\|` | Maximize split height / width |
-| `Ctrl-W p` / `t` / `b` | Previous / top / bottom editor group |
-| `Ctrl-W H` / `J` / `K` / `L` | Move window to far left/bottom/top/right |
-| `Ctrl-W T` | Move window to new editor group |
-| `Ctrl-W x` | Exchange with next window |
-| `Ctrl-W r` / `R` | Rotate windows forward / backward |
-| `Ctrl-W f` | Split and open file under cursor |
-| `Ctrl-W d` | Split and go to definition (LSP) |
+| `Ctrl-W h/j/k/l` | Focus window left/down/up/right (`:wincmd h/j/k/l`) |
+| `Ctrl-W w` / `c` / `o` / `q` / `n` | Cycle / close / close-others / quit / new (`:wincmd w/c/o/q/n`) |
+| `Ctrl-W +` / `-` / `>` / `<` | Resize split height/width (`:wincmd +/-/>/<`) |
+| `Ctrl-W =` | Equalize all split sizes (`:wincmd =`) |
+| `Ctrl-W _` / `\|` | Maximize split height / width (`:wincmd _/\|`) |
+| `Ctrl-W p` / `t` / `b` | Previous / top / bottom editor group (`:wincmd p/t/b`) |
+| `Ctrl-W H` / `J` / `K` / `L` | Move window to far left/bottom/top/right (`:wincmd H/J/K/L`) |
+| `Ctrl-W T` | Move window to new editor group (`:wincmd T`) |
+| `Ctrl-W x` | Exchange with next window (`:wincmd x`) |
+| `Ctrl-W r` / `R` | Rotate windows forward / backward (`:wincmd r/R`) |
+| `Ctrl-W f` | Split and open file under cursor (`:wincmd f`) |
+| `Ctrl-W d` | Split and go to definition (LSP) (`:wincmd d`) |
 | `Ctrl-P` | Open fuzzy file finder |
 | `Ctrl-G` | Show file info (name, line, col, %) |
 | `F1` | Command palette |
@@ -1245,6 +1260,8 @@ All ex commands support Vim-style abbreviations (e.g., `:j` for `:join`, `:y` fo
 | `:f[ile]` | Show current file name and info |
 | `:ene[w]` | Open a new empty buffer |
 | `:new` / `:vne[w]` | Open new buffer in horizontal / vertical split |
+| `:close` / `:only` | Close current window / close all other windows |
+| `:winc[md] {char}` | Execute window command (e.g., `:wincmd h` = `Ctrl-W h`) |
 | `:up[date]` | Write buffer only if modified |
 | `:sav[eas] {file}` | Save buffer to a new file path |
 | `:ve[rsion]` | Show VimCode version info |
@@ -1295,6 +1312,16 @@ All ex commands support Vim-style abbreviations (e.g., `:j` for `:join`, `:y` fo
 | `:LspInstall <lang>` | Install LSP server for language via Mason |
 | `:Lformat` | Format buffer via LSP |
 | `:Rename <newname>` | Rename symbol under cursor across workspace |
+| `:def` | Go to definition (LSP) |
+| `:refs` | Find references (LSP) |
+| `:hover` | Show hover info (LSP) |
+| `:LspImpl` | Go to implementation (LSP) |
+| `:LspTypedef` | Go to type definition (LSP) |
+| `:nextdiag` / `:prevdiag` | Jump to next / previous LSP diagnostic |
+| `:nexthunk` / `:prevhunk` | Jump to next / previous git hunk |
+| `:fuzzy` | Open fuzzy file finder |
+| `:sidebar` | Toggle sidebar |
+| `:palette` | Open command palette |
 | `:Comment [N]` | Toggle comment on N lines (46+ languages; `:Commentary` alias) |
 | `:DapInstall <lang>` | Install debug adapter for language |
 | `:DapInfo` | Show detected DAP adapters |
@@ -1338,24 +1365,24 @@ All ex commands support Vim-style abbreviations (e.g., `:j` for `:join`, `:y` fo
 
 ```
 src/
-├── main.rs         (~12,134 lines)  GTK4/Relm4 UI, rendering, sidebar resize, fuzzy popup, context menu, drag-and-drop
-├── tui_main.rs     (~10,778 lines)  ratatui/crossterm TUI backend, fuzzy popup, rename/move prompts
-├── render.rs        (~5,125 lines)  Platform-agnostic ScreenLayout bridge (DebugSidebarData, SourceControlData, ExtPanelData, BottomPanelTabs)
+├── main.rs         (~12,162 lines)  GTK4/Relm4 UI, rendering, sidebar resize, fuzzy popup, context menu, drag-and-drop
+├── tui_main.rs     (~10,937 lines)  ratatui/crossterm TUI backend, fuzzy popup, rename/move prompts
+├── render.rs        (~5,130 lines)  Platform-agnostic ScreenLayout bridge (DebugSidebarData, SourceControlData, ExtPanelData, BottomPanelTabs)
 ├── icons.rs            (~30 lines)  Nerd Font file-type icons (GTK + TUI)
 └── core/            (~29,500 lines)  Zero GTK/rendering deps — fully testable
-    ├── engine.rs    (~40,548 lines)  Orchestrator: keys, commands, git, macros, LSP, DAP, plugins, workspaces
+    ├── engine.rs    (~41,407 lines)  Orchestrator: keys, commands, git, macros, LSP, DAP, plugins, workspaces
     ├── markdown.rs     (~497 lines)  Markdown → styled plain text converter (pulldown-cmark)
     ├── plugin.rs     (~1,534 lines)  Lua 5.4 plugin manager (mlua vendored; vimcode.* API; async_shell; panel API)
     ├── terminal.rs     (~320 lines)  PTY-backed terminal pane (portable-pty + vt100, history ring buffer)
-    ├── lsp.rs        (~2,306 lines)  LSP protocol transport + single-server client (request ID tracking, JSON-RPC framing, semantic tokens)
-    ├── lsp_manager.rs  (~830 lines)  Multi-server coordinator with initialization guards + built-in registry + semantic legends
-    ├── dap.rs          (~671 lines)  DAP protocol transport + event routing + seq→command tracking + BreakpointInfo
-    ├── dap_manager.rs  (~1,089 lines)  DAP multi-adapter coordinator + launch.json + tasks.json support + install scripts
+    ├── lsp.rs        (~2,329 lines)  LSP protocol transport + single-server client (request ID tracking, JSON-RPC framing, semantic tokens)
+    ├── lsp_manager.rs  (~868 lines)  Multi-server coordinator with initialization guards + built-in registry + semantic legends
+    ├── dap.rs          (~707 lines)  DAP protocol transport + event routing + seq→command tracking + BreakpointInfo
+    ├── dap_manager.rs (~1,423 lines)  DAP multi-adapter coordinator + launch.json + tasks.json support + install scripts
     ├── ai.rs               (~336 lines)  AI provider integration (Anthropic/OpenAI/Ollama via curl subprocess)
     ├── project_search.rs (~630 lines)  Regex/case/whole-word search + replace (ignore + regex crates)
-    ├── buffer_manager.rs (~707 lines)  Buffer lifecycle, undo/redo stacks, semantic tokens
+    ├── buffer_manager.rs (~803 lines)  Buffer lifecycle, undo/redo stacks, semantic tokens
     ├── buffer.rs       (~120 lines)  Rope-based text storage (ropey)
-    ├── settings.rs   (~1,973 lines)  JSON config, :set parsing, key binding notation, SETTING_DEFS
+    ├── settings.rs   (~2,131 lines)  JSON config, :set parsing, key binding notation, SETTING_DEFS
     ├── session.rs      (~235 lines)  Session state persistence + per-workspace paths
     ├── git.rs        (~1,821 lines)  Git subprocesses: diff, blame, stage_hunk, SC panel, worktrees, git log, branches
     └── window.rs, tab.rs, view.rs, cursor.rs, mode.rs, syntax.rs (~984 lines)

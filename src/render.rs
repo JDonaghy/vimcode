@@ -649,6 +649,8 @@ pub struct ExtSidebarItem {
     /// Number of bundled Lua scripts.
     pub script_count: usize,
     pub installed: bool,
+    /// True when a newer version is available in the registry.
+    pub update_available: bool,
 }
 
 /// Rendering data for the Extensions sidebar panel.
@@ -3206,22 +3208,25 @@ fn build_source_control_data(engine: &Engine) -> Option<SourceControlData> {
 
 fn build_ext_sidebar_data(engine: &Engine) -> Option<ExtSidebarData> {
     // Always build so backends can check ext_sidebar_has_focus.
-    let manifest_to_item =
-        |m: &crate::core::extensions::ExtensionManifest, installed: bool| -> ExtSidebarItem {
-            ExtSidebarItem {
-                name: m.name.clone(),
-                display_name: if m.display_name.is_empty() {
-                    m.name.clone()
-                } else {
-                    m.display_name.clone()
-                },
-                description: m.description.clone(),
-                lsp_binary: m.lsp.binary.clone(),
-                dap_adapter: m.dap.adapter.clone(),
-                script_count: m.scripts.len(),
-                installed,
-            }
-        };
+    let manifest_to_item = |m: &crate::core::extensions::ExtensionManifest,
+                            installed: bool,
+                            has_update: bool|
+     -> ExtSidebarItem {
+        ExtSidebarItem {
+            name: m.name.clone(),
+            display_name: if m.display_name.is_empty() {
+                m.name.clone()
+            } else {
+                m.display_name.clone()
+            },
+            description: m.description.clone(),
+            lsp_binary: m.lsp.binary.clone(),
+            dap_adapter: m.dap.adapter.clone(),
+            script_count: m.scripts.len(),
+            installed,
+            update_available: has_update,
+        }
+    };
 
     let items_installed: Vec<ExtSidebarItem> = engine
         .ext_available_manifests()
@@ -3233,7 +3238,7 @@ fn build_ext_sidebar_data(engine: &Engine) -> Option<ExtSidebarData> {
                 || m.name.to_lowercase().contains(&q)
                 || m.display_name.to_lowercase().contains(&q)
         })
-        .map(|m| manifest_to_item(m, true))
+        .map(|m| manifest_to_item(m, true, engine.ext_has_update(&m.name)))
         .collect();
 
     let items_available: Vec<ExtSidebarItem> = engine
@@ -3246,7 +3251,7 @@ fn build_ext_sidebar_data(engine: &Engine) -> Option<ExtSidebarData> {
                 || m.name.to_lowercase().contains(&q)
                 || m.display_name.to_lowercase().contains(&q)
         })
-        .map(|m| manifest_to_item(m, false))
+        .map(|m| manifest_to_item(m, false, false))
         .collect();
 
     Some(ExtSidebarData {

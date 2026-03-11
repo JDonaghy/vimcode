@@ -25,7 +25,6 @@ modules:
   - name: vimcode
     buildsystem: simple
     build-commands:
-      - cargo --offline fetch --manifest-path Cargo.toml --verbose
       - cargo --offline build --release --verbose
       - install -Dm755 target/release/vimcode /app/bin/vimcode
       - install -Dm644 data/io.github.jdonaghy.VimCode.desktop /app/share/applications/io.github.jdonaghy.VimCode.desktop
@@ -35,3 +34,12 @@ modules:
       - type: dir
         path: ..
       - cargo-sources.json
+      - type: inline
+        contents: |
+          [source.crates-io]
+          replace-with = "vendored-sources"
+
+          [source.vendored-sources]
+          directory = "cargo/vendor"
+        dest: cargo
+        dest-filename: config.toml

@@ -40,6 +40,10 @@ pub struct ExtensionManifest {
     /// Optional comment style override for languages handled by this extension.
     #[serde(default)]
     pub comment: Option<CommentConfig>,
+    /// Base URL of the registry this manifest was fetched from.
+    /// Derived at fetch time; not serialized to JSON/TOML.
+    #[serde(skip)]
+    pub registry_base_url: String,
 }
 
 /// Comment style override specified in an extension manifest `[comment]` section.
@@ -58,9 +62,16 @@ pub struct LspConfig {
     /// Binary name that must be on PATH (e.g. `"csharp-ls"`).
     #[serde(default)]
     pub binary: String,
-    /// Shell command to install the LSP server.
+    /// Shell command to install the LSP server (generic / Linux fallback).
     #[serde(default)]
     pub install: String,
+    /// Platform-specific install commands (override `install` when non-empty).
+    #[serde(default)]
+    pub install_linux: String,
+    #[serde(default)]
+    pub install_macos: String,
+    #[serde(default)]
+    pub install_windows: String,
     /// Fallback binaries tried in order when `binary` is not found on PATH.
     /// E.g. `["basedpyright-langserver", "pylsp", "jedi-language-server"]` for Python.
     #[serde(default)]
@@ -68,6 +79,23 @@ pub struct LspConfig {
     /// Command-line arguments passed to the LSP binary (default: `["--stdio"]` if needed).
     #[serde(default)]
     pub args: Vec<String>,
+}
+
+impl LspConfig {
+    /// Return the install command for the current platform.
+    /// Prefers the platform-specific field; falls back to the generic `install` field.
+    pub fn install_cmd_for_platform(&self) -> &str {
+        let platform = platform_install_field(
+            &self.install_linux,
+            &self.install_macos,
+            &self.install_windows,
+        );
+        if platform.is_empty() {
+            &self.install
+        } else {
+            platform
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -78,15 +106,58 @@ pub struct DapConfig {
     /// Executable to launch for the DAP adapter (e.g. `"codelldb"`, `"python"`).
     #[serde(default)]
     pub binary: String,
-    /// Shell command to install the DAP adapter.
+    /// Shell command to install the DAP adapter (generic / Linux fallback).
     #[serde(default)]
     pub install: String,
+    /// Platform-specific install commands (override `install` when non-empty).
+    #[serde(default)]
+    pub install_linux: String,
+    #[serde(default)]
+    pub install_macos: String,
+    #[serde(default)]
+    pub install_windows: String,
     /// Transport protocol: `"stdio"` (default) or `"tcp"`.
     #[serde(default)]
     pub transport: String,
     /// Arguments passed to the DAP binary.
     #[serde(default)]
     pub args: Vec<String>,
+}
+
+impl DapConfig {
+    /// Return the install command for the current platform.
+    /// Prefers the platform-specific field; falls back to the generic `install` field.
+    pub fn install_cmd_for_platform(&self) -> &str {
+        let platform = platform_install_field(
+            &self.install_linux,
+            &self.install_macos,
+            &self.install_windows,
+        );
+        if platform.is_empty() {
+            &self.install
+        } else {
+            platform
+        }
+    }
+}
+
+/// Pick the install command string for the current OS.
+fn platform_install_field<'a>(linux: &'a str, macos: &'a str, windows: &'a str) -> &'a str {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = (linux, macos);
+        windows
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (linux, windows);
+        macos
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let _ = (macos, windows);
+        linux
+    }
 }
 
 impl ExtensionManifest {

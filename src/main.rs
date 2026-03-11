@@ -453,8 +453,8 @@ enum Msg {
     CloseTabConfirmed { save: bool },
     /// A setting was changed via the Settings sidebar form widget.
     SettingChanged { key: String, value: String },
-    /// Open the keymaps editor scratch buffer.
-    OpenKeymapsEditor,
+    /// Open a buffer editor for the named setting key (e.g. "keymaps", "extension_registries").
+    OpenBufferEditor(String),
     /// Alt key released — confirm tab switcher if open.
     TabSwitcherRelease,
 }
@@ -598,17 +598,26 @@ fn build_setting_row(
             row.append(&dropdown);
         }
         render::SettingType::BufferEditor => {
-            let count_label =
-                gtk4::Label::new(Some(&format!("{} defined", settings.keymaps.len())));
-            count_label.set_valign(gtk4::Align::Center);
-            count_label.set_css_classes(&["dim-label"]);
-            row.append(&count_label);
+            let count_text = match def.key {
+                "keymaps" => format!("{} defined", settings.keymaps.len()),
+                "extension_registries" => {
+                    format!("{} configured", settings.extension_registries.len())
+                }
+                _ => String::new(),
+            };
+            if !count_text.is_empty() {
+                let count_label = gtk4::Label::new(Some(&count_text));
+                count_label.set_valign(gtk4::Align::Center);
+                count_label.set_css_classes(&["dim-label"]);
+                row.append(&count_label);
+            }
 
             let button = gtk4::Button::with_label("Edit…");
             button.set_valign(gtk4::Align::Center);
             let sender_c = sender.clone();
+            let key_c = def.key.to_string();
             button.connect_clicked(move |_| {
-                sender_c.send(Msg::OpenKeymapsEditor).ok();
+                sender_c.send(Msg::OpenBufferEditor(key_c.clone())).ok();
             });
             row.append(&button);
         }
@@ -4725,8 +4734,14 @@ impl SimpleComponent for App {
                 }
                 self.draw_needed.set(true);
             }
-            Msg::OpenKeymapsEditor => {
-                self.engine.borrow_mut().open_keymaps_editor();
+            Msg::OpenBufferEditor(key) => {
+                let mut engine = self.engine.borrow_mut();
+                match key.as_str() {
+                    "keymaps" => engine.open_keymaps_editor(),
+                    "extension_registries" => engine.open_registries_editor(),
+                    _ => {}
+                }
+                drop(engine);
                 self.draw_needed.set(true);
             }
             Msg::ToggleFindDialog => {
@@ -10416,8 +10431,12 @@ fn draw_ext_sidebar(
                 cr.rectangle(x, y + row as f64 * line_height, w, line_height);
                 cr.fill().ok();
             }
-            // Status dot + name
-            let name_text = format!("  ● {}", item.display_name);
+            // Status dot + name + update indicator
+            let name_text = if item.update_available {
+                format!("  ● {} \u{2191}", item.display_name) // ↑ update indicator
+            } else {
+                format!("  ● {}", item.display_name)
+            };
             cr.set_source_rgb(fg_r, fg_g, fg_b);
             layout.set_text(&name_text);
             let (_, lh4) = layout.pixel_size();
@@ -10427,7 +10446,11 @@ fn draw_ext_sidebar(
             );
             pangocairo::show_layout(cr, layout);
             // Right-aligned hint
-            let hint = "  [d] remove";
+            let hint = if item.update_available {
+                "  [u] update"
+            } else {
+                "  [d] remove"
+            };
             cr.set_source_rgb(dim_r, dim_g, dim_b);
             layout.set_text(hint);
             let (hint_w, _) = layout.pixel_size();
@@ -12110,6 +12133,11 @@ fn main() {
     if tui_mode {
         tui_main::run(file_path, debug_log);
         return;
+    }
+
+    // Ensure a display is set so GTK doesn't fail with "Failed to open display".
+    if std::env::var_os("WAYLAND_DISPLAY").is_none() && std::env::var_os("DISPLAY").is_none() {
+        std::env::set_var("DISPLAY", ":0");
     }
 
     // Install icon and .desktop file so the taskbar/launcher can find them.

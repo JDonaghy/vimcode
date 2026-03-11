@@ -89,6 +89,7 @@ fn test_manifests() -> Vec<vimcode_core::core::extensions::ExtensionManifest> {
                 install: "go install github.com/go-delve/delve/cmd/dlv@latest".to_string(),
                 transport: "stdio".to_string(),
                 args: vec!["dap".to_string()],
+                ..Default::default()
             },
             workspace_markers: vec!["go.mod".to_string(), "go.sum".to_string()],
             ..Default::default()
@@ -161,6 +162,7 @@ fn test_manifests() -> Vec<vimcode_core::core::extensions::ExtensionManifest> {
                     "jedi-language-server".to_string(),
                 ],
                 args: vec!["--stdio".to_string()],
+                ..Default::default()
             },
             dap: DapConfig {
                 adapter: "debugpy".to_string(),
@@ -1185,19 +1187,60 @@ fn ext_sidebar_search_resets_selection_to_zero_on_input() {
     );
 }
 
-// ── Settings: extension_registry_url ──────────────────────────────────────────
+// ── Settings: extension_registries ────────────────────────────────────────────
 
 #[test]
-fn extension_registry_url_is_not_empty_by_default() {
+fn extension_registries_has_default_url() {
     let s = vimcode_core::Settings::default();
     assert!(
-        !s.extension_registry_url.is_empty(),
-        "extension_registry_url should have a non-empty default"
+        !s.extension_registries.is_empty(),
+        "extension_registries should have at least one default URL"
     );
     assert!(
-        s.extension_registry_url.starts_with("http"),
-        "extension_registry_url should be an http(s) URL: {}",
-        s.extension_registry_url
+        s.extension_registries[0].starts_with("http"),
+        "first registry URL should be an http(s) URL: {}",
+        s.extension_registries[0]
+    );
+}
+
+#[test]
+fn extension_registries_set_via_comma_separated() {
+    let mut s = vimcode_core::Settings::default();
+    s.set_value_str(
+        "extension_registries",
+        "https://a.example.com/registry.json, https://b.example.com/registry.json",
+    )
+    .unwrap();
+    assert_eq!(s.extension_registries.len(), 2);
+    assert_eq!(
+        s.extension_registries[0],
+        "https://a.example.com/registry.json"
+    );
+    assert_eq!(
+        s.extension_registries[1],
+        "https://b.example.com/registry.json"
+    );
+}
+
+#[test]
+fn extension_registries_get_value_str() {
+    let s = vimcode_core::Settings::default();
+    let val = s.get_value_str("extension_registries");
+    assert!(
+        val.contains("https://"),
+        "get_value_str should return URLs: {}",
+        val
+    );
+}
+
+#[test]
+fn extension_registries_query_via_set() {
+    let mut s = vimcode_core::Settings::default();
+    let result = s.parse_set_option("extension_registries?").unwrap();
+    assert!(
+        result.starts_with("extension_registries="),
+        "query should start with 'extension_registries=': {}",
+        result
     );
 }
 
@@ -2652,5 +2695,226 @@ fn scratch_buffer_display_name() {
     assert_eq!(
         e.buffer_manager.get(buf_id).unwrap().display_name(),
         "[GitFileHistory]"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Extension versioning, cross-platform, backward compatibility
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn extension_version_stored_on_install() {
+    use vimcode_core::core::extensions::*;
+    let mut e = engine_with("");
+    e.ext_registry = Some(vec![ExtensionManifest {
+        name: "test-ext".to_string(),
+        display_name: "Test Extension".to_string(),
+        version: "1.2.3".to_string(),
+        scripts: vec![],
+        ..Default::default()
+    }]);
+    e.ext_install_from_registry("test-ext");
+    assert!(e.extension_state.is_installed("test-ext"));
+    assert_eq!(e.extension_state.installed_version("test-ext"), "1.2.3");
+    // Clean up
+    e.extension_state.installed.clear();
+}
+
+#[test]
+fn extension_version_update_detection() {
+    use vimcode_core::core::extensions::*;
+    let mut e = engine_with("");
+    // Install at v1.0.0
+    e.extension_state.mark_installed_version("my-ext", "1.0.0");
+    // Registry has v2.0.0
+    e.ext_registry = Some(vec![ExtensionManifest {
+        name: "my-ext".to_string(),
+        display_name: "My Extension".to_string(),
+        version: "2.0.0".to_string(),
+        ..Default::default()
+    }]);
+    assert!(
+        e.ext_has_update("my-ext"),
+        "should detect update when versions differ"
+    );
+    // Update to v2.0.0
+    e.extension_state.mark_installed_version("my-ext", "2.0.0");
+    assert!(
+        !e.ext_has_update("my-ext"),
+        "should not detect update when versions match"
+    );
+    // Clean up
+    e.extension_state.installed.clear();
+}
+
+#[test]
+fn extension_version_no_update_for_uninstalled() {
+    use vimcode_core::core::extensions::*;
+    let mut e = engine_with("");
+    e.ext_registry = Some(vec![ExtensionManifest {
+        name: "not-installed".to_string(),
+        display_name: "Not Installed".to_string(),
+        version: "1.0.0".to_string(),
+        ..Default::default()
+    }]);
+    assert!(
+        !e.ext_has_update("not-installed"),
+        "uninstalled extension should not report update"
+    );
+}
+
+#[test]
+fn extension_version_empty_registry_version_no_update() {
+    use vimcode_core::core::extensions::*;
+    let mut e = engine_with("");
+    e.extension_state.mark_installed_version("my-ext", "1.0.0");
+    // Registry has empty version
+    e.ext_registry = Some(vec![ExtensionManifest {
+        name: "my-ext".to_string(),
+        display_name: "My Extension".to_string(),
+        version: String::new(),
+        ..Default::default()
+    }]);
+    assert!(
+        !e.ext_has_update("my-ext"),
+        "empty registry version should not trigger update"
+    );
+    e.extension_state.installed.clear();
+}
+
+#[test]
+fn extension_state_backward_compat_plain_strings() {
+    // Old extensions.json format: installed is a plain string list
+    let json = r#"{"installed":["rust","python"],"dismissed":["java"]}"#;
+    let state: vimcode_core::core::session::ExtensionState =
+        serde_json::from_str(json).expect("should deserialize old format");
+    assert!(state.is_installed("rust"));
+    assert!(state.is_installed("python"));
+    assert!(state.is_dismissed("java"));
+    // Version should be empty for migrated entries
+    assert_eq!(state.installed_version("rust"), "");
+    assert_eq!(state.installed_version("python"), "");
+}
+
+#[test]
+fn extension_state_new_format_roundtrip() {
+    let json = r#"{"installed":[{"name":"rust","version":"1.0.0"},{"name":"python","version":"2.1.0"}],"dismissed":[]}"#;
+    let state: vimcode_core::core::session::ExtensionState =
+        serde_json::from_str(json).expect("should deserialize new format");
+    assert!(state.is_installed("rust"));
+    assert_eq!(state.installed_version("rust"), "1.0.0");
+    assert_eq!(state.installed_version("python"), "2.1.0");
+    // Re-serialize and back
+    let json2 = serde_json::to_string(&state).unwrap();
+    let state2: vimcode_core::core::session::ExtensionState =
+        serde_json::from_str(&json2).expect("roundtrip should work");
+    assert_eq!(state2.installed_version("rust"), "1.0.0");
+}
+
+#[test]
+fn extension_state_mixed_format() {
+    // Mixed: some old strings, some new objects
+    let json = r#"{"installed":["old-ext",{"name":"new-ext","version":"3.0.0"}],"dismissed":[]}"#;
+    let state: vimcode_core::core::session::ExtensionState =
+        serde_json::from_str(json).expect("should handle mixed format");
+    assert!(state.is_installed("old-ext"));
+    assert_eq!(state.installed_version("old-ext"), "");
+    assert!(state.is_installed("new-ext"));
+    assert_eq!(state.installed_version("new-ext"), "3.0.0");
+}
+
+#[test]
+fn extension_mark_installed_version_updates_existing() {
+    let mut state = vimcode_core::core::session::ExtensionState::default();
+    state.mark_installed_version("ext-a", "1.0.0");
+    assert_eq!(state.installed_version("ext-a"), "1.0.0");
+    // Update version
+    state.mark_installed_version("ext-a", "2.0.0");
+    assert_eq!(state.installed_version("ext-a"), "2.0.0");
+    // Should still be a single entry
+    assert_eq!(
+        state.installed.iter().filter(|e| e.name == "ext-a").count(),
+        1
+    );
+}
+
+#[test]
+fn platform_install_cmd_fallback() {
+    use vimcode_core::core::extensions::*;
+    // When platform-specific fields are empty, falls back to generic install
+    let lsp = LspConfig {
+        install: "npm install -g foo".to_string(),
+        ..Default::default()
+    };
+    assert_eq!(lsp.install_cmd_for_platform(), "npm install -g foo");
+}
+
+#[test]
+fn platform_install_cmd_linux_override() {
+    use vimcode_core::core::extensions::*;
+    let lsp = LspConfig {
+        install: "generic-cmd".to_string(),
+        install_linux: "linux-cmd".to_string(),
+        ..Default::default()
+    };
+    // On Linux, the platform-specific command should be preferred
+    #[cfg(target_os = "linux")]
+    assert_eq!(lsp.install_cmd_for_platform(), "linux-cmd");
+    #[cfg(target_os = "macos")]
+    assert_eq!(lsp.install_cmd_for_platform(), "generic-cmd");
+    #[cfg(target_os = "windows")]
+    assert_eq!(lsp.install_cmd_for_platform(), "generic-cmd");
+}
+
+#[test]
+fn dap_platform_install_cmd_fallback() {
+    use vimcode_core::core::extensions::*;
+    let dap = DapConfig {
+        install: "install-dap".to_string(),
+        ..Default::default()
+    };
+    assert_eq!(dap.install_cmd_for_platform(), "install-dap");
+}
+
+#[test]
+fn ext_update_not_installed() {
+    let mut e = engine_with("");
+    e.ext_registry = Some(test_manifests());
+    e.ext_update_one("bash");
+    assert!(
+        e.message.contains("not installed"),
+        "should report not installed: {}",
+        e.message
+    );
+}
+
+#[test]
+fn ext_update_all_when_up_to_date() {
+    use vimcode_core::core::extensions::*;
+    let mut e = engine_with("");
+    // Install with matching version
+    e.extension_state.mark_installed_version("bash", "1.0.0");
+    e.ext_registry = Some(vec![ExtensionManifest {
+        name: "bash".to_string(),
+        display_name: "Bash".to_string(),
+        version: "1.0.0".to_string(),
+        ..Default::default()
+    }]);
+    e.ext_update_all();
+    assert!(
+        e.message.contains("up to date"),
+        "should report up to date: {}",
+        e.message
+    );
+    e.extension_state.installed.clear();
+}
+
+#[test]
+fn config_dir_helper_returns_vimcode() {
+    let dir = vimcode_core::core::paths::vimcode_config_dir();
+    let s = dir.to_string_lossy();
+    assert!(
+        s.contains("vimcode"),
+        "config dir should contain 'vimcode': {s}"
     );
 }

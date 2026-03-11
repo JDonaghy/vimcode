@@ -19,8 +19,7 @@ pub struct SwapHeader {
 
 /// Directory where all swap files live.
 pub fn swap_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".config/vimcode/swap")
+    super::paths::vimcode_config_dir().join("swap")
 }
 
 /// Compute the swap file path for a given canonical file path.

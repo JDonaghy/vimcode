@@ -183,7 +183,7 @@ fn preview_link_cleaned_on_close() {
 fn extension_readme_opens_in_own_tab() {
     let mut e = engine_with("");
     // Simulate having an installed extension with a README on disk.
-    e.extension_state.installed.push("rust".to_string());
+    e.extension_state.mark_installed("rust");
     // Seed the registry so ext_installed_items() can find the manifest.
     e.ext_registry = Some(vec![vimcode_core::core::extensions::ExtensionManifest {
         name: "rust".to_string(),

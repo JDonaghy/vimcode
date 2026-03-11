@@ -19,6 +19,10 @@ pub fn engine_with(text: &str) -> Engine {
     let mut e = Engine::new();
     e.settings = vimcode_core::Settings::default();
     e.extension_state = vimcode_core::core::session::ExtensionState::default();
+    e.ext_registry = None;
+    // Reset mode + keymaps in case Engine::new() loaded VSCode mode from disk.
+    e.mode = Mode::Normal;
+    e.rebuild_user_keymaps();
     if !text.is_empty() {
         e.buffer_mut().insert(0, text);
     }

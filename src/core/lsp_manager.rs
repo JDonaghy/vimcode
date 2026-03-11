@@ -231,19 +231,25 @@ fn resolve_command(cmd: &str) -> Option<PathBuf> {
 
     // Check common tool directories that may not be in PATH when launched
     // from a desktop environment (not a login shell).
-    if let Some(home) = std::env::var_os("HOME") {
-        let home = PathBuf::from(home);
-        let tool_dirs = [
-            home.join(".dotnet/tools"),
-            home.join(".cargo/bin"),
-            home.join(".local/bin"),
-            home.join("go/bin"),
-            home.join(".npm-global/bin"),
-        ];
-        for dir in &tool_dirs {
-            let candidate = dir.join(binary);
-            if candidate.exists() {
-                return Some(candidate);
+    let home = super::paths::home_dir();
+    let tool_dirs = [
+        home.join(".dotnet/tools"),
+        home.join(".cargo/bin"),
+        home.join(".local/bin"),
+        home.join("go/bin"),
+        home.join(".npm-global/bin"),
+    ];
+    for dir in &tool_dirs {
+        let candidate = dir.join(binary);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+        // On Windows, also check with .exe suffix
+        #[cfg(target_os = "windows")]
+        if !binary.ends_with(".exe") {
+            let exe = dir.join(format!("{binary}.exe"));
+            if exe.exists() {
+                return Some(exe);
             }
         }
     }

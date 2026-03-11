@@ -103,8 +103,7 @@ fn mason_bin_dir() -> Option<PathBuf> {
 /// errors that modern Linux distros (Ubuntu 22.04+, Debian 12, Fedora 38+)
 /// produce when pip tries to install into the system Python.
 pub fn debugpy_venv_dir() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".config/vimcode/debugpy-venv"))
+    Some(super::paths::vimcode_config_dir().join("debugpy-venv"))
 }
 
 /// Find the Python interpreter for the *user's project* (not the adapter).
@@ -218,10 +217,13 @@ pub fn install_cmd_for_adapter(
     ext_manifests: &[extensions::ExtensionManifest],
 ) -> Option<String> {
     // Check manifests: find any manifest whose dap.adapter matches and has a
-    // non-empty dap.install field.
+    // non-empty dap.install field (platform-specific preferred).
     for manifest in ext_manifests {
-        if manifest.dap.adapter == adapter_name && !manifest.dap.install.is_empty() {
-            return Some(manifest.dap.install.clone());
+        if manifest.dap.adapter == adapter_name {
+            let cmd = manifest.dap.install_cmd_for_platform();
+            if !cmd.is_empty() {
+                return Some(cmd.to_string());
+            }
         }
     }
 
@@ -1111,6 +1113,7 @@ mod tests {
                 install: "go install github.com/go-delve/delve/cmd/dlv@latest".to_string(),
                 transport: "stdio".to_string(),
                 args: vec!["dap".to_string()],
+                ..Default::default()
             },
             ..Default::default()
         };

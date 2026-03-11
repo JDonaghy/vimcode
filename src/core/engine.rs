@@ -17,6 +17,7 @@ use super::lsp::{
     WorkspaceEdit,
 };
 use super::lsp_manager::LspManager;
+use super::paths;
 use super::plugin;
 use super::project_search::{self, ProjectMatch, ReplaceResult, SearchError, SearchOptions};
 use super::registry;
@@ -127,6 +128,7 @@ static EX_ABBREVS: &[(&str, usize)] = &[
     ("vnew", 3),
     ("vsplit", 2),
     ("wall", 2),
+    ("wincmd", 4),
     ("wqall", 3),
     ("write", 1),
     ("xall", 2),
@@ -573,6 +575,18 @@ pub static PALETTE_COMMANDS: &[PaletteCommand] = &[
         vscode_shortcut: "",
         action: "MarkdownPreview",
     },
+    PaletteCommand {
+        label: "Preferences: Open Keybinding Reference",
+        shortcut: "",
+        vscode_shortcut: "",
+        action: "Keybindings",
+    },
+    PaletteCommand {
+        label: "Preferences: Open Keyboard Shortcuts",
+        shortcut: "",
+        vscode_shortcut: "",
+        action: "Keymaps",
+    },
 ];
 
 /// How a file should be opened: as a temporary preview or permanent buffer.
@@ -767,6 +781,373 @@ fn parse_keymap_def(s: &str) -> Option<UserKeymap> {
         return None;
     }
     Some(UserKeymap { mode, keys, action })
+}
+
+// ── Keybinding reference generators ──────────────────────────────────────────
+
+fn keybindings_reference_vim() -> String {
+    "\
+VimCode — Vim Mode Keybinding Reference
+========================================
+Use / to search.  :Keymaps to add custom overrides.
+Commands shown on the right (e.g. :def) can be remapped via :map n <key> :command
+
+── Movement ────────────────────────────────────────────
+h j k l             Left / down / up / right
+w b e ge            Word forward / back / end / prev-end
+W B E gE            WORD forward / back / end / prev-end
+0  ^  $  g_         Line start / first non-blank / end / last non-blank
+f{c} F{c}           Find char forward / backward
+t{c} T{c}           Till char forward / backward
+;  ,                Repeat / reverse last f/t/F/T
+gg  G               First / last line  ({N}gg = line N)
+{  }                Paragraph backward / forward
+(  )                Sentence backward / forward
+H M L               Screen top / middle / bottom
+%                   Matching bracket
++  -                First non-blank of next / prev line
+|                   Go to column N
+gj gk               Visual (screen) line down / up (wrap mode)
+Ctrl+D  Ctrl+U      Half-page down / up
+Ctrl+F  Ctrl+B      Page down / up
+Ctrl+E  Ctrl+Y      Scroll one line down / up (cursor stays)
+Ctrl+O  Ctrl+I      Jump list back / forward
+
+── Editing ─────────────────────────────────────────────
+i I                 Insert before cursor / at first non-blank
+a A                 Append after cursor / at end of line
+o O                 Open line below / above
+s S                 Substitute char / line
+x X                 Delete char under / before cursor
+dd D                Delete line / to end of line
+cc C                Change line / to end of line
+yy Y                Yank line(s)
+p P                 Paste after / before
+gp gP               Paste, leave cursor after pasted text
+]p [p               Paste with indent adjusted
+r{c}                Replace char under cursor
+R                   Replace (overtype) mode
+u  Ctrl+R           Undo / redo
+U                   Undo all changes on current line
+.                   Repeat last change
+~                   Toggle case under cursor
+J  gJ               Join lines (with / without space)
+Ctrl+A  Ctrl+X      Increment / decrement number
+&  g&               Repeat last :s on line / all lines
+
+── Operators (+ motion or text object) ─────────────────
+d{motion}           Delete
+c{motion}           Change
+y{motion}           Yank
+>{motion}  >>       Indent
+<{motion}  <<       Dedent
+={motion}  ==       Auto-indent
+g~{motion}          Toggle case
+gu{motion}          Lowercase
+gU{motion}          Uppercase
+gq{motion}          Reflow to textwidth
+gw{motion}          Reflow, keep cursor
+g?{motion}          ROT13 encode
+!{motion}{cmd}      Filter through shell command
+zf{motion}          Create fold
+
+── Text Objects ────────────────────────────────────────
+iw aw               Inner / around word
+iW aW               Inner / around WORD
+is as               Inner / around sentence
+ip ap               Inner / around paragraph
+i\" a\"               Inner / around double quotes
+i' a'               Inner / around single quotes
+i` a`               Inner / around backticks
+i( a(  ib ab        Inner / around parentheses
+i{ a{  iB aB        Inner / around braces
+i[ a[               Inner / around brackets
+i< a<               Inner / around angle brackets
+it at               Inner / around HTML/XML tag
+
+── g-Commands ──────────────────────────────────────────
+gg                  Go to first line
+gd                  Go to definition (LSP)                :def
+gr                  Find references (LSP)                 :refs
+gy                  Go to type definition (LSP)           :LspTypedef
+gi                  Insert at last insert position
+gI                  Insert at column 1
+gf gF               Open file / file:line under cursor
+gx                  Open URL in default application
+gt gT               Next / previous tab
+gv                  Reselect last visual selection
+gn gN               Select next / prev search match
+g* g#               Search word (partial match)
+g; g,               Older / newer change position
+g.                  Go to last change
+ga                  Print ASCII value of char
+g8                  Print UTF-8 hex bytes
+go                  Go to byte offset N
+gcc                 Toggle line comment
+
+── z-Commands ──────────────────────────────────────────
+zz zt zb            Scroll cursor to center / top / bottom
+z<CR> z. z-         Scroll + move to first non-blank
+zh zl               Scroll horizontally left / right
+zH zL               Scroll half-screen horizontally
+zs ze               Scroll cursor to left / right edge
+za zo zc            Toggle / open / close fold
+zA zO zC            Toggle / open / close fold recursively
+zR zM               Open all / close all folds
+zd zD               Delete fold / recursively
+zf{motion} zF       Create fold / for N lines
+zv                  Open folds to show cursor
+zx                  Recompute folds
+zj zk               Next / previous fold
+
+── Search & Marks ──────────────────────────────────────
+/ ?                 Search forward / backward
+n N                 Next / previous match
+* #                 Search word under cursor (bounded)
+m{a-z}              Set local mark
+'{a-z}  `{a-z}     Jump to mark line / position
+m{A-Z}              Set global mark
+'' ``               Previous position (line / exact)
+'. `.               Last edit (line / exact)
+
+── Macros & Registers ──────────────────────────────────
+q{a-z}              Record macro    q  Stop recording
+@{a-z}              Play macro      @@  Repeat last
+@:                  Repeat last ex command
+\"{reg}              Use register for next yank/delete/paste
+
+── Window Commands (Ctrl+W prefix) ─────────────────────
+Ctrl+W h/j/k/l     Focus left / down / up / right        :wincmd h/j/k/l
+Ctrl+W w  W         Cycle next / previous window          :wincmd w
+Ctrl+W c  q         Close window                          :close
+Ctrl+W o            Close all other windows               :only
+Ctrl+W s  v         Horizontal / vertical split           :split  :vsplit
+Ctrl+W e  E         Split editor group right / down       :wincmd e/E
+Ctrl+W n            New window                            :new
+Ctrl+W + - < > =    Resize splits                         :wincmd +/-/</>
+Ctrl+W _ |          Maximize height / width               :wincmd _/|
+Ctrl+W H/J/K/L     Move to far left/bottom/top/right     :wincmd H/J/K/L
+Ctrl+W T            Move window to new editor group       :wincmd T
+Ctrl+W x            Exchange with next window             :wincmd x
+Ctrl+W r R          Rotate windows forward / backward     :wincmd r/R
+Ctrl+W p            Previous window                       :wincmd p
+Ctrl+W t b          Top / bottom window                   :wincmd t/b
+Ctrl+W f            Split + open file under cursor        :wincmd f
+Ctrl+W d            Split + go to definition (LSP)        :wincmd d
+
+── Bracket Navigation ──────────────────────────────────
+]c [c               Next / prev git hunk                  :nexthunk / :prevhunk
+]d [d               Next / prev LSP diagnostic            :nextdiag / :prevdiag
+[[ ]]               Section backward / forward
+[] ][               Section end backward / forward
+[m ]m               Method start backward / forward
+[M ]M               Method end backward / forward
+[{ ]}               Unmatched { / }
+[( ])               Unmatched ( / )
+[* ]*               Comment block start / end
+[z ]z               Fold start / end
+
+── Visual Mode ─────────────────────────────────────────
+v V Ctrl+V          Char / line / block visual mode
+Escape              Exit visual mode
+o O                 Swap cursor to other end / corner
+d x                 Delete selection
+c s                 Change selection
+y                   Yank selection
+p P                 Paste over selection
+> <                 Indent / dedent
+= ~                 Auto-indent / toggle case
+u U                 Lowercase / uppercase
+r{c}                Replace all chars with {c}
+I A                 Block insert / append (block mode)
+J gJ                Join lines (with / without space)
+gq gw               Reflow to textwidth
+gc                  Toggle comment
+g Ctrl+A/X          Sequential increment / decrement
+:                   Command mode with '<,'> range
+
+── Insert Mode ─────────────────────────────────────────
+Escape              Return to normal mode
+Ctrl+W              Delete word before cursor
+Ctrl+U              Delete to start of line
+Ctrl+T  Ctrl+D      Indent / dedent current line
+Ctrl+R {reg}        Insert register contents
+Ctrl+N  Ctrl+P      Next / prev completion
+Ctrl+O              Execute one normal-mode command
+Ctrl+E  Ctrl+Y      Insert char from line below / above
+Ctrl+A              Insert previously-inserted text
+Ctrl+V {char}       Insert next char literally
+Ctrl+Space          Trigger completion popup
+
+── Leader Key (default: Space) ─────────────────────────
+<leader>rn          LSP rename symbol                     :Rename
+<leader>gf          LSP format buffer                     :Lformat
+<leader>gi          LSP go to implementation              :LspImpl
+
+── Panel / Global Shortcuts ────────────────────────────
+Ctrl+P              Fuzzy file finder                     :fuzzy
+Ctrl+G              File info (name, line, col, %)
+Ctrl+B              Toggle sidebar                        :sidebar
+Ctrl+T              Toggle terminal panel                 :terminal
+Ctrl+\\              Split editor right
+Ctrl+1..9           Focus editor group by position
+Alt+E               Focus file explorer
+Alt+F               Focus search panel
+Alt+D               Add cursor at next match
+Ctrl+Shift+L        Select all occurrences
+Ctrl+Shift+P        Command palette                       :palette
+F1                  Command palette                       :palette
+K                   LSP hover info                        :hover
+F5/F6/F9/F10/F11   Debug: start/pause/BP/step-over/step-into
+                                                          :debug/:pause/:brkpt/:stepover/:stepin
+Shift+F5/F11        Debug: stop / step-out                :stop/:stepout
+Alt+M               Toggle Vim ↔ VSCode mode
+Ctrl+Tab            MRU tab switcher
+
+── Common Ex Commands ──────────────────────────────────
+:w :wa :wq :x       Save / all / save+quit
+:q :q! :qa :qa!     Quit / force / all / force-all
+:e <file>  :e!      Open file / reload
+:sp :vs              Horizontal / vertical split
+:tabnew :tabclose   New / close tab
+:s/pat/rep/[gi]     Substitute on line
+:%s/pat/rep/[gi]    Substitute all lines
+:g/pat/cmd          Global command
+:set <opt>          Query/change setting
+:noh                Clear search highlight
+:Gdiff :Gblame      Git diff / blame
+:Keymaps            Edit custom keymaps
+:Keybindings        This reference
+:colorscheme <name> Change theme
+:ExtInstall <name>  Install extension
+:LspInfo            LSP status
+:help               Help topics
+"
+    .to_string()
+}
+
+fn keybindings_reference_vscode() -> String {
+    "\
+VimCode — VSCode Mode Keybinding Reference
+===========================================
+Use Ctrl+F or / to search.
+Remap keys: F1 → \"Open Keyboard Shortcuts\", or :map n <key> :command
+
+── Editing ─────────────────────────────────────────────
+Ctrl+Z              Undo
+Ctrl+Y              Redo
+Ctrl+A              Select all
+Ctrl+C              Copy selection
+Ctrl+X              Cut selection (or cut line if empty)
+Ctrl+V              Paste
+Ctrl+/              Toggle line comment
+Ctrl+Shift+K        Delete current line
+Ctrl+Enter          Insert blank line below
+Ctrl+Shift+Enter    Insert blank line above
+Ctrl+L              Select current line
+Ctrl+BackSpace      Delete word backward
+Ctrl+Delete         Delete word forward
+Tab                 Insert tab / indent
+Shift+Tab           Outdent
+
+── Navigation ──────────────────────────────────────────
+Arrow keys          Move cursor
+Home / End          Smart line start / line end
+Ctrl+Right/Left     Move word forward / backward
+Ctrl+Home/End       Document start / end
+Page Up / Down      Page up / down
+Ctrl+G              Go to line (prompt)
+Ctrl+P              Fuzzy file finder                     :fuzzy
+Ctrl+Shift+P        Command palette                       :palette
+
+── Selection ───────────────────────────────────────────
+Shift+Arrow         Extend selection by char / line
+Shift+Home/End      Extend to line start / end
+Ctrl+Shift+Right    Extend selection word right
+Ctrl+Shift+Left     Extend selection word left
+Ctrl+Shift+Home     Extend to document start
+Ctrl+Shift+End      Extend to document end
+Ctrl+D              Select word; repeat = add next occurrence
+Ctrl+Shift+L        Select all occurrences (multi-cursor)
+
+── Multi-Cursor ────────────────────────────────────────
+Alt+Shift+Up/Down   Add cursor above / below
+Ctrl+D              Progressive: word → next occurrence
+Ctrl+Shift+L        All occurrences at once
+Escape              Collapse to single cursor
+
+── Line Operations ─────────────────────────────────────
+Alt+Up / Down       Move line(s) up / down
+Alt+Z               Toggle word wrap
+
+── Indentation ─────────────────────────────────────────
+Ctrl+]              Indent
+Ctrl+[              Outdent
+Ctrl+Shift+[        Fold region
+Ctrl+Shift+]        Unfold region
+
+── Ctrl+K Chord (press Ctrl+K, then second key) ───────
+Ctrl+K, Ctrl+C      Add line comment
+Ctrl+K, Ctrl+U      Remove line comment
+Ctrl+K, Ctrl+W      Close all editors in group
+Ctrl+K, Ctrl+F      Format document
+
+── Panel & View ────────────────────────────────────────
+F1                  Command palette                       :palette
+F10                 Toggle menu bar
+Ctrl+B              Toggle sidebar                        :sidebar
+Ctrl+J / Ctrl+`     Toggle terminal panel                 :terminal
+Ctrl+,              Open settings
+Ctrl+\\              Split editor right
+Ctrl+1..9           Focus editor group by position
+Alt+E               Focus file explorer
+Alt+F               Focus search panel
+Ctrl+Tab            MRU tab switcher
+Ctrl+Q              Quit
+
+── Debug Keys ──────────────────────────────────────────
+F5                  Start / continue debugging            :debug
+Shift+F5            Stop debugging                        :stop
+F6                  Pause debugger                        :pause
+F9                  Toggle breakpoint                     :brkpt
+F10                 Step over                             :stepover
+F11                 Step into                             :stepin
+Shift+F11           Step out                              :stepout
+F2                  Rename symbol (LSP)                   :Rename
+F12                 Go to definition (LSP)                :def
+Shift+F12           Find references (LSP)                 :refs
+Ctrl+F12            Go to implementation (LSP)            :LspImpl
+Shift+Alt+F         Format document (LSP)                 :Lformat
+
+── Panel Shortcuts (configurable in settings) ──────────
+Ctrl+P              Fuzzy file finder                     :fuzzy
+Ctrl+G              Go to line / file info
+Ctrl+B              Toggle sidebar                        :sidebar
+Ctrl+T              Toggle terminal                       :terminal
+Alt+E               Focus explorer
+Alt+F               Focus search
+Alt+D               Add cursor at next match
+Ctrl+Shift+L        Select all occurrences
+Alt+M               Toggle Vim ↔ VSCode mode
+
+── Common Commands (: prefix) ──────────────────────────
+:w :wa :wq           Save / all / save+quit
+:q :q!               Quit / force quit
+:e <file>            Open file
+:sp :vs              Horizontal / vertical split
+:tabnew :tabclose    New / close tab
+:s/pat/rep/[gi]      Substitute on line
+:%s/pat/rep/[gi]     Substitute all lines
+:set <opt>           Query/change setting
+:Gdiff :Gblame       Git diff / blame
+:Keymaps             Edit custom keymaps
+:Keybindings         This reference
+:colorscheme <name>  Change theme
+:ExtInstall <name>   Install extension
+:LspInfo             LSP status
+:help                Help topics
+"
+    .to_string()
 }
 
 /// Encode a keypress into the canonical string used for keymap matching.
@@ -2226,6 +2607,10 @@ impl Engine {
         // Keymaps scratch buffer: save content back to settings instead of disk
         if self.active_buffer_state().is_keymaps_buf {
             return self.save_keymaps_buffer();
+        }
+        // Registries scratch buffer: save content back to settings
+        if self.active_buffer_state().is_registries_buf {
+            return self.save_registries_buffer();
         }
 
         // Promote preview on save
@@ -7246,151 +7631,18 @@ impl Engine {
                 }
             }
             '\x17' => {
-                // Ctrl-W prefix
-                match unicode {
-                    Some('h') => self.focus_window_direction(SplitDirection::Vertical, false),
-                    Some('j') => self.focus_window_direction(SplitDirection::Horizontal, true),
-                    Some('k') => self.focus_window_direction(SplitDirection::Horizontal, false),
-                    Some('l') => self.focus_window_direction(SplitDirection::Vertical, true),
-                    Some('H') => {
-                        // Ctrl-W H: move window to far left (full-height vertical split)
-                        self.move_window_to_edge(SplitDirection::Vertical, false);
-                    }
-                    Some('J') => {
-                        // Ctrl-W J: move window to far bottom (full-width horizontal split)
-                        self.move_window_to_edge(SplitDirection::Horizontal, true);
-                    }
-                    Some('K') => {
-                        // Ctrl-W K: move window to far top (full-width horizontal split)
-                        self.move_window_to_edge(SplitDirection::Horizontal, false);
-                    }
-                    Some('L') => {
-                        // Ctrl-W L: move window to far right (full-height vertical split)
-                        self.move_window_to_edge(SplitDirection::Vertical, true);
-                    }
-                    Some('T') => {
-                        // Ctrl-W T: move current window to a new tab group
-                        self.move_window_to_new_group();
-                    }
-                    Some('x') => {
-                        // Ctrl-W x: exchange current window with next window in the same tab
-                        self.exchange_windows();
-                    }
-                    Some('r') => {
-                        // Ctrl-W r: rotate windows downward/rightward
-                        self.rotate_windows(true);
-                    }
-                    Some('R') => {
-                        // Ctrl-W R: rotate windows upward/leftward
-                        self.rotate_windows(false);
-                    }
-                    Some('w') | Some('W') => self.focus_next_window(),
-                    Some('c') | Some('C') => {
-                        self.close_window();
-                    }
-                    Some('o') | Some('O') => self.close_other_windows(),
-                    Some('s') | Some('S') => self.split_window(SplitDirection::Horizontal, None),
-                    Some('v') | Some('V') => self.split_window(SplitDirection::Vertical, None),
-                    Some('e') => self.open_editor_group(SplitDirection::Vertical),
-                    Some('E') => self.open_editor_group(SplitDirection::Horizontal),
-                    Some('q') => {
-                        // Ctrl-W q: quit window (alias for close)
-                        self.close_window();
-                    }
-                    Some('n') => {
-                        // Ctrl-W n: new window (horizontal split with empty buffer)
-                        let _ = self.execute_command("new");
-                    }
-                    Some('+') => {
-                        // Ctrl-W +: increase height (adjust parent horizontal split)
-                        let count = self.take_count().max(1);
-                        self.resize_window_split(SplitDirection::Horizontal, true, count);
-                    }
-                    Some('-') => {
-                        // Ctrl-W -: decrease height
-                        let count = self.take_count().max(1);
-                        self.resize_window_split(SplitDirection::Horizontal, false, count);
-                    }
-                    Some('>') => {
-                        // Ctrl-W >: increase width (adjust parent vertical split)
-                        let count = self.take_count().max(1);
-                        self.resize_window_split(SplitDirection::Vertical, true, count);
-                    }
-                    Some('<') => {
-                        // Ctrl-W <: decrease width
-                        let count = self.take_count().max(1);
-                        self.resize_window_split(SplitDirection::Vertical, false, count);
-                    }
-                    Some('=') => {
-                        // Ctrl-W =: equalize all splits
-                        self.equalize_splits();
-                    }
-                    Some('_') => {
-                        // Ctrl-W _: maximize height (set horizontal split to extreme)
-                        self.maximize_window_split(SplitDirection::Horizontal);
-                    }
-                    Some('|') => {
-                        // Ctrl-W |: maximize width (set vertical split to extreme)
-                        self.maximize_window_split(SplitDirection::Vertical);
-                    }
-                    Some('p') => {
-                        // Ctrl-W p: go to previous (last accessed) group
-                        if let Some(prev) = self.prev_active_group {
-                            if self.editor_groups.contains_key(&prev) {
-                                let cur = self.active_group;
-                                self.active_group = prev;
-                                self.prev_active_group = Some(cur);
-                            }
-                        }
-                    }
-                    Some('t') => {
-                        // Ctrl-W t: go to top-left (first) group
-                        if let Some(first) = self.group_layout.nth_leaf(0) {
-                            if first != self.active_group {
-                                self.prev_active_group = Some(self.active_group);
-                            }
-                            self.active_group = first;
-                        }
-                    }
-                    Some('b') => {
-                        // Ctrl-W b: go to bottom-right (last) group
-                        let ids = self.group_layout.group_ids();
-                        if let Some(&last) = ids.last() {
-                            if last != self.active_group {
-                                self.prev_active_group = Some(self.active_group);
-                            }
-                            self.active_group = last;
-                        }
-                    }
-                    Some('f') => {
-                        // Ctrl-W f: split + open file under cursor (gf in new split)
-                        if let Some(path) = self.file_path_under_cursor() {
-                            let abs_path = if path.is_absolute() {
-                                path
-                            } else {
-                                self.cwd.join(&path)
-                            };
-                            self.split_window(SplitDirection::Horizontal, None);
-                            return EngineAction::OpenFile(abs_path);
-                        } else {
-                            self.message = "No file path under cursor".to_string();
-                        }
-                    }
-                    Some('d') => {
-                        // Ctrl-W d: split + go to definition
-                        self.split_window(SplitDirection::Horizontal, None);
-                        self.push_jump_location();
-                        self.lsp_request_definition();
-                    }
-                    _ => {
-                        // Also handle by key_name for special keys
-                        match key_name {
-                            "Left" => self.focus_window_direction(SplitDirection::Vertical, false),
-                            "Down" => self.focus_window_direction(SplitDirection::Horizontal, true),
-                            "Up" => self.focus_window_direction(SplitDirection::Horizontal, false),
-                            "Right" => self.focus_window_direction(SplitDirection::Vertical, true),
-                            _ => {}
-                        }
+                // Ctrl-W prefix — delegate to execute_wincmd
+                if let Some(ch) = unicode {
+                    let count = self.take_count().max(1);
+                    return self.execute_wincmd(ch, count);
+                } else {
+                    // Arrow key fallback for special keys
+                    match key_name {
+                        "Left" => self.focus_window_direction(SplitDirection::Vertical, false),
+                        "Down" => self.focus_window_direction(SplitDirection::Horizontal, true),
+                        "Up" => self.focus_window_direction(SplitDirection::Horizontal, false),
+                        "Right" => self.focus_window_direction(SplitDirection::Vertical, true),
+                        _ => {}
                     }
                 }
             }
@@ -11780,6 +12032,10 @@ impl Engine {
             // Splits & tabs
             "split",
             "vsplit",
+            "close",
+            "only",
+            "new",
+            "wincmd ",
             "tabnew",
             "tabnext",
             "tabprev",
@@ -11794,6 +12050,9 @@ impl Engine {
             "set ",
             "config reload",
             "Settings",
+            "Keymaps",
+            "Keybindings",
+            "Keybindings ",
             "colorscheme ",
             // Editor groups
             "EditorGroupSplit",
@@ -11839,6 +12098,19 @@ impl Engine {
             "LspInstall",
             "Lformat",
             "Rename",
+            "def",
+            "refs",
+            "hover",
+            "LspImpl",
+            "LspTypedef",
+            // Navigation
+            "nextdiag",
+            "prevdiag",
+            "nexthunk",
+            "prevhunk",
+            "fuzzy",
+            "sidebar",
+            "palette",
             // DAP / Debug
             "DapInfo",
             "DapInstall",
@@ -11987,6 +12259,11 @@ impl Engine {
                     results.dedup();
                     results
                 }
+                "Keybindings" | "keybindings" => ["vim", "vscode"]
+                    .iter()
+                    .filter(|m| m.starts_with(arg_partial))
+                    .map(|m| format!("Keybindings {m}"))
+                    .collect(),
                 "colorscheme" => {
                     // Complete theme names
                     let mut names = vec![
@@ -12997,11 +13274,7 @@ impl Engine {
     /// Initialize the plugin manager: load all `.lua` files / `init.lua` dirs
     /// from `~/.config/vimcode/plugins/`.
     pub fn plugin_init(&mut self) {
-        let home = match std::env::var("HOME") {
-            Ok(h) => h,
-            Err(_) => return,
-        };
-        let config_base = PathBuf::from(&home).join(".config/vimcode");
+        let config_base = paths::vimcode_config_dir();
         let plugins_dir = config_base.join("plugins");
         let extensions_dir = config_base.join("extensions");
 
@@ -13041,7 +13314,7 @@ impl Engine {
                             // explicitly installed.  Scripts on disk from a
                             // previous install (or leftover extraction) should
                             // not run unless the extension is installed.
-                            if !self.extension_state.installed.contains(&ext_name) {
+                            if !self.extension_state.is_installed(&ext_name) {
                                 continue;
                             }
                             mgr.load_plugins_dir(&ext_dir, &self.settings.disabled_plugins);
@@ -13565,12 +13838,17 @@ impl Engine {
             return None;
         }
 
-        let mode_str = match self.mode {
-            Mode::Normal => "n",
-            Mode::Visual | Mode::VisualLine | Mode::VisualBlock => "v",
-            Mode::Insert => "i",
-            Mode::Command => "c",
-            _ => return None,
+        let mode_str = if self.is_vscode_mode() {
+            // VSCode mode has no modal distinction; "n" keymaps apply.
+            "n"
+        } else {
+            match self.mode {
+                Mode::Normal => "n",
+                Mode::Visual | Mode::VisualLine | Mode::VisualBlock => "v",
+                Mode::Insert => "i",
+                Mode::Command => "c",
+                _ => return None,
+            }
         };
 
         let encoded = encode_keypress(key_name, unicode, ctrl);
@@ -14273,6 +14551,20 @@ impl Engine {
                 return EngineAction::None;
             }
 
+            if let Some(name) = subcmd.strip_prefix("Update").map(|s| s.trim()) {
+                // :ExtUpdate [name] — update one or all extensions
+                if name.is_empty() {
+                    // Update all installed extensions
+                    self.ext_update_all();
+                } else {
+                    self.ext_update_one(name);
+                }
+                if let Some(cmd) = self.pending_terminal_command.take() {
+                    return EngineAction::RunInTerminal(cmd);
+                }
+                return EngineAction::None;
+            }
+
             if let Some(name) = subcmd.strip_prefix("Enable").map(|s| s.trim()) {
                 // :ExtEnable <name>
                 if name.is_empty() {
@@ -14480,6 +14772,24 @@ impl Engine {
             return EngineAction::None;
         }
 
+        // Handle :winc[md] {char} [count]
+        if cmd == "wincmd" || cmd.starts_with("wincmd ") {
+            let args = cmd.strip_prefix("wincmd").unwrap().trim();
+            if args.is_empty() {
+                self.message = "E471: Argument required".to_string();
+                return EngineAction::None;
+            }
+            let mut chars = args.chars();
+            let ch = chars.next().unwrap();
+            let rest = chars.as_str().trim();
+            let count = if rest.is_empty() {
+                1
+            } else {
+                rest.parse::<usize>().unwrap_or(1).max(1)
+            };
+            return self.execute_wincmd(ch, count);
+        }
+
         // Handle :tabnew / :tabedit [file]
         if cmd == "tabnew"
             || cmd == "tabe"
@@ -14637,6 +14947,25 @@ impl Engine {
         // Handle :Keymaps — open keymaps editor scratch buffer
         if cmd == "Keymaps" || cmd == "keymaps" {
             self.open_keymaps_editor();
+            return EngineAction::None;
+        }
+
+        // Handle :Keybindings [vim|vscode] — open read-only keybinding reference
+        if let Some(rest) = cmd
+            .strip_prefix("Keybindings")
+            .or_else(|| cmd.strip_prefix("keybindings"))
+        {
+            let arg = rest.trim();
+            let force_vscode = match arg {
+                "vim" => Some(false),
+                "vscode" => Some(true),
+                "" => None, // auto-detect from current mode
+                _ => {
+                    self.message = "Usage: :Keybindings [vim|vscode]".to_string();
+                    return EngineAction::None;
+                }
+            };
+            self.open_keybindings_reference_for(force_vscode);
             return EngineAction::None;
         }
 
@@ -15355,6 +15684,34 @@ impl Engine {
             }
             "refs" => {
                 self.lsp_request_references();
+                EngineAction::None
+            }
+            "hover" => {
+                self.lsp_request_hover();
+                EngineAction::None
+            }
+            "LspImpl" => {
+                self.lsp_request_implementation();
+                EngineAction::None
+            }
+            "LspTypedef" => {
+                self.lsp_request_type_definition();
+                EngineAction::None
+            }
+            "nextdiag" => {
+                self.jump_next_diagnostic();
+                EngineAction::None
+            }
+            "prevdiag" => {
+                self.jump_prev_diagnostic();
+                EngineAction::None
+            }
+            "nexthunk" => {
+                self.jump_next_hunk();
+                EngineAction::None
+            }
+            "prevhunk" => {
+                self.jump_prev_hunk();
                 EngineAction::None
             }
             "back" => {
@@ -20161,6 +20518,100 @@ impl Engine {
         }
     }
 
+    /// Execute a window command by character (`:wincmd {char}` and Ctrl-W {char}).
+    fn execute_wincmd(&mut self, ch: char, count: usize) -> EngineAction {
+        match ch {
+            // Focus
+            'h' => self.focus_window_direction(SplitDirection::Vertical, false),
+            'j' => self.focus_window_direction(SplitDirection::Horizontal, true),
+            'k' => self.focus_window_direction(SplitDirection::Horizontal, false),
+            'l' => self.focus_window_direction(SplitDirection::Vertical, true),
+            'w' | 'W' => self.focus_next_window(),
+            'p' => {
+                if let Some(prev) = self.prev_active_group {
+                    if self.editor_groups.contains_key(&prev) {
+                        let cur = self.active_group;
+                        self.active_group = prev;
+                        self.prev_active_group = Some(cur);
+                    }
+                }
+            }
+            't' => {
+                if let Some(first) = self.group_layout.nth_leaf(0) {
+                    if first != self.active_group {
+                        self.prev_active_group = Some(self.active_group);
+                    }
+                    self.active_group = first;
+                }
+            }
+            'b' => {
+                let ids = self.group_layout.group_ids();
+                if let Some(&last) = ids.last() {
+                    if last != self.active_group {
+                        self.prev_active_group = Some(self.active_group);
+                    }
+                    self.active_group = last;
+                }
+            }
+            // Move
+            'H' => self.move_window_to_edge(SplitDirection::Vertical, false),
+            'J' => self.move_window_to_edge(SplitDirection::Horizontal, true),
+            'K' => self.move_window_to_edge(SplitDirection::Horizontal, false),
+            'L' => self.move_window_to_edge(SplitDirection::Vertical, true),
+            'T' => self.move_window_to_new_group(),
+            'x' => self.exchange_windows(),
+            'r' => self.rotate_windows(true),
+            'R' => self.rotate_windows(false),
+            // Split / Close
+            's' | 'S' => self.split_window(SplitDirection::Horizontal, None),
+            'v' | 'V' => self.split_window(SplitDirection::Vertical, None),
+            'c' | 'C' => {
+                self.close_window();
+            }
+            'q' => {
+                self.close_window();
+            }
+            'o' | 'O' => self.close_other_windows(),
+            'n' => {
+                let _ = self.execute_command("new");
+            }
+            // Editor groups
+            'e' => self.open_editor_group(SplitDirection::Vertical),
+            'E' => self.open_editor_group(SplitDirection::Horizontal),
+            // Resize (count-aware)
+            '+' => self.resize_window_split(SplitDirection::Horizontal, true, count),
+            '-' => self.resize_window_split(SplitDirection::Horizontal, false, count),
+            '>' => self.resize_window_split(SplitDirection::Vertical, true, count),
+            '<' => self.resize_window_split(SplitDirection::Vertical, false, count),
+            '=' => self.equalize_splits(),
+            '_' => self.maximize_window_split(SplitDirection::Horizontal),
+            '|' => self.maximize_window_split(SplitDirection::Vertical),
+            // Composite
+            'f' => {
+                if let Some(path) = self.file_path_under_cursor() {
+                    let abs_path = if path.is_absolute() {
+                        path
+                    } else {
+                        self.cwd.join(&path)
+                    };
+                    self.split_window(SplitDirection::Horizontal, None);
+                    return EngineAction::OpenFile(abs_path);
+                } else {
+                    self.message = "No file path under cursor".to_string();
+                }
+            }
+            'd' => {
+                self.split_window(SplitDirection::Horizontal, None);
+                self.push_jump_location();
+                self.lsp_request_definition();
+            }
+            _ => {
+                self.message = format!("Unknown wincmd: {}", ch);
+            }
+        }
+        EngineAction::None
+    }
+
     /// Ctrl-W H/J/K/L: move current window to far edge.
     /// Creates a new editor group at the edge of the entire layout.
     fn move_window_to_edge(&mut self, direction: SplitDirection, forward: bool) {
@@ -20986,10 +21437,9 @@ impl Engine {
         let mut result: Vec<extensions::ExtensionManifest> =
             self.ext_registry.clone().unwrap_or_default();
 
-        // Merge local extensions: scan ~/.config/vimcode/extensions/*/manifest.toml
+        // Merge local extensions: scan extensions/*/manifest.toml in config dir
         // so developers can test extensions locally before publishing to the registry.
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        let ext_base = std::path::PathBuf::from(&home).join(".config/vimcode/extensions");
+        let ext_base = paths::vimcode_config_dir().join("extensions");
         if let Ok(entries) = std::fs::read_dir(&ext_base) {
             for entry in entries.filter_map(|e| e.ok()) {
                 let dir = entry.path();
@@ -21011,21 +21461,39 @@ impl Engine {
         result
     }
 
-    /// Spawn a background thread to fetch the remote registry.
+    /// Spawn a background thread to fetch all configured extension registries.
     /// Result arrives via `ext_registry_rx`.
     pub fn ext_refresh(&mut self) {
         if self.ext_registry_fetching {
             return; // already in progress
         }
-        let url = self.settings.extension_registry_url.clone();
+        let urls = self.settings.extension_registries.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let result = registry::fetch_registry(&url);
+            let mut merged: Vec<extensions::ExtensionManifest> = Vec::new();
+            for url in &urls {
+                if let Some(mut entries) = registry::fetch_registry(url) {
+                    let base = registry::base_url_from_registry(url);
+                    for m in &mut entries {
+                        m.registry_base_url = base.clone();
+                    }
+                    // Later registries override earlier ones on name collision
+                    for entry in entries {
+                        merged.retain(|m| !m.name.eq_ignore_ascii_case(&entry.name));
+                        merged.push(entry);
+                    }
+                }
+            }
+            let result = if merged.is_empty() && !urls.is_empty() {
+                None // all fetches failed
+            } else {
+                Some(merged)
+            };
             let _ = tx.send(result);
         });
         self.ext_registry_rx = Some(rx);
         self.ext_registry_fetching = true;
-        self.message = "Fetching extension registry...".to_string();
+        self.message = "Fetching extension registries...".to_string();
     }
 
     /// Non-blocking check for a completed registry fetch.
@@ -21073,15 +21541,17 @@ impl Engine {
         let ext_name = manifest.name.clone();
 
         // Download scripts from the registry (skip files already on disk for local dev)
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        let ext_dir = std::path::PathBuf::from(&home)
-            .join(".config/vimcode/extensions")
+        let ext_dir = paths::vimcode_config_dir()
+            .join("extensions")
             .join(&ext_name);
-        if !manifest.scripts.is_empty() && std::fs::create_dir_all(&ext_dir).is_ok() {
+        if !manifest.scripts.is_empty()
+            && !manifest.registry_base_url.is_empty()
+            && std::fs::create_dir_all(&ext_dir).is_ok()
+        {
             for script in &manifest.scripts {
                 let dest = ext_dir.join(script);
                 if !dest.exists() {
-                    let url = format!("{}/{}/{}", registry::FILES_BASE_URL, ext_name, script);
+                    let url = format!("{}/{}/{}", manifest.registry_base_url, ext_name, script);
                     let _ = registry::download_script(&url, &dest);
                 }
             }
@@ -21101,10 +21571,10 @@ impl Engine {
             let found_bin = all_lsp.iter().copied().find(|b| binary_on_path(b));
             if let Some(bin) = found_bin {
                 status_parts.push(format!("LSP: {bin} ✓"));
-            } else if !manifest.lsp.install.is_empty() {
+            } else if !manifest.lsp.install_cmd_for_platform().is_empty() {
                 let lsp_key = format!("ext:{ext_name}:lsp");
                 self.lsp_installing.insert(lsp_key.clone());
-                install_commands.push(manifest.lsp.install.clone());
+                install_commands.push(manifest.lsp.install_cmd_for_platform().to_string());
                 self.pending_install_context = Some(InstallContext {
                     ext_name: ext_name.clone(),
                     install_key: lsp_key,
@@ -21123,10 +21593,10 @@ impl Engine {
             let already_on_path = !dap_binary.is_empty() && binary_on_path(dap_binary);
             if already_on_path {
                 status_parts.push(format!("DAP: {dap_binary} ✓"));
-            } else if !manifest.dap.install.is_empty() {
+            } else if !manifest.dap.install_cmd_for_platform().is_empty() {
                 let dap_key = format!("dap:{}", manifest.dap.adapter);
                 self.lsp_installing.insert(dap_key.clone());
-                install_commands.push(manifest.dap.install.clone());
+                install_commands.push(manifest.dap.install_cmd_for_platform().to_string());
                 // Only set install context if LSP didn't already set it.
                 if self.pending_install_context.is_none() {
                     self.pending_install_context = Some(InstallContext {
@@ -21151,8 +21621,9 @@ impl Engine {
             self.pending_terminal_command = Some(format!("{header} && {combined}"));
         }
 
-        // Mark installed and persist
-        self.extension_state.mark_installed(&ext_name);
+        // Mark installed with version and persist
+        self.extension_state
+            .mark_installed_version(&ext_name, &manifest.version);
         let _ = self.extension_state.save();
 
         // Reload plugins so newly extracted scripts are active
@@ -21191,13 +21662,10 @@ impl Engine {
     /// LSP binaries are NOT removed (they may be shared with other tools).
     pub fn ext_remove(&mut self, name: &str) {
         let name = name.to_string();
-        self.extension_state.installed.retain(|n| n != &name);
+        self.extension_state.installed.retain(|e| e.name != name);
         let _ = self.extension_state.save();
 
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        let ext_dir = std::path::PathBuf::from(&home)
-            .join(".config/vimcode/extensions")
-            .join(&name);
+        let ext_dir = paths::vimcode_config_dir().join("extensions").join(&name);
         let _ = std::fs::remove_dir_all(&ext_dir);
 
         // Reload plugins so removed scripts are no longer active
@@ -21205,6 +21673,150 @@ impl Engine {
         self.plugin_init();
 
         self.message = format!("Extension '{name}' removed (LSP binary untouched)");
+    }
+
+    /// Update a single extension: re-download scripts and update version.
+    pub fn ext_update_one(&mut self, name: &str) {
+        if !self.extension_state.is_installed(name) {
+            self.message = format!("Extension '{name}' is not installed");
+            return;
+        }
+        let manifest = self
+            .ext_available_manifests()
+            .into_iter()
+            .find(|m| m.name.eq_ignore_ascii_case(name));
+        let manifest = match manifest {
+            Some(m) => m,
+            None => {
+                self.message = format!("Extension '{name}' not found in registry");
+                return;
+            }
+        };
+
+        let ext_name = manifest.name.clone();
+        let new_version = manifest.version.clone();
+
+        // Re-download scripts (overwrite existing files)
+        let ext_dir = paths::vimcode_config_dir()
+            .join("extensions")
+            .join(&ext_name);
+        if !manifest.scripts.is_empty()
+            && !manifest.registry_base_url.is_empty()
+            && std::fs::create_dir_all(&ext_dir).is_ok()
+        {
+            for script in &manifest.scripts {
+                let dest = ext_dir.join(script);
+                let url = format!("{}/{}/{}", manifest.registry_base_url, ext_name, script);
+                let _ = registry::download_script(&url, &dest);
+            }
+        }
+
+        // Check if LSP/DAP install commands need to run (only if binaries missing)
+        let mut install_commands: Vec<String> = Vec::new();
+        if !manifest.lsp.binary.is_empty() {
+            let all_lsp: Vec<&str> = std::iter::once(manifest.lsp.binary.as_str())
+                .chain(manifest.lsp.fallback_binaries.iter().map(|s| s.as_str()))
+                .filter(|b| !b.is_empty())
+                .collect();
+            if all_lsp.iter().copied().all(|b| !binary_on_path(b)) {
+                let cmd = manifest.lsp.install_cmd_for_platform();
+                if !cmd.is_empty() {
+                    install_commands.push(cmd.to_string());
+                }
+            }
+        }
+        if !manifest.dap.adapter.is_empty()
+            && !manifest.dap.binary.is_empty()
+            && !binary_on_path(&manifest.dap.binary)
+        {
+            let cmd = manifest.dap.install_cmd_for_platform();
+            if !cmd.is_empty() {
+                install_commands.push(cmd.to_string());
+            }
+        }
+
+        if !install_commands.is_empty() {
+            let combined = install_commands.join(" && ");
+            let header = format!("echo '── Updating {ext_name} ──'");
+            self.pending_terminal_command = Some(format!("{header} && {combined}"));
+        }
+
+        // Update version
+        self.extension_state
+            .mark_installed_version(&ext_name, &new_version);
+        let _ = self.extension_state.save();
+
+        // Reload plugins
+        self.plugin_manager = None;
+        self.plugin_init();
+
+        self.message = if new_version.is_empty() {
+            format!("Extension '{ext_name}' updated")
+        } else {
+            format!("Extension '{ext_name}' updated to v{new_version}")
+        };
+    }
+
+    /// Update all installed extensions that have newer versions available.
+    pub fn ext_update_all(&mut self) {
+        let manifests = self.ext_available_manifests();
+        let mut updated = Vec::new();
+        for manifest in &manifests {
+            let installed_ver = self.extension_state.installed_version(&manifest.name);
+            if installed_ver.is_empty() && self.extension_state.is_installed(&manifest.name) {
+                // No version tracked — always update
+                updated.push(manifest.name.clone());
+            } else if self.extension_state.is_installed(&manifest.name)
+                && !manifest.version.is_empty()
+                && manifest.version != installed_ver
+            {
+                updated.push(manifest.name.clone());
+            }
+        }
+        if updated.is_empty() {
+            self.message = "All extensions are up to date".to_string();
+            return;
+        }
+        let count = updated.len();
+        for name in &updated {
+            // Re-download scripts for each
+            if let Some(manifest) = manifests.iter().find(|m| &m.name == name) {
+                let ext_dir = paths::vimcode_config_dir().join("extensions").join(name);
+                if !manifest.scripts.is_empty()
+                    && !manifest.registry_base_url.is_empty()
+                    && std::fs::create_dir_all(&ext_dir).is_ok()
+                {
+                    for script in &manifest.scripts {
+                        let dest = ext_dir.join(script);
+                        let url = format!("{}/{}/{}", manifest.registry_base_url, name, script);
+                        let _ = registry::download_script(&url, &dest);
+                    }
+                }
+                self.extension_state
+                    .mark_installed_version(name, &manifest.version);
+            }
+        }
+        let _ = self.extension_state.save();
+        self.plugin_manager = None;
+        self.plugin_init();
+        self.message = format!("{count} extension(s) updated: {}", updated.join(", "));
+    }
+
+    /// Returns true if a newer version is available for the given extension.
+    pub fn ext_has_update(&self, name: &str) -> bool {
+        if !self.extension_state.is_installed(name) {
+            return false;
+        }
+        let installed_ver = self.extension_state.installed_version(name);
+        if let Some(registry) = &self.ext_registry {
+            if let Some(manifest) = registry.iter().find(|m| m.name == name) {
+                if manifest.version.is_empty() {
+                    return false;
+                }
+                return installed_ver.is_empty() || manifest.version != installed_ver;
+            }
+        }
+        false
     }
 
     // ─── Extension Panel helpers ────────────────────────────────────────────
@@ -21429,6 +22041,7 @@ impl Engine {
             }
             "Return" => {
                 // Open README for any extension (installed or available)
+                let manifests = self.ext_available_manifests();
                 let installed = self.ext_installed_items();
                 let sel = self.ext_sidebar_selected;
                 let name = if sel < installed.len() {
@@ -21439,15 +22052,19 @@ impl Engine {
                     available.get(avail_idx).map(|m| m.name.clone())
                 };
                 if let Some(name) = name {
+                    let base_url = manifests
+                        .iter()
+                        .find(|m| m.name == name)
+                        .map(|m| m.registry_base_url.as_str())
+                        .unwrap_or("");
                     // Try to load README from installed extension dir, otherwise fetch from registry
-                    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-                    let readme_path = std::path::PathBuf::from(&home)
-                        .join(".config/vimcode/extensions")
+                    let readme_path = paths::vimcode_config_dir()
+                        .join("extensions")
                         .join(&name)
                         .join("README.md");
                     let content = std::fs::read_to_string(&readme_path)
                         .ok()
-                        .or_else(|| registry::fetch_readme(&name));
+                        .or_else(|| registry::fetch_readme(base_url, &name));
                     if let Some(content) = content {
                         self.open_markdown_preview_in_tab(&content, &name);
                     } else {
@@ -21469,17 +22086,17 @@ impl Engine {
                     let available = self.ext_available_items();
                     let avail_idx = sel.saturating_sub(installed.len());
                     if avail_idx < available.len() {
+                        let base_url = available[avail_idx].registry_base_url.clone();
                         let name = available[avail_idx].name.clone();
                         self.ext_install_from_registry(&name);
                         // Try to open README after install
-                        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-                        let readme_path = std::path::PathBuf::from(&home)
-                            .join(".config/vimcode/extensions")
+                        let readme_path = paths::vimcode_config_dir()
+                            .join("extensions")
                             .join(&name)
                             .join("README.md");
                         let content = std::fs::read_to_string(&readme_path)
                             .ok()
-                            .or_else(|| registry::fetch_readme(&name));
+                            .or_else(|| registry::fetch_readme(&base_url, &name));
                         if let Some(content) = content {
                             self.open_markdown_preview_in_tab(&content, &name);
                         }
@@ -21509,6 +22126,20 @@ impl Engine {
                     let new_total = self.ext_flat_item_count();
                     if new_total > 0 && self.ext_sidebar_selected >= new_total {
                         self.ext_sidebar_selected = new_total - 1;
+                    }
+                }
+                true
+            }
+            "u" => {
+                // Update the selected installed extension
+                let installed = self.ext_installed_items();
+                let sel = self.ext_sidebar_selected;
+                if sel < installed.len() {
+                    let name = installed[sel].name.clone();
+                    if self.ext_has_update(&name) {
+                        self.ext_update_one(&name);
+                    } else {
+                        self.message = format!("Extension '{name}' is already up to date");
                     }
                 }
                 true
@@ -21766,10 +22397,12 @@ impl Engine {
                                 }
                             }
                             SettingType::BufferEditor => {
-                                if matches!(key, "Return" | "Space" | "l" | "Right")
-                                    && def.key == "keymaps"
-                                {
-                                    self.open_keymaps_editor();
+                                if matches!(key, "Return" | "Space" | "l" | "Right") {
+                                    match def.key {
+                                        "keymaps" => self.open_keymaps_editor(),
+                                        "extension_registries" => self.open_registries_editor(),
+                                        _ => {}
+                                    }
                                 }
                             }
                         }
@@ -21828,12 +22461,28 @@ impl Engine {
             return;
         }
 
-        // Build content: one keymap per line
-        let content = if self.settings.keymaps.is_empty() {
-            String::new()
-        } else {
-            format!("{}\n", self.settings.keymaps.join("\n"))
-        };
+        // Build content: header comment + one keymap per line
+        let mut content = String::from(
+            "# User keymaps — one per line.  :w to save.\n\
+             # Format: mode keys :command\n\
+             # Modes: n (normal), v (visual), i (insert), c (command)\n\
+             # Keys:  single char (x), modifier (<C-x>, <A-x>), sequence (gcc)\n\
+             #\n\
+             # In VSCode mode, \"n\" keymaps apply (use modifiers like <C-x>, <A-x>).\n\
+             # Run :Keybindings to see all built-in keybindings and command names.\n\
+             #\n\
+             # Examples:\n\
+             # n <C-/> :Commentary\n\
+             # v <C-/> :Commentary\n\
+             # n gcc   :Commentary\n\
+             # n <A-j> :move +1\n\
+             # n <A-k> :move -1\n\
+             #\n",
+        );
+        for km in &self.settings.keymaps {
+            content.push_str(km);
+            content.push('\n');
+        }
         let buf_id = self.buffer_manager.create();
         if let Some(state) = self.buffer_manager.get_mut(buf_id) {
             state.buffer.content = ropey::Rope::from_str(&content);
@@ -21862,7 +22511,7 @@ impl Engine {
         for line_idx in 0..rope.len_lines() {
             let line: String = rope.line(line_idx).chars().collect();
             let trimmed = line.trim();
-            if trimmed.is_empty() {
+            if trimmed.is_empty() || trimmed.starts_with('#') {
                 continue;
             }
             // Validate the keymap definition
@@ -21885,6 +22534,171 @@ impl Engine {
             "{} keymap{} saved to settings",
             count,
             if count == 1 { "" } else { "s" }
+        );
+        Ok(())
+    }
+
+    /// Open a read-only reference buffer listing all default keybindings.
+    /// `force_vscode`: `None` = auto-detect from current mode,
+    /// `Some(true)` = VSCode, `Some(false)` = Vim.
+    pub fn open_keybindings_reference_for(&mut self, force_vscode: Option<bool>) {
+        let is_vscode = force_vscode.unwrap_or_else(|| self.is_vscode_mode());
+        let scratch_name = if is_vscode {
+            "Keybindings (VSCode)"
+        } else {
+            "Keybindings (Vim)"
+        };
+
+        // Reuse existing buffer for the same mode if already open
+        let existing_buf_id = self
+            .buffer_manager
+            .iter()
+            .find(|(_, state)| state.scratch_name.as_deref() == Some(scratch_name))
+            .map(|(id, _)| *id);
+
+        if let Some(buf_id) = existing_buf_id {
+            let tab_idx = self
+                .active_group()
+                .tabs
+                .iter()
+                .enumerate()
+                .find(|(_, tab)| {
+                    self.windows
+                        .get(&tab.active_window)
+                        .is_some_and(|w| w.buffer_id == buf_id)
+                })
+                .map(|(i, _)| i);
+            if let Some(idx) = tab_idx {
+                self.active_group_mut().active_tab = idx;
+            } else {
+                self.active_window_mut().buffer_id = buf_id;
+                self.view_mut().cursor.line = 0;
+                self.view_mut().cursor.col = 0;
+            }
+            return;
+        }
+
+        let content = if is_vscode {
+            keybindings_reference_vscode()
+        } else {
+            keybindings_reference_vim()
+        };
+
+        let buf_id = self.buffer_manager.create();
+        if let Some(state) = self.buffer_manager.get_mut(buf_id) {
+            state.buffer.content = ropey::Rope::from_str(&content);
+            state.scratch_name = Some(scratch_name.to_string());
+            state.read_only = true;
+            state.dirty = false;
+        }
+
+        let window_id = self.new_window_id();
+        let window = Window::new(window_id, buf_id);
+        self.windows.insert(window_id, window);
+        let tab_id = self.new_tab_id();
+        let tab = Tab::new(tab_id, window_id);
+        self.active_group_mut().tabs.push(tab);
+        self.active_group_mut().active_tab = self.active_group().tabs.len() - 1;
+
+        let mode_name = if is_vscode { "VSCode" } else { "Vim" };
+        self.message = format!(
+            "{mode_name} keybindings reference — use / to search. Try :Keybindings {}",
+            if is_vscode { "vim" } else { "vscode" }
+        );
+    }
+
+    /// Open a scratch buffer for editing extension registry URLs (one per line).
+    pub fn open_registries_editor(&mut self) {
+        // If a registries buffer already exists, switch to it
+        let existing_buf_id = self
+            .buffer_manager
+            .iter()
+            .find(|(_, state)| state.is_registries_buf)
+            .map(|(id, _)| *id);
+
+        if let Some(buf_id) = existing_buf_id {
+            let tab_idx = self
+                .active_group()
+                .tabs
+                .iter()
+                .enumerate()
+                .find(|(_, tab)| {
+                    self.windows
+                        .get(&tab.active_window)
+                        .is_some_and(|w| w.buffer_id == buf_id)
+                })
+                .map(|(i, _)| i);
+
+            if let Some(idx) = tab_idx {
+                self.active_group_mut().active_tab = idx;
+            } else {
+                self.active_window_mut().buffer_id = buf_id;
+                self.view_mut().cursor.line = 0;
+                self.view_mut().cursor.col = 0;
+            }
+            self.settings_has_focus = false;
+            return;
+        }
+
+        // Build content: header comment + one URL per line
+        let mut content = String::from(
+            "# Extension registries — one URL per line.\n\
+             # Lines starting with # are comments.\n",
+        );
+        for url in &self.settings.extension_registries {
+            content.push_str(url);
+            content.push('\n');
+        }
+
+        let buf_id = self.buffer_manager.create();
+        if let Some(state) = self.buffer_manager.get_mut(buf_id) {
+            state.buffer.content = ropey::Rope::from_str(&content);
+            state.is_registries_buf = true;
+            state.dirty = false;
+        }
+
+        let window_id = self.new_window_id();
+        let window = Window::new(window_id, buf_id);
+        self.windows.insert(window_id, window);
+        let tab_id = self.new_tab_id();
+        let tab = Tab::new(tab_id, window_id);
+        self.active_group_mut().tabs.push(tab);
+        self.active_group_mut().active_tab = self.active_group().tabs.len() - 1;
+
+        self.settings_has_focus = false;
+        self.message =
+            "Edit extension registries (one URL per line, # comments). :w to save.".to_string();
+    }
+
+    /// Save registries buffer content back to settings.
+    pub fn save_registries_buffer(&mut self) -> Result<(), String> {
+        let state = self.active_buffer_state();
+        let rope = &state.buffer.content;
+        let mut urls = Vec::new();
+        for line_idx in 0..rope.len_lines() {
+            let line: String = rope.line(line_idx).chars().collect();
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
+                return Err(format!(
+                    "Invalid URL on line {}: \"{}\" (must start with http:// or https://)",
+                    line_idx + 1,
+                    trimmed
+                ));
+            }
+            urls.push(trimmed.to_string());
+        }
+
+        self.settings.extension_registries = urls;
+        let _ = self.settings.save();
+        let count = self.settings.extension_registries.len();
+        self.active_buffer_state_mut().dirty = false;
+        self.message = format!(
+            "{} registr{} saved to settings",
+            count,
+            if count == 1 { "y" } else { "ies" }
         );
         Ok(())
     }
@@ -25519,8 +26333,8 @@ impl Engine {
 /// List custom VSCode theme names from `~/.config/vimcode/themes/*.json`.
 fn list_custom_theme_names() -> Vec<String> {
     let mut names = Vec::new();
-    if let Ok(home) = std::env::var("HOME") {
-        let dir = std::path::PathBuf::from(home).join(".config/vimcode/themes");
+    {
+        let dir = paths::vimcode_config_dir().join("themes");
         if let Ok(entries) = std::fs::read_dir(&dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -25537,9 +26351,9 @@ fn list_custom_theme_names() -> Vec<String> {
 }
 
 fn binary_on_path(binary: &str) -> bool {
-    let path_var = std::env::var("PATH").unwrap_or_default();
-    for dir in path_var.split(':') {
-        let full = std::path::Path::new(dir).join(binary);
+    let path_var = std::env::var_os("PATH").unwrap_or_default();
+    for dir in std::env::split_paths(&path_var) {
+        let full = dir.join(binary);
         if full.exists() {
             super::lsp_manager::install_log(&format!(
                 "[ext-check] FOUND {binary} at {}",
@@ -25547,10 +26361,22 @@ fn binary_on_path(binary: &str) -> bool {
             ));
             return true;
         }
+        // On Windows, also check with .exe suffix
+        #[cfg(target_os = "windows")]
+        if !binary.ends_with(".exe") {
+            let exe = dir.join(format!("{binary}.exe"));
+            if exe.exists() {
+                super::lsp_manager::install_log(&format!(
+                    "[ext-check] FOUND {binary}.exe at {}",
+                    exe.display()
+                ));
+                return true;
+            }
+        }
     }
     super::lsp_manager::install_log(&format!(
         "[ext-check] NOT FOUND {binary} in PATH={}",
-        path_var
+        path_var.to_string_lossy()
     ));
     false
 }
@@ -28233,6 +29059,19 @@ impl Engine {
         // to the command handler — no undo group needed.
         if self.mode == Mode::Command {
             return self.handle_command_key(key_name, unicode, ctrl);
+        }
+
+        // User-defined keymaps (`:map n <key> :command`) work in VSCode mode too.
+        // Mode "n" maps are matched since VSCode has no modal distinction.
+        if !self.user_keymaps.is_empty() {
+            let mut km_changed = false;
+            if let Some(km_action) = self.try_user_keymap(key_name, unicode, ctrl, &mut km_changed)
+            {
+                if km_changed {
+                    self.set_dirty(true);
+                }
+                return km_action;
+            }
         }
 
         let mut changed = false;

@@ -6,19 +6,23 @@ use std::path::{Path, PathBuf};
 use super::extensions::ExtensionManifest;
 
 /// Default registry URL — raw GitHub content from the vimcode-ext repo.
-/// Override via `settings.extension_registry_url` for self-hosted / custom domain.
-pub const REGISTRY_URL: &str =
+pub const DEFAULT_REGISTRY_URL: &str =
     "https://raw.githubusercontent.com/JDonaghy/vimcode-ext/main/registry.json";
 
-/// Base URL for downloading individual extension files (scripts, manifests, READMEs).
-pub const FILES_BASE_URL: &str = "https://raw.githubusercontent.com/JDonaghy/vimcode-ext/main";
+/// Derive the base URL for downloading extension files from a registry URL.
+/// `".../main/registry.json"` → `".../main"`.
+pub fn base_url_from_registry(registry_url: &str) -> String {
+    registry_url
+        .rsplit_once('/')
+        .map(|(base, _)| base.to_string())
+        .unwrap_or_else(|| registry_url.to_string())
+}
 
 // ─── Registry cache ───────────────────────────────────────────────────────────
 
 /// Path to the local registry cache file.
 fn cache_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".config/vimcode/registry_cache.json")
+    super::paths::vimcode_config_dir().join("registry_cache.json")
 }
 
 /// Load the cached registry from disk. Returns `None` on any I/O or parse error.
@@ -70,9 +74,12 @@ pub fn download_script(url: &str, dest: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Download a README from the remote registry. Returns `None` on failure.
-pub fn fetch_readme(ext_name: &str) -> Option<String> {
-    let url = format!("{}/{}/README.md", FILES_BASE_URL, ext_name);
+/// Download a README from a registry. Returns `None` on failure or empty base URL.
+pub fn fetch_readme(base_url: &str, ext_name: &str) -> Option<String> {
+    if base_url.is_empty() {
+        return None;
+    }
+    let url = format!("{}/{}/README.md", base_url, ext_name);
     let output = std::process::Command::new("curl")
         .args(["-sf", "--max-time", "10"])
         .arg(&url)
@@ -89,14 +96,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_url_is_nonempty() {
-        assert!(!REGISTRY_URL.is_empty());
-        assert!(REGISTRY_URL.starts_with("https://"));
+    fn default_registry_url_is_nonempty() {
+        assert!(!DEFAULT_REGISTRY_URL.is_empty());
+        assert!(DEFAULT_REGISTRY_URL.starts_with("https://"));
     }
 
     #[test]
-    fn files_base_url_is_nonempty() {
-        assert!(!FILES_BASE_URL.is_empty());
+    fn base_url_from_registry_strips_filename() {
+        assert_eq!(
+            base_url_from_registry("https://example.com/main/registry.json"),
+            "https://example.com/main"
+        );
+        assert_eq!(
+            base_url_from_registry("https://example.com/registry.json"),
+            "https://example.com"
+        );
+        // No slash — returns input as-is
+        assert_eq!(base_url_from_registry("bare-string"), "bare-string");
     }
 
     #[test]

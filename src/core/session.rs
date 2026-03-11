@@ -52,13 +52,11 @@ struct LegacySession {
 
 impl HistoryState {
     fn history_path() -> PathBuf {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        PathBuf::from(home).join(".config/vimcode/history.json")
+        super::paths::vimcode_config_dir().join("history.json")
     }
 
     fn legacy_session_path() -> PathBuf {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        PathBuf::from(home).join(".config/vimcode/session.json")
+        super::paths::vimcode_config_dir().join("session.json")
     }
 
     /// Load history from history.json.
@@ -127,13 +125,57 @@ impl HistoryState {
 // ExtensionState — installed/dismissed extension tracking
 // ---------------------------------------------------------------------------
 
+/// A single installed extension with its version.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InstalledExtension {
+    pub name: String,
+    #[serde(default)]
+    pub version: String,
+}
+
+/// Custom deserializer that accepts both the old format (plain string list)
+/// and the new format (list of `InstalledExtension` objects).
+fn deserialize_installed<'de, D>(deserializer: D) -> Result<Vec<InstalledExtension>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+    use serde_json::Value;
+
+    let values: Vec<Value> = Vec::deserialize(deserializer)?;
+    let mut result = Vec::with_capacity(values.len());
+    for v in values {
+        match v {
+            Value::String(name) => {
+                // Old format: plain string → version unknown
+                result.push(InstalledExtension {
+                    name,
+                    version: String::new(),
+                });
+            }
+            Value::Object(_) => {
+                // New format: object with name+version
+                let ext: InstalledExtension =
+                    serde_json::from_value(v).map_err(de::Error::custom)?;
+                result.push(ext);
+            }
+            _ => {
+                return Err(de::Error::custom(
+                    "expected string or object in installed list",
+                ));
+            }
+        }
+    }
+    Ok(result)
+}
+
 /// Which extensions the user has installed or dismissed, persisted to
 /// `~/.config/vimcode/extensions.json`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ExtensionState {
-    /// Names of extensions the user has installed (e.g. `["csharp", "git-insights"]`).
-    #[serde(default)]
-    pub installed: Vec<String>,
+    /// Extensions the user has installed, with version tracking.
+    #[serde(default, deserialize_with = "deserialize_installed")]
+    pub installed: Vec<InstalledExtension>,
     /// Names of extensions the user dismissed the install prompt for.
     #[serde(default)]
     pub dismissed: Vec<String>,
@@ -141,8 +183,7 @@ pub struct ExtensionState {
 
 impl ExtensionState {
     fn extensions_path() -> std::path::PathBuf {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        std::path::PathBuf::from(home).join(".config/vimcode/extensions.json")
+        super::paths::vimcode_config_dir().join("extensions.json")
     }
 
     /// Load extension state from disk.  Returns `Default` when the file is
@@ -181,11 +222,25 @@ impl ExtensionState {
         }
     }
 
-    /// Mark an extension as installed, removing any dismissed entry.
+    /// Mark an extension as installed (with version), removing any dismissed entry.
+    #[allow(dead_code)]
     pub fn mark_installed(&mut self, name: &str) {
+        self.mark_installed_version(name, "");
+    }
+
+    /// Mark an extension as installed with a specific version.
+    pub fn mark_installed_version(&mut self, name: &str, version: &str) {
         self.dismissed.retain(|n| n != name);
-        if !self.installed.contains(&name.to_string()) {
-            self.installed.push(name.to_string());
+        if let Some(existing) = self.installed.iter_mut().find(|e| e.name == name) {
+            // Update version of already-installed extension
+            if !version.is_empty() {
+                existing.version = version.to_string();
+            }
+        } else {
+            self.installed.push(InstalledExtension {
+                name: name.to_string(),
+                version: version.to_string(),
+            });
         }
     }
 
@@ -197,7 +252,16 @@ impl ExtensionState {
     }
 
     pub fn is_installed(&self, name: &str) -> bool {
-        self.installed.iter().any(|n| n == name)
+        self.installed.iter().any(|e| e.name == name)
+    }
+
+    /// Return the installed version of an extension, or empty string if not tracked.
+    pub fn installed_version(&self, name: &str) -> &str {
+        self.installed
+            .iter()
+            .find(|e| e.name == name)
+            .map(|e| e.version.as_str())
+            .unwrap_or("")
     }
 
     pub fn is_dismissed(&self, name: &str) -> bool {
@@ -382,8 +446,7 @@ impl SessionState {
     }
 
     fn session_path() -> PathBuf {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        PathBuf::from(home).join(".config/vimcode/session.json")
+        super::paths::vimcode_config_dir().join("session.json")
     }
 
     /// Compute a stable per-workspace session path based on the workspace root.
@@ -397,9 +460,8 @@ impl SessionState {
             hash ^= byte as u64;
             hash = hash.wrapping_mul(0x00000100000001b3);
         }
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        PathBuf::from(home)
-            .join(".config/vimcode/sessions")
+        super::paths::vimcode_config_dir()
+            .join("sessions")
             .join(format!("{:016x}.json", hash))
     }
 
@@ -656,7 +718,10 @@ mod tests {
         assert!(es.is_installed("csharp"));
         // idempotent
         es.mark_installed("csharp");
-        assert_eq!(es.installed.iter().filter(|n| *n == "csharp").count(), 1);
+        assert_eq!(
+            es.installed.iter().filter(|e| e.name == "csharp").count(),
+            1
+        );
     }
 
     #[test]
