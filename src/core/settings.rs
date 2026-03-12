@@ -184,11 +184,14 @@ pub struct Settings {
     #[serde(default)]
     pub textwidth: usize,
 
-    /// URL of the extension registry JSON file.
-    /// Default points to the official VimCode GitHub registry.
-    /// Override for self-hosted or GitHub Pages custom domain setups.
-    #[serde(default = "default_extension_registry_url")]
-    pub extension_registry_url: String,
+    /// URLs of extension registry JSON files (fetched in order; later entries override earlier
+    /// on name collision). Default: the official VimCode GitHub registry.
+    #[serde(default = "default_extension_registries")]
+    pub extension_registries: Vec<String>,
+
+    /// Legacy field — migrated into `extension_registries` on load.
+    #[serde(default, skip_serializing)]
+    extension_registry_url: String,
 
     /// Name of the active colour scheme. Built-in options: "onedark" (default),
     /// "gruvbox-dark", "tokyo-night", "solarized-dark".
@@ -329,8 +332,8 @@ fn default_leader() -> char {
     ' '
 }
 
-fn default_extension_registry_url() -> String {
-    crate::core::registry::REGISTRY_URL.to_string()
+fn default_extension_registries() -> Vec<String> {
+    vec![crate::core::registry::DEFAULT_REGISTRY_URL.to_string()]
 }
 
 fn default_colorscheme() -> String {
@@ -617,7 +620,8 @@ impl Default for Settings {
             splitright: false,
             colorcolumn: String::new(),
             textwidth: 0,
-            extension_registry_url: default_extension_registry_url(),
+            extension_registries: default_extension_registries(),
+            extension_registry_url: String::new(),
             colorscheme: default_colorscheme(),
             ai_provider: default_ai_provider(),
             ai_api_key: String::new(),
@@ -679,8 +683,27 @@ impl Settings {
         let contents = fs::read_to_string(&path)
             .map_err(|e| format!("Failed to read settings file at {}: {}", path.display(), e))?;
 
-        serde_json::from_str(&contents)
-            .map_err(|e| format!("Failed to parse settings.json: {}. Check JSON syntax.", e))
+        let mut settings: Self = serde_json::from_str(&contents)
+            .map_err(|e| format!("Failed to parse settings.json: {}. Check JSON syntax.", e))?;
+        settings.migrate_legacy_fields();
+        Ok(settings)
+    }
+
+    /// Migrate deprecated fields into their replacements.
+    fn migrate_legacy_fields(&mut self) {
+        // extension_registry_url (String) → extension_registries (Vec<String>)
+        if !self.extension_registry_url.is_empty() {
+            let default_regs = default_extension_registries();
+            // If registries is still the default (single official URL) and the old field
+            // is set to something different, replace with the old value.
+            if self.extension_registries == default_regs
+                && self.extension_registries.first().map(|s| s.as_str())
+                    != Some(&self.extension_registry_url)
+            {
+                self.extension_registries = vec![self.extension_registry_url.clone()];
+            }
+            self.extension_registry_url.clear();
+        }
     }
 
     /// Apply a single vim `:set` argument and update `self` in place.
@@ -909,6 +932,13 @@ impl Settings {
                     .map_err(|_| format!("Invalid value for {name}: '{value}'"))?;
                 self.updatetime = n;
             }
+            "extension_registries" => {
+                self.extension_registries = value
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
             _ => return Err(format!("Unknown option: {name}")),
         }
         Ok(())
@@ -1046,6 +1076,10 @@ impl Settings {
             } else {
                 "noautopairs".to_string()
             }),
+            "extension_registries" => Ok(format!(
+                "extension_registries={}",
+                self.extension_registries.join(",")
+            )),
             _ => Err(format!("Unknown option: {opt}")),
         }
     }
@@ -1077,11 +1111,7 @@ impl Settings {
     }
 
     pub fn settings_file_path() -> PathBuf {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        PathBuf::from(home)
-            .join(".config")
-            .join("vimcode")
-            .join("settings.json")
+        super::paths::vimcode_config_dir().join("settings.json")
     }
 
     /// Get the current value of a setting as a string.
@@ -1136,6 +1166,7 @@ impl Settings {
             "indent_guides" | "indentguides" => self.indent_guides.to_string(),
             "match_brackets" | "matchbrackets" => self.match_brackets.to_string(),
             "auto_pairs" | "autopairs" => self.auto_pairs.to_string(),
+            "extension_registries" => self.extension_registries.join(", "),
             _ => String::new(),
         }
     }
@@ -1231,6 +1262,13 @@ impl Settings {
             "indent_guides" | "indentguides" => self.indent_guides = value == "true",
             "match_brackets" | "matchbrackets" => self.match_brackets = value == "true",
             "auto_pairs" | "autopairs" => self.auto_pairs = value == "true",
+            "extension_registries" => {
+                self.extension_registries = value
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
             _ => return Err(format!("Unknown setting key: {key}")),
         }
         Ok(())
@@ -1284,8 +1322,8 @@ pub fn available_colorschemes() -> Vec<String> {
         "tokyo-night".into(),
         "solarized-dark".into(),
     ];
-    if let Some(home) = std::env::var_os("HOME") {
-        let dir = std::path::PathBuf::from(home).join(".config/vimcode/themes");
+    {
+        let dir = super::paths::vimcode_config_dir().join("themes");
         if let Ok(entries) = std::fs::read_dir(&dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -1601,6 +1639,14 @@ pub static SETTING_DEFS: &[SettingDef] = &[
         description: "Auto-close brackets and quotes in Insert mode",
         category: "Editor",
         setting_type: SettingType::Bool,
+    },
+    // ── Extensions ────────────────────────────────────────────────────────────
+    SettingDef {
+        key: "extension_registries",
+        label: "Registries",
+        description: "Press Enter to edit registry URLs (one per line, # comments)",
+        category: "Extensions",
+        setting_type: SettingType::BufferEditor,
     },
     // ── TUI ─────────────────────────────────────────────────────────────────
     SettingDef {

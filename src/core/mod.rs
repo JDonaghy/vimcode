@@ -12,6 +12,7 @@ pub mod lsp;
 pub mod lsp_manager;
 pub mod markdown;
 pub mod mode;
+pub mod paths;
 pub mod plugin;
 pub mod project_search;
 pub mod registry;

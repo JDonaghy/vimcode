@@ -14,8 +14,17 @@ fn keymaps_command_opens_scratch_buffer() {
     // Should now be in a keymaps buffer
     assert!(e.active_buffer_state().is_keymaps_buf);
     let lines = get_lines(&e);
-    assert_eq!(lines[0], "n K :join");
-    assert_eq!(lines[1], "n J :nop");
+    // Header comments come first, then user keymaps
+    assert!(
+        lines[0].starts_with('#'),
+        "first line should be a comment header"
+    );
+    let user_lines: Vec<&str> = lines
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|l| !l.starts_with('#') && !l.is_empty())
+        .collect();
+    assert_eq!(user_lines, vec!["n K :join", "n J :nop"]);
 }
 
 #[test]
@@ -31,9 +40,18 @@ fn keymaps_editor_empty_settings() {
     assert!(e.settings.keymaps.is_empty());
     exec(&mut e, "Keymaps");
     assert!(e.active_buffer_state().is_keymaps_buf);
-    // Empty buffer — no content lines (just one empty line)
+    // Should have comment header but no user keymaps
     let lines = get_lines(&e);
-    assert!(lines.is_empty() || lines[0].is_empty());
+    assert!(
+        lines[0].starts_with('#'),
+        "first line should be a comment header"
+    );
+    let user_lines: Vec<&str> = lines
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|l| !l.starts_with('#') && !l.is_empty())
+        .collect();
+    assert!(user_lines.is_empty(), "no user keymaps should be present");
 }
 
 #[test]

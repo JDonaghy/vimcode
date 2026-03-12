@@ -11,7 +11,7 @@ env:
 
 jobs:
   test:
-    name: Test
+    name: Test (Linux)
     runs-on: ubuntu-24.04   # GTK 4.14 — satisfies features = ["v4_10"] in Cargo.toml
 
     steps:

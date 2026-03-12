@@ -649,6 +649,8 @@ pub struct ExtSidebarItem {
     /// Number of bundled Lua scripts.
     pub script_count: usize,
     pub installed: bool,
+    /// True when a newer version is available in the registry.
+    pub update_available: bool,
 }
 
 /// Rendering data for the Extensions sidebar panel.
@@ -670,6 +672,27 @@ pub struct ExtSidebarData {
     pub input_active: bool,
     /// True while a background registry fetch is in-flight.
     pub fetching: bool,
+}
+
+// ─── ExtPanelData (extension-provided sidebar panels) ────────────────────────
+
+/// Rendering data for a single extension-provided sidebar panel.
+#[derive(Debug, Clone)]
+pub struct ExtPanelData {
+    pub name: String,
+    pub title: String,
+    pub sections: Vec<ExtPanelSectionData>,
+    pub selected: usize,
+    pub has_focus: bool,
+    pub scroll_top: usize,
+}
+
+/// A single section within an extension panel.
+#[derive(Debug, Clone)]
+pub struct ExtPanelSectionData {
+    pub name: String,
+    pub items: Vec<crate::core::plugin::ExtPanelItem>,
+    pub expanded: bool,
 }
 
 // ─── AiPanelData ─────────────────────────────────────────────────────────────
@@ -1489,6 +1512,8 @@ pub struct ScreenLayout {
     pub ext_sidebar: Option<ExtSidebarData>,
     /// AI assistant panel data — `Some` when the AI panel is the active sidebar panel.
     pub ai_panel: Option<AiPanelData>,
+    /// Extension-provided panel data — `Some` when an extension panel is the active sidebar panel.
+    pub ext_panel: Option<ExtPanelData>,
     /// Breadcrumb bars for each editor group (empty when breadcrumbs are disabled).
     pub breadcrumbs: Vec<BreadcrumbBar>,
 }
@@ -3107,6 +3132,7 @@ pub fn build_screen_layout(
         editor_group_split,
         ext_sidebar,
         ai_panel,
+        ext_panel: build_ext_panel_data(engine),
         breadcrumbs,
     }
 }
@@ -3182,22 +3208,25 @@ fn build_source_control_data(engine: &Engine) -> Option<SourceControlData> {
 
 fn build_ext_sidebar_data(engine: &Engine) -> Option<ExtSidebarData> {
     // Always build so backends can check ext_sidebar_has_focus.
-    let manifest_to_item =
-        |m: &crate::core::extensions::ExtensionManifest, installed: bool| -> ExtSidebarItem {
-            ExtSidebarItem {
-                name: m.name.clone(),
-                display_name: if m.display_name.is_empty() {
-                    m.name.clone()
-                } else {
-                    m.display_name.clone()
-                },
-                description: m.description.clone(),
-                lsp_binary: m.lsp.binary.clone(),
-                dap_adapter: m.dap.adapter.clone(),
-                script_count: m.scripts.len(),
-                installed,
-            }
-        };
+    let manifest_to_item = |m: &crate::core::extensions::ExtensionManifest,
+                            installed: bool,
+                            has_update: bool|
+     -> ExtSidebarItem {
+        ExtSidebarItem {
+            name: m.name.clone(),
+            display_name: if m.display_name.is_empty() {
+                m.name.clone()
+            } else {
+                m.display_name.clone()
+            },
+            description: m.description.clone(),
+            lsp_binary: m.lsp.binary.clone(),
+            dap_adapter: m.dap.adapter.clone(),
+            script_count: m.scripts.len(),
+            installed,
+            update_available: has_update,
+        }
+    };
 
     let items_installed: Vec<ExtSidebarItem> = engine
         .ext_available_manifests()
@@ -3209,7 +3238,7 @@ fn build_ext_sidebar_data(engine: &Engine) -> Option<ExtSidebarData> {
                 || m.name.to_lowercase().contains(&q)
                 || m.display_name.to_lowercase().contains(&q)
         })
-        .map(|m| manifest_to_item(m, true))
+        .map(|m| manifest_to_item(m, true, engine.ext_has_update(&m.name)))
         .collect();
 
     let items_available: Vec<ExtSidebarItem> = engine
@@ -3222,7 +3251,7 @@ fn build_ext_sidebar_data(engine: &Engine) -> Option<ExtSidebarData> {
                 || m.name.to_lowercase().contains(&q)
                 || m.display_name.to_lowercase().contains(&q)
         })
-        .map(|m| manifest_to_item(m, false))
+        .map(|m| manifest_to_item(m, false, false))
         .collect();
 
     Some(ExtSidebarData {
@@ -3234,6 +3263,39 @@ fn build_ext_sidebar_data(engine: &Engine) -> Option<ExtSidebarData> {
         query: engine.ext_sidebar_query.clone(),
         input_active: engine.ext_sidebar_input_active,
         fetching: engine.ext_registry_fetching,
+    })
+}
+
+fn build_ext_panel_data(engine: &Engine) -> Option<ExtPanelData> {
+    let panel_name = engine.ext_panel_active.as_ref()?;
+    let reg = engine.ext_panels.get(panel_name)?;
+    let expanded_vec = engine.ext_panel_sections_expanded.get(panel_name);
+    let sections: Vec<ExtPanelSectionData> = reg
+        .sections
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let expanded = expanded_vec.and_then(|v| v.get(i)).copied().unwrap_or(true);
+            let key = (panel_name.clone(), name.clone());
+            let items = engine
+                .ext_panel_items
+                .get(&key)
+                .cloned()
+                .unwrap_or_default();
+            ExtPanelSectionData {
+                name: name.clone(),
+                items,
+                expanded,
+            }
+        })
+        .collect();
+    Some(ExtPanelData {
+        name: panel_name.clone(),
+        title: reg.title.clone(),
+        sections,
+        selected: engine.ext_panel_selected,
+        has_focus: engine.ext_panel_has_focus,
+        scroll_top: engine.ext_panel_scroll_top,
     })
 }
 

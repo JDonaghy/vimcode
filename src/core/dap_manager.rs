@@ -103,8 +103,7 @@ fn mason_bin_dir() -> Option<PathBuf> {
 /// errors that modern Linux distros (Ubuntu 22.04+, Debian 12, Fedora 38+)
 /// produce when pip tries to install into the system Python.
 pub fn debugpy_venv_dir() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".config/vimcode/debugpy-venv"))
+    Some(super::paths::vimcode_config_dir().join("debugpy-venv"))
 }
 
 /// Find the Python interpreter for the *user's project* (not the adapter).
@@ -213,13 +212,17 @@ pub fn resolve_binary(name: &str) -> Option<PathBuf> {
 /// installation.
 ///
 /// On Unix the command is run via `sh -c`; on Windows via `cmd /C`.
-pub fn install_cmd_for_adapter(adapter_name: &str) -> Option<String> {
+pub fn install_cmd_for_adapter(
+    adapter_name: &str,
+    ext_manifests: &[extensions::ExtensionManifest],
+) -> Option<String> {
     // Check manifests: find any manifest whose dap.adapter matches and has a
-    // non-empty dap.install field.
-    for bundle in extensions::BUNDLED {
-        if let Some(manifest) = extensions::ExtensionManifest::parse(bundle.manifest_toml) {
-            if manifest.dap.adapter == adapter_name && !manifest.dap.install.is_empty() {
-                return Some(manifest.dap.install.clone());
+    // non-empty dap.install field (platform-specific preferred).
+    for manifest in ext_manifests {
+        if manifest.dap.adapter == adapter_name {
+            let cmd = manifest.dap.install_cmd_for_platform();
+            if !cmd.is_empty() {
+                return Some(cmd.to_string());
             }
         }
     }
@@ -682,7 +685,10 @@ pub fn generate_launch_json(lang: &str, workspace_folder: &str) -> String {
 /// also detected without hardcoding them here.
 ///
 /// Falls back to `start_dir` itself if no marker is found.
-pub fn find_workspace_root(start_dir: &std::path::Path) -> std::path::PathBuf {
+pub fn find_workspace_root(
+    start_dir: &std::path::Path,
+    ext_manifests: &[extensions::ExtensionManifest],
+) -> std::path::PathBuf {
     const CORE_MARKERS: &[&str] = &[
         "Cargo.toml",
         "package.json",
@@ -694,11 +700,10 @@ pub fn find_workspace_root(start_dir: &std::path::Path) -> std::path::PathBuf {
     // Glob-style markers checked via directory scan (e.g. *.sln for C#).
     const GLOB_EXTS: &[&str] = &["sln", "csproj"];
 
-    // Collect additional markers from bundled extension manifests.
-    let manifest_markers: Vec<String> = extensions::BUNDLED
+    // Collect additional markers from extension manifests.
+    let manifest_markers: Vec<String> = ext_manifests
         .iter()
-        .filter_map(|b| extensions::ExtensionManifest::parse(b.manifest_toml))
-        .flat_map(|m| m.workspace_markers)
+        .flat_map(|m| m.workspace_markers.clone())
         .filter(|mk| {
             // Exclude glob-style markers (containing '*') — they are handled
             // separately via the GLOB_EXTS extension scan.
@@ -797,18 +802,22 @@ impl DapManager {
     /// then falls back to the built-in `ADAPTER_REGISTRY`.
     /// `name_or_lang` may be an adapter name (e.g. `"codelldb"`) or a language
     /// identifier (e.g. `"rust"`).
-    pub fn start_adapter(&mut self, name_or_lang: &str) -> Result<(), String> {
+    pub fn start_adapter(
+        &mut self,
+        name_or_lang: &str,
+        ext_manifests: &[extensions::ExtensionManifest],
+    ) -> Result<(), String> {
         // ── 1. Try to resolve from extension manifest ────────────────────────
         // Check by language ID first, then treat name_or_lang as an adapter name
         // matched against manifest dap.adapter fields.
-        let manifest_dap = extensions::find_for_language_id(name_or_lang)
-            .map(|(_, m)| m)
+        let manifest_dap = extensions::find_manifest_for_language_id(ext_manifests, name_or_lang)
+            .cloned()
             .or_else(|| {
                 // Search all manifests for one whose dap.adapter matches.
-                extensions::BUNDLED
+                ext_manifests
                     .iter()
-                    .filter_map(|b| extensions::ExtensionManifest::parse(b.manifest_toml))
                     .find(|m| m.dap.adapter == name_or_lang)
+                    .cloned()
             })
             .filter(|m| !m.dap.binary.is_empty());
 
@@ -979,7 +988,7 @@ mod tests {
 
     #[test]
     fn test_install_cmd_codelldb_contains_github_url() {
-        let cmd = install_cmd_for_adapter("codelldb");
+        let cmd = install_cmd_for_adapter("codelldb", &[]);
         assert!(cmd.is_some(), "codelldb should have an install command");
         let cmd = cmd.unwrap();
         assert!(
@@ -990,7 +999,7 @@ mod tests {
 
     #[test]
     fn test_install_cmd_debugpy() {
-        let cmd = install_cmd_for_adapter("debugpy");
+        let cmd = install_cmd_for_adapter("debugpy", &[]);
         assert!(cmd.is_some());
         let cmd = cmd.unwrap();
         assert!(cmd.contains("pip") && cmd.contains("debugpy"), "{cmd}");
@@ -1000,7 +1009,7 @@ mod tests {
     fn test_install_cmd_debugpy_creates_venv() {
         // The install command must create a managed venv before installing into it.
         // This avoids PEP 668 "externally managed environment" errors.
-        let cmd = install_cmd_for_adapter("debugpy").expect("debugpy should have install cmd");
+        let cmd = install_cmd_for_adapter("debugpy", &[]).expect("debugpy should have install cmd");
         assert!(
             cmd.contains("venv"),
             "install cmd should create a venv: {cmd}"
@@ -1010,7 +1019,7 @@ mod tests {
     #[test]
     fn test_install_cmd_debugpy_installs_into_venv_not_system() {
         // debugpy must be installed into the managed venv, not the system Python.
-        let cmd = install_cmd_for_adapter("debugpy").expect("debugpy should have install cmd");
+        let cmd = install_cmd_for_adapter("debugpy", &[]).expect("debugpy should have install cmd");
         assert!(
             cmd.contains("debugpy-venv"),
             "install cmd should target the managed venv path: {cmd}"
@@ -1020,7 +1029,7 @@ mod tests {
     #[test]
     fn test_install_cmd_debugpy_uses_m_pip() {
         // Install via `-m pip` so the pip belongs to the venv python.
-        let cmd = install_cmd_for_adapter("debugpy").expect("debugpy should have install cmd");
+        let cmd = install_cmd_for_adapter("debugpy", &[]).expect("debugpy should have install cmd");
         assert!(
             cmd.contains("-m pip"),
             "install cmd should use `-m pip`: {cmd}"
@@ -1030,7 +1039,7 @@ mod tests {
     #[test]
     fn test_install_cmd_debugpy_does_not_use_bare_pip3() {
         // Must not start with a bare `pip`/`pip3` call — that would bypass the venv.
-        let cmd = install_cmd_for_adapter("debugpy").expect("debugpy should have install cmd");
+        let cmd = install_cmd_for_adapter("debugpy", &[]).expect("debugpy should have install cmd");
         assert!(
             !cmd.starts_with("pip"),
             "install cmd must not start with bare pip/pip3: {cmd}"
@@ -1092,8 +1101,23 @@ mod tests {
     }
 
     #[test]
-    fn test_install_cmd_delve() {
-        let cmd = install_cmd_for_adapter("delve");
+    fn test_install_cmd_delve_from_manifest() {
+        use super::super::extensions::ExtensionManifest;
+        // Simulate a Go manifest with delve DAP config
+        let go_manifest = ExtensionManifest {
+            name: "go".to_string(),
+            display_name: "Go".to_string(),
+            dap: super::super::extensions::DapConfig {
+                adapter: "delve".to_string(),
+                binary: "dlv".to_string(),
+                install: "go install github.com/go-delve/delve/cmd/dlv@latest".to_string(),
+                transport: "stdio".to_string(),
+                args: vec!["dap".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let cmd = install_cmd_for_adapter("delve", &[go_manifest]);
         assert!(cmd.is_some());
         let cmd = cmd.unwrap();
         assert!(cmd.contains("go install") && cmd.contains("dlv"), "{cmd}");
@@ -1101,7 +1125,7 @@ mod tests {
 
     #[test]
     fn test_install_cmd_netcoredbg() {
-        let cmd = install_cmd_for_adapter("netcoredbg");
+        let cmd = install_cmd_for_adapter("netcoredbg", &[]);
         assert!(cmd.is_some());
         let cmd = cmd.unwrap();
         assert!(cmd.contains("netcoredbg") && cmd.contains("curl"), "{cmd}");
@@ -1109,9 +1133,9 @@ mod tests {
 
     #[test]
     fn test_install_cmd_unknown_returns_none() {
-        assert!(install_cmd_for_adapter("java-debug").is_none());
-        assert!(install_cmd_for_adapter("js-debug").is_none());
-        assert!(install_cmd_for_adapter("nonexistent").is_none());
+        assert!(install_cmd_for_adapter("java-debug", &[]).is_none());
+        assert!(install_cmd_for_adapter("js-debug", &[]).is_none());
+        assert!(install_cmd_for_adapter("nonexistent", &[]).is_none());
     }
 
     // ── parse_launch_json ─────────────────────────────────────────────────────
@@ -1255,7 +1279,7 @@ mod tests {
         // Use the actual vimcode project root which has Cargo.toml.
         // Start from a subdirectory and expect to find the root.
         let start = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let root = find_workspace_root(&start);
+        let root = find_workspace_root(&start, &[]);
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         assert_eq!(root, manifest_dir, "should find project root from src/");
     }
@@ -1263,7 +1287,7 @@ mod tests {
     #[test]
     fn test_find_workspace_root_at_root_itself() {
         let start = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let root = find_workspace_root(start);
+        let root = find_workspace_root(start, &[]);
         assert_eq!(root, start, "root dir with Cargo.toml should return itself");
     }
 
@@ -1271,7 +1295,7 @@ mod tests {
     fn test_find_workspace_root_no_marker_returns_start() {
         // /tmp should have no workspace markers.
         let start = std::path::Path::new("/tmp");
-        let root = find_workspace_root(start);
+        let root = find_workspace_root(start, &[]);
         assert_eq!(root, start, "no markers → fall back to start dir");
     }
 

@@ -1,9 +1,24 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 161 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 167 archived here. Recent work summary in PROJECT_STATE.md.
 
 ---
+
+**Session 167 — :wincmd Ex Command (4071 tests):**
+Added `:wincmd {char} [count]` ex command (abbreviation `:winc`) that executes any window command programmatically (e.g., `:wincmd h` is equivalent to `Ctrl-W h`). Refactored the `Ctrl-W` handler to delegate to a shared `execute_wincmd()` method, eliminating code duplication between the key handler and the new ex command. Updated `:Keybindings` reference to show command names alongside keybindings. Added `:close`, `:only`, `:new`, `:wincmd` to tab completion. 23 integration tests in `tests/wincmd.rs`.
+
+**Session 166 — Extension Registry Decoupling (4053 tests):**
+Fully decoupled extensions from compiled-in data. Removed `BUNDLED` static array and all `include_str!()` from `extensions.rs`. Extensions now fetched from remote GitHub registry ([vimcode-ext](https://github.com/JDonaghy/vimcode-ext)) and cached locally at `~/.config/vimcode/registry_cache.json`. `ext_available_manifests()` merges registry + local extensions from `~/.config/vimcode/extensions/*/manifest.toml`. `LspManager` stores manifests via `set_ext_manifests()`, `DapManager` functions accept manifests as parameters. New extensions can be added without updating VimCode code. Local extension development supported: create `manifest.toml` + scripts in `extensions/<name>/`, they appear in the sidebar automatically. Removed `extensions/` directory from repo. Generated `registry.json` with all 17 extension manifests. Updated EXTENSIONS.md with local dev workflow and registry submission guide.
+
+**Session 165 — Extension Panel API + Git Log Panel (4053 tests):**
+Extension panel infrastructure for custom sidebar panels from Lua plugins. New types: `PanelRegistration`, `ExtPanelItem`, `ExtPanelStyle` in plugin.rs. Lua API: `vimcode.panel.register/set_items/parse_event`, `vimcode.git.branches()`. Engine state: `ext_panels`, `ext_panel_items`, `ext_panel_active`, `ext_panel_has_focus`, `ext_panel_selected`, `ext_panel_scroll_top`, `ext_panel_sections_expanded`. `handle_ext_panel_key()` with j/k nav, Tab expand/collapse, Enter `panel_select` event, q/Esc unfocus, other keys `panel_action` event. Render: `ExtPanelData`/`ExtPanelSectionData` in render.rs, `build_ext_panel_data()`. TUI: `render_ext_panel()`, dynamic activity bar icons, keyboard routing, click handling. GTK: `SidebarPanel::ExtPanel(String)` variant. Git Log Panel: `git::list_branches()`/`BranchEntry` in git.rs, new `git_log_panel.lua` script with Branches/Log/Stash sections, manifest updated (8 scripts total). 17 integration tests in `tests/ext_panel.rs`.
+
+**Session 163 — Git Insights enhancement (4036 tests):**
+Full git-insights extension overhaul. Part 1: Extended Lua plugin API with 12 new `vimcode.git.*` bindings. Added 9 new git.rs functions + 2 structs (`DetailedLogEntry`, `StashEntry`). Part 2: Scratch buffer API — `ScratchBufferRequest` struct, `vimcode.buf.open_scratch()` Lua binding, engine handler in `apply_plugin_ctx()`. `BufferState.scratch_name` for `[Name]` tab display. 6 new Lua scripts for git-insights. BUNDLED array updated from 1→7 scripts. 36 new tests total. Also fixed Flatpak build (cargo-sources.json regen).
+
+**Session 162 — Bulk paste performance fix (4003 tests):**
+Fixed critical performance bug: pasting large text in insert mode caused UI freeze / 100% CPU. Root cause was `Event::Paste` (TUI) and `ClipboardPasteToInput` (GTK) feeding each character individually through `handle_key()`. New `Engine::paste_in_insert_mode(text)` method does a single bulk `insert_with_undo()`. Also added safety guard in `compute_word_wrap_segments()`. 8 new tests in `tests/paste_insert.rs`.
 
 **Session 161 — Terminal install + F1 palette (3995 tests):**
 Extension install scripts now run in a visible terminal pane (TerminalPane::new_command) instead of silently in the background — users see real-time output, errors, and can enter sudo passwords. InstallContext struct tracks extension name/install key for post-install LSP/DAP registration. EngineAction::RunInTerminal bridges engine→UI. F1 opens Command Palette in both Vim and VSCode modes (fixes Ctrl+Shift+P not working in many terminals). 3 new extension install tests.

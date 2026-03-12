@@ -4,6 +4,10 @@ This document covers everything needed to build VimCode extensions, including th
 and the TOML manifest format. An extension bundles an LSP server config, optional DAP (debugger)
 adapter, and optional Lua scripts into a single named package.
 
+> **Registry:** Official extensions live in the [vimcode-ext](https://github.com/JDonaghy/vimcode-ext)
+> repository. VimCode fetches the registry on startup and caches it locally. You can also develop
+> and test extensions locally before submitting them to the registry.
+
 ## Quick Start
 
 Create a directory under `~/.config/vimcode/extensions/` with a `manifest.toml` and optional
@@ -12,11 +16,54 @@ Lua scripts:
 ```
 ~/.config/vimcode/extensions/my-extension/
 ├── manifest.toml    # Required: extension metadata + LSP/DAP config
-└── my_script.lua    # Optional: Lua plugin script
+├── my_script.lua    # Optional: Lua plugin script
+└── README.md        # Optional: shown in Extensions panel on Enter
 ```
 
 Install with `:ExtInstall my-extension`, manage with `:ExtList`, `:ExtDisable`, `:ExtEnable`,
 `:ExtRemove`.
+
+## Local Extension Development
+
+You can develop and test extensions entirely locally without publishing to the registry:
+
+1. **Create the extension directory:**
+   ```bash
+   mkdir -p ~/.config/vimcode/extensions/my-extension
+   ```
+
+2. **Write a `manifest.toml`** (see schema below):
+   ```toml
+   name = "my-extension"
+   display_name = "My Extension"
+   description = "What it does"
+   version = "0.1.0"
+   scripts = ["my_script.lua"]
+   ```
+
+3. **Write your Lua scripts** in the same directory.
+
+4. **Install it:** Open VimCode, open the Extensions panel — your local extension appears
+   in the AVAILABLE list. Press `i` or run `:ExtInstall my-extension` to activate it.
+   Alternatively, you can directly run `:ExtInstall my-extension` without opening the panel.
+
+5. **Iterate:** Edit your scripts, then `:Plugin reload` to reload without restarting.
+
+Local extensions override registry extensions with the same name, so you can fork and modify
+an existing extension by copying it to `~/.config/vimcode/extensions/<name>/`.
+
+### Submitting to the Registry
+
+When your extension is ready, submit a PR to
+[vimcode-ext](https://github.com/JDonaghy/vimcode-ext) adding your extension directory
+(manifest.toml + scripts + README.md) and an entry in `registry.json`. Once merged,
+it becomes available to all VimCode users via the Extensions panel.
+
+### Self-Hosted Registry
+
+Set `extension_registry_url` in `~/.config/vimcode/settings.json` to point to your own
+`registry.json` URL. The format is the same as the official registry — a JSON array of
+extension manifest objects.
 
 ---
 
@@ -141,7 +188,8 @@ display_name = "Git Insights"
 description = "Inline git blame annotations and file history"
 file_extensions = []
 language_ids = []
-scripts = ["blame.lua"]
+scripts = ["blame.lua", "history.lua", "show.lua", "line_history.lua",
+           "diff.lua", "stash.lua", "repo_log.lua", "git_log_panel.lua"]
 ```
 
 ### Minimal LSP-Only Extension
@@ -212,6 +260,8 @@ vimcode.buf.cursor()            -- Returns {line=N, col=M} (1-indexed)
 vimcode.buf.set_cursor(line, col) -- Move cursor to position
 vimcode.buf.annotate_line(n, text) -- Add virtual text annotation to line n
 vimcode.buf.clear_annotations() -- Clear all line annotations
+vimcode.buf.open_scratch(name, content, opts) -- Open a scratch buffer
+  -- opts (optional table): readonly=bool, filetype=string, split="vertical"|"horizontal"
 ```
 
 ### Settings Functions (`vimcode.opt.*`)
@@ -238,14 +288,51 @@ vimcode.state.mark("a")         -- Get mark position: {line=N, col=M} or nil
 ### Git Functions (`vimcode.git.*`)
 
 ```lua
--- Get blame info for a line (returns table or nil)
+-- Get blame info for a single line (returns table or nil)
 local blame = vimcode.git.blame_line(10)
--- blame = {hash="abc123", author="Name", date="2024-01-01",
+-- blame = {hash="abc123", author="Name", date=1700000000,
 --          relative_date="3 days ago", message="Fix bug", not_committed=false}
 
--- Get recent commits for the current file
+-- Get structured blame for every line in the current buffer
+local all_blame = vimcode.git.blame_file()
+-- all_blame = {{hash="abc123", author="Name", ...}, ...}
+
+-- Get recent commits for the current file (simple)
 local log = vimcode.git.log_file(20)
 -- log = {{hash="abc123", message="Fix bug"}, ...}
+
+-- Get detailed commits for the current file (with author, date, stat)
+local detailed = vimcode.git.file_log_detailed(20)
+-- detailed = {{hash="abc123", author="Name", date="3 days ago", message="Fix bug", stat="1 file changed"}, ...}
+
+-- Get commits that touched a specific line range
+local line_commits = vimcode.git.line_log(10, 20, 50)
+-- line_commits = {{hash="abc123", author="Name", date="3 days ago", message="Fix"}, ...}
+
+-- Get repo-wide commit log
+local repo_log = vimcode.git.log(100)
+-- repo_log = {{hash="abc123", message="Fix bug"}, ...}
+
+-- Show full commit details
+local show = vimcode.git.show("abc123")  -- string or nil
+
+-- Diff against a ref (branch, tag, HEAD, etc.)
+local diff = vimcode.git.diff_ref("main")  -- string or nil
+
+-- Repository info
+local root = vimcode.git.repo_root()  -- string or nil
+local branch = vimcode.git.branch()   -- string or nil
+
+-- Stash operations
+local stashes = vimcode.git.stash_list()
+-- stashes = {{index=0, message="WIP", branch="main"}, ...}
+local result = vimcode.git.stash_push("save my work")  -- string
+local result = vimcode.git.stash_pop(0)                 -- string
+local diff = vimcode.git.stash_show(0)                   -- string or nil
+
+-- List all branches with tracking info
+local branches = vimcode.git.branches()
+-- branches = {{name="main", tracking="origin/main", is_current=true}, ...}
 ```
 
 ### Async Shell Execution
@@ -267,6 +354,58 @@ vimcode.on("my_result_event", function(output)
     vimcode.message("Result: " .. output)
 end)
 ```
+
+### Panel API (`vimcode.panel.*`)
+
+Extensions can register custom sidebar panels that appear in the activity bar. This is the same mechanism used by the git-insights extension's Git Log panel.
+
+```lua
+-- Register a custom sidebar panel (call at load time)
+vimcode.panel.register("my_panel", {
+    icon = "X",                          -- Single character for activity bar icon
+    sections = {"Section A", "Section B"}, -- Named collapsible sections
+    on_focus = function()                -- Called when panel gains focus
+        -- Populate sections here
+    end
+})
+
+-- Populate a section with items
+vimcode.panel.set_items("my_panel", "Section A", {
+    {label = "Item 1", hint = "description", icon = "*", style = "normal"},
+    {label = "Item 2", hint = "extra info",  icon = "+", style = "dim"},
+    {label = "Item 3", hint = "important",   icon = "!", style = "bold"},
+})
+
+-- Parse event argument from panel_select/panel_action hooks
+local info = vimcode.panel.parse_event(arg)
+-- info = {panel="my_panel", section="Section A", index=0, label="Item 1", key="a"}
+```
+
+**Panel navigation keys** (when panel has focus):
+
+| Key | Action |
+|-----|--------|
+| `j` / `k` | Navigate items |
+| `Tab` | Expand/collapse section |
+| `Enter` | Fire `panel_select` event for current item |
+| `q` / `Escape` | Unfocus panel |
+| Other keys | Fire `panel_action` event with the key |
+
+**Panel events:**
+
+| Event | Argument | When |
+|-------|----------|------|
+| `panel_focus` | panel name | Panel gains focus in sidebar |
+| `panel_select` | `"panel:section:index:label"` | Enter pressed on item |
+| `panel_action` | `"key:panel:section:index:label"` | Other key pressed on item |
+
+**Item styles:**
+
+| Style | Effect |
+|-------|--------|
+| `"normal"` | Default foreground color |
+| `"dim"` | Muted/grey text |
+| `"bold"` | Highlighted/bright text |
 
 ### Comment Style Override
 
@@ -296,6 +435,9 @@ vimcode.set_comment_style("haskell", {
 | `InsertEnter` | mode name | Entered Insert mode |
 | `InsertLeave` | mode name | Left Insert mode |
 | `ModeChanged` | `"Old->New"` | Any mode change (e.g., `"Normal->Insert"`) |
+| `panel_focus` | panel name | Extension panel gains focus |
+| `panel_select` | `"panel:section:index:label"` | Enter pressed on extension panel item |
+| `panel_action` | `"key:panel:section:index:label"` | Other key pressed on extension panel item |
 | Custom | shell output | `async_shell()` callback event |
 
 ---

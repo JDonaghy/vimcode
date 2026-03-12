@@ -1,9 +1,9 @@
 # VimCode Project State
 
-**Last updated:** Mar 10, 2026 (Session 162 — Bulk paste fix) | **Tests:** 4003
+**Last updated:** Mar 11, 2026 (Session 169 — GitHub Wiki) | **Tests:** 4088
 
 > Feature documentation lives in **README.md**.
-> Per-session implementation notes through Session 161 are in **SESSION_HISTORY.md**.
+> Per-session implementation notes through Session 167 are in **SESSION_HISTORY.md**.
 
 ---
 
@@ -26,7 +26,10 @@ When implementing a new key/command, add tests covering:
 
 ## Recent Work
 
-**Session 162 — Bulk paste performance fix (4003 tests):**
-Fixed critical performance bug: pasting large text in insert mode caused UI freeze / 100% CPU. Root cause was `Event::Paste` (TUI) and `ClipboardPasteToInput` (GTK) feeding each character individually through `handle_key()`, triggering ~N tree-sitter reparses, bracket match scans, auto-completion scans, etc. for an N-character paste. New `Engine::paste_in_insert_mode(text)` method does a single bulk `insert_with_undo()` and runs all expensive post-processing once. Also added safety guard in `compute_word_wrap_segments()` (`pos = break_at.max(pos + 1)`) to prevent potential infinite loops. 8 new tests in `tests/paste_insert.rs`.
+**Session 169 — GitHub Wiki (4088 tests):**
+Created the VimCode GitHub Wiki with 9 pages: Home, Getting Started, Key Remapping, Settings Reference, Extension Development, Lua Plugin API, Theme Customization, DAP Debugger Setup, LSP Configuration. Added Documentation section with wiki links to README.md. Updated extension guide link to point to wiki.
 
-> Sessions 161 and earlier archived in **SESSION_HISTORY.md**.
+**Session 168 — Keybinding Discoverability + VSCode Remapping (4088 tests):**
+Made keybinding remapping discoverable and enabled it in VSCode mode. Added 7 new ex command aliases (`:hover`, `:LspImpl`, `:LspTypedef`, `:nextdiag`, `:prevdiag`, `:nexthunk`, `:prevhunk`) so every remappable keybinding has a named command. Updated `:Keybindings` reference (both Vim and VSCode) to show command names alongside bindings (e.g., `gd → :def`, `F12 → :def`, `Ctrl+P → :fuzzy`) with a remapping hint. Added 12 commands to `available_commands()` for tab completion. Enabled `:map` remapping in VSCode mode — `handle_vscode_key()` now checks `try_user_keymap()` before built-in handlers; mode `"n"` keymaps apply. Added "Open Keyboard Shortcuts" to command palette so VSCode users can F1 → remap keys. Updated `:Keymaps` help text to mention VSCode mode. Fixed pre-existing test hermiticity bug: `engine_with()` now resets `mode` to Normal and rebuilds `user_keymaps` (was leaking disk settings into tests). 17 new tests in `tests/wincmd.rs` (40 total). README updated with discoverability instructions.
+
+> Sessions 167 and earlier archived in **SESSION_HISTORY.md**.

@@ -891,6 +891,24 @@ pub struct GitLogEntry {
     pub message: String,
 }
 
+/// A detailed log entry with author, date, and stat summary.
+#[derive(Debug, Clone)]
+pub struct DetailedLogEntry {
+    pub hash: String,
+    pub author: String,
+    pub date: String,
+    pub message: String,
+    pub stat: String,
+}
+
+/// A single stash entry from `git stash list`.
+#[derive(Debug, Clone)]
+pub struct StashEntry {
+    pub index: usize,
+    pub message: String,
+    pub branch: String,
+}
+
 /// Return the last `limit` commits as `GitLogEntry` items.
 pub fn git_log(dir: &Path, limit: usize) -> Vec<GitLogEntry> {
     let limit_str = format!("-{}", limit);
@@ -1088,6 +1106,302 @@ pub fn log_file(repo_root: &Path, file: &Path, limit: usize) -> Vec<GitLogEntry>
         .collect()
 }
 
+// ─── Extended git API (for plugin system) ─────────────────────────────────────
+
+/// Run `git show <hash>` and return the full output.
+pub fn show_commit(dir: &Path, hash: &str) -> Option<String> {
+    run_git(dir, &["show", hash])
+}
+
+/// Run `git blame --porcelain` on the full file and return structured blame info
+/// for every line.
+pub fn blame_file_structured(
+    repo_root: &Path,
+    file: &Path,
+    buf_contents: Option<&str>,
+) -> Vec<BlameInfo> {
+    let file_str = match file.to_str() {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+    let raw = if let Some(contents) = buf_contents {
+        match run_git_stdin(
+            repo_root,
+            &["blame", "--porcelain", "--contents", "-", "--", file_str],
+            contents,
+        ) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        }
+    } else {
+        match run_git(repo_root, &["blame", "--porcelain", "--", file_str]) {
+            Some(r) => r,
+            None => return Vec::new(),
+        }
+    };
+    if raw.trim().is_empty() {
+        return Vec::new();
+    }
+
+    let mut results = Vec::new();
+    let mut hash = String::new();
+    let mut author = String::new();
+    let mut timestamp: i64 = 0;
+    let mut summary = String::new();
+    let mut commit_info: HashMap<String, (String, i64, String)> = HashMap::new();
+
+    for line in raw.lines() {
+        if line.starts_with('\t') {
+            // Source content line — emit blame entry
+            if let Some((a, t, s)) = commit_info.get(&hash) {
+                author = a.clone();
+                timestamp = *t;
+                summary = s.clone();
+            }
+            let short_hash: String = hash.chars().take(8).collect();
+            results.push(BlameInfo {
+                not_committed: short_hash.chars().all(|c| c == '0'),
+                relative_date: epoch_to_relative(timestamp),
+                hash: short_hash,
+                author: author.clone(),
+                timestamp,
+                message: summary.clone(),
+            });
+        } else if let Some(a) = line.strip_prefix("author ") {
+            author = a.to_string();
+        } else if let Some(t) = line.strip_prefix("author-time ") {
+            timestamp = t.trim().parse().unwrap_or(0);
+        } else if let Some(s) = line.strip_prefix("summary ") {
+            summary = s.to_string();
+        } else {
+            let bytes = line.as_bytes();
+            if bytes.len() >= 42
+                && bytes[40] == b' '
+                && bytes[..40].iter().all(|&b| b.is_ascii_hexdigit())
+            {
+                let full_hash = line[..40].to_string();
+                // Store info if we have it, before switching to new hash
+                if !hash.is_empty() {
+                    commit_info
+                        .entry(hash.clone())
+                        .or_insert_with(|| (author.clone(), timestamp, summary.clone()));
+                }
+                hash = full_hash;
+            }
+        }
+    }
+
+    results
+}
+
+/// Run `git log -L start,end:file` and return detailed log entries for a line range.
+pub fn log_line_range(
+    repo_root: &Path,
+    file: &Path,
+    start: usize,
+    end: usize,
+    limit: usize,
+) -> Vec<DetailedLogEntry> {
+    let file_str = match file.to_str() {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+    let range = format!("-L {},{}", start, end);
+    // git log -L doesn't support --oneline well, use custom format
+    let format_str = "--format=%H%n%an%n%ar%n%s";
+    let limit_str = format!("-{}", limit);
+    let output = match run_git(
+        repo_root,
+        &[
+            "log",
+            &limit_str,
+            &range,
+            format_str,
+            "--no-patch",
+            "--",
+            file_str,
+        ],
+    ) {
+        Some(o) => o,
+        None => return Vec::new(),
+    };
+
+    // Parse groups of 4 lines: hash, author, date, message
+    let lines: Vec<&str> = output.lines().collect();
+    let mut entries = Vec::new();
+    let mut i = 0;
+    while i + 3 < lines.len() {
+        // Skip empty lines
+        if lines[i].is_empty() {
+            i += 1;
+            continue;
+        }
+        let hash = &lines[i];
+        let author = lines[i + 1];
+        let date = lines[i + 2];
+        let message = lines[i + 3];
+        entries.push(DetailedLogEntry {
+            hash: hash.chars().take(8).collect(),
+            author: author.to_string(),
+            date: date.to_string(),
+            message: message.to_string(),
+            stat: String::new(),
+        });
+        i += 4;
+    }
+    entries
+}
+
+/// Run `git diff <ref>` and return the full diff output.
+pub fn diff_against_ref(dir: &Path, ref_spec: &str) -> Option<String> {
+    run_git(dir, &["diff", ref_spec])
+}
+
+/// Return detailed log entries for a specific file.
+pub fn file_log_detailed(repo_root: &Path, file: &Path, limit: usize) -> Vec<DetailedLogEntry> {
+    let file_str = match file.to_str() {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+    let limit_str = format!("-{}", limit);
+    let format_str = "--format=%h%n%an%n%ar%n%s";
+    let output = match run_git(
+        repo_root,
+        &[
+            "log",
+            &limit_str,
+            format_str,
+            "--stat",
+            "--stat-width=60",
+            "--",
+            file_str,
+        ],
+    ) {
+        Some(o) => o,
+        None => return Vec::new(),
+    };
+
+    // Parse: hash, author, date, message, then stat lines until blank line
+    let lines: Vec<&str> = output.lines().collect();
+    let mut entries = Vec::new();
+    let mut i = 0;
+    while i + 3 < lines.len() {
+        if lines[i].is_empty() {
+            i += 1;
+            continue;
+        }
+        let hash = lines[i].to_string();
+        let author = lines[i + 1].to_string();
+        let date = lines[i + 2].to_string();
+        let message = lines[i + 3].to_string();
+        i += 4;
+        // Collect stat lines until blank line or EOF
+        let mut stat_lines = Vec::new();
+        while i < lines.len() && !lines[i].is_empty() {
+            stat_lines.push(lines[i]);
+            i += 1;
+        }
+        let stat = if let Some(last) = stat_lines.last() {
+            // The last stat line is the summary (e.g. "3 files changed, 12 insertions(+)")
+            last.trim().to_string()
+        } else {
+            String::new()
+        };
+        entries.push(DetailedLogEntry {
+            hash,
+            author,
+            date,
+            message,
+            stat,
+        });
+    }
+    entries
+}
+
+/// Return the list of stash entries.
+pub fn stash_list(dir: &Path) -> Vec<StashEntry> {
+    let output = match run_git(dir, &["stash", "list"]) {
+        Some(o) => o,
+        None => return Vec::new(),
+    };
+    output
+        .lines()
+        .filter_map(|line| {
+            // Format: "stash@{0}: On branch_name: message"
+            let rest = line.strip_prefix("stash@{")?;
+            let (idx_str, rest) = rest.split_once('}')?;
+            let index: usize = idx_str.parse().ok()?;
+            let rest = rest.strip_prefix(": ")?;
+            // "On <branch>: <message>" or "WIP on <branch>: <hash> <message>"
+            let (branch, message) = if let Some(r) = rest.strip_prefix("On ") {
+                if let Some((b, m)) = r.split_once(": ") {
+                    (b.to_string(), m.to_string())
+                } else {
+                    (r.to_string(), String::new())
+                }
+            } else if let Some(r) = rest.strip_prefix("WIP on ") {
+                if let Some((b, m)) = r.split_once(": ") {
+                    (b.to_string(), m.to_string())
+                } else {
+                    (r.to_string(), String::new())
+                }
+            } else {
+                (String::new(), rest.to_string())
+            };
+            Some(StashEntry {
+                index,
+                message,
+                branch,
+            })
+        })
+        .collect()
+}
+
+/// Push changes to stash with an optional message.
+pub fn stash_push(dir: &Path, msg: Option<&str>) -> Result<String, String> {
+    let output = if let Some(m) = msg {
+        Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["stash", "push", "-m", m])
+            .output()
+    } else {
+        Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["stash", "push"])
+            .output()
+    };
+    let output = output.map_err(|e| format!("git stash push failed: {}", e))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+/// Pop a stash entry by index.
+pub fn stash_pop(dir: &Path, index: usize) -> Result<String, String> {
+    let stash_ref = format!("stash@{{{}}}", index);
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["stash", "pop", &stash_ref])
+        .output()
+        .map_err(|e| format!("git stash pop failed: {}", e))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+/// Show a stash entry's diff by index.
+pub fn stash_show(dir: &Path, index: usize) -> Option<String> {
+    let stash_ref = format!("stash@{{{}}}", index);
+    run_git(dir, &["stash", "show", "-p", &stash_ref])
+}
+
 /// Return `(ahead, behind)` commit counts relative to the upstream branch.
 pub fn ahead_behind(dir: &Path) -> (u32, u32) {
     let out = match run_git(dir, &["rev-list", "--left-right", "--count", "HEAD...@{u}"]) {
@@ -1098,6 +1412,56 @@ pub fn ahead_behind(dir: &Path) -> (u32, u32) {
     let ahead = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
     let behind = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
     (ahead, behind)
+}
+
+/// A single entry from `git branch -a`.
+#[derive(Debug, Clone)]
+pub struct BranchEntry {
+    pub name: String,
+    pub is_current: bool,
+    pub upstream: Option<String>,
+    pub ahead_behind: Option<String>,
+}
+
+/// List all branches (local + remote) with tracking info.
+pub fn list_branches(dir: &Path) -> Vec<BranchEntry> {
+    let out = match run_git(
+        dir,
+        &[
+            "branch",
+            "-a",
+            "--format=%(refname:short)|%(HEAD)|%(upstream:short)|%(upstream:track)",
+        ],
+    ) {
+        Some(o) => o,
+        None => return Vec::new(),
+    };
+    out.lines()
+        .filter(|l| !l.is_empty())
+        .map(|line| {
+            let parts: Vec<&str> = line.splitn(4, '|').collect();
+            let name = parts.first().copied().unwrap_or("").to_string();
+            let is_current = parts.get(1).copied().unwrap_or("") == "*";
+            let upstream_raw = parts.get(2).copied().unwrap_or("");
+            let upstream = if upstream_raw.is_empty() {
+                None
+            } else {
+                Some(upstream_raw.to_string())
+            };
+            let track_raw = parts.get(3).copied().unwrap_or("");
+            let ahead_behind = if track_raw.is_empty() {
+                None
+            } else {
+                Some(track_raw.to_string())
+            };
+            BranchEntry {
+                name,
+                is_current,
+                upstream,
+                ahead_behind,
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1199,6 +1563,60 @@ filename src/main.rs\n\
         let result = epoch_to_relative(0); // Unix epoch: 1970-01
         assert!(result.starts_with("1970"), "expected YYYY-MM, got {result}");
     }
+
+    #[test]
+    fn test_stash_list_parses() {
+        let input = "stash@{0}: On main: WIP save\nstash@{1}: WIP on feature: abc1234 half done\n";
+        let entries = parse_stash_list(input);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].index, 0);
+        assert_eq!(entries[0].branch, "main");
+        assert_eq!(entries[0].message, "WIP save");
+        assert_eq!(entries[1].index, 1);
+        assert_eq!(entries[1].branch, "feature");
+        assert_eq!(entries[1].message, "abc1234 half done");
+    }
+
+    #[test]
+    fn test_stash_list_empty() {
+        let entries = parse_stash_list("");
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_blame_file_structured_basic() {
+        let hash = "a".repeat(40);
+        let input = format!(
+            "{h} 1 1 2\nauthor Alice\nauthor-time 1700000000\nsummary Fix bug\nfilename foo.rs\n\tline one\n\
+             {h} 2 2\nfilename foo.rs\n\tline two\n",
+            h = hash
+        );
+        let entries = parse_blame_file_porcelain(&input);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].hash, "aaaaaaaa");
+        assert_eq!(entries[0].author, "Alice");
+        assert_eq!(entries[0].message, "Fix bug");
+        assert_eq!(entries[1].hash, "aaaaaaaa");
+        assert_eq!(entries[1].author, "Alice");
+    }
+
+    #[test]
+    fn test_blame_file_structured_empty() {
+        let entries = parse_blame_file_porcelain("");
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_detailed_log_parse() {
+        let input = "abc1234\nAlice\n3 days ago\nFix the bug\n 1 file changed, 3 insertions(+)\n";
+        let entries = parse_detailed_log(input);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].hash, "abc1234");
+        assert_eq!(entries[0].author, "Alice");
+        assert_eq!(entries[0].date, "3 days ago");
+        assert_eq!(entries[0].message, "Fix the bug");
+        assert_eq!(entries[0].stat, "1 file changed, 3 insertions(+)");
+    }
 }
 
 /// Unit-testable helper — parse a `git blame --porcelain` output for a single
@@ -1273,6 +1691,130 @@ fn parse_worktree_porcelain(output: &str, current_dir: &Path) -> Vec<WorktreeEnt
             branch: current_branch,
             is_main: is_first,
             is_current,
+        });
+    }
+    entries
+}
+
+/// Unit-testable stash list parser — mirrors the parse logic in `stash_list`.
+#[cfg(test)]
+fn parse_stash_list(output: &str) -> Vec<StashEntry> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let rest = line.strip_prefix("stash@{")?;
+            let (idx_str, rest) = rest.split_once('}')?;
+            let index: usize = idx_str.parse().ok()?;
+            let rest = rest.strip_prefix(": ")?;
+            let (branch, message) = if let Some(r) = rest.strip_prefix("On ") {
+                if let Some((b, m)) = r.split_once(": ") {
+                    (b.to_string(), m.to_string())
+                } else {
+                    (r.to_string(), String::new())
+                }
+            } else if let Some(r) = rest.strip_prefix("WIP on ") {
+                if let Some((b, m)) = r.split_once(": ") {
+                    (b.to_string(), m.to_string())
+                } else {
+                    (r.to_string(), String::new())
+                }
+            } else {
+                (String::new(), rest.to_string())
+            };
+            Some(StashEntry {
+                index,
+                message,
+                branch,
+            })
+        })
+        .collect()
+}
+
+/// Unit-testable blame file parser — mirrors the parse logic in `blame_file_structured`.
+#[cfg(test)]
+fn parse_blame_file_porcelain(raw: &str) -> Vec<BlameInfo> {
+    if raw.trim().is_empty() {
+        return Vec::new();
+    }
+    let mut results = Vec::new();
+    let mut hash = String::new();
+    let mut author = String::new();
+    let mut timestamp: i64 = 0;
+    let mut summary = String::new();
+    let mut commit_info: HashMap<String, (String, i64, String)> = HashMap::new();
+
+    for line in raw.lines() {
+        if line.starts_with('\t') {
+            if let Some((a, t, s)) = commit_info.get(&hash) {
+                author = a.clone();
+                timestamp = *t;
+                summary = s.clone();
+            }
+            let short_hash: String = hash.chars().take(8).collect();
+            results.push(BlameInfo {
+                not_committed: short_hash.chars().all(|c| c == '0'),
+                relative_date: epoch_to_relative(timestamp),
+                hash: short_hash,
+                author: author.clone(),
+                timestamp,
+                message: summary.clone(),
+            });
+        } else if let Some(a) = line.strip_prefix("author ") {
+            author = a.to_string();
+        } else if let Some(t) = line.strip_prefix("author-time ") {
+            timestamp = t.trim().parse().unwrap_or(0);
+        } else if let Some(s) = line.strip_prefix("summary ") {
+            summary = s.to_string();
+        } else {
+            let bytes = line.as_bytes();
+            if bytes.len() >= 42
+                && bytes[40] == b' '
+                && bytes[..40].iter().all(|&b| b.is_ascii_hexdigit())
+            {
+                let full_hash = line[..40].to_string();
+                if !hash.is_empty() {
+                    commit_info
+                        .entry(hash.clone())
+                        .or_insert_with(|| (author.clone(), timestamp, summary.clone()));
+                }
+                hash = full_hash;
+            }
+        }
+    }
+    results
+}
+
+/// Unit-testable detailed log parser — mirrors the parse logic in `file_log_detailed`.
+#[cfg(test)]
+fn parse_detailed_log(output: &str) -> Vec<DetailedLogEntry> {
+    let lines: Vec<&str> = output.lines().collect();
+    let mut entries = Vec::new();
+    let mut i = 0;
+    while i + 3 < lines.len() {
+        if lines[i].is_empty() {
+            i += 1;
+            continue;
+        }
+        let hash = lines[i].to_string();
+        let author = lines[i + 1].to_string();
+        let date = lines[i + 2].to_string();
+        let message = lines[i + 3].to_string();
+        i += 4;
+        let mut stat_lines = Vec::new();
+        while i < lines.len() && !lines[i].is_empty() {
+            stat_lines.push(lines[i]);
+            i += 1;
+        }
+        let stat = stat_lines
+            .last()
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        entries.push(DetailedLogEntry {
+            hash,
+            author,
+            date,
+            message,
+            stat,
         });
     }
     entries

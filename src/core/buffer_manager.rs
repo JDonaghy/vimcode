@@ -94,6 +94,10 @@ pub struct BufferState {
     pub netrw_dir: Option<PathBuf>,
     /// Whether this buffer is a keymaps editor scratch buffer.
     pub is_keymaps_buf: bool,
+    /// Whether this buffer is an extension registries editor scratch buffer.
+    pub is_registries_buf: bool,
+    /// Display name for plugin-created scratch buffers (shown in tab bar).
+    pub scratch_name: Option<String>,
     /// Last-known modification time of the file on disk.
     /// Set on file open and save; used by `check_file_changes()` to detect external edits.
     pub file_mtime: Option<SystemTime>,
@@ -139,6 +143,8 @@ impl BufferState {
             semantic_tokens: Vec::new(),
             netrw_dir: None,
             is_keymaps_buf: false,
+            is_registries_buf: false,
+            scratch_name: None,
             file_mtime: None,
             file_change_warned: false,
         };
@@ -175,6 +181,8 @@ impl BufferState {
             semantic_tokens: Vec::new(),
             netrw_dir: None,
             is_keymaps_buf: false,
+            is_registries_buf: false,
+            scratch_name: None,
             file_mtime,
             file_change_warned: false,
         };
@@ -232,6 +240,12 @@ impl BufferState {
     pub fn display_name(&self) -> String {
         if self.is_keymaps_buf {
             return "[Keymaps]".to_string();
+        }
+        if self.is_registries_buf {
+            return "[Registries]".to_string();
+        }
+        if let Some(ref name) = self.scratch_name {
+            return format!("[{}]", name);
         }
         self.file_path
             .as_ref()

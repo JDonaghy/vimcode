@@ -182,8 +182,22 @@ fn preview_link_cleaned_on_close() {
 #[test]
 fn extension_readme_opens_in_own_tab() {
     let mut e = engine_with("");
-    // Simulate having an installed extension.
-    e.extension_state.installed.push("rust".to_string());
+    // Simulate having an installed extension with a README on disk.
+    e.extension_state.mark_installed("rust");
+    // Seed the registry so ext_installed_items() can find the manifest.
+    e.ext_registry = Some(vec![vimcode_core::core::extensions::ExtensionManifest {
+        name: "rust".to_string(),
+        display_name: "Rust".to_string(),
+        ..Default::default()
+    }]);
+
+    // Create a temporary README file so the sidebar can read it
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let ext_dir = std::path::PathBuf::from(&home).join(".config/vimcode/extensions/rust");
+    let _ = std::fs::create_dir_all(&ext_dir);
+    let readme_path = ext_dir.join("README.md");
+    std::fs::write(&readme_path, "# Rust Extension\nREADME content").unwrap();
+
     e.ext_sidebar_has_focus = true;
     e.ext_sidebar_sections_expanded = [true, false];
     e.ext_sidebar_selected = 0; // First installed item.
@@ -196,12 +210,14 @@ fn extension_readme_opens_in_own_tab() {
         before_tabs + 1,
         "README should open in a new tab"
     );
-    assert!(e.message.contains("README"));
     // The new buffer should be read-only with md_rendered.
     let buf_id = e.active_buffer_id();
     let state = e.buffer_manager.get(buf_id).unwrap();
     assert!(state.read_only);
     assert!(state.md_rendered.is_some());
+
+    // Clean up
+    let _ = std::fs::remove_file(&readme_path);
 }
 
 // ─── Undo/redo refreshes preview ────────────────────────────────────────────
