@@ -1516,6 +1516,19 @@ pub struct ScreenLayout {
     pub ext_panel: Option<ExtPanelData>,
     /// Breadcrumb bars for each editor group (empty when breadcrumbs are disabled).
     pub breadcrumbs: Vec<BreadcrumbBar>,
+    /// Git diff peek popup — `Some` when the user is previewing a diff hunk.
+    pub diff_peek: Option<DiffPeekPopup>,
+}
+
+/// A floating popup showing a diff hunk preview with revert/stage actions.
+#[derive(Debug, Clone)]
+pub struct DiffPeekPopup {
+    /// Buffer line the popup is anchored to (0-indexed).
+    pub anchor_line: usize,
+    /// Raw diff hunk lines (with +/-/space prefix) to display.
+    pub hunk_lines: Vec<String>,
+    /// Which action button is focused: 0 = Revert, 1 = Stage.
+    pub focused_action: usize,
 }
 
 // ─── Theme ────────────────────────────────────────────────────────────────────
@@ -1596,6 +1609,7 @@ pub struct Theme {
     // Git diff gutter markers
     pub git_added: Color,
     pub git_modified: Color,
+    pub git_deleted: Color,
 
     // Completion popup
     pub completion_bg: Color,
@@ -1740,6 +1754,7 @@ impl Theme {
             // Git diff gutter markers
             git_added: Color::from_hex("#98c379"),    // green
             git_modified: Color::from_hex("#e5c07b"), // yellow
+            git_deleted: Color::from_hex("#e06c75"),  // red
 
             // Completion popup (OneDark palette)
             completion_bg: Color::from_hex("#282c34"),
@@ -1862,6 +1877,7 @@ impl Theme {
 
             git_added: Color::from_hex("#b8bb26"),
             git_modified: Color::from_hex("#fabd2f"),
+            git_deleted: Color::from_hex("#fb4934"),
 
             completion_bg: Color::from_hex("#32302f"),
             completion_selected_bg: Color::from_hex("#504945"),
@@ -1973,6 +1989,7 @@ impl Theme {
 
             git_added: Color::from_hex("#9ece6a"),
             git_modified: Color::from_hex("#e0af68"),
+            git_deleted: Color::from_hex("#f7768e"),
 
             completion_bg: Color::from_hex("#1f2335"),
             completion_selected_bg: Color::from_hex("#364a82"),
@@ -2084,6 +2101,7 @@ impl Theme {
 
             git_added: Color::from_hex("#859900"),
             git_modified: Color::from_hex("#b58900"),
+            git_deleted: Color::from_hex("#dc322f"),
 
             completion_bg: Color::from_hex("#073642"),
             completion_selected_bg: Color::from_hex("#0d4a5a"),
@@ -2342,6 +2360,11 @@ impl Theme {
             .or_else(|| color("gitDecoration.modifiedResourceForeground"))
         {
             theme.git_modified = c;
+        }
+        if let Some(c) = color("editorGutter.deletedBackground")
+            .or_else(|| color("gitDecoration.deletedResourceForeground"))
+        {
+            theme.git_deleted = c;
         }
 
         // ── Diagnostics ──────────────────────────────────────────────────
@@ -3134,6 +3157,11 @@ pub fn build_screen_layout(
         ai_panel,
         ext_panel: build_ext_panel_data(engine),
         breadcrumbs,
+        diff_peek: engine.diff_peek.as_ref().map(|dp| DiffPeekPopup {
+            anchor_line: dp.anchor_line,
+            hunk_lines: dp.hunk_lines.clone(),
+            focused_action: dp.focused_action,
+        }),
     }
 }
 
@@ -4089,6 +4117,7 @@ fn build_rendered_window(
             let git_part = if has_git {
                 match git_status {
                     Some(GitLineStatus::Added) | Some(GitLineStatus::Modified) => "▌",
+                    Some(GitLineStatus::Deleted) => "▾",
                     None => " ",
                 }
             } else {

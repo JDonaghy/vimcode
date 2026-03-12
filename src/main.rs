@@ -6851,6 +6851,9 @@ fn draw_editor(
     // 5c2. Draw signature-help popup (on top of everything else, shown in insert mode)
     draw_signature_popup(cr, &layout, &screen, &theme, line_height, char_width);
 
+    // 5c3. Draw diff peek popup (inline git hunk preview)
+    draw_diff_peek_popup(cr, &layout, &screen, &theme, line_height, char_width);
+
     // 5d. Draw fuzzy file-picker modal (on top of everything else)
     draw_fuzzy_popup(
         cr,
@@ -7755,6 +7758,7 @@ fn draw_window(
                 let git_color = match rl.git_diff {
                     Some(GitLineStatus::Added) => theme.git_added,
                     Some(GitLineStatus::Modified) => theme.git_modified,
+                    Some(GitLineStatus::Deleted) => theme.git_deleted,
                     None => theme.line_number_fg,
                 };
                 layout.set_text(&git_ch);
@@ -8447,6 +8451,89 @@ fn draw_hover_popup(
         layout.set_attributes(None);
         cr.move_to(popup_x, popup_y + 2.0 + i as f64 * line_height);
         pangocairo::show_layout(cr, layout);
+    }
+}
+
+fn draw_diff_peek_popup(
+    cr: &Context,
+    layout: &pango::Layout,
+    screen: &render::ScreenLayout,
+    theme: &Theme,
+    line_height: f64,
+    char_width: f64,
+) {
+    let Some(peek) = &screen.diff_peek else {
+        return;
+    };
+    let Some(active_win) = screen
+        .windows
+        .iter()
+        .find(|w| w.window_id == screen.active_window_id)
+    else {
+        return;
+    };
+
+    let gutter_width = active_win.gutter_char_width as f64 * char_width;
+    let anchor_view_line = peek.anchor_line.saturating_sub(active_win.scroll_top);
+
+    // Dimensions.
+    let max_line_len = peek.hunk_lines.iter().map(|l| l.len()).max().unwrap_or(10);
+    let action_bar_lines = 1;
+    let num_lines = (peek.hunk_lines.len() + action_bar_lines).min(30);
+    let popup_w = ((max_line_len + 4) as f64 * char_width).max(200.0);
+    let popup_h = num_lines as f64 * line_height + 6.0;
+
+    // Position below the anchor line.
+    let popup_x = active_win.rect.x + gutter_width;
+    let popup_y = active_win.rect.y + (anchor_view_line as f64 + 1.0) * line_height;
+
+    // Background.
+    let (r, g, b) = theme.hover_bg.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
+    cr.fill().ok();
+
+    // Border.
+    let (r, g, b) = theme.hover_border.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    cr.set_line_width(1.0);
+    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
+    cr.stroke().ok();
+
+    // Diff lines with color coding.
+    for (i, hline) in peek.hunk_lines.iter().enumerate().take(29) {
+        let (r, g, b) = if hline.starts_with('+') {
+            theme.git_added.to_cairo()
+        } else if hline.starts_with('-') {
+            theme.git_deleted.to_cairo()
+        } else {
+            theme.hover_fg.to_cairo()
+        };
+        cr.set_source_rgb(r, g, b);
+        let display = format!(" {}", hline);
+        layout.set_text(&display);
+        layout.set_attributes(None);
+        cr.move_to(popup_x, popup_y + 2.0 + i as f64 * line_height);
+        pangocairo::show_layout(cr, layout);
+    }
+
+    // Action bar at bottom.
+    let action_y = popup_y + 2.0 + peek.hunk_lines.len().min(29) as f64 * line_height;
+    let labels = ["[r] Revert", "[s] Stage"];
+    let mut ax = popup_x + char_width;
+    for (idx, label) in labels.iter().enumerate() {
+        let is_focused = idx == peek.focused_action;
+        let (r, g, b) = if is_focused {
+            theme.cursor.to_cairo()
+        } else {
+            theme.hover_fg.to_cairo()
+        };
+        cr.set_source_rgb(r, g, b);
+        layout.set_text(label);
+        layout.set_attributes(None);
+        cr.move_to(ax, action_y);
+        pangocairo::show_layout(cr, layout);
+        ax += (label.len() as f64 + 2.0) * char_width;
     }
 }
 
@@ -11052,16 +11139,24 @@ fn pixel_to_click_target(
 
     // Gutter click
     if x >= rect.x && x < rect.x + gutter_width && gutter_width > 0.0 {
-        // If the breakpoint column is visible and the click landed in its cell
-        // (always the leftmost gutter character), toggle the breakpoint instead
-        // of the fold.
-        if has_bp_click && x < rect.x + char_width {
+        // Determine which gutter column was clicked.
+        let gutter_col = ((x - rect.x) / char_width).floor() as usize;
+        let bp_offset = if has_bp_click { 1 } else { 0 };
+        let git_col = if has_git { bp_offset } else { usize::MAX };
+
+        if has_bp_click && gutter_col == 0 {
+            // Breakpoint column (leftmost).
             let file = buffer_state
                 .file_path
                 .as_ref()
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_default();
             engine.dap_toggle_breakpoint(&file, line as u64 + 1);
+        } else if gutter_col == git_col {
+            // Git diff column — open diff peek popup.
+            engine.active_tab_mut().active_window = window_id;
+            engine.view_mut().cursor.line = line;
+            engine.open_diff_peek();
         } else {
             engine.toggle_fold_at_line(line);
         }

@@ -35,7 +35,7 @@ For detailed how-to guides and configuration references, see the **[VimCode Wiki
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 4088 tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 4105 tests, zero async runtime dependency
 
 > **Note:** VimCode does not implement VimScript. Extension and scripting is handled via
 > the built-in Lua 5.4 plugin system. The goal is full Vim *keybinding* and *editing*
@@ -788,8 +788,9 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `<leader>gi` | Go to implementation (LSP) |
 | `gy` | Go to type definition (LSP) |
 | `gs` | Stage hunk (in `:Gdiff` buffer) |
+| `gD` | Diff peek — preview hunk popup with Revert/Stage |
 | `K` | Show hover info (LSP) |
-| `]c` / `[c` | Next / previous hunk |
+| `]c` / `[c` | Next / previous change (works on real files + diff buffers) |
 | `]d` / `[d` | Next / previous diagnostic (LSP) |
 | `[[` / `]]` | Section backward / forward (`{` in column 0) |
 | `[]` / `][` | Section end backward / forward (`}` in column 0) |
@@ -911,6 +912,7 @@ All ex commands support Vim-style abbreviations (e.g., `:j` for `:join`, `:y` fo
 | `:Gfetch` / `:Gf` | Fetch |
 | `:Gblame` | Blame (scroll-synced split) |
 | `:Ghs` / `:Ghunk` | Stage hunk under cursor |
+| `:DiffPeek` | Open diff hunk peek popup at cursor (revert/stage) |
 | `:GWorktreeAdd <branch> <path>` | Add git worktree |
 | `:GWorktreeRemove <path>` | Remove git worktree |
 | `:OpenFolder <path>` | Open folder (clears buffers, loads per-project session) |

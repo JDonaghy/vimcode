@@ -476,6 +476,12 @@ pub static PALETTE_COMMANDS: &[PaletteCommand] = &[
         vscode_shortcut: "",
         action: "Gfetch",
     },
+    PaletteCommand {
+        label: "Git: Peek Change",
+        shortcut: "gD",
+        vscode_shortcut: "gD",
+        action: "DiffPeek",
+    },
     // LSP
     PaletteCommand {
         label: "LSP: Info",
@@ -1211,6 +1217,22 @@ fn decode_keypress(encoded: &str) -> (String, Option<char>, bool) {
     }
 }
 
+/// State for the inline diff peek popup (preview a git diff hunk).
+pub struct DiffPeekState {
+    /// Index into the buffer's `diff_hunks` array.
+    pub hunk_index: usize,
+    /// Buffer line the popup is anchored to (0-indexed).
+    pub anchor_line: usize,
+    /// Raw hunk lines (with +/-/space prefix) for display.
+    pub hunk_lines: Vec<String>,
+    /// The file_header from the hunk (needed for stage/revert).
+    pub file_header: String,
+    /// The Hunk itself (needed for stage/revert).
+    pub hunk: git::Hunk,
+    /// Which action is focused: 0 = Revert, 1 = Stage.
+    pub focused_action: usize,
+}
+
 pub struct Engine {
     // --- Multi-buffer/window state ---
     pub buffer_manager: BufferManager,
@@ -1583,6 +1605,10 @@ pub struct Engine {
     /// Per-window per-line diff status.  Keyed by WindowId, value is a Vec
     /// with one entry per buffer line.
     pub diff_results: HashMap<WindowId, Vec<DiffLine>>,
+
+    // --- Inline diff peek popup ---
+    /// Git diff peek popup state, or `None` when no peek is active.
+    pub diff_peek: Option<DiffPeekState>,
 
     // --- Clipboard callbacks (set by UI backend) ---
     /// Read text from the system clipboard.  Set by the GTK/TUI backend at startup.
@@ -2085,6 +2111,7 @@ impl Engine {
             palette_scroll_top: 0,
             diff_window_pair: None,
             diff_results: HashMap::new(),
+            diff_peek: None,
             clipboard_read: None,
             clipboard_write: None,
             mouse_drag_active: false,
@@ -2757,7 +2784,7 @@ impl Engine {
     // Git integration
     // =======================================================================
 
-    /// Refresh git diff markers for the given buffer.
+    /// Refresh git diff markers and structured hunks for the given buffer.
     fn refresh_git_diff(&mut self, buffer_id: BufferId) {
         if let Some(path) = self
             .buffer_manager
@@ -2765,8 +2792,10 @@ impl Engine {
             .and_then(|s| s.file_path.clone())
         {
             let diff = git::compute_file_diff(&path);
+            let hunks = git::compute_file_diff_hunks(&path);
             if let Some(state) = self.buffer_manager.get_mut(buffer_id) {
                 state.git_diff = diff;
+                state.diff_hunks = hunks;
             }
         }
     }
@@ -3079,33 +3108,257 @@ impl Engine {
         }
     }
 
-    /// Jump to the next `@@` hunk header below the cursor in the current buffer.
+    /// Jump to the next changed region below the cursor.
+    /// On real files: uses `git_diff` markers. On diff buffers: searches for `@@` headers.
     fn jump_next_hunk(&mut self) {
-        let start = self.view().cursor.line + 1;
-        let total = self.buffer().len_lines();
-        for i in start..total {
-            let line: String = self.buffer().content.line(i).chars().collect();
-            if line.starts_with("@@") {
-                self.view_mut().cursor.line = i;
-                self.view_mut().cursor.col = 0;
-                return;
+        let cur = self.view().cursor.line;
+        let bid = self.active_window().buffer_id;
+        let git_diff = &self.buffer_manager.get(bid).map(|s| &s.git_diff);
+        let has_git = git_diff.is_some_and(|d| !d.is_empty());
+
+        if has_git {
+            // Navigate using git_diff markers on real files.
+            let gd = self.buffer_manager.get(bid).unwrap();
+            let total = gd.git_diff.len();
+            // Skip past the current changed region, then find the next one.
+            let mut i = cur + 1;
+            // Skip lines that are part of the same changed region as the cursor.
+            while i < total
+                && gd.git_diff.get(cur).copied().flatten().is_some()
+                && gd.git_diff.get(i).copied().flatten().is_some()
+            {
+                i += 1;
             }
+            // Find the next changed line.
+            while i < total {
+                if gd.git_diff[i].is_some() {
+                    self.view_mut().cursor.line = i;
+                    self.view_mut().cursor.col = 0;
+                    self.scroll_cursor_center();
+                    return;
+                }
+                i += 1;
+            }
+            self.message = "No more hunks".to_string();
+        } else {
+            // Fallback: search for @@ headers in diff buffers.
+            let start = cur + 1;
+            let total = self.buffer().len_lines();
+            for i in start..total {
+                let line: String = self.buffer().content.line(i).chars().collect();
+                if line.starts_with("@@") {
+                    self.view_mut().cursor.line = i;
+                    self.view_mut().cursor.col = 0;
+                    return;
+                }
+            }
+            self.message = "No more hunks".to_string();
         }
-        self.message = "No more hunks".to_string();
     }
 
-    /// Jump to the previous `@@` hunk header above the cursor in the current buffer.
+    /// Jump to the previous changed region above the cursor.
+    /// On real files: uses `git_diff` markers. On diff buffers: searches for `@@` headers.
     fn jump_prev_hunk(&mut self) {
         let cur = self.view().cursor.line;
-        for i in (0..cur).rev() {
-            let line: String = self.buffer().content.line(i).chars().collect();
-            if line.starts_with("@@") {
-                self.view_mut().cursor.line = i;
-                self.view_mut().cursor.col = 0;
+        let bid = self.active_window().buffer_id;
+        let git_diff = &self.buffer_manager.get(bid).map(|s| &s.git_diff);
+        let has_git = git_diff.is_some_and(|d| !d.is_empty());
+
+        if has_git {
+            let gd = self.buffer_manager.get(bid).unwrap();
+            // Skip backwards past the current changed region.
+            let mut i = cur.saturating_sub(1);
+            while i > 0
+                && gd.git_diff.get(cur).copied().flatten().is_some()
+                && gd.git_diff.get(i).copied().flatten().is_some()
+            {
+                i -= 1;
+            }
+            // Find the previous changed line.
+            loop {
+                if gd.git_diff.get(i).copied().flatten().is_some() {
+                    // Walk backwards to the start of this changed region.
+                    while i > 0 && gd.git_diff.get(i - 1).copied().flatten().is_some() {
+                        i -= 1;
+                    }
+                    self.view_mut().cursor.line = i;
+                    self.view_mut().cursor.col = 0;
+                    self.scroll_cursor_center();
+                    return;
+                }
+                if i == 0 {
+                    break;
+                }
+                i -= 1;
+            }
+            self.message = "No more hunks".to_string();
+        } else {
+            for i in (0..cur).rev() {
+                let line: String = self.buffer().content.line(i).chars().collect();
+                if line.starts_with("@@") {
+                    self.view_mut().cursor.line = i;
+                    self.view_mut().cursor.col = 0;
+                    return;
+                }
+            }
+            self.message = "No more hunks".to_string();
+        }
+    }
+
+    /// Open the diff peek popup for the hunk under the cursor on the current buffer.
+    pub fn open_diff_peek(&mut self) {
+        let bid = self.active_window().buffer_id;
+        let cursor_line = self.view().cursor.line;
+        let hunks = match self.buffer_manager.get(bid) {
+            Some(s) => s.diff_hunks.clone(),
+            None => {
+                self.message = "No diff data".to_string();
                 return;
             }
+        };
+        if hunks.is_empty() {
+            self.message = "No changes in this file".to_string();
+            return;
         }
-        self.message = "No more hunks".to_string();
+        let idx = match git::hunk_for_line(&hunks, cursor_line) {
+            Some(i) => i,
+            None => {
+                self.message = "No hunk at cursor".to_string();
+                return;
+            }
+        };
+        let h = &hunks[idx];
+        self.diff_peek = Some(DiffPeekState {
+            hunk_index: idx,
+            anchor_line: cursor_line,
+            hunk_lines: h.hunk.lines.clone(),
+            file_header: h.file_header.clone(),
+            hunk: h.hunk.clone(),
+            focused_action: 1, // default to Stage
+        });
+    }
+
+    /// Close the diff peek popup.
+    pub fn close_diff_peek(&mut self) {
+        self.diff_peek = None;
+    }
+
+    /// Revert the hunk shown in the diff peek popup.
+    fn diff_peek_revert(&mut self) {
+        let peek = match self.diff_peek.take() {
+            Some(p) => p,
+            None => return,
+        };
+        let bid = self.active_window().buffer_id;
+        let path = match self
+            .buffer_manager
+            .get(bid)
+            .and_then(|s| s.file_path.clone())
+        {
+            Some(p) => p,
+            None => {
+                self.message = "No file path".to_string();
+                return;
+            }
+        };
+        let dir = match path.parent() {
+            Some(d) => d.to_path_buf(),
+            None => return,
+        };
+        match git::revert_hunk(&dir, &peek.file_header, &peek.hunk) {
+            Ok(()) => {
+                // Reload buffer contents from disk.
+                if let Ok(contents) = std::fs::read_to_string(&path) {
+                    if let Some(state) = self.buffer_manager.get_mut(bid) {
+                        state.buffer.content = ropey::Rope::from_str(&contents);
+                    }
+                }
+                self.refresh_git_diff(bid);
+                self.message = "Hunk reverted".to_string();
+            }
+            Err(e) => {
+                self.message = format!("Revert failed: {e}");
+            }
+        }
+    }
+
+    /// Stage the hunk shown in the diff peek popup.
+    fn diff_peek_stage(&mut self) {
+        let peek = match self.diff_peek.take() {
+            Some(p) => p,
+            None => return,
+        };
+        let bid = self.active_window().buffer_id;
+        let path = match self
+            .buffer_manager
+            .get(bid)
+            .and_then(|s| s.file_path.clone())
+        {
+            Some(p) => p,
+            None => {
+                self.message = "No file path".to_string();
+                return;
+            }
+        };
+        let dir = match git::find_repo_root(&path) {
+            Some(d) => d,
+            None => {
+                self.message = "Not a git repository".to_string();
+                return;
+            }
+        };
+        match git::stage_hunk(&dir, &peek.file_header, &peek.hunk) {
+            Ok(()) => {
+                self.refresh_git_diff(bid);
+                self.message = format!("Hunk {} staged", peek.hunk_index + 1);
+            }
+            Err(e) => {
+                self.message = format!("Stage failed: {e}");
+            }
+        }
+    }
+
+    /// Handle a keypress while the diff peek popup is open.
+    /// Returns true if the key was consumed, false to pass through.
+    fn handle_diff_peek_key(&mut self, key_name: &str, unicode: Option<char>) -> bool {
+        match key_name {
+            "Escape" | "q" => {
+                self.close_diff_peek();
+                true
+            }
+            _ => match unicode {
+                Some('s') => {
+                    self.diff_peek_stage();
+                    true
+                }
+                Some('r') => {
+                    self.diff_peek_revert();
+                    true
+                }
+                Some('h') | Some('l') => {
+                    // Toggle focused action (0=Revert, 1=Stage).
+                    if let Some(ref mut peek) = self.diff_peek {
+                        peek.focused_action = 1 - peek.focused_action;
+                    }
+                    true
+                }
+                Some('\r') | Some('\n') => {
+                    // Confirm focused action.
+                    let action = self.diff_peek.as_ref().map(|p| p.focused_action);
+                    match action {
+                        Some(0) => self.diff_peek_revert(),
+                        Some(1) => self.diff_peek_stage(),
+                        _ => {}
+                    }
+                    true
+                }
+                _ => {
+                    // Any other key closes the popup and falls through.
+                    self.close_diff_peek();
+                    false
+                }
+            },
+        }
     }
 
     /// Stage the hunk under the cursor using `git apply --cached`.
@@ -5612,6 +5865,11 @@ impl Engine {
             return self.handle_palette_key(key_name, unicode, ctrl);
         }
 
+        // Diff peek popup intercepts keys when open.
+        if self.diff_peek.is_some() && self.handle_diff_peek_key(key_name, unicode) {
+            return EngineAction::None;
+        }
+
         // Fuzzy finder intercepts all keys when open.
         if self.fuzzy_open {
             return self.handle_fuzzy_key(key_name, unicode, ctrl);
@@ -7144,6 +7402,9 @@ impl Engine {
                 Some('d') => {
                     self.push_jump_location();
                     self.lsp_request_definition();
+                }
+                Some('D') => {
+                    self.open_diff_peek();
                 }
                 Some('r') => {
                     self.push_jump_location();
@@ -12091,6 +12352,7 @@ impl Engine {
             "Gfetch",
             "GWorktreeAdd",
             "GWorktreeRemove",
+            "DiffPeek",
             // LSP
             "LspInfo",
             "LspRestart",
@@ -14328,6 +14590,12 @@ impl Engine {
         // Handle :Ghs / :Ghunk — stage hunk under cursor
         if cmd == "Ghs" || cmd == "Ghunk" {
             return self.cmd_git_stage_hunk();
+        }
+
+        // Handle :DiffPeek — open inline diff peek popup
+        if cmd == "DiffPeek" {
+            self.open_diff_peek();
+            return EngineAction::None;
         }
 
         // Handle :GWorktreeAdd <branch> <path>
@@ -36589,6 +36857,229 @@ mod tests {
         engine.view_mut().cursor.line = 0;
         engine.jump_next_hunk();
         assert!(engine.message.contains("No more hunks"));
+    }
+
+    // ─── Diff peek + enhanced hunk nav ─────────────────────────────────────
+
+    #[test]
+    fn test_open_diff_peek_no_hunks() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().content = ropey::Rope::from_str("hello\nworld\n");
+        engine.update_syntax();
+        engine.open_diff_peek();
+        assert!(engine.diff_peek.is_none());
+        assert!(engine.message.contains("No changes"));
+    }
+
+    #[test]
+    fn test_open_diff_peek_with_hunks() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().content = ropey::Rope::from_str("line1\nline2\nline3\n");
+        engine.update_syntax();
+
+        // Simulate having diff hunks cached on the buffer.
+        let bid = engine.active_window().buffer_id;
+        if let Some(state) = engine.buffer_manager.get_mut(bid) {
+            state.diff_hunks = vec![git::DiffHunkInfo {
+                file_header: "diff --git a/f b/f\n--- a/f\n+++ b/f".to_string(),
+                hunk: git::Hunk {
+                    header: "@@ -1,2 +1,3 @@".to_string(),
+                    lines: vec![
+                        " line1".to_string(),
+                        "+line2".to_string(),
+                        " line3".to_string(),
+                    ],
+                },
+                new_start: 0,
+                new_count: 3,
+            }];
+        }
+
+        engine.view_mut().cursor.line = 1;
+        engine.open_diff_peek();
+        assert!(engine.diff_peek.is_some());
+        let peek = engine.diff_peek.as_ref().unwrap();
+        assert_eq!(peek.anchor_line, 1);
+        assert_eq!(peek.hunk_lines.len(), 3);
+        assert_eq!(peek.focused_action, 1); // default to Stage
+    }
+
+    #[test]
+    fn test_diff_peek_close() {
+        let mut engine = Engine::new();
+        engine.diff_peek = Some(DiffPeekState {
+            hunk_index: 0,
+            anchor_line: 5,
+            hunk_lines: vec!["+added".to_string()],
+            file_header: String::new(),
+            hunk: git::Hunk {
+                header: "@@ -1 +1,2 @@".to_string(),
+                lines: vec!["+added".to_string()],
+            },
+            focused_action: 1,
+        });
+        engine.close_diff_peek();
+        assert!(engine.diff_peek.is_none());
+    }
+
+    #[test]
+    fn test_diff_peek_key_escape() {
+        let mut engine = Engine::new();
+        engine.diff_peek = Some(DiffPeekState {
+            hunk_index: 0,
+            anchor_line: 0,
+            hunk_lines: vec![],
+            file_header: String::new(),
+            hunk: git::Hunk {
+                header: String::new(),
+                lines: vec![],
+            },
+            focused_action: 1,
+        });
+        let consumed = engine.handle_diff_peek_key("Escape", None);
+        assert!(consumed);
+        assert!(engine.diff_peek.is_none());
+    }
+
+    #[test]
+    fn test_diff_peek_key_toggle_focus() {
+        let mut engine = Engine::new();
+        engine.diff_peek = Some(DiffPeekState {
+            hunk_index: 0,
+            anchor_line: 0,
+            hunk_lines: vec![],
+            file_header: String::new(),
+            hunk: git::Hunk {
+                header: String::new(),
+                lines: vec![],
+            },
+            focused_action: 1,
+        });
+        engine.handle_diff_peek_key("h", Some('h'));
+        assert_eq!(engine.diff_peek.as_ref().unwrap().focused_action, 0);
+        engine.handle_diff_peek_key("l", Some('l'));
+        assert_eq!(engine.diff_peek.as_ref().unwrap().focused_action, 1);
+    }
+
+    #[test]
+    fn test_diff_peek_key_unknown_closes() {
+        let mut engine = Engine::new();
+        engine.diff_peek = Some(DiffPeekState {
+            hunk_index: 0,
+            anchor_line: 0,
+            hunk_lines: vec![],
+            file_header: String::new(),
+            hunk: git::Hunk {
+                header: String::new(),
+                lines: vec![],
+            },
+            focused_action: 0,
+        });
+        let consumed = engine.handle_diff_peek_key("j", Some('j'));
+        assert!(!consumed); // falls through
+        assert!(engine.diff_peek.is_none());
+    }
+
+    #[test]
+    fn test_jump_next_hunk_with_git_diff() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().content = ropey::Rope::from_str("a\nb\nc\nd\ne\nf\ng\nh\ni\nj\n");
+        engine.update_syntax();
+        // Simulate git_diff: lines 2-3 changed, line 7 changed.
+        let bid = engine.active_window().buffer_id;
+        if let Some(state) = engine.buffer_manager.get_mut(bid) {
+            state.git_diff = vec![
+                None,
+                None,
+                Some(git::GitLineStatus::Modified),
+                Some(git::GitLineStatus::Modified),
+                None,
+                None,
+                None,
+                Some(git::GitLineStatus::Added),
+                None,
+                None,
+            ];
+        }
+        engine.view_mut().cursor.line = 0;
+        engine.jump_next_hunk();
+        assert_eq!(engine.view().cursor.line, 2); // first changed region
+
+        engine.jump_next_hunk();
+        assert_eq!(engine.view().cursor.line, 7); // second changed region
+
+        engine.jump_next_hunk();
+        assert!(engine.message.contains("No more hunks"));
+    }
+
+    #[test]
+    fn test_jump_prev_hunk_with_git_diff() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().content = ropey::Rope::from_str("a\nb\nc\nd\ne\nf\ng\nh\ni\nj\n");
+        engine.update_syntax();
+        let bid = engine.active_window().buffer_id;
+        if let Some(state) = engine.buffer_manager.get_mut(bid) {
+            state.git_diff = vec![
+                None,
+                None,
+                Some(git::GitLineStatus::Modified),
+                Some(git::GitLineStatus::Modified),
+                None,
+                None,
+                None,
+                Some(git::GitLineStatus::Added),
+                None,
+                None,
+            ];
+        }
+        engine.view_mut().cursor.line = 9;
+        engine.jump_prev_hunk();
+        assert_eq!(engine.view().cursor.line, 7); // second changed region start
+
+        engine.jump_prev_hunk();
+        assert_eq!(engine.view().cursor.line, 2); // first changed region start
+
+        engine.jump_prev_hunk();
+        assert!(engine.message.contains("No more hunks"));
+    }
+
+    #[test]
+    fn test_gd_uppercase_opens_diff_peek() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().content = ropey::Rope::from_str("line1\nline2\n");
+        engine.update_syntax();
+        // First keypress sets pending_key to 'g'.
+        engine.handle_key("g", Some('g'), false);
+        // Second keypress 'D' should trigger open_diff_peek.
+        engine.handle_key("D", Some('D'), false);
+        // No diff hunks → should show "No changes" message.
+        assert!(
+            engine.message.contains("No changes") || engine.message.contains("No diff"),
+            "got: {}",
+            engine.message
+        );
+    }
+
+    #[test]
+    fn test_diff_peek_command() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().content = ropey::Rope::from_str("line1\nline2\n");
+        engine.update_syntax();
+        engine.execute_command("DiffPeek");
+        assert!(
+            engine.message.contains("No changes") || engine.message.contains("No diff"),
+            "got: {}",
+            engine.message
+        );
+    }
+
+    #[test]
+    fn test_deleted_git_line_status_variant_exists() {
+        // Verify the Deleted variant is usable (compile-time check + runtime assertion).
+        let status = git::GitLineStatus::Deleted;
+        assert_eq!(status, git::GitLineStatus::Deleted);
+        assert_ne!(status, git::GitLineStatus::Added);
+        assert_ne!(status, git::GitLineStatus::Modified);
     }
 
     // ─── Paragraph text objects (ip / ap) ───────────────────────────────────

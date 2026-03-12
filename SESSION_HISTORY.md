@@ -1,9 +1,18 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 167 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 170 archived here. Recent work summary in PROJECT_STATE.md.
 
 ---
+
+**Session 170 — Inline Diff Peek + Enhanced Hunk Nav (4105 tests):**
+Inline diff preview (VSCode parity): `gD` / `:DiffPeek` / click gutter marker opens floating popup showing hunk diff lines (red=removed, green=added) with `[r] Revert` / `[s] Stage` actions. Deleted-line gutter indicator (`▾` in red) for pure deletions. `]c`/`[c` now navigate changed regions on real source files using `git_diff` markers (previously only worked in diff buffers). New `DiffPeekState`/`DiffPeekPopup` structs, `DiffHunkInfo` with line-range mapping, `compute_file_diff_hunks()`, `hunk_for_line()`, `revert_hunk()` in git.rs. `git_deleted` color added to all 4 themes. Both GTK and TUI backends render popup + detect git gutter clicks. "Git: Peek Change" in command palette. 17 new tests.
+
+**Session 169 — GitHub Wiki (4088 tests):**
+Created the VimCode GitHub Wiki with 9 pages: Home, Getting Started, Key Remapping, Settings Reference, Extension Development, Lua Plugin API, Theme Customization, DAP Debugger Setup, LSP Configuration. Added Documentation section with wiki links to README.md. Updated extension guide link to point to wiki.
+
+**Session 168 — Keybinding Discoverability + VSCode Remapping (4088 tests):**
+Made keybinding remapping discoverable and enabled it in VSCode mode. Added 7 new ex command aliases (`:hover`, `:LspImpl`, `:LspTypedef`, `:nextdiag`, `:prevdiag`, `:nexthunk`, `:prevhunk`) so every remappable keybinding has a named command. Updated `:Keybindings` reference (both Vim and VSCode) to show command names alongside bindings (e.g., `gd → :def`, `F12 → :def`, `Ctrl+P → :fuzzy`) with a remapping hint. Added 12 commands to `available_commands()` for tab completion. Enabled `:map` remapping in VSCode mode — `handle_vscode_key()` now checks `try_user_keymap()` before built-in handlers; mode `"n"` keymaps apply. Added "Open Keyboard Shortcuts" to command palette so VSCode users can F1 → remap keys. Updated `:Keymaps` help text to mention VSCode mode. Fixed pre-existing test hermiticity bug: `engine_with()` now resets `mode` to Normal and rebuilds `user_keymaps` (was leaking disk settings into tests). 17 new tests in `tests/wincmd.rs` (40 total). README updated with discoverability instructions.
 
 **Session 167 — :wincmd Ex Command (4071 tests):**
 Added `:wincmd {char} [count]` ex command (abbreviation `:winc`) that executes any window command programmatically (e.g., `:wincmd h` is equivalent to `Ctrl-W h`). Refactored the `Ctrl-W` handler to delegate to a shared `execute_wincmd()` method, eliminating code duplication between the key handler and the new ex command. Updated `:Keybindings` reference to show command names alongside keybindings. Added `:close`, `:only`, `:new`, `:wincmd` to tab completion. 23 integration tests in `tests/wincmd.rs`.
