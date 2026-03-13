@@ -31,7 +31,7 @@ fn test_swap_created_on_file_open() {
     // Instead, verify the engine's swap state: no recovery pending,
     // and we can check internal state.
     assert!(
-        e.swap_recovery.is_none(),
+        e.pending_swap_recovery.is_none(),
         "no recovery should be pending for a fresh file"
     );
 
@@ -81,7 +81,7 @@ fn test_swap_deleted_on_close() {
     assert!(closed);
 
     // Verify the buffer is gone.
-    assert!(e.swap_recovery.is_none());
+    assert!(e.pending_swap_recovery.is_none());
 
     let _ = fs::remove_file(&path);
 }
@@ -136,13 +136,18 @@ fn test_swap_recovery_offered() {
     let mut e = engine_with("");
     e.open_file_in_tab(&path);
 
-    // Recovery should be offered.
-    assert!(e.swap_recovery.is_some(), "recovery should be pending");
+    // Recovery should be offered via dialog.
     assert!(
-        e.message.contains("[R]ecover"),
-        "message should mention [R]ecover, got: {}",
-        e.message
+        e.pending_swap_recovery.is_some(),
+        "recovery should be pending"
     );
+    assert!(
+        e.dialog.is_some(),
+        "dialog should be open for swap recovery"
+    );
+    let dialog = e.dialog.as_ref().unwrap();
+    assert_eq!(dialog.tag, "swap_recovery");
+    assert_eq!(dialog.buttons.len(), 3);
 
     // Clean up.
     let _ = fs::remove_file(&swap_path);
@@ -171,12 +176,12 @@ fn test_swap_recovery_recover() {
 
     let mut e = engine_with("");
     e.open_file_in_tab(&path);
-    assert!(e.swap_recovery.is_some());
+    assert!(e.pending_swap_recovery.is_some());
 
     // Press R to recover.
     press(&mut e, 'R');
 
-    assert!(e.swap_recovery.is_none());
+    assert!(e.pending_swap_recovery.is_none());
     assert_eq!(buf(&e), "recovered content\n");
     assert!(
         e.active_buffer_state().dirty,
@@ -210,12 +215,12 @@ fn test_swap_recovery_delete() {
 
     let mut e = engine_with("");
     e.open_file_in_tab(&path);
-    assert!(e.swap_recovery.is_some());
+    assert!(e.pending_swap_recovery.is_some());
 
     // Press D to delete the swap.
     press(&mut e, 'D');
 
-    assert!(e.swap_recovery.is_none());
+    assert!(e.pending_swap_recovery.is_none());
     // Buffer should have the original file content, not the recovered content.
     assert_eq!(buf(&e), "original content\n");
     assert!(e.message.contains("deleted"));
@@ -253,12 +258,12 @@ fn test_swap_recovery_abort() {
     let mut e = engine_with("");
     e.open_file_in_tab(&path2); // Open a second file first.
     e.open_file_in_tab(&path);
-    assert!(e.swap_recovery.is_some());
+    assert!(e.pending_swap_recovery.is_some());
 
     // Press A to abort — should close the tab.
     press(&mut e, 'A');
 
-    assert!(e.swap_recovery.is_none());
+    assert!(e.pending_swap_recovery.is_none());
     // Swap file should still exist (left for next time).
     assert!(swap_path.exists(), "swap file should be preserved on abort");
 
@@ -277,7 +282,7 @@ fn test_swap_disabled_by_setting() {
     e.open_file_in_tab(&path);
 
     // No recovery should be pending.
-    assert!(e.swap_recovery.is_none());
+    assert!(e.pending_swap_recovery.is_none());
 
     // swap_mark_dirty should be a no-op.
     e.swap_mark_dirty();
@@ -296,7 +301,7 @@ fn test_swap_not_created_for_unnamed_buffers() {
     // tick should be a no-op (no canonical path to hash).
     e.settings.updatetime = 0;
     e.tick_swap_files();
-    assert!(e.swap_recovery.is_none());
+    assert!(e.pending_swap_recovery.is_none());
 }
 
 // ── 11. Settings support ────────────────────────────────────────────────────
@@ -368,18 +373,18 @@ fn test_swap_recovery_intercepts_normal_keys() {
 
     let mut e = engine_with("");
     e.open_file_in_tab(&path);
-    assert!(e.swap_recovery.is_some());
+    assert!(e.pending_swap_recovery.is_some());
 
     // Pressing 'j' (not R/D/A) should NOT clear recovery.
     press(&mut e, 'j');
     assert!(
-        e.swap_recovery.is_some(),
+        e.pending_swap_recovery.is_some(),
         "unrecognized key should not clear recovery"
     );
 
     // Now press 'r' (lowercase) to recover.
     press(&mut e, 'r');
-    assert!(e.swap_recovery.is_none());
+    assert!(e.pending_swap_recovery.is_none());
 
     let _ = fs::remove_file(&swap_path);
     let _ = fs::remove_file(&path);

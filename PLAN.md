@@ -5,9 +5,9 @@
 ---
 
 ## Recently Completed
-- **Session 173**: Diff View Fixes — Aligned scroll sync in `sync_scroll_binds()`, auto-enable fold filtering in all diff entry points, `is_in_diff_view()` checks all groups, render fix for aligned_idx advancement past folded lines, 1 test. Known remaining issues in BUGS.md.
+- **Session 174**: Bug Fixes — Modal dialog system for swap recovery, stderr suppression in TUI, sticky completion popup fix, diff padding suppression with fold filtering, large-file diff fix (removed MAX_LINES guard), GTK Find Panel focus fix, Visual Ctrl-D/U fix, undo/redo LSP notification, diff toolbar cross-group verification. 40 new tests.
 
-> Sessions 172 and earlier in **SESSION_HISTORY.md**.
+> Sessions 173 and earlier in **SESSION_HISTORY.md**.
 
 ## Roadmap
 

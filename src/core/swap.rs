@@ -40,8 +40,7 @@ pub fn write_swap(swap_path: &Path, header: &SwapHeader, content: &str) {
         return;
     }
     let dir = swap_path.parent().unwrap_or(Path::new("."));
-    if let Err(e) = fs::create_dir_all(dir) {
-        eprintln!("swap: cannot create dir {:?}: {}", dir, e);
+    if fs::create_dir_all(dir).is_err() {
         return;
     }
     let tmp = swap_path.with_extension("tmp");
@@ -57,8 +56,7 @@ pub fn write_swap(swap_path: &Path, header: &SwapHeader, content: &str) {
         fs::rename(&tmp, swap_path)?;
         Ok(())
     })();
-    if let Err(e) = result {
-        eprintln!("swap: write error for {:?}: {}", swap_path, e);
+    if result.is_err() {
         let _ = fs::remove_file(&tmp);
     }
 }

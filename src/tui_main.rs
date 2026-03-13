@@ -602,6 +602,42 @@ fn dir_fuzzy_score(path: &str, query: &str) -> Option<i32> {
 }
 
 // =============================================================================
+// Stderr suppression (prevents "Can't open display" from corrupting TUI)
+// =============================================================================
+
+/// RAII guard that redirects stderr to /dev/null and restores on drop.
+struct StderrGuard {
+    saved_fd: i32,
+}
+
+/// Temporarily suppress stderr output. Returns `None` if the operation fails.
+fn suppress_stderr() -> Option<StderrGuard> {
+    unsafe {
+        let saved = libc::dup(2);
+        if saved < 0 {
+            return None;
+        }
+        let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
+        if devnull < 0 {
+            libc::close(saved);
+            return None;
+        }
+        libc::dup2(devnull, 2);
+        libc::close(devnull);
+        Some(StderrGuard { saved_fd: saved })
+    }
+}
+
+impl Drop for StderrGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::dup2(self.saved_fd, 2);
+            libc::close(self.saved_fd);
+        }
+    }
+}
+
+// =============================================================================
 // Clipboard setup helpers
 // =============================================================================
 
@@ -614,6 +650,10 @@ fn dir_fuzzy_score(path: &str, query: &str) -> Option<i32> {
 /// X11 events).  Subprocess reads each open their own independent X11 connection
 /// and have no such conflict.
 fn build_clipboard_ctx() -> Option<Box<dyn copypasta_ext::ClipboardProviderExt>> {
+    // Suppress stderr to prevent "Can't open display" from corrupting the TUI
+    // when clipboard providers probe for X11/Wayland availability.
+    let _guard = suppress_stderr();
+
     // On Unix (Linux / BSDs) but not macOS, prefer the binary (subprocess) X11
     // context when running under X11.
     #[cfg(all(
@@ -5338,6 +5378,11 @@ fn draw_frame(
         render_tab_switcher_popup(frame.buffer_mut(), area, ts, theme);
     }
 
+    // ── Modal dialog (highest z-order) ───────────────────────────────────────
+    if let Some(ref dialog) = screen.dialog {
+        render_dialog_popup(frame.buffer_mut(), area, dialog, theme);
+    }
+
     // ── Quickfix panel (persistent bottom strip) ──────────────────────────────
     if let Some(ref qf) = screen.quickfix {
         render_quickfix_panel(
@@ -7233,6 +7278,130 @@ fn render_close_tab_confirm_overlay(
             '─'
         };
         set_cell(buf, cx, bottom, ch, border_fg, bg_color);
+    }
+}
+
+fn render_dialog_popup(
+    buf: &mut ratatui::buffer::Buffer,
+    term_area: Rect,
+    dialog: &render::DialogPanel,
+    theme: &Theme,
+) {
+    let bg = rc(theme.fuzzy_bg);
+    let fg = rc(theme.fuzzy_fg);
+    let sel_bg = rc(theme.fuzzy_selected_bg);
+    let border_fg = rc(theme.fuzzy_border);
+    let title_fg = rc(theme.fuzzy_title_fg);
+
+    // Compute dimensions: widest line of body or title, at least 40.
+    let body_max = dialog.body.iter().map(|l| l.len()).max().unwrap_or(0);
+    let btn_row_len: usize = dialog
+        .buttons
+        .iter()
+        .map(|(lbl, _)| lbl.len() + 4) // "  [label]  "
+        .sum::<usize>()
+        + 2;
+    let content_width = body_max.max(dialog.title.len() + 4).max(btn_row_len);
+    let width = (content_width as u16 + 4).clamp(40, term_area.width.saturating_sub(4));
+    // Height: top border + title + blank + body lines + blank + button row + bottom border.
+    let height = (3 + dialog.body.len() as u16 + 2 + 1).min(term_area.height.saturating_sub(4));
+
+    let x = (term_area.width.saturating_sub(width)) / 2;
+    let y = (term_area.height.saturating_sub(height)) / 2;
+
+    // Clear background.
+    for row in y..y + height {
+        for col in x..x + width {
+            if col < term_area.width && row < term_area.height {
+                set_cell(buf, col, row, ' ', fg, bg);
+            }
+        }
+    }
+
+    // Top border.
+    for col in 0..width {
+        let cx = x + col;
+        if cx < term_area.width {
+            let ch = if col == 0 {
+                '╭'
+            } else if col == width - 1 {
+                '╮'
+            } else {
+                '─'
+            };
+            set_cell(buf, cx, y, ch, border_fg, bg);
+        }
+    }
+    // Title overlay.
+    let title = format!(" {} ", dialog.title);
+    for (i, ch) in title.chars().enumerate() {
+        let cx = x + 2 + i as u16;
+        if cx + 1 < x + width && cx < term_area.width {
+            set_cell(buf, cx, y, ch, title_fg, bg);
+        }
+    }
+
+    // Left/right borders for content rows.
+    for row in (y + 1)..(y + height - 1) {
+        if row < term_area.height {
+            if x < term_area.width {
+                set_cell(buf, x, row, '│', border_fg, bg);
+            }
+            let rx = x + width - 1;
+            if rx < term_area.width {
+                set_cell(buf, rx, row, '│', border_fg, bg);
+            }
+        }
+    }
+
+    // Body lines.
+    let body_y = y + 2;
+    for (i, line) in dialog.body.iter().enumerate() {
+        let row = body_y + i as u16;
+        if row >= y + height - 2 {
+            break;
+        }
+        for (j, ch) in line.chars().enumerate() {
+            let cx = x + 2 + j as u16;
+            if cx + 1 < x + width && cx < term_area.width && row < term_area.height {
+                set_cell(buf, cx, row, ch, fg, bg);
+            }
+        }
+    }
+
+    // Button row — last content row before bottom border.
+    let btn_y = y + height - 2;
+    if btn_y < term_area.height {
+        let mut col_offset = 2u16;
+        for (label, is_selected) in &dialog.buttons {
+            let btn_text = format!("  {}  ", label);
+            let btn_bg = if *is_selected { sel_bg } else { bg };
+            for ch in btn_text.chars() {
+                let cx = x + col_offset;
+                if cx + 1 < x + width && cx < term_area.width {
+                    set_cell(buf, cx, btn_y, ch, fg, btn_bg);
+                }
+                col_offset += 1;
+            }
+        }
+    }
+
+    // Bottom border.
+    let bottom = y + height - 1;
+    if bottom < term_area.height {
+        for col in 0..width {
+            let cx = x + col;
+            if cx < term_area.width {
+                let ch = if col == 0 {
+                    '╰'
+                } else if col == width - 1 {
+                    '╯'
+                } else {
+                    '─'
+                };
+                set_cell(buf, cx, bottom, ch, border_fg, bg);
+            }
+        }
     }
 }
 

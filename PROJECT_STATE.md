@@ -1,9 +1,9 @@
 # VimCode Project State
 
-**Last updated:** Mar 12, 2026 (Session 173 — Diff View Fixes: Aligned Scroll Sync + Auto-Filter) | **Tests:** 4214
+**Last updated:** Mar 13, 2026 (Session 174 — Bug Fixes: Dialog System, Completion, Diff, Find Panel) | **Tests:** 4254
 
 > Feature documentation lives in **README.md**.
-> Per-session implementation notes through Session 173 are in **SESSION_HISTORY.md**.
+> Per-session implementation notes through Session 174 are in **SESSION_HISTORY.md**.
 
 ---
 
@@ -26,7 +26,7 @@ When implementing a new key/command, add tests covering:
 
 ## Recent Work
 
-**Session 173 — Diff View Fixes: Aligned Scroll Sync + Auto-Filter (4214 tests):**
-Aligned-position-aware scroll sync for diff windows: `sync_scroll_binds()` now maps scroll positions through `diff_aligned` sequences. Auto-enable `diff_unchanged_hidden` + `diff_apply_folds()` in all diff entry points. `is_in_diff_view()` checks all groups. Render fix: `build_rendered_window` advances `aligned_idx` past folded lines. Known remaining issues in BUGS.md. 1 new test.
+**Session 174 — Bug Fixes: Dialog System, Completion, Diff, Find Panel (4254 tests):**
+Dismissable modal dialog system (`Dialog`/`DialogButton` structs, `show_dialog()`/`handle_dialog_key()`/`process_dialog_result()`) replacing status-bar messages for swap recovery. Stderr suppression in TUI clipboard init (RAII `StderrGuard` with `dup2`). Removed 6 `eprintln!` calls from core modules. Fixed sticky completion popup (new `dismiss_completion()` cancels pending LSP request; mode check in CompletionResponse handler). Fixed diff view padding with fold filtering (skip padding when `diff_unchanged_hidden`). Fixed diff view not working on large files (removed `MAX_LINES: 5000` guard in `lcs_diff()`). Fixed Find Panel text input in GTK (detect Entry focus, return `Propagation::Proceed`). Fixed Visual Mode Ctrl-D/U (`!ctrl` guards). Fixed undo/redo not notifying LSP. Verified diff toolbar renders on both group tab bars. 40 new tests.
 
-> Sessions 172 and earlier archived in **SESSION_HISTORY.md**.
+> Sessions 173 and earlier archived in **SESSION_HISTORY.md**.

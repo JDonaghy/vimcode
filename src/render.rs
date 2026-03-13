@@ -1575,6 +1575,37 @@ pub struct ScreenLayout {
     pub diff_peek: Option<DiffPeekPopup>,
     /// Diff toolbar data for the single-group tab bar.
     pub diff_toolbar: Option<DiffToolbarData>,
+    /// Modal dialog popup — `Some` when a dialog is open.
+    pub dialog: Option<DialogPanel>,
+}
+
+/// A modal dialog displayed over the editor.
+#[derive(Debug, Clone)]
+pub struct DialogPanel {
+    pub title: String,
+    pub body: Vec<String>,
+    /// Each button is `(formatted_label, is_selected)`.
+    pub buttons: Vec<(String, bool)>,
+}
+
+/// Format a button label with the hotkey character bracketed.
+/// e.g., `format_button_label("Recover", 'r')` → `"[R]ecover"`.
+pub fn format_button_label(label: &str, hotkey: char) -> String {
+    let lower = hotkey.to_ascii_lowercase();
+    let upper = hotkey.to_ascii_uppercase();
+    // Find the first case-insensitive match of the hotkey in the label.
+    if let Some(pos) = label.find(|c: char| c.to_ascii_lowercase() == lower) {
+        let ch = label.as_bytes()[pos] as char;
+        format!(
+            "{}[{}]{}",
+            &label[..pos],
+            ch.to_ascii_uppercase(),
+            &label[pos + ch.len_utf8()..]
+        )
+    } else {
+        // Hotkey not found in label — prepend it.
+        format!("[{}] {}", upper, label)
+    }
 }
 
 /// A floating popup showing a diff hunk preview with revert/stage actions.
@@ -3396,6 +3427,16 @@ pub fn build_screen_layout(
             hunk_lines: dp.hunk_lines.clone(),
         }),
         diff_toolbar,
+        dialog: engine.dialog.as_ref().map(|d| DialogPanel {
+            title: d.title.clone(),
+            body: d.body.clone(),
+            buttons: d
+                .buttons
+                .iter()
+                .enumerate()
+                .map(|(i, btn)| (format_button_label(&btn.label, btn.hotkey), i == d.selected))
+                .collect(),
+        }),
     }
 }
 
@@ -4334,6 +4375,13 @@ fn build_rendered_window(
                         break; // reached the current buffer line
                     }
                     // This source line is before scroll_top — skip it.
+                    aligned_idx += 1;
+                    continue;
+                }
+                // When unchanged lines are hidden (fold-filtered diff view),
+                // suppress padding lines — alignment is meaningless when
+                // the unchanged context between hunks is collapsed.
+                if engine.diff_unchanged_hidden {
                     aligned_idx += 1;
                     continue;
                 }
@@ -5502,5 +5550,67 @@ mod tests {
         assert_eq!(theme.status_bg, Color::try_from_hex("#181825").unwrap());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_format_button_label() {
+        assert_eq!(super::format_button_label("Recover", 'r'), "[R]ecover");
+        assert_eq!(
+            super::format_button_label("Delete swap", 'd'),
+            "[D]elete swap"
+        );
+        assert_eq!(super::format_button_label("Abort", 'a'), "[A]bort");
+        assert_eq!(super::format_button_label("OK", 'o'), "[O]K");
+        // Hotkey not in label → prepended.
+        assert_eq!(super::format_button_label("Yes", 'z'), "[Z] Yes");
+    }
+
+    #[test]
+    fn test_diff_toolbar_on_both_group_tab_bars() {
+        use crate::core::engine::{Engine, OpenMode};
+        use crate::core::window::SplitDirection;
+
+        let dir = std::env::temp_dir().join("vimcode_render_diff_groups");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f1 = dir.join("a.txt");
+        let f2 = dir.join("b.txt");
+        std::fs::write(&f1, "same\nold\nsame\n").unwrap();
+        std::fs::write(&f2, "same\nnew\nsame\n").unwrap();
+
+        let mut engine = Engine::new();
+        engine
+            .open_file_with_mode(&f1, OpenMode::Permanent)
+            .unwrap();
+        engine.execute_command("diffthis");
+
+        // Create a second editor group and open the second file.
+        engine.open_editor_group(SplitDirection::Vertical);
+        engine
+            .open_file_with_mode(&f2, OpenMode::Permanent)
+            .unwrap();
+        engine.execute_command("diffthis");
+        assert!(engine.is_in_diff_view());
+
+        // Build window rects for both groups.
+        let content_bounds = WindowRect::new(0.0, 1.0, 80.0, 24.0);
+        let (rects, _) = engine.calculate_group_window_rects(content_bounds, 1.0);
+        let theme = Theme::onedark();
+        let layout = build_screen_layout(&engine, &theme, &rects, 1.0, 1.0, false);
+
+        // Both group tab bars should have diff_toolbar populated.
+        let split = layout
+            .editor_group_split
+            .expect("should have editor group split");
+        assert!(
+            split.group_tab_bars.len() >= 2,
+            "should have 2+ group tab bars"
+        );
+        for gtb in &split.group_tab_bars {
+            assert!(
+                gtb.diff_toolbar.is_some(),
+                "group {:?} should have diff toolbar, but it's None",
+                gtb.group_id
+            );
+        }
     }
 }

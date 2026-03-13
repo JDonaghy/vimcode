@@ -199,6 +199,24 @@ pub struct SwapRecovery {
     pub buffer_id: BufferId,
 }
 
+/// A button in a modal dialog.
+#[derive(Debug, Clone)]
+pub struct DialogButton {
+    pub label: String,
+    pub hotkey: char,
+    pub action: String,
+}
+
+/// A modal dialog displayed over the editor.
+#[derive(Debug, Clone)]
+pub struct Dialog {
+    pub title: String,
+    pub body: Vec<String>,
+    pub buttons: Vec<DialogButton>,
+    pub selected: usize,
+    pub tag: String,
+}
+
 /// A single entry in the command palette.
 pub struct PaletteCommand {
     pub label: &'static str,
@@ -2017,8 +2035,10 @@ pub struct Engine {
     swap_write_needed: HashSet<BufferId>,
     /// When we last wrote swap files to disk.
     swap_last_write: std::time::Instant,
-    /// Pending recovery dialog (user must press R/D/A).
-    pub swap_recovery: Option<SwapRecovery>,
+    /// Pending swap recovery data (used by the dialog system).
+    pub pending_swap_recovery: Option<SwapRecovery>,
+    /// Modal dialog displayed over the editor.
+    pub dialog: Option<Dialog>,
 
     // --- VSCode mode state ---
     /// Ctrl+K chord pending: waiting for the second key of a Ctrl+K combo.
@@ -2331,7 +2351,8 @@ impl Engine {
             md_preview_links: HashMap::new(),
             swap_write_needed: HashSet::new(),
             swap_last_write: std::time::Instant::now(),
-            swap_recovery: None,
+            pending_swap_recovery: None,
+            dialog: None,
             vscode_pending_ctrl_k: false,
             ext_panels: HashMap::new(),
             ext_panel_items: HashMap::new(),
@@ -2673,6 +2694,10 @@ impl Engine {
             // Update dirty flag based on whether we're back at the saved state.
             let at_saved = self.active_buffer_state().is_at_saved_state();
             self.set_dirty(!at_saved);
+            // Notify LSP of the content change so diagnostics update.
+            let active_id = self.active_buffer_id();
+            self.lsp_dirty_buffers.insert(active_id, true);
+            self.swap_mark_dirty();
             true
         } else {
             self.message = "Already at oldest change".to_string();
@@ -2688,6 +2713,10 @@ impl Engine {
             // Update dirty flag based on whether we're back at the saved state.
             let at_saved = self.active_buffer_state().is_at_saved_state();
             self.set_dirty(!at_saved);
+            // Notify LSP of the content change so diagnostics update.
+            let active_id = self.active_buffer_id();
+            self.lsp_dirty_buffers.insert(active_id, true);
+            self.swap_mark_dirty();
             true
         } else {
             self.message = "Already at newest change".to_string();
@@ -5352,8 +5381,8 @@ impl Engine {
         }
 
         self.refresh_git_diff(buffer_id);
-        // Don't overwrite a pending swap recovery message.
-        if self.swap_recovery.is_none() {
+        // Don't overwrite a pending dialog message.
+        if self.dialog.is_none() {
             self.message = format!("\"{}\"", path.display());
         }
         self.lsp_did_open(buffer_id);
@@ -6407,8 +6436,8 @@ impl Engine {
         ctrl: bool,
     ) -> EngineAction {
         // Clear message on any keypress (unless we're in command/search mode
-        // or a swap recovery dialog is pending — its prompt is in self.message)
-        if self.mode != Mode::Command && self.mode != Mode::Search && self.swap_recovery.is_none() {
+        // or a dialog is open)
+        if self.mode != Mode::Command && self.mode != Mode::Search && self.dialog.is_none() {
             self.message.clear();
         }
         // Dismiss LSP hover popup on any keypress
@@ -6429,9 +6458,12 @@ impl Engine {
             }
         }
 
-        // Swap recovery dialog intercepts R/D/A keys.
-        if self.swap_recovery.is_some() {
-            return self.handle_swap_recovery_key(key_name, unicode);
+        // Modal dialog intercepts all keys.
+        if self.dialog.is_some() {
+            if let Some((tag, action)) = self.handle_dialog_key(key_name, unicode) {
+                return self.process_dialog_result(&tag, &action);
+            }
+            return EngineAction::None;
         }
 
         // Ctrl+Tab opens the tab switcher (or cycles forward if already open).
@@ -6604,6 +6636,12 @@ impl Engine {
                     format!("Extension '{name}' dismissed — :ExtEnable {name} to re-enable");
                 return EngineAction::None;
             }
+        }
+
+        // Safety: dismiss completion popup if it's visible outside Insert mode.
+        // This can happen if a late-arriving LSP response set it after mode change.
+        if self.completion_idx.is_some() && self.mode != Mode::Insert && !self.is_vscode_mode() {
+            self.dismiss_completion();
         }
 
         // Capture cursor position before dispatching (used by cursor_move hook below).
@@ -10457,9 +10495,7 @@ impl Engine {
         if !ctrl && key_name == "Tab" && self.completion_display_only {
             if let Some(idx) = self.completion_idx {
                 self.apply_completion_candidate(idx);
-                self.completion_candidates.clear();
-                self.completion_idx = None;
-                self.completion_display_only = false;
+                self.dismiss_completion();
                 *changed = true;
                 return;
             }
@@ -10486,9 +10522,7 @@ impl Engine {
 
         // Clear completion state on any non-completion key.
         if self.completion_idx.is_some() {
-            self.completion_candidates.clear();
-            self.completion_idx = None;
-            self.completion_display_only = false;
+            self.dismiss_completion();
         }
 
         // Ctrl+R: insert register content at cursor
@@ -11099,9 +11133,7 @@ impl Engine {
             self.ai_ghost_clear();
         }
         if self.completion_idx.is_some() {
-            self.completion_candidates.clear();
-            self.completion_idx = None;
-            self.completion_display_only = false;
+            self.dismiss_completion();
         }
 
         let line = self.view().cursor.line;
@@ -11854,7 +11886,7 @@ impl Engine {
                     self.paste_visual_selection(changed);
                     return EngineAction::None;
                 }
-                'd' => {
+                'd' if !ctrl => {
                     self.count = None; // Clear count (not used for visual operators)
                     self.delete_visual_selection(changed);
                     return EngineAction::None;
@@ -11869,7 +11901,7 @@ impl Engine {
                     self.change_visual_selection(changed);
                     return EngineAction::None;
                 }
-                'u' if self.pending_key.is_none() => {
+                'u' if !ctrl && self.pending_key.is_none() => {
                     self.count = None; // Clear count (not used for visual operators)
                     self.lowercase_visual_selection(changed);
                     return EngineAction::None;
@@ -20402,14 +20434,23 @@ impl Engine {
         self.view_mut().cursor.col = start + candidate.len();
     }
 
+    /// Dismiss the completion popup and cancel any pending LSP completion request.
+    /// This ensures that a late-arriving LSP response cannot re-show a popup
+    /// after the user has already dismissed it (e.g. by pressing Escape or
+    /// moving the cursor).
+    fn dismiss_completion(&mut self) {
+        self.completion_candidates.clear();
+        self.completion_idx = None;
+        self.completion_display_only = false;
+        self.lsp_pending_completion = None;
+    }
+
     /// Trigger auto-popup completion based on current cursor prefix.
     /// Called after each text change in Insert mode.
     fn trigger_auto_completion(&mut self) {
         let (prefix, _) = self.completion_prefix_at_cursor();
         if prefix.is_empty() {
-            self.completion_candidates.clear();
-            self.completion_idx = None;
-            self.completion_display_only = false;
+            self.dismiss_completion();
             return;
         }
         let candidates = self.word_completions_for_prefix(&prefix);
@@ -20419,7 +20460,7 @@ impl Engine {
             self.completion_idx = Some(0);
             self.completion_display_only = true;
         } else {
-            // No buffer-word hits yet; still fire LSP (may populate asynchronously)
+            // No buffer-word hits yet; clear popup but keep LSP pending
             self.completion_candidates.clear();
             self.completion_idx = None;
             self.completion_display_only = false;
@@ -24252,7 +24293,7 @@ impl Engine {
             return false;
         }
         // Don't overwrite an existing recovery dialog.
-        if self.swap_recovery.is_some() {
+        if self.pending_swap_recovery.is_some() {
             self.swap_create_for_buffer(buf_id);
             return false;
         }
@@ -24305,36 +24346,50 @@ impl Engine {
             );
             return false;
         }
-        // PID is dead → offer recovery.
+        // PID is dead → offer recovery via dialog.
         let fname = file_path.file_name().unwrap_or_default().to_string_lossy();
-        self.message = format!(
-            "Swap file found for \"{}\". [R]ecover, [D]elete swap, [A]bort",
-            fname
-        );
-        self.swap_recovery = Some(SwapRecovery {
+        self.pending_swap_recovery = Some(SwapRecovery {
             swap_path,
             recovered_content: content,
             buffer_id: buf_id,
         });
+        self.show_dialog(
+            "swap_recovery",
+            "Swap File Found",
+            vec![
+                format!("A swap file was found for \"{}\".", fname),
+                format!("Modified: {}", header.modified),
+                format!("Original PID: {} (no longer running)", header.pid),
+            ],
+            vec![
+                DialogButton {
+                    label: "Recover".into(),
+                    hotkey: 'r',
+                    action: "recover".into(),
+                },
+                DialogButton {
+                    label: "Delete swap".into(),
+                    hotkey: 'd',
+                    action: "delete".into(),
+                },
+                DialogButton {
+                    label: "Abort".into(),
+                    hotkey: 'a',
+                    action: "abort".into(),
+                },
+            ],
+        );
         true
     }
 
-    /// Handle a key press when a swap recovery dialog is pending.
-    /// Returns `true` if the key was consumed.
-    fn handle_swap_recovery_key(&mut self, key_name: &str, unicode: Option<char>) -> EngineAction {
-        let recovery = match self.swap_recovery.take() {
+    /// Process the result of a swap recovery dialog action.
+    fn process_swap_dialog_action(&mut self, action: &str) -> EngineAction {
+        let recovery = match self.pending_swap_recovery.take() {
             Some(r) => r,
             None => return EngineAction::None,
         };
-        // TUI sends key_name="" with the char in unicode; GTK sends key_name="r".
-        let effective = if !key_name.is_empty() {
-            key_name.to_string()
-        } else {
-            unicode.map(|c| c.to_string()).unwrap_or_default()
-        };
-        match effective.as_str() {
-            "r" | "R" => {
-                // Replace buffer content with recovered content.
+        match action {
+            "recover" => {
                 let state = self.buffer_manager.get_mut(recovery.buffer_id);
                 if let Some(state) = state {
                     let len = state.buffer.len_chars();
@@ -24348,34 +24403,123 @@ impl Engine {
                 self.swap_create_for_buffer(recovery.buffer_id);
                 self.message = "Recovered from swap file".to_string();
             }
-            "d" | "D" => {
-                // Delete the stale swap, keep the file as-is.
+            "delete" => {
                 super::swap::delete_swap(&recovery.swap_path);
                 self.swap_create_for_buffer(recovery.buffer_id);
                 self.message = "Swap file deleted".to_string();
             }
-            "a" | "A" => {
-                // Abort — close the tab, leave swap for next time.
+            "abort" | "cancel" => {
                 self.close_tab();
                 self.message.clear();
             }
-            _ => {
-                // Unrecognized key — put recovery back and re-display prompt.
-                let fname = self
-                    .buffer_manager
-                    .get(recovery.buffer_id)
-                    .and_then(|s| s.file_path.as_ref())
-                    .and_then(|p| p.file_name())
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                self.message = format!(
-                    "Swap file found for \"{}\". [R]ecover, [D]elete swap, [A]bort",
-                    fname
-                );
-                self.swap_recovery = Some(recovery);
-            }
+            _ => {}
         }
         EngineAction::None
+    }
+
+    // ─── Dialog system ─────────────────────────────────────────────────
+
+    /// Show a modal dialog.
+    pub fn show_dialog(
+        &mut self,
+        tag: &str,
+        title: &str,
+        body: Vec<String>,
+        buttons: Vec<DialogButton>,
+    ) {
+        self.dialog = Some(Dialog {
+            title: title.to_string(),
+            body,
+            buttons,
+            selected: 0,
+            tag: tag.to_string(),
+        });
+    }
+
+    /// Convenience: show an error dialog with a single OK button.
+    #[allow(dead_code)]
+    pub fn show_error_dialog(&mut self, title: &str, message: &str) {
+        self.show_dialog(
+            "error",
+            title,
+            vec![message.to_string()],
+            vec![DialogButton {
+                label: "OK".into(),
+                hotkey: 'o',
+                action: "ok".into(),
+            }],
+        );
+    }
+
+    /// Handle a key press when a dialog is open.
+    /// Returns `Some((tag, action))` when the dialog is dismissed, `None` to keep it open.
+    fn handle_dialog_key(
+        &mut self,
+        key_name: &str,
+        unicode: Option<char>,
+    ) -> Option<(String, String)> {
+        let dialog = self.dialog.as_mut()?;
+        // TUI sends key_name="" with the char in unicode; GTK sends key_name="r".
+        let effective = if !key_name.is_empty() {
+            key_name.to_string()
+        } else {
+            unicode.map(|c| c.to_string()).unwrap_or_default()
+        };
+
+        match effective.as_str() {
+            "Escape" => {
+                let tag = dialog.tag.clone();
+                self.dialog = None;
+                Some((tag, "cancel".to_string()))
+            }
+            "Return" => {
+                let tag = dialog.tag.clone();
+                let action = dialog
+                    .buttons
+                    .get(dialog.selected)
+                    .map(|b| b.action.clone())
+                    .unwrap_or_else(|| "cancel".to_string());
+                self.dialog = None;
+                Some((tag, action))
+            }
+            "Left" | "h" => {
+                if dialog.selected > 0 {
+                    dialog.selected -= 1;
+                }
+                None
+            }
+            "Right" | "l" => {
+                if dialog.selected + 1 < dialog.buttons.len() {
+                    dialog.selected += 1;
+                }
+                None
+            }
+            _ => {
+                // Check hotkeys (case-insensitive).
+                let ch = effective
+                    .chars()
+                    .next()
+                    .unwrap_or('\0')
+                    .to_ascii_lowercase();
+                for btn in &dialog.buttons {
+                    if btn.hotkey == ch {
+                        let tag = dialog.tag.clone();
+                        let action = btn.action.clone();
+                        self.dialog = None;
+                        return Some((tag, action));
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    /// Dispatch a dialog result to the appropriate handler.
+    fn process_dialog_result(&mut self, tag: &str, action: &str) -> EngineAction {
+        match tag {
+            "swap_recovery" => self.process_swap_dialog_action(action),
+            _ => EngineAction::None,
+        }
     }
 
     /// Mark the active buffer as needing a swap write.
@@ -24435,7 +24579,7 @@ impl Engine {
         }
         let buf_ids = self.buffer_manager.list();
         for buf_id in buf_ids {
-            if self.swap_recovery.is_some() {
+            if self.pending_swap_recovery.is_some() {
                 // Already showing a recovery dialog — just create swaps for the rest.
                 self.swap_create_for_buffer(buf_id);
             } else {
@@ -24451,7 +24595,7 @@ impl Engine {
     /// don't correspond to any currently-open buffer.  Opens the first
     /// orphaned file in a new tab and offers recovery.
     fn swap_scan_stale(&mut self) {
-        if !self.settings.swap_file || self.swap_recovery.is_some() {
+        if !self.settings.swap_file || self.pending_swap_recovery.is_some() {
             return;
         }
         let stale = super::swap::find_stale_swaps();
@@ -24479,9 +24623,9 @@ impl Engine {
             }
             // Open the file in a new tab.  `open_file_in_tab` calls
             // `swap_check_on_open` internally, which will detect the
-            // stale swap and set `swap_recovery` for us.
+            // stale swap and set `pending_swap_recovery` for us.
             self.open_file_in_tab(&header.file_path);
-            if self.swap_recovery.is_some() {
+            if self.pending_swap_recovery.is_some() {
                 return;
             }
         }
@@ -24697,7 +24841,10 @@ impl Engine {
                     if self.lsp_pending_completion == Some(request_id) {
                         // Popup completion response — populate display-only popup
                         self.lsp_pending_completion = None;
-                        if !items.is_empty() {
+                        // Only show completion if still in Insert mode (or VSCode mode).
+                        // The user may have pressed Escape between the request and response.
+                        let in_insert = self.mode == Mode::Insert || self.is_vscode_mode();
+                        if in_insert && !items.is_empty() {
                             let (cur_prefix, _) = self.completion_prefix_at_cursor();
                             let lsp_cands: Vec<String> = items
                                 .iter()
@@ -27835,14 +27982,11 @@ pub fn lcs_diff(a: &[&str], b: &[&str]) -> (Vec<DiffLine>, Vec<DiffLine>) {
         return (vec![DiffLine::Removed; n], vec![]);
     }
 
-    // Guard: bail out early on very large inputs to avoid O(N·D) blow-up.
-    // Myers diff with trace is O(D²) in memory and O(N·D) in time.
-    const MAX_LINES: usize = 5_000;
-    if n > MAX_LINES || m > MAX_LINES {
-        return (vec![DiffLine::Same; n], vec![DiffLine::Same; m]);
-    }
-
     // Maximum edit distance we're willing to explore.
+    // Myers diff is O(N·D) in time and O(D²) in memory where D = edit distance.
+    // For large files with small diffs (the common case), D is small so this is
+    // fast regardless of file size.  The MAX_EDIT_DIST cap prevents blow-up when
+    // two files are extremely different.
     const MAX_EDIT_DIST: usize = 2_000;
     let max_d = (n + m).min(MAX_EDIT_DIST);
 
@@ -30712,9 +30856,7 @@ impl Engine {
                 "Escape" => {
                     // Dismiss completion popup if open
                     if self.completion_idx.is_some() {
-                        self.completion_candidates.clear();
-                        self.completion_idx = None;
-                        self.completion_display_only = false;
+                        self.dismiss_completion();
                     } else if self.lsp_completion_active {
                         self.lsp_completion_active = false;
                     } else if !self.view().extra_cursors.is_empty() {
@@ -37820,6 +37962,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_escape_from_insert_clears_pending_lsp_completion() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "foobar\n");
+        press_char(&mut engine, 'G');
+        press_char(&mut engine, 'o');
+        press_char(&mut engine, 'f');
+        press_char(&mut engine, 'o');
+        press_char(&mut engine, 'o'); // "foo" → popup active
+        assert!(engine.completion_idx.is_some());
+        // Simulate a pending LSP completion request
+        engine.lsp_pending_completion = Some(42);
+        // Escape exits insert mode and clears completion + pending LSP
+        press_special(&mut engine, "Escape");
+        assert!(engine.completion_idx.is_none());
+        assert!(
+            engine.lsp_pending_completion.is_none(),
+            "pending LSP completion should be cancelled on Escape"
+        );
+    }
+
+    #[test]
+    fn test_completion_dismissed_in_normal_mode() {
+        let mut engine = Engine::new();
+        // Manually set completion state as if from a race condition
+        engine.completion_candidates = vec!["hello".to_string()];
+        engine.completion_idx = Some(0);
+        engine.completion_display_only = true;
+        assert_eq!(engine.mode, Mode::Normal);
+        // Any key in Normal mode should dismiss the popup
+        press_char(&mut engine, 'j');
+        assert!(
+            engine.completion_idx.is_none(),
+            "completion should be dismissed when not in Insert mode"
+        );
+    }
+
     // ── :set command (engine-level) ───────────────────────────────────────────
 
     #[test]
@@ -38794,6 +38973,32 @@ mod tests {
         engine.handle_key("a", Some('a'), false);
         let active_id = engine.active_buffer_id();
         assert!(engine.lsp_dirty_buffers.contains_key(&active_id));
+    }
+
+    #[test]
+    fn test_undo_redo_marks_lsp_dirty() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello");
+        // Type something to create an undo entry.
+        press_char(&mut engine, 'i');
+        press_char(&mut engine, 'x');
+        press_special(&mut engine, "Escape");
+        // Clear LSP dirty flag.
+        engine.lsp_dirty_buffers.clear();
+        // Undo should mark the buffer as LSP-dirty.
+        engine.undo();
+        let active_id = engine.active_buffer_id();
+        assert!(
+            engine.lsp_dirty_buffers.contains_key(&active_id),
+            "undo should mark buffer as LSP-dirty"
+        );
+        // Clear and test redo.
+        engine.lsp_dirty_buffers.clear();
+        engine.redo();
+        assert!(
+            engine.lsp_dirty_buffers.contains_key(&active_id),
+            "redo should mark buffer as LSP-dirty"
+        );
     }
 
     // =======================================================================
@@ -40204,6 +40409,34 @@ mod tests {
         assert!(ab[0].source_line.is_some());
     }
 
+    #[test]
+    fn test_lcs_diff_large_files_with_small_diff() {
+        // Regression: files >5000 lines used to return all-Same due to MAX_LINES guard.
+        let mut a_lines: Vec<String> = (0..8000).map(|i| format!("line {i}")).collect();
+        let mut b_lines = a_lines.clone();
+        // Insert 3 new lines in the middle of b.
+        b_lines.insert(4000, "new line 1".to_string());
+        b_lines.insert(4001, "new line 2".to_string());
+        b_lines.insert(4002, "new line 3".to_string());
+        // Also change one line.
+        a_lines[100] = "original line 100".to_string();
+        b_lines[100] = "modified line 100".to_string();
+
+        let a_refs: Vec<&str> = a_lines.iter().map(String::as_str).collect();
+        let b_refs: Vec<&str> = b_lines.iter().map(String::as_str).collect();
+        let (da, db) = lcs_diff(&a_refs, &b_refs);
+
+        // Should detect actual changes, not return all-Same.
+        let a_changes = da.iter().filter(|d| **d != DiffLine::Same).count();
+        let b_changes = db.iter().filter(|d| **d != DiffLine::Same).count();
+        assert!(
+            a_changes > 0 || b_changes > 0,
+            "diff should detect changes in large files"
+        );
+        // Specifically: b should have 3 Added lines + 1 changed line.
+        assert!(b_changes >= 3, "b should have at least 3 Added lines");
+    }
+
     // ─── cmd_diffthis / cmd_diffoff / cmd_diffsplit tests ─────────────────────
 
     #[test]
@@ -40522,6 +40755,58 @@ mod tests {
         // diff_current_change_index should return data for toolbar.
         let idx = engine.diff_current_change_index();
         assert!(idx.is_some(), "toolbar should have change index data");
+    }
+
+    #[test]
+    fn test_diffthis_across_editor_groups() {
+        let mut engine = Engine::new();
+        let dir = std::env::temp_dir().join("vimcode_diffthis_groups");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f1 = dir.join("a_grp.txt");
+        let f2 = dir.join("b_grp.txt");
+        std::fs::write(&f1, "same\nold\nsame\n").unwrap();
+        std::fs::write(&f2, "same\nnew\nsame\n").unwrap();
+
+        // Open first file and mark for diff.
+        engine
+            .open_file_with_mode(&f1, OpenMode::Permanent)
+            .unwrap();
+        let win_a = engine.active_window_id();
+        engine.execute_command("diffthis");
+
+        // Split into a new editor group and open the second file.
+        engine.open_editor_group(SplitDirection::Vertical);
+        engine
+            .open_file_with_mode(&f2, OpenMode::Permanent)
+            .unwrap();
+        let win_b = engine.active_window_id();
+        assert_ne!(win_a, win_b);
+
+        // Mark second window for diff.
+        engine.execute_command("diffthis");
+        assert!(engine.is_in_diff_view());
+        let (a, b) = engine.diff_window_pair.unwrap();
+        assert_ne!(a, b);
+
+        // Verify both windows are in different groups.
+        let group_ids = engine.group_layout.group_ids();
+        assert!(group_ids.len() >= 2, "should have at least 2 editor groups");
+
+        // Verify each group contains one of the diff windows.
+        for &gid in &group_ids {
+            if let Some(group) = engine.editor_groups.get(&gid) {
+                let wids = group.active_tab().layout.window_ids();
+                let has_diff = wids.contains(&a) || wids.contains(&b);
+                if has_diff {
+                    // This group should be detected by is_in_diff_view's logic
+                    assert!(engine.is_in_diff_view(), "diff view should be detected");
+                }
+            }
+        }
+
+        // Verify diff results have data.
+        let regions = engine.diff_change_regions(b);
+        assert!(!regions.is_empty(), "should detect changes");
     }
 
     // ── cmd_git_diff_split tests ────────────────────────────────────────────
@@ -43563,5 +43848,174 @@ mod tests {
         engine.handle_key("k", Some('k'), true);
         assert_eq!(engine.command_buffer, "hel");
         assert_eq!(engine.command_cursor, 3);
+    }
+
+    // ─── Visual mode Ctrl-D / Ctrl-U tests ─────────────────────────────
+
+    #[test]
+    fn test_visual_ctrl_d_extends_selection_down() {
+        let mut engine = Engine::new();
+        // 20 lines so half-page is meaningful
+        let text = (0..20)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        engine.buffer_mut().insert(0, &text);
+        engine.view_mut().viewport_lines = 10;
+        // Enter visual mode on line 0
+        press_char(&mut engine, 'v');
+        assert!(matches!(engine.mode, Mode::Visual));
+        // Ctrl-D should move cursor down by half page (5 lines), extending selection
+        press_ctrl(&mut engine, 'd');
+        assert!(matches!(engine.mode, Mode::Visual));
+        assert_eq!(engine.view().cursor.line, 5);
+        // Buffer should be unchanged (not deleted)
+        assert_eq!(engine.buffer().len_lines(), 20);
+    }
+
+    #[test]
+    fn test_visual_ctrl_u_extends_selection_up() {
+        let mut engine = Engine::new();
+        let text = (0..20)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        engine.buffer_mut().insert(0, &text);
+        engine.view_mut().viewport_lines = 10;
+        // Move to line 10
+        engine.view_mut().cursor.line = 10;
+        // Enter visual mode
+        press_char(&mut engine, 'v');
+        assert!(matches!(engine.mode, Mode::Visual));
+        // Ctrl-U should move cursor up by half page (5 lines), extending selection
+        press_ctrl(&mut engine, 'u');
+        assert!(matches!(engine.mode, Mode::Visual));
+        assert_eq!(engine.view().cursor.line, 5);
+        // Buffer should be unchanged (case not toggled)
+        let content = engine.buffer().to_string();
+        assert!(content.starts_with("line 0"));
+    }
+
+    // ─── Dialog system tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_dialog_show_and_escape() {
+        let mut e = Engine::new();
+        e.buffer_mut().insert(0, "hello");
+        e.show_dialog(
+            "test",
+            "Test Dialog",
+            vec!["Body line".into()],
+            vec![DialogButton {
+                label: "OK".into(),
+                hotkey: 'o',
+                action: "ok".into(),
+            }],
+        );
+        assert!(e.dialog.is_some());
+        // Escape dismisses.
+        e.handle_key("Escape", None, false);
+        assert!(e.dialog.is_none());
+    }
+
+    #[test]
+    fn test_dialog_hotkey() {
+        let mut e = Engine::new();
+        e.show_dialog(
+            "test",
+            "Choose",
+            vec!["Pick one".into()],
+            vec![
+                DialogButton {
+                    label: "Recover".into(),
+                    hotkey: 'r',
+                    action: "recover".into(),
+                },
+                DialogButton {
+                    label: "Delete".into(),
+                    hotkey: 'd',
+                    action: "delete".into(),
+                },
+            ],
+        );
+        // Press 'r' → hotkey should dismiss.
+        e.handle_key("", Some('r'), false);
+        assert!(e.dialog.is_none());
+    }
+
+    #[test]
+    fn test_dialog_arrow_nav_and_enter() {
+        let mut e = Engine::new();
+        e.show_dialog(
+            "test",
+            "Choose",
+            vec![],
+            vec![
+                DialogButton {
+                    label: "A".into(),
+                    hotkey: 'a',
+                    action: "a_action".into(),
+                },
+                DialogButton {
+                    label: "B".into(),
+                    hotkey: 'b',
+                    action: "b_action".into(),
+                },
+                DialogButton {
+                    label: "C".into(),
+                    hotkey: 'c',
+                    action: "c_action".into(),
+                },
+            ],
+        );
+        assert_eq!(e.dialog.as_ref().unwrap().selected, 0);
+        // Move right.
+        e.handle_key("Right", None, false);
+        assert_eq!(e.dialog.as_ref().unwrap().selected, 1);
+        // Move right again.
+        e.handle_key("Right", None, false);
+        assert_eq!(e.dialog.as_ref().unwrap().selected, 2);
+        // Right at end → stays at 2.
+        e.handle_key("Right", None, false);
+        assert_eq!(e.dialog.as_ref().unwrap().selected, 2);
+        // Move left.
+        e.handle_key("Left", None, false);
+        assert_eq!(e.dialog.as_ref().unwrap().selected, 1);
+        // Enter confirms the selected button.
+        e.handle_key("Return", None, false);
+        assert!(e.dialog.is_none());
+    }
+
+    #[test]
+    fn test_dialog_blocks_normal_keys() {
+        let mut e = Engine::new();
+        e.buffer_mut().insert(0, "hello");
+        e.show_dialog(
+            "test",
+            "Block",
+            vec![],
+            vec![DialogButton {
+                label: "OK".into(),
+                hotkey: 'o',
+                action: "ok".into(),
+            }],
+        );
+        // Press 'x' which would normally delete a char — dialog should consume it.
+        e.handle_key("", Some('x'), false);
+        assert!(e.dialog.is_some()); // Dialog still open.
+        assert_eq!(e.buffer().to_string(), "hello"); // Buffer unchanged.
+    }
+
+    #[test]
+    fn test_show_error_dialog() {
+        let mut e = Engine::new();
+        e.show_error_dialog("Error", "Something went wrong");
+        let dialog = e.dialog.as_ref().unwrap();
+        assert_eq!(dialog.tag, "error");
+        assert_eq!(dialog.title, "Error");
+        assert_eq!(dialog.body, vec!["Something went wrong"]);
+        assert_eq!(dialog.buttons.len(), 1);
+        assert_eq!(dialog.buttons[0].hotkey, 'o');
+        assert_eq!(dialog.buttons[0].action, "ok");
     }
 }

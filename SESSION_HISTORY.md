@@ -1,9 +1,12 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 173 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 174 archived here. Recent work summary in PROJECT_STATE.md.
 
 ---
+
+**Session 174 — Bug Fixes: Dialog System, Completion, Diff, Find Panel (4254 tests):**
+Dismissable modal dialog system: `Dialog`/`DialogButton` structs with `show_dialog()`/`show_error_dialog()`/`handle_dialog_key()`/`process_dialog_result()` in engine.rs; `DialogPanel`/`format_button_label()` in render.rs; `render_dialog_popup()` in TUI; `draw_dialog_popup()` in GTK. Swap recovery migrated from status-bar messages to modal dialog (`pending_swap_recovery` field, `process_swap_dialog_action()`). Stderr suppression: RAII `StderrGuard` wrapping `build_clipboard_ctx()` in TUI to prevent "Can't open display" noise. Removed 6 `eprintln!` calls from `swap.rs`/`settings.rs`/`lsp_manager.rs`. Fixed sticky completion popup: `dismiss_completion()` helper clears candidates + cancels `lsp_pending_completion`; CompletionResponse handler checks Insert mode; safety dismiss in `handle_key()` for non-Insert modes. Fixed diff view padding: skip padding entries when `diff_unchanged_hidden` in `build_rendered_window()`. Fixed diff view on large files: removed `MAX_LINES: 5000` guard in `lcs_diff()` that prevented Myers diff on files >5000 lines. Fixed GTK Find Panel: capture-phase key handler detects `Entry`/`Text` widget focus and returns `Propagation::Proceed`. Fixed Visual Mode Ctrl-D/U: added `!ctrl` guards on `'d'`/`'u'` match arms. Fixed undo/redo not notifying LSP: `undo()`/`redo()` now insert into `lsp_dirty_buffers`. Verified diff toolbar populates on both group tab bars. 40 new tests.
 
 **Session 173 — Diff View Fixes: Aligned Scroll Sync + Auto-Filter (4214 tests):**
 Aligned-position-aware scroll sync for diff windows: `sync_scroll_binds()` now maps scroll positions through `diff_aligned` sequences instead of copying raw buffer line numbers, so both sides stay in visual lockstep even when one side has large padding blocks. Auto-enable `diff_unchanged_hidden` + `diff_apply_folds()` in `cmd_diffthis()`, `cmd_diffsplit()`, and `cmd_git_diff_split()` so the filter is active by default when entering diff mode. `is_in_diff_view()` now checks all editor groups (not just the active one) for diff window presence. Render fix: `build_rendered_window` advances `aligned_idx` past hidden (folded) lines and their adjacent padding entries. Known remaining issues logged in BUGS.md: large padding blocks still not fully suppressed in filtered view, toolbar not always appearing on both group tab bars. 1 new test.

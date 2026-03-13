@@ -376,10 +376,7 @@ impl LspManager {
                 self.servers.push(server);
                 Some(id)
             }
-            Err(e) => {
-                eprintln!("LSP: Failed to start {} — {}", config.command, e);
-                None
-            }
+            Err(_) => None,
         }
     }
 

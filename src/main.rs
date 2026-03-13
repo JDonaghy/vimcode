@@ -1285,12 +1285,40 @@ impl SimpleComponent for App {
 
                             add_controller = gtk4::EventControllerKey {
                                 set_propagation_phase: gtk4::PropagationPhase::Capture,
-                                connect_key_pressed[sender, engine] => move |_, key, _, modifier| {
+                                connect_key_pressed[sender, engine] => move |ctrl_ref, key, _, modifier| {
                                     let key_name = key.name().map(|s| s.to_string()).unwrap_or_default();
                                     let unicode = key.to_unicode().filter(|c| !c.is_control());
                                     let ctrl = modifier.contains(gdk::ModifierType::CONTROL_MASK);
                                     let shift = modifier.contains(gdk::ModifierType::SHIFT_MASK);
                                     let alt = modifier.contains(gdk::ModifierType::ALT_MASK);
+
+                                    // When a GTK Entry widget has focus (find dialog, search panel),
+                                    // let most keys propagate to it. Only intercept Escape and
+                                    // global shortcuts (Ctrl-F, Ctrl-Tab, etc.).
+                                    let entry_has_focus = ctrl_ref
+                                        .widget()
+                                        .root()
+                                        .and_then(|r| r.downcast::<gtk4::Window>().ok())
+                                        .and_then(|w| gtk4::prelude::GtkWindowExt::focus(&w))
+                                        .is_some_and(|f| {
+                                            f.downcast_ref::<gtk4::Entry>().is_some()
+                                                || f.downcast_ref::<gtk4::Text>().is_some()
+                                        });
+                                    if entry_has_focus {
+                                        // Escape: close the find dialog and return focus to editor.
+                                        if key_name == "Escape" {
+                                            sender.input(Msg::CloseFindDialog);
+                                            sender.input(Msg::Resize);
+                                            return gtk4::glib::Propagation::Stop;
+                                        }
+                                        // Ctrl-F: toggle find dialog.
+                                        if ctrl && !shift && unicode == Some('f') {
+                                            sender.input(Msg::ToggleFindDialog);
+                                            return gtk4::glib::Propagation::Stop;
+                                        }
+                                        // Let all other keys reach the Entry widget.
+                                        return gtk4::glib::Propagation::Proceed;
+                                    }
 
                                     // Alt+letter: open menu (when menu bar visible)
                                     if alt && !ctrl && !shift {
@@ -6945,6 +6973,17 @@ fn draw_editor(
         line_height,
     );
 
+    // 5e4. Draw modal dialog (highest z-order)
+    draw_dialog_popup(
+        cr,
+        &layout,
+        &screen,
+        &theme,
+        width as f64,
+        height as f64,
+        line_height,
+    );
+
     // 5f2. Draw quickfix panel (persistent bottom strip above status bar)
     if qf_px > 0.0 {
         let qf_y = height as f64 - status_bar_height - debug_toolbar_px - qf_px - term_px;
@@ -9204,6 +9243,112 @@ fn draw_tab_switcher_popup(
             cr.move_to(popup_x + popup_w - pw as f64 - 8.0, item_y);
             pangocairo::show_layout(cr, &layout);
         }
+    }
+}
+
+/// Draw a modal dialog popup centered on the screen.
+#[allow(clippy::too_many_arguments)]
+fn draw_dialog_popup(
+    cr: &Context,
+    layout: &pango::Layout,
+    screen: &render::ScreenLayout,
+    theme: &Theme,
+    editor_width: f64,
+    editor_height: f64,
+    line_height: f64,
+) {
+    let Some(dialog) = &screen.dialog else {
+        return;
+    };
+
+    let pango_ctx = pangocairo::create_context(cr);
+    let ui_font_desc = FontDescription::from_string(UI_FONT);
+    let ui_layout = pango::Layout::new(&pango_ctx);
+    ui_layout.set_font_description(Some(&ui_font_desc));
+
+    // Measure button row width.
+    let mut btn_total_w = 8.0; // padding
+    for (label, _) in &dialog.buttons {
+        ui_layout.set_text(&format!("  {}  ", label));
+        let (w, _) = ui_layout.pixel_size();
+        btn_total_w += w as f64 + 4.0;
+    }
+
+    // Measure body width.
+    let mut body_max_w = 0.0f64;
+    for line in &dialog.body {
+        layout.set_text(line);
+        let (w, _) = layout.pixel_size();
+        body_max_w = body_max_w.max(w as f64);
+    }
+
+    // Title width.
+    ui_layout.set_text(&dialog.title);
+    let (title_w, _) = ui_layout.pixel_size();
+
+    let content_w = body_max_w.max(title_w as f64 + 16.0).max(btn_total_w);
+    let popup_w = (content_w + 32.0).clamp(350.0, editor_width - 40.0);
+    let popup_h = ((3.0 + dialog.body.len() as f64 + 2.0) * line_height).min(editor_height - 40.0);
+
+    let popup_x = (editor_width - popup_w) / 2.0;
+    let popup_y = (editor_height - popup_h) / 2.0;
+
+    // Background.
+    let (r, g, b) = theme.fuzzy_bg.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
+    cr.fill().ok();
+
+    // Border.
+    let (r, g, b) = theme.fuzzy_border.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    cr.set_line_width(1.0);
+    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
+    cr.stroke().ok();
+
+    // Title.
+    let (r, g, b) = theme.fuzzy_title_fg.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    ui_layout.set_text(&dialog.title);
+    ui_layout.set_attributes(None);
+    cr.move_to(popup_x + 12.0, popup_y + line_height * 0.3);
+    pangocairo::show_layout(cr, &ui_layout);
+
+    // Body lines.
+    let body_y = popup_y + line_height * 1.8;
+    let (r, g, b) = theme.fuzzy_fg.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    for (i, line) in dialog.body.iter().enumerate() {
+        layout.set_text(line);
+        layout.set_attributes(None);
+        cr.move_to(popup_x + 12.0, body_y + i as f64 * line_height);
+        pangocairo::show_layout(cr, layout);
+    }
+
+    // Button row.
+    let btn_y = popup_y + popup_h - line_height * 1.5;
+    let mut bx = popup_x + 12.0;
+    for (label, is_selected) in &dialog.buttons {
+        let btn_text = format!("  {}  ", label);
+        ui_layout.set_text(&btn_text);
+        let (bw, bh) = ui_layout.pixel_size();
+        let bw = bw as f64;
+        let bh = bh as f64;
+
+        if *is_selected {
+            let (r, g, b) = theme.fuzzy_selected_bg.to_cairo();
+            cr.set_source_rgb(r, g, b);
+            cr.rectangle(bx, btn_y, bw, bh);
+            cr.fill().ok();
+        }
+
+        let (r, g, b) = theme.fuzzy_fg.to_cairo();
+        cr.set_source_rgb(r, g, b);
+        ui_layout.set_attributes(None);
+        cr.move_to(bx, btn_y);
+        pangocairo::show_layout(cr, &ui_layout);
+
+        bx += bw + 4.0;
     }
 }
 
