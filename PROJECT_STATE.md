@@ -1,9 +1,9 @@
 # VimCode Project State
 
-**Last updated:** Mar 11, 2026 (Session 170 — Inline Diff Peek + Enhanced Hunk Nav) | **Tests:** 4105
+**Last updated:** Mar 12, 2026 (Session 173 — Diff View Fixes: Aligned Scroll Sync + Auto-Filter) | **Tests:** 4214
 
 > Feature documentation lives in **README.md**.
-> Per-session implementation notes through Session 167 are in **SESSION_HISTORY.md**.
+> Per-session implementation notes through Session 173 are in **SESSION_HISTORY.md**.
 
 ---
 
@@ -26,7 +26,7 @@ When implementing a new key/command, add tests covering:
 
 ## Recent Work
 
-**Session 170 — Inline Diff Peek + Enhanced Hunk Nav (4105 tests):**
-Inline diff preview (VSCode parity): `gD` / `:DiffPeek` / click gutter marker opens floating popup showing hunk diff lines (red=removed, green=added) with `[r] Revert` / `[s] Stage` actions. Deleted-line gutter indicator (`▾` in red) for pure deletions. `]c`/`[c` now navigate changed regions on real source files using `git_diff` markers (previously only worked in diff buffers). New `DiffPeekState`/`DiffPeekPopup` structs, `DiffHunkInfo` with line-range mapping, `compute_file_diff_hunks()`, `hunk_for_line()`, `revert_hunk()` in git.rs. `git_deleted` color added to all 4 themes. Both GTK and TUI backends render popup + detect git gutter clicks. "Git: Peek Change" in command palette. 17 new tests.
+**Session 173 — Diff View Fixes: Aligned Scroll Sync + Auto-Filter (4214 tests):**
+Aligned-position-aware scroll sync for diff windows: `sync_scroll_binds()` now maps scroll positions through `diff_aligned` sequences. Auto-enable `diff_unchanged_hidden` + `diff_apply_folds()` in all diff entry points. `is_in_diff_view()` checks all groups. Render fix: `build_rendered_window` advances `aligned_idx` past folded lines. Known remaining issues in BUGS.md. 1 new test.
 
-> Sessions 169 and earlier archived in **SESSION_HISTORY.md**.
+> Sessions 172 and earlier archived in **SESSION_HISTORY.md**.

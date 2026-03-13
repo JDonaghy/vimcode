@@ -945,6 +945,132 @@ mod tests {
     fn test_parse_blame_porcelain_empty() {
         assert!(parse_blame_porcelain("").is_empty());
     }
+
+    // ── show_file_at_ref ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_show_file_at_ref_returns_head_content() {
+        use std::process::Command;
+        let dir = std::env::temp_dir().join("vimcode_show_ref_head");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "t@t.com"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "T"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        let file = dir.join("test.txt");
+        std::fs::write(&file, "original\n").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        // Modify working copy
+        std::fs::write(&file, "modified\n").unwrap();
+
+        let content = show_file_at_ref(&dir, "HEAD", "test.txt");
+        assert!(content.is_some(), "should return HEAD content");
+        assert_eq!(content.unwrap().trim(), "original");
+    }
+
+    #[test]
+    fn test_show_file_at_ref_nonexistent() {
+        use std::process::Command;
+        let dir = std::env::temp_dir().join("vimcode_show_ref_nofile");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "t@t.com"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "T"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        // Create an empty commit so HEAD exists
+        Command::new("git")
+            .args(["commit", "--allow-empty", "-m", "init"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+
+        let content = show_file_at_ref(&dir, "HEAD", "doesnotexist.txt");
+        assert!(content.is_none(), "should return None for nonexistent file");
+    }
+
+    #[test]
+    fn test_checkout_branch_and_create_branch() {
+        use std::process::Command;
+        let dir = std::env::temp_dir().join("vimcode_branch_ops");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        std::fs::write(dir.join("f.txt"), "x").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+
+        // Create a new branch
+        assert!(create_branch(&dir, "feature-x").is_ok());
+        assert_eq!(current_branch(&dir).as_deref(), Some("feature-x"));
+
+        // Switch back to main/master
+        let main = if checkout_branch(&dir, "main").is_ok() {
+            "main"
+        } else {
+            checkout_branch(&dir, "master").unwrap();
+            "master"
+        };
+        assert_eq!(current_branch(&dir).as_deref(), Some(main));
+
+        // Switch to feature-x again
+        assert!(checkout_branch(&dir, "feature-x").is_ok());
+        assert_eq!(current_branch(&dir).as_deref(), Some("feature-x"));
+    }
 }
 
 // ─── Source Control helpers ───────────────────────────────────────────────────
@@ -1012,6 +1138,16 @@ pub fn unstage_path(dir: &Path, path: &str) -> Result<(), String> {
 /// Discard working-tree changes for a path (equivalent to `git checkout -- <path>`).
 pub fn discard_path(dir: &Path, path: &str) -> Result<(), String> {
     run_git_result(dir, &["checkout", "--", path])
+}
+
+/// Switch to an existing branch.
+pub fn checkout_branch(dir: &Path, branch: &str) -> Result<(), String> {
+    run_git_result(dir, &["switch", branch])
+}
+
+/// Create a new branch and switch to it.
+pub fn create_branch(dir: &Path, branch: &str) -> Result<(), String> {
+    run_git_result(dir, &["switch", "-c", branch])
 }
 
 fn run_git_result(dir: &Path, args: &[&str]) -> Result<(), String> {
@@ -1320,6 +1456,15 @@ pub fn log_file(repo_root: &Path, file: &Path, limit: usize) -> Vec<GitLogEntry>
 /// Run `git show <hash>` and return the full output.
 pub fn show_commit(dir: &Path, hash: &str) -> Option<String> {
     run_git(dir, &["show", hash])
+}
+
+/// Retrieve the contents of a file at a given git revision.
+///
+/// `rev` is typically `"HEAD"` but can be any ref/commit.
+/// `rel_path` is the path relative to the repository root.
+/// Returns `None` if the file doesn't exist at that revision or git fails.
+pub fn show_file_at_ref(dir: &Path, rev: &str, rel_path: &str) -> Option<String> {
+    run_git(dir, &["show", &format!("{rev}:{rel_path}")])
 }
 
 /// Run `git blame --porcelain` on the full file and return structured blame info

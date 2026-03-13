@@ -81,6 +81,10 @@ fn matches_gtk_key(binding: &str, key: gdk::Key, state: gdk::ModifierType) -> bo
 /// Cached tab slot positions (x_start, x_end) per group, populated during draw.
 type TabSlotMap = HashMap<usize, Vec<(f64, f64)>>;
 
+/// Cached diff toolbar button positions: (prev_start, prev_end, next_start, next_end, fold_start, fold_end).
+/// Populated during draw_tab_bar, used for click hit-testing.
+type DiffBtnPositions = Option<(f64, f64, f64, f64, f64, f64)>;
+
 struct App {
     engine: Rc<RefCell<Engine>>,
     /// Set to true in update() whenever a draw is needed; cleared by the #[watch] block.
@@ -166,6 +170,8 @@ struct App {
     /// Cached tab slot widths per group, populated during draw_tab_bar for click hit-testing.
     /// Key = group_id.0 (or usize::MAX for single-group mode), Value = cumulative x positions.
     tab_slot_positions: Rc<RefCell<TabSlotMap>>,
+    /// Cached diff toolbar button pixel positions, populated during draw_tab_bar.
+    diff_btn_positions: Rc<RefCell<DiffBtnPositions>>,
     /// True while the user is dragging the terminal panel's scrollbar thumb.
     terminal_sb_dragging: bool,
     /// True while the user drags the terminal header row to resize the panel.
@@ -1957,6 +1963,7 @@ impl SimpleComponent for App {
         let h_sb_drag_cell: Rc<Cell<Option<core::WindowId>>> = Rc::new(Cell::new(None));
         let tab_slot_positions_cell: Rc<RefCell<TabSlotMap>> =
             Rc::new(RefCell::new(HashMap::new()));
+        let diff_btn_positions_cell: Rc<RefCell<DiffBtnPositions>> = Rc::new(RefCell::new(None));
         let sidebar_inner_sw_ref: Rc<RefCell<Option<gtk4::ScrolledWindow>>> =
             Rc::new(RefCell::new(None));
         let sidebar_revealer_ref: Rc<RefCell<Option<gtk4::Revealer>>> = Rc::new(RefCell::new(None));
@@ -2060,6 +2067,7 @@ impl SimpleComponent for App {
             h_sb_hovered: false,
             tab_close_hover: None,
             tab_slot_positions: tab_slot_positions_cell.clone(),
+            diff_btn_positions: diff_btn_positions_cell.clone(),
             terminal_sb_dragging: false,
             terminal_resize_dragging: false,
             terminal_split_dragging: false,
@@ -3187,6 +3195,7 @@ impl SimpleComponent for App {
         let h_sb_drag_for_draw = h_sb_drag_cell.clone();
         let last_metrics_for_draw = last_metrics_cell.clone();
         let tab_slots_for_draw = tab_slot_positions_cell.clone();
+        let diff_btn_for_draw = diff_btn_positions_cell.clone();
         widgets
             .drawing_area
             .set_draw_func(move |_, cr, width, height| {
@@ -3202,6 +3211,7 @@ impl SimpleComponent for App {
                     h_sb_drag_for_draw.get(),
                     &last_metrics_for_draw,
                     &tab_slots_for_draw,
+                    &diff_btn_for_draw,
                 );
             });
 
@@ -3851,6 +3861,7 @@ impl SimpleComponent for App {
                                 self.cached_line_height,
                                 self.cached_char_width,
                                 &self.tab_slot_positions.borrow(),
+                                &self.diff_btn_positions.borrow(),
                             );
                             match click_result {
                                 Some(true) => {
@@ -3925,6 +3936,7 @@ impl SimpleComponent for App {
                     self.cached_line_height,
                     self.cached_char_width,
                     &self.tab_slot_positions.borrow(),
+                    &self.diff_btn_positions.borrow(),
                 ) {
                     engine.add_cursor_at_pos(line, col);
                 }
@@ -3946,6 +3958,7 @@ impl SimpleComponent for App {
                     self.cached_line_height,
                     self.cached_char_width,
                     &self.tab_slot_positions.borrow(),
+                    &self.diff_btn_positions.borrow(),
                 );
                 self.draw_needed.set(true);
             }
@@ -3990,6 +4003,7 @@ impl SimpleComponent for App {
                             self.cached_line_height,
                             self.cached_char_width,
                             &self.tab_slot_positions.borrow(),
+                            &self.diff_btn_positions.borrow(),
                         );
                         if let ClickTarget::TabBar = target {
                             // The tab was already switched by pixel_to_click_target.
@@ -4156,6 +4170,7 @@ impl SimpleComponent for App {
                             self.cached_line_height,
                             self.cached_char_width,
                             &self.tab_slot_positions.borrow(),
+                            &self.diff_btn_positions.borrow(),
                         );
                         self.draw_needed.set(true);
                     }
@@ -5649,7 +5664,15 @@ impl SimpleComponent for App {
                 self.draw_needed.set(true);
             }
             Msg::ScSidebarClick(x_click, y) => {
-                let lh = self.cached_line_height;
+                // Compute line height from the UI font (not editor font) to match drawing.
+                let lh = if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
+                    let font_desc = FontDescription::from_string(UI_FONT);
+                    let pango_ctx = da.pango_context();
+                    let fm = pango_ctx.metrics(Some(&font_desc), None);
+                    (fm.ascent() + fm.descent()) as f64 / pango::SCALE as f64
+                } else {
+                    self.cached_line_height
+                };
                 if lh <= 0.0 {
                     return;
                 }
@@ -5722,12 +5745,18 @@ impl SimpleComponent for App {
             }
             Msg::ScKey(key_name, ctrl) => {
                 let mut engine = self.engine.borrow_mut();
-                if engine.sc_commit_input_active {
-                    // In commit input mode, pass everything through.
+                if engine.sc_commit_input_active
+                    || engine.sc_branch_picker_open
+                    || engine.sc_branch_create_mode
+                    || engine.sc_help_open
+                {
+                    // In input/popup mode, pass everything through.
                     let (mapped_key, unicode): (&str, Option<char>) = match key_name.as_str() {
                         "Return" | "KP_Enter" => ("Return", None),
                         "Escape" => ("Escape", None),
                         "BackSpace" => ("BackSpace", None),
+                        "Up" => ("Up", None),
+                        "Down" => ("Down", None),
                         other => {
                             let mut chars = other.chars();
                             if let (Some(ch), None) = (chars.next(), chars.next()) {
@@ -5763,6 +5792,9 @@ impl SimpleComponent for App {
                         "p" => "p",
                         "P" => "P",
                         "f" => "f",
+                        "b" => "b",
+                        "B" => "B",
+                        "question" | "?" => "?",
                         _ => "",
                     };
                     if !mapped.is_empty() {
@@ -5798,8 +5830,16 @@ impl SimpleComponent for App {
             }
             Msg::ExtSidebarClick(x_click, y_click) => {
                 let mut engine = self.engine.borrow_mut();
-                // Compute line_height from cached value
-                let line_height = self.cached_line_height.max(1.0);
+                // Compute line_height from UI font (not editor font) to match drawing.
+                let line_height = if let Some(ref da) = *self.ext_sidebar_da_ref.borrow() {
+                    let font_desc = FontDescription::from_string(UI_FONT);
+                    let pango_ctx = da.pango_context();
+                    let fm = pango_ctx.metrics(Some(&font_desc), None);
+                    (fm.ascent() + fm.descent()) as f64 / pango::SCALE as f64
+                } else {
+                    self.cached_line_height
+                }
+                .max(1.0);
                 let row = (y_click / line_height) as usize;
                 // Row 0 = header, Row 1 = search, Row 2+ = sections
                 // Focus the panel on any click
@@ -6619,6 +6659,7 @@ fn draw_editor(
     h_sb_dragging_window: Option<core::WindowId>,
     last_metrics: &std::rc::Rc<std::cell::Cell<(f64, f64)>>,
     tab_slot_positions_out: &Rc<RefCell<TabSlotMap>>,
+    diff_btn_positions_out: &Rc<RefCell<DiffBtnPositions>>,
 ) {
     let theme = Theme::from_name(&engine.settings.colorscheme);
 
@@ -6768,7 +6809,7 @@ fn draw_editor(
                     None
                 }
             });
-            let positions = draw_tab_bar(
+            let (positions, dbp) = draw_tab_bar(
                 cr,
                 &layout,
                 &theme,
@@ -6778,10 +6819,14 @@ fn draw_editor(
                 0.0,
                 is_active,
                 hover_idx,
+                gtb.diff_toolbar.as_ref(),
             );
             tab_slot_positions_out
                 .borrow_mut()
                 .insert(gtb.group_id.0, positions);
+            if dbp.is_some() {
+                *diff_btn_positions_out.borrow_mut() = dbp;
+            }
             cr.restore().ok();
             // Active-group indicator: bright bottom border.
             if is_active {
@@ -6796,7 +6841,7 @@ fn draw_editor(
     } else {
         // Single group: draw tab bar at full width with split buttons.
         let hover_idx = tab_close_hover.map(|(_gid, tidx)| tidx);
-        let positions = draw_tab_bar(
+        let (positions, dbp) = draw_tab_bar(
             cr,
             &layout,
             &theme,
@@ -6806,11 +6851,13 @@ fn draw_editor(
             0.0,
             true,
             hover_idx,
+            screen.diff_toolbar.as_ref(),
         );
         // Use group_id 0 for single-group mode
         tab_slot_positions_out
             .borrow_mut()
             .insert(engine.active_group.0, positions);
+        *diff_btn_positions_out.borrow_mut() = dbp;
     }
 
     // 4b. Draw breadcrumb bar(s) below tab bar(s)
@@ -7389,7 +7436,8 @@ fn draw_tab_bar(
     y_offset: f64,
     show_split_btn: bool,
     hovered_close_tab: Option<usize>,
-) -> Vec<(f64, f64)> {
+    diff_toolbar: Option<&render::DiffToolbarData>,
+) -> (Vec<(f64, f64)>, DiffBtnPositions) {
     // Tab bar background
     let (r, g, b) = theme.tab_bar_bg.to_cairo();
     cr.set_source_rgb(r, g, b);
@@ -7418,7 +7466,32 @@ fn draw_tab_bar(
     } else {
         (0.0, 0.0)
     };
-    let tab_area_width = width - both_btns_px;
+    // Measure diff toolbar buttons if present.
+    let diff_btn_prev_text = " \u{F0143}"; // " 󰅃"
+    let diff_btn_next_text = " \u{F0140}"; // " 󰅀"
+    let diff_btn_fold_text = " \u{F0233}"; // " 󰈳"
+    let (diff_btns_px, diff_label_px) = if let Some(dt) = diff_toolbar {
+        layout.set_font_description(Some(&normal_font));
+        layout.set_text(diff_btn_prev_text);
+        let (wp, _) = layout.pixel_size();
+        layout.set_text(diff_btn_next_text);
+        let (wn, _) = layout.pixel_size();
+        layout.set_text(diff_btn_fold_text);
+        let (wf, _) = layout.pixel_size();
+        let btns = wp as f64 + wn as f64 + wf as f64;
+        let label = if let Some(lbl) = &dt.change_label {
+            layout.set_text(&format!(" {lbl}"));
+            let (wl, _) = layout.pixel_size();
+            wl as f64
+        } else {
+            0.0
+        };
+        (btns, label)
+    } else {
+        (0.0, 0.0)
+    };
+    let diff_total_px = diff_btns_px + diff_label_px;
+    let tab_area_width = width - both_btns_px - diff_total_px;
 
     // Measure the close button (×) once for use in every tab.
     layout.set_font_description(Some(&normal_font));
@@ -7556,6 +7629,55 @@ fn draw_tab_bar(
         x += slot_w;
     }
 
+    // Draw diff toolbar buttons (to the left of split buttons).
+    let diff_btn_pos: DiffBtnPositions = if let Some(dt) = diff_toolbar {
+        layout.set_font_description(Some(&normal_font));
+        let (fr, fg_g, fb) = theme.tab_inactive_fg.to_cairo();
+        let mut dx = width - both_btns_px - diff_total_px;
+        // Change label (e.g. " 2 of 5")
+        if let Some(lbl) = &dt.change_label {
+            let (fr2, fg2, fb2) = theme.foreground.to_cairo();
+            cr.set_source_rgb(fr2, fg2, fb2);
+            layout.set_text(&format!(" {lbl}"));
+            cr.move_to(dx, y_offset);
+            pangocairo::show_layout(cr, layout);
+            dx += diff_label_px;
+        }
+        // Prev button
+        let prev_start = dx;
+        cr.set_source_rgb(fr, fg_g, fb);
+        layout.set_text(diff_btn_prev_text);
+        cr.move_to(dx, y_offset);
+        pangocairo::show_layout(cr, layout);
+        let (wp, _) = layout.pixel_size();
+        dx += wp as f64;
+        let prev_end = dx;
+        // Next button
+        let next_start = dx;
+        layout.set_text(diff_btn_next_text);
+        cr.move_to(dx, y_offset);
+        pangocairo::show_layout(cr, layout);
+        let (wn, _) = layout.pixel_size();
+        dx += wn as f64;
+        let next_end = dx;
+        // Fold toggle (highlighted when active)
+        let fold_start = dx;
+        if dt.unchanged_hidden {
+            let (ar, ag, ab) = theme.tab_active_fg.to_cairo();
+            cr.set_source_rgb(ar, ag, ab);
+        }
+        layout.set_text(diff_btn_fold_text);
+        cr.move_to(dx, y_offset);
+        pangocairo::show_layout(cr, layout);
+        let (wf, _) = layout.pixel_size();
+        let fold_end = dx + wf as f64;
+        Some((
+            prev_start, prev_end, next_start, next_end, fold_start, fold_end,
+        ))
+    } else {
+        None
+    };
+
     // Draw split-right then split-down buttons at the right edge.
     if show_split_btn && both_btns_px > 0.0 {
         layout.set_font_description(Some(&normal_font));
@@ -7573,7 +7695,7 @@ fn draw_tab_bar(
 
     // Restore original editor font for subsequent rendering
     layout.set_font_description(Some(&saved_font));
-    slot_positions
+    (slot_positions, diff_btn_pos)
 }
 
 fn draw_breadcrumb_bar(
@@ -7666,6 +7788,7 @@ fn draw_window(
             match diff_status {
                 DiffLine::Added => Some(theme.diff_added_bg),
                 DiffLine::Removed => Some(theme.diff_removed_bg),
+                DiffLine::Padding => Some(theme.diff_padding_bg),
                 DiffLine::Same => None,
             }
         } else {
@@ -8519,15 +8642,10 @@ fn draw_diff_peek_popup(
 
     // Action bar at bottom.
     let action_y = popup_y + 2.0 + peek.hunk_lines.len().min(29) as f64 * line_height;
-    let labels = ["[r] Revert", "[s] Stage"];
+    let labels = ["[s] Stage", "[r] Revert", "[q] Close"];
     let mut ax = popup_x + char_width;
-    for (idx, label) in labels.iter().enumerate() {
-        let is_focused = idx == peek.focused_action;
-        let (r, g, b) = if is_focused {
-            theme.cursor.to_cairo()
-        } else {
-            theme.hover_fg.to_cairo()
-        };
+    let (r, g, b) = theme.hover_fg.to_cairo();
+    for label in &labels {
         cr.set_source_rgb(r, g, b);
         layout.set_text(label);
         layout.set_attributes(None);
@@ -10103,6 +10221,26 @@ fn draw_source_control_panel(
         return;
     };
 
+    // Draw hint bar at bottom when focused.
+    let h = if sc.has_focus && h > line_height * 3.0 {
+        let hint_y = y + h - line_height;
+        let (hdr_r, hdr_g, hdr_b) = theme.status_bg.to_cairo();
+        cr.set_source_rgb(hdr_r, hdr_g, hdr_b);
+        cr.rectangle(x, hint_y, w, line_height);
+        cr.fill().ok();
+        let hint_text = " Press '?' for help";
+        let (dim_r, dim_g, dim_b) = theme.line_number_fg.to_cairo();
+        cr.set_source_rgb(dim_r, dim_g, dim_b);
+        layout.set_text(hint_text);
+        layout.set_attributes(None);
+        let (_, lh) = layout.pixel_size();
+        cr.move_to(x + 2.0, hint_y + (line_height - lh as f64) / 2.0);
+        pangocairo::show_layout(cr, layout);
+        h - line_height
+    } else {
+        h
+    };
+
     let (bg_r, bg_g, bg_b) = theme.completion_bg.to_cairo();
     let (hdr_r, hdr_g, hdr_b) = theme.status_bg.to_cairo();
     let (fg_r, fg_g, fg_b) = theme.status_fg.to_cairo();
@@ -10397,6 +10535,147 @@ fn draw_source_control_panel(
             log_flat_start,
             sc.selected,
         );
+    }
+
+    // ── Branch picker / create overlay ───────────────────────────────────────
+    if let Some(ref bp) = sc.branch_picker {
+        let popup_w = w.min(300.0);
+        let popup_h = if bp.create_mode {
+            line_height * 3.0
+        } else {
+            (line_height * (bp.results.len() as f64 + 3.0)).min(h - line_height * 2.0)
+        };
+        let popup_x = x + (w - popup_w) / 2.0;
+        let popup_y = y + line_height * 2.0;
+
+        // Background
+        let (r, g, b) = theme.completion_bg.to_cairo();
+        cr.set_source_rgb(r, g, b);
+        cr.rectangle(popup_x, popup_y, popup_w, popup_h);
+        cr.fill().ok();
+        // Border
+        let (r, g, b) = theme.completion_border.to_cairo();
+        cr.set_source_rgb(r, g, b);
+        cr.set_line_width(1.0);
+        cr.rectangle(popup_x, popup_y, popup_w, popup_h);
+        cr.stroke().ok();
+
+        // Title
+        let title = if bp.create_mode {
+            "New Branch"
+        } else {
+            "Switch Branch"
+        };
+        let (r, g, b) = theme.completion_fg.to_cairo();
+        cr.set_source_rgb(r, g, b);
+        layout.set_text(title);
+        layout.set_attributes(None);
+        cr.move_to(popup_x + 8.0, popup_y);
+        pangocairo::show_layout(cr, layout);
+
+        if bp.create_mode {
+            let input_text = format!("Name: {}▏", bp.create_input);
+            layout.set_text(&input_text);
+            cr.move_to(popup_x + 8.0, popup_y + line_height);
+            pangocairo::show_layout(cr, layout);
+        } else {
+            // Query row
+            let query_text = format!("\u{f002} {}", bp.query);
+            let (r, g, b) = theme.completion_fg.to_cairo();
+            cr.set_source_rgb(r, g, b);
+            layout.set_text(&query_text);
+            layout.set_attributes(None);
+            cr.move_to(popup_x + 8.0, popup_y + line_height);
+            pangocairo::show_layout(cr, layout);
+
+            // Branch list
+            for (i, (name, is_current)) in bp.results.iter().enumerate() {
+                let ry = popup_y + line_height * (i as f64 + 2.0);
+                if ry + line_height > popup_y + popup_h {
+                    break;
+                }
+                // Selection highlight
+                if i == bp.selected {
+                    let (r, g, b) = theme.completion_selected_bg.to_cairo();
+                    cr.set_source_rgb(r, g, b);
+                    cr.rectangle(popup_x + 1.0, ry, popup_w - 2.0, line_height);
+                    cr.fill().ok();
+                }
+                let marker = if *is_current { "● " } else { "  " };
+                let display = format!("{marker}{name}");
+                let (r, g, b) = theme.completion_fg.to_cairo();
+                cr.set_source_rgb(r, g, b);
+                layout.set_text(&display);
+                layout.set_attributes(None);
+                cr.move_to(popup_x + 8.0, ry);
+                pangocairo::show_layout(cr, layout);
+            }
+        }
+    }
+
+    // ── Help dialog overlay ──────────────────────────────────────────────────
+    if sc.help_open {
+        let bindings: &[(&str, &str)] = &[
+            ("j/k", "Navigate"),
+            ("s", "Stage / unstage"),
+            ("S", "Stage all"),
+            ("d", "Discard file"),
+            ("D", "Discard all unstaged"),
+            ("c", "Commit message"),
+            ("b", "Switch branch"),
+            ("B", "Create branch"),
+            ("p", "Push"),
+            ("P", "Pull"),
+            ("f", "Fetch"),
+            ("r", "Refresh"),
+            ("Tab", "Expand / collapse"),
+            ("Enter", "Open file"),
+            ("q/Esc", "Close panel"),
+        ];
+        let popup_w = w.min(280.0);
+        let popup_h = line_height * (bindings.len() as f64 + 2.0);
+        let popup_x = x + (w - popup_w) / 2.0;
+        let popup_y = y + (h - popup_h) / 2.0;
+
+        let (r, g, b) = theme.completion_bg.to_cairo();
+        cr.set_source_rgb(r, g, b);
+        cr.rectangle(popup_x, popup_y, popup_w, popup_h);
+        cr.fill().ok();
+        let (r, g, b) = theme.completion_border.to_cairo();
+        cr.set_source_rgb(r, g, b);
+        cr.set_line_width(1.0);
+        cr.rectangle(popup_x, popup_y, popup_w, popup_h);
+        cr.stroke().ok();
+
+        // Title + close hint
+        let (r, g, b) = theme.completion_fg.to_cairo();
+        cr.set_source_rgb(r, g, b);
+        layout.set_text("Keybindings");
+        layout.set_attributes(None);
+        cr.move_to(popup_x + 8.0, popup_y);
+        pangocairo::show_layout(cr, layout);
+
+        layout.set_text("x");
+        cr.move_to(popup_x + popup_w - 16.0, popup_y);
+        pangocairo::show_layout(cr, layout);
+
+        // Bindings
+        for (i, (key, desc)) in bindings.iter().enumerate() {
+            let ry = popup_y + line_height * (i as f64 + 1.0);
+            let (r, g, b) = theme.function.to_cairo();
+            cr.set_source_rgb(r, g, b);
+            layout.set_text(key);
+            layout.set_attributes(None);
+            cr.move_to(popup_x + 12.0, ry);
+            pangocairo::show_layout(cr, layout);
+
+            let (r, g, b) = theme.completion_fg.to_cairo();
+            cr.set_source_rgb(r, g, b);
+            layout.set_text(desc);
+            layout.set_attributes(None);
+            cr.move_to(popup_x + 100.0, ry);
+            pangocairo::show_layout(cr, layout);
+        }
     }
 }
 
@@ -10929,6 +11208,12 @@ enum ClickTarget {
     SplitButton(core::window::GroupId, crate::core::window::SplitDirection),
     /// Click was on a tab's × close button: (group_id, tab_idx).
     CloseTab(core::window::GroupId, usize),
+    /// Click was on a diff toolbar prev-change button.
+    DiffToolbarPrev,
+    /// Click was on a diff toolbar next-change button.
+    DiffToolbarNext,
+    /// Click was on a diff toolbar toggle-fold button.
+    DiffToolbarToggleFold,
     /// Click was outside any actionable area.
     None,
 }
@@ -10945,6 +11230,7 @@ fn pixel_to_click_target(
     line_height: f64,
     char_width: f64,
     tab_slot_positions: &TabSlotMap,
+    diff_btn_positions: &DiffBtnPositions,
 ) -> ClickTarget {
     let tab_bar_height = if engine.settings.breadcrumbs {
         line_height * 2.0
@@ -11012,6 +11298,19 @@ fn pixel_to_click_target(
                         group_id,
                         crate::core::window::SplitDirection::Vertical,
                     );
+                }
+
+                // Hit-test diff toolbar buttons using cached Pango-measured positions.
+                if let Some((prev_start, prev_end, next_start, next_end, fold_start, fold_end)) =
+                    *diff_btn_positions
+                {
+                    if local_x >= prev_start && local_x < prev_end {
+                        return ClickTarget::DiffToolbarPrev;
+                    } else if local_x >= next_start && local_x < next_end {
+                        return ClickTarget::DiffToolbarNext;
+                    } else if local_x >= fold_start && local_x < fold_end {
+                        return ClickTarget::DiffToolbarToggleFold;
+                    }
                 }
 
                 // Hit-test tabs using cached Pango-measured positions from draw_tab_bar.
@@ -11208,6 +11507,7 @@ fn handle_mouse_click(
     line_height: f64,
     char_width: f64,
     tab_slot_positions: &TabSlotMap,
+    diff_btn_positions: &DiffBtnPositions,
 ) -> Option<bool> {
     match pixel_to_click_target(
         engine,
@@ -11218,6 +11518,7 @@ fn handle_mouse_click(
         line_height,
         char_width,
         tab_slot_positions,
+        diff_btn_positions,
     ) {
         ClickTarget::BufferPos(wid, line, col) => {
             // Alt+Click in VSCode mode → add cursor at position
@@ -11231,6 +11532,22 @@ fn handle_mouse_click(
         ClickTarget::SplitButton(group_id, dir) => {
             engine.active_group = group_id;
             engine.open_editor_group(dir);
+            None
+        }
+        ClickTarget::DiffToolbarPrev => {
+            if engine.windows.contains_key(&engine.active_window_id()) {
+                engine.jump_prev_hunk();
+            }
+            None
+        }
+        ClickTarget::DiffToolbarNext => {
+            if engine.windows.contains_key(&engine.active_window_id()) {
+                engine.jump_next_hunk();
+            }
+            None
+        }
+        ClickTarget::DiffToolbarToggleFold => {
+            engine.diff_toggle_hide_unchanged();
             None
         }
         ClickTarget::CloseTab(group_id, tab_idx) => {
@@ -11363,6 +11680,7 @@ fn handle_mouse_double_click(
     line_height: f64,
     char_width: f64,
     tab_slot_positions: &TabSlotMap,
+    diff_btn_positions: &DiffBtnPositions,
 ) {
     if let ClickTarget::BufferPos(wid, line, col) = pixel_to_click_target(
         engine,
@@ -11373,6 +11691,7 @@ fn handle_mouse_double_click(
         line_height,
         char_width,
         tab_slot_positions,
+        diff_btn_positions,
     ) {
         engine.mouse_double_click(wid, line, col);
     }
@@ -11389,6 +11708,7 @@ fn handle_mouse_drag(
     line_height: f64,
     char_width: f64,
     tab_slot_positions: &TabSlotMap,
+    diff_btn_positions: &DiffBtnPositions,
 ) {
     if let ClickTarget::BufferPos(wid, line, col) = pixel_to_click_target(
         engine,
@@ -11399,6 +11719,7 @@ fn handle_mouse_drag(
         line_height,
         char_width,
         tab_slot_positions,
+        diff_btn_positions,
     ) {
         engine.mouse_drag(wid, line, col);
     }

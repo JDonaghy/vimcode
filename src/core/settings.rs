@@ -194,7 +194,7 @@ pub struct Settings {
     extension_registry_url: String,
 
     /// Name of the active colour scheme. Built-in options: "onedark" (default),
-    /// "gruvbox-dark", "tokyo-night", "solarized-dark".
+    /// "gruvbox-dark", "tokyo-night", "solarized-dark", "vscode-dark".
     /// Select with `:colorscheme <name>`.
     #[serde(default = "default_colorscheme")]
     pub colorscheme: String,
@@ -1321,6 +1321,7 @@ pub fn available_colorschemes() -> Vec<String> {
         "gruvbox-dark".into(),
         "tokyo-night".into(),
         "solarized-dark".into(),
+        "vscode-dark".into(),
     ];
     {
         let dir = super::paths::vimcode_config_dir().join("themes");

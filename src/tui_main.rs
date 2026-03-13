@@ -2232,12 +2232,18 @@ fn event_loop(
                             needs_redraw = true;
                             continue;
                         }
-                        if engine.sc_commit_input_active {
-                            // In commit input mode, route all keys to commit handler.
+                        if engine.sc_commit_input_active
+                            || engine.sc_branch_picker_open
+                            || engine.sc_branch_create_mode
+                            || engine.sc_help_open
+                        {
+                            // In input/popup mode, route all keys through.
                             let (key_str, unicode): (&str, Option<char>) = match key_event.code {
                                 KeyCode::Enter => ("Return", None),
                                 KeyCode::Esc => ("Escape", None),
                                 KeyCode::Backspace => ("BackSpace", None),
+                                KeyCode::Up => ("Up", None),
+                                KeyCode::Down => ("Down", None),
                                 KeyCode::Char(ch) => ("char", Some(ch)),
                                 _ => ("", None),
                             };
@@ -2260,6 +2266,9 @@ fn event_loop(
                                 KeyCode::Char('p') => Some("p"),
                                 KeyCode::Char('P') => Some("P"),
                                 KeyCode::Char('f') => Some("f"),
+                                KeyCode::Char('b') if !ctrl => Some("b"),
+                                KeyCode::Char('B') => Some("B"),
+                                KeyCode::Char('?') => Some("?"),
                                 KeyCode::Tab => Some("Tab"),
                                 KeyCode::Enter => Some("Return"),
                                 KeyCode::Char('q') | KeyCode::Esc => Some("Escape"),
@@ -4578,11 +4587,19 @@ fn handle_mouse(
                 let gx = gtb.bounds.x as u16;
                 let gw = gtb.bounds.width as u16;
                 if row == tab_bar_row && rel_col >= gx && rel_col < gx + gw {
-                    matched_group = Some((gtb.group_id, rel_col - gx, gw, &gtb.tabs));
+                    matched_group = Some((
+                        gtb.group_id,
+                        rel_col - gx,
+                        gw,
+                        &gtb.tabs,
+                        gtb.diff_toolbar.as_ref(),
+                    ));
                     break;
                 }
             }
-            if let Some((group_id, local_col, bar_width, group_tabs)) = matched_group {
+            if let Some((group_id, local_col, bar_width, group_tabs, diff_toolbar_ref)) =
+                matched_group
+            {
                 engine.active_group = group_id;
 
                 let mut x: u16 = 0;
@@ -4626,34 +4643,50 @@ fn handle_mouse(
                     }
                 }
                 if !tab_matched {
-                    if bar_width >= TAB_SPLIT_BTN_COLS
-                        && local_col >= bar_width - TAB_SPLIT_BTN_COLS
-                    {
-                        debug_log!(
-                            "split-down btn (multi-group): groups={} active={:?}",
-                            engine.group_layout.leaf_count(),
-                            engine.active_group
-                        );
-                        engine.open_editor_group(SplitDirection::Horizontal);
-                        debug_log!(
-                            "  after split: groups={} layout={:?}",
-                            engine.group_layout.leaf_count(),
-                            engine.group_layout
-                        );
+                    // Calculate diff toolbar zone (label + 3 buttons).
+                    let diff_total_cols = if let Some(dt) = diff_toolbar_ref {
+                        let label_cols = dt
+                            .change_label
+                            .as_ref()
+                            .map(|l| l.len() as u16 + 1)
+                            .unwrap_or(0);
+                        DIFF_TOOLBAR_BTN_COLS + label_cols
                     } else {
-                        let both = TAB_SPLIT_BTN_COLS * 2;
-                        if bar_width >= both && local_col >= bar_width - both {
-                            debug_log!(
-                                "split-right btn (multi-group): groups={} active={:?}",
-                                engine.group_layout.leaf_count(),
-                                engine.active_group
-                            );
+                        0
+                    };
+                    let split_end = bar_width;
+                    let split_start = split_end.saturating_sub(TAB_SPLIT_BOTH_COLS);
+                    let diff_end = split_start;
+                    let diff_start = diff_end.saturating_sub(diff_total_cols);
+                    // Hit-test split buttons (rightmost).
+                    if local_col >= split_start && bar_width >= TAB_SPLIT_BOTH_COLS {
+                        let in_split = local_col - split_start;
+                        if in_split >= TAB_SPLIT_BTN_COLS {
+                            engine.open_editor_group(SplitDirection::Horizontal);
+                        } else {
                             engine.open_editor_group(SplitDirection::Vertical);
-                            debug_log!(
-                                "  after split: groups={} layout={:?}",
-                                engine.group_layout.leaf_count(),
-                                engine.group_layout
-                            );
+                        }
+                    } else if diff_total_cols > 0 && local_col >= diff_start && local_col < diff_end
+                    {
+                        // Hit-test diff toolbar buttons (prev, next, fold).
+                        // Layout: [label][prev][next][fold].
+                        // Buttons occupy last 9 cols of the diff zone.
+                        let in_diff = local_col - diff_start;
+                        let label_cols = diff_total_cols - DIFF_TOOLBAR_BTN_COLS;
+                        let in_btns = in_diff.saturating_sub(label_cols);
+                        let has_win = engine.windows.contains_key(&engine.active_window_id());
+                        if in_diff < label_cols {
+                            // Clicked on the label — no-op.
+                        } else if in_btns < DIFF_BTN_COLS {
+                            if has_win {
+                                engine.jump_prev_hunk();
+                            }
+                        } else if in_btns < DIFF_BTN_COLS * 2 {
+                            if has_win {
+                                engine.jump_next_hunk();
+                            }
+                        } else {
+                            engine.diff_toggle_hide_unchanged();
                         }
                     }
                 }
@@ -4699,32 +4732,44 @@ fn handle_mouse(
                 x += tab_width;
             }
             if !tab_matched {
-                if bar_width >= TAB_SPLIT_BTN_COLS && local_col >= bar_width - TAB_SPLIT_BTN_COLS {
-                    debug_log!(
-                        "split-down btn (single-group): groups={} active={:?}",
-                        engine.group_layout.leaf_count(),
-                        engine.active_group
-                    );
-                    engine.open_editor_group(SplitDirection::Horizontal);
-                    debug_log!(
-                        "  after split: groups={} layout={:?}",
-                        engine.group_layout.leaf_count(),
-                        engine.group_layout
-                    );
+                let diff_total_cols = if let Some(dt) = layout.diff_toolbar.as_ref() {
+                    let label_cols = dt
+                        .change_label
+                        .as_ref()
+                        .map(|l| l.len() as u16 + 1)
+                        .unwrap_or(0);
+                    DIFF_TOOLBAR_BTN_COLS + label_cols
                 } else {
-                    let both = TAB_SPLIT_BTN_COLS * 2;
-                    if bar_width >= both && local_col >= bar_width - both {
-                        debug_log!(
-                            "split-right btn (single-group): groups={} active={:?}",
-                            engine.group_layout.leaf_count(),
-                            engine.active_group
-                        );
+                    0
+                };
+                let split_end = bar_width;
+                let split_start = split_end.saturating_sub(TAB_SPLIT_BOTH_COLS);
+                let diff_end = split_start;
+                let diff_start = diff_end.saturating_sub(diff_total_cols);
+                if local_col >= split_start && bar_width >= TAB_SPLIT_BOTH_COLS {
+                    let in_split = local_col - split_start;
+                    if in_split >= TAB_SPLIT_BTN_COLS {
+                        engine.open_editor_group(SplitDirection::Horizontal);
+                    } else {
                         engine.open_editor_group(SplitDirection::Vertical);
-                        debug_log!(
-                            "  after split: groups={} layout={:?}",
-                            engine.group_layout.leaf_count(),
-                            engine.group_layout
-                        );
+                    }
+                } else if diff_total_cols > 0 && local_col >= diff_start && local_col < diff_end {
+                    let in_diff = local_col - diff_start;
+                    let label_cols = diff_total_cols - DIFF_TOOLBAR_BTN_COLS;
+                    let in_btns = in_diff.saturating_sub(label_cols);
+                    let has_win = engine.windows.contains_key(&engine.active_window_id());
+                    if in_diff < label_cols {
+                        // Clicked on label — no-op.
+                    } else if in_btns < DIFF_BTN_COLS {
+                        if has_win {
+                            engine.jump_prev_hunk();
+                        }
+                    } else if in_btns < DIFF_BTN_COLS * 2 {
+                        if has_win {
+                            engine.jump_next_hunk();
+                        }
+                    } else {
+                        engine.diff_toggle_hide_unchanged();
                     }
                 }
             }
@@ -5110,7 +5155,14 @@ fn draw_frame(
                     width: tab_w,
                     height: 1,
                 };
-                render_tab_bar(frame.buffer_mut(), g_tab, &gtb.tabs, theme, is_active);
+                render_tab_bar(
+                    frame.buffer_mut(),
+                    g_tab,
+                    &gtb.tabs,
+                    theme,
+                    is_active,
+                    gtb.diff_toolbar.as_ref(),
+                );
             }
         }
         // Draw breadcrumb bars (below each group's tab bar).
@@ -5160,7 +5212,14 @@ fn draw_frame(
             width: editor_area.width,
             height: 1,
         };
-        render_tab_bar(frame.buffer_mut(), tab_rect, &screen.tab_bar, theme, true);
+        render_tab_bar(
+            frame.buffer_mut(),
+            tab_rect,
+            &screen.tab_bar,
+            theme,
+            true,
+            screen.diff_toolbar.as_ref(),
+        );
         // Draw breadcrumb bar for the single group.
         if let Some(bc) = screen.breadcrumbs.first() {
             if !bc.segments.is_empty() {
@@ -5518,6 +5577,36 @@ fn set_cell(buf: &mut ratatui::buffer::Buffer, x: u16, y: u16, ch: char, fg: RCo
     }
 }
 
+/// Set a buffer cell with a 2-wide character (e.g. Nerd Font glyph), resetting
+/// the following cell so ratatui knows it's a continuation of the wide char.
+fn set_cell_wide(
+    buf: &mut ratatui::buffer::Buffer,
+    x: u16,
+    y: u16,
+    ch: char,
+    fg: RColor,
+    bg: RColor,
+) {
+    let area = buf.area;
+    if x < area.x + area.width && y < area.y + area.height {
+        // Use set_string which correctly handles double-width characters
+        // (measures width via unicode-segmentation, resets continuation cells).
+        // Private Use Area glyphs (Nerd Font) report width=1 to unicode_width
+        // but render as 2 columns in the terminal, so we write the glyph as a
+        // string and explicitly skip the next cell to prevent ratatui's diff
+        // algorithm from emitting it (which would overwrite the glyph's second
+        // column).
+        let mut s = String::with_capacity(4);
+        s.push(ch);
+        buf.get_mut(x, y).set_symbol(&s).set_fg(fg).set_bg(bg);
+        if x + 1 < area.x + area.width {
+            let next = buf.get_mut(x + 1, y);
+            next.reset();
+            next.set_skip(true);
+        }
+    }
+}
+
 fn set_cell_styled(
     buf: &mut ratatui::buffer::Buffer,
     x: u16,
@@ -5542,14 +5631,16 @@ const TAB_CLOSE_CHAR: char = '×'; // U+00D7 MULTIPLICATION SIGN
 /// Terminal columns used by each tab's close button (the × itself + trailing space).
 const TAB_CLOSE_COLS: u16 = 2;
 
-/// Split-right button: space + nf-md-view_split_vertical (2-wide NF glyph).
-const TAB_BTN_SPLIT_RIGHT: &str = " \u{F0932}"; // " 󰤲"
-/// Split-down button: space + nf-md-view_split_horizontal (2-wide NF glyph).
-const TAB_BTN_SPLIT_DOWN: &str = " \u{F0931}"; // " 󰤱"
+// Split button glyphs: \u{F0932} (split-right), \u{F0931} (split-down).
 /// Terminal columns occupied by each split button (1 space + 2-wide NF glyph).
 const TAB_SPLIT_BTN_COLS: u16 = 3;
 /// Total columns reserved for both split buttons.
 const TAB_SPLIT_BOTH_COLS: u16 = TAB_SPLIT_BTN_COLS * 2;
+
+/// Terminal columns per diff toolbar button (1 space + 2-wide NF glyph).
+const DIFF_BTN_COLS: u16 = 3;
+/// Total columns for all three diff toolbar buttons.
+const DIFF_TOOLBAR_BTN_COLS: u16 = DIFF_BTN_COLS * 3;
 
 fn render_tab_bar(
     buf: &mut ratatui::buffer::Buffer,
@@ -5557,6 +5648,7 @@ fn render_tab_bar(
     tabs: &[render::TabInfo],
     theme: &Theme,
     show_split_btns: bool,
+    diff_toolbar: Option<&render::DiffToolbarData>,
 ) {
     let bar_bg = rc(theme.tab_bar_bg);
 
@@ -5564,9 +5656,27 @@ fn render_tab_bar(
         set_cell(buf, x, area.y, ' ', bar_bg, bar_bg);
     }
 
-    // Reserve columns at the right edge for the two split buttons.
-    let tab_end = if show_split_btns && area.width >= TAB_SPLIT_BOTH_COLS {
-        area.x + area.width - TAB_SPLIT_BOTH_COLS
+    // Calculate total reserved columns at the right edge.
+    let diff_cols = if diff_toolbar.is_some() {
+        // 3 buttons + up to 6 chars for label like "2 of 5" + 1 space
+        let label_cols = diff_toolbar
+            .and_then(|d| d.change_label.as_ref())
+            .map(|l| l.len() as u16 + 1)
+            .unwrap_or(0);
+        DIFF_TOOLBAR_BTN_COLS + label_cols
+    } else {
+        0
+    };
+    let split_cols = if show_split_btns {
+        TAB_SPLIT_BOTH_COLS
+    } else {
+        0
+    };
+    let reserved = diff_cols + split_cols;
+
+    // Reserve columns at the right edge for buttons.
+    let tab_end = if area.width >= reserved {
+        area.x + area.width - reserved
     } else {
         area.x + area.width
     };
@@ -5611,18 +5721,53 @@ fn render_tab_bar(
         }
     }
 
+    // Draw diff toolbar buttons (to the left of split buttons).
+    if let Some(dt) = diff_toolbar {
+        if area.width >= reserved {
+            let mut bx = area.x + area.width - reserved;
+            let btn_fg = rc(theme.tab_inactive_fg);
+            let active_fg = rc(theme.tab_active_fg);
+            // Change label (e.g. "2/5")
+            if let Some(label) = &dt.change_label {
+                let label_fg = rc(theme.foreground);
+                set_cell(buf, bx, area.y, ' ', label_fg, bar_bg);
+                bx += 1;
+                for ch in label.chars() {
+                    set_cell(buf, bx, area.y, ch, label_fg, bar_bg);
+                    bx += 1;
+                }
+            }
+            // Prev button (space + 2-wide NF glyph = 3 cols)
+            set_cell(buf, bx, area.y, ' ', btn_fg, bar_bg);
+            set_cell_wide(buf, bx + 1, area.y, '\u{F0143}', btn_fg, bar_bg);
+            bx += DIFF_BTN_COLS;
+            // Next button
+            set_cell(buf, bx, area.y, ' ', btn_fg, bar_bg);
+            set_cell_wide(buf, bx + 1, area.y, '\u{F0140}', btn_fg, bar_bg);
+            bx += DIFF_BTN_COLS;
+            // Fold toggle button (highlighted when active)
+            let fold_fg = if dt.unchanged_hidden {
+                active_fg
+            } else {
+                btn_fg
+            };
+            set_cell(buf, bx, area.y, ' ', fold_fg, bar_bg);
+            set_cell_wide(buf, bx + 1, area.y, '\u{F0233}', fold_fg, bar_bg);
+            bx += DIFF_BTN_COLS;
+        }
+    }
+
     // Draw split-right then split-down buttons at the right edge.
-    if show_split_btns && area.width >= TAB_SPLIT_BOTH_COLS {
+    if show_split_btns && area.width >= split_cols {
         let btn_fg = rc(theme.tab_inactive_fg);
-        let mut bx = area.x + area.width - TAB_SPLIT_BOTH_COLS;
-        for ch in TAB_BTN_SPLIT_RIGHT.chars() {
-            set_cell(buf, bx, area.y, ch, btn_fg, bar_bg);
-            bx += 1;
-        }
-        for ch in TAB_BTN_SPLIT_DOWN.chars() {
-            set_cell(buf, bx, area.y, ch, btn_fg, bar_bg);
-            bx += 1;
-        }
+        let mut bx = area.x + area.width - split_cols;
+        // Split-right button (space + 2-wide NF glyph = 3 cols)
+        set_cell(buf, bx, area.y, ' ', btn_fg, bar_bg);
+        set_cell_wide(buf, bx + 1, area.y, '\u{F0932}', btn_fg, bar_bg);
+        bx += TAB_SPLIT_BTN_COLS;
+        // Split-down button
+        set_cell(buf, bx, area.y, ' ', btn_fg, bar_bg);
+        set_cell_wide(buf, bx + 1, area.y, '\u{F0931}', btn_fg, bar_bg);
     }
 }
 
@@ -5893,19 +6038,14 @@ fn render_diff_peek_popup(
                 cell.set_char(ch).set_fg(border_color);
             }
         }
-        let labels = ["[r] Revert", "[s] Stage"];
+        let labels = ["[s] Stage", "[r] Revert", "[q] Close"];
         let mut cx = x + 2;
-        for (idx, label) in labels.iter().enumerate() {
-            let lbl_fg = if idx == peek.focused_action {
-                rc(theme.cursor)
-            } else {
-                fg_color
-            };
+        for label in &labels {
             for ch in label.chars() {
                 if cx + 1 < x + width && cx < term_area.width {
                     buf.get_mut(cx, action_row)
                         .set_char(ch)
-                        .set_fg(lbl_fg)
+                        .set_fg(fg_color)
                         .set_bg(bg_color);
                 }
                 cx += 1;
@@ -7137,6 +7277,7 @@ fn render_window(frame: &mut ratatui::Frame, area: Rect, window: &RenderedWindow
             match line.diff_status {
                 Some(DiffLine::Added) => rc(theme.diff_added_bg),
                 Some(DiffLine::Removed) => rc(theme.diff_removed_bg),
+                Some(DiffLine::Padding) => rc(theme.diff_padding_bg),
                 _ => window_bg,
             }
         };
@@ -9548,6 +9689,26 @@ fn render_source_control(
         return;
     };
 
+    // Reserve bottom row for hint bar when focused.
+    let area = if sc.has_focus && area.height > 2 {
+        let hint_y = area.y + area.height - 1;
+        let hint_text = " Press '?' for help";
+        for cx in area.x..area.x + area.width {
+            set_cell(buf, cx, hint_y, ' ', dim_fg, hdr_bg);
+        }
+        for (i, ch) in hint_text.chars().enumerate().take(area.width as usize) {
+            set_cell(buf, area.x + i as u16, hint_y, ch, dim_fg, hdr_bg);
+        }
+        Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height: area.height - 1,
+        }
+    } else {
+        area
+    };
+
     // ── Row 0: header "SOURCE CONTROL" ──────────────────────────────────────
     let branch_info = if sc.ahead > 0 || sc.behind > 0 {
         format!(
@@ -9881,6 +10042,226 @@ fn render_source_control(
         }
     }
     let _ = (row_y, flat_row); // consumed by rendering loop
+
+    // ── Branch picker / create popup ─────────────────────────────────────────
+    if let Some(ref bp) = sc.branch_picker {
+        let popup_bg = rc(theme.completion_bg);
+        let popup_fg = rc(theme.completion_fg);
+        let popup_border = rc(theme.completion_border);
+        let popup_sel = rc(theme.completion_selected_bg);
+        let popup_w = area.width.saturating_sub(2).min(40);
+        let popup_h = if bp.create_mode {
+            3u16
+        } else {
+            area.height.saturating_sub(4).min(15)
+        };
+        let popup_x = area.x + (area.width.saturating_sub(popup_w)) / 2;
+        let popup_y = area.y + 2;
+        // Clear popup area
+        for y in popup_y..popup_y + popup_h {
+            for x in popup_x..popup_x + popup_w {
+                set_cell(buf, x, y, ' ', popup_fg, popup_bg);
+            }
+        }
+        // Top border
+        if popup_w >= 2 {
+            set_cell(buf, popup_x, popup_y, '┌', popup_border, popup_bg);
+            set_cell(
+                buf,
+                popup_x + popup_w - 1,
+                popup_y,
+                '┐',
+                popup_border,
+                popup_bg,
+            );
+            for x in popup_x + 1..popup_x + popup_w - 1 {
+                set_cell(buf, x, popup_y, '─', popup_border, popup_bg);
+            }
+            let title = if bp.create_mode {
+                " New Branch "
+            } else {
+                " Switch Branch "
+            };
+            let title_x = popup_x + 1;
+            for (i, ch) in title.chars().enumerate() {
+                let x = title_x + i as u16;
+                if x < popup_x + popup_w - 1 {
+                    set_cell(buf, x, popup_y, ch, popup_border, popup_bg);
+                }
+            }
+        }
+        if bp.create_mode {
+            let iy = popup_y + 1;
+            let label = "Name: ";
+            for (i, ch) in label.chars().enumerate() {
+                let x = popup_x + 1 + i as u16;
+                if x < popup_x + popup_w - 1 {
+                    set_cell(buf, x, iy, ch, dim_fg, popup_bg);
+                }
+            }
+            let input_x = popup_x + 1 + label.len() as u16;
+            for (i, ch) in bp.create_input.chars().enumerate() {
+                let x = input_x + i as u16;
+                if x < popup_x + popup_w - 1 {
+                    set_cell(buf, x, iy, ch, popup_fg, popup_bg);
+                }
+            }
+            let cx = input_x + bp.create_input.len() as u16;
+            if cx < popup_x + popup_w - 1 {
+                set_cell(buf, cx, iy, '▏', popup_fg, popup_bg);
+            }
+            let by = popup_y + popup_h - 1;
+            set_cell(buf, popup_x, by, '└', popup_border, popup_bg);
+            set_cell(buf, popup_x + popup_w - 1, by, '┘', popup_border, popup_bg);
+            for x in popup_x + 1..popup_x + popup_w - 1 {
+                set_cell(buf, x, by, '─', popup_border, popup_bg);
+            }
+        } else {
+            let iy = popup_y + 1;
+            let prefix = " \u{f002} ";
+            for (i, ch) in prefix.chars().enumerate() {
+                let x = popup_x + i as u16;
+                if x < popup_x + popup_w {
+                    set_cell(buf, x, iy, ch, dim_fg, popup_bg);
+                }
+            }
+            let qx = popup_x + prefix.chars().count() as u16;
+            for (i, ch) in bp.query.chars().enumerate() {
+                let x = qx + i as u16;
+                if x < popup_x + popup_w - 1 {
+                    set_cell(buf, x, iy, ch, popup_fg, popup_bg);
+                }
+            }
+            let list_y = popup_y + 2;
+            let list_h = popup_h.saturating_sub(3) as usize;
+            let scroll_off = if bp.selected >= list_h {
+                bp.selected - list_h + 1
+            } else {
+                0
+            };
+            for (vi, (name, is_current)) in
+                bp.results.iter().skip(scroll_off).take(list_h).enumerate()
+            {
+                let y = list_y + vi as u16;
+                let is_sel = vi + scroll_off == bp.selected;
+                let bg = if is_sel { popup_sel } else { popup_bg };
+                for x in popup_x..popup_x + popup_w {
+                    set_cell(buf, x, y, ' ', popup_fg, bg);
+                }
+                let marker = if *is_current { "● " } else { "  " };
+                let display = format!("{marker}{name}");
+                for (i, ch) in display.chars().enumerate() {
+                    let x = popup_x + 1 + i as u16;
+                    if x < popup_x + popup_w - 1 {
+                        set_cell(buf, x, y, ch, popup_fg, bg);
+                    }
+                }
+            }
+            let by = popup_y + popup_h - 1;
+            if by >= list_y {
+                set_cell(buf, popup_x, by, '└', popup_border, popup_bg);
+                set_cell(buf, popup_x + popup_w - 1, by, '┘', popup_border, popup_bg);
+                for x in popup_x + 1..popup_x + popup_w - 1 {
+                    set_cell(buf, x, by, '─', popup_border, popup_bg);
+                }
+            }
+        }
+        // Side borders
+        for y in popup_y + 1..popup_y + popup_h.saturating_sub(1) {
+            set_cell(buf, popup_x, y, '│', popup_border, popup_bg);
+            if popup_x + popup_w > 0 {
+                set_cell(buf, popup_x + popup_w - 1, y, '│', popup_border, popup_bg);
+            }
+        }
+    }
+
+    // ── Help dialog ──────────────────────────────────────────────────────────
+    if sc.help_open {
+        let popup_bg = rc(theme.completion_bg);
+        let popup_fg = rc(theme.completion_fg);
+        let popup_border = rc(theme.completion_border);
+        let bindings: &[(&str, &str)] = &[
+            ("j/k", "Navigate"),
+            ("s", "Stage / unstage"),
+            ("S", "Stage all"),
+            ("d", "Discard file"),
+            ("D", "Discard all unstaged"),
+            ("c", "Commit message"),
+            ("b", "Switch branch"),
+            ("B", "Create branch"),
+            ("p", "Push"),
+            ("P", "Pull"),
+            ("f", "Fetch"),
+            ("r", "Refresh"),
+            ("Tab", "Expand / collapse"),
+            ("Enter", "Open file"),
+            ("q/Esc", "Close panel"),
+        ];
+        let popup_w = area.width.saturating_sub(2).min(36);
+        let popup_h = (bindings.len() as u16 + 3).min(area.height.saturating_sub(2));
+        let popup_x = area.x + (area.width.saturating_sub(popup_w)) / 2;
+        let popup_y = area.y + (area.height.saturating_sub(popup_h)) / 2;
+        for y in popup_y..popup_y + popup_h {
+            for x in popup_x..popup_x + popup_w {
+                set_cell(buf, x, y, ' ', popup_fg, popup_bg);
+            }
+        }
+        set_cell(buf, popup_x, popup_y, '┌', popup_border, popup_bg);
+        set_cell(
+            buf,
+            popup_x + popup_w - 1,
+            popup_y,
+            '┐',
+            popup_border,
+            popup_bg,
+        );
+        for x in popup_x + 1..popup_x + popup_w - 1 {
+            set_cell(buf, x, popup_y, '─', popup_border, popup_bg);
+        }
+        let title = " Keybindings ";
+        let tx = popup_x + (popup_w.saturating_sub(title.len() as u16)) / 2;
+        for (i, ch) in title.chars().enumerate() {
+            let x = tx + i as u16;
+            if x > popup_x && x < popup_x + popup_w - 1 {
+                set_cell(buf, x, popup_y, ch, popup_border, popup_bg);
+            }
+        }
+        // Close hint
+        let close_x = popup_x + popup_w - 2;
+        if close_x > popup_x {
+            set_cell(buf, close_x, popup_y, 'x', popup_border, popup_bg);
+        }
+        let key_fg = rc(theme.function);
+        for (i, (key, desc)) in bindings.iter().enumerate() {
+            let y = popup_y + 1 + i as u16;
+            if y >= popup_y + popup_h - 1 {
+                break;
+            }
+            for (j, ch) in key.chars().enumerate() {
+                let x = popup_x + 2 + j as u16;
+                if x < popup_x + popup_w - 1 {
+                    set_cell(buf, x, y, ch, key_fg, popup_bg);
+                }
+            }
+            let desc_x = popup_x + 12;
+            for (j, ch) in desc.chars().enumerate() {
+                let x = desc_x + j as u16;
+                if x < popup_x + popup_w - 1 {
+                    set_cell(buf, x, y, ch, popup_fg, popup_bg);
+                }
+            }
+        }
+        let by = popup_y + popup_h - 1;
+        set_cell(buf, popup_x, by, '└', popup_border, popup_bg);
+        set_cell(buf, popup_x + popup_w - 1, by, '┘', popup_border, popup_bg);
+        for x in popup_x + 1..popup_x + popup_w - 1 {
+            set_cell(buf, x, by, '─', popup_border, popup_bg);
+        }
+        for y in popup_y + 1..popup_y + popup_h - 1 {
+            set_cell(buf, popup_x, y, '│', popup_border, popup_bg);
+            set_cell(buf, popup_x + popup_w - 1, y, '│', popup_border, popup_bg);
+        }
+    }
 }
 
 // ─── Extension panel (plugin-provided) ───────────────────────────────────────

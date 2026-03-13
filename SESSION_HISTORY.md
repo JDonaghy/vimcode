@@ -1,9 +1,18 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 170 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 173 archived here. Recent work summary in PROJECT_STATE.md.
 
 ---
+
+**Session 173 — Diff View Fixes: Aligned Scroll Sync + Auto-Filter (4214 tests):**
+Aligned-position-aware scroll sync for diff windows: `sync_scroll_binds()` now maps scroll positions through `diff_aligned` sequences instead of copying raw buffer line numbers, so both sides stay in visual lockstep even when one side has large padding blocks. Auto-enable `diff_unchanged_hidden` + `diff_apply_folds()` in `cmd_diffthis()`, `cmd_diffsplit()`, and `cmd_git_diff_split()` so the filter is active by default when entering diff mode. `is_in_diff_view()` now checks all editor groups (not just the active one) for diff window presence. Render fix: `build_rendered_window` advances `aligned_idx` past hidden (folded) lines and their adjacent padding entries. Known remaining issues logged in BUGS.md: large padding blocks still not fully suppressed in filtered view, toolbar not always appearing on both group tab bars. 1 new test.
+
+**Session 172 — VSCode-Style Diff Toolbar + Unified Hunk Navigation (4193 tests):**
+Diff toolbar in tab bar with prev/next change buttons, toggle hide-unchanged button, and "N of M" change label. `]c`/`[c` now use `diff_results` when in two-window diff mode (falls back to git_diff markers or `@@` headers otherwise). Fold-based hiding of unchanged sections with 3-line context around changes. `:DiffNext`/`:DiffPrev`/`:DiffToggleContext` ex commands + palette entries. `zR` auto-disables hidden mode. Cleanup in `cmd_diffoff()` and `close_window()`. Both GTK and TUI backends render toolbar and handle clicks. 6 new tests.
+
+**Session 171 — VSCode-Style Side-by-Side Diff Editor (4160 tests):**
+`:Gdiffsplit` / `:Gds` opens HEAD (read-only) on left and working copy (editable) on right with LCS diff coloring (green=added, red=removed), scroll-bound. SC panel Enter now opens diff split for tracked changed files (untracked/new files open normally). Diff recomputes on save and after hunk stage/revert via `gD`. Diff state cleaned up on window/tab close. `git::show_file_at_ref()` retrieves file content at any git revision. "Git: Diff Split" in command palette. 7 new tests.
 
 **Session 170 — Inline Diff Peek + Enhanced Hunk Nav (4105 tests):**
 Inline diff preview (VSCode parity): `gD` / `:DiffPeek` / click gutter marker opens floating popup showing hunk diff lines (red=removed, green=added) with `[r] Revert` / `[s] Stage` actions. Deleted-line gutter indicator (`▾` in red) for pure deletions. `]c`/`[c` now navigate changed regions on real source files using `git_diff` markers (previously only worked in diff buffers). New `DiffPeekState`/`DiffPeekPopup` structs, `DiffHunkInfo` with line-range mapping, `compute_file_diff_hunks()`, `hunk_for_line()`, `revert_hunk()` in git.rs. `git_deleted` color added to all 4 themes. Both GTK and TUI backends render popup + detect git gutter clicks. "Git: Peek Change" in command palette. 17 new tests.

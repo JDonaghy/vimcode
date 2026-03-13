@@ -249,7 +249,7 @@ cargo fmt
 - Fold state is per-window (two windows on same buffer can have different folds)
 
 **Hunk navigation (diff buffers)**
-- `]c` / `[c` — jump to next/previous `@@` hunk in a `:Gdiff` buffer
+- `]c` / `[c` — jump to next/previous change region (uses diff results in side-by-side view, `@@` headers in unified diff, git diff markers otherwise)
 
 ---
 
@@ -433,6 +433,7 @@ For full details on adapters, launch.json, conditional breakpoints, and the debu
 | Command | Aliases | Description |
 |---------|---------|-------------|
 | `:Gdiff` | `:Gd` | Open unified diff in vertical split |
+| `:Gdiffsplit` | `:Gds` | Side-by-side diff: HEAD (read-only) left, working copy right |
 | `:Gstatus` | `:Gs` | Open `git status` in vertical split |
 | `:Gadd` | `:Ga` | Stage current file (`git add`) |
 | `:Gadd!` | `:Ga!` | Stage all changes (`git add -A`) |
@@ -441,6 +442,8 @@ For full details on adapters, launch.json, conditional breakpoints, and the debu
 | `:Gpull` | `:Gpl` | Pull current branch |
 | `:Gfetch` | `:Gf` | Fetch |
 | `:Gblame` | `:Gb` | Open `git blame` in scroll-synced vertical split |
+| `:Gswitch <branch>` | `:Gsw` | Switch to an existing branch |
+| `:Gbranch <name>` | | Create a new branch and switch to it |
 | `:Ghs` | `:Ghunk` | Stage hunk under cursor (in a `:Gdiff` buffer) |
 
 **Hunk staging workflow**
@@ -475,10 +478,17 @@ Click the git branch icon in the activity bar to open the Source Control panel �
 - `Tab` — collapse/expand the current section
 - `q` / `Escape` — return focus to the editor
 
+**Branch operations:**
+- `b` — open branch picker (fuzzy-filter, `Enter` to switch, `Escape` to cancel)
+- `B` — create a new branch (type name, `Enter` to create + switch)
+
 **Remote operations (from panel):**
 - `p` — push current branch
 - `P` — pull current branch
 - `f` — fetch
+
+**Help:**
+- `?` — show keybindings help dialog (any key closes it)
 
 **Worktree and remote commands:**
 
@@ -604,7 +614,7 @@ Runtime changes are written through to `~/.config/vimcode/settings.json` immedia
 
 - `:set option?` — query current value; `:set option!` — toggle boolean; `:set` — show all
 - `:Settings` — open `settings.json` for direct editing
-- `:colorscheme <name>` — switch theme (`onedark`, `gruvbox-dark`, `tokyo-night`, `solarized-dark`, or custom VSCode `.json` themes from `~/.config/vimcode/themes/`)
+- `:colorscheme <name>` — switch theme (`onedark`, `gruvbox-dark`, `tokyo-night`, `solarized-dark`, `vscode-dark`, or custom VSCode `.json` themes from `~/.config/vimcode/themes/`)
 - **Settings sidebar** — click the gear icon for a VSCode-style interactive form
 
 Additional settings (AI, terminal, swap files, indent guides, etc.), configurable key bindings (`panel_keys`, `explorer_keys`, `completion_keys`), and user key mappings are documented in the **[Settings Reference](https://github.com/JDonaghy/vimcode/wiki/Settings-Reference)** and **[Key Remapping](https://github.com/JDonaghy/vimcode/wiki/Key-Remapping)** wiki pages.
@@ -904,13 +914,16 @@ All ex commands support Vim-style abbreviations (e.g., `:j` for `:join`, `:y` fo
 | `:!{cmd}` | Execute shell command and show output |
 | `:r {file}` | Read file contents into buffer after cursor line |
 | `:tabmove [N]` | Move current tab to position N (0-based, default = end) |
-| `:Gdiff` / `:Gstatus` | Git diff / status |
+| `:Gdiff` / `:Gdiffsplit` | Git diff (unified / side-by-side) |
+| `:Gstatus` | Git status |
 | `:Gadd` / `:Gadd!` | Stage file / stage all |
 | `:Gcommit <msg>` | Commit |
 | `:Gpush` | Push |
 | `:Gpull` / `:Gpl` | Pull |
 | `:Gfetch` / `:Gf` | Fetch |
 | `:Gblame` | Blame (scroll-synced split) |
+| `:Gswitch <branch>` / `:Gsw` | Switch to existing branch |
+| `:Gbranch <name>` | Create new branch and switch to it |
 | `:Ghs` / `:Ghunk` | Stage hunk under cursor |
 | `:DiffPeek` | Open diff hunk peek popup at cursor (revert/stage) |
 | `:GWorktreeAdd <branch> <path>` | Add git worktree |
@@ -922,6 +935,9 @@ All ex commands support Vim-style abbreviations (e.g., `:j` for `:join`, `:y` fo
 | `:cd <path>` | Change working directory |
 | `:diffsplit <file>` | Open file in vsplit with diff highlighting |
 | `:diffthis` | Mark current window as diff participant (two calls activate diff) |
+| `:DiffNext` | Jump to next change in diff view |
+| `:DiffPrev` | Jump to previous change in diff view |
+| `:DiffToggleContext` | Toggle hiding unchanged sections in diff view |
 | `:diffoff` | Clear diff highlighting |
 | `:grep <pat>` / `:vimgrep <pat>` | Search project, populate quickfix list |
 | `:copen` / `:ccl` | Open / close quickfix panel |

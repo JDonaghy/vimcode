@@ -5,11 +5,9 @@
 ---
 
 ## Recently Completed
-- **Session 170**: Inline Diff Peek + Enhanced Hunk Nav — `gD`/`:DiffPeek`/gutter click opens diff hunk popup (removed=red, added=green, `[r] Revert`/`[s] Stage`), deleted-line gutter `▾` indicator, `]c`/`[c` on real files, `DiffHunkInfo`/`DiffPeekState`/`DiffPeekPopup`, `revert_hunk()`, `git_deleted` theme color, GTK+TUI popup + gutter click, 17 tests
-- **Session 169**: GitHub Wiki — 9 pages; Documentation section added to README with wiki links
-- **Session 168**: Keybinding discoverability + VSCode remapping — 7 new ex command aliases, command names in `:Keybindings`, `:map` in VSCode mode, test hermiticity fix, 17 tests
+- **Session 173**: Diff View Fixes — Aligned scroll sync in `sync_scroll_binds()`, auto-enable fold filtering in all diff entry points, `is_in_diff_view()` checks all groups, render fix for aligned_idx advancement past folded lines, 1 test. Known remaining issues in BUGS.md.
 
-> Sessions 167 and earlier in **SESSION_HISTORY.md**.
+> Sessions 172 and earlier in **SESSION_HISTORY.md**.
 
 ## Roadmap
 
