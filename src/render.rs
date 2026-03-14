@@ -4303,8 +4303,9 @@ fn build_rendered_window(
     // For the TUI backend, rect.width is already in cell columns and char_width=1.0,
     // so the formula reduces to rect.width - gutter_char_width, which is exact.
     // In the GTK backend (char_width > 1.0) reserve pixels for the vertical
-    // scrollbar overlay so text never renders behind it.
-    let scrollbar_px: f64 = if char_width > 1.0 { 10.0 } else { 0.0 };
+    // scrollbar overlay so text never renders behind it.  CSS requests 4px
+    // but GTK may allocate slightly more; 8px is a safe reserve.
+    let scrollbar_px: f64 = if char_width > 1.0 { 8.0 } else { 0.0 };
     let render_viewport_cols = if char_width > 0.0 {
         let total_chars = ((rect.width - scrollbar_px) / char_width).floor() as usize;
         total_chars.saturating_sub(gutter_char_width).max(1)
