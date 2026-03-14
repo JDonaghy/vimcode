@@ -245,6 +245,8 @@ pub struct RenderedLine {
     pub git_diff: Option<GitLineStatus>,
     /// LSP diagnostic marks on this line (may be empty).
     pub diagnostics: Vec<DiagnosticMark>,
+    /// Spell-check error marks on this line (may be empty).
+    pub spell_errors: Vec<SpellMark>,
     /// Two-way diff status for this line (`None` when diff mode is off).
     pub diff_status: Option<DiffLine>,
     /// True when there is a DAP breakpoint set on this line.
@@ -287,6 +289,15 @@ pub struct DiagnosticMark {
     pub severity: crate::core::lsp::DiagnosticSeverity,
     /// Short message text (for tooltip/hover).
     pub message: String,
+}
+
+/// A misspelled word on a rendered line (for underline/squiggle rendering).
+#[derive(Debug, Clone)]
+pub struct SpellMark {
+    /// Start column (char index) within the line.
+    pub start_col: usize,
+    /// End column (char index, exclusive) within the line.
+    pub end_col: usize,
 }
 
 // ─── Cursor ───────────────────────────────────────────────────────────────────
@@ -1709,6 +1720,9 @@ pub struct Theme {
     pub diagnostic_info: Color,
     pub diagnostic_hint: Color,
 
+    // Spell checking
+    pub spell_error: Color,
+
     // Hover popup
     pub hover_bg: Color,
     pub hover_fg: Color,
@@ -1854,6 +1868,7 @@ impl Theme {
             diagnostic_warning: Color::from_hex("#e5c07b"), // yellow
             diagnostic_info: Color::from_hex("#61afef"),  // blue
             diagnostic_hint: Color::from_hex("#5c6370"),  // grey
+            spell_error: Color::from_hex("#56b6c2"),      // cyan
 
             // Hover popup
             hover_bg: Color::from_hex("#21252b"),
@@ -1976,6 +1991,7 @@ impl Theme {
             diagnostic_warning: Color::from_hex("#fabd2f"),
             diagnostic_info: Color::from_hex("#83a598"),
             diagnostic_hint: Color::from_hex("#928374"),
+            spell_error: Color::from_hex("#8ec07c"),
 
             hover_bg: Color::from_hex("#32302f"),
             hover_fg: Color::from_hex("#ebdbb2"),
@@ -2090,6 +2106,7 @@ impl Theme {
             diagnostic_warning: Color::from_hex("#e0af68"),
             diagnostic_info: Color::from_hex("#7aa2f7"),
             diagnostic_hint: Color::from_hex("#565f89"),
+            spell_error: Color::from_hex("#7dcfff"),
 
             hover_bg: Color::from_hex("#1f2335"),
             hover_fg: Color::from_hex("#c0caf5"),
@@ -2204,6 +2221,7 @@ impl Theme {
             diagnostic_warning: Color::from_hex("#b58900"),
             diagnostic_info: Color::from_hex("#268bd2"),
             diagnostic_hint: Color::from_hex("#586e75"),
+            spell_error: Color::from_hex("#2aa198"),
 
             hover_bg: Color::from_hex("#073642"),
             hover_fg: Color::from_hex("#93a1a1"),
@@ -2318,6 +2336,7 @@ impl Theme {
             diagnostic_warning: Color::from_hex("#cca700"),
             diagnostic_info: Color::from_hex("#3794ff"),
             diagnostic_hint: Color::from_hex("#858585"),
+            spell_error: Color::from_hex("#4fc1ff"),
 
             hover_bg: Color::from_hex("#252526"),
             hover_fg: Color::from_hex("#d4d4d4"),
@@ -2589,6 +2608,9 @@ impl Theme {
         }
         if let Some(c) = color("editorHint.foreground") {
             theme.diagnostic_hint = c;
+        }
+        if let Some(c) = color("editorSpellChecker.foreground") {
+            theme.spell_error = c;
         }
 
         // ── Diff ─────────────────────────────────────────────────────────
@@ -4280,8 +4302,11 @@ fn build_rendered_window(
     // hardcoded char_width_approx of 9.0 px and a fixed gutter offset of 5).
     // For the TUI backend, rect.width is already in cell columns and char_width=1.0,
     // so the formula reduces to rect.width - gutter_char_width, which is exact.
+    // In the GTK backend (char_width > 1.0) reserve pixels for the vertical
+    // scrollbar overlay so text never renders behind it.
+    let scrollbar_px: f64 = if char_width > 1.0 { 5.0 } else { 0.0 };
     let render_viewport_cols = if char_width > 0.0 {
-        let total_chars = (rect.width / char_width).floor() as usize;
+        let total_chars = ((rect.width - scrollbar_px) / char_width).floor() as usize;
         total_chars.saturating_sub(gutter_char_width).max(1)
     } else {
         view.viewport_cols.max(1)
@@ -4398,6 +4423,7 @@ fn build_rendered_window(
                     line_idx,
                     git_diff: None,
                     diagnostics: vec![],
+                    spell_errors: vec![],
                     diff_status: Some(DiffLine::Padding),
                     is_breakpoint: false,
                     is_conditional_bp: false,
@@ -4547,6 +4573,36 @@ fn build_rendered_window(
             Vec::new()
         };
 
+        // Spell-check errors for this line — computed on visible lines only.
+        let line_spell_errors: Vec<SpellMark> = if engine.settings.spell {
+            if let Some(ref checker) = engine.spell_checker {
+                let has_syntax = buffer_state
+                    .file_path
+                    .as_ref()
+                    .and_then(|p| p.to_str())
+                    .and_then(crate::core::syntax::SyntaxLanguage::from_path)
+                    .is_some();
+                let line_start_byte = buffer.content.line_to_byte(line_idx);
+                crate::core::spell::check_line(
+                    checker,
+                    &line_str,
+                    &buffer_state.highlights,
+                    line_start_byte,
+                    has_syntax,
+                )
+                .into_iter()
+                .map(|e| SpellMark {
+                    start_col: e.start_col,
+                    end_col: e.end_col,
+                })
+                .collect()
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
         // Two-way diff status for this line.
         let diff_status = engine
             .diff_results
@@ -4603,6 +4659,11 @@ fn build_rendered_window(
                     } else {
                         line_diagnostics.clone()
                     },
+                    spell_errors: if is_cont {
+                        Vec::new()
+                    } else {
+                        line_spell_errors.clone()
+                    },
                     diff_status,
                     is_breakpoint: !is_cont && is_breakpoint,
                     is_conditional_bp: !is_cont && is_conditional_bp,
@@ -4639,6 +4700,7 @@ fn build_rendered_window(
                             line_idx,
                             git_diff: None,
                             diagnostics: Vec::new(),
+                            spell_errors: Vec::new(),
                             diff_status: None,
                             is_breakpoint: false,
                             is_conditional_bp: false,
@@ -4664,6 +4726,7 @@ fn build_rendered_window(
                 line_idx,
                 git_diff: git_status,
                 diagnostics: line_diagnostics,
+                spell_errors: line_spell_errors,
                 diff_status,
                 is_breakpoint,
                 is_conditional_bp,
@@ -4701,6 +4764,7 @@ fn build_rendered_window(
                         line_idx,
                         git_diff: None,
                         diagnostics: Vec::new(),
+                        spell_errors: Vec::new(),
                         diff_status: None,
                         is_breakpoint: false,
                         is_conditional_bp: false,
@@ -5612,5 +5676,32 @@ mod tests {
                 gtb.group_id
             );
         }
+    }
+
+    #[test]
+    fn test_spell_errors_in_rendered_lines() {
+        use crate::core::Engine;
+
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "the quik brown fox\n");
+        engine.settings.spell = true;
+        engine.ensure_spell_checker();
+
+        let rects = vec![(
+            engine.active_window_id(),
+            WindowRect::new(0.0, 0.0, 80.0, 24.0),
+        )];
+        let theme = Theme::onedark();
+        let layout = build_screen_layout(&engine, &theme, &rects, 1.0, 1.0, false);
+
+        // The first window's first line should have a spell error on "quik".
+        let window = &layout.windows[0];
+        let first_line = &window.lines[0];
+        assert!(
+            !first_line.spell_errors.is_empty(),
+            "expected spell errors on 'the quik brown fox', got none"
+        );
+        assert_eq!(first_line.spell_errors[0].start_col, 4);
+        assert_eq!(first_line.spell_errors[0].end_col, 8);
     }
 }

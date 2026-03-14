@@ -5,17 +5,19 @@
 ---
 
 ## Recently Completed
+- **Session 180b**: Spell Checker Bug Fixes + UI Polish — z= numbered suggestion list with single-key selection; fixed markdown spell checking (SyntaxLanguage::from_path vs empty highlights); undo/dirty tracking for spell replacements; GTK scrollbar width halved (10→5px); text overflow behind scrollbar fixed; group divider grab fixed (proper editor bounds in hit-test/drag).
+- **Session 180**: Spell Checker — `src/core/spell.rs` with spellbook 0.4 (pure-Rust Hunspell); bundled en_US dictionary compiled into binary; user dictionary at `~/.config/vimcode/user.dic`; tree-sitter-aware (comments/strings in code, all text in plain text/Markdown); `]s`/`[s`/`z=`/`zg`/`zw` keybindings; `spell`/`spelllang` settings; `:set spell`/`:set nospell`; "Toggle Spell Check" palette entry; cyan dotted underline (GTK) + colored underline (TUI); 60 new tests (4314 total).
 - **Session 179**: Resize Tab Groups — GTK Alt+,/Alt+. keyboard; TUI mouse drag on group dividers; both backends now have full keyboard + mouse group resize.
 - **Session 178**: Version Querying — `--version` / `-V` CLI flag on both binaries; Help > About shows version; `env!("CARGO_PKG_VERSION")` compile-time.
 - **Session 177**: Fix Wrap Mode Mouse Click — GTK `view_row_to_buf_pos_wrap()` uses word-wrap segments for correct visual-row-to-buffer-line mapping; TUI click/drag add `segment_col_offset`. Fixes BUGS.md wrap click issue.
 - **Session 176**: GTK Performance — Lazy tree loading (one level at a time, expand on demand), Open Folder fix (set_current_dir + engine.cwd for tree refresh).
 
-> Sessions 175 and earlier in **SESSION_HISTORY.md**.
+> Sessions 180 and earlier in **SESSION_HISTORY.md**.
 
 ## Roadmap
-- Add a spell checker, either like vim's built in one, or as an extension. Needs discussion. Also need to think about supporting languages other than US English.
+- [x] **Spell checker** — Vim-compatible `]s`/`[s`/`z=`/`zg`/`zw`; spellbook Hunspell parser; bundled en_US dictionary; tree-sitter-aware; `spell`/`spelllang` settings; user dictionary at `~/.config/vimcode/user.dic`
 - [x] Add the ability to resize tabgroups: i.e. the leftgroup gets bigger at the right's expense and vice-versa. Also should work for vertically stacked tab groups, as well as with both the mouse and via key combos that are remappable in both tui and gui mode.
-- [x] Implement version querying so that the semantic version and build number can be displayed via Help:About and by typing "vcd --version" which shows the version but doesn't start the editor.
+- [x] Implement version querying so that the semantic version and build number can be displaced via Help:About and by typing "vcd --version" which shows the version but doesn't start the editor.
 ### Git
 - [x] **Stage hunks** — `]c`/`[c` navigation, `gs`/`:Ghs` to stage hunk under cursor
 - [x] **Inline diff peek** — `gD`/`:DiffPeek`/gutter click shows hunk popup with Revert/Stage, deleted-line `▾` gutter marker, `]c`/`[c` on real files

@@ -3856,7 +3856,30 @@ impl SimpleComponent for App {
                     {
                         let engine = self.engine.borrow();
                         if !engine.group_layout.is_single_group() {
-                            let editor_bottom = height - 2.0 * self.cached_line_height;
+                            let lh = self.cached_line_height;
+                            let wildmenu_px = if engine.wildmenu_items.is_empty() {
+                                0.0
+                            } else {
+                                lh
+                            };
+                            let status_h = lh * 2.0 + wildmenu_px;
+                            let dbg_px = if engine.debug_toolbar_visible {
+                                lh
+                            } else {
+                                0.0
+                            };
+                            let qf_px = if engine.quickfix_open && !engine.quickfix_items.is_empty()
+                            {
+                                6.0 * lh
+                            } else {
+                                0.0
+                            };
+                            let term_px = if engine.terminal_open || engine.bottom_panel_open {
+                                (engine.session.terminal_panel_rows as f64 + 2.0) * lh
+                            } else {
+                                0.0
+                            };
+                            let editor_bottom = height - status_h - dbg_px - qf_px - term_px;
                             let content_bounds =
                                 core::window::WindowRect::new(0.0, 0.0, width, editor_bottom);
                             let dividers = engine.group_layout.dividers(content_bounds, &mut 0);
@@ -4118,7 +4141,31 @@ impl SimpleComponent for App {
                 }
                 // Editor group divider drag — adjust split ratio.
                 if let Some(split_index) = self.group_divider_dragging {
-                    let editor_bottom = height - 2.0 * self.cached_line_height;
+                    let engine = self.engine.borrow();
+                    let lh = self.cached_line_height;
+                    let wildmenu_px = if engine.wildmenu_items.is_empty() {
+                        0.0
+                    } else {
+                        lh
+                    };
+                    let status_h = lh * 2.0 + wildmenu_px;
+                    let dbg_px = if engine.debug_toolbar_visible {
+                        lh
+                    } else {
+                        0.0
+                    };
+                    let qf_px = if engine.quickfix_open && !engine.quickfix_items.is_empty() {
+                        6.0 * lh
+                    } else {
+                        0.0
+                    };
+                    let term_px = if engine.terminal_open || engine.bottom_panel_open {
+                        (engine.session.terminal_panel_rows as f64 + 2.0) * lh
+                    } else {
+                        0.0
+                    };
+                    let editor_bottom = height - status_h - dbg_px - qf_px - term_px;
+                    drop(engine);
                     let content_bounds =
                         core::window::WindowRect::new(0.0, 0.0, width, editor_bottom);
                     let dividers = self
@@ -6311,10 +6358,10 @@ fn sync_scrollbar_positions(
         ws.vertical.set_halign(gtk4::Align::Start);
         ws.vertical.set_valign(gtk4::Align::Start);
         ws.vertical
-            .set_margin_start(rect.x as i32 + (rect.width - 10.0) as i32);
+            .set_margin_start(rect.x as i32 + (rect.width - 5.0) as i32);
         ws.vertical.set_margin_top(rect.y as i32);
         ws.vertical
-            .set_height_request((rect.height as i32 - 10).max(0));
+            .set_height_request((rect.height as i32 - 5).max(0));
 
         // Horizontal scrollbar is drawn in Cairo by draw_editor — nothing to do here.
     }
@@ -6622,13 +6669,13 @@ impl App {
         // Vertical scrollbar
         let v_adj = gtk4::Adjustment::new(0.0, 0.0, 100.0, 1.0, 10.0, 20.0);
         let vertical = gtk4::Scrollbar::new(gtk4::Orientation::Vertical, Some(&v_adj));
-        vertical.set_width_request(10);
+        vertical.set_width_request(5);
         vertical.set_hexpand(false);
         vertical.set_vexpand(false);
 
         // Cursor indicator
         let cursor_indicator = gtk4::DrawingArea::new();
-        cursor_indicator.set_width_request(10);
+        cursor_indicator.set_width_request(5);
         cursor_indicator.set_height_request(4);
         cursor_indicator.set_can_target(false);
         cursor_indicator.set_halign(gtk4::Align::Start);
@@ -8222,6 +8269,44 @@ fn draw_window(
                 up = !up;
             }
             cr.stroke().ok();
+        }
+
+        // Spell error underlines (dotted underline in spell_error color)
+        for sm in &rl.spell_errors {
+            let (sr, sg, sb) = theme.spell_error.to_cairo();
+            cr.set_source_rgb(sr, sg, sb);
+            cr.set_line_width(1.0);
+
+            let start_byte = rl
+                .raw_text
+                .char_indices()
+                .nth(sm.start_col)
+                .map(|(i, _)| i)
+                .unwrap_or(rl.raw_text.len());
+            let end_byte = rl
+                .raw_text
+                .char_indices()
+                .nth(sm.end_col)
+                .map(|(i, _)| i)
+                .unwrap_or(rl.raw_text.len());
+
+            layout.set_text(&rl.raw_text);
+            layout.set_attributes(None);
+
+            let start_pos = layout.index_to_pos(start_byte as i32);
+            let end_pos = layout.index_to_pos(end_byte as i32);
+            let x0 = text_x_offset + start_pos.x() as f64 / pango::SCALE as f64;
+            let x1 = text_x_offset + end_pos.x() as f64 / pango::SCALE as f64;
+            let underline_y = y + line_height - 2.0;
+
+            // Draw dotted underline
+            let dot_spacing = 3.0;
+            let mut dx = x0;
+            while dx < x1 {
+                cr.rectangle(dx, underline_y, 1.0, 1.0);
+                dx += dot_spacing;
+            }
+            cr.fill().ok();
         }
     }
 
@@ -11694,8 +11779,9 @@ fn pixel_to_click_target(
     // Compute the buffer line and segment column offset, accounting for wrapping.
     let (line, seg_col_offset) = if engine.settings.wrap {
         // Compute viewport_cols the same way render.rs does for word-wrap segments.
+        let scrollbar_px: f64 = if char_width > 1.0 { 5.0 } else { 0.0 };
         let render_viewport_cols = if char_width > 0.0 {
-            let total_chars = (rect.width / char_width).floor() as usize;
+            let total_chars = ((rect.width - scrollbar_px) / char_width).floor() as usize;
             total_chars.saturating_sub(gutter_char_width).max(1)
         } else {
             1

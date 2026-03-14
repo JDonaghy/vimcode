@@ -1,9 +1,12 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 179 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 180 archived here. Recent work summary in PROJECT_STATE.md.
 
 ---
+
+**Session 180 — Spell Checker (4314 tests):**
+New `src/core/spell.rs` (~200 lines): spell checking via `spellbook` 0.4 (pure-Rust Hunspell parser). Bundled `dictionaries/en_US.aff` + `en_US.dic` compiled into binary via `include_bytes!`. User dictionary at `~/.config/vimcode/user.dic`. Tree-sitter aware: only checks comments/strings in code files; all text in plain-text/Markdown files. New settings: `spell` (bool, default false), `spelllang` (string, default "en_US"). `:set spell` / `:set nospell` to toggle; "Toggle Spell Check" in command palette. Vim keybindings: `]s`/`[s` (next/prev error), `z=` (suggestions), `zg` (add to dict), `zw` (mark wrong). Visual: cyan dotted underline in GTK (wavy dots), colored underline in TUI. `SpellError` struct with char-based columns. `check_line()` with syntax-aware filtering. 60 new tests: 11 in spell.rs + 6 in engine.rs.
 
 **Session 179 — Resize Tab Groups (4266 tests):**
 Added keyboard and mouse resize for editor group splits. GTK: Alt+,/Alt+. keyboard shortcuts (shrink/expand active group by 0.05 ratio). TUI: mouse drag on group dividers — `dragging_group_divider: Option<usize>` state, hit-testing on `GroupDivider` positions from `ScreenLayout`, drag handler computes new ratio from mouse position via `set_ratio_at_index()`. Alt+,/Alt+. already existed in TUI. GTK drag already existed. Both backends now have full keyboard + mouse group resize.

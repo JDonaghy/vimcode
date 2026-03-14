@@ -7674,6 +7674,26 @@ fn render_window(frame: &mut ratatui::Frame, area: Rect, window: &RenderedWindow
             }
         }
 
+        // Spell error underlines
+        let spell_fg = rc(theme.spell_error);
+        for sm in &line.spell_errors {
+            for col in sm.start_col..sm.end_col {
+                if col < window.scroll_left {
+                    continue;
+                }
+                let vis_col = (col - window.scroll_left) as u16;
+                if vis_col >= text_width {
+                    break;
+                }
+                let cx = text_area_x + vis_col;
+                if cx < area.x + area.width && screen_y < area.y + area.height {
+                    let cell = frame.buffer_mut().get_mut(cx, screen_y);
+                    cell.set_fg(spell_fg);
+                    cell.modifier |= Modifier::UNDERLINED;
+                }
+            }
+        }
+
         // Bracket match highlighting
         let bracket_bg = rc(theme.bracket_match_bg);
         for &(view_line, col) in &window.bracket_match_positions {
