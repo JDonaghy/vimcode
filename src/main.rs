@@ -6358,10 +6358,10 @@ fn sync_scrollbar_positions(
         ws.vertical.set_halign(gtk4::Align::Start);
         ws.vertical.set_valign(gtk4::Align::Start);
         ws.vertical
-            .set_margin_start(rect.x as i32 + (rect.width - 5.0) as i32);
+            .set_margin_start(rect.x as i32 + (rect.width - 10.0) as i32);
         ws.vertical.set_margin_top(rect.y as i32);
         ws.vertical
-            .set_height_request((rect.height as i32 - 5).max(0));
+            .set_height_request((rect.height as i32 - 10).max(0));
 
         // Horizontal scrollbar is drawn in Cairo by draw_editor — nothing to do here.
     }
@@ -6669,13 +6669,13 @@ impl App {
         // Vertical scrollbar
         let v_adj = gtk4::Adjustment::new(0.0, 0.0, 100.0, 1.0, 10.0, 20.0);
         let vertical = gtk4::Scrollbar::new(gtk4::Orientation::Vertical, Some(&v_adj));
-        vertical.set_width_request(5);
+        vertical.set_width_request(10);
         vertical.set_hexpand(false);
         vertical.set_vexpand(false);
 
         // Cursor indicator
         let cursor_indicator = gtk4::DrawingArea::new();
-        cursor_indicator.set_width_request(5);
+        cursor_indicator.set_width_request(10);
         cursor_indicator.set_height_request(4);
         cursor_indicator.set_can_target(false);
         cursor_indicator.set_halign(gtk4::Align::Start);
@@ -11779,7 +11779,7 @@ fn pixel_to_click_target(
     // Compute the buffer line and segment column offset, accounting for wrapping.
     let (line, seg_col_offset) = if engine.settings.wrap {
         // Compute viewport_cols the same way render.rs does for word-wrap segments.
-        let scrollbar_px: f64 = if char_width > 1.0 { 5.0 } else { 0.0 };
+        let scrollbar_px: f64 = if char_width > 1.0 { 10.0 } else { 0.0 };
         let render_viewport_cols = if char_width > 0.0 {
             let total_chars = ((rect.width - scrollbar_px) / char_width).floor() as usize;
             total_chars.saturating_sub(gutter_char_width).max(1)
