@@ -125,6 +125,15 @@ pub struct Settings {
     #[serde(default)]
     pub wrap: bool,
 
+    /// When true, highlights misspelled words with underlines.
+    /// Corresponds to Vim's `:set spell` / `:set nospell`.
+    #[serde(default)]
+    pub spell: bool,
+
+    /// Spell-check language code (Hunspell dictionary name).
+    #[serde(default = "default_spelllang")]
+    pub spelllang: String,
+
     /// Whether the Lua plugin system is enabled (default true).
     #[serde(default = "default_plugins_enabled")]
     pub plugins_enabled: bool,
@@ -310,6 +319,10 @@ fn default_shift_width() -> u8 {
 
 fn default_lsp_enabled() -> bool {
     true // Default: enabled
+}
+
+fn default_spelllang() -> String {
+    "en_US".to_string()
 }
 
 fn default_plugins_enabled() -> bool {
@@ -607,6 +620,8 @@ impl Default for Settings {
             editor_mode: EditorMode::Vim,
             leader: default_leader(),
             wrap: false,
+            spell: false,
+            spelllang: default_spelllang(),
             plugins_enabled: default_plugins_enabled(),
             disabled_plugins: Vec::new(),
             keymaps: Vec::new(),
@@ -794,6 +809,7 @@ impl Settings {
             EditorMode::Vscode => "mode=vscode",
         };
         let wrap = if self.wrap { "wrap" } else { "nowrap" };
+        let spell = if self.spell { "spell" } else { "nospell" };
         let hls = if self.hlsearch {
             "hlsearch"
         } else {
@@ -810,7 +826,7 @@ impl Settings {
             "nosmartcase"
         };
         format!(
-            "{}  {}  ts={}  sw={}  {}  {}  {}  {}  {}  {}  {}  {}  {}  so={}  tw={}",
+            "{}  {}  ts={}  sw={}  {}  {}  {}  {}  {}  {}  {}  {}  {}  {}  so={}  tw={}",
             num,
             et,
             self.tabstop,
@@ -821,6 +837,7 @@ impl Settings {
             fos,
             mode,
             wrap,
+            spell,
             hls,
             ic,
             sc,
@@ -862,6 +879,7 @@ impl Settings {
             "incsearch" | "is" => self.incremental_search = enable,
             "lsp" => self.lsp_enabled = enable,
             "wrap" => self.wrap = enable,
+            "spell" => self.spell = enable,
             "hlsearch" | "hls" => self.hlsearch = enable,
             "ignorecase" | "ic" => self.ignorecase = enable,
             "smartcase" | "scs" => self.smartcase = enable,
@@ -996,6 +1014,12 @@ impl Settings {
             } else {
                 "nowrap".to_string()
             }),
+            "spell" => Ok(if self.spell {
+                "spell".to_string()
+            } else {
+                "nospell".to_string()
+            }),
+            "spelllang" => Ok(format!("spelllang={}", self.spelllang)),
             "hlsearch" | "hls" => Ok(if self.hlsearch {
                 "hlsearch".to_string()
             } else {
@@ -1128,6 +1152,8 @@ impl Settings {
             "expand_tab" => self.expand_tab.to_string(),
             "auto_indent" => self.auto_indent.to_string(),
             "wrap" => self.wrap.to_string(),
+            "spell" => self.spell.to_string(),
+            "spelllang" => self.spelllang.clone(),
             "scrolloff" => self.scrolloff.to_string(),
             "colorcolumn" => self.colorcolumn.clone(),
             "textwidth" => self.textwidth.to_string(),
@@ -1200,6 +1226,8 @@ impl Settings {
             "expand_tab" => self.expand_tab = value == "true",
             "auto_indent" => self.auto_indent = value == "true",
             "wrap" => self.wrap = value == "true",
+            "spell" => self.spell = value == "true",
+            "spelllang" => self.spelllang = value.to_string(),
             "scrolloff" => {
                 self.scrolloff = value
                     .parse()
@@ -1463,6 +1491,20 @@ pub static SETTING_DEFS: &[SettingDef] = &[
             min: 100,
             max: 60000,
         },
+    },
+    SettingDef {
+        key: "spell",
+        label: "Spell Check",
+        description: "Highlight misspelled words (comments/strings in code files)",
+        category: "Editor",
+        setting_type: SettingType::Bool,
+    },
+    SettingDef {
+        key: "spelllang",
+        label: "Spell Language",
+        description: "Spell-check language code (e.g. en_US)",
+        category: "Editor",
+        setting_type: SettingType::StringVal,
     },
     // ── Search ───────────────────────────────────────────────────────────────
     SettingDef {

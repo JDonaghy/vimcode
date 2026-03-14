@@ -1,9 +1,9 @@
 # VimCode Project State
 
-**Last updated:** Mar 13, 2026 (Session 176 — GTK Performance: Lazy Tree + Open Folder Fix) | **Tests:** 4266
+**Last updated:** Mar 14, 2026 (Session 180b — Spell Checker Bug Fixes + UI Polish) | **Tests:** 4316
 
 > Feature documentation lives in **README.md**.
-> Per-session implementation notes through Session 176 are in **SESSION_HISTORY.md**.
+> Per-session implementation notes through Session 180 are in **SESSION_HISTORY.md**.
 
 ---
 
@@ -26,7 +26,13 @@ When implementing a new key/command, add tests covering:
 
 ## Recent Work
 
-**Session 176 — GTK Performance: Lazy Tree + Open Folder Fix (4266 tests):**
-GTK explorer tree lazy loading: replaced eager recursive `build_file_tree()` with `build_file_tree_shallow()` that populates one directory level at a time with dummy placeholder children; `tree_row_expanded()` replaces dummies with real children on demand via `row-expanded` signal. Fixes multi-second startup when opening in large directories (e.g., home). Open Folder fix: `open_folder()` now calls `std::env::set_current_dir()` to update process working directory; `RefreshFileTree` handler uses `engine.cwd` instead of `std::env::current_dir()`. `highlight_file_in_tree` rewritten to walk path components, expanding ancestors lazily.
+### Session 180b — Spell Checker Bug Fixes + UI Polish (Mar 14, 2026)
+- **z= suggestions**: numbered list UI with single-key selection (1-9, a-z), like Neovim; `spell_suggestions` state intercepts keys at top of `handle_key()`
+- **Markdown spell checking**: fixed `has_syntax` detection — was using `!highlights.is_empty()` (wrong: all files get Rust parser as fallback); now uses `SyntaxLanguage::from_path()` to check if file has recognized syntax
+- **Undo/dirty tracking**: spell replacements now use `delete_with_undo()`/`insert_with_undo()` + `set_dirty(true)` instead of raw buffer ops
+- **GTK scrollbar width**: halved from 10px to 5px (scrollbar widget + cursor indicator + margin + height)
+- **Text overflow behind scrollbar**: subtracted 5px scrollbar width from `render_viewport_cols` in `render.rs`
+- **Group divider grab**: fixed hit-test and drag handler bounds — was using `height - 2.0 * line_height` instead of properly subtracting wildmenu/debug toolbar/quickfix/terminal panel heights to match actual editor bounds
+- 2 new tests (4316 total)
 
-> Sessions 175 and earlier archived in **SESSION_HISTORY.md**.
+> Sessions 180 and earlier archived in **SESSION_HISTORY.md**.

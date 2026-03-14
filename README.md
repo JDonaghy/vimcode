@@ -35,7 +35,7 @@ For detailed how-to guides and configuration references, see the **[VimCode Wiki
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 4263 tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 4316 tests, zero async runtime dependency
 
 > **Note:** VimCode does not implement VimScript. Extension and scripting is handled via
 > the built-in Lua 5.4 plugin system. The goal is full Vim *keybinding* and *editing*
@@ -100,6 +100,7 @@ cargo build
 cargo run -- <file>                         # GTK window
 cargo run -- --tui <file>                   # Terminal UI (alias: -t)
 cargo run -- --tui --debug /tmp/v.log       # TUI with debug log
+cargo run -- --version                      # Print version and exit (alias: -V)
 cargo test -- --test-threads=1
 cargo clippy -- -D warnings
 cargo fmt
@@ -248,6 +249,16 @@ cargo fmt
 - `+` / `-` gutter indicators; entire gutter column is clickable
 - Fold state is per-window (two windows on same buffer can have different folds)
 
+**Spell Checking**
+- `:set spell` / `:set nospell` — enable/disable; also togglable via "Toggle Spell Check" in the command palette
+- Misspelled words shown with a cyan dotted underline (wavy dots in GTK, colored underline in TUI)
+- **Tree-sitter aware:** in code files only comments and strings are checked; in plain-text and Markdown files the whole buffer is checked
+- `]s` / `[s` — jump to next/previous spelling error
+- `z=` — show spelling suggestions for word under cursor (displayed in status bar)
+- `zg` — add word under cursor to the user dictionary (`~/.config/vimcode/user.dic`)
+- `zw` — mark word as wrong (add to wrong-word list)
+- Bundled en_US dictionary (Hunspell-compatible, compiled into the binary); `spelllang` setting selects the language (only `en_US` currently bundled)
+
 **Hunk navigation (diff buffers)**
 - `]c` / `[c` — jump to next/previous change region (uses diff results in side-by-side view, `@@` headers in unified diff, git diff markers otherwise)
 
@@ -281,8 +292,8 @@ cargo fmt
 - `:EditorGroupFocus` / `:egf` — cycle focus to the next group
 - `:EditorGroupClose` / `:egc` — close the active group (sibling promoted)
 - `:EditorGroupMoveTab` / `:egmt` — move the current tab to the next group
-- `Alt+,` / `Alt+.` (TUI) — resize the parent split of the active group
-- Drag any divider (GTK) — resize that specific split
+- `Alt+,` / `Alt+.` — shrink / expand the active group (both GTK and TUI)
+- Drag any group divider — resize that specific split (both GTK and TUI)
 
 **Quit / Save**
 - `:w` — save; `:wq` — save and quit
@@ -610,6 +621,8 @@ Runtime changes are written through to `~/.config/vimcode/settings.json` immedia
 | `autoread` / `noautoread` | `ar` | on | Automatically reload files modified on disk |
 | `lsp` / `nolsp` | | on | Enable/disable LSP language servers |
 | `formatonsave` / `noformatonsave` | `fos` | off | Auto-format buffer via LSP before saving |
+| `spell` / `nospell` | | off | Enable spell checking (wavy underline on misspelled words) |
+| `spelllang=XX` | | `en_US` | Spell check language (currently only `en_US` is bundled) |
 | `mode=vim` / `mode=vscode` | | vim | Editor mode (see **VSCode Mode** below) |
 
 - `:set option?` — query current value; `:set option!` — toggle boolean; `:set` — show all
@@ -823,6 +836,10 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `zx` | Recompute folds (open all + close all) |
 | `zj` / `zk` | Move to next / previous fold |
 | `zs` / `ze` | Scroll cursor to left / right edge of screen |
+| `]s` / `[s` | Next / previous spelling error |
+| `z=` | Show spelling suggestions for word under cursor |
+| `zg` | Add word under cursor to user dictionary |
+| `zw` | Mark word under cursor as misspelled (add to wrong-word list) |
 | `Ctrl-W h/j/k/l` | Focus window left/down/up/right (`:wincmd h/j/k/l`) |
 | `Ctrl-W w` / `c` / `o` / `q` / `n` | Cycle / close / close-others / quit / new (`:wincmd w/c/o/q/n`) |
 | `Ctrl-W +` / `-` / `>` / `<` | Resize split height/width (`:wincmd +/-/>/<`) |
@@ -902,6 +919,7 @@ All ex commands support Vim-style abbreviations (e.g., `:j` for `:join`, `:y` fo
 | `:tabdo {cmd}` | Execute command in every tab |
 | `:di[splay]` | Display register contents (alias for `:reg`) |
 | `:set [option]` | Change / query setting |
+| `:set spell` / `:set nospell` | Enable / disable spell checking |
 | `:noh` / `:nohlsearch` | Clear current search highlight |
 | `:echo {text}` | Display a message in the status bar |
 | `:reg` / `:registers` | Display register contents |
@@ -1002,11 +1020,11 @@ All ex commands support Vim-style abbreviations (e.g., `:j` for `:join`, `:y` fo
 
 ```
 src/
-├── main.rs         (~12,723 lines)  GTK4/Relm4 UI, rendering, sidebar resize, fuzzy popup, context menu, drag-and-drop
-├── tui_main.rs     (~11,623 lines)  ratatui/crossterm TUI backend, fuzzy popup, rename/move prompts
+├── main.rs         (~13,000 lines)  GTK4/Relm4 UI, rendering, sidebar resize, fuzzy popup, context menu, drag-and-drop
+├── tui_main.rs     (~11,711 lines)  ratatui/crossterm TUI backend, fuzzy popup, rename/move prompts
 ├── render.rs        (~5,616 lines)  Platform-agnostic ScreenLayout bridge (DebugSidebarData, SourceControlData, ExtPanelData, BottomPanelTabs)
 ├── icons.rs            (~30 lines)  Nerd Font file-type icons (GTK + TUI)
-└── core/            (~29,500 lines)  Zero GTK/rendering deps — fully testable
+└── core/            (~63,448 lines)  Zero GTK/rendering deps — fully testable
     ├── engine.rs    (~44,021 lines)  Orchestrator: keys, commands, git, macros, LSP, DAP, plugins, workspaces
     ├── markdown.rs     (~497 lines)  Markdown → styled plain text converter (pulldown-cmark)
     ├── plugin.rs     (~1,534 lines)  Lua 5.4 plugin manager (mlua vendored; vimcode.* API; async_shell; panel API)
@@ -1022,10 +1040,13 @@ src/
     ├── settings.rs   (~2,131 lines)  JSON config, :set parsing, key binding notation, SETTING_DEFS
     ├── session.rs      (~235 lines)  Session state persistence + per-workspace paths
     ├── git.rs        (~1,821 lines)  Git subprocesses: diff, blame, stage_hunk, SC panel, worktrees, git log, branches
+    ├── spell.rs        (~200 lines)  Spell checker (spellbook/Hunspell; tree-sitter-aware; user dictionary)
     └── window.rs, tab.rs, view.rs, cursor.rs, mode.rs, syntax.rs (~984 lines)
 ```
 
 **Design rule:** `src/core/` has zero GTK/rendering dependencies and is testable in isolation.
+
+`dictionaries/` — bundled en_US Hunspell dictionary files (`.aff` + `.dic`) compiled into the binary via `include_bytes!`.
 
 
 ## Acknowledgements
@@ -1051,6 +1072,7 @@ VimCode is built on the shoulders of giants, and I take very little credit for i
 | LSP | lsp-types (protocol definitions) |
 | Config | serde + serde_json |
 | Plugins | mlua 0.9 (Lua 5.4, vendored) |
+| Spell check | spellbook 0.4 (pure-Rust Hunspell parser) |
 
 ## License
 

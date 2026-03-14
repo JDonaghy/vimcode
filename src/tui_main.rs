@@ -920,6 +920,8 @@ fn event_loop(
     let mut dragging_terminal_resize: bool = false;
     // True while user drags the terminal split divider left/right.
     let mut dragging_terminal_split: bool = false;
+    // Non-None while user is dragging a group divider (stores split_index).
+    let mut dragging_group_divider: Option<usize> = None;
     // Cache of the last rendered layout for mouse hit-testing
     let mut last_layout: Option<render::ScreenLayout> = None;
     // Double-click detection state
@@ -3293,6 +3295,7 @@ fn event_loop(
                                 &mut dragging_debug_output_sb,
                                 &mut dragging_terminal_resize,
                                 &mut dragging_terminal_split,
+                                &mut dragging_group_divider,
                                 &mut dragging_settings_sb,
                                 last_layout.as_ref(),
                                 &mut sidebar_prompt,
@@ -3332,6 +3335,7 @@ fn event_loop(
                     &mut dragging_debug_output_sb,
                     &mut dragging_terminal_resize,
                     &mut dragging_terminal_split,
+                    &mut dragging_group_divider,
                     &mut dragging_settings_sb,
                     last_layout.as_ref(),
                     &mut sidebar_prompt,
@@ -3406,6 +3410,7 @@ fn handle_mouse(
     dragging_debug_output_sb: &mut Option<(u16, u16, usize)>,
     dragging_terminal_resize: &mut bool,
     dragging_terminal_split: &mut bool,
+    dragging_group_divider: &mut Option<usize>,
     dragging_settings_sb: &mut Option<SidebarScrollDrag>,
     last_layout: Option<&render::ScreenLayout>,
     sidebar_prompt: &mut Option<SidebarPrompt>,
@@ -3497,6 +3502,26 @@ fn handle_mouse(
                 engine.session.terminal_panel_rows = new_rows;
                 return sidebar_width;
             }
+            // Group divider drag — update ratio based on mouse position.
+            if let Some(split_index) = *dragging_group_divider {
+                if let Some(split) = last_layout.and_then(|l| l.editor_group_split.as_ref()) {
+                    if let Some(div) = split.dividers.iter().find(|d| d.split_index == split_index)
+                    {
+                        let mr: u16 = if engine.menu_bar_visible { 1 } else { 0 };
+                        let editor_row = row.saturating_sub(mr);
+                        let rel_col = col.saturating_sub(editor_left);
+                        let mouse_pos = match div.direction {
+                            crate::core::window::SplitDirection::Vertical => rel_col as f64,
+                            crate::core::window::SplitDirection::Horizontal => editor_row as f64,
+                        };
+                        let new_ratio = (mouse_pos - div.axis_start) / div.axis_size;
+                        engine
+                            .group_layout
+                            .set_ratio_at_index(split_index, new_ratio);
+                    }
+                }
+                return sidebar_width;
+            }
             // Terminal split divider drag — update visual column position (no PTY resize yet).
             if *dragging_terminal_split {
                 let term_width = terminal_size.map(|s| s.width).unwrap_or(80);
@@ -3570,13 +3595,14 @@ fn handle_mouse(
                             && editor_row < wy + wh
                         {
                             let view_row = (editor_row - wy) as usize;
-                            let buf_line = rw
-                                .lines
-                                .get(view_row)
+                            let drag_rl = rw.lines.get(view_row);
+                            let buf_line = drag_rl
                                 .map(|l| l.line_idx)
                                 .unwrap_or_else(|| rw.scroll_top + view_row);
-                            let col_in_text =
-                                (rel_col - wx).saturating_sub(gutter) as usize + rw.scroll_left;
+                            let seg_offset = drag_rl.map(|l| l.segment_col_offset).unwrap_or(0);
+                            let col_in_text = (rel_col - wx).saturating_sub(gutter) as usize
+                                + rw.scroll_left
+                                + seg_offset;
                             engine.mouse_drag(rw.window_id, buf_line, col_in_text);
                             *mouse_text_drag = true;
                             return sidebar_width;
@@ -3617,6 +3643,7 @@ fn handle_mouse(
             *dragging_terminal_sb = None;
             *dragging_debug_output_sb = None;
             *dragging_settings_sb = None;
+            *dragging_group_divider = None;
             *cmd_dragging = false;
             if *dragging_terminal_resize {
                 *dragging_terminal_resize = false;
@@ -4833,6 +4860,32 @@ fn handle_mouse(
     // so we only subtract menu_rows here (not the tab bar row).
     let editor_row = row.saturating_sub(menu_rows);
 
+    // ── Group divider click — start drag ──────────────────────────────────────
+    if let Some(layout) = last_layout {
+        if let Some(ref split) = layout.editor_group_split {
+            for div in &split.dividers {
+                let hit = match div.direction {
+                    crate::core::window::SplitDirection::Vertical => {
+                        let div_col = div.position.round() as u16;
+                        rel_col == div_col
+                            && (editor_row as f64) >= div.cross_start
+                            && (editor_row as f64) < div.cross_start + div.cross_size
+                    }
+                    crate::core::window::SplitDirection::Horizontal => {
+                        let div_row = div.position.round() as u16;
+                        editor_row == div_row
+                            && (rel_col as f64) >= div.cross_start
+                            && (rel_col as f64) < div.cross_start + div.cross_size
+                    }
+                };
+                if hit {
+                    *dragging_group_divider = Some(div.split_index);
+                    return sidebar_width;
+                }
+            }
+        }
+    }
+
     if let Some(layout) = last_layout {
         for rw in &layout.windows {
             let wx = rw.rect.x as u16;
@@ -4932,13 +4985,15 @@ fn handle_mouse(
                     }
                     return sidebar_width;
                 }
-                // Text area click — fold-aware row → buffer line mapping
-                let buf_line = rw
-                    .lines
-                    .get(view_row)
+                // Text area click — fold/wrap-aware row → buffer line mapping
+                let clicked_rl = rw.lines.get(view_row);
+                let buf_line = clicked_rl
                     .map(|l| l.line_idx)
                     .unwrap_or_else(|| rw.scroll_top + view_row);
-                let col_in_text = (rel_col - wx - gutter) as usize + rw.scroll_left;
+                // For wrapped lines, add segment_col_offset so the click
+                // targets the correct column within the full buffer line.
+                let seg_offset = clicked_rl.map(|l| l.segment_col_offset).unwrap_or(0);
+                let col_in_text = (rel_col - wx - gutter) as usize + rw.scroll_left + seg_offset;
 
                 // Double-click detection
                 let now = Instant::now();
@@ -7614,6 +7669,26 @@ fn render_window(frame: &mut ratatui::Frame, area: Rect, window: &RenderedWindow
                 if cx < area.x + area.width && screen_y < area.y + area.height {
                     let cell = frame.buffer_mut().get_mut(cx, screen_y);
                     cell.set_fg(diag_fg);
+                    cell.modifier |= Modifier::UNDERLINED;
+                }
+            }
+        }
+
+        // Spell error underlines
+        let spell_fg = rc(theme.spell_error);
+        for sm in &line.spell_errors {
+            for col in sm.start_col..sm.end_col {
+                if col < window.scroll_left {
+                    continue;
+                }
+                let vis_col = (col - window.scroll_left) as u16;
+                if vis_col >= text_width {
+                    break;
+                }
+                let cx = text_area_x + vis_col;
+                if cx < area.x + area.width && screen_y < area.y + area.height {
+                    let cell = frame.buffer_mut().get_mut(cx, screen_y);
+                    cell.set_fg(spell_fg);
                     cell.modifier |= Modifier::UNDERLINED;
                 }
             }

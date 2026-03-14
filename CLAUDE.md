@@ -82,6 +82,8 @@ This prevents CI failures and maintains code quality.
 
 **Engine Facade Methods:** `buffer()`, `buffer_mut()`, `view()`, `view_mut()`, `cursor()` — all operate on active window's buffer
 
+**Show User-Facing Info (About, errors, confirmations):** Use the modal dialog system (`show_dialog()` / `show_error_dialog()`) rather than `self.message`. Dialogs are preferred for anything that deserves user attention — the message bar is for transient status only.
+
 **Add New Setting:** When adding a new user-configurable setting, update ALL FOUR of these:
 1. Add field to `Settings` struct in `settings.rs` with `#[serde(default = "default_fn_name")]`
 2. Create default function returning sensible default value

@@ -1,9 +1,21 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 176 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 180 archived here. Recent work summary in PROJECT_STATE.md.
 
 ---
+
+**Session 180 — Spell Checker (4314 tests):**
+New `src/core/spell.rs` (~200 lines): spell checking via `spellbook` 0.4 (pure-Rust Hunspell parser). Bundled `dictionaries/en_US.aff` + `en_US.dic` compiled into binary via `include_bytes!`. User dictionary at `~/.config/vimcode/user.dic`. Tree-sitter aware: only checks comments/strings in code files; all text in plain-text/Markdown files. New settings: `spell` (bool, default false), `spelllang` (string, default "en_US"). `:set spell` / `:set nospell` to toggle; "Toggle Spell Check" in command palette. Vim keybindings: `]s`/`[s` (next/prev error), `z=` (suggestions), `zg` (add to dict), `zw` (mark wrong). Visual: cyan dotted underline in GTK (wavy dots), colored underline in TUI. `SpellError` struct with char-based columns. `check_line()` with syntax-aware filtering. 60 new tests: 11 in spell.rs + 6 in engine.rs.
+
+**Session 179 — Resize Tab Groups (4266 tests):**
+Added keyboard and mouse resize for editor group splits. GTK: Alt+,/Alt+. keyboard shortcuts (shrink/expand active group by 0.05 ratio). TUI: mouse drag on group dividers — `dragging_group_divider: Option<usize>` state, hit-testing on `GroupDivider` positions from `ScreenLayout`, drag handler computes new ratio from mouse position via `set_ratio_at_index()`. Alt+,/Alt+. already existed in TUI. GTK drag already existed. Both backends now have full keyboard + mouse group resize.
+
+**Session 178 — Version Querying (4266 tests):**
+Added `--version` / `-V` CLI flag to both `vimcode` and `vcd` binaries — prints `VimCode <version>` and exits before UI initialization. Updated Help > About menu action to show version in a modal dialog (using the dialog system instead of message bar). Version sourced from `Cargo.toml` via `env!("CARGO_PKG_VERSION")`.
+
+**Session 177 — Fix Wrap Mode Mouse Click (4266 tests):**
+Fixed mouse click targeting on wrapped lines in both GTK and TUI backends. GTK: added `view_row_to_buf_pos_wrap()` in `main.rs` that walks buffer lines from scroll_top using `compute_word_wrap_segments()` (same word-wrap algorithm as renderer) to correctly map visual rows to `(buffer_line, segment_col_offset)`; `pixel_to_click_target()` now calls this when `settings.wrap` is true instead of the wrap-unaware `view_row_to_buf_line()`; column calculation walks from `segment_col_offset` instead of 0. TUI: click handler and drag handler in `tui_main.rs` now read `segment_col_offset` from the rendered line and add it to `col_in_text`. Previously, clicking on a wrap-continuation row mapped to the wrong buffer line (GTK used 1:1 visual-row-to-buffer-line mapping ignoring wraps) or wrong column (TUI didn't account for segment offset). Cleared BUGS.md.
 
 **Session 176 — GTK Performance: Lazy Tree + Open Folder Fix (4266 tests):**
 GTK explorer tree lazy loading: replaced eager recursive `build_file_tree()` with `build_file_tree_shallow()` that populates one directory level at a time with dummy placeholder children (`TREE_DUMMY_PATH`); `tree_row_expanded()` replaces dummies with real children on demand via `row-expanded` signal. Fixes multi-second startup when opening in large directories (e.g., home directory). Open Folder fix: `open_folder()` now calls `std::env::set_current_dir(&canonical)` to update process working directory alongside `engine.cwd`; `RefreshFileTree` handler uses `engine.cwd` instead of `std::env::current_dir()`, so tree repopulates with the new folder as root. `highlight_file_in_tree` rewritten to walk path components, expanding ancestors lazily. Removed `find_tree_path_for_file` (no longer needed).
