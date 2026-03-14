@@ -2837,6 +2837,18 @@ impl SimpleComponent for App {
         // Set the model on the TreeView
         widgets.file_tree_view.set_model(Some(&tree_store));
 
+        // Lazy-load: populate directory children when the user expands a row.
+        {
+            let engine_ref = engine.clone();
+            let tree_store_ref = tree_store.clone();
+            widgets
+                .file_tree_view
+                .connect_row_expanded(move |_tree_view, iter, _tree_path| {
+                    let show_hidden = engine_ref.borrow().settings.show_hidden_files;
+                    tree_row_expanded(&tree_store_ref, iter, show_hidden);
+                });
+        }
+
         // Expand the root node so the tree contents are visible
         widgets
             .file_tree_view
@@ -12418,7 +12430,12 @@ fn load_css(theme: &Theme) -> gtk4::CssProvider {
     provider
 }
 
+/// Sentinel path stored in the dummy placeholder child of unexpanded directories.
+const TREE_DUMMY_PATH: &str = "__vimcode_loading__";
+
 /// Build file tree with a root folder node at the top (like VSCode).
+/// Only the root's immediate children are populated; subdirectories are
+/// lazily expanded via the `row-expanded` signal (see `tree_row_expanded`).
 fn build_file_tree_with_root(store: &gtk4::TreeStore, root: &Path, show_hidden: bool) {
     let root_name = root
         .file_name()
@@ -12434,12 +12451,13 @@ fn build_file_tree_with_root(store: &gtk4::TreeStore, root: &Path, show_hidden: 
             (2, &root.to_string_lossy().to_string()),
         ],
     );
-    build_file_tree(store, Some(&root_iter), root, show_hidden);
+    build_file_tree_shallow(store, Some(&root_iter), root, show_hidden);
 }
 
-/// Build file tree recursively
-/// TreeStore columns: [Icon(String), Name(String), FullPath(String)]
-fn build_file_tree(
+/// Populate one level of children under `parent`.  For each child directory
+/// a dummy placeholder row is added so the expand arrow appears, but its
+/// contents are not read until the user actually expands the row.
+fn build_file_tree_shallow(
     store: &gtk4::TreeStore,
     parent: Option<&gtk4::TreeIter>,
     path: &Path,
@@ -12447,7 +12465,7 @@ fn build_file_tree(
 ) {
     let entries = match fs::read_dir(path) {
         Ok(e) => e,
-        Err(_) => return, // Handle permission errors silently
+        Err(_) => return,
     };
 
     let mut entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
@@ -12456,7 +12474,6 @@ fn build_file_tree(
     entries.sort_by(|a, b| {
         let a_is_dir = a.path().is_dir();
         let b_is_dir = b.path().is_dir();
-
         match (a_is_dir, b_is_dir) {
             (true, false) => std::cmp::Ordering::Less,
             (false, true) => std::cmp::Ordering::Greater,
@@ -12465,16 +12482,18 @@ fn build_file_tree(
     });
 
     for entry in entries {
-        let path = entry.path();
+        let child_path = entry.path();
         let name = entry.file_name().to_string_lossy().to_string();
 
-        // Skip hidden files unless the setting is enabled
         if name.starts_with('.') && name != "." && name != ".." && !show_hidden {
             continue;
         }
 
-        let is_dir = path.is_dir();
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let is_dir = child_path.is_dir();
+        let ext = child_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
         let icon = if is_dir {
             "\u{f07b}" // nf-fa-folder
         } else {
@@ -12487,18 +12506,40 @@ fn build_file_tree(
             &[
                 (0, &icon),
                 (1, &name),
-                (2, &path.to_string_lossy().to_string()),
+                (2, &child_path.to_string_lossy().to_string()),
             ],
         );
 
-        // Recursively add subdirectories
+        // For directories, insert a dummy child so the expand arrow appears.
         if is_dir {
-            // Limit recursion depth to prevent hanging on deep trees
-            let depth = parent.map_or(0, |_| 1); // Simple depth tracking
-            if depth < 10 {
-                build_file_tree(store, Some(&iter), &path, show_hidden);
-            }
+            store.insert_with_values(
+                Some(&iter),
+                None,
+                &[(0, &""), (1, &""), (2, &TREE_DUMMY_PATH)],
+            );
         }
+    }
+}
+
+/// Called when a tree row is expanded.  Replaces the dummy placeholder with
+/// the directory's real contents (one level deep).
+fn tree_row_expanded(store: &gtk4::TreeStore, iter: &gtk4::TreeIter, show_hidden: bool) {
+    use gtk4::prelude::TreeModelExt;
+    let dir_path: String = store.get_value(iter, 2).get().unwrap_or_default();
+    if dir_path.is_empty() {
+        return;
+    }
+
+    // Check whether the first child is the dummy placeholder.
+    if let Some(child) = store.iter_children(Some(iter)) {
+        let child_path: String = store.get_value(&child, 2).get().unwrap_or_default();
+        if child_path == TREE_DUMMY_PATH {
+            // Remove the dummy and populate real children.
+            store.remove(&child);
+            build_file_tree_shallow(store, Some(iter), Path::new(&dir_path), show_hidden);
+        }
+        // If the first child is NOT the dummy, the directory was already
+        // populated (e.g. collapsed and re-expanded) — nothing to do.
     }
 }
 
@@ -12586,7 +12627,10 @@ fn validate_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Find and select file in tree, expanding parents if needed
+/// Find and select file in tree, expanding parents if needed.
+/// With lazy loading, parent directories may not be populated yet, so we
+/// walk the path components from the root, expanding (and thus populating)
+/// each ancestor before searching for the next child.
 fn highlight_file_in_tree(tree_view: &gtk4::TreeView, file_path: &Path) {
     let Some(model) = tree_view.model() else {
         return;
@@ -12595,59 +12639,70 @@ fn highlight_file_in_tree(tree_view: &gtk4::TreeView, file_path: &Path) {
         return;
     };
 
-    // Find the file in tree by full path (column 2)
-    let path_str = file_path.to_string_lossy().to_string();
+    // Find the cwd root node (first child of the store).
+    let Some(root_iter) = tree_store.iter_first() else {
+        return;
+    };
+    let root_path_str: String = tree_store
+        .get_value(&root_iter, 2)
+        .get()
+        .unwrap_or_default();
+    let root_path = PathBuf::from(&root_path_str);
+    let rel = match file_path.strip_prefix(&root_path) {
+        Ok(r) => r,
+        Err(_) => return, // file not under the project root
+    };
 
-    if let Some(tree_path) = find_tree_path_for_file(tree_store, &path_str, None) {
-        // Expand parents
-        if tree_path.depth() > 1 {
-            let mut parent_path = tree_path.clone();
-            parent_path.up();
-            tree_view.expand_to_path(&parent_path);
+    // Walk the relative path components, expanding each directory.
+    let mut current_iter = root_iter;
+    for component in rel.components() {
+        let name = component.as_os_str().to_string_lossy();
+
+        // Ensure this directory's children are populated (trigger lazy load).
+        let tp = tree_store.path(&current_iter);
+        tree_view.expand_row(&tp, false);
+
+        // Search children for the matching name.
+        let mut found = false;
+        if let Some(child_iter) = tree_store.iter_children(Some(&current_iter)) {
+            loop {
+                let child_name: String = tree_store
+                    .get_value(&child_iter, 1)
+                    .get()
+                    .unwrap_or_default();
+                if child_name == name.as_ref() {
+                    current_iter = child_iter;
+                    found = true;
+                    break;
+                }
+                if !tree_store.iter_next(&child_iter) {
+                    break;
+                }
+            }
         }
-
-        // Select the row
-        tree_view.selection().select_path(&tree_path);
-
-        // Scroll to make visible
-        tree_view.scroll_to_cell(
-            Some(&tree_path),
-            None::<&gtk4::TreeViewColumn>,
-            false,
-            0.0,
-            0.0,
-        );
-    }
-}
-
-/// Recursively find tree path for given file path string
-fn find_tree_path_for_file(
-    model: &gtk4::TreeStore,
-    target_path: &str,
-    parent: Option<&gtk4::TreeIter>,
-) -> Option<gtk4::TreePath> {
-    let n = model.iter_n_children(parent);
-
-    for i in 0..n {
-        let iter = if let Some(parent) = parent {
-            model.iter_nth_child(Some(parent), i)?
-        } else {
-            model.iter_nth_child(None, i)?
-        };
-
-        // Check if this row matches
-        let path_str: String = model.get_value(&iter, 2).get().ok()?;
-        if path_str == target_path {
-            return Some(model.path(&iter));
-        }
-
-        // Recursively check children
-        if let Some(found) = find_tree_path_for_file(model, target_path, Some(&iter)) {
-            return Some(found);
+        if !found {
+            return;
         }
     }
 
-    None
+    // current_iter now points to the target file/directory.
+    let tree_path = tree_store.path(&current_iter);
+
+    // Expand parents so the row is visible.
+    if tree_path.depth() > 1 {
+        let mut parent_path = tree_path.clone();
+        parent_path.up();
+        tree_view.expand_to_path(&parent_path);
+    }
+
+    tree_view.selection().select_path(&tree_path);
+    tree_view.scroll_to_cell(
+        Some(&tree_path),
+        None::<&gtk4::TreeViewColumn>,
+        false,
+        0.0,
+        0.0,
+    );
 }
 
 /// Install the application icon and `.desktop` file to `~/.local/share/` so that
