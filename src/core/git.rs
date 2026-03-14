@@ -7,6 +7,8 @@ use std::process::{Command, Stdio};
 pub enum GitLineStatus {
     Added,
     Modified,
+    /// Lines were deleted at this position (shown as ▾ in gutter).
+    Deleted,
 }
 
 // ─── Source Control: file status ──────────────────────────────────────────────
@@ -62,6 +64,17 @@ pub struct WorktreeEntry {
 pub struct Hunk {
     pub header: String,     // full "@@ -a,b +c,d @@" line
     pub lines: Vec<String>, // body lines (with +/-/space prefix)
+}
+
+/// Structured diff hunk with line-range mapping to the current buffer.
+#[derive(Debug, Clone)]
+pub struct DiffHunkInfo {
+    pub file_header: String,
+    pub hunk: Hunk,
+    /// First line in the new (working) file, 0-indexed.
+    pub new_start: usize,
+    /// Number of new-file lines covered by this hunk.
+    pub new_count: usize,
 }
 
 fn run_git(dir: &Path, args: &[&str]) -> Option<String> {
@@ -308,6 +321,20 @@ pub fn stage_hunk(dir: &Path, file_header: &str, hunk: &Hunk) -> Result<(), Stri
     run_git_stdin(dir, &["apply", "--cached", "-"], &patch).map(|_| ())
 }
 
+/// Revert a single hunk by applying the patch in reverse to the working tree.
+pub fn revert_hunk(dir: &Path, file_header: &str, hunk: &Hunk) -> Result<(), String> {
+    let mut patch = String::new();
+    patch.push_str(file_header);
+    patch.push('\n');
+    patch.push_str(&hunk.header);
+    patch.push('\n');
+    for line in &hunk.lines {
+        patch.push_str(line);
+        patch.push('\n');
+    }
+    run_git_stdin(dir, &["apply", "--reverse", "-"], &patch).map(|_| ())
+}
+
 // ─── Commit / push ────────────────────────────────────────────────────────────
 
 /// Run `git commit -m <message>`. Returns Ok(summary) or Err(message).
@@ -530,6 +557,73 @@ pub fn blame_text(path: &Path) -> Option<String> {
 
 // ─── Diff ─────────────────────────────────────────────────────────────────────
 
+/// Parse the `+start,count` portion of a `@@ ... @@` header. Returns 0-indexed start and count.
+fn parse_hunk_new_range(header: &str) -> (usize, usize) {
+    if let Some(rest) = header.strip_prefix("@@ ") {
+        if let Some(plus) = rest.split('+').nth(1) {
+            let parts: Vec<&str> = plus.split([',', ' ']).collect();
+            let start = parts
+                .first()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(1);
+            let count = parts
+                .get(1)
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(1);
+            return (start.saturating_sub(1), count);
+        }
+    }
+    (0, 0)
+}
+
+/// Compute structured diff hunks for a file, with line-range info for the working copy.
+pub fn compute_file_diff_hunks(path: &Path) -> Vec<DiffHunkInfo> {
+    let dir = match path.parent() {
+        Some(d) => d,
+        None => return vec![],
+    };
+    let path_str = match path.to_str() {
+        Some(s) => s,
+        None => return vec![],
+    };
+    let diff = match run_git(dir, &["diff", "HEAD", "--", path_str]) {
+        Some(d) if !d.trim().is_empty() => d,
+        _ => return vec![],
+    };
+    let (file_header, hunks) = parse_diff_hunks(&diff);
+    hunks
+        .into_iter()
+        .map(|hunk| {
+            let (new_start, new_count) = parse_hunk_new_range(&hunk.header);
+            DiffHunkInfo {
+                file_header: file_header.clone(),
+                hunk,
+                new_start,
+                new_count,
+            }
+        })
+        .collect()
+}
+
+/// Find which hunk covers a given buffer line (0-indexed). Returns the hunk index.
+pub fn hunk_for_line(hunks: &[DiffHunkInfo], line: usize) -> Option<usize> {
+    // Exact range match first.
+    for (i, h) in hunks.iter().enumerate() {
+        let end = h.new_start + h.new_count.max(1);
+        if line >= h.new_start && line < end {
+            return Some(i);
+        }
+    }
+    // For pure deletions (new_count == 0), check if line is at the boundary.
+    for (i, h) in hunks.iter().enumerate() {
+        if h.new_count == 0 && (line == h.new_start || (h.new_start > 0 && line == h.new_start - 1))
+        {
+            return Some(i);
+        }
+    }
+    None
+}
+
 pub fn compute_file_diff(path: &Path) -> Vec<Option<GitLineStatus>> {
     let dir = match path.parent() {
         Some(d) => d,
@@ -569,6 +663,13 @@ fn parse_unified_diff(diff: &str, total_lines: usize) -> Vec<Option<GitLineStatu
 
     for line in diff.lines() {
         if let Some(rest) = line.strip_prefix("@@ ") {
+            // Flush pending pure-deletions from previous hunk.
+            if pending_del > 0 {
+                let mark = new_line.min(total_lines.saturating_sub(1));
+                if result[mark].is_none() {
+                    result[mark] = Some(GitLineStatus::Deleted);
+                }
+            }
             // Parse +new_start from "@@ -a,b +new_start,c @@"
             if let Some(plus) = rest.split('+').nth(1) {
                 let s = plus.split([',', ' ']).next().unwrap_or("1");
@@ -588,8 +689,19 @@ fn parse_unified_diff(diff: &str, total_lines: usize) -> Vec<Option<GitLineStatu
             }
             new_line += 1;
         } else if !line.starts_with('\\') {
+            // Context line — flush pending pure-deletions.
+            if pending_del > 0 && new_line < total_lines && result[new_line].is_none() {
+                result[new_line] = Some(GitLineStatus::Deleted);
+            }
             pending_del = 0;
             new_line += 1;
+        }
+    }
+    // Trailing pure-deletions at end of diff.
+    if pending_del > 0 {
+        let mark = new_line.min(total_lines.saturating_sub(1));
+        if result[mark].is_none() {
+            result[mark] = Some(GitLineStatus::Deleted);
         }
     }
     result
@@ -665,6 +777,103 @@ mod tests {
         assert!(result.iter().all(|s| s.is_none()));
     }
 
+    #[test]
+    fn test_parse_unified_diff_pure_deletion() {
+        // Deleting lines 2-3 from a 5-line file (old) → 3-line file (new)
+        // @@ -1,5 +1,3 @$ context\n-del1\n-del2\n context\n context
+        let diff = "@@ -1,5 +1,3 @@\n line1\n-del1\n-del2\n line2\n line3\n";
+        let result = parse_unified_diff(diff, 3);
+        // line 0 (line1) = context → None
+        // line 1 (line2) = first context after deletion → Deleted marker
+        // line 2 (line3) = context → None
+        assert_eq!(result[0], None);
+        assert_eq!(result[1], Some(GitLineStatus::Deleted));
+        assert_eq!(result[2], None);
+    }
+
+    #[test]
+    fn test_parse_unified_diff_trailing_deletion() {
+        // Delete the last 2 lines. Old: 4 lines → New: 2 lines.
+        let diff = "@@ -1,4 +1,2 @@\n line1\n line2\n-del1\n-del2\n";
+        let result = parse_unified_diff(diff, 2);
+        // line 0 (line1) = context → None
+        // line 1 (line2) = last line, trailing deletions → Deleted marker
+        assert_eq!(result[0], None);
+        assert_eq!(result[1], Some(GitLineStatus::Deleted));
+    }
+
+    #[test]
+    fn test_parse_unified_diff_deletion_at_start() {
+        // Delete first 2 lines. Old: 4 lines → New: 2 lines.
+        let diff = "@@ -1,4 +1,2 @@\n-del1\n-del2\n line1\n line2\n";
+        let result = parse_unified_diff(diff, 2);
+        // line 0 = first line after deletion → Deleted marker
+        // line 1 = context → None
+        assert_eq!(result[0], Some(GitLineStatus::Deleted));
+        assert_eq!(result[1], None);
+    }
+
+    // ── hunk_for_line ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_hunk_for_line_exact_match() {
+        let hunks = vec![
+            DiffHunkInfo {
+                file_header: String::new(),
+                hunk: Hunk {
+                    header: "@@ -1,2 +1,3 @@".to_string(),
+                    lines: vec![],
+                },
+                new_start: 0,
+                new_count: 3,
+            },
+            DiffHunkInfo {
+                file_header: String::new(),
+                hunk: Hunk {
+                    header: "@@ -10,2 +11,2 @@".to_string(),
+                    lines: vec![],
+                },
+                new_start: 10,
+                new_count: 2,
+            },
+        ];
+        assert_eq!(hunk_for_line(&hunks, 0), Some(0));
+        assert_eq!(hunk_for_line(&hunks, 2), Some(0));
+        assert_eq!(hunk_for_line(&hunks, 3), None);
+        assert_eq!(hunk_for_line(&hunks, 10), Some(1));
+        assert_eq!(hunk_for_line(&hunks, 11), Some(1));
+        assert_eq!(hunk_for_line(&hunks, 12), None);
+    }
+
+    #[test]
+    fn test_hunk_for_line_pure_deletion() {
+        // Pure deletion: new_count=0 at position 5.
+        let hunks = vec![DiffHunkInfo {
+            file_header: String::new(),
+            hunk: Hunk {
+                header: "@@ -5,2 +5,0 @@".to_string(),
+                lines: vec![],
+            },
+            new_start: 5,
+            new_count: 0,
+        }];
+        // Should match at the boundary lines.
+        assert_eq!(hunk_for_line(&hunks, 4), Some(0));
+        assert_eq!(hunk_for_line(&hunks, 5), Some(0));
+        assert_eq!(hunk_for_line(&hunks, 3), None);
+        assert_eq!(hunk_for_line(&hunks, 6), None);
+    }
+
+    // ── parse_hunk_new_range ────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_hunk_new_range() {
+        assert_eq!(parse_hunk_new_range("@@ -1,3 +1,4 @@"), (0, 4));
+        assert_eq!(parse_hunk_new_range("@@ -10,2 +11,2 @@"), (10, 2));
+        assert_eq!(parse_hunk_new_range("@@ -5,2 +5,0 @@"), (4, 0));
+        assert_eq!(parse_hunk_new_range("@@ -1 +1 @@"), (0, 1));
+    }
+
     // ── blame helpers ──────────────────────────────────────────────────────
 
     #[test]
@@ -736,6 +945,132 @@ mod tests {
     fn test_parse_blame_porcelain_empty() {
         assert!(parse_blame_porcelain("").is_empty());
     }
+
+    // ── show_file_at_ref ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_show_file_at_ref_returns_head_content() {
+        use std::process::Command;
+        let dir = std::env::temp_dir().join("vimcode_show_ref_head");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "t@t.com"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "T"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        let file = dir.join("test.txt");
+        std::fs::write(&file, "original\n").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        // Modify working copy
+        std::fs::write(&file, "modified\n").unwrap();
+
+        let content = show_file_at_ref(&dir, "HEAD", "test.txt");
+        assert!(content.is_some(), "should return HEAD content");
+        assert_eq!(content.unwrap().trim(), "original");
+    }
+
+    #[test]
+    fn test_show_file_at_ref_nonexistent() {
+        use std::process::Command;
+        let dir = std::env::temp_dir().join("vimcode_show_ref_nofile");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "t@t.com"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "T"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        // Create an empty commit so HEAD exists
+        Command::new("git")
+            .args(["commit", "--allow-empty", "-m", "init"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+
+        let content = show_file_at_ref(&dir, "HEAD", "doesnotexist.txt");
+        assert!(content.is_none(), "should return None for nonexistent file");
+    }
+
+    #[test]
+    fn test_checkout_branch_and_create_branch() {
+        use std::process::Command;
+        let dir = std::env::temp_dir().join("vimcode_branch_ops");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        std::fs::write(dir.join("f.txt"), "x").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+
+        // Create a new branch
+        assert!(create_branch(&dir, "feature-x").is_ok());
+        assert_eq!(current_branch(&dir).as_deref(), Some("feature-x"));
+
+        // Switch back to main/master
+        let main = if checkout_branch(&dir, "main").is_ok() {
+            "main"
+        } else {
+            checkout_branch(&dir, "master").unwrap();
+            "master"
+        };
+        assert_eq!(current_branch(&dir).as_deref(), Some(main));
+
+        // Switch to feature-x again
+        assert!(checkout_branch(&dir, "feature-x").is_ok());
+        assert_eq!(current_branch(&dir).as_deref(), Some("feature-x"));
+    }
 }
 
 // ─── Source Control helpers ───────────────────────────────────────────────────
@@ -803,6 +1138,16 @@ pub fn unstage_path(dir: &Path, path: &str) -> Result<(), String> {
 /// Discard working-tree changes for a path (equivalent to `git checkout -- <path>`).
 pub fn discard_path(dir: &Path, path: &str) -> Result<(), String> {
     run_git_result(dir, &["checkout", "--", path])
+}
+
+/// Switch to an existing branch.
+pub fn checkout_branch(dir: &Path, branch: &str) -> Result<(), String> {
+    run_git_result(dir, &["switch", branch])
+}
+
+/// Create a new branch and switch to it.
+pub fn create_branch(dir: &Path, branch: &str) -> Result<(), String> {
+    run_git_result(dir, &["switch", "-c", branch])
 }
 
 fn run_git_result(dir: &Path, args: &[&str]) -> Result<(), String> {
@@ -1111,6 +1456,15 @@ pub fn log_file(repo_root: &Path, file: &Path, limit: usize) -> Vec<GitLogEntry>
 /// Run `git show <hash>` and return the full output.
 pub fn show_commit(dir: &Path, hash: &str) -> Option<String> {
     run_git(dir, &["show", hash])
+}
+
+/// Retrieve the contents of a file at a given git revision.
+///
+/// `rev` is typically `"HEAD"` but can be any ref/commit.
+/// `rel_path` is the path relative to the repository root.
+/// Returns `None` if the file doesn't exist at that revision or git fails.
+pub fn show_file_at_ref(dir: &Path, rev: &str, rel_path: &str) -> Option<String> {
+    run_git(dir, &["show", &format!("{rev}:{rel_path}")])
 }
 
 /// Run `git blame --porcelain` on the full file and return structured blame info

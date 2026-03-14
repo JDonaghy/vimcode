@@ -1,9 +1,9 @@
 # VimCode Project State
 
-**Last updated:** Mar 11, 2026 (Session 169 — GitHub Wiki) | **Tests:** 4088
+**Last updated:** Mar 13, 2026 (Session 175 — Diff View Improvements: Click Handling, Fold-Aware Scrolling, Aligned Folds) | **Tests:** 4263
 
 > Feature documentation lives in **README.md**.
-> Per-session implementation notes through Session 167 are in **SESSION_HISTORY.md**.
+> Per-session implementation notes through Session 175 are in **SESSION_HISTORY.md**.
 
 ---
 
@@ -26,10 +26,7 @@ When implementing a new key/command, add tests covering:
 
 ## Recent Work
 
-**Session 169 — GitHub Wiki (4088 tests):**
-Created the VimCode GitHub Wiki with 9 pages: Home, Getting Started, Key Remapping, Settings Reference, Extension Development, Lua Plugin API, Theme Customization, DAP Debugger Setup, LSP Configuration. Added Documentation section with wiki links to README.md. Updated extension guide link to point to wiki.
+**Session 175 — Diff View Improvements: Click Handling, Fold-Aware Scrolling, Aligned Folds (4263 tests):**
+Per-group diff toolbar click handling (GTK `DiffBtnMap`/`SplitBtnMap` replacing single shared cache; TUI `was_active` tracking). Click precedence fix: diff toolbar checked before split buttons in both backends. Split buttons visible on all groups in diff mode. Fold-aware scrolling: `next_visible_line()`/`prev_visible_line()` on View skip fold bodies; Ctrl-D/U/F/B/E/Y + scroll wheel all fold-aware in normal, visual, and both backends. Aligned-sequence fold computation: `diff_apply_folds()` rewritten to use `diff_aligned` (visual row → buffer line mapping) instead of raw `diff_results`, fixing incorrect folds when files have different line counts. `sc_has_focus` cleared on diff commands. TUI diff toolbar glyphs reverted to Nerd Font with 3-col button width. 3 new tests.
 
-**Session 168 — Keybinding Discoverability + VSCode Remapping (4088 tests):**
-Made keybinding remapping discoverable and enabled it in VSCode mode. Added 7 new ex command aliases (`:hover`, `:LspImpl`, `:LspTypedef`, `:nextdiag`, `:prevdiag`, `:nexthunk`, `:prevhunk`) so every remappable keybinding has a named command. Updated `:Keybindings` reference (both Vim and VSCode) to show command names alongside bindings (e.g., `gd → :def`, `F12 → :def`, `Ctrl+P → :fuzzy`) with a remapping hint. Added 12 commands to `available_commands()` for tab completion. Enabled `:map` remapping in VSCode mode — `handle_vscode_key()` now checks `try_user_keymap()` before built-in handlers; mode `"n"` keymaps apply. Added "Open Keyboard Shortcuts" to command palette so VSCode users can F1 → remap keys. Updated `:Keymaps` help text to mention VSCode mode. Fixed pre-existing test hermiticity bug: `engine_with()` now resets `mode` to Normal and rebuilds `user_keymaps` (was leaking disk settings into tests). 17 new tests in `tests/wincmd.rs` (40 total). README updated with discoverability instructions.
-
-> Sessions 167 and earlier archived in **SESSION_HISTORY.md**.
+> Sessions 174 and earlier archived in **SESSION_HISTORY.md**.

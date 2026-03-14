@@ -194,7 +194,7 @@ pub struct Settings {
     extension_registry_url: String,
 
     /// Name of the active colour scheme. Built-in options: "onedark" (default),
-    /// "gruvbox-dark", "tokyo-night", "solarized-dark".
+    /// "gruvbox-dark", "tokyo-night", "solarized-dark", "vscode-dark".
     /// Select with `:colorscheme <name>`.
     #[serde(default = "default_colorscheme")]
     pub colorscheme: String,
@@ -658,18 +658,12 @@ impl Settings {
             Ok(settings) => {
                 // Automatically update settings file to include any new fields with defaults
                 // This preserves existing settings while adding new ones
-                if let Err(e) = settings.save() {
-                    eprintln!("Warning: Failed to update settings file: {}", e);
-                }
+                let _ = settings.save();
                 settings
             }
-            Err(e) => {
-                eprintln!("Warning: {}. Using defaults.", e);
+            Err(_) => {
                 let defaults = Settings::default();
-                // Repair empty/corrupt file by writing defaults
-                if let Err(save_err) = defaults.save() {
-                    eprintln!("Warning: Failed to write default settings: {}", save_err);
-                }
+                let _ = defaults.save();
                 defaults
             }
         }
@@ -1321,6 +1315,7 @@ pub fn available_colorschemes() -> Vec<String> {
         "gruvbox-dark".into(),
         "tokyo-night".into(),
         "solarized-dark".into(),
+        "vscode-dark".into(),
     ];
     {
         let dir = super::paths::vimcode_config_dir().join("themes");

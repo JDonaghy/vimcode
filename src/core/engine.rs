@@ -26,7 +26,7 @@ use super::settings::{EditorMode, Settings};
 use super::syntax::Syntax;
 use super::tab::{Tab, TabId};
 use super::terminal::{default_shell, InstallContext, TerminalPane};
-use super::view::View;
+use super::view::{FoldRegion, View};
 use super::window::{
     DropZone, GroupDivider, GroupId, GroupLayout, SplitDirection, Window, WindowId, WindowLayout,
     WindowRect,
@@ -197,6 +197,24 @@ pub struct SwapRecovery {
     pub swap_path: PathBuf,
     pub recovered_content: String,
     pub buffer_id: BufferId,
+}
+
+/// A button in a modal dialog.
+#[derive(Debug, Clone)]
+pub struct DialogButton {
+    pub label: String,
+    pub hotkey: char,
+    pub action: String,
+}
+
+/// A modal dialog displayed over the editor.
+#[derive(Debug, Clone)]
+pub struct Dialog {
+    pub title: String,
+    pub body: Vec<String>,
+    pub buttons: Vec<DialogButton>,
+    pub selected: usize,
+    pub tag: String,
 }
 
 /// A single entry in the command palette.
@@ -447,6 +465,24 @@ pub static PALETTE_COMMANDS: &[PaletteCommand] = &[
         action: "Gdiff",
     },
     PaletteCommand {
+        label: "Git: Diff Split",
+        shortcut: "",
+        vscode_shortcut: "",
+        action: "Gdiffsplit",
+    },
+    PaletteCommand {
+        label: "Git: Switch Branch",
+        shortcut: "",
+        vscode_shortcut: "",
+        action: "Gswitch",
+    },
+    PaletteCommand {
+        label: "Git: Create Branch",
+        shortcut: "",
+        vscode_shortcut: "",
+        action: "Gbranch",
+    },
+    PaletteCommand {
         label: "Git: Blame",
         shortcut: "",
         vscode_shortcut: "",
@@ -475,6 +511,12 @@ pub static PALETTE_COMMANDS: &[PaletteCommand] = &[
         shortcut: "",
         vscode_shortcut: "",
         action: "Gfetch",
+    },
+    PaletteCommand {
+        label: "Git: Peek Change",
+        shortcut: "gD",
+        vscode_shortcut: "gD",
+        action: "DiffPeek",
     },
     // LSP
     PaletteCommand {
@@ -587,6 +629,24 @@ pub static PALETTE_COMMANDS: &[PaletteCommand] = &[
         vscode_shortcut: "",
         action: "Keymaps",
     },
+    PaletteCommand {
+        label: "Diff: Next Change",
+        shortcut: "]c",
+        vscode_shortcut: "",
+        action: "DiffNext",
+    },
+    PaletteCommand {
+        label: "Diff: Previous Change",
+        shortcut: "[c",
+        vscode_shortcut: "",
+        action: "DiffPrev",
+    },
+    PaletteCommand {
+        label: "Diff: Toggle Hide Unchanged",
+        shortcut: "",
+        vscode_shortcut: "",
+        action: "DiffToggleContext",
+    },
 ];
 
 /// How a file should be opened: as a temporary preview or permanent buffer.
@@ -602,12 +662,25 @@ pub enum OpenMode {
 /// Maximum depth for macro recursion to prevent infinite loops.
 const MAX_MACRO_RECURSION: usize = 100;
 
+/// Number of context lines to keep visible around diff changes when hiding unchanged sections.
+const DIFF_CONTEXT_LINES: usize = 3;
+
 /// Per-line diff status used by the two-way diff feature (`:diffthis` / `:diffsplit`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DiffLine {
     Same,
     Added,
     Removed,
+    /// Filler line inserted for alignment — no buffer content.
+    Padding,
+}
+
+/// One entry in the aligned diff sequence.  Maps a visual row to either
+/// a real buffer line (`source_line = Some(n)`) or a padding filler
+/// (`source_line = None`).
+#[derive(Clone, Copy, Debug)]
+pub struct AlignedDiffEntry {
+    pub source_line: Option<usize>,
 }
 
 /// Direction of the last search operation
@@ -884,6 +957,7 @@ ga                  Print ASCII value of char
 g8                  Print UTF-8 hex bytes
 go                  Go to byte offset N
 gcc                 Toggle line comment
+gD                  Peek git change (diff popup)      :DiffPeek
 
 ── z-Commands ──────────────────────────────────────────
 zz zt zb            Scroll cursor to center / top / bottom
@@ -1003,6 +1077,22 @@ F5/F6/F9/F10/F11   Debug: start/pause/BP/step-over/step-into
 Shift+F5/F11        Debug: stop / step-out                :stop/:stepout
 Alt+M               Toggle Vim ↔ VSCode mode
 Ctrl+Tab            MRU tab switcher
+
+── Source Control Panel ────────────────────────────
+s                   Stage / unstage file (on header: bulk)
+d                   Discard changes on file
+D                   Discard all unstaged (on CHANGES header)
+c                   Open commit input       Enter  Commit
+p P f               Push / pull / fetch
+r                   Refresh
+Tab                 Expand / collapse section
+q  Escape           Unfocus panel
+
+── Diff Peek Popup (gD) ───────────────────────────
+gD                  Open diff peek on hunk            :DiffPeek
+s                   Stage hunk
+r                   Revert hunk
+q  Escape           Close popup
 
 ── Common Ex Commands ──────────────────────────────────
 :w :wa :wq :x       Save / all / save+quit
@@ -1130,6 +1220,22 @@ Alt+D               Add cursor at next match
 Ctrl+Shift+L        Select all occurrences
 Alt+M               Toggle Vim ↔ VSCode mode
 
+── Source Control Panel ────────────────────────────
+s                   Stage / unstage file (on header: bulk)
+d                   Discard changes on file
+D                   Discard all unstaged (on CHANGES header)
+c                   Open commit input       Enter  Commit
+p P f               Push / pull / fetch
+r                   Refresh
+Tab                 Expand / collapse section
+q  Escape           Unfocus panel
+
+── Diff Peek Popup (gD) ───────────────────────────
+gD                  Open diff peek on hunk            :DiffPeek
+s                   Stage hunk
+r                   Revert hunk
+q  Escape           Close popup
+
 ── Common Commands (: prefix) ──────────────────────────
 :w :wa :wq           Save / all / save+quit
 :q :q!               Quit / force quit
@@ -1209,6 +1315,20 @@ fn decode_keypress(encoded: &str) -> (String, Option<char>, bool) {
         let key = ch.map(|c| c.to_string()).unwrap_or_default();
         (key, ch, false)
     }
+}
+
+/// State for the inline diff peek popup (preview a git diff hunk).
+pub struct DiffPeekState {
+    /// Index into the buffer's `diff_hunks` array.
+    pub hunk_index: usize,
+    /// Buffer line the popup is anchored to (0-indexed).
+    pub anchor_line: usize,
+    /// Raw hunk lines (with +/-/space prefix) for display.
+    pub hunk_lines: Vec<String>,
+    /// The file_header from the hunk (needed for stage/revert).
+    pub file_header: String,
+    /// The Hunk itself (needed for stage/revert).
+    pub hunk: git::Hunk,
 }
 
 pub struct Engine {
@@ -1509,6 +1629,17 @@ pub struct Engine {
     /// Which action button (0=Commit 1=Push 2=Pull 3=Sync) is keyboard-focused, or None.
     pub sc_button_focused: Option<usize>,
 
+    // Branch picker popup (opened with `b` in SC panel)
+    pub sc_branch_picker_open: bool,
+    pub sc_branch_picker_query: String,
+    pub sc_branch_picker_branches: Vec<git::BranchEntry>,
+    pub sc_branch_picker_selected: usize,
+    /// Create-branch mode (opened with `B` in SC panel)
+    pub sc_branch_create_mode: bool,
+    pub sc_branch_create_input: String,
+    /// SC panel help dialog visible
+    pub sc_help_open: bool,
+
     // --- Plugin system ---
     /// Manages loaded Lua plugins. `None` if no plugins dir or plugins disabled.
     pub plugin_manager: Option<plugin::PluginManager>,
@@ -1583,6 +1714,16 @@ pub struct Engine {
     /// Per-window per-line diff status.  Keyed by WindowId, value is a Vec
     /// with one entry per buffer line.
     pub diff_results: HashMap<WindowId, Vec<DiffLine>>,
+    /// Aligned diff sequences for visual padding.  Each entry maps a visual
+    /// row to a real buffer line or a padding filler so that matching content
+    /// appears at the same row on both sides of a diff split.
+    pub diff_aligned: HashMap<WindowId, Vec<AlignedDiffEntry>>,
+    /// Whether unchanged sections in the diff view are hidden (folded).
+    pub diff_unchanged_hidden: bool,
+
+    // --- Inline diff peek popup ---
+    /// Git diff peek popup state, or `None` when no peek is active.
+    pub diff_peek: Option<DiffPeekState>,
 
     // --- Clipboard callbacks (set by UI backend) ---
     /// Read text from the system clipboard.  Set by the GTK/TUI backend at startup.
@@ -1894,8 +2035,10 @@ pub struct Engine {
     swap_write_needed: HashSet<BufferId>,
     /// When we last wrote swap files to disk.
     swap_last_write: std::time::Instant,
-    /// Pending recovery dialog (user must press R/D/A).
-    pub swap_recovery: Option<SwapRecovery>,
+    /// Pending swap recovery data (used by the dialog system).
+    pub pending_swap_recovery: Option<SwapRecovery>,
+    /// Modal dialog displayed over the editor.
+    pub dialog: Option<Dialog>,
 
     // --- VSCode mode state ---
     /// Ctrl+K chord pending: waiting for the second key of a Ctrl+K combo.
@@ -2057,6 +2200,13 @@ impl Engine {
             sc_commit_message: String::new(),
             sc_commit_input_active: false,
             sc_button_focused: None,
+            sc_branch_picker_open: false,
+            sc_branch_picker_query: String::new(),
+            sc_branch_picker_branches: Vec::new(),
+            sc_branch_picker_selected: 0,
+            sc_branch_create_mode: false,
+            sc_branch_create_input: String::new(),
+            sc_help_open: false,
             plugin_manager: None,
             comment_overrides: HashMap::new(),
             cwd,
@@ -2085,6 +2235,9 @@ impl Engine {
             palette_scroll_top: 0,
             diff_window_pair: None,
             diff_results: HashMap::new(),
+            diff_aligned: HashMap::new(),
+            diff_unchanged_hidden: false,
+            diff_peek: None,
             clipboard_read: None,
             clipboard_write: None,
             mouse_drag_active: false,
@@ -2198,7 +2351,8 @@ impl Engine {
             md_preview_links: HashMap::new(),
             swap_write_needed: HashSet::new(),
             swap_last_write: std::time::Instant::now(),
-            swap_recovery: None,
+            pending_swap_recovery: None,
+            dialog: None,
             vscode_pending_ctrl_k: false,
             ext_panels: HashMap::new(),
             ext_panel_items: HashMap::new(),
@@ -2408,10 +2562,50 @@ impl Engine {
         self.view().scroll_top
     }
 
-    /// Set scroll_top for the active window.
+    /// Set scroll_top for the active window, snapping out of fold bodies.
     #[allow(dead_code)]
     pub fn set_scroll_top(&mut self, scroll_top: usize) {
-        self.view_mut().scroll_top = scroll_top;
+        let snapped = Self::snap_scroll_top(&self.view().folds, scroll_top);
+        self.view_mut().scroll_top = snapped;
+    }
+
+    /// Scroll the active window down by `count` visible lines (fold-aware).
+    pub fn scroll_down_visible(&mut self, count: usize) {
+        let max_line = self.buffer().len_lines().saturating_sub(1);
+        let st = self.view().scroll_top;
+        let new_top = self.view().next_visible_line(st, count, max_line);
+        self.view_mut().scroll_top = new_top;
+    }
+
+    /// Scroll the active window up by `count` visible lines (fold-aware).
+    pub fn scroll_up_visible(&mut self, count: usize) {
+        let st = self.view().scroll_top;
+        let new_top = self.view().prev_visible_line(st, count);
+        self.view_mut().scroll_top = new_top;
+    }
+
+    /// Scroll a specific window down by `count` visible lines (fold-aware).
+    pub fn scroll_down_visible_for_window(&mut self, window_id: WindowId, count: usize) {
+        if let Some(window) = self.windows.get(&window_id) {
+            let buf_id = window.buffer_id;
+            let max_line = self
+                .buffer_manager
+                .get(buf_id)
+                .map(|bs| bs.buffer.len_lines().saturating_sub(1))
+                .unwrap_or(0);
+            let new_top = window
+                .view
+                .next_visible_line(window.view.scroll_top, count, max_line);
+            self.windows.get_mut(&window_id).unwrap().view.scroll_top = new_top;
+        }
+    }
+
+    /// Scroll a specific window up by `count` visible lines (fold-aware).
+    pub fn scroll_up_visible_for_window(&mut self, window_id: WindowId, count: usize) {
+        if let Some(window) = self.windows.get(&window_id) {
+            let new_top = window.view.prev_visible_line(window.view.scroll_top, count);
+            self.windows.get_mut(&window_id).unwrap().view.scroll_top = new_top;
+        }
     }
 
     /// Get viewport_lines for the active window.
@@ -2456,11 +2650,23 @@ impl Engine {
         }
     }
 
-    /// Set scroll_top for a specific window without changing the active window.
+    /// Set scroll_top for a specific window without changing the active window,
+    /// snapping out of fold bodies.
+    #[allow(dead_code)]
     pub fn set_scroll_top_for_window(&mut self, window_id: WindowId, scroll_top: usize) {
         if let Some(window) = self.windows.get_mut(&window_id) {
-            window.view.scroll_top = scroll_top;
+            window.view.scroll_top = Self::snap_scroll_top(&window.view.folds, scroll_top);
         }
+    }
+
+    /// If `line` falls inside a fold body, snap to the fold header (start).
+    fn snap_scroll_top(folds: &[FoldRegion], line: usize) -> usize {
+        for f in folds {
+            if line > f.start && line <= f.end {
+                return f.start;
+            }
+        }
+        line
     }
 
     /// Set scroll_left for a specific window without changing the active window.
@@ -2540,6 +2746,10 @@ impl Engine {
             // Update dirty flag based on whether we're back at the saved state.
             let at_saved = self.active_buffer_state().is_at_saved_state();
             self.set_dirty(!at_saved);
+            // Notify LSP of the content change so diagnostics update.
+            let active_id = self.active_buffer_id();
+            self.lsp_dirty_buffers.insert(active_id, true);
+            self.swap_mark_dirty();
             true
         } else {
             self.message = "Already at oldest change".to_string();
@@ -2555,6 +2765,10 @@ impl Engine {
             // Update dirty flag based on whether we're back at the saved state.
             let at_saved = self.active_buffer_state().is_at_saved_state();
             self.set_dirty(!at_saved);
+            // Notify LSP of the content change so diagnostics update.
+            let active_id = self.active_buffer_id();
+            self.lsp_dirty_buffers.insert(active_id, true);
+            self.swap_mark_dirty();
             true
         } else {
             self.message = "Already at newest change".to_string();
@@ -2626,6 +2840,7 @@ impl Engine {
                     // Refresh git diff after save
                     let id = self.active_buffer_id();
                     self.refresh_git_diff(id);
+                    self.compute_diff();
                     self.lsp_did_save(id);
                     // Delete swap file — content is safely on disk now.
                     self.swap_delete_for_buffer(id);
@@ -2757,7 +2972,7 @@ impl Engine {
     // Git integration
     // =======================================================================
 
-    /// Refresh git diff markers for the given buffer.
+    /// Refresh git diff markers and structured hunks for the given buffer.
     fn refresh_git_diff(&mut self, buffer_id: BufferId) {
         if let Some(path) = self
             .buffer_manager
@@ -2765,8 +2980,10 @@ impl Engine {
             .and_then(|s| s.file_path.clone())
         {
             let diff = git::compute_file_diff(&path);
+            let hunks = git::compute_file_diff_hunks(&path);
             if let Some(state) = self.buffer_manager.get_mut(buffer_id) {
                 state.git_diff = diff;
+                state.diff_hunks = hunks;
             }
         }
     }
@@ -3051,6 +3268,8 @@ impl Engine {
 
     /// Open the git diff for the current file in a vertical split.
     fn cmd_git_diff(&mut self) -> EngineAction {
+        // Ensure editor receives keys after opening diff.
+        self.sc_has_focus = false;
         let path = match self.file_path().map(|p| p.to_path_buf()) {
             Some(p) => p,
             None => {
@@ -3079,33 +3298,374 @@ impl Engine {
         }
     }
 
-    /// Jump to the next `@@` hunk header below the cursor in the current buffer.
-    fn jump_next_hunk(&mut self) {
-        let start = self.view().cursor.line + 1;
-        let total = self.buffer().len_lines();
-        for i in start..total {
-            let line: String = self.buffer().content.line(i).chars().collect();
-            if line.starts_with("@@") {
-                self.view_mut().cursor.line = i;
-                self.view_mut().cursor.col = 0;
-                return;
+    /// Open a VSCode-style side-by-side diff: HEAD (read-only) on the left,
+    /// working copy (editable) on the right, with LCS diff coloring.
+    ///
+    /// If a diff split is already active, closes it first to avoid
+    /// accumulating splits on repeated invocations.
+    pub fn cmd_git_diff_split(&mut self, path: &Path) -> EngineAction {
+        // Ensure editor receives keys after opening diff.
+        self.sc_has_focus = false;
+        // If a diff split is already active, tear it down first.
+        if let Some((left_win, right_win)) = self.diff_window_pair.take() {
+            self.diff_results.clear();
+            self.diff_aligned.clear();
+            self.scroll_bind_pairs
+                .retain(|&(a, b)| !(a == left_win && b == right_win));
+            // Close the HEAD (left) window + its scratch buffer.
+            if self.windows.contains_key(&left_win) {
+                let left_buf = self.windows[&left_win].buffer_id;
+                self.windows.remove(&left_win);
+                // Remove from layout.
+                let tab = self.active_tab_mut();
+                if let Some(new_layout) = tab.layout.remove(left_win) {
+                    tab.layout = new_layout;
+                }
+                // Delete the scratch buffer if nothing else references it.
+                let still_used = self.windows.values().any(|w| w.buffer_id == left_buf);
+                if !still_used {
+                    let _ = self.buffer_manager.delete(left_buf, true);
+                }
+            }
+            // Make sure we're focused on a valid window.
+            if !self
+                .active_tab()
+                .layout
+                .window_ids()
+                .contains(&self.active_tab().active_window)
+            {
+                if let Some(first) = self.active_tab().layout.window_ids().first().copied() {
+                    self.active_tab_mut().active_window = first;
+                }
             }
         }
-        self.message = "No more hunks".to_string();
+
+        let repo_root = match git::find_repo_root(path) {
+            Some(r) => r,
+            None => {
+                self.message = "Not in a git repository".to_string();
+                return EngineAction::Error;
+            }
+        };
+        let rel_path = match path.strip_prefix(&repo_root) {
+            Ok(r) => r.to_string_lossy().to_string(),
+            Err(_) => {
+                self.message = "Cannot compute relative path".to_string();
+                return EngineAction::Error;
+            }
+        };
+        let head_content = match git::show_file_at_ref(&repo_root, "HEAD", &rel_path) {
+            Some(c) => c,
+            None => {
+                self.message = "File has no HEAD version (untracked?)".to_string();
+                return EngineAction::Error;
+            }
+        };
+
+        // Open working copy file if not already open.
+        if let Err(e) = self.open_file_with_mode(path, crate::core::OpenMode::Permanent) {
+            self.message = e;
+            return EngineAction::Error;
+        }
+        let right_win = self.active_window_id();
+
+        // Create scratch buffer with HEAD content.
+        let head_buf_id = self.buffer_manager.create();
+        if let Some(state) = self.buffer_manager.get_mut(head_buf_id) {
+            state.buffer.content = ropey::Rope::from_str(&head_content);
+            state.read_only = true;
+            let file_name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "file".to_string());
+            state.scratch_name = Some(format!("{file_name} (HEAD)"));
+            // Set syntax highlighting to match the file type.
+            if let Some(syn) = crate::core::syntax::Syntax::new_from_path(path.to_str()) {
+                state.syntax = syn;
+            }
+            state.update_syntax();
+        }
+
+        // Split: new window (left) gets HEAD buffer.
+        self.split_window(SplitDirection::Vertical, None);
+        let left_win = self.active_window_id();
+        self.active_window_mut().buffer_id = head_buf_id;
+
+        // Focus the right (working copy) window.
+        let tab = self.active_tab_mut();
+        tab.active_window = right_win;
+
+        // Bind scroll and set up diff.
+        self.scroll_bind_pairs.push((left_win, right_win));
+        self.diff_window_pair = Some((left_win, right_win));
+        self.compute_diff();
+        self.diff_unchanged_hidden = true;
+        self.diff_apply_folds();
+        self.diff_jump_to_first_change(left_win, right_win);
+
+        // Refresh git diff on working copy for gutter markers.
+        let right_buf_id = self
+            .windows
+            .get(&right_win)
+            .map(|w| w.buffer_id)
+            .unwrap_or(head_buf_id);
+        self.refresh_git_diff(right_buf_id);
+
+        self.message = format!("Diff split: {}", path.display());
+        EngineAction::None
     }
 
-    /// Jump to the previous `@@` hunk header above the cursor in the current buffer.
-    fn jump_prev_hunk(&mut self) {
-        let cur = self.view().cursor.line;
-        for i in (0..cur).rev() {
-            let line: String = self.buffer().content.line(i).chars().collect();
-            if line.starts_with("@@") {
-                self.view_mut().cursor.line = i;
-                self.view_mut().cursor.col = 0;
+    /// Jump to the next changed region below the cursor.
+    /// On real files: uses `git_diff` markers. On diff buffers: searches for `@@` headers.
+    /// In two-window diff mode: uses `diff_results` for navigation.
+    pub fn jump_next_hunk(&mut self) {
+        if let Some((a, b)) = self.diff_window_pair {
+            let active = self.active_window_id();
+            if active == a || active == b {
+                self.diff_jump_next();
                 return;
             }
         }
-        self.message = "No more hunks".to_string();
+        let cur = self.view().cursor.line;
+        let bid = self.active_window().buffer_id;
+        let git_diff = &self.buffer_manager.get(bid).map(|s| &s.git_diff);
+        let has_git = git_diff.is_some_and(|d| !d.is_empty());
+
+        if has_git {
+            // Navigate using git_diff markers on real files.
+            let gd = self.buffer_manager.get(bid).unwrap();
+            let total = gd.git_diff.len();
+            // Skip past the current changed region, then find the next one.
+            let mut i = cur + 1;
+            // Skip lines that are part of the same changed region as the cursor.
+            while i < total
+                && gd.git_diff.get(cur).copied().flatten().is_some()
+                && gd.git_diff.get(i).copied().flatten().is_some()
+            {
+                i += 1;
+            }
+            // Find the next changed line.
+            while i < total {
+                if gd.git_diff[i].is_some() {
+                    self.view_mut().cursor.line = i;
+                    self.view_mut().cursor.col = 0;
+                    self.scroll_cursor_center();
+                    return;
+                }
+                i += 1;
+            }
+            self.message = "No more hunks".to_string();
+        } else {
+            // Fallback: search for @@ headers in diff buffers.
+            let start = cur + 1;
+            let total = self.buffer().len_lines();
+            for i in start..total {
+                let line: String = self.buffer().content.line(i).chars().collect();
+                if line.starts_with("@@") {
+                    self.view_mut().cursor.line = i;
+                    self.view_mut().cursor.col = 0;
+                    return;
+                }
+            }
+            self.message = "No more hunks".to_string();
+        }
+    }
+
+    /// Jump to the previous changed region above the cursor.
+    /// On real files: uses `git_diff` markers. On diff buffers: searches for `@@` headers.
+    /// In two-window diff mode: uses `diff_results` for navigation.
+    pub fn jump_prev_hunk(&mut self) {
+        if let Some((a, b)) = self.diff_window_pair {
+            let active = self.active_window_id();
+            if active == a || active == b {
+                self.diff_jump_prev();
+                return;
+            }
+        }
+        let cur = self.view().cursor.line;
+        let bid = self.active_window().buffer_id;
+        let git_diff = &self.buffer_manager.get(bid).map(|s| &s.git_diff);
+        let has_git = git_diff.is_some_and(|d| !d.is_empty());
+
+        if has_git {
+            let gd = self.buffer_manager.get(bid).unwrap();
+            // Skip backwards past the current changed region.
+            let mut i = cur.saturating_sub(1);
+            while i > 0
+                && gd.git_diff.get(cur).copied().flatten().is_some()
+                && gd.git_diff.get(i).copied().flatten().is_some()
+            {
+                i -= 1;
+            }
+            // Find the previous changed line.
+            loop {
+                if gd.git_diff.get(i).copied().flatten().is_some() {
+                    // Walk backwards to the start of this changed region.
+                    while i > 0 && gd.git_diff.get(i - 1).copied().flatten().is_some() {
+                        i -= 1;
+                    }
+                    self.view_mut().cursor.line = i;
+                    self.view_mut().cursor.col = 0;
+                    self.scroll_cursor_center();
+                    return;
+                }
+                if i == 0 {
+                    break;
+                }
+                i -= 1;
+            }
+            self.message = "No more hunks".to_string();
+        } else {
+            for i in (0..cur).rev() {
+                let line: String = self.buffer().content.line(i).chars().collect();
+                if line.starts_with("@@") {
+                    self.view_mut().cursor.line = i;
+                    self.view_mut().cursor.col = 0;
+                    return;
+                }
+            }
+            self.message = "No more hunks".to_string();
+        }
+    }
+
+    /// Open the diff peek popup for the hunk under the cursor on the current buffer.
+    pub fn open_diff_peek(&mut self) {
+        let bid = self.active_window().buffer_id;
+        let cursor_line = self.view().cursor.line;
+        let hunks = match self.buffer_manager.get(bid) {
+            Some(s) => s.diff_hunks.clone(),
+            None => {
+                self.message = "No diff data".to_string();
+                return;
+            }
+        };
+        if hunks.is_empty() {
+            self.message = "No changes in this file".to_string();
+            return;
+        }
+        let idx = match git::hunk_for_line(&hunks, cursor_line) {
+            Some(i) => i,
+            None => {
+                self.message = "No hunk at cursor".to_string();
+                return;
+            }
+        };
+        let h = &hunks[idx];
+        self.diff_peek = Some(DiffPeekState {
+            hunk_index: idx,
+            anchor_line: cursor_line,
+            hunk_lines: h.hunk.lines.clone(),
+            file_header: h.file_header.clone(),
+            hunk: h.hunk.clone(),
+        });
+    }
+
+    /// Close the diff peek popup.
+    pub fn close_diff_peek(&mut self) {
+        self.diff_peek = None;
+    }
+
+    /// Revert the hunk shown in the diff peek popup.
+    fn diff_peek_revert(&mut self) {
+        let peek = match self.diff_peek.take() {
+            Some(p) => p,
+            None => return,
+        };
+        let bid = self.active_window().buffer_id;
+        let path = match self
+            .buffer_manager
+            .get(bid)
+            .and_then(|s| s.file_path.clone())
+        {
+            Some(p) => p,
+            None => {
+                self.message = "No file path".to_string();
+                return;
+            }
+        };
+        let dir = match path.parent() {
+            Some(d) => d.to_path_buf(),
+            None => return,
+        };
+        match git::revert_hunk(&dir, &peek.file_header, &peek.hunk) {
+            Ok(()) => {
+                // Reload buffer contents from disk.
+                if let Ok(contents) = std::fs::read_to_string(&path) {
+                    if let Some(state) = self.buffer_manager.get_mut(bid) {
+                        state.buffer.content = ropey::Rope::from_str(&contents);
+                    }
+                }
+                self.refresh_git_diff(bid);
+                self.compute_diff();
+                self.message = "Hunk reverted".to_string();
+            }
+            Err(e) => {
+                self.message = format!("Revert failed: {e}");
+            }
+        }
+    }
+
+    /// Stage the hunk shown in the diff peek popup.
+    fn diff_peek_stage(&mut self) {
+        let peek = match self.diff_peek.take() {
+            Some(p) => p,
+            None => return,
+        };
+        let bid = self.active_window().buffer_id;
+        let path = match self
+            .buffer_manager
+            .get(bid)
+            .and_then(|s| s.file_path.clone())
+        {
+            Some(p) => p,
+            None => {
+                self.message = "No file path".to_string();
+                return;
+            }
+        };
+        let dir = match git::find_repo_root(&path) {
+            Some(d) => d,
+            None => {
+                self.message = "Not a git repository".to_string();
+                return;
+            }
+        };
+        match git::stage_hunk(&dir, &peek.file_header, &peek.hunk) {
+            Ok(()) => {
+                self.refresh_git_diff(bid);
+                self.compute_diff();
+                self.message = format!("Hunk {} staged", peek.hunk_index + 1);
+            }
+            Err(e) => {
+                self.message = format!("Stage failed: {e}");
+            }
+        }
+    }
+
+    /// Handle a keypress while the diff peek popup is open.
+    /// Returns true if the key was consumed, false to pass through.
+    fn handle_diff_peek_key(&mut self, key_name: &str, unicode: Option<char>) -> bool {
+        match key_name {
+            "Escape" | "q" => {
+                self.close_diff_peek();
+                true
+            }
+            _ => match unicode {
+                Some('s') => {
+                    self.diff_peek_stage();
+                    true
+                }
+                Some('r') => {
+                    self.diff_peek_revert();
+                    true
+                }
+                _ => {
+                    // Any other key closes the popup and falls through.
+                    self.close_diff_peek();
+                    false
+                }
+            },
+        }
     }
 
     /// Stage the hunk under the cursor using `git apply --cached`.
@@ -3539,7 +4099,11 @@ impl Engine {
             Some((a, b)) if a == b && a != win => {
                 // Second window chosen: activate diff.
                 self.diff_window_pair = Some((a, win));
+                self.scroll_bind_pairs.push((a, win));
                 self.compute_diff();
+                self.diff_unchanged_hidden = true;
+                self.diff_apply_folds();
+                self.diff_jump_to_first_change(a, win);
                 self.message = "Diff active".to_string();
             }
             Some(_) => {
@@ -3551,8 +4115,22 @@ impl Engine {
 
     /// Disable diff mode and clear all diff state.
     pub fn cmd_diffoff(&mut self) -> EngineAction {
+        // Clear folds and scroll bindings on both diff windows.
+        if let Some((a, b)) = self.diff_window_pair {
+            if let Some(w) = self.windows.get_mut(&a) {
+                w.view.open_all_folds();
+            }
+            if let Some(w) = self.windows.get_mut(&b) {
+                w.view.open_all_folds();
+            }
+            self.scroll_bind_pairs
+                .retain(|&(x, y)| !((x == a && y == b) || (x == b && y == a)));
+        }
         self.diff_window_pair = None;
         self.diff_results.clear();
+        self.diff_aligned.clear();
+        self.diff_aligned.clear();
+        self.diff_unchanged_hidden = false;
         self.message = "Diff off".to_string();
         EngineAction::None
     }
@@ -3563,8 +4141,12 @@ impl Engine {
         let left_win = self.active_window_id();
         self.split_window(SplitDirection::Vertical, Some(path));
         let right_win = self.active_window_id();
+        self.scroll_bind_pairs.push((left_win, right_win));
         self.diff_window_pair = Some((left_win, right_win));
         self.compute_diff();
+        self.diff_unchanged_hidden = true;
+        self.diff_apply_folds();
+        self.diff_jump_to_first_change(left_win, right_win);
         self.message = format!("Diff: {}", path.display());
         EngineAction::None
     }
@@ -3600,9 +4182,399 @@ impl Engine {
         };
         let a_refs: Vec<&str> = a_lines.iter().map(String::as_str).collect();
         let b_refs: Vec<&str> = b_lines.iter().map(String::as_str).collect();
-        let (da, db) = lcs_diff(&a_refs, &b_refs);
+        let (mut da, mut db) = lcs_diff(&a_refs, &b_refs);
+        // Post-process: short runs of Same lines sandwiched between changes
+        // (blank lines, common braces, shared imports) fragment what the user
+        // perceives as a single edit.  Re-classify runs of up to N Same lines
+        // so the coloured block stays contiguous.
+        merge_short_same_runs(&mut da, DiffLine::Removed);
+        merge_short_same_runs(&mut db, DiffLine::Added);
+
+        // Build aligned sequences with padding for visual alignment.
+        let (aligned_a, aligned_b) = build_aligned_diff(&da, &db);
+        self.diff_aligned.insert(a_win, aligned_a);
+        self.diff_aligned.insert(b_win, aligned_b);
+
         self.diff_results.insert(a_win, da);
         self.diff_results.insert(b_win, db);
+        // Re-apply folds if unchanged sections are hidden.
+        if self.diff_unchanged_hidden {
+            self.diff_apply_folds();
+        }
+    }
+
+    /// Jump both diff windows to the first changed line, or reset to top if
+    /// there are no changes.
+    fn diff_jump_to_first_change(&mut self, left_win: WindowId, right_win: WindowId) {
+        let first_change = self
+            .diff_results
+            .get(&right_win)
+            .and_then(|d| d.iter().position(|s| *s != DiffLine::Same));
+        if let Some(line) = first_change {
+            for win_id in [left_win, right_win] {
+                if let Some(w) = self.windows.get_mut(&win_id) {
+                    w.view.cursor.line = line;
+                    w.view.cursor.col = 0;
+                    w.view.scroll_top = line.saturating_sub(3);
+                }
+            }
+        } else {
+            for win_id in [left_win, right_win] {
+                if let Some(w) = self.windows.get_mut(&win_id) {
+                    w.view.cursor.line = 0;
+                    w.view.cursor.col = 0;
+                    w.view.scroll_top = 0;
+                }
+            }
+        }
+    }
+
+    /// Returns true if the editor is currently in a two-window diff view and
+    /// at least one of the diff windows belongs to the active group.
+    pub fn is_in_diff_view(&self) -> bool {
+        if let Some((a, b)) = self.diff_window_pair {
+            if a == b {
+                return false;
+            }
+            // Check all groups so the toolbar appears on every group
+            // that contains a diff window, not just the active one.
+            for group in self.editor_groups.values() {
+                let win_ids = group.active_tab().layout.window_ids();
+                if win_ids.contains(&a) || win_ids.contains(&b) {
+                    return true;
+                }
+            }
+            false
+        } else {
+            false
+        }
+    }
+
+    /// Collects contiguous runs of non-`DiffLine::Same` lines for a given window
+    /// as `(start_line, end_line)` inclusive pairs.
+    pub fn diff_change_regions(&self, win_id: WindowId) -> Vec<(usize, usize)> {
+        let results = match self.diff_results.get(&win_id) {
+            Some(r) => r,
+            None => return vec![],
+        };
+        let mut regions = Vec::new();
+        let mut i = 0;
+        while i < results.len() {
+            if results[i] != DiffLine::Same {
+                let start = i;
+                while i < results.len() && results[i] != DiffLine::Same {
+                    i += 1;
+                }
+                regions.push((start, i - 1));
+            } else {
+                i += 1;
+            }
+        }
+        regions
+    }
+
+    /// Jump to the next change region in the diff view.
+    fn diff_jump_next(&mut self) {
+        let win_id = self.active_window_id();
+        let regions = self.diff_change_regions(win_id);
+        if regions.is_empty() {
+            self.message = "No changes in diff".to_string();
+            return;
+        }
+        let cur = self.view().cursor.line;
+        // Find first region starting past cursor.
+        let (target, region_idx, wrapped) = if let Some((i, &(start, _))) =
+            regions.iter().enumerate().find(|&(_, &(s, _))| s > cur)
+        {
+            (start, i, false)
+        } else {
+            (regions[0].0, 0, true)
+        };
+        self.view_mut().cursor.line = target;
+        self.view_mut().cursor.col = 0;
+        self.scroll_cursor_center();
+        if wrapped {
+            self.message = "Wrapped to first change".to_string();
+        }
+        // Move partner window's cursor to the corresponding change region.
+        self.diff_sync_partner_cursor(win_id, region_idx);
+    }
+
+    /// Jump to the previous change region in the diff view.
+    fn diff_jump_prev(&mut self) {
+        let win_id = self.active_window_id();
+        let regions = self.diff_change_regions(win_id);
+        if regions.is_empty() {
+            self.message = "No changes in diff".to_string();
+            return;
+        }
+        let cur = self.view().cursor.line;
+        // Find last region ending before cursor.
+        let (target, region_idx, wrapped) = if let Some((i, &(start, _))) = regions
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|&(_, &(_, e))| e < cur)
+        {
+            (start, i, false)
+        } else {
+            let last_idx = regions.len() - 1;
+            (regions[last_idx].0, last_idx, true)
+        };
+        self.view_mut().cursor.line = target;
+        self.view_mut().cursor.col = 0;
+        self.scroll_cursor_center();
+        if wrapped {
+            self.message = "Wrapped to last change".to_string();
+        }
+        // Move partner window's cursor to the corresponding change region.
+        self.diff_sync_partner_cursor(win_id, region_idx);
+    }
+
+    /// Move the partner diff window's cursor to the change region at `region_idx`.
+    fn diff_sync_partner_cursor(&mut self, active_win: WindowId, region_idx: usize) {
+        let (a, b) = match self.diff_window_pair {
+            Some(pair) => pair,
+            None => return,
+        };
+        let partner = if active_win == a {
+            b
+        } else if active_win == b {
+            a
+        } else {
+            return;
+        };
+        let partner_regions = self.diff_change_regions(partner);
+        if let Some(&(start, _)) = partner_regions.get(region_idx) {
+            if let Some(w) = self.windows.get_mut(&partner) {
+                w.view.cursor.line = start;
+                w.view.cursor.col = 0;
+            }
+        }
+        // Sync scroll so both windows are aligned.
+        self.sync_scroll_binds();
+    }
+
+    /// Toggle hiding of unchanged sections in the diff view using folds.
+    pub fn diff_toggle_hide_unchanged(&mut self) {
+        if self.diff_window_pair.is_none() {
+            self.message = "Not in diff mode".to_string();
+            return;
+        }
+        self.diff_unchanged_hidden = !self.diff_unchanged_hidden;
+        if self.diff_unchanged_hidden {
+            self.diff_apply_folds();
+            // Check if any folds were actually created.
+            let has_folds = if let Some((a, b)) = self.diff_window_pair {
+                let af = self
+                    .windows
+                    .get(&a)
+                    .map(|w| !w.view.folds.is_empty())
+                    .unwrap_or(false);
+                let bf = self
+                    .windows
+                    .get(&b)
+                    .map(|w| !w.view.folds.is_empty())
+                    .unwrap_or(false);
+                af || bf
+            } else {
+                false
+            };
+            if has_folds {
+                self.message = "Unchanged sections hidden".to_string();
+            } else {
+                self.diff_unchanged_hidden = false;
+                self.message = "All lines are near changes — nothing to hide".to_string();
+            }
+        } else {
+            // Open all folds on both diff windows.
+            if let Some((a, b)) = self.diff_window_pair {
+                if let Some(w) = self.windows.get_mut(&a) {
+                    w.view.open_all_folds();
+                }
+                if let Some(w) = self.windows.get_mut(&b) {
+                    w.view.open_all_folds();
+                }
+            }
+            self.message = "Unchanged sections visible".to_string();
+        }
+    }
+
+    /// Apply folds to hide unchanged sections in both diff windows.
+    ///
+    /// Uses the aligned diff sequences (same length on both sides) so that
+    /// fold regions correspond correctly even when the two buffers have
+    /// different line counts due to insertions/deletions.
+    fn diff_apply_folds(&mut self) {
+        let (a_win, b_win) = match self.diff_window_pair {
+            Some(pair) => pair,
+            None => return,
+        };
+        let aligned_a = self.diff_aligned.get(&a_win).cloned().unwrap_or_default();
+        let aligned_b = self.diff_aligned.get(&b_win).cloned().unwrap_or_default();
+        let a_results = self.diff_results.get(&a_win).cloned().unwrap_or_default();
+        let b_results = self.diff_results.get(&b_win).cloned().unwrap_or_default();
+        let visual_rows = aligned_a.len().max(aligned_b.len());
+        if visual_rows == 0 {
+            return;
+        }
+
+        // Build a per-visual-row "changed" flag: true if either side has a
+        // non-Same line or a padding filler at that row.
+        let mut changed = vec![false; visual_rows];
+        for (row, entry) in aligned_a.iter().enumerate() {
+            match entry.source_line {
+                Some(line) if line < a_results.len() && a_results[line] != DiffLine::Same => {
+                    changed[row] = true;
+                }
+                None => changed[row] = true, // padding
+                _ => {}
+            }
+        }
+        for (row, entry) in aligned_b.iter().enumerate() {
+            match entry.source_line {
+                Some(line) if line < b_results.len() && b_results[line] != DiffLine::Same => {
+                    changed[row] = true;
+                }
+                None => changed[row] = true,
+                _ => {}
+            }
+        }
+
+        // Mark context lines around changes as visible.
+        let mut visible = vec![false; visual_rows];
+        for (row, &is_changed) in changed.iter().enumerate() {
+            if is_changed {
+                let ctx_start = row.saturating_sub(DIFF_CONTEXT_LINES);
+                let ctx_end = (row + DIFF_CONTEXT_LINES).min(visual_rows - 1);
+                for v in visible.iter_mut().take(ctx_end + 1).skip(ctx_start) {
+                    *v = true;
+                }
+            }
+        }
+
+        if visible.iter().all(|&v| v) {
+            return; // nothing to fold
+        }
+
+        // For each window, translate visible visual rows to buffer lines,
+        // then fold the buffer lines that are not visible.
+        for (win_id, aligned) in [(a_win, &aligned_a), (b_win, &aligned_b)] {
+            let buf_lines = if let Some(w) = self.windows.get(&win_id) {
+                self.buffer_manager
+                    .get(w.buffer_id)
+                    .map(|bs| bs.buffer.len_lines())
+                    .unwrap_or(0)
+            } else {
+                continue;
+            };
+            if buf_lines == 0 {
+                continue;
+            }
+
+            // Mark which buffer lines should be visible.
+            let mut buf_visible = vec![false; buf_lines];
+            for (row, entry) in aligned.iter().enumerate() {
+                if row < visible.len() && visible[row] {
+                    if let Some(line) = entry.source_line {
+                        if line < buf_lines {
+                            buf_visible[line] = true;
+                        }
+                    }
+                }
+            }
+
+            // Collect contiguous invisible runs as fold regions.
+            let mut folds = Vec::new();
+            let mut i = 0;
+            while i < buf_lines {
+                if !buf_visible[i] {
+                    let start = i;
+                    while i < buf_lines && !buf_visible[i] {
+                        i += 1;
+                    }
+                    folds.push((start, i - 1));
+                } else {
+                    i += 1;
+                }
+            }
+
+            if let Some(w) = self.windows.get_mut(&win_id) {
+                w.view.open_all_folds();
+                for (start, end) in folds {
+                    w.view.close_fold(start, end);
+                }
+            }
+        }
+    }
+
+    /// Helper: extract change regions from a diff results array (no self needed).
+    #[allow(dead_code)]
+    fn change_regions_from_results(results: &[DiffLine]) -> Vec<(usize, usize)> {
+        let mut regions = Vec::new();
+        let mut i = 0;
+        while i < results.len() {
+            if results[i] != DiffLine::Same {
+                let start = i;
+                while i < results.len() && results[i] != DiffLine::Same {
+                    i += 1;
+                }
+                regions.push((start, i - 1));
+            } else {
+                i += 1;
+            }
+        }
+        regions
+    }
+
+    /// Returns `(current_1based, total)` for the diff toolbar label, or `None`
+    /// if not in diff view or no changes exist.
+    /// Count unified diff hunks by walking both windows' diff results in
+    /// parallel.  A hunk is any contiguous region where at least one side
+    /// has non-Same lines.  Returns the hunk regions for the *active* window
+    /// alongside the unified total.
+    pub fn diff_unified_regions(&self) -> (Vec<(usize, usize)>, usize) {
+        let (a_win, b_win) = match self.diff_window_pair {
+            Some(pair) => pair,
+            None => return (vec![], 0),
+        };
+        let active = self.active_window_id();
+        let other = if active == a_win { b_win } else { a_win };
+
+        let active_regions = self.diff_change_regions(active);
+        let other_regions = self.diff_change_regions(other);
+
+        // Build a unified count by merging both sides' regions based on
+        // matching Same-line positions.  The two sides have the same number
+        // of Same lines (by construction of the diff), so we use the Same
+        // lines as synchronisation points.
+        //
+        // Simple approach: use the side with more regions as the total.
+        // This works because each logical change produces a region on at
+        // least one side, and the side with more regions has the correct
+        // count (the other side just merges adjacent hunks due to missing
+        // Removed/Added lines).
+        let total = active_regions.len().max(other_regions.len());
+        (active_regions, total)
+    }
+
+    pub fn diff_current_change_index(&self) -> Option<(usize, usize)> {
+        let (regions, total) = self.diff_unified_regions();
+        if total == 0 {
+            return None;
+        }
+        let cur = self.view().cursor.line;
+        // Find which region the cursor is in or closest after.
+        for (i, &(start, end)) in regions.iter().enumerate() {
+            if cur >= start && cur <= end {
+                return Some((i + 1, total));
+            }
+            if start > cur {
+                return Some((i + 1, total));
+            }
+        }
+        // Cursor is past all regions on the active side — show total.
+        Some((total, total))
     }
 
     // =======================================================================
@@ -3786,9 +4758,47 @@ impl Engine {
         }
 
         // Remove window from windows map and any scroll-bind pairs that referenced it.
+        let closed_buf_id = self.windows.get(&window_id).map(|w| w.buffer_id);
         self.windows.remove(&window_id);
         self.scroll_bind_pairs
             .retain(|&(a, b)| a != window_id && b != window_id);
+        if let Some((a, b)) = self.diff_window_pair.take() {
+            if a == window_id || b == window_id {
+                self.diff_results.clear();
+                self.diff_aligned.clear();
+                self.diff_unchanged_hidden = false;
+                // Close the partner diff window + clean up scratch buffers.
+                let partner = if a == window_id { b } else { a };
+                let partner_buf = self.windows.get(&partner).map(|w| w.buffer_id);
+                // Remove partner window from layout and windows map.
+                if self.windows.contains_key(&partner) {
+                    let tab = self.active_tab_mut();
+                    if let Some(new_layout) = tab.layout.remove(partner) {
+                        tab.layout = new_layout;
+                        if let Some(first) = tab.layout.window_ids().first().copied() {
+                            tab.active_window = first;
+                        }
+                    }
+                    self.windows.remove(&partner);
+                    self.scroll_bind_pairs
+                        .retain(|&(x, y)| x != partner && y != partner);
+                }
+                // Delete orphaned scratch buffers (the HEAD side).
+                for buf_id in [closed_buf_id, partner_buf].into_iter().flatten() {
+                    let still_used = self.windows.values().any(|w| w.buffer_id == buf_id);
+                    if !still_used {
+                        if let Some(state) = self.buffer_manager.get(buf_id) {
+                            if state.scratch_name.is_some() {
+                                let _ = self.buffer_manager.delete(buf_id, true);
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Not our window — restore the pair.
+                self.diff_window_pair = Some((a, b));
+            }
+        }
 
         true
     }
@@ -3813,6 +4823,13 @@ impl Engine {
         for id in windows_to_close {
             self.windows.remove(&id);
             self.scroll_bind_pairs.retain(|&(a, b)| a != id && b != id);
+            if let Some((a, b)) = self.diff_window_pair {
+                if a == id || b == id {
+                    self.diff_window_pair = None;
+                    self.diff_results.clear();
+                    self.diff_aligned.clear();
+                }
+            }
         }
 
         self.message = String::new();
@@ -3969,6 +4986,15 @@ impl Engine {
         // Remove all windows in this tab
         for window_id in &window_ids {
             self.windows.remove(window_id);
+            self.scroll_bind_pairs
+                .retain(|&(a, b)| a != *window_id && b != *window_id);
+            if let Some((a, b)) = self.diff_window_pair {
+                if a == *window_id || b == *window_id {
+                    self.diff_window_pair = None;
+                    self.diff_results.clear();
+                    self.diff_aligned.clear();
+                }
+            }
         }
 
         let closed_group = self.active_group;
@@ -4489,8 +5515,8 @@ impl Engine {
         }
 
         self.refresh_git_diff(buffer_id);
-        // Don't overwrite a pending swap recovery message.
-        if self.swap_recovery.is_none() {
+        // Don't overwrite a pending dialog message.
+        if self.dialog.is_none() {
             self.message = format!("\"{}\"", path.display());
         }
         self.lsp_did_open(buffer_id);
@@ -5224,6 +6250,42 @@ impl Engine {
                         let ratio = active_scroll as f64 / active_lines as f64;
                         w.view.scroll_top = ((ratio * partner_lines as f64).round() as usize)
                             .min(partner_lines.saturating_sub(1));
+                    } else if let (Some(active_aligned), Some(partner_aligned)) = (
+                        self.diff_aligned.get(&active_id),
+                        self.diff_aligned.get(&pid),
+                    ) {
+                        // Aligned diff scroll: map active scroll_top through
+                        // aligned sequences so both sides stay in visual lockstep
+                        // even when one side has large padding blocks.
+                        let target_idx = active_aligned
+                            .iter()
+                            .position(|e| e.source_line == Some(active_scroll))
+                            .unwrap_or_else(|| {
+                                // Fallback: find nearest aligned entry at or after active_scroll.
+                                active_aligned
+                                    .iter()
+                                    .position(|e| e.source_line.is_some_and(|l| l >= active_scroll))
+                                    .unwrap_or(active_aligned.len().saturating_sub(1))
+                            });
+                        // Map that aligned index to the partner's buffer line.
+                        let partner_line = if target_idx < partner_aligned.len() {
+                            partner_aligned[target_idx..]
+                                .iter()
+                                .find_map(|e| e.source_line)
+                                .or_else(|| {
+                                    partner_aligned[..target_idx]
+                                        .iter()
+                                        .rev()
+                                        .find_map(|e| e.source_line)
+                                })
+                                .unwrap_or(0)
+                        } else {
+                            partner_aligned
+                                .last()
+                                .and_then(|e| e.source_line)
+                                .unwrap_or(0)
+                        };
+                        w.view.scroll_top = partner_line;
                     } else {
                         w.view.scroll_top = active_scroll;
                     }
@@ -5508,8 +6570,8 @@ impl Engine {
         ctrl: bool,
     ) -> EngineAction {
         // Clear message on any keypress (unless we're in command/search mode
-        // or a swap recovery dialog is pending — its prompt is in self.message)
-        if self.mode != Mode::Command && self.mode != Mode::Search && self.swap_recovery.is_none() {
+        // or a dialog is open)
+        if self.mode != Mode::Command && self.mode != Mode::Search && self.dialog.is_none() {
             self.message.clear();
         }
         // Dismiss LSP hover popup on any keypress
@@ -5530,9 +6592,12 @@ impl Engine {
             }
         }
 
-        // Swap recovery dialog intercepts R/D/A keys.
-        if self.swap_recovery.is_some() {
-            return self.handle_swap_recovery_key(key_name, unicode);
+        // Modal dialog intercepts all keys.
+        if self.dialog.is_some() {
+            if let Some((tag, action)) = self.handle_dialog_key(key_name, unicode) {
+                return self.process_dialog_result(&tag, &action);
+            }
+            return EngineAction::None;
         }
 
         // Ctrl+Tab opens the tab switcher (or cycles forward if already open).
@@ -5610,6 +6675,11 @@ impl Engine {
         // Command palette intercepts all keys when open.
         if self.palette_open {
             return self.handle_palette_key(key_name, unicode, ctrl);
+        }
+
+        // Diff peek popup intercepts keys when open.
+        if self.diff_peek.is_some() && self.handle_diff_peek_key(key_name, unicode) {
+            return EngineAction::None;
         }
 
         // Fuzzy finder intercepts all keys when open.
@@ -5700,6 +6770,12 @@ impl Engine {
                     format!("Extension '{name}' dismissed — :ExtEnable {name} to re-enable");
                 return EngineAction::None;
             }
+        }
+
+        // Safety: dismiss completion popup if it's visible outside Insert mode.
+        // This can happen if a late-arriving LSP response set it after mode change.
+        if self.completion_idx.is_some() && self.mode != Mode::Insert && !self.is_vscode_mode() {
+            self.dismiss_completion();
         }
 
         // Capture cursor position before dispatching (used by cursor_move hook below).
@@ -5968,23 +7044,25 @@ impl Engine {
         if ctrl {
             match key_name {
                 "d" => {
-                    // Half-page down
+                    // Half-page down (fold-aware)
                     let count = self.take_count();
                     let half = self.viewport_lines() / 2;
                     let scroll_amount = half * count;
                     let max_line = self.buffer().len_lines().saturating_sub(1);
-                    self.view_mut().cursor.line =
-                        (self.view().cursor.line + scroll_amount).min(max_line);
+                    let cur = self.view().cursor.line;
+                    let new_line = self.view().next_visible_line(cur, scroll_amount, max_line);
+                    self.view_mut().cursor.line = new_line;
                     self.clamp_cursor_col();
                     return EngineAction::None;
                 }
                 "u" => {
-                    // Ctrl-U: Half-page up
+                    // Ctrl-U: Half-page up (fold-aware)
                     let count = self.take_count();
                     let half = self.viewport_lines() / 2;
                     let scroll_amount = half * count;
-                    self.view_mut().cursor.line =
-                        self.view().cursor.line.saturating_sub(scroll_amount);
+                    let cur = self.view().cursor.line;
+                    let new_line = self.view().prev_visible_line(cur, scroll_amount);
+                    self.view_mut().cursor.line = new_line;
                     self.clamp_cursor_col();
                     return EngineAction::None;
                 }
@@ -5995,23 +7073,25 @@ impl Engine {
                     return EngineAction::None;
                 }
                 "f" => {
-                    // Full page down
+                    // Full page down (fold-aware)
                     let count = self.take_count();
                     let viewport = self.viewport_lines();
                     let scroll_amount = viewport * count;
                     let max_line = self.buffer().len_lines().saturating_sub(1);
-                    self.view_mut().cursor.line =
-                        (self.view().cursor.line + scroll_amount).min(max_line);
+                    let cur = self.view().cursor.line;
+                    let new_line = self.view().next_visible_line(cur, scroll_amount, max_line);
+                    self.view_mut().cursor.line = new_line;
                     self.clamp_cursor_col();
                     return EngineAction::None;
                 }
                 "b" => {
-                    // Full page up
+                    // Full page up (fold-aware)
                     let count = self.take_count();
                     let viewport = self.viewport_lines();
                     let scroll_amount = viewport * count;
-                    self.view_mut().cursor.line =
-                        self.view().cursor.line.saturating_sub(scroll_amount);
+                    let cur = self.view().cursor.line;
+                    let new_line = self.view().prev_visible_line(cur, scroll_amount);
+                    self.view_mut().cursor.line = new_line;
                     self.clamp_cursor_col();
                     return EngineAction::None;
                 }
@@ -6072,11 +7152,9 @@ impl Engine {
                     return EngineAction::None;
                 }
                 "e" => {
-                    // Ctrl-E: scroll down one line (cursor stays in place if possible)
+                    // Ctrl-E: scroll down one line (fold-aware, cursor stays)
                     let count = self.take_count();
-                    let max_scroll = self.buffer().len_lines().saturating_sub(1);
-                    let new_top = (self.view().scroll_top + count).min(max_scroll);
-                    self.view_mut().scroll_top = new_top;
+                    self.scroll_down_visible(count);
                     // Keep cursor visible
                     let viewport = self.viewport_lines();
                     if viewport > 0 && self.view().cursor.line < self.view().scroll_top {
@@ -6086,10 +7164,9 @@ impl Engine {
                     return EngineAction::None;
                 }
                 "y" => {
-                    // Ctrl-Y: scroll up one line (cursor stays in place if possible)
+                    // Ctrl-Y: scroll up one line (fold-aware, cursor stays)
                     let count = self.take_count();
-                    let new_top = self.view().scroll_top.saturating_sub(count);
-                    self.view_mut().scroll_top = new_top;
+                    self.scroll_up_visible(count);
                     // Keep cursor visible
                     let viewport = self.viewport_lines();
                     if viewport > 0 && self.view().cursor.line >= self.view().scroll_top + viewport
@@ -7145,6 +8222,9 @@ impl Engine {
                     self.push_jump_location();
                     self.lsp_request_definition();
                 }
+                Some('D') => {
+                    self.open_diff_peek();
+                }
                 Some('r') => {
                     self.push_jump_location();
                     self.lsp_request_references();
@@ -7908,7 +8988,12 @@ impl Engine {
                     Some('a') => self.cmd_fold_toggle(),
                     Some('o') => self.cmd_fold_open(),
                     Some('c') => self.cmd_fold_close(),
-                    Some('R') => self.view_mut().open_all_folds(),
+                    Some('R') => {
+                        self.view_mut().open_all_folds();
+                        if self.diff_unchanged_hidden {
+                            self.diff_unchanged_hidden = false;
+                        }
+                    }
                     Some('M') => self.cmd_fold_close_all(),
                     // Fold: recursive
                     Some('A') => self.cmd_fold_toggle_recursive(),
@@ -9545,9 +10630,7 @@ impl Engine {
         if !ctrl && key_name == "Tab" && self.completion_display_only {
             if let Some(idx) = self.completion_idx {
                 self.apply_completion_candidate(idx);
-                self.completion_candidates.clear();
-                self.completion_idx = None;
-                self.completion_display_only = false;
+                self.dismiss_completion();
                 *changed = true;
                 return;
             }
@@ -9574,9 +10657,7 @@ impl Engine {
 
         // Clear completion state on any non-completion key.
         if self.completion_idx.is_some() {
-            self.completion_candidates.clear();
-            self.completion_idx = None;
-            self.completion_display_only = false;
+            self.dismiss_completion();
         }
 
         // Ctrl+R: insert register content at cursor
@@ -10187,9 +11268,7 @@ impl Engine {
             self.ai_ghost_clear();
         }
         if self.completion_idx.is_some() {
-            self.completion_candidates.clear();
-            self.completion_idx = None;
-            self.completion_display_only = false;
+            self.dismiss_completion();
         }
 
         let line = self.view().cursor.line;
@@ -10942,7 +12021,7 @@ impl Engine {
                     self.paste_visual_selection(changed);
                     return EngineAction::None;
                 }
-                'd' => {
+                'd' if !ctrl => {
                     self.count = None; // Clear count (not used for visual operators)
                     self.delete_visual_selection(changed);
                     return EngineAction::None;
@@ -10957,7 +12036,7 @@ impl Engine {
                     self.change_visual_selection(changed);
                     return EngineAction::None;
                 }
-                'u' if self.pending_key.is_none() => {
+                'u' if !ctrl && self.pending_key.is_none() => {
                     self.count = None; // Clear count (not used for visual operators)
                     self.lowercase_visual_selection(changed);
                     return EngineAction::None;
@@ -11132,40 +12211,48 @@ impl Engine {
         }
 
         // Handle navigation keys (extend selection)
-        // These use the same movement logic as normal mode
+        // These use the same movement logic as normal mode (fold-aware)
         if ctrl {
             match key_name {
                 "d" => {
                     let count = self.take_count();
                     let half = self.viewport_lines() / 2;
+                    let scroll_amount = half * count;
                     let max_line = self.buffer().len_lines().saturating_sub(1);
-                    self.view_mut().cursor.line =
-                        (self.view().cursor.line + half * count).min(max_line);
+                    let cur = self.view().cursor.line;
+                    let new_line = self.view().next_visible_line(cur, scroll_amount, max_line);
+                    self.view_mut().cursor.line = new_line;
                     self.clamp_cursor_col();
                     return EngineAction::None;
                 }
                 "u" => {
                     let count = self.take_count();
                     let half = self.viewport_lines() / 2;
-                    self.view_mut().cursor.line =
-                        self.view().cursor.line.saturating_sub(half * count);
+                    let scroll_amount = half * count;
+                    let cur = self.view().cursor.line;
+                    let new_line = self.view().prev_visible_line(cur, scroll_amount);
+                    self.view_mut().cursor.line = new_line;
                     self.clamp_cursor_col();
                     return EngineAction::None;
                 }
                 "f" => {
                     let count = self.take_count();
                     let viewport = self.viewport_lines();
+                    let scroll_amount = viewport * count;
                     let max_line = self.buffer().len_lines().saturating_sub(1);
-                    self.view_mut().cursor.line =
-                        (self.view().cursor.line + viewport * count).min(max_line);
+                    let cur = self.view().cursor.line;
+                    let new_line = self.view().next_visible_line(cur, scroll_amount, max_line);
+                    self.view_mut().cursor.line = new_line;
                     self.clamp_cursor_col();
                     return EngineAction::None;
                 }
                 "b" => {
                     let count = self.take_count();
                     let viewport = self.viewport_lines();
-                    self.view_mut().cursor.line =
-                        self.view().cursor.line.saturating_sub(viewport * count);
+                    let scroll_amount = viewport * count;
+                    let cur = self.view().cursor.line;
+                    let new_line = self.view().prev_visible_line(cur, scroll_amount);
+                    self.view_mut().cursor.line = new_line;
                     self.clamp_cursor_col();
                     return EngineAction::None;
                 }
@@ -12075,6 +13162,8 @@ impl Engine {
             // Git
             "Gdiff",
             "Gd",
+            "Gdiffsplit",
+            "Gds",
             "Gstatus",
             "Gs",
             "Gadd",
@@ -12089,8 +13178,17 @@ impl Engine {
             "Ghunk",
             "Gpull",
             "Gfetch",
+            "Gswitch",
+            "GSwitch",
+            "Gsw",
+            "Gbranch",
+            "GBranch",
             "GWorktreeAdd",
             "GWorktreeRemove",
+            "DiffPeek",
+            "DiffNext",
+            "DiffPrev",
+            "DiffToggleContext",
             // LSP
             "LspInfo",
             "LspRestart",
@@ -12368,6 +13466,9 @@ impl Engine {
                 }
             }
         }
+
+        // Delete swap files for all current buffers before discarding them.
+        self.cleanup_all_swaps();
 
         // Clear all existing buffers and tabs, reset to single empty window
         self.buffer_manager = super::buffer_manager::BufferManager::new();
@@ -12961,6 +14062,19 @@ impl Engine {
     /// Handle a key press when the Source Control panel has focus.
     /// Returns true if the key was consumed.
     pub fn handle_sc_key(&mut self, key: &str, ctrl: bool, unicode: Option<char>) -> bool {
+        // Help dialog: any key closes it.
+        if self.sc_help_open {
+            self.sc_help_open = false;
+            return true;
+        }
+        // Branch picker popup.
+        if self.sc_branch_picker_open {
+            return self.handle_sc_branch_picker_key(key, ctrl, unicode);
+        }
+        // Branch create input.
+        if self.sc_branch_create_mode {
+            return self.handle_sc_branch_create_key(key, unicode);
+        }
         // If commit input is active, delegate to the input handler.
         if self.sc_commit_input_active {
             return self.handle_sc_commit_input_key(key, ctrl, unicode);
@@ -13055,8 +14169,18 @@ impl Engine {
                         if !path.exists() {
                             self.message = format!("SC: file not found: {}", path.display());
                         } else {
-                            let _ =
-                                self.open_file_with_mode(&path, crate::core::OpenMode::Permanent);
+                            // For files with a HEAD version, open diff split.
+                            // For untracked/new files, open normally.
+                            let is_new = matches!(f.unstaged, Some(git::StatusKind::Untracked))
+                                || matches!(f.staged, Some(git::StatusKind::Added));
+                            let has_head = !is_new
+                                && git::show_file_at_ref(&git_root, "HEAD", &f.path).is_some();
+                            if has_head {
+                                self.cmd_git_diff_split(&path);
+                            } else {
+                                let _ = self
+                                    .open_file_with_mode(&path, crate::core::OpenMode::Permanent);
+                            }
                             // Clear focus so the editor receives keys after opening.
                             self.sc_has_focus = false;
                             self.sc_button_focused = None;
@@ -13075,8 +14199,159 @@ impl Engine {
                 self.sc_refresh();
                 true
             }
+            "b" => {
+                self.sc_open_branch_picker();
+                true
+            }
+            "B" => {
+                self.sc_open_branch_create();
+                true
+            }
+            "?" => {
+                self.sc_help_open = true;
+                true
+            }
             _ => false,
         }
+    }
+
+    // ── Branch picker ─────────────────────────────────────────────────
+
+    fn sc_open_branch_picker(&mut self) {
+        let root = git::find_repo_root(&self.cwd).unwrap_or_else(|| self.cwd.clone());
+        self.sc_branch_picker_branches = git::list_branches(&root);
+        self.sc_branch_picker_query.clear();
+        self.sc_branch_picker_selected = 0;
+        self.sc_branch_picker_open = true;
+    }
+
+    fn sc_close_branch_picker(&mut self) {
+        self.sc_branch_picker_open = false;
+        self.sc_branch_picker_query.clear();
+        self.sc_branch_picker_branches.clear();
+        self.sc_branch_picker_selected = 0;
+    }
+
+    pub fn sc_branch_picker_filtered(&self) -> Vec<(usize, i32)> {
+        let q = &self.sc_branch_picker_query;
+        let mut results: Vec<(usize, i32)> = self
+            .sc_branch_picker_branches
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| Self::fuzzy_score(&b.name, q).map(|s| (i, s)))
+            .collect();
+        results.sort_by(|a, b| b.1.cmp(&a.1));
+        results.truncate(50);
+        results
+    }
+
+    fn sc_branch_picker_confirm(&mut self) {
+        let filtered = self.sc_branch_picker_filtered();
+        if let Some(&(idx, _)) = filtered.get(self.sc_branch_picker_selected) {
+            let branch = self.sc_branch_picker_branches[idx].name.clone();
+            let root = git::find_repo_root(&self.cwd).unwrap_or_else(|| self.cwd.clone());
+            // Strip "remotes/origin/" prefix for remote branches.
+            let name = branch.strip_prefix("remotes/origin/").unwrap_or(&branch);
+            match git::checkout_branch(&root, name) {
+                Ok(()) => {
+                    self.message = format!("Switched to {name}");
+                    self.sc_refresh();
+                }
+                Err(e) => self.message = format!("Switch failed: {e}"),
+            }
+        }
+        self.sc_close_branch_picker();
+    }
+
+    fn handle_sc_branch_picker_key(
+        &mut self,
+        key: &str,
+        ctrl: bool,
+        unicode: Option<char>,
+    ) -> bool {
+        match key {
+            "Escape" | "q" => {
+                self.sc_close_branch_picker();
+            }
+            "Return" | "Enter" => {
+                self.sc_branch_picker_confirm();
+            }
+            "Up" | "k" => {
+                self.sc_branch_picker_selected = self.sc_branch_picker_selected.saturating_sub(1);
+            }
+            "Down" | "j" => {
+                let count = self.sc_branch_picker_filtered().len();
+                if count > 0 {
+                    self.sc_branch_picker_selected =
+                        (self.sc_branch_picker_selected + 1).min(count - 1);
+                }
+            }
+            "BackSpace" => {
+                self.sc_branch_picker_query.pop();
+                self.sc_branch_picker_selected = 0;
+            }
+            _ => {
+                if ctrl {
+                    return true;
+                }
+                if let Some(ch) = unicode {
+                    if !ch.is_control() {
+                        self.sc_branch_picker_query.push(ch);
+                        self.sc_branch_picker_selected = 0;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    // ── Branch create ────────────────────────────────────────────────
+
+    fn sc_open_branch_create(&mut self) {
+        self.sc_branch_create_mode = true;
+        self.sc_branch_create_input.clear();
+    }
+
+    fn sc_branch_create_confirm(&mut self) {
+        let name = self.sc_branch_create_input.trim().to_string();
+        if name.is_empty() {
+            self.message = "Branch name cannot be empty".to_string();
+            self.sc_branch_create_mode = false;
+            return;
+        }
+        let root = git::find_repo_root(&self.cwd).unwrap_or_else(|| self.cwd.clone());
+        match git::create_branch(&root, &name) {
+            Ok(()) => {
+                self.message = format!("Created and switched to {name}");
+                self.sc_refresh();
+            }
+            Err(e) => self.message = format!("Create branch failed: {e}"),
+        }
+        self.sc_branch_create_mode = false;
+        self.sc_branch_create_input.clear();
+    }
+
+    fn handle_sc_branch_create_key(&mut self, key: &str, unicode: Option<char>) -> bool {
+        match key {
+            "Escape" => {
+                self.sc_branch_create_mode = false;
+                self.sc_branch_create_input.clear();
+            }
+            "Return" | "Enter" => {
+                self.sc_branch_create_confirm();
+            }
+            "BackSpace" => {
+                self.sc_branch_create_input.pop();
+            }
+            _ => {
+                if let Some(ch) = unicode {
+                    if !ch.is_control() {
+                        self.sc_branch_create_input.push(ch);
+                    }
+                }
+            }
+        }
+        true
     }
 
     /// Number of visible flat rows across all sections.
@@ -14274,6 +15549,30 @@ impl Engine {
             return self.cmd_git_diff();
         }
 
+        // Handle :Gdiffsplit / :Gds [path]
+        if cmd == "Gdiffsplit" || cmd == "Gds" {
+            let path = match self.file_path().map(|p| p.to_path_buf()) {
+                Some(p) => p,
+                None => {
+                    self.message = "No file".to_string();
+                    return EngineAction::Error;
+                }
+            };
+            return self.cmd_git_diff_split(&path);
+        }
+        if let Some(path_str) = cmd
+            .strip_prefix("Gdiffsplit ")
+            .or_else(|| cmd.strip_prefix("Gds "))
+        {
+            let path = Path::new(path_str.trim());
+            let abs_path = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                self.cwd.join(path)
+            };
+            return self.cmd_git_diff_split(&abs_path);
+        }
+
         // Two-way diff commands
         if cmd == "diffthis" {
             return self.cmd_diffthis();
@@ -14287,6 +15586,18 @@ impl Engine {
         }
         if cmd == "diffsplit" {
             self.message = "Usage: :diffsplit <file>".to_string();
+            return EngineAction::None;
+        }
+        if cmd == "DiffNext" {
+            self.diff_jump_next();
+            return EngineAction::None;
+        }
+        if cmd == "DiffPrev" {
+            self.diff_jump_prev();
+            return EngineAction::None;
+        }
+        if cmd == "DiffToggleContext" {
+            self.diff_toggle_hide_unchanged();
             return EngineAction::None;
         }
 
@@ -14328,6 +15639,12 @@ impl Engine {
         // Handle :Ghs / :Ghunk — stage hunk under cursor
         if cmd == "Ghs" || cmd == "Ghunk" {
             return self.cmd_git_stage_hunk();
+        }
+
+        // Handle :DiffPeek — open inline diff peek popup
+        if cmd == "DiffPeek" {
+            self.open_diff_peek();
+            return EngineAction::None;
         }
 
         // Handle :GWorktreeAdd <branch> <path>
@@ -14401,6 +15718,40 @@ impl Engine {
         // Handle :Gfetch — git fetch
         if cmd == "Gfetch" {
             self.sc_fetch();
+            return EngineAction::None;
+        }
+
+        // Handle :Gswitch <branch> / :Gbranch <name> — branch operations
+        if let Some(branch) = cmd
+            .strip_prefix("Gswitch ")
+            .or_else(|| cmd.strip_prefix("GSwitch "))
+            .or_else(|| cmd.strip_prefix("Gsw "))
+        {
+            let branch = branch.trim();
+            let root = git::find_repo_root(&self.cwd).unwrap_or_else(|| self.cwd.clone());
+            match git::checkout_branch(&root, branch) {
+                Ok(()) => {
+                    self.message = format!("Switched to {branch}");
+                    self.sc_refresh();
+                }
+                Err(e) => self.message = format!("Switch failed: {e}"),
+            }
+            return EngineAction::None;
+        }
+        if let Some(branch) = cmd
+            .strip_prefix("Gbranch ")
+            .or_else(|| cmd.strip_prefix("GBranch "))
+            .or_else(|| cmd.strip_prefix("Gb "))
+        {
+            let branch = branch.trim();
+            let root = git::find_repo_root(&self.cwd).unwrap_or_else(|| self.cwd.clone());
+            match git::create_branch(&root, branch) {
+                Ok(()) => {
+                    self.message = format!("Created and switched to {branch}");
+                    self.sc_refresh();
+                }
+                Err(e) => self.message = format!("Create branch failed: {e}"),
+            }
             return EngineAction::None;
         }
 
@@ -19226,14 +20577,23 @@ impl Engine {
         self.view_mut().cursor.col = start + candidate.len();
     }
 
+    /// Dismiss the completion popup and cancel any pending LSP completion request.
+    /// This ensures that a late-arriving LSP response cannot re-show a popup
+    /// after the user has already dismissed it (e.g. by pressing Escape or
+    /// moving the cursor).
+    fn dismiss_completion(&mut self) {
+        self.completion_candidates.clear();
+        self.completion_idx = None;
+        self.completion_display_only = false;
+        self.lsp_pending_completion = None;
+    }
+
     /// Trigger auto-popup completion based on current cursor prefix.
     /// Called after each text change in Insert mode.
     fn trigger_auto_completion(&mut self) {
         let (prefix, _) = self.completion_prefix_at_cursor();
         if prefix.is_empty() {
-            self.completion_candidates.clear();
-            self.completion_idx = None;
-            self.completion_display_only = false;
+            self.dismiss_completion();
             return;
         }
         let candidates = self.word_completions_for_prefix(&prefix);
@@ -19243,7 +20603,7 @@ impl Engine {
             self.completion_idx = Some(0);
             self.completion_display_only = true;
         } else {
-            // No buffer-word hits yet; still fire LSP (may populate asynchronously)
+            // No buffer-word hits yet; clear popup but keep LSP pending
             self.completion_candidates.clear();
             self.completion_idx = None;
             self.completion_display_only = false;
@@ -20855,7 +22215,7 @@ impl Engine {
             Some(DiffLine::Same) => {
                 self.message = "Line is the same in both files".to_string();
             }
-            Some(DiffLine::Added) | Some(DiffLine::Removed) | None => {
+            Some(DiffLine::Added) | Some(DiffLine::Removed) | Some(DiffLine::Padding) | None => {
                 // Get the corresponding line from the other window
                 // For simplicity, use the same line number from the other buffer
                 if let Some(other_win) = self.windows.get(&other) {
@@ -23076,7 +24436,7 @@ impl Engine {
             return false;
         }
         // Don't overwrite an existing recovery dialog.
-        if self.swap_recovery.is_some() {
+        if self.pending_swap_recovery.is_some() {
             self.swap_create_for_buffer(buf_id);
             return false;
         }
@@ -23129,36 +24489,50 @@ impl Engine {
             );
             return false;
         }
-        // PID is dead → offer recovery.
+        // PID is dead → offer recovery via dialog.
         let fname = file_path.file_name().unwrap_or_default().to_string_lossy();
-        self.message = format!(
-            "Swap file found for \"{}\". [R]ecover, [D]elete swap, [A]bort",
-            fname
-        );
-        self.swap_recovery = Some(SwapRecovery {
+        self.pending_swap_recovery = Some(SwapRecovery {
             swap_path,
             recovered_content: content,
             buffer_id: buf_id,
         });
+        self.show_dialog(
+            "swap_recovery",
+            "Swap File Found",
+            vec![
+                format!("A swap file was found for \"{}\".", fname),
+                format!("Modified: {}", header.modified),
+                format!("Original PID: {} (no longer running)", header.pid),
+            ],
+            vec![
+                DialogButton {
+                    label: "Recover".into(),
+                    hotkey: 'r',
+                    action: "recover".into(),
+                },
+                DialogButton {
+                    label: "Delete swap".into(),
+                    hotkey: 'd',
+                    action: "delete".into(),
+                },
+                DialogButton {
+                    label: "Abort".into(),
+                    hotkey: 'a',
+                    action: "abort".into(),
+                },
+            ],
+        );
         true
     }
 
-    /// Handle a key press when a swap recovery dialog is pending.
-    /// Returns `true` if the key was consumed.
-    fn handle_swap_recovery_key(&mut self, key_name: &str, unicode: Option<char>) -> EngineAction {
-        let recovery = match self.swap_recovery.take() {
+    /// Process the result of a swap recovery dialog action.
+    fn process_swap_dialog_action(&mut self, action: &str) -> EngineAction {
+        let recovery = match self.pending_swap_recovery.take() {
             Some(r) => r,
             None => return EngineAction::None,
         };
-        // TUI sends key_name="" with the char in unicode; GTK sends key_name="r".
-        let effective = if !key_name.is_empty() {
-            key_name.to_string()
-        } else {
-            unicode.map(|c| c.to_string()).unwrap_or_default()
-        };
-        match effective.as_str() {
-            "r" | "R" => {
-                // Replace buffer content with recovered content.
+        match action {
+            "recover" => {
                 let state = self.buffer_manager.get_mut(recovery.buffer_id);
                 if let Some(state) = state {
                     let len = state.buffer.len_chars();
@@ -23172,34 +24546,123 @@ impl Engine {
                 self.swap_create_for_buffer(recovery.buffer_id);
                 self.message = "Recovered from swap file".to_string();
             }
-            "d" | "D" => {
-                // Delete the stale swap, keep the file as-is.
+            "delete" => {
                 super::swap::delete_swap(&recovery.swap_path);
                 self.swap_create_for_buffer(recovery.buffer_id);
                 self.message = "Swap file deleted".to_string();
             }
-            "a" | "A" => {
-                // Abort — close the tab, leave swap for next time.
+            "abort" | "cancel" => {
                 self.close_tab();
                 self.message.clear();
             }
-            _ => {
-                // Unrecognized key — put recovery back and re-display prompt.
-                let fname = self
-                    .buffer_manager
-                    .get(recovery.buffer_id)
-                    .and_then(|s| s.file_path.as_ref())
-                    .and_then(|p| p.file_name())
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                self.message = format!(
-                    "Swap file found for \"{}\". [R]ecover, [D]elete swap, [A]bort",
-                    fname
-                );
-                self.swap_recovery = Some(recovery);
-            }
+            _ => {}
         }
         EngineAction::None
+    }
+
+    // ─── Dialog system ─────────────────────────────────────────────────
+
+    /// Show a modal dialog.
+    pub fn show_dialog(
+        &mut self,
+        tag: &str,
+        title: &str,
+        body: Vec<String>,
+        buttons: Vec<DialogButton>,
+    ) {
+        self.dialog = Some(Dialog {
+            title: title.to_string(),
+            body,
+            buttons,
+            selected: 0,
+            tag: tag.to_string(),
+        });
+    }
+
+    /// Convenience: show an error dialog with a single OK button.
+    #[allow(dead_code)]
+    pub fn show_error_dialog(&mut self, title: &str, message: &str) {
+        self.show_dialog(
+            "error",
+            title,
+            vec![message.to_string()],
+            vec![DialogButton {
+                label: "OK".into(),
+                hotkey: 'o',
+                action: "ok".into(),
+            }],
+        );
+    }
+
+    /// Handle a key press when a dialog is open.
+    /// Returns `Some((tag, action))` when the dialog is dismissed, `None` to keep it open.
+    fn handle_dialog_key(
+        &mut self,
+        key_name: &str,
+        unicode: Option<char>,
+    ) -> Option<(String, String)> {
+        let dialog = self.dialog.as_mut()?;
+        // TUI sends key_name="" with the char in unicode; GTK sends key_name="r".
+        let effective = if !key_name.is_empty() {
+            key_name.to_string()
+        } else {
+            unicode.map(|c| c.to_string()).unwrap_or_default()
+        };
+
+        match effective.as_str() {
+            "Escape" => {
+                let tag = dialog.tag.clone();
+                self.dialog = None;
+                Some((tag, "cancel".to_string()))
+            }
+            "Return" => {
+                let tag = dialog.tag.clone();
+                let action = dialog
+                    .buttons
+                    .get(dialog.selected)
+                    .map(|b| b.action.clone())
+                    .unwrap_or_else(|| "cancel".to_string());
+                self.dialog = None;
+                Some((tag, action))
+            }
+            "Left" | "h" => {
+                if dialog.selected > 0 {
+                    dialog.selected -= 1;
+                }
+                None
+            }
+            "Right" | "l" => {
+                if dialog.selected + 1 < dialog.buttons.len() {
+                    dialog.selected += 1;
+                }
+                None
+            }
+            _ => {
+                // Check hotkeys (case-insensitive).
+                let ch = effective
+                    .chars()
+                    .next()
+                    .unwrap_or('\0')
+                    .to_ascii_lowercase();
+                for btn in &dialog.buttons {
+                    if btn.hotkey == ch {
+                        let tag = dialog.tag.clone();
+                        let action = btn.action.clone();
+                        self.dialog = None;
+                        return Some((tag, action));
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    /// Dispatch a dialog result to the appropriate handler.
+    fn process_dialog_result(&mut self, tag: &str, action: &str) -> EngineAction {
+        match tag {
+            "swap_recovery" => self.process_swap_dialog_action(action),
+            _ => EngineAction::None,
+        }
     }
 
     /// Mark the active buffer as needing a swap write.
@@ -23259,7 +24722,7 @@ impl Engine {
         }
         let buf_ids = self.buffer_manager.list();
         for buf_id in buf_ids {
-            if self.swap_recovery.is_some() {
+            if self.pending_swap_recovery.is_some() {
                 // Already showing a recovery dialog — just create swaps for the rest.
                 self.swap_create_for_buffer(buf_id);
             } else {
@@ -23275,7 +24738,7 @@ impl Engine {
     /// don't correspond to any currently-open buffer.  Opens the first
     /// orphaned file in a new tab and offers recovery.
     fn swap_scan_stale(&mut self) {
-        if !self.settings.swap_file || self.swap_recovery.is_some() {
+        if !self.settings.swap_file || self.pending_swap_recovery.is_some() {
             return;
         }
         let stale = super::swap::find_stale_swaps();
@@ -23303,9 +24766,9 @@ impl Engine {
             }
             // Open the file in a new tab.  `open_file_in_tab` calls
             // `swap_check_on_open` internally, which will detect the
-            // stale swap and set `swap_recovery` for us.
+            // stale swap and set `pending_swap_recovery` for us.
             self.open_file_in_tab(&header.file_path);
-            if self.swap_recovery.is_some() {
+            if self.pending_swap_recovery.is_some() {
                 return;
             }
         }
@@ -23521,7 +24984,10 @@ impl Engine {
                     if self.lsp_pending_completion == Some(request_id) {
                         // Popup completion response — populate display-only popup
                         self.lsp_pending_completion = None;
-                        if !items.is_empty() {
+                        // Only show completion if still in Insert mode (or VSCode mode).
+                        // The user may have pressed Escape between the request and response.
+                        let in_insert = self.mode == Mode::Insert || self.is_vscode_mode();
+                        if in_insert && !items.is_empty() {
                             let (cur_prefix, _) = self.completion_prefix_at_cursor();
                             let lsp_cands: Vec<String> = items
                                 .iter()
@@ -26513,63 +27979,251 @@ fn rust_debug_binary(cwd: &std::path::Path) -> Result<String, String> {
 // =============================================================================
 
 /// Compute per-line diff status for two sequences of lines using a standard
-/// LCS (Longest Common Subsequence) approach.
+/// Maximum number of consecutive `Same` lines between two changed regions
+/// that will be absorbed into the surrounding change for visual continuity.
+/// Short "islands" of matching lines in the middle of an edit are typically
+/// incidental (blank lines, common braces, imports) and fragmenting the
+/// coloured block around them is confusing.
+const DIFF_MERGE_SAME_THRESHOLD: usize = 1;
+
+/// Post-process LCS diff results: short runs of `Same` lines (up to
+/// [`DIFF_MERGE_SAME_THRESHOLD`]) that sit between two non-Same regions
+/// are re-classified to `fill`, preventing visual fragmentation of what
+/// the user perceives as a single edit.
+fn merge_short_same_runs(results: &mut [DiffLine], fill: DiffLine) {
+    let n = results.len();
+    let mut i = 0;
+    while i < n {
+        if results[i] == DiffLine::Same {
+            let start = i;
+            while i < n && results[i] == DiffLine::Same {
+                i += 1;
+            }
+            let run_len = i - start;
+            let before_changed = start > 0 && results[start - 1] != DiffLine::Same;
+            let after_changed = i < n && results[i] != DiffLine::Same;
+            if before_changed && after_changed && run_len <= DIFF_MERGE_SAME_THRESHOLD {
+                for r in results.iter_mut().take(i).skip(start) {
+                    *r = fill;
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// Myers diff algorithm — finds the Shortest Edit Script (SES) between two
+/// sequences of lines.  Complexity is O((N+M)·D) where D is the edit distance,
+/// which is much faster than O(N×M) LCS when the files are large but the
+/// diff is small (the common case).
 ///
 /// Returns `(status_a, status_b)` where each element corresponds to one line
 /// of the respective input sequence:
 /// - `DiffLine::Same`    — line is shared by both sides.
-/// - `DiffLine::Removed` — line exists in `a` but not `b` (deleted from a's perspective).
-/// - `DiffLine::Added`   — line exists in `b` but not `a` (added from b's perspective).
+/// - `DiffLine::Removed` — line exists in `a` but not `b`.
+/// - `DiffLine::Added`   — line exists in `b` but not `a`.
 ///
-/// Files longer than 3000 lines are too slow to diff with O(N×M) LCS; in that
-/// case all lines are emitted as `Same` and the engine sets a message.
-pub fn lcs_diff(a: &[&str], b: &[&str]) -> (Vec<DiffLine>, Vec<DiffLine>) {
-    const MAX_LINES: usize = 3000;
-    if a.len() > MAX_LINES || b.len() > MAX_LINES {
-        return (vec![DiffLine::Same; a.len()], vec![DiffLine::Same; b.len()]);
-    }
+/// Build aligned diff sequences with padding so that Same lines appear at the
+/// same visual row.  Walks the raw per-file diff status arrays (one entry per
+/// buffer line) with two pointers and inserts `DiffLine::Padding` entries on
+/// the opposite side whenever one side has Removed/Added lines that the other
+/// does not.
+///
+/// Returns `(aligned_a, aligned_b)` — both the same length.
+pub fn build_aligned_diff(
+    da: &[DiffLine],
+    db: &[DiffLine],
+) -> (Vec<AlignedDiffEntry>, Vec<AlignedDiffEntry>) {
+    let mut aligned_a = Vec::new();
+    let mut aligned_b = Vec::new();
+    let mut i = 0; // pointer into da (side A)
+    let mut j = 0; // pointer into db (side B)
 
-    let m = a.len();
-    let n = b.len();
+    while i < da.len() || j < db.len() {
+        // Both sides have Same — they correspond to each other.
+        if i < da.len() && j < db.len() && da[i] == DiffLine::Same && db[j] == DiffLine::Same {
+            aligned_a.push(AlignedDiffEntry {
+                source_line: Some(i),
+            });
+            aligned_b.push(AlignedDiffEntry {
+                source_line: Some(j),
+            });
+            i += 1;
+            j += 1;
+            continue;
+        }
 
-    // Build LCS table
-    let mut dp = vec![vec![0usize; n + 1]; m + 1];
-    for i in (0..m).rev() {
-        for j in (0..n).rev() {
-            dp[i][j] = if a[i] == b[j] {
-                dp[i + 1][j + 1] + 1
+        // Collect a change hunk: consume all non-Same lines from both sides.
+        let mut removed = Vec::new();
+        let mut added = Vec::new();
+        while i < da.len() && da[i] != DiffLine::Same {
+            removed.push(i);
+            i += 1;
+        }
+        while j < db.len() && db[j] != DiffLine::Same {
+            added.push(j);
+            j += 1;
+        }
+
+        // If both sides hit Same (or end) without consuming anything,
+        // treat remaining Same lines on either side as unmatched to avoid
+        // an infinite loop.
+        if removed.is_empty() && added.is_empty() {
+            if i < da.len() {
+                aligned_a.push(AlignedDiffEntry {
+                    source_line: Some(i),
+                });
+                aligned_b.push(AlignedDiffEntry { source_line: None });
+                i += 1;
+            }
+            if j < db.len() {
+                aligned_a.push(AlignedDiffEntry { source_line: None });
+                aligned_b.push(AlignedDiffEntry {
+                    source_line: Some(j),
+                });
+                j += 1;
+            }
+            continue;
+        }
+
+        // Pair up removed/added lines, padding the shorter side.
+        let max_len = removed.len().max(added.len());
+        for k in 0..max_len {
+            if k < removed.len() {
+                aligned_a.push(AlignedDiffEntry {
+                    source_line: Some(removed[k]),
+                });
             } else {
-                dp[i + 1][j].max(dp[i][j + 1])
-            };
+                aligned_a.push(AlignedDiffEntry { source_line: None });
+            }
+            if k < added.len() {
+                aligned_b.push(AlignedDiffEntry {
+                    source_line: Some(added[k]),
+                });
+            } else {
+                aligned_b.push(AlignedDiffEntry { source_line: None });
+            }
         }
     }
 
-    // Backtrack to assign per-line status
-    let mut da = Vec::with_capacity(m);
-    let mut db = Vec::with_capacity(n);
-    let mut i = 0;
-    let mut j = 0;
-    while i < m && j < n {
-        if a[i] == b[j] {
-            da.push(DiffLine::Same);
-            db.push(DiffLine::Same);
-            i += 1;
-            j += 1;
-        } else if dp[i + 1][j] >= dp[i][j + 1] {
-            da.push(DiffLine::Removed);
-            i += 1;
-        } else {
-            db.push(DiffLine::Added);
-            j += 1;
+    (aligned_a, aligned_b)
+}
+
+/// Falls back to all-Same if the edit distance exceeds `MAX_EDIT_DIST` (to
+/// avoid pathological runtime on completely unrelated files).
+pub fn lcs_diff(a: &[&str], b: &[&str]) -> (Vec<DiffLine>, Vec<DiffLine>) {
+    let n = a.len();
+    let m = b.len();
+    if n == 0 && m == 0 {
+        return (vec![], vec![]);
+    }
+    if n == 0 {
+        return (vec![], vec![DiffLine::Added; m]);
+    }
+    if m == 0 {
+        return (vec![DiffLine::Removed; n], vec![]);
+    }
+
+    // Maximum edit distance we're willing to explore.
+    // Myers diff is O(N·D) in time and O(D²) in memory where D = edit distance.
+    // For large files with small diffs (the common case), D is small so this is
+    // fast regardless of file size.  The MAX_EDIT_DIST cap prevents blow-up when
+    // two files are extremely different.
+    const MAX_EDIT_DIST: usize = 2_000;
+    let max_d = (n + m).min(MAX_EDIT_DIST);
+
+    // V array indexed by k = x - y, offset so k=0 maps to index `offset`.
+    let offset = max_d;
+    let v_size = 2 * max_d + 1;
+    let mut v = vec![0usize; v_size];
+
+    // Store the trace of V snapshots for backtracking.
+    let mut trace: Vec<Vec<usize>> = Vec::with_capacity(max_d);
+
+    let mut found_d = None;
+    'outer: for d in 0..=max_d {
+        trace.push(v.clone());
+
+        for k in (-(d as isize)..=(d as isize)).step_by(2) {
+            let ki = (k + offset as isize) as usize;
+
+            let mut x = if d == 0 {
+                0
+            } else if k == -(d as isize) || (k != d as isize && v[ki - 1] < v[ki + 1]) {
+                v[ki + 1] // move down (insert)
+            } else {
+                v[ki - 1] + 1 // move right (delete)
+            };
+
+            let mut y = (x as isize - k) as usize;
+
+            // Follow diagonal (matching lines)
+            while x < n && y < m && a[x] == b[y] {
+                x += 1;
+                y += 1;
+            }
+
+            v[ki] = x;
+
+            if x >= n && y >= m {
+                found_d = Some(d);
+                break 'outer;
+            }
         }
     }
-    while i < m {
-        da.push(DiffLine::Removed);
-        i += 1;
+
+    if found_d.is_none() {
+        // Edit distance exceeded limit — fall back to all-Same.
+        return (vec![DiffLine::Same; n], vec![DiffLine::Same; m]);
     }
-    while j < n {
-        db.push(DiffLine::Added);
-        j += 1;
+    let d = found_d.unwrap();
+
+    // Backtrack through the trace to build an edit script.
+    // Each edit is either Insert(y_idx) or Delete(x_idx), in reverse order.
+    #[derive(Clone, Copy)]
+    enum Edit {
+        Insert(usize), // b[y] was inserted
+        Delete(usize), // a[x] was deleted
+    }
+    let mut edits: Vec<Edit> = Vec::with_capacity(d);
+    let mut cx = n;
+    let mut cy = m;
+
+    for d_step in (1..=d).rev() {
+        let v_d = &trace[d_step];
+        let k = cx as isize - cy as isize;
+        let ki = (k + offset as isize) as usize;
+
+        let is_insert =
+            k == -(d_step as isize) || (k != d_step as isize && v_d[ki - 1] < v_d[ki + 1]);
+
+        let prev_k = if is_insert { k + 1 } else { k - 1 };
+        let prev_ki = (prev_k + offset as isize) as usize;
+        let prev_x = v_d[prev_ki];
+        let prev_y = (prev_x as isize - prev_k) as usize;
+
+        if is_insert {
+            // y stepped from prev_y to prev_y+1, then diagonal to (cx, cy).
+            edits.push(Edit::Insert(prev_y));
+        } else {
+            // x stepped from prev_x to prev_x+1, then diagonal to (cx, cy).
+            edits.push(Edit::Delete(prev_x));
+        }
+
+        cx = prev_x;
+        cy = prev_y;
+    }
+    edits.reverse();
+
+    // Build per-line status arrays from the edit script.
+    let mut da = vec![DiffLine::Same; n];
+    let mut db = vec![DiffLine::Same; m];
+    for edit in &edits {
+        match *edit {
+            Edit::Delete(x) => da[x] = DiffLine::Removed,
+            Edit::Insert(y) => db[y] = DiffLine::Added,
+        }
     }
 
     (da, db)
@@ -29345,9 +30999,7 @@ impl Engine {
                 "Escape" => {
                     // Dismiss completion popup if open
                     if self.completion_idx.is_some() {
-                        self.completion_candidates.clear();
-                        self.completion_idx = None;
-                        self.completion_display_only = false;
+                        self.dismiss_completion();
                     } else if self.lsp_completion_active {
                         self.lsp_completion_active = false;
                     } else if !self.view().extra_cursors.is_empty() {
@@ -30955,6 +32607,61 @@ mod tests {
 
         engine.handle_key("u", Some('u'), true);
         assert_eq!(engine.view().cursor.line, 40);
+    }
+
+    #[test]
+    fn test_ctrl_d_fold_aware() {
+        let mut engine = Engine::new();
+        let mut text = String::new();
+        for i in 0..200 {
+            text.push_str(&format!("line {}\n", i));
+        }
+        engine.buffer_mut().insert(0, &text);
+        engine.set_viewport_lines(20);
+        // Create a large fold: lines 5..=100 are hidden (line 5 is header)
+        engine.view_mut().close_fold(5, 100);
+        // Cursor at line 0, Ctrl-D = half page (10 visible lines)
+        engine.handle_key("d", Some('d'), true);
+        // Should skip fold body and land on a visible line
+        // Lines 0-5 are visible (0,1,2,3,4,5=header), then 101+ are visible
+        // From 0, advance 10 visible: 1,2,3,4,5,101,102,103,104,105
+        assert_eq!(engine.view().cursor.line, 105);
+    }
+
+    #[test]
+    fn test_ctrl_u_fold_aware() {
+        let mut engine = Engine::new();
+        let mut text = String::new();
+        for i in 0..200 {
+            text.push_str(&format!("line {}\n", i));
+        }
+        engine.buffer_mut().insert(0, &text);
+        engine.set_viewport_lines(20);
+        // Create a large fold: lines 5..=100 are hidden
+        engine.view_mut().close_fold(5, 100);
+        // Cursor at line 110, Ctrl-U = half page (10 visible lines)
+        engine.view_mut().cursor.line = 110;
+        engine.handle_key("u", Some('u'), true);
+        // From 110, go back 10 visible: 109,108,107,106,105,104,103,102,101,5
+        assert_eq!(engine.view().cursor.line, 5);
+    }
+
+    #[test]
+    fn test_scroll_down_visible_skips_folds() {
+        let mut engine = Engine::new();
+        let mut text = String::new();
+        for i in 0..200 {
+            text.push_str(&format!("line {}\n", i));
+        }
+        engine.buffer_mut().insert(0, &text);
+        engine.set_viewport_lines(20);
+        // Fold lines 10..=100
+        engine.view_mut().close_fold(10, 100);
+        engine.view_mut().scroll_top = 8;
+        // Scroll down 5 visible lines
+        engine.scroll_down_visible(5);
+        // From 8: 9, 10(header), 101, 102, 103
+        assert_eq!(engine.view().scroll_top, 103);
     }
 
     #[test]
@@ -36453,6 +38160,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_escape_from_insert_clears_pending_lsp_completion() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "foobar\n");
+        press_char(&mut engine, 'G');
+        press_char(&mut engine, 'o');
+        press_char(&mut engine, 'f');
+        press_char(&mut engine, 'o');
+        press_char(&mut engine, 'o'); // "foo" → popup active
+        assert!(engine.completion_idx.is_some());
+        // Simulate a pending LSP completion request
+        engine.lsp_pending_completion = Some(42);
+        // Escape exits insert mode and clears completion + pending LSP
+        press_special(&mut engine, "Escape");
+        assert!(engine.completion_idx.is_none());
+        assert!(
+            engine.lsp_pending_completion.is_none(),
+            "pending LSP completion should be cancelled on Escape"
+        );
+    }
+
+    #[test]
+    fn test_completion_dismissed_in_normal_mode() {
+        let mut engine = Engine::new();
+        // Manually set completion state as if from a race condition
+        engine.completion_candidates = vec!["hello".to_string()];
+        engine.completion_idx = Some(0);
+        engine.completion_display_only = true;
+        assert_eq!(engine.mode, Mode::Normal);
+        // Any key in Normal mode should dismiss the popup
+        press_char(&mut engine, 'j');
+        assert!(
+            engine.completion_idx.is_none(),
+            "completion should be dismissed when not in Insert mode"
+        );
+    }
+
     // ── :set command (engine-level) ───────────────────────────────────────────
 
     #[test]
@@ -36589,6 +38333,223 @@ mod tests {
         engine.view_mut().cursor.line = 0;
         engine.jump_next_hunk();
         assert!(engine.message.contains("No more hunks"));
+    }
+
+    // ─── Diff peek + enhanced hunk nav ─────────────────────────────────────
+
+    #[test]
+    fn test_open_diff_peek_no_hunks() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().content = ropey::Rope::from_str("hello\nworld\n");
+        engine.update_syntax();
+        engine.open_diff_peek();
+        assert!(engine.diff_peek.is_none());
+        assert!(engine.message.contains("No changes"));
+    }
+
+    #[test]
+    fn test_open_diff_peek_with_hunks() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().content = ropey::Rope::from_str("line1\nline2\nline3\n");
+        engine.update_syntax();
+
+        // Simulate having diff hunks cached on the buffer.
+        let bid = engine.active_window().buffer_id;
+        if let Some(state) = engine.buffer_manager.get_mut(bid) {
+            state.diff_hunks = vec![git::DiffHunkInfo {
+                file_header: "diff --git a/f b/f\n--- a/f\n+++ b/f".to_string(),
+                hunk: git::Hunk {
+                    header: "@@ -1,2 +1,3 @@".to_string(),
+                    lines: vec![
+                        " line1".to_string(),
+                        "+line2".to_string(),
+                        " line3".to_string(),
+                    ],
+                },
+                new_start: 0,
+                new_count: 3,
+            }];
+        }
+
+        engine.view_mut().cursor.line = 1;
+        engine.open_diff_peek();
+        assert!(engine.diff_peek.is_some());
+        let peek = engine.diff_peek.as_ref().unwrap();
+        assert_eq!(peek.anchor_line, 1);
+        assert_eq!(peek.hunk_lines.len(), 3);
+    }
+
+    #[test]
+    fn test_diff_peek_close() {
+        let mut engine = Engine::new();
+        engine.diff_peek = Some(DiffPeekState {
+            hunk_index: 0,
+            anchor_line: 5,
+            hunk_lines: vec!["+added".to_string()],
+            file_header: String::new(),
+            hunk: git::Hunk {
+                header: "@@ -1 +1,2 @@".to_string(),
+                lines: vec!["+added".to_string()],
+            },
+        });
+        engine.close_diff_peek();
+        assert!(engine.diff_peek.is_none());
+    }
+
+    #[test]
+    fn test_diff_peek_key_escape() {
+        let mut engine = Engine::new();
+        engine.diff_peek = Some(DiffPeekState {
+            hunk_index: 0,
+            anchor_line: 0,
+            hunk_lines: vec![],
+            file_header: String::new(),
+            hunk: git::Hunk {
+                header: String::new(),
+                lines: vec![],
+            },
+        });
+        let consumed = engine.handle_diff_peek_key("Escape", None);
+        assert!(consumed);
+        assert!(engine.diff_peek.is_none());
+    }
+
+    #[test]
+    fn test_diff_peek_key_h_closes() {
+        let mut engine = Engine::new();
+        engine.diff_peek = Some(DiffPeekState {
+            hunk_index: 0,
+            anchor_line: 0,
+            hunk_lines: vec![],
+            file_header: String::new(),
+            hunk: git::Hunk {
+                header: String::new(),
+                lines: vec![],
+            },
+        });
+        let consumed = engine.handle_diff_peek_key("h", Some('h'));
+        assert!(!consumed); // falls through
+        assert!(engine.diff_peek.is_none());
+    }
+
+    #[test]
+    fn test_diff_peek_key_unknown_closes() {
+        let mut engine = Engine::new();
+        engine.diff_peek = Some(DiffPeekState {
+            hunk_index: 0,
+            anchor_line: 0,
+            hunk_lines: vec![],
+            file_header: String::new(),
+            hunk: git::Hunk {
+                header: String::new(),
+                lines: vec![],
+            },
+        });
+        let consumed = engine.handle_diff_peek_key("j", Some('j'));
+        assert!(!consumed); // falls through
+        assert!(engine.diff_peek.is_none());
+    }
+
+    #[test]
+    fn test_jump_next_hunk_with_git_diff() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().content = ropey::Rope::from_str("a\nb\nc\nd\ne\nf\ng\nh\ni\nj\n");
+        engine.update_syntax();
+        // Simulate git_diff: lines 2-3 changed, line 7 changed.
+        let bid = engine.active_window().buffer_id;
+        if let Some(state) = engine.buffer_manager.get_mut(bid) {
+            state.git_diff = vec![
+                None,
+                None,
+                Some(git::GitLineStatus::Modified),
+                Some(git::GitLineStatus::Modified),
+                None,
+                None,
+                None,
+                Some(git::GitLineStatus::Added),
+                None,
+                None,
+            ];
+        }
+        engine.view_mut().cursor.line = 0;
+        engine.jump_next_hunk();
+        assert_eq!(engine.view().cursor.line, 2); // first changed region
+
+        engine.jump_next_hunk();
+        assert_eq!(engine.view().cursor.line, 7); // second changed region
+
+        engine.jump_next_hunk();
+        assert!(engine.message.contains("No more hunks"));
+    }
+
+    #[test]
+    fn test_jump_prev_hunk_with_git_diff() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().content = ropey::Rope::from_str("a\nb\nc\nd\ne\nf\ng\nh\ni\nj\n");
+        engine.update_syntax();
+        let bid = engine.active_window().buffer_id;
+        if let Some(state) = engine.buffer_manager.get_mut(bid) {
+            state.git_diff = vec![
+                None,
+                None,
+                Some(git::GitLineStatus::Modified),
+                Some(git::GitLineStatus::Modified),
+                None,
+                None,
+                None,
+                Some(git::GitLineStatus::Added),
+                None,
+                None,
+            ];
+        }
+        engine.view_mut().cursor.line = 9;
+        engine.jump_prev_hunk();
+        assert_eq!(engine.view().cursor.line, 7); // second changed region start
+
+        engine.jump_prev_hunk();
+        assert_eq!(engine.view().cursor.line, 2); // first changed region start
+
+        engine.jump_prev_hunk();
+        assert!(engine.message.contains("No more hunks"));
+    }
+
+    #[test]
+    fn test_gd_uppercase_opens_diff_peek() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().content = ropey::Rope::from_str("line1\nline2\n");
+        engine.update_syntax();
+        // First keypress sets pending_key to 'g'.
+        engine.handle_key("g", Some('g'), false);
+        // Second keypress 'D' should trigger open_diff_peek.
+        engine.handle_key("D", Some('D'), false);
+        // No diff hunks → should show "No changes" message.
+        assert!(
+            engine.message.contains("No changes") || engine.message.contains("No diff"),
+            "got: {}",
+            engine.message
+        );
+    }
+
+    #[test]
+    fn test_diff_peek_command() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().content = ropey::Rope::from_str("line1\nline2\n");
+        engine.update_syntax();
+        engine.execute_command("DiffPeek");
+        assert!(
+            engine.message.contains("No changes") || engine.message.contains("No diff"),
+            "got: {}",
+            engine.message
+        );
+    }
+
+    #[test]
+    fn test_deleted_git_line_status_variant_exists() {
+        // Verify the Deleted variant is usable (compile-time check + runtime assertion).
+        let status = git::GitLineStatus::Deleted;
+        assert_eq!(status, git::GitLineStatus::Deleted);
+        assert_ne!(status, git::GitLineStatus::Added);
+        assert_ne!(status, git::GitLineStatus::Modified);
     }
 
     // ─── Paragraph text objects (ip / ap) ───────────────────────────────────
@@ -37210,6 +39171,32 @@ mod tests {
         engine.handle_key("a", Some('a'), false);
         let active_id = engine.active_buffer_id();
         assert!(engine.lsp_dirty_buffers.contains_key(&active_id));
+    }
+
+    #[test]
+    fn test_undo_redo_marks_lsp_dirty() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello");
+        // Type something to create an undo entry.
+        press_char(&mut engine, 'i');
+        press_char(&mut engine, 'x');
+        press_special(&mut engine, "Escape");
+        // Clear LSP dirty flag.
+        engine.lsp_dirty_buffers.clear();
+        // Undo should mark the buffer as LSP-dirty.
+        engine.undo();
+        let active_id = engine.active_buffer_id();
+        assert!(
+            engine.lsp_dirty_buffers.contains_key(&active_id),
+            "undo should mark buffer as LSP-dirty"
+        );
+        // Clear and test redo.
+        engine.lsp_dirty_buffers.clear();
+        engine.redo();
+        assert!(
+            engine.lsp_dirty_buffers.contains_key(&active_id),
+            "redo should mark buffer as LSP-dirty"
+        );
     }
 
     // =======================================================================
@@ -38498,6 +40485,53 @@ mod tests {
     }
 
     #[test]
+    fn test_myers_diff_two_change_blocks() {
+        // Mirrors the README vs README2 scenario: two distinct change blocks
+        // separated by 2 unchanged lines — must NOT merge into one block.
+        let a = &[
+            "# DemoConsoleGame",
+            "Simple demo game",
+            "",
+            "In the end he did get a degree",
+            "",
+            "Now he's doing a masters",
+            "",
+            "So, now the only point",
+        ];
+        let b = &[
+            "# DemoConsoleGame",
+            "Simple demo game",
+            "",
+            "In the end he did ge asdfadt a degree",
+            "",
+            "",
+            "asds",
+            "",
+            "zdxfasd",
+            "",
+            "",
+            "Now he's doing a masters",
+            "",
+            "asdfsd",
+            "",
+            "So, now the only point",
+        ];
+        let (da, db) = lcs_diff(a, b);
+        // Line 3 of a should be Removed, line 3 of b should be Added (changed line).
+        assert_eq!(da[3], DiffLine::Removed);
+        assert_eq!(db[3], DiffLine::Added);
+        // Lines 5-10 of b should be Added (inserted block).
+        for i in 5..11 {
+            assert_eq!(db[i], DiffLine::Added, "b[{}] should be Added", i);
+        }
+        // a[5] "Now he's doing..." should be Same (not merged).
+        assert_eq!(da[5], DiffLine::Same);
+        assert_eq!(db[11], DiffLine::Same);
+        // b[13] "asdfsd" should be Added (second change block).
+        assert_eq!(db[13], DiffLine::Added);
+    }
+
+    #[test]
     fn test_lcs_diff_changed_line() {
         let a = &["hello world"];
         let b = &["hello rust"];
@@ -38511,6 +40545,94 @@ mod tests {
         let (da, db) = lcs_diff(&[], &[]);
         assert!(da.is_empty());
         assert!(db.is_empty());
+    }
+
+    #[test]
+    fn test_merge_short_same_runs_blank_lines() {
+        // Blank lines inside an added block should not fragment it.
+        let a = &["header", "old", "footer"];
+        let b = &["header", "new1", "", "new2", "", "new3", "footer"];
+        let (da, mut db) = lcs_diff(a, b);
+        merge_short_same_runs(&mut db, DiffLine::Added);
+        // All lines between header and footer should be Added on the b side.
+        assert_eq!(db[0], DiffLine::Same, "header");
+        for i in 1..6 {
+            assert_eq!(db[i], DiffLine::Added, "line {i} should be Added");
+        }
+        assert_eq!(db[6], DiffLine::Same, "footer");
+        // A side should still have Removed for 'old'.
+        assert_eq!(da[0], DiffLine::Same);
+        assert_eq!(da[1], DiffLine::Removed);
+        assert_eq!(da[2], DiffLine::Same);
+    }
+
+    #[test]
+    fn test_merge_short_same_runs_common_lines() {
+        // Short runs of common lines (braces, imports) between changes should
+        // be absorbed into the surrounding change region.
+        let a = &["header", "}", "footer"];
+        let b = &["header", "new1", "}", "new2", "footer"];
+        let (_da, mut db) = lcs_diff(a, b);
+        merge_short_same_runs(&mut db, DiffLine::Added);
+        assert_eq!(db[0], DiffLine::Same, "header");
+        // "new1", "}", "new2" should all be Added (} is a short Same island).
+        for i in 1..4 {
+            assert_eq!(db[i], DiffLine::Added, "line {i} should be Added");
+        }
+        assert_eq!(db[4], DiffLine::Same, "footer");
+    }
+
+    #[test]
+    fn test_build_aligned_diff_unequal_same_tails() {
+        // Regression: when one side has more Same lines than the other,
+        // build_aligned_diff must not loop forever.
+        use DiffLine::*;
+        let da = vec![Same, Same, Removed, Same, Same];
+        let db = vec![Same, Same, Same];
+        // This used to hang — the fix ensures progress when one side is
+        // exhausted while the other still has Same lines.
+        let (aa, ab) = build_aligned_diff(&da, &db);
+        assert_eq!(aa.len(), ab.len());
+    }
+
+    #[test]
+    fn test_build_aligned_diff_basic() {
+        use DiffLine::*;
+        let da = vec![Same, Removed, Same];
+        let db = vec![Same, Added, Same];
+        let (aa, ab) = build_aligned_diff(&da, &db);
+        assert_eq!(aa.len(), ab.len());
+        // First and last should map to source lines.
+        assert!(aa[0].source_line.is_some());
+        assert!(ab[0].source_line.is_some());
+    }
+
+    #[test]
+    fn test_lcs_diff_large_files_with_small_diff() {
+        // Regression: files >5000 lines used to return all-Same due to MAX_LINES guard.
+        let mut a_lines: Vec<String> = (0..8000).map(|i| format!("line {i}")).collect();
+        let mut b_lines = a_lines.clone();
+        // Insert 3 new lines in the middle of b.
+        b_lines.insert(4000, "new line 1".to_string());
+        b_lines.insert(4001, "new line 2".to_string());
+        b_lines.insert(4002, "new line 3".to_string());
+        // Also change one line.
+        a_lines[100] = "original line 100".to_string();
+        b_lines[100] = "modified line 100".to_string();
+
+        let a_refs: Vec<&str> = a_lines.iter().map(String::as_str).collect();
+        let b_refs: Vec<&str> = b_lines.iter().map(String::as_str).collect();
+        let (da, db) = lcs_diff(&a_refs, &b_refs);
+
+        // Should detect actual changes, not return all-Same.
+        let a_changes = da.iter().filter(|d| **d != DiffLine::Same).count();
+        let b_changes = db.iter().filter(|d| **d != DiffLine::Same).count();
+        assert!(
+            a_changes > 0 || b_changes > 0,
+            "diff should detect changes in large files"
+        );
+        // Specifically: b should have 3 Added lines + 1 changed line.
+        assert!(b_changes >= 3, "b should have at least 3 Added lines");
     }
 
     // ─── cmd_diffthis / cmd_diffoff / cmd_diffsplit tests ─────────────────────
@@ -38581,6 +40703,459 @@ mod tests {
         );
         assert!(engine.diff_window_pair.is_some());
         assert!(!engine.diff_results.is_empty());
+    }
+
+    // ── Diff toolbar + navigation tests ──────────────────────────────────────
+
+    #[test]
+    fn test_diff_change_regions() {
+        let mut engine = Engine::new();
+        let dir = std::env::temp_dir().join("vimcode_diff_regions");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f1 = dir.join("a_regions.txt");
+        let f2 = dir.join("b_regions.txt");
+        std::fs::write(&f1, "same\nalpha\nsame\nsame\nsame\nsame\nbeta\nsame\n").unwrap();
+        std::fs::write(&f2, "same\nALPHA\nsame\nsame\nsame\nsame\nBETA\nsame\n").unwrap();
+
+        engine
+            .open_file_with_mode(&f1, OpenMode::Permanent)
+            .unwrap();
+        engine.execute_command(&format!("diffsplit {}", f2.display()));
+
+        let win_id = engine.active_window_id();
+        let regions = engine.diff_change_regions(win_id);
+        assert_eq!(regions.len(), 2, "should detect two change regions");
+        assert_eq!(regions[0], (1, 1));
+        assert_eq!(regions[1], (6, 6));
+    }
+
+    #[test]
+    fn test_diff_jump_next_prev() {
+        let mut engine = Engine::new();
+        let dir = std::env::temp_dir().join("vimcode_diff_jump");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f1 = dir.join("a_jump.txt");
+        let f2 = dir.join("b_jump.txt");
+        std::fs::write(&f1, "same\nold1\nsame\nsame\nsame\nsame\nold2\nsame\n").unwrap();
+        std::fs::write(&f2, "same\nnew1\nsame\nsame\nsame\nsame\nnew2\nsame\n").unwrap();
+
+        engine
+            .open_file_with_mode(&f1, OpenMode::Permanent)
+            .unwrap();
+        engine.execute_command(&format!("diffsplit {}", f2.display()));
+
+        // Cursor starts at line 0.
+        engine.view_mut().cursor.line = 0;
+        engine.view_mut().cursor.col = 0;
+
+        // Jump to next change — should land on first change (line 1).
+        engine.jump_next_hunk();
+        assert_eq!(engine.view().cursor.line, 1);
+
+        // Jump to next change — should land on second change (line 6).
+        engine.jump_next_hunk();
+        assert_eq!(engine.view().cursor.line, 6);
+
+        // Jump to next change — should wrap to first (line 1).
+        engine.jump_next_hunk();
+        assert_eq!(engine.view().cursor.line, 1);
+        assert!(engine.message.contains("Wrapped"));
+
+        // Jump to prev change — should wrap to last (line 6).
+        engine.jump_prev_hunk();
+        assert_eq!(engine.view().cursor.line, 6);
+    }
+
+    #[test]
+    fn test_diff_toggle_hide_unchanged() {
+        let mut engine = Engine::new();
+        let dir = std::env::temp_dir().join("vimcode_diff_fold");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f1 = dir.join("a_fold.txt");
+        let f2 = dir.join("b_fold.txt");
+        // 10 same lines, then 1 changed, then 10 same lines.
+        let same_block = "s\n".repeat(10);
+        std::fs::write(&f1, format!("{same_block}old\n{same_block}")).unwrap();
+        std::fs::write(&f2, format!("{same_block}new\n{same_block}")).unwrap();
+
+        engine
+            .open_file_with_mode(&f1, OpenMode::Permanent)
+            .unwrap();
+        engine.execute_command(&format!("diffsplit {}", f2.display()));
+
+        // diff_unchanged_hidden is auto-enabled by diffsplit.
+        assert!(engine.diff_unchanged_hidden);
+
+        // Both windows should have folds.
+        let (a, b) = engine.diff_window_pair.unwrap();
+        let a_folds = &engine.windows.get(&a).unwrap().view.folds;
+        let b_folds = &engine.windows.get(&b).unwrap().view.folds;
+        assert!(!a_folds.is_empty(), "window A should have folds");
+        assert!(!b_folds.is_empty(), "window B should have folds");
+
+        // Toggle back — folds should be cleared.
+        engine.diff_toggle_hide_unchanged();
+        assert!(!engine.diff_unchanged_hidden);
+        let a_folds = &engine.windows.get(&a).unwrap().view.folds;
+        let b_folds = &engine.windows.get(&b).unwrap().view.folds;
+        assert!(a_folds.is_empty(), "window A folds should be cleared");
+        assert!(b_folds.is_empty(), "window B folds should be cleared");
+    }
+
+    #[test]
+    fn test_diff_aligned_scroll_sync() {
+        let mut engine = Engine::new();
+        let dir = std::env::temp_dir().join("vimcode_diff_aligned_scroll");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f1 = dir.join("a_scroll.txt");
+        let f2 = dir.join("b_scroll.txt");
+        // Left: 5 same lines, then "old", then 5 same lines.
+        // Right: 5 same lines, then 10 new lines, then "new", then 5 same lines.
+        // This creates a large padding block on the left side.
+        let same5 = "s\n".repeat(5);
+        let added10 = "added\n".repeat(10);
+        std::fs::write(&f1, format!("{same5}old\n{same5}")).unwrap();
+        std::fs::write(&f2, format!("{same5}{added10}new\n{same5}")).unwrap();
+
+        engine
+            .open_file_with_mode(&f1, OpenMode::Permanent)
+            .unwrap();
+        engine.execute_command(&format!("diffsplit {}", f2.display()));
+
+        let (a, b) = engine.diff_window_pair.unwrap();
+        // Both windows should have aligned data.
+        assert!(engine.diff_aligned.contains_key(&a));
+        assert!(engine.diff_aligned.contains_key(&b));
+
+        // Scroll the right window (b) down and sync.
+        engine.active_tab_mut().active_window = b;
+        engine.windows.get_mut(&b).unwrap().view.scroll_top = 8;
+        engine.sync_scroll_binds();
+
+        // Left window should have been mapped through aligned data,
+        // not set to the raw scroll_top value of 8.
+        let a_scroll = engine.windows.get(&a).unwrap().view.scroll_top;
+        // The left file only has 11 lines (5 same + "old" + 5 same),
+        // so a raw copy of 8 would be near the end. The aligned mapping
+        // should produce a smaller value since the padding absorbs the offset.
+        assert!(
+            a_scroll < 8,
+            "expected aligned scroll mapping to give a_scroll < 8, got {a_scroll}"
+        );
+    }
+
+    #[test]
+    fn test_diff_current_change_index() {
+        let mut engine = Engine::new();
+        let dir = std::env::temp_dir().join("vimcode_diff_idx");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f1 = dir.join("a_idx.txt");
+        let f2 = dir.join("b_idx.txt");
+        std::fs::write(&f1, "s\nold1\ns\ns\ns\ns\nold2\ns\ns\ns\ns\nold3\ns\n").unwrap();
+        std::fs::write(&f2, "s\nnew1\ns\ns\ns\ns\nnew2\ns\ns\ns\ns\nnew3\ns\n").unwrap();
+
+        engine
+            .open_file_with_mode(&f1, OpenMode::Permanent)
+            .unwrap();
+        engine.execute_command(&format!("diffsplit {}", f2.display()));
+
+        // At line 0 (before first change).
+        engine.view_mut().cursor.line = 0;
+        let idx = engine.diff_current_change_index();
+        assert_eq!(idx, Some((1, 3))); // closest after is first change
+
+        // At line 1 (in first change).
+        engine.view_mut().cursor.line = 1;
+        let idx = engine.diff_current_change_index();
+        assert_eq!(idx, Some((1, 3)));
+
+        // At line 6 (in second change).
+        engine.view_mut().cursor.line = 6;
+        let idx = engine.diff_current_change_index();
+        assert_eq!(idx, Some((2, 3)));
+
+        // At line 11 (in third change).
+        engine.view_mut().cursor.line = 11;
+        let idx = engine.diff_current_change_index();
+        assert_eq!(idx, Some((3, 3)));
+    }
+
+    #[test]
+    fn test_jump_hunk_delegates_in_diff_mode() {
+        let mut engine = Engine::new();
+        let dir = std::env::temp_dir().join("vimcode_diff_delegate");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f1 = dir.join("a_deleg.txt");
+        let f2 = dir.join("b_deleg.txt");
+        std::fs::write(&f1, "same\nold\nsame\n").unwrap();
+        std::fs::write(&f2, "same\nnew\nsame\n").unwrap();
+
+        engine
+            .open_file_with_mode(&f1, OpenMode::Permanent)
+            .unwrap();
+        engine.execute_command(&format!("diffsplit {}", f2.display()));
+
+        // ]c should use diff_results, not git_diff.
+        engine.view_mut().cursor.line = 0;
+        engine.jump_next_hunk();
+        assert_eq!(
+            engine.view().cursor.line,
+            1,
+            "]c should jump to diff change region"
+        );
+    }
+
+    #[test]
+    fn test_diffthis_toolbar_and_scroll_sync() {
+        let mut engine = Engine::new();
+        let dir = std::env::temp_dir().join("vimcode_diffthis_toolbar");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f1 = dir.join("a_dt.txt");
+        let f2 = dir.join("b_dt.txt");
+        std::fs::write(&f1, "same\nold1\nsame\nsame\nsame\nsame\nold2\nsame\n").unwrap();
+        std::fs::write(&f2, "same\nnew1\nsame\nsame\nsame\nsame\nnew2\nsame\n").unwrap();
+
+        // Open first file and run :diffthis.
+        engine
+            .open_file_with_mode(&f1, OpenMode::Permanent)
+            .unwrap();
+        let win_a = engine.active_window_id();
+        engine.execute_command("diffthis");
+        // Placeholder state: a == a, is_in_diff_view should be false.
+        assert!(!engine.is_in_diff_view());
+
+        // Open second file in a split and run :diffthis.
+        engine.execute_command(&format!("vs {}", f2.display()));
+        let win_b = engine.active_window_id();
+        assert_ne!(win_a, win_b);
+        engine.execute_command("diffthis");
+
+        // Now diff should be active.
+        assert!(engine.is_in_diff_view());
+        assert!(engine.diff_window_pair.is_some());
+        let (a, b) = engine.diff_window_pair.unwrap();
+        assert_ne!(a, b);
+
+        // diff_results should be populated.
+        assert!(!engine.diff_results.is_empty());
+        let regions = engine.diff_change_regions(engine.active_window_id());
+        assert_eq!(regions.len(), 2, "should detect two change regions");
+
+        // Scroll binding should be set up (added by diffthis).
+        assert!(
+            engine
+                .scroll_bind_pairs
+                .iter()
+                .any(|&(x, y)| (x == a && y == b) || (x == b && y == a)),
+            "diffthis should register scroll binding"
+        );
+
+        // diff_current_change_index should return data for toolbar.
+        let idx = engine.diff_current_change_index();
+        assert!(idx.is_some(), "toolbar should have change index data");
+    }
+
+    #[test]
+    fn test_diffthis_across_editor_groups() {
+        let mut engine = Engine::new();
+        let dir = std::env::temp_dir().join("vimcode_diffthis_groups");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f1 = dir.join("a_grp.txt");
+        let f2 = dir.join("b_grp.txt");
+        std::fs::write(&f1, "same\nold\nsame\n").unwrap();
+        std::fs::write(&f2, "same\nnew\nsame\n").unwrap();
+
+        // Open first file and mark for diff.
+        engine
+            .open_file_with_mode(&f1, OpenMode::Permanent)
+            .unwrap();
+        let win_a = engine.active_window_id();
+        engine.execute_command("diffthis");
+
+        // Split into a new editor group and open the second file.
+        engine.open_editor_group(SplitDirection::Vertical);
+        engine
+            .open_file_with_mode(&f2, OpenMode::Permanent)
+            .unwrap();
+        let win_b = engine.active_window_id();
+        assert_ne!(win_a, win_b);
+
+        // Mark second window for diff.
+        engine.execute_command("diffthis");
+        assert!(engine.is_in_diff_view());
+        let (a, b) = engine.diff_window_pair.unwrap();
+        assert_ne!(a, b);
+
+        // Verify both windows are in different groups.
+        let group_ids = engine.group_layout.group_ids();
+        assert!(group_ids.len() >= 2, "should have at least 2 editor groups");
+
+        // Verify each group contains one of the diff windows.
+        for &gid in &group_ids {
+            if let Some(group) = engine.editor_groups.get(&gid) {
+                let wids = group.active_tab().layout.window_ids();
+                let has_diff = wids.contains(&a) || wids.contains(&b);
+                if has_diff {
+                    // This group should be detected by is_in_diff_view's logic
+                    assert!(engine.is_in_diff_view(), "diff view should be detected");
+                }
+            }
+        }
+
+        // Verify diff results have data.
+        let regions = engine.diff_change_regions(b);
+        assert!(!regions.is_empty(), "should detect changes");
+    }
+
+    // ── cmd_git_diff_split tests ────────────────────────────────────────────
+
+    /// Create a temp git repo with one committed file, then modify it.
+    /// Returns (repo_dir, file_path).
+    fn setup_git_diff_split_repo(suffix: &str) -> (PathBuf, PathBuf) {
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!("vimcode_gds_{suffix}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // init + commit
+        Command::new("git")
+            .args(["init"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        let file = dir.join("hello.rs");
+        std::fs::write(&file, "fn main() {\n    println!(\"hello\");\n}\n").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        // Modify the file (working copy differs from HEAD)
+        std::fs::write(
+            &file,
+            "fn main() {\n    println!(\"hello world\");\n    println!(\"new line\");\n}\n",
+        )
+        .unwrap();
+        (dir, file)
+    }
+
+    #[test]
+    fn test_git_diff_split_creates_pair() {
+        let (dir, file) = setup_git_diff_split_repo("creates_pair");
+        let mut engine = Engine::new();
+        engine.cwd = dir.clone();
+        let result = engine.cmd_git_diff_split(&file);
+        assert!(
+            !matches!(result, EngineAction::Error),
+            "cmd_git_diff_split should succeed: {}",
+            engine.message
+        );
+        // Should have 2 windows
+        assert_eq!(engine.active_tab().layout.window_ids().len(), 2);
+        // diff_window_pair should be set
+        assert!(engine.diff_window_pair.is_some());
+        // scroll_bind_pairs should have the pair
+        assert!(!engine.scroll_bind_pairs.is_empty());
+        // diff_results should be populated
+        assert!(!engine.diff_results.is_empty());
+        // Both windows should have diff results with non-Same entries
+        let (left, right) = engine.diff_window_pair.unwrap();
+        let left_results = engine.diff_results.get(&left).expect("left diff_results");
+        let right_results = engine.diff_results.get(&right).expect("right diff_results");
+        let left_has_changes = left_results.iter().any(|d| *d != DiffLine::Same);
+        let right_has_changes = right_results.iter().any(|d| *d != DiffLine::Same);
+        assert!(
+            left_has_changes,
+            "left should have Added/Removed entries, got {:?}",
+            left_results
+        );
+        assert!(
+            right_has_changes,
+            "right should have Added/Removed entries, got {:?}",
+            right_results
+        );
+    }
+
+    #[test]
+    fn test_git_diff_split_left_readonly() {
+        let (dir, file) = setup_git_diff_split_repo("left_ro");
+        let mut engine = Engine::new();
+        engine.cwd = dir.clone();
+        engine.cmd_git_diff_split(&file);
+        let (left_win, _right_win) = engine.diff_window_pair.unwrap();
+        let left_buf_id = engine.windows.get(&left_win).unwrap().buffer_id;
+        let left_state = engine.buffer_manager.get(left_buf_id).unwrap();
+        assert!(left_state.read_only, "HEAD buffer should be read-only");
+    }
+
+    #[test]
+    fn test_git_diff_split_head_scratch_name() {
+        let (dir, file) = setup_git_diff_split_repo("scratch");
+        let mut engine = Engine::new();
+        engine.cwd = dir.clone();
+        engine.cmd_git_diff_split(&file);
+        let (left_win, _) = engine.diff_window_pair.unwrap();
+        let left_buf_id = engine.windows.get(&left_win).unwrap().buffer_id;
+        let left_state = engine.buffer_manager.get(left_buf_id).unwrap();
+        let name = left_state.scratch_name.as_deref().unwrap_or("");
+        assert!(
+            name.contains("(HEAD)"),
+            "scratch_name should contain (HEAD), got: {name}"
+        );
+    }
+
+    #[test]
+    fn test_git_diff_split_untracked_file_errors() {
+        use std::process::Command;
+        let dir = std::env::temp_dir().join("vimcode_gds_untracked");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        let file = dir.join("new_file.txt");
+        std::fs::write(&file, "untracked content\n").unwrap();
+
+        let mut engine = Engine::new();
+        engine.cwd = dir.clone();
+        let result = engine.cmd_git_diff_split(&file);
+        assert!(
+            matches!(result, EngineAction::Error),
+            "untracked file should error"
+        );
+        assert!(engine.message.contains("no HEAD version"));
+    }
+
+    #[test]
+    fn test_close_window_cleans_diff_state() {
+        let (dir, file) = setup_git_diff_split_repo("close_win");
+        let mut engine = Engine::new();
+        engine.cwd = dir.clone();
+        engine.cmd_git_diff_split(&file);
+        assert!(engine.diff_window_pair.is_some());
+        // Close active window — should clean up diff state
+        engine.close_window();
+        assert!(
+            engine.diff_window_pair.is_none(),
+            "diff_window_pair should be cleared after closing a diff window"
+        );
+        assert!(engine.diff_results.is_empty());
     }
 
     // ── Help command tests ──────────────────────────────────────────────────
@@ -40586,6 +43161,74 @@ mod tests {
         assert_ne!(r2, EngineAction::Error);
     }
 
+    #[test]
+    fn test_sc_branch_picker_open_close() {
+        let mut engine = make_sc_engine_with_files();
+        engine.sc_has_focus = true;
+        assert!(!engine.sc_branch_picker_open);
+        engine.handle_sc_key("b", false, None);
+        assert!(engine.sc_branch_picker_open);
+        // Escape closes it
+        engine.handle_sc_key("Escape", false, None);
+        assert!(!engine.sc_branch_picker_open);
+        assert!(engine.sc_branch_picker_query.is_empty());
+    }
+
+    #[test]
+    fn test_sc_branch_picker_typing_filters() {
+        let mut engine = make_sc_engine_with_files();
+        engine.sc_has_focus = true;
+        engine.handle_sc_key("b", false, None);
+        assert!(engine.sc_branch_picker_open);
+        // Type a query character
+        engine.handle_sc_key("", false, Some('m'));
+        assert_eq!(engine.sc_branch_picker_query, "m");
+        engine.handle_sc_key("", false, Some('a'));
+        assert_eq!(engine.sc_branch_picker_query, "ma");
+        // Backspace removes
+        engine.handle_sc_key("BackSpace", false, None);
+        assert_eq!(engine.sc_branch_picker_query, "m");
+    }
+
+    #[test]
+    fn test_sc_branch_create_mode() {
+        let mut engine = make_sc_engine_with_files();
+        engine.sc_has_focus = true;
+        engine.handle_sc_key("B", false, None);
+        assert!(engine.sc_branch_create_mode);
+        // Type branch name
+        engine.handle_sc_key("", false, Some('f'));
+        engine.handle_sc_key("", false, Some('o'));
+        engine.handle_sc_key("", false, Some('o'));
+        assert_eq!(engine.sc_branch_create_input, "foo");
+        // Escape cancels
+        engine.handle_sc_key("Escape", false, None);
+        assert!(!engine.sc_branch_create_mode);
+        assert!(engine.sc_branch_create_input.is_empty());
+    }
+
+    #[test]
+    fn test_sc_help_toggle() {
+        let mut engine = make_sc_engine_with_files();
+        engine.sc_has_focus = true;
+        assert!(!engine.sc_help_open);
+        engine.handle_sc_key("?", false, None);
+        assert!(engine.sc_help_open);
+        // Any key closes
+        engine.handle_sc_key("j", false, None);
+        assert!(!engine.sc_help_open);
+    }
+
+    #[test]
+    fn test_sc_help_escape_closes() {
+        let mut engine = make_sc_engine_with_files();
+        engine.sc_has_focus = true;
+        engine.handle_sc_key("?", false, None);
+        assert!(engine.sc_help_open);
+        engine.handle_sc_key("Escape", false, None);
+        assert!(!engine.sc_help_open);
+    }
+
     // ─── sc_visual_row_to_flat tests (click-math correctness) ─────────────────
 
     /// make_sc_engine_with_files gives: 1 staged file + 1 unstaged file,
@@ -41403,5 +44046,174 @@ mod tests {
         engine.handle_key("k", Some('k'), true);
         assert_eq!(engine.command_buffer, "hel");
         assert_eq!(engine.command_cursor, 3);
+    }
+
+    // ─── Visual mode Ctrl-D / Ctrl-U tests ─────────────────────────────
+
+    #[test]
+    fn test_visual_ctrl_d_extends_selection_down() {
+        let mut engine = Engine::new();
+        // 20 lines so half-page is meaningful
+        let text = (0..20)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        engine.buffer_mut().insert(0, &text);
+        engine.view_mut().viewport_lines = 10;
+        // Enter visual mode on line 0
+        press_char(&mut engine, 'v');
+        assert!(matches!(engine.mode, Mode::Visual));
+        // Ctrl-D should move cursor down by half page (5 lines), extending selection
+        press_ctrl(&mut engine, 'd');
+        assert!(matches!(engine.mode, Mode::Visual));
+        assert_eq!(engine.view().cursor.line, 5);
+        // Buffer should be unchanged (not deleted)
+        assert_eq!(engine.buffer().len_lines(), 20);
+    }
+
+    #[test]
+    fn test_visual_ctrl_u_extends_selection_up() {
+        let mut engine = Engine::new();
+        let text = (0..20)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        engine.buffer_mut().insert(0, &text);
+        engine.view_mut().viewport_lines = 10;
+        // Move to line 10
+        engine.view_mut().cursor.line = 10;
+        // Enter visual mode
+        press_char(&mut engine, 'v');
+        assert!(matches!(engine.mode, Mode::Visual));
+        // Ctrl-U should move cursor up by half page (5 lines), extending selection
+        press_ctrl(&mut engine, 'u');
+        assert!(matches!(engine.mode, Mode::Visual));
+        assert_eq!(engine.view().cursor.line, 5);
+        // Buffer should be unchanged (case not toggled)
+        let content = engine.buffer().to_string();
+        assert!(content.starts_with("line 0"));
+    }
+
+    // ─── Dialog system tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_dialog_show_and_escape() {
+        let mut e = Engine::new();
+        e.buffer_mut().insert(0, "hello");
+        e.show_dialog(
+            "test",
+            "Test Dialog",
+            vec!["Body line".into()],
+            vec![DialogButton {
+                label: "OK".into(),
+                hotkey: 'o',
+                action: "ok".into(),
+            }],
+        );
+        assert!(e.dialog.is_some());
+        // Escape dismisses.
+        e.handle_key("Escape", None, false);
+        assert!(e.dialog.is_none());
+    }
+
+    #[test]
+    fn test_dialog_hotkey() {
+        let mut e = Engine::new();
+        e.show_dialog(
+            "test",
+            "Choose",
+            vec!["Pick one".into()],
+            vec![
+                DialogButton {
+                    label: "Recover".into(),
+                    hotkey: 'r',
+                    action: "recover".into(),
+                },
+                DialogButton {
+                    label: "Delete".into(),
+                    hotkey: 'd',
+                    action: "delete".into(),
+                },
+            ],
+        );
+        // Press 'r' → hotkey should dismiss.
+        e.handle_key("", Some('r'), false);
+        assert!(e.dialog.is_none());
+    }
+
+    #[test]
+    fn test_dialog_arrow_nav_and_enter() {
+        let mut e = Engine::new();
+        e.show_dialog(
+            "test",
+            "Choose",
+            vec![],
+            vec![
+                DialogButton {
+                    label: "A".into(),
+                    hotkey: 'a',
+                    action: "a_action".into(),
+                },
+                DialogButton {
+                    label: "B".into(),
+                    hotkey: 'b',
+                    action: "b_action".into(),
+                },
+                DialogButton {
+                    label: "C".into(),
+                    hotkey: 'c',
+                    action: "c_action".into(),
+                },
+            ],
+        );
+        assert_eq!(e.dialog.as_ref().unwrap().selected, 0);
+        // Move right.
+        e.handle_key("Right", None, false);
+        assert_eq!(e.dialog.as_ref().unwrap().selected, 1);
+        // Move right again.
+        e.handle_key("Right", None, false);
+        assert_eq!(e.dialog.as_ref().unwrap().selected, 2);
+        // Right at end → stays at 2.
+        e.handle_key("Right", None, false);
+        assert_eq!(e.dialog.as_ref().unwrap().selected, 2);
+        // Move left.
+        e.handle_key("Left", None, false);
+        assert_eq!(e.dialog.as_ref().unwrap().selected, 1);
+        // Enter confirms the selected button.
+        e.handle_key("Return", None, false);
+        assert!(e.dialog.is_none());
+    }
+
+    #[test]
+    fn test_dialog_blocks_normal_keys() {
+        let mut e = Engine::new();
+        e.buffer_mut().insert(0, "hello");
+        e.show_dialog(
+            "test",
+            "Block",
+            vec![],
+            vec![DialogButton {
+                label: "OK".into(),
+                hotkey: 'o',
+                action: "ok".into(),
+            }],
+        );
+        // Press 'x' which would normally delete a char — dialog should consume it.
+        e.handle_key("", Some('x'), false);
+        assert!(e.dialog.is_some()); // Dialog still open.
+        assert_eq!(e.buffer().to_string(), "hello"); // Buffer unchanged.
+    }
+
+    #[test]
+    fn test_show_error_dialog() {
+        let mut e = Engine::new();
+        e.show_error_dialog("Error", "Something went wrong");
+        let dialog = e.dialog.as_ref().unwrap();
+        assert_eq!(dialog.tag, "error");
+        assert_eq!(dialog.title, "Error");
+        assert_eq!(dialog.body, vec!["Something went wrong"]);
+        assert_eq!(dialog.buttons.len(), 1);
+        assert_eq!(dialog.buttons[0].hotkey, 'o');
+        assert_eq!(dialog.buttons[0].action, "ok");
     }
 }

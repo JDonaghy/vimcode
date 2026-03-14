@@ -14,8 +14,8 @@
 
 use crate::core::buffer::Buffer;
 use crate::core::dap::DapVariable;
+use crate::core::engine::{AlignedDiffEntry, DiffLine, Engine, SearchDirection};
 pub use crate::core::engine::{BottomPanelKind, DebugSidebarSection};
-use crate::core::engine::{DiffLine, Engine, SearchDirection};
 use crate::core::lsp::SignatureHelpData;
 use crate::core::settings::LineNumberMode;
 pub use crate::core::settings::{SettingDef, SettingType, SETTING_DEFS};
@@ -70,6 +70,31 @@ impl Color {
             _ => return None,
         };
         Some(Self { r, g, b })
+    }
+
+    /// Parse `#rrggbbaa` and alpha-blend against `bg`. If no alpha component
+    /// is present, behaves identically to `try_from_hex`.
+    pub fn try_from_hex_over(s: &str, bg: Color) -> Option<Self> {
+        let s = s.trim_start_matches('#');
+        match s.len() {
+            8 => {
+                let r = u8::from_str_radix(&s[0..2], 16).ok()?;
+                let g = u8::from_str_radix(&s[2..4], 16).ok()?;
+                let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+                let a = u8::from_str_radix(&s[6..8], 16).ok()?;
+                // Enforce minimum alpha so diff backgrounds stay visible in terminals.
+                let alpha = (a as f64 / 255.0).max(0.25);
+                let blend = |fg: u8, bg: u8| -> u8 {
+                    (fg as f64 * alpha + bg as f64 * (1.0 - alpha)).round() as u8
+                };
+                Some(Self {
+                    r: blend(r, bg.r),
+                    g: blend(g, bg.g),
+                    b: blend(b, bg.b),
+                })
+            }
+            _ => Self::try_from_hex(s),
+        }
     }
 
     /// Blend this colour toward white by `amount` (0.0 = unchanged, 1.0 = white).
@@ -327,6 +352,17 @@ pub struct TabInfo {
 
 // ─── EditorGroupSplitData ─────────────────────────────────────────────────────
 
+/// Diff toolbar data shown in the tab bar when a diff view is active.
+#[derive(Debug, Clone)]
+pub struct DiffToolbarData {
+    /// Label like "2 of 5", or `None` if cursor is not near a change.
+    pub change_label: Option<String>,
+    /// Total number of change regions.
+    pub total_changes: usize,
+    /// Whether unchanged sections are currently hidden (folded).
+    pub unchanged_hidden: bool,
+}
+
 /// Tab bar + bounds for one editor group.
 #[derive(Debug, Clone)]
 pub struct GroupTabBar {
@@ -334,6 +370,8 @@ pub struct GroupTabBar {
     pub tabs: Vec<TabInfo>,
     /// Content area of this group (tab bar drawn at top edge).
     pub bounds: WindowRect,
+    /// Diff toolbar data, present when the group is showing a diff view.
+    pub diff_toolbar: Option<DiffToolbarData>,
 }
 
 /// One segment in the breadcrumb bar (either a path component or a symbol).
@@ -632,6 +670,23 @@ pub struct SourceControlData {
     pub commit_input_active: bool,
     /// Which action button is keyboard-focused (0=Commit 1=Push 2=Pull 3=Sync), or None.
     pub button_focused: Option<usize>,
+    /// Branch picker popup data (None when closed).
+    pub branch_picker: Option<BranchPickerData>,
+    /// SC help dialog visible.
+    pub help_open: bool,
+}
+
+/// Data for the branch picker / create popup in the SC panel.
+#[derive(Debug, Clone)]
+pub struct BranchPickerData {
+    pub query: String,
+    /// (branch_name, is_current)
+    pub results: Vec<(String, bool)>,
+    pub selected: usize,
+    /// When true, the popup is in "create new branch" mode.
+    pub create_mode: bool,
+    /// The new branch name being typed (only in create mode).
+    pub create_input: String,
 }
 
 // ─── ExtSidebarData ───────────────────────────────────────────────────────────
@@ -1516,6 +1571,50 @@ pub struct ScreenLayout {
     pub ext_panel: Option<ExtPanelData>,
     /// Breadcrumb bars for each editor group (empty when breadcrumbs are disabled).
     pub breadcrumbs: Vec<BreadcrumbBar>,
+    /// Git diff peek popup — `Some` when the user is previewing a diff hunk.
+    pub diff_peek: Option<DiffPeekPopup>,
+    /// Diff toolbar data for the single-group tab bar.
+    pub diff_toolbar: Option<DiffToolbarData>,
+    /// Modal dialog popup — `Some` when a dialog is open.
+    pub dialog: Option<DialogPanel>,
+}
+
+/// A modal dialog displayed over the editor.
+#[derive(Debug, Clone)]
+pub struct DialogPanel {
+    pub title: String,
+    pub body: Vec<String>,
+    /// Each button is `(formatted_label, is_selected)`.
+    pub buttons: Vec<(String, bool)>,
+}
+
+/// Format a button label with the hotkey character bracketed.
+/// e.g., `format_button_label("Recover", 'r')` → `"[R]ecover"`.
+pub fn format_button_label(label: &str, hotkey: char) -> String {
+    let lower = hotkey.to_ascii_lowercase();
+    let upper = hotkey.to_ascii_uppercase();
+    // Find the first case-insensitive match of the hotkey in the label.
+    if let Some(pos) = label.find(|c: char| c.to_ascii_lowercase() == lower) {
+        let ch = label.as_bytes()[pos] as char;
+        format!(
+            "{}[{}]{}",
+            &label[..pos],
+            ch.to_ascii_uppercase(),
+            &label[pos + ch.len_utf8()..]
+        )
+    } else {
+        // Hotkey not found in label — prepend it.
+        format!("[{}] {}", upper, label)
+    }
+}
+
+/// A floating popup showing a diff hunk preview with revert/stage actions.
+#[derive(Debug, Clone)]
+pub struct DiffPeekPopup {
+    /// Buffer line the popup is anchored to (0-indexed).
+    pub anchor_line: usize,
+    /// Raw diff hunk lines (with +/-/space prefix) to display.
+    pub hunk_lines: Vec<String>,
 }
 
 // ─── Theme ────────────────────────────────────────────────────────────────────
@@ -1596,6 +1695,7 @@ pub struct Theme {
     // Git diff gutter markers
     pub git_added: Color,
     pub git_modified: Color,
+    pub git_deleted: Color,
 
     // Completion popup
     pub completion_bg: Color,
@@ -1625,6 +1725,7 @@ pub struct Theme {
     // Two-way diff background colours
     pub diff_added_bg: Color,
     pub diff_removed_bg: Color,
+    pub diff_padding_bg: Color,
 
     // DAP stopped-line highlight
     pub dap_stopped_bg: Color,
@@ -1740,6 +1841,7 @@ impl Theme {
             // Git diff gutter markers
             git_added: Color::from_hex("#98c379"),    // green
             git_modified: Color::from_hex("#e5c07b"), // yellow
+            git_deleted: Color::from_hex("#e06c75"),  // red
 
             // Completion popup (OneDark palette)
             completion_bg: Color::from_hex("#282c34"),
@@ -1766,9 +1868,10 @@ impl Theme {
             fuzzy_border: Color::from_hex("#528bff"),
             fuzzy_title_fg: Color::from_hex("#e5c07b"),
 
-            // Two-way diff backgrounds (dark green / dark red)
-            diff_added_bg: Color::from_hex("#1e3a1e"), // dark green
-            diff_removed_bg: Color::from_hex("#3a1e1e"), // dark red
+            // Two-way diff backgrounds — must be clearly green/red in terminals
+            diff_added_bg: Color::from_hex("#14541a"),
+            diff_removed_bg: Color::from_hex("#541a1a"),
+            diff_padding_bg: Color::from_hex("#2d2d2d"),
 
             // DAP stopped-line (dark amber)
             dap_stopped_bg: Color::from_hex("#3a3000"),
@@ -1862,6 +1965,7 @@ impl Theme {
 
             git_added: Color::from_hex("#b8bb26"),
             git_modified: Color::from_hex("#fabd2f"),
+            git_deleted: Color::from_hex("#fb4934"),
 
             completion_bg: Color::from_hex("#32302f"),
             completion_selected_bg: Color::from_hex("#504945"),
@@ -1884,8 +1988,10 @@ impl Theme {
             fuzzy_border: Color::from_hex("#458588"),
             fuzzy_title_fg: Color::from_hex("#fabd2f"),
 
-            diff_added_bg: Color::from_hex("#1e2e1e"),
-            diff_removed_bg: Color::from_hex("#2e1e1e"),
+            // (bg #282828)
+            diff_added_bg: Color::from_hex("#1e5e24"),
+            diff_removed_bg: Color::from_hex("#5e2424"),
+            diff_padding_bg: Color::from_hex("#333333"),
 
             dap_stopped_bg: Color::from_hex("#3a3000"),
 
@@ -1973,6 +2079,7 @@ impl Theme {
 
             git_added: Color::from_hex("#9ece6a"),
             git_modified: Color::from_hex("#e0af68"),
+            git_deleted: Color::from_hex("#f7768e"),
 
             completion_bg: Color::from_hex("#1f2335"),
             completion_selected_bg: Color::from_hex("#364a82"),
@@ -1995,8 +2102,10 @@ impl Theme {
             fuzzy_border: Color::from_hex("#7aa2f7"),
             fuzzy_title_fg: Color::from_hex("#e0af68"),
 
-            diff_added_bg: Color::from_hex("#1a2a1a"),
-            diff_removed_bg: Color::from_hex("#2a1a1a"),
+            // (bg #1a1b26)
+            diff_added_bg: Color::from_hex("#14541a"),
+            diff_removed_bg: Color::from_hex("#541a28"),
+            diff_padding_bg: Color::from_hex("#252530"),
 
             dap_stopped_bg: Color::from_hex("#2a2500"),
 
@@ -2084,6 +2193,7 @@ impl Theme {
 
             git_added: Color::from_hex("#859900"),
             git_modified: Color::from_hex("#b58900"),
+            git_deleted: Color::from_hex("#dc322f"),
 
             completion_bg: Color::from_hex("#073642"),
             completion_selected_bg: Color::from_hex("#0d4a5a"),
@@ -2106,8 +2216,10 @@ impl Theme {
             fuzzy_border: Color::from_hex("#268bd2"),
             fuzzy_title_fg: Color::from_hex("#b58900"),
 
-            diff_added_bg: Color::from_hex("#00261a"),
-            diff_removed_bg: Color::from_hex("#260007"),
+            // (bg #002b36)
+            diff_added_bg: Color::from_hex("#005e30"),
+            diff_removed_bg: Color::from_hex("#5e1a28"),
+            diff_padding_bg: Color::from_hex("#0a3545"),
 
             dap_stopped_bg: Color::from_hex("#2b2000"),
 
@@ -2144,12 +2256,127 @@ impl Theme {
         }
     }
 
+    /// VSCode Dark+ colour scheme.
+    pub fn vscode_dark() -> Self {
+        Self {
+            background: Color::from_hex("#1e1e1e"),
+            active_background: Color::from_hex("#252526"),
+            foreground: Color::from_hex("#d4d4d4"),
+
+            keyword: Color::from_hex("#569cd6"),    // blue
+            string_lit: Color::from_hex("#ce9178"), // salmon
+            comment: Color::from_hex("#6a9955"),    // green
+            function: Color::from_hex("#dcdcaa"),   // yellow
+            type_name: Color::from_hex("#4ec9b0"),  // teal
+            variable: Color::from_hex("#9cdcfe"),   // light blue
+            number: Color::from_hex("#b5cea8"),     // light green
+            default_fg: Color::from_hex("#d4d4d4"),
+
+            selection: Color::from_hex("#264f78"),
+            selection_alpha: 0.6,
+
+            cursor: Color::from_hex("#aeafad"),
+            cursor_normal_alpha: 0.6,
+
+            search_match_bg: Color::from_hex("#515c6a"),
+            search_current_match_bg: Color::from_hex("#613214"),
+            search_match_fg: Color::from_hex("#d4d4d4"),
+
+            tab_bar_bg: Color::from_hex("#252526"),
+            tab_active_bg: Color::from_hex("#1e1e1e"),
+            tab_active_fg: Color::from_hex("#ffffff"),
+            tab_inactive_fg: Color::from_hex("#969696"),
+            tab_preview_active_fg: Color::from_hex("#cccccc"),
+            tab_preview_inactive_fg: Color::from_hex("#7f7f7f"),
+
+            status_bg: Color::from_hex("#007acc"),
+            status_fg: Color::from_hex("#ffffff"),
+
+            wildmenu_bg: Color::from_hex("#252526"),
+            wildmenu_fg: Color::from_hex("#d4d4d4"),
+            wildmenu_sel_bg: Color::from_hex("#04395e"),
+            wildmenu_sel_fg: Color::from_hex("#ffffff"),
+
+            command_bg: Color::from_hex("#1e1e1e"),
+            command_fg: Color::from_hex("#d4d4d4"),
+
+            line_number_fg: Color::from_hex("#858585"),
+            line_number_active_fg: Color::from_hex("#c6c6c6"),
+
+            separator: Color::from_hex("#414141"),
+
+            git_added: Color::from_hex("#587c0c"),
+            git_modified: Color::from_hex("#0c7d9d"),
+            git_deleted: Color::from_hex("#94151b"),
+
+            completion_bg: Color::from_hex("#252526"),
+            completion_selected_bg: Color::from_hex("#04395e"),
+            completion_fg: Color::from_hex("#d4d4d4"),
+            completion_border: Color::from_hex("#454545"),
+
+            diagnostic_error: Color::from_hex("#f14c4c"),
+            diagnostic_warning: Color::from_hex("#cca700"),
+            diagnostic_info: Color::from_hex("#3794ff"),
+            diagnostic_hint: Color::from_hex("#858585"),
+
+            hover_bg: Color::from_hex("#252526"),
+            hover_fg: Color::from_hex("#d4d4d4"),
+            hover_border: Color::from_hex("#454545"),
+
+            fuzzy_bg: Color::from_hex("#252526"),
+            fuzzy_selected_bg: Color::from_hex("#04395e"),
+            fuzzy_fg: Color::from_hex("#d4d4d4"),
+            fuzzy_query_fg: Color::from_hex("#0097fb"),
+            fuzzy_border: Color::from_hex("#007acc"),
+            fuzzy_title_fg: Color::from_hex("#dcdcaa"),
+
+            // (bg #1e1e1e)
+            diff_added_bg: Color::from_hex("#14541a"),
+            diff_removed_bg: Color::from_hex("#541a1a"),
+            diff_padding_bg: Color::from_hex("#2d2d2d"),
+
+            dap_stopped_bg: Color::from_hex("#3a3000"),
+
+            yank_highlight_bg: Color::from_hex("#dcdcaa"),
+            yank_highlight_alpha: 0.25,
+
+            annotation_fg: Color::from_hex("#858585"),
+            ghost_text_fg: Color::from_hex("#5a5a5a"),
+
+            md_heading1: Color::from_hex("#dcdcaa"),
+            md_heading2: Color::from_hex("#569cd6"),
+            md_heading3: Color::from_hex("#c586c0"),
+            md_code: Color::from_hex("#ce9178"),
+            md_link: Color::from_hex("#3794ff"),
+
+            sidebar_sel_bg: Color::from_hex("#37373d"),
+            sidebar_sel_bg_inactive: Color::from_hex("#2a2d2e"),
+            semantic_parameter: Color::from_hex("#9cdcfe"), // light blue
+            semantic_property: Color::from_hex("#9cdcfe"),  // light blue
+            semantic_namespace: Color::from_hex("#4ec9b0"), // teal
+            semantic_enum_member: Color::from_hex("#4fc1ff"), // bright blue
+            semantic_interface: Color::from_hex("#4ec9b0"), // teal
+            semantic_type_parameter: Color::from_hex("#4ec9b0"),
+            semantic_decorator: Color::from_hex("#dcdcaa"), // yellow
+            semantic_macro: Color::from_hex("#dcdcaa"),     // yellow
+
+            breadcrumb_bg: Color::from_hex("#1e1e1e"),
+            breadcrumb_fg: Color::from_hex("#858585"),
+            breadcrumb_active_fg: Color::from_hex("#d4d4d4"),
+
+            indent_guide_fg: Color::from_hex("#404040"),
+            indent_guide_active_fg: Color::from_hex("#707070"),
+            bracket_match_bg: Color::from_hex("#3a3d41"),
+        }
+    }
+
     /// Return a theme by name. Falls back to `onedark` for unknown names.
     pub fn from_name(name: &str) -> Self {
         match name {
             "gruvbox" | "gruvbox-dark" => Self::gruvbox_dark(),
             "tokyo-night" | "tokyonight" => Self::tokyo_night(),
             "solarized" | "solarized-dark" => Self::solarized_dark(),
+            "vscode-dark" | "vscode" | "dark+" => Self::vscode_dark(),
             "onedark" => Self::onedark(),
             _ => {
                 // Try loading a VSCode theme from ~/.config/vimcode/themes/
@@ -2169,6 +2396,7 @@ impl Theme {
             "gruvbox-dark".into(),
             "tokyo-night".into(),
             "solarized-dark".into(),
+            "vscode-dark".into(),
         ];
         // Append custom VSCode themes from ~/.config/vimcode/themes/
         if let Some(dir) = Self::themes_dir() {
@@ -2343,6 +2571,11 @@ impl Theme {
         {
             theme.git_modified = c;
         }
+        if let Some(c) = color("editorGutter.deletedBackground")
+            .or_else(|| color("gitDecoration.deletedResourceForeground"))
+        {
+            theme.git_deleted = c;
+        }
 
         // ── Diagnostics ──────────────────────────────────────────────────
         if let Some(c) = color("editorError.foreground") {
@@ -2359,11 +2592,23 @@ impl Theme {
         }
 
         // ── Diff ─────────────────────────────────────────────────────────
-        if let Some(c) = color("diffEditor.insertedTextBackground") {
-            theme.diff_added_bg = c;
+        // Alpha-blend diff backgrounds against the editor background so that
+        // `#rrggbbaa` values (common in VSCode themes) produce correct results.
+        if let Some(s) = colors
+            .and_then(|c| c.get("diffEditor.insertedTextBackground"))
+            .and_then(|v| v.as_str())
+        {
+            if let Some(c) = Color::try_from_hex_over(s, theme.background) {
+                theme.diff_added_bg = c;
+            }
         }
-        if let Some(c) = color("diffEditor.removedTextBackground") {
-            theme.diff_removed_bg = c;
+        if let Some(s) = colors
+            .and_then(|c| c.get("diffEditor.removedTextBackground"))
+            .and_then(|v| v.as_str())
+        {
+            if let Some(c) = Color::try_from_hex_over(s, theme.background) {
+                theme.diff_removed_bg = c;
+            }
         }
 
         // ── Annotations / ghost text ─────────────────────────────────────
@@ -3031,10 +3276,38 @@ pub fn build_screen_layout(
                     max_y = 0.0;
                 }
                 let bounds = WindowRect::new(min_x, min_y, max_x - min_x, max_y - min_y);
+                // Populate diff toolbar if this group contains a diff window.
+                let diff_toolbar = if engine.is_in_diff_view() {
+                    if let Some((a, b)) = engine.diff_window_pair {
+                        let group = engine.editor_groups.get(&gid);
+                        let has_diff_win = group.is_some_and(|g| {
+                            let wids = g.active_tab().layout.window_ids();
+                            wids.contains(&a) || wids.contains(&b)
+                        });
+                        if has_diff_win {
+                            let (_, total) = engine.diff_unified_regions();
+                            let change_label = engine
+                                .diff_current_change_index()
+                                .map(|(c, t)| format!("{c} of {t}"));
+                            Some(DiffToolbarData {
+                                change_label,
+                                total_changes: total,
+                                unchanged_hidden: engine.diff_unchanged_hidden,
+                            })
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
                 GroupTabBar {
                     group_id: gid,
                     tabs,
                     bounds,
+                    diff_toolbar,
                 }
             })
             .collect();
@@ -3108,6 +3381,21 @@ pub fn build_screen_layout(
         vec![]
     };
 
+    // Compute diff toolbar for single-group mode (multi-group has it on GroupTabBar).
+    let diff_toolbar = if editor_group_split.is_none() && engine.is_in_diff_view() {
+        let (_, total) = engine.diff_unified_regions();
+        let change_label = engine
+            .diff_current_change_index()
+            .map(|(c, t)| format!("{c} of {t}"));
+        Some(DiffToolbarData {
+            change_label,
+            total_changes: total,
+            unchanged_hidden: engine.diff_unchanged_hidden,
+        })
+    } else {
+        None
+    };
+
     ScreenLayout {
         tab_bar,
         windows,
@@ -3134,6 +3422,21 @@ pub fn build_screen_layout(
         ai_panel,
         ext_panel: build_ext_panel_data(engine),
         breadcrumbs,
+        diff_peek: engine.diff_peek.as_ref().map(|dp| DiffPeekPopup {
+            anchor_line: dp.anchor_line,
+            hunk_lines: dp.hunk_lines.clone(),
+        }),
+        diff_toolbar,
+        dialog: engine.dialog.as_ref().map(|d| DialogPanel {
+            title: d.title.clone(),
+            body: d.body.clone(),
+            buttons: d
+                .buttons
+                .iter()
+                .enumerate()
+                .map(|(i, btn)| (format_button_label(&btn.label, btn.hotkey), i == d.selected))
+                .collect(),
+        }),
     }
 }
 
@@ -3203,6 +3506,34 @@ fn build_source_control_data(engine: &Engine) -> Option<SourceControlData> {
         commit_message: engine.sc_commit_message.clone(),
         commit_input_active: engine.sc_commit_input_active,
         button_focused: engine.sc_button_focused,
+        branch_picker: if engine.sc_branch_picker_open {
+            let filtered = engine.sc_branch_picker_filtered();
+            let results = filtered
+                .iter()
+                .map(|&(i, _)| {
+                    let b = &engine.sc_branch_picker_branches[i];
+                    (b.name.clone(), b.is_current)
+                })
+                .collect();
+            Some(BranchPickerData {
+                query: engine.sc_branch_picker_query.clone(),
+                results,
+                selected: engine.sc_branch_picker_selected,
+                create_mode: false,
+                create_input: String::new(),
+            })
+        } else if engine.sc_branch_create_mode {
+            Some(BranchPickerData {
+                query: String::new(),
+                results: Vec::new(),
+                selected: 0,
+                create_mode: true,
+                create_input: engine.sc_branch_create_input.clone(),
+            })
+        } else {
+            None
+        },
+        help_open: engine.sc_help_open,
     })
 }
 
@@ -3994,14 +4325,106 @@ fn build_rendered_window(
             (None, Vec::new())
         };
 
+    // Look up aligned diff data for this window (for visual padding).
+    let diff_aligned: Option<&[AlignedDiffEntry]> =
+        engine.diff_aligned.get(&window_id).map(|v| v.as_slice());
+
     // Build rendered lines (fold-aware: skip hidden lines, jump over fold bodies)
     let mut lines = Vec::with_capacity(visible_lines);
+
+    // When aligned diff data exists, iterate through the aligned sequence
+    // so padding lines appear at the correct visual positions.
+    let mut aligned_idx: usize = if let Some(aligned) = diff_aligned {
+        // Find the aligned entry corresponding to scroll_top.
+        aligned
+            .iter()
+            .position(|e| e.source_line.is_some_and(|sl| sl >= scroll_top))
+            .unwrap_or(0)
+    } else {
+        0
+    };
     let mut line_idx = scroll_top;
     while lines.len() < visible_lines && line_idx < total_lines {
         // Skip hidden lines (fold bodies).
         if view.is_line_hidden(line_idx) {
+            // Also advance aligned_idx past this hidden line's entry
+            // (and any adjacent padding) so padding for folded regions
+            // doesn't get emitted as blank lines.
+            if let Some(aligned) = diff_aligned {
+                while aligned_idx < aligned.len() {
+                    match aligned[aligned_idx].source_line {
+                        Some(sl) if sl == line_idx => {
+                            aligned_idx += 1;
+                            break;
+                        }
+                        Some(sl) if sl > line_idx => break,
+                        _ => aligned_idx += 1, // skip padding or earlier source lines
+                    }
+                }
+            }
             line_idx += 1;
             continue;
+        }
+
+        // Emit padding lines from the aligned diff sequence before this buffer line.
+        if let Some(aligned) = diff_aligned {
+            while aligned_idx < aligned.len() && lines.len() < visible_lines {
+                let entry = &aligned[aligned_idx];
+                if let Some(sl) = entry.source_line {
+                    if sl >= line_idx {
+                        break; // reached the current buffer line
+                    }
+                    // This source line is before scroll_top — skip it.
+                    aligned_idx += 1;
+                    continue;
+                }
+                // When unchanged lines are hidden (fold-filtered diff view),
+                // suppress padding lines — alignment is meaningless when
+                // the unchanged context between hunks is collapsed.
+                if engine.diff_unchanged_hidden {
+                    aligned_idx += 1;
+                    continue;
+                }
+                // Padding entry — emit an empty rendered line.
+                let padding_gutter = format!(
+                    "{:>width$} ",
+                    "",
+                    width = gutter_char_width.saturating_sub(1)
+                );
+                lines.push(RenderedLine {
+                    gutter_text: padding_gutter,
+                    raw_text: String::new(),
+                    spans: vec![],
+                    line_idx,
+                    git_diff: None,
+                    diagnostics: vec![],
+                    diff_status: Some(DiffLine::Padding),
+                    is_breakpoint: false,
+                    is_conditional_bp: false,
+                    is_dap_current: false,
+                    is_wrap_continuation: false,
+                    segment_col_offset: 0,
+                    annotation: None,
+                    ghost_suffix: None,
+                    is_current_line: false,
+                    is_fold_header: false,
+                    folded_line_count: 0,
+                    is_ghost_continuation: false,
+                    indent_guides: vec![],
+                });
+                aligned_idx += 1;
+            }
+            if lines.len() >= visible_lines {
+                break;
+            }
+            // Advance aligned_idx past this buffer line's entry.
+            if aligned_idx < aligned.len() {
+                if let Some(sl) = aligned[aligned_idx].source_line {
+                    if sl == line_idx {
+                        aligned_idx += 1;
+                    }
+                }
+            }
         }
 
         let is_fold_header = view.fold_at(line_idx).is_some();
@@ -4089,6 +4512,7 @@ fn build_rendered_window(
             let git_part = if has_git {
                 match git_status {
                     Some(GitLineStatus::Added) | Some(GitLineStatus::Modified) => "▌",
+                    Some(GitLineStatus::Deleted) => "▾",
                     None => " ",
                 }
             } else {
@@ -4179,7 +4603,7 @@ fn build_rendered_window(
                     } else {
                         line_diagnostics.clone()
                     },
-                    diff_status: if is_cont { None } else { diff_status },
+                    diff_status,
                     is_breakpoint: !is_cont && is_breakpoint,
                     is_conditional_bp: !is_cont && is_conditional_bp,
                     is_dap_current,
@@ -5126,5 +5550,67 @@ mod tests {
         assert_eq!(theme.status_bg, Color::try_from_hex("#181825").unwrap());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_format_button_label() {
+        assert_eq!(super::format_button_label("Recover", 'r'), "[R]ecover");
+        assert_eq!(
+            super::format_button_label("Delete swap", 'd'),
+            "[D]elete swap"
+        );
+        assert_eq!(super::format_button_label("Abort", 'a'), "[A]bort");
+        assert_eq!(super::format_button_label("OK", 'o'), "[O]K");
+        // Hotkey not in label → prepended.
+        assert_eq!(super::format_button_label("Yes", 'z'), "[Z] Yes");
+    }
+
+    #[test]
+    fn test_diff_toolbar_on_both_group_tab_bars() {
+        use crate::core::engine::{Engine, OpenMode};
+        use crate::core::window::SplitDirection;
+
+        let dir = std::env::temp_dir().join("vimcode_render_diff_groups");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f1 = dir.join("a.txt");
+        let f2 = dir.join("b.txt");
+        std::fs::write(&f1, "same\nold\nsame\n").unwrap();
+        std::fs::write(&f2, "same\nnew\nsame\n").unwrap();
+
+        let mut engine = Engine::new();
+        engine
+            .open_file_with_mode(&f1, OpenMode::Permanent)
+            .unwrap();
+        engine.execute_command("diffthis");
+
+        // Create a second editor group and open the second file.
+        engine.open_editor_group(SplitDirection::Vertical);
+        engine
+            .open_file_with_mode(&f2, OpenMode::Permanent)
+            .unwrap();
+        engine.execute_command("diffthis");
+        assert!(engine.is_in_diff_view());
+
+        // Build window rects for both groups.
+        let content_bounds = WindowRect::new(0.0, 1.0, 80.0, 24.0);
+        let (rects, _) = engine.calculate_group_window_rects(content_bounds, 1.0);
+        let theme = Theme::onedark();
+        let layout = build_screen_layout(&engine, &theme, &rects, 1.0, 1.0, false);
+
+        // Both group tab bars should have diff_toolbar populated.
+        let split = layout
+            .editor_group_split
+            .expect("should have editor group split");
+        assert!(
+            split.group_tab_bars.len() >= 2,
+            "should have 2+ group tab bars"
+        );
+        for gtb in &split.group_tab_bars {
+            assert!(
+                gtb.diff_toolbar.is_some(),
+                "group {:?} should have diff toolbar, but it's None",
+                gtb.group_id
+            );
+        }
     }
 }

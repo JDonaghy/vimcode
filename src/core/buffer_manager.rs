@@ -77,8 +77,10 @@ pub struct BufferState {
     pub current_undo_group: Option<UndoEntry>,
     /// Original line content for U (undo line) command: (line_number, original_content)
     pub line_undo_state: Option<(usize, String)>,
-    /// Per-line git diff status (Added/Modified/None). Empty when not in a git repo.
+    /// Per-line git diff status (Added/Modified/Deleted/None). Empty when not in a git repo.
     pub git_diff: Vec<Option<crate::core::git::GitLineStatus>>,
+    /// Structured diff hunks for the working copy, cached from `compute_file_diff_hunks`.
+    pub diff_hunks: Vec<crate::core::git::DiffHunkInfo>,
     /// LSP language identifier (e.g. "rust", "python") for this buffer, if applicable.
     pub lsp_language_id: Option<String>,
     /// Cached maximum line length (in chars) across the whole buffer.
@@ -136,6 +138,7 @@ impl BufferState {
             current_undo_group: None,
             line_undo_state: None,
             git_diff: Vec::new(),
+            diff_hunks: Vec::new(),
             lsp_language_id: None,
             max_col: 0,
             read_only: false,
@@ -174,6 +177,7 @@ impl BufferState {
             current_undo_group: None,
             line_undo_state: None,
             git_diff: Vec::new(),
+            diff_hunks: Vec::new(),
             lsp_language_id,
             max_col: 0,
             read_only: false,

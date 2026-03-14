@@ -100,6 +100,41 @@ impl View {
         self.folds.retain(|f| !(f.start >= start && f.start <= end));
     }
 
+    /// Advance `count` visible lines forward from `from`, skipping fold bodies.
+    /// Returns the resulting line index, clamped to `max_line`.
+    pub fn next_visible_line(&self, from: usize, count: usize, max_line: usize) -> usize {
+        let mut line = from;
+        let mut remaining = count;
+        while remaining > 0 && line < max_line {
+            line += 1;
+            // If we landed inside a fold body, jump past it
+            if let Some(f) = self.folds.iter().find(|f| line > f.start && line <= f.end) {
+                line = f.end + 1;
+            }
+            if line > max_line {
+                return max_line;
+            }
+            remaining -= 1;
+        }
+        line.min(max_line)
+    }
+
+    /// Go back `count` visible lines from `from`, skipping fold bodies.
+    /// Returns the resulting line index.
+    pub fn prev_visible_line(&self, from: usize, count: usize) -> usize {
+        let mut line = from;
+        let mut remaining = count;
+        while remaining > 0 && line > 0 {
+            line -= 1;
+            // If we landed inside a fold body, jump to the fold header
+            if let Some(f) = self.folds.iter().find(|f| line > f.start && line <= f.end) {
+                line = f.start;
+            }
+            remaining -= 1;
+        }
+        line
+    }
+
     /// Ensure the cursor is visible within the viewport, adjusting scroll_top.
     pub fn ensure_cursor_visible(&mut self) {
         if self.cursor.line < self.scroll_top {
