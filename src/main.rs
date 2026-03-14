@@ -4588,25 +4588,18 @@ impl SimpleComponent for App {
             }
             Msg::RefreshFileTree => {
                 if let Some(ref store) = self.tree_store {
-                    match std::env::current_dir() {
-                        Ok(cwd) => {
-                            store.clear();
-                            build_file_tree_with_root(
-                                store,
-                                &cwd,
-                                self.engine.borrow().settings.show_hidden_files,
-                            );
-                            if let Some(ref tv) = *self.file_tree_view.borrow() {
-                                tv.expand_row(&gtk4::TreePath::from_indices(&[0]), false);
-                                // Highlight the active file in the tree after rebuild.
-                                if let Some(path) = self.engine.borrow().file_path().cloned() {
-                                    highlight_file_in_tree(tv, &path);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            self.engine.borrow_mut().message =
-                                format!("Error refreshing tree: {}", e);
+                    let cwd = self.engine.borrow().cwd.clone();
+                    store.clear();
+                    build_file_tree_with_root(
+                        store,
+                        &cwd,
+                        self.engine.borrow().settings.show_hidden_files,
+                    );
+                    if let Some(ref tv) = *self.file_tree_view.borrow() {
+                        tv.expand_row(&gtk4::TreePath::from_indices(&[0]), false);
+                        // Highlight the active file in the tree after rebuild.
+                        if let Some(path) = self.engine.borrow().file_path().cloned() {
+                            highlight_file_in_tree(tv, &path);
                         }
                     }
                 }

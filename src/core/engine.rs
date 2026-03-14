@@ -13488,9 +13488,10 @@ impl Engine {
         self.next_group_id = 1;
         self.mode = Mode::Normal;
 
-        // Update cwd + workspace root
+        // Update cwd + workspace root + process working directory
         self.cwd = canonical.clone();
         self.workspace_root = Some(canonical.clone());
+        let _ = std::env::set_current_dir(&canonical);
 
         // Update git branch
         self.git_branch = git::current_branch(&canonical);

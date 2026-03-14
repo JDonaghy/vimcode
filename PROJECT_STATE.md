@@ -1,9 +1,9 @@
 # VimCode Project State
 
-**Last updated:** Mar 13, 2026 (Session 175 — Diff View Improvements: Click Handling, Fold-Aware Scrolling, Aligned Folds) | **Tests:** 4263
+**Last updated:** Mar 13, 2026 (Session 176 — GTK Performance: Lazy Tree + Open Folder Fix) | **Tests:** 4266
 
 > Feature documentation lives in **README.md**.
-> Per-session implementation notes through Session 175 are in **SESSION_HISTORY.md**.
+> Per-session implementation notes through Session 176 are in **SESSION_HISTORY.md**.
 
 ---
 
@@ -26,7 +26,7 @@ When implementing a new key/command, add tests covering:
 
 ## Recent Work
 
-**Session 175 — Diff View Improvements: Click Handling, Fold-Aware Scrolling, Aligned Folds (4263 tests):**
-Per-group diff toolbar click handling (GTK `DiffBtnMap`/`SplitBtnMap` replacing single shared cache; TUI `was_active` tracking). Click precedence fix: diff toolbar checked before split buttons in both backends. Split buttons visible on all groups in diff mode. Fold-aware scrolling: `next_visible_line()`/`prev_visible_line()` on View skip fold bodies; Ctrl-D/U/F/B/E/Y + scroll wheel all fold-aware in normal, visual, and both backends. Aligned-sequence fold computation: `diff_apply_folds()` rewritten to use `diff_aligned` (visual row → buffer line mapping) instead of raw `diff_results`, fixing incorrect folds when files have different line counts. `sc_has_focus` cleared on diff commands. TUI diff toolbar glyphs reverted to Nerd Font with 3-col button width. 3 new tests.
+**Session 176 — GTK Performance: Lazy Tree + Open Folder Fix (4266 tests):**
+GTK explorer tree lazy loading: replaced eager recursive `build_file_tree()` with `build_file_tree_shallow()` that populates one directory level at a time with dummy placeholder children; `tree_row_expanded()` replaces dummies with real children on demand via `row-expanded` signal. Fixes multi-second startup when opening in large directories (e.g., home). Open Folder fix: `open_folder()` now calls `std::env::set_current_dir()` to update process working directory; `RefreshFileTree` handler uses `engine.cwd` instead of `std::env::current_dir()`. `highlight_file_in_tree` rewritten to walk path components, expanding ancestors lazily.
 
-> Sessions 174 and earlier archived in **SESSION_HISTORY.md**.
+> Sessions 175 and earlier archived in **SESSION_HISTORY.md**.
