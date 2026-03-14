@@ -5,13 +5,15 @@
 ---
 
 ## Recently Completed
+- **Session 177**: Fix Wrap Mode Mouse Click — GTK `view_row_to_buf_pos_wrap()` uses word-wrap segments for correct visual-row-to-buffer-line mapping; TUI click/drag add `segment_col_offset`. Fixes BUGS.md wrap click issue.
 - **Session 176**: GTK Performance — Lazy tree loading (one level at a time, expand on demand), Open Folder fix (set_current_dir + engine.cwd for tree refresh).
-- **Session 175**: Diff View Improvements — Per-group diff toolbar click handling (GTK + TUI), fold-aware scrolling (Ctrl-D/U/F/B/E/Y + scroll wheel skip fold bodies), aligned-sequence fold computation (uses diff_aligned instead of raw diff_results), sc_has_focus fix, TUI glyph revert. 3 new tests.
 
-> Sessions 173 and earlier in **SESSION_HISTORY.md**.
+> Sessions 175 and earlier in **SESSION_HISTORY.md**.
 
 ## Roadmap
-
+- Add a spell checker, either like vim's built in one, or as an extension. Needs discussion. Also need to think about supporting languages other than US English.
+- Add the ability to resize tabgroups: i.e. the leftgroup gets bigger at the right's expense and vice-versa. Also should work for vertically stacked tab groups, as well as with both the emouse and via key combos that are remappable in both tui and gui mode.
+- Implement version querying so that the semantic version and build number can be displayed via Help:About and by typing "vcd --verison" which shows teh version but doesn't start the editor.
 ### Git
 - [x] **Stage hunks** — `]c`/`[c` navigation, `gs`/`:Ghs` to stage hunk under cursor
 - [x] **Inline diff peek** — `gD`/`:DiffPeek`/gutter click shows hunk popup with Revert/Stage, deleted-line `▾` gutter marker, `]c`/`[c` on real files

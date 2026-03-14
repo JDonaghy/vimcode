@@ -3570,13 +3570,14 @@ fn handle_mouse(
                             && editor_row < wy + wh
                         {
                             let view_row = (editor_row - wy) as usize;
-                            let buf_line = rw
-                                .lines
-                                .get(view_row)
+                            let drag_rl = rw.lines.get(view_row);
+                            let buf_line = drag_rl
                                 .map(|l| l.line_idx)
                                 .unwrap_or_else(|| rw.scroll_top + view_row);
-                            let col_in_text =
-                                (rel_col - wx).saturating_sub(gutter) as usize + rw.scroll_left;
+                            let seg_offset = drag_rl.map(|l| l.segment_col_offset).unwrap_or(0);
+                            let col_in_text = (rel_col - wx).saturating_sub(gutter) as usize
+                                + rw.scroll_left
+                                + seg_offset;
                             engine.mouse_drag(rw.window_id, buf_line, col_in_text);
                             *mouse_text_drag = true;
                             return sidebar_width;
@@ -4932,13 +4933,15 @@ fn handle_mouse(
                     }
                     return sidebar_width;
                 }
-                // Text area click — fold-aware row → buffer line mapping
-                let buf_line = rw
-                    .lines
-                    .get(view_row)
+                // Text area click — fold/wrap-aware row → buffer line mapping
+                let clicked_rl = rw.lines.get(view_row);
+                let buf_line = clicked_rl
                     .map(|l| l.line_idx)
                     .unwrap_or_else(|| rw.scroll_top + view_row);
-                let col_in_text = (rel_col - wx - gutter) as usize + rw.scroll_left;
+                // For wrapped lines, add segment_col_offset so the click
+                // targets the correct column within the full buffer line.
+                let seg_offset = clicked_rl.map(|l| l.segment_col_offset).unwrap_or(0);
+                let col_in_text = (rel_col - wx - gutter) as usize + rw.scroll_left + seg_offset;
 
                 // Double-click detection
                 let now = Instant::now();

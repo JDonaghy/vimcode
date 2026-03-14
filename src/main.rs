@@ -6681,6 +6681,45 @@ fn view_row_to_buf_line(
     total_lines.saturating_sub(1)
 }
 
+/// Like `view_row_to_buf_line`, but accounts for word-wrapped lines.
+/// Returns `(buffer_line, segment_col_offset)` — the segment offset is the
+/// character index within the buffer line where the clicked visual segment starts.
+fn view_row_to_buf_pos_wrap(
+    view: &crate::core::view::View,
+    buffer: &crate::core::buffer::Buffer,
+    scroll_top: usize,
+    view_row: usize,
+    total_lines: usize,
+    viewport_cols: usize,
+) -> (usize, usize) {
+    let mut buf_line = scroll_top;
+    let mut visible = 0usize;
+    while buf_line < total_lines {
+        if view.is_line_hidden(buf_line) {
+            buf_line += 1;
+            continue;
+        }
+        // Compute how many visual rows this buffer line occupies when wrapped.
+        let line_str = buffer.content.line(buf_line).to_string();
+        let line_str = line_str.trim_end_matches('\n');
+        let segments = render::compute_word_wrap_segments(line_str, viewport_cols);
+        let visual_rows = segments.len();
+        if view_row < visible + visual_rows {
+            // The clicked row falls within this buffer line.
+            let seg_idx = view_row - visible;
+            let seg_col_offset = segments.get(seg_idx).map(|&(start, _)| start).unwrap_or(0);
+            return (buf_line, seg_col_offset);
+        }
+        visible += visual_rows;
+        if let Some(fold) = view.fold_at(buf_line) {
+            buf_line = fold.end + 1;
+        } else {
+            buf_line += 1;
+        }
+    }
+    (total_lines.saturating_sub(1), 0)
+}
+
 /// Calculate gutter width in pixels based on line number mode and buffer size
 #[allow(dead_code)]
 fn calculate_gutter_width(mode: LineNumberMode, total_lines: usize, char_width: f64) -> f64 {
@@ -11637,7 +11676,30 @@ fn pixel_to_click_target(
 
     let relative_y = y - rect.y;
     let view_row = (relative_y / line_height).floor() as usize;
-    let line = view_row_to_buf_line(view, view.scroll_top, view_row, total_lines);
+
+    // Compute the buffer line and segment column offset, accounting for wrapping.
+    let (line, seg_col_offset) = if engine.settings.wrap {
+        // Compute viewport_cols the same way render.rs does for word-wrap segments.
+        let render_viewport_cols = if char_width > 0.0 {
+            let total_chars = (rect.width / char_width).floor() as usize;
+            total_chars.saturating_sub(gutter_char_width).max(1)
+        } else {
+            1
+        };
+        view_row_to_buf_pos_wrap(
+            view,
+            buffer,
+            view.scroll_top,
+            view_row,
+            total_lines,
+            render_viewport_cols,
+        )
+    } else {
+        (
+            view_row_to_buf_line(view, view.scroll_top, view_row, total_lines),
+            0,
+        )
+    };
 
     // Gutter click
     if x >= rect.x && x < rect.x + gutter_width && gutter_width > 0.0 {
@@ -11677,10 +11739,12 @@ fn pixel_to_click_target(
         0
     };
 
+    // Walk the line text starting from segment_col_offset to find the
+    // logical column corresponding to the clicked display column.
     let line_text = buffer.content.line(line).to_string();
-    let mut col = 0;
+    let mut col = seg_col_offset;
     let mut display_pos = 0;
-    for ch in line_text.chars() {
+    for ch in line_text.chars().skip(seg_col_offset) {
         if display_pos >= display_col {
             break;
         }

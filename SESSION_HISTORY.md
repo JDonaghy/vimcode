@@ -1,9 +1,12 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 176 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 177 archived here. Recent work summary in PROJECT_STATE.md.
 
 ---
+
+**Session 177 — Fix Wrap Mode Mouse Click (4266 tests):**
+Fixed mouse click targeting on wrapped lines in both GTK and TUI backends. GTK: added `view_row_to_buf_pos_wrap()` in `main.rs` that walks buffer lines from scroll_top using `compute_word_wrap_segments()` (same word-wrap algorithm as renderer) to correctly map visual rows to `(buffer_line, segment_col_offset)`; `pixel_to_click_target()` now calls this when `settings.wrap` is true instead of the wrap-unaware `view_row_to_buf_line()`; column calculation walks from `segment_col_offset` instead of 0. TUI: click handler and drag handler in `tui_main.rs` now read `segment_col_offset` from the rendered line and add it to `col_in_text`. Previously, clicking on a wrap-continuation row mapped to the wrong buffer line (GTK used 1:1 visual-row-to-buffer-line mapping ignoring wraps) or wrong column (TUI didn't account for segment offset). Cleared BUGS.md.
 
 **Session 176 — GTK Performance: Lazy Tree + Open Folder Fix (4266 tests):**
 GTK explorer tree lazy loading: replaced eager recursive `build_file_tree()` with `build_file_tree_shallow()` that populates one directory level at a time with dummy placeholder children (`TREE_DUMMY_PATH`); `tree_row_expanded()` replaces dummies with real children on demand via `row-expanded` signal. Fixes multi-second startup when opening in large directories (e.g., home directory). Open Folder fix: `open_folder()` now calls `std::env::set_current_dir(&canonical)` to update process working directory alongside `engine.cwd`; `RefreshFileTree` handler uses `engine.cwd` instead of `std::env::current_dir()`, so tree repopulates with the new folder as root. `highlight_file_in_tree` rewritten to walk path components, expanding ancestors lazily. Removed `find_tree_path_for_file` (no longer needed).
