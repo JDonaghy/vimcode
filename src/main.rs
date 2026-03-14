@@ -81,9 +81,20 @@ fn matches_gtk_key(binding: &str, key: gdk::Key, state: gdk::ModifierType) -> bo
 /// Cached tab slot positions (x_start, x_end) per group, populated during draw.
 type TabSlotMap = HashMap<usize, Vec<(f64, f64)>>;
 
-/// Cached diff toolbar button positions: (prev_start, prev_end, next_start, next_end, fold_start, fold_end).
+/// Cached diff toolbar button positions per group: group_id -> (prev_start, prev_end, next_start, next_end, fold_start, fold_end).
 /// Populated during draw_tab_bar, used for click hit-testing.
-type DiffBtnPositions = Option<(f64, f64, f64, f64, f64, f64)>;
+type DiffBtnMap = HashMap<usize, (f64, f64, f64, f64, f64, f64)>;
+
+/// Cached split button pixel widths per group: group_id -> (both_btns_px, btn_right_px).
+/// Only populated when split buttons are visible (active group in multi-group, or single-group mode).
+type SplitBtnMap = HashMap<usize, (f64, f64)>;
+
+/// Return type of draw_tab_bar: (tab_slot_positions, diff_btn_positions, split_btn_widths).
+type TabBarDrawResult = (
+    Vec<(f64, f64)>,
+    Option<(f64, f64, f64, f64, f64, f64)>,
+    Option<(f64, f64)>,
+);
 
 struct App {
     engine: Rc<RefCell<Engine>>,
@@ -171,7 +182,8 @@ struct App {
     /// Key = group_id.0 (or usize::MAX for single-group mode), Value = cumulative x positions.
     tab_slot_positions: Rc<RefCell<TabSlotMap>>,
     /// Cached diff toolbar button pixel positions, populated during draw_tab_bar.
-    diff_btn_positions: Rc<RefCell<DiffBtnPositions>>,
+    diff_btn_map: Rc<RefCell<DiffBtnMap>>,
+    split_btn_map: Rc<RefCell<SplitBtnMap>>,
     /// True while the user is dragging the terminal panel's scrollbar thumb.
     terminal_sb_dragging: bool,
     /// True while the user drags the terminal header row to resize the panel.
@@ -1991,7 +2003,8 @@ impl SimpleComponent for App {
         let h_sb_drag_cell: Rc<Cell<Option<core::WindowId>>> = Rc::new(Cell::new(None));
         let tab_slot_positions_cell: Rc<RefCell<TabSlotMap>> =
             Rc::new(RefCell::new(HashMap::new()));
-        let diff_btn_positions_cell: Rc<RefCell<DiffBtnPositions>> = Rc::new(RefCell::new(None));
+        let diff_btn_map_cell: Rc<RefCell<DiffBtnMap>> = Rc::new(RefCell::new(HashMap::new()));
+        let split_btn_map_cell: Rc<RefCell<SplitBtnMap>> = Rc::new(RefCell::new(HashMap::new()));
         let sidebar_inner_sw_ref: Rc<RefCell<Option<gtk4::ScrolledWindow>>> =
             Rc::new(RefCell::new(None));
         let sidebar_revealer_ref: Rc<RefCell<Option<gtk4::Revealer>>> = Rc::new(RefCell::new(None));
@@ -2095,7 +2108,8 @@ impl SimpleComponent for App {
             h_sb_hovered: false,
             tab_close_hover: None,
             tab_slot_positions: tab_slot_positions_cell.clone(),
-            diff_btn_positions: diff_btn_positions_cell.clone(),
+            diff_btn_map: diff_btn_map_cell.clone(),
+            split_btn_map: split_btn_map_cell.clone(),
             terminal_sb_dragging: false,
             terminal_resize_dragging: false,
             terminal_split_dragging: false,
@@ -3223,7 +3237,8 @@ impl SimpleComponent for App {
         let h_sb_drag_for_draw = h_sb_drag_cell.clone();
         let last_metrics_for_draw = last_metrics_cell.clone();
         let tab_slots_for_draw = tab_slot_positions_cell.clone();
-        let diff_btn_for_draw = diff_btn_positions_cell.clone();
+        let diff_btn_for_draw = diff_btn_map_cell.clone();
+        let split_btn_for_draw = split_btn_map_cell.clone();
         widgets
             .drawing_area
             .set_draw_func(move |_, cr, width, height| {
@@ -3240,6 +3255,7 @@ impl SimpleComponent for App {
                     &last_metrics_for_draw,
                     &tab_slots_for_draw,
                     &diff_btn_for_draw,
+                    &split_btn_for_draw,
                 );
             });
 
@@ -3889,7 +3905,8 @@ impl SimpleComponent for App {
                                 self.cached_line_height,
                                 self.cached_char_width,
                                 &self.tab_slot_positions.borrow(),
-                                &self.diff_btn_positions.borrow(),
+                                &self.diff_btn_map.borrow(),
+                                &self.split_btn_map.borrow(),
                             );
                             match click_result {
                                 Some(true) => {
@@ -3964,7 +3981,8 @@ impl SimpleComponent for App {
                     self.cached_line_height,
                     self.cached_char_width,
                     &self.tab_slot_positions.borrow(),
-                    &self.diff_btn_positions.borrow(),
+                    &self.diff_btn_map.borrow(),
+                    &self.split_btn_map.borrow(),
                 ) {
                     engine.add_cursor_at_pos(line, col);
                 }
@@ -3986,7 +4004,8 @@ impl SimpleComponent for App {
                     self.cached_line_height,
                     self.cached_char_width,
                     &self.tab_slot_positions.borrow(),
-                    &self.diff_btn_positions.borrow(),
+                    &self.diff_btn_map.borrow(),
+                    &self.split_btn_map.borrow(),
                 );
                 self.draw_needed.set(true);
             }
@@ -4031,7 +4050,8 @@ impl SimpleComponent for App {
                             self.cached_line_height,
                             self.cached_char_width,
                             &self.tab_slot_positions.borrow(),
-                            &self.diff_btn_positions.borrow(),
+                            &self.diff_btn_map.borrow(),
+                            &self.split_btn_map.borrow(),
                         );
                         if let ClickTarget::TabBar = target {
                             // The tab was already switched by pixel_to_click_target.
@@ -4198,7 +4218,8 @@ impl SimpleComponent for App {
                             self.cached_line_height,
                             self.cached_char_width,
                             &self.tab_slot_positions.borrow(),
-                            &self.diff_btn_positions.borrow(),
+                            &self.diff_btn_map.borrow(),
+                            &self.split_btn_map.borrow(),
                         );
                         self.draw_needed.set(true);
                     }
@@ -4662,14 +4683,17 @@ impl SimpleComponent for App {
                 let mut engine = self.engine.borrow_mut();
                 if delta_y.abs() > 0.01 {
                     let lines = engine.buffer().len_lines().saturating_sub(1);
-                    let scroll_amount = (delta_y * 3.0).round() as isize;
-                    let st = engine.view().scroll_top as isize;
-                    let new_top = (st + scroll_amount).clamp(0, lines as isize) as usize;
-                    engine.set_scroll_top(new_top);
+                    let scroll_count = (delta_y * 3.0).round().abs() as usize;
+                    if delta_y > 0.0 {
+                        engine.scroll_down_visible(scroll_count);
+                    } else {
+                        engine.scroll_up_visible(scroll_count);
+                    }
                     // Move cursor into viewport instead of snapping scroll back.
                     let scrolloff = engine.settings.scrolloff;
                     let vp = engine.view().viewport_lines.max(1);
                     let cur = engine.view().cursor.line;
+                    let new_top = engine.view().scroll_top;
                     if cur < new_top + scrolloff {
                         engine.view_mut().cursor.line = (new_top + scrolloff).min(lines);
                         engine.clamp_cursor_col();
@@ -6687,9 +6711,14 @@ fn draw_editor(
     h_sb_dragging_window: Option<core::WindowId>,
     last_metrics: &std::rc::Rc<std::cell::Cell<(f64, f64)>>,
     tab_slot_positions_out: &Rc<RefCell<TabSlotMap>>,
-    diff_btn_positions_out: &Rc<RefCell<DiffBtnPositions>>,
+    diff_btn_map_out: &Rc<RefCell<DiffBtnMap>>,
+    split_btn_map_out: &Rc<RefCell<SplitBtnMap>>,
 ) {
     let theme = Theme::from_name(&engine.settings.colorscheme);
+
+    // Clear cached button positions from previous frame.
+    diff_btn_map_out.borrow_mut().clear();
+    split_btn_map_out.borrow_mut().clear();
 
     // 1. Background
     let (bg_r, bg_g, bg_b) = theme.background.to_cairo();
@@ -6826,6 +6855,9 @@ fn draw_editor(
             let tab_x = gtb.bounds.x;
             let tab_w = gtb.bounds.width;
             let is_active = gtb.group_id == split.active_group;
+            // In diff mode, show split buttons on all groups so clicking
+            // an inactive group's toolbar doesn't cause a visual shift.
+            let show_split = is_active || engine.is_in_diff_view();
             cr.save().ok();
             cr.rectangle(tab_x, tab_y, tab_w, line_height);
             cr.clip();
@@ -6837,7 +6869,7 @@ fn draw_editor(
                     None
                 }
             });
-            let (positions, dbp) = draw_tab_bar(
+            let (positions, dbp, sbp) = draw_tab_bar(
                 cr,
                 &layout,
                 &theme,
@@ -6845,15 +6877,18 @@ fn draw_editor(
                 tab_w,
                 line_height,
                 0.0,
-                is_active,
+                show_split,
                 hover_idx,
                 gtb.diff_toolbar.as_ref(),
             );
             tab_slot_positions_out
                 .borrow_mut()
                 .insert(gtb.group_id.0, positions);
-            if dbp.is_some() {
-                *diff_btn_positions_out.borrow_mut() = dbp;
+            if let Some(dp) = dbp {
+                diff_btn_map_out.borrow_mut().insert(gtb.group_id.0, dp);
+            }
+            if let Some(sp) = sbp {
+                split_btn_map_out.borrow_mut().insert(gtb.group_id.0, sp);
             }
             cr.restore().ok();
             // Active-group indicator: bright bottom border.
@@ -6869,7 +6904,7 @@ fn draw_editor(
     } else {
         // Single group: draw tab bar at full width with split buttons.
         let hover_idx = tab_close_hover.map(|(_gid, tidx)| tidx);
-        let (positions, dbp) = draw_tab_bar(
+        let (positions, dbp, sbp) = draw_tab_bar(
             cr,
             &layout,
             &theme,
@@ -6885,7 +6920,16 @@ fn draw_editor(
         tab_slot_positions_out
             .borrow_mut()
             .insert(engine.active_group.0, positions);
-        *diff_btn_positions_out.borrow_mut() = dbp;
+        if let Some(dp) = dbp {
+            diff_btn_map_out
+                .borrow_mut()
+                .insert(engine.active_group.0, dp);
+        }
+        if let Some(sp) = sbp {
+            split_btn_map_out
+                .borrow_mut()
+                .insert(engine.active_group.0, sp);
+        }
     }
 
     // 4b. Draw breadcrumb bar(s) below tab bar(s)
@@ -7476,7 +7520,7 @@ fn draw_tab_bar(
     show_split_btn: bool,
     hovered_close_tab: Option<usize>,
     diff_toolbar: Option<&render::DiffToolbarData>,
-) -> (Vec<(f64, f64)>, DiffBtnPositions) {
+) -> TabBarDrawResult {
     // Tab bar background
     let (r, g, b) = theme.tab_bar_bg.to_cairo();
     cr.set_source_rgb(r, g, b);
@@ -7669,7 +7713,7 @@ fn draw_tab_bar(
     }
 
     // Draw diff toolbar buttons (to the left of split buttons).
-    let diff_btn_pos: DiffBtnPositions = if let Some(dt) = diff_toolbar {
+    let diff_btn_pos: Option<(f64, f64, f64, f64, f64, f64)> = if let Some(dt) = diff_toolbar {
         layout.set_font_description(Some(&normal_font));
         let (fr, fg_g, fb) = theme.tab_inactive_fg.to_cairo();
         let mut dx = width - both_btns_px - diff_total_px;
@@ -7732,9 +7776,15 @@ fn draw_tab_bar(
         pangocairo::show_layout(cr, layout);
     }
 
+    let split_btn_info = if show_split_btn && both_btns_px > 0.0 {
+        Some((both_btns_px, btn_right_px))
+    } else {
+        None
+    };
+
     // Restore original editor font for subsequent rendering
     layout.set_font_description(Some(&saved_font));
-    (slot_positions, diff_btn_pos)
+    (slot_positions, diff_btn_pos, split_btn_info)
 }
 
 fn draw_breadcrumb_bar(
@@ -11375,7 +11425,8 @@ fn pixel_to_click_target(
     line_height: f64,
     char_width: f64,
     tab_slot_positions: &TabSlotMap,
-    diff_btn_positions: &DiffBtnPositions,
+    diff_btn_map: &DiffBtnMap,
+    split_btn_map: &SplitBtnMap,
 ) -> ClickTarget {
     let tab_bar_height = if engine.settings.breadcrumbs {
         line_height * 2.0
@@ -11428,26 +11479,10 @@ fn pixel_to_click_target(
                 engine.active_group = group_id;
                 let local_x = x - tab_x_start;
 
-                // Hit-test split buttons.
-                let btn_right_px = " \u{F0932}".chars().count() as f64 * char_width;
-                let btn_down_px = " \u{F0931}".chars().count() as f64 * char_width;
-                let both_btns_px = btn_right_px + btn_down_px;
-                if local_x >= bar_width - btn_down_px {
-                    return ClickTarget::SplitButton(
-                        group_id,
-                        crate::core::window::SplitDirection::Horizontal,
-                    );
-                }
-                if both_btns_px > 0.0 && local_x >= bar_width - both_btns_px {
-                    return ClickTarget::SplitButton(
-                        group_id,
-                        crate::core::window::SplitDirection::Vertical,
-                    );
-                }
-
-                // Hit-test diff toolbar buttons using cached Pango-measured positions.
-                if let Some((prev_start, prev_end, next_start, next_end, fold_start, fold_end)) =
-                    *diff_btn_positions
+                // Hit-test diff toolbar buttons FIRST (they sit left of split
+                // buttons, so check them before split to avoid boundary overlap).
+                if let Some(&(prev_start, prev_end, next_start, next_end, fold_start, fold_end)) =
+                    diff_btn_map.get(&group_id.0)
                 {
                     if local_x >= prev_start && local_x < prev_end {
                         return ClickTarget::DiffToolbarPrev;
@@ -11455,6 +11490,24 @@ fn pixel_to_click_target(
                         return ClickTarget::DiffToolbarNext;
                     } else if local_x >= fold_start && local_x < fold_end {
                         return ClickTarget::DiffToolbarToggleFold;
+                    }
+                }
+
+                // Hit-test split buttons using cached Pango-measured widths.
+                // Only check if this group actually has split buttons drawn.
+                if let Some(&(both_btns_px, btn_right_px)) = split_btn_map.get(&group_id.0) {
+                    let btn_down_px = both_btns_px - btn_right_px;
+                    if local_x >= bar_width - btn_down_px {
+                        return ClickTarget::SplitButton(
+                            group_id,
+                            crate::core::window::SplitDirection::Horizontal,
+                        );
+                    }
+                    if local_x >= bar_width - both_btns_px {
+                        return ClickTarget::SplitButton(
+                            group_id,
+                            crate::core::window::SplitDirection::Vertical,
+                        );
                     }
                 }
 
@@ -11652,7 +11705,8 @@ fn handle_mouse_click(
     line_height: f64,
     char_width: f64,
     tab_slot_positions: &TabSlotMap,
-    diff_btn_positions: &DiffBtnPositions,
+    diff_btn_map: &DiffBtnMap,
+    split_btn_map: &SplitBtnMap,
 ) -> Option<bool> {
     match pixel_to_click_target(
         engine,
@@ -11663,7 +11717,8 @@ fn handle_mouse_click(
         line_height,
         char_width,
         tab_slot_positions,
-        diff_btn_positions,
+        diff_btn_map,
+        split_btn_map,
     ) {
         ClickTarget::BufferPos(wid, line, col) => {
             // Alt+Click in VSCode mode → add cursor at position
@@ -11825,7 +11880,8 @@ fn handle_mouse_double_click(
     line_height: f64,
     char_width: f64,
     tab_slot_positions: &TabSlotMap,
-    diff_btn_positions: &DiffBtnPositions,
+    diff_btn_map: &DiffBtnMap,
+    split_btn_map: &SplitBtnMap,
 ) {
     if let ClickTarget::BufferPos(wid, line, col) = pixel_to_click_target(
         engine,
@@ -11836,7 +11892,8 @@ fn handle_mouse_double_click(
         line_height,
         char_width,
         tab_slot_positions,
-        diff_btn_positions,
+        diff_btn_map,
+        split_btn_map,
     ) {
         engine.mouse_double_click(wid, line, col);
     }
@@ -11853,7 +11910,8 @@ fn handle_mouse_drag(
     line_height: f64,
     char_width: f64,
     tab_slot_positions: &TabSlotMap,
-    diff_btn_positions: &DiffBtnPositions,
+    diff_btn_map: &DiffBtnMap,
+    split_btn_map: &SplitBtnMap,
 ) {
     if let ClickTarget::BufferPos(wid, line, col) = pixel_to_click_target(
         engine,
@@ -11864,7 +11922,8 @@ fn handle_mouse_drag(
         line_height,
         char_width,
         tab_slot_positions,
-        diff_btn_positions,
+        diff_btn_map,
+        split_btn_map,
     ) {
         engine.mouse_drag(wid, line, col);
     }

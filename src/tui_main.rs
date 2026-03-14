@@ -3800,25 +3800,19 @@ fn handle_mouse(
                     })
                 });
                 if let Some(rw) = scrolled {
-                    let total = rw.total_lines.saturating_sub(1);
-                    let st = rw.scroll_top;
-                    let new_top = if matches!(ev.kind, MouseEventKind::ScrollUp) {
-                        st.saturating_sub(3)
+                    if matches!(ev.kind, MouseEventKind::ScrollUp) {
+                        engine.scroll_up_visible_for_window(rw.window_id, 3);
                     } else {
-                        (st + 3).min(total)
-                    };
-                    engine.set_scroll_top_for_window(rw.window_id, new_top);
+                        engine.scroll_down_visible_for_window(rw.window_id, 3);
+                    }
                     engine.sync_scroll_binds();
                 } else {
                     // Fallback: scroll active window
-                    let lines = engine.buffer().len_lines().saturating_sub(1);
-                    let st = engine.view().scroll_top;
-                    let new_top = if matches!(ev.kind, MouseEventKind::ScrollUp) {
-                        st.saturating_sub(3)
+                    if matches!(ev.kind, MouseEventKind::ScrollUp) {
+                        engine.scroll_up_visible(3);
                     } else {
-                        (st + 3).min(lines)
-                    };
-                    engine.set_scroll_top(new_top);
+                        engine.scroll_down_visible(3);
+                    }
                     engine.ensure_cursor_visible();
                     engine.sync_scroll_binds();
                 }
@@ -4627,18 +4621,26 @@ fn handle_mouse(
                 let gx = gtb.bounds.x as u16;
                 let gw = gtb.bounds.width as u16;
                 if row == tab_bar_row && rel_col >= gx && rel_col < gx + gw {
+                    let was_active = gtb.group_id == split.active_group;
                     matched_group = Some((
                         gtb.group_id,
                         rel_col - gx,
                         gw,
                         &gtb.tabs,
                         gtb.diff_toolbar.as_ref(),
+                        was_active,
                     ));
                     break;
                 }
             }
-            if let Some((group_id, local_col, bar_width, group_tabs, diff_toolbar_ref)) =
-                matched_group
+            if let Some((
+                group_id,
+                local_col,
+                bar_width,
+                group_tabs,
+                diff_toolbar_ref,
+                was_active,
+            )) = matched_group
             {
                 engine.active_group = group_id;
 
@@ -4694,23 +4696,19 @@ fn handle_mouse(
                     } else {
                         0
                     };
+                    // Split buttons exist on active group, or all groups in diff mode.
+                    let had_split = was_active || engine.is_in_diff_view();
+                    let split_cols = if had_split { TAB_SPLIT_BOTH_COLS } else { 0 };
                     let split_end = bar_width;
-                    let split_start = split_end.saturating_sub(TAB_SPLIT_BOTH_COLS);
+                    let split_start = split_end.saturating_sub(split_cols);
                     let diff_end = split_start;
                     let diff_start = diff_end.saturating_sub(diff_total_cols);
-                    // Hit-test split buttons (rightmost).
-                    if local_col >= split_start && bar_width >= TAB_SPLIT_BOTH_COLS {
-                        let in_split = local_col - split_start;
-                        if in_split >= TAB_SPLIT_BTN_COLS {
-                            engine.open_editor_group(SplitDirection::Horizontal);
-                        } else {
-                            engine.open_editor_group(SplitDirection::Vertical);
-                        }
-                    } else if diff_total_cols > 0 && local_col >= diff_start && local_col < diff_end
-                    {
+                    // Hit-test diff toolbar buttons FIRST (they sit left of
+                    // split buttons, so check them before split to avoid
+                    // boundary overlap).
+                    if diff_total_cols > 0 && local_col >= diff_start && local_col < diff_end {
                         // Hit-test diff toolbar buttons (prev, next, fold).
                         // Layout: [label][prev][next][fold].
-                        // Buttons occupy last 9 cols of the diff zone.
                         let in_diff = local_col - diff_start;
                         let label_cols = diff_total_cols - DIFF_TOOLBAR_BTN_COLS;
                         let in_btns = in_diff.saturating_sub(label_cols);
@@ -4727,6 +4725,17 @@ fn handle_mouse(
                             }
                         } else {
                             engine.diff_toggle_hide_unchanged();
+                        }
+                    } else if had_split
+                        && local_col >= split_start
+                        && bar_width >= TAB_SPLIT_BOTH_COLS
+                    {
+                        // Hit-test split buttons (rightmost).
+                        let in_split = local_col - split_start;
+                        if in_split >= TAB_SPLIT_BTN_COLS {
+                            engine.open_editor_group(SplitDirection::Horizontal);
+                        } else {
+                            engine.open_editor_group(SplitDirection::Vertical);
                         }
                     }
                 }
@@ -4786,14 +4795,8 @@ fn handle_mouse(
                 let split_start = split_end.saturating_sub(TAB_SPLIT_BOTH_COLS);
                 let diff_end = split_start;
                 let diff_start = diff_end.saturating_sub(diff_total_cols);
-                if local_col >= split_start && bar_width >= TAB_SPLIT_BOTH_COLS {
-                    let in_split = local_col - split_start;
-                    if in_split >= TAB_SPLIT_BTN_COLS {
-                        engine.open_editor_group(SplitDirection::Horizontal);
-                    } else {
-                        engine.open_editor_group(SplitDirection::Vertical);
-                    }
-                } else if diff_total_cols > 0 && local_col >= diff_start && local_col < diff_end {
+                // Check diff toolbar FIRST to avoid boundary overlap with split buttons.
+                if diff_total_cols > 0 && local_col >= diff_start && local_col < diff_end {
                     let in_diff = local_col - diff_start;
                     let label_cols = diff_total_cols - DIFF_TOOLBAR_BTN_COLS;
                     let in_btns = in_diff.saturating_sub(label_cols);
@@ -4810,6 +4813,13 @@ fn handle_mouse(
                         }
                     } else {
                         engine.diff_toggle_hide_unchanged();
+                    }
+                } else if local_col >= split_start && bar_width >= TAB_SPLIT_BOTH_COLS {
+                    let in_split = local_col - split_start;
+                    if in_split >= TAB_SPLIT_BTN_COLS {
+                        engine.open_editor_group(SplitDirection::Horizontal);
+                    } else {
+                        engine.open_editor_group(SplitDirection::Vertical);
                     }
                 }
             }
@@ -5187,6 +5197,9 @@ fn draw_frame(
             let tab_x = gtb.bounds.x as u16 + editor_area.x;
             let tab_w = gtb.bounds.width as u16;
             let is_active = gtb.group_id == split.active_group;
+            // In diff mode, show split buttons on all groups so clicking
+            // an inactive group's toolbar doesn't cause a visual shift.
+            let show_split = is_active || engine.is_in_diff_view();
             if tab_w > 0 {
                 let bar_y = editor_area.y + (gtb.bounds.y as u16).saturating_sub(tui_tbh);
                 let g_tab = Rect {
@@ -5200,7 +5213,7 @@ fn draw_frame(
                     g_tab,
                     &gtb.tabs,
                     theme,
-                    is_active,
+                    show_split,
                     gtb.diff_toolbar.as_ref(),
                 );
             }
@@ -5682,7 +5695,7 @@ const TAB_SPLIT_BTN_COLS: u16 = 3;
 /// Total columns reserved for both split buttons.
 const TAB_SPLIT_BOTH_COLS: u16 = TAB_SPLIT_BTN_COLS * 2;
 
-/// Terminal columns per diff toolbar button (1 space + 2-wide NF glyph).
+/// Terminal columns per diff toolbar button (1 space + 1 char + 1 space).
 const DIFF_BTN_COLS: u16 = 3;
 /// Total columns for all three diff toolbar buttons.
 const DIFF_TOOLBAR_BTN_COLS: u16 = DIFF_BTN_COLS * 3;

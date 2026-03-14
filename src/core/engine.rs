@@ -26,7 +26,7 @@ use super::settings::{EditorMode, Settings};
 use super::syntax::Syntax;
 use super::tab::{Tab, TabId};
 use super::terminal::{default_shell, InstallContext, TerminalPane};
-use super::view::View;
+use super::view::{FoldRegion, View};
 use super::window::{
     DropZone, GroupDivider, GroupId, GroupLayout, SplitDirection, Window, WindowId, WindowLayout,
     WindowRect,
@@ -2562,10 +2562,50 @@ impl Engine {
         self.view().scroll_top
     }
 
-    /// Set scroll_top for the active window.
+    /// Set scroll_top for the active window, snapping out of fold bodies.
     #[allow(dead_code)]
     pub fn set_scroll_top(&mut self, scroll_top: usize) {
-        self.view_mut().scroll_top = scroll_top;
+        let snapped = Self::snap_scroll_top(&self.view().folds, scroll_top);
+        self.view_mut().scroll_top = snapped;
+    }
+
+    /// Scroll the active window down by `count` visible lines (fold-aware).
+    pub fn scroll_down_visible(&mut self, count: usize) {
+        let max_line = self.buffer().len_lines().saturating_sub(1);
+        let st = self.view().scroll_top;
+        let new_top = self.view().next_visible_line(st, count, max_line);
+        self.view_mut().scroll_top = new_top;
+    }
+
+    /// Scroll the active window up by `count` visible lines (fold-aware).
+    pub fn scroll_up_visible(&mut self, count: usize) {
+        let st = self.view().scroll_top;
+        let new_top = self.view().prev_visible_line(st, count);
+        self.view_mut().scroll_top = new_top;
+    }
+
+    /// Scroll a specific window down by `count` visible lines (fold-aware).
+    pub fn scroll_down_visible_for_window(&mut self, window_id: WindowId, count: usize) {
+        if let Some(window) = self.windows.get(&window_id) {
+            let buf_id = window.buffer_id;
+            let max_line = self
+                .buffer_manager
+                .get(buf_id)
+                .map(|bs| bs.buffer.len_lines().saturating_sub(1))
+                .unwrap_or(0);
+            let new_top = window
+                .view
+                .next_visible_line(window.view.scroll_top, count, max_line);
+            self.windows.get_mut(&window_id).unwrap().view.scroll_top = new_top;
+        }
+    }
+
+    /// Scroll a specific window up by `count` visible lines (fold-aware).
+    pub fn scroll_up_visible_for_window(&mut self, window_id: WindowId, count: usize) {
+        if let Some(window) = self.windows.get(&window_id) {
+            let new_top = window.view.prev_visible_line(window.view.scroll_top, count);
+            self.windows.get_mut(&window_id).unwrap().view.scroll_top = new_top;
+        }
     }
 
     /// Get viewport_lines for the active window.
@@ -2610,11 +2650,23 @@ impl Engine {
         }
     }
 
-    /// Set scroll_top for a specific window without changing the active window.
+    /// Set scroll_top for a specific window without changing the active window,
+    /// snapping out of fold bodies.
+    #[allow(dead_code)]
     pub fn set_scroll_top_for_window(&mut self, window_id: WindowId, scroll_top: usize) {
         if let Some(window) = self.windows.get_mut(&window_id) {
-            window.view.scroll_top = scroll_top;
+            window.view.scroll_top = Self::snap_scroll_top(&window.view.folds, scroll_top);
         }
+    }
+
+    /// If `line` falls inside a fold body, snap to the fold header (start).
+    fn snap_scroll_top(folds: &[FoldRegion], line: usize) -> usize {
+        for f in folds {
+            if line > f.start && line <= f.end {
+                return f.start;
+            }
+        }
+        line
     }
 
     /// Set scroll_left for a specific window without changing the active window.
@@ -3216,6 +3268,8 @@ impl Engine {
 
     /// Open the git diff for the current file in a vertical split.
     fn cmd_git_diff(&mut self) -> EngineAction {
+        // Ensure editor receives keys after opening diff.
+        self.sc_has_focus = false;
         let path = match self.file_path().map(|p| p.to_path_buf()) {
             Some(p) => p,
             None => {
@@ -3250,6 +3304,8 @@ impl Engine {
     /// If a diff split is already active, closes it first to avoid
     /// accumulating splits on repeated invocations.
     pub fn cmd_git_diff_split(&mut self, path: &Path) -> EngineAction {
+        // Ensure editor receives keys after opening diff.
+        self.sc_has_focus = false;
         // If a diff split is already active, tear it down first.
         if let Some((left_win, right_win)) = self.diff_window_pair.take() {
             self.diff_results.clear();
@@ -4345,37 +4401,96 @@ impl Engine {
     }
 
     /// Apply folds to hide unchanged sections in both diff windows.
+    ///
+    /// Uses the aligned diff sequences (same length on both sides) so that
+    /// fold regions correspond correctly even when the two buffers have
+    /// different line counts due to insertions/deletions.
     fn diff_apply_folds(&mut self) {
         let (a_win, b_win) = match self.diff_window_pair {
             Some(pair) => pair,
             None => return,
         };
-        for win_id in [a_win, b_win] {
-            let regions = self.diff_change_regions(win_id);
-            let total = self.diff_results.get(&win_id).map(|r| r.len()).unwrap_or(0);
-            if total == 0 {
-                continue;
+        let aligned_a = self.diff_aligned.get(&a_win).cloned().unwrap_or_default();
+        let aligned_b = self.diff_aligned.get(&b_win).cloned().unwrap_or_default();
+        let a_results = self.diff_results.get(&a_win).cloned().unwrap_or_default();
+        let b_results = self.diff_results.get(&b_win).cloned().unwrap_or_default();
+        let visual_rows = aligned_a.len().max(aligned_b.len());
+        if visual_rows == 0 {
+            return;
+        }
+
+        // Build a per-visual-row "changed" flag: true if either side has a
+        // non-Same line or a padding filler at that row.
+        let mut changed = vec![false; visual_rows];
+        for (row, entry) in aligned_a.iter().enumerate() {
+            match entry.source_line {
+                Some(line) if line < a_results.len() && a_results[line] != DiffLine::Same => {
+                    changed[row] = true;
+                }
+                None => changed[row] = true, // padding
+                _ => {}
             }
-            // Build a set of lines that should remain visible (change regions + context).
-            let mut visible = vec![false; total];
-            for &(start, end) in &regions {
-                let ctx_start = start.saturating_sub(DIFF_CONTEXT_LINES);
-                let ctx_end = (end + DIFF_CONTEXT_LINES).min(total - 1);
+        }
+        for (row, entry) in aligned_b.iter().enumerate() {
+            match entry.source_line {
+                Some(line) if line < b_results.len() && b_results[line] != DiffLine::Same => {
+                    changed[row] = true;
+                }
+                None => changed[row] = true,
+                _ => {}
+            }
+        }
+
+        // Mark context lines around changes as visible.
+        let mut visible = vec![false; visual_rows];
+        for (row, &is_changed) in changed.iter().enumerate() {
+            if is_changed {
+                let ctx_start = row.saturating_sub(DIFF_CONTEXT_LINES);
+                let ctx_end = (row + DIFF_CONTEXT_LINES).min(visual_rows - 1);
                 for v in visible.iter_mut().take(ctx_end + 1).skip(ctx_start) {
                     *v = true;
                 }
             }
-            // If no changes, don't fold anything.
-            if regions.is_empty() {
+        }
+
+        if visible.iter().all(|&v| v) {
+            return; // nothing to fold
+        }
+
+        // For each window, translate visible visual rows to buffer lines,
+        // then fold the buffer lines that are not visible.
+        for (win_id, aligned) in [(a_win, &aligned_a), (b_win, &aligned_b)] {
+            let buf_lines = if let Some(w) = self.windows.get(&win_id) {
+                self.buffer_manager
+                    .get(w.buffer_id)
+                    .map(|bs| bs.buffer.len_lines())
+                    .unwrap_or(0)
+            } else {
+                continue;
+            };
+            if buf_lines == 0 {
                 continue;
             }
+
+            // Mark which buffer lines should be visible.
+            let mut buf_visible = vec![false; buf_lines];
+            for (row, entry) in aligned.iter().enumerate() {
+                if row < visible.len() && visible[row] {
+                    if let Some(line) = entry.source_line {
+                        if line < buf_lines {
+                            buf_visible[line] = true;
+                        }
+                    }
+                }
+            }
+
             // Collect contiguous invisible runs as fold regions.
             let mut folds = Vec::new();
             let mut i = 0;
-            while i < total {
-                if !visible[i] {
+            while i < buf_lines {
+                if !buf_visible[i] {
                     let start = i;
-                    while i < total && !visible[i] {
+                    while i < buf_lines && !buf_visible[i] {
                         i += 1;
                     }
                     folds.push((start, i - 1));
@@ -4383,7 +4498,7 @@ impl Engine {
                     i += 1;
                 }
             }
-            // Apply folds.
+
             if let Some(w) = self.windows.get_mut(&win_id) {
                 w.view.open_all_folds();
                 for (start, end) in folds {
@@ -4391,6 +4506,25 @@ impl Engine {
                 }
             }
         }
+    }
+
+    /// Helper: extract change regions from a diff results array (no self needed).
+    #[allow(dead_code)]
+    fn change_regions_from_results(results: &[DiffLine]) -> Vec<(usize, usize)> {
+        let mut regions = Vec::new();
+        let mut i = 0;
+        while i < results.len() {
+            if results[i] != DiffLine::Same {
+                let start = i;
+                while i < results.len() && results[i] != DiffLine::Same {
+                    i += 1;
+                }
+                regions.push((start, i - 1));
+            } else {
+                i += 1;
+            }
+        }
+        regions
     }
 
     /// Returns `(current_1based, total)` for the diff toolbar label, or `None`
@@ -6910,23 +7044,25 @@ impl Engine {
         if ctrl {
             match key_name {
                 "d" => {
-                    // Half-page down
+                    // Half-page down (fold-aware)
                     let count = self.take_count();
                     let half = self.viewport_lines() / 2;
                     let scroll_amount = half * count;
                     let max_line = self.buffer().len_lines().saturating_sub(1);
-                    self.view_mut().cursor.line =
-                        (self.view().cursor.line + scroll_amount).min(max_line);
+                    let cur = self.view().cursor.line;
+                    let new_line = self.view().next_visible_line(cur, scroll_amount, max_line);
+                    self.view_mut().cursor.line = new_line;
                     self.clamp_cursor_col();
                     return EngineAction::None;
                 }
                 "u" => {
-                    // Ctrl-U: Half-page up
+                    // Ctrl-U: Half-page up (fold-aware)
                     let count = self.take_count();
                     let half = self.viewport_lines() / 2;
                     let scroll_amount = half * count;
-                    self.view_mut().cursor.line =
-                        self.view().cursor.line.saturating_sub(scroll_amount);
+                    let cur = self.view().cursor.line;
+                    let new_line = self.view().prev_visible_line(cur, scroll_amount);
+                    self.view_mut().cursor.line = new_line;
                     self.clamp_cursor_col();
                     return EngineAction::None;
                 }
@@ -6937,23 +7073,25 @@ impl Engine {
                     return EngineAction::None;
                 }
                 "f" => {
-                    // Full page down
+                    // Full page down (fold-aware)
                     let count = self.take_count();
                     let viewport = self.viewport_lines();
                     let scroll_amount = viewport * count;
                     let max_line = self.buffer().len_lines().saturating_sub(1);
-                    self.view_mut().cursor.line =
-                        (self.view().cursor.line + scroll_amount).min(max_line);
+                    let cur = self.view().cursor.line;
+                    let new_line = self.view().next_visible_line(cur, scroll_amount, max_line);
+                    self.view_mut().cursor.line = new_line;
                     self.clamp_cursor_col();
                     return EngineAction::None;
                 }
                 "b" => {
-                    // Full page up
+                    // Full page up (fold-aware)
                     let count = self.take_count();
                     let viewport = self.viewport_lines();
                     let scroll_amount = viewport * count;
-                    self.view_mut().cursor.line =
-                        self.view().cursor.line.saturating_sub(scroll_amount);
+                    let cur = self.view().cursor.line;
+                    let new_line = self.view().prev_visible_line(cur, scroll_amount);
+                    self.view_mut().cursor.line = new_line;
                     self.clamp_cursor_col();
                     return EngineAction::None;
                 }
@@ -7014,11 +7152,9 @@ impl Engine {
                     return EngineAction::None;
                 }
                 "e" => {
-                    // Ctrl-E: scroll down one line (cursor stays in place if possible)
+                    // Ctrl-E: scroll down one line (fold-aware, cursor stays)
                     let count = self.take_count();
-                    let max_scroll = self.buffer().len_lines().saturating_sub(1);
-                    let new_top = (self.view().scroll_top + count).min(max_scroll);
-                    self.view_mut().scroll_top = new_top;
+                    self.scroll_down_visible(count);
                     // Keep cursor visible
                     let viewport = self.viewport_lines();
                     if viewport > 0 && self.view().cursor.line < self.view().scroll_top {
@@ -7028,10 +7164,9 @@ impl Engine {
                     return EngineAction::None;
                 }
                 "y" => {
-                    // Ctrl-Y: scroll up one line (cursor stays in place if possible)
+                    // Ctrl-Y: scroll up one line (fold-aware, cursor stays)
                     let count = self.take_count();
-                    let new_top = self.view().scroll_top.saturating_sub(count);
-                    self.view_mut().scroll_top = new_top;
+                    self.scroll_up_visible(count);
                     // Keep cursor visible
                     let viewport = self.viewport_lines();
                     if viewport > 0 && self.view().cursor.line >= self.view().scroll_top + viewport
@@ -12076,40 +12211,48 @@ impl Engine {
         }
 
         // Handle navigation keys (extend selection)
-        // These use the same movement logic as normal mode
+        // These use the same movement logic as normal mode (fold-aware)
         if ctrl {
             match key_name {
                 "d" => {
                     let count = self.take_count();
                     let half = self.viewport_lines() / 2;
+                    let scroll_amount = half * count;
                     let max_line = self.buffer().len_lines().saturating_sub(1);
-                    self.view_mut().cursor.line =
-                        (self.view().cursor.line + half * count).min(max_line);
+                    let cur = self.view().cursor.line;
+                    let new_line = self.view().next_visible_line(cur, scroll_amount, max_line);
+                    self.view_mut().cursor.line = new_line;
                     self.clamp_cursor_col();
                     return EngineAction::None;
                 }
                 "u" => {
                     let count = self.take_count();
                     let half = self.viewport_lines() / 2;
-                    self.view_mut().cursor.line =
-                        self.view().cursor.line.saturating_sub(half * count);
+                    let scroll_amount = half * count;
+                    let cur = self.view().cursor.line;
+                    let new_line = self.view().prev_visible_line(cur, scroll_amount);
+                    self.view_mut().cursor.line = new_line;
                     self.clamp_cursor_col();
                     return EngineAction::None;
                 }
                 "f" => {
                     let count = self.take_count();
                     let viewport = self.viewport_lines();
+                    let scroll_amount = viewport * count;
                     let max_line = self.buffer().len_lines().saturating_sub(1);
-                    self.view_mut().cursor.line =
-                        (self.view().cursor.line + viewport * count).min(max_line);
+                    let cur = self.view().cursor.line;
+                    let new_line = self.view().next_visible_line(cur, scroll_amount, max_line);
+                    self.view_mut().cursor.line = new_line;
                     self.clamp_cursor_col();
                     return EngineAction::None;
                 }
                 "b" => {
                     let count = self.take_count();
                     let viewport = self.viewport_lines();
-                    self.view_mut().cursor.line =
-                        self.view().cursor.line.saturating_sub(viewport * count);
+                    let scroll_amount = viewport * count;
+                    let cur = self.view().cursor.line;
+                    let new_line = self.view().prev_visible_line(cur, scroll_amount);
+                    self.view_mut().cursor.line = new_line;
                     self.clamp_cursor_col();
                     return EngineAction::None;
                 }
@@ -32464,6 +32607,61 @@ mod tests {
 
         engine.handle_key("u", Some('u'), true);
         assert_eq!(engine.view().cursor.line, 40);
+    }
+
+    #[test]
+    fn test_ctrl_d_fold_aware() {
+        let mut engine = Engine::new();
+        let mut text = String::new();
+        for i in 0..200 {
+            text.push_str(&format!("line {}\n", i));
+        }
+        engine.buffer_mut().insert(0, &text);
+        engine.set_viewport_lines(20);
+        // Create a large fold: lines 5..=100 are hidden (line 5 is header)
+        engine.view_mut().close_fold(5, 100);
+        // Cursor at line 0, Ctrl-D = half page (10 visible lines)
+        engine.handle_key("d", Some('d'), true);
+        // Should skip fold body and land on a visible line
+        // Lines 0-5 are visible (0,1,2,3,4,5=header), then 101+ are visible
+        // From 0, advance 10 visible: 1,2,3,4,5,101,102,103,104,105
+        assert_eq!(engine.view().cursor.line, 105);
+    }
+
+    #[test]
+    fn test_ctrl_u_fold_aware() {
+        let mut engine = Engine::new();
+        let mut text = String::new();
+        for i in 0..200 {
+            text.push_str(&format!("line {}\n", i));
+        }
+        engine.buffer_mut().insert(0, &text);
+        engine.set_viewport_lines(20);
+        // Create a large fold: lines 5..=100 are hidden
+        engine.view_mut().close_fold(5, 100);
+        // Cursor at line 110, Ctrl-U = half page (10 visible lines)
+        engine.view_mut().cursor.line = 110;
+        engine.handle_key("u", Some('u'), true);
+        // From 110, go back 10 visible: 109,108,107,106,105,104,103,102,101,5
+        assert_eq!(engine.view().cursor.line, 5);
+    }
+
+    #[test]
+    fn test_scroll_down_visible_skips_folds() {
+        let mut engine = Engine::new();
+        let mut text = String::new();
+        for i in 0..200 {
+            text.push_str(&format!("line {}\n", i));
+        }
+        engine.buffer_mut().insert(0, &text);
+        engine.set_viewport_lines(20);
+        // Fold lines 10..=100
+        engine.view_mut().close_fold(10, 100);
+        engine.view_mut().scroll_top = 8;
+        // Scroll down 5 visible lines
+        engine.scroll_down_visible(5);
+        // From 8: 9, 10(header), 101, 102, 103
+        assert_eq!(engine.view().scroll_top, 103);
     }
 
     #[test]

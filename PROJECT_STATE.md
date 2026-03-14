@@ -1,9 +1,9 @@
 # VimCode Project State
 
-**Last updated:** Mar 13, 2026 (Session 174 — Bug Fixes: Dialog System, Completion, Diff, Find Panel) | **Tests:** 4254
+**Last updated:** Mar 13, 2026 (Session 175 — Diff View Improvements: Click Handling, Fold-Aware Scrolling, Aligned Folds) | **Tests:** 4263
 
 > Feature documentation lives in **README.md**.
-> Per-session implementation notes through Session 174 are in **SESSION_HISTORY.md**.
+> Per-session implementation notes through Session 175 are in **SESSION_HISTORY.md**.
 
 ---
 
@@ -26,7 +26,7 @@ When implementing a new key/command, add tests covering:
 
 ## Recent Work
 
-**Session 174 — Bug Fixes: Dialog System, Completion, Diff, Find Panel (4254 tests):**
-Dismissable modal dialog system (`Dialog`/`DialogButton` structs, `show_dialog()`/`handle_dialog_key()`/`process_dialog_result()`) replacing status-bar messages for swap recovery. Stderr suppression in TUI clipboard init (RAII `StderrGuard` with `dup2`). Removed 6 `eprintln!` calls from core modules. Fixed sticky completion popup (new `dismiss_completion()` cancels pending LSP request; mode check in CompletionResponse handler). Fixed diff view padding with fold filtering (skip padding when `diff_unchanged_hidden`). Fixed diff view not working on large files (removed `MAX_LINES: 5000` guard in `lcs_diff()`). Fixed Find Panel text input in GTK (detect Entry focus, return `Propagation::Proceed`). Fixed Visual Mode Ctrl-D/U (`!ctrl` guards). Fixed undo/redo not notifying LSP. Verified diff toolbar renders on both group tab bars. 40 new tests.
+**Session 175 — Diff View Improvements: Click Handling, Fold-Aware Scrolling, Aligned Folds (4263 tests):**
+Per-group diff toolbar click handling (GTK `DiffBtnMap`/`SplitBtnMap` replacing single shared cache; TUI `was_active` tracking). Click precedence fix: diff toolbar checked before split buttons in both backends. Split buttons visible on all groups in diff mode. Fold-aware scrolling: `next_visible_line()`/`prev_visible_line()` on View skip fold bodies; Ctrl-D/U/F/B/E/Y + scroll wheel all fold-aware in normal, visual, and both backends. Aligned-sequence fold computation: `diff_apply_folds()` rewritten to use `diff_aligned` (visual row → buffer line mapping) instead of raw `diff_results`, fixing incorrect folds when files have different line counts. `sc_has_focus` cleared on diff commands. TUI diff toolbar glyphs reverted to Nerd Font with 3-col button width. 3 new tests.
 
-> Sessions 173 and earlier archived in **SESSION_HISTORY.md**.
+> Sessions 174 and earlier archived in **SESSION_HISTORY.md**.

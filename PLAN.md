@@ -5,6 +5,7 @@
 ---
 
 ## Recently Completed
+- **Session 175**: Diff View Improvements — Per-group diff toolbar click handling (GTK + TUI), fold-aware scrolling (Ctrl-D/U/F/B/E/Y + scroll wheel skip fold bodies), aligned-sequence fold computation (uses diff_aligned instead of raw diff_results), sc_has_focus fix, TUI glyph revert. 3 new tests.
 - **Session 174**: Bug Fixes — Modal dialog system for swap recovery, stderr suppression in TUI, sticky completion popup fix, diff padding suppression with fold filtering, large-file diff fix (removed MAX_LINES guard), GTK Find Panel focus fix, Visual Ctrl-D/U fix, undo/redo LSP notification, diff toolbar cross-group verification. 40 new tests.
 
 > Sessions 173 and earlier in **SESSION_HISTORY.md**.
