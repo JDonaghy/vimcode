@@ -5,6 +5,8 @@
 ---
 
 ## Recently Completed
+- **Session 179**: Resize Tab Groups — GTK Alt+,/Alt+. keyboard; TUI mouse drag on group dividers; both backends now have full keyboard + mouse group resize.
+- **Session 178**: Version Querying — `--version` / `-V` CLI flag on both binaries; Help > About shows version; `env!("CARGO_PKG_VERSION")` compile-time.
 - **Session 177**: Fix Wrap Mode Mouse Click — GTK `view_row_to_buf_pos_wrap()` uses word-wrap segments for correct visual-row-to-buffer-line mapping; TUI click/drag add `segment_col_offset`. Fixes BUGS.md wrap click issue.
 - **Session 176**: GTK Performance — Lazy tree loading (one level at a time, expand on demand), Open Folder fix (set_current_dir + engine.cwd for tree refresh).
 
@@ -12,8 +14,8 @@
 
 ## Roadmap
 - Add a spell checker, either like vim's built in one, or as an extension. Needs discussion. Also need to think about supporting languages other than US English.
-- Add the ability to resize tabgroups: i.e. the leftgroup gets bigger at the right's expense and vice-versa. Also should work for vertically stacked tab groups, as well as with both the emouse and via key combos that are remappable in both tui and gui mode.
-- Implement version querying so that the semantic version and build number can be displayed via Help:About and by typing "vcd --verison" which shows teh version but doesn't start the editor.
+- [x] Add the ability to resize tabgroups: i.e. the leftgroup gets bigger at the right's expense and vice-versa. Also should work for vertically stacked tab groups, as well as with both the mouse and via key combos that are remappable in both tui and gui mode.
+- [x] Implement version querying so that the semantic version and build number can be displayed via Help:About and by typing "vcd --version" which shows the version but doesn't start the editor.
 ### Git
 - [x] **Stage hunks** — `]c`/`[c` navigation, `gs`/`:Ghs` to stage hunk under cursor
 - [x] **Inline diff peek** — `gD`/`:DiffPeek`/gutter click shows hunk popup with Revert/Stage, deleted-line `▾` gutter marker, `]c`/`[c` on real files

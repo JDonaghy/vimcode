@@ -1417,6 +1417,20 @@ impl SimpleComponent for App {
                                         return gtk4::glib::Propagation::Stop;
                                     }
 
+                                    // Alt+, / Alt+. — resize editor group split
+                                    if alt && !ctrl && !shift {
+                                        if unicode == Some(',') {
+                                            engine.borrow_mut().group_resize(-0.05);
+                                            sender.input(Msg::Resize);
+                                            return gtk4::glib::Propagation::Stop;
+                                        }
+                                        if unicode == Some('.') {
+                                            engine.borrow_mut().group_resize(0.05);
+                                            sender.input(Msg::Resize);
+                                            return gtk4::glib::Propagation::Stop;
+                                        }
+                                    }
+
                                     // Shift+Alt+F: LSP format document
                                     if alt && shift && !ctrl {
                                         let key_lower = key_name.to_ascii_lowercase();
@@ -12835,6 +12849,12 @@ fn install_icon_and_desktop() {
 fn main() {
     // Parse CLI args to get optional file path
     let args: Vec<String> = std::env::args().collect();
+
+    // --version / -V: print version and exit
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("VimCode {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
 
     // --tui / -t flag: launch the terminal UI instead of GTK
     let tui_mode = args.iter().any(|a| a == "--tui" || a == "-t");

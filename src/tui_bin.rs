@@ -16,6 +16,12 @@ mod tui_main;
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
+    // --version / -V: print version and exit
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("VimCode {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+
     // --debug <logfile>: write debug log to the given file
     let debug_log = args
         .iter()

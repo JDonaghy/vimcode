@@ -100,6 +100,7 @@ cargo build
 cargo run -- <file>                         # GTK window
 cargo run -- --tui <file>                   # Terminal UI (alias: -t)
 cargo run -- --tui --debug /tmp/v.log       # TUI with debug log
+cargo run -- --version                      # Print version and exit (alias: -V)
 cargo test -- --test-threads=1
 cargo clippy -- -D warnings
 cargo fmt
@@ -281,8 +282,8 @@ cargo fmt
 - `:EditorGroupFocus` / `:egf` — cycle focus to the next group
 - `:EditorGroupClose` / `:egc` — close the active group (sibling promoted)
 - `:EditorGroupMoveTab` / `:egmt` — move the current tab to the next group
-- `Alt+,` / `Alt+.` (TUI) — resize the parent split of the active group
-- Drag any divider (GTK) — resize that specific split
+- `Alt+,` / `Alt+.` — shrink / expand the active group (both GTK and TUI)
+- Drag any group divider — resize that specific split (both GTK and TUI)
 
 **Quit / Save**
 - `:w` — save; `:wq` — save and quit

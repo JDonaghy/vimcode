@@ -16967,7 +16967,20 @@ impl Engine {
                 EngineAction::None
             }
             "about" => {
-                self.message = "VimCode — Vim-like editor in Rust + GTK4".to_string();
+                self.show_dialog(
+                    "about",
+                    "About VimCode",
+                    vec![
+                        format!("VimCode {}", env!("CARGO_PKG_VERSION")),
+                        String::new(),
+                        "Vim-like code editor in Rust + GTK4".to_string(),
+                    ],
+                    vec![DialogButton {
+                        label: "OK".to_string(),
+                        hotkey: 'o',
+                        action: "ok".to_string(),
+                    }],
+                );
                 EngineAction::None
             }
             "openrecent" | "OpenRecent" => EngineAction::OpenRecentDialog,

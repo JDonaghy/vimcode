@@ -1,9 +1,9 @@
 # VimCode Project State
 
-**Last updated:** Mar 14, 2026 (Session 177 — Fix Wrap Mode Mouse Click) | **Tests:** 4266
+**Last updated:** Mar 14, 2026 (Session 179 — Resize Tab Groups) | **Tests:** 4266
 
 > Feature documentation lives in **README.md**.
-> Per-session implementation notes through Session 177 are in **SESSION_HISTORY.md**.
+> Per-session implementation notes through Session 179 are in **SESSION_HISTORY.md**.
 
 ---
 
@@ -26,7 +26,4 @@ When implementing a new key/command, add tests covering:
 
 ## Recent Work
 
-**Session 177 — Fix Wrap Mode Mouse Click (4266 tests):**
-Fixed mouse click targeting on wrapped lines in both GTK and TUI backends. GTK: added `view_row_to_buf_pos_wrap()` that walks buffer lines from scroll_top using `compute_word_wrap_segments()` (same word-wrap algorithm as renderer) to correctly map visual rows to `(buffer_line, segment_col_offset)`; `pixel_to_click_target()` now uses this when `settings.wrap` is true; column calculation walks from `segment_col_offset`. TUI: click and drag handlers now add `segment_col_offset` from the rendered line to `col_in_text`. Previously, clicking on a wrap-continuation row mapped to the wrong buffer line (GTK) or wrong column (TUI).
-
-> Sessions 176 and earlier archived in **SESSION_HISTORY.md**.
+> Sessions 179 and earlier archived in **SESSION_HISTORY.md**.
