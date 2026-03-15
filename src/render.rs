@@ -1022,7 +1022,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
                 separator: true,
             },
             MenuItemData {
-                label: "Open Workspace…",
+                label: "Open Workspace From File…",
                 shortcut: "",
                 vscode_shortcut: "",
                 action: "open_workspace_dialog",

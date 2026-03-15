@@ -374,12 +374,9 @@ struct DebugSidebarScrollDrag {
 
 /// What the folder picker should do when the user confirms a selection.
 #[derive(Clone, PartialEq)]
-#[allow(clippy::enum_variant_names)]
 enum FolderPickerMode {
     /// Open as a workspace folder (`engine.open_folder()`).
     OpenFolder,
-    /// Open as a workspace file (`engine.open_workspace()`).
-    OpenWorkspace,
     /// Pick from the list of recently opened workspaces.
     OpenRecent,
 }
@@ -770,9 +767,15 @@ pub fn run(file_path: Option<PathBuf>, debug_log_path: Option<String>) {
     engine.plugin_init();
     engine.restore_session_files();
     if let Some(path) = file_path {
-        // Open the CLI file in a tab (on top of any restored session files)
-        debug_log!("Opening file from CLI: {:?}", path);
-        engine.open_file_in_tab(&path);
+        if path.is_dir() {
+            // Directory argument: set cwd and open as workspace folder
+            debug_log!("Opening directory from CLI: {:?}", path);
+            engine.open_folder(&path);
+        } else {
+            // Open the CLI file in a tab (on top of any restored session files)
+            debug_log!("Opening file from CLI: {:?}", path);
+            engine.open_file_in_tab(&path);
+        }
     }
 
     setup_tui_clipboard(&mut engine);
@@ -1534,9 +1537,6 @@ fn event_loop(
                                     match mode {
                                         FolderPickerMode::OpenFolder => {
                                             engine.open_folder(&path);
-                                        }
-                                        FolderPickerMode::OpenWorkspace => {
-                                            engine.open_workspace(&path);
                                         }
                                         FolderPickerMode::OpenRecent => {}
                                     }
@@ -2828,11 +2828,14 @@ fn event_loop(
                                                         engine.settings.show_hidden_files,
                                                     ));
                                                 } else if act == EngineAction::OpenWorkspaceDialog {
-                                                    folder_picker = Some(FolderPickerState::new(
-                                                        &engine.cwd.clone(),
-                                                        FolderPickerMode::OpenWorkspace,
-                                                        engine.settings.show_hidden_files,
-                                                    ));
+                                                    // open_workspace_from_file() already ran;
+                                                    // refresh sidebar.
+                                                    sidebar = TuiSidebar::new(
+                                                        engine.cwd.clone(),
+                                                        sidebar.visible,
+                                                    );
+                                                    sidebar.show_hidden_files =
+                                                        engine.settings.show_hidden_files;
                                                 } else if act == EngineAction::SaveWorkspaceAsDialog
                                                 {
                                                     let ws_path =
@@ -3122,11 +3125,10 @@ fn event_loop(
                             ));
                             needs_redraw = true;
                         } else if action == EngineAction::OpenWorkspaceDialog {
-                            folder_picker = Some(FolderPickerState::new(
-                                &engine.cwd.clone(),
-                                FolderPickerMode::OpenWorkspace,
-                                engine.settings.show_hidden_files,
-                            ));
+                            // open_workspace_from_file() already ran in the engine;
+                            // just refresh the sidebar to reflect the new cwd.
+                            sidebar = TuiSidebar::new(engine.cwd.clone(), sidebar.visible);
+                            sidebar.show_hidden_files = engine.settings.show_hidden_files;
                             needs_redraw = true;
                         } else if action == EngineAction::SaveWorkspaceAsDialog {
                             // For TUI, save workspace to current directory immediately
@@ -3439,6 +3441,39 @@ fn handle_mouse(
         } else {
             0
         };
+
+    // ── Folder picker mouse handling ────────────────────────────────────────────
+    if let Some(ref mut picker) = folder_picker {
+        if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
+            let term_cols = terminal_size.map(|s| s.width).unwrap_or(80);
+            let term_rows = terminal_size.map(|s| s.height).unwrap_or(24);
+            let popup_w = (term_cols * 3 / 5).max(50);
+            let popup_h = (term_rows * 55 / 100).max(15);
+            let popup_x = (term_cols.saturating_sub(popup_w)) / 2;
+            let popup_y = (term_rows.saturating_sub(popup_h)) / 2;
+            let results_start = popup_y + 3;
+            let results_end = popup_y + popup_h - 1;
+
+            if col >= popup_x
+                && col < popup_x + popup_w
+                && row >= results_start
+                && row < results_end
+            {
+                let clicked_idx = picker.scroll_top + (row - results_start) as usize;
+                if clicked_idx < picker.filtered.len() {
+                    picker.selected = clicked_idx;
+                }
+            } else if col < popup_x
+                || col >= popup_x + popup_w
+                || row < popup_y
+                || row >= popup_y + popup_h
+            {
+                // Click outside popup — dismiss
+                *folder_picker = None;
+            }
+            return sidebar_width;
+        }
+    }
 
     // ── Sidebar separator drag (works anywhere, regardless of row) ────────────
     let sep_col = ab_width + if sidebar.visible { sidebar_width } else { 0 };
@@ -3934,11 +3969,10 @@ fn handle_mouse(
                                 engine.settings.show_hidden_files,
                             ));
                         } else if act == EngineAction::OpenWorkspaceDialog {
-                            *folder_picker = Some(FolderPickerState::new(
-                                &engine.cwd.clone(),
-                                FolderPickerMode::OpenWorkspace,
-                                engine.settings.show_hidden_files,
-                            ));
+                            // open_workspace_from_file() already ran in the engine;
+                            // refresh the sidebar to reflect the new cwd.
+                            *sidebar = TuiSidebar::new(engine.cwd.clone(), sidebar.visible);
+                            sidebar.show_hidden_files = engine.settings.show_hidden_files;
                         } else if act == EngineAction::SaveWorkspaceAsDialog {
                             let ws_path = engine.cwd.join(".vimcode-workspace");
                             engine.save_workspace_as(&ws_path);
@@ -6435,12 +6469,6 @@ fn render_folder_picker(
     let title_text = match picker.mode {
         FolderPickerMode::OpenFolder => format!(
             " Open Folder {}  {}/{} ",
-            root_display,
-            picker.filtered.len(),
-            picker.all_entries.len()
-        ),
-        FolderPickerMode::OpenWorkspace => format!(
-            " Open Workspace {}  {}/{} ",
             root_display,
             picker.filtered.len(),
             picker.all_entries.len()

@@ -249,7 +249,7 @@ pub static PALETTE_COMMANDS: &[PaletteCommand] = &[
         action: "open_folder_dialog",
     },
     PaletteCommand {
-        label: "File: Open Workspace…",
+        label: "File: Open Workspace From File…",
         shortcut: "",
         vscode_shortcut: "",
         action: "open_workspace_dialog",
@@ -13602,6 +13602,27 @@ impl Engine {
     }
 
     /// Write a `.vimcode-workspace` file at the given path with the current folder.
+    /// Open or create a workspace in the directory of the currently active file.
+    /// If a `.vimcode-workspace` file already exists there, open it; otherwise
+    /// create one and then open the folder.
+    pub fn open_workspace_from_file(&mut self) {
+        let buf_id = self.active_window().buffer_id;
+        let dir = self
+            .buffer_manager
+            .get(buf_id)
+            .and_then(|bs| bs.file_path.as_ref())
+            .and_then(|fp| fp.parent())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| self.cwd.clone());
+        let ws_path = dir.join(".vimcode-workspace");
+        if ws_path.exists() {
+            self.open_workspace(&ws_path);
+        } else {
+            self.save_workspace_as(&ws_path);
+            self.open_folder(&dir);
+        }
+    }
+
     pub fn save_workspace_as(&mut self, ws_path: &Path) {
         let folder_path = if let Some(parent) = ws_path.parent() {
             // Make folder path relative to workspace file location
@@ -15269,6 +15290,7 @@ impl Engine {
             return EngineAction::OpenFolderDialog;
         }
         if cmd == "OpenWorkspace" || cmd == "open_workspace_dialog" {
+            self.open_workspace_from_file();
             return EngineAction::OpenWorkspaceDialog;
         }
         if cmd == "SaveWorkspaceAs" || cmd == "save_workspace_as_dialog" {
