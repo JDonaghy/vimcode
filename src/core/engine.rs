@@ -724,6 +724,13 @@ struct Change {
     motion: Option<Motion>,
 }
 
+/// C preprocessor directive kind for `[#` / `]#` navigation.
+enum PreprocKind {
+    If,
+    ElseElif,
+    Endif,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
 enum ChangeOp {
@@ -1465,6 +1472,9 @@ pub struct Engine {
     last_change: Option<Change>,
     /// Text accumulated during insert mode for repeat
     insert_text_buffer: String,
+    /// When true, Replace mode uses virtual column awareness (gR).
+    /// Tabs are expanded to spaces before overwriting.
+    virtual_replace: bool,
     /// When insert mode was entered via a change operator (cw, ce, cb, etc.),
     /// stores (motion_char, count) so `.` can replay the full change.
     pending_change_motion: Option<(char, usize)>,
@@ -2155,6 +2165,7 @@ impl Engine {
             pending_text_object: None,
             last_change: None,
             insert_text_buffer: String::new(),
+            virtual_replace: false,
             pending_change_motion: None,
             settings: {
                 // Ensure settings.json exists with defaults
@@ -2731,12 +2742,21 @@ impl Engine {
         let cursor = *self.cursor();
         // Save line state before modification (for U command)
         self.save_line_for_undo();
+        // Record the "before" state in the timeline on first edit
+        if self.active_buffer_state().undo_timeline.is_empty() {
+            self.active_buffer_state_mut()
+                .record_timeline_snapshot(cursor);
+        }
         self.active_buffer_state_mut().start_undo_group(cursor);
     }
 
     /// Finish the current undo group for the active buffer.
     pub fn finish_undo_group(&mut self) {
         self.active_buffer_state_mut().finish_undo_group();
+        // Record timeline snapshot for g-/g+ after each completed edit
+        let cursor = self.view().cursor;
+        self.active_buffer_state_mut()
+            .record_timeline_snapshot(cursor);
     }
 
     /// Return to Normal mode from any mode, performing any necessary cleanup
@@ -2781,13 +2801,14 @@ impl Engine {
         if let Some(cursor) = self.active_buffer_state_mut().undo() {
             self.view_mut().cursor = cursor;
             self.clamp_cursor_col();
-            // Update dirty flag based on whether we're back at the saved state.
             let at_saved = self.active_buffer_state().is_at_saved_state();
             self.set_dirty(!at_saved);
-            // Notify LSP of the content change so diagnostics update.
             let active_id = self.active_buffer_id();
             self.lsp_dirty_buffers.insert(active_id, true);
             self.swap_mark_dirty();
+            // Record state in timeline for g-/g+
+            let cur = self.view().cursor;
+            self.active_buffer_state_mut().record_timeline_snapshot(cur);
             true
         } else {
             self.message = "Already at oldest change".to_string();
@@ -2800,18 +2821,90 @@ impl Engine {
         if let Some(cursor) = self.active_buffer_state_mut().redo() {
             self.view_mut().cursor = cursor;
             self.clamp_cursor_col();
-            // Update dirty flag based on whether we're back at the saved state.
             let at_saved = self.active_buffer_state().is_at_saved_state();
             self.set_dirty(!at_saved);
-            // Notify LSP of the content change so diagnostics update.
             let active_id = self.active_buffer_id();
             self.lsp_dirty_buffers.insert(active_id, true);
             self.swap_mark_dirty();
+            // Record state in timeline for g-/g+
+            let cur = self.view().cursor;
+            self.active_buffer_state_mut().record_timeline_snapshot(cur);
             true
         } else {
             self.message = "Already at newest change".to_string();
             false
         }
+    }
+
+    /// Navigate to an earlier buffer state chronologically (`g-`).
+    pub fn g_earlier(&mut self) -> bool {
+        let bs = self.active_buffer_state_mut();
+        if bs.undo_timeline.is_empty() {
+            return false;
+        }
+        // current_pos points to the timeline entry matching current buffer state.
+        // None means "at latest" = last index.
+        let current_pos = bs
+            .undo_timeline_pos
+            .unwrap_or(bs.undo_timeline.len().saturating_sub(1));
+        if current_pos == 0 {
+            return false; // already at earliest
+        }
+        let target = current_pos - 1;
+        let (ref text, cursor) = bs.undo_timeline[target];
+        let text_clone = text.clone();
+        let char_len = bs.buffer.len_chars();
+        bs.buffer.delete_range(0, char_len);
+        if !text_clone.is_empty() {
+            bs.buffer.insert(0, &text_clone);
+        }
+        bs.undo_timeline_pos = Some(target);
+        bs.update_syntax();
+        self.view_mut().cursor = cursor;
+        self.clamp_cursor_col();
+        self.set_dirty(true);
+        let active_id = self.active_buffer_id();
+        self.lsp_dirty_buffers.insert(active_id, true);
+        self.swap_mark_dirty();
+        let total = self.active_buffer_state().undo_timeline.len();
+        self.message = format!("{} change(s); g- #{}/{}", total, target + 1, total);
+        true
+    }
+
+    /// Navigate to a later buffer state chronologically (`g+`).
+    pub fn g_later(&mut self) -> bool {
+        let bs = self.active_buffer_state_mut();
+        if bs.undo_timeline.is_empty() {
+            return false;
+        }
+        let last = bs.undo_timeline.len() - 1;
+        let current_pos = bs.undo_timeline_pos.unwrap_or(last);
+        if current_pos >= last {
+            return false; // already at latest
+        }
+        let target = current_pos + 1;
+        let (ref text, cursor) = bs.undo_timeline[target];
+        let text_clone = text.clone();
+        let char_len = bs.buffer.len_chars();
+        bs.buffer.delete_range(0, char_len);
+        if !text_clone.is_empty() {
+            bs.buffer.insert(0, &text_clone);
+        }
+        if target == last {
+            bs.undo_timeline_pos = None; // back at latest
+        } else {
+            bs.undo_timeline_pos = Some(target);
+        }
+        bs.update_syntax();
+        self.view_mut().cursor = cursor;
+        self.clamp_cursor_col();
+        self.set_dirty(true);
+        let active_id = self.active_buffer_id();
+        self.lsp_dirty_buffers.insert(active_id, true);
+        self.swap_mark_dirty();
+        let total = self.active_buffer_state().undo_timeline.len();
+        self.message = format!("{} change(s); g+ #{}/{}", total, target + 1, total);
+        true
     }
 
     /// Check if undo is available.
@@ -7073,6 +7166,17 @@ impl Engine {
             }
         }
 
+        // Command-line window: Enter executes, q closes
+        if self.active_buffer_state().is_cmdline_buf {
+            if key_name == "Return" || key_name == "KP_Enter" {
+                return self.cmdline_window_execute();
+            }
+            if unicode == Some('q') && self.pending_key.is_none() {
+                self.close_tab();
+                return EngineAction::None;
+            }
+        }
+
         // If leader mode is active, route all keypresses there first.
         if self.leader_partial.is_some() {
             return self.handle_leader_key(unicode);
@@ -8445,6 +8549,26 @@ impl Engine {
                         self.message = "No previous substitute command".to_string();
                     }
                 }
+                Some('+') => {
+                    // g+: go to newer text state (chronological)
+                    let count = self.take_count();
+                    for _ in 0..count {
+                        if !self.g_later() {
+                            break;
+                        }
+                    }
+                    *changed = true;
+                }
+                Some('-') => {
+                    // g-: go to older text state (chronological)
+                    let count = self.take_count();
+                    for _ in 0..count {
+                        if !self.g_earlier() {
+                            break;
+                        }
+                    }
+                    *changed = true;
+                }
                 Some('o') => {
                     // go: go to byte N in the buffer (1-indexed, like Vim)
                     let byte_n = self.take_count().saturating_sub(1);
@@ -8480,6 +8604,14 @@ impl Engine {
                 Some('w') => {
                     // gw{motion}: format text, keep cursor
                     self.pending_operator = Some('Q');
+                }
+                Some('R') => {
+                    // gR: enter Virtual Replace mode (tab-aware overwrite)
+                    self.start_undo_group();
+                    self.insert_text_buffer.clear();
+                    self.virtual_replace = true;
+                    self.mode = Mode::Replace;
+                    self.count = None;
                 }
                 Some('?') => {
                     // g?{motion}: ROT13 encode operator
@@ -8584,6 +8716,13 @@ impl Engine {
                         self.jump_comment_end();
                     }
                 }
+                Some('#') => {
+                    // ]#: jump to next unmatched #else or #endif
+                    let count = self.take_count();
+                    for _ in 0..count {
+                        self.jump_preproc_forward();
+                    }
+                }
                 _ => {}
             },
             '[' => match unicode {
@@ -8669,6 +8808,13 @@ impl Engine {
                         self.jump_comment_start();
                     }
                 }
+                Some('#') => {
+                    // [#: jump to previous unmatched #if or #else
+                    let count = self.take_count();
+                    for _ in 0..count {
+                        self.jump_preproc_backward();
+                    }
+                }
                 _ => {}
             },
             'd' => {
@@ -8690,9 +8836,13 @@ impl Engine {
                 }
             }
             'q' => {
-                // Macro recording: q<register>
+                // Macro recording: q<register>, or command-line window: q: / q/ / q?
                 if let Some(ch) = unicode {
-                    if ch.is_ascii_lowercase() {
+                    if ch == ':' {
+                        self.open_cmdline_window(false);
+                    } else if ch == '/' || ch == '?' {
+                        self.open_cmdline_window(true);
+                    } else if ch.is_ascii_lowercase() {
                         self.start_macro_recording(ch);
                     } else {
                         self.message = "Invalid register for macro".to_string();
@@ -14746,7 +14896,13 @@ impl Engine {
         let mode_name = match self.mode {
             Mode::Normal => "Normal",
             Mode::Insert => "Insert",
-            Mode::Replace => "Replace",
+            Mode::Replace => {
+                if self.virtual_replace {
+                    "VReplace"
+                } else {
+                    "Replace"
+                }
+            }
             Mode::Command => "Command",
             Mode::Search => "Search",
             Mode::Visual => "Visual",
@@ -19379,6 +19535,7 @@ impl Engine {
         let _ = ctrl;
         match key_name {
             "Escape" => {
+                self.virtual_replace = false;
                 self.mode = Mode::Normal;
                 self.clamp_cursor_col();
             }
@@ -19422,6 +19579,40 @@ impl Engine {
                     } else {
                         0
                     };
+
+                    // Virtual Replace: expand tab to spaces before overwriting
+                    if self.virtual_replace && col < line_content_len {
+                        let cur_char = self.buffer().content.char(char_idx);
+                        if cur_char == '\t' {
+                            let tabstop = self.settings.tabstop as usize;
+                            // Calculate visual column of cursor
+                            let line_start = self.buffer().line_to_char(line);
+                            let mut vcol = 0usize;
+                            for i in 0..col {
+                                let c = self.buffer().content.char(line_start + i);
+                                if c == '\t' {
+                                    vcol = (vcol / tabstop + 1) * tabstop;
+                                } else {
+                                    vcol += 1;
+                                }
+                            }
+                            let tab_width = tabstop - (vcol % tabstop);
+                            // Replace tab with spaces, then overwrite first space
+                            self.start_undo_group();
+                            self.delete_with_undo(char_idx, char_idx + 1);
+                            let spaces = " ".repeat(tab_width);
+                            self.insert_with_undo(char_idx, &spaces);
+                            // Now overwrite the first space with the typed char
+                            self.delete_with_undo(char_idx, char_idx + 1);
+                            let mut buf = [0u8; 4];
+                            let s = ch.encode_utf8(&mut buf);
+                            self.insert_with_undo(char_idx, s);
+                            self.view_mut().cursor.col += 1;
+                            self.finish_undo_group();
+                            *changed = true;
+                            return;
+                        }
+                    }
 
                     self.start_undo_group();
                     if col < line_content_len {
@@ -22767,6 +22958,101 @@ impl Engine {
         }
     }
 
+    /// Jump forward to next unmatched `#else` or `#endif` (`]#`).
+    /// Uses depth tracking: `#if`/`#ifdef`/`#ifndef` increase depth,
+    /// `#endif` decreases depth, `#else`/`#elif` match at depth 0.
+    fn jump_preproc_forward(&mut self) {
+        let total = self.buffer().len_lines();
+        let start = self.view().cursor.line + 1;
+        let mut depth: i32 = 0;
+        for line_idx in start..total {
+            let line: String = self.buffer().content.line(line_idx).chars().collect();
+            let trimmed = line.trim();
+            if let Some(directive) = Self::preproc_directive(trimmed) {
+                match directive {
+                    PreprocKind::If => depth += 1,
+                    PreprocKind::ElseElif => {
+                        if depth == 0 {
+                            self.view_mut().cursor.line = line_idx;
+                            self.view_mut().cursor.col = 0;
+                            self.clamp_cursor_col();
+                            return;
+                        }
+                    }
+                    PreprocKind::Endif => {
+                        if depth == 0 {
+                            self.view_mut().cursor.line = line_idx;
+                            self.view_mut().cursor.col = 0;
+                            self.clamp_cursor_col();
+                            return;
+                        }
+                        depth -= 1;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Jump backward to previous unmatched `#if` or `#else` (`[#`).
+    /// Uses depth tracking: `#endif` increases depth,
+    /// `#if`/`#ifdef`/`#ifndef` decrease depth, `#else`/`#elif` match at depth 0.
+    fn jump_preproc_backward(&mut self) {
+        let cursor_line = self.view().cursor.line;
+        if cursor_line == 0 {
+            return;
+        }
+        let mut depth: i32 = 0;
+        for line_idx in (0..cursor_line).rev() {
+            let line: String = self.buffer().content.line(line_idx).chars().collect();
+            let trimmed = line.trim();
+            if let Some(directive) = Self::preproc_directive(trimmed) {
+                match directive {
+                    PreprocKind::Endif => depth += 1,
+                    PreprocKind::ElseElif => {
+                        if depth == 0 {
+                            self.view_mut().cursor.line = line_idx;
+                            self.view_mut().cursor.col = 0;
+                            self.clamp_cursor_col();
+                            return;
+                        }
+                    }
+                    PreprocKind::If => {
+                        if depth == 0 {
+                            self.view_mut().cursor.line = line_idx;
+                            self.view_mut().cursor.col = 0;
+                            self.clamp_cursor_col();
+                            return;
+                        }
+                        depth -= 1;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Classify a trimmed line as a preprocessor directive kind.
+    fn preproc_directive(trimmed: &str) -> Option<PreprocKind> {
+        if !trimmed.starts_with('#') {
+            return None;
+        }
+        // Strip '#' and optional whitespace after it
+        let after_hash = trimmed[1..].trim_start();
+        if after_hash.starts_with("ifdef")
+            || after_hash.starts_with("ifndef")
+            || after_hash.starts_with("if ")
+            || after_hash.starts_with("if\t")
+            || after_hash == "if"
+        {
+            Some(PreprocKind::If)
+        } else if after_hash.starts_with("else") || after_hash.starts_with("elif") {
+            Some(PreprocKind::ElseElif)
+        } else if after_hash.starts_with("endif") {
+            Some(PreprocKind::Endif)
+        } else {
+            None
+        }
+    }
+
     /// `do` (diff obtain): in a diff view, replace the current line in the active
     /// window with the corresponding line from the other diff window.
     fn diff_obtain(&mut self, changed: &mut bool) {
@@ -24706,6 +24992,87 @@ impl Engine {
             if count == 1 { "" } else { "s" }
         );
         Ok(())
+    }
+
+    /// Open a command-line window (`q:` for commands, `q/`/`q?` for searches).
+    /// Shows history in a scratch buffer. Enter on a line executes it.
+    pub fn open_cmdline_window(&mut self, is_search: bool) {
+        let history = if is_search {
+            &self.history.search_history
+        } else {
+            &self.history.command_history
+        };
+
+        // Build content: one history entry per line, empty line at end for new entry
+        let mut content = String::new();
+        for entry in history.iter() {
+            content.push_str(entry);
+            content.push('\n');
+        }
+        content.push('\n'); // empty line at bottom for new command
+
+        let buf_id = self.buffer_manager.create();
+        if let Some(state) = self.buffer_manager.get_mut(buf_id) {
+            state.buffer.content = ropey::Rope::from_str(&content);
+            state.is_cmdline_buf = true;
+            state.cmdline_is_search = is_search;
+            state.dirty = false;
+            state.scratch_name = Some(if is_search {
+                "[Search History]".to_string()
+            } else {
+                "[Command History]".to_string()
+            });
+        }
+
+        let window_id = self.new_window_id();
+        let window = Window::new(window_id, buf_id);
+        self.windows.insert(window_id, window);
+        let tab_id = self.new_tab_id();
+        let tab = Tab::new(tab_id, window_id);
+        self.active_group_mut().tabs.push(tab);
+        self.active_group_mut().active_tab = self.active_group().tabs.len() - 1;
+
+        // Move cursor to last line (the empty line for new entry)
+        let total = self.buffer().len_lines();
+        self.view_mut().cursor.line = total.saturating_sub(1);
+        self.view_mut().cursor.col = 0;
+
+        self.mode = Mode::Normal;
+        self.message = "Press Enter to execute, q to close".to_string();
+    }
+
+    /// Execute the current line in a command-line window buffer.
+    /// Called when Enter is pressed in a cmdline buffer in Normal mode.
+    pub fn cmdline_window_execute(&mut self) -> EngineAction {
+        let is_search = self.active_buffer_state().cmdline_is_search;
+        let line_idx = self.view().cursor.line;
+        let line: String = self
+            .buffer()
+            .content
+            .line(line_idx)
+            .chars()
+            .collect::<String>()
+            .trim()
+            .to_string();
+
+        if line.is_empty() {
+            return EngineAction::None;
+        }
+
+        // Close the cmdline window
+        self.close_tab();
+
+        if is_search {
+            // Execute as a forward search
+            self.search_query = line;
+            self.search_direction = SearchDirection::Forward;
+            self.run_search();
+            self.search_next();
+        } else {
+            // Execute as an ex command
+            return self.execute_command(&line);
+        }
+        EngineAction::None
     }
 
     /// Open a read-only reference buffer listing all default keybindings.

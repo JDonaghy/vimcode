@@ -1,9 +1,15 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 180b archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 182 archived here. Recent work summary in PROJECT_STATE.md.
 
 ---
+
+**Session 182 — LaTeX Extension: Parts A + C (4391 tests):**
+LaTeX text objects (`ie`/`ae` environment, `ic`/`ac` command, `i$`/`a$` math) and motions (`]]`/`[[` section jumps, `]m`/`[m`/`]M`/`[M` environment jumps, `][`/`[]` for `\end{}`). Registry extension in `vimcode-ext` repo — `latex/manifest.toml` with texlab LSP, `latex/latex.lua` with vimtex-inspired keymaps. Bug fixes: `vcd <dir>` opens folder as workspace, TUI folder picker mouse clicks. 22 new tests.
+
+**Session 181 — LaTeX Extension: Tree-sitter Syntax + Spell Checking (4331 tests):**
+Tree-sitter LaTeX support (18th language); vendored `tree-sitter-latex` v0.3.0 grammar; LaTeX-aware spell checking (`check_line()` API updated from `bool` to `Option<SyntaxLanguage>`). 15 new tests.
 
 **Session 180b — Spell Checker Bug Fixes + UI Polish (4316 tests):**
 z= suggestions: numbered list UI with single-key selection (1-9, a-z); `spell_suggestions` state intercepts keys at top of `handle_key()`. Markdown spell checking: fixed `has_syntax` detection to use `SyntaxLanguage::from_path()` instead of `!highlights.is_empty()`. Undo/dirty tracking for spell replacements. GTK scrollbar width halved (10→5px). Text overflow behind scrollbar fixed. Group divider grab bounds fixed.

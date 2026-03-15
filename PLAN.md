@@ -5,7 +5,8 @@
 ---
 
 ## Recently Completed
-- **Session 182**: LaTeX Extension (Parts A + C) — **Part C**: LaTeX text objects (`ie`/`ae` environment, `ic`/`ac` command, `i$`/`a$` math) and motions (`]]`/`[[` section jumps, `]m`/`[m`/`]M`/`[M` environment jumps, `][`/`[]` for `\end{}`); 22 new tests (4391 total). **Part A**: LaTeX registry extension in `vimcode-ext` repo — manifest.toml with texlab LSP, `latex.lua` with `<leader>ll` compile, `<leader>lv` view PDF, `<leader>lc/lC` clean, `<leader>le` log, `<leader>lt` TOC panel; `:LatexCompile`/`:LatexView`/`:LatexClean`/`:LatexLog`/`:LatexToc` commands. Also fixed: `vcd <dir>` opens folder, "Open Workspace From File…" renames, TUI folder picker mouse clicks.
+- **Session 183**: Vim Compatibility Gap Closure — `[#`/`]#` preprocessor navigation, `gR` virtual replace mode, `g+`/`g-` timeline undo, `q:`/`q/`/`q?` command-line history window; VIM_COMPATIBILITY 412→414/417 (99%); 31 new tests (4422 total).
+- **Session 182**: LaTeX Extension (Parts A + C) — LaTeX text objects + motions + registry extension; 22 new tests (4391 total).
 - **Session 181**: LaTeX Extension (Part B) — tree-sitter LaTeX syntax highlighting (18th language); vendored grammar v0.3.0 via build.rs+cc; LaTeX-aware spell checking (inverted logic: check prose, skip commands/math); `check_line()` API updated from `bool` to `Option<SyntaxLanguage>`.
 - **Session 180b**: Spell Checker Bug Fixes + UI Polish — z= numbered suggestion list with single-key selection; fixed markdown spell checking (SyntaxLanguage::from_path vs empty highlights); undo/dirty tracking for spell replacements; GTK scrollbar width halved (10→5px); text overflow behind scrollbar fixed; group divider grab fixed (proper editor bounds in hit-test/drag).
 - **Session 180**: Spell Checker — `src/core/spell.rs` with spellbook 0.4 (pure-Rust Hunspell); bundled en_US dictionary compiled into binary; user dictionary at `~/.config/vimcode/user.dic`; tree-sitter-aware (comments/strings in code, all text in plain text/Markdown); `]s`/`[s`/`z=`/`zg`/`zw` keybindings; `spell`/`spelllang` settings; `:set spell`/`:set nospell`; "Toggle Spell Check" palette entry; cyan dotted underline (GTK) + colored underline (TUI); 60 new tests (4314 total).
@@ -14,7 +15,7 @@
 - **Session 177**: Fix Wrap Mode Mouse Click — GTK `view_row_to_buf_pos_wrap()` uses word-wrap segments for correct visual-row-to-buffer-line mapping; TUI click/drag add `segment_col_offset`. Fixes BUGS.md wrap click issue.
 - **Session 176**: GTK Performance — Lazy tree loading (one level at a time, expand on demand), Open Folder fix (set_current_dir + engine.cwd for tree refresh).
 
-> Sessions 180b and earlier in **SESSION_HISTORY.md**.
+> Sessions 182 and earlier in **SESSION_HISTORY.md**.
 
 ## Roadmap
 - [x] **Spell checker** — Vim-compatible `]s`/`[s`/`z=`/`zg`/`zw`; spellbook Hunspell parser; bundled en_US dictionary; tree-sitter-aware; `spell`/`spelllang` settings; user dictionary at `~/.config/vimcode/user.dic`

@@ -230,11 +230,11 @@ See [README.md](README.md) for full feature documentation.
 | `CTRL-L` | Redraw screen | ✅ | Clears message |
 | `do` | Diff obtain | ✅ | Pull line from other diff window |
 | `dp` | Diff put | ✅ | Push line to other diff window |
-| `q:` | Command-line window | ❌ | Complex UI feature |
-| `q/` / `q?` | Search history window | ❌ | Complex UI feature |
+| `q:` | Command-line window | ✅ | Opens history buffer, Enter executes |
+| `q/` / `q?` | Search history window | ✅ | Opens search history, Enter searches |
 | `cgn` | Change next match | ✅ | Repeat with `.` |
 
-**Other: 30/33 (91%)**
+**Other: 32/33 (97%)**
 
 ---
 
@@ -297,13 +297,13 @@ See [README.md](README.md) for full feature documentation.
 | `gI` | Insert at column 1 | ✅ | |
 | `gm` / `gM` | Middle of screen/text line | ✅ | |
 | `g?{motion}` | ROT13 encode | ✅ | Supports text objects, all motions |
-| `g+` / `g-` | Undo tree newer/older | ❌ | |
-| `gR` / `gr` | Virtual replace mode | ❌ | |
+| `g+` / `g-` | Undo tree newer/older | ✅ | Chronological timeline navigation |
+| `gR` | Virtual replace mode | ✅ | Tab-aware overwrite; `gr` is LSP references |
 | `g'` / `` g` `` | Mark without jumplist | ✅ | |
 | `g&` | Repeat `:s` all lines | ✅ | |
 | `gH` / `gV` | Select mode | N/A | No Select mode |
 
-**g-commands: 32/34 (94%)**
+**g-commands: 34/34 (100%)**
 
 ---
 
@@ -400,11 +400,11 @@ See [README.md](README.md) for full feature documentation.
 | `[(` / `])` | Unmatched `(` / `)` | ✅ | Depth-tracked |
 | `[*` / `]*` | Comment start/end | ✅ | Finds `/*` and `*/` |
 | `[/` / `]/` | C comment start/end | ✅ | Alias for `[*`/`]*` |
-| `[#` / `]#` | Preprocessor directive | ❌ | |
+| `[#` / `]#` | Preprocessor directive | ✅ | Depth-tracked `#if`/`#else`/`#endif` |
 | `[z` / `]z` | Fold start/end | ✅ | Navigate within fold |
 | `[s` / `]s` | Spelling errors | N/A | No spell check |
 
-**Bracket commands: 12/13 (92%)** (excluding N/A)
+**Bracket commands: 13/13 (100%)** (excluding N/A)
 
 ---
 
@@ -608,23 +608,19 @@ These are not in Vim but are part of VimCode:
 | Movement | 48 | 48 | 100% |
 | Editing | 51 | 51 | 100% |
 | Search & Marks | 26 | 26 | 100% |
-| Normal — Other | 30 | 33 | 91% |
+| Normal — Other | 32 | 33 | 97% |
 | Text Objects | 16 | 16 | 100% |
-| g-Commands | 32 | 34 | 94% |
+| g-Commands | 34 | 34 | 100% |
 | z-Commands | 23 | 23 | 100% |
 | Window (CTRL-W) | 33 | 33 | 100% |
-| Bracket ([ / ]) | 12 | 13 | 92% |
+| Bracket ([ / ]) | 13 | 13 | 100% |
 | Operator-Pending | 21 | 21 | 100% |
 | Visual Mode | 26 | 26 | 100% |
 | Ex Commands | 70 | 70 | 100% |
-| **Total** | **409** | **417** | **98%** |
+| **Total** | **414** | **417** | **99%** |
 
 N/A commands (VimScript, digraphs, spelling, etc.) are excluded from totals.
 
 ### Remaining Missing Commands
 
 - `CTRL-]` (tag jump — ⚠️ partial via `gd`)
-- `q:`/`q?` (command-line/search history window)
-- `g+`/`g-` (undo tree newer/older)
-- `gR`/`gr` (virtual replace mode)
-- `[#`/`]#` (unmatched #if/#else)

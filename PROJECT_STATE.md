@@ -1,9 +1,9 @@
 # VimCode Project State
 
-**Last updated:** Mar 14, 2026 (Session 182 — LaTeX Extension: Parts A + C) | **Tests:** 4391
+**Last updated:** Mar 15, 2026 (Session 183 — Vim Compatibility Gap Closure) | **Tests:** 4422
 
 > Feature documentation lives in **README.md**.
-> Per-session implementation notes through Session 180b are in **SESSION_HISTORY.md**.
+> Per-session implementation notes through Session 182 are in **SESSION_HISTORY.md**.
 
 ---
 
@@ -26,18 +26,12 @@ When implementing a new key/command, add tests covering:
 
 ## Recent Work
 
-### Session 182 — LaTeX Extension: Parts A + C (Mar 14, 2026)
-- **LaTeX text objects**: `ie`/`ae` (inner/around `\begin{env}...\end{env}`, nested-aware), `ic`/`ac` (inner/around `\command{...}`, LaTeX only), `i$`/`a$` (inner/around math: `$...$`, `$$...$$`, `\[...\]`, `\(...\)`)
-- **LaTeX motions**: `]]`/`[[` jump to next/previous `\section`/`\chapter`/`\subsection`/`\subsubsection`/`\part`/`\paragraph`/`\subparagraph` (including starred variants); `][`/`[]` jump to next/previous `\end{}`; `]m`/`[m` jump to next/previous `\begin{}`; `]M`/`[M` jump to next/previous `\end{}`
-- **Registry extension (vimcode-ext repo)**: `latex/manifest.toml` with texlab LSP config; `latex/latex.lua` with vimtex-inspired keymaps (`<leader>ll` compile, `<leader>lv` view, `<leader>lc`/`lC` clean, `<leader>le` log, `<leader>lt` TOC); TOC sidebar panel via `vimcode.panel` API; `:LatexCompile`/`:LatexView`/`:LatexClean`/`:LatexCleanAll`/`:LatexLog`/`:LatexToc` commands
-- **Bug fixes**: `vcd <directory>` opens folder as workspace (TUI + GTK); "Open Workspace From File…" creates/opens `.vimcode-workspace` in current file's directory; TUI folder picker mouse click support
-- 22 new tests (4391 total)
+### Session 183 — Vim Compatibility Gap Closure (Mar 15, 2026)
+- **`[#`/`]#` preprocessor navigation**: Jump to matching `#if`/`#ifdef`/`#ifndef`/`#else`/`#elif`/`#endif` directives with depth tracking; supports nesting, indented directives, count prefix. `PreprocKind` enum + `jump_preproc_forward()`/`jump_preproc_backward()`/`preproc_directive()` methods.
+- **`gR` virtual replace mode**: Enter with `gR`; overwrites characters like `R` but expands tabs to spaces (inserts `tabstop` spaces instead of overwriting with tab character). `virtual_replace: bool` engine field; modified `handle_replace_key()`.
+- **`g+`/`g-` timeline undo**: Chronological undo navigation via `undo_timeline: Vec<(String, Cursor)>` on `BufferState`; `record_timeline_snapshot()` captures state after each undo group; `g_earlier()`/`g_later()` navigate the timeline independent of the undo tree.
+- **`q:`/`q/`/`q?` command-line window**: Opens command or search history in a scratch buffer tab; Enter on a line executes the command or performs the search; `q` closes the window. `open_cmdline_window()`/`cmdline_window_execute()` methods; `is_cmdline_buf`/`cmdline_is_search` fields on `BufferState`.
+- **VIM_COMPATIBILITY.md**: 412/417 → 414/417 (99%). Bracket 13/13 (100%), g-commands 34/34 (100%), Normal Other 32/33 (97%). Only remaining gap: `CTRL-]` (partial via `gd`).
+- 31 new tests (4422 total)
 
-### Session 181 — LaTeX Extension: Tree-sitter Syntax + Spell Checking (Mar 14, 2026)
-- **Tree-sitter LaTeX support**: Added `SyntaxLanguage::Latex` — 18th built-in language. Vendored `tree-sitter-latex` v0.3.0 grammar (language version 14, compatible with tree-sitter 0.24) under `vendor/tree-sitter-latex/`. Compiled via `build.rs` + `cc` crate. Highlight query covers comments, commands (`generic_command`), sections, math (inline/displayed/environment), labels, citations. Breadcrumb scopes: `generic_environment`, `section`, `chapter`, `subsection`, `subsubsection`.
-- **File extensions**: `.tex`, `.bib`, `.cls`, `.sty`, `.dtx`, `.ltx`
-- **LaTeX-aware spell checking**: Changed `check_line()` signature from `has_syntax: bool` to `syntax_lang: Option<SyntaxLanguage>`. LaTeX mode inverts the logic — checks all prose text EXCEPT words in `keyword` (commands) and `type` (math) scopes. Added `is_in_latex_command_or_math()` helper.
-- **Flatpak**: Regenerated `flatpak/cargo-sources.json` with new `cc` and `tree-sitter-language` dependencies.
-- 15 new tests across syntax.rs (8: detection + highlighting) and spell.rs (3: LaTeX prose/commands/math + existing tests updated for new API) — 4331 total
-
-> Sessions 180b and earlier archived in **SESSION_HISTORY.md**.
+> Sessions 182 and earlier archived in **SESSION_HISTORY.md**.

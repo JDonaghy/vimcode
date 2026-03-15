@@ -77,6 +77,12 @@ pub struct BufferState {
     pub current_undo_group: Option<UndoEntry>,
     /// Original line content for U (undo line) command: (line_number, original_content)
     pub line_undo_state: Option<(usize, String)>,
+    /// Chronological timeline of buffer states for `g-`/`g+` navigation.
+    /// Each entry is (buffer_text, cursor). Capped at `UNDO_TIMELINE_MAX`.
+    pub undo_timeline: Vec<(String, Cursor)>,
+    /// Current position in the undo timeline (index into `undo_timeline`).
+    /// `None` means we're at the latest state (no g-/g+ active).
+    pub undo_timeline_pos: Option<usize>,
     /// Per-line git diff status (Added/Modified/Deleted/None). Empty when not in a git repo.
     pub git_diff: Vec<Option<crate::core::git::GitLineStatus>>,
     /// Structured diff hunks for the working copy, cached from `compute_file_diff_hunks`.
@@ -98,6 +104,10 @@ pub struct BufferState {
     pub is_keymaps_buf: bool,
     /// Whether this buffer is an extension registries editor scratch buffer.
     pub is_registries_buf: bool,
+    /// Whether this buffer is a command-line window (`q:` / `q/` / `q?`).
+    pub is_cmdline_buf: bool,
+    /// If true, the command-line window is for search history; if false, for command history.
+    pub cmdline_is_search: bool,
     /// Display name for plugin-created scratch buffers (shown in tab bar).
     pub scratch_name: Option<String>,
     /// Last-known modification time of the file on disk.
@@ -137,6 +147,8 @@ impl BufferState {
             redo_stack: Vec::new(),
             current_undo_group: None,
             line_undo_state: None,
+            undo_timeline: Vec::new(),
+            undo_timeline_pos: None,
             git_diff: Vec::new(),
             diff_hunks: Vec::new(),
             lsp_language_id: None,
@@ -147,6 +159,8 @@ impl BufferState {
             netrw_dir: None,
             is_keymaps_buf: false,
             is_registries_buf: false,
+            is_cmdline_buf: false,
+            cmdline_is_search: false,
             scratch_name: None,
             file_mtime: None,
             file_change_warned: false,
@@ -176,6 +190,8 @@ impl BufferState {
             redo_stack: Vec::new(),
             current_undo_group: None,
             line_undo_state: None,
+            undo_timeline: Vec::new(),
+            undo_timeline_pos: None,
             git_diff: Vec::new(),
             diff_hunks: Vec::new(),
             lsp_language_id,
@@ -186,6 +202,8 @@ impl BufferState {
             netrw_dir: None,
             is_keymaps_buf: false,
             is_registries_buf: false,
+            is_cmdline_buf: false,
+            cmdline_is_search: false,
             scratch_name: None,
             file_mtime,
             file_change_warned: false,
@@ -231,6 +249,8 @@ impl BufferState {
             self.undo_stack.clear();
             self.redo_stack.clear();
             self.current_undo_group = None;
+            self.undo_timeline.clear();
+            self.undo_timeline_pos = None;
             self.file_mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
             self.file_change_warned = false;
             self.update_syntax();
@@ -269,6 +289,24 @@ impl BufferState {
         // If there's already a group in progress, finish it first
         self.finish_undo_group();
         self.current_undo_group = Some(UndoEntry::new(cursor));
+    }
+
+    /// Maximum number of timeline snapshots to keep.
+    const UNDO_TIMELINE_MAX: usize = 200;
+
+    /// Record a timeline snapshot of the current buffer state + cursor.
+    pub fn record_timeline_snapshot(&mut self, cursor: Cursor) {
+        let text = self.buffer.to_string();
+        // If we navigated backward via g- and then edited, trim future entries
+        if let Some(pos) = self.undo_timeline_pos {
+            self.undo_timeline.truncate(pos + 1);
+        }
+        self.undo_timeline_pos = None;
+        self.undo_timeline.push((text, cursor));
+        // Cap size
+        if self.undo_timeline.len() > Self::UNDO_TIMELINE_MAX {
+            self.undo_timeline.remove(0);
+        }
     }
 
     /// Record an insert operation in the current undo group.

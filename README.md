@@ -35,7 +35,7 @@ For detailed how-to guides and configuration references, see the **[VimCode Wiki
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 4391 tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 4422 tests, zero async runtime dependency
 
 > **Note:** VimCode does not implement VimScript. Extension and scripting is handled via
 > the built-in Lua 5.4 plugin system. The goal is full Vim *keybinding* and *editing*
@@ -805,6 +805,8 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `n` / `N` | Next / previous match |
 | `m{a-z}` / `'{a-z}` | Set mark / jump to mark |
 | `q{a-z}` / `@{a-z}` | Record macro / play macro |
+| `q:` | Open command-line history window (Enter executes, `q` closes) |
+| `q/` / `q?` | Open search history window (Enter searches, `q` closes) |
 | `gt` / `gT` | Next / previous tab |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | MRU tab switcher (forward / backward) |
 | `Alt+t` | MRU tab switcher (TUI + GTK compatible) |
@@ -815,6 +817,8 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `gy` | Go to type definition (LSP) |
 | `gs` | Stage hunk (in `:Gdiff` buffer) |
 | `gD` | Diff peek — preview hunk popup with Revert/Stage |
+| `gR` | Enter virtual replace mode (expands tabs to spaces when overwriting) |
+| `g+` / `g-` | Go to newer / older text state (chronological undo timeline) |
 | `K` | Show hover info (LSP) |
 | `]c` / `[c` | Next / previous change (works on real files + diff buffers) |
 | `]d` / `[d` | Next / previous diagnostic (LSP) |
@@ -825,6 +829,7 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `[{` / `]}` | Jump to unmatched `{` / `}` |
 | `[(` / `])` | Jump to unmatched `(` / `)` |
 | `[*` / `]*` | Jump to comment block start / end (`/*`/`*/`) |
+| `[#` / `]#` | Jump to previous / next unmatched `#if`/`#else`/`#endif` preprocessor directive |
 | `[z` / `]z` | Jump to fold start / end |
 | `do` | Diff obtain (pull line from other diff window) |
 | `dp` | Diff put (push line to other diff window) |
