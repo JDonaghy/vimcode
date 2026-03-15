@@ -31453,13 +31453,12 @@ impl Engine {
         let line_count = self.buffer().content.len_lines();
         let cur_line = self.cursor().line;
         let cur_col = self.cursor().col;
-        let has_syntax = self
+        let syntax_lang = self
             .active_buffer_state()
             .file_path
             .as_ref()
             .and_then(|p| p.to_str())
-            .and_then(super::syntax::SyntaxLanguage::from_path)
-            .is_some();
+            .and_then(super::syntax::SyntaxLanguage::from_path);
 
         let mut found = None;
         for offset in 0..line_count {
@@ -31472,7 +31471,7 @@ impl Engine {
                 &line_str,
                 highlights,
                 line_start_byte,
-                has_syntax,
+                syntax_lang,
             );
             for e in &errors {
                 if li == cur_line && e.start_col <= cur_col {
@@ -31510,13 +31509,12 @@ impl Engine {
         let line_count = self.buffer().content.len_lines();
         let cur_line = self.cursor().line;
         let cur_col = self.cursor().col;
-        let has_syntax = self
+        let syntax_lang = self
             .active_buffer_state()
             .file_path
             .as_ref()
             .and_then(|p| p.to_str())
-            .and_then(super::syntax::SyntaxLanguage::from_path)
-            .is_some();
+            .and_then(super::syntax::SyntaxLanguage::from_path);
 
         let mut found = None;
         for offset in 0..line_count {
@@ -31529,7 +31527,7 @@ impl Engine {
                 &line_str,
                 highlights,
                 line_start_byte,
-                has_syntax,
+                syntax_lang,
             );
             for e in errors.iter().rev() {
                 if li == cur_line && e.start_col >= cur_col {

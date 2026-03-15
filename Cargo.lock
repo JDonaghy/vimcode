@@ -2200,6 +2200,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 name = "vimcode"
 version = "0.3.6"
 dependencies = [
+ "cc",
  "copypasta-ext",
  "gio 0.17.10",
  "gtk4",
@@ -2230,6 +2231,7 @@ dependencies = [
  "tree-sitter-java",
  "tree-sitter-javascript",
  "tree-sitter-json",
+ "tree-sitter-language",
  "tree-sitter-python",
  "tree-sitter-ruby",
  "tree-sitter-rust",

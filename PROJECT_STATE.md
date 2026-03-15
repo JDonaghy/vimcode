@@ -1,9 +1,9 @@
 # VimCode Project State
 
-**Last updated:** Mar 14, 2026 (Session 180b — Spell Checker Bug Fixes + UI Polish) | **Tests:** 4316
+**Last updated:** Mar 14, 2026 (Session 181 — LaTeX Extension: Tree-sitter + Spell Checking) | **Tests:** 4331
 
 > Feature documentation lives in **README.md**.
-> Per-session implementation notes through Session 180 are in **SESSION_HISTORY.md**.
+> Per-session implementation notes through Session 180b are in **SESSION_HISTORY.md**.
 
 ---
 
@@ -26,13 +26,11 @@ When implementing a new key/command, add tests covering:
 
 ## Recent Work
 
-### Session 180b — Spell Checker Bug Fixes + UI Polish (Mar 14, 2026)
-- **z= suggestions**: numbered list UI with single-key selection (1-9, a-z), like Neovim; `spell_suggestions` state intercepts keys at top of `handle_key()`
-- **Markdown spell checking**: fixed `has_syntax` detection — was using `!highlights.is_empty()` (wrong: all files get Rust parser as fallback); now uses `SyntaxLanguage::from_path()` to check if file has recognized syntax
-- **Undo/dirty tracking**: spell replacements now use `delete_with_undo()`/`insert_with_undo()` + `set_dirty(true)` instead of raw buffer ops
-- **GTK scrollbar width**: halved from 10px to 5px (scrollbar widget + cursor indicator + margin + height)
-- **Text overflow behind scrollbar**: subtracted 5px scrollbar width from `render_viewport_cols` in `render.rs`
-- **Group divider grab**: fixed hit-test and drag handler bounds — was using `height - 2.0 * line_height` instead of properly subtracting wildmenu/debug toolbar/quickfix/terminal panel heights to match actual editor bounds
-- 2 new tests (4316 total)
+### Session 181 — LaTeX Extension: Tree-sitter Syntax + Spell Checking (Mar 14, 2026)
+- **Tree-sitter LaTeX support**: Added `SyntaxLanguage::Latex` — 18th built-in language. Vendored `tree-sitter-latex` v0.3.0 grammar (language version 14, compatible with tree-sitter 0.24) under `vendor/tree-sitter-latex/`. Compiled via `build.rs` + `cc` crate. Highlight query covers comments, commands (`generic_command`), sections, math (inline/displayed/environment), labels, citations. Breadcrumb scopes: `generic_environment`, `section`, `chapter`, `subsection`, `subsubsection`.
+- **File extensions**: `.tex`, `.bib`, `.cls`, `.sty`, `.dtx`, `.ltx`
+- **LaTeX-aware spell checking**: Changed `check_line()` signature from `has_syntax: bool` to `syntax_lang: Option<SyntaxLanguage>`. LaTeX mode inverts the logic — checks all prose text EXCEPT words in `keyword` (commands) and `type` (math) scopes. Added `is_in_latex_command_or_math()` helper.
+- **Flatpak**: Regenerated `flatpak/cargo-sources.json` with new `cc` and `tree-sitter-language` dependencies.
+- 15 new tests across syntax.rs (8: detection + highlighting) and spell.rs (3: LaTeX prose/commands/math + existing tests updated for new API) — 4331 total
 
-> Sessions 180 and earlier archived in **SESSION_HISTORY.md**.
+> Sessions 180b and earlier archived in **SESSION_HISTORY.md**.

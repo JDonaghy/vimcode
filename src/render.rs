@@ -4577,19 +4577,18 @@ fn build_rendered_window(
         // Spell-check errors for this line — computed on visible lines only.
         let line_spell_errors: Vec<SpellMark> = if engine.settings.spell {
             if let Some(ref checker) = engine.spell_checker {
-                let has_syntax = buffer_state
+                let syntax_lang = buffer_state
                     .file_path
                     .as_ref()
                     .and_then(|p| p.to_str())
-                    .and_then(crate::core::syntax::SyntaxLanguage::from_path)
-                    .is_some();
+                    .and_then(crate::core::syntax::SyntaxLanguage::from_path);
                 let line_start_byte = buffer.content.line_to_byte(line_idx);
                 crate::core::spell::check_line(
                     checker,
                     &line_str,
                     &buffer_state.highlights,
                     line_start_byte,
-                    has_syntax,
+                    syntax_lang,
                 )
                 .into_iter()
                 .map(|e| SpellMark {

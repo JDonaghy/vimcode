@@ -3,6 +3,7 @@
 //! Bundled en_US dictionary compiled into the binary.  User dictionary
 //! at `~/.config/vimcode/user.dic` (one word per line).
 
+use super::syntax::SyntaxLanguage;
 use std::path::PathBuf;
 
 /// A misspelled word with its byte and char position within a line.
@@ -115,9 +116,13 @@ fn save_user_dict_words(words: &[String]) {
 
 /// Check a single line for spelling errors.
 ///
-/// If `has_syntax` is true, only words whose byte range overlaps a
-/// `"comment"` or `"string"` tree-sitter scope are checked.  Otherwise
-/// all words are checked (for plain text files).
+/// `syntax_lang` controls scope-aware checking:
+/// - `None` → plain text, check all words.
+/// - `Some(Latex)` → **inverted**: check all words EXCEPT those inside
+///   `command_name`, `inline_formula`, `math_environment`, or
+///   `displayed_equation` scopes (LaTeX commands & math are not prose).
+/// - `Some(_)` → standard code mode: only check words inside `comment`
+///   or `string` scopes.
 ///
 /// `highlights` are `(start_byte, end_byte, scope)` relative to the
 /// full buffer.  `line_start_byte` is the byte offset of this line
@@ -127,7 +132,7 @@ pub fn check_line(
     line: &str,
     highlights: &[(usize, usize, String)],
     line_start_byte: usize,
-    has_syntax: bool,
+    syntax_lang: Option<SyntaxLanguage>,
 ) -> Vec<SpellError> {
     let mut errors = Vec::new();
     // Extract words: contiguous runs of alphabetic + apostrophe chars
@@ -156,14 +161,16 @@ pub fn check_line(
                 let trimmed_start_col = word_start_col + word[..trim_offset].chars().count();
                 let trimmed_end_col = trimmed_start_col + trimmed.chars().count();
 
-                let should_check = if has_syntax {
-                    is_in_comment_or_string(
-                        highlights,
-                        line_start_byte + trimmed_start_byte,
-                        line_start_byte + trimmed_end_byte,
-                    )
-                } else {
-                    true
+                let abs_start = line_start_byte + trimmed_start_byte;
+                let abs_end = line_start_byte + trimmed_end_byte;
+
+                let should_check = match syntax_lang {
+                    None => true,
+                    Some(SyntaxLanguage::Latex) => {
+                        // Inverted: check everything EXCEPT commands/math
+                        !is_in_latex_command_or_math(highlights, abs_start, abs_end)
+                    }
+                    Some(_) => is_in_comment_or_string(highlights, abs_start, abs_end),
                 };
 
                 if should_check && !checker.check_word(trimmed) {
@@ -178,6 +185,27 @@ pub fn check_line(
         }
     }
     errors
+}
+
+/// Returns true if any byte in `[start, end)` overlaps a LaTeX command or math scope.
+fn is_in_latex_command_or_math(
+    highlights: &[(usize, usize, String)],
+    start: usize,
+    end: usize,
+) -> bool {
+    for (hs, he, scope) in highlights {
+        if *he <= start {
+            continue;
+        }
+        if *hs >= end {
+            continue;
+        }
+        // keyword = command_name, type = inline_formula/math_environment/displayed_equation
+        if scope == "keyword" || scope == "type" {
+            return true;
+        }
+    }
+    false
 }
 
 /// Returns true if any byte in `[start, end)` overlaps a comment or string scope.
@@ -261,7 +289,7 @@ mod tests {
     fn test_check_line_plain_text() {
         let c = checker();
         let line = "The quik brown fox";
-        let errors = check_line(&c, line, &[], 0, false);
+        let errors = check_line(&c, line, &[], 0, None);
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].word, "quik");
         assert_eq!(errors[0].start_col, 4);
@@ -272,7 +300,7 @@ mod tests {
     fn test_check_line_no_errors() {
         let c = checker();
         let line = "The quick brown fox";
-        let errors = check_line(&c, line, &[], 0, false);
+        let errors = check_line(&c, line, &[], 0, None);
         assert!(errors.is_empty());
     }
 
@@ -282,7 +310,7 @@ mod tests {
         // "helo" at bytes 0..4, comment scope covers it
         let line = "helo world";
         let highlights = vec![(0, 4, "comment".to_string())];
-        let errors = check_line(&c, line, &highlights, 0, true);
+        let errors = check_line(&c, line, &highlights, 0, Some(SyntaxLanguage::Rust));
         // "helo" is in comment scope → checked → flagged
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].word, "helo");
@@ -297,15 +325,51 @@ mod tests {
         let line = "fn helo() {}";
         // No comment/string scopes — everything is code
         let highlights = vec![(0, 2, "keyword".to_string())];
-        let errors = check_line(&c, line, &highlights, 0, true);
+        let errors = check_line(&c, line, &highlights, 0, Some(SyntaxLanguage::Rust));
         assert!(errors.is_empty()); // "helo" not in comment/string, skipped
+    }
+
+    #[test]
+    fn test_check_line_latex_checks_prose() {
+        let c = checker();
+        // In LaTeX, prose words outside commands/math should be checked
+        let line = "This has a speling error";
+        let errors = check_line(&c, line, &[], 0, Some(SyntaxLanguage::Latex));
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].word, "speling");
+    }
+
+    #[test]
+    fn test_check_line_latex_skips_commands() {
+        let c = checker();
+        // LaTeX command "\documentclass" — the command_name maps to "keyword"
+        let line = "\\documentclass article";
+        // "documentclass" at bytes 1..14 is keyword scope
+        let highlights = vec![(1, 14, "keyword".to_string())];
+        let errors = check_line(&c, line, &highlights, 0, Some(SyntaxLanguage::Latex));
+        // "documentclass" is in keyword scope → skipped in LaTeX mode
+        // "article" is not in any scope → checked (it's a valid English word)
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn test_check_line_latex_skips_math() {
+        let c = checker();
+        // Math formula content maps to "type" scope
+        let line = "See $\\alpha + \\beta$ here";
+        // inline_formula bytes covering the math part
+        let highlights = vec![(4, 20, "type".to_string())];
+        let errors = check_line(&c, line, &highlights, 0, Some(SyntaxLanguage::Latex));
+        // "alpha" and "beta" are in type scope → skipped
+        // "See" and "here" are valid English words
+        assert!(errors.is_empty());
     }
 
     #[test]
     fn test_apostrophe_handling() {
         let c = checker();
         let line = "don't won't can't";
-        let errors = check_line(&c, line, &[], 0, false);
+        let errors = check_line(&c, line, &[], 0, None);
         assert!(errors.is_empty());
     }
 }

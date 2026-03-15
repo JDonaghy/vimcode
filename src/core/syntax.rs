@@ -20,6 +20,7 @@ pub enum SyntaxLanguage {
     Java,
     Toml,
     Yaml,
+    Latex,
     // TODO: Lua (tree-sitter-lua 0.4 requires tree-sitter 0.25+, language version 15)
 }
 
@@ -76,6 +77,14 @@ impl SyntaxLanguage {
             Some(Self::Yaml)
         } else if path_lower.ends_with(".html") || path_lower.ends_with(".htm") {
             Some(Self::Html)
+        } else if path_lower.ends_with(".tex")
+            || path_lower.ends_with(".bib")
+            || path_lower.ends_with(".cls")
+            || path_lower.ends_with(".sty")
+            || path_lower.ends_with(".dtx")
+            || path_lower.ends_with(".ltx")
+        {
+            Some(Self::Latex)
         } else {
             None
         }
@@ -100,6 +109,15 @@ impl SyntaxLanguage {
             Self::Java => tree_sitter_java::LANGUAGE.into(),
             Self::Toml => tree_sitter_toml_ng::LANGUAGE.into(),
             Self::Yaml => tree_sitter_yaml::LANGUAGE.into(),
+            Self::Latex => {
+                #[link(name = "tree_sitter_latex")]
+                extern "C" {
+                    fn tree_sitter_latex() -> *const ();
+                }
+                let lang_fn =
+                    unsafe { tree_sitter_language::LanguageFn::from_raw(tree_sitter_latex) };
+                lang_fn.into()
+            }
         }
     }
 
@@ -564,6 +582,27 @@ impl SyntaxLanguage {
                 (doctype) @keyword
                 (raw_text) @string
             ",
+            Self::Latex => "
+                (line_comment) @comment
+                (block_comment) @comment
+                (generic_command command: (command_name) @keyword)
+                (section) @function
+                (subsection) @function
+                (subsubsection) @function
+                (chapter) @function
+                (paragraph) @function
+                (begin) @keyword
+                (end) @keyword
+                (class_include) @keyword
+                (package_include) @keyword
+                (new_command_definition) @keyword
+                (label_definition) @variable
+                (label_reference) @variable
+                (citation) @string
+                (inline_formula) @type
+                (math_environment) @type
+                (displayed_equation) @type
+            ",
         }
     }
 }
@@ -736,6 +775,13 @@ impl Syntax {
                 "namespace_declaration",
             ],
             SyntaxLanguage::Ruby => &["class", "module", "method", "singleton_method"],
+            SyntaxLanguage::Latex => &[
+                "generic_environment",
+                "section",
+                "chapter",
+                "subsection",
+                "subsubsection",
+            ],
             _ => &[],
         }
     }
@@ -927,6 +973,38 @@ mod tests {
         assert_eq!(
             SyntaxLanguage::from_path("CONFIG.YAML"),
             Some(SyntaxLanguage::Yaml)
+        );
+    }
+
+    #[test]
+    fn test_language_detection_latex() {
+        assert_eq!(
+            SyntaxLanguage::from_path("paper.tex"),
+            Some(SyntaxLanguage::Latex)
+        );
+        assert_eq!(
+            SyntaxLanguage::from_path("refs.bib"),
+            Some(SyntaxLanguage::Latex)
+        );
+        assert_eq!(
+            SyntaxLanguage::from_path("custom.cls"),
+            Some(SyntaxLanguage::Latex)
+        );
+        assert_eq!(
+            SyntaxLanguage::from_path("package.sty"),
+            Some(SyntaxLanguage::Latex)
+        );
+        assert_eq!(
+            SyntaxLanguage::from_path("doc.dtx"),
+            Some(SyntaxLanguage::Latex)
+        );
+        assert_eq!(
+            SyntaxLanguage::from_path("main.ltx"),
+            Some(SyntaxLanguage::Latex)
+        );
+        assert_eq!(
+            SyntaxLanguage::from_path("PAPER.TEX"),
+            Some(SyntaxLanguage::Latex)
         );
     }
 
@@ -1171,6 +1249,18 @@ mod tests {
             !key_highlights.iter().any(|(_, _, k)| k == "string"),
             "key should NOT be string"
         );
+    }
+
+    #[test]
+    fn test_syntax_latex_basic() {
+        let mut syntax = Syntax::new_for_language(SyntaxLanguage::Latex);
+        let code = "\\documentclass{article}\n\\begin{document}\nHello world.\n% a comment\n$x^2 + y^2$\n\\end{document}\n";
+        let highlights = syntax.parse(code);
+        assert!(!highlights.is_empty());
+        let kinds: Vec<&str> = highlights.iter().map(|(_, _, k)| k.as_str()).collect();
+        assert!(kinds.contains(&"comment"), "should highlight comments");
+        assert!(kinds.contains(&"keyword"), "should highlight commands");
+        assert!(kinds.contains(&"type"), "should highlight math");
     }
 
     #[test]
