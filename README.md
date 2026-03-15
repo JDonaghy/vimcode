@@ -92,6 +92,7 @@ VimCode requires **GTK4 development libraries** for the GUI backend. The TUI mod
 **Platform notes:**
 - **macOS:** GTK4 works via Homebrew; this is not a native AppKit app
 - **Windows:** Use the MSYS2 MinGW64 shell and set `rustup default stable-x86_64-pc-windows-gnu`
+- **Nerd Font recommended:** VimCode uses Nerd Font icons throughout the UI — the file explorer, activity bar, tab bar, terminal toolbar, and debug panel all rely on Nerd Font glyphs. Install any [Nerd Font](https://www.nerdfonts.com/) (e.g. JetBrainsMono Nerd Font, FiraCode Nerd Font) and set it as your terminal font (TUI) or configure `font_family` in `settings.json` (GTK). Without a Nerd Font, icons will display as missing-glyph boxes.
 
 ### Build & run
 
