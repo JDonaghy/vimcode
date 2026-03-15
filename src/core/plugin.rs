@@ -322,6 +322,13 @@ impl PluginManager {
             .unwrap_or_default()
     }
 
+    /// Check if any registered keymap for `mode` starts with `prefix`.
+    pub fn has_keymap_prefix(&self, mode: &str, prefix: &str) -> bool {
+        self.keymaps
+            .keys()
+            .any(|(m, k)| m == mode && k.starts_with(prefix))
+    }
+
     /// Execute a registered keymap for `(mode, key)`. Returns `(found, updated_context)`.
     pub fn call_keymap(
         &self,

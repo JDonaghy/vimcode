@@ -10313,7 +10313,7 @@ impl Engine {
         let mut partial = self.leader_partial.take().unwrap_or_default();
         partial.push(ch);
 
-        // All known leader sequences
+        // All known built-in leader sequences
         const SEQUENCES: &[&str] = &["rn", "gf", "gF", "gi"];
 
         match partial.as_str() {
@@ -10333,12 +10333,30 @@ impl Engine {
                 self.push_jump_location();
                 self.lsp_request_implementation();
             }
-            // Partial match — keep accumulating if the partial is a prefix of some sequence
-            s if SEQUENCES.iter().any(|seq| seq.starts_with(s)) => {
-                self.leader_partial = Some(partial);
-            }
-            _ => {
-                self.message = format!("Unknown leader sequence: <leader>{partial}");
+            s => {
+                // Check if this is a complete plugin keymap match
+                let leader_key = format!("<leader>{s}");
+                if self.plugin_run_keymap("n", &leader_key) {
+                    return EngineAction::None;
+                }
+
+                // Check if partial is a prefix of a built-in sequence
+                if SEQUENCES.iter().any(|seq| seq.starts_with(s)) {
+                    self.leader_partial = Some(partial);
+                    return EngineAction::None;
+                }
+
+                // Check if partial is a prefix of any plugin keymap
+                let prefix = format!("<leader>{s}");
+                let has_plugin_prefix = self
+                    .plugin_manager
+                    .as_ref()
+                    .is_some_and(|pm| pm.has_keymap_prefix("n", &prefix));
+                if has_plugin_prefix {
+                    self.leader_partial = Some(partial);
+                } else {
+                    self.message = format!("Unknown leader sequence: <leader>{partial}");
+                }
             }
         }
         EngineAction::None
