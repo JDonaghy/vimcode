@@ -35,7 +35,7 @@ For detailed how-to guides and configuration references, see the **[VimCode Wiki
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 4331 tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 4391 tests, zero async runtime dependency
 
 > **Note:** VimCode does not implement VimScript. Extension and scripting is handled via
 > the built-in Lua 5.4 plugin system. The goal is full Vim *keybinding* and *editing*
@@ -158,6 +158,9 @@ cargo fmt
 - `is` / `as` — inner/around sentence (`.`/`!`/`?`-terminated); `as` includes trailing whitespace
 - `it` / `at` — inner/around HTML/XML tag (`dit` deletes content, `dat` deletes element; case-insensitive, nesting-aware)
 - `` i` `` / `` a` `` — inner/around backticks
+- `ie` / `ae` — inner/around LaTeX `\begin{env}...\end{env}` (nested-aware, LaTeX buffers only)
+- `ic` / `ac` — inner/around LaTeX `\command{...}` (LaTeX buffers only)
+- `i$` / `a$` — inner/around LaTeX math (`$...$`, `$$...$$`, `\[...\]`, `\(...\)`; LaTeX buffers only)
 
 **Count prefix** — prepend any number to multiply: `5j`, `3dd`, `10yy`, `2w`, etc.
 
@@ -815,10 +818,10 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `K` | Show hover info (LSP) |
 | `]c` / `[c` | Next / previous change (works on real files + diff buffers) |
 | `]d` / `[d` | Next / previous diagnostic (LSP) |
-| `[[` / `]]` | Section backward / forward (`{` in column 0) |
-| `[]` / `][` | Section end backward / forward (`}` in column 0) |
-| `[m` / `]m` | Method start backward / forward |
-| `[M` / `]M` | Method end backward / forward |
+| `[[` / `]]` | Section backward / forward (`{` in col 0; LaTeX: `\section`/`\chapter`/etc.) |
+| `[]` / `][` | Section end backward / forward (`}` in col 0; LaTeX: `\end{}`) |
+| `[m` / `]m` | Method start backward / forward (LaTeX: `\begin{}`) |
+| `[M` / `]M` | Method end backward / forward (LaTeX: `\end{}`) |
 | `[{` / `]}` | Jump to unmatched `{` / `}` |
 | `[(` / `])` | Jump to unmatched `(` / `)` |
 | `[*` / `]*` | Jump to comment block start / end (`/*`/`*/`) |

@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Mar 14, 2026 (Session 181 — LaTeX Extension: Tree-sitter + Spell Checking) | **Tests:** 4331
+**Last updated:** Mar 14, 2026 (Session 182 — LaTeX Extension: Parts A + C) | **Tests:** 4391
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 180b are in **SESSION_HISTORY.md**.
@@ -25,6 +25,13 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+### Session 182 — LaTeX Extension: Parts A + C (Mar 14, 2026)
+- **LaTeX text objects**: `ie`/`ae` (inner/around `\begin{env}...\end{env}`, nested-aware), `ic`/`ac` (inner/around `\command{...}`, LaTeX only), `i$`/`a$` (inner/around math: `$...$`, `$$...$$`, `\[...\]`, `\(...\)`)
+- **LaTeX motions**: `]]`/`[[` jump to next/previous `\section`/`\chapter`/`\subsection`/`\subsubsection`/`\part`/`\paragraph`/`\subparagraph` (including starred variants); `][`/`[]` jump to next/previous `\end{}`; `]m`/`[m` jump to next/previous `\begin{}`; `]M`/`[M` jump to next/previous `\end{}`
+- **Registry extension (vimcode-ext repo)**: `latex/manifest.toml` with texlab LSP config; `latex/latex.lua` with vimtex-inspired keymaps (`<leader>ll` compile, `<leader>lv` view, `<leader>lc`/`lC` clean, `<leader>le` log, `<leader>lt` TOC); TOC sidebar panel via `vimcode.panel` API; `:LatexCompile`/`:LatexView`/`:LatexClean`/`:LatexCleanAll`/`:LatexLog`/`:LatexToc` commands
+- **Bug fixes**: `vcd <directory>` opens folder as workspace (TUI + GTK); "Open Workspace From File…" creates/opens `.vimcode-workspace` in current file's directory; TUI folder picker mouse click support
+- 22 new tests (4391 total)
 
 ### Session 181 — LaTeX Extension: Tree-sitter Syntax + Spell Checking (Mar 14, 2026)
 - **Tree-sitter LaTeX support**: Added `SyntaxLanguage::Latex` — 18th built-in language. Vendored `tree-sitter-latex` v0.3.0 grammar (language version 14, compatible with tree-sitter 0.24) under `vendor/tree-sitter-latex/`. Compiled via `build.rs` + `cc` crate. Highlight query covers comments, commands (`generic_command`), sections, math (inline/displayed/environment), labels, citations. Breadcrumb scopes: `generic_environment`, `section`, `chapter`, `subsection`, `subsubsection`.
