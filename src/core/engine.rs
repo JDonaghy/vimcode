@@ -70,6 +70,20 @@ pub enum EngineAction {
     QuitWithError,
 }
 
+/// A row in the Settings sidebar flat list.
+/// Distinguishes core settings from extension-declared settings.
+#[derive(Debug, Clone)]
+pub enum SettingsRow {
+    /// Core category header: index into `setting_categories()`.
+    CoreCategory(usize),
+    /// Core setting: index into `SETTING_DEFS`.
+    CoreSetting(usize),
+    /// Extension category header: extension name.
+    ExtCategory(String),
+    /// Extension setting: `(extension_name, setting_key)`.
+    ExtSetting(String, String),
+}
+
 // ── Ex command abbreviation table ────────────────────────────────────────────
 // Each entry is (canonical_name, min_prefix_length).
 // `normalize_ex_command("sor foo")` → `"sort foo"`.
@@ -1985,6 +1999,12 @@ pub struct Engine {
     pub settings_edit_buf: String,
     /// Per-category collapsed state.
     pub settings_collapsed: Vec<bool>,
+    /// Per-extension settings: ext_name → { key → value }.
+    pub ext_settings: HashMap<String, HashMap<String, String>>,
+    /// Per-extension-category collapsed state in the Settings sidebar.
+    pub ext_settings_collapsed: HashMap<String, bool>,
+    /// When editing an extension setting inline: `(ext_name, key)`.
+    pub ext_settings_editing: Option<(String, String)>,
 
     // --- Virtual text / line annotations ---
     /// Inline annotation text indexed by 0-based buffer line number.
@@ -2344,6 +2364,9 @@ impl Engine {
             settings_editing: None,
             settings_edit_buf: String::new(),
             settings_collapsed: vec![false; super::settings::setting_categories().len()],
+            ext_settings: HashMap::new(),
+            ext_settings_collapsed: HashMap::new(),
+            ext_settings_editing: None,
             line_annotations: HashMap::new(),
             async_shell_tasks: HashMap::new(),
             ai_ghost_text: None,
@@ -14672,6 +14695,16 @@ impl Engine {
                     self.ext_panels.insert(name.clone(), panel.clone());
                 }
                 self.plugin_manager = Some(mgr);
+                // Load per-extension settings for installed extensions
+                let installed_names: Vec<String> = self
+                    .extension_state
+                    .installed
+                    .iter()
+                    .map(|e| e.name.clone())
+                    .collect();
+                for name in &installed_names {
+                    self.load_ext_settings(name);
+                }
                 // Populate comment style overrides from installed extension manifests
                 self.populate_comment_overrides();
                 // Fire VimEnter event after plugin initialization is complete
@@ -14808,6 +14841,12 @@ impl Engine {
                 map.insert(key.to_string(), val);
             }
         }
+        // Include extension settings with "extname.key" namespace
+        for (ext_name, values) in &self.ext_settings {
+            for (key, val) in values {
+                map.insert(format!("{ext_name}.{key}"), val.clone());
+            }
+        }
         map
     }
 
@@ -14865,8 +14904,14 @@ impl Engine {
             let max_col = self.get_max_cursor_col(clamped_line);
             self.view_mut().cursor.col = col.min(max_col);
         }
-        // Apply settings changes
+        // Apply settings changes — "extname.key" routes to extension settings
         for (key, value) in ctx.set_settings {
+            if let Some((ext_name, ext_key)) = key.split_once('.') {
+                if self.ext_settings.contains_key(ext_name) {
+                    self.set_ext_setting(ext_name, ext_key, &value);
+                    continue;
+                }
+            }
             let _ = self.settings.set_value_str(&key, &value);
         }
         // Apply register writes
@@ -23421,6 +23466,21 @@ impl Engine {
         }
     }
 
+    /// Resolve the base URL for downloading extension files.
+    /// Uses the manifest's `registry_base_url` if available, otherwise derives it
+    /// from the first configured registry URL (the field is `#[serde(skip)]` so it's
+    /// empty when loaded from cache).
+    fn resolve_registry_base_url(&self, manifest: &extensions::ExtensionManifest) -> String {
+        if !manifest.registry_base_url.is_empty() {
+            return manifest.registry_base_url.clone();
+        }
+        self.settings
+            .extension_registries
+            .first()
+            .map(|url| registry::base_url_from_registry(url))
+            .unwrap_or_default()
+    }
+
     /// Install an extension by name: download scripts, run LSP/DAP install, mark installed.
     pub fn ext_install_from_registry(&mut self, name: &str) {
         let manifest = self
@@ -23441,14 +23501,15 @@ impl Engine {
         let ext_dir = paths::vimcode_config_dir()
             .join("extensions")
             .join(&ext_name);
+        let base_url = self.resolve_registry_base_url(&manifest);
         if !manifest.scripts.is_empty()
-            && !manifest.registry_base_url.is_empty()
+            && !base_url.is_empty()
             && std::fs::create_dir_all(&ext_dir).is_ok()
         {
             for script in &manifest.scripts {
                 let dest = ext_dir.join(script);
                 if !dest.exists() {
-                    let url = format!("{}/{}/{}", manifest.registry_base_url, ext_name, script);
+                    let url = format!("{}/{}/{}", base_url, ext_name, script);
                     let _ = registry::download_script(&url, &dest);
                 }
             }
@@ -23562,6 +23623,10 @@ impl Engine {
         self.extension_state.installed.retain(|e| e.name != name);
         let _ = self.extension_state.save();
 
+        // Remove in-memory extension settings
+        self.ext_settings.remove(&name);
+        self.ext_settings_collapsed.remove(&name);
+
         let ext_dir = paths::vimcode_config_dir().join("extensions").join(&name);
         let _ = std::fs::remove_dir_all(&ext_dir);
 
@@ -23597,13 +23662,14 @@ impl Engine {
         let ext_dir = paths::vimcode_config_dir()
             .join("extensions")
             .join(&ext_name);
+        let base_url = self.resolve_registry_base_url(&manifest);
         if !manifest.scripts.is_empty()
-            && !manifest.registry_base_url.is_empty()
+            && !base_url.is_empty()
             && std::fs::create_dir_all(&ext_dir).is_ok()
         {
             for script in &manifest.scripts {
                 let dest = ext_dir.join(script);
-                let url = format!("{}/{}/{}", manifest.registry_base_url, ext_name, script);
+                let url = format!("{}/{}/{}", base_url, ext_name, script);
                 let _ = registry::download_script(&url, &dest);
             }
         }
@@ -23679,13 +23745,14 @@ impl Engine {
             // Re-download scripts for each
             if let Some(manifest) = manifests.iter().find(|m| &m.name == name) {
                 let ext_dir = paths::vimcode_config_dir().join("extensions").join(name);
+                let base_url = self.resolve_registry_base_url(manifest);
                 if !manifest.scripts.is_empty()
-                    && !manifest.registry_base_url.is_empty()
+                    && !base_url.is_empty()
                     && std::fs::create_dir_all(&ext_dir).is_ok()
                 {
                     for script in &manifest.scripts {
                         let dest = ext_dir.join(script);
-                        let url = format!("{}/{}/{}", manifest.registry_base_url, name, script);
+                        let url = format!("{}/{}/{}", base_url, name, script);
                         let _ = registry::download_script(&url, &dest);
                     }
                 }
@@ -23952,8 +24019,8 @@ impl Engine {
                     let base_url = manifests
                         .iter()
                         .find(|m| m.name == name)
-                        .map(|m| m.registry_base_url.as_str())
-                        .unwrap_or("");
+                        .map(|m| self.resolve_registry_base_url(m))
+                        .unwrap_or_default();
                     // Try to load README from installed extension dir, otherwise fetch from registry
                     let readme_path = paths::vimcode_config_dir()
                         .join("extensions")
@@ -23961,7 +24028,7 @@ impl Engine {
                         .join("README.md");
                     let content = std::fs::read_to_string(&readme_path)
                         .ok()
-                        .or_else(|| registry::fetch_readme(base_url, &name));
+                        .or_else(|| registry::fetch_readme(&base_url, &name));
                     if let Some(content) = content {
                         self.open_markdown_preview_in_tab(&content, &name);
                     } else {
@@ -23983,7 +24050,7 @@ impl Engine {
                     let available = self.ext_available_items();
                     let avail_idx = sel.saturating_sub(installed.len());
                     if avail_idx < available.len() {
-                        let base_url = available[avail_idx].registry_base_url.clone();
+                        let base_url = self.resolve_registry_base_url(&available[avail_idx]);
                         let name = available[avail_idx].name.clone();
                         self.ext_install_from_registry(&name);
                         // Try to open README after install
@@ -24091,19 +24158,16 @@ impl Engine {
     // ── Settings sidebar panel ──────────────────────────────────────────────────
 
     /// Row types for the settings flat list.
-    /// Category(cat_idx) = a collapsible category header.
-    /// Setting(def_idx) = a setting from SETTING_DEFS.
-    pub fn settings_flat_list(&self) -> Vec<(bool, usize)> {
-        // Returns Vec<(is_category, index)>
-        // is_category=true → index is into setting_categories()
-        // is_category=false → index is into SETTING_DEFS
+    /// Build the flat list of rows for the Settings sidebar.
+    /// Includes both core settings and extension-declared settings.
+    pub fn settings_flat_list(&self) -> Vec<SettingsRow> {
         use super::settings::{setting_categories, SETTING_DEFS};
         let cats = setting_categories();
         let query = self.settings_query.to_lowercase();
         let mut rows = Vec::new();
 
+        // Core settings
         for (cat_idx, &cat) in cats.iter().enumerate() {
-            // Collect settings in this category that match the query
             let matching: Vec<usize> = SETTING_DEFS
                 .iter()
                 .enumerate()
@@ -24121,17 +24185,132 @@ impl Engine {
                 continue;
             }
 
-            rows.push((true, cat_idx)); // Category header
+            rows.push(SettingsRow::CoreCategory(cat_idx));
 
             let collapsed =
                 cat_idx < self.settings_collapsed.len() && self.settings_collapsed[cat_idx];
             if !collapsed {
                 for def_idx in matching {
-                    rows.push((false, def_idx));
+                    rows.push(SettingsRow::CoreSetting(def_idx));
                 }
             }
         }
+
+        // Extension settings — one section per installed extension that declares settings
+        for manifest in self.ext_available_manifests() {
+            if manifest.settings.is_empty() || !self.extension_state.is_installed(&manifest.name) {
+                continue;
+            }
+            let matching: Vec<&super::extensions::ExtSettingDef> = manifest
+                .settings
+                .iter()
+                .filter(|s| {
+                    query.is_empty()
+                        || s.label.to_lowercase().contains(&query)
+                        || s.key.to_lowercase().contains(&query)
+                        || s.description.to_lowercase().contains(&query)
+                })
+                .collect();
+            if matching.is_empty() {
+                continue;
+            }
+
+            rows.push(SettingsRow::ExtCategory(manifest.name.clone()));
+
+            let collapsed = self
+                .ext_settings_collapsed
+                .get(&manifest.name)
+                .copied()
+                .unwrap_or(false);
+            if !collapsed {
+                for def in matching {
+                    rows.push(SettingsRow::ExtSetting(
+                        manifest.name.clone(),
+                        def.key.clone(),
+                    ));
+                }
+            }
+        }
+
         rows
+    }
+
+    /// Load an extension's settings from disk, merging with manifest defaults.
+    pub fn load_ext_settings(&mut self, ext_name: &str) {
+        let manifest = self
+            .ext_available_manifests()
+            .into_iter()
+            .find(|m| m.name == ext_name);
+        let manifest = match manifest {
+            Some(m) => m,
+            None => return,
+        };
+        let mut values = HashMap::new();
+        // Start with defaults from manifest
+        for def in &manifest.settings {
+            values.insert(def.key.clone(), def.default.clone());
+        }
+        // Overlay with saved values from disk
+        let path = paths::vimcode_config_dir()
+            .join("extensions")
+            .join(ext_name)
+            .join("settings.json");
+        if let Ok(data) = std::fs::read_to_string(&path) {
+            if let Ok(saved) = serde_json::from_str::<HashMap<String, String>>(&data) {
+                for (k, v) in saved {
+                    values.insert(k, v);
+                }
+            }
+        }
+        if !values.is_empty() {
+            self.ext_settings.insert(ext_name.to_string(), values);
+        }
+    }
+
+    /// Save an extension's settings to disk.
+    fn save_ext_settings(&self, ext_name: &str) {
+        if let Some(values) = self.ext_settings.get(ext_name) {
+            let path = paths::vimcode_config_dir()
+                .join("extensions")
+                .join(ext_name)
+                .join("settings.json");
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Ok(json) = serde_json::to_string_pretty(values) {
+                let _ = std::fs::write(&path, json);
+            }
+        }
+    }
+
+    /// Get an extension setting value by `ext_name` and `key`.
+    pub fn get_ext_setting(&self, ext_name: &str, key: &str) -> String {
+        self.ext_settings
+            .get(ext_name)
+            .and_then(|m| m.get(key))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Set an extension setting value and save to disk.
+    pub fn set_ext_setting(&mut self, ext_name: &str, key: &str, value: &str) {
+        self.ext_settings
+            .entry(ext_name.to_string())
+            .or_default()
+            .insert(key.to_string(), value.to_string());
+        self.save_ext_settings(ext_name);
+    }
+
+    /// Look up an `ExtSettingDef` by extension name and key.
+    pub fn find_ext_setting_def(
+        &self,
+        ext_name: &str,
+        key: &str,
+    ) -> Option<super::extensions::ExtSettingDef> {
+        self.ext_available_manifests()
+            .into_iter()
+            .find(|m| m.name == ext_name)
+            .and_then(|m| m.settings.into_iter().find(|s| s.key == key))
     }
 
     /// Handle a key press while the settings panel has focus.
@@ -24162,7 +24341,7 @@ impl Engine {
             return;
         }
 
-        // Inline editing active (string/int)
+        // Inline editing active — core setting (string/int)
         if let Some(def_idx) = self.settings_editing {
             match key {
                 "Escape" => {
@@ -24185,8 +24364,43 @@ impl Engine {
                     if let Some(ch) = unicode {
                         if !ch.is_control() {
                             let def = &SETTING_DEFS[def_idx];
-                            // For integers, only accept digits
                             if matches!(def.setting_type, SettingType::Integer { .. }) {
+                                if ch.is_ascii_digit() {
+                                    self.settings_edit_buf.push(ch);
+                                }
+                            } else {
+                                self.settings_edit_buf.push(ch);
+                            }
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        // Inline editing active — extension setting (string/int)
+        if let Some((ref ext_name, ref ext_key)) = self.ext_settings_editing.clone() {
+            match key {
+                "Escape" => {
+                    self.ext_settings_editing = None;
+                    self.settings_edit_buf.clear();
+                }
+                "Return" => {
+                    let val = self.settings_edit_buf.clone();
+                    self.set_ext_setting(ext_name, ext_key, &val);
+                    self.ext_settings_editing = None;
+                    self.settings_edit_buf.clear();
+                }
+                "BackSpace" => {
+                    self.settings_edit_buf.pop();
+                }
+                _ => {
+                    if let Some(ch) = unicode {
+                        if !ch.is_control() {
+                            let is_int = self
+                                .find_ext_setting_def(ext_name, ext_key)
+                                .is_some_and(|d| d.r#type == "integer");
+                            if is_int {
                                 if ch.is_ascii_digit() {
                                     self.settings_edit_buf.push(ch);
                                 }
@@ -24221,84 +24435,143 @@ impl Engine {
             }
             "Tab" | "Return" | "Space" | "l" | "Right" | "h" | "Left" => {
                 if self.settings_selected < total {
-                    let (is_cat, idx) = flat[self.settings_selected];
-                    if is_cat {
-                        // Category header: toggle collapse on Tab/Enter/Space
-                        if matches!(key, "Tab" | "Return" | "Space")
-                            && idx < self.settings_collapsed.len()
-                        {
-                            self.settings_collapsed[idx] = !self.settings_collapsed[idx];
+                    match &flat[self.settings_selected] {
+                        SettingsRow::CoreCategory(cat_idx) => {
+                            let cat_idx = *cat_idx;
+                            if matches!(key, "Tab" | "Return" | "Space")
+                                && cat_idx < self.settings_collapsed.len()
+                            {
+                                self.settings_collapsed[cat_idx] =
+                                    !self.settings_collapsed[cat_idx];
+                            }
                         }
-                    } else {
-                        // Setting row
-                        let def = &SETTING_DEFS[idx];
-                        match &def.setting_type {
-                            SettingType::Bool => {
-                                if matches!(key, "Return" | "Space") {
-                                    let cur = self.settings.get_value_str(def.key);
-                                    let new_val = if cur == "true" { "false" } else { "true" };
-                                    if self.settings.set_value_str(def.key, new_val).is_ok() {
-                                        let _ = self.settings.save();
-                                    }
-                                }
-                            }
-                            SettingType::Enum(options) => {
-                                let forward = matches!(key, "Return" | "Space" | "l" | "Right");
-                                let backward = matches!(key, "h" | "Left");
-                                if forward || backward {
-                                    let cur = self.settings.get_value_str(def.key);
-                                    if let Some(pos) =
-                                        options.iter().position(|&o| o == cur.as_str())
-                                    {
-                                        let next = if forward {
-                                            (pos + 1) % options.len()
-                                        } else {
-                                            (pos + options.len() - 1) % options.len()
-                                        };
-                                        if self
-                                            .settings
-                                            .set_value_str(def.key, options[next])
-                                            .is_ok()
-                                        {
+                        SettingsRow::CoreSetting(idx) => {
+                            let idx = *idx;
+                            let def = &SETTING_DEFS[idx];
+                            match &def.setting_type {
+                                SettingType::Bool => {
+                                    if matches!(key, "Return" | "Space") {
+                                        let cur = self.settings.get_value_str(def.key);
+                                        let new_val = if cur == "true" { "false" } else { "true" };
+                                        if self.settings.set_value_str(def.key, new_val).is_ok() {
                                             let _ = self.settings.save();
                                         }
                                     }
                                 }
-                            }
-                            SettingType::DynamicEnum(options_fn) => {
-                                let forward = matches!(key, "Return" | "Space" | "l" | "Right");
-                                let backward = matches!(key, "h" | "Left");
-                                if forward || backward {
-                                    let options = options_fn();
-                                    let cur = self.settings.get_value_str(def.key);
-                                    if let Some(pos) = options.iter().position(|o| o == &cur) {
-                                        let next = if forward {
-                                            (pos + 1) % options.len()
-                                        } else {
-                                            (pos + options.len() - 1) % options.len()
-                                        };
-                                        if self
-                                            .settings
-                                            .set_value_str(def.key, &options[next])
-                                            .is_ok()
+                                SettingType::Enum(options) => {
+                                    let forward = matches!(key, "Return" | "Space" | "l" | "Right");
+                                    let backward = matches!(key, "h" | "Left");
+                                    if forward || backward {
+                                        let cur = self.settings.get_value_str(def.key);
+                                        if let Some(pos) =
+                                            options.iter().position(|&o| o == cur.as_str())
                                         {
-                                            let _ = self.settings.save();
+                                            let next = if forward {
+                                                (pos + 1) % options.len()
+                                            } else {
+                                                (pos + options.len() - 1) % options.len()
+                                            };
+                                            if self
+                                                .settings
+                                                .set_value_str(def.key, options[next])
+                                                .is_ok()
+                                            {
+                                                let _ = self.settings.save();
+                                            }
+                                        }
+                                    }
+                                }
+                                SettingType::DynamicEnum(options_fn) => {
+                                    let forward = matches!(key, "Return" | "Space" | "l" | "Right");
+                                    let backward = matches!(key, "h" | "Left");
+                                    if forward || backward {
+                                        let options = options_fn();
+                                        let cur = self.settings.get_value_str(def.key);
+                                        if let Some(pos) = options.iter().position(|o| o == &cur) {
+                                            let next = if forward {
+                                                (pos + 1) % options.len()
+                                            } else {
+                                                (pos + options.len() - 1) % options.len()
+                                            };
+                                            if self
+                                                .settings
+                                                .set_value_str(def.key, &options[next])
+                                                .is_ok()
+                                            {
+                                                let _ = self.settings.save();
+                                            }
+                                        }
+                                    }
+                                }
+                                SettingType::Integer { .. } | SettingType::StringVal => {
+                                    if matches!(key, "Return") {
+                                        self.settings_editing = Some(idx);
+                                        self.settings_edit_buf =
+                                            self.settings.get_value_str(def.key);
+                                    }
+                                }
+                                SettingType::BufferEditor => {
+                                    if matches!(key, "Return" | "Space" | "l" | "Right") {
+                                        match def.key {
+                                            "keymaps" => self.open_keymaps_editor(),
+                                            "extension_registries" => self.open_registries_editor(),
+                                            _ => {}
                                         }
                                     }
                                 }
                             }
-                            SettingType::Integer { .. } | SettingType::StringVal => {
-                                if matches!(key, "Return") {
-                                    self.settings_editing = Some(idx);
-                                    self.settings_edit_buf = self.settings.get_value_str(def.key);
-                                }
+                        }
+                        SettingsRow::ExtCategory(name) => {
+                            if matches!(key, "Tab" | "Return" | "Space") {
+                                let collapsed = self
+                                    .ext_settings_collapsed
+                                    .entry(name.clone())
+                                    .or_insert(false);
+                                *collapsed = !*collapsed;
                             }
-                            SettingType::BufferEditor => {
-                                if matches!(key, "Return" | "Space" | "l" | "Right") {
-                                    match def.key {
-                                        "keymaps" => self.open_keymaps_editor(),
-                                        "extension_registries" => self.open_registries_editor(),
-                                        _ => {}
+                        }
+                        SettingsRow::ExtSetting(ext_name, ext_key) => {
+                            let ext_name = ext_name.clone();
+                            let ext_key = ext_key.clone();
+                            if let Some(def) = self.find_ext_setting_def(&ext_name, &ext_key) {
+                                match def.r#type.as_str() {
+                                    "bool" => {
+                                        if matches!(key, "Return" | "Space") {
+                                            let cur = self.get_ext_setting(&ext_name, &ext_key);
+                                            let new_val =
+                                                if cur == "true" { "false" } else { "true" };
+                                            self.set_ext_setting(&ext_name, &ext_key, new_val);
+                                        }
+                                    }
+                                    "enum" => {
+                                        let forward =
+                                            matches!(key, "Return" | "Space" | "l" | "Right");
+                                        let backward = matches!(key, "h" | "Left");
+                                        if (forward || backward) && !def.options.is_empty() {
+                                            let cur = self.get_ext_setting(&ext_name, &ext_key);
+                                            if let Some(pos) =
+                                                def.options.iter().position(|o| o == &cur)
+                                            {
+                                                let next = if forward {
+                                                    (pos + 1) % def.options.len()
+                                                } else {
+                                                    (pos + def.options.len() - 1)
+                                                        % def.options.len()
+                                                };
+                                                self.set_ext_setting(
+                                                    &ext_name,
+                                                    &ext_key,
+                                                    &def.options[next],
+                                                );
+                                            }
+                                        }
+                                    }
+                                    _ => {
+                                        if matches!(key, "Return") {
+                                            self.settings_edit_buf =
+                                                self.get_ext_setting(&ext_name, &ext_key);
+                                            self.ext_settings_editing = Some((ext_name, ext_key));
+                                        }
                                     }
                                 }
                             }

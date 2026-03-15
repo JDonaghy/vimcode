@@ -2115,13 +2115,23 @@ fn event_loop(
                             // Only if the selected row is not an enum (h/Left cycles enums)
                             let flat = engine.settings_flat_list();
                             let is_enum = if engine.settings_selected < flat.len() {
-                                let (is_cat, idx) = flat[engine.settings_selected];
-                                !is_cat
-                                    && matches!(
-                                        crate::core::settings::SETTING_DEFS[idx].setting_type,
-                                        crate::core::settings::SettingType::Enum(_)
-                                            | crate::core::settings::SettingType::DynamicEnum(_)
-                                    )
+                                match &flat[engine.settings_selected] {
+                                    crate::core::engine::SettingsRow::CoreSetting(idx) => {
+                                        matches!(
+                                            crate::core::settings::SETTING_DEFS[*idx].setting_type,
+                                            crate::core::settings::SettingType::Enum(_)
+                                                | crate::core::settings::SettingType::DynamicEnum(
+                                                    _
+                                                )
+                                        )
+                                    }
+                                    crate::core::engine::SettingsRow::ExtSetting(ext_name, key) => {
+                                        engine
+                                            .find_ext_setting_def(ext_name, key)
+                                            .is_some_and(|d| d.r#type == "enum")
+                                    }
+                                    _ => false,
+                                }
                             } else {
                                 false
                             };
@@ -8993,7 +9003,8 @@ fn render_settings_panel(
             break;
         }
 
-        let (is_cat, idx) = flat[fi];
+        use crate::core::engine::SettingsRow;
+        let row = &flat[fi];
         let is_selected = fi == engine.settings_selected && engine.settings_has_focus;
         let row_bg = if is_selected { sel_bg } else { bg };
 
@@ -9002,132 +9013,233 @@ fn render_settings_panel(
             set_cell(buf, x, y, ' ', fg, row_bg);
         }
 
-        if is_cat {
-            // Category header
-            let collapsed = idx < engine.settings_collapsed.len() && engine.settings_collapsed[idx];
-            let arrow = if collapsed { '▶' } else { '▼' };
-            let cat_name = if idx < cats.len() { cats[idx] } else { "?" };
-            let mut x = area.x + 1;
-            set_cell(buf, x, y, arrow, cat_fg, row_bg);
-            x += 2;
-            for ch in cat_name.chars() {
-                if x >= area.x + content_width {
-                    break;
+        let right_edge = area.x + content_width;
+
+        match row {
+            SettingsRow::CoreCategory(cat_idx) => {
+                let collapsed = *cat_idx < engine.settings_collapsed.len()
+                    && engine.settings_collapsed[*cat_idx];
+                let arrow = if collapsed { '▶' } else { '▼' };
+                let cat_name = if *cat_idx < cats.len() {
+                    cats[*cat_idx]
+                } else {
+                    "?"
+                };
+                let mut x = area.x + 1;
+                set_cell(buf, x, y, arrow, cat_fg, row_bg);
+                x += 2;
+                for ch in cat_name.chars() {
+                    if x >= area.x + content_width {
+                        break;
+                    }
+                    set_cell(buf, x, y, ch, cat_fg, row_bg);
+                    x += 1;
                 }
-                set_cell(buf, x, y, ch, cat_fg, row_bg);
-                x += 1;
             }
-        } else {
-            // Setting row
-            let def = &SETTING_DEFS[idx];
-            // Label (indented)
-            let mut x = area.x + 3;
-            for ch in def.label.chars() {
-                if x >= area.x + content_width {
-                    break;
+            SettingsRow::ExtCategory(name) => {
+                let collapsed = engine
+                    .ext_settings_collapsed
+                    .get(name)
+                    .copied()
+                    .unwrap_or(false);
+                let arrow = if collapsed { '▶' } else { '▼' };
+                // Use display_name if available, otherwise capitalize name
+                let display = engine
+                    .ext_available_manifests()
+                    .into_iter()
+                    .find(|m| &m.name == name)
+                    .map(|m| m.display_name.clone())
+                    .unwrap_or_else(|| name.clone());
+                let mut x = area.x + 1;
+                set_cell(buf, x, y, arrow, cat_fg, row_bg);
+                x += 2;
+                for ch in display.chars() {
+                    if x >= area.x + content_width {
+                        break;
+                    }
+                    set_cell(buf, x, y, ch, cat_fg, row_bg);
+                    x += 1;
                 }
-                set_cell(buf, x, y, ch, fg, row_bg);
-                x += 1;
             }
-
-            // Value (right-aligned)
-            let right_edge = area.x + content_width;
-
-            // Check if we're editing this setting inline
-            let editing_this = engine.settings_editing == Some(idx);
-
-            match &def.setting_type {
-                SettingType::Bool => {
-                    let val = engine.settings.get_value_str(def.key);
-                    let display = if val == "true" { "[✓]" } else { "[ ]" };
-                    let val_len = 3u16;
-                    let vx = right_edge.saturating_sub(val_len + 1);
-                    let mut cx = vx;
-                    for ch in display.chars() {
-                        if cx >= right_edge {
-                            break;
-                        }
-                        set_cell(buf, cx, y, ch, key_fg, row_bg);
-                        cx += 1;
+            SettingsRow::CoreSetting(idx) => {
+                let def = &SETTING_DEFS[*idx];
+                let mut x = area.x + 3;
+                for ch in def.label.chars() {
+                    if x >= area.x + content_width {
+                        break;
                     }
+                    set_cell(buf, x, y, ch, fg, row_bg);
+                    x += 1;
                 }
-                SettingType::Integer { .. } => {
-                    let display = if editing_this {
-                        format!("{}█", engine.settings_edit_buf)
-                    } else {
-                        engine.settings.get_value_str(def.key)
-                    };
-                    let val_len = display.chars().count() as u16;
-                    let vx = right_edge.saturating_sub(val_len + 1);
-                    let mut cx = vx.max(x);
-                    for ch in display.chars() {
-                        if cx >= right_edge {
-                            break;
-                        }
-                        set_cell(buf, cx, y, ch, key_fg, row_bg);
-                        cx += 1;
-                    }
-                }
-                SettingType::Enum(_) | SettingType::DynamicEnum(_) => {
-                    let val = engine.settings.get_value_str(def.key);
-                    let display = format!("{} ▸", val);
-                    let val_len = display.chars().count() as u16;
-                    let vx = right_edge.saturating_sub(val_len + 1);
-                    let mut cx = vx.max(x);
-                    for ch in display.chars() {
-                        if cx >= right_edge {
-                            break;
-                        }
-                        set_cell(buf, cx, y, ch, key_fg, row_bg);
-                        cx += 1;
-                    }
-                }
-                SettingType::StringVal => {
-                    let display = if editing_this {
-                        format!("{}█", engine.settings_edit_buf)
-                    } else {
+
+                let editing_this = engine.settings_editing == Some(*idx);
+
+                match &def.setting_type {
+                    SettingType::Bool => {
                         let val = engine.settings.get_value_str(def.key);
-                        if val.is_empty() {
+                        let display = if val == "true" { "[✓]" } else { "[ ]" };
+                        let val_len = 3u16;
+                        let vx = right_edge.saturating_sub(val_len + 1);
+                        let mut cx = vx;
+                        for ch in display.chars() {
+                            if cx >= right_edge {
+                                break;
+                            }
+                            set_cell(buf, cx, y, ch, key_fg, row_bg);
+                            cx += 1;
+                        }
+                    }
+                    SettingType::Integer { .. } => {
+                        let display = if editing_this {
+                            format!("{}█", engine.settings_edit_buf)
+                        } else {
+                            engine.settings.get_value_str(def.key)
+                        };
+                        let val_len = display.chars().count() as u16;
+                        let vx = right_edge.saturating_sub(val_len + 1);
+                        let mut cx = vx.max(x);
+                        for ch in display.chars() {
+                            if cx >= right_edge {
+                                break;
+                            }
+                            set_cell(buf, cx, y, ch, key_fg, row_bg);
+                            cx += 1;
+                        }
+                    }
+                    SettingType::Enum(_) | SettingType::DynamicEnum(_) => {
+                        let val = engine.settings.get_value_str(def.key);
+                        let display = format!("{val} ▸");
+                        let val_len = display.chars().count() as u16;
+                        let vx = right_edge.saturating_sub(val_len + 1);
+                        let mut cx = vx.max(x);
+                        for ch in display.chars() {
+                            if cx >= right_edge {
+                                break;
+                            }
+                            set_cell(buf, cx, y, ch, key_fg, row_bg);
+                            cx += 1;
+                        }
+                    }
+                    SettingType::StringVal => {
+                        let display = if editing_this {
+                            format!("{}█", engine.settings_edit_buf)
+                        } else {
+                            let val = engine.settings.get_value_str(def.key);
+                            if val.is_empty() {
+                                "(empty)".to_string()
+                            } else {
+                                val
+                            }
+                        };
+                        let max_val_width = content_width.saturating_sub(x - area.x + 2) as usize;
+                        let truncated: String = display.chars().take(max_val_width).collect();
+                        let val_len = truncated.chars().count() as u16;
+                        let vx = right_edge.saturating_sub(val_len + 1);
+                        let mut cx = vx.max(x);
+                        let val_fg = if editing_this { fg } else { dim_fg };
+                        for ch in truncated.chars() {
+                            if cx >= right_edge {
+                                break;
+                            }
+                            set_cell(buf, cx, y, ch, val_fg, row_bg);
+                            cx += 1;
+                        }
+                    }
+                    SettingType::BufferEditor => {
+                        let display = match def.key {
+                            "keymaps" => {
+                                format!("{} defined ▸", engine.settings.keymaps.len())
+                            }
+                            "extension_registries" => {
+                                format!(
+                                    "{} configured ▸",
+                                    engine.settings.extension_registries.len()
+                                )
+                            }
+                            _ => "▸".to_string(),
+                        };
+                        let val_len = display.chars().count() as u16;
+                        let vx = right_edge.saturating_sub(val_len + 1);
+                        let mut cx = vx.max(x);
+                        for ch in display.chars() {
+                            if cx >= right_edge {
+                                break;
+                            }
+                            set_cell(buf, cx, y, ch, key_fg, row_bg);
+                            cx += 1;
+                        }
+                    }
+                }
+            }
+            SettingsRow::ExtSetting(ext_name, ext_key) => {
+                // Extension setting — render like core settings
+                let def = engine.find_ext_setting_def(ext_name, ext_key);
+                let label = def.as_ref().map(|d| d.label.as_str()).unwrap_or(ext_key);
+                let mut x = area.x + 3;
+                for ch in label.chars() {
+                    if x >= area.x + content_width {
+                        break;
+                    }
+                    set_cell(buf, x, y, ch, fg, row_bg);
+                    x += 1;
+                }
+
+                let editing_this = engine
+                    .ext_settings_editing
+                    .as_ref()
+                    .is_some_and(|(en, ek)| en == ext_name && ek == ext_key);
+                let val = engine.get_ext_setting(ext_name, ext_key);
+                let typ = def.as_ref().map(|d| d.r#type.as_str()).unwrap_or("string");
+
+                match typ {
+                    "bool" => {
+                        let display = if val == "true" { "[✓]" } else { "[ ]" };
+                        let val_len = 3u16;
+                        let vx = right_edge.saturating_sub(val_len + 1);
+                        let mut cx = vx;
+                        for ch in display.chars() {
+                            if cx >= right_edge {
+                                break;
+                            }
+                            set_cell(buf, cx, y, ch, key_fg, row_bg);
+                            cx += 1;
+                        }
+                    }
+                    "enum" => {
+                        let display = format!("{val} ▸");
+                        let val_len = display.chars().count() as u16;
+                        let vx = right_edge.saturating_sub(val_len + 1);
+                        let mut cx = vx.max(x);
+                        for ch in display.chars() {
+                            if cx >= right_edge {
+                                break;
+                            }
+                            set_cell(buf, cx, y, ch, key_fg, row_bg);
+                            cx += 1;
+                        }
+                    }
+                    _ => {
+                        // string/integer
+                        let display = if editing_this {
+                            format!("{}█", engine.settings_edit_buf)
+                        } else if val.is_empty() {
                             "(empty)".to_string()
                         } else {
                             val
+                        };
+                        let max_val_width = content_width.saturating_sub(x - area.x + 2) as usize;
+                        let truncated: String = display.chars().take(max_val_width).collect();
+                        let val_len = truncated.chars().count() as u16;
+                        let vx = right_edge.saturating_sub(val_len + 1);
+                        let mut cx = vx.max(x);
+                        let val_fg = if editing_this { fg } else { dim_fg };
+                        for ch in truncated.chars() {
+                            if cx >= right_edge {
+                                break;
+                            }
+                            set_cell(buf, cx, y, ch, val_fg, row_bg);
+                            cx += 1;
                         }
-                    };
-                    // Truncate to fit
-                    let max_val_width = content_width.saturating_sub(x - area.x + 2) as usize;
-                    let truncated: String = display.chars().take(max_val_width).collect();
-                    let val_len = truncated.chars().count() as u16;
-                    let vx = right_edge.saturating_sub(val_len + 1);
-                    let mut cx = vx.max(x);
-                    let val_fg = if editing_this { fg } else { dim_fg };
-                    for ch in truncated.chars() {
-                        if cx >= right_edge {
-                            break;
-                        }
-                        set_cell(buf, cx, y, ch, val_fg, row_bg);
-                        cx += 1;
-                    }
-                }
-                SettingType::BufferEditor => {
-                    let display = match def.key {
-                        "keymaps" => format!("{} defined ▸", engine.settings.keymaps.len()),
-                        "extension_registries" => {
-                            format!(
-                                "{} configured ▸",
-                                engine.settings.extension_registries.len()
-                            )
-                        }
-                        _ => "▸".to_string(),
-                    };
-                    let val_len = display.chars().count() as u16;
-                    let vx = right_edge.saturating_sub(val_len + 1);
-                    let mut cx = vx.max(x);
-                    for ch in display.chars() {
-                        if cx >= right_edge {
-                            break;
-                        }
-                        set_cell(buf, cx, y, ch, key_fg, row_bg);
-                        cx += 1;
                     }
                 }
             }
