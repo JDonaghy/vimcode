@@ -1942,7 +1942,11 @@ impl SimpleComponent for App {
             e.plugin_init();
             e.restore_session_files();
             if let Some(ref path) = file_path {
-                e.open_file_in_tab(path);
+                if path.is_dir() {
+                    e.open_folder(path);
+                } else {
+                    e.open_file_in_tab(path);
+                }
             }
             e
         };
@@ -5685,7 +5689,8 @@ impl SimpleComponent for App {
                         sender.input(Msg::OpenFolderDialog);
                     }
                     "open_workspace_dialog" => {
-                        sender.input(Msg::OpenWorkspaceDialog);
+                        self.engine.borrow_mut().open_workspace_from_file();
+                        sender.input(Msg::RefreshFileTree);
                     }
                     "save_workspace_as_dialog" => {
                         sender.input(Msg::SaveWorkspaceAsDialog);
@@ -6225,19 +6230,9 @@ impl SimpleComponent for App {
                 self.draw_needed.set(true);
             }
             Msg::OpenWorkspaceDialog => {
-                let engine = self.engine.clone();
-                let sender2 = sender.input_sender().clone();
-                let dialog = gtk4::FileDialog::new();
-                dialog.set_title("Open Workspace");
-                let win = self.window.clone();
-                dialog.open(Some(&win), gtk4::gio::Cancellable::NONE, move |result| {
-                    if let Ok(file) = result {
-                        if let Some(path) = gtk4::prelude::FileExt::path(&file) {
-                            engine.borrow_mut().open_workspace(&path);
-                            sender2.send(Msg::RefreshFileTree).ok();
-                        }
-                    }
-                });
+                // open_workspace_from_file() already ran in the engine;
+                // just refresh the file tree.
+                sender.input(Msg::RefreshFileTree);
                 self.draw_needed.set(true);
             }
             Msg::SaveWorkspaceAsDialog => {

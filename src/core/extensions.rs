@@ -11,6 +11,32 @@ use serde::{Deserialize, Serialize};
 
 // ─── Manifest deserialization ─────────────────────────────────────────────────
 
+/// A user-configurable setting declared by an extension.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct ExtSettingDef {
+    /// Setting key (used in `vimcode.opt.get("extname.key")`).
+    pub key: String,
+    /// Human-readable label shown in the Settings UI.
+    #[serde(default)]
+    pub label: String,
+    /// Short description shown as a tooltip or subtitle.
+    #[serde(default)]
+    pub description: String,
+    /// Value type: `"bool"`, `"string"`, `"integer"`, or `"enum"`.
+    #[serde(default = "default_setting_type")]
+    pub r#type: String,
+    /// Default value (as a string).
+    #[serde(default)]
+    pub default: String,
+    /// For `"enum"` type: the list of allowed values.
+    #[serde(default)]
+    pub options: Vec<String>,
+}
+
+fn default_setting_type() -> String {
+    "string".to_string()
+}
+
 /// Parsed contents of a `manifest.toml` (or registry JSON entry).
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct ExtensionManifest {
@@ -40,6 +66,9 @@ pub struct ExtensionManifest {
     /// Optional comment style override for languages handled by this extension.
     #[serde(default)]
     pub comment: Option<CommentConfig>,
+    /// User-configurable settings declared by this extension.
+    #[serde(default)]
+    pub settings: Vec<ExtSettingDef>,
     /// Base URL of the registry this manifest was fetched from.
     /// Derived at fetch time; not serialized to JSON/TOML.
     #[serde(skip)]

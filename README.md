@@ -35,7 +35,7 @@ For detailed how-to guides and configuration references, see the **[VimCode Wiki
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 4316 tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 4391 tests, zero async runtime dependency
 
 > **Note:** VimCode does not implement VimScript. Extension and scripting is handled via
 > the built-in Lua 5.4 plugin system. The goal is full Vim *keybinding* and *editing*
@@ -158,6 +158,9 @@ cargo fmt
 - `is` / `as` — inner/around sentence (`.`/`!`/`?`-terminated); `as` includes trailing whitespace
 - `it` / `at` — inner/around HTML/XML tag (`dit` deletes content, `dat` deletes element; case-insensitive, nesting-aware)
 - `` i` `` / `` a` `` — inner/around backticks
+- `ie` / `ae` — inner/around LaTeX `\begin{env}...\end{env}` (nested-aware, LaTeX buffers only)
+- `ic` / `ac` — inner/around LaTeX `\command{...}` (LaTeX buffers only)
+- `i$` / `a$` — inner/around LaTeX math (`$...$`, `$$...$$`, `\[...\]`, `\(...\)`; LaTeX buffers only)
 
 **Count prefix** — prepend any number to multiply: `5j`, `3dd`, `10yy`, `2w`, etc.
 
@@ -815,10 +818,10 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `K` | Show hover info (LSP) |
 | `]c` / `[c` | Next / previous change (works on real files + diff buffers) |
 | `]d` / `[d` | Next / previous diagnostic (LSP) |
-| `[[` / `]]` | Section backward / forward (`{` in column 0) |
-| `[]` / `][` | Section end backward / forward (`}` in column 0) |
-| `[m` / `]m` | Method start backward / forward |
-| `[M` / `]M` | Method end backward / forward |
+| `[[` / `]]` | Section backward / forward (`{` in col 0; LaTeX: `\section`/`\chapter`/etc.) |
+| `[]` / `][` | Section end backward / forward (`}` in col 0; LaTeX: `\end{}`) |
+| `[m` / `]m` | Method start backward / forward (LaTeX: `\begin{}`) |
+| `[M` / `]M` | Method end backward / forward (LaTeX: `\end{}`) |
 | `[{` / `]}` | Jump to unmatched `{` / `}` |
 | `[(` / `])` | Jump to unmatched `(` / `)` |
 | `[*` / `]*` | Jump to comment block start / end (`/*`/`*/`) |
@@ -1040,8 +1043,9 @@ src/
     ├── settings.rs   (~2,131 lines)  JSON config, :set parsing, key binding notation, SETTING_DEFS
     ├── session.rs      (~235 lines)  Session state persistence + per-workspace paths
     ├── git.rs        (~1,821 lines)  Git subprocesses: diff, blame, stage_hunk, SC panel, worktrees, git log, branches
-    ├── spell.rs        (~200 lines)  Spell checker (spellbook/Hunspell; tree-sitter-aware; user dictionary)
-    └── window.rs, tab.rs, view.rs, cursor.rs, mode.rs, syntax.rs (~984 lines)
+    ├── spell.rs        (~375 lines)  Spell checker (spellbook/Hunspell; tree-sitter-aware; LaTeX-aware; user dictionary)
+    ├── syntax.rs     (~1,319 lines)  Tree-sitter highlighting for 18 languages (incl. LaTeX via vendored grammar)
+    └── window.rs, tab.rs, view.rs, cursor.rs, mode.rs (~700 lines)
 ```
 
 **Design rule:** `src/core/` has zero GTK/rendering dependencies and is testable in isolation.
@@ -1068,7 +1072,7 @@ VimCode is built on the shoulders of giants, and I take very little credit for i
 | TUI UI | ratatui 0.27 + crossterm |
 | Rendering | Pango + Cairo (CPU, no GPU) |
 | Text | Ropey (rope data structure) |
-| Parsing | Tree-sitter |
+| Parsing | Tree-sitter (18 languages incl. LaTeX) |
 | LSP | lsp-types (protocol definitions) |
 | Config | serde + serde_json |
 | Plugins | mlua 0.9 (Lua 5.4, vendored) |

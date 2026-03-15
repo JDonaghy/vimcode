@@ -70,6 +70,20 @@ pub enum EngineAction {
     QuitWithError,
 }
 
+/// A row in the Settings sidebar flat list.
+/// Distinguishes core settings from extension-declared settings.
+#[derive(Debug, Clone)]
+pub enum SettingsRow {
+    /// Core category header: index into `setting_categories()`.
+    CoreCategory(usize),
+    /// Core setting: index into `SETTING_DEFS`.
+    CoreSetting(usize),
+    /// Extension category header: extension name.
+    ExtCategory(String),
+    /// Extension setting: `(extension_name, setting_key)`.
+    ExtSetting(String, String),
+}
+
 // ── Ex command abbreviation table ────────────────────────────────────────────
 // Each entry is (canonical_name, min_prefix_length).
 // `normalize_ex_command("sor foo")` → `"sort foo"`.
@@ -249,7 +263,7 @@ pub static PALETTE_COMMANDS: &[PaletteCommand] = &[
         action: "open_folder_dialog",
     },
     PaletteCommand {
-        label: "File: Open Workspace…",
+        label: "File: Open Workspace From File…",
         shortcut: "",
         vscode_shortcut: "",
         action: "open_workspace_dialog",
@@ -1985,6 +1999,12 @@ pub struct Engine {
     pub settings_edit_buf: String,
     /// Per-category collapsed state.
     pub settings_collapsed: Vec<bool>,
+    /// Per-extension settings: ext_name → { key → value }.
+    pub ext_settings: HashMap<String, HashMap<String, String>>,
+    /// Per-extension-category collapsed state in the Settings sidebar.
+    pub ext_settings_collapsed: HashMap<String, bool>,
+    /// When editing an extension setting inline: `(ext_name, key)`.
+    pub ext_settings_editing: Option<(String, String)>,
 
     // --- Virtual text / line annotations ---
     /// Inline annotation text indexed by 0-based buffer line number.
@@ -2344,6 +2364,9 @@ impl Engine {
             settings_editing: None,
             settings_edit_buf: String::new(),
             settings_collapsed: vec![false; super::settings::setting_categories().len()],
+            ext_settings: HashMap::new(),
+            ext_settings_collapsed: HashMap::new(),
+            ext_settings_editing: None,
             line_annotations: HashMap::new(),
             async_shell_tasks: HashMap::new(),
             ai_ghost_text: None,
@@ -10313,7 +10336,7 @@ impl Engine {
         let mut partial = self.leader_partial.take().unwrap_or_default();
         partial.push(ch);
 
-        // All known leader sequences
+        // All known built-in leader sequences
         const SEQUENCES: &[&str] = &["rn", "gf", "gF", "gi"];
 
         match partial.as_str() {
@@ -10333,12 +10356,30 @@ impl Engine {
                 self.push_jump_location();
                 self.lsp_request_implementation();
             }
-            // Partial match — keep accumulating if the partial is a prefix of some sequence
-            s if SEQUENCES.iter().any(|seq| seq.starts_with(s)) => {
-                self.leader_partial = Some(partial);
-            }
-            _ => {
-                self.message = format!("Unknown leader sequence: <leader>{partial}");
+            s => {
+                // Check if this is a complete plugin keymap match
+                let leader_key = format!("<leader>{s}");
+                if self.plugin_run_keymap("n", &leader_key) {
+                    return EngineAction::None;
+                }
+
+                // Check if partial is a prefix of a built-in sequence
+                if SEQUENCES.iter().any(|seq| seq.starts_with(s)) {
+                    self.leader_partial = Some(partial);
+                    return EngineAction::None;
+                }
+
+                // Check if partial is a prefix of any plugin keymap
+                let prefix = format!("<leader>{s}");
+                let has_plugin_prefix = self
+                    .plugin_manager
+                    .as_ref()
+                    .is_some_and(|pm| pm.has_keymap_prefix("n", &prefix));
+                if has_plugin_prefix {
+                    self.leader_partial = Some(partial);
+                } else {
+                    self.message = format!("Unknown leader sequence: <leader>{partial}");
+                }
             }
         }
         EngineAction::None
@@ -13602,6 +13643,27 @@ impl Engine {
     }
 
     /// Write a `.vimcode-workspace` file at the given path with the current folder.
+    /// Open or create a workspace in the directory of the currently active file.
+    /// If a `.vimcode-workspace` file already exists there, open it; otherwise
+    /// create one and then open the folder.
+    pub fn open_workspace_from_file(&mut self) {
+        let buf_id = self.active_window().buffer_id;
+        let dir = self
+            .buffer_manager
+            .get(buf_id)
+            .and_then(|bs| bs.file_path.as_ref())
+            .and_then(|fp| fp.parent())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| self.cwd.clone());
+        let ws_path = dir.join(".vimcode-workspace");
+        if ws_path.exists() {
+            self.open_workspace(&ws_path);
+        } else {
+            self.save_workspace_as(&ws_path);
+            self.open_folder(&dir);
+        }
+    }
+
     pub fn save_workspace_as(&mut self, ws_path: &Path) {
         let folder_path = if let Some(parent) = ws_path.parent() {
             // Make folder path relative to workspace file location
@@ -14633,6 +14695,16 @@ impl Engine {
                     self.ext_panels.insert(name.clone(), panel.clone());
                 }
                 self.plugin_manager = Some(mgr);
+                // Load per-extension settings for installed extensions
+                let installed_names: Vec<String> = self
+                    .extension_state
+                    .installed
+                    .iter()
+                    .map(|e| e.name.clone())
+                    .collect();
+                for name in &installed_names {
+                    self.load_ext_settings(name);
+                }
                 // Populate comment style overrides from installed extension manifests
                 self.populate_comment_overrides();
                 // Fire VimEnter event after plugin initialization is complete
@@ -14769,6 +14841,12 @@ impl Engine {
                 map.insert(key.to_string(), val);
             }
         }
+        // Include extension settings with "extname.key" namespace
+        for (ext_name, values) in &self.ext_settings {
+            for (key, val) in values {
+                map.insert(format!("{ext_name}.{key}"), val.clone());
+            }
+        }
         map
     }
 
@@ -14826,8 +14904,14 @@ impl Engine {
             let max_col = self.get_max_cursor_col(clamped_line);
             self.view_mut().cursor.col = col.min(max_col);
         }
-        // Apply settings changes
+        // Apply settings changes — "extname.key" routes to extension settings
         for (key, value) in ctx.set_settings {
+            if let Some((ext_name, ext_key)) = key.split_once('.') {
+                if self.ext_settings.contains_key(ext_name) {
+                    self.set_ext_setting(ext_name, ext_key, &value);
+                    continue;
+                }
+            }
             let _ = self.settings.set_value_str(&key, &value);
         }
         // Apply register writes
@@ -15269,6 +15353,7 @@ impl Engine {
             return EngineAction::OpenFolderDialog;
         }
         if cmd == "OpenWorkspace" || cmd == "open_workspace_dialog" {
+            self.open_workspace_from_file();
             return EngineAction::OpenWorkspaceDialog;
         }
         if cmd == "SaveWorkspaceAs" || cmd == "save_workspace_as_dialog" {
@@ -19689,6 +19774,9 @@ impl Engine {
             's' => self.find_sentence_object(modifier, cursor_pos),
             't' => self.find_tag_text_object(modifier, cursor_pos),
             '`' => self.find_quote_object(modifier, '`', cursor_pos),
+            'e' => self.find_latex_environment_object(modifier, cursor_pos),
+            'c' if self.is_latex_buffer() => self.find_latex_command_object(modifier, cursor_pos),
+            '$' => self.find_latex_math_object(modifier, cursor_pos),
             _ => None,
         }
     }
@@ -20191,6 +20279,319 @@ impl Engine {
             }
             scan_pos = open_start - 1;
         }
+    }
+
+    /// Check if the active buffer is a LaTeX file.
+    fn is_latex_buffer(&self) -> bool {
+        self.active_buffer_state().syntax.language() == super::syntax::SyntaxLanguage::Latex
+    }
+
+    /// Find LaTeX \begin{env}...\end{env} text object range (ie/ae).
+    fn find_latex_environment_object(
+        &self,
+        modifier: char,
+        cursor_pos: usize,
+    ) -> Option<(usize, usize)> {
+        if !self.is_latex_buffer() {
+            return None;
+        }
+        let total_chars = self.buffer().len_chars();
+        if total_chars == 0 || cursor_pos >= total_chars {
+            return None;
+        }
+
+        // Collect text into a string for substring search
+        let text: String = self.buffer().content.chars().collect();
+
+        // Find the enclosing \begin{name}...\end{name} pair.
+        // Walk backward from cursor to find \begin{...}, tracking nesting.
+        let mut scan = cursor_pos;
+        loop {
+            // Find previous \begin{ or \end{
+            let before = &text[..=scan.min(text.len() - 1)];
+            let begin_pos = before.rfind("\\begin{");
+            let end_pos = before.rfind("\\end{");
+
+            // If we find \end{ closer than \begin{, we need to skip over that
+            // nested environment.
+            match (begin_pos, end_pos) {
+                (Some(bp), Some(ep)) if ep > bp => {
+                    // \end{ is closer — this is a nested close, skip past it
+                    if bp == 0 {
+                        return None;
+                    }
+                    scan = bp.saturating_sub(1);
+                    continue;
+                }
+                (Some(bp), _) => {
+                    // Found a \begin{...} candidate
+                    let env_name = self.latex_extract_env_name(&text, bp + 7)?;
+                    let begin_end = bp + 7 + env_name.len() + 1; // past closing }
+
+                    // Now find matching \end{env_name} forward, tracking nesting
+                    let mut depth: usize = 1;
+                    let mut fwd = begin_end;
+                    while fwd < text.len() {
+                        if text[fwd..].starts_with(&format!("\\begin{{{env_name}}}")) {
+                            depth += 1;
+                            fwd += 7 + env_name.len() + 1;
+                        } else if text[fwd..].starts_with(&format!("\\end{{{env_name}}}")) {
+                            depth -= 1;
+                            if depth == 0 {
+                                let end_start = fwd;
+                                let end_end = fwd + 5 + env_name.len() + 1;
+                                // Check cursor is within this range
+                                if cursor_pos >= bp && cursor_pos < end_end {
+                                    return if modifier == 'i' {
+                                        Some((begin_end, end_start))
+                                    } else {
+                                        Some((bp, end_end))
+                                    };
+                                }
+                                break;
+                            }
+                            fwd += 5 + env_name.len() + 1;
+                        } else {
+                            fwd += 1;
+                        }
+                    }
+                    // This \begin didn't enclose cursor, try further back
+                    if bp == 0 {
+                        return None;
+                    }
+                    scan = bp - 1;
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// Extract environment name from text starting at the position after `\begin{`.
+    fn latex_extract_env_name(&self, text: &str, start: usize) -> Option<String> {
+        let rest = text.get(start..)?;
+        let end = rest.find('}')?;
+        let name = &rest[..end];
+        if name.is_empty() {
+            return None;
+        }
+        Some(name.to_string())
+    }
+
+    /// Find LaTeX \command{...} text object range (ic/ac).
+    /// `ic` selects the content inside braces, `ac` selects command + braces.
+    fn find_latex_command_object(
+        &self,
+        modifier: char,
+        cursor_pos: usize,
+    ) -> Option<(usize, usize)> {
+        let total_chars = self.buffer().len_chars();
+        if total_chars == 0 || cursor_pos >= total_chars {
+            return None;
+        }
+
+        let text: String = self.buffer().content.chars().collect();
+
+        // If cursor is inside braces, walk back to find the command
+        // First check if we're inside {...}
+        let mut cmd_start;
+        let mut brace_start = None;
+        let mut depth: i32 = 0;
+        for i in (0..=cursor_pos.min(text.len() - 1)).rev() {
+            let c = text.as_bytes().get(i).copied().unwrap_or(0) as char;
+            if c == '}' {
+                depth += 1;
+            } else if c == '{' {
+                if depth == 0 {
+                    brace_start = Some(i);
+                    break;
+                }
+                depth -= 1;
+            }
+        }
+
+        if let Some(bs) = brace_start {
+            // Find the matching close brace
+            let mut depth2: i32 = 1;
+            let mut brace_end = None;
+            for i in (bs + 1)..text.len() {
+                let c = text.as_bytes().get(i).copied().unwrap_or(0) as char;
+                if c == '{' {
+                    depth2 += 1;
+                } else if c == '}' {
+                    depth2 -= 1;
+                    if depth2 == 0 {
+                        brace_end = Some(i + 1);
+                        break;
+                    }
+                }
+            }
+            let brace_end = brace_end?;
+
+            // Walk backward from '{' to find \command
+            if bs > 0 {
+                cmd_start = bs - 1;
+                while cmd_start > 0 && text.as_bytes()[cmd_start].is_ascii_alphabetic() {
+                    cmd_start -= 1;
+                }
+                if text.as_bytes()[cmd_start] == b'\\' {
+                    return if modifier == 'i' {
+                        Some((bs + 1, brace_end - 1))
+                    } else {
+                        Some((cmd_start, brace_end))
+                    };
+                }
+            }
+        }
+
+        // Maybe cursor is on the \command itself — find the next { after it
+        cmd_start = cursor_pos;
+        while cmd_start > 0
+            && text
+                .as_bytes()
+                .get(cmd_start)
+                .is_some_and(|b| b.is_ascii_alphabetic())
+        {
+            cmd_start -= 1;
+        }
+        if text.as_bytes().get(cmd_start) == Some(&b'\\') {
+            // Find the opening brace
+            let mut pos = cmd_start + 1;
+            while pos < text.len() && text.as_bytes()[pos].is_ascii_alphabetic() {
+                pos += 1;
+            }
+            if text.as_bytes().get(pos) == Some(&b'{') {
+                let bs = pos;
+                let mut depth3: i32 = 1;
+                let mut brace_end = None;
+                for i in (bs + 1)..text.len() {
+                    let c = text.as_bytes()[i] as char;
+                    if c == '{' {
+                        depth3 += 1;
+                    } else if c == '}' {
+                        depth3 -= 1;
+                        if depth3 == 0 {
+                            brace_end = Some(i + 1);
+                            break;
+                        }
+                    }
+                }
+                let brace_end = brace_end?;
+                return if modifier == 'i' {
+                    Some((bs + 1, brace_end - 1))
+                } else {
+                    Some((cmd_start, brace_end))
+                };
+            }
+        }
+
+        None
+    }
+
+    /// Find LaTeX math text object range (i$/a$).
+    /// Handles $...$, $$...$$, \(...\), \[...\].
+    fn find_latex_math_object(&self, modifier: char, cursor_pos: usize) -> Option<(usize, usize)> {
+        if !self.is_latex_buffer() {
+            return None;
+        }
+        let total_chars = self.buffer().len_chars();
+        if total_chars == 0 || cursor_pos >= total_chars {
+            return None;
+        }
+
+        let text: String = self.buffer().content.chars().collect();
+        let bytes = text.as_bytes();
+
+        // Try \[...\] (display math)
+        if let Some(result) =
+            self.find_latex_delimited_pair(&text, cursor_pos, "\\[", "\\]", modifier)
+        {
+            return Some(result);
+        }
+
+        // Try \(...\) (inline math)
+        if let Some(result) =
+            self.find_latex_delimited_pair(&text, cursor_pos, "\\(", "\\)", modifier)
+        {
+            return Some(result);
+        }
+
+        // Try $$...$$ first (display math), then $...$ (inline math)
+        // Scan for $ signs in the text, pairing them up
+        let mut dollar_positions: Vec<(usize, bool)> = Vec::new(); // (pos, is_double)
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'$' {
+                // Check for escaped \$
+                if i > 0 && bytes[i - 1] == b'\\' {
+                    i += 1;
+                    continue;
+                }
+                if i + 1 < bytes.len() && bytes[i + 1] == b'$' {
+                    dollar_positions.push((i, true));
+                    i += 2;
+                } else {
+                    dollar_positions.push((i, false));
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
+        }
+
+        // Pair up dollars: each pair of same-type consecutive entries forms a math region
+        let mut idx = 0;
+        while idx + 1 < dollar_positions.len() {
+            let (start, is_double_start) = dollar_positions[idx];
+            let (end, is_double_end) = dollar_positions[idx + 1];
+            if is_double_start == is_double_end {
+                let delim_len = if is_double_start { 2 } else { 1 };
+                let outer_start = start;
+                let outer_end = end + delim_len;
+                if cursor_pos >= outer_start && cursor_pos < outer_end {
+                    return if modifier == 'i' {
+                        Some((start + delim_len, end))
+                    } else {
+                        Some((outer_start, outer_end))
+                    };
+                }
+                idx += 2;
+            } else {
+                idx += 1;
+            }
+        }
+
+        None
+    }
+
+    /// Find a delimited pair like \[...\] or \(...\) around the cursor.
+    fn find_latex_delimited_pair(
+        &self,
+        text: &str,
+        cursor_pos: usize,
+        open: &str,
+        close: &str,
+        modifier: char,
+    ) -> Option<(usize, usize)> {
+        // Search backward for the open delimiter
+        for start in (0..=cursor_pos).rev() {
+            if text[start..].starts_with(open) {
+                let inner_start = start + open.len();
+                // Search forward for matching close delimiter
+                if let Some(rel) = text[inner_start..].find(close) {
+                    let close_start = inner_start + rel;
+                    let outer_end = close_start + close.len();
+                    if cursor_pos >= start && cursor_pos < outer_end {
+                        return if modifier == 'i' {
+                            Some((inner_start, close_start))
+                        } else {
+                            Some((start, outer_end))
+                        };
+                    }
+                }
+                break; // Only check the nearest open delimiter
+            }
+        }
+        None
     }
 
     /// Apply an operator to a text object
@@ -21719,7 +22120,13 @@ impl Engine {
 
     /// Jump to next section start (]] or next section end (][).
     /// `end_section`: false = start ('{' in column 0), true = end ('}' in column 0).
+    /// In LaTeX buffers: ]] jumps to next \section/\chapter/\subsection/\subsubsection,
+    /// ][ jumps to next \end{...}.
     fn jump_section_forward(&mut self, end_section: bool) {
+        if self.is_latex_buffer() {
+            self.jump_latex_section_forward(end_section);
+            return;
+        }
         let target_char = if end_section { '}' } else { '{' };
         let total = self.buffer().len_lines();
         let start = self.view().cursor.line + 1;
@@ -21736,7 +22143,12 @@ impl Engine {
     }
 
     /// Jump to previous section start ([[) or previous section end (][]).
+    /// In LaTeX buffers: [[ jumps to previous \section/etc., [] jumps to previous \end{}.
     fn jump_section_backward(&mut self, end_section: bool) {
+        if self.is_latex_buffer() {
+            self.jump_latex_section_backward(end_section);
+            return;
+        }
         let target_char = if end_section { '}' } else { '{' };
         let cur = self.view().cursor.line;
         for line in (0..cur).rev() {
@@ -21752,7 +22164,12 @@ impl Engine {
     }
 
     /// Jump to next method start (]m) — finds next '{' that starts a block.
+    /// In LaTeX buffers: ]m jumps to next \begin{...}.
     fn jump_method_start_forward(&mut self) {
+        if self.is_latex_buffer() {
+            self.jump_latex_env_forward(false);
+            return;
+        }
         let total_chars = self.buffer().len_chars();
         let cur_pos = self.buffer().line_to_char(self.view().cursor.line) + self.view().cursor.col;
         let mut pos = cur_pos + 1;
@@ -21769,7 +22186,12 @@ impl Engine {
     }
 
     /// Jump to previous method start ([m).
+    /// In LaTeX buffers: [m jumps to previous \begin{...}.
     fn jump_method_start_backward(&mut self) {
+        if self.is_latex_buffer() {
+            self.jump_latex_env_backward(false);
+            return;
+        }
         let cur_pos = self.buffer().line_to_char(self.view().cursor.line) + self.view().cursor.col;
         if cur_pos == 0 {
             return;
@@ -21791,7 +22213,12 @@ impl Engine {
     }
 
     /// Jump to next method end (]M) — finds next '}'.
+    /// In LaTeX buffers: ]M jumps to next \end{...}.
     fn jump_method_end_forward(&mut self) {
+        if self.is_latex_buffer() {
+            self.jump_latex_env_forward(true);
+            return;
+        }
         let total_chars = self.buffer().len_chars();
         let cur_pos = self.buffer().line_to_char(self.view().cursor.line) + self.view().cursor.col;
         let mut pos = cur_pos + 1;
@@ -21808,7 +22235,12 @@ impl Engine {
     }
 
     /// Jump to previous method end ([M).
+    /// In LaTeX buffers: [M jumps to previous \end{...}.
     fn jump_method_end_backward(&mut self) {
+        if self.is_latex_buffer() {
+            self.jump_latex_env_backward(true);
+            return;
+        }
         let cur_pos = self.buffer().line_to_char(self.view().cursor.line) + self.view().cursor.col;
         if cur_pos == 0 {
             return;
@@ -21826,6 +22258,111 @@ impl Engine {
                 break;
             }
             pos -= 1;
+        }
+    }
+
+    // --- LaTeX-specific motion helpers ---
+
+    /// LaTeX section commands to match for ]] / [[ jumps.
+    const LATEX_SECTION_COMMANDS: &'static [&'static str] = &[
+        "\\part",
+        "\\chapter",
+        "\\section",
+        "\\subsection",
+        "\\subsubsection",
+        "\\paragraph",
+        "\\subparagraph",
+    ];
+
+    /// Jump forward to next LaTeX section command (]]) or \end{} (][).
+    fn jump_latex_section_forward(&mut self, end_section: bool) {
+        let total = self.buffer().len_lines();
+        let start = self.view().cursor.line + 1;
+        for line in start..total {
+            let line_text = self.buffer().content.line(line).chars().collect::<String>();
+            let trimmed = line_text.trim_start();
+            if end_section {
+                if trimmed.starts_with("\\end{") {
+                    self.view_mut().cursor.line = line;
+                    self.view_mut().cursor.col = 0;
+                    return;
+                }
+            } else {
+                for cmd in Self::LATEX_SECTION_COMMANDS {
+                    if let Some(after) = trimmed.strip_prefix(cmd) {
+                        if after.starts_with('{') || after.starts_with('*') || after.is_empty() {
+                            self.view_mut().cursor.line = line;
+                            self.view_mut().cursor.col = 0;
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Jump backward to previous LaTeX section command ([[) or \end{} ([]).
+    fn jump_latex_section_backward(&mut self, end_section: bool) {
+        let cur = self.view().cursor.line;
+        for line in (0..cur).rev() {
+            let line_text = self.buffer().content.line(line).chars().collect::<String>();
+            let trimmed = line_text.trim_start();
+            if end_section {
+                if trimmed.starts_with("\\end{") {
+                    self.view_mut().cursor.line = line;
+                    self.view_mut().cursor.col = 0;
+                    return;
+                }
+            } else {
+                for cmd in Self::LATEX_SECTION_COMMANDS {
+                    if let Some(after) = trimmed.strip_prefix(cmd) {
+                        if after.starts_with('{') || after.starts_with('*') || after.is_empty() {
+                            self.view_mut().cursor.line = line;
+                            self.view_mut().cursor.col = 0;
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Jump forward to next \begin{} (is_end=false) or \end{} (is_end=true).
+    fn jump_latex_env_forward(&mut self, is_end: bool) {
+        let needle = if is_end { "\\end{" } else { "\\begin{" };
+        let total = self.buffer().len_lines();
+        let start_line = self.view().cursor.line;
+        let start_col = self.view().cursor.col;
+        for line in start_line..total {
+            let line_text = self.buffer().content.line(line).chars().collect::<String>();
+            let search_from = if line == start_line { start_col + 1 } else { 0 };
+            if search_from < line_text.len() {
+                if let Some(rel) = line_text[search_from..].find(needle) {
+                    self.view_mut().cursor.line = line;
+                    self.view_mut().cursor.col = search_from + rel;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Jump backward to previous \begin{} (is_end=false) or \end{} (is_end=true).
+    fn jump_latex_env_backward(&mut self, is_end: bool) {
+        let needle = if is_end { "\\end{" } else { "\\begin{" };
+        let start_line = self.view().cursor.line;
+        let start_col = self.view().cursor.col;
+        for line in (0..=start_line).rev() {
+            let line_text = self.buffer().content.line(line).chars().collect::<String>();
+            let search_end = if line == start_line {
+                start_col
+            } else {
+                line_text.len()
+            };
+            if let Some(pos) = line_text[..search_end].rfind(needle) {
+                self.view_mut().cursor.line = line;
+                self.view_mut().cursor.col = pos;
+                return;
+            }
         }
     }
 
@@ -22929,6 +23466,21 @@ impl Engine {
         }
     }
 
+    /// Resolve the base URL for downloading extension files.
+    /// Uses the manifest's `registry_base_url` if available, otherwise derives it
+    /// from the first configured registry URL (the field is `#[serde(skip)]` so it's
+    /// empty when loaded from cache).
+    fn resolve_registry_base_url(&self, manifest: &extensions::ExtensionManifest) -> String {
+        if !manifest.registry_base_url.is_empty() {
+            return manifest.registry_base_url.clone();
+        }
+        self.settings
+            .extension_registries
+            .first()
+            .map(|url| registry::base_url_from_registry(url))
+            .unwrap_or_default()
+    }
+
     /// Install an extension by name: download scripts, run LSP/DAP install, mark installed.
     pub fn ext_install_from_registry(&mut self, name: &str) {
         let manifest = self
@@ -22949,14 +23501,15 @@ impl Engine {
         let ext_dir = paths::vimcode_config_dir()
             .join("extensions")
             .join(&ext_name);
+        let base_url = self.resolve_registry_base_url(&manifest);
         if !manifest.scripts.is_empty()
-            && !manifest.registry_base_url.is_empty()
+            && !base_url.is_empty()
             && std::fs::create_dir_all(&ext_dir).is_ok()
         {
             for script in &manifest.scripts {
                 let dest = ext_dir.join(script);
                 if !dest.exists() {
-                    let url = format!("{}/{}/{}", manifest.registry_base_url, ext_name, script);
+                    let url = format!("{}/{}/{}", base_url, ext_name, script);
                     let _ = registry::download_script(&url, &dest);
                 }
             }
@@ -23070,6 +23623,10 @@ impl Engine {
         self.extension_state.installed.retain(|e| e.name != name);
         let _ = self.extension_state.save();
 
+        // Remove in-memory extension settings
+        self.ext_settings.remove(&name);
+        self.ext_settings_collapsed.remove(&name);
+
         let ext_dir = paths::vimcode_config_dir().join("extensions").join(&name);
         let _ = std::fs::remove_dir_all(&ext_dir);
 
@@ -23105,13 +23662,14 @@ impl Engine {
         let ext_dir = paths::vimcode_config_dir()
             .join("extensions")
             .join(&ext_name);
+        let base_url = self.resolve_registry_base_url(&manifest);
         if !manifest.scripts.is_empty()
-            && !manifest.registry_base_url.is_empty()
+            && !base_url.is_empty()
             && std::fs::create_dir_all(&ext_dir).is_ok()
         {
             for script in &manifest.scripts {
                 let dest = ext_dir.join(script);
-                let url = format!("{}/{}/{}", manifest.registry_base_url, ext_name, script);
+                let url = format!("{}/{}/{}", base_url, ext_name, script);
                 let _ = registry::download_script(&url, &dest);
             }
         }
@@ -23187,13 +23745,14 @@ impl Engine {
             // Re-download scripts for each
             if let Some(manifest) = manifests.iter().find(|m| &m.name == name) {
                 let ext_dir = paths::vimcode_config_dir().join("extensions").join(name);
+                let base_url = self.resolve_registry_base_url(manifest);
                 if !manifest.scripts.is_empty()
-                    && !manifest.registry_base_url.is_empty()
+                    && !base_url.is_empty()
                     && std::fs::create_dir_all(&ext_dir).is_ok()
                 {
                     for script in &manifest.scripts {
                         let dest = ext_dir.join(script);
-                        let url = format!("{}/{}/{}", manifest.registry_base_url, name, script);
+                        let url = format!("{}/{}/{}", base_url, name, script);
                         let _ = registry::download_script(&url, &dest);
                     }
                 }
@@ -23460,8 +24019,8 @@ impl Engine {
                     let base_url = manifests
                         .iter()
                         .find(|m| m.name == name)
-                        .map(|m| m.registry_base_url.as_str())
-                        .unwrap_or("");
+                        .map(|m| self.resolve_registry_base_url(m))
+                        .unwrap_or_default();
                     // Try to load README from installed extension dir, otherwise fetch from registry
                     let readme_path = paths::vimcode_config_dir()
                         .join("extensions")
@@ -23469,7 +24028,7 @@ impl Engine {
                         .join("README.md");
                     let content = std::fs::read_to_string(&readme_path)
                         .ok()
-                        .or_else(|| registry::fetch_readme(base_url, &name));
+                        .or_else(|| registry::fetch_readme(&base_url, &name));
                     if let Some(content) = content {
                         self.open_markdown_preview_in_tab(&content, &name);
                     } else {
@@ -23491,7 +24050,7 @@ impl Engine {
                     let available = self.ext_available_items();
                     let avail_idx = sel.saturating_sub(installed.len());
                     if avail_idx < available.len() {
-                        let base_url = available[avail_idx].registry_base_url.clone();
+                        let base_url = self.resolve_registry_base_url(&available[avail_idx]);
                         let name = available[avail_idx].name.clone();
                         self.ext_install_from_registry(&name);
                         // Try to open README after install
@@ -23599,19 +24158,16 @@ impl Engine {
     // ── Settings sidebar panel ──────────────────────────────────────────────────
 
     /// Row types for the settings flat list.
-    /// Category(cat_idx) = a collapsible category header.
-    /// Setting(def_idx) = a setting from SETTING_DEFS.
-    pub fn settings_flat_list(&self) -> Vec<(bool, usize)> {
-        // Returns Vec<(is_category, index)>
-        // is_category=true → index is into setting_categories()
-        // is_category=false → index is into SETTING_DEFS
+    /// Build the flat list of rows for the Settings sidebar.
+    /// Includes both core settings and extension-declared settings.
+    pub fn settings_flat_list(&self) -> Vec<SettingsRow> {
         use super::settings::{setting_categories, SETTING_DEFS};
         let cats = setting_categories();
         let query = self.settings_query.to_lowercase();
         let mut rows = Vec::new();
 
+        // Core settings
         for (cat_idx, &cat) in cats.iter().enumerate() {
-            // Collect settings in this category that match the query
             let matching: Vec<usize> = SETTING_DEFS
                 .iter()
                 .enumerate()
@@ -23629,17 +24185,132 @@ impl Engine {
                 continue;
             }
 
-            rows.push((true, cat_idx)); // Category header
+            rows.push(SettingsRow::CoreCategory(cat_idx));
 
             let collapsed =
                 cat_idx < self.settings_collapsed.len() && self.settings_collapsed[cat_idx];
             if !collapsed {
                 for def_idx in matching {
-                    rows.push((false, def_idx));
+                    rows.push(SettingsRow::CoreSetting(def_idx));
                 }
             }
         }
+
+        // Extension settings — one section per installed extension that declares settings
+        for manifest in self.ext_available_manifests() {
+            if manifest.settings.is_empty() || !self.extension_state.is_installed(&manifest.name) {
+                continue;
+            }
+            let matching: Vec<&super::extensions::ExtSettingDef> = manifest
+                .settings
+                .iter()
+                .filter(|s| {
+                    query.is_empty()
+                        || s.label.to_lowercase().contains(&query)
+                        || s.key.to_lowercase().contains(&query)
+                        || s.description.to_lowercase().contains(&query)
+                })
+                .collect();
+            if matching.is_empty() {
+                continue;
+            }
+
+            rows.push(SettingsRow::ExtCategory(manifest.name.clone()));
+
+            let collapsed = self
+                .ext_settings_collapsed
+                .get(&manifest.name)
+                .copied()
+                .unwrap_or(false);
+            if !collapsed {
+                for def in matching {
+                    rows.push(SettingsRow::ExtSetting(
+                        manifest.name.clone(),
+                        def.key.clone(),
+                    ));
+                }
+            }
+        }
+
         rows
+    }
+
+    /// Load an extension's settings from disk, merging with manifest defaults.
+    pub fn load_ext_settings(&mut self, ext_name: &str) {
+        let manifest = self
+            .ext_available_manifests()
+            .into_iter()
+            .find(|m| m.name == ext_name);
+        let manifest = match manifest {
+            Some(m) => m,
+            None => return,
+        };
+        let mut values = HashMap::new();
+        // Start with defaults from manifest
+        for def in &manifest.settings {
+            values.insert(def.key.clone(), def.default.clone());
+        }
+        // Overlay with saved values from disk
+        let path = paths::vimcode_config_dir()
+            .join("extensions")
+            .join(ext_name)
+            .join("settings.json");
+        if let Ok(data) = std::fs::read_to_string(&path) {
+            if let Ok(saved) = serde_json::from_str::<HashMap<String, String>>(&data) {
+                for (k, v) in saved {
+                    values.insert(k, v);
+                }
+            }
+        }
+        if !values.is_empty() {
+            self.ext_settings.insert(ext_name.to_string(), values);
+        }
+    }
+
+    /// Save an extension's settings to disk.
+    fn save_ext_settings(&self, ext_name: &str) {
+        if let Some(values) = self.ext_settings.get(ext_name) {
+            let path = paths::vimcode_config_dir()
+                .join("extensions")
+                .join(ext_name)
+                .join("settings.json");
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Ok(json) = serde_json::to_string_pretty(values) {
+                let _ = std::fs::write(&path, json);
+            }
+        }
+    }
+
+    /// Get an extension setting value by `ext_name` and `key`.
+    pub fn get_ext_setting(&self, ext_name: &str, key: &str) -> String {
+        self.ext_settings
+            .get(ext_name)
+            .and_then(|m| m.get(key))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Set an extension setting value and save to disk.
+    pub fn set_ext_setting(&mut self, ext_name: &str, key: &str, value: &str) {
+        self.ext_settings
+            .entry(ext_name.to_string())
+            .or_default()
+            .insert(key.to_string(), value.to_string());
+        self.save_ext_settings(ext_name);
+    }
+
+    /// Look up an `ExtSettingDef` by extension name and key.
+    pub fn find_ext_setting_def(
+        &self,
+        ext_name: &str,
+        key: &str,
+    ) -> Option<super::extensions::ExtSettingDef> {
+        self.ext_available_manifests()
+            .into_iter()
+            .find(|m| m.name == ext_name)
+            .and_then(|m| m.settings.into_iter().find(|s| s.key == key))
     }
 
     /// Handle a key press while the settings panel has focus.
@@ -23670,7 +24341,7 @@ impl Engine {
             return;
         }
 
-        // Inline editing active (string/int)
+        // Inline editing active — core setting (string/int)
         if let Some(def_idx) = self.settings_editing {
             match key {
                 "Escape" => {
@@ -23693,8 +24364,43 @@ impl Engine {
                     if let Some(ch) = unicode {
                         if !ch.is_control() {
                             let def = &SETTING_DEFS[def_idx];
-                            // For integers, only accept digits
                             if matches!(def.setting_type, SettingType::Integer { .. }) {
+                                if ch.is_ascii_digit() {
+                                    self.settings_edit_buf.push(ch);
+                                }
+                            } else {
+                                self.settings_edit_buf.push(ch);
+                            }
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        // Inline editing active — extension setting (string/int)
+        if let Some((ref ext_name, ref ext_key)) = self.ext_settings_editing.clone() {
+            match key {
+                "Escape" => {
+                    self.ext_settings_editing = None;
+                    self.settings_edit_buf.clear();
+                }
+                "Return" => {
+                    let val = self.settings_edit_buf.clone();
+                    self.set_ext_setting(ext_name, ext_key, &val);
+                    self.ext_settings_editing = None;
+                    self.settings_edit_buf.clear();
+                }
+                "BackSpace" => {
+                    self.settings_edit_buf.pop();
+                }
+                _ => {
+                    if let Some(ch) = unicode {
+                        if !ch.is_control() {
+                            let is_int = self
+                                .find_ext_setting_def(ext_name, ext_key)
+                                .is_some_and(|d| d.r#type == "integer");
+                            if is_int {
                                 if ch.is_ascii_digit() {
                                     self.settings_edit_buf.push(ch);
                                 }
@@ -23729,84 +24435,143 @@ impl Engine {
             }
             "Tab" | "Return" | "Space" | "l" | "Right" | "h" | "Left" => {
                 if self.settings_selected < total {
-                    let (is_cat, idx) = flat[self.settings_selected];
-                    if is_cat {
-                        // Category header: toggle collapse on Tab/Enter/Space
-                        if matches!(key, "Tab" | "Return" | "Space")
-                            && idx < self.settings_collapsed.len()
-                        {
-                            self.settings_collapsed[idx] = !self.settings_collapsed[idx];
+                    match &flat[self.settings_selected] {
+                        SettingsRow::CoreCategory(cat_idx) => {
+                            let cat_idx = *cat_idx;
+                            if matches!(key, "Tab" | "Return" | "Space")
+                                && cat_idx < self.settings_collapsed.len()
+                            {
+                                self.settings_collapsed[cat_idx] =
+                                    !self.settings_collapsed[cat_idx];
+                            }
                         }
-                    } else {
-                        // Setting row
-                        let def = &SETTING_DEFS[idx];
-                        match &def.setting_type {
-                            SettingType::Bool => {
-                                if matches!(key, "Return" | "Space") {
-                                    let cur = self.settings.get_value_str(def.key);
-                                    let new_val = if cur == "true" { "false" } else { "true" };
-                                    if self.settings.set_value_str(def.key, new_val).is_ok() {
-                                        let _ = self.settings.save();
-                                    }
-                                }
-                            }
-                            SettingType::Enum(options) => {
-                                let forward = matches!(key, "Return" | "Space" | "l" | "Right");
-                                let backward = matches!(key, "h" | "Left");
-                                if forward || backward {
-                                    let cur = self.settings.get_value_str(def.key);
-                                    if let Some(pos) =
-                                        options.iter().position(|&o| o == cur.as_str())
-                                    {
-                                        let next = if forward {
-                                            (pos + 1) % options.len()
-                                        } else {
-                                            (pos + options.len() - 1) % options.len()
-                                        };
-                                        if self
-                                            .settings
-                                            .set_value_str(def.key, options[next])
-                                            .is_ok()
-                                        {
+                        SettingsRow::CoreSetting(idx) => {
+                            let idx = *idx;
+                            let def = &SETTING_DEFS[idx];
+                            match &def.setting_type {
+                                SettingType::Bool => {
+                                    if matches!(key, "Return" | "Space") {
+                                        let cur = self.settings.get_value_str(def.key);
+                                        let new_val = if cur == "true" { "false" } else { "true" };
+                                        if self.settings.set_value_str(def.key, new_val).is_ok() {
                                             let _ = self.settings.save();
                                         }
                                     }
                                 }
-                            }
-                            SettingType::DynamicEnum(options_fn) => {
-                                let forward = matches!(key, "Return" | "Space" | "l" | "Right");
-                                let backward = matches!(key, "h" | "Left");
-                                if forward || backward {
-                                    let options = options_fn();
-                                    let cur = self.settings.get_value_str(def.key);
-                                    if let Some(pos) = options.iter().position(|o| o == &cur) {
-                                        let next = if forward {
-                                            (pos + 1) % options.len()
-                                        } else {
-                                            (pos + options.len() - 1) % options.len()
-                                        };
-                                        if self
-                                            .settings
-                                            .set_value_str(def.key, &options[next])
-                                            .is_ok()
+                                SettingType::Enum(options) => {
+                                    let forward = matches!(key, "Return" | "Space" | "l" | "Right");
+                                    let backward = matches!(key, "h" | "Left");
+                                    if forward || backward {
+                                        let cur = self.settings.get_value_str(def.key);
+                                        if let Some(pos) =
+                                            options.iter().position(|&o| o == cur.as_str())
                                         {
-                                            let _ = self.settings.save();
+                                            let next = if forward {
+                                                (pos + 1) % options.len()
+                                            } else {
+                                                (pos + options.len() - 1) % options.len()
+                                            };
+                                            if self
+                                                .settings
+                                                .set_value_str(def.key, options[next])
+                                                .is_ok()
+                                            {
+                                                let _ = self.settings.save();
+                                            }
+                                        }
+                                    }
+                                }
+                                SettingType::DynamicEnum(options_fn) => {
+                                    let forward = matches!(key, "Return" | "Space" | "l" | "Right");
+                                    let backward = matches!(key, "h" | "Left");
+                                    if forward || backward {
+                                        let options = options_fn();
+                                        let cur = self.settings.get_value_str(def.key);
+                                        if let Some(pos) = options.iter().position(|o| o == &cur) {
+                                            let next = if forward {
+                                                (pos + 1) % options.len()
+                                            } else {
+                                                (pos + options.len() - 1) % options.len()
+                                            };
+                                            if self
+                                                .settings
+                                                .set_value_str(def.key, &options[next])
+                                                .is_ok()
+                                            {
+                                                let _ = self.settings.save();
+                                            }
+                                        }
+                                    }
+                                }
+                                SettingType::Integer { .. } | SettingType::StringVal => {
+                                    if matches!(key, "Return") {
+                                        self.settings_editing = Some(idx);
+                                        self.settings_edit_buf =
+                                            self.settings.get_value_str(def.key);
+                                    }
+                                }
+                                SettingType::BufferEditor => {
+                                    if matches!(key, "Return" | "Space" | "l" | "Right") {
+                                        match def.key {
+                                            "keymaps" => self.open_keymaps_editor(),
+                                            "extension_registries" => self.open_registries_editor(),
+                                            _ => {}
                                         }
                                     }
                                 }
                             }
-                            SettingType::Integer { .. } | SettingType::StringVal => {
-                                if matches!(key, "Return") {
-                                    self.settings_editing = Some(idx);
-                                    self.settings_edit_buf = self.settings.get_value_str(def.key);
-                                }
+                        }
+                        SettingsRow::ExtCategory(name) => {
+                            if matches!(key, "Tab" | "Return" | "Space") {
+                                let collapsed = self
+                                    .ext_settings_collapsed
+                                    .entry(name.clone())
+                                    .or_insert(false);
+                                *collapsed = !*collapsed;
                             }
-                            SettingType::BufferEditor => {
-                                if matches!(key, "Return" | "Space" | "l" | "Right") {
-                                    match def.key {
-                                        "keymaps" => self.open_keymaps_editor(),
-                                        "extension_registries" => self.open_registries_editor(),
-                                        _ => {}
+                        }
+                        SettingsRow::ExtSetting(ext_name, ext_key) => {
+                            let ext_name = ext_name.clone();
+                            let ext_key = ext_key.clone();
+                            if let Some(def) = self.find_ext_setting_def(&ext_name, &ext_key) {
+                                match def.r#type.as_str() {
+                                    "bool" => {
+                                        if matches!(key, "Return" | "Space") {
+                                            let cur = self.get_ext_setting(&ext_name, &ext_key);
+                                            let new_val =
+                                                if cur == "true" { "false" } else { "true" };
+                                            self.set_ext_setting(&ext_name, &ext_key, new_val);
+                                        }
+                                    }
+                                    "enum" => {
+                                        let forward =
+                                            matches!(key, "Return" | "Space" | "l" | "Right");
+                                        let backward = matches!(key, "h" | "Left");
+                                        if (forward || backward) && !def.options.is_empty() {
+                                            let cur = self.get_ext_setting(&ext_name, &ext_key);
+                                            if let Some(pos) =
+                                                def.options.iter().position(|o| o == &cur)
+                                            {
+                                                let next = if forward {
+                                                    (pos + 1) % def.options.len()
+                                                } else {
+                                                    (pos + def.options.len() - 1)
+                                                        % def.options.len()
+                                                };
+                                                self.set_ext_setting(
+                                                    &ext_name,
+                                                    &ext_key,
+                                                    &def.options[next],
+                                                );
+                                            }
+                                        }
+                                    }
+                                    _ => {
+                                        if matches!(key, "Return") {
+                                            self.settings_edit_buf =
+                                                self.get_ext_setting(&ext_name, &ext_key);
+                                            self.ext_settings_editing = Some((ext_name, ext_key));
+                                        }
                                     }
                                 }
                             }
@@ -31453,13 +32218,12 @@ impl Engine {
         let line_count = self.buffer().content.len_lines();
         let cur_line = self.cursor().line;
         let cur_col = self.cursor().col;
-        let has_syntax = self
+        let syntax_lang = self
             .active_buffer_state()
             .file_path
             .as_ref()
             .and_then(|p| p.to_str())
-            .and_then(super::syntax::SyntaxLanguage::from_path)
-            .is_some();
+            .and_then(super::syntax::SyntaxLanguage::from_path);
 
         let mut found = None;
         for offset in 0..line_count {
@@ -31472,7 +32236,7 @@ impl Engine {
                 &line_str,
                 highlights,
                 line_start_byte,
-                has_syntax,
+                syntax_lang,
             );
             for e in &errors {
                 if li == cur_line && e.start_col <= cur_col {
@@ -31510,13 +32274,12 @@ impl Engine {
         let line_count = self.buffer().content.len_lines();
         let cur_line = self.cursor().line;
         let cur_col = self.cursor().col;
-        let has_syntax = self
+        let syntax_lang = self
             .active_buffer_state()
             .file_path
             .as_ref()
             .and_then(|p| p.to_str())
-            .and_then(super::syntax::SyntaxLanguage::from_path)
-            .is_some();
+            .and_then(super::syntax::SyntaxLanguage::from_path);
 
         let mut found = None;
         for offset in 0..line_count {
@@ -31529,7 +32292,7 @@ impl Engine {
                 &line_str,
                 highlights,
                 line_start_byte,
-                has_syntax,
+                syntax_lang,
             );
             for e in errors.iter().rev() {
                 if li == cur_line && e.start_col >= cur_col {
@@ -44618,5 +45381,287 @@ mod tests {
         e.ensure_spell_checker();
         assert!(e.settings.spell);
         assert!(e.spell_checker.is_some());
+    }
+
+    // ── LaTeX text objects and motions ────────────────────────────────────────
+
+    fn latex_engine(text: &str) -> Engine {
+        use crate::core::syntax::{Syntax, SyntaxLanguage};
+        let mut e = engine_with_text(text);
+        e.active_buffer_state_mut().syntax = Syntax::new_for_language(SyntaxLanguage::Latex);
+        e
+    }
+
+    #[test]
+    fn test_latex_environment_object_inner() {
+        let mut e = latex_engine("\\begin{itemize}\nitem one\nitem two\n\\end{itemize}\n");
+        // Move cursor to line 1 (inside the environment)
+        e.view_mut().cursor.line = 1;
+        e.view_mut().cursor.col = 0;
+        press_char(&mut e, 'd');
+        press_char(&mut e, 'i');
+        press_char(&mut e, 'e');
+        let content = e.buffer().to_string();
+        assert!(content.contains("\\begin{itemize}"));
+        assert!(content.contains("\\end{itemize}"));
+        assert!(!content.contains("item one"));
+    }
+
+    #[test]
+    fn test_latex_environment_object_around() {
+        let mut e = latex_engine("before\n\\begin{itemize}\nitem one\n\\end{itemize}\nafter\n");
+        e.view_mut().cursor.line = 2;
+        e.view_mut().cursor.col = 0;
+        press_char(&mut e, 'd');
+        press_char(&mut e, 'a');
+        press_char(&mut e, 'e');
+        let content = e.buffer().to_string();
+        assert!(!content.contains("\\begin{itemize}"));
+        assert!(!content.contains("\\end{itemize}"));
+        assert!(content.contains("before"));
+        assert!(content.contains("after"));
+    }
+
+    #[test]
+    fn test_latex_environment_object_nested() {
+        let mut e = latex_engine(
+            "\\begin{enumerate}\n\\begin{itemize}\nhello\n\\end{itemize}\n\\end{enumerate}\n",
+        );
+        // Cursor inside inner environment
+        e.view_mut().cursor.line = 2;
+        e.view_mut().cursor.col = 0;
+        press_char(&mut e, 'd');
+        press_char(&mut e, 'i');
+        press_char(&mut e, 'e');
+        let content = e.buffer().to_string();
+        // Inner environment \begin/\end{itemize} should remain
+        assert!(content.contains("\\begin{itemize}"));
+        assert!(content.contains("\\end{itemize}"));
+        assert!(!content.contains("hello"));
+    }
+
+    #[test]
+    fn test_latex_math_object_inline() {
+        let mut e = latex_engine("Text $x^2 + y^2$ more\n");
+        e.view_mut().cursor.line = 0;
+        e.view_mut().cursor.col = 7; // inside $...$
+        press_char(&mut e, 'd');
+        press_char(&mut e, 'i');
+        press_char(&mut e, '$');
+        let content = e.buffer().to_string();
+        assert!(content.contains("$$")); // delimiters remain, content removed
+        assert!(!content.contains("x^2"));
+    }
+
+    #[test]
+    fn test_latex_math_object_around() {
+        let mut e = latex_engine("Text $x^2$ more\n");
+        e.view_mut().cursor.line = 0;
+        e.view_mut().cursor.col = 6; // inside $...$
+        press_char(&mut e, 'd');
+        press_char(&mut e, 'a');
+        press_char(&mut e, '$');
+        let content = e.buffer().to_string();
+        assert!(!content.contains("$"));
+        assert!(content.contains("Text "));
+        assert!(content.contains("more"));
+    }
+
+    #[test]
+    fn test_latex_math_object_display() {
+        let mut e = latex_engine("Text \\[a + b\\] more\n");
+        e.view_mut().cursor.line = 0;
+        e.view_mut().cursor.col = 8; // inside \[...\]
+        press_char(&mut e, 'd');
+        press_char(&mut e, 'i');
+        press_char(&mut e, '$');
+        let content = e.buffer().to_string();
+        assert!(content.contains("\\[\\]")); // delimiters remain
+        assert!(!content.contains("a + b"));
+    }
+
+    #[test]
+    fn test_latex_command_object_inner() {
+        let mut e = latex_engine("\\textbf{hello world}\n");
+        e.view_mut().cursor.line = 0;
+        e.view_mut().cursor.col = 10; // inside braces
+        press_char(&mut e, 'd');
+        press_char(&mut e, 'i');
+        press_char(&mut e, 'c');
+        let content = e.buffer().to_string();
+        assert!(content.contains("\\textbf{}"));
+        assert!(!content.contains("hello"));
+    }
+
+    #[test]
+    fn test_latex_command_object_around() {
+        let mut e = latex_engine("some \\textbf{hello} text\n");
+        e.view_mut().cursor.line = 0;
+        e.view_mut().cursor.col = 14; // inside braces
+        press_char(&mut e, 'd');
+        press_char(&mut e, 'a');
+        press_char(&mut e, 'c');
+        let content = e.buffer().to_string();
+        assert!(!content.contains("\\textbf"));
+        assert!(content.contains("some "));
+        assert!(content.contains(" text"));
+    }
+
+    #[test]
+    fn test_latex_section_jump_forward() {
+        let mut e =
+            latex_engine("\\section{One}\ntext\n\\subsection{Two}\nmore\n\\section{Three}\n");
+        e.view_mut().cursor.line = 0;
+        e.view_mut().cursor.col = 0;
+        // ]] jump to next section
+        press_char(&mut e, ']');
+        press_char(&mut e, ']');
+        assert_eq!(e.view().cursor.line, 2);
+        // Again
+        press_char(&mut e, ']');
+        press_char(&mut e, ']');
+        assert_eq!(e.view().cursor.line, 4);
+    }
+
+    #[test]
+    fn test_latex_section_jump_backward() {
+        let mut e =
+            latex_engine("\\section{One}\ntext\n\\subsection{Two}\nmore\n\\section{Three}\n");
+        e.view_mut().cursor.line = 4;
+        e.view_mut().cursor.col = 0;
+        // [[ jump to previous section
+        press_char(&mut e, '[');
+        press_char(&mut e, '[');
+        assert_eq!(e.view().cursor.line, 2);
+        press_char(&mut e, '[');
+        press_char(&mut e, '[');
+        assert_eq!(e.view().cursor.line, 0);
+    }
+
+    #[test]
+    fn test_latex_env_jump_forward() {
+        let mut e = latex_engine(
+            "\\begin{document}\ntext\n\\begin{itemize}\nitem\n\\end{itemize}\n\\end{document}\n",
+        );
+        e.view_mut().cursor.line = 0;
+        e.view_mut().cursor.col = 0;
+        // ]m jump to next \begin
+        press_char(&mut e, ']');
+        press_char(&mut e, 'm');
+        assert_eq!(e.view().cursor.line, 2);
+        assert_eq!(e.view().cursor.col, 0);
+    }
+
+    #[test]
+    fn test_latex_env_jump_backward() {
+        let mut e = latex_engine(
+            "\\begin{document}\ntext\n\\begin{itemize}\nitem\n\\end{itemize}\n\\end{document}\n",
+        );
+        e.view_mut().cursor.line = 4;
+        e.view_mut().cursor.col = 0;
+        // [m jump to previous \begin
+        press_char(&mut e, '[');
+        press_char(&mut e, 'm');
+        assert_eq!(e.view().cursor.line, 2);
+        assert_eq!(e.view().cursor.col, 0);
+    }
+
+    #[test]
+    fn test_latex_env_end_jump_forward() {
+        let mut e = latex_engine(
+            "\\begin{document}\ntext\n\\begin{itemize}\nitem\n\\end{itemize}\n\\end{document}\n",
+        );
+        e.view_mut().cursor.line = 0;
+        e.view_mut().cursor.col = 0;
+        // ]M jump to next \end
+        press_char(&mut e, ']');
+        press_char(&mut e, 'M');
+        assert_eq!(e.view().cursor.line, 4);
+        assert_eq!(e.view().cursor.col, 0);
+    }
+
+    #[test]
+    fn test_latex_env_end_jump_backward() {
+        let mut e = latex_engine(
+            "\\begin{document}\ntext\n\\begin{itemize}\nitem\n\\end{itemize}\n\\end{document}\n",
+        );
+        e.view_mut().cursor.line = 5;
+        e.view_mut().cursor.col = 0;
+        // [M jump to previous \end
+        press_char(&mut e, '[');
+        press_char(&mut e, 'M');
+        assert_eq!(e.view().cursor.line, 4);
+    }
+
+    #[test]
+    fn test_latex_section_end_jump() {
+        let mut e = latex_engine("\\section{One}\ntext\n\\end{document}\nmore\n\\end{other}\n");
+        e.view_mut().cursor.line = 0;
+        // ][ jump to next \end
+        press_char(&mut e, ']');
+        press_char(&mut e, '[');
+        assert_eq!(e.view().cursor.line, 2);
+    }
+
+    #[test]
+    fn test_latex_section_commands_variants() {
+        let mut e = latex_engine("text\n\\chapter{C}\nmore\n\\paragraph{P}\nend\n");
+        e.view_mut().cursor.line = 0;
+        press_char(&mut e, ']');
+        press_char(&mut e, ']');
+        assert_eq!(e.view().cursor.line, 1); // \chapter
+        press_char(&mut e, ']');
+        press_char(&mut e, ']');
+        assert_eq!(e.view().cursor.line, 3); // \paragraph
+    }
+
+    #[test]
+    fn test_latex_starred_section() {
+        let mut e = latex_engine("text\n\\section*{Unnumbered}\nmore\n");
+        e.view_mut().cursor.line = 0;
+        press_char(&mut e, ']');
+        press_char(&mut e, ']');
+        assert_eq!(e.view().cursor.line, 1); // \section* matches
+    }
+
+    #[test]
+    fn test_latex_yank_environment_inner() {
+        let mut e = latex_engine("\\begin{quote}\nhello\n\\end{quote}\n");
+        e.view_mut().cursor.line = 1;
+        e.view_mut().cursor.col = 0;
+        press_char(&mut e, 'y');
+        press_char(&mut e, 'i');
+        press_char(&mut e, 'e');
+        // Content should be unchanged
+        assert!(e.buffer().to_string().contains("hello"));
+        // Register should contain the inner content
+        let (text, _) = e.registers.get(&'"').expect("register should be set");
+        assert!(text.contains("hello"));
+        assert!(!text.contains("\\begin"));
+    }
+
+    #[test]
+    fn test_latex_env_object_not_in_non_latex() {
+        // ie/ae should do nothing in non-LaTeX buffers
+        let mut e = engine_with_text("\\begin{test}\nhello\n\\end{test}\n");
+        e.view_mut().cursor.line = 1;
+        press_char(&mut e, 'd');
+        press_char(&mut e, 'i');
+        press_char(&mut e, 'e');
+        // Buffer unchanged — non-LaTeX buffer
+        assert!(e.buffer().to_string().contains("hello"));
+    }
+
+    #[test]
+    fn test_latex_double_dollar_math() {
+        let mut e = latex_engine("Text $$E=mc^2$$ more\n");
+        e.view_mut().cursor.line = 0;
+        e.view_mut().cursor.col = 8;
+        press_char(&mut e, 'd');
+        press_char(&mut e, 'i');
+        press_char(&mut e, '$');
+        let content = e.buffer().to_string();
+        assert!(content.contains("$$$$")); // delimiters remain
+        assert!(!content.contains("E=mc"));
     }
 }

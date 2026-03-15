@@ -367,6 +367,8 @@ pub fn language_id_from_path(path: &Path) -> Option<String> {
         "sql" => "sql",
         "sol" => "solidity",
         "swift" => "swift",
+        "tex" | "ltx" | "dtx" | "cls" | "sty" => "latex",
+        "bib" => "bibtex",
         _ => return None,
     };
     Some(lang.to_string())

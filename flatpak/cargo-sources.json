@@ -2212,6 +2212,19 @@
     {
         "type": "archive",
         "archive-type": "tar-gzip",
+        "url": "https://static.crates.io/crates/spellbook/spellbook-0.4.0.crate",
+        "sha256": "28332bb44a9e7e7f1aa43ce4d97b6d1b27323a1fc160d4cfe0089245e1750845",
+        "dest": "cargo/vendor/spellbook-0.4.0"
+    },
+    {
+        "type": "inline",
+        "contents": "{\"package\": \"28332bb44a9e7e7f1aa43ce4d97b6d1b27323a1fc160d4cfe0089245e1750845\", \"files\": {}}",
+        "dest": "cargo/vendor/spellbook-0.4.0",
+        "dest-filename": ".cargo-checksum.json"
+    },
+    {
+        "type": "archive",
+        "archive-type": "tar-gzip",
         "url": "https://static.crates.io/crates/spin/spin-0.9.8.crate",
         "sha256": "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67",
         "dest": "cargo/vendor/spin-0.9.8"
@@ -3508,11 +3521,5 @@
         "contents": "{\"package\": \"b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa\", \"files\": {}}",
         "dest": "cargo/vendor/zmij-1.0.21",
         "dest-filename": ".cargo-checksum.json"
-    },
-    {
-        "type": "inline",
-        "contents": "[source.vendored-sources]\ndirectory = \"cargo/vendor\"\n\n[source.crates-io]\nreplace-with = \"vendored-sources\"\n",
-        "dest": "cargo",
-        "dest-filename": "config"
     }
 ]

@@ -1,9 +1,12 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 180 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 180b archived here. Recent work summary in PROJECT_STATE.md.
 
 ---
+
+**Session 180b — Spell Checker Bug Fixes + UI Polish (4316 tests):**
+z= suggestions: numbered list UI with single-key selection (1-9, a-z); `spell_suggestions` state intercepts keys at top of `handle_key()`. Markdown spell checking: fixed `has_syntax` detection to use `SyntaxLanguage::from_path()` instead of `!highlights.is_empty()`. Undo/dirty tracking for spell replacements. GTK scrollbar width halved (10→5px). Text overflow behind scrollbar fixed. Group divider grab bounds fixed.
 
 **Session 180 — Spell Checker (4314 tests):**
 New `src/core/spell.rs` (~200 lines): spell checking via `spellbook` 0.4 (pure-Rust Hunspell parser). Bundled `dictionaries/en_US.aff` + `en_US.dic` compiled into binary via `include_bytes!`. User dictionary at `~/.config/vimcode/user.dic`. Tree-sitter aware: only checks comments/strings in code files; all text in plain-text/Markdown files. New settings: `spell` (bool, default false), `spelllang` (string, default "en_US"). `:set spell` / `:set nospell` to toggle; "Toggle Spell Check" in command palette. Vim keybindings: `]s`/`[s` (next/prev error), `z=` (suggestions), `zg` (add to dict), `zw` (mark wrong). Visual: cyan dotted underline in GTK (wavy dots), colored underline in TUI. `SpellError` struct with char-based columns. `check_line()` with syntax-aware filtering. 60 new tests: 11 in spell.rs + 6 in engine.rs.

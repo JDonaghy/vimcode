@@ -374,12 +374,9 @@ struct DebugSidebarScrollDrag {
 
 /// What the folder picker should do when the user confirms a selection.
 #[derive(Clone, PartialEq)]
-#[allow(clippy::enum_variant_names)]
 enum FolderPickerMode {
     /// Open as a workspace folder (`engine.open_folder()`).
     OpenFolder,
-    /// Open as a workspace file (`engine.open_workspace()`).
-    OpenWorkspace,
     /// Pick from the list of recently opened workspaces.
     OpenRecent,
 }
@@ -770,9 +767,15 @@ pub fn run(file_path: Option<PathBuf>, debug_log_path: Option<String>) {
     engine.plugin_init();
     engine.restore_session_files();
     if let Some(path) = file_path {
-        // Open the CLI file in a tab (on top of any restored session files)
-        debug_log!("Opening file from CLI: {:?}", path);
-        engine.open_file_in_tab(&path);
+        if path.is_dir() {
+            // Directory argument: set cwd and open as workspace folder
+            debug_log!("Opening directory from CLI: {:?}", path);
+            engine.open_folder(&path);
+        } else {
+            // Open the CLI file in a tab (on top of any restored session files)
+            debug_log!("Opening file from CLI: {:?}", path);
+            engine.open_file_in_tab(&path);
+        }
     }
 
     setup_tui_clipboard(&mut engine);
@@ -1535,9 +1538,6 @@ fn event_loop(
                                         FolderPickerMode::OpenFolder => {
                                             engine.open_folder(&path);
                                         }
-                                        FolderPickerMode::OpenWorkspace => {
-                                            engine.open_workspace(&path);
-                                        }
                                         FolderPickerMode::OpenRecent => {}
                                     }
                                     sidebar = TuiSidebar::new(engine.cwd.clone(), sidebar.visible);
@@ -2115,13 +2115,23 @@ fn event_loop(
                             // Only if the selected row is not an enum (h/Left cycles enums)
                             let flat = engine.settings_flat_list();
                             let is_enum = if engine.settings_selected < flat.len() {
-                                let (is_cat, idx) = flat[engine.settings_selected];
-                                !is_cat
-                                    && matches!(
-                                        crate::core::settings::SETTING_DEFS[idx].setting_type,
-                                        crate::core::settings::SettingType::Enum(_)
-                                            | crate::core::settings::SettingType::DynamicEnum(_)
-                                    )
+                                match &flat[engine.settings_selected] {
+                                    crate::core::engine::SettingsRow::CoreSetting(idx) => {
+                                        matches!(
+                                            crate::core::settings::SETTING_DEFS[*idx].setting_type,
+                                            crate::core::settings::SettingType::Enum(_)
+                                                | crate::core::settings::SettingType::DynamicEnum(
+                                                    _
+                                                )
+                                        )
+                                    }
+                                    crate::core::engine::SettingsRow::ExtSetting(ext_name, key) => {
+                                        engine
+                                            .find_ext_setting_def(ext_name, key)
+                                            .is_some_and(|d| d.r#type == "enum")
+                                    }
+                                    _ => false,
+                                }
                             } else {
                                 false
                             };
@@ -2828,11 +2838,14 @@ fn event_loop(
                                                         engine.settings.show_hidden_files,
                                                     ));
                                                 } else if act == EngineAction::OpenWorkspaceDialog {
-                                                    folder_picker = Some(FolderPickerState::new(
-                                                        &engine.cwd.clone(),
-                                                        FolderPickerMode::OpenWorkspace,
-                                                        engine.settings.show_hidden_files,
-                                                    ));
+                                                    // open_workspace_from_file() already ran;
+                                                    // refresh sidebar.
+                                                    sidebar = TuiSidebar::new(
+                                                        engine.cwd.clone(),
+                                                        sidebar.visible,
+                                                    );
+                                                    sidebar.show_hidden_files =
+                                                        engine.settings.show_hidden_files;
                                                 } else if act == EngineAction::SaveWorkspaceAsDialog
                                                 {
                                                     let ws_path =
@@ -3122,11 +3135,10 @@ fn event_loop(
                             ));
                             needs_redraw = true;
                         } else if action == EngineAction::OpenWorkspaceDialog {
-                            folder_picker = Some(FolderPickerState::new(
-                                &engine.cwd.clone(),
-                                FolderPickerMode::OpenWorkspace,
-                                engine.settings.show_hidden_files,
-                            ));
+                            // open_workspace_from_file() already ran in the engine;
+                            // just refresh the sidebar to reflect the new cwd.
+                            sidebar = TuiSidebar::new(engine.cwd.clone(), sidebar.visible);
+                            sidebar.show_hidden_files = engine.settings.show_hidden_files;
                             needs_redraw = true;
                         } else if action == EngineAction::SaveWorkspaceAsDialog {
                             // For TUI, save workspace to current directory immediately
@@ -3439,6 +3451,39 @@ fn handle_mouse(
         } else {
             0
         };
+
+    // ── Folder picker mouse handling ────────────────────────────────────────────
+    if let Some(ref mut picker) = folder_picker {
+        if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
+            let term_cols = terminal_size.map(|s| s.width).unwrap_or(80);
+            let term_rows = terminal_size.map(|s| s.height).unwrap_or(24);
+            let popup_w = (term_cols * 3 / 5).max(50);
+            let popup_h = (term_rows * 55 / 100).max(15);
+            let popup_x = (term_cols.saturating_sub(popup_w)) / 2;
+            let popup_y = (term_rows.saturating_sub(popup_h)) / 2;
+            let results_start = popup_y + 3;
+            let results_end = popup_y + popup_h - 1;
+
+            if col >= popup_x
+                && col < popup_x + popup_w
+                && row >= results_start
+                && row < results_end
+            {
+                let clicked_idx = picker.scroll_top + (row - results_start) as usize;
+                if clicked_idx < picker.filtered.len() {
+                    picker.selected = clicked_idx;
+                }
+            } else if col < popup_x
+                || col >= popup_x + popup_w
+                || row < popup_y
+                || row >= popup_y + popup_h
+            {
+                // Click outside popup — dismiss
+                *folder_picker = None;
+            }
+            return sidebar_width;
+        }
+    }
 
     // ── Sidebar separator drag (works anywhere, regardless of row) ────────────
     let sep_col = ab_width + if sidebar.visible { sidebar_width } else { 0 };
@@ -3934,11 +3979,10 @@ fn handle_mouse(
                                 engine.settings.show_hidden_files,
                             ));
                         } else if act == EngineAction::OpenWorkspaceDialog {
-                            *folder_picker = Some(FolderPickerState::new(
-                                &engine.cwd.clone(),
-                                FolderPickerMode::OpenWorkspace,
-                                engine.settings.show_hidden_files,
-                            ));
+                            // open_workspace_from_file() already ran in the engine;
+                            // refresh the sidebar to reflect the new cwd.
+                            *sidebar = TuiSidebar::new(engine.cwd.clone(), sidebar.visible);
+                            sidebar.show_hidden_files = engine.settings.show_hidden_files;
                         } else if act == EngineAction::SaveWorkspaceAsDialog {
                             let ws_path = engine.cwd.join(".vimcode-workspace");
                             engine.save_workspace_as(&ws_path);
@@ -6435,12 +6479,6 @@ fn render_folder_picker(
     let title_text = match picker.mode {
         FolderPickerMode::OpenFolder => format!(
             " Open Folder {}  {}/{} ",
-            root_display,
-            picker.filtered.len(),
-            picker.all_entries.len()
-        ),
-        FolderPickerMode::OpenWorkspace => format!(
-            " Open Workspace {}  {}/{} ",
             root_display,
             picker.filtered.len(),
             picker.all_entries.len()
@@ -8965,7 +9003,8 @@ fn render_settings_panel(
             break;
         }
 
-        let (is_cat, idx) = flat[fi];
+        use crate::core::engine::SettingsRow;
+        let row = &flat[fi];
         let is_selected = fi == engine.settings_selected && engine.settings_has_focus;
         let row_bg = if is_selected { sel_bg } else { bg };
 
@@ -8974,132 +9013,233 @@ fn render_settings_panel(
             set_cell(buf, x, y, ' ', fg, row_bg);
         }
 
-        if is_cat {
-            // Category header
-            let collapsed = idx < engine.settings_collapsed.len() && engine.settings_collapsed[idx];
-            let arrow = if collapsed { '▶' } else { '▼' };
-            let cat_name = if idx < cats.len() { cats[idx] } else { "?" };
-            let mut x = area.x + 1;
-            set_cell(buf, x, y, arrow, cat_fg, row_bg);
-            x += 2;
-            for ch in cat_name.chars() {
-                if x >= area.x + content_width {
-                    break;
+        let right_edge = area.x + content_width;
+
+        match row {
+            SettingsRow::CoreCategory(cat_idx) => {
+                let collapsed = *cat_idx < engine.settings_collapsed.len()
+                    && engine.settings_collapsed[*cat_idx];
+                let arrow = if collapsed { '▶' } else { '▼' };
+                let cat_name = if *cat_idx < cats.len() {
+                    cats[*cat_idx]
+                } else {
+                    "?"
+                };
+                let mut x = area.x + 1;
+                set_cell(buf, x, y, arrow, cat_fg, row_bg);
+                x += 2;
+                for ch in cat_name.chars() {
+                    if x >= area.x + content_width {
+                        break;
+                    }
+                    set_cell(buf, x, y, ch, cat_fg, row_bg);
+                    x += 1;
                 }
-                set_cell(buf, x, y, ch, cat_fg, row_bg);
-                x += 1;
             }
-        } else {
-            // Setting row
-            let def = &SETTING_DEFS[idx];
-            // Label (indented)
-            let mut x = area.x + 3;
-            for ch in def.label.chars() {
-                if x >= area.x + content_width {
-                    break;
+            SettingsRow::ExtCategory(name) => {
+                let collapsed = engine
+                    .ext_settings_collapsed
+                    .get(name)
+                    .copied()
+                    .unwrap_or(false);
+                let arrow = if collapsed { '▶' } else { '▼' };
+                // Use display_name if available, otherwise capitalize name
+                let display = engine
+                    .ext_available_manifests()
+                    .into_iter()
+                    .find(|m| &m.name == name)
+                    .map(|m| m.display_name.clone())
+                    .unwrap_or_else(|| name.clone());
+                let mut x = area.x + 1;
+                set_cell(buf, x, y, arrow, cat_fg, row_bg);
+                x += 2;
+                for ch in display.chars() {
+                    if x >= area.x + content_width {
+                        break;
+                    }
+                    set_cell(buf, x, y, ch, cat_fg, row_bg);
+                    x += 1;
                 }
-                set_cell(buf, x, y, ch, fg, row_bg);
-                x += 1;
             }
-
-            // Value (right-aligned)
-            let right_edge = area.x + content_width;
-
-            // Check if we're editing this setting inline
-            let editing_this = engine.settings_editing == Some(idx);
-
-            match &def.setting_type {
-                SettingType::Bool => {
-                    let val = engine.settings.get_value_str(def.key);
-                    let display = if val == "true" { "[✓]" } else { "[ ]" };
-                    let val_len = 3u16;
-                    let vx = right_edge.saturating_sub(val_len + 1);
-                    let mut cx = vx;
-                    for ch in display.chars() {
-                        if cx >= right_edge {
-                            break;
-                        }
-                        set_cell(buf, cx, y, ch, key_fg, row_bg);
-                        cx += 1;
+            SettingsRow::CoreSetting(idx) => {
+                let def = &SETTING_DEFS[*idx];
+                let mut x = area.x + 3;
+                for ch in def.label.chars() {
+                    if x >= area.x + content_width {
+                        break;
                     }
+                    set_cell(buf, x, y, ch, fg, row_bg);
+                    x += 1;
                 }
-                SettingType::Integer { .. } => {
-                    let display = if editing_this {
-                        format!("{}█", engine.settings_edit_buf)
-                    } else {
-                        engine.settings.get_value_str(def.key)
-                    };
-                    let val_len = display.chars().count() as u16;
-                    let vx = right_edge.saturating_sub(val_len + 1);
-                    let mut cx = vx.max(x);
-                    for ch in display.chars() {
-                        if cx >= right_edge {
-                            break;
-                        }
-                        set_cell(buf, cx, y, ch, key_fg, row_bg);
-                        cx += 1;
-                    }
-                }
-                SettingType::Enum(_) | SettingType::DynamicEnum(_) => {
-                    let val = engine.settings.get_value_str(def.key);
-                    let display = format!("{} ▸", val);
-                    let val_len = display.chars().count() as u16;
-                    let vx = right_edge.saturating_sub(val_len + 1);
-                    let mut cx = vx.max(x);
-                    for ch in display.chars() {
-                        if cx >= right_edge {
-                            break;
-                        }
-                        set_cell(buf, cx, y, ch, key_fg, row_bg);
-                        cx += 1;
-                    }
-                }
-                SettingType::StringVal => {
-                    let display = if editing_this {
-                        format!("{}█", engine.settings_edit_buf)
-                    } else {
+
+                let editing_this = engine.settings_editing == Some(*idx);
+
+                match &def.setting_type {
+                    SettingType::Bool => {
                         let val = engine.settings.get_value_str(def.key);
-                        if val.is_empty() {
+                        let display = if val == "true" { "[✓]" } else { "[ ]" };
+                        let val_len = 3u16;
+                        let vx = right_edge.saturating_sub(val_len + 1);
+                        let mut cx = vx;
+                        for ch in display.chars() {
+                            if cx >= right_edge {
+                                break;
+                            }
+                            set_cell(buf, cx, y, ch, key_fg, row_bg);
+                            cx += 1;
+                        }
+                    }
+                    SettingType::Integer { .. } => {
+                        let display = if editing_this {
+                            format!("{}█", engine.settings_edit_buf)
+                        } else {
+                            engine.settings.get_value_str(def.key)
+                        };
+                        let val_len = display.chars().count() as u16;
+                        let vx = right_edge.saturating_sub(val_len + 1);
+                        let mut cx = vx.max(x);
+                        for ch in display.chars() {
+                            if cx >= right_edge {
+                                break;
+                            }
+                            set_cell(buf, cx, y, ch, key_fg, row_bg);
+                            cx += 1;
+                        }
+                    }
+                    SettingType::Enum(_) | SettingType::DynamicEnum(_) => {
+                        let val = engine.settings.get_value_str(def.key);
+                        let display = format!("{val} ▸");
+                        let val_len = display.chars().count() as u16;
+                        let vx = right_edge.saturating_sub(val_len + 1);
+                        let mut cx = vx.max(x);
+                        for ch in display.chars() {
+                            if cx >= right_edge {
+                                break;
+                            }
+                            set_cell(buf, cx, y, ch, key_fg, row_bg);
+                            cx += 1;
+                        }
+                    }
+                    SettingType::StringVal => {
+                        let display = if editing_this {
+                            format!("{}█", engine.settings_edit_buf)
+                        } else {
+                            let val = engine.settings.get_value_str(def.key);
+                            if val.is_empty() {
+                                "(empty)".to_string()
+                            } else {
+                                val
+                            }
+                        };
+                        let max_val_width = content_width.saturating_sub(x - area.x + 2) as usize;
+                        let truncated: String = display.chars().take(max_val_width).collect();
+                        let val_len = truncated.chars().count() as u16;
+                        let vx = right_edge.saturating_sub(val_len + 1);
+                        let mut cx = vx.max(x);
+                        let val_fg = if editing_this { fg } else { dim_fg };
+                        for ch in truncated.chars() {
+                            if cx >= right_edge {
+                                break;
+                            }
+                            set_cell(buf, cx, y, ch, val_fg, row_bg);
+                            cx += 1;
+                        }
+                    }
+                    SettingType::BufferEditor => {
+                        let display = match def.key {
+                            "keymaps" => {
+                                format!("{} defined ▸", engine.settings.keymaps.len())
+                            }
+                            "extension_registries" => {
+                                format!(
+                                    "{} configured ▸",
+                                    engine.settings.extension_registries.len()
+                                )
+                            }
+                            _ => "▸".to_string(),
+                        };
+                        let val_len = display.chars().count() as u16;
+                        let vx = right_edge.saturating_sub(val_len + 1);
+                        let mut cx = vx.max(x);
+                        for ch in display.chars() {
+                            if cx >= right_edge {
+                                break;
+                            }
+                            set_cell(buf, cx, y, ch, key_fg, row_bg);
+                            cx += 1;
+                        }
+                    }
+                }
+            }
+            SettingsRow::ExtSetting(ext_name, ext_key) => {
+                // Extension setting — render like core settings
+                let def = engine.find_ext_setting_def(ext_name, ext_key);
+                let label = def.as_ref().map(|d| d.label.as_str()).unwrap_or(ext_key);
+                let mut x = area.x + 3;
+                for ch in label.chars() {
+                    if x >= area.x + content_width {
+                        break;
+                    }
+                    set_cell(buf, x, y, ch, fg, row_bg);
+                    x += 1;
+                }
+
+                let editing_this = engine
+                    .ext_settings_editing
+                    .as_ref()
+                    .is_some_and(|(en, ek)| en == ext_name && ek == ext_key);
+                let val = engine.get_ext_setting(ext_name, ext_key);
+                let typ = def.as_ref().map(|d| d.r#type.as_str()).unwrap_or("string");
+
+                match typ {
+                    "bool" => {
+                        let display = if val == "true" { "[✓]" } else { "[ ]" };
+                        let val_len = 3u16;
+                        let vx = right_edge.saturating_sub(val_len + 1);
+                        let mut cx = vx;
+                        for ch in display.chars() {
+                            if cx >= right_edge {
+                                break;
+                            }
+                            set_cell(buf, cx, y, ch, key_fg, row_bg);
+                            cx += 1;
+                        }
+                    }
+                    "enum" => {
+                        let display = format!("{val} ▸");
+                        let val_len = display.chars().count() as u16;
+                        let vx = right_edge.saturating_sub(val_len + 1);
+                        let mut cx = vx.max(x);
+                        for ch in display.chars() {
+                            if cx >= right_edge {
+                                break;
+                            }
+                            set_cell(buf, cx, y, ch, key_fg, row_bg);
+                            cx += 1;
+                        }
+                    }
+                    _ => {
+                        // string/integer
+                        let display = if editing_this {
+                            format!("{}█", engine.settings_edit_buf)
+                        } else if val.is_empty() {
                             "(empty)".to_string()
                         } else {
                             val
+                        };
+                        let max_val_width = content_width.saturating_sub(x - area.x + 2) as usize;
+                        let truncated: String = display.chars().take(max_val_width).collect();
+                        let val_len = truncated.chars().count() as u16;
+                        let vx = right_edge.saturating_sub(val_len + 1);
+                        let mut cx = vx.max(x);
+                        let val_fg = if editing_this { fg } else { dim_fg };
+                        for ch in truncated.chars() {
+                            if cx >= right_edge {
+                                break;
+                            }
+                            set_cell(buf, cx, y, ch, val_fg, row_bg);
+                            cx += 1;
                         }
-                    };
-                    // Truncate to fit
-                    let max_val_width = content_width.saturating_sub(x - area.x + 2) as usize;
-                    let truncated: String = display.chars().take(max_val_width).collect();
-                    let val_len = truncated.chars().count() as u16;
-                    let vx = right_edge.saturating_sub(val_len + 1);
-                    let mut cx = vx.max(x);
-                    let val_fg = if editing_this { fg } else { dim_fg };
-                    for ch in truncated.chars() {
-                        if cx >= right_edge {
-                            break;
-                        }
-                        set_cell(buf, cx, y, ch, val_fg, row_bg);
-                        cx += 1;
-                    }
-                }
-                SettingType::BufferEditor => {
-                    let display = match def.key {
-                        "keymaps" => format!("{} defined ▸", engine.settings.keymaps.len()),
-                        "extension_registries" => {
-                            format!(
-                                "{} configured ▸",
-                                engine.settings.extension_registries.len()
-                            )
-                        }
-                        _ => "▸".to_string(),
-                    };
-                    let val_len = display.chars().count() as u16;
-                    let vx = right_edge.saturating_sub(val_len + 1);
-                    let mut cx = vx.max(x);
-                    for ch in display.chars() {
-                        if cx >= right_edge {
-                            break;
-                        }
-                        set_cell(buf, cx, y, ch, key_fg, row_bg);
-                        cx += 1;
                     }
                 }
             }

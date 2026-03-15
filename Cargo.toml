@@ -1,6 +1,6 @@
 [package]
 name = "vimcode"
-version = "0.3.6"
+version = "0.3.7"
 edition = "2021"
 description = "Vim-like code editor with GTK4 and tree-sitter"
 license = "MIT"
@@ -58,6 +58,8 @@ tree-sitter-c-sharp = "0.23"
 tree-sitter-java = "0.23"
 tree-sitter-toml-ng = "0.7"
 tree-sitter-yaml = "0.7"
+tree-sitter-language = "0.1"
+# tree-sitter-latex: vendored from latex-lsp/tree-sitter-latex v0.3.0 (language version 14)
 # tree-sitter-lua requires tree-sitter 0.25+ (language version 15)
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -75,6 +77,9 @@ libc = "0.2"
 pulldown-cmark = { version = "0.13", default-features = false }
 streaming-iterator = "0.1.9"
 spellbook = "0.4.0"
+
+[build-dependencies]
+cc = "1.0"
 
 # Optimize dependencies in dev builds — GTK/Relm4/Cairo/Pango FFI calls and
 # Tree-sitter parsing are 10-50× slower without optimization, causing visible

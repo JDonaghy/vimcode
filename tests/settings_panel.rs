@@ -1,5 +1,17 @@
 mod common;
 use common::*;
+use vimcode_core::core::engine::SettingsRow;
+
+/// Helper: find the flat list index for a core setting by key.
+fn find_core_setting(e: &vimcode_core::core::engine::Engine, key: &str) -> usize {
+    let flat = e.settings_flat_list();
+    flat.iter()
+        .position(|row| {
+            matches!(row, SettingsRow::CoreSetting(idx)
+                if vimcode_core::core::settings::SETTING_DEFS[*idx].key == key)
+        })
+        .unwrap_or_else(|| panic!("{key} setting not found in flat list"))
+}
 
 #[test]
 fn settings_panel_focus() {
@@ -25,15 +37,7 @@ fn settings_panel_toggle_bool() {
     let mut e = engine_with("hello\n");
     e.settings_has_focus = true;
 
-    // Find cursorline setting index in flat list
-    let flat = e.settings_flat_list();
-    let cursorline_idx = flat
-        .iter()
-        .position(|&(is_cat, idx)| {
-            !is_cat && vimcode_core::core::settings::SETTING_DEFS[idx].key == "cursorline"
-        })
-        .expect("cursorline setting not found in flat list");
-
+    let cursorline_idx = find_core_setting(&e, "cursorline");
     let original = e.settings.cursorline;
     e.settings_selected = cursorline_idx;
 
@@ -51,15 +55,7 @@ fn settings_panel_cycle_enum() {
     let mut e = engine_with("hello\n");
     e.settings_has_focus = true;
 
-    // Find line_numbers setting
-    let flat = e.settings_flat_list();
-    let ln_idx = flat
-        .iter()
-        .position(|&(is_cat, idx)| {
-            !is_cat && vimcode_core::core::settings::SETTING_DEFS[idx].key == "line_numbers"
-        })
-        .expect("line_numbers setting not found");
-
+    let ln_idx = find_core_setting(&e, "line_numbers");
     e.settings_selected = ln_idx;
     let original = e.settings.get_value_str("line_numbers");
 
@@ -111,15 +107,7 @@ fn settings_panel_edit_int() {
     let mut e = engine_with("hello\n");
     e.settings_has_focus = true;
 
-    // Find tabstop setting
-    let flat = e.settings_flat_list();
-    let ts_idx = flat
-        .iter()
-        .position(|&(is_cat, idx)| {
-            !is_cat && vimcode_core::core::settings::SETTING_DEFS[idx].key == "tabstop"
-        })
-        .expect("tabstop not found");
-
+    let ts_idx = find_core_setting(&e, "tabstop");
     e.settings_selected = ts_idx;
 
     // Enter to start editing
@@ -127,7 +115,6 @@ fn settings_panel_edit_int() {
     assert!(e.settings_editing.is_some());
 
     // Clear and type new value
-    // First clear the prefilled buffer
     while !e.settings_edit_buf.is_empty() {
         e.handle_settings_key("BackSpace", false, None);
     }
@@ -148,15 +135,7 @@ fn settings_panel_edit_string() {
     let mut e = engine_with("hello\n");
     e.settings_has_focus = true;
 
-    // Find colorcolumn setting
-    let flat = e.settings_flat_list();
-    let cc_idx = flat
-        .iter()
-        .position(|&(is_cat, idx)| {
-            !is_cat && vimcode_core::core::settings::SETTING_DEFS[idx].key == "colorcolumn"
-        })
-        .expect("colorcolumn not found");
-
+    let cc_idx = find_core_setting(&e, "colorcolumn");
     e.settings_selected = cc_idx;
 
     // Enter to start editing
@@ -184,7 +163,10 @@ fn settings_panel_collapse_category() {
     let initial_count = e.settings_flat_list().len();
     // First row should be a category header
     let flat = e.settings_flat_list();
-    assert!(flat[0].0, "first row should be a category header");
+    assert!(
+        matches!(flat[0], SettingsRow::CoreCategory(_)),
+        "first row should be a category header"
+    );
 
     e.settings_selected = 0;
 
@@ -209,14 +191,7 @@ fn settings_panel_escape_cancels_edit() {
     let mut e = engine_with("hello\n");
     e.settings_has_focus = true;
 
-    let flat = e.settings_flat_list();
-    let ts_idx = flat
-        .iter()
-        .position(|&(is_cat, idx)| {
-            !is_cat && vimcode_core::core::settings::SETTING_DEFS[idx].key == "tabstop"
-        })
-        .expect("tabstop not found");
-
+    let ts_idx = find_core_setting(&e, "tabstop");
     e.settings_selected = ts_idx;
     let original_tabstop = e.settings.tabstop;
 
@@ -244,15 +219,7 @@ fn settings_panel_cycle_colorscheme() {
     let mut e = engine_with("hello\n");
     e.settings_has_focus = true;
 
-    // Find colorscheme setting (DynamicEnum)
-    let flat = e.settings_flat_list();
-    let cs_idx = flat
-        .iter()
-        .position(|&(is_cat, idx)| {
-            !is_cat && vimcode_core::core::settings::SETTING_DEFS[idx].key == "colorscheme"
-        })
-        .expect("colorscheme setting not found");
-
+    let cs_idx = find_core_setting(&e, "colorscheme");
     e.settings_selected = cs_idx;
     assert_eq!(e.settings.colorscheme, "onedark");
 
