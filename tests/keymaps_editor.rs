@@ -157,11 +157,13 @@ fn settings_panel_keymaps_row_opens_editor() {
     e.settings_has_focus = true;
 
     // Find the keymaps setting in flat list
+    use vimcode_core::core::engine::SettingsRow;
     let flat = e.settings_flat_list();
     let keymaps_idx = flat
         .iter()
-        .position(|&(is_cat, idx)| {
-            !is_cat && vimcode_core::core::settings::SETTING_DEFS[idx].key == "keymaps"
+        .position(|row| {
+            matches!(row, SettingsRow::CoreSetting(idx)
+                if vimcode_core::core::settings::SETTING_DEFS[*idx].key == "keymaps")
         })
         .expect("keymaps setting not found in flat list");
 
