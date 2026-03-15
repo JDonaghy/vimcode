@@ -19711,6 +19711,9 @@ impl Engine {
             's' => self.find_sentence_object(modifier, cursor_pos),
             't' => self.find_tag_text_object(modifier, cursor_pos),
             '`' => self.find_quote_object(modifier, '`', cursor_pos),
+            'e' => self.find_latex_environment_object(modifier, cursor_pos),
+            'c' if self.is_latex_buffer() => self.find_latex_command_object(modifier, cursor_pos),
+            '$' => self.find_latex_math_object(modifier, cursor_pos),
             _ => None,
         }
     }
@@ -20213,6 +20216,319 @@ impl Engine {
             }
             scan_pos = open_start - 1;
         }
+    }
+
+    /// Check if the active buffer is a LaTeX file.
+    fn is_latex_buffer(&self) -> bool {
+        self.active_buffer_state().syntax.language() == super::syntax::SyntaxLanguage::Latex
+    }
+
+    /// Find LaTeX \begin{env}...\end{env} text object range (ie/ae).
+    fn find_latex_environment_object(
+        &self,
+        modifier: char,
+        cursor_pos: usize,
+    ) -> Option<(usize, usize)> {
+        if !self.is_latex_buffer() {
+            return None;
+        }
+        let total_chars = self.buffer().len_chars();
+        if total_chars == 0 || cursor_pos >= total_chars {
+            return None;
+        }
+
+        // Collect text into a string for substring search
+        let text: String = self.buffer().content.chars().collect();
+
+        // Find the enclosing \begin{name}...\end{name} pair.
+        // Walk backward from cursor to find \begin{...}, tracking nesting.
+        let mut scan = cursor_pos;
+        loop {
+            // Find previous \begin{ or \end{
+            let before = &text[..=scan.min(text.len() - 1)];
+            let begin_pos = before.rfind("\\begin{");
+            let end_pos = before.rfind("\\end{");
+
+            // If we find \end{ closer than \begin{, we need to skip over that
+            // nested environment.
+            match (begin_pos, end_pos) {
+                (Some(bp), Some(ep)) if ep > bp => {
+                    // \end{ is closer — this is a nested close, skip past it
+                    if bp == 0 {
+                        return None;
+                    }
+                    scan = bp.saturating_sub(1);
+                    continue;
+                }
+                (Some(bp), _) => {
+                    // Found a \begin{...} candidate
+                    let env_name = self.latex_extract_env_name(&text, bp + 7)?;
+                    let begin_end = bp + 7 + env_name.len() + 1; // past closing }
+
+                    // Now find matching \end{env_name} forward, tracking nesting
+                    let mut depth: usize = 1;
+                    let mut fwd = begin_end;
+                    while fwd < text.len() {
+                        if text[fwd..].starts_with(&format!("\\begin{{{env_name}}}")) {
+                            depth += 1;
+                            fwd += 7 + env_name.len() + 1;
+                        } else if text[fwd..].starts_with(&format!("\\end{{{env_name}}}")) {
+                            depth -= 1;
+                            if depth == 0 {
+                                let end_start = fwd;
+                                let end_end = fwd + 5 + env_name.len() + 1;
+                                // Check cursor is within this range
+                                if cursor_pos >= bp && cursor_pos < end_end {
+                                    return if modifier == 'i' {
+                                        Some((begin_end, end_start))
+                                    } else {
+                                        Some((bp, end_end))
+                                    };
+                                }
+                                break;
+                            }
+                            fwd += 5 + env_name.len() + 1;
+                        } else {
+                            fwd += 1;
+                        }
+                    }
+                    // This \begin didn't enclose cursor, try further back
+                    if bp == 0 {
+                        return None;
+                    }
+                    scan = bp - 1;
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// Extract environment name from text starting at the position after `\begin{`.
+    fn latex_extract_env_name(&self, text: &str, start: usize) -> Option<String> {
+        let rest = text.get(start..)?;
+        let end = rest.find('}')?;
+        let name = &rest[..end];
+        if name.is_empty() {
+            return None;
+        }
+        Some(name.to_string())
+    }
+
+    /// Find LaTeX \command{...} text object range (ic/ac).
+    /// `ic` selects the content inside braces, `ac` selects command + braces.
+    fn find_latex_command_object(
+        &self,
+        modifier: char,
+        cursor_pos: usize,
+    ) -> Option<(usize, usize)> {
+        let total_chars = self.buffer().len_chars();
+        if total_chars == 0 || cursor_pos >= total_chars {
+            return None;
+        }
+
+        let text: String = self.buffer().content.chars().collect();
+
+        // If cursor is inside braces, walk back to find the command
+        // First check if we're inside {...}
+        let mut cmd_start;
+        let mut brace_start = None;
+        let mut depth: i32 = 0;
+        for i in (0..=cursor_pos.min(text.len() - 1)).rev() {
+            let c = text.as_bytes().get(i).copied().unwrap_or(0) as char;
+            if c == '}' {
+                depth += 1;
+            } else if c == '{' {
+                if depth == 0 {
+                    brace_start = Some(i);
+                    break;
+                }
+                depth -= 1;
+            }
+        }
+
+        if let Some(bs) = brace_start {
+            // Find the matching close brace
+            let mut depth2: i32 = 1;
+            let mut brace_end = None;
+            for i in (bs + 1)..text.len() {
+                let c = text.as_bytes().get(i).copied().unwrap_or(0) as char;
+                if c == '{' {
+                    depth2 += 1;
+                } else if c == '}' {
+                    depth2 -= 1;
+                    if depth2 == 0 {
+                        brace_end = Some(i + 1);
+                        break;
+                    }
+                }
+            }
+            let brace_end = brace_end?;
+
+            // Walk backward from '{' to find \command
+            if bs > 0 {
+                cmd_start = bs - 1;
+                while cmd_start > 0 && text.as_bytes()[cmd_start].is_ascii_alphabetic() {
+                    cmd_start -= 1;
+                }
+                if text.as_bytes()[cmd_start] == b'\\' {
+                    return if modifier == 'i' {
+                        Some((bs + 1, brace_end - 1))
+                    } else {
+                        Some((cmd_start, brace_end))
+                    };
+                }
+            }
+        }
+
+        // Maybe cursor is on the \command itself — find the next { after it
+        cmd_start = cursor_pos;
+        while cmd_start > 0
+            && text
+                .as_bytes()
+                .get(cmd_start)
+                .is_some_and(|b| b.is_ascii_alphabetic())
+        {
+            cmd_start -= 1;
+        }
+        if text.as_bytes().get(cmd_start) == Some(&b'\\') {
+            // Find the opening brace
+            let mut pos = cmd_start + 1;
+            while pos < text.len() && text.as_bytes()[pos].is_ascii_alphabetic() {
+                pos += 1;
+            }
+            if text.as_bytes().get(pos) == Some(&b'{') {
+                let bs = pos;
+                let mut depth3: i32 = 1;
+                let mut brace_end = None;
+                for i in (bs + 1)..text.len() {
+                    let c = text.as_bytes()[i] as char;
+                    if c == '{' {
+                        depth3 += 1;
+                    } else if c == '}' {
+                        depth3 -= 1;
+                        if depth3 == 0 {
+                            brace_end = Some(i + 1);
+                            break;
+                        }
+                    }
+                }
+                let brace_end = brace_end?;
+                return if modifier == 'i' {
+                    Some((bs + 1, brace_end - 1))
+                } else {
+                    Some((cmd_start, brace_end))
+                };
+            }
+        }
+
+        None
+    }
+
+    /// Find LaTeX math text object range (i$/a$).
+    /// Handles $...$, $$...$$, \(...\), \[...\].
+    fn find_latex_math_object(&self, modifier: char, cursor_pos: usize) -> Option<(usize, usize)> {
+        if !self.is_latex_buffer() {
+            return None;
+        }
+        let total_chars = self.buffer().len_chars();
+        if total_chars == 0 || cursor_pos >= total_chars {
+            return None;
+        }
+
+        let text: String = self.buffer().content.chars().collect();
+        let bytes = text.as_bytes();
+
+        // Try \[...\] (display math)
+        if let Some(result) =
+            self.find_latex_delimited_pair(&text, cursor_pos, "\\[", "\\]", modifier)
+        {
+            return Some(result);
+        }
+
+        // Try \(...\) (inline math)
+        if let Some(result) =
+            self.find_latex_delimited_pair(&text, cursor_pos, "\\(", "\\)", modifier)
+        {
+            return Some(result);
+        }
+
+        // Try $$...$$ first (display math), then $...$ (inline math)
+        // Scan for $ signs in the text, pairing them up
+        let mut dollar_positions: Vec<(usize, bool)> = Vec::new(); // (pos, is_double)
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'$' {
+                // Check for escaped \$
+                if i > 0 && bytes[i - 1] == b'\\' {
+                    i += 1;
+                    continue;
+                }
+                if i + 1 < bytes.len() && bytes[i + 1] == b'$' {
+                    dollar_positions.push((i, true));
+                    i += 2;
+                } else {
+                    dollar_positions.push((i, false));
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
+        }
+
+        // Pair up dollars: each pair of same-type consecutive entries forms a math region
+        let mut idx = 0;
+        while idx + 1 < dollar_positions.len() {
+            let (start, is_double_start) = dollar_positions[idx];
+            let (end, is_double_end) = dollar_positions[idx + 1];
+            if is_double_start == is_double_end {
+                let delim_len = if is_double_start { 2 } else { 1 };
+                let outer_start = start;
+                let outer_end = end + delim_len;
+                if cursor_pos >= outer_start && cursor_pos < outer_end {
+                    return if modifier == 'i' {
+                        Some((start + delim_len, end))
+                    } else {
+                        Some((outer_start, outer_end))
+                    };
+                }
+                idx += 2;
+            } else {
+                idx += 1;
+            }
+        }
+
+        None
+    }
+
+    /// Find a delimited pair like \[...\] or \(...\) around the cursor.
+    fn find_latex_delimited_pair(
+        &self,
+        text: &str,
+        cursor_pos: usize,
+        open: &str,
+        close: &str,
+        modifier: char,
+    ) -> Option<(usize, usize)> {
+        // Search backward for the open delimiter
+        for start in (0..=cursor_pos).rev() {
+            if text[start..].starts_with(open) {
+                let inner_start = start + open.len();
+                // Search forward for matching close delimiter
+                if let Some(rel) = text[inner_start..].find(close) {
+                    let close_start = inner_start + rel;
+                    let outer_end = close_start + close.len();
+                    if cursor_pos >= start && cursor_pos < outer_end {
+                        return if modifier == 'i' {
+                            Some((inner_start, close_start))
+                        } else {
+                            Some((start, outer_end))
+                        };
+                    }
+                }
+                break; // Only check the nearest open delimiter
+            }
+        }
+        None
     }
 
     /// Apply an operator to a text object
@@ -21741,7 +22057,13 @@ impl Engine {
 
     /// Jump to next section start (]] or next section end (][).
     /// `end_section`: false = start ('{' in column 0), true = end ('}' in column 0).
+    /// In LaTeX buffers: ]] jumps to next \section/\chapter/\subsection/\subsubsection,
+    /// ][ jumps to next \end{...}.
     fn jump_section_forward(&mut self, end_section: bool) {
+        if self.is_latex_buffer() {
+            self.jump_latex_section_forward(end_section);
+            return;
+        }
         let target_char = if end_section { '}' } else { '{' };
         let total = self.buffer().len_lines();
         let start = self.view().cursor.line + 1;
@@ -21758,7 +22080,12 @@ impl Engine {
     }
 
     /// Jump to previous section start ([[) or previous section end (][]).
+    /// In LaTeX buffers: [[ jumps to previous \section/etc., [] jumps to previous \end{}.
     fn jump_section_backward(&mut self, end_section: bool) {
+        if self.is_latex_buffer() {
+            self.jump_latex_section_backward(end_section);
+            return;
+        }
         let target_char = if end_section { '}' } else { '{' };
         let cur = self.view().cursor.line;
         for line in (0..cur).rev() {
@@ -21774,7 +22101,12 @@ impl Engine {
     }
 
     /// Jump to next method start (]m) — finds next '{' that starts a block.
+    /// In LaTeX buffers: ]m jumps to next \begin{...}.
     fn jump_method_start_forward(&mut self) {
+        if self.is_latex_buffer() {
+            self.jump_latex_env_forward(false);
+            return;
+        }
         let total_chars = self.buffer().len_chars();
         let cur_pos = self.buffer().line_to_char(self.view().cursor.line) + self.view().cursor.col;
         let mut pos = cur_pos + 1;
@@ -21791,7 +22123,12 @@ impl Engine {
     }
 
     /// Jump to previous method start ([m).
+    /// In LaTeX buffers: [m jumps to previous \begin{...}.
     fn jump_method_start_backward(&mut self) {
+        if self.is_latex_buffer() {
+            self.jump_latex_env_backward(false);
+            return;
+        }
         let cur_pos = self.buffer().line_to_char(self.view().cursor.line) + self.view().cursor.col;
         if cur_pos == 0 {
             return;
@@ -21813,7 +22150,12 @@ impl Engine {
     }
 
     /// Jump to next method end (]M) — finds next '}'.
+    /// In LaTeX buffers: ]M jumps to next \end{...}.
     fn jump_method_end_forward(&mut self) {
+        if self.is_latex_buffer() {
+            self.jump_latex_env_forward(true);
+            return;
+        }
         let total_chars = self.buffer().len_chars();
         let cur_pos = self.buffer().line_to_char(self.view().cursor.line) + self.view().cursor.col;
         let mut pos = cur_pos + 1;
@@ -21830,7 +22172,12 @@ impl Engine {
     }
 
     /// Jump to previous method end ([M).
+    /// In LaTeX buffers: [M jumps to previous \end{...}.
     fn jump_method_end_backward(&mut self) {
+        if self.is_latex_buffer() {
+            self.jump_latex_env_backward(true);
+            return;
+        }
         let cur_pos = self.buffer().line_to_char(self.view().cursor.line) + self.view().cursor.col;
         if cur_pos == 0 {
             return;
@@ -21848,6 +22195,111 @@ impl Engine {
                 break;
             }
             pos -= 1;
+        }
+    }
+
+    // --- LaTeX-specific motion helpers ---
+
+    /// LaTeX section commands to match for ]] / [[ jumps.
+    const LATEX_SECTION_COMMANDS: &'static [&'static str] = &[
+        "\\part",
+        "\\chapter",
+        "\\section",
+        "\\subsection",
+        "\\subsubsection",
+        "\\paragraph",
+        "\\subparagraph",
+    ];
+
+    /// Jump forward to next LaTeX section command (]]) or \end{} (][).
+    fn jump_latex_section_forward(&mut self, end_section: bool) {
+        let total = self.buffer().len_lines();
+        let start = self.view().cursor.line + 1;
+        for line in start..total {
+            let line_text = self.buffer().content.line(line).chars().collect::<String>();
+            let trimmed = line_text.trim_start();
+            if end_section {
+                if trimmed.starts_with("\\end{") {
+                    self.view_mut().cursor.line = line;
+                    self.view_mut().cursor.col = 0;
+                    return;
+                }
+            } else {
+                for cmd in Self::LATEX_SECTION_COMMANDS {
+                    if let Some(after) = trimmed.strip_prefix(cmd) {
+                        if after.starts_with('{') || after.starts_with('*') || after.is_empty() {
+                            self.view_mut().cursor.line = line;
+                            self.view_mut().cursor.col = 0;
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Jump backward to previous LaTeX section command ([[) or \end{} ([]).
+    fn jump_latex_section_backward(&mut self, end_section: bool) {
+        let cur = self.view().cursor.line;
+        for line in (0..cur).rev() {
+            let line_text = self.buffer().content.line(line).chars().collect::<String>();
+            let trimmed = line_text.trim_start();
+            if end_section {
+                if trimmed.starts_with("\\end{") {
+                    self.view_mut().cursor.line = line;
+                    self.view_mut().cursor.col = 0;
+                    return;
+                }
+            } else {
+                for cmd in Self::LATEX_SECTION_COMMANDS {
+                    if let Some(after) = trimmed.strip_prefix(cmd) {
+                        if after.starts_with('{') || after.starts_with('*') || after.is_empty() {
+                            self.view_mut().cursor.line = line;
+                            self.view_mut().cursor.col = 0;
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Jump forward to next \begin{} (is_end=false) or \end{} (is_end=true).
+    fn jump_latex_env_forward(&mut self, is_end: bool) {
+        let needle = if is_end { "\\end{" } else { "\\begin{" };
+        let total = self.buffer().len_lines();
+        let start_line = self.view().cursor.line;
+        let start_col = self.view().cursor.col;
+        for line in start_line..total {
+            let line_text = self.buffer().content.line(line).chars().collect::<String>();
+            let search_from = if line == start_line { start_col + 1 } else { 0 };
+            if search_from < line_text.len() {
+                if let Some(rel) = line_text[search_from..].find(needle) {
+                    self.view_mut().cursor.line = line;
+                    self.view_mut().cursor.col = search_from + rel;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Jump backward to previous \begin{} (is_end=false) or \end{} (is_end=true).
+    fn jump_latex_env_backward(&mut self, is_end: bool) {
+        let needle = if is_end { "\\end{" } else { "\\begin{" };
+        let start_line = self.view().cursor.line;
+        let start_col = self.view().cursor.col;
+        for line in (0..=start_line).rev() {
+            let line_text = self.buffer().content.line(line).chars().collect::<String>();
+            let search_end = if line == start_line {
+                start_col
+            } else {
+                line_text.len()
+            };
+            if let Some(pos) = line_text[..search_end].rfind(needle) {
+                self.view_mut().cursor.line = line;
+                self.view_mut().cursor.col = pos;
+                return;
+            }
         }
     }
 
@@ -44638,5 +45090,287 @@ mod tests {
         e.ensure_spell_checker();
         assert!(e.settings.spell);
         assert!(e.spell_checker.is_some());
+    }
+
+    // ── LaTeX text objects and motions ────────────────────────────────────────
+
+    fn latex_engine(text: &str) -> Engine {
+        use crate::core::syntax::{Syntax, SyntaxLanguage};
+        let mut e = engine_with_text(text);
+        e.active_buffer_state_mut().syntax = Syntax::new_for_language(SyntaxLanguage::Latex);
+        e
+    }
+
+    #[test]
+    fn test_latex_environment_object_inner() {
+        let mut e = latex_engine("\\begin{itemize}\nitem one\nitem two\n\\end{itemize}\n");
+        // Move cursor to line 1 (inside the environment)
+        e.view_mut().cursor.line = 1;
+        e.view_mut().cursor.col = 0;
+        press_char(&mut e, 'd');
+        press_char(&mut e, 'i');
+        press_char(&mut e, 'e');
+        let content = e.buffer().to_string();
+        assert!(content.contains("\\begin{itemize}"));
+        assert!(content.contains("\\end{itemize}"));
+        assert!(!content.contains("item one"));
+    }
+
+    #[test]
+    fn test_latex_environment_object_around() {
+        let mut e = latex_engine("before\n\\begin{itemize}\nitem one\n\\end{itemize}\nafter\n");
+        e.view_mut().cursor.line = 2;
+        e.view_mut().cursor.col = 0;
+        press_char(&mut e, 'd');
+        press_char(&mut e, 'a');
+        press_char(&mut e, 'e');
+        let content = e.buffer().to_string();
+        assert!(!content.contains("\\begin{itemize}"));
+        assert!(!content.contains("\\end{itemize}"));
+        assert!(content.contains("before"));
+        assert!(content.contains("after"));
+    }
+
+    #[test]
+    fn test_latex_environment_object_nested() {
+        let mut e = latex_engine(
+            "\\begin{enumerate}\n\\begin{itemize}\nhello\n\\end{itemize}\n\\end{enumerate}\n",
+        );
+        // Cursor inside inner environment
+        e.view_mut().cursor.line = 2;
+        e.view_mut().cursor.col = 0;
+        press_char(&mut e, 'd');
+        press_char(&mut e, 'i');
+        press_char(&mut e, 'e');
+        let content = e.buffer().to_string();
+        // Inner environment \begin/\end{itemize} should remain
+        assert!(content.contains("\\begin{itemize}"));
+        assert!(content.contains("\\end{itemize}"));
+        assert!(!content.contains("hello"));
+    }
+
+    #[test]
+    fn test_latex_math_object_inline() {
+        let mut e = latex_engine("Text $x^2 + y^2$ more\n");
+        e.view_mut().cursor.line = 0;
+        e.view_mut().cursor.col = 7; // inside $...$
+        press_char(&mut e, 'd');
+        press_char(&mut e, 'i');
+        press_char(&mut e, '$');
+        let content = e.buffer().to_string();
+        assert!(content.contains("$$")); // delimiters remain, content removed
+        assert!(!content.contains("x^2"));
+    }
+
+    #[test]
+    fn test_latex_math_object_around() {
+        let mut e = latex_engine("Text $x^2$ more\n");
+        e.view_mut().cursor.line = 0;
+        e.view_mut().cursor.col = 6; // inside $...$
+        press_char(&mut e, 'd');
+        press_char(&mut e, 'a');
+        press_char(&mut e, '$');
+        let content = e.buffer().to_string();
+        assert!(!content.contains("$"));
+        assert!(content.contains("Text "));
+        assert!(content.contains("more"));
+    }
+
+    #[test]
+    fn test_latex_math_object_display() {
+        let mut e = latex_engine("Text \\[a + b\\] more\n");
+        e.view_mut().cursor.line = 0;
+        e.view_mut().cursor.col = 8; // inside \[...\]
+        press_char(&mut e, 'd');
+        press_char(&mut e, 'i');
+        press_char(&mut e, '$');
+        let content = e.buffer().to_string();
+        assert!(content.contains("\\[\\]")); // delimiters remain
+        assert!(!content.contains("a + b"));
+    }
+
+    #[test]
+    fn test_latex_command_object_inner() {
+        let mut e = latex_engine("\\textbf{hello world}\n");
+        e.view_mut().cursor.line = 0;
+        e.view_mut().cursor.col = 10; // inside braces
+        press_char(&mut e, 'd');
+        press_char(&mut e, 'i');
+        press_char(&mut e, 'c');
+        let content = e.buffer().to_string();
+        assert!(content.contains("\\textbf{}"));
+        assert!(!content.contains("hello"));
+    }
+
+    #[test]
+    fn test_latex_command_object_around() {
+        let mut e = latex_engine("some \\textbf{hello} text\n");
+        e.view_mut().cursor.line = 0;
+        e.view_mut().cursor.col = 14; // inside braces
+        press_char(&mut e, 'd');
+        press_char(&mut e, 'a');
+        press_char(&mut e, 'c');
+        let content = e.buffer().to_string();
+        assert!(!content.contains("\\textbf"));
+        assert!(content.contains("some "));
+        assert!(content.contains(" text"));
+    }
+
+    #[test]
+    fn test_latex_section_jump_forward() {
+        let mut e =
+            latex_engine("\\section{One}\ntext\n\\subsection{Two}\nmore\n\\section{Three}\n");
+        e.view_mut().cursor.line = 0;
+        e.view_mut().cursor.col = 0;
+        // ]] jump to next section
+        press_char(&mut e, ']');
+        press_char(&mut e, ']');
+        assert_eq!(e.view().cursor.line, 2);
+        // Again
+        press_char(&mut e, ']');
+        press_char(&mut e, ']');
+        assert_eq!(e.view().cursor.line, 4);
+    }
+
+    #[test]
+    fn test_latex_section_jump_backward() {
+        let mut e =
+            latex_engine("\\section{One}\ntext\n\\subsection{Two}\nmore\n\\section{Three}\n");
+        e.view_mut().cursor.line = 4;
+        e.view_mut().cursor.col = 0;
+        // [[ jump to previous section
+        press_char(&mut e, '[');
+        press_char(&mut e, '[');
+        assert_eq!(e.view().cursor.line, 2);
+        press_char(&mut e, '[');
+        press_char(&mut e, '[');
+        assert_eq!(e.view().cursor.line, 0);
+    }
+
+    #[test]
+    fn test_latex_env_jump_forward() {
+        let mut e = latex_engine(
+            "\\begin{document}\ntext\n\\begin{itemize}\nitem\n\\end{itemize}\n\\end{document}\n",
+        );
+        e.view_mut().cursor.line = 0;
+        e.view_mut().cursor.col = 0;
+        // ]m jump to next \begin
+        press_char(&mut e, ']');
+        press_char(&mut e, 'm');
+        assert_eq!(e.view().cursor.line, 2);
+        assert_eq!(e.view().cursor.col, 0);
+    }
+
+    #[test]
+    fn test_latex_env_jump_backward() {
+        let mut e = latex_engine(
+            "\\begin{document}\ntext\n\\begin{itemize}\nitem\n\\end{itemize}\n\\end{document}\n",
+        );
+        e.view_mut().cursor.line = 4;
+        e.view_mut().cursor.col = 0;
+        // [m jump to previous \begin
+        press_char(&mut e, '[');
+        press_char(&mut e, 'm');
+        assert_eq!(e.view().cursor.line, 2);
+        assert_eq!(e.view().cursor.col, 0);
+    }
+
+    #[test]
+    fn test_latex_env_end_jump_forward() {
+        let mut e = latex_engine(
+            "\\begin{document}\ntext\n\\begin{itemize}\nitem\n\\end{itemize}\n\\end{document}\n",
+        );
+        e.view_mut().cursor.line = 0;
+        e.view_mut().cursor.col = 0;
+        // ]M jump to next \end
+        press_char(&mut e, ']');
+        press_char(&mut e, 'M');
+        assert_eq!(e.view().cursor.line, 4);
+        assert_eq!(e.view().cursor.col, 0);
+    }
+
+    #[test]
+    fn test_latex_env_end_jump_backward() {
+        let mut e = latex_engine(
+            "\\begin{document}\ntext\n\\begin{itemize}\nitem\n\\end{itemize}\n\\end{document}\n",
+        );
+        e.view_mut().cursor.line = 5;
+        e.view_mut().cursor.col = 0;
+        // [M jump to previous \end
+        press_char(&mut e, '[');
+        press_char(&mut e, 'M');
+        assert_eq!(e.view().cursor.line, 4);
+    }
+
+    #[test]
+    fn test_latex_section_end_jump() {
+        let mut e = latex_engine("\\section{One}\ntext\n\\end{document}\nmore\n\\end{other}\n");
+        e.view_mut().cursor.line = 0;
+        // ][ jump to next \end
+        press_char(&mut e, ']');
+        press_char(&mut e, '[');
+        assert_eq!(e.view().cursor.line, 2);
+    }
+
+    #[test]
+    fn test_latex_section_commands_variants() {
+        let mut e = latex_engine("text\n\\chapter{C}\nmore\n\\paragraph{P}\nend\n");
+        e.view_mut().cursor.line = 0;
+        press_char(&mut e, ']');
+        press_char(&mut e, ']');
+        assert_eq!(e.view().cursor.line, 1); // \chapter
+        press_char(&mut e, ']');
+        press_char(&mut e, ']');
+        assert_eq!(e.view().cursor.line, 3); // \paragraph
+    }
+
+    #[test]
+    fn test_latex_starred_section() {
+        let mut e = latex_engine("text\n\\section*{Unnumbered}\nmore\n");
+        e.view_mut().cursor.line = 0;
+        press_char(&mut e, ']');
+        press_char(&mut e, ']');
+        assert_eq!(e.view().cursor.line, 1); // \section* matches
+    }
+
+    #[test]
+    fn test_latex_yank_environment_inner() {
+        let mut e = latex_engine("\\begin{quote}\nhello\n\\end{quote}\n");
+        e.view_mut().cursor.line = 1;
+        e.view_mut().cursor.col = 0;
+        press_char(&mut e, 'y');
+        press_char(&mut e, 'i');
+        press_char(&mut e, 'e');
+        // Content should be unchanged
+        assert!(e.buffer().to_string().contains("hello"));
+        // Register should contain the inner content
+        let (text, _) = e.registers.get(&'"').expect("register should be set");
+        assert!(text.contains("hello"));
+        assert!(!text.contains("\\begin"));
+    }
+
+    #[test]
+    fn test_latex_env_object_not_in_non_latex() {
+        // ie/ae should do nothing in non-LaTeX buffers
+        let mut e = engine_with_text("\\begin{test}\nhello\n\\end{test}\n");
+        e.view_mut().cursor.line = 1;
+        press_char(&mut e, 'd');
+        press_char(&mut e, 'i');
+        press_char(&mut e, 'e');
+        // Buffer unchanged — non-LaTeX buffer
+        assert!(e.buffer().to_string().contains("hello"));
+    }
+
+    #[test]
+    fn test_latex_double_dollar_math() {
+        let mut e = latex_engine("Text $$E=mc^2$$ more\n");
+        e.view_mut().cursor.line = 0;
+        e.view_mut().cursor.col = 8;
+        press_char(&mut e, 'd');
+        press_char(&mut e, 'i');
+        press_char(&mut e, '$');
+        let content = e.buffer().to_string();
+        assert!(content.contains("$$$$")); // delimiters remain
+        assert!(!content.contains("E=mc"));
     }
 }
