@@ -1,9 +1,9 @@
 # VimCode Project State
 
-**Last updated:** Mar 15, 2026 (Session 184 — Right-Click Context Menus) | **Tests:** 4460
+**Last updated:** Mar 16, 2026 (Session 187 — Tab Context Menu Splits Fix) | **Tests:** 4498
 
 > Feature documentation lives in **README.md**.
-> Per-session implementation notes through Session 183 are in **SESSION_HISTORY.md**.
+> Per-session implementation notes through Session 186 are in **SESSION_HISTORY.md**.
 
 ---
 
@@ -26,13 +26,10 @@ When implementing a new key/command, add tests covering:
 
 ## Recent Work
 
-### Session 184 — Right-Click Context Menus (Mar 15, 2026)
-- **Explorer right-click context menu**: Different menus for files vs folders (matching VSCode). File menu: Open to Side, Open Containing Folder, Select for Compare, Copy Path, Copy Relative Path, Rename, Delete. Folder menu: New File, New Folder, Open Containing Folder, Find in Folder, Copy Path, Copy Relative Path, Rename, Delete.
-- **Tab bar right-click context menu**: Close, Close Others, Close to Right, Close Saved, Copy Path, Copy Relative Path, Reveal in File Explorer, Split Right, Split Down. Disabled items when not applicable (e.g., Close Others with 1 tab).
-- **Engine data model**: `ContextMenuState` / `ContextMenuTarget` structs; `open_explorer_context_menu()` / `open_tab_context_menu()` / `handle_context_menu_key()` methods; `context_menu: Option<ContextMenuState>` engine field.
-- **TUI rendering**: `render_context_menu_popup()` with box-drawing borders; mouse hover highlighting via `MouseEventKind::Moved` handler; left-click confirms, right-click/Escape dismisses.
-- **GTK rendering**: `PopoverMenu::from_model()` with `gio::Menu` sections + `SimpleActionGroup` actions; native hover highlighting; `swap_ctx_popover()` pattern for lifecycle management; suppressed non-fatal `gtk_css_node_insert_after` GTK4 assertion via GLib log handler.
-- **render.rs**: `ContextMenuPanel` / `ContextMenuRenderItem` structs; `build_context_menu_panel()` produces platform-agnostic data.
-- 38 new tests (4460 total); `tests/context_menu.rs` integration test file.
+### Session 187 — Tab Context Menu Splits Fix (Mar 16, 2026)
+- **Fixed GTK/TUI split inconsistency**: GTK tab context menu "Split Right"/"Split Down" was calling `open_editor_group()` (creating new editor groups) while engine's `context_menu_confirm()` called `split_window()` (Vim window splits). Fixed GTK to call `split_window()` matching the engine.
+- **Added 4 split options to tab context menu**: "Split Right" and "Split Down" create Vim window splits within the current tab; "Split Right to New Group" and "Split Down to New Group" create new editor groups (VSCode-style). Both backends now behave identically.
+- **README clarified**: Added 3-layer explainer (Windows/Tabs/Editor Groups) in Multi-File Editing section; renamed "Editor Groups" to "Editor Groups / Tab Groups"; added clarifying note to Windows section.
+- 4 new tests in `tests/context_menu.rs`.
 
-> Sessions 183 and earlier archived in **SESSION_HISTORY.md**.
+> Sessions 186 and earlier archived in **SESSION_HISTORY.md**.

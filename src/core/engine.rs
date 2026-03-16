@@ -828,6 +828,17 @@ pub struct ContextMenuState {
     pub screen_y: u16,
 }
 
+/// State for inline rename editing in the explorer sidebar.
+#[derive(Debug, Clone)]
+pub struct ExplorerRenameState {
+    /// The file/directory being renamed.
+    pub path: PathBuf,
+    /// Current text input (the new name).
+    pub input: String,
+    /// Byte-offset cursor position within `input`.
+    pub cursor: usize,
+}
+
 /// One panel in a VSCode-style editor-group split.
 /// Each group owns its own tab bar and independent tab navigation.
 /// Single-group mode (the default) is identical to the previous behaviour.
@@ -2138,6 +2149,18 @@ pub struct Engine {
     // --- Context menu ---
     /// Active right-click context menu state (TUI-driven). None when no menu is open.
     pub context_menu: Option<ContextMenuState>,
+    /// File selected as "left side" for a two-way diff comparison (via context menu).
+    pub diff_selected_file: Option<PathBuf>,
+    /// Pending move awaiting user confirmation: (source_path, dest_dir).
+    pub pending_move: Option<(PathBuf, PathBuf)>,
+    /// Set to true when a file move completes; backends should refresh the explorer tree
+    /// and clear this flag.
+    pub explorer_needs_refresh: bool,
+
+    /// Inline rename state for the explorer sidebar.  When `Some`, the
+    /// sidebar row matching `path` should render an editable text input
+    /// instead of the plain filename.
+    pub explorer_rename: Option<ExplorerRenameState>,
 }
 
 impl Engine {
@@ -2447,6 +2470,10 @@ impl Engine {
             ext_panel_scroll_top: 0,
             ext_panel_sections_expanded: HashMap::new(),
             context_menu: None,
+            diff_selected_file: None,
+            pending_move: None,
+            explorer_needs_refresh: false,
+            explorer_rename: None,
         };
         // If vscode mode is configured, start in Insert mode with menu visible
         if engine.is_vscode_mode() {
@@ -4212,6 +4239,160 @@ impl Engine {
         Ok(())
     }
 
+    /// Start inline rename for the given path in the explorer sidebar.
+    ///
+    /// Pre-fills the input with the current filename and places the cursor
+    /// at the end.  Backends should render an editable text field on the
+    /// matching explorer row while this state is active.
+    pub fn start_explorer_rename(&mut self, path: PathBuf) {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let cursor = name.len();
+        self.explorer_rename = Some(ExplorerRenameState {
+            path,
+            input: name,
+            cursor,
+        });
+    }
+
+    /// Handle a key press while inline rename is active.
+    ///
+    /// Returns `true` if the key was consumed.  On Enter the rename is
+    /// committed; on Escape it is cancelled.  Sets `explorer_needs_refresh`
+    /// on success so backends rebuild the tree.
+    pub fn handle_explorer_rename_key(
+        &mut self,
+        key_name: &str,
+        unicode: Option<char>,
+        ctrl: bool,
+    ) -> bool {
+        let state = match self.explorer_rename.as_mut() {
+            Some(s) => s,
+            None => return false,
+        };
+
+        match key_name {
+            "Escape" => {
+                self.explorer_rename = None;
+                return true;
+            }
+            "Return" => {
+                let path = state.path.clone();
+                let input = state.input.clone();
+                self.explorer_rename = None;
+                let new_name = input.trim();
+                if new_name.is_empty() {
+                    self.message = "Name cannot be empty".to_string();
+                } else {
+                    match self.rename_file(&path, new_name) {
+                        Ok(()) => {
+                            self.explorer_needs_refresh = true;
+                            self.message = format!("Renamed to '{}'", new_name);
+                        }
+                        Err(e) => {
+                            self.message = e;
+                        }
+                    }
+                }
+                return true;
+            }
+            "BackSpace" => {
+                if state.cursor > 0 {
+                    let prev = state.input[..state.cursor]
+                        .char_indices()
+                        .next_back()
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                    state.input.remove(prev);
+                    state.cursor = prev;
+                }
+                return true;
+            }
+            "Delete" => {
+                if state.cursor < state.input.len() {
+                    state.input.remove(state.cursor);
+                }
+                return true;
+            }
+            "Left" => {
+                if state.cursor > 0 {
+                    state.cursor = state.input[..state.cursor]
+                        .char_indices()
+                        .next_back()
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                }
+                return true;
+            }
+            "Right" => {
+                if state.cursor < state.input.len() {
+                    let rest = &state.input[state.cursor..];
+                    state.cursor = rest
+                        .char_indices()
+                        .nth(1)
+                        .map(|(i, _)| state.cursor + i)
+                        .unwrap_or(state.input.len());
+                }
+                return true;
+            }
+            "Home" => {
+                state.cursor = 0;
+                return true;
+            }
+            "End" => {
+                state.cursor = state.input.len();
+                return true;
+            }
+            _ => {}
+        }
+
+        // Printable character insertion
+        if !ctrl {
+            if let Some(ch) = unicode {
+                if !ch.is_control() {
+                    state.input.insert(state.cursor, ch);
+                    state.cursor += ch.len_utf8();
+                    return true;
+                }
+            }
+        }
+
+        // Consume all other keys while rename is active (don't let them leak)
+        true
+    }
+
+    /// Show a confirmation dialog before moving a file/folder.
+    ///
+    /// Stores the pending move and displays a Yes/No dialog.  The actual
+    /// `move_file()` call happens when the user confirms via the dialog.
+    pub fn confirm_move_file(&mut self, src: &Path, dest: &Path) {
+        let src_name = src
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| src.to_string_lossy().to_string());
+        let dest_display = dest.to_string_lossy().to_string();
+        self.pending_move = Some((src.to_path_buf(), dest.to_path_buf()));
+        self.show_dialog(
+            "confirm_move",
+            "Confirm Move",
+            vec![format!("Move '{}' to '{}'?", src_name, dest_display)],
+            vec![
+                DialogButton {
+                    label: "Yes".into(),
+                    hotkey: 'y',
+                    action: "yes".into(),
+                },
+                DialogButton {
+                    label: "No".into(),
+                    hotkey: 'n',
+                    action: "no".into(),
+                },
+            ],
+        );
+    }
+
     /// Move `src` into `dest_dir` (a directory).
     ///
     /// The filename is preserved.  Any open buffer whose `file_path` matches
@@ -4233,6 +4414,31 @@ impl Engine {
             }
             dest.to_path_buf()
         };
+        // Prevent moving a directory into its own subtree.
+        if src.is_dir() {
+            let canon_src = src.canonicalize().unwrap_or_else(|_| src.to_path_buf());
+            let dest_parent = final_dest
+                .parent()
+                .and_then(|p| p.canonicalize().ok())
+                .unwrap_or_else(|| final_dest.clone());
+            if dest_parent.starts_with(&canon_src) {
+                return Err("Cannot move a folder into its own subtree".to_string());
+            }
+        }
+
+        // Prevent no-op moves (same location).
+        if final_dest == src
+            || src
+                .canonicalize()
+                .ok()
+                .zip(final_dest.parent().and_then(|p| p.canonicalize().ok()))
+                .is_some_and(|(cs, cd)| {
+                    cs.parent() == Some(cd.as_path()) && cs.file_name() == final_dest.file_name()
+                })
+        {
+            return Ok(());
+        }
+
         std::fs::rename(src, &final_dest).map_err(|e| format!("Move failed: {}", e))?;
 
         // Update any open buffer that was showing the old path.
@@ -5345,11 +5551,17 @@ impl Engine {
             let _ = std::process::Command::new("open")
                 .arg("-R")
                 .arg(path)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
                 .spawn();
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+            let _ = std::process::Command::new("xdg-open")
+                .arg(dir)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
         }
     }
 
@@ -5436,6 +5648,20 @@ impl Engine {
             ContextMenuItem {
                 label: "Split Down".into(),
                 action: "split_down".into(),
+                shortcut: String::new(),
+                separator_after: true,
+                enabled: true,
+            },
+            ContextMenuItem {
+                label: "Split Right to New Group".into(),
+                action: "group_split_right".into(),
+                shortcut: String::new(),
+                separator_after: false,
+                enabled: true,
+            },
+            ContextMenuItem {
+                label: "Split Down to New Group".into(),
+                action: "group_split_down".into(),
                 shortcut: String::new(),
                 separator_after: false,
                 enabled: true,
@@ -5545,13 +5771,36 @@ impl Engine {
                 separator_after: false,
                 enabled: true,
             });
-            items.push(ContextMenuItem {
-                label: "Select for Compare".into(),
-                action: "select_for_diff".into(),
-                shortcut: String::new(),
-                separator_after: true,
-                enabled: true,
-            });
+            if self.diff_selected_file.is_some() {
+                let sel_name = self
+                    .diff_selected_file
+                    .as_ref()
+                    .and_then(|p| p.file_name())
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "file".into());
+                items.push(ContextMenuItem {
+                    label: format!("Compare with '{sel_name}'"),
+                    action: "diff_with_selected".into(),
+                    shortcut: String::new(),
+                    separator_after: false,
+                    enabled: true,
+                });
+                items.push(ContextMenuItem {
+                    label: "Select for Compare".into(),
+                    action: "select_for_diff".into(),
+                    shortcut: String::new(),
+                    separator_after: true,
+                    enabled: true,
+                });
+            } else {
+                items.push(ContextMenuItem {
+                    label: "Select for Compare".into(),
+                    action: "select_for_diff".into(),
+                    shortcut: String::new(),
+                    separator_after: true,
+                    enabled: true,
+                });
+            }
             items.push(ContextMenuItem {
                 label: "Copy Path".into(),
                 action: "copy_path".into(),
@@ -5689,6 +5938,24 @@ impl Engine {
                         }
                         self.split_window(SplitDirection::Horizontal, None);
                     }
+                    "group_split_right" => {
+                        self.active_group = group_id;
+                        if let Some(g) = self.editor_groups.get_mut(&group_id) {
+                            if tab_idx < g.tabs.len() {
+                                g.active_tab = tab_idx;
+                            }
+                        }
+                        self.open_editor_group(SplitDirection::Vertical);
+                    }
+                    "group_split_down" => {
+                        self.active_group = group_id;
+                        if let Some(g) = self.editor_groups.get_mut(&group_id) {
+                            if tab_idx < g.tabs.len() {
+                                g.active_tab = tab_idx;
+                            }
+                        }
+                        self.open_editor_group(SplitDirection::Horizontal);
+                    }
                     _ => {}
                 }
             }
@@ -5710,6 +5977,33 @@ impl Engine {
                     }
                     "reveal" => {
                         self.reveal_in_file_manager(path);
+                    }
+                    "select_for_diff" => {
+                        let name = path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| path.display().to_string());
+                        self.diff_selected_file = Some(path.clone());
+                        self.message = format!(
+                            "Selected '{name}' for compare. Right-click another file to compare."
+                        );
+                    }
+                    "diff_with_selected" => {
+                        if let Some(left_path) = self.diff_selected_file.take() {
+                            self.open_file_in_tab(&left_path);
+                            self.cmd_diffthis();
+                            self.cmd_diffsplit(path);
+                        } else {
+                            self.message =
+                                "No file selected for compare. Use 'Select for Compare' first."
+                                    .to_string();
+                        }
+                    }
+                    "open_side" => {
+                        self.open_editor_group(crate::core::window::SplitDirection::Vertical);
+                        // Replace the cloned buffer with the target file.
+                        let path_str = path.display().to_string();
+                        self.execute_command(&format!("e {path_str}"));
                     }
                     // new_file, new_folder, rename, delete are handled by the UI backend
                     // since they involve sidebar prompts. Return the action string.
@@ -9211,7 +9505,11 @@ impl Engine {
                     if let Some(url) = self.word_under_cursor() {
                         #[cfg(not(test))]
                         {
-                            let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+                            let _ = std::process::Command::new("xdg-open")
+                                .arg(&url)
+                                .stdout(std::process::Stdio::null())
+                                .stderr(std::process::Stdio::null())
+                                .spawn();
                         }
                         self.message = format!("Opening: {}", url);
                     }
@@ -26365,6 +26663,7 @@ impl Engine {
                 self.message = "Swap file deleted".to_string();
             }
             "abort" | "cancel" => {
+                super::swap::delete_swap(&recovery.swap_path);
                 self.close_tab();
                 self.message.clear();
             }
@@ -26405,6 +26704,24 @@ impl Engine {
                 action: "ok".into(),
             }],
         );
+    }
+
+    /// Click a dialog button by index.  Returns the `EngineAction` from
+    /// processing the dialog result, or `None` if the index is out of range.
+    pub fn dialog_click_button(&mut self, idx: usize) -> EngineAction {
+        let (tag, action) = {
+            let dialog = match self.dialog.as_ref() {
+                Some(d) => d,
+                None => return EngineAction::None,
+            };
+            let btn = match dialog.buttons.get(idx) {
+                Some(b) => b,
+                None => return EngineAction::None,
+            };
+            (dialog.tag.clone(), btn.action.clone())
+        };
+        self.dialog = None;
+        self.process_dialog_result(&tag, &action)
     }
 
     /// Handle a key press when a dialog is open.
@@ -26474,6 +26791,28 @@ impl Engine {
     fn process_dialog_result(&mut self, tag: &str, action: &str) -> EngineAction {
         match tag {
             "swap_recovery" => self.process_swap_dialog_action(action),
+            "confirm_move" => {
+                if action == "yes" {
+                    if let Some((src, dest)) = self.pending_move.take() {
+                        match self.move_file(&src, &dest) {
+                            Ok(()) => {
+                                let name = src
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().to_string())
+                                    .unwrap_or_default();
+                                self.message = format!("Moved '{}' to '{}'", name, dest.display());
+                                self.explorer_needs_refresh = true;
+                            }
+                            Err(e) => {
+                                self.message = e;
+                            }
+                        }
+                    }
+                } else {
+                    self.pending_move = None;
+                }
+                EngineAction::None
+            }
             _ => EngineAction::None,
         }
     }
@@ -29171,8 +29510,14 @@ impl Engine {
 
     /// Create a new terminal tab (always spawns a fresh shell in the editor's CWD).
     pub fn terminal_new_tab(&mut self, cols: u16, rows: u16) {
+        self.terminal_new_tab_at(cols, rows, None);
+    }
+
+    /// Create a new terminal tab, optionally at a specific working directory.
+    /// If `dir` is None, uses the editor's CWD.
+    pub fn terminal_new_tab_at(&mut self, cols: u16, rows: u16, dir: Option<&Path>) {
         let shell = default_shell();
-        let cwd = self.cwd.clone();
+        let cwd = dir.unwrap_or(&self.cwd).to_path_buf();
         let history_cap = self.settings.terminal_scrollback_lines;
         match TerminalPane::new(cols, rows, &shell, &cwd, history_cap) {
             Ok(pane) => {
@@ -42548,6 +42893,159 @@ mod tests {
             Path::new("/tmp/not_a_real_dir_xyz_vc"),
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_confirm_move_shows_dialog() {
+        let base = std::env::temp_dir().join("vimcode_confirm_move_dlg");
+        let dest = base.join("target_dir");
+        std::fs::create_dir_all(&dest).unwrap();
+        let src = base.join("confirm_me.txt");
+        std::fs::write(&src, "data").unwrap();
+
+        let mut engine = Engine::new();
+        engine.confirm_move_file(&src, &dest);
+
+        // Dialog should be shown.
+        assert!(engine.dialog.is_some());
+        let dialog = engine.dialog.as_ref().unwrap();
+        assert_eq!(dialog.tag, "confirm_move");
+        assert!(dialog.body[0].contains("confirm_me.txt"));
+        assert_eq!(dialog.buttons.len(), 2);
+
+        // Pending move should be stored.
+        assert!(engine.pending_move.is_some());
+        let (ps, pd) = engine.pending_move.as_ref().unwrap();
+        assert_eq!(ps, &src);
+        assert_eq!(pd, &dest);
+
+        // Simulate pressing 'y' (Yes) — dialog handles it.
+        let _action = engine.handle_key("y", Some('y'), false);
+
+        // File should have been moved.
+        assert!(!src.exists());
+        assert!(dest.join("confirm_me.txt").exists());
+        assert!(engine.dialog.is_none());
+        assert!(engine.pending_move.is_none());
+        assert!(engine.explorer_needs_refresh);
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_confirm_move_cancel() {
+        let base = std::env::temp_dir().join("vimcode_confirm_move_cancel");
+        let dest = base.join("target_dir_c");
+        std::fs::create_dir_all(&dest).unwrap();
+        let src = base.join("stay_put.txt");
+        std::fs::write(&src, "data").unwrap();
+
+        let mut engine = Engine::new();
+        engine.confirm_move_file(&src, &dest);
+
+        // Simulate pressing 'n' (No).
+        let _action = engine.handle_key("n", Some('n'), false);
+
+        // File should NOT have been moved.
+        assert!(src.exists());
+        assert!(!dest.join("stay_put.txt").exists());
+        assert!(engine.dialog.is_none());
+        assert!(engine.pending_move.is_none());
+        assert!(!engine.explorer_needs_refresh);
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_move_file_into_own_subtree() {
+        let base = std::env::temp_dir().join("vimcode_move_subtree");
+        let parent = base.join("parent_dir");
+        let child = parent.join("child_dir");
+        std::fs::create_dir_all(&child).unwrap();
+
+        let mut engine = Engine::new();
+        let result = engine.move_file(&parent, &child);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().contains("subtree"),
+            "should reject moving folder into its own subtree"
+        );
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_move_file_same_directory_noop() {
+        let base = std::env::temp_dir().join("vimcode_move_noop");
+        std::fs::create_dir_all(&base).unwrap();
+        let src = base.join("stay.txt");
+        std::fs::write(&src, "stay").unwrap();
+
+        let mut engine = Engine::new();
+        // Moving a file into the directory it's already in should be a no-op.
+        let result = engine.move_file(&src, &base);
+        assert!(result.is_ok());
+        assert!(src.exists(), "file should still be at original location");
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_move_directory_basic() {
+        let base = std::env::temp_dir().join("vimcode_move_dir");
+        let src = base.join("src_dir");
+        let dest = base.join("dest_dir");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(src.join("file.txt"), "content").unwrap();
+
+        let mut engine = Engine::new();
+        engine.move_file(&src, &dest).unwrap();
+
+        assert!(!src.exists(), "source dir should be gone");
+        assert!(
+            dest.join("src_dir").join("file.txt").exists(),
+            "dir should be moved with contents"
+        );
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_move_file_updates_buffer_path() {
+        let base = std::env::temp_dir().join("vimcode_move_bufupd");
+        let dest = base.join("dest_mv");
+        std::fs::create_dir_all(&dest).unwrap();
+        let src = base.join("tracked.txt");
+        std::fs::write(&src, "tracked").unwrap();
+
+        let mut engine = Engine::new();
+        engine
+            .open_file_with_mode(&src, OpenMode::Permanent)
+            .unwrap();
+
+        engine.move_file(&src, &dest).unwrap();
+
+        let expected = dest.join("tracked.txt");
+        let updated = engine.buffer_manager.list().into_iter().any(|id| {
+            engine
+                .buffer_manager
+                .get(id)
+                .and_then(|s| s.file_path.as_ref())
+                == Some(&expected)
+        });
+        assert!(
+            updated,
+            "open buffer should point to new location after move"
+        );
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     // ─── LCS diff tests ───────────────────────────────────────────────────────

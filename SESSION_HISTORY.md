@@ -1,9 +1,18 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 183 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 186 archived here. Recent work summary in PROJECT_STATE.md.
 
 ---
+
+**Session 186 — Drag-and-Drop File Move + Context Menu Clamping (4468 tests):**
+Drag-and-drop file/folder move in both TUI (mouse Down→Drag→Up flow with `explorer_drag_src`/`explorer_drag_active`/`explorer_drop_target` state) and GTK (`DragSource`/`DropTarget` API with `Msg::MoveFile`). Engine-driven Yes/No confirmation dialog (`confirm_move_file()`/`pending_move`/`process_dialog_result`). Clickable dialog buttons: TUI computes positions from rendered layout; GTK uses `DialogBtnRects` (`Rc<RefCell<...>>`) shared between draw closure and click handler with actual Pango-measured button rects. Fixed GTK dialog "No" button activating "Yes" (proportional vs monospace font mismatch). Fixed GTK crash on drag (removed legacy GTK3 DnD handlers). Subtree move prevention + same-directory no-op. Context menu popup clamping: moved popup rendering after status/command line in TUI draw order. 6 new tests.
+
+**Session 185 — Context Menu Action Polish + Bug Fixes (4468 tests):**
+Select for Compare / Compare with Selected two-step file comparison flow (engine `diff_selected_file`). Fixed GTK `copy_relative_path` (was sending absolute path — added `Msg::CopyRelativePath`). Fixed GTK `open_side` (was opening in current group — added `Msg::OpenSide`). Fixed "Open to Side" creating 2 tab groups (`open_editor_group()` clone + `open_file_in_tab()` double-add — fixed to use `:e` replacement). Fixed swap file "Abort" not deleting swap (added `delete_swap()` to abort path). Fixed xdg-open stderr corrupting TUI (redirect stdout/stderr to `/dev/null`). Fixed "Open in Integrated Terminal" (TUI: `terminal_new_tab_at()`; GTK: added `Msg::OpenTerminalAt(dir)` + `ctx.open_terminal` GIO action). Deduplicated TUI action handlers (engine-only for `copy_path`, `copy_relative_path`, `reveal`, `open_side`). 8 new tests.
+
+**Session 184 — Right-Click Context Menus (4460 tests):**
+Explorer right-click context menu with different menus for files vs folders (matching VSCode). Tab bar right-click context menu (Close, Close Others, Close to Right, Close Saved, Copy Path, Copy Relative Path, Reveal, Split Right/Down). `ContextMenuState`/`ContextMenuTarget` data model in engine. TUI: `render_context_menu_popup()` with box-drawing borders, mouse hover highlighting. GTK: `PopoverMenu` with `gio::Menu` sections + `SimpleActionGroup` actions; `swap_ctx_popover()` lifecycle; GLib log handler for non-fatal GTK4 assertion. `render.rs`: `ContextMenuPanel`/`ContextMenuRenderItem`. `tests/context_menu.rs` integration test file. 38 new tests.
 
 **Session 183 — Vim Compatibility Gap Closure (4422 tests):**
 `[#`/`]#` preprocessor navigation (C/C++ `#if`/`#endif` bracket matching), `gR` virtual replace mode (fixed-width character replacement preserving column alignment), `g+`/`g-` timeline undo (chronological undo tree traversal), `q:`/`q?` command-line history window (scrollable popup with Enter to execute, editable entries). VIM_COMPATIBILITY 412→414/417 (99%). 31 new tests.

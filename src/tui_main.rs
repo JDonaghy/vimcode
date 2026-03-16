@@ -319,8 +319,6 @@ enum PromptKind {
     /// New folder inside the given directory.
     NewFolder(PathBuf),
     DeleteConfirm(PathBuf),
-    /// Rename: the path to rename; input will be the new bare name.
-    Rename(PathBuf),
     /// Move: source path; input is destination dir (relative to project root).
     MoveFile(PathBuf),
 }
@@ -937,6 +935,10 @@ fn event_loop(
     // Command-line mouse text selection: (start_col, end_col) in the rendered row.
     let mut cmd_sel: Option<(usize, usize)> = None;
     let mut cmd_dragging = false;
+    // Explorer drag-and-drop: row index where mouse-down occurred (potential drag source).
+    let mut explorer_drag_src: Option<usize> = None;
+    // Active explorer drag state: (source row index, current target row index or None).
+    let mut explorer_drag_active: Option<(usize, Option<usize>)> = None;
 
     // Track unnamed register content so we only write to clipboard on changes.
     let mut last_clipboard_content: Option<String> = None;
@@ -1073,6 +1075,7 @@ fn event_loop(
             terminal
                 .draw(|frame| {
                     if let Some(s) = &screen {
+                        let drop_target = explorer_drag_active.as_ref().and_then(|&(_, t)| t);
                         draw_frame(
                             frame,
                             s,
@@ -1089,6 +1092,7 @@ fn event_loop(
                             quit_confirm,
                             close_tab_confirm,
                             cmd_sel,
+                            drop_target,
                         );
                     }
                 })
@@ -1411,6 +1415,21 @@ fn event_loop(
                         needs_redraw = true;
                         continue;
                     }
+                }
+
+                // ── Inline rename in explorer ────────────────────────────────
+                if engine.explorer_rename.is_some() {
+                    if let Some((key_name, unicode, ctrl)) =
+                        translate_key(key_event, keyboard_enhanced)
+                    {
+                        engine.handle_explorer_rename_key(&key_name, unicode, ctrl);
+                        if engine.explorer_needs_refresh {
+                            sidebar.build_rows();
+                            engine.explorer_needs_refresh = false;
+                        }
+                    }
+                    needs_redraw = true;
+                    continue;
                 }
 
                 // ── Prompt mode (sidebar CRUD) ──────────────────────────────
@@ -2478,16 +2497,7 @@ fn event_loop(
                                         let idx = sidebar.selected;
                                         if idx < sidebar.rows.len() {
                                             let path = sidebar.rows[idx].path.clone();
-                                            let current_name = path
-                                                .file_name()
-                                                .map(|n| n.to_string_lossy().to_string())
-                                                .unwrap_or_default();
-                                            let cursor = current_name.len();
-                                            sidebar_prompt = Some(SidebarPrompt {
-                                                kind: PromptKind::Rename(path),
-                                                input: current_name,
-                                                cursor,
-                                            });
+                                            engine.start_explorer_rename(path);
                                         }
                                     }
                                     ExplorerAction::MoveFile => {
@@ -3109,6 +3119,7 @@ fn event_loop(
                                     engine,
                                     &sidebar,
                                     &mut sidebar_prompt,
+                                    terminal.size().ok(),
                                 );
                             }
                             needs_redraw = true;
@@ -3231,6 +3242,11 @@ fn event_loop(
                     }
                     // Sync unnamed register → system clipboard (clipboard=unnamedplus).
                     sync_tui_clipboard(engine, &mut last_clipboard_content);
+                    // Rebuild explorer tree if a file move just completed.
+                    if engine.explorer_needs_refresh {
+                        engine.explorer_needs_refresh = false;
+                        sidebar.build_rows();
+                    }
                     // Schedule yank highlight clear after 200 ms.
                     if engine.yank_highlight.is_some() {
                         yank_hl_deadline = Some(Instant::now() + Duration::from_millis(200));
@@ -3344,6 +3360,8 @@ fn event_loop(
                                 &mut cmd_sel,
                                 &mut cmd_dragging,
                                 &mut mouse_should_quit,
+                                &mut explorer_drag_src,
+                                &mut explorer_drag_active,
                             );
                             if mouse_should_quit {
                                 return;
@@ -3384,6 +3402,8 @@ fn event_loop(
                     &mut cmd_sel,
                     &mut cmd_dragging,
                     &mut mouse_should_quit,
+                    &mut explorer_drag_src,
+                    &mut explorer_drag_active,
                 );
                 if mouse_should_quit {
                     return;
@@ -3438,6 +3458,7 @@ fn handle_explorer_context_action(
     engine: &mut Engine,
     sidebar: &TuiSidebar,
     sidebar_prompt: &mut Option<SidebarPrompt>,
+    terminal_size: Option<ratatui::layout::Rect>,
 ) {
     // Get the path from the engine's last context menu target.
     // Note: context_menu_confirm() already took the menu, so we reconstruct
@@ -3479,17 +3500,7 @@ fn handle_explorer_context_action(
             });
         }
         "rename" => {
-            *sidebar_prompt = Some(SidebarPrompt {
-                kind: PromptKind::Rename(path.clone()),
-                input: path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default(),
-                cursor: path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().len())
-                    .unwrap_or(0),
-            });
+            engine.start_explorer_rename(path);
         }
         "delete" => {
             *sidebar_prompt = Some(SidebarPrompt {
@@ -3498,33 +3509,20 @@ fn handle_explorer_context_action(
                 cursor: 0,
             });
         }
-        "copy_path" => {
-            let text = path.to_string_lossy().into_owned();
-            if let Some(ref cb) = engine.clipboard_write {
-                let _ = cb(&text);
-            }
-            engine.message = format!("Copied: {text}");
-        }
-        "copy_relative_path" => {
-            let text = engine.copy_relative_path(&path);
-            if let Some(ref cb) = engine.clipboard_write {
-                let _ = cb(&text);
-            }
-            engine.message = format!("Copied: {text}");
-        }
-        "reveal" => {
-            engine.reveal_in_file_manager(&path);
-        }
-        "open_side" => {
-            engine.open_editor_group(crate::core::window::SplitDirection::Vertical);
-            engine.open_file_in_tab(&path);
-        }
+        // copy_path, copy_relative_path, reveal, open_side are handled by the engine
+        "copy_path" | "copy_relative_path" | "reveal" | "open_side" => {}
         "open_terminal" => {
-            engine.terminal_open = true;
+            let dir = if is_dir {
+                path.clone()
+            } else {
+                path.parent().unwrap_or(&sidebar.root).to_path_buf()
+            };
+            let cols = terminal_size.map(|s| s.width).unwrap_or(80);
+            let rows = engine.session.terminal_panel_rows;
+            engine.terminal_new_tab_at(cols, rows, Some(&dir));
         }
-        "select_for_diff" => {
-            engine.message = "Selected for compare (use :Gdiff)".into();
-        }
+        // select_for_diff and diff_with_selected are handled by the engine
+        "select_for_diff" | "diff_with_selected" => {}
         "find_in_folder" => {
             engine.grep_open = true;
         }
@@ -3563,6 +3561,8 @@ fn handle_mouse(
     cmd_sel: &mut Option<(usize, usize)>,
     cmd_dragging: &mut bool,
     should_quit: &mut bool,
+    explorer_drag_src: &mut Option<usize>,
+    explorer_drag_active: &mut Option<(usize, Option<usize>)>,
 ) -> u16 {
     let col = ev.column;
     let row = ev.row;
@@ -3579,6 +3579,55 @@ fn handle_mouse(
         } else {
             0
         };
+
+    // ── Dialog popup click handling ─────────────────────────────────────────────
+    if engine.dialog.is_some() {
+        if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
+            let term_cols = terminal_size.map(|s| s.width).unwrap_or(80);
+            // Recompute dialog geometry (same formula as render_dialog_popup).
+            let dialog = engine.dialog.as_ref().unwrap();
+            let body_max = dialog.body.iter().map(|l| l.len()).max().unwrap_or(0);
+            let btn_row_len: usize = dialog
+                .buttons
+                .iter()
+                .map(|b| render::format_button_label(&b.label, b.hotkey).len() + 4)
+                .sum::<usize>()
+                + 2;
+            let content_width = body_max.max(dialog.title.len() + 4).max(btn_row_len);
+            let width = (content_width as u16 + 4).clamp(40, term_cols.saturating_sub(4));
+            let height = (3 + dialog.body.len() as u16 + 2 + 1).min(term_height.saturating_sub(4));
+            let px = (term_cols.saturating_sub(width)) / 2;
+            let py = (term_height.saturating_sub(height)) / 2;
+            let btn_y = py + height - 2;
+
+            if row == btn_y {
+                // Walk the button positions to find which was clicked.
+                let mut col_offset = px + 2;
+                for (idx, btn) in dialog.buttons.iter().enumerate() {
+                    let label = render::format_button_label(&btn.label, btn.hotkey);
+                    let btn_w = label.len() as u16 + 4; // "  label  "
+                    if col >= col_offset && col < col_offset + btn_w {
+                        let action = engine.dialog_click_button(idx);
+                        if engine.explorer_needs_refresh {
+                            engine.explorer_needs_refresh = false;
+                            sidebar.build_rows();
+                        }
+                        if handle_action(engine, action) {
+                            *should_quit = true;
+                        }
+                        return sidebar_width;
+                    }
+                    col_offset += btn_w;
+                }
+            }
+            // Click outside dialog — dismiss (Escape equivalent).
+            if col < px || col >= px + width || row < py || row >= py + height {
+                engine.dialog = None;
+                engine.pending_move = None;
+            }
+        }
+        return sidebar_width;
+    }
 
     // ── Folder picker mouse handling ────────────────────────────────────────────
     if let Some(ref mut picker) = folder_picker {
@@ -3625,6 +3674,38 @@ fn handle_mouse(
             return new_w.clamp(15, 150);
         }
         MouseEventKind::Drag(MouseButton::Left) => {
+            // Explorer drag-and-drop: activate or update target row.
+            if explorer_drag_src.is_some() || explorer_drag_active.is_some() {
+                let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
+                if sidebar.visible
+                    && sidebar.active_panel == TuiPanel::Explorer
+                    && col >= ab_width
+                    && col < ab_width + sidebar_width
+                {
+                    let sidebar_row = row.saturating_sub(menu_rows);
+                    if sidebar_row >= 1 {
+                        let tree_row =
+                            (sidebar_row as usize).saturating_sub(1) + sidebar.scroll_top;
+                        if tree_row < sidebar.rows.len() {
+                            if let Some(src_row) = *explorer_drag_src {
+                                // Only activate drag if target differs from source.
+                                if tree_row != src_row {
+                                    *explorer_drag_active = Some((src_row, Some(tree_row)));
+                                    *explorer_drag_src = None;
+                                }
+                            } else if let Some((src, _)) = explorer_drag_active {
+                                *explorer_drag_active = Some((*src, Some(tree_row)));
+                            }
+                        }
+                    }
+                } else if let Some((src, _)) = explorer_drag_active {
+                    // Mouse dragged outside sidebar — clear target but keep active.
+                    *explorer_drag_active = Some((*src, None));
+                }
+                if explorer_drag_active.is_some() {
+                    return sidebar_width;
+                }
+            }
             // Command-line text selection drag
             if *cmd_dragging {
                 if let Some(ref mut sel) = *cmd_sel {
@@ -3809,6 +3890,27 @@ fn handle_mouse(
             }
         }
         MouseEventKind::Up(MouseButton::Left) => {
+            // Explorer drag-and-drop: execute move on release.
+            if let Some((src_row, Some(target_row))) = explorer_drag_active.take() {
+                *explorer_drag_src = None;
+                if src_row < sidebar.rows.len() && target_row < sidebar.rows.len() {
+                    let src_path = sidebar.rows[src_row].path.clone();
+                    let target = &sidebar.rows[target_row];
+                    let dest_dir = if target.is_dir {
+                        target.path.clone()
+                    } else {
+                        target
+                            .path
+                            .parent()
+                            .unwrap_or(std::path::Path::new("."))
+                            .to_path_buf()
+                    };
+                    engine.confirm_move_file(&src_path, &dest_dir);
+                }
+                return sidebar_width;
+            }
+            *explorer_drag_src = None;
+            *explorer_drag_active = None;
             *dragging_sidebar = false;
             *dragging_scrollbar = None;
             *dragging_sidebar_search = None;
@@ -4122,6 +4224,7 @@ fn handle_mouse(
                                         engine,
                                         sidebar,
                                         sidebar_prompt,
+                                        *terminal_size,
                                     );
                                 }
                             }
@@ -4614,6 +4717,8 @@ fn handle_mouse(
             }
             let tree_row = (sidebar_row as usize).saturating_sub(1) + sidebar.scroll_top;
             if tree_row < sidebar.rows.len() {
+                // Record potential drag source for DnD.
+                *explorer_drag_src = Some(tree_row);
                 if sidebar.rows[tree_row].is_dir {
                     sidebar.selected = tree_row;
                     sidebar.toggle_dir(tree_row);
@@ -5447,6 +5552,7 @@ fn draw_frame(
     quit_confirm: bool,
     close_tab_confirm: bool,
     cmd_sel: Option<(usize, usize)>,
+    explorer_drop_target: Option<usize>,
 ) {
     let area = frame.size();
 
@@ -5543,7 +5649,14 @@ fn draw_frame(
         };
         let sep_x = sidebar_sep_area.x + sidebar_sep_area.width - 1;
 
-        render_sidebar(frame.buffer_mut(), sidebar_area, sidebar, engine, theme);
+        render_sidebar(
+            frame.buffer_mut(),
+            sidebar_area,
+            sidebar,
+            engine,
+            theme,
+            explorer_drop_target,
+        );
         // Note: render_sidebar / render_search_panel write back scroll_top to sidebar
 
         // Separator column
@@ -5780,16 +5893,6 @@ fn draw_frame(
         render_tab_switcher_popup(frame.buffer_mut(), area, ts, theme);
     }
 
-    // ── Context menu popup ─────────────────────────────────────────────────
-    if let Some(ref ctx_menu) = screen.context_menu {
-        render_context_menu(frame.buffer_mut(), area, ctx_menu, theme);
-    }
-
-    // ── Modal dialog (highest z-order) ───────────────────────────────────────
-    if let Some(ref dialog) = screen.dialog {
-        render_dialog_popup(frame.buffer_mut(), area, dialog, theme);
-    }
-
     // ── Quickfix panel (persistent bottom strip) ──────────────────────────────
     if let Some(ref qf) = screen.quickfix {
         render_quickfix_panel(
@@ -5870,13 +5973,6 @@ fn draw_frame(
                     .unwrap_or_default();
                 (format!("Delete '{}'? (y/n)", name), 0)
             }
-            PromptKind::Rename(path) => {
-                let name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                (format!("Rename '{}' to: ", name), prompt.cursor)
-            }
             PromptKind::MoveFile(_) => ("Move to: ".to_string(), prompt.cursor),
         };
         let prompt_text = format!("{}{}", prefix, prompt.input);
@@ -5906,6 +6002,16 @@ fn draw_frame(
                 }
             }
         }
+    }
+
+    // ── Context menu popup (above status/command line) ─────────────────────
+    if let Some(ref ctx_menu) = screen.context_menu {
+        render_context_menu(frame.buffer_mut(), area, ctx_menu, theme);
+    }
+
+    // ── Modal dialog (highest z-order after quit confirm) ────────────────────
+    if let Some(ref dialog) = screen.dialog {
+        render_dialog_popup(frame.buffer_mut(), area, dialog, theme);
     }
 
     // ── Menu dropdown — rendered last so it draws on top of everything ────────
@@ -5972,20 +6078,6 @@ fn handle_sidebar_prompt(
                     engine.message = format!("Error deleting: {}", e);
                 } else {
                     sidebar.build_rows();
-                }
-            }
-        }
-        PromptKind::Rename(path) => {
-            let new_name = input.trim();
-            if !new_name.is_empty() {
-                match engine.rename_file(&path, new_name) {
-                    Ok(()) => {
-                        sidebar.build_rows();
-                        engine.message = format!("Renamed to '{}'", new_name);
-                    }
-                    Err(e) => {
-                        engine.message = e;
-                    }
                 }
             }
         }
@@ -9007,7 +9099,7 @@ fn render_activity_bar(
         (2, TuiPanel::Search, '\u{f002}'),     // nf-fa-search
         (3, TuiPanel::Debug, '\u{f188}'),      // nf-fa-bug
         (4, TuiPanel::Git, '\u{e702}'),        // nf-dev-git_branch
-        (5, TuiPanel::Extensions, '\u{eb85}'), // nf-cod-extensions
+        (5, TuiPanel::Extensions, '\u{eae6}'), // nf-cod-extensions
         (6, TuiPanel::Ai, '\u{f0e5}'),         // nf-fa-comment (AI chat)
     ];
 
@@ -9087,6 +9179,7 @@ fn render_sidebar(
     sidebar: &mut TuiSidebar,
     engine: &Engine,
     theme: &Theme,
+    explorer_drop_target: Option<usize>,
 ) {
     let header_fg = rc(theme.status_fg);
     let header_bg = rc(theme.status_bg);
@@ -9237,10 +9330,18 @@ fn render_sidebar(
 
         // Determine colours
         let is_selected = row_idx == sidebar.selected;
+        let is_drop_target = explorer_drop_target == Some(row_idx);
         let canonical_path = row.path.canonicalize().unwrap_or_else(|_| row.path.clone());
         let is_active = open_paths.contains(&canonical_path);
 
-        let (fg, bg) = if is_selected {
+        let drop_bg = rc(render::Color {
+            r: 40,
+            g: 60,
+            b: 80,
+        }); // muted blue highlight
+        let (fg, bg) = if is_drop_target {
+            (sel_fg, drop_bg)
+        } else if is_selected {
             (sel_fg, sel_bg)
         } else if is_active {
             (active_file_fg, row_bg)
@@ -9298,13 +9399,46 @@ fn render_sidebar(
                 x += 1;
             }
         }
-        // Name
-        for ch in row.name.chars() {
-            if x >= area.x + area.width {
-                break;
+        // Name — or inline rename input when active on this row
+        let is_renaming = engine
+            .explorer_rename
+            .as_ref()
+            .is_some_and(|r| r.path == row.path);
+        if is_renaming {
+            let rename = engine.explorer_rename.as_ref().unwrap();
+            let input_bg = rc(theme.background);
+            let input_fg = rc(theme.foreground);
+            let input_start_x = x;
+            // Render the input text
+            for (byte_idx, ch) in rename.input.char_indices() {
+                if x >= area.x + area.width {
+                    break;
+                }
+                let is_cursor = byte_idx == rename.cursor;
+                let cell_fg = if is_cursor { input_bg } else { input_fg };
+                let cell_bg = if is_cursor { input_fg } else { input_bg };
+                set_cell(buf, x, screen_y, ch, cell_fg, cell_bg);
+                x += 1;
             }
-            set_cell(buf, x, screen_y, ch, fg, bg);
-            x += 1;
+            // Cursor at end of input (append position)
+            if rename.cursor >= rename.input.len() && x < area.x + area.width {
+                set_cell(buf, x, screen_y, ' ', input_bg, input_fg);
+                x += 1;
+            }
+            // Fill remaining width with input background
+            while x < area.x + area.width {
+                set_cell(buf, x, screen_y, ' ', input_fg, input_bg);
+                x += 1;
+            }
+            let _ = input_start_x;
+        } else {
+            for ch in row.name.chars() {
+                if x >= area.x + area.width {
+                    break;
+                }
+                set_cell(buf, x, screen_y, ch, fg, bg);
+                x += 1;
+            }
         }
     }
 

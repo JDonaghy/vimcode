@@ -35,7 +35,7 @@ For detailed how-to guides and configuration references, see the **[VimCode Wiki
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 4460 tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 4498 tests, zero async runtime dependency
 
 > **Note:** VimCode does not implement VimScript. Extension and scripting is handled via
 > the built-in Lua 5.4 plugin system. The goal is full Vim *keybinding* and *editing*
@@ -270,13 +270,20 @@ cargo fmt
 
 ### Multi-File Editing
 
+VimCode has three spatial layers that combine Vim and VSCode concepts:
+- **Windows** — Vim-style splits *within* a single tab (`:split`, `:vsplit`, `Ctrl-W s/v`)
+- **Tabs** — pages within an editor group, like Vim tabs or browser tabs (`gt`/`gT`, `:tabnew`)
+- **Editor Groups** — VSCode-style side-by-side tab bars (`Ctrl+\`, `Ctrl-W e/E`), each with its own set of tabs
+
+The tab context menu offers both: "Split Right/Down" creates a Vim window split inside the current tab, while "Split Right/Down to New Group" creates a new editor group with its own tab bar.
+
 **Buffers**
 - `:bn` / `:bp` — next/previous buffer
 - `:b#` — alternate buffer
 - `:ls` — list buffers (shows `[Preview]` suffix for preview tabs)
 - `:bd` — delete buffer
 
-**Windows**
+**Windows** (splits within the current tab — not to be confused with Editor Groups)
 - `:split` / `:vsplit` — horizontal/vertical split
 - `:close` — close window; `:only` — close all other windows
 - `Ctrl-W h/j/k/l` — move focus between panes (or `:wincmd h/j/k/l`)
@@ -289,7 +296,7 @@ cargo fmt
 - `Ctrl+Tab` / `Ctrl+Shift+Tab` — MRU tab switcher popup (cycles most-recently-used tabs; Enter confirms, Escape cancels); release modifier to auto-confirm (GTK)
 - `Alt+t` — MRU tab switcher (works in both TUI and GTK; hold Alt and press `t` to cycle; release Alt or wait 500ms to confirm in TUI)
 
-**Editor Groups (VSCode-style split panes, recursive)**
+**Editor Groups / Tab Groups (VSCode-style split panes, recursive)**
 - `Ctrl+\` — split editor right (any group can be split again for nested layouts)
 - `Ctrl-W e` / `Ctrl-W E` — split editor right / down
 - `Ctrl+1` through `Ctrl+9` — focus group by position (tree order)
@@ -425,7 +432,7 @@ For full details on adapters, launch.json, conditional breakpoints, and the debu
 - **Auto-refresh** — filesystem changes are detected automatically (no manual refresh needed)
 - **Rename:** `F2` (GTK inline) / `r` (TUI prompt) — rename file or folder in-place
 - **Move:** Drag-and-drop (GTK) / `M` key prompt (TUI) — move to another folder; full path pre-filled with cursor key editing (Left/Right/Home/End/Delete)
-- **Right-click context menu (GTK):** New File, New Folder, Rename, Delete, Copy Path, Select for Diff
+- **Right-click context menu:** New File, New Folder, Rename, Delete, Copy Path, Copy Relative Path, Open to Side, Select for Compare / Compare with Selected (opens diff view), Reveal in File Manager; tab bar: Close, Close Others, Close to Right, Close Saved, Split Right/Down
 - **Preview mode:**
   - Single-click → preview tab (italic/dimmed, replaced by next single-click)
   - Double-click → permanent tab
