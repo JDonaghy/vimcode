@@ -1,9 +1,9 @@
 # VimCode Project State
 
-**Last updated:** Mar 15, 2026 (Session 183 — Vim Compatibility Gap Closure) | **Tests:** 4422
+**Last updated:** Mar 15, 2026 (Session 184 — Right-Click Context Menus) | **Tests:** 4460
 
 > Feature documentation lives in **README.md**.
-> Per-session implementation notes through Session 182 are in **SESSION_HISTORY.md**.
+> Per-session implementation notes through Session 183 are in **SESSION_HISTORY.md**.
 
 ---
 
@@ -26,12 +26,13 @@ When implementing a new key/command, add tests covering:
 
 ## Recent Work
 
-### Session 183 — Vim Compatibility Gap Closure (Mar 15, 2026)
-- **`[#`/`]#` preprocessor navigation**: Jump to matching `#if`/`#ifdef`/`#ifndef`/`#else`/`#elif`/`#endif` directives with depth tracking; supports nesting, indented directives, count prefix. `PreprocKind` enum + `jump_preproc_forward()`/`jump_preproc_backward()`/`preproc_directive()` methods.
-- **`gR` virtual replace mode**: Enter with `gR`; overwrites characters like `R` but expands tabs to spaces (inserts `tabstop` spaces instead of overwriting with tab character). `virtual_replace: bool` engine field; modified `handle_replace_key()`.
-- **`g+`/`g-` timeline undo**: Chronological undo navigation via `undo_timeline: Vec<(String, Cursor)>` on `BufferState`; `record_timeline_snapshot()` captures state after each undo group; `g_earlier()`/`g_later()` navigate the timeline independent of the undo tree.
-- **`q:`/`q/`/`q?` command-line window**: Opens command or search history in a scratch buffer tab; Enter on a line executes the command or performs the search; `q` closes the window. `open_cmdline_window()`/`cmdline_window_execute()` methods; `is_cmdline_buf`/`cmdline_is_search` fields on `BufferState`.
-- **VIM_COMPATIBILITY.md**: 412/417 → 414/417 (99%). Bracket 13/13 (100%), g-commands 34/34 (100%), Normal Other 32/33 (97%). Only remaining gap: `CTRL-]` (partial via `gd`).
-- 31 new tests (4422 total)
+### Session 184 — Right-Click Context Menus (Mar 15, 2026)
+- **Explorer right-click context menu**: Different menus for files vs folders (matching VSCode). File menu: Open to Side, Open Containing Folder, Select for Compare, Copy Path, Copy Relative Path, Rename, Delete. Folder menu: New File, New Folder, Open Containing Folder, Find in Folder, Copy Path, Copy Relative Path, Rename, Delete.
+- **Tab bar right-click context menu**: Close, Close Others, Close to Right, Close Saved, Copy Path, Copy Relative Path, Reveal in File Explorer, Split Right, Split Down. Disabled items when not applicable (e.g., Close Others with 1 tab).
+- **Engine data model**: `ContextMenuState` / `ContextMenuTarget` structs; `open_explorer_context_menu()` / `open_tab_context_menu()` / `handle_context_menu_key()` methods; `context_menu: Option<ContextMenuState>` engine field.
+- **TUI rendering**: `render_context_menu_popup()` with box-drawing borders; mouse hover highlighting via `MouseEventKind::Moved` handler; left-click confirms, right-click/Escape dismisses.
+- **GTK rendering**: `PopoverMenu::from_model()` with `gio::Menu` sections + `SimpleActionGroup` actions; native hover highlighting; `swap_ctx_popover()` pattern for lifecycle management; suppressed non-fatal `gtk_css_node_insert_after` GTK4 assertion via GLib log handler.
+- **render.rs**: `ContextMenuPanel` / `ContextMenuRenderItem` structs; `build_context_menu_panel()` produces platform-agnostic data.
+- 38 new tests (4460 total); `tests/context_menu.rs` integration test file.
 
-> Sessions 182 and earlier archived in **SESSION_HISTORY.md**.
+> Sessions 183 and earlier archived in **SESSION_HISTORY.md**.

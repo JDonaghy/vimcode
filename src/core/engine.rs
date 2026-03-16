@@ -795,6 +795,39 @@ pub struct TabDragState {
     pub tab_name: String,
 }
 
+// ── Context menu data model ──────────────────────────────────────────────────
+
+/// What the context menu was opened on.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub enum ContextMenuTarget {
+    Tab { group_id: GroupId, tab_idx: usize },
+    ExplorerFile { path: PathBuf },
+    ExplorerDir { path: PathBuf },
+}
+
+/// A single item in a context menu popup.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct ContextMenuItem {
+    pub label: String,
+    pub action: String,
+    pub shortcut: String,
+    pub separator_after: bool,
+    pub enabled: bool,
+}
+
+/// State for an open context menu popup (engine-driven, rendered by TUI).
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct ContextMenuState {
+    pub target: ContextMenuTarget,
+    pub items: Vec<ContextMenuItem>,
+    pub selected: usize,
+    pub screen_x: u16,
+    pub screen_y: u16,
+}
+
 /// One panel in a VSCode-style editor-group split.
 /// Each group owns its own tab bar and independent tab navigation.
 /// Single-group mode (the default) is identical to the previous behaviour.
@@ -2101,6 +2134,10 @@ pub struct Engine {
     pub ext_panel_scroll_top: usize,
     /// Per-panel section expanded state.
     pub ext_panel_sections_expanded: HashMap<String, Vec<bool>>,
+
+    // --- Context menu ---
+    /// Active right-click context menu state (TUI-driven). None when no menu is open.
+    pub context_menu: Option<ContextMenuState>,
 }
 
 impl Engine {
@@ -2409,6 +2446,7 @@ impl Engine {
             ext_panel_selected: 0,
             ext_panel_scroll_top: 0,
             ext_panel_sections_expanded: HashMap::new(),
+            context_menu: None,
         };
         // If vscode mode is configured, start in Insert mode with menu visible
         if engine.is_vscode_mode() {
@@ -5166,6 +5204,587 @@ impl Engine {
         true
     }
 
+    /// Close a specific tab by group and index. Used for right-click "Close" on non-active tabs.
+    pub fn close_tab_at(&mut self, group_id: GroupId, tab_idx: usize) -> bool {
+        // Switch to the target group/tab, then close it.
+        if !self.editor_groups.contains_key(&group_id) {
+            return false;
+        }
+        let tabs_len = self.editor_groups[&group_id].tabs.len();
+        if tab_idx >= tabs_len {
+            return false;
+        }
+        let prev_group = self.active_group;
+        let prev_tab = self.active_group().active_tab;
+        self.active_group = group_id;
+        self.editor_groups.get_mut(&group_id).unwrap().active_tab = tab_idx;
+        let closed = self.close_tab();
+        // If we didn't close (last tab), restore.
+        if !closed {
+            self.active_group = prev_group;
+            if let Some(g) = self.editor_groups.get_mut(&prev_group) {
+                if prev_tab < g.tabs.len() {
+                    g.active_tab = prev_tab;
+                }
+            }
+        }
+        closed
+    }
+
+    /// Close all tabs in the current group except the active one.
+    pub fn close_other_tabs(&mut self) {
+        let active_tab_idx = self.active_group().active_tab;
+        let tabs_len = self.active_group().tabs.len();
+        if tabs_len <= 1 {
+            return;
+        }
+        // Close tabs from highest index to lowest, skipping active.
+        for i in (0..tabs_len).rev() {
+            if i == active_tab_idx {
+                continue;
+            }
+            // Set active to the tab we want to close, then close it.
+            self.active_group_mut().active_tab = i;
+            self.close_tab();
+            // After closing, the active_tab might have shifted.
+        }
+        // Ensure the originally active tab (now the only one) is selected.
+        self.active_group_mut().active_tab = 0;
+        self.tab_mru_touch();
+    }
+
+    /// Close all tabs to the right of the active tab.
+    pub fn close_tabs_to_right(&mut self) {
+        let active_tab_idx = self.active_group().active_tab;
+        let tabs_len = self.active_group().tabs.len();
+        if active_tab_idx >= tabs_len - 1 {
+            return;
+        }
+        // Close from rightmost inward.
+        for i in (active_tab_idx + 1..tabs_len).rev() {
+            self.active_group_mut().active_tab = i;
+            self.close_tab();
+        }
+        self.active_group_mut().active_tab = active_tab_idx;
+        self.tab_mru_touch();
+    }
+
+    /// Close all tabs to the left of the active tab.
+    pub fn close_tabs_to_left(&mut self) {
+        let active_tab_idx = self.active_group().active_tab;
+        if active_tab_idx == 0 {
+            return;
+        }
+        // Close from index 0 up to (not including) active.
+        // Each close at index 0 shifts everything left.
+        for _ in 0..active_tab_idx {
+            self.active_group_mut().active_tab = 0;
+            self.close_tab();
+        }
+        self.active_group_mut().active_tab = 0;
+        self.tab_mru_touch();
+    }
+
+    /// Close all non-dirty tabs except the active one.
+    pub fn close_saved_tabs(&mut self) {
+        let active_tab_idx = self.active_group().active_tab;
+        let tabs_len = self.active_group().tabs.len();
+        if tabs_len <= 1 {
+            return;
+        }
+        // Collect indices of non-dirty, non-active tabs.
+        let mut to_close = Vec::new();
+        for i in 0..tabs_len {
+            if i == active_tab_idx {
+                continue;
+            }
+            // Check if the tab's primary buffer is dirty.
+            let tab = &self.active_group().tabs[i];
+            let wid = tab.active_window;
+            if let Some(w) = self.windows.get(&wid) {
+                if let Some(bs) = self.buffer_manager.get(w.buffer_id) {
+                    if bs.dirty {
+                        continue;
+                    }
+                }
+            }
+            to_close.push(i);
+        }
+        // Close from highest index to lowest.
+        for i in to_close.into_iter().rev() {
+            self.active_group_mut().active_tab = i;
+            self.close_tab();
+        }
+        // Recalculate the active tab (original one shifted down by removed tabs below it).
+        let remaining = self.active_group().tabs.len();
+        if self.active_group().active_tab >= remaining {
+            self.active_group_mut().active_tab = remaining.saturating_sub(1);
+        }
+        self.tab_mru_touch();
+    }
+
+    /// Get the file path of a tab's primary window buffer.
+    pub fn tab_file_path(&self, group_id: GroupId, tab_idx: usize) -> Option<PathBuf> {
+        let group = self.editor_groups.get(&group_id)?;
+        let tab = group.tabs.get(tab_idx)?;
+        let wid = tab.active_window;
+        let w = self.windows.get(&wid)?;
+        let bs = self.buffer_manager.get(w.buffer_id)?;
+        bs.file_path.clone()
+    }
+
+    /// Open the system file manager at the given path's parent directory.
+    pub fn reveal_in_file_manager(&self, path: &Path) {
+        let dir = if path.is_dir() {
+            path
+        } else {
+            path.parent().unwrap_or(path)
+        };
+        #[cfg(target_os = "macos")]
+        {
+            let _ = std::process::Command::new("open")
+                .arg("-R")
+                .arg(path)
+                .spawn();
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+        }
+    }
+
+    /// Return the path relative to cwd.
+    pub fn copy_relative_path(&self, path: &Path) -> String {
+        path.strip_prefix(&self.cwd)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    // ── Context menu methods ─────────────────────────────────────────────────
+
+    /// Open a context menu for a tab.
+    pub fn open_tab_context_menu(&mut self, group_id: GroupId, tab_idx: usize, x: u16, y: u16) {
+        let group = match self.editor_groups.get(&group_id) {
+            Some(g) => g,
+            None => return,
+        };
+        let tabs_len = group.tabs.len();
+        if tab_idx >= tabs_len {
+            return;
+        }
+
+        let has_file = self.tab_file_path(group_id, tab_idx).is_some();
+
+        let items = vec![
+            ContextMenuItem {
+                label: "Close".into(),
+                action: "close".into(),
+                shortcut: "Ctrl+W".into(),
+                separator_after: false,
+                enabled: true,
+            },
+            ContextMenuItem {
+                label: "Close Others".into(),
+                action: "close_others".into(),
+                shortcut: String::new(),
+                separator_after: false,
+                enabled: tabs_len > 1,
+            },
+            ContextMenuItem {
+                label: "Close to the Right".into(),
+                action: "close_right".into(),
+                shortcut: String::new(),
+                separator_after: false,
+                enabled: tab_idx < tabs_len - 1,
+            },
+            ContextMenuItem {
+                label: "Close Saved".into(),
+                action: "close_saved".into(),
+                shortcut: String::new(),
+                separator_after: true,
+                enabled: true,
+            },
+            ContextMenuItem {
+                label: "Copy Path".into(),
+                action: "copy_path".into(),
+                shortcut: String::new(),
+                separator_after: false,
+                enabled: has_file,
+            },
+            ContextMenuItem {
+                label: "Copy Relative Path".into(),
+                action: "copy_relative_path".into(),
+                shortcut: String::new(),
+                separator_after: true,
+                enabled: has_file,
+            },
+            ContextMenuItem {
+                label: "Reveal in File Explorer".into(),
+                action: "reveal".into(),
+                shortcut: String::new(),
+                separator_after: true,
+                enabled: has_file,
+            },
+            ContextMenuItem {
+                label: "Split Right".into(),
+                action: "split_right".into(),
+                shortcut: String::new(),
+                separator_after: false,
+                enabled: true,
+            },
+            ContextMenuItem {
+                label: "Split Down".into(),
+                action: "split_down".into(),
+                shortcut: String::new(),
+                separator_after: false,
+                enabled: true,
+            },
+        ];
+
+        // Select the first enabled item.
+        let selected = items.iter().position(|i| i.enabled).unwrap_or(0);
+
+        self.context_menu = Some(ContextMenuState {
+            target: ContextMenuTarget::Tab { group_id, tab_idx },
+            items,
+            selected,
+            screen_x: x,
+            screen_y: y,
+        });
+    }
+
+    /// Open a context menu for an explorer file/directory.
+    pub fn open_explorer_context_menu(&mut self, path: PathBuf, is_dir: bool, x: u16, y: u16) {
+        let mut items = vec![];
+        if is_dir {
+            // Folder context menu (matches VSCode folder menu)
+            items.push(ContextMenuItem {
+                label: "New File...".into(),
+                action: "new_file".into(),
+                shortcut: String::new(),
+                separator_after: false,
+                enabled: true,
+            });
+            items.push(ContextMenuItem {
+                label: "New Folder...".into(),
+                action: "new_folder".into(),
+                shortcut: String::new(),
+                separator_after: false,
+                enabled: true,
+            });
+            items.push(ContextMenuItem {
+                label: "Open Containing Folder".into(),
+                action: "reveal".into(),
+                shortcut: "Ctrl+Alt+R".into(),
+                separator_after: false,
+                enabled: true,
+            });
+            items.push(ContextMenuItem {
+                label: "Open in Integrated Terminal".into(),
+                action: "open_terminal".into(),
+                shortcut: String::new(),
+                separator_after: false,
+                enabled: true,
+            });
+            items.push(ContextMenuItem {
+                label: "Find in Folder...".into(),
+                action: "find_in_folder".into(),
+                shortcut: "Shift+Alt+F".into(),
+                separator_after: true,
+                enabled: true,
+            });
+            items.push(ContextMenuItem {
+                label: "Copy Path".into(),
+                action: "copy_path".into(),
+                shortcut: "Ctrl+Alt+C".into(),
+                separator_after: false,
+                enabled: true,
+            });
+            items.push(ContextMenuItem {
+                label: "Copy Relative Path".into(),
+                action: "copy_relative_path".into(),
+                shortcut: "Ctrl+Shift+Alt+C".into(),
+                separator_after: true,
+                enabled: true,
+            });
+            items.push(ContextMenuItem {
+                label: "Rename...".into(),
+                action: "rename".into(),
+                shortcut: "F2".into(),
+                separator_after: false,
+                enabled: true,
+            });
+            items.push(ContextMenuItem {
+                label: "Delete".into(),
+                action: "delete".into(),
+                shortcut: "Delete".into(),
+                separator_after: false,
+                enabled: true,
+            });
+        } else {
+            // File context menu (matches VSCode file menu)
+            items.push(ContextMenuItem {
+                label: "Open to the Side".into(),
+                action: "open_side".into(),
+                shortcut: "Ctrl+Enter".into(),
+                separator_after: false,
+                enabled: true,
+            });
+            items.push(ContextMenuItem {
+                label: "Open Containing Folder".into(),
+                action: "reveal".into(),
+                shortcut: "Ctrl+Alt+R".into(),
+                separator_after: false,
+                enabled: true,
+            });
+            items.push(ContextMenuItem {
+                label: "Open in Integrated Terminal".into(),
+                action: "open_terminal".into(),
+                shortcut: String::new(),
+                separator_after: false,
+                enabled: true,
+            });
+            items.push(ContextMenuItem {
+                label: "Select for Compare".into(),
+                action: "select_for_diff".into(),
+                shortcut: String::new(),
+                separator_after: true,
+                enabled: true,
+            });
+            items.push(ContextMenuItem {
+                label: "Copy Path".into(),
+                action: "copy_path".into(),
+                shortcut: "Ctrl+Alt+C".into(),
+                separator_after: false,
+                enabled: true,
+            });
+            items.push(ContextMenuItem {
+                label: "Copy Relative Path".into(),
+                action: "copy_relative_path".into(),
+                shortcut: "Ctrl+Shift+Alt+C".into(),
+                separator_after: true,
+                enabled: true,
+            });
+            items.push(ContextMenuItem {
+                label: "Rename...".into(),
+                action: "rename".into(),
+                shortcut: "F2".into(),
+                separator_after: false,
+                enabled: true,
+            });
+            items.push(ContextMenuItem {
+                label: "Delete".into(),
+                action: "delete".into(),
+                shortcut: "Delete".into(),
+                separator_after: false,
+                enabled: true,
+            });
+        }
+
+        let target = if is_dir {
+            ContextMenuTarget::ExplorerDir { path }
+        } else {
+            ContextMenuTarget::ExplorerFile { path }
+        };
+
+        self.context_menu = Some(ContextMenuState {
+            target,
+            items,
+            selected: 0,
+            screen_x: x,
+            screen_y: y,
+        });
+    }
+
+    /// Close the context menu without executing any action.
+    pub fn close_context_menu(&mut self) {
+        self.context_menu = None;
+    }
+
+    /// Confirm the currently selected context menu item. Returns the action string.
+    pub fn context_menu_confirm(&mut self) -> Option<String> {
+        let menu = self.context_menu.take()?;
+        let item = menu.items.get(menu.selected)?;
+        if !item.enabled {
+            return None;
+        }
+        let action = item.action.clone();
+
+        match &menu.target {
+            ContextMenuTarget::Tab { group_id, tab_idx } => {
+                let group_id = *group_id;
+                let tab_idx = *tab_idx;
+                match action.as_str() {
+                    "close" => {
+                        self.close_tab_at(group_id, tab_idx);
+                    }
+                    "close_others" => {
+                        // Focus the target tab first, then close others.
+                        self.active_group = group_id;
+                        if let Some(g) = self.editor_groups.get_mut(&group_id) {
+                            if tab_idx < g.tabs.len() {
+                                g.active_tab = tab_idx;
+                            }
+                        }
+                        self.close_other_tabs();
+                    }
+                    "close_right" => {
+                        self.active_group = group_id;
+                        if let Some(g) = self.editor_groups.get_mut(&group_id) {
+                            if tab_idx < g.tabs.len() {
+                                g.active_tab = tab_idx;
+                            }
+                        }
+                        self.close_tabs_to_right();
+                    }
+                    "close_saved" => {
+                        self.active_group = group_id;
+                        if let Some(g) = self.editor_groups.get_mut(&group_id) {
+                            if tab_idx < g.tabs.len() {
+                                g.active_tab = tab_idx;
+                            }
+                        }
+                        self.close_saved_tabs();
+                    }
+                    "copy_path" => {
+                        if let Some(path) = self.tab_file_path(group_id, tab_idx) {
+                            let text = path.to_string_lossy().into_owned();
+                            if let Some(ref cb) = self.clipboard_write {
+                                let _ = cb(&text);
+                            }
+                            self.message = format!("Copied: {text}");
+                        }
+                    }
+                    "copy_relative_path" => {
+                        if let Some(path) = self.tab_file_path(group_id, tab_idx) {
+                            let text = self.copy_relative_path(&path);
+                            if let Some(ref cb) = self.clipboard_write {
+                                let _ = cb(&text);
+                            }
+                            self.message = format!("Copied: {text}");
+                        }
+                    }
+                    "reveal" => {
+                        if let Some(path) = self.tab_file_path(group_id, tab_idx) {
+                            self.reveal_in_file_manager(&path);
+                        }
+                    }
+                    "split_right" => {
+                        // Focus the target tab, then split.
+                        self.active_group = group_id;
+                        if let Some(g) = self.editor_groups.get_mut(&group_id) {
+                            if tab_idx < g.tabs.len() {
+                                g.active_tab = tab_idx;
+                            }
+                        }
+                        self.split_window(SplitDirection::Vertical, None);
+                    }
+                    "split_down" => {
+                        self.active_group = group_id;
+                        if let Some(g) = self.editor_groups.get_mut(&group_id) {
+                            if tab_idx < g.tabs.len() {
+                                g.active_tab = tab_idx;
+                            }
+                        }
+                        self.split_window(SplitDirection::Horizontal, None);
+                    }
+                    _ => {}
+                }
+            }
+            ContextMenuTarget::ExplorerFile { path } | ContextMenuTarget::ExplorerDir { path } => {
+                match action.as_str() {
+                    "copy_path" => {
+                        let text = path.to_string_lossy().into_owned();
+                        if let Some(ref cb) = self.clipboard_write {
+                            let _ = cb(&text);
+                        }
+                        self.message = format!("Copied: {text}");
+                    }
+                    "copy_relative_path" => {
+                        let text = self.copy_relative_path(path);
+                        if let Some(ref cb) = self.clipboard_write {
+                            let _ = cb(&text);
+                        }
+                        self.message = format!("Copied: {text}");
+                    }
+                    "reveal" => {
+                        self.reveal_in_file_manager(path);
+                    }
+                    // new_file, new_folder, rename, delete are handled by the UI backend
+                    // since they involve sidebar prompts. Return the action string.
+                    _ => {}
+                }
+            }
+        }
+
+        Some(action)
+    }
+
+    /// Handle keyboard input for the context menu popup.
+    /// Returns true if the key was consumed.
+    pub fn handle_context_menu_key(&mut self, key_name: &str) -> (bool, Option<String>) {
+        if self.context_menu.is_none() {
+            return (false, None);
+        }
+
+        match key_name {
+            "j" | "Down" => {
+                if let Some(ref mut menu) = self.context_menu {
+                    // Move to next enabled item.
+                    let len = menu.items.len();
+                    let mut next = (menu.selected + 1) % len;
+                    let start = next;
+                    loop {
+                        if menu.items[next].enabled {
+                            break;
+                        }
+                        next = (next + 1) % len;
+                        if next == start {
+                            break;
+                        }
+                    }
+                    menu.selected = next;
+                }
+                (true, None)
+            }
+            "k" | "Up" => {
+                if let Some(ref mut menu) = self.context_menu {
+                    let len = menu.items.len();
+                    let mut prev = if menu.selected == 0 {
+                        len - 1
+                    } else {
+                        menu.selected - 1
+                    };
+                    let start = prev;
+                    loop {
+                        if menu.items[prev].enabled {
+                            break;
+                        }
+                        prev = if prev == 0 { len - 1 } else { prev - 1 };
+                        if prev == start {
+                            break;
+                        }
+                    }
+                    menu.selected = prev;
+                }
+                (true, None)
+            }
+            "Return" | "l" => {
+                let action = self.context_menu_confirm();
+                (true, action)
+            }
+            "Escape" | "q" | "h" => {
+                self.close_context_menu();
+                (true, None)
+            }
+            _ => {
+                self.close_context_menu();
+                (true, None)
+            }
+        }
+    }
+
     /// Record the current (group, tab_index) as the most recently used tab.
     pub fn tab_mru_touch(&mut self) {
         let entry = (self.active_group, self.active_group().active_tab);
@@ -6735,6 +7354,14 @@ impl Engine {
                 return self.process_dialog_result(&tag, &action);
             }
             return EngineAction::None;
+        }
+
+        // Context menu intercepts all keys when open.
+        if self.context_menu.is_some() {
+            let (consumed, _action) = self.handle_context_menu_key(key_name);
+            if consumed {
+                return EngineAction::None;
+            }
         }
 
         // Ctrl+Tab opens the tab switcher (or cycles forward if already open).
@@ -16426,8 +17053,17 @@ impl Engine {
         }
 
         // Handle :tabc[lose]
-        if cmd == "tabclose" {
-            self.close_tab();
+        if cmd == "tabclose" || cmd.starts_with("tabclose ") {
+            let arg = cmd.strip_prefix("tabclose").unwrap().trim();
+            match arg {
+                "others" => self.close_other_tabs(),
+                "right" => self.close_tabs_to_right(),
+                "left" => self.close_tabs_to_left(),
+                "saved" => self.close_saved_tabs(),
+                _ => {
+                    self.close_tab();
+                }
+            }
             return EngineAction::None;
         }
 

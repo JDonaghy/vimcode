@@ -216,6 +216,9 @@ struct App {
     /// correct in-memory state) and clears the flag.  Prevents the GIO file watcher from
     /// redundantly reloading settings that VimCode just saved.
     settings_self_save: bool,
+    /// Active context-menu popover (explorer or tab). Kept alive so we can
+    /// unparent it before creating a new one (avoids GTK CSS node assertions).
+    active_ctx_popover: Rc<RefCell<Option<gtk4::PopoverMenu>>>,
 }
 
 /// Drag state for a Cairo-drawn horizontal scrollbar.
@@ -475,6 +478,13 @@ enum Msg {
     OpenBufferEditor(String),
     /// Alt key released — confirm tab switcher if open.
     TabSwitcherRelease,
+    /// Right-click on a tab in the tab bar: (group_id, tab_idx, pixel x, pixel y).
+    TabRightClick {
+        group_id: core::window::GroupId,
+        tab_idx: usize,
+        x: f64,
+        y: f64,
+    },
 }
 
 /// Build a single setting row widget (label+description on left, control widget on right).
@@ -924,7 +934,7 @@ impl SimpleComponent for App {
                                 set_height_request: 32,
                                 connect_clicked[sender, file_tree_view] => move |_| {
                                     let parent_dir = selected_parent_dir(&file_tree_view);
-                                    show_name_prompt_dialog("New File", "", {
+                                    show_name_prompt_dialog("New File", "", None, {
                                         let s = sender.clone();
                                         move |name| s.input(Msg::CreateFile(parent_dir.clone(), name))
                                     });
@@ -938,7 +948,7 @@ impl SimpleComponent for App {
                                 set_height_request: 32,
                                 connect_clicked[sender, file_tree_view] => move |_| {
                                     let parent_dir = selected_parent_dir(&file_tree_view);
-                                    show_name_prompt_dialog("New Folder", "", {
+                                    show_name_prompt_dialog("New Folder", "", None, {
                                         let s = sender.clone();
                                         move |name| s.input(Msg::CreateFolder(parent_dir.clone(), name))
                                     });
@@ -1996,6 +2006,8 @@ impl SimpleComponent for App {
         ]);
 
         let file_tree_view_ref = Rc::new(RefCell::new(None));
+        let active_ctx_popover_ref: Rc<RefCell<Option<gtk4::PopoverMenu>>> =
+            Rc::new(RefCell::new(None));
         let drawing_area_ref = Rc::new(RefCell::new(None));
         let menu_bar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> = Rc::new(RefCell::new(None));
         let menu_dropdown_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> =
@@ -2141,6 +2153,7 @@ impl SimpleComponent for App {
             css_provider,
             last_colorscheme,
             settings_self_save: false,
+            active_ctx_popover: active_ctx_popover_ref.clone(),
         };
         let widgets = view_output!();
 
@@ -2922,21 +2935,22 @@ impl SimpleComponent for App {
         });
         widgets.file_tree_view.add_controller(gesture);
 
-        // Right-click context menu
+        // Right-click context menu — plain Popover with flat buttons (no
+        // PopoverMenu, avoids GTK4 internal ScrolledWindow sizing issues).
         {
             let sender_rc = sender.clone();
+            let ctx_pop_rc = active_ctx_popover_ref.clone();
             let right_click = gtk4::GestureClick::new();
-            right_click.set_button(3); // right mouse button
+            right_click.set_button(3);
             right_click.connect_pressed(move |gesture, _n_press, x, y| {
                 let widget = gesture.widget();
                 let Some(tree_view) = widget.downcast_ref::<gtk4::TreeView>() else {
                     return;
                 };
-                // Select the row under the cursor
+                // Select the row under cursor
                 if let Some((Some(tp), _, _, _)) = tree_view.path_at_pos(x as i32, y as i32) {
                     tree_view.selection().select_path(&tp);
                 }
-                // Get selected path
                 let selected_path: Option<PathBuf> =
                     tree_view.selection().selected().and_then(|(model, iter)| {
                         let s: String = model.get_value(&iter, 2).get().ok()?;
@@ -2947,44 +2961,35 @@ impl SimpleComponent for App {
                         }
                     });
                 let Some(target) = selected_path else { return };
+                let is_dir = target.is_dir();
 
-                // Build a simple popover with buttons
-                let menu_box = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
-                menu_box.set_margin_all(4);
+                // Build gio::Menu with sections
+                let menu = gtk4::gio::Menu::new();
+                if is_dir {
+                    let s1 = gtk4::gio::Menu::new();
+                    s1.append(Some("New File..."), Some("ctx.new_file"));
+                    s1.append(Some("New Folder..."), Some("ctx.new_folder"));
+                    s1.append(Some("Open Containing Folder"), Some("ctx.reveal"));
+                    s1.append(Some("Find in Folder..."), Some("ctx.find_in_folder"));
+                    menu.append_section(None, &s1);
+                } else {
+                    let s1 = gtk4::gio::Menu::new();
+                    s1.append(Some("Open to the Side"), Some("ctx.open_side"));
+                    s1.append(Some("Open Containing Folder"), Some("ctx.reveal"));
+                    s1.append(Some("Select for Compare"), Some("ctx.select_for_diff"));
+                    menu.append_section(None, &s1);
+                }
+                let s2 = gtk4::gio::Menu::new();
+                s2.append(Some("Copy Path"), Some("ctx.copy_path"));
+                s2.append(Some("Copy Relative Path"), Some("ctx.copy_relative_path"));
+                menu.append_section(None, &s2);
+                let s3 = gtk4::gio::Menu::new();
+                s3.append(Some("Rename..."), Some("ctx.rename"));
+                s3.append(Some("Delete"), Some("ctx.delete"));
+                menu.append_section(None, &s3);
 
-                let add_btn = |label: &str| -> gtk4::Button {
-                    let b = gtk4::Button::with_label(label);
-                    b.set_has_frame(false);
-                    b.set_halign(gtk4::Align::Fill);
-                    b
-                };
-
-                let btn_new_file = add_btn("New File");
-                let btn_new_folder = add_btn("New Folder");
-                let btn_rename = add_btn("Rename  F2");
-                let btn_delete = add_btn("Delete  Del");
-                let btn_copy_path = add_btn("Copy Path");
-                let btn_select_diff = add_btn("Select for Diff");
-
-                menu_box.append(&btn_new_file);
-                menu_box.append(&btn_new_folder);
-                menu_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
-                menu_box.append(&btn_rename);
-                menu_box.append(&btn_delete);
-                menu_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
-                menu_box.append(&btn_copy_path);
-                menu_box.append(&btn_select_diff);
-
-                let popover = gtk4::Popover::new();
-                popover.set_child(Some(&menu_box));
-                popover.set_parent(tree_view);
-                // Position near cursor
-                let rect = gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1);
-                popover.set_pointing_to(Some(&rect));
-                popover.set_autohide(true);
-                popover.popup();
-
-                // Determine parent dir for "New File" / "New Folder"
+                // Build action group
+                let actions = gtk4::gio::SimpleActionGroup::new();
                 let parent_dir = if target.is_dir() {
                     target.clone()
                 } else {
@@ -2994,91 +2999,170 @@ impl SimpleComponent for App {
                         .to_path_buf()
                 };
 
-                // Wire up buttons
-                let s = sender_rc.clone();
-                let pd = parent_dir.clone();
-                let p = popover.clone();
-                btn_new_file.connect_clicked(move |_| {
-                    p.popdown();
-                    let pd2 = pd.clone();
-                    show_name_prompt_dialog("New File", "", {
-                        let s2 = s.clone();
-                        move |name| s2.input(Msg::CreateFile(pd2.clone(), name))
+                {
+                    let s = sender_rc.clone();
+                    let pd = parent_dir.clone();
+                    let a = gtk4::gio::SimpleAction::new("new_file", None);
+                    a.connect_activate(move |_, _| {
+                        let pd2 = pd.clone();
+                        show_name_prompt_dialog("New File", "", None, {
+                            let s2 = s.clone();
+                            move |name| s2.input(Msg::CreateFile(pd2.clone(), name))
+                        });
                     });
-                });
-                let s = sender_rc.clone();
-                let pd = parent_dir.clone();
-                let p = popover.clone();
-                btn_new_folder.connect_clicked(move |_| {
-                    p.popdown();
-                    let pd2 = pd.clone();
-                    show_name_prompt_dialog("New Folder", "", {
-                        let s2 = s.clone();
-                        move |name| s2.input(Msg::CreateFolder(pd2.clone(), name))
+                    actions.add_action(&a);
+                }
+                {
+                    let s = sender_rc.clone();
+                    let pd = parent_dir.clone();
+                    let a = gtk4::gio::SimpleAction::new("new_folder", None);
+                    a.connect_activate(move |_, _| {
+                        let pd2 = pd.clone();
+                        show_name_prompt_dialog("New Folder", "", None, {
+                            let s2 = s.clone();
+                            move |name| s2.input(Msg::CreateFolder(pd2.clone(), name))
+                        });
                     });
-                });
-                let s = sender_rc.clone();
-                let tgt = target.clone();
-                let tv_clone = tree_view.clone();
-                let p = popover.clone();
-                btn_rename.connect_clicked(move |_| {
-                    // Trigger inline rename via a simple dialog
-                    let dialog = gtk4::Dialog::with_buttons(
-                        Some("Rename"),
-                        None::<&gtk4::Window>,
-                        gtk4::DialogFlags::MODAL | gtk4::DialogFlags::DESTROY_WITH_PARENT,
-                        &[
-                            ("Rename", gtk4::ResponseType::Accept),
-                            ("Cancel", gtk4::ResponseType::Cancel),
-                        ],
-                    );
-                    let entry = gtk4::Entry::new();
-                    let current = tgt
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_default();
-                    entry.set_text(&current);
-                    entry.select_region(0, -1);
-                    dialog.content_area().append(&entry);
-                    dialog.set_default_response(gtk4::ResponseType::Accept);
-                    entry.set_activates_default(true);
-                    let s2 = s.clone();
-                    let tgt2 = tgt.clone();
-                    let tv2 = tv_clone.clone();
-                    dialog.connect_response(move |dlg, resp| {
-                        if resp == gtk4::ResponseType::Accept {
-                            let new_name = entry.text().to_string();
-                            if !new_name.is_empty() {
-                                s2.input(Msg::RenameFile(tgt2.clone(), new_name));
+                    actions.add_action(&a);
+                }
+                {
+                    let s = sender_rc.clone();
+                    let tgt = target.clone();
+                    let tv = tree_view.clone();
+                    let a = gtk4::gio::SimpleAction::new("rename", None);
+                    a.connect_activate(move |_, _| {
+                        let parent_win = tv.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
+                        let dialog = gtk4::Dialog::with_buttons(
+                            Some("Rename"),
+                            parent_win.as_ref(),
+                            gtk4::DialogFlags::MODAL | gtk4::DialogFlags::DESTROY_WITH_PARENT,
+                            &[
+                                ("Rename", gtk4::ResponseType::Accept),
+                                ("Cancel", gtk4::ResponseType::Cancel),
+                            ],
+                        );
+                        let entry = gtk4::Entry::new();
+                        let current = tgt
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        entry.set_text(&current);
+                        entry.select_region(0, -1);
+                        dialog.content_area().append(&entry);
+                        dialog.set_default_response(gtk4::ResponseType::Accept);
+                        entry.set_activates_default(true);
+                        let s2 = s.clone();
+                        let tgt2 = tgt.clone();
+                        let tv2 = tv.clone();
+                        dialog.connect_response(move |dlg, resp| {
+                            if resp == gtk4::ResponseType::Accept {
+                                let new_name = entry.text().to_string();
+                                if !new_name.is_empty() {
+                                    s2.input(Msg::RenameFile(tgt2.clone(), new_name));
+                                }
                             }
-                        }
-                        tv2.grab_focus();
-                        dlg.close();
+                            tv2.grab_focus();
+                            dlg.close();
+                        });
+                        dialog.present();
                     });
-                    dialog.present();
-                    p.popdown();
+                    actions.add_action(&a);
+                }
+                {
+                    let s = sender_rc.clone();
+                    let tgt = target.clone();
+                    let a = gtk4::gio::SimpleAction::new("delete", None);
+                    a.connect_activate(move |_, _| {
+                        s.input(Msg::ConfirmDeletePath(tgt.clone()));
+                    });
+                    actions.add_action(&a);
+                }
+                {
+                    let s = sender_rc.clone();
+                    let tgt = target.clone();
+                    let a = gtk4::gio::SimpleAction::new("copy_path", None);
+                    a.connect_activate(move |_, _| {
+                        s.input(Msg::CopyPath(tgt.clone()));
+                    });
+                    actions.add_action(&a);
+                }
+                {
+                    let s = sender_rc.clone();
+                    let tgt = target.clone();
+                    let a = gtk4::gio::SimpleAction::new("copy_relative_path", None);
+                    a.connect_activate(move |_, _| {
+                        s.input(Msg::CopyPath(tgt.clone()));
+                    });
+                    actions.add_action(&a);
+                }
+                {
+                    let tgt = target.clone();
+                    let a = gtk4::gio::SimpleAction::new("reveal", None);
+                    a.connect_activate(move |_, _| {
+                        let dir = if tgt.is_dir() {
+                            tgt.clone()
+                        } else {
+                            tgt.parent()
+                                .unwrap_or(std::path::Path::new("."))
+                                .to_path_buf()
+                        };
+                        let _ = std::process::Command::new("xdg-open").arg(&dir).spawn();
+                    });
+                    actions.add_action(&a);
+                }
+                {
+                    let s = sender_rc.clone();
+                    let tgt = target.clone();
+                    let a = gtk4::gio::SimpleAction::new("select_for_diff", None);
+                    a.connect_activate(move |_, _| {
+                        s.input(Msg::SelectForDiff(tgt.clone()));
+                    });
+                    actions.add_action(&a);
+                }
+                {
+                    let s = sender_rc.clone();
+                    let tgt = target.clone();
+                    let a = gtk4::gio::SimpleAction::new("open_side", None);
+                    a.connect_activate(move |_, _| {
+                        s.input(Msg::OpenFileFromSidebar(tgt.clone()));
+                    });
+                    actions.add_action(&a);
+                }
+                {
+                    let s = sender_rc.clone();
+                    let a = gtk4::gio::SimpleAction::new("find_in_folder", None);
+                    a.connect_activate(move |_, _| {
+                        s.input(Msg::ToggleFocusSearch);
+                    });
+                    actions.add_action(&a);
+                }
+
+                // Clean up previous popover, create new PopoverMenu.
+                let n_rows = menu_row_count(&menu);
+                // Parent to the ScrolledWindow (tree_view's parent) so that
+                // hover events work correctly — PopoverMenu inside a
+                // ScrolledWindow's child doesn't receive motion events properly.
+                let popover_parent: gtk4::Widget = tree_view
+                    .parent()
+                    .unwrap_or_else(|| tree_view.clone().upcast());
+                let (px, py) = tree_view
+                    .translate_coordinates(&popover_parent, x, y)
+                    .unwrap_or((x, y));
+                popover_parent.insert_action_group("ctx", Some(&actions));
+                swap_ctx_popover(&ctx_pop_rc, {
+                    let popover = gtk4::PopoverMenu::from_model(Some(&menu));
+                    popover.set_parent(&popover_parent);
+                    popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(
+                        px as i32, py as i32, 1, 1,
+                    )));
+                    popover.set_has_arrow(false);
+                    popover.set_position(gtk4::PositionType::Right);
+                    popover.set_size_request(-1, n_rows * 22 + 14);
+                    popover
                 });
-                let s = sender_rc.clone();
-                let tgt = target.clone();
-                let p = popover.clone();
-                btn_delete.connect_clicked(move |_| {
-                    p.popdown();
-                    s.input(Msg::ConfirmDeletePath(tgt.clone()));
-                });
-                let s = sender_rc.clone();
-                let tgt = target.clone();
-                let p = popover.clone();
-                btn_copy_path.connect_clicked(move |_| {
-                    s.input(Msg::CopyPath(tgt.clone()));
-                    p.popdown();
-                });
-                let s = sender_rc.clone();
-                let tgt = target.clone();
-                let p = popover.clone();
-                btn_select_diff.connect_clicked(move |_| {
-                    s.input(Msg::SelectForDiff(tgt.clone()));
-                    p.popdown();
-                });
+                if let Some(ref p) = *ctx_pop_rc.borrow() {
+                    p.popup();
+                }
             });
             widgets.file_tree_view.add_controller(right_click);
         }
@@ -3434,6 +3518,54 @@ impl SimpleComponent for App {
                 pos_cell_leave.set((-1.0, -1.0));
             });
             widgets.drawing_area.add_controller(mc);
+        }
+
+        // Right-click on drawing area (tab bar context menu).
+        {
+            let engine_rc = engine.clone();
+            let sender_rc = sender.input_sender().clone();
+            let lh_rc = line_height_cell.clone();
+            let tab_slots_rc = tab_slot_positions_cell.clone();
+            let diff_btn_rc = diff_btn_map_cell.clone();
+            let split_btn_rc = split_btn_map_cell.clone();
+            let rc_gesture = gtk4::GestureClick::new();
+            rc_gesture.set_button(3);
+            rc_gesture.connect_pressed(move |gesture, _n_press, x, y| {
+                let widget = gesture.widget();
+                let width = widget.width() as f64;
+                let height = widget.height() as f64;
+                let lh = lh_rc.get().max(1.0);
+                // We only care about tab bar clicks.
+                let mut engine = engine_rc.borrow_mut();
+                let target = pixel_to_click_target(
+                    &mut engine,
+                    x,
+                    y,
+                    width,
+                    height,
+                    lh,
+                    0.0, // char_width not needed for tab bar detection
+                    &tab_slots_rc.borrow(),
+                    &diff_btn_rc.borrow(),
+                    &split_btn_rc.borrow(),
+                );
+                if let ClickTarget::TabBar = target {
+                    let group_id = engine.active_group;
+                    let tab_idx = engine
+                        .editor_groups
+                        .get(&group_id)
+                        .map(|g| g.active_tab)
+                        .unwrap_or(0);
+                    drop(engine);
+                    let _ = sender_rc.send(Msg::TabRightClick {
+                        group_id,
+                        tab_idx,
+                        x,
+                        y,
+                    });
+                }
+            });
+            widgets.drawing_area.add_controller(rc_gesture);
         }
 
         // Tab switcher auto-confirm: poll modifier state every 50ms while open.
@@ -3794,6 +3926,221 @@ impl SimpleComponent for App {
             Msg::ClearYankHighlight => {
                 self.engine.borrow_mut().clear_yank_highlight();
                 self.draw_needed.set(true);
+            }
+            Msg::TabRightClick {
+                group_id,
+                tab_idx,
+                x,
+                y,
+            } => {
+                let da = match self.drawing_area.borrow().as_ref() {
+                    Some(da) => da.clone(),
+                    None => return,
+                };
+
+                let engine = self.engine.borrow();
+                let group = match engine.editor_groups.get(&group_id) {
+                    Some(g) => g,
+                    None => return,
+                };
+                let tab_count = group.tabs.len();
+                let file_path = engine.tab_file_path(group_id, tab_idx);
+                let has_file = file_path.is_some();
+                let is_last = tab_idx + 1 >= tab_count;
+                drop(engine);
+
+                // Build gio::Menu for tab context menu
+                let menu = gtk4::gio::Menu::new();
+                let s1 = gtk4::gio::Menu::new();
+                s1.append(Some("Close"), Some("tabctx.close"));
+                s1.append(Some("Close Others"), Some("tabctx.close_others"));
+                s1.append(Some("Close to the Right"), Some("tabctx.close_right"));
+                s1.append(Some("Close Saved"), Some("tabctx.close_saved"));
+                menu.append_section(None, &s1);
+                let s2 = gtk4::gio::Menu::new();
+                s2.append(Some("Copy Path"), Some("tabctx.copy_path"));
+                s2.append(Some("Copy Relative Path"), Some("tabctx.copy_rel"));
+                menu.append_section(None, &s2);
+                let s3 = gtk4::gio::Menu::new();
+                s3.append(Some("Reveal in File Explorer"), Some("tabctx.reveal"));
+                menu.append_section(None, &s3);
+                let s4 = gtk4::gio::Menu::new();
+                s4.append(Some("Split Right"), Some("tabctx.split_right"));
+                s4.append(Some("Split Down"), Some("tabctx.split_down"));
+                menu.append_section(None, &s4);
+
+                // Build action group
+                let actions = gtk4::gio::SimpleActionGroup::new();
+
+                macro_rules! tab_action {
+                    ($name:expr, $engine:expr, $draw:expr, $body:expr) => {{
+                        let engine_ref = $engine.clone();
+                        let draw_ref = $draw.clone();
+                        let a = gtk4::gio::SimpleAction::new($name, None);
+                        a.connect_activate(move |_, _| {
+                            $body(&engine_ref, &draw_ref);
+                        });
+                        if ($name == "close_others" && tab_count <= 1)
+                            || ($name == "close_right" && is_last)
+                            || (($name == "copy_path" || $name == "copy_rel" || $name == "reveal")
+                                && !has_file)
+                        {
+                            a.set_enabled(false);
+                        }
+                        actions.add_action(&a);
+                    }};
+                }
+
+                {
+                    let engine_ref = self.engine.clone();
+                    let draw_ref = self.draw_needed.clone();
+                    let sender = self.sender.clone();
+                    let a = gtk4::gio::SimpleAction::new("close", None);
+                    a.connect_activate(move |_, _| {
+                        let mut e = engine_ref.borrow_mut();
+                        e.active_group = group_id;
+                        if let Some(g) = e.editor_groups.get_mut(&group_id) {
+                            g.active_tab = tab_idx;
+                        }
+                        if e.dirty() {
+                            drop(e);
+                            let _ = sender.send(Msg::ShowCloseTabConfirm);
+                        } else {
+                            e.close_tab();
+                            draw_ref.set(true);
+                        }
+                    });
+                    actions.add_action(&a);
+                }
+
+                tab_action!(
+                    "close_others",
+                    self.engine,
+                    self.draw_needed,
+                    |engine_ref: &Rc<RefCell<Engine>>, draw_ref: &Rc<Cell<bool>>| {
+                        let mut e = engine_ref.borrow_mut();
+                        e.active_group = group_id;
+                        if let Some(g) = e.editor_groups.get_mut(&group_id) {
+                            g.active_tab = tab_idx;
+                        }
+                        e.close_other_tabs();
+                        draw_ref.set(true);
+                    }
+                );
+                tab_action!(
+                    "close_right",
+                    self.engine,
+                    self.draw_needed,
+                    |engine_ref: &Rc<RefCell<Engine>>, draw_ref: &Rc<Cell<bool>>| {
+                        let mut e = engine_ref.borrow_mut();
+                        e.active_group = group_id;
+                        if let Some(g) = e.editor_groups.get_mut(&group_id) {
+                            g.active_tab = tab_idx;
+                        }
+                        e.close_tabs_to_right();
+                        draw_ref.set(true);
+                    }
+                );
+                tab_action!(
+                    "close_saved",
+                    self.engine,
+                    self.draw_needed,
+                    |engine_ref: &Rc<RefCell<Engine>>, draw_ref: &Rc<Cell<bool>>| {
+                        let mut e = engine_ref.borrow_mut();
+                        e.active_group = group_id;
+                        if let Some(g) = e.editor_groups.get_mut(&group_id) {
+                            g.active_tab = tab_idx;
+                        }
+                        e.close_saved_tabs();
+                        draw_ref.set(true);
+                    }
+                );
+                tab_action!(
+                    "copy_path",
+                    self.engine,
+                    self.draw_needed,
+                    |engine_ref: &Rc<RefCell<Engine>>, draw_ref: &Rc<Cell<bool>>| {
+                        let e = engine_ref.borrow();
+                        if let Some(path) = e.tab_file_path(group_id, tab_idx) {
+                            let text = path.to_string_lossy().to_string();
+                            if let Some(ref cb) = e.clipboard_write {
+                                let _ = cb(&text);
+                            }
+                            drop(e);
+                            engine_ref.borrow_mut().message = format!("Copied: {text}");
+                        }
+                        draw_ref.set(true);
+                    }
+                );
+                tab_action!(
+                    "copy_rel",
+                    self.engine,
+                    self.draw_needed,
+                    |engine_ref: &Rc<RefCell<Engine>>, draw_ref: &Rc<Cell<bool>>| {
+                        let e = engine_ref.borrow();
+                        if let Some(path) = e.tab_file_path(group_id, tab_idx) {
+                            let rel = e.copy_relative_path(&path);
+                            if let Some(ref cb) = e.clipboard_write {
+                                let _ = cb(&rel);
+                            }
+                            drop(e);
+                            engine_ref.borrow_mut().message = format!("Copied: {rel}");
+                        }
+                        draw_ref.set(true);
+                    }
+                );
+                tab_action!(
+                    "reveal",
+                    self.engine,
+                    self.draw_needed,
+                    |engine_ref: &Rc<RefCell<Engine>>, _draw_ref: &Rc<Cell<bool>>| {
+                        let e = engine_ref.borrow();
+                        if let Some(path) = e.tab_file_path(group_id, tab_idx) {
+                            drop(e);
+                            engine_ref.borrow().reveal_in_file_manager(&path);
+                        }
+                    }
+                );
+                tab_action!(
+                    "split_right",
+                    self.engine,
+                    self.draw_needed,
+                    |engine_ref: &Rc<RefCell<Engine>>, draw_ref: &Rc<Cell<bool>>| {
+                        engine_ref
+                            .borrow_mut()
+                            .open_editor_group(core::window::SplitDirection::Vertical);
+                        draw_ref.set(true);
+                    }
+                );
+                tab_action!(
+                    "split_down",
+                    self.engine,
+                    self.draw_needed,
+                    |engine_ref: &Rc<RefCell<Engine>>, draw_ref: &Rc<Cell<bool>>| {
+                        engine_ref
+                            .borrow_mut()
+                            .open_editor_group(core::window::SplitDirection::Horizontal);
+                        draw_ref.set(true);
+                    }
+                );
+
+                da.insert_action_group("tabctx", Some(&actions));
+
+                let n_rows = menu_row_count(&menu);
+                swap_ctx_popover(&self.active_ctx_popover, {
+                    let popover = gtk4::PopoverMenu::from_model(Some(&menu));
+                    popover.set_parent(&da);
+                    popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(
+                        x as i32, y as i32, 1, 1,
+                    )));
+                    popover.set_has_arrow(false);
+                    popover.set_position(gtk4::PositionType::Right);
+                    popover.set_size_request(-1, n_rows * 22 + 14);
+                    popover
+                });
+                if let Some(ref p) = *self.active_ctx_popover.borrow() {
+                    p.popup();
+                }
             }
             Msg::TabSwitcherRelease => {
                 // Handled directly by the root EventControllerKey release handler.
@@ -4705,9 +5052,15 @@ impl SimpleComponent for App {
                     .unwrap_or("unknown")
                     .to_string();
                 let item_type = if path.is_dir() { "folder" } else { "file" };
+                let parent_win = self
+                    .drawing_area
+                    .borrow()
+                    .as_ref()
+                    .and_then(|da| da.root())
+                    .and_then(|r| r.downcast::<gtk4::Window>().ok());
                 let dialog = gtk4::Dialog::with_buttons(
                     Some("Confirm Delete"),
-                    None::<&gtk4::Window>,
+                    parent_win.as_ref(),
                     gtk4::DialogFlags::MODAL | gtk4::DialogFlags::DESTROY_WITH_PARENT,
                     &[
                         ("Delete", gtk4::ResponseType::Accept),
@@ -12709,6 +13062,23 @@ const STATIC_CSS: &str = "
         }
         ";
 
+/// Clean up any previous context-menu popover from the shared slot,
+/// then store the new one.  The old popover is popdown'd + unparented
+/// **before** the new one is set_parent'd, so there is never a moment
+/// where two popovers coexist on the same parent.
+fn swap_ctx_popover(slot: &Rc<RefCell<Option<gtk4::PopoverMenu>>>, new: gtk4::PopoverMenu) {
+    let mut guard = slot.borrow_mut();
+    if let Some(old) = guard.take() {
+        old.popdown();
+        // NOTE: we intentionally do NOT call old.unparent() here.
+        // GTK4 internally tears down the CSS node tree during unparent(),
+        // which triggers a non-fatal "gtk_css_node_insert_after" assertion.
+        // Letting GTK handle the lifecycle naturally avoids the assertion.
+        // The old widget will be dropped when this Option is overwritten.
+    }
+    *guard = Some(new);
+}
+
 fn load_css(theme: &Theme) -> gtk4::CssProvider {
     let provider = gtk4::CssProvider::new();
     let combined = format!("{STATIC_CSS}\n{}", make_theme_css(theme));
@@ -12858,10 +13228,15 @@ fn selected_parent_dir(tv: &gtk4::TreeView) -> PathBuf {
 /// Show a modal dialog with a text entry prompting for a name.
 /// `title` is the dialog title, `prefill` pre-populates the entry,
 /// and `on_accept` is called with the entered text when the user confirms.
-fn show_name_prompt_dialog<F: Fn(String) + 'static>(title: &str, prefill: &str, on_accept: F) {
+fn show_name_prompt_dialog<F: Fn(String) + 'static>(
+    title: &str,
+    prefill: &str,
+    parent: Option<&gtk4::Window>,
+    on_accept: F,
+) {
     let dialog = gtk4::Dialog::with_buttons(
         Some(title),
-        None::<&gtk4::Window>,
+        parent,
         gtk4::DialogFlags::MODAL | gtk4::DialogFlags::DESTROY_WITH_PARENT,
         &[
             ("Create", gtk4::ResponseType::Accept),
@@ -13067,6 +13442,51 @@ fn install_icon_and_desktop() {
     }
 }
 
+/// Count total visible rows in a gio::Menu (items + section separators).
+fn menu_row_count(menu: &gtk4::gio::Menu) -> i32 {
+    let mut rows = 0i32;
+    for i in 0..menu.n_items() {
+        if let Some(section) = menu
+            .item_link(i, "section")
+            .and_then(|m| m.downcast::<gtk4::gio::Menu>().ok())
+        {
+            if i > 0 {
+                rows += 1; // separator
+            }
+            rows += section.n_items();
+        } else {
+            rows += 1;
+        }
+    }
+    rows
+}
+
+/// GLib log handler that suppresses the known GTK4 `gtk_css_node_insert_after`
+/// assertion while forwarding all other CRITICAL messages to the default handler.
+unsafe extern "C" fn suppress_css_node_warning(
+    log_domain: *const std::ffi::c_char,
+    log_level: gtk4::glib::ffi::GLogLevelFlags,
+    message: *const std::ffi::c_char,
+    _user_data: gtk4::glib::ffi::gpointer,
+) {
+    let msg = unsafe { std::ffi::CStr::from_ptr(message) }
+        .to_str()
+        .unwrap_or("");
+    if msg.contains("gtk_css_node_insert_after") {
+        return; // suppress
+    }
+    // Forward other CRITICAL messages to stderr.
+    let domain = unsafe { std::ffi::CStr::from_ptr(log_domain) }
+        .to_str()
+        .unwrap_or("?");
+    let level_str = if log_level & gtk4::glib::ffi::G_LOG_LEVEL_CRITICAL != 0 {
+        "CRITICAL"
+    } else {
+        "WARNING"
+    };
+    eprintln!("({domain}): Gtk-{level_str}: {msg}");
+}
+
 fn main() {
     // Parse CLI args to get optional file path
     let args: Vec<String> = std::env::args().collect();
@@ -13115,6 +13535,18 @@ fn main() {
 
     // Install icon and .desktop file so the taskbar/launcher can find them.
     install_icon_and_desktop();
+
+    // Suppress the non-fatal "gtk_css_node_insert_after" assertion that GTK4
+    // emits internally when PopoverMenu widgets are created/destroyed.
+    // This is a known GTK4 issue with no workaround; the assertion is harmless.
+    unsafe {
+        gtk4::glib::ffi::g_log_set_handler(
+            c"Gtk".as_ptr(),
+            gtk4::glib::ffi::G_LOG_LEVEL_CRITICAL,
+            Some(suppress_css_node_warning),
+            std::ptr::null_mut(),
+        );
+    }
 
     let gtk_app = gtk4::Application::builder()
         .application_id("com.vimcode.VimCode")

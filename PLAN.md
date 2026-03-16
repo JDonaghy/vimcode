@@ -5,6 +5,7 @@
 ---
 
 ## Recently Completed
+- **Session 184**: Right-Click Context Menus — explorer + tab bar context menus in both GTK and TUI; `ContextMenuState`/`ContextMenuTarget` data model; different menus for files vs folders; `PopoverMenu` with `gio::Menu` sections in GTK; box-drawing overlay in TUI; mouse hover highlighting; GLib log handler for non-fatal GTK4 assertion; 38 new tests (4460 total).
 - **Session 183**: Vim Compatibility Gap Closure — `[#`/`]#` preprocessor navigation, `gR` virtual replace mode, `g+`/`g-` timeline undo, `q:`/`q/`/`q?` command-line history window; VIM_COMPATIBILITY 412→414/417 (99%); 31 new tests (4422 total).
 - **Session 182**: LaTeX Extension (Parts A + C) — LaTeX text objects + motions + registry extension; 22 new tests (4391 total).
 - **Session 181**: LaTeX Extension (Part B) — tree-sitter LaTeX syntax highlighting (18th language); vendored grammar v0.3.0 via build.rs+cc; LaTeX-aware spell checking (inverted logic: check prose, skip commands/math); `check_line()` API updated from `bool` to `Option<SyntaxLanguage>`.
@@ -74,6 +75,9 @@
 - [x] **AI assistant panel** — sidebar chat panel; configurable provider (Anthropic Claude, OpenAI, Ollama local); `ai_provider`/`ai_api_key`/`ai_model`/`ai_base_url` in settings; activity bar chat icon opens panel; multi-turn conversation; `:AI <msg>` and `:AiClear` commands (session 118)
 - [x] **AI inline completions** — ghost-text completions from AI provider interleaved with LSP ghost text; separate `ai_completions` setting (default false to avoid unexpected API costs); debounced after 500ms idle in insert mode; Tab accepts whole suggestion, `Alt-]`/`Alt-[` cycle through alternatives
 - [x] **Swap file crash recovery** — Vim-like swap files (`~/.config/vimcode/swap/`); FNV-1a path hashing; atomic writes (`.tmp` + rename); PID-based stale detection; `[R]ecover/[D]elete/[A]bort` recovery dialog; `:set swapfile`/`:set updatetime=N`; periodic writes via `tick_swap_files()`; cleanup on shutdown
+
+### Context Menus
+- [ ] **Context menu action polish** — Review and fix all right-click menu item behaviors in both explorer and tab bar context menus; "Select for Compare" should change to "Compare with Selected" after first selection, and triggering it should open a diff view; verify all actions work correctly (New File, New Folder, Rename, Delete, Copy Path, Copy Relative Path, Open to Side, Reveal, Find in Folder, Close/Close Others/Close Right/Close Saved, Split Right/Down)
 
 ### Documentation
 - [x] **GitHub Wiki** — 9 pages: Home, Getting Started, Key Remapping, Settings Reference, Extension Development, Lua Plugin API, Theme Customization, DAP Debugger Setup, LSP Configuration; README Documentation section links to wiki
