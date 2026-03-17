@@ -804,6 +804,7 @@ pub enum ContextMenuTarget {
     Tab { group_id: GroupId, tab_idx: usize },
     ExplorerFile { path: PathBuf },
     ExplorerDir { path: PathBuf },
+    Editor,
 }
 
 /// A single item in a context menu popup.
@@ -5758,6 +5759,13 @@ impl Engine {
                 enabled: true,
             });
             items.push(ContextMenuItem {
+                label: "Open to the Side (vsplit)".into(),
+                action: "open_side_vsplit".into(),
+                shortcut: String::new(),
+                separator_after: false,
+                enabled: true,
+            });
+            items.push(ContextMenuItem {
                 label: "Open Containing Folder".into(),
                 action: "reveal".into(),
                 shortcut: "Ctrl+Alt+R".into(),
@@ -5841,6 +5849,90 @@ impl Engine {
             target,
             items,
             selected: 0,
+            screen_x: x,
+            screen_y: y,
+        });
+    }
+
+    /// Open a context menu for the editor area (right-click on buffer text).
+    pub fn open_editor_context_menu(&mut self, x: u16, y: u16) {
+        let has_file = self.file_path().is_some();
+        let has_lsp = self.lsp_manager.is_some();
+        let has_selection = matches!(
+            self.mode,
+            Mode::Visual | Mode::VisualLine | Mode::VisualBlock
+        );
+        let vsc = self.is_vscode_mode();
+        let items = vec![
+            ContextMenuItem {
+                label: "Go to Definition".into(),
+                action: "goto_definition".into(),
+                shortcut: if vsc { "F12" } else { "gd" }.into(),
+                separator_after: false,
+                enabled: has_lsp,
+            },
+            ContextMenuItem {
+                label: "Go to References".into(),
+                action: "goto_references".into(),
+                shortcut: if vsc { "Shift+F12" } else { "gr" }.into(),
+                separator_after: false,
+                enabled: has_lsp,
+            },
+            ContextMenuItem {
+                label: "Rename Symbol".into(),
+                action: "rename_symbol".into(),
+                shortcut: if vsc { "F2" } else { "<leader>rn" }.into(),
+                separator_after: true,
+                enabled: has_lsp,
+            },
+            ContextMenuItem {
+                label: "Open Changes".into(),
+                action: "open_changes".into(),
+                shortcut: "gD".into(),
+                separator_after: true,
+                enabled: has_file,
+            },
+            ContextMenuItem {
+                label: "Cut".into(),
+                action: "cut".into(),
+                shortcut: if vsc { "Ctrl+X" } else { "" }.into(),
+                separator_after: false,
+                enabled: has_selection,
+            },
+            ContextMenuItem {
+                label: "Copy".into(),
+                action: "copy".into(),
+                shortcut: if vsc { "Ctrl+C" } else { "" }.into(),
+                separator_after: false,
+                enabled: has_selection,
+            },
+            ContextMenuItem {
+                label: "Paste".into(),
+                action: "paste".into(),
+                shortcut: if vsc { "Ctrl+V" } else { "" }.into(),
+                separator_after: true,
+                enabled: true,
+            },
+            ContextMenuItem {
+                label: "Open to the Side (vsplit)".into(),
+                action: "open_side_vsplit".into(),
+                shortcut: String::new(),
+                separator_after: true,
+                enabled: has_file,
+            },
+            ContextMenuItem {
+                label: "Command Palette".into(),
+                action: "command_palette".into(),
+                shortcut: "F1".into(),
+                separator_after: false,
+                enabled: true,
+            },
+        ];
+        let selected = items.iter().position(|i| i.enabled).unwrap_or(0);
+        self.context_menu = Some(ContextMenuState {
+            target: ContextMenuTarget::Editor,
+            items,
+            selected,
             screen_x: x,
             screen_y: y,
         });
@@ -6005,11 +6097,85 @@ impl Engine {
                         let path_str = path.display().to_string();
                         self.execute_command(&format!("e {path_str}"));
                     }
+                    "open_side_vsplit" => {
+                        self.split_window(SplitDirection::Vertical, None);
+                        let _ = self.open_file_with_mode(path, OpenMode::Permanent);
+                    }
                     // new_file, new_folder, rename, delete are handled by the UI backend
                     // since they involve sidebar prompts. Return the action string.
                     _ => {}
                 }
             }
+            ContextMenuTarget::Editor => match action.as_str() {
+                "goto_definition" => {
+                    self.lsp_request_definition();
+                }
+                "goto_references" => {
+                    self.lsp_request_references();
+                }
+                "rename_symbol" => {
+                    // Enter command mode with :Rename pre-filled for user to type new name.
+                    self.mode = Mode::Command;
+                    self.command_buffer = "Rename ".to_string();
+                }
+                "open_changes" => {
+                    self.open_diff_peek();
+                }
+                "cut" => {
+                    // Yank selection to clipboard, then delete.
+                    if matches!(
+                        self.mode,
+                        Mode::Visual | Mode::VisualLine | Mode::VisualBlock
+                    ) {
+                        self.yank_visual_selection();
+                        // Copy yanked text to system clipboard.
+                        if let Some((ref text, _)) = self.registers.get(&'"') {
+                            let text = text.clone();
+                            if let Some(ref cb) = self.clipboard_write {
+                                let _ = cb(&text);
+                            }
+                        }
+                        let mut changed = false;
+                        self.delete_visual_selection(&mut changed);
+                    }
+                }
+                "copy" => {
+                    if matches!(
+                        self.mode,
+                        Mode::Visual | Mode::VisualLine | Mode::VisualBlock
+                    ) {
+                        self.yank_visual_selection();
+                        if let Some((ref text, _)) = self.registers.get(&'"') {
+                            let text = text.clone();
+                            if let Some(ref cb) = self.clipboard_write {
+                                let _ = cb(&text);
+                            }
+                        }
+                        self.mode = Mode::Normal;
+                    }
+                }
+                "paste" => {
+                    if let Some(ref cb_read) = self.clipboard_read {
+                        if let Ok(text) = cb_read() {
+                            if !text.is_empty() {
+                                self.registers.insert('"', (text, false));
+                                let mut changed = false;
+                                self.paste_after(&mut changed);
+                            }
+                        }
+                    }
+                }
+                "open_side_vsplit" => {
+                    if let Some(path) = self.file_path().map(|p| p.to_path_buf()) {
+                        self.split_window(SplitDirection::Vertical, None);
+                        let _ = self.open_file_with_mode(&path, OpenMode::Permanent);
+                    }
+                }
+                "command_palette" => {
+                    self.open_command_palette();
+                }
+                _ => {}
+            },
         }
 
         Some(action)
@@ -13737,7 +13903,7 @@ impl Engine {
         }
     }
 
-    fn yank_visual_selection(&mut self) {
+    pub fn yank_visual_selection(&mut self) {
         // Capture the selection region for highlight before exiting visual mode
         let hl_region = self.get_visual_selection_range().map(|(start, end)| {
             let is_linewise = matches!(self.mode, Mode::VisualLine);
@@ -13762,7 +13928,7 @@ impl Engine {
         self.visual_anchor = None;
     }
 
-    fn delete_visual_selection(&mut self, changed: &mut bool) {
+    pub fn delete_visual_selection(&mut self, changed: &mut bool) {
         if let Some((text, is_linewise)) = self.get_visual_selection_text() {
             // Store in register
             let reg = self.selected_register.unwrap_or('"');
@@ -22962,7 +23128,7 @@ impl Engine {
     }
 
     /// Paste after cursor (p). Linewise pastes below current line.
-    fn paste_after(&mut self, changed: &mut bool) {
+    pub fn paste_after(&mut self, changed: &mut bool) {
         let reg = self.active_register();
         let (content, is_linewise) = match self.get_register_content(reg) {
             Some(pair) => pair,
@@ -27162,6 +27328,7 @@ impl Engine {
                 }
                 LspEvent::DefinitionResponse { locations, .. } => {
                     self.lsp_pending_definition = None;
+                    self.message.clear();
                     if let Some(loc) = locations.first() {
                         let path = loc.path.clone();
                         let line = loc.range.start.line as usize;
@@ -27344,6 +27511,7 @@ impl Engine {
                 }
                 LspEvent::ImplementationResponse { locations, .. } => {
                     self.lsp_pending_implementation = None;
+                    self.message.clear();
                     if let Some(loc) = locations.first() {
                         let path = loc.path.clone();
                         let line = loc.range.start.line as usize;
@@ -27368,6 +27536,7 @@ impl Engine {
                 }
                 LspEvent::TypeDefinitionResponse { locations, .. } => {
                     self.lsp_pending_type_definition = None;
+                    self.message.clear();
                     if let Some(loc) = locations.first() {
                         let path = loc.path.clone();
                         let line = loc.range.start.line as usize;
@@ -27505,7 +27674,7 @@ impl Engine {
     }
 
     /// Request LSP go-to-definition at cursor position.
-    fn lsp_request_definition(&mut self) {
+    pub fn lsp_request_definition(&mut self) {
         if !self.settings.lsp_enabled {
             return;
         }
@@ -27548,7 +27717,7 @@ impl Engine {
     }
 
     /// Request LSP find-references at cursor position.
-    fn lsp_request_references(&mut self) {
+    pub fn lsp_request_references(&mut self) {
         if !self.settings.lsp_enabled {
             return;
         }

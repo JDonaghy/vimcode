@@ -35,7 +35,7 @@ For detailed how-to guides and configuration references, see the **[VimCode Wiki
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 4498 tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 4511 tests, zero async runtime dependency
 
 > **Note:** VimCode does not implement VimScript. Extension and scripting is handled via
 > the built-in Lua 5.4 plugin system. The goal is full Vim *keybinding* and *editing*
@@ -432,7 +432,7 @@ For full details on adapters, launch.json, conditional breakpoints, and the debu
 - **Auto-refresh** — filesystem changes are detected automatically (no manual refresh needed)
 - **Rename:** `F2` (GTK inline) / `r` (TUI prompt) — rename file or folder in-place
 - **Move:** Drag-and-drop (GTK) / `M` key prompt (TUI) — move to another folder; full path pre-filled with cursor key editing (Left/Right/Home/End/Delete)
-- **Right-click context menu:** New File, New Folder, Rename, Delete, Copy Path, Copy Relative Path, Open to Side, Select for Compare / Compare with Selected (opens diff view), Reveal in File Manager; tab bar: Close, Close Others, Close to Right, Close Saved, Split Right/Down
+- **Right-click context menu:** New File, New Folder, Rename, Delete, Copy Path, Copy Relative Path, Open to Side, Open to Side (vsplit), Select for Compare / Compare with Selected (opens diff view), Reveal in File Manager; tab bar: Close, Close Others, Close to Right, Close Saved, Split Right/Down; editor area: Go to Definition, Go to References, Rename Symbol, Open Changes, Cut, Copy, Paste, Open to Side (vsplit), Command Palette
 - **Preview mode:**
   - Single-click → preview tab (italic/dimmed, replaced by next single-click)
   - Double-click → permanent tab

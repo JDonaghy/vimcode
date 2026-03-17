@@ -1,6 +1,7 @@
 mod common;
 
 use common::*;
+use vimcode_core::core::engine::ContextMenuTarget;
 use vimcode_core::core::window::GroupId;
 use vimcode_core::Engine;
 
@@ -313,9 +314,10 @@ fn test_explorer_context_menu_file() {
     e.open_explorer_context_menu(path, false, 5, 10);
     assert!(e.context_menu.is_some());
     let menu = e.context_menu.as_ref().unwrap();
-    assert_eq!(menu.items.len(), 8);
+    assert_eq!(menu.items.len(), 9);
     assert_eq!(menu.items[0].label, "Open to the Side");
-    assert_eq!(menu.items[4].label, "Copy Path");
+    assert_eq!(menu.items[1].label, "Open to the Side (vsplit)");
+    assert_eq!(menu.items[5].label, "Copy Path");
 }
 
 #[test]
@@ -439,15 +441,15 @@ fn test_diff_with_selected_opens_diff_view() {
 #[test]
 fn test_explorer_menu_file_count_with_selection() {
     let mut e = engine_with("hello");
-    // Without selection: 8 items
-    e.open_explorer_context_menu(std::path::PathBuf::from("/tmp/a.rs"), false, 5, 10);
-    assert_eq!(e.context_menu.as_ref().unwrap().items.len(), 8);
-    e.close_context_menu();
-
-    // With selection: 9 items (Compare with + Select for Compare)
-    e.diff_selected_file = Some(std::path::PathBuf::from("/tmp/other.rs"));
+    // Without selection: 9 items (includes "Open to the Side (vsplit)")
     e.open_explorer_context_menu(std::path::PathBuf::from("/tmp/a.rs"), false, 5, 10);
     assert_eq!(e.context_menu.as_ref().unwrap().items.len(), 9);
+    e.close_context_menu();
+
+    // With selection: 10 items (Compare with + Select for Compare)
+    e.diff_selected_file = Some(std::path::PathBuf::from("/tmp/other.rs"));
+    e.open_explorer_context_menu(std::path::PathBuf::from("/tmp/a.rs"), false, 5, 10);
+    assert_eq!(e.context_menu.as_ref().unwrap().items.len(), 10);
 }
 
 #[test]
@@ -921,4 +923,327 @@ fn test_inline_rename_directory() {
     assert!(dir.join("new_folder").exists());
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+// ── Editor context menu ─────────────────────────────────────────────────────
+
+#[test]
+fn test_editor_context_menu_has_open_side_vsplit() {
+    let dir = std::env::temp_dir().join(format!("edctx_{}", rand_name()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("foo.txt");
+    std::fs::write(&path, "hello\nworld").unwrap();
+
+    let mut e = engine_with("");
+    e.open_file_in_tab(&path);
+    assert!(
+        e.file_path().is_some(),
+        "file_path should be set after open"
+    );
+
+    e.open_editor_context_menu(10, 10);
+    let cm = e.context_menu.as_ref().unwrap();
+    assert!(matches!(cm.target, ContextMenuTarget::Editor));
+    assert_eq!(cm.items.len(), 9);
+    // Check the full menu structure.
+    assert_eq!(cm.items[0].action, "goto_definition");
+    assert_eq!(cm.items[1].action, "goto_references");
+    assert_eq!(cm.items[2].action, "rename_symbol");
+    assert!(cm.items[2].separator_after);
+    assert_eq!(cm.items[3].action, "open_changes");
+    assert!(cm.items[3].separator_after);
+    assert_eq!(cm.items[4].action, "cut");
+    assert_eq!(cm.items[5].action, "copy");
+    assert_eq!(cm.items[6].action, "paste");
+    assert!(cm.items[6].separator_after);
+    assert_eq!(cm.items[7].action, "open_side_vsplit");
+    assert_eq!(cm.items[8].action, "command_palette");
+    // open_side_vsplit should be enabled when file is open.
+    assert!(cm.items[7].enabled);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn test_editor_context_menu_disabled_without_file() {
+    let mut e = engine_with("no file buffer");
+    e.open_editor_context_menu(10, 10);
+    let cm = e.context_menu.as_ref().unwrap();
+    // LSP items disabled (no LSP).
+    assert!(!cm.items[0].enabled); // goto_definition
+    assert!(!cm.items[1].enabled); // goto_references
+    assert!(!cm.items[2].enabled); // rename_symbol
+                                   // open_changes disabled (no file).
+    assert!(!cm.items[3].enabled);
+    // cut/copy disabled (no selection).
+    assert!(!cm.items[4].enabled);
+    assert!(!cm.items[5].enabled);
+    // paste always enabled.
+    assert!(cm.items[6].enabled);
+    // open_side_vsplit disabled (no file).
+    assert!(!cm.items[7].enabled);
+    // command_palette always enabled.
+    assert!(cm.items[8].enabled);
+}
+
+#[test]
+fn test_editor_context_menu_open_side_vsplit_creates_split() {
+    let dir = std::env::temp_dir().join(format!("edctx_split_{}", rand_name()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("test.txt");
+    std::fs::write(&path, "line1\nline2").unwrap();
+
+    let mut e = engine_with("");
+    e.open_file_in_tab(&path);
+
+    let win_count_before = e.active_tab().layout.window_ids().len();
+    assert_eq!(win_count_before, 1);
+
+    // Open editor context menu, select open_side_vsplit, and confirm.
+    e.open_editor_context_menu(10, 10);
+    let vsplit_idx = e
+        .context_menu
+        .as_ref()
+        .unwrap()
+        .items
+        .iter()
+        .position(|i| i.action == "open_side_vsplit")
+        .unwrap();
+    e.context_menu.as_mut().unwrap().selected = vsplit_idx;
+    let action = e.context_menu_confirm();
+    assert_eq!(action.as_deref(), Some("open_side_vsplit"));
+
+    // Should now have 2 windows (vsplit).
+    let win_count_after = e.active_tab().layout.window_ids().len();
+    assert_eq!(win_count_after, 2);
+
+    // The active window should still be showing the same file.
+    assert_eq!(e.file_path().unwrap(), &path);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn test_explorer_open_side_vsplit_creates_split() {
+    let dir = std::env::temp_dir().join(format!("expl_vsplit_{}", rand_name()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("target.txt");
+    std::fs::write(&path, "content").unwrap();
+
+    let mut e = engine_with("original");
+    let win_count_before = e.active_tab().layout.window_ids().len();
+    assert_eq!(win_count_before, 1);
+
+    // Open explorer context menu on the file and select "Open to the Side (vsplit)".
+    e.open_explorer_context_menu(path.clone(), false, 5, 10);
+    let cm = e.context_menu.as_ref().unwrap();
+    let vsplit_idx = cm
+        .items
+        .iter()
+        .position(|i| i.action == "open_side_vsplit")
+        .unwrap();
+    e.context_menu.as_mut().unwrap().selected = vsplit_idx;
+    let action = e.context_menu_confirm();
+    assert_eq!(action.as_deref(), Some("open_side_vsplit"));
+
+    // Should now have 2 windows (vsplit), with the target file open.
+    let win_count_after = e.active_tab().layout.window_ids().len();
+    assert_eq!(win_count_after, 2);
+    assert_eq!(e.file_path().unwrap(), &path);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn test_editor_context_menu_lsp_items_disabled_without_lsp() {
+    let dir = std::env::temp_dir().join(format!("edctx_lsp_{}", rand_name()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("test.rs");
+    std::fs::write(&path, "fn main() {}").unwrap();
+
+    let mut e = engine_with("");
+    e.settings.lsp_enabled = false;
+    e.open_file_in_tab(&path);
+    // LSP is disabled, so lsp_manager should remain None.
+    e.open_editor_context_menu(10, 10);
+    let cm = e.context_menu.as_ref().unwrap();
+    assert!(
+        !cm.items[0].enabled,
+        "goto_definition should be disabled without LSP"
+    );
+    assert!(
+        !cm.items[1].enabled,
+        "goto_references should be disabled without LSP"
+    );
+    assert!(
+        !cm.items[2].enabled,
+        "rename_symbol should be disabled without LSP"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn test_editor_context_menu_cut_copy_enabled_in_visual_mode() {
+    let dir = std::env::temp_dir().join(format!("edctx_vis_{}", rand_name()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("test.txt");
+    std::fs::write(&path, "hello world").unwrap();
+
+    let mut e = engine_with("");
+    e.open_file_in_tab(&path);
+
+    // Enter visual mode.
+    press(&mut e, 'v');
+    assert_eq!(e.mode, vimcode_core::core::Mode::Visual);
+
+    e.open_editor_context_menu(10, 10);
+    let cm = e.context_menu.as_ref().unwrap();
+    assert!(cm.items[4].enabled, "cut should be enabled in visual mode");
+    assert!(cm.items[5].enabled, "copy should be enabled in visual mode");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn test_editor_context_menu_command_palette_action() {
+    let mut e = engine_with("some text");
+
+    e.open_editor_context_menu(10, 10);
+    let palette_idx = e
+        .context_menu
+        .as_ref()
+        .unwrap()
+        .items
+        .iter()
+        .position(|i| i.action == "command_palette")
+        .unwrap();
+    e.context_menu.as_mut().unwrap().selected = palette_idx;
+    let action = e.context_menu_confirm();
+    assert_eq!(action.as_deref(), Some("command_palette"));
+    assert!(e.palette_open);
+}
+
+#[test]
+fn test_editor_context_menu_rename_disabled_without_lsp() {
+    let dir = std::env::temp_dir().join(format!("edctx_ren_{}", rand_name()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("test.rs");
+    std::fs::write(&path, "fn main() {}").unwrap();
+
+    let mut e = engine_with("");
+    e.settings.lsp_enabled = false;
+    e.open_file_in_tab(&path);
+
+    e.open_editor_context_menu(10, 10);
+    let rename_idx = e
+        .context_menu
+        .as_ref()
+        .unwrap()
+        .items
+        .iter()
+        .position(|i| i.action == "rename_symbol")
+        .unwrap();
+    // rename_symbol is disabled without LSP, so confirm should return None.
+    e.context_menu.as_mut().unwrap().selected = rename_idx;
+    let action = e.context_menu_confirm();
+    assert!(action.is_none(), "rename should be disabled without LSP");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn test_editor_context_menu_paste_always_enabled() {
+    let mut e = engine_with("text");
+    e.open_editor_context_menu(10, 10);
+    let cm = e.context_menu.as_ref().unwrap();
+    let paste = cm.items.iter().find(|i| i.action == "paste").unwrap();
+    assert!(paste.enabled);
+}
+
+#[test]
+fn test_editor_context_menu_shortcuts_vim_mode() {
+    let dir = std::env::temp_dir().join(format!("edctx_sc_{}", rand_name()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("test.txt");
+    std::fs::write(&path, "content").unwrap();
+
+    let mut e = engine_with("");
+    e.open_file_in_tab(&path);
+    e.open_editor_context_menu(10, 10);
+    let cm = e.context_menu.as_ref().unwrap();
+
+    // Vim-style shortcuts.
+    assert_eq!(cm.items[0].shortcut, "gd");
+    assert_eq!(cm.items[1].shortcut, "gr");
+    assert_eq!(cm.items[2].shortcut, "<leader>rn");
+    assert_eq!(cm.items[3].shortcut, "gD");
+    // Cut/Copy/Paste have no shortcut in Vim mode.
+    assert_eq!(cm.items[4].shortcut, "");
+    assert_eq!(cm.items[5].shortcut, "");
+    assert_eq!(cm.items[6].shortcut, "");
+    assert_eq!(cm.items[8].shortcut, "F1");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn test_editor_context_menu_shortcuts_vscode_mode() {
+    let dir = std::env::temp_dir().join(format!("edctx_vsc_{}", rand_name()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("test.txt");
+    std::fs::write(&path, "content").unwrap();
+
+    let mut e = engine_with("");
+    e.settings.editor_mode = vimcode_core::core::settings::EditorMode::Vscode;
+    e.open_file_in_tab(&path);
+    e.open_editor_context_menu(10, 10);
+    let cm = e.context_menu.as_ref().unwrap();
+
+    // VSCode-style shortcuts.
+    assert_eq!(cm.items[0].shortcut, "F12");
+    assert_eq!(cm.items[1].shortcut, "Shift+F12");
+    assert_eq!(cm.items[2].shortcut, "F2");
+    assert_eq!(cm.items[3].shortcut, "gD");
+    // Cut/Copy/Paste show Ctrl+X/C/V in VSCode mode.
+    assert_eq!(cm.items[4].shortcut, "Ctrl+X");
+    assert_eq!(cm.items[5].shortcut, "Ctrl+C");
+    assert_eq!(cm.items[6].shortcut, "Ctrl+V");
+    assert_eq!(cm.items[8].shortcut, "F1");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn test_editor_context_menu_open_changes_enabled_with_file() {
+    let dir = std::env::temp_dir().join(format!("edctx_oc_{}", rand_name()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("file.txt");
+    std::fs::write(&path, "data").unwrap();
+
+    let mut e = engine_with("");
+    e.open_file_in_tab(&path);
+    e.open_editor_context_menu(10, 10);
+    let cm = e.context_menu.as_ref().unwrap();
+    let oc = cm
+        .items
+        .iter()
+        .find(|i| i.action == "open_changes")
+        .unwrap();
+    assert!(
+        oc.enabled,
+        "open_changes should be enabled when file is open"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn test_editor_context_menu_first_enabled_selected() {
+    // Without file or LSP, first enabled item should be "paste" (index 6).
+    let mut e = engine_with("no file");
+    e.open_editor_context_menu(10, 10);
+    let cm = e.context_menu.as_ref().unwrap();
+    assert_eq!(cm.selected, 6, "first enabled item should be paste");
+    assert_eq!(cm.items[cm.selected].action, "paste");
 }

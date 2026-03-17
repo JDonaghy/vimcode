@@ -1,9 +1,21 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 186 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 190 archived here. Recent work summary in PROJECT_STATE.md.
 
 ---
+
+**Session 190 — LSP Go-to-Definition Fix + Kitty Keyboard Fix (4511 tests):**
+Editor right-click context menu expanded to 9 items with mode-aware shortcuts (Vim vs VSCode keybindings displayed per `editor_mode` setting). Kitty terminal ":" not working fix: `shift_map_us()` function in TUI translates base key + SHIFT modifier to correct shifted character when `REPORT_ALL_KEYS_AS_ESCAPE_CODES` keyboard enhancement is active. **LSP `gd` "hanging" fix**: Definition response was arriving and being processed correctly, but `self.message` ("Jumping to definition...") was never cleared after a successful jump — making it appear stuck. Added `self.message.clear()` to `DefinitionResponse`, `ImplementationResponse`, and `TypeDefinitionResponse` handlers. LSP debug logging infrastructure added to `send_request()` and reader thread (gated behind `VIMCODE_LSP_DEBUG` env var); also added `unwrap_or()` fallback for definition/hover responses and string ID fallback for response parsing (some servers echo IDs as strings). Debug logging removed after diagnosis.
+
+**Session 189 — VSCode-style Editor Context Menu (4510 tests):**
+Full 9-item editor right-click context menu: Go to Definition, Go to References, Rename Symbol, Open Changes, Cut, Copy, Paste, Open to the Side, Command Palette. LSP items disabled without active server; Cut/Copy disabled without visual selection. Engine-driven for both GTK and TUI. Made 5 engine methods `pub`: `yank_visual_selection`, `delete_visual_selection`, `paste_after`, `lsp_request_definition`, `lsp_request_references`. 8 new tests.
+
+**Session 188 — Centralize Context Menus + Editor Right-Click (4501 tests):**
+GTK context menus now driven by engine items: `build_gio_menu_from_engine_items()` helper builds `gio::Menu` with sections from `ContextMenuItem.separator_after` boundaries. Both explorer and tab context menus call `engine.open_*_context_menu()`, clone items, clear engine state, build `gio::Menu`. Tab action enabled/disabled state from `ContextMenuItem.enabled` via `enabled_map` HashMap (replaces hardcoded `tab_count`/`is_last`/`has_file` conditions). Explorer actions use `add_action()` helper for engine-driven enabled state. Fixed `copy_rel` → `copy_relative_path` action name mismatch. New `ContextMenuTarget::Editor` variant + `open_editor_context_menu()` with "Open to the Side (vsplit)" item (disabled when no file). `context_menu_confirm()` handles `open_side_vsplit` via `split_window()` + `open_file_with_mode()`. GTK: `Msg::EditorRightClick` + `ClickTarget::BufferPos`/`Gutter` in right-click handler → PopoverMenu. TUI: right-click on editor area calls `open_editor_context_menu()`. Explorer file menu also gets "Open to the Side (vsplit)" (Vim-style split, not editor group). 4 new tests.
+
+**Session 187 — Tab Context Menu Splits Fix (4498 tests):**
+Fixed GTK/TUI split inconsistency: GTK tab context menu "Split Right"/"Split Down" was calling `open_editor_group()` (new editor groups) while engine's `context_menu_confirm()` called `split_window()` (Vim window splits). Fixed GTK to call `split_window()` matching the engine. Added 4 split options to tab context menu: "Split Right" and "Split Down" (Vim window splits within current tab); "Split Right to New Group" and "Split Down to New Group" (new editor groups, VSCode-style). README 3-layer explainer (Windows/Tabs/Editor Groups). 4 new tests.
 
 **Session 186 — Drag-and-Drop File Move + Context Menu Clamping (4468 tests):**
 Drag-and-drop file/folder move in both TUI (mouse Down→Drag→Up flow with `explorer_drag_src`/`explorer_drag_active`/`explorer_drop_target` state) and GTK (`DragSource`/`DropTarget` API with `Msg::MoveFile`). Engine-driven Yes/No confirmation dialog (`confirm_move_file()`/`pending_move`/`process_dialog_result`). Clickable dialog buttons: TUI computes positions from rendered layout; GTK uses `DialogBtnRects` (`Rc<RefCell<...>>`) shared between draw closure and click handler with actual Pango-measured button rects. Fixed GTK dialog "No" button activating "Yes" (proportional vs monospace font mismatch). Fixed GTK crash on drag (removed legacy GTK3 DnD handlers). Subtree move prevention + same-directory no-op. Context menu popup clamping: moved popup rendering after status/command line in TUI draw order. 6 new tests.

@@ -25,6 +25,8 @@ fn init_debug_log(path: &str) {
     match std::fs::File::create(path) {
         Ok(f) => {
             let _ = DEBUG_LOG.set(Mutex::new(f));
+            // Also enable LSP debug logging (read by the reader thread in lsp.rs).
+            std::env::set_var("VIMCODE_LSP_DEBUG", "1");
         }
         Err(e) => {
             eprintln!("Warning: cannot open debug log {path}: {e}");
@@ -3509,8 +3511,8 @@ fn handle_explorer_context_action(
                 cursor: 0,
             });
         }
-        // copy_path, copy_relative_path, reveal, open_side are handled by the engine
-        "copy_path" | "copy_relative_path" | "reveal" | "open_side" => {}
+        // copy_path, copy_relative_path, reveal, open_side, open_side_vsplit handled by engine
+        "copy_path" | "copy_relative_path" | "reveal" | "open_side" | "open_side_vsplit" => {}
         "open_terminal" => {
             let dir = if is_dir {
                 path.clone()
@@ -4190,6 +4192,11 @@ fn handle_mouse(
                     }
                 }
             }
+        }
+
+        // Right-click on editor area → open editor context menu
+        if col >= editor_left {
+            engine.open_editor_context_menu(col, row + 1);
         }
 
         return sidebar_width;
@@ -10421,6 +10428,40 @@ fn render_command_line(
 
 // ─── Input translation ────────────────────────────────────────────────────────
 
+/// Map an unshifted US-keyboard base key to its shifted counterpart.
+/// With the Kitty keyboard protocol + REPORT_ALL_KEYS_AS_ESCAPE_CODES, terminals
+/// report the physical base key plus a SHIFT modifier instead of the resulting
+/// character.  This restores the expected character (e.g. ';' + Shift → ':').
+/// If the key has no standard shift mapping, return it unchanged.
+fn shift_map_us(c: char) -> char {
+    match c {
+        '`' => '~',
+        '1' => '!',
+        '2' => '@',
+        '3' => '#',
+        '4' => '$',
+        '5' => '%',
+        '6' => '^',
+        '7' => '&',
+        '8' => '*',
+        '9' => '(',
+        '0' => ')',
+        '-' => '_',
+        '=' => '+',
+        '[' => '{',
+        ']' => '}',
+        '\\' => '|',
+        ';' => ':',
+        '\'' => '"',
+        ',' => '<',
+        '.' => '>',
+        '/' => '?',
+        // Letters: Shift+a → 'A' (crossterm usually already sends uppercase).
+        c if c.is_ascii_lowercase() => c.to_ascii_uppercase(),
+        _ => c,
+    }
+}
+
 fn translate_key(event: KeyEvent, keyboard_enhanced: bool) -> Option<(String, Option<char>, bool)> {
     if event.kind == KeyEventKind::Release {
         return None;
@@ -10477,7 +10518,17 @@ fn translate_key(event: KeyEvent, keyboard_enhanced: bool) -> Option<(String, Op
                 };
                 (name, Some(lower))
             } else {
-                ("".to_string(), Some(c))
+                // With keyboard enhancement (Kitty protocol + REPORT_ALL_KEYS_AS_ESCAPE_CODES),
+                // shifted symbol keys may arrive as the base key + SHIFT modifier instead of
+                // the resulting character.  For example ':' comes as Char(';') + SHIFT, not
+                // Char(':').  Apply the standard US keyboard shift mapping so the engine
+                // receives the correct character.
+                let resolved = if keyboard_enhanced && shift {
+                    shift_map_us(c)
+                } else {
+                    c
+                };
+                ("".to_string(), Some(resolved))
             };
             Some((key_name, unicode, ctrl))
         }

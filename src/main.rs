@@ -494,6 +494,8 @@ enum Msg {
         x: f64,
         y: f64,
     },
+    /// Right-click on the editor area (buffer text).
+    EditorRightClick { x: f64, y: f64 },
 }
 
 /// Build a single setting row widget (label+description on left, control widget on right).
@@ -3002,55 +3004,35 @@ impl SimpleComponent for App {
                 let Some(target) = selected_path else { return };
                 let is_dir = target.is_dir();
 
-                // Build gio::Menu with sections
-                let menu = gtk4::gio::Menu::new();
-                if is_dir {
-                    let s1 = gtk4::gio::Menu::new();
-                    s1.append(Some("New File..."), Some("ctx.new_file"));
-                    s1.append(Some("New Folder..."), Some("ctx.new_folder"));
-                    s1.append(Some("Open Containing Folder"), Some("ctx.reveal"));
-                    s1.append(
-                        Some("Open in Integrated Terminal"),
-                        Some("ctx.open_terminal"),
-                    );
-                    s1.append(Some("Find in Folder..."), Some("ctx.find_in_folder"));
-                    menu.append_section(None, &s1);
-                } else {
-                    let s1 = gtk4::gio::Menu::new();
-                    s1.append(Some("Open to the Side"), Some("ctx.open_side"));
-                    s1.append(Some("Open Containing Folder"), Some("ctx.reveal"));
-                    s1.append(
-                        Some("Open in Integrated Terminal"),
-                        Some("ctx.open_terminal"),
-                    );
-                    let has_diff_sel = engine_ctx.borrow().diff_selected_file.is_some();
-                    if has_diff_sel {
-                        let sel_name = engine_ctx
-                            .borrow()
-                            .diff_selected_file
-                            .as_ref()
-                            .and_then(|p| p.file_name())
-                            .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_else(|| "file".into());
-                        s1.append(
-                            Some(&format!("Compare with '{sel_name}'")),
-                            Some("ctx.diff_with_selected"),
-                        );
-                    }
-                    s1.append(Some("Select for Compare"), Some("ctx.select_for_diff"));
-                    menu.append_section(None, &s1);
-                }
-                let s2 = gtk4::gio::Menu::new();
-                s2.append(Some("Copy Path"), Some("ctx.copy_path"));
-                s2.append(Some("Copy Relative Path"), Some("ctx.copy_relative_path"));
-                menu.append_section(None, &s2);
-                let s3 = gtk4::gio::Menu::new();
-                s3.append(Some("Rename..."), Some("ctx.rename"));
-                s3.append(Some("Delete"), Some("ctx.delete"));
-                menu.append_section(None, &s3);
+                // Build gio::Menu from engine-generated items (single source of truth).
+                engine_ctx
+                    .borrow_mut()
+                    .open_explorer_context_menu(target.clone(), is_dir, 0, 0);
+                let items: Vec<core::engine::ContextMenuItem> = engine_ctx
+                    .borrow()
+                    .context_menu
+                    .as_ref()
+                    .map(|cm| cm.items.clone())
+                    .unwrap_or_default();
+                engine_ctx.borrow_mut().close_context_menu();
+                let menu = build_gio_menu_from_engine_items(&items, "ctx");
 
-                // Build action group
+                // Collect enabled state from engine items keyed by action string.
+                let ctx_enabled: std::collections::HashMap<String, bool> = items
+                    .iter()
+                    .map(|it| (it.action.clone(), it.enabled))
+                    .collect();
+
+                // Build action group. `add_ctx_action` respects engine-driven enabled state.
                 let actions = gtk4::gio::SimpleActionGroup::new();
+                // Helper: register action and apply engine-driven enabled state.
+                let add_action = |actions: &gtk4::gio::SimpleActionGroup,
+                                  a: &gtk4::gio::SimpleAction| {
+                    if ctx_enabled.get(a.name().as_str()) == Some(&false) {
+                        a.set_enabled(false);
+                    }
+                    actions.add_action(a);
+                };
                 let parent_dir = if target.is_dir() {
                     target.clone()
                 } else {
@@ -3071,7 +3053,7 @@ impl SimpleComponent for App {
                             move |name| s2.input(Msg::CreateFile(pd2.clone(), name))
                         });
                     });
-                    actions.add_action(&a);
+                    add_action(&actions, &a);
                 }
                 {
                     let s = sender_rc.clone();
@@ -3084,7 +3066,7 @@ impl SimpleComponent for App {
                             move |name| s2.input(Msg::CreateFolder(pd2.clone(), name))
                         });
                     });
-                    actions.add_action(&a);
+                    add_action(&actions, &a);
                 }
                 {
                     let tv = tree_view.clone();
@@ -3116,7 +3098,7 @@ impl SimpleComponent for App {
                             }
                         });
                     });
-                    actions.add_action(&a);
+                    add_action(&actions, &a);
                 }
                 {
                     let s = sender_rc.clone();
@@ -3125,7 +3107,7 @@ impl SimpleComponent for App {
                     a.connect_activate(move |_, _| {
                         s.input(Msg::ConfirmDeletePath(tgt.clone()));
                     });
-                    actions.add_action(&a);
+                    add_action(&actions, &a);
                 }
                 {
                     let s = sender_rc.clone();
@@ -3134,7 +3116,7 @@ impl SimpleComponent for App {
                     a.connect_activate(move |_, _| {
                         s.input(Msg::CopyPath(tgt.clone()));
                     });
-                    actions.add_action(&a);
+                    add_action(&actions, &a);
                 }
                 {
                     let s = sender_rc.clone();
@@ -3143,7 +3125,7 @@ impl SimpleComponent for App {
                     a.connect_activate(move |_, _| {
                         s.input(Msg::CopyRelativePath(tgt.clone()));
                     });
-                    actions.add_action(&a);
+                    add_action(&actions, &a);
                 }
                 {
                     let tgt = target.clone();
@@ -3162,7 +3144,7 @@ impl SimpleComponent for App {
                             .stderr(std::process::Stdio::null())
                             .spawn();
                     });
-                    actions.add_action(&a);
+                    add_action(&actions, &a);
                 }
                 {
                     let s = sender_rc.clone();
@@ -3171,7 +3153,7 @@ impl SimpleComponent for App {
                     a.connect_activate(move |_, _| {
                         s.input(Msg::SelectForDiff(tgt.clone()));
                     });
-                    actions.add_action(&a);
+                    add_action(&actions, &a);
                 }
                 {
                     let s = sender_rc.clone();
@@ -3180,7 +3162,7 @@ impl SimpleComponent for App {
                     a.connect_activate(move |_, _| {
                         s.input(Msg::DiffWithSelected(tgt.clone()));
                     });
-                    actions.add_action(&a);
+                    add_action(&actions, &a);
                 }
                 {
                     let s = sender_rc.clone();
@@ -3189,7 +3171,18 @@ impl SimpleComponent for App {
                     a.connect_activate(move |_, _| {
                         s.input(Msg::OpenSide(tgt.clone()));
                     });
-                    actions.add_action(&a);
+                    add_action(&actions, &a);
+                }
+                {
+                    let eng = engine_ctx.clone();
+                    let tgt = target.clone();
+                    let a = gtk4::gio::SimpleAction::new("open_side_vsplit", None);
+                    a.connect_activate(move |_, _| {
+                        let mut e = eng.borrow_mut();
+                        e.split_window(crate::core::window::SplitDirection::Vertical, None);
+                        let _ = e.open_file_with_mode(&tgt, crate::core::OpenMode::Permanent);
+                    });
+                    add_action(&actions, &a);
                 }
                 {
                     let s = sender_rc.clone();
@@ -3206,7 +3199,7 @@ impl SimpleComponent for App {
                         };
                         s.input(Msg::OpenTerminalAt(dir));
                     });
-                    actions.add_action(&a);
+                    add_action(&actions, &a);
                 }
                 {
                     let s = sender_rc.clone();
@@ -3214,7 +3207,7 @@ impl SimpleComponent for App {
                     a.connect_activate(move |_, _| {
                         s.input(Msg::ToggleFocusSearch);
                     });
-                    actions.add_action(&a);
+                    add_action(&actions, &a);
                 }
 
                 // Clean up previous popover, create new PopoverMenu.
@@ -3602,7 +3595,7 @@ impl SimpleComponent for App {
             widgets.drawing_area.add_controller(mc);
         }
 
-        // Right-click on drawing area (tab bar context menu).
+        // Right-click on drawing area (tab bar or editor context menu).
         {
             let engine_rc = engine.clone();
             let sender_rc = sender.input_sender().clone();
@@ -3617,7 +3610,6 @@ impl SimpleComponent for App {
                 let width = widget.width() as f64;
                 let height = widget.height() as f64;
                 let lh = lh_rc.get().max(1.0);
-                // We only care about tab bar clicks.
                 let mut engine = engine_rc.borrow_mut();
                 let target = pixel_to_click_target(
                     &mut engine,
@@ -3631,20 +3623,27 @@ impl SimpleComponent for App {
                     &diff_btn_rc.borrow(),
                     &split_btn_rc.borrow(),
                 );
-                if let ClickTarget::TabBar = target {
-                    let group_id = engine.active_group;
-                    let tab_idx = engine
-                        .editor_groups
-                        .get(&group_id)
-                        .map(|g| g.active_tab)
-                        .unwrap_or(0);
-                    drop(engine);
-                    let _ = sender_rc.send(Msg::TabRightClick {
-                        group_id,
-                        tab_idx,
-                        x,
-                        y,
-                    });
+                match target {
+                    ClickTarget::TabBar => {
+                        let group_id = engine.active_group;
+                        let tab_idx = engine
+                            .editor_groups
+                            .get(&group_id)
+                            .map(|g| g.active_tab)
+                            .unwrap_or(0);
+                        drop(engine);
+                        let _ = sender_rc.send(Msg::TabRightClick {
+                            group_id,
+                            tab_idx,
+                            x,
+                            y,
+                        });
+                    }
+                    ClickTarget::BufferPos(..) | ClickTarget::Gutter => {
+                        drop(engine);
+                        let _ = sender_rc.send(Msg::EditorRightClick { x, y });
+                    }
+                    _ => {}
                 }
             });
             widgets.drawing_area.add_controller(rc_gesture);
@@ -4020,46 +4019,26 @@ impl SimpleComponent for App {
                     None => return,
                 };
 
-                let engine = self.engine.borrow();
-                let group = match engine.editor_groups.get(&group_id) {
-                    Some(g) => g,
-                    None => return,
+                // Build gio::Menu from engine-generated items (single source of truth).
+                let items: Vec<core::engine::ContextMenuItem> = {
+                    let mut engine = self.engine.borrow_mut();
+                    engine.open_tab_context_menu(group_id, tab_idx, 0, 0);
+                    let items = engine
+                        .context_menu
+                        .as_ref()
+                        .map(|cm| cm.items.clone())
+                        .unwrap_or_default();
+                    engine.close_context_menu();
+                    items
                 };
-                let tab_count = group.tabs.len();
-                let file_path = engine.tab_file_path(group_id, tab_idx);
-                let has_file = file_path.is_some();
-                let is_last = tab_idx + 1 >= tab_count;
-                drop(engine);
 
-                // Build gio::Menu for tab context menu
-                let menu = gtk4::gio::Menu::new();
-                let s1 = gtk4::gio::Menu::new();
-                s1.append(Some("Close"), Some("tabctx.close"));
-                s1.append(Some("Close Others"), Some("tabctx.close_others"));
-                s1.append(Some("Close to the Right"), Some("tabctx.close_right"));
-                s1.append(Some("Close Saved"), Some("tabctx.close_saved"));
-                menu.append_section(None, &s1);
-                let s2 = gtk4::gio::Menu::new();
-                s2.append(Some("Copy Path"), Some("tabctx.copy_path"));
-                s2.append(Some("Copy Relative Path"), Some("tabctx.copy_rel"));
-                menu.append_section(None, &s2);
-                let s3 = gtk4::gio::Menu::new();
-                s3.append(Some("Reveal in File Explorer"), Some("tabctx.reveal"));
-                menu.append_section(None, &s3);
-                let s4 = gtk4::gio::Menu::new();
-                s4.append(Some("Split Right"), Some("tabctx.split_right"));
-                s4.append(Some("Split Down"), Some("tabctx.split_down"));
-                menu.append_section(None, &s4);
-                let s5 = gtk4::gio::Menu::new();
-                s5.append(
-                    Some("Split Right to New Group"),
-                    Some("tabctx.group_split_right"),
-                );
-                s5.append(
-                    Some("Split Down to New Group"),
-                    Some("tabctx.group_split_down"),
-                );
-                menu.append_section(None, &s5);
+                let menu = build_gio_menu_from_engine_items(&items, "tabctx");
+
+                // Collect enabled state from engine items keyed by action string.
+                let enabled_map: std::collections::HashMap<String, bool> = items
+                    .iter()
+                    .map(|it| (it.action.clone(), it.enabled))
+                    .collect();
 
                 // Build action group
                 let actions = gtk4::gio::SimpleActionGroup::new();
@@ -4072,11 +4051,7 @@ impl SimpleComponent for App {
                         a.connect_activate(move |_, _| {
                             $body(&engine_ref, &draw_ref);
                         });
-                        if ($name == "close_others" && tab_count <= 1)
-                            || ($name == "close_right" && is_last)
-                            || (($name == "copy_path" || $name == "copy_rel" || $name == "reveal")
-                                && !has_file)
-                        {
+                        if enabled_map.get($name) == Some(&false) {
                             a.set_enabled(false);
                         }
                         actions.add_action(&a);
@@ -4165,7 +4140,7 @@ impl SimpleComponent for App {
                     }
                 );
                 tab_action!(
-                    "copy_rel",
+                    "copy_relative_path",
                     self.engine,
                     self.draw_needed,
                     |engine_ref: &Rc<RefCell<Engine>>, draw_ref: &Rc<Cell<bool>>| {
@@ -4259,6 +4234,200 @@ impl SimpleComponent for App {
             Msg::TabSwitcherRelease => {
                 // Handled directly by the root EventControllerKey release handler.
                 // Kept as a no-op for exhaustive match.
+            }
+            Msg::EditorRightClick { x, y } => {
+                let da = match self.drawing_area.borrow().as_ref() {
+                    Some(da) => da.clone(),
+                    None => return,
+                };
+
+                // Build gio::Menu from engine-generated items (single source of truth).
+                let items: Vec<core::engine::ContextMenuItem> = {
+                    let mut engine = self.engine.borrow_mut();
+                    engine.open_editor_context_menu(0, 0);
+                    let items = engine
+                        .context_menu
+                        .as_ref()
+                        .map(|cm| cm.items.clone())
+                        .unwrap_or_default();
+                    engine.close_context_menu();
+                    items
+                };
+
+                let menu = build_gio_menu_from_engine_items(&items, "edctx");
+
+                let enabled_map: std::collections::HashMap<String, bool> = items
+                    .iter()
+                    .map(|it| (it.action.clone(), it.enabled))
+                    .collect();
+
+                let actions = gtk4::gio::SimpleActionGroup::new();
+
+                // Helper macro to reduce boilerplate for engine-driven actions.
+                macro_rules! add_editor_ctx_action {
+                    ($name:expr, $engine_rc:expr, $draw_rc:expr, $body:expr) => {{
+                        let engine_ref = $engine_rc.clone();
+                        let draw_ref = $draw_rc.clone();
+                        let a = gtk4::gio::SimpleAction::new($name, None);
+                        a.connect_activate(move |_, _| {
+                            ($body)(&engine_ref, &draw_ref);
+                        });
+                        if enabled_map.get($name) == Some(&false) {
+                            a.set_enabled(false);
+                        }
+                        actions.add_action(&a);
+                    }};
+                }
+
+                add_editor_ctx_action!(
+                    "goto_definition",
+                    self.engine,
+                    self.draw_needed,
+                    |eng: &std::cell::RefCell<core::Engine>, dr: &std::cell::Cell<bool>| {
+                        eng.borrow_mut().lsp_request_definition();
+                        dr.set(true);
+                    }
+                );
+
+                add_editor_ctx_action!(
+                    "goto_references",
+                    self.engine,
+                    self.draw_needed,
+                    |eng: &std::cell::RefCell<core::Engine>, dr: &std::cell::Cell<bool>| {
+                        eng.borrow_mut().lsp_request_references();
+                        dr.set(true);
+                    }
+                );
+
+                add_editor_ctx_action!(
+                    "rename_symbol",
+                    self.engine,
+                    self.draw_needed,
+                    |eng: &std::cell::RefCell<core::Engine>, dr: &std::cell::Cell<bool>| {
+                        let mut e = eng.borrow_mut();
+                        e.mode = core::Mode::Command;
+                        e.command_buffer = "Rename ".to_string();
+                        dr.set(true);
+                    }
+                );
+
+                add_editor_ctx_action!(
+                    "open_changes",
+                    self.engine,
+                    self.draw_needed,
+                    |eng: &std::cell::RefCell<core::Engine>, dr: &std::cell::Cell<bool>| {
+                        eng.borrow_mut().open_diff_peek();
+                        dr.set(true);
+                    }
+                );
+
+                add_editor_ctx_action!(
+                    "cut",
+                    self.engine,
+                    self.draw_needed,
+                    |eng: &std::cell::RefCell<core::Engine>, dr: &std::cell::Cell<bool>| {
+                        let mut e = eng.borrow_mut();
+                        if matches!(
+                            e.mode,
+                            core::Mode::Visual | core::Mode::VisualLine | core::Mode::VisualBlock
+                        ) {
+                            e.yank_visual_selection();
+                            if let Some((ref text, _)) = e.registers.get(&'"') {
+                                let text = text.clone();
+                                if let Some(ref cb) = e.clipboard_write {
+                                    let _ = cb(&text);
+                                }
+                            }
+                            let mut changed = false;
+                            e.delete_visual_selection(&mut changed);
+                        }
+                        dr.set(true);
+                    }
+                );
+
+                add_editor_ctx_action!(
+                    "copy",
+                    self.engine,
+                    self.draw_needed,
+                    |eng: &std::cell::RefCell<core::Engine>, dr: &std::cell::Cell<bool>| {
+                        let mut e = eng.borrow_mut();
+                        if matches!(
+                            e.mode,
+                            core::Mode::Visual | core::Mode::VisualLine | core::Mode::VisualBlock
+                        ) {
+                            e.yank_visual_selection();
+                            if let Some((ref text, _)) = e.registers.get(&'"') {
+                                let text = text.clone();
+                                if let Some(ref cb) = e.clipboard_write {
+                                    let _ = cb(&text);
+                                }
+                            }
+                            e.mode = core::Mode::Normal;
+                        }
+                        dr.set(true);
+                    }
+                );
+
+                add_editor_ctx_action!(
+                    "paste",
+                    self.engine,
+                    self.draw_needed,
+                    |eng: &std::cell::RefCell<core::Engine>, dr: &std::cell::Cell<bool>| {
+                        let mut e = eng.borrow_mut();
+                        if let Some(ref cb_read) = e.clipboard_read {
+                            if let Ok(text) = cb_read() {
+                                if !text.is_empty() {
+                                    e.registers.insert('"', (text, false));
+                                    let mut changed = false;
+                                    e.paste_after(&mut changed);
+                                }
+                            }
+                        }
+                        dr.set(true);
+                    }
+                );
+
+                add_editor_ctx_action!(
+                    "open_side_vsplit",
+                    self.engine,
+                    self.draw_needed,
+                    |eng: &std::cell::RefCell<core::Engine>, dr: &std::cell::Cell<bool>| {
+                        let mut e = eng.borrow_mut();
+                        if let Some(path) = e.file_path().map(|p| p.to_path_buf()) {
+                            e.split_window(core::window::SplitDirection::Vertical, None);
+                            let _ = e.open_file_with_mode(&path, core::OpenMode::Permanent);
+                        }
+                        dr.set(true);
+                    }
+                );
+
+                add_editor_ctx_action!(
+                    "command_palette",
+                    self.engine,
+                    self.draw_needed,
+                    |eng: &std::cell::RefCell<core::Engine>, dr: &std::cell::Cell<bool>| {
+                        eng.borrow_mut().open_command_palette();
+                        dr.set(true);
+                    }
+                );
+
+                da.insert_action_group("edctx", Some(&actions));
+
+                let n_rows = menu_row_count(&menu);
+                swap_ctx_popover(&self.active_ctx_popover, {
+                    let popover = gtk4::PopoverMenu::from_model(Some(&menu));
+                    popover.set_parent(&da);
+                    popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(
+                        x as i32, y as i32, 1, 1,
+                    )));
+                    popover.set_has_arrow(false);
+                    popover.set_position(gtk4::PositionType::Right);
+                    popover.set_size_request(-1, n_rows * 22 + 14);
+                    popover
+                });
+                if let Some(ref p) = *self.active_ctx_popover.borrow() {
+                    p.popup();
+                }
             }
             Msg::Resize => {
                 // Propagate window resize to open terminal panes.
@@ -13248,6 +13417,30 @@ const STATIC_CSS: &str = "
             border-color: #0e639c;
         }
         ";
+
+/// Build a `gio::Menu` from engine-generated `ContextMenuItem`s.
+/// Groups items into sections split at `separator_after` boundaries.
+fn build_gio_menu_from_engine_items(
+    items: &[core::engine::ContextMenuItem],
+    action_prefix: &str,
+) -> gtk4::gio::Menu {
+    let menu = gtk4::gio::Menu::new();
+    let mut section = gtk4::gio::Menu::new();
+    for item in items {
+        section.append(
+            Some(&item.label),
+            Some(&format!("{action_prefix}.{}", item.action)),
+        );
+        if item.separator_after {
+            menu.append_section(None, &section);
+            section = gtk4::gio::Menu::new();
+        }
+    }
+    if section.n_items() > 0 {
+        menu.append_section(None, &section);
+    }
+    menu
+}
 
 /// Clean up any previous context-menu popover from the shared slot,
 /// then store the new one.  The old popover is popdown'd + unparented

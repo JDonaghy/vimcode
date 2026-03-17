@@ -5,11 +5,13 @@
 ---
 
 ## Recently Completed
-- **Session 187**: Tab Context Menu Splits Fix — Fixed GTK/TUI split inconsistency (GTK was creating editor groups, engine was doing window splits); added 4 split options (Split Right/Down for Vim splits, Split Right/Down to New Group for editor groups); README 3-layer explainer; 4 new tests (4498 total).
-- **Session 186**: Drag-and-Drop File Move + Context Menu Clamping — TUI mouse drag + GTK DragSource/DropTarget; confirmation dialog with clickable buttons; fixed GTK dialog button misalignment (proportional vs monospace font); subtree move prevention; context menu popup z-order fix; 6 new tests (4468 total).
-- **Session 185**: Context Menu Action Polish + Bug Fixes — Select for Compare / Compare with Selected diff flow; fixed GTK copy_relative_path and open_side bugs; fixed "Open to Side" creating 2 tab groups; fixed swap file "Abort" not deleting swap; fixed xdg-open stderr corrupting TUI; fixed "Open in Integrated Terminal" (TUI noop + GTK missing); `terminal_new_tab_at()` for directory-specific terminals; deduplicated TUI action handlers; 8 new tests (4468 total).
+- **Session 191**: Subprocess stderr safety audit — Audited all `Command::new()` call sites (~50); only `registry.rs` `download_script()` had inherited stderr (`.status()` without redirect); fixed by adding `.stdout(null()).stderr(null())`. All other sites already use `.output()` (auto-captures) or explicit `Stdio` redirection. 4511 tests.
+- **Session 190**: LSP Go-to-Definition Fix + Kitty Keyboard Fix — Fixed `gd`/`gi`/`gy` appearing to hang (message not cleared after successful jump); Kitty `shift_map_us()` fix for shifted symbols; context menu mode-aware shortcuts; LSP response robustness (string ID fallback, `unwrap_or` on definition/hover parse). 4511 tests.
+- **Session 189**: VSCode-style Editor Context Menu — Full 9-item editor right-click menu; engine-driven for both GTK and TUI; 8 new tests (4510 total).
+- **Session 188**: Centralize Context Menus + Editor Right-Click — GTK context menus driven by engine items; 4 new tests (4501 total).
+- **Session 187**: Tab Context Menu Splits Fix — Fixed GTK/TUI split inconsistency; added 4 split options; 4 new tests (4498 total).
 
-> Sessions 186 and earlier in **SESSION_HISTORY.md**.
+> Sessions 189 and earlier in **SESSION_HISTORY.md**.
 
 ## Roadmap
 - [x] **Spell checker** — Vim-compatible `]s`/`[s`/`z=`/`zg`/`zw`; spellbook Hunspell parser; bundled en_US dictionary; tree-sitter-aware; `spell`/`spelllang` settings; user dictionary at `~/.config/vimcode/user.dic`
@@ -74,13 +76,16 @@
 
 ### Explorer
 - [x] **Drag-and-drop file/folder move** — Drag files and folders in the explorer tree to move them to a new location. Should work in both TUI (mouse drag) and GTK (native DnD) backends. Visual feedback during drag (insertion indicator, highlight target folder). Confirmation dialog with clickable buttons.
-- [ ] **Inline rename in explorer** — Rename files/folders directly in the explorer tree (as close to in-place editing as possible), rather than via a separate prompt. In GTK this can be a native editable cell; in TUI, render an input field overlaid on the tree row.
-- [ ] **Copy/paste files in explorer** — "Copy" and "Paste" items in the right-click context menu. Copy stores the source path; Paste into a different folder duplicates with the same name, Paste into the same folder prompts for a new name (inline in the tree). Support both single files and folders (recursive copy).
+- [x] **Inline rename in explorer** — Rename files/folders directly in the explorer tree (as close to in-place editing as possible), rather than via a separate prompt. In GTK this can be a native editable cell; in TUI, render an input field overlaid on the tree row.
+- [x] **Copy/paste files in explorer** — "Copy" and "Paste" items in the right-click context menu. Copy stores the source path; Paste into a different folder duplicates with the same name, Paste into the same folder prompts for a new name (inline in the tree). Support both single files and folders (recursive copy).
 - [x] **Context menu popup clamping** — TUI context menu popup rendering moved after status/command line in draw order so popups are no longer painted over by lower UI elements. Position clamping ensures popup stays within terminal bounds.
 
+### Editor
+- [x] **VSCode-style editor right-click context menu** — Full 9-item editor right-click: Go to Definition (`gd`), Go to References (`gr`), Rename Symbol (`<leader>rn`), Open Changes (`gD`), Cut, Copy, Paste, Open to the Side (vsplit), Command Palette (`Ctrl+Shift+P`). LSP items disabled without active server; Cut/Copy disabled without visual selection. Both GTK and TUI backends.
+
 ### Robustness
-- [ ] **Centralize context menu definitions** — GTK backend hardcodes its own `gio::Menu` items separately from the engine's `open_explorer_context_menu()` / `open_tab_context_menu()`. This causes drift (e.g. "Open in Integrated Terminal" was missing from GTK). GTK should read from the engine's `ContextMenuState.items` to build its native menus, so new items only need to be added once in the engine.
-- [ ] **Subprocess stderr safety audit** — Audit all `Command::spawn()` calls across the codebase to ensure stdout/stderr are redirected (null or piped). Unguarded spawns let child process output corrupt the TUI display. Fixed `xdg-open`/`open` calls; need to verify LSP, DAP, git, terminal, and any other subprocess spawns are safe.
+- [x] **Centralize context menu definitions** — GTK backend hardcodes its own `gio::Menu` items separately from the engine's `open_explorer_context_menu()` / `open_tab_context_menu()`. This causes drift (e.g. "Open in Integrated Terminal" was missing from GTK). GTK should read from the engine's `ContextMenuState.items` to build its native menus, so new items only need to be added once in the engine.
+- [x] **Subprocess stderr safety audit** — Audit all `Command::spawn()` calls across the codebase to ensure stdout/stderr are redirected (null or piped). Unguarded spawns let child process output corrupt the TUI display. Fixed `xdg-open`/`open` calls; need to verify LSP, DAP, git, terminal, and any other subprocess spawns are safe.
 
 ### Documentation
 - [x] **GitHub Wiki** — 9 pages: Home, Getting Started, Key Remapping, Settings Reference, Extension Development, Lua Plugin API, Theme Customization, DAP Debugger Setup, LSP Configuration; README Documentation section links to wiki
