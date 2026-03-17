@@ -724,6 +724,13 @@ struct Change {
     motion: Option<Motion>,
 }
 
+/// C preprocessor directive kind for `[#` / `]#` navigation.
+enum PreprocKind {
+    If,
+    ElseElif,
+    Endif,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
 enum ChangeOp {
@@ -786,6 +793,51 @@ pub struct TabDragState {
     pub source_group: GroupId,
     pub source_tab_index: usize,
     pub tab_name: String,
+}
+
+// ── Context menu data model ──────────────────────────────────────────────────
+
+/// What the context menu was opened on.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub enum ContextMenuTarget {
+    Tab { group_id: GroupId, tab_idx: usize },
+    ExplorerFile { path: PathBuf },
+    ExplorerDir { path: PathBuf },
+    Editor,
+}
+
+/// A single item in a context menu popup.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct ContextMenuItem {
+    pub label: String,
+    pub action: String,
+    pub shortcut: String,
+    pub separator_after: bool,
+    pub enabled: bool,
+}
+
+/// State for an open context menu popup (engine-driven, rendered by TUI).
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct ContextMenuState {
+    pub target: ContextMenuTarget,
+    pub items: Vec<ContextMenuItem>,
+    pub selected: usize,
+    pub screen_x: u16,
+    pub screen_y: u16,
+}
+
+/// State for inline rename editing in the explorer sidebar.
+#[derive(Debug, Clone)]
+pub struct ExplorerRenameState {
+    /// The file/directory being renamed.
+    pub path: PathBuf,
+    /// Current text input (the new name).
+    pub input: String,
+    /// Byte-offset cursor position within `input`.
+    pub cursor: usize,
 }
 
 /// One panel in a VSCode-style editor-group split.
@@ -1465,6 +1517,9 @@ pub struct Engine {
     last_change: Option<Change>,
     /// Text accumulated during insert mode for repeat
     insert_text_buffer: String,
+    /// When true, Replace mode uses virtual column awareness (gR).
+    /// Tabs are expanded to spaces before overwriting.
+    virtual_replace: bool,
     /// When insert mode was entered via a change operator (cw, ce, cb, etc.),
     /// stores (motion_char, count) so `.` can replay the full change.
     pending_change_motion: Option<(char, usize)>,
@@ -2091,6 +2146,22 @@ pub struct Engine {
     pub ext_panel_scroll_top: usize,
     /// Per-panel section expanded state.
     pub ext_panel_sections_expanded: HashMap<String, Vec<bool>>,
+
+    // --- Context menu ---
+    /// Active right-click context menu state (TUI-driven). None when no menu is open.
+    pub context_menu: Option<ContextMenuState>,
+    /// File selected as "left side" for a two-way diff comparison (via context menu).
+    pub diff_selected_file: Option<PathBuf>,
+    /// Pending move awaiting user confirmation: (source_path, dest_dir).
+    pub pending_move: Option<(PathBuf, PathBuf)>,
+    /// Set to true when a file move completes; backends should refresh the explorer tree
+    /// and clear this flag.
+    pub explorer_needs_refresh: bool,
+
+    /// Inline rename state for the explorer sidebar.  When `Some`, the
+    /// sidebar row matching `path` should render an editable text input
+    /// instead of the plain filename.
+    pub explorer_rename: Option<ExplorerRenameState>,
 }
 
 impl Engine {
@@ -2155,6 +2226,7 @@ impl Engine {
             pending_text_object: None,
             last_change: None,
             insert_text_buffer: String::new(),
+            virtual_replace: false,
             pending_change_motion: None,
             settings: {
                 // Ensure settings.json exists with defaults
@@ -2398,6 +2470,11 @@ impl Engine {
             ext_panel_selected: 0,
             ext_panel_scroll_top: 0,
             ext_panel_sections_expanded: HashMap::new(),
+            context_menu: None,
+            diff_selected_file: None,
+            pending_move: None,
+            explorer_needs_refresh: false,
+            explorer_rename: None,
         };
         // If vscode mode is configured, start in Insert mode with menu visible
         if engine.is_vscode_mode() {
@@ -2731,12 +2808,21 @@ impl Engine {
         let cursor = *self.cursor();
         // Save line state before modification (for U command)
         self.save_line_for_undo();
+        // Record the "before" state in the timeline on first edit
+        if self.active_buffer_state().undo_timeline.is_empty() {
+            self.active_buffer_state_mut()
+                .record_timeline_snapshot(cursor);
+        }
         self.active_buffer_state_mut().start_undo_group(cursor);
     }
 
     /// Finish the current undo group for the active buffer.
     pub fn finish_undo_group(&mut self) {
         self.active_buffer_state_mut().finish_undo_group();
+        // Record timeline snapshot for g-/g+ after each completed edit
+        let cursor = self.view().cursor;
+        self.active_buffer_state_mut()
+            .record_timeline_snapshot(cursor);
     }
 
     /// Return to Normal mode from any mode, performing any necessary cleanup
@@ -2781,13 +2867,14 @@ impl Engine {
         if let Some(cursor) = self.active_buffer_state_mut().undo() {
             self.view_mut().cursor = cursor;
             self.clamp_cursor_col();
-            // Update dirty flag based on whether we're back at the saved state.
             let at_saved = self.active_buffer_state().is_at_saved_state();
             self.set_dirty(!at_saved);
-            // Notify LSP of the content change so diagnostics update.
             let active_id = self.active_buffer_id();
             self.lsp_dirty_buffers.insert(active_id, true);
             self.swap_mark_dirty();
+            // Record state in timeline for g-/g+
+            let cur = self.view().cursor;
+            self.active_buffer_state_mut().record_timeline_snapshot(cur);
             true
         } else {
             self.message = "Already at oldest change".to_string();
@@ -2800,18 +2887,90 @@ impl Engine {
         if let Some(cursor) = self.active_buffer_state_mut().redo() {
             self.view_mut().cursor = cursor;
             self.clamp_cursor_col();
-            // Update dirty flag based on whether we're back at the saved state.
             let at_saved = self.active_buffer_state().is_at_saved_state();
             self.set_dirty(!at_saved);
-            // Notify LSP of the content change so diagnostics update.
             let active_id = self.active_buffer_id();
             self.lsp_dirty_buffers.insert(active_id, true);
             self.swap_mark_dirty();
+            // Record state in timeline for g-/g+
+            let cur = self.view().cursor;
+            self.active_buffer_state_mut().record_timeline_snapshot(cur);
             true
         } else {
             self.message = "Already at newest change".to_string();
             false
         }
+    }
+
+    /// Navigate to an earlier buffer state chronologically (`g-`).
+    pub fn g_earlier(&mut self) -> bool {
+        let bs = self.active_buffer_state_mut();
+        if bs.undo_timeline.is_empty() {
+            return false;
+        }
+        // current_pos points to the timeline entry matching current buffer state.
+        // None means "at latest" = last index.
+        let current_pos = bs
+            .undo_timeline_pos
+            .unwrap_or(bs.undo_timeline.len().saturating_sub(1));
+        if current_pos == 0 {
+            return false; // already at earliest
+        }
+        let target = current_pos - 1;
+        let (ref text, cursor) = bs.undo_timeline[target];
+        let text_clone = text.clone();
+        let char_len = bs.buffer.len_chars();
+        bs.buffer.delete_range(0, char_len);
+        if !text_clone.is_empty() {
+            bs.buffer.insert(0, &text_clone);
+        }
+        bs.undo_timeline_pos = Some(target);
+        bs.update_syntax();
+        self.view_mut().cursor = cursor;
+        self.clamp_cursor_col();
+        self.set_dirty(true);
+        let active_id = self.active_buffer_id();
+        self.lsp_dirty_buffers.insert(active_id, true);
+        self.swap_mark_dirty();
+        let total = self.active_buffer_state().undo_timeline.len();
+        self.message = format!("{} change(s); g- #{}/{}", total, target + 1, total);
+        true
+    }
+
+    /// Navigate to a later buffer state chronologically (`g+`).
+    pub fn g_later(&mut self) -> bool {
+        let bs = self.active_buffer_state_mut();
+        if bs.undo_timeline.is_empty() {
+            return false;
+        }
+        let last = bs.undo_timeline.len() - 1;
+        let current_pos = bs.undo_timeline_pos.unwrap_or(last);
+        if current_pos >= last {
+            return false; // already at latest
+        }
+        let target = current_pos + 1;
+        let (ref text, cursor) = bs.undo_timeline[target];
+        let text_clone = text.clone();
+        let char_len = bs.buffer.len_chars();
+        bs.buffer.delete_range(0, char_len);
+        if !text_clone.is_empty() {
+            bs.buffer.insert(0, &text_clone);
+        }
+        if target == last {
+            bs.undo_timeline_pos = None; // back at latest
+        } else {
+            bs.undo_timeline_pos = Some(target);
+        }
+        bs.update_syntax();
+        self.view_mut().cursor = cursor;
+        self.clamp_cursor_col();
+        self.set_dirty(true);
+        let active_id = self.active_buffer_id();
+        self.lsp_dirty_buffers.insert(active_id, true);
+        self.swap_mark_dirty();
+        let total = self.active_buffer_state().undo_timeline.len();
+        self.message = format!("{} change(s); g+ #{}/{}", total, target + 1, total);
+        true
     }
 
     /// Check if undo is available.
@@ -4081,6 +4240,160 @@ impl Engine {
         Ok(())
     }
 
+    /// Start inline rename for the given path in the explorer sidebar.
+    ///
+    /// Pre-fills the input with the current filename and places the cursor
+    /// at the end.  Backends should render an editable text field on the
+    /// matching explorer row while this state is active.
+    pub fn start_explorer_rename(&mut self, path: PathBuf) {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let cursor = name.len();
+        self.explorer_rename = Some(ExplorerRenameState {
+            path,
+            input: name,
+            cursor,
+        });
+    }
+
+    /// Handle a key press while inline rename is active.
+    ///
+    /// Returns `true` if the key was consumed.  On Enter the rename is
+    /// committed; on Escape it is cancelled.  Sets `explorer_needs_refresh`
+    /// on success so backends rebuild the tree.
+    pub fn handle_explorer_rename_key(
+        &mut self,
+        key_name: &str,
+        unicode: Option<char>,
+        ctrl: bool,
+    ) -> bool {
+        let state = match self.explorer_rename.as_mut() {
+            Some(s) => s,
+            None => return false,
+        };
+
+        match key_name {
+            "Escape" => {
+                self.explorer_rename = None;
+                return true;
+            }
+            "Return" => {
+                let path = state.path.clone();
+                let input = state.input.clone();
+                self.explorer_rename = None;
+                let new_name = input.trim();
+                if new_name.is_empty() {
+                    self.message = "Name cannot be empty".to_string();
+                } else {
+                    match self.rename_file(&path, new_name) {
+                        Ok(()) => {
+                            self.explorer_needs_refresh = true;
+                            self.message = format!("Renamed to '{}'", new_name);
+                        }
+                        Err(e) => {
+                            self.message = e;
+                        }
+                    }
+                }
+                return true;
+            }
+            "BackSpace" => {
+                if state.cursor > 0 {
+                    let prev = state.input[..state.cursor]
+                        .char_indices()
+                        .next_back()
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                    state.input.remove(prev);
+                    state.cursor = prev;
+                }
+                return true;
+            }
+            "Delete" => {
+                if state.cursor < state.input.len() {
+                    state.input.remove(state.cursor);
+                }
+                return true;
+            }
+            "Left" => {
+                if state.cursor > 0 {
+                    state.cursor = state.input[..state.cursor]
+                        .char_indices()
+                        .next_back()
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                }
+                return true;
+            }
+            "Right" => {
+                if state.cursor < state.input.len() {
+                    let rest = &state.input[state.cursor..];
+                    state.cursor = rest
+                        .char_indices()
+                        .nth(1)
+                        .map(|(i, _)| state.cursor + i)
+                        .unwrap_or(state.input.len());
+                }
+                return true;
+            }
+            "Home" => {
+                state.cursor = 0;
+                return true;
+            }
+            "End" => {
+                state.cursor = state.input.len();
+                return true;
+            }
+            _ => {}
+        }
+
+        // Printable character insertion
+        if !ctrl {
+            if let Some(ch) = unicode {
+                if !ch.is_control() {
+                    state.input.insert(state.cursor, ch);
+                    state.cursor += ch.len_utf8();
+                    return true;
+                }
+            }
+        }
+
+        // Consume all other keys while rename is active (don't let them leak)
+        true
+    }
+
+    /// Show a confirmation dialog before moving a file/folder.
+    ///
+    /// Stores the pending move and displays a Yes/No dialog.  The actual
+    /// `move_file()` call happens when the user confirms via the dialog.
+    pub fn confirm_move_file(&mut self, src: &Path, dest: &Path) {
+        let src_name = src
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| src.to_string_lossy().to_string());
+        let dest_display = dest.to_string_lossy().to_string();
+        self.pending_move = Some((src.to_path_buf(), dest.to_path_buf()));
+        self.show_dialog(
+            "confirm_move",
+            "Confirm Move",
+            vec![format!("Move '{}' to '{}'?", src_name, dest_display)],
+            vec![
+                DialogButton {
+                    label: "Yes".into(),
+                    hotkey: 'y',
+                    action: "yes".into(),
+                },
+                DialogButton {
+                    label: "No".into(),
+                    hotkey: 'n',
+                    action: "no".into(),
+                },
+            ],
+        );
+    }
+
     /// Move `src` into `dest_dir` (a directory).
     ///
     /// The filename is preserved.  Any open buffer whose `file_path` matches
@@ -4102,6 +4415,31 @@ impl Engine {
             }
             dest.to_path_buf()
         };
+        // Prevent moving a directory into its own subtree.
+        if src.is_dir() {
+            let canon_src = src.canonicalize().unwrap_or_else(|_| src.to_path_buf());
+            let dest_parent = final_dest
+                .parent()
+                .and_then(|p| p.canonicalize().ok())
+                .unwrap_or_else(|| final_dest.clone());
+            if dest_parent.starts_with(&canon_src) {
+                return Err("Cannot move a folder into its own subtree".to_string());
+            }
+        }
+
+        // Prevent no-op moves (same location).
+        if final_dest == src
+            || src
+                .canonicalize()
+                .ok()
+                .zip(final_dest.parent().and_then(|p| p.canonicalize().ok()))
+                .is_some_and(|(cs, cd)| {
+                    cs.parent() == Some(cd.as_path()) && cs.file_name() == final_dest.file_name()
+                })
+        {
+            return Ok(());
+        }
+
         std::fs::rename(src, &final_dest).map_err(|e| format!("Move failed: {}", e))?;
 
         // Update any open buffer that was showing the old path.
@@ -5071,6 +5409,840 @@ impl Engine {
         }
 
         true
+    }
+
+    /// Close a specific tab by group and index. Used for right-click "Close" on non-active tabs.
+    pub fn close_tab_at(&mut self, group_id: GroupId, tab_idx: usize) -> bool {
+        // Switch to the target group/tab, then close it.
+        if !self.editor_groups.contains_key(&group_id) {
+            return false;
+        }
+        let tabs_len = self.editor_groups[&group_id].tabs.len();
+        if tab_idx >= tabs_len {
+            return false;
+        }
+        let prev_group = self.active_group;
+        let prev_tab = self.active_group().active_tab;
+        self.active_group = group_id;
+        self.editor_groups.get_mut(&group_id).unwrap().active_tab = tab_idx;
+        let closed = self.close_tab();
+        // If we didn't close (last tab), restore.
+        if !closed {
+            self.active_group = prev_group;
+            if let Some(g) = self.editor_groups.get_mut(&prev_group) {
+                if prev_tab < g.tabs.len() {
+                    g.active_tab = prev_tab;
+                }
+            }
+        }
+        closed
+    }
+
+    /// Close all tabs in the current group except the active one.
+    pub fn close_other_tabs(&mut self) {
+        let active_tab_idx = self.active_group().active_tab;
+        let tabs_len = self.active_group().tabs.len();
+        if tabs_len <= 1 {
+            return;
+        }
+        // Close tabs from highest index to lowest, skipping active.
+        for i in (0..tabs_len).rev() {
+            if i == active_tab_idx {
+                continue;
+            }
+            // Set active to the tab we want to close, then close it.
+            self.active_group_mut().active_tab = i;
+            self.close_tab();
+            // After closing, the active_tab might have shifted.
+        }
+        // Ensure the originally active tab (now the only one) is selected.
+        self.active_group_mut().active_tab = 0;
+        self.tab_mru_touch();
+    }
+
+    /// Close all tabs to the right of the active tab.
+    pub fn close_tabs_to_right(&mut self) {
+        let active_tab_idx = self.active_group().active_tab;
+        let tabs_len = self.active_group().tabs.len();
+        if active_tab_idx >= tabs_len - 1 {
+            return;
+        }
+        // Close from rightmost inward.
+        for i in (active_tab_idx + 1..tabs_len).rev() {
+            self.active_group_mut().active_tab = i;
+            self.close_tab();
+        }
+        self.active_group_mut().active_tab = active_tab_idx;
+        self.tab_mru_touch();
+    }
+
+    /// Close all tabs to the left of the active tab.
+    pub fn close_tabs_to_left(&mut self) {
+        let active_tab_idx = self.active_group().active_tab;
+        if active_tab_idx == 0 {
+            return;
+        }
+        // Close from index 0 up to (not including) active.
+        // Each close at index 0 shifts everything left.
+        for _ in 0..active_tab_idx {
+            self.active_group_mut().active_tab = 0;
+            self.close_tab();
+        }
+        self.active_group_mut().active_tab = 0;
+        self.tab_mru_touch();
+    }
+
+    /// Close all non-dirty tabs except the active one.
+    pub fn close_saved_tabs(&mut self) {
+        let active_tab_idx = self.active_group().active_tab;
+        let tabs_len = self.active_group().tabs.len();
+        if tabs_len <= 1 {
+            return;
+        }
+        // Collect indices of non-dirty, non-active tabs.
+        let mut to_close = Vec::new();
+        for i in 0..tabs_len {
+            if i == active_tab_idx {
+                continue;
+            }
+            // Check if the tab's primary buffer is dirty.
+            let tab = &self.active_group().tabs[i];
+            let wid = tab.active_window;
+            if let Some(w) = self.windows.get(&wid) {
+                if let Some(bs) = self.buffer_manager.get(w.buffer_id) {
+                    if bs.dirty {
+                        continue;
+                    }
+                }
+            }
+            to_close.push(i);
+        }
+        // Close from highest index to lowest.
+        for i in to_close.into_iter().rev() {
+            self.active_group_mut().active_tab = i;
+            self.close_tab();
+        }
+        // Recalculate the active tab (original one shifted down by removed tabs below it).
+        let remaining = self.active_group().tabs.len();
+        if self.active_group().active_tab >= remaining {
+            self.active_group_mut().active_tab = remaining.saturating_sub(1);
+        }
+        self.tab_mru_touch();
+    }
+
+    /// Get the file path of a tab's primary window buffer.
+    pub fn tab_file_path(&self, group_id: GroupId, tab_idx: usize) -> Option<PathBuf> {
+        let group = self.editor_groups.get(&group_id)?;
+        let tab = group.tabs.get(tab_idx)?;
+        let wid = tab.active_window;
+        let w = self.windows.get(&wid)?;
+        let bs = self.buffer_manager.get(w.buffer_id)?;
+        bs.file_path.clone()
+    }
+
+    /// Open the system file manager at the given path's parent directory.
+    pub fn reveal_in_file_manager(&self, path: &Path) {
+        let dir = if path.is_dir() {
+            path
+        } else {
+            path.parent().unwrap_or(path)
+        };
+        #[cfg(target_os = "macos")]
+        {
+            let _ = std::process::Command::new("open")
+                .arg("-R")
+                .arg(path)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = std::process::Command::new("xdg-open")
+                .arg(dir)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+        }
+    }
+
+    /// Return the path relative to cwd.
+    pub fn copy_relative_path(&self, path: &Path) -> String {
+        path.strip_prefix(&self.cwd)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    // ── Context menu methods ─────────────────────────────────────────────────
+
+    /// Open a context menu for a tab.
+    pub fn open_tab_context_menu(&mut self, group_id: GroupId, tab_idx: usize, x: u16, y: u16) {
+        let group = match self.editor_groups.get(&group_id) {
+            Some(g) => g,
+            None => return,
+        };
+        let tabs_len = group.tabs.len();
+        if tab_idx >= tabs_len {
+            return;
+        }
+
+        let has_file = self.tab_file_path(group_id, tab_idx).is_some();
+
+        let items = vec![
+            ContextMenuItem {
+                label: "Close".into(),
+                action: "close".into(),
+                shortcut: "Ctrl+W".into(),
+                separator_after: false,
+                enabled: true,
+            },
+            ContextMenuItem {
+                label: "Close Others".into(),
+                action: "close_others".into(),
+                shortcut: String::new(),
+                separator_after: false,
+                enabled: tabs_len > 1,
+            },
+            ContextMenuItem {
+                label: "Close to the Right".into(),
+                action: "close_right".into(),
+                shortcut: String::new(),
+                separator_after: false,
+                enabled: tab_idx < tabs_len - 1,
+            },
+            ContextMenuItem {
+                label: "Close Saved".into(),
+                action: "close_saved".into(),
+                shortcut: String::new(),
+                separator_after: true,
+                enabled: true,
+            },
+            ContextMenuItem {
+                label: "Copy Path".into(),
+                action: "copy_path".into(),
+                shortcut: String::new(),
+                separator_after: false,
+                enabled: has_file,
+            },
+            ContextMenuItem {
+                label: "Copy Relative Path".into(),
+                action: "copy_relative_path".into(),
+                shortcut: String::new(),
+                separator_after: true,
+                enabled: has_file,
+            },
+            ContextMenuItem {
+                label: "Reveal in File Explorer".into(),
+                action: "reveal".into(),
+                shortcut: String::new(),
+                separator_after: true,
+                enabled: has_file,
+            },
+            ContextMenuItem {
+                label: "Split Right".into(),
+                action: "split_right".into(),
+                shortcut: String::new(),
+                separator_after: false,
+                enabled: true,
+            },
+            ContextMenuItem {
+                label: "Split Down".into(),
+                action: "split_down".into(),
+                shortcut: String::new(),
+                separator_after: true,
+                enabled: true,
+            },
+            ContextMenuItem {
+                label: "Split Right to New Group".into(),
+                action: "group_split_right".into(),
+                shortcut: String::new(),
+                separator_after: false,
+                enabled: true,
+            },
+            ContextMenuItem {
+                label: "Split Down to New Group".into(),
+                action: "group_split_down".into(),
+                shortcut: String::new(),
+                separator_after: false,
+                enabled: true,
+            },
+        ];
+
+        // Select the first enabled item.
+        let selected = items.iter().position(|i| i.enabled).unwrap_or(0);
+
+        self.context_menu = Some(ContextMenuState {
+            target: ContextMenuTarget::Tab { group_id, tab_idx },
+            items,
+            selected,
+            screen_x: x,
+            screen_y: y,
+        });
+    }
+
+    /// Open a context menu for an explorer file/directory.
+    pub fn open_explorer_context_menu(&mut self, path: PathBuf, is_dir: bool, x: u16, y: u16) {
+        let mut items = vec![];
+        if is_dir {
+            // Folder context menu (matches VSCode folder menu)
+            items.push(ContextMenuItem {
+                label: "New File...".into(),
+                action: "new_file".into(),
+                shortcut: String::new(),
+                separator_after: false,
+                enabled: true,
+            });
+            items.push(ContextMenuItem {
+                label: "New Folder...".into(),
+                action: "new_folder".into(),
+                shortcut: String::new(),
+                separator_after: false,
+                enabled: true,
+            });
+            items.push(ContextMenuItem {
+                label: "Open Containing Folder".into(),
+                action: "reveal".into(),
+                shortcut: "Ctrl+Alt+R".into(),
+                separator_after: false,
+                enabled: true,
+            });
+            items.push(ContextMenuItem {
+                label: "Open in Integrated Terminal".into(),
+                action: "open_terminal".into(),
+                shortcut: String::new(),
+                separator_after: false,
+                enabled: true,
+            });
+            items.push(ContextMenuItem {
+                label: "Find in Folder...".into(),
+                action: "find_in_folder".into(),
+                shortcut: "Shift+Alt+F".into(),
+                separator_after: true,
+                enabled: true,
+            });
+            items.push(ContextMenuItem {
+                label: "Copy Path".into(),
+                action: "copy_path".into(),
+                shortcut: "Ctrl+Alt+C".into(),
+                separator_after: false,
+                enabled: true,
+            });
+            items.push(ContextMenuItem {
+                label: "Copy Relative Path".into(),
+                action: "copy_relative_path".into(),
+                shortcut: "Ctrl+Shift+Alt+C".into(),
+                separator_after: true,
+                enabled: true,
+            });
+            items.push(ContextMenuItem {
+                label: "Rename...".into(),
+                action: "rename".into(),
+                shortcut: "F2".into(),
+                separator_after: false,
+                enabled: true,
+            });
+            items.push(ContextMenuItem {
+                label: "Delete".into(),
+                action: "delete".into(),
+                shortcut: "Delete".into(),
+                separator_after: false,
+                enabled: true,
+            });
+        } else {
+            // File context menu (matches VSCode file menu)
+            items.push(ContextMenuItem {
+                label: "Open to the Side".into(),
+                action: "open_side".into(),
+                shortcut: "Ctrl+Enter".into(),
+                separator_after: false,
+                enabled: true,
+            });
+            items.push(ContextMenuItem {
+                label: "Open to the Side (vsplit)".into(),
+                action: "open_side_vsplit".into(),
+                shortcut: String::new(),
+                separator_after: false,
+                enabled: true,
+            });
+            items.push(ContextMenuItem {
+                label: "Open Containing Folder".into(),
+                action: "reveal".into(),
+                shortcut: "Ctrl+Alt+R".into(),
+                separator_after: false,
+                enabled: true,
+            });
+            items.push(ContextMenuItem {
+                label: "Open in Integrated Terminal".into(),
+                action: "open_terminal".into(),
+                shortcut: String::new(),
+                separator_after: false,
+                enabled: true,
+            });
+            if self.diff_selected_file.is_some() {
+                let sel_name = self
+                    .diff_selected_file
+                    .as_ref()
+                    .and_then(|p| p.file_name())
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "file".into());
+                items.push(ContextMenuItem {
+                    label: format!("Compare with '{sel_name}'"),
+                    action: "diff_with_selected".into(),
+                    shortcut: String::new(),
+                    separator_after: false,
+                    enabled: true,
+                });
+                items.push(ContextMenuItem {
+                    label: "Select for Compare".into(),
+                    action: "select_for_diff".into(),
+                    shortcut: String::new(),
+                    separator_after: true,
+                    enabled: true,
+                });
+            } else {
+                items.push(ContextMenuItem {
+                    label: "Select for Compare".into(),
+                    action: "select_for_diff".into(),
+                    shortcut: String::new(),
+                    separator_after: true,
+                    enabled: true,
+                });
+            }
+            items.push(ContextMenuItem {
+                label: "Copy Path".into(),
+                action: "copy_path".into(),
+                shortcut: "Ctrl+Alt+C".into(),
+                separator_after: false,
+                enabled: true,
+            });
+            items.push(ContextMenuItem {
+                label: "Copy Relative Path".into(),
+                action: "copy_relative_path".into(),
+                shortcut: "Ctrl+Shift+Alt+C".into(),
+                separator_after: true,
+                enabled: true,
+            });
+            items.push(ContextMenuItem {
+                label: "Rename...".into(),
+                action: "rename".into(),
+                shortcut: "F2".into(),
+                separator_after: false,
+                enabled: true,
+            });
+            items.push(ContextMenuItem {
+                label: "Delete".into(),
+                action: "delete".into(),
+                shortcut: "Delete".into(),
+                separator_after: false,
+                enabled: true,
+            });
+        }
+
+        let target = if is_dir {
+            ContextMenuTarget::ExplorerDir { path }
+        } else {
+            ContextMenuTarget::ExplorerFile { path }
+        };
+
+        self.context_menu = Some(ContextMenuState {
+            target,
+            items,
+            selected: 0,
+            screen_x: x,
+            screen_y: y,
+        });
+    }
+
+    /// Open a context menu for the editor area (right-click on buffer text).
+    pub fn open_editor_context_menu(&mut self, x: u16, y: u16) {
+        let has_file = self.file_path().is_some();
+        let has_lsp = self.lsp_manager.is_some();
+        let has_selection = matches!(
+            self.mode,
+            Mode::Visual | Mode::VisualLine | Mode::VisualBlock
+        );
+        let vsc = self.is_vscode_mode();
+        let items = vec![
+            ContextMenuItem {
+                label: "Go to Definition".into(),
+                action: "goto_definition".into(),
+                shortcut: if vsc { "F12" } else { "gd" }.into(),
+                separator_after: false,
+                enabled: has_lsp,
+            },
+            ContextMenuItem {
+                label: "Go to References".into(),
+                action: "goto_references".into(),
+                shortcut: if vsc { "Shift+F12" } else { "gr" }.into(),
+                separator_after: false,
+                enabled: has_lsp,
+            },
+            ContextMenuItem {
+                label: "Rename Symbol".into(),
+                action: "rename_symbol".into(),
+                shortcut: if vsc { "F2" } else { "<leader>rn" }.into(),
+                separator_after: true,
+                enabled: has_lsp,
+            },
+            ContextMenuItem {
+                label: "Open Changes".into(),
+                action: "open_changes".into(),
+                shortcut: "gD".into(),
+                separator_after: true,
+                enabled: has_file,
+            },
+            ContextMenuItem {
+                label: "Cut".into(),
+                action: "cut".into(),
+                shortcut: if vsc { "Ctrl+X" } else { "" }.into(),
+                separator_after: false,
+                enabled: has_selection,
+            },
+            ContextMenuItem {
+                label: "Copy".into(),
+                action: "copy".into(),
+                shortcut: if vsc { "Ctrl+C" } else { "" }.into(),
+                separator_after: false,
+                enabled: has_selection,
+            },
+            ContextMenuItem {
+                label: "Paste".into(),
+                action: "paste".into(),
+                shortcut: if vsc { "Ctrl+V" } else { "" }.into(),
+                separator_after: true,
+                enabled: true,
+            },
+            ContextMenuItem {
+                label: "Open to the Side (vsplit)".into(),
+                action: "open_side_vsplit".into(),
+                shortcut: String::new(),
+                separator_after: true,
+                enabled: has_file,
+            },
+            ContextMenuItem {
+                label: "Command Palette".into(),
+                action: "command_palette".into(),
+                shortcut: "F1".into(),
+                separator_after: false,
+                enabled: true,
+            },
+        ];
+        let selected = items.iter().position(|i| i.enabled).unwrap_or(0);
+        self.context_menu = Some(ContextMenuState {
+            target: ContextMenuTarget::Editor,
+            items,
+            selected,
+            screen_x: x,
+            screen_y: y,
+        });
+    }
+
+    /// Close the context menu without executing any action.
+    pub fn close_context_menu(&mut self) {
+        self.context_menu = None;
+    }
+
+    /// Confirm the currently selected context menu item. Returns the action string.
+    pub fn context_menu_confirm(&mut self) -> Option<String> {
+        let menu = self.context_menu.take()?;
+        let item = menu.items.get(menu.selected)?;
+        if !item.enabled {
+            return None;
+        }
+        let action = item.action.clone();
+
+        match &menu.target {
+            ContextMenuTarget::Tab { group_id, tab_idx } => {
+                let group_id = *group_id;
+                let tab_idx = *tab_idx;
+                match action.as_str() {
+                    "close" => {
+                        self.close_tab_at(group_id, tab_idx);
+                    }
+                    "close_others" => {
+                        // Focus the target tab first, then close others.
+                        self.active_group = group_id;
+                        if let Some(g) = self.editor_groups.get_mut(&group_id) {
+                            if tab_idx < g.tabs.len() {
+                                g.active_tab = tab_idx;
+                            }
+                        }
+                        self.close_other_tabs();
+                    }
+                    "close_right" => {
+                        self.active_group = group_id;
+                        if let Some(g) = self.editor_groups.get_mut(&group_id) {
+                            if tab_idx < g.tabs.len() {
+                                g.active_tab = tab_idx;
+                            }
+                        }
+                        self.close_tabs_to_right();
+                    }
+                    "close_saved" => {
+                        self.active_group = group_id;
+                        if let Some(g) = self.editor_groups.get_mut(&group_id) {
+                            if tab_idx < g.tabs.len() {
+                                g.active_tab = tab_idx;
+                            }
+                        }
+                        self.close_saved_tabs();
+                    }
+                    "copy_path" => {
+                        if let Some(path) = self.tab_file_path(group_id, tab_idx) {
+                            let text = path.to_string_lossy().into_owned();
+                            if let Some(ref cb) = self.clipboard_write {
+                                let _ = cb(&text);
+                            }
+                            self.message = format!("Copied: {text}");
+                        }
+                    }
+                    "copy_relative_path" => {
+                        if let Some(path) = self.tab_file_path(group_id, tab_idx) {
+                            let text = self.copy_relative_path(&path);
+                            if let Some(ref cb) = self.clipboard_write {
+                                let _ = cb(&text);
+                            }
+                            self.message = format!("Copied: {text}");
+                        }
+                    }
+                    "reveal" => {
+                        if let Some(path) = self.tab_file_path(group_id, tab_idx) {
+                            self.reveal_in_file_manager(&path);
+                        }
+                    }
+                    "split_right" => {
+                        // Focus the target tab, then split.
+                        self.active_group = group_id;
+                        if let Some(g) = self.editor_groups.get_mut(&group_id) {
+                            if tab_idx < g.tabs.len() {
+                                g.active_tab = tab_idx;
+                            }
+                        }
+                        self.split_window(SplitDirection::Vertical, None);
+                    }
+                    "split_down" => {
+                        self.active_group = group_id;
+                        if let Some(g) = self.editor_groups.get_mut(&group_id) {
+                            if tab_idx < g.tabs.len() {
+                                g.active_tab = tab_idx;
+                            }
+                        }
+                        self.split_window(SplitDirection::Horizontal, None);
+                    }
+                    "group_split_right" => {
+                        self.active_group = group_id;
+                        if let Some(g) = self.editor_groups.get_mut(&group_id) {
+                            if tab_idx < g.tabs.len() {
+                                g.active_tab = tab_idx;
+                            }
+                        }
+                        self.open_editor_group(SplitDirection::Vertical);
+                    }
+                    "group_split_down" => {
+                        self.active_group = group_id;
+                        if let Some(g) = self.editor_groups.get_mut(&group_id) {
+                            if tab_idx < g.tabs.len() {
+                                g.active_tab = tab_idx;
+                            }
+                        }
+                        self.open_editor_group(SplitDirection::Horizontal);
+                    }
+                    _ => {}
+                }
+            }
+            ContextMenuTarget::ExplorerFile { path } | ContextMenuTarget::ExplorerDir { path } => {
+                match action.as_str() {
+                    "copy_path" => {
+                        let text = path.to_string_lossy().into_owned();
+                        if let Some(ref cb) = self.clipboard_write {
+                            let _ = cb(&text);
+                        }
+                        self.message = format!("Copied: {text}");
+                    }
+                    "copy_relative_path" => {
+                        let text = self.copy_relative_path(path);
+                        if let Some(ref cb) = self.clipboard_write {
+                            let _ = cb(&text);
+                        }
+                        self.message = format!("Copied: {text}");
+                    }
+                    "reveal" => {
+                        self.reveal_in_file_manager(path);
+                    }
+                    "select_for_diff" => {
+                        let name = path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| path.display().to_string());
+                        self.diff_selected_file = Some(path.clone());
+                        self.message = format!(
+                            "Selected '{name}' for compare. Right-click another file to compare."
+                        );
+                    }
+                    "diff_with_selected" => {
+                        if let Some(left_path) = self.diff_selected_file.take() {
+                            self.open_file_in_tab(&left_path);
+                            self.cmd_diffthis();
+                            self.cmd_diffsplit(path);
+                        } else {
+                            self.message =
+                                "No file selected for compare. Use 'Select for Compare' first."
+                                    .to_string();
+                        }
+                    }
+                    "open_side" => {
+                        self.open_editor_group(crate::core::window::SplitDirection::Vertical);
+                        // Replace the cloned buffer with the target file.
+                        let path_str = path.display().to_string();
+                        self.execute_command(&format!("e {path_str}"));
+                    }
+                    "open_side_vsplit" => {
+                        self.split_window(SplitDirection::Vertical, None);
+                        let _ = self.open_file_with_mode(path, OpenMode::Permanent);
+                    }
+                    // new_file, new_folder, rename, delete are handled by the UI backend
+                    // since they involve sidebar prompts. Return the action string.
+                    _ => {}
+                }
+            }
+            ContextMenuTarget::Editor => match action.as_str() {
+                "goto_definition" => {
+                    self.lsp_request_definition();
+                }
+                "goto_references" => {
+                    self.lsp_request_references();
+                }
+                "rename_symbol" => {
+                    // Enter command mode with :Rename pre-filled for user to type new name.
+                    self.mode = Mode::Command;
+                    self.command_buffer = "Rename ".to_string();
+                }
+                "open_changes" => {
+                    self.open_diff_peek();
+                }
+                "cut" => {
+                    // Yank selection to clipboard, then delete.
+                    if matches!(
+                        self.mode,
+                        Mode::Visual | Mode::VisualLine | Mode::VisualBlock
+                    ) {
+                        self.yank_visual_selection();
+                        // Copy yanked text to system clipboard.
+                        if let Some((ref text, _)) = self.registers.get(&'"') {
+                            let text = text.clone();
+                            if let Some(ref cb) = self.clipboard_write {
+                                let _ = cb(&text);
+                            }
+                        }
+                        let mut changed = false;
+                        self.delete_visual_selection(&mut changed);
+                    }
+                }
+                "copy" => {
+                    if matches!(
+                        self.mode,
+                        Mode::Visual | Mode::VisualLine | Mode::VisualBlock
+                    ) {
+                        self.yank_visual_selection();
+                        if let Some((ref text, _)) = self.registers.get(&'"') {
+                            let text = text.clone();
+                            if let Some(ref cb) = self.clipboard_write {
+                                let _ = cb(&text);
+                            }
+                        }
+                        self.mode = Mode::Normal;
+                    }
+                }
+                "paste" => {
+                    if let Some(ref cb_read) = self.clipboard_read {
+                        if let Ok(text) = cb_read() {
+                            if !text.is_empty() {
+                                self.registers.insert('"', (text, false));
+                                let mut changed = false;
+                                self.paste_after(&mut changed);
+                            }
+                        }
+                    }
+                }
+                "open_side_vsplit" => {
+                    if let Some(path) = self.file_path().map(|p| p.to_path_buf()) {
+                        self.split_window(SplitDirection::Vertical, None);
+                        let _ = self.open_file_with_mode(&path, OpenMode::Permanent);
+                    }
+                }
+                "command_palette" => {
+                    self.open_command_palette();
+                }
+                _ => {}
+            },
+        }
+
+        Some(action)
+    }
+
+    /// Handle keyboard input for the context menu popup.
+    /// Returns true if the key was consumed.
+    pub fn handle_context_menu_key(&mut self, key_name: &str) -> (bool, Option<String>) {
+        if self.context_menu.is_none() {
+            return (false, None);
+        }
+
+        match key_name {
+            "j" | "Down" => {
+                if let Some(ref mut menu) = self.context_menu {
+                    // Move to next enabled item.
+                    let len = menu.items.len();
+                    let mut next = (menu.selected + 1) % len;
+                    let start = next;
+                    loop {
+                        if menu.items[next].enabled {
+                            break;
+                        }
+                        next = (next + 1) % len;
+                        if next == start {
+                            break;
+                        }
+                    }
+                    menu.selected = next;
+                }
+                (true, None)
+            }
+            "k" | "Up" => {
+                if let Some(ref mut menu) = self.context_menu {
+                    let len = menu.items.len();
+                    let mut prev = if menu.selected == 0 {
+                        len - 1
+                    } else {
+                        menu.selected - 1
+                    };
+                    let start = prev;
+                    loop {
+                        if menu.items[prev].enabled {
+                            break;
+                        }
+                        prev = if prev == 0 { len - 1 } else { prev - 1 };
+                        if prev == start {
+                            break;
+                        }
+                    }
+                    menu.selected = prev;
+                }
+                (true, None)
+            }
+            "Return" | "l" => {
+                let action = self.context_menu_confirm();
+                (true, action)
+            }
+            "Escape" | "q" | "h" => {
+                self.close_context_menu();
+                (true, None)
+            }
+            _ => {
+                self.close_context_menu();
+                (true, None)
+            }
+        }
     }
 
     /// Record the current (group, tab_index) as the most recently used tab.
@@ -6644,6 +7816,14 @@ impl Engine {
             return EngineAction::None;
         }
 
+        // Context menu intercepts all keys when open.
+        if self.context_menu.is_some() {
+            let (consumed, _action) = self.handle_context_menu_key(key_name);
+            if consumed {
+                return EngineAction::None;
+            }
+        }
+
         // Ctrl+Tab opens the tab switcher (or cycles forward if already open).
         if ctrl && key_name == "Tab" {
             if self.tab_switcher_open {
@@ -7070,6 +8250,17 @@ impl Engine {
             if unicode == Some('-') && self.pending_key.is_none() && self.pending_operator.is_none()
             {
                 return self.netrw_go_parent();
+            }
+        }
+
+        // Command-line window: Enter executes, q closes
+        if self.active_buffer_state().is_cmdline_buf {
+            if key_name == "Return" || key_name == "KP_Enter" {
+                return self.cmdline_window_execute();
+            }
+            if unicode == Some('q') && self.pending_key.is_none() {
+                self.close_tab();
+                return EngineAction::None;
             }
         }
 
@@ -8445,6 +9636,26 @@ impl Engine {
                         self.message = "No previous substitute command".to_string();
                     }
                 }
+                Some('+') => {
+                    // g+: go to newer text state (chronological)
+                    let count = self.take_count();
+                    for _ in 0..count {
+                        if !self.g_later() {
+                            break;
+                        }
+                    }
+                    *changed = true;
+                }
+                Some('-') => {
+                    // g-: go to older text state (chronological)
+                    let count = self.take_count();
+                    for _ in 0..count {
+                        if !self.g_earlier() {
+                            break;
+                        }
+                    }
+                    *changed = true;
+                }
                 Some('o') => {
                     // go: go to byte N in the buffer (1-indexed, like Vim)
                     let byte_n = self.take_count().saturating_sub(1);
@@ -8460,7 +9671,11 @@ impl Engine {
                     if let Some(url) = self.word_under_cursor() {
                         #[cfg(not(test))]
                         {
-                            let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+                            let _ = std::process::Command::new("xdg-open")
+                                .arg(&url)
+                                .stdout(std::process::Stdio::null())
+                                .stderr(std::process::Stdio::null())
+                                .spawn();
                         }
                         self.message = format!("Opening: {}", url);
                     }
@@ -8480,6 +9695,14 @@ impl Engine {
                 Some('w') => {
                     // gw{motion}: format text, keep cursor
                     self.pending_operator = Some('Q');
+                }
+                Some('R') => {
+                    // gR: enter Virtual Replace mode (tab-aware overwrite)
+                    self.start_undo_group();
+                    self.insert_text_buffer.clear();
+                    self.virtual_replace = true;
+                    self.mode = Mode::Replace;
+                    self.count = None;
                 }
                 Some('?') => {
                     // g?{motion}: ROT13 encode operator
@@ -8584,6 +9807,13 @@ impl Engine {
                         self.jump_comment_end();
                     }
                 }
+                Some('#') => {
+                    // ]#: jump to next unmatched #else or #endif
+                    let count = self.take_count();
+                    for _ in 0..count {
+                        self.jump_preproc_forward();
+                    }
+                }
                 _ => {}
             },
             '[' => match unicode {
@@ -8669,6 +9899,13 @@ impl Engine {
                         self.jump_comment_start();
                     }
                 }
+                Some('#') => {
+                    // [#: jump to previous unmatched #if or #else
+                    let count = self.take_count();
+                    for _ in 0..count {
+                        self.jump_preproc_backward();
+                    }
+                }
                 _ => {}
             },
             'd' => {
@@ -8690,9 +9927,13 @@ impl Engine {
                 }
             }
             'q' => {
-                // Macro recording: q<register>
+                // Macro recording: q<register>, or command-line window: q: / q/ / q?
                 if let Some(ch) = unicode {
-                    if ch.is_ascii_lowercase() {
+                    if ch == ':' {
+                        self.open_cmdline_window(false);
+                    } else if ch == '/' || ch == '?' {
+                        self.open_cmdline_window(true);
+                    } else if ch.is_ascii_lowercase() {
                         self.start_macro_recording(ch);
                     } else {
                         self.message = "Invalid register for macro".to_string();
@@ -12662,7 +13903,7 @@ impl Engine {
         }
     }
 
-    fn yank_visual_selection(&mut self) {
+    pub fn yank_visual_selection(&mut self) {
         // Capture the selection region for highlight before exiting visual mode
         let hl_region = self.get_visual_selection_range().map(|(start, end)| {
             let is_linewise = matches!(self.mode, Mode::VisualLine);
@@ -12687,7 +13928,7 @@ impl Engine {
         self.visual_anchor = None;
     }
 
-    fn delete_visual_selection(&mut self, changed: &mut bool) {
+    pub fn delete_visual_selection(&mut self, changed: &mut bool) {
         if let Some((text, is_linewise)) = self.get_visual_selection_text() {
             // Store in register
             let reg = self.selected_register.unwrap_or('"');
@@ -14746,7 +15987,13 @@ impl Engine {
         let mode_name = match self.mode {
             Mode::Normal => "Normal",
             Mode::Insert => "Insert",
-            Mode::Replace => "Replace",
+            Mode::Replace => {
+                if self.virtual_replace {
+                    "VReplace"
+                } else {
+                    "Replace"
+                }
+            }
             Mode::Command => "Command",
             Mode::Search => "Search",
             Mode::Visual => "Visual",
@@ -16270,8 +17517,17 @@ impl Engine {
         }
 
         // Handle :tabc[lose]
-        if cmd == "tabclose" {
-            self.close_tab();
+        if cmd == "tabclose" || cmd.starts_with("tabclose ") {
+            let arg = cmd.strip_prefix("tabclose").unwrap().trim();
+            match arg {
+                "others" => self.close_other_tabs(),
+                "right" => self.close_tabs_to_right(),
+                "left" => self.close_tabs_to_left(),
+                "saved" => self.close_saved_tabs(),
+                _ => {
+                    self.close_tab();
+                }
+            }
             return EngineAction::None;
         }
 
@@ -19379,6 +20635,7 @@ impl Engine {
         let _ = ctrl;
         match key_name {
             "Escape" => {
+                self.virtual_replace = false;
                 self.mode = Mode::Normal;
                 self.clamp_cursor_col();
             }
@@ -19422,6 +20679,40 @@ impl Engine {
                     } else {
                         0
                     };
+
+                    // Virtual Replace: expand tab to spaces before overwriting
+                    if self.virtual_replace && col < line_content_len {
+                        let cur_char = self.buffer().content.char(char_idx);
+                        if cur_char == '\t' {
+                            let tabstop = self.settings.tabstop as usize;
+                            // Calculate visual column of cursor
+                            let line_start = self.buffer().line_to_char(line);
+                            let mut vcol = 0usize;
+                            for i in 0..col {
+                                let c = self.buffer().content.char(line_start + i);
+                                if c == '\t' {
+                                    vcol = (vcol / tabstop + 1) * tabstop;
+                                } else {
+                                    vcol += 1;
+                                }
+                            }
+                            let tab_width = tabstop - (vcol % tabstop);
+                            // Replace tab with spaces, then overwrite first space
+                            self.start_undo_group();
+                            self.delete_with_undo(char_idx, char_idx + 1);
+                            let spaces = " ".repeat(tab_width);
+                            self.insert_with_undo(char_idx, &spaces);
+                            // Now overwrite the first space with the typed char
+                            self.delete_with_undo(char_idx, char_idx + 1);
+                            let mut buf = [0u8; 4];
+                            let s = ch.encode_utf8(&mut buf);
+                            self.insert_with_undo(char_idx, s);
+                            self.view_mut().cursor.col += 1;
+                            self.finish_undo_group();
+                            *changed = true;
+                            return;
+                        }
+                    }
 
                     self.start_undo_group();
                     if col < line_content_len {
@@ -21837,7 +23128,7 @@ impl Engine {
     }
 
     /// Paste after cursor (p). Linewise pastes below current line.
-    fn paste_after(&mut self, changed: &mut bool) {
+    pub fn paste_after(&mut self, changed: &mut bool) {
         let reg = self.active_register();
         let (content, is_linewise) = match self.get_register_content(reg) {
             Some(pair) => pair,
@@ -22764,6 +24055,101 @@ impl Engine {
                 self.clamp_cursor_col();
                 return;
             }
+        }
+    }
+
+    /// Jump forward to next unmatched `#else` or `#endif` (`]#`).
+    /// Uses depth tracking: `#if`/`#ifdef`/`#ifndef` increase depth,
+    /// `#endif` decreases depth, `#else`/`#elif` match at depth 0.
+    fn jump_preproc_forward(&mut self) {
+        let total = self.buffer().len_lines();
+        let start = self.view().cursor.line + 1;
+        let mut depth: i32 = 0;
+        for line_idx in start..total {
+            let line: String = self.buffer().content.line(line_idx).chars().collect();
+            let trimmed = line.trim();
+            if let Some(directive) = Self::preproc_directive(trimmed) {
+                match directive {
+                    PreprocKind::If => depth += 1,
+                    PreprocKind::ElseElif => {
+                        if depth == 0 {
+                            self.view_mut().cursor.line = line_idx;
+                            self.view_mut().cursor.col = 0;
+                            self.clamp_cursor_col();
+                            return;
+                        }
+                    }
+                    PreprocKind::Endif => {
+                        if depth == 0 {
+                            self.view_mut().cursor.line = line_idx;
+                            self.view_mut().cursor.col = 0;
+                            self.clamp_cursor_col();
+                            return;
+                        }
+                        depth -= 1;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Jump backward to previous unmatched `#if` or `#else` (`[#`).
+    /// Uses depth tracking: `#endif` increases depth,
+    /// `#if`/`#ifdef`/`#ifndef` decrease depth, `#else`/`#elif` match at depth 0.
+    fn jump_preproc_backward(&mut self) {
+        let cursor_line = self.view().cursor.line;
+        if cursor_line == 0 {
+            return;
+        }
+        let mut depth: i32 = 0;
+        for line_idx in (0..cursor_line).rev() {
+            let line: String = self.buffer().content.line(line_idx).chars().collect();
+            let trimmed = line.trim();
+            if let Some(directive) = Self::preproc_directive(trimmed) {
+                match directive {
+                    PreprocKind::Endif => depth += 1,
+                    PreprocKind::ElseElif => {
+                        if depth == 0 {
+                            self.view_mut().cursor.line = line_idx;
+                            self.view_mut().cursor.col = 0;
+                            self.clamp_cursor_col();
+                            return;
+                        }
+                    }
+                    PreprocKind::If => {
+                        if depth == 0 {
+                            self.view_mut().cursor.line = line_idx;
+                            self.view_mut().cursor.col = 0;
+                            self.clamp_cursor_col();
+                            return;
+                        }
+                        depth -= 1;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Classify a trimmed line as a preprocessor directive kind.
+    fn preproc_directive(trimmed: &str) -> Option<PreprocKind> {
+        if !trimmed.starts_with('#') {
+            return None;
+        }
+        // Strip '#' and optional whitespace after it
+        let after_hash = trimmed[1..].trim_start();
+        if after_hash.starts_with("ifdef")
+            || after_hash.starts_with("ifndef")
+            || after_hash.starts_with("if ")
+            || after_hash.starts_with("if\t")
+            || after_hash == "if"
+        {
+            Some(PreprocKind::If)
+        } else if after_hash.starts_with("else") || after_hash.starts_with("elif") {
+            Some(PreprocKind::ElseElif)
+        } else if after_hash.starts_with("endif") {
+            Some(PreprocKind::Endif)
+        } else {
+            None
         }
     }
 
@@ -24708,6 +26094,87 @@ impl Engine {
         Ok(())
     }
 
+    /// Open a command-line window (`q:` for commands, `q/`/`q?` for searches).
+    /// Shows history in a scratch buffer. Enter on a line executes it.
+    pub fn open_cmdline_window(&mut self, is_search: bool) {
+        let history = if is_search {
+            &self.history.search_history
+        } else {
+            &self.history.command_history
+        };
+
+        // Build content: one history entry per line, empty line at end for new entry
+        let mut content = String::new();
+        for entry in history.iter() {
+            content.push_str(entry);
+            content.push('\n');
+        }
+        content.push('\n'); // empty line at bottom for new command
+
+        let buf_id = self.buffer_manager.create();
+        if let Some(state) = self.buffer_manager.get_mut(buf_id) {
+            state.buffer.content = ropey::Rope::from_str(&content);
+            state.is_cmdline_buf = true;
+            state.cmdline_is_search = is_search;
+            state.dirty = false;
+            state.scratch_name = Some(if is_search {
+                "[Search History]".to_string()
+            } else {
+                "[Command History]".to_string()
+            });
+        }
+
+        let window_id = self.new_window_id();
+        let window = Window::new(window_id, buf_id);
+        self.windows.insert(window_id, window);
+        let tab_id = self.new_tab_id();
+        let tab = Tab::new(tab_id, window_id);
+        self.active_group_mut().tabs.push(tab);
+        self.active_group_mut().active_tab = self.active_group().tabs.len() - 1;
+
+        // Move cursor to last line (the empty line for new entry)
+        let total = self.buffer().len_lines();
+        self.view_mut().cursor.line = total.saturating_sub(1);
+        self.view_mut().cursor.col = 0;
+
+        self.mode = Mode::Normal;
+        self.message = "Press Enter to execute, q to close".to_string();
+    }
+
+    /// Execute the current line in a command-line window buffer.
+    /// Called when Enter is pressed in a cmdline buffer in Normal mode.
+    pub fn cmdline_window_execute(&mut self) -> EngineAction {
+        let is_search = self.active_buffer_state().cmdline_is_search;
+        let line_idx = self.view().cursor.line;
+        let line: String = self
+            .buffer()
+            .content
+            .line(line_idx)
+            .chars()
+            .collect::<String>()
+            .trim()
+            .to_string();
+
+        if line.is_empty() {
+            return EngineAction::None;
+        }
+
+        // Close the cmdline window
+        self.close_tab();
+
+        if is_search {
+            // Execute as a forward search
+            self.search_query = line;
+            self.search_direction = SearchDirection::Forward;
+            self.run_search();
+            self.search_next();
+        } else {
+            // Execute as an ex command
+            return self.execute_command(&line);
+        }
+        EngineAction::None
+    }
+
     /// Open a read-only reference buffer listing all default keybindings.
     /// `force_vscode`: `None` = auto-detect from current mode,
     /// `Some(true)` = VSCode, `Some(false)` = Vim.
@@ -25362,6 +26829,7 @@ impl Engine {
                 self.message = "Swap file deleted".to_string();
             }
             "abort" | "cancel" => {
+                super::swap::delete_swap(&recovery.swap_path);
                 self.close_tab();
                 self.message.clear();
             }
@@ -25402,6 +26870,24 @@ impl Engine {
                 action: "ok".into(),
             }],
         );
+    }
+
+    /// Click a dialog button by index.  Returns the `EngineAction` from
+    /// processing the dialog result, or `None` if the index is out of range.
+    pub fn dialog_click_button(&mut self, idx: usize) -> EngineAction {
+        let (tag, action) = {
+            let dialog = match self.dialog.as_ref() {
+                Some(d) => d,
+                None => return EngineAction::None,
+            };
+            let btn = match dialog.buttons.get(idx) {
+                Some(b) => b,
+                None => return EngineAction::None,
+            };
+            (dialog.tag.clone(), btn.action.clone())
+        };
+        self.dialog = None;
+        self.process_dialog_result(&tag, &action)
     }
 
     /// Handle a key press when a dialog is open.
@@ -25471,6 +26957,28 @@ impl Engine {
     fn process_dialog_result(&mut self, tag: &str, action: &str) -> EngineAction {
         match tag {
             "swap_recovery" => self.process_swap_dialog_action(action),
+            "confirm_move" => {
+                if action == "yes" {
+                    if let Some((src, dest)) = self.pending_move.take() {
+                        match self.move_file(&src, &dest) {
+                            Ok(()) => {
+                                let name = src
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().to_string())
+                                    .unwrap_or_default();
+                                self.message = format!("Moved '{}' to '{}'", name, dest.display());
+                                self.explorer_needs_refresh = true;
+                            }
+                            Err(e) => {
+                                self.message = e;
+                            }
+                        }
+                    }
+                } else {
+                    self.pending_move = None;
+                }
+                EngineAction::None
+            }
             _ => EngineAction::None,
         }
     }
@@ -25820,6 +27328,7 @@ impl Engine {
                 }
                 LspEvent::DefinitionResponse { locations, .. } => {
                     self.lsp_pending_definition = None;
+                    self.message.clear();
                     if let Some(loc) = locations.first() {
                         let path = loc.path.clone();
                         let line = loc.range.start.line as usize;
@@ -26002,6 +27511,7 @@ impl Engine {
                 }
                 LspEvent::ImplementationResponse { locations, .. } => {
                     self.lsp_pending_implementation = None;
+                    self.message.clear();
                     if let Some(loc) = locations.first() {
                         let path = loc.path.clone();
                         let line = loc.range.start.line as usize;
@@ -26026,6 +27536,7 @@ impl Engine {
                 }
                 LspEvent::TypeDefinitionResponse { locations, .. } => {
                     self.lsp_pending_type_definition = None;
+                    self.message.clear();
                     if let Some(loc) = locations.first() {
                         let path = loc.path.clone();
                         let line = loc.range.start.line as usize;
@@ -26163,7 +27674,7 @@ impl Engine {
     }
 
     /// Request LSP go-to-definition at cursor position.
-    fn lsp_request_definition(&mut self) {
+    pub fn lsp_request_definition(&mut self) {
         if !self.settings.lsp_enabled {
             return;
         }
@@ -26206,7 +27717,7 @@ impl Engine {
     }
 
     /// Request LSP find-references at cursor position.
-    fn lsp_request_references(&mut self) {
+    pub fn lsp_request_references(&mut self) {
         if !self.settings.lsp_enabled {
             return;
         }
@@ -28168,8 +29679,14 @@ impl Engine {
 
     /// Create a new terminal tab (always spawns a fresh shell in the editor's CWD).
     pub fn terminal_new_tab(&mut self, cols: u16, rows: u16) {
+        self.terminal_new_tab_at(cols, rows, None);
+    }
+
+    /// Create a new terminal tab, optionally at a specific working directory.
+    /// If `dir` is None, uses the editor's CWD.
+    pub fn terminal_new_tab_at(&mut self, cols: u16, rows: u16, dir: Option<&Path>) {
         let shell = default_shell();
-        let cwd = self.cwd.clone();
+        let cwd = dir.unwrap_or(&self.cwd).to_path_buf();
         let history_cap = self.settings.terminal_scrollback_lines;
         match TerminalPane::new(cols, rows, &shell, &cwd, history_cap) {
             Ok(pane) => {
@@ -41545,6 +43062,159 @@ mod tests {
             Path::new("/tmp/not_a_real_dir_xyz_vc"),
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_confirm_move_shows_dialog() {
+        let base = std::env::temp_dir().join("vimcode_confirm_move_dlg");
+        let dest = base.join("target_dir");
+        std::fs::create_dir_all(&dest).unwrap();
+        let src = base.join("confirm_me.txt");
+        std::fs::write(&src, "data").unwrap();
+
+        let mut engine = Engine::new();
+        engine.confirm_move_file(&src, &dest);
+
+        // Dialog should be shown.
+        assert!(engine.dialog.is_some());
+        let dialog = engine.dialog.as_ref().unwrap();
+        assert_eq!(dialog.tag, "confirm_move");
+        assert!(dialog.body[0].contains("confirm_me.txt"));
+        assert_eq!(dialog.buttons.len(), 2);
+
+        // Pending move should be stored.
+        assert!(engine.pending_move.is_some());
+        let (ps, pd) = engine.pending_move.as_ref().unwrap();
+        assert_eq!(ps, &src);
+        assert_eq!(pd, &dest);
+
+        // Simulate pressing 'y' (Yes) — dialog handles it.
+        let _action = engine.handle_key("y", Some('y'), false);
+
+        // File should have been moved.
+        assert!(!src.exists());
+        assert!(dest.join("confirm_me.txt").exists());
+        assert!(engine.dialog.is_none());
+        assert!(engine.pending_move.is_none());
+        assert!(engine.explorer_needs_refresh);
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_confirm_move_cancel() {
+        let base = std::env::temp_dir().join("vimcode_confirm_move_cancel");
+        let dest = base.join("target_dir_c");
+        std::fs::create_dir_all(&dest).unwrap();
+        let src = base.join("stay_put.txt");
+        std::fs::write(&src, "data").unwrap();
+
+        let mut engine = Engine::new();
+        engine.confirm_move_file(&src, &dest);
+
+        // Simulate pressing 'n' (No).
+        let _action = engine.handle_key("n", Some('n'), false);
+
+        // File should NOT have been moved.
+        assert!(src.exists());
+        assert!(!dest.join("stay_put.txt").exists());
+        assert!(engine.dialog.is_none());
+        assert!(engine.pending_move.is_none());
+        assert!(!engine.explorer_needs_refresh);
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_move_file_into_own_subtree() {
+        let base = std::env::temp_dir().join("vimcode_move_subtree");
+        let parent = base.join("parent_dir");
+        let child = parent.join("child_dir");
+        std::fs::create_dir_all(&child).unwrap();
+
+        let mut engine = Engine::new();
+        let result = engine.move_file(&parent, &child);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().contains("subtree"),
+            "should reject moving folder into its own subtree"
+        );
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_move_file_same_directory_noop() {
+        let base = std::env::temp_dir().join("vimcode_move_noop");
+        std::fs::create_dir_all(&base).unwrap();
+        let src = base.join("stay.txt");
+        std::fs::write(&src, "stay").unwrap();
+
+        let mut engine = Engine::new();
+        // Moving a file into the directory it's already in should be a no-op.
+        let result = engine.move_file(&src, &base);
+        assert!(result.is_ok());
+        assert!(src.exists(), "file should still be at original location");
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_move_directory_basic() {
+        let base = std::env::temp_dir().join("vimcode_move_dir");
+        let src = base.join("src_dir");
+        let dest = base.join("dest_dir");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(src.join("file.txt"), "content").unwrap();
+
+        let mut engine = Engine::new();
+        engine.move_file(&src, &dest).unwrap();
+
+        assert!(!src.exists(), "source dir should be gone");
+        assert!(
+            dest.join("src_dir").join("file.txt").exists(),
+            "dir should be moved with contents"
+        );
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_move_file_updates_buffer_path() {
+        let base = std::env::temp_dir().join("vimcode_move_bufupd");
+        let dest = base.join("dest_mv");
+        std::fs::create_dir_all(&dest).unwrap();
+        let src = base.join("tracked.txt");
+        std::fs::write(&src, "tracked").unwrap();
+
+        let mut engine = Engine::new();
+        engine
+            .open_file_with_mode(&src, OpenMode::Permanent)
+            .unwrap();
+
+        engine.move_file(&src, &dest).unwrap();
+
+        let expected = dest.join("tracked.txt");
+        let updated = engine.buffer_manager.list().into_iter().any(|id| {
+            engine
+                .buffer_manager
+                .get(id)
+                .and_then(|s| s.file_path.as_ref())
+                == Some(&expected)
+        });
+        assert!(
+            updated,
+            "open buffer should point to new location after move"
+        );
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     // ─── LCS diff tests ───────────────────────────────────────────────────────

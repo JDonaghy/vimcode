@@ -5,16 +5,13 @@
 ---
 
 ## Recently Completed
-- **Session 182**: LaTeX Extension (Parts A + C) — **Part C**: LaTeX text objects (`ie`/`ae` environment, `ic`/`ac` command, `i$`/`a$` math) and motions (`]]`/`[[` section jumps, `]m`/`[m`/`]M`/`[M` environment jumps, `][`/`[]` for `\end{}`); 22 new tests (4391 total). **Part A**: LaTeX registry extension in `vimcode-ext` repo — manifest.toml with texlab LSP, `latex.lua` with `<leader>ll` compile, `<leader>lv` view PDF, `<leader>lc/lC` clean, `<leader>le` log, `<leader>lt` TOC panel; `:LatexCompile`/`:LatexView`/`:LatexClean`/`:LatexLog`/`:LatexToc` commands. Also fixed: `vcd <dir>` opens folder, "Open Workspace From File…" renames, TUI folder picker mouse clicks.
-- **Session 181**: LaTeX Extension (Part B) — tree-sitter LaTeX syntax highlighting (18th language); vendored grammar v0.3.0 via build.rs+cc; LaTeX-aware spell checking (inverted logic: check prose, skip commands/math); `check_line()` API updated from `bool` to `Option<SyntaxLanguage>`.
-- **Session 180b**: Spell Checker Bug Fixes + UI Polish — z= numbered suggestion list with single-key selection; fixed markdown spell checking (SyntaxLanguage::from_path vs empty highlights); undo/dirty tracking for spell replacements; GTK scrollbar width halved (10→5px); text overflow behind scrollbar fixed; group divider grab fixed (proper editor bounds in hit-test/drag).
-- **Session 180**: Spell Checker — `src/core/spell.rs` with spellbook 0.4 (pure-Rust Hunspell); bundled en_US dictionary compiled into binary; user dictionary at `~/.config/vimcode/user.dic`; tree-sitter-aware (comments/strings in code, all text in plain text/Markdown); `]s`/`[s`/`z=`/`zg`/`zw` keybindings; `spell`/`spelllang` settings; `:set spell`/`:set nospell`; "Toggle Spell Check" palette entry; cyan dotted underline (GTK) + colored underline (TUI); 60 new tests (4314 total).
-- **Session 179**: Resize Tab Groups — GTK Alt+,/Alt+. keyboard; TUI mouse drag on group dividers; both backends now have full keyboard + mouse group resize.
-- **Session 178**: Version Querying — `--version` / `-V` CLI flag on both binaries; Help > About shows version; `env!("CARGO_PKG_VERSION")` compile-time.
-- **Session 177**: Fix Wrap Mode Mouse Click — GTK `view_row_to_buf_pos_wrap()` uses word-wrap segments for correct visual-row-to-buffer-line mapping; TUI click/drag add `segment_col_offset`. Fixes BUGS.md wrap click issue.
-- **Session 176**: GTK Performance — Lazy tree loading (one level at a time, expand on demand), Open Folder fix (set_current_dir + engine.cwd for tree refresh).
+- **Session 191**: Subprocess stderr safety audit — Audited all `Command::new()` call sites (~50); only `registry.rs` `download_script()` had inherited stderr (`.status()` without redirect); fixed by adding `.stdout(null()).stderr(null())`. All other sites already use `.output()` (auto-captures) or explicit `Stdio` redirection. 4511 tests.
+- **Session 190**: LSP Go-to-Definition Fix + Kitty Keyboard Fix — Fixed `gd`/`gi`/`gy` appearing to hang (message not cleared after successful jump); Kitty `shift_map_us()` fix for shifted symbols; context menu mode-aware shortcuts; LSP response robustness (string ID fallback, `unwrap_or` on definition/hover parse). 4511 tests.
+- **Session 189**: VSCode-style Editor Context Menu — Full 9-item editor right-click menu; engine-driven for both GTK and TUI; 8 new tests (4510 total).
+- **Session 188**: Centralize Context Menus + Editor Right-Click — GTK context menus driven by engine items; 4 new tests (4501 total).
+- **Session 187**: Tab Context Menu Splits Fix — Fixed GTK/TUI split inconsistency; added 4 split options; 4 new tests (4498 total).
 
-> Sessions 180b and earlier in **SESSION_HISTORY.md**.
+> Sessions 189 and earlier in **SESSION_HISTORY.md**.
 
 ## Roadmap
 - [x] **Spell checker** — Vim-compatible `]s`/`[s`/`z=`/`zg`/`zw`; spellbook Hunspell parser; bundled en_US dictionary; tree-sitter-aware; `spell`/`spelllang` settings; user dictionary at `~/.config/vimcode/user.dic`
@@ -73,6 +70,22 @@
 - [x] **AI assistant panel** — sidebar chat panel; configurable provider (Anthropic Claude, OpenAI, Ollama local); `ai_provider`/`ai_api_key`/`ai_model`/`ai_base_url` in settings; activity bar chat icon opens panel; multi-turn conversation; `:AI <msg>` and `:AiClear` commands (session 118)
 - [x] **AI inline completions** — ghost-text completions from AI provider interleaved with LSP ghost text; separate `ai_completions` setting (default false to avoid unexpected API costs); debounced after 500ms idle in insert mode; Tab accepts whole suggestion, `Alt-]`/`Alt-[` cycle through alternatives
 - [x] **Swap file crash recovery** — Vim-like swap files (`~/.config/vimcode/swap/`); FNV-1a path hashing; atomic writes (`.tmp` + rename); PID-based stale detection; `[R]ecover/[D]elete/[A]bort` recovery dialog; `:set swapfile`/`:set updatetime=N`; periodic writes via `tick_swap_files()`; cleanup on shutdown
+
+### Context Menus
+- [x] **Context menu action polish** — Two-step "Select for Compare" → "Compare with 'file'" diff flow; fixed GTK copy_relative_path and open_side bugs; engine-driven action handling; 8 new tests
+
+### Explorer
+- [x] **Drag-and-drop file/folder move** — Drag files and folders in the explorer tree to move them to a new location. Should work in both TUI (mouse drag) and GTK (native DnD) backends. Visual feedback during drag (insertion indicator, highlight target folder). Confirmation dialog with clickable buttons.
+- [x] **Inline rename in explorer** — Rename files/folders directly in the explorer tree (as close to in-place editing as possible), rather than via a separate prompt. In GTK this can be a native editable cell; in TUI, render an input field overlaid on the tree row.
+- [x] **Copy/paste files in explorer** — "Copy" and "Paste" items in the right-click context menu. Copy stores the source path; Paste into a different folder duplicates with the same name, Paste into the same folder prompts for a new name (inline in the tree). Support both single files and folders (recursive copy).
+- [x] **Context menu popup clamping** — TUI context menu popup rendering moved after status/command line in draw order so popups are no longer painted over by lower UI elements. Position clamping ensures popup stays within terminal bounds.
+
+### Editor
+- [x] **VSCode-style editor right-click context menu** — Full 9-item editor right-click: Go to Definition (`gd`), Go to References (`gr`), Rename Symbol (`<leader>rn`), Open Changes (`gD`), Cut, Copy, Paste, Open to the Side (vsplit), Command Palette (`Ctrl+Shift+P`). LSP items disabled without active server; Cut/Copy disabled without visual selection. Both GTK and TUI backends.
+
+### Robustness
+- [x] **Centralize context menu definitions** — GTK backend hardcodes its own `gio::Menu` items separately from the engine's `open_explorer_context_menu()` / `open_tab_context_menu()`. This causes drift (e.g. "Open in Integrated Terminal" was missing from GTK). GTK should read from the engine's `ContextMenuState.items` to build its native menus, so new items only need to be added once in the engine.
+- [x] **Subprocess stderr safety audit** — Audit all `Command::spawn()` calls across the codebase to ensure stdout/stderr are redirected (null or piped). Unguarded spawns let child process output corrupt the TUI display. Fixed `xdg-open`/`open` calls; need to verify LSP, DAP, git, terminal, and any other subprocess spawns are safe.
 
 ### Documentation
 - [x] **GitHub Wiki** — 9 pages: Home, Getting Started, Key Remapping, Settings Reference, Extension Development, Lua Plugin API, Theme Customization, DAP Debugger Setup, LSP Configuration; README Documentation section links to wiki

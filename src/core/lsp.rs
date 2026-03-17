@@ -1073,6 +1073,18 @@ fn reader_thread(
             Err(_) => continue,
         };
 
+        // Debug logging: write all LSP traffic to /tmp/vimcode-lsp-debug.log when --debug is active.
+        if std::env::var("VIMCODE_LSP_DEBUG").is_ok() {
+            use std::io::Write as _;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/vimcode-lsp-debug.log")
+            {
+                let _ = writeln!(f, "[server {}] {}", server_id, json);
+            }
+        }
+
         // Handle server → client messages that have a "method" field.
         if let Some(method) = json.get("method").and_then(|m| m.as_str()) {
             // Server-initiated requests have both "method" and "id" — respond to them.
@@ -1100,7 +1112,13 @@ fn reader_thread(
         }
 
         // Handle responses to our requests (has "id")
-        if let Some(id) = json.get("id").and_then(|v| v.as_i64()) {
+        // Try i64 first; fall back to parsing a string "123" as i64 (some servers
+        // echo the ID as a JSON string instead of a number).
+        let maybe_id = json.get("id").and_then(|v| {
+            v.as_i64()
+                .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+        });
+        if let Some(id) = maybe_id {
             // Look up which method this response is for
             let method = pending_requests
                 .lock()
@@ -1135,23 +1153,34 @@ fn reader_thread(
                     }
                 }
                 Some("textDocument/definition") => {
-                    if let Some(r) = result {
-                        if let Some(event) = try_parse_definition_response(server_id, id, r) {
-                            let _ = tx.send(event);
-                        }
-                    } else if is_error {
-                        let _ = tx.send(LspEvent::DefinitionResponse {
+                    let event = if let Some(r) = result {
+                        try_parse_definition_response(server_id, id, r).unwrap_or(
+                            LspEvent::DefinitionResponse {
+                                server_id,
+                                request_id: id,
+                                locations: Vec::new(),
+                            },
+                        )
+                    } else {
+                        // Error response or missing result — send empty.
+                        LspEvent::DefinitionResponse {
                             server_id,
                             request_id: id,
                             locations: Vec::new(),
-                        });
-                    }
+                        }
+                    };
+                    let _ = tx.send(event);
                 }
                 Some("textDocument/hover") => {
                     if let Some(r) = result {
-                        if let Some(event) = try_parse_hover_response(server_id, id, r) {
-                            let _ = tx.send(event);
-                        }
+                        let event = try_parse_hover_response(server_id, id, r).unwrap_or(
+                            LspEvent::HoverResponse {
+                                server_id,
+                                request_id: id,
+                                contents: None,
+                            },
+                        );
+                        let _ = tx.send(event);
                     } else if is_error {
                         let _ = tx.send(LspEvent::HoverResponse {
                             server_id,

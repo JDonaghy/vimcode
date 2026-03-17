@@ -1588,6 +1588,26 @@ pub struct ScreenLayout {
     pub diff_toolbar: Option<DiffToolbarData>,
     /// Modal dialog popup — `Some` when a dialog is open.
     pub dialog: Option<DialogPanel>,
+    /// Context menu popup — `Some` when an engine context menu is open.
+    pub context_menu: Option<ContextMenuPanel>,
+}
+
+/// Context menu data for TUI rendering.
+#[derive(Debug, Clone)]
+pub struct ContextMenuPanel {
+    pub items: Vec<ContextMenuRenderItem>,
+    pub selected_idx: usize,
+    pub screen_col: u16,
+    pub screen_row: u16,
+}
+
+/// A single rendered context menu item.
+#[derive(Debug, Clone)]
+pub struct ContextMenuRenderItem {
+    pub label: String,
+    pub shortcut: String,
+    pub separator_after: bool,
+    pub enabled: bool,
 }
 
 /// A modal dialog displayed over the editor.
@@ -3458,6 +3478,21 @@ pub fn build_screen_layout(
                 .enumerate()
                 .map(|(i, btn)| (format_button_label(&btn.label, btn.hotkey), i == d.selected))
                 .collect(),
+        }),
+        context_menu: engine.context_menu.as_ref().map(|cm| ContextMenuPanel {
+            items: cm
+                .items
+                .iter()
+                .map(|item| ContextMenuRenderItem {
+                    label: item.label.clone(),
+                    shortcut: item.shortcut.clone(),
+                    separator_after: item.separator_after,
+                    enabled: item.enabled,
+                })
+                .collect(),
+            selected_idx: cm.selected,
+            screen_col: cm.screen_x,
+            screen_row: cm.screen_y,
         }),
     }
 }

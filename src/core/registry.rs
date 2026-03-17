@@ -66,6 +66,8 @@ pub fn download_script(url: &str, dest: &Path) -> std::io::Result<()> {
         .args(["-sf", "--max-time", "30", "-o"])
         .arg(dest)
         .arg(url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status()?;
     if status.success() {
         Ok(())

@@ -1,9 +1,9 @@
 # VimCode Project State
 
-**Last updated:** Mar 14, 2026 (Session 182 — LaTeX Extension: Parts A + C) | **Tests:** 4391
+**Last updated:** Mar 16, 2026 (Session 191 — Subprocess stderr safety audit) | **Tests:** 4511
 
 > Feature documentation lives in **README.md**.
-> Per-session implementation notes through Session 180b are in **SESSION_HISTORY.md**.
+> Per-session implementation notes through Session 191 are in **SESSION_HISTORY.md**.
 
 ---
 
@@ -26,18 +26,18 @@ When implementing a new key/command, add tests covering:
 
 ## Recent Work
 
-### Session 182 — LaTeX Extension: Parts A + C (Mar 14, 2026)
-- **LaTeX text objects**: `ie`/`ae` (inner/around `\begin{env}...\end{env}`, nested-aware), `ic`/`ac` (inner/around `\command{...}`, LaTeX only), `i$`/`a$` (inner/around math: `$...$`, `$$...$$`, `\[...\]`, `\(...\)`)
-- **LaTeX motions**: `]]`/`[[` jump to next/previous `\section`/`\chapter`/`\subsection`/`\subsubsection`/`\part`/`\paragraph`/`\subparagraph` (including starred variants); `][`/`[]` jump to next/previous `\end{}`; `]m`/`[m` jump to next/previous `\begin{}`; `]M`/`[M` jump to next/previous `\end{}`
-- **Registry extension (vimcode-ext repo)**: `latex/manifest.toml` with texlab LSP config; `latex/latex.lua` with vimtex-inspired keymaps (`<leader>ll` compile, `<leader>lv` view, `<leader>lc`/`lC` clean, `<leader>le` log, `<leader>lt` TOC); TOC sidebar panel via `vimcode.panel` API; `:LatexCompile`/`:LatexView`/`:LatexClean`/`:LatexCleanAll`/`:LatexLog`/`:LatexToc` commands
-- **Bug fixes**: `vcd <directory>` opens folder as workspace (TUI + GTK); "Open Workspace From File…" creates/opens `.vimcode-workspace` in current file's directory; TUI folder picker mouse click support
-- 22 new tests (4391 total)
+### Session 191 — Subprocess stderr safety audit (Mar 16, 2026)
+- Audited all ~50 `Command::new()` call sites across the codebase
+- Only one unsafe site found: `registry.rs` `download_script()` used `.status()` with inherited stderr — could corrupt TUI display during extension downloads
+- Fixed by adding `.stdout(Stdio::null()).stderr(Stdio::null())` to the curl call
+- All other sites already safe: `.output()` auto-captures both streams; `.spawn()` calls all have explicit `Stdio` redirection
+- Breakdown: `git.rs` (~20 calls, all `.output()`), `engine.rs` (~8 calls, all redirected or `.output()`), `ai.rs` (3 curl `.output()`), `dap.rs`/`lsp.rs` (`.spawn()` with explicit piped/null), `dap_manager.rs`/`lsp_manager.rs` (all `.output()`)
 
-### Session 181 — LaTeX Extension: Tree-sitter Syntax + Spell Checking (Mar 14, 2026)
-- **Tree-sitter LaTeX support**: Added `SyntaxLanguage::Latex` — 18th built-in language. Vendored `tree-sitter-latex` v0.3.0 grammar (language version 14, compatible with tree-sitter 0.24) under `vendor/tree-sitter-latex/`. Compiled via `build.rs` + `cc` crate. Highlight query covers comments, commands (`generic_command`), sections, math (inline/displayed/environment), labels, citations. Breadcrumb scopes: `generic_environment`, `section`, `chapter`, `subsection`, `subsubsection`.
-- **File extensions**: `.tex`, `.bib`, `.cls`, `.sty`, `.dtx`, `.ltx`
-- **LaTeX-aware spell checking**: Changed `check_line()` signature from `has_syntax: bool` to `syntax_lang: Option<SyntaxLanguage>`. LaTeX mode inverts the logic — checks all prose text EXCEPT words in `keyword` (commands) and `type` (math) scopes. Added `is_in_latex_command_or_math()` helper.
-- **Flatpak**: Regenerated `flatpak/cargo-sources.json` with new `cc` and `tree-sitter-language` dependencies.
-- 15 new tests across syntax.rs (8: detection + highlighting) and spell.rs (3: LaTeX prose/commands/math + existing tests updated for new API) — 4331 total
+### Session 190 — LSP Go-to-Definition Fix + Kitty Keyboard Fix (Mar 16, 2026)
+- **Context menu mode-aware shortcuts**: Editor right-click context menu shows Vim shortcuts (`gd`, `gr`, `gD`) in Vim mode and VSCode shortcuts (`F12`, `Shift+F12`, `F2`) in VSCode mode.
+- **Kitty terminal ":" fix**: `shift_map_us()` in TUI translates base key + SHIFT modifier to correct shifted character when Kitty's `REPORT_ALL_KEYS_AS_ESCAPE_CODES` keyboard enhancement sends `; + Shift` instead of `:`.
+- **LSP `gd` "hanging" fix**: `DefinitionResponse`, `ImplementationResponse`, and `TypeDefinitionResponse` handlers now clear `self.message` after processing. Previously "Jumping to definition..." message persisted after successful jump, appearing as if the operation was still pending.
+- **LSP response robustness**: Added `unwrap_or()` fallback for definition/hover responses (empty result instead of silent drop); string ID fallback for response parsing (some servers echo IDs as strings).
+- LSP debug logging infrastructure (gated behind `VIMCODE_LSP_DEBUG` env var) retained in `lsp.rs` reader thread.
 
-> Sessions 180b and earlier archived in **SESSION_HISTORY.md**.
+> Sessions 189 and earlier archived in **SESSION_HISTORY.md**.

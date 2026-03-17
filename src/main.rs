@@ -89,6 +89,9 @@ type DiffBtnMap = HashMap<usize, (f64, f64, f64, f64, f64, f64)>;
 /// Only populated when split buttons are visible (active group in multi-group, or single-group mode).
 type SplitBtnMap = HashMap<usize, (f64, f64)>;
 
+/// Cached dialog button hit rects: Vec<(x, y, w, h)> populated by draw_dialog_popup.
+type DialogBtnRects = Vec<(f64, f64, f64, f64)>;
+
 /// Return type of draw_tab_bar: (tab_slot_positions, diff_btn_positions, split_btn_widths).
 type TabBarDrawResult = (
     Vec<(f64, f64)>,
@@ -136,6 +139,8 @@ struct App {
     overlay: Rc<RefCell<Option<gtk4::Overlay>>>,
     cached_line_height: f64,
     cached_char_width: f64,
+    /// Cached dialog button hit rects: Vec<(x, y, w, h)> populated by draw_dialog_popup.
+    dialog_btn_rects: Rc<RefCell<DialogBtnRects>>,
     /// Shared with the drawing-area resize callback so scrollbars can be
     /// repositioned synchronously (before each frame) without going through
     /// Relm4's async message queue.
@@ -164,8 +169,6 @@ struct App {
     project_search_status: String,
     /// Ref to the search results ListBox so we can rebuild it after each search.
     search_results_list: Rc<RefCell<Option<gtk4::ListBox>>>,
-    /// File selected as "left side" for a two-way diff (via context menu).
-    diff_selected_file: Option<PathBuf>,
     /// Last content written to system clipboard.
     /// Used to avoid redundant writes on every keystroke.
     last_clipboard_content: Option<String>,
@@ -216,6 +219,9 @@ struct App {
     /// correct in-memory state) and clears the flag.  Prevents the GIO file watcher from
     /// redundantly reloading settings that VimCode just saved.
     settings_self_save: bool,
+    /// Active context-menu popover (explorer or tab). Kept alive so we can
+    /// unparent it before creating a new one (avoids GTK CSS node assertions).
+    active_ctx_popover: Rc<RefCell<Option<gtk4::PopoverMenu>>>,
 }
 
 /// Drag state for a Cairo-drawn horizontal scrollbar.
@@ -264,6 +270,8 @@ enum Msg {
     /// Open file from sidebar tree view (switches to existing tab or opens new permanent tab).
     /// Used for double-click.
     OpenFileFromSidebar(PathBuf),
+    /// Open file in a new split group to the side.
+    OpenSide(PathBuf),
     /// Preview file from sidebar tree view (single-click, replaces current preview tab).
     PreviewFileFromSidebar(PathBuf),
     /// Create a new file: (parent_dir, name).
@@ -371,6 +379,8 @@ enum Msg {
     MoveFile(PathBuf, PathBuf),
     /// Copy the file path to the clipboard.
     CopyPath(PathBuf),
+    /// Copy the relative file path to the clipboard.
+    CopyRelativePath(PathBuf),
     /// Remember this file as the "left side" for a two-way diff.
     SelectForDiff(PathBuf),
     /// Open a vsplit diff: current file is right side, stored path is left.
@@ -379,6 +389,8 @@ enum Msg {
     ClipboardPasteToInput { text: String },
     /// Toggle the integrated terminal panel open/closed.
     ToggleTerminal,
+    /// Open a new terminal tab at a specific directory.
+    OpenTerminalAt(PathBuf),
     /// Open a new terminal tab.
     NewTerminalTab,
     /// Run a command in a visible terminal pane (for installs).
@@ -475,6 +487,15 @@ enum Msg {
     OpenBufferEditor(String),
     /// Alt key released — confirm tab switcher if open.
     TabSwitcherRelease,
+    /// Right-click on a tab in the tab bar: (group_id, tab_idx, pixel x, pixel y).
+    TabRightClick {
+        group_id: core::window::GroupId,
+        tab_idx: usize,
+        x: f64,
+        y: f64,
+    },
+    /// Right-click on the editor area (buffer text).
+    EditorRightClick { x: f64, y: f64 },
 }
 
 /// Build a single setting row widget (label+description on left, control widget on right).
@@ -835,7 +856,7 @@ impl SimpleComponent for App {
                     },
 
                     gtk4::Button {
-                        set_label: "\u{eb85}",
+                        set_label: "\u{eae6}",
                         set_tooltip_text: Some("Extensions"),
                         set_width_request: 48,
                         set_height_request: 48,
@@ -924,7 +945,7 @@ impl SimpleComponent for App {
                                 set_height_request: 32,
                                 connect_clicked[sender, file_tree_view] => move |_| {
                                     let parent_dir = selected_parent_dir(&file_tree_view);
-                                    show_name_prompt_dialog("New File", "", {
+                                    show_name_prompt_dialog("New File", "", None, {
                                         let s = sender.clone();
                                         move |name| s.input(Msg::CreateFile(parent_dir.clone(), name))
                                     });
@@ -938,7 +959,7 @@ impl SimpleComponent for App {
                                 set_height_request: 32,
                                 connect_clicked[sender, file_tree_view] => move |_| {
                                     let parent_dir = selected_parent_dir(&file_tree_view);
-                                    show_name_prompt_dialog("New Folder", "", {
+                                    show_name_prompt_dialog("New Folder", "", None, {
                                         let s = sender.clone();
                                         move |name| s.input(Msg::CreateFolder(parent_dir.clone(), name))
                                     });
@@ -1996,6 +2017,8 @@ impl SimpleComponent for App {
         ]);
 
         let file_tree_view_ref = Rc::new(RefCell::new(None));
+        let active_ctx_popover_ref: Rc<RefCell<Option<gtk4::PopoverMenu>>> =
+            Rc::new(RefCell::new(None));
         let drawing_area_ref = Rc::new(RefCell::new(None));
         let menu_bar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> = Rc::new(RefCell::new(None));
         let menu_dropdown_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> =
@@ -2092,6 +2115,7 @@ impl SimpleComponent for App {
             overlay: overlay_ref.clone(),
             cached_line_height: 24.0,
             cached_char_width: 9.0,
+            dialog_btn_rects: Rc::new(RefCell::new(Vec::new())),
             line_height_cell: line_height_cell.clone(),
             char_width_cell: char_width_cell.clone(),
             draw_needed: Rc::new(Cell::new(false)),
@@ -2119,7 +2143,6 @@ impl SimpleComponent for App {
             ai_panel_box_ref: ai_panel_box_ref.clone(),
             project_search_status: String::new(),
             search_results_list: search_results_list_ref.clone(),
-            diff_selected_file: None,
             last_clipboard_content: None,
             clipboard,
             h_sb_dragging: None,
@@ -2141,6 +2164,7 @@ impl SimpleComponent for App {
             css_provider,
             last_colorscheme,
             settings_self_save: false,
+            active_ctx_popover: active_ctx_popover_ref.clone(),
         };
         let widgets = view_output!();
 
@@ -2845,10 +2869,38 @@ impl SimpleComponent for App {
         col.pack_start(&icon_cell, false);
         col.add_attribute(&icon_cell, "text", 0);
 
-        // Filename cell renderer (expanding)
+        // Filename cell renderer (expanding) — made editable on demand for inline rename
         let name_cell = gtk4::CellRendererText::new();
         col.pack_start(&name_cell, true);
         col.add_attribute(&name_cell, "text", 1);
+
+        // Handle inline cell editing for rename
+        {
+            let sender_for_edit = sender.clone();
+            let ts_for_edit = tree_store.clone();
+            let name_cell_for_cancel = name_cell.clone();
+            name_cell.connect_edited(move |cell, tree_path, new_text| {
+                // Disable editable after edit completes
+                cell.set_property("editable", false);
+                let new_name = new_text.trim();
+                if new_name.is_empty() {
+                    return;
+                }
+                // Get the old path from the TreeStore (column 2)
+                if let Some(iter) = ts_for_edit.iter(&tree_path) {
+                    let old_path_str: String =
+                        ts_for_edit.get_value(&iter, 2).get().unwrap_or_default();
+                    if !old_path_str.is_empty() {
+                        let old_path = PathBuf::from(&old_path_str);
+                        sender_for_edit.input(Msg::RenameFile(old_path, new_name.to_string()));
+                    }
+                }
+            });
+            name_cell.connect_editing_canceled(move |_cell| {
+                // Disable editable when editing is cancelled
+                name_cell_for_cancel.set_property("editable", false);
+            });
+        }
 
         widgets.file_tree_view.append_column(&col);
 
@@ -2922,21 +2974,24 @@ impl SimpleComponent for App {
         });
         widgets.file_tree_view.add_controller(gesture);
 
-        // Right-click context menu
+        // Right-click context menu — plain Popover with flat buttons (no
+        // PopoverMenu, avoids GTK4 internal ScrolledWindow sizing issues).
         {
             let sender_rc = sender.clone();
+            let ctx_pop_rc = active_ctx_popover_ref.clone();
+            let engine_ctx = engine.clone();
+            let name_cell_rc = name_cell.clone();
             let right_click = gtk4::GestureClick::new();
-            right_click.set_button(3); // right mouse button
+            right_click.set_button(3);
             right_click.connect_pressed(move |gesture, _n_press, x, y| {
                 let widget = gesture.widget();
                 let Some(tree_view) = widget.downcast_ref::<gtk4::TreeView>() else {
                     return;
                 };
-                // Select the row under the cursor
+                // Select the row under cursor
                 if let Some((Some(tp), _, _, _)) = tree_view.path_at_pos(x as i32, y as i32) {
                     tree_view.selection().select_path(&tp);
                 }
-                // Get selected path
                 let selected_path: Option<PathBuf> =
                     tree_view.selection().selected().and_then(|(model, iter)| {
                         let s: String = model.get_value(&iter, 2).get().ok()?;
@@ -2947,44 +3002,37 @@ impl SimpleComponent for App {
                         }
                     });
                 let Some(target) = selected_path else { return };
+                let is_dir = target.is_dir();
 
-                // Build a simple popover with buttons
-                let menu_box = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
-                menu_box.set_margin_all(4);
+                // Build gio::Menu from engine-generated items (single source of truth).
+                engine_ctx
+                    .borrow_mut()
+                    .open_explorer_context_menu(target.clone(), is_dir, 0, 0);
+                let items: Vec<core::engine::ContextMenuItem> = engine_ctx
+                    .borrow()
+                    .context_menu
+                    .as_ref()
+                    .map(|cm| cm.items.clone())
+                    .unwrap_or_default();
+                engine_ctx.borrow_mut().close_context_menu();
+                let menu = build_gio_menu_from_engine_items(&items, "ctx");
 
-                let add_btn = |label: &str| -> gtk4::Button {
-                    let b = gtk4::Button::with_label(label);
-                    b.set_has_frame(false);
-                    b.set_halign(gtk4::Align::Fill);
-                    b
+                // Collect enabled state from engine items keyed by action string.
+                let ctx_enabled: std::collections::HashMap<String, bool> = items
+                    .iter()
+                    .map(|it| (it.action.clone(), it.enabled))
+                    .collect();
+
+                // Build action group. `add_ctx_action` respects engine-driven enabled state.
+                let actions = gtk4::gio::SimpleActionGroup::new();
+                // Helper: register action and apply engine-driven enabled state.
+                let add_action = |actions: &gtk4::gio::SimpleActionGroup,
+                                  a: &gtk4::gio::SimpleAction| {
+                    if ctx_enabled.get(a.name().as_str()) == Some(&false) {
+                        a.set_enabled(false);
+                    }
+                    actions.add_action(a);
                 };
-
-                let btn_new_file = add_btn("New File");
-                let btn_new_folder = add_btn("New Folder");
-                let btn_rename = add_btn("Rename  F2");
-                let btn_delete = add_btn("Delete  Del");
-                let btn_copy_path = add_btn("Copy Path");
-                let btn_select_diff = add_btn("Select for Diff");
-
-                menu_box.append(&btn_new_file);
-                menu_box.append(&btn_new_folder);
-                menu_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
-                menu_box.append(&btn_rename);
-                menu_box.append(&btn_delete);
-                menu_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
-                menu_box.append(&btn_copy_path);
-                menu_box.append(&btn_select_diff);
-
-                let popover = gtk4::Popover::new();
-                popover.set_child(Some(&menu_box));
-                popover.set_parent(tree_view);
-                // Position near cursor
-                let rect = gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1);
-                popover.set_pointing_to(Some(&rect));
-                popover.set_autohide(true);
-                popover.popup();
-
-                // Determine parent dir for "New File" / "New Folder"
                 let parent_dir = if target.is_dir() {
                     target.clone()
                 } else {
@@ -2994,91 +3042,200 @@ impl SimpleComponent for App {
                         .to_path_buf()
                 };
 
-                // Wire up buttons
-                let s = sender_rc.clone();
-                let pd = parent_dir.clone();
-                let p = popover.clone();
-                btn_new_file.connect_clicked(move |_| {
-                    p.popdown();
-                    let pd2 = pd.clone();
-                    show_name_prompt_dialog("New File", "", {
-                        let s2 = s.clone();
-                        move |name| s2.input(Msg::CreateFile(pd2.clone(), name))
+                {
+                    let s = sender_rc.clone();
+                    let pd = parent_dir.clone();
+                    let a = gtk4::gio::SimpleAction::new("new_file", None);
+                    a.connect_activate(move |_, _| {
+                        let pd2 = pd.clone();
+                        show_name_prompt_dialog("New File", "", None, {
+                            let s2 = s.clone();
+                            move |name| s2.input(Msg::CreateFile(pd2.clone(), name))
+                        });
                     });
-                });
-                let s = sender_rc.clone();
-                let pd = parent_dir.clone();
-                let p = popover.clone();
-                btn_new_folder.connect_clicked(move |_| {
-                    p.popdown();
-                    let pd2 = pd.clone();
-                    show_name_prompt_dialog("New Folder", "", {
-                        let s2 = s.clone();
-                        move |name| s2.input(Msg::CreateFolder(pd2.clone(), name))
+                    add_action(&actions, &a);
+                }
+                {
+                    let s = sender_rc.clone();
+                    let pd = parent_dir.clone();
+                    let a = gtk4::gio::SimpleAction::new("new_folder", None);
+                    a.connect_activate(move |_, _| {
+                        let pd2 = pd.clone();
+                        show_name_prompt_dialog("New Folder", "", None, {
+                            let s2 = s.clone();
+                            move |name| s2.input(Msg::CreateFolder(pd2.clone(), name))
+                        });
                     });
-                });
-                let s = sender_rc.clone();
-                let tgt = target.clone();
-                let tv_clone = tree_view.clone();
-                let p = popover.clone();
-                btn_rename.connect_clicked(move |_| {
-                    // Trigger inline rename via a simple dialog
-                    let dialog = gtk4::Dialog::with_buttons(
-                        Some("Rename"),
-                        None::<&gtk4::Window>,
-                        gtk4::DialogFlags::MODAL | gtk4::DialogFlags::DESTROY_WITH_PARENT,
-                        &[
-                            ("Rename", gtk4::ResponseType::Accept),
-                            ("Cancel", gtk4::ResponseType::Cancel),
-                        ],
-                    );
-                    let entry = gtk4::Entry::new();
-                    let current = tgt
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_default();
-                    entry.set_text(&current);
-                    entry.select_region(0, -1);
-                    dialog.content_area().append(&entry);
-                    dialog.set_default_response(gtk4::ResponseType::Accept);
-                    entry.set_activates_default(true);
-                    let s2 = s.clone();
-                    let tgt2 = tgt.clone();
-                    let tv2 = tv_clone.clone();
-                    dialog.connect_response(move |dlg, resp| {
-                        if resp == gtk4::ResponseType::Accept {
-                            let new_name = entry.text().to_string();
-                            if !new_name.is_empty() {
-                                s2.input(Msg::RenameFile(tgt2.clone(), new_name));
-                            }
+                    add_action(&actions, &a);
+                }
+                {
+                    let tv = tree_view.clone();
+                    let nc = name_cell_rc.clone();
+                    let pop_ref = ctx_pop_rc.clone();
+                    let a = gtk4::gio::SimpleAction::new("rename", None);
+                    a.connect_activate(move |_, _| {
+                        // Close the context menu popover first so it doesn't
+                        // steal focus from the inline editor.
+                        if let Some(ref p) = *pop_ref.borrow() {
+                            p.popdown();
                         }
-                        tv2.grab_focus();
-                        dlg.close();
+                        // Start inline cell editing on idle so the popover
+                        // has time to close and release focus.
+                        let tv2 = tv.clone();
+                        let nc2 = nc.clone();
+                        gtk4::glib::idle_add_local_once(move || {
+                            nc2.set_property("editable", true);
+                            if let Some(column) = tv2.column(0) {
+                                if let Some((model, iter)) = tv2.selection().selected() {
+                                    let tree_path = model.path(&iter);
+                                    gtk4::prelude::TreeViewExt::set_cursor(
+                                        &tv2,
+                                        &tree_path,
+                                        Some(&column),
+                                        true,
+                                    );
+                                }
+                            }
+                        });
                     });
-                    dialog.present();
-                    p.popdown();
+                    add_action(&actions, &a);
+                }
+                {
+                    let s = sender_rc.clone();
+                    let tgt = target.clone();
+                    let a = gtk4::gio::SimpleAction::new("delete", None);
+                    a.connect_activate(move |_, _| {
+                        s.input(Msg::ConfirmDeletePath(tgt.clone()));
+                    });
+                    add_action(&actions, &a);
+                }
+                {
+                    let s = sender_rc.clone();
+                    let tgt = target.clone();
+                    let a = gtk4::gio::SimpleAction::new("copy_path", None);
+                    a.connect_activate(move |_, _| {
+                        s.input(Msg::CopyPath(tgt.clone()));
+                    });
+                    add_action(&actions, &a);
+                }
+                {
+                    let s = sender_rc.clone();
+                    let tgt = target.clone();
+                    let a = gtk4::gio::SimpleAction::new("copy_relative_path", None);
+                    a.connect_activate(move |_, _| {
+                        s.input(Msg::CopyRelativePath(tgt.clone()));
+                    });
+                    add_action(&actions, &a);
+                }
+                {
+                    let tgt = target.clone();
+                    let a = gtk4::gio::SimpleAction::new("reveal", None);
+                    a.connect_activate(move |_, _| {
+                        let dir = if tgt.is_dir() {
+                            tgt.clone()
+                        } else {
+                            tgt.parent()
+                                .unwrap_or(std::path::Path::new("."))
+                                .to_path_buf()
+                        };
+                        let _ = std::process::Command::new("xdg-open")
+                            .arg(&dir)
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .spawn();
+                    });
+                    add_action(&actions, &a);
+                }
+                {
+                    let s = sender_rc.clone();
+                    let tgt = target.clone();
+                    let a = gtk4::gio::SimpleAction::new("select_for_diff", None);
+                    a.connect_activate(move |_, _| {
+                        s.input(Msg::SelectForDiff(tgt.clone()));
+                    });
+                    add_action(&actions, &a);
+                }
+                {
+                    let s = sender_rc.clone();
+                    let tgt = target.clone();
+                    let a = gtk4::gio::SimpleAction::new("diff_with_selected", None);
+                    a.connect_activate(move |_, _| {
+                        s.input(Msg::DiffWithSelected(tgt.clone()));
+                    });
+                    add_action(&actions, &a);
+                }
+                {
+                    let s = sender_rc.clone();
+                    let tgt = target.clone();
+                    let a = gtk4::gio::SimpleAction::new("open_side", None);
+                    a.connect_activate(move |_, _| {
+                        s.input(Msg::OpenSide(tgt.clone()));
+                    });
+                    add_action(&actions, &a);
+                }
+                {
+                    let eng = engine_ctx.clone();
+                    let tgt = target.clone();
+                    let a = gtk4::gio::SimpleAction::new("open_side_vsplit", None);
+                    a.connect_activate(move |_, _| {
+                        let mut e = eng.borrow_mut();
+                        e.split_window(crate::core::window::SplitDirection::Vertical, None);
+                        let _ = e.open_file_with_mode(&tgt, crate::core::OpenMode::Permanent);
+                    });
+                    add_action(&actions, &a);
+                }
+                {
+                    let s = sender_rc.clone();
+                    let tgt = target.clone();
+                    let tgt_is_dir = is_dir;
+                    let a = gtk4::gio::SimpleAction::new("open_terminal", None);
+                    a.connect_activate(move |_, _| {
+                        let dir = if tgt_is_dir {
+                            tgt.clone()
+                        } else {
+                            tgt.parent()
+                                .unwrap_or(std::path::Path::new("."))
+                                .to_path_buf()
+                        };
+                        s.input(Msg::OpenTerminalAt(dir));
+                    });
+                    add_action(&actions, &a);
+                }
+                {
+                    let s = sender_rc.clone();
+                    let a = gtk4::gio::SimpleAction::new("find_in_folder", None);
+                    a.connect_activate(move |_, _| {
+                        s.input(Msg::ToggleFocusSearch);
+                    });
+                    add_action(&actions, &a);
+                }
+
+                // Clean up previous popover, create new PopoverMenu.
+                let n_rows = menu_row_count(&menu);
+                // Parent to the ScrolledWindow (tree_view's parent) so that
+                // hover events work correctly — PopoverMenu inside a
+                // ScrolledWindow's child doesn't receive motion events properly.
+                let popover_parent: gtk4::Widget = tree_view
+                    .parent()
+                    .unwrap_or_else(|| tree_view.clone().upcast());
+                let (px, py) = tree_view
+                    .translate_coordinates(&popover_parent, x, y)
+                    .unwrap_or((x, y));
+                popover_parent.insert_action_group("ctx", Some(&actions));
+                swap_ctx_popover(&ctx_pop_rc, {
+                    let popover = gtk4::PopoverMenu::from_model(Some(&menu));
+                    popover.set_parent(&popover_parent);
+                    popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(
+                        px as i32, py as i32, 1, 1,
+                    )));
+                    popover.set_has_arrow(false);
+                    popover.set_position(gtk4::PositionType::Right);
+                    popover.set_size_request(-1, n_rows * 22 + 14);
+                    popover
                 });
-                let s = sender_rc.clone();
-                let tgt = target.clone();
-                let p = popover.clone();
-                btn_delete.connect_clicked(move |_| {
-                    p.popdown();
-                    s.input(Msg::ConfirmDeletePath(tgt.clone()));
-                });
-                let s = sender_rc.clone();
-                let tgt = target.clone();
-                let p = popover.clone();
-                btn_copy_path.connect_clicked(move |_| {
-                    s.input(Msg::CopyPath(tgt.clone()));
-                    p.popdown();
-                });
-                let s = sender_rc.clone();
-                let tgt = target.clone();
-                let p = popover.clone();
-                btn_select_diff.connect_clicked(move |_| {
-                    s.input(Msg::SelectForDiff(tgt.clone()));
-                    p.popdown();
-                });
+                if let Some(ref p) = *ctx_pop_rc.borrow() {
+                    p.popup();
+                }
             });
             widgets.file_tree_view.add_controller(right_click);
         }
@@ -3400,6 +3557,7 @@ impl SimpleComponent for App {
         let tab_slots_for_draw = tab_slot_positions_cell.clone();
         let diff_btn_for_draw = diff_btn_map_cell.clone();
         let split_btn_for_draw = split_btn_map_cell.clone();
+        let dialog_btn_for_draw = model.dialog_btn_rects.clone();
         widgets
             .drawing_area
             .set_draw_func(move |_, cr, width, height| {
@@ -3417,6 +3575,7 @@ impl SimpleComponent for App {
                     &tab_slots_for_draw,
                     &diff_btn_for_draw,
                     &split_btn_for_draw,
+                    &dialog_btn_for_draw,
                 );
             });
 
@@ -3434,6 +3593,60 @@ impl SimpleComponent for App {
                 pos_cell_leave.set((-1.0, -1.0));
             });
             widgets.drawing_area.add_controller(mc);
+        }
+
+        // Right-click on drawing area (tab bar or editor context menu).
+        {
+            let engine_rc = engine.clone();
+            let sender_rc = sender.input_sender().clone();
+            let lh_rc = line_height_cell.clone();
+            let tab_slots_rc = tab_slot_positions_cell.clone();
+            let diff_btn_rc = diff_btn_map_cell.clone();
+            let split_btn_rc = split_btn_map_cell.clone();
+            let rc_gesture = gtk4::GestureClick::new();
+            rc_gesture.set_button(3);
+            rc_gesture.connect_pressed(move |gesture, _n_press, x, y| {
+                let widget = gesture.widget();
+                let width = widget.width() as f64;
+                let height = widget.height() as f64;
+                let lh = lh_rc.get().max(1.0);
+                let mut engine = engine_rc.borrow_mut();
+                let target = pixel_to_click_target(
+                    &mut engine,
+                    x,
+                    y,
+                    width,
+                    height,
+                    lh,
+                    0.0, // char_width not needed for tab bar detection
+                    &tab_slots_rc.borrow(),
+                    &diff_btn_rc.borrow(),
+                    &split_btn_rc.borrow(),
+                );
+                match target {
+                    ClickTarget::TabBar => {
+                        let group_id = engine.active_group;
+                        let tab_idx = engine
+                            .editor_groups
+                            .get(&group_id)
+                            .map(|g| g.active_tab)
+                            .unwrap_or(0);
+                        drop(engine);
+                        let _ = sender_rc.send(Msg::TabRightClick {
+                            group_id,
+                            tab_idx,
+                            x,
+                            y,
+                        });
+                    }
+                    ClickTarget::BufferPos(..) | ClickTarget::Gutter => {
+                        drop(engine);
+                        let _ = sender_rc.send(Msg::EditorRightClick { x, y });
+                    }
+                    _ => {}
+                }
+            });
+            widgets.drawing_area.add_controller(rc_gesture);
         }
 
         // Tab switcher auto-confirm: poll modifier state every 50ms while open.
@@ -3795,9 +4008,426 @@ impl SimpleComponent for App {
                 self.engine.borrow_mut().clear_yank_highlight();
                 self.draw_needed.set(true);
             }
+            Msg::TabRightClick {
+                group_id,
+                tab_idx,
+                x,
+                y,
+            } => {
+                let da = match self.drawing_area.borrow().as_ref() {
+                    Some(da) => da.clone(),
+                    None => return,
+                };
+
+                // Build gio::Menu from engine-generated items (single source of truth).
+                let items: Vec<core::engine::ContextMenuItem> = {
+                    let mut engine = self.engine.borrow_mut();
+                    engine.open_tab_context_menu(group_id, tab_idx, 0, 0);
+                    let items = engine
+                        .context_menu
+                        .as_ref()
+                        .map(|cm| cm.items.clone())
+                        .unwrap_or_default();
+                    engine.close_context_menu();
+                    items
+                };
+
+                let menu = build_gio_menu_from_engine_items(&items, "tabctx");
+
+                // Collect enabled state from engine items keyed by action string.
+                let enabled_map: std::collections::HashMap<String, bool> = items
+                    .iter()
+                    .map(|it| (it.action.clone(), it.enabled))
+                    .collect();
+
+                // Build action group
+                let actions = gtk4::gio::SimpleActionGroup::new();
+
+                macro_rules! tab_action {
+                    ($name:expr, $engine:expr, $draw:expr, $body:expr) => {{
+                        let engine_ref = $engine.clone();
+                        let draw_ref = $draw.clone();
+                        let a = gtk4::gio::SimpleAction::new($name, None);
+                        a.connect_activate(move |_, _| {
+                            $body(&engine_ref, &draw_ref);
+                        });
+                        if enabled_map.get($name) == Some(&false) {
+                            a.set_enabled(false);
+                        }
+                        actions.add_action(&a);
+                    }};
+                }
+
+                {
+                    let engine_ref = self.engine.clone();
+                    let draw_ref = self.draw_needed.clone();
+                    let sender = self.sender.clone();
+                    let a = gtk4::gio::SimpleAction::new("close", None);
+                    a.connect_activate(move |_, _| {
+                        let mut e = engine_ref.borrow_mut();
+                        e.active_group = group_id;
+                        if let Some(g) = e.editor_groups.get_mut(&group_id) {
+                            g.active_tab = tab_idx;
+                        }
+                        if e.dirty() {
+                            drop(e);
+                            let _ = sender.send(Msg::ShowCloseTabConfirm);
+                        } else {
+                            e.close_tab();
+                            draw_ref.set(true);
+                        }
+                    });
+                    actions.add_action(&a);
+                }
+
+                tab_action!(
+                    "close_others",
+                    self.engine,
+                    self.draw_needed,
+                    |engine_ref: &Rc<RefCell<Engine>>, draw_ref: &Rc<Cell<bool>>| {
+                        let mut e = engine_ref.borrow_mut();
+                        e.active_group = group_id;
+                        if let Some(g) = e.editor_groups.get_mut(&group_id) {
+                            g.active_tab = tab_idx;
+                        }
+                        e.close_other_tabs();
+                        draw_ref.set(true);
+                    }
+                );
+                tab_action!(
+                    "close_right",
+                    self.engine,
+                    self.draw_needed,
+                    |engine_ref: &Rc<RefCell<Engine>>, draw_ref: &Rc<Cell<bool>>| {
+                        let mut e = engine_ref.borrow_mut();
+                        e.active_group = group_id;
+                        if let Some(g) = e.editor_groups.get_mut(&group_id) {
+                            g.active_tab = tab_idx;
+                        }
+                        e.close_tabs_to_right();
+                        draw_ref.set(true);
+                    }
+                );
+                tab_action!(
+                    "close_saved",
+                    self.engine,
+                    self.draw_needed,
+                    |engine_ref: &Rc<RefCell<Engine>>, draw_ref: &Rc<Cell<bool>>| {
+                        let mut e = engine_ref.borrow_mut();
+                        e.active_group = group_id;
+                        if let Some(g) = e.editor_groups.get_mut(&group_id) {
+                            g.active_tab = tab_idx;
+                        }
+                        e.close_saved_tabs();
+                        draw_ref.set(true);
+                    }
+                );
+                tab_action!(
+                    "copy_path",
+                    self.engine,
+                    self.draw_needed,
+                    |engine_ref: &Rc<RefCell<Engine>>, draw_ref: &Rc<Cell<bool>>| {
+                        let e = engine_ref.borrow();
+                        if let Some(path) = e.tab_file_path(group_id, tab_idx) {
+                            let text = path.to_string_lossy().to_string();
+                            if let Some(ref cb) = e.clipboard_write {
+                                let _ = cb(&text);
+                            }
+                            drop(e);
+                            engine_ref.borrow_mut().message = format!("Copied: {text}");
+                        }
+                        draw_ref.set(true);
+                    }
+                );
+                tab_action!(
+                    "copy_relative_path",
+                    self.engine,
+                    self.draw_needed,
+                    |engine_ref: &Rc<RefCell<Engine>>, draw_ref: &Rc<Cell<bool>>| {
+                        let e = engine_ref.borrow();
+                        if let Some(path) = e.tab_file_path(group_id, tab_idx) {
+                            let rel = e.copy_relative_path(&path);
+                            if let Some(ref cb) = e.clipboard_write {
+                                let _ = cb(&rel);
+                            }
+                            drop(e);
+                            engine_ref.borrow_mut().message = format!("Copied: {rel}");
+                        }
+                        draw_ref.set(true);
+                    }
+                );
+                tab_action!(
+                    "reveal",
+                    self.engine,
+                    self.draw_needed,
+                    |engine_ref: &Rc<RefCell<Engine>>, _draw_ref: &Rc<Cell<bool>>| {
+                        let e = engine_ref.borrow();
+                        if let Some(path) = e.tab_file_path(group_id, tab_idx) {
+                            drop(e);
+                            engine_ref.borrow().reveal_in_file_manager(&path);
+                        }
+                    }
+                );
+                tab_action!(
+                    "split_right",
+                    self.engine,
+                    self.draw_needed,
+                    |engine_ref: &Rc<RefCell<Engine>>, draw_ref: &Rc<Cell<bool>>| {
+                        engine_ref
+                            .borrow_mut()
+                            .split_window(core::window::SplitDirection::Vertical, None);
+                        draw_ref.set(true);
+                    }
+                );
+                tab_action!(
+                    "split_down",
+                    self.engine,
+                    self.draw_needed,
+                    |engine_ref: &Rc<RefCell<Engine>>, draw_ref: &Rc<Cell<bool>>| {
+                        engine_ref
+                            .borrow_mut()
+                            .split_window(core::window::SplitDirection::Horizontal, None);
+                        draw_ref.set(true);
+                    }
+                );
+                tab_action!(
+                    "group_split_right",
+                    self.engine,
+                    self.draw_needed,
+                    |engine_ref: &Rc<RefCell<Engine>>, draw_ref: &Rc<Cell<bool>>| {
+                        engine_ref
+                            .borrow_mut()
+                            .open_editor_group(core::window::SplitDirection::Vertical);
+                        draw_ref.set(true);
+                    }
+                );
+                tab_action!(
+                    "group_split_down",
+                    self.engine,
+                    self.draw_needed,
+                    |engine_ref: &Rc<RefCell<Engine>>, draw_ref: &Rc<Cell<bool>>| {
+                        engine_ref
+                            .borrow_mut()
+                            .open_editor_group(core::window::SplitDirection::Horizontal);
+                        draw_ref.set(true);
+                    }
+                );
+
+                da.insert_action_group("tabctx", Some(&actions));
+
+                let n_rows = menu_row_count(&menu);
+                swap_ctx_popover(&self.active_ctx_popover, {
+                    let popover = gtk4::PopoverMenu::from_model(Some(&menu));
+                    popover.set_parent(&da);
+                    popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(
+                        x as i32, y as i32, 1, 1,
+                    )));
+                    popover.set_has_arrow(false);
+                    popover.set_position(gtk4::PositionType::Right);
+                    popover.set_size_request(-1, n_rows * 22 + 14);
+                    popover
+                });
+                if let Some(ref p) = *self.active_ctx_popover.borrow() {
+                    p.popup();
+                }
+            }
             Msg::TabSwitcherRelease => {
                 // Handled directly by the root EventControllerKey release handler.
                 // Kept as a no-op for exhaustive match.
+            }
+            Msg::EditorRightClick { x, y } => {
+                let da = match self.drawing_area.borrow().as_ref() {
+                    Some(da) => da.clone(),
+                    None => return,
+                };
+
+                // Build gio::Menu from engine-generated items (single source of truth).
+                let items: Vec<core::engine::ContextMenuItem> = {
+                    let mut engine = self.engine.borrow_mut();
+                    engine.open_editor_context_menu(0, 0);
+                    let items = engine
+                        .context_menu
+                        .as_ref()
+                        .map(|cm| cm.items.clone())
+                        .unwrap_or_default();
+                    engine.close_context_menu();
+                    items
+                };
+
+                let menu = build_gio_menu_from_engine_items(&items, "edctx");
+
+                let enabled_map: std::collections::HashMap<String, bool> = items
+                    .iter()
+                    .map(|it| (it.action.clone(), it.enabled))
+                    .collect();
+
+                let actions = gtk4::gio::SimpleActionGroup::new();
+
+                // Helper macro to reduce boilerplate for engine-driven actions.
+                macro_rules! add_editor_ctx_action {
+                    ($name:expr, $engine_rc:expr, $draw_rc:expr, $body:expr) => {{
+                        let engine_ref = $engine_rc.clone();
+                        let draw_ref = $draw_rc.clone();
+                        let a = gtk4::gio::SimpleAction::new($name, None);
+                        a.connect_activate(move |_, _| {
+                            ($body)(&engine_ref, &draw_ref);
+                        });
+                        if enabled_map.get($name) == Some(&false) {
+                            a.set_enabled(false);
+                        }
+                        actions.add_action(&a);
+                    }};
+                }
+
+                add_editor_ctx_action!(
+                    "goto_definition",
+                    self.engine,
+                    self.draw_needed,
+                    |eng: &std::cell::RefCell<core::Engine>, dr: &std::cell::Cell<bool>| {
+                        eng.borrow_mut().lsp_request_definition();
+                        dr.set(true);
+                    }
+                );
+
+                add_editor_ctx_action!(
+                    "goto_references",
+                    self.engine,
+                    self.draw_needed,
+                    |eng: &std::cell::RefCell<core::Engine>, dr: &std::cell::Cell<bool>| {
+                        eng.borrow_mut().lsp_request_references();
+                        dr.set(true);
+                    }
+                );
+
+                add_editor_ctx_action!(
+                    "rename_symbol",
+                    self.engine,
+                    self.draw_needed,
+                    |eng: &std::cell::RefCell<core::Engine>, dr: &std::cell::Cell<bool>| {
+                        let mut e = eng.borrow_mut();
+                        e.mode = core::Mode::Command;
+                        e.command_buffer = "Rename ".to_string();
+                        dr.set(true);
+                    }
+                );
+
+                add_editor_ctx_action!(
+                    "open_changes",
+                    self.engine,
+                    self.draw_needed,
+                    |eng: &std::cell::RefCell<core::Engine>, dr: &std::cell::Cell<bool>| {
+                        eng.borrow_mut().open_diff_peek();
+                        dr.set(true);
+                    }
+                );
+
+                add_editor_ctx_action!(
+                    "cut",
+                    self.engine,
+                    self.draw_needed,
+                    |eng: &std::cell::RefCell<core::Engine>, dr: &std::cell::Cell<bool>| {
+                        let mut e = eng.borrow_mut();
+                        if matches!(
+                            e.mode,
+                            core::Mode::Visual | core::Mode::VisualLine | core::Mode::VisualBlock
+                        ) {
+                            e.yank_visual_selection();
+                            if let Some((ref text, _)) = e.registers.get(&'"') {
+                                let text = text.clone();
+                                if let Some(ref cb) = e.clipboard_write {
+                                    let _ = cb(&text);
+                                }
+                            }
+                            let mut changed = false;
+                            e.delete_visual_selection(&mut changed);
+                        }
+                        dr.set(true);
+                    }
+                );
+
+                add_editor_ctx_action!(
+                    "copy",
+                    self.engine,
+                    self.draw_needed,
+                    |eng: &std::cell::RefCell<core::Engine>, dr: &std::cell::Cell<bool>| {
+                        let mut e = eng.borrow_mut();
+                        if matches!(
+                            e.mode,
+                            core::Mode::Visual | core::Mode::VisualLine | core::Mode::VisualBlock
+                        ) {
+                            e.yank_visual_selection();
+                            if let Some((ref text, _)) = e.registers.get(&'"') {
+                                let text = text.clone();
+                                if let Some(ref cb) = e.clipboard_write {
+                                    let _ = cb(&text);
+                                }
+                            }
+                            e.mode = core::Mode::Normal;
+                        }
+                        dr.set(true);
+                    }
+                );
+
+                add_editor_ctx_action!(
+                    "paste",
+                    self.engine,
+                    self.draw_needed,
+                    |eng: &std::cell::RefCell<core::Engine>, dr: &std::cell::Cell<bool>| {
+                        let mut e = eng.borrow_mut();
+                        if let Some(ref cb_read) = e.clipboard_read {
+                            if let Ok(text) = cb_read() {
+                                if !text.is_empty() {
+                                    e.registers.insert('"', (text, false));
+                                    let mut changed = false;
+                                    e.paste_after(&mut changed);
+                                }
+                            }
+                        }
+                        dr.set(true);
+                    }
+                );
+
+                add_editor_ctx_action!(
+                    "open_side_vsplit",
+                    self.engine,
+                    self.draw_needed,
+                    |eng: &std::cell::RefCell<core::Engine>, dr: &std::cell::Cell<bool>| {
+                        let mut e = eng.borrow_mut();
+                        if let Some(path) = e.file_path().map(|p| p.to_path_buf()) {
+                            e.split_window(core::window::SplitDirection::Vertical, None);
+                            let _ = e.open_file_with_mode(&path, core::OpenMode::Permanent);
+                        }
+                        dr.set(true);
+                    }
+                );
+
+                add_editor_ctx_action!(
+                    "command_palette",
+                    self.engine,
+                    self.draw_needed,
+                    |eng: &std::cell::RefCell<core::Engine>, dr: &std::cell::Cell<bool>| {
+                        eng.borrow_mut().open_command_palette();
+                        dr.set(true);
+                    }
+                );
+
+                da.insert_action_group("edctx", Some(&actions));
+
+                let n_rows = menu_row_count(&menu);
+                swap_ctx_popover(&self.active_ctx_popover, {
+                    let popover = gtk4::PopoverMenu::from_model(Some(&menu));
+                    popover.set_parent(&da);
+                    popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(
+                        x as i32, y as i32, 1, 1,
+                    )));
+                    popover.set_has_arrow(false);
+                    popover.set_position(gtk4::PositionType::Right);
+                    popover.set_size_request(-1, n_rows * 22 + 14);
+                    popover
+                });
+                if let Some(ref p) = *self.active_ctx_popover.borrow() {
+                    p.popup();
+                }
             }
             Msg::Resize => {
                 // Propagate window resize to open terminal panes.
@@ -3817,337 +4447,393 @@ impl SimpleComponent for App {
                 height,
                 alt,
             } => {
-                // Snapshot the active file path before processing the click so we
-                // can detect tab switches (and only then highlight in the tree).
-                let file_before_click = self.engine.borrow().file_path().cloned();
-                // Clicking in the editor clears debug sidebar focus.
-                self.engine.borrow_mut().dap_sidebar_has_focus = false;
-                // Check if click lands in the terminal panel before general handling.
-                // Layout (bottom to top): status | toolbar | terminal | quickfix | DAP | editor
-                let in_terminal = if self.cached_line_height > 0.0 {
+                // Dialog button click — highest z-order element.
+                if self.engine.borrow().dialog.is_some() {
+                    let lh = self.cached_line_height.max(1.0);
+                    let btn_rects = self.dialog_btn_rects.borrow().clone();
+
+                    // Use actual button rects from the last draw_dialog_popup call.
+                    let mut clicked_btn: Option<usize> = None;
+                    for (idx, &(bx, by, bw, bh)) in btn_rects.iter().enumerate() {
+                        if x >= bx && x < bx + bw && y >= by && y < by + bh {
+                            clicked_btn = Some(idx);
+                            break;
+                        }
+                    }
+
+                    // Compute popup bounds for outside-click detection.
                     let engine = self.engine.borrow();
-                    if engine.terminal_open || engine.bottom_panel_open {
-                        let term_px = (engine.session.terminal_panel_rows as f64 + 2.0)
-                            * self.cached_line_height;
-                        let status_h = 2.0 * self.cached_line_height;
-                        let toolbar_px = if engine.debug_toolbar_visible {
-                            self.cached_line_height
+                    let dialog = engine.dialog.as_ref().unwrap();
+                    let popup_h = ((3.0 + dialog.body.len() as f64 + 2.0) * lh).min(height - 40.0);
+                    // Approximate popup width from button rects span.
+                    let (popup_x, popup_w) =
+                        if let (Some(first), Some(last)) = (btn_rects.first(), btn_rects.last()) {
+                            // Buttons start at popup_x + 12, so popup_x = first.0 - 12
+                            let px = first.0 - 12.0;
+                            // popup_w is at least wide enough to contain all buttons + padding
+                            let pw = (last.0 + last.2 - px + 12.0).max(350.0);
+                            (px, pw)
                         } else {
-                            0.0
+                            ((width - 350.0) / 2.0, 350.0)
                         };
-                        let term_y = height - status_h - toolbar_px - term_px;
-                        if y >= term_y {
-                            // 0 = tab bar, 1 = toolbar, 2 = content
-                            let zone = if y >= term_y + 2.0 * self.cached_line_height {
-                                2
-                            } else if y >= term_y + self.cached_line_height {
-                                1
+                    let popup_y_pos = (height - popup_h) / 2.0;
+                    let outside = x < popup_x
+                        || x >= popup_x + popup_w
+                        || y < popup_y_pos
+                        || y >= popup_y_pos + popup_h;
+                    drop(engine);
+
+                    if let Some(idx) = clicked_btn {
+                        let _action = self.engine.borrow_mut().dialog_click_button(idx);
+                        if self.engine.borrow().explorer_needs_refresh {
+                            self.engine.borrow_mut().explorer_needs_refresh = false;
+                            sender.input(Msg::RefreshFileTree);
+                        }
+                    } else if outside {
+                        self.engine.borrow_mut().dialog = None;
+                        self.engine.borrow_mut().pending_move = None;
+                    }
+                    self.draw_needed.set(true);
+                } else {
+                    // Snapshot the active file path before processing the click so we
+                    // can detect tab switches (and only then highlight in the tree).
+                    let file_before_click = self.engine.borrow().file_path().cloned();
+                    // Clicking in the editor clears debug sidebar focus.
+                    self.engine.borrow_mut().dap_sidebar_has_focus = false;
+                    // Check if click lands in the terminal panel before general handling.
+                    // Layout (bottom to top): status | toolbar | terminal | quickfix | DAP | editor
+                    let in_terminal = if self.cached_line_height > 0.0 {
+                        let engine = self.engine.borrow();
+                        if engine.terminal_open || engine.bottom_panel_open {
+                            let term_px = (engine.session.terminal_panel_rows as f64 + 2.0)
+                                * self.cached_line_height;
+                            let status_h = 2.0 * self.cached_line_height;
+                            let toolbar_px = if engine.debug_toolbar_visible {
+                                self.cached_line_height
                             } else {
-                                0
+                                0.0
                             };
-                            Some((term_y, zone))
+                            let term_y = height - status_h - toolbar_px - term_px;
+                            if y >= term_y {
+                                // 0 = tab bar, 1 = toolbar, 2 = content
+                                let zone = if y >= term_y + 2.0 * self.cached_line_height {
+                                    2
+                                } else if y >= term_y + self.cached_line_height {
+                                    1
+                                } else {
+                                    0
+                                };
+                                Some((term_y, zone))
+                            } else {
+                                None
+                            }
                         } else {
                             None
                         }
                     } else {
                         None
-                    }
-                } else {
-                    None
-                };
-                if let Some((term_y, zone)) = in_terminal {
-                    if zone == 0 {
-                        // Click on the tab bar row: switch active bottom panel tab.
-                        // Sans-serif chars are ~60% of monospace width; use that estimate.
-                        let cw = self.cached_char_width.max(1.0) * 0.6;
-                        let padding = 12.0;
-                        let terminal_label = "TERMINAL";
-                        let debug_label = "DEBUG CONSOLE";
-                        let terminal_w = padding + terminal_label.len() as f64 * cw + padding;
-                        let tab_x = x - padding; // offset matches cursor_x start
-                        let new_kind = if tab_x < terminal_w {
-                            render::BottomPanelKind::Terminal
-                        } else if tab_x < terminal_w + debug_label.len() as f64 * cw + padding * 2.0
-                        {
-                            render::BottomPanelKind::DebugOutput
-                        } else {
-                            self.engine.borrow().bottom_panel_kind.clone()
-                        };
-                        self.engine.borrow_mut().bottom_panel_kind = new_kind;
-                        sender.input(Msg::Resize); // triggers redraw
-                        return;
-                    }
-                    self.engine.borrow_mut().terminal_has_focus = true;
-                    if zone == 2 {
-                        const SB_W: f64 = 6.0;
-                        // In split mode: detect a click on the divider (start drag)
-                        // or set keyboard focus to the appropriate pane.
-                        let on_divider = if self.engine.borrow().terminal_split
-                            && self.engine.borrow().terminal_panes.len() >= 2
-                        {
-                            let left_cols = {
-                                let engine = self.engine.borrow();
-                                if engine.terminal_split_left_cols > 0 {
-                                    engine.terminal_split_left_cols
-                                } else {
-                                    engine.terminal_panes[0].cols
-                                }
-                            };
-                            let div_x = left_cols as f64 * self.cached_char_width;
-                            if x < width - SB_W && (x - div_x).abs() < 4.0 {
-                                self.terminal_split_dragging = true;
-                                true
-                            } else {
-                                let mut engine = self.engine.borrow_mut();
-                                engine.terminal_active = if x < div_x { 0 } else { 1 };
-                                false
-                            }
-                        } else {
-                            false
-                        };
-                        if !on_divider {
-                            // 6px scrollbar strip on the right edge — start a scrollbar drag.
-                            if x >= width - SB_W {
-                                self.terminal_sb_dragging = true;
-                            } else {
-                                self.terminal_sb_dragging = false;
-                                self.terminal_resize_dragging = false;
-                                let row = ((y - term_y - 2.0 * self.cached_line_height)
-                                    / self.cached_line_height)
-                                    as u16;
-                                let col = (x / self.cached_char_width.max(1.0)) as u16;
-                                self.engine.borrow_mut().terminal_scroll_reset();
-                                if let Some(term) = self.engine.borrow_mut().active_terminal_mut() {
-                                    term.selection = Some(crate::core::terminal::TermSelection {
-                                        start_row: row,
-                                        start_col: col,
-                                        end_row: row,
-                                        end_col: col,
-                                    });
-                                }
-                            }
-                        }
-                    } else {
-                        // Header row click — tab switch, toolbar buttons, or resize drag.
-                        const TERMINAL_TAB_COLS: usize = 4;
-                        let tab_count = self.engine.borrow().terminal_panes.len();
-                        let tab_area_px =
-                            tab_count as f64 * TERMINAL_TAB_COLS as f64 * self.cached_char_width;
-                        // Right-aligned buttons (3 chars each): + ⊞ ×
-                        let close_x = width - self.cached_char_width * 2.0;
-                        let split_x = width - self.cached_char_width * 4.0;
-                        let add_x = width - self.cached_char_width * 6.0;
-                        if x < tab_area_px && self.cached_char_width > 0.0 {
-                            let idx =
-                                (x / (TERMINAL_TAB_COLS as f64 * self.cached_char_width)) as usize;
-                            sender.input(Msg::TerminalSwitchTab(idx));
-                        } else if x >= close_x {
-                            sender.input(Msg::TerminalCloseActiveTab);
-                        } else if x >= split_x {
-                            sender.input(Msg::TerminalToggleSplit);
-                        } else if x >= add_x {
-                            sender.input(Msg::NewTerminalTab);
-                        } else {
-                            self.terminal_resize_dragging = true;
-                        }
-                    }
-                    self.draw_needed.set(true);
-                } else {
-                    {
-                        let mut engine = self.engine.borrow_mut();
-                        // Clicking outside the terminal panel returns focus to the editor.
-                        engine.terminal_has_focus = false;
-                    }
-
-                    // Dropdown clicks are fully handled by the menu_dropdown_da overlay
-                    // widget (which has can_target=true while a menu is open).
-                    // If we reach here, no menu is open and we proceed with normal handling.
-
-                    // ── H scrollbar hit-test (before editor click) ────────────────
-                    // If the click lands on a Cairo h scrollbar, start a drag and
-                    // don't pass the click through to the editor.
-                    {
-                        let lh = self.cached_line_height;
-                        let cw = self.cached_char_width;
-                        let engine = self.engine.borrow();
-                        let rects = compute_editor_window_rects(&engine, width, height, lh);
-                        if let Some((win_id, px_per_col, scroll_left)) =
-                            h_scrollbar_hit_test(&engine, x, y, &rects, cw, lh)
-                        {
-                            drop(engine);
-                            self.h_sb_dragging = Some(HScrollDragState {
-                                window_id: win_id,
-                                drag_start_x: x,
-                                scroll_left_at_start: scroll_left,
-                                px_per_col,
-                            });
-                            self.h_sb_drag_cell.set(Some(win_id));
-                            self.draw_needed.set(true);
-                            return; // consume click; don't send it to the editor
-                        }
-                    }
-
-                    // ── Editor group divider hit-test ─────────────────────────────
-                    {
-                        let engine = self.engine.borrow();
-                        if !engine.group_layout.is_single_group() {
-                            let lh = self.cached_line_height;
-                            let wildmenu_px = if engine.wildmenu_items.is_empty() {
-                                0.0
-                            } else {
-                                lh
-                            };
-                            let status_h = lh * 2.0 + wildmenu_px;
-                            let dbg_px = if engine.debug_toolbar_visible {
-                                lh
-                            } else {
-                                0.0
-                            };
-                            let qf_px = if engine.quickfix_open && !engine.quickfix_items.is_empty()
+                    };
+                    if let Some((term_y, zone)) = in_terminal {
+                        if zone == 0 {
+                            // Click on the tab bar row: switch active bottom panel tab.
+                            // Sans-serif chars are ~60% of monospace width; use that estimate.
+                            let cw = self.cached_char_width.max(1.0) * 0.6;
+                            let padding = 12.0;
+                            let terminal_label = "TERMINAL";
+                            let debug_label = "DEBUG CONSOLE";
+                            let terminal_w = padding + terminal_label.len() as f64 * cw + padding;
+                            let tab_x = x - padding; // offset matches cursor_x start
+                            let new_kind = if tab_x < terminal_w {
+                                render::BottomPanelKind::Terminal
+                            } else if tab_x
+                                < terminal_w + debug_label.len() as f64 * cw + padding * 2.0
                             {
-                                6.0 * lh
+                                render::BottomPanelKind::DebugOutput
                             } else {
-                                0.0
+                                self.engine.borrow().bottom_panel_kind.clone()
                             };
-                            let term_px = if engine.terminal_open || engine.bottom_panel_open {
-                                (engine.session.terminal_panel_rows as f64 + 2.0) * lh
-                            } else {
-                                0.0
-                            };
-                            let editor_bottom = height - status_h - dbg_px - qf_px - term_px;
-                            let content_bounds =
-                                core::window::WindowRect::new(0.0, 0.0, width, editor_bottom);
-                            let dividers = engine.group_layout.dividers(content_bounds, &mut 0);
-                            for div in &dividers {
-                                let hit = match div.direction {
-                                    core::window::SplitDirection::Vertical => {
-                                        (x - div.position).abs() < 6.0
-                                            && y >= div.cross_start
-                                            && y < div.cross_start + div.cross_size
-                                    }
-                                    core::window::SplitDirection::Horizontal => {
-                                        (y - div.position).abs() < 6.0
-                                            && x >= div.cross_start
-                                            && x < div.cross_start + div.cross_size
+                            self.engine.borrow_mut().bottom_panel_kind = new_kind;
+                            sender.input(Msg::Resize); // triggers redraw
+                            return;
+                        }
+                        self.engine.borrow_mut().terminal_has_focus = true;
+                        if zone == 2 {
+                            const SB_W: f64 = 6.0;
+                            // In split mode: detect a click on the divider (start drag)
+                            // or set keyboard focus to the appropriate pane.
+                            let on_divider = if self.engine.borrow().terminal_split
+                                && self.engine.borrow().terminal_panes.len() >= 2
+                            {
+                                let left_cols = {
+                                    let engine = self.engine.borrow();
+                                    if engine.terminal_split_left_cols > 0 {
+                                        engine.terminal_split_left_cols
+                                    } else {
+                                        engine.terminal_panes[0].cols
                                     }
                                 };
-                                if hit {
-                                    let si = div.split_index;
-                                    drop(engine);
-                                    self.group_divider_dragging = Some(si);
-                                    return;
+                                let div_x = left_cols as f64 * self.cached_char_width;
+                                if x < width - SB_W && (x - div_x).abs() < 4.0 {
+                                    self.terminal_split_dragging = true;
+                                    true
+                                } else {
+                                    let mut engine = self.engine.borrow_mut();
+                                    engine.terminal_active = if x < div_x { 0 } else { 1 };
+                                    false
                                 }
-                            }
-                        }
-                    }
-
-                    {
-                        let mut engine = self.engine.borrow_mut();
-
-                        // ── Debug toolbar hit-test ────────────────────────────────
-                        let mut toolbar_handled = false;
-                        if engine.debug_toolbar_visible && self.cached_line_height > 0.0 {
-                            // Toolbar is the single row above status(1)+cmd(1).
-                            // It is always at a fixed position; terminal/quickfix/DAP
-                            // panels stack above it, not below it.
-                            let toolbar_y =
-                                height - 2.0 * self.cached_line_height - self.cached_line_height;
-                            if y >= toolbar_y && y < toolbar_y + self.cached_line_height {
-                                let mut cursor_x = 8.0_f64;
-                                for (idx, btn) in render::DEBUG_BUTTONS.iter().enumerate() {
-                                    if idx == 4 {
-                                        cursor_x += 16.0; // visual separator gap
+                            } else {
+                                false
+                            };
+                            if !on_divider {
+                                // 6px scrollbar strip on the right edge — start a scrollbar drag.
+                                if x >= width - SB_W {
+                                    self.terminal_sb_dragging = true;
+                                } else {
+                                    self.terminal_sb_dragging = false;
+                                    self.terminal_resize_dragging = false;
+                                    let row = ((y - term_y - 2.0 * self.cached_line_height)
+                                        / self.cached_line_height)
+                                        as u16;
+                                    let col = (x / self.cached_char_width.max(1.0)) as u16;
+                                    self.engine.borrow_mut().terminal_scroll_reset();
+                                    if let Some(term) =
+                                        self.engine.borrow_mut().active_terminal_mut()
+                                    {
+                                        term.selection =
+                                            Some(crate::core::terminal::TermSelection {
+                                                start_row: row,
+                                                start_col: col,
+                                                end_row: row,
+                                                end_col: col,
+                                            });
                                     }
-                                    let text_len =
-                                        btn.icon.chars().count() + btn.key_hint.chars().count() + 4; // " (hint) "
-                                    let btn_w = text_len as f64 * self.cached_char_width;
-                                    if x >= cursor_x && x < cursor_x + btn_w {
-                                        let _ = engine.execute_command(btn.action);
-                                        toolbar_handled = true;
-                                        break;
-                                    }
-                                    cursor_x += btn_w;
-                                }
-                                if !toolbar_handled {
-                                    toolbar_handled = true; // click in toolbar row, consume event
                                 }
                             }
-                        }
-
-                        if !toolbar_handled {
-                            // Clear selection on click in VSCode mode.
-                            if engine.is_vscode_mode() {
-                                engine.vscode_clear_selection();
-                            }
-                            let click_result = handle_mouse_click(
-                                &mut engine,
-                                x,
-                                y,
-                                width,
-                                height,
-                                alt,
-                                self.cached_line_height,
-                                self.cached_char_width,
-                                &self.tab_slot_positions.borrow(),
-                                &self.diff_btn_map.borrow(),
-                                &self.split_btn_map.borrow(),
-                            );
-                            match click_result {
-                                Some(true) => {
-                                    drop(engine);
-                                    sender.input(Msg::ShowCloseTabConfirm);
-                                    self.draw_needed.set(true);
-                                    return;
-                                }
-                                Some(false) => {
-                                    // Buffer click — fire hooks and reveal file
-                                }
-                                None => {
-                                    // Tab bar / split button click — skip hooks.
-                                    // Record drag start position for tab drag-and-drop.
-                                    self.tab_drag_start = Some((x, y));
-                                    // Defer sidebar tree highlight so tab switch renders instantly.
-                                    let new_file_path = engine.file_path().cloned();
-                                    drop(engine);
-                                    if new_file_path != file_before_click {
-                                        if let Some(path) = new_file_path {
-                                            let tree_ref = self.file_tree_view.clone();
-                                            gtk4::glib::timeout_add_local_once(
-                                                std::time::Duration::from_millis(50),
-                                                move || {
-                                                    if let Some(ref tree) = *tree_ref.borrow() {
-                                                        highlight_file_in_tree(tree, &path);
-                                                    }
-                                                },
-                                            );
-                                        }
-                                    }
-                                    self.draw_needed.set(true);
-                                    return;
-                                }
-                            }
-                        }
-
-                        // Fire cursor_move hook so plugins (e.g. git-insights blame)
-                        // see the new cursor position after a mouse click.
-                        engine.fire_cursor_move_hook();
-
-                        // Reveal the active file in the sidebar tree only when the
-                        // active file actually changed (e.g. tab click), NOT on every
-                        // editor click.  highlight_file_in_tree does a full DFS of the
-                        // GTK TreeStore which is O(N_files) and very slow in debug builds.
-                        let new_file_path = engine.file_path().cloned();
-                        drop(engine);
-                        if new_file_path != file_before_click {
-                            if let Some(path) = new_file_path {
-                                if let Some(ref tree) = *self.file_tree_view.borrow() {
-                                    highlight_file_in_tree(tree, &path);
-                                }
+                        } else {
+                            // Header row click — tab switch, toolbar buttons, or resize drag.
+                            const TERMINAL_TAB_COLS: usize = 4;
+                            let tab_count = self.engine.borrow().terminal_panes.len();
+                            let tab_area_px = tab_count as f64
+                                * TERMINAL_TAB_COLS as f64
+                                * self.cached_char_width;
+                            // Right-aligned buttons (3 chars each): + ⊞ ×
+                            let close_x = width - self.cached_char_width * 2.0;
+                            let split_x = width - self.cached_char_width * 4.0;
+                            let add_x = width - self.cached_char_width * 6.0;
+                            if x < tab_area_px && self.cached_char_width > 0.0 {
+                                let idx = (x / (TERMINAL_TAB_COLS as f64 * self.cached_char_width))
+                                    as usize;
+                                sender.input(Msg::TerminalSwitchTab(idx));
+                            } else if x >= close_x {
+                                sender.input(Msg::TerminalCloseActiveTab);
+                            } else if x >= split_x {
+                                sender.input(Msg::TerminalToggleSplit);
+                            } else if x >= add_x {
+                                sender.input(Msg::NewTerminalTab);
+                            } else {
+                                self.terminal_resize_dragging = true;
                             }
                         }
                         self.draw_needed.set(true);
+                    } else {
+                        {
+                            let mut engine = self.engine.borrow_mut();
+                            // Clicking outside the terminal panel returns focus to the editor.
+                            engine.terminal_has_focus = false;
+                        }
+
+                        // Dropdown clicks are fully handled by the menu_dropdown_da overlay
+                        // widget (which has can_target=true while a menu is open).
+                        // If we reach here, no menu is open and we proceed with normal handling.
+
+                        // ── H scrollbar hit-test (before editor click) ────────────────
+                        // If the click lands on a Cairo h scrollbar, start a drag and
+                        // don't pass the click through to the editor.
+                        {
+                            let lh = self.cached_line_height;
+                            let cw = self.cached_char_width;
+                            let engine = self.engine.borrow();
+                            let rects = compute_editor_window_rects(&engine, width, height, lh);
+                            if let Some((win_id, px_per_col, scroll_left)) =
+                                h_scrollbar_hit_test(&engine, x, y, &rects, cw, lh)
+                            {
+                                drop(engine);
+                                self.h_sb_dragging = Some(HScrollDragState {
+                                    window_id: win_id,
+                                    drag_start_x: x,
+                                    scroll_left_at_start: scroll_left,
+                                    px_per_col,
+                                });
+                                self.h_sb_drag_cell.set(Some(win_id));
+                                self.draw_needed.set(true);
+                                return; // consume click; don't send it to the editor
+                            }
+                        }
+
+                        // ── Editor group divider hit-test ─────────────────────────────
+                        {
+                            let engine = self.engine.borrow();
+                            if !engine.group_layout.is_single_group() {
+                                let lh = self.cached_line_height;
+                                let wildmenu_px = if engine.wildmenu_items.is_empty() {
+                                    0.0
+                                } else {
+                                    lh
+                                };
+                                let status_h = lh * 2.0 + wildmenu_px;
+                                let dbg_px = if engine.debug_toolbar_visible {
+                                    lh
+                                } else {
+                                    0.0
+                                };
+                                let qf_px =
+                                    if engine.quickfix_open && !engine.quickfix_items.is_empty() {
+                                        6.0 * lh
+                                    } else {
+                                        0.0
+                                    };
+                                let term_px = if engine.terminal_open || engine.bottom_panel_open {
+                                    (engine.session.terminal_panel_rows as f64 + 2.0) * lh
+                                } else {
+                                    0.0
+                                };
+                                let editor_bottom = height - status_h - dbg_px - qf_px - term_px;
+                                let content_bounds =
+                                    core::window::WindowRect::new(0.0, 0.0, width, editor_bottom);
+                                let dividers = engine.group_layout.dividers(content_bounds, &mut 0);
+                                for div in &dividers {
+                                    let hit = match div.direction {
+                                        core::window::SplitDirection::Vertical => {
+                                            (x - div.position).abs() < 6.0
+                                                && y >= div.cross_start
+                                                && y < div.cross_start + div.cross_size
+                                        }
+                                        core::window::SplitDirection::Horizontal => {
+                                            (y - div.position).abs() < 6.0
+                                                && x >= div.cross_start
+                                                && x < div.cross_start + div.cross_size
+                                        }
+                                    };
+                                    if hit {
+                                        let si = div.split_index;
+                                        drop(engine);
+                                        self.group_divider_dragging = Some(si);
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+
+                        {
+                            let mut engine = self.engine.borrow_mut();
+
+                            // ── Debug toolbar hit-test ────────────────────────────────
+                            let mut toolbar_handled = false;
+                            if engine.debug_toolbar_visible && self.cached_line_height > 0.0 {
+                                // Toolbar is the single row above status(1)+cmd(1).
+                                // It is always at a fixed position; terminal/quickfix/DAP
+                                // panels stack above it, not below it.
+                                let toolbar_y = height
+                                    - 2.0 * self.cached_line_height
+                                    - self.cached_line_height;
+                                if y >= toolbar_y && y < toolbar_y + self.cached_line_height {
+                                    let mut cursor_x = 8.0_f64;
+                                    for (idx, btn) in render::DEBUG_BUTTONS.iter().enumerate() {
+                                        if idx == 4 {
+                                            cursor_x += 16.0; // visual separator gap
+                                        }
+                                        let text_len = btn.icon.chars().count()
+                                            + btn.key_hint.chars().count()
+                                            + 4; // " (hint) "
+                                        let btn_w = text_len as f64 * self.cached_char_width;
+                                        if x >= cursor_x && x < cursor_x + btn_w {
+                                            let _ = engine.execute_command(btn.action);
+                                            toolbar_handled = true;
+                                            break;
+                                        }
+                                        cursor_x += btn_w;
+                                    }
+                                    if !toolbar_handled {
+                                        toolbar_handled = true; // click in toolbar row, consume event
+                                    }
+                                }
+                            }
+
+                            if !toolbar_handled {
+                                // Clear selection on click in VSCode mode.
+                                if engine.is_vscode_mode() {
+                                    engine.vscode_clear_selection();
+                                }
+                                let click_result = handle_mouse_click(
+                                    &mut engine,
+                                    x,
+                                    y,
+                                    width,
+                                    height,
+                                    alt,
+                                    self.cached_line_height,
+                                    self.cached_char_width,
+                                    &self.tab_slot_positions.borrow(),
+                                    &self.diff_btn_map.borrow(),
+                                    &self.split_btn_map.borrow(),
+                                );
+                                match click_result {
+                                    Some(true) => {
+                                        drop(engine);
+                                        sender.input(Msg::ShowCloseTabConfirm);
+                                        self.draw_needed.set(true);
+                                        return;
+                                    }
+                                    Some(false) => {
+                                        // Buffer click — fire hooks and reveal file
+                                    }
+                                    None => {
+                                        // Tab bar / split button click — skip hooks.
+                                        // Record drag start position for tab drag-and-drop.
+                                        self.tab_drag_start = Some((x, y));
+                                        // Defer sidebar tree highlight so tab switch renders instantly.
+                                        let new_file_path = engine.file_path().cloned();
+                                        drop(engine);
+                                        if new_file_path != file_before_click {
+                                            if let Some(path) = new_file_path {
+                                                let tree_ref = self.file_tree_view.clone();
+                                                gtk4::glib::timeout_add_local_once(
+                                                    std::time::Duration::from_millis(50),
+                                                    move || {
+                                                        if let Some(ref tree) = *tree_ref.borrow() {
+                                                            highlight_file_in_tree(tree, &path);
+                                                        }
+                                                    },
+                                                );
+                                            }
+                                        }
+                                        self.draw_needed.set(true);
+                                        return;
+                                    }
+                                }
+                            }
+
+                            // Fire cursor_move hook so plugins (e.g. git-insights blame)
+                            // see the new cursor position after a mouse click.
+                            engine.fire_cursor_move_hook();
+
+                            // Reveal the active file in the sidebar tree only when the
+                            // active file actually changed (e.g. tab click), NOT on every
+                            // editor click.  highlight_file_in_tree does a full DFS of the
+                            // GTK TreeStore which is O(N_files) and very slow in debug builds.
+                            let new_file_path = engine.file_path().cloned();
+                            drop(engine);
+                            if new_file_path != file_before_click {
+                                if let Some(path) = new_file_path {
+                                    if let Some(ref tree) = *self.file_tree_view.borrow() {
+                                        highlight_file_in_tree(tree, &path);
+                                    }
+                                }
+                            }
+                            self.draw_needed.set(true);
+                        }
                     }
-                }
+                } // close else (dialog not open)
             }
             Msg::CtrlMouseClick {
                 x,
@@ -4611,6 +5297,18 @@ impl SimpleComponent for App {
                 self.tree_has_focus = false;
                 self.draw_needed.set(true);
             }
+            Msg::OpenSide(path) => {
+                let mut engine = self.engine.borrow_mut();
+                engine.open_editor_group(core::window::SplitDirection::Vertical);
+                // Replace the cloned buffer in the new group with the target file.
+                engine.execute_command(&format!("e {}", path.display()));
+                drop(engine);
+                if let Some(ref drawing) = *self.drawing_area.borrow() {
+                    drawing.grab_focus();
+                }
+                self.tree_has_focus = false;
+                self.draw_needed.set(true);
+            }
             Msg::PreviewFileFromSidebar(path) => {
                 let mut engine = self.engine.borrow_mut();
                 // Single-click: open as a preview tab (replaceable by next single-click).
@@ -4705,9 +5403,15 @@ impl SimpleComponent for App {
                     .unwrap_or("unknown")
                     .to_string();
                 let item_type = if path.is_dir() { "folder" } else { "file" };
+                let parent_win = self
+                    .drawing_area
+                    .borrow()
+                    .as_ref()
+                    .and_then(|da| da.root())
+                    .and_then(|r| r.downcast::<gtk4::Window>().ok());
                 let dialog = gtk4::Dialog::with_buttons(
                     Some("Confirm Delete"),
-                    None::<&gtk4::Window>,
+                    parent_win.as_ref(),
                     gtk4::DialogFlags::MODAL | gtk4::DialogFlags::DESTROY_WITH_PARENT,
                     &[
                         ("Delete", gtk4::ResponseType::Accept),
@@ -5271,6 +5975,11 @@ impl SimpleComponent for App {
                         da.queue_draw();
                     }
                 }
+                // Explorer refresh after confirmed file move.
+                if self.engine.borrow().explorer_needs_refresh {
+                    self.engine.borrow_mut().explorer_needs_refresh = false;
+                    sender.input(Msg::RefreshFileTree);
+                }
                 // Auto-refresh SC panel every 2s to pick up external git changes.
                 if self.sidebar_visible
                     && self.active_panel == SidebarPanel::Git
@@ -5367,36 +6076,7 @@ impl SimpleComponent for App {
                 self.draw_needed.set(true);
             }
             Msg::MoveFile(src, dest_dir) => {
-                let name = src
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                let result = self.engine.borrow_mut().move_file(&src, &dest_dir);
-                match result {
-                    Ok(()) => {
-                        self.engine.borrow_mut().message =
-                            format!("Moved '{}' to '{}'", name, dest_dir.display());
-                        // Refresh tree inline so we can highlight the moved file
-                        if let Some(ref store) = self.tree_store {
-                            if let Ok(cwd) = std::env::current_dir() {
-                                store.clear();
-                                build_file_tree_with_root(
-                                    store,
-                                    &cwd,
-                                    self.engine.borrow().settings.show_hidden_files,
-                                );
-                            }
-                        }
-                        let new_path = dest_dir.join(&name);
-                        if let Some(ref tree) = *self.file_tree_view.borrow() {
-                            tree.expand_row(&gtk4::TreePath::from_indices(&[0]), false);
-                            highlight_file_in_tree(tree, &new_path);
-                        }
-                    }
-                    Err(e) => {
-                        self.engine.borrow_mut().message = e;
-                    }
-                }
+                self.engine.borrow_mut().confirm_move_file(&src, &dest_dir);
                 self.draw_needed.set(true);
             }
             Msg::CopyPath(path) => {
@@ -5407,30 +6087,35 @@ impl SimpleComponent for App {
                 }
                 self.draw_needed.set(true);
             }
+            Msg::CopyRelativePath(path) => {
+                let rel = self.engine.borrow().copy_relative_path(&path);
+                if let Some(display) = gtk4::gdk::Display::default() {
+                    display.clipboard().set_text(&rel);
+                    self.engine.borrow_mut().message = format!("Copied: {}", rel);
+                }
+                self.draw_needed.set(true);
+            }
             Msg::SelectForDiff(path) => {
                 let name = path
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| path.display().to_string());
-                self.diff_selected_file = Some(path);
-                self.engine.borrow_mut().message = format!(
-                    "Selected '{}' for diff. Right-click another file → Diff with…",
-                    name
-                );
+                self.engine.borrow_mut().diff_selected_file = Some(path);
+                self.engine.borrow_mut().message =
+                    format!("Selected '{name}' for compare. Right-click another file to compare.");
                 self.draw_needed.set(true);
             }
             Msg::DiffWithSelected(right_path) => {
-                if let Some(left_path) = self.diff_selected_file.take() {
-                    // Open left file and mark it as diff left side
-                    self.engine.borrow_mut().open_file_in_tab(&left_path);
-                    self.engine.borrow_mut().cmd_diffthis();
-                    // Open right file in vsplit + activate diff
-                    self.engine.borrow_mut().cmd_diffsplit(&right_path);
+                let mut engine = self.engine.borrow_mut();
+                if let Some(left_path) = engine.diff_selected_file.take() {
+                    engine.open_file_in_tab(&left_path);
+                    engine.cmd_diffthis();
+                    engine.cmd_diffsplit(&right_path);
                 } else {
-                    self.engine.borrow_mut().message =
-                        "No file selected for diff. Right-click a file → Select for Diff first."
-                            .to_string();
+                    engine.message =
+                        "No file selected for compare. Use 'Select for Compare' first.".to_string();
                 }
+                drop(engine);
                 self.draw_needed.set(true);
             }
             Msg::ClipboardPasteToInput { text } => {
@@ -5506,6 +6191,23 @@ impl SimpleComponent for App {
                 } else {
                     self.engine.borrow_mut().toggle_terminal();
                 }
+                self.draw_needed.set(true);
+            }
+            Msg::OpenTerminalAt(dir) => {
+                let cols = if let Some(da) = self.drawing_area.borrow().as_ref() {
+                    if self.cached_char_width > 0.0 {
+                        (da.width() as f64 / self.cached_char_width) as u16
+                    } else {
+                        80
+                    }
+                } else {
+                    80
+                }
+                .max(40);
+                let rows = self.engine.borrow().session.terminal_panel_rows;
+                self.engine
+                    .borrow_mut()
+                    .terminal_new_tab_at(cols, rows, Some(&dir));
                 self.draw_needed.set(true);
             }
             Msg::NewTerminalTab => {
@@ -6949,6 +7651,7 @@ fn draw_editor(
     tab_slot_positions_out: &Rc<RefCell<TabSlotMap>>,
     diff_btn_map_out: &Rc<RefCell<DiffBtnMap>>,
     split_btn_map_out: &Rc<RefCell<SplitBtnMap>>,
+    dialog_btn_rects_out: &Rc<RefCell<DialogBtnRects>>,
 ) {
     let theme = Theme::from_name(&engine.settings.colorscheme);
 
@@ -7254,7 +7957,7 @@ fn draw_editor(
     );
 
     // 5e4. Draw modal dialog (highest z-order)
-    draw_dialog_popup(
+    let btn_rects = draw_dialog_popup(
         cr,
         &layout,
         &screen,
@@ -7263,6 +7966,7 @@ fn draw_editor(
         height as f64,
         line_height,
     );
+    *dialog_btn_rects_out.borrow_mut() = btn_rects;
 
     // 5f2. Draw quickfix panel (persistent bottom strip above status bar)
     if qf_px > 0.0 {
@@ -9572,6 +10276,7 @@ fn draw_tab_switcher_popup(
 
 /// Draw a modal dialog popup centered on the screen.
 #[allow(clippy::too_many_arguments)]
+/// Returns button hit-rects `(x, y, w, h)` for each dialog button.
 fn draw_dialog_popup(
     cr: &Context,
     layout: &pango::Layout,
@@ -9580,9 +10285,9 @@ fn draw_dialog_popup(
     editor_width: f64,
     editor_height: f64,
     line_height: f64,
-) {
+) -> Vec<(f64, f64, f64, f64)> {
     let Some(dialog) = &screen.dialog else {
-        return;
+        return Vec::new();
     };
 
     let pango_ctx = pangocairo::create_context(cr);
@@ -9652,12 +10357,15 @@ fn draw_dialog_popup(
     // Button row.
     let btn_y = popup_y + popup_h - line_height * 1.5;
     let mut bx = popup_x + 12.0;
+    let mut rects = Vec::with_capacity(dialog.buttons.len());
     for (label, is_selected) in &dialog.buttons {
         let btn_text = format!("  {}  ", label);
         ui_layout.set_text(&btn_text);
         let (bw, bh) = ui_layout.pixel_size();
         let bw = bw as f64;
         let bh = bh as f64;
+
+        rects.push((bx, btn_y, bw, bh));
 
         if *is_selected {
             let (r, g, b) = theme.fuzzy_selected_bg.to_cairo();
@@ -9674,6 +10382,7 @@ fn draw_dialog_popup(
 
         bx += bw + 4.0;
     }
+    rects
 }
 
 /// Draw the tab bar for the bottom panel (Terminal / Debug Output).
@@ -11183,9 +11892,9 @@ fn draw_ext_sidebar(
     cr.rectangle(x, y + row as f64 * line_height, w, line_height);
     cr.fill().ok();
     let hdr_text = if ext.fetching {
-        "  \u{eb85} EXTENSIONS  (fetching…)".to_string()
+        "  \u{eae6} EXTENSIONS  (fetching…)".to_string()
     } else {
-        "  \u{eb85} EXTENSIONS".to_string()
+        "  \u{eae6} EXTENSIONS".to_string()
     };
     cr.set_source_rgb(fg_r, fg_g, fg_b);
     layout.set_text(&hdr_text);
@@ -12709,6 +13418,47 @@ const STATIC_CSS: &str = "
         }
         ";
 
+/// Build a `gio::Menu` from engine-generated `ContextMenuItem`s.
+/// Groups items into sections split at `separator_after` boundaries.
+fn build_gio_menu_from_engine_items(
+    items: &[core::engine::ContextMenuItem],
+    action_prefix: &str,
+) -> gtk4::gio::Menu {
+    let menu = gtk4::gio::Menu::new();
+    let mut section = gtk4::gio::Menu::new();
+    for item in items {
+        section.append(
+            Some(&item.label),
+            Some(&format!("{action_prefix}.{}", item.action)),
+        );
+        if item.separator_after {
+            menu.append_section(None, &section);
+            section = gtk4::gio::Menu::new();
+        }
+    }
+    if section.n_items() > 0 {
+        menu.append_section(None, &section);
+    }
+    menu
+}
+
+/// Clean up any previous context-menu popover from the shared slot,
+/// then store the new one.  The old popover is popdown'd + unparented
+/// **before** the new one is set_parent'd, so there is never a moment
+/// where two popovers coexist on the same parent.
+fn swap_ctx_popover(slot: &Rc<RefCell<Option<gtk4::PopoverMenu>>>, new: gtk4::PopoverMenu) {
+    let mut guard = slot.borrow_mut();
+    if let Some(old) = guard.take() {
+        old.popdown();
+        // NOTE: we intentionally do NOT call old.unparent() here.
+        // GTK4 internally tears down the CSS node tree during unparent(),
+        // which triggers a non-fatal "gtk_css_node_insert_after" assertion.
+        // Letting GTK handle the lifecycle naturally avoids the assertion.
+        // The old widget will be dropped when this Option is overwritten.
+    }
+    *guard = Some(new);
+}
+
 fn load_css(theme: &Theme) -> gtk4::CssProvider {
     let provider = gtk4::CssProvider::new();
     let combined = format!("{STATIC_CSS}\n{}", make_theme_css(theme));
@@ -12858,10 +13608,15 @@ fn selected_parent_dir(tv: &gtk4::TreeView) -> PathBuf {
 /// Show a modal dialog with a text entry prompting for a name.
 /// `title` is the dialog title, `prefill` pre-populates the entry,
 /// and `on_accept` is called with the entered text when the user confirms.
-fn show_name_prompt_dialog<F: Fn(String) + 'static>(title: &str, prefill: &str, on_accept: F) {
+fn show_name_prompt_dialog<F: Fn(String) + 'static>(
+    title: &str,
+    prefill: &str,
+    parent: Option<&gtk4::Window>,
+    on_accept: F,
+) {
     let dialog = gtk4::Dialog::with_buttons(
         Some(title),
-        None::<&gtk4::Window>,
+        parent,
         gtk4::DialogFlags::MODAL | gtk4::DialogFlags::DESTROY_WITH_PARENT,
         &[
             ("Create", gtk4::ResponseType::Accept),
@@ -13067,6 +13822,51 @@ fn install_icon_and_desktop() {
     }
 }
 
+/// Count total visible rows in a gio::Menu (items + section separators).
+fn menu_row_count(menu: &gtk4::gio::Menu) -> i32 {
+    let mut rows = 0i32;
+    for i in 0..menu.n_items() {
+        if let Some(section) = menu
+            .item_link(i, "section")
+            .and_then(|m| m.downcast::<gtk4::gio::Menu>().ok())
+        {
+            if i > 0 {
+                rows += 1; // separator
+            }
+            rows += section.n_items();
+        } else {
+            rows += 1;
+        }
+    }
+    rows
+}
+
+/// GLib log handler that suppresses the known GTK4 `gtk_css_node_insert_after`
+/// assertion while forwarding all other CRITICAL messages to the default handler.
+unsafe extern "C" fn suppress_css_node_warning(
+    log_domain: *const std::ffi::c_char,
+    log_level: gtk4::glib::ffi::GLogLevelFlags,
+    message: *const std::ffi::c_char,
+    _user_data: gtk4::glib::ffi::gpointer,
+) {
+    let msg = unsafe { std::ffi::CStr::from_ptr(message) }
+        .to_str()
+        .unwrap_or("");
+    if msg.contains("gtk_css_node_insert_after") {
+        return; // suppress
+    }
+    // Forward other CRITICAL messages to stderr.
+    let domain = unsafe { std::ffi::CStr::from_ptr(log_domain) }
+        .to_str()
+        .unwrap_or("?");
+    let level_str = if log_level & gtk4::glib::ffi::G_LOG_LEVEL_CRITICAL != 0 {
+        "CRITICAL"
+    } else {
+        "WARNING"
+    };
+    eprintln!("({domain}): Gtk-{level_str}: {msg}");
+}
+
 fn main() {
     // Parse CLI args to get optional file path
     let args: Vec<String> = std::env::args().collect();
@@ -13115,6 +13915,18 @@ fn main() {
 
     // Install icon and .desktop file so the taskbar/launcher can find them.
     install_icon_and_desktop();
+
+    // Suppress the non-fatal "gtk_css_node_insert_after" assertion that GTK4
+    // emits internally when PopoverMenu widgets are created/destroyed.
+    // This is a known GTK4 issue with no workaround; the assertion is harmless.
+    unsafe {
+        gtk4::glib::ffi::g_log_set_handler(
+            c"Gtk".as_ptr(),
+            gtk4::glib::ffi::G_LOG_LEVEL_CRITICAL,
+            Some(suppress_css_node_warning),
+            std::ptr::null_mut(),
+        );
+    }
 
     let gtk_app = gtk4::Application::builder()
         .application_id("com.vimcode.VimCode")
