@@ -3033,7 +3033,8 @@ impl Engine {
         if let Some(ref path) = state.file_path.clone() {
             match state.save() {
                 Ok(line_count) => {
-                    self.message = format!("\"{}\" {}L written", path.display(), line_count);
+                    let rel = self.copy_relative_path(path);
+                    self.message = format!("\"{}\" {}L written", rel, line_count);
                     // Refresh git diff after save
                     let id = self.active_buffer_id();
                     self.refresh_git_diff(id);

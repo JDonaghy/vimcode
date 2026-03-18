@@ -5456,7 +5456,10 @@ fn build_status_line(engine: &Engine) -> (String, String) {
     let mode_str = engine.mode_str();
 
     let filename = match engine.file_path() {
-        Some(p) => p.display().to_string(),
+        Some(p) => p
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_else(|| p.display().to_string()),
         None => "[No Name]".to_string(),
     };
 
