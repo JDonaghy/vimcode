@@ -65,8 +65,8 @@ pub struct BufferState {
     pub preview: bool,
     /// For diff buffers: the source file the diff was generated from.
     pub source_file: Option<PathBuf>,
-    /// Syntax highlighter for this buffer.
-    pub syntax: Syntax,
+    /// Syntax highlighter for this buffer (`None` for plain text / unrecognised extensions).
+    pub syntax: Option<Syntax>,
     /// Cached syntax highlights (byte ranges + scope names).
     pub highlights: Vec<(usize, usize, String)>,
     /// Undo stack (most recent at the end).
@@ -141,7 +141,7 @@ impl BufferState {
             saved_undo_depth: None,
             preview: false,
             source_file: None,
-            syntax: Syntax::new(),
+            syntax: None,
             highlights: Vec::new(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -170,8 +170,7 @@ impl BufferState {
     }
 
     pub fn with_file(buffer: Buffer, path: PathBuf) -> Self {
-        // Try to detect language from file path, fallback to Rust
-        let syntax = Syntax::new_from_path(path.to_str()).unwrap_or_default();
+        let syntax = Syntax::new_from_path(path.to_str());
         let lsp_language_id = crate::core::lsp::language_id_from_path(&path);
         let canonical_path = path.canonicalize().ok();
         let file_mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
@@ -215,7 +214,11 @@ impl BufferState {
     /// Re-parse the buffer and update syntax highlights and max_col cache.
     pub fn update_syntax(&mut self) {
         let text = self.buffer.to_string();
-        self.highlights = self.syntax.parse(&text);
+        self.highlights = if let Some(ref mut syn) = self.syntax {
+            syn.parse(&text)
+        } else {
+            Vec::new()
+        };
         // Cache max line length while we have the text; avoids O(N) scan every render.
         self.max_col = text.lines().map(|l| l.chars().count()).max().unwrap_or(0);
     }

@@ -4064,9 +4064,11 @@ fn build_breadcrumbs_for_group(engine: &Engine, group_id: GroupId) -> Vec<Breadc
     {
         let cursor = &window.view.cursor;
         let text = buf_state.buffer.to_string();
-        let scopes = buf_state
-            .syntax
-            .enclosing_scopes(&text, cursor.line, cursor.col);
+        let scopes = if let Some(ref syn) = buf_state.syntax {
+            syn.enclosing_scopes(&text, cursor.line, cursor.col)
+        } else {
+            Vec::new()
+        };
         for scope in scopes {
             segments.push(BreadcrumbSegment {
                 label: scope.name,

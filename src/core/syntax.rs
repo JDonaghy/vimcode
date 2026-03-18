@@ -645,17 +645,6 @@ impl Syntax {
         path.and_then(SyntaxLanguage::from_path)
             .map(Self::new_for_language)
     }
-
-    /// Create a new Syntax highlighter for Rust (default/fallback)
-    pub fn new() -> Self {
-        Self::new_for_language(SyntaxLanguage::Rust)
-    }
-}
-
-impl Default for Syntax {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl Syntax {

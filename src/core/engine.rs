@@ -3579,7 +3579,7 @@ impl Engine {
             state.scratch_name = Some(format!("{file_name} (HEAD)"));
             // Set syntax highlighting to match the file type.
             if let Some(syn) = crate::core::syntax::Syntax::new_from_path(path.to_str()) {
-                state.syntax = syn;
+                state.syntax = Some(syn);
             }
             state.update_syntax();
         }
@@ -16286,7 +16286,7 @@ impl Engine {
                     };
                     let fake_path = format!("scratch.{ext}");
                     if let Some(syn) = Syntax::new_from_path(Some(&fake_path)) {
-                        state.syntax = syn;
+                        state.syntax = Some(syn);
                         state.update_syntax();
                     }
                     state.lsp_language_id = Some(ft.clone());
@@ -21575,7 +21575,10 @@ impl Engine {
 
     /// Check if the active buffer is a LaTeX file.
     fn is_latex_buffer(&self) -> bool {
-        self.active_buffer_state().syntax.language() == super::syntax::SyntaxLanguage::Latex
+        self.active_buffer_state()
+            .syntax
+            .as_ref()
+            .is_some_and(|s| s.language() == super::syntax::SyntaxLanguage::Latex)
     }
 
     /// Find LaTeX \begin{env}...\end{env} text object range (ie/ae).
@@ -47059,7 +47062,7 @@ mod tests {
     fn latex_engine(text: &str) -> Engine {
         use crate::core::syntax::{Syntax, SyntaxLanguage};
         let mut e = engine_with_text(text);
-        e.active_buffer_state_mut().syntax = Syntax::new_for_language(SyntaxLanguage::Latex);
+        e.active_buffer_state_mut().syntax = Some(Syntax::new_for_language(SyntaxLanguage::Latex));
         e
     }
 

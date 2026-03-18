@@ -1,8 +1,5 @@
 # Known Bugs
 
-In a .md file some key words have a different font color from most words even when no Lsp Server is running. E.g. the word "use" is highlighted in blue in vscode theme. Also words in double quotes are in orange.
-
-
 
 ## GTK Scrollbar / Tab Group Divider Overlap
 
