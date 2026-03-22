@@ -48,6 +48,23 @@ use std::collections::HashMap;
 
 use copypasta_ext::ClipboardProviderExt;
 
+/// Open a URL in the default browser (only https/http).
+fn open_url(url: &str) {
+    if !crate::core::engine::is_safe_url(url) {
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    let cmd = "open";
+    #[cfg(not(target_os = "macos"))]
+    let cmd = "xdg-open";
+    std::process::Command::new(cmd)
+        .arg(url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok();
+}
+
 /// Returns true if `key` + `state` match a panel_keys binding string like `<C-b>`, `<C-S-e>`.
 fn matches_gtk_key(binding: &str, key: gdk::Key, state: gdk::ModifierType) -> bool {
     let Some((ctrl, shift, alt, key_name)) =
@@ -114,6 +131,10 @@ struct App {
     debug_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>>,
     git_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>>,
     ext_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>>,
+    /// DrawingArea for extension-provided panels (e.g. git-insights GIT LOG).
+    ext_dyn_panel_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>>,
+    /// Outer Box for the extension-provided panel sidebar.
+    ext_dyn_panel_box: Rc<RefCell<Option<gtk4::Box>>>,
     ai_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>>,
     sidebar_inner_sw: Rc<RefCell<Option<gtk4::ScrolledWindow>>>,
     /// Direct ref to the sidebar Revealer for programmatic open/close.
@@ -208,6 +229,17 @@ struct App {
     /// Full-window overlay DrawingArea that draws the menu dropdown.
     /// Can-target toggles true/false with menu open/close.
     menu_dropdown_da: Rc<RefCell<Option<gtk4::DrawingArea>>>,
+    /// Full-window overlay DrawingArea for panel hover popups.
+    panel_hover_da: Rc<RefCell<Option<gtk4::DrawingArea>>>,
+    /// Link hit rects populated during hover popup draw: (x, y, w, h, url, is_native).
+    #[allow(clippy::type_complexity)]
+    panel_hover_link_rects: Rc<RefCell<Vec<(f64, f64, f64, f64, String, bool)>>>,
+    /// Popup bounding rect (x, y, w, h) — set during draw, used for motion hit-testing.
+    #[allow(dead_code, clippy::type_complexity)]
+    panel_hover_popup_rect: Rc<Cell<Option<(f64, f64, f64, f64)>>>,
+    /// Editor hover popup bounding rect (x, y, w, h) — set during draw, used for click hit-testing.
+    #[allow(clippy::type_complexity)]
+    editor_hover_popup_rect: Rc<Cell<Option<(f64, f64, f64, f64)>>>,
     /// Cached line height shared with menu_dropdown_da draw/click closures.
     menu_dd_line_height: Rc<Cell<f64>>,
     /// CSS provider registered with the GTK display — updated when colorscheme changes.
@@ -445,12 +477,24 @@ enum Msg {
     DebugSidebarScroll(f64),
     /// Click in the Source Control sidebar DrawingArea (x, y coordinates in pixels).
     ScSidebarClick(f64, f64),
+    /// Mouse motion in the Source Control sidebar DrawingArea (x, y).
+    ScSidebarMotion(f64, f64),
     /// Key press in the Source Control sidebar DrawingArea.
     ScKey(String, bool),
-    /// Key press in the Extensions sidebar DrawingArea.
-    ExtSidebarKey(String),
-    /// Click in the Extensions sidebar DrawingArea (x, y).
-    ExtSidebarClick(f64, f64),
+    /// Key press in the Extensions sidebar DrawingArea (key_name, unicode).
+    ExtSidebarKey(String, Option<char>),
+    /// Click in the Extensions sidebar DrawingArea (x, y, n_press).
+    ExtSidebarClick(f64, f64, i32),
+    /// Key press in an extension-provided panel DrawingArea (e.g. git-insights).
+    ExtPanelKey(String, Option<char>),
+    /// Click in an extension-provided panel DrawingArea (x, y, n_press).
+    ExtPanelClick(f64, f64, i32),
+    /// Right-click in an extension-provided panel DrawingArea (x, y).
+    ExtPanelRightClick(f64, f64),
+    /// Mouse motion in an extension-provided panel DrawingArea (x, y).
+    ExtPanelMouseMove(f64, f64),
+    /// Click on the panel hover popup overlay (x, y in window coords).
+    PanelHoverClick(f64, f64),
     /// Key press in the AI sidebar DrawingArea.
     AiSidebarKey(String, bool, Option<char>),
     /// Click in the AI sidebar DrawingArea (x, y).
@@ -1267,6 +1311,26 @@ impl SimpleComponent for App {
                             },
                         },
 
+                        // Extension-provided panel (e.g. git-insights GIT LOG)
+                        #[name = "ext_dyn_panel"]
+                        gtk4::Box {
+                            set_orientation: gtk4::Orientation::Vertical,
+                            set_css_classes: &["sidebar"],
+
+                            #[watch]
+                            set_visible: {
+                                if matches!(model.active_panel, SidebarPanel::ExtPanel(_)) {
+                                    ext_dyn_panel_da.queue_draw();
+                                }
+                                matches!(model.active_panel, SidebarPanel::ExtPanel(_))
+                            },
+
+                            #[name = "ext_dyn_panel_da"]
+                            gtk4::DrawingArea {
+                                set_vexpand: true,
+                            },
+                        },
+
                         // AI assistant sidebar panel
                         #[name = "ai_panel_box"]
                         gtk4::Box {
@@ -2023,6 +2087,17 @@ impl SimpleComponent for App {
         let menu_bar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> = Rc::new(RefCell::new(None));
         let menu_dropdown_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> =
             Rc::new(RefCell::new(None));
+        let panel_hover_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> =
+            Rc::new(RefCell::new(None));
+        #[allow(clippy::type_complexity)]
+        let panel_hover_link_rects: Rc<RefCell<Vec<(f64, f64, f64, f64, String, bool)>>> =
+            Rc::new(RefCell::new(Vec::new()));
+        #[allow(clippy::type_complexity)]
+        let panel_hover_popup_rect: Rc<Cell<Option<(f64, f64, f64, f64)>>> =
+            Rc::new(Cell::new(None));
+        #[allow(clippy::type_complexity)]
+        let editor_hover_popup_rect: Rc<Cell<Option<(f64, f64, f64, f64)>>> =
+            Rc::new(Cell::new(None));
         let menu_dd_lh: Rc<Cell<f64>> = Rc::new(Cell::new(24.0));
         let debug_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> =
             Rc::new(RefCell::new(None));
@@ -2059,6 +2134,9 @@ impl SimpleComponent for App {
         let ext_panel_box_ref: Rc<RefCell<Option<gtk4::Box>>> = Rc::new(RefCell::new(None));
         let ext_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> =
             Rc::new(RefCell::new(None));
+        let ext_dyn_panel_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> =
+            Rc::new(RefCell::new(None));
+        let ext_dyn_panel_box_ref: Rc<RefCell<Option<gtk4::Box>>> = Rc::new(RefCell::new(None));
         let settings_panel_box_ref: Rc<RefCell<Option<gtk4::Box>>> = Rc::new(RefCell::new(None));
         let ai_panel_box_ref: Rc<RefCell<Option<gtk4::Box>>> = Rc::new(RefCell::new(None));
         let ai_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> = Rc::new(RefCell::new(None));
@@ -2137,6 +2215,8 @@ impl SimpleComponent for App {
             debug_panel_box: debug_panel_box_ref.clone(),
             git_panel_box: git_panel_box_ref.clone(),
             ext_panel_box: ext_panel_box_ref.clone(),
+            ext_dyn_panel_da_ref: ext_dyn_panel_da_ref.clone(),
+            ext_dyn_panel_box: ext_dyn_panel_box_ref.clone(),
             settings_panel_box: settings_panel_box_ref.clone(),
             settings_list_box: Rc::new(RefCell::new(None)),
             settings_sections: Rc::new(RefCell::new(Vec::new())),
@@ -2160,6 +2240,10 @@ impl SimpleComponent for App {
             last_sc_refresh: std::time::Instant::now(),
             last_file_check: std::time::Instant::now(),
             menu_dropdown_da: menu_dropdown_da_ref.clone(),
+            panel_hover_da: panel_hover_da_ref.clone(),
+            panel_hover_link_rects: panel_hover_link_rects.clone(),
+            panel_hover_popup_rect: panel_hover_popup_rect.clone(),
+            editor_hover_popup_rect: editor_hover_popup_rect.clone(),
             menu_dd_line_height: menu_dd_lh.clone(),
             css_provider,
             last_colorscheme,
@@ -2180,6 +2264,7 @@ impl SimpleComponent for App {
         *debug_panel_box_ref.borrow_mut() = Some(widgets.debug_panel.clone());
         *git_panel_box_ref.borrow_mut() = Some(widgets.git_panel.clone());
         *ext_panel_box_ref.borrow_mut() = Some(widgets.ext_panel.clone());
+        *ext_dyn_panel_box_ref.borrow_mut() = Some(widgets.ext_dyn_panel.clone());
         *settings_panel_box_ref.borrow_mut() = Some(widgets.settings_panel.clone());
         *ai_panel_box_ref.borrow_mut() = Some(widgets.ai_panel_box.clone());
         *search_results_list_ref.borrow_mut() = Some(widgets.search_results_list.clone());
@@ -2492,6 +2577,104 @@ impl SimpleComponent for App {
             *menu_dropdown_da_ref.borrow_mut() = Some(menu_dd_da);
         }
 
+        // ── Panel hover popup overlay DrawingArea ────────────────────────────
+        // A full-window transparent overlay that draws the panel hover popup
+        // to the right of the sidebar (extending into the editor area).
+        {
+            let hover_da = gtk4::DrawingArea::new();
+            hover_da.set_hexpand(true);
+            hover_da.set_vexpand(true);
+            hover_da.set_can_target(false); // pass-through until popup has links
+
+            {
+                let engine = engine.clone();
+                let lh = menu_dd_lh.clone();
+                let link_rects = panel_hover_link_rects.clone();
+                let popup_rect = panel_hover_popup_rect.clone();
+                hover_da.set_draw_func(move |da, cr, _w, _h| {
+                    link_rects.borrow_mut().clear();
+                    popup_rect.set(None);
+                    let engine = engine.borrow();
+                    if engine.panel_hover.is_none() {
+                        return;
+                    }
+                    let theme = Theme::from_name(&engine.settings.colorscheme);
+                    let font_desc = FontDescription::from_string(UI_FONT);
+                    let pango_ctx = pangocairo::create_context(cr);
+                    let layout = pango::Layout::new(&pango_ctx);
+                    layout.set_font_description(Some(&font_desc));
+                    let font_metrics = pango_ctx.metrics(Some(&font_desc), None);
+                    let line_height = (font_metrics.ascent() + font_metrics.descent()) as f64
+                        / pango::SCALE as f64;
+                    lh.set(line_height);
+                    let char_width =
+                        font_metrics.approximate_char_width() as f64 / pango::SCALE as f64;
+                    let screen =
+                        build_screen_layout(&engine, &theme, &[], line_height, char_width, false);
+                    let window_w = da.width() as f64;
+                    let window_h = da.height() as f64;
+                    let sidebar_right = 48.0 + engine.session.sidebar_width as f64;
+                    let is_native = engine
+                        .panel_hover
+                        .as_ref()
+                        .map(|ph| ph.is_native())
+                        .unwrap_or(false);
+                    let (rects, bounds) = draw_panel_hover_popup(
+                        cr,
+                        &layout,
+                        &screen,
+                        &theme,
+                        sidebar_right,
+                        0.0,
+                        window_w,
+                        window_h,
+                        line_height,
+                        is_native,
+                    );
+                    *link_rects.borrow_mut() = rects;
+                    popup_rect.set(bounds);
+                });
+            }
+
+            widgets.window_overlay.add_overlay(&hover_da);
+            *panel_hover_da_ref.borrow_mut() = Some(hover_da);
+
+            // Capture-phase click on the window overlay: intercept clicks on
+            // popup links before they reach child widgets.
+            {
+                let sender_hover = sender.input_sender().clone();
+                let popup_rect_click = panel_hover_popup_rect.clone();
+                let gesture = gtk4::GestureClick::new();
+                gesture.set_propagation_phase(gtk4::PropagationPhase::Capture);
+                gesture.connect_pressed(move |gesture, _n_press, x, y| {
+                    if let Some((px, py, pw, ph)) = popup_rect_click.get() {
+                        if x >= px && x <= px + pw && y >= py && y <= py + ph {
+                            sender_hover.send(Msg::PanelHoverClick(x, y)).ok();
+                            gesture.set_state(gtk4::EventSequenceState::Claimed);
+                        }
+                    }
+                });
+                widgets.window_overlay.add_controller(gesture);
+            }
+
+            // Capture-phase motion on the window overlay: cancel dismiss when
+            // the mouse is over the popup area.
+            {
+                let engine_motion = engine.clone();
+                let popup_rect_motion = panel_hover_popup_rect.clone();
+                let motion = gtk4::EventControllerMotion::new();
+                motion.set_propagation_phase(gtk4::PropagationPhase::Capture);
+                motion.connect_motion(move |_, x, y| {
+                    if let Some((px, py, pw, ph)) = popup_rect_motion.get() {
+                        if x >= px && x <= px + pw && y >= py && y <= py + ph {
+                            engine_motion.borrow_mut().cancel_panel_hover_dismiss();
+                        }
+                    }
+                });
+                widgets.window_overlay.add_controller(motion);
+            }
+        }
+
         // ── Menu bar DrawingArea setup ─────────────────────────────────────────
         // Draw function: renders menu labels using the same Cairo helper.
         {
@@ -2708,6 +2891,18 @@ impl SimpleComponent for App {
             });
             widgets.git_sidebar_da.add_controller(gesture);
         }
+        {
+            let sender_sc = sender.input_sender().clone();
+            let motion = gtk4::EventControllerMotion::new();
+            motion.connect_motion(move |_, x, y| {
+                sender_sc.send(Msg::ScSidebarMotion(x, y)).ok();
+            });
+            let sender_leave = sender.input_sender().clone();
+            motion.connect_leave(move |_| {
+                sender_leave.send(Msg::ScSidebarMotion(-1.0, -1.0)).ok();
+            });
+            widgets.git_sidebar_da.add_controller(motion);
+        }
         *git_sidebar_da_ref.borrow_mut() = Some(widgets.git_sidebar_da.clone());
 
         // ── Extensions sidebar draw + key setup ───────────────────────────────
@@ -2736,7 +2931,8 @@ impl SimpleComponent for App {
             let key_ctrl = gtk4::EventControllerKey::new();
             key_ctrl.connect_key_pressed(move |_, key, _, _modifier| {
                 let key_name = key.name().map(|s| s.to_string()).unwrap_or_default();
-                sender_ext.send(Msg::ExtSidebarKey(key_name)).ok();
+                let unicode = key.to_unicode().filter(|c| !c.is_control());
+                sender_ext.send(Msg::ExtSidebarKey(key_name, unicode)).ok();
                 gtk4::glib::Propagation::Stop
             });
             widgets.ext_sidebar_da.set_focusable(true);
@@ -2746,12 +2942,115 @@ impl SimpleComponent for App {
             let sender_ext = sender.input_sender().clone();
             let gesture = gtk4::GestureClick::new();
             gesture.set_button(1);
-            gesture.connect_pressed(move |_, _, x, y| {
-                sender_ext.send(Msg::ExtSidebarClick(x, y)).ok();
+            gesture.connect_pressed(move |_, n_press, x, y| {
+                sender_ext.send(Msg::ExtSidebarClick(x, y, n_press)).ok();
             });
             widgets.ext_sidebar_da.add_controller(gesture);
         }
         *ext_sidebar_da_ref.borrow_mut() = Some(widgets.ext_sidebar_da.clone());
+
+        // ── Extension-provided panel (e.g. git-insights) draw + key + click ──
+        {
+            let engine = engine.clone();
+            widgets
+                .ext_dyn_panel_da
+                .set_draw_func(move |da, cr, _w, _h| {
+                    let engine = engine.borrow();
+                    let theme = Theme::from_name(&engine.settings.colorscheme);
+                    let font_desc = FontDescription::from_string(UI_FONT);
+                    let pango_ctx = pangocairo::create_context(cr);
+                    let layout = pango::Layout::new(&pango_ctx);
+                    layout.set_font_description(Some(&font_desc));
+                    let font_metrics = pango_ctx.metrics(Some(&font_desc), None);
+                    let line_height = (font_metrics.ascent() + font_metrics.descent()) as f64
+                        / pango::SCALE as f64;
+                    let char_width =
+                        font_metrics.approximate_char_width() as f64 / pango::SCALE as f64;
+                    let screen =
+                        build_screen_layout(&engine, &theme, &[], line_height, char_width, false);
+                    let w = da.width() as f64;
+                    let h = da.height() as f64;
+                    draw_ext_dyn_panel(cr, &layout, &screen, &theme, 0.0, 0.0, w, h, line_height);
+                });
+        }
+        {
+            let sender_ep = sender.input_sender().clone();
+            let key_ctrl = gtk4::EventControllerKey::new();
+            key_ctrl.connect_key_pressed(move |_, key, _, _modifier| {
+                let key_name = key.name().map(|s| s.to_string()).unwrap_or_default();
+                let unicode = key.to_unicode().filter(|c| !c.is_control());
+                sender_ep.send(Msg::ExtPanelKey(key_name, unicode)).ok();
+                gtk4::glib::Propagation::Stop
+            });
+            widgets.ext_dyn_panel_da.set_focusable(true);
+            widgets.ext_dyn_panel_da.add_controller(key_ctrl);
+        }
+        {
+            let sender_ep = sender.input_sender().clone();
+            let gesture = gtk4::GestureClick::new();
+            gesture.set_button(1);
+            gesture.connect_pressed(move |_, n_press, x, y| {
+                sender_ep.send(Msg::ExtPanelClick(x, y, n_press)).ok();
+            });
+            widgets.ext_dyn_panel_da.add_controller(gesture);
+        }
+        {
+            let sender_ep_rc = sender.input_sender().clone();
+            let gesture_rc = gtk4::GestureClick::new();
+            gesture_rc.set_button(3);
+            gesture_rc.connect_pressed(move |_, _n_press, x, y| {
+                sender_ep_rc.send(Msg::ExtPanelRightClick(x, y)).ok();
+            });
+            widgets.ext_dyn_panel_da.add_controller(gesture_rc);
+        }
+        {
+            let sender_motion = sender.input_sender().clone();
+            let motion = gtk4::EventControllerMotion::new();
+            motion.connect_motion(move |_, x, y| {
+                sender_motion.send(Msg::ExtPanelMouseMove(x, y)).ok();
+            });
+            widgets.ext_dyn_panel_da.add_controller(motion);
+        }
+        *ext_dyn_panel_da_ref.borrow_mut() = Some(widgets.ext_dyn_panel_da.clone());
+
+        // ── Dynamic activity bar buttons for extension-provided panels ────────
+        {
+            let eng = engine.borrow();
+            let mut panels: Vec<_> = eng.ext_panels.values().collect();
+            panels.sort_by(|a, b| a.name.cmp(&b.name));
+            // Find the Separator widget in the activity bar (push-to-bottom spacer).
+            // Insert ext panel buttons just before it.
+            let activity_bar = &widgets.activity_bar;
+            let mut separator_widget: Option<gtk4::Widget> = None;
+            let mut child = activity_bar.first_child();
+            while let Some(ref w) = child {
+                if w.downcast_ref::<gtk4::Separator>().is_some() {
+                    separator_widget = Some(w.clone());
+                    break;
+                }
+                child = w.next_sibling();
+            }
+            // Track the last button we inserted so the next one goes after it.
+            let mut insert_after: Option<gtk4::Widget> =
+                separator_widget.as_ref().and_then(|s| s.prev_sibling());
+            for panel in &panels {
+                let btn = gtk4::Button::new();
+                btn.set_label(&panel.icon.to_string());
+                btn.set_tooltip_text(Some(&panel.title));
+                btn.set_width_request(48);
+                btn.set_height_request(48);
+                btn.set_css_classes(&["activity-button"]);
+                let panel_name = panel.name.clone();
+                let sender_btn = sender.input_sender().clone();
+                btn.connect_clicked(move |_| {
+                    sender_btn
+                        .send(Msg::SwitchPanel(SidebarPanel::ExtPanel(panel_name.clone())))
+                        .ok();
+                });
+                activity_bar.insert_child_after(&btn, insert_after.as_ref());
+                insert_after = Some(btn.upcast());
+            }
+        }
 
         // AI sidebar DrawingArea: draw function + key controller + click gesture
         {
@@ -3558,6 +3857,7 @@ impl SimpleComponent for App {
         let diff_btn_for_draw = diff_btn_map_cell.clone();
         let split_btn_for_draw = split_btn_map_cell.clone();
         let dialog_btn_for_draw = model.dialog_btn_rects.clone();
+        let editor_hover_rect_for_draw = model.editor_hover_popup_rect.clone();
         widgets
             .drawing_area
             .set_draw_func(move |_, cr, width, height| {
@@ -3576,6 +3876,7 @@ impl SimpleComponent for App {
                     &diff_btn_for_draw,
                     &split_btn_for_draw,
                     &dialog_btn_for_draw,
+                    &editor_hover_rect_for_draw,
                 );
             });
 
@@ -3756,6 +4057,12 @@ impl SimpleComponent for App {
                     return;
                 }
 
+                // Dismiss any panel hover popup on key press.
+                self.engine.borrow_mut().dismiss_panel_hover_now();
+                if let Some(ref da) = *self.panel_hover_da.borrow() {
+                    da.queue_draw();
+                }
+
                 // In VSCode mode, Ctrl-V reads clipboard into register '+' before
                 // calling handle_key (which will read it via get_register_content).
                 if ctrl && key_name == "v" && self.engine.borrow().is_vscode_mode() {
@@ -3789,6 +4096,148 @@ impl SimpleComponent for App {
                             }
                         }
                         // Fall through — handle_key() will execute the paste.
+                    }
+                }
+
+                // Route keys to sidebar handlers when a sidebar has focus.
+                // GTK focus on sidebar DrawingAreas is unreliable, so we check
+                // the engine focus flags here (same approach as TUI backend).
+                {
+                    let mut engine = self.engine.borrow_mut();
+                    if engine.ext_panel_has_focus {
+                        let mapped: &str = match key_name.as_str() {
+                            "Return" | "KP_Enter" => "Return",
+                            "Escape" => "Escape",
+                            "Up" => "Up",
+                            "Down" => "Down",
+                            "Tab" | "ISO_Left_Tab" => "Tab",
+                            other => other,
+                        };
+                        if engine.dialog.is_some() {
+                            engine.handle_key(mapped, unicode, false);
+                        } else {
+                            engine.handle_ext_panel_key(mapped, false, unicode);
+                        }
+                        let still_focused = engine.ext_panel_has_focus;
+                        let has_dialog = engine.dialog.is_some();
+                        drop(engine);
+                        if !still_focused || has_dialog {
+                            if let Some(ref drawing) = *self.drawing_area.borrow() {
+                                drawing.grab_focus();
+                            }
+                        }
+                        if let Some(ref da) = *self.ext_dyn_panel_da_ref.borrow() {
+                            da.queue_draw();
+                        }
+                        self.draw_needed.set(true);
+                        return;
+                    }
+                    if engine.ext_sidebar_has_focus {
+                        let mapped: &str = match key_name.as_str() {
+                            "slash" => "/",
+                            "Return" | "KP_Enter" => "Return",
+                            "Escape" => "Escape",
+                            "BackSpace" => "BackSpace",
+                            "Up" => "Up",
+                            "Down" => "Down",
+                            "Tab" | "ISO_Left_Tab" => "Tab",
+                            other => other,
+                        };
+                        if engine.dialog.is_some() {
+                            engine.handle_key(mapped, unicode, false);
+                        } else {
+                            engine.handle_ext_sidebar_key(mapped, false, unicode);
+                        }
+                        let still_focused = engine.ext_sidebar_has_focus;
+                        let has_dialog = engine.dialog.is_some();
+                        drop(engine);
+                        if !still_focused || has_dialog {
+                            if let Some(ref drawing) = *self.drawing_area.borrow() {
+                                drawing.grab_focus();
+                            }
+                        }
+                        if let Some(ref da) = *self.ext_sidebar_da_ref.borrow() {
+                            da.queue_draw();
+                        }
+                        self.draw_needed.set(true);
+                        return;
+                    }
+                    if engine.sc_has_focus {
+                        let (mapped, sc_unicode): (&str, Option<char>) = match key_name.as_str() {
+                            "Return" | "KP_Enter" => ("Return", None),
+                            "Escape" => ("Escape", None),
+                            "BackSpace" => ("BackSpace", None),
+                            "Delete" => ("Delete", None),
+                            "Up" => ("Up", None),
+                            "Down" => ("Down", None),
+                            "Left" => ("Left", None),
+                            "Right" => ("Right", None),
+                            "Home" => ("Home", None),
+                            "End" => ("End", None),
+                            other => {
+                                let mut chars = other.chars();
+                                if let (Some(ch), None) = (chars.next(), chars.next()) {
+                                    (other, Some(ch))
+                                } else {
+                                    (other, None)
+                                }
+                            }
+                        };
+                        if engine.dialog.is_some() {
+                            engine.handle_key(mapped, sc_unicode, ctrl);
+                        } else {
+                            engine.handle_sc_key(mapped, ctrl, sc_unicode);
+                        }
+                        let still_focused = engine.sc_has_focus;
+                        drop(engine);
+                        if !still_focused {
+                            if let Some(ref drawing) = *self.drawing_area.borrow() {
+                                drawing.grab_focus();
+                            }
+                        }
+                        if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
+                            da.queue_draw();
+                        }
+                        self.draw_needed.set(true);
+                        return;
+                    }
+                    if engine.dap_sidebar_has_focus {
+                        if engine.dialog.is_some() {
+                            engine.handle_key(&key_name, unicode, ctrl);
+                        } else {
+                            engine.handle_debug_sidebar_key(&key_name, ctrl);
+                        }
+                        let still_focused = engine.dap_sidebar_has_focus;
+                        drop(engine);
+                        if !still_focused {
+                            if let Some(ref drawing) = *self.drawing_area.borrow() {
+                                drawing.grab_focus();
+                            }
+                        }
+                        if let Some(ref da) = *self.debug_sidebar_da_ref.borrow() {
+                            da.queue_draw();
+                        }
+                        self.draw_needed.set(true);
+                        return;
+                    }
+                    if engine.ai_has_focus {
+                        if engine.dialog.is_some() {
+                            engine.handle_key(&key_name, unicode, ctrl);
+                        } else {
+                            engine.handle_ai_panel_key(&key_name, ctrl, unicode);
+                        }
+                        let still_focused = engine.ai_has_focus;
+                        drop(engine);
+                        if !still_focused {
+                            if let Some(ref drawing) = *self.drawing_area.borrow() {
+                                drawing.grab_focus();
+                            }
+                        }
+                        if let Some(ref da) = *self.ai_sidebar_da_ref.borrow() {
+                            da.queue_draw();
+                        }
+                        self.draw_needed.set(true);
+                        return;
                     }
                 }
 
@@ -3883,6 +4332,9 @@ impl SimpleComponent for App {
                         drop(engine);
                         std::process::exit(1);
                     }
+                    EngineAction::OpenUrl(url) => {
+                        open_url(&url);
+                    }
                     EngineAction::None | EngineAction::Error => {}
                 }
 
@@ -3964,6 +4416,9 @@ impl SimpleComponent for App {
                             engine.lsp_shutdown();
                             drop(engine);
                             std::process::exit(1);
+                        }
+                        EngineAction::OpenUrl(url) => {
+                            open_url(&url);
                         }
                         EngineAction::None | EngineAction::Error => {}
                     }
@@ -4447,6 +4902,33 @@ impl SimpleComponent for App {
                 height,
                 alt,
             } => {
+                // Editor hover: click on the popup focuses it; click elsewhere dismisses it
+                {
+                    let engine = self.engine.borrow();
+                    if engine.editor_hover.is_some() {
+                        let rect = self.editor_hover_popup_rect.get();
+                        let on_popup = if let Some((px, py, pw, ph)) = rect {
+                            x >= px && x < px + pw && y >= py && y < py + ph
+                        } else {
+                            false
+                        };
+                        let has_focus = engine.editor_hover_has_focus;
+                        drop(engine);
+                        if on_popup {
+                            if !has_focus {
+                                self.engine.borrow_mut().editor_hover_has_focus = true;
+                            }
+                            // Consume click — don't process as editor click
+                            self.draw_needed.set(true);
+                            return;
+                        } else if !has_focus {
+                            self.engine.borrow_mut().dismiss_editor_hover();
+                        } else {
+                            // Focused popup — click outside dismisses
+                            self.engine.borrow_mut().dismiss_editor_hover();
+                        }
+                    }
+                }
                 // Dialog button click — highest z-order element.
                 if self.engine.borrow().dialog.is_some() {
                     let lh = self.cached_line_height.max(1.0);
@@ -5204,6 +5686,9 @@ impl SimpleComponent for App {
                         b.set_visible(show && p == which);
                     }
                 }
+                if let Some(ref b) = *self.ext_dyn_panel_box.borrow() {
+                    b.set_visible(show && matches!(p, SidebarPanel::ExtPanel(_)));
+                }
                 // Save sidebar visibility to session state
                 let mut engine = self.engine.borrow_mut();
                 engine.session.explorer_visible = self.sidebar_visible;
@@ -5213,8 +5698,37 @@ impl SimpleComponent for App {
                 if self.active_panel == panel {
                     // Same panel - toggle visibility
                     self.sidebar_visible = !self.sidebar_visible;
+                    // Set engine focus flags when toggling back to visible
+                    if self.sidebar_visible {
+                        match panel {
+                            SidebarPanel::Git => {
+                                self.engine.borrow_mut().sc_has_focus = true;
+                            }
+                            SidebarPanel::Extensions => {
+                                self.engine.borrow_mut().ext_sidebar_has_focus = true;
+                            }
+                            SidebarPanel::Ai => {
+                                self.engine.borrow_mut().ai_has_focus = true;
+                            }
+                            SidebarPanel::Debug => {
+                                self.engine.borrow_mut().dap_sidebar_has_focus = true;
+                            }
+                            SidebarPanel::ExtPanel(ref name) => {
+                                let mut engine = self.engine.borrow_mut();
+                                engine.ext_panel_has_focus = true;
+                                engine.ext_panel_active = Some(name.clone());
+                            }
+                            _ => {}
+                        }
+                    }
                 } else {
                     // Different panel - switch and ensure visible
+                    // Clear ext panel focus when switching away
+                    if matches!(self.active_panel, SidebarPanel::ExtPanel(_)) {
+                        let mut engine = self.engine.borrow_mut();
+                        engine.ext_panel_has_focus = false;
+                        engine.ext_panel_active = None;
+                    }
                     self.active_panel = panel;
                     self.sidebar_visible = true;
                     // Refresh SC data when switching to the Git panel
@@ -5222,10 +5736,6 @@ impl SimpleComponent for App {
                         let mut engine = self.engine.borrow_mut();
                         engine.sc_refresh();
                         engine.sc_has_focus = true;
-                        drop(engine);
-                        if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
-                            da.grab_focus();
-                        }
                     }
                     // Focus + refresh when switching to Extensions panel
                     if self.active_panel == SidebarPanel::Extensions {
@@ -5235,17 +5745,18 @@ impl SimpleComponent for App {
                         if engine.ext_registry.is_none() && !engine.ext_registry_fetching {
                             engine.ext_refresh();
                         }
-                        drop(engine);
-                        if let Some(ref da) = *self.ext_sidebar_da_ref.borrow() {
-                            da.grab_focus();
-                        }
                     }
                     // Focus when switching to AI panel
                     if self.active_panel == SidebarPanel::Ai {
                         self.engine.borrow_mut().ai_has_focus = true;
-                        if let Some(ref da) = *self.ai_sidebar_da_ref.borrow() {
-                            da.grab_focus();
-                        }
+                    }
+                    // Focus + fire panel_focus event for ext panels
+                    if let SidebarPanel::ExtPanel(ref name) = self.active_panel {
+                        let mut engine = self.engine.borrow_mut();
+                        engine.ext_panel_has_focus = true;
+                        engine.ext_panel_active = Some(name.clone());
+                        engine.ext_panel_selected = 0;
+                        engine.plugin_event("panel_focus", name);
                     }
                     // Rebuild settings form so widgets reflect current engine.settings
                     // (e.g. toggles changed via :set command since the panel was last open).
@@ -5279,6 +5790,41 @@ impl SimpleComponent for App {
                 ] {
                     if let Some(ref b) = *panel_ref.borrow() {
                         b.set_visible(show_sidebar && p == which);
+                    }
+                }
+                // Extension-provided panel box: visible when any ExtPanel variant is active
+                if let Some(ref b) = *self.ext_dyn_panel_box.borrow() {
+                    b.set_visible(show_sidebar && matches!(p, SidebarPanel::ExtPanel(_)));
+                }
+                // Grab focus on sidebar DA AFTER visibility is set (hidden widgets can't accept focus).
+                if show_sidebar {
+                    match p {
+                        SidebarPanel::Git => {
+                            if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
+                                da.grab_focus();
+                            }
+                        }
+                        SidebarPanel::Extensions => {
+                            if let Some(ref da) = *self.ext_sidebar_da_ref.borrow() {
+                                da.grab_focus();
+                            }
+                        }
+                        SidebarPanel::Debug => {
+                            if let Some(ref da) = *self.debug_sidebar_da_ref.borrow() {
+                                da.grab_focus();
+                            }
+                        }
+                        SidebarPanel::Ai => {
+                            if let Some(ref da) = *self.ai_sidebar_da_ref.borrow() {
+                                da.grab_focus();
+                            }
+                        }
+                        SidebarPanel::ExtPanel(_) => {
+                            if let Some(ref da) = *self.ext_dyn_panel_da_ref.borrow() {
+                                da.grab_focus();
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 self.draw_needed.set(true);
@@ -5586,6 +6132,15 @@ impl SimpleComponent for App {
             }
             Msg::MouseScroll { delta_x, delta_y } => {
                 let mut engine = self.engine.borrow_mut();
+                // If editor hover popup is visible, scroll it instead of the editor
+                if engine.editor_hover.is_some() && delta_y.abs() > 0.01 {
+                    let delta = (delta_y * 3.0).round() as i32;
+                    if engine.editor_hover_scroll(delta) {
+                        drop(engine);
+                        self.draw_needed.set(true);
+                        return;
+                    }
+                }
                 if delta_y.abs() > 0.01 {
                     let lines = engine.buffer().len_lines().saturating_sub(1);
                     let scroll_count = (delta_y * 3.0).round().abs() as usize;
@@ -5910,6 +6465,69 @@ impl SimpleComponent for App {
                                 );
                             }
                         }
+
+                        // Editor hover: convert mouse pixel position to editor (line, col)
+                        // and feed into dwell detection for auto-hover popups.
+                        if mx >= 0.0 {
+                            let mut engine = self.engine.borrow_mut();
+                            if engine.settings.hover_delay > 0
+                                && !engine.editor_hover_has_focus
+                                && (matches!(engine.mode, core::Mode::Normal | core::Mode::Visual)
+                                    || engine.is_vscode_mode())
+                            {
+                                let active_wid = engine.active_window_id();
+                                if let Some((_wid, rect)) =
+                                    rects.iter().find(|(w, _)| *w == active_wid)
+                                {
+                                    if mx >= rect.x
+                                        && mx < rect.x + rect.width
+                                        && my >= rect.y
+                                        && my < rect.y + rect.height
+                                    {
+                                        let total_lines = engine.buffer().len_lines();
+                                        // Approximate gutter width — exact value doesn't need
+                                        // to be pixel-perfect for hover dwell detection.
+                                        let gutter = render::calculate_gutter_cols(
+                                            engine.settings.line_numbers,
+                                            total_lines,
+                                            cw,
+                                            true, // assume git column present
+                                            false,
+                                        );
+                                        let gutter_px = gutter as f64 * cw;
+                                        let text_x = rect.x + gutter_px;
+                                        let scroll_top = engine.view().scroll_top;
+                                        let scroll_left = engine.view().scroll_left;
+                                        if mx >= text_x {
+                                            // Check if mouse is over the editor hover popup
+                                            let mouse_on_popup = engine.editor_hover.is_some()
+                                                && self.editor_hover_popup_rect.get().is_some_and(
+                                                    |(px, py, pw, ph)| {
+                                                        mx >= px
+                                                            && mx < px + pw
+                                                            && my >= py
+                                                            && my < py + ph
+                                                    },
+                                                );
+                                            if !mouse_on_popup {
+                                                let rel_y = my - rect.y;
+                                                let rel_x = mx - text_x;
+                                                let vis_line = (rel_y / lh).floor() as usize;
+                                                let line = scroll_top + vis_line;
+                                                let col =
+                                                    scroll_left + (rel_x / cw).floor() as usize;
+                                                engine.editor_hover_mouse_move(line, col, false);
+                                            }
+                                        }
+                                    } else if engine.editor_hover.is_some()
+                                        && !engine.editor_hover_has_focus
+                                    {
+                                        // Mouse outside editor area — dismiss hover
+                                        engine.dismiss_editor_hover();
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 if self.engine.borrow_mut().poll_project_search() {
@@ -6010,6 +6628,15 @@ impl SimpleComponent for App {
                         self.draw_needed.set(true);
                     }
                 }
+                // Poll for completed SC diff background request.
+                {
+                    if self.engine.borrow_mut().poll_sc_diff() {
+                        if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
+                            da.queue_draw();
+                        }
+                        self.draw_needed.set(true);
+                    }
+                }
                 // Poll for completed async shell tasks (plugin background commands).
                 {
                     if self.engine.borrow_mut().poll_async_shells() {
@@ -6033,6 +6660,35 @@ impl SimpleComponent for App {
                         self.draw_needed.set(true);
                     }
                 }
+                // Poll for panel hover popup (dwell detection).
+                {
+                    let had_hover = self.engine.borrow().panel_hover.is_some();
+                    let changed = self.engine.borrow_mut().poll_panel_hover();
+                    let has_hover = self.engine.borrow().panel_hover.is_some();
+                    if changed || (had_hover && !has_hover) {
+                        if let Some(ref da) = *self.panel_hover_da.borrow() {
+                            da.queue_draw();
+                        }
+                        self.draw_needed.set(true);
+                    }
+                }
+                // Poll for editor hover popup (dwell detection / delayed dismiss).
+                {
+                    let changed = self.engine.borrow_mut().poll_editor_hover();
+                    if changed {
+                        self.draw_needed.set(true);
+                    }
+                }
+                // Poll async blame results.
+                {
+                    let changed = self.engine.borrow_mut().poll_blame();
+                    if changed {
+                        self.draw_needed.set(true);
+                    }
+                }
+                // Syntax refresh is deferred entirely until leaving insert mode
+                // (Escape calls refresh_syntax_if_stale). This avoids blocking the
+                // GTK idle handler with a 100-250ms reparse during active typing.
                 // Tick swap file writes (only does work when updatetime elapsed).
                 self.engine.borrow_mut().tick_swap_files();
                 // Sync the OS window title with the active buffer name (taskbar/pager).
@@ -6539,6 +7195,15 @@ impl SimpleComponent for App {
             }
             Msg::DebugSidebarKey(key_name, ctrl) => {
                 let mut engine = self.engine.borrow_mut();
+                if engine.dialog.is_some() {
+                    engine.handle_key(&key_name, key_name.chars().next(), ctrl);
+                    drop(engine);
+                    if let Some(ref drawing) = *self.drawing_area.borrow() {
+                        drawing.grab_focus();
+                    }
+                    self.draw_needed.set(true);
+                    return;
+                }
                 // Compute section heights for ensure_visible.
                 if let Some(ref da) = *self.debug_sidebar_da_ref.borrow() {
                     let lh = self.cached_line_height;
@@ -6632,7 +7297,6 @@ impl SimpleComponent for App {
                 if lh <= 0.0 {
                     return;
                 }
-                let row_idx = (y / lh) as usize;
                 self.tree_has_focus = false;
                 if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
                     da.grab_focus();
@@ -6642,33 +7306,110 @@ impl SimpleComponent for App {
                 let action: Option<&'static str> = {
                     let mut engine = self.engine.borrow_mut();
                     engine.sc_has_focus = true;
-                    if row_idx == 0 {
+                    // Pixel-based hit zones matching draw_source_control_panel layout:
+                    //   header:  0 .. lh
+                    //   gap:     lh .. lh+gap
+                    //   commit:  lh+gap .. lh+gap+commit_h
+                    //   gap:     .. + gap
+                    //   buttons: .. + lh
+                    //   gap:     .. + gap
+                    //   sections: item_height rows
+                    let gap = (lh * 0.3).round();
+                    let commit_rows = engine.sc_commit_message.split('\n').count().max(1);
+                    let commit_h = commit_rows as f64 * lh;
+                    let header_end = lh;
+                    let commit_top = header_end + gap;
+                    let commit_bottom = commit_top + commit_h;
+                    let btn_top = commit_bottom + gap;
+                    let btn_bottom = btn_top + lh;
+                    let section_top = btn_bottom + gap;
+                    let item_height = (lh * 1.4).round();
+
+                    if y < header_end {
                         // Panel header — no-op
+                        engine.sc_commit_input_active = false;
                         None
-                    } else if row_idx == 1 {
-                        // Commit input row
+                    } else if y >= commit_top && y < commit_bottom {
+                        // Commit input row(s)
                         engine.sc_commit_input_active = true;
+                        engine.sc_commit_cursor = engine.sc_commit_message.len();
                         None
-                    } else if row_idx == 2 {
+                    } else if y >= btn_top && y < btn_bottom {
+                        engine.sc_commit_input_active = false;
                         // Button row: Commit (~50%), Push/Pull/Sync (~17% each, icon-only).
                         if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
                             let da_w = da.width() as f64;
-                            if da_w > 0.0 {
-                                let commit_w = da_w / 2.0;
-                                let btn_idx = if x_click < commit_w {
+                            let margin = 4.0;
+                            let btn_w = da_w - margin * 2.0;
+                            let rel_x = x_click - margin;
+                            if btn_w > 0.0 && rel_x >= 0.0 && rel_x < btn_w {
+                                let commit_w = btn_w / 2.0;
+                                let btn_idx = if rel_x < commit_w {
                                     0
                                 } else {
-                                    let icon_w = (da_w - commit_w) / 3.0;
-                                    ((1.0 + (x_click - commit_w) / icon_w) as usize).min(3)
+                                    let icon_w = (btn_w - commit_w) / 3.0;
+                                    ((1.0 + (rel_x - commit_w) / icon_w) as usize).min(3)
                                 };
                                 engine.sc_activate_button(btn_idx);
                             }
                         }
                         None
-                    } else {
-                        // GTK does not render a "(no changes)" hint for empty
-                        // expanded sections, so empty_section_hint = false.
-                        match engine.sc_visual_row_to_flat(row_idx, false) {
+                    } else if y >= section_top {
+                        engine.sc_commit_input_active = false;
+                        // Accumulator walk matching draw_source_control_panel layout:
+                        // headers use line_height, items use item_height (1.4×).
+                        let staged_count = engine
+                            .sc_file_statuses
+                            .iter()
+                            .filter(|f| f.staged.is_some())
+                            .count();
+                        let unstaged_count = engine
+                            .sc_file_statuses
+                            .iter()
+                            .filter(|f| f.unstaged.is_some())
+                            .count();
+                        let show_worktrees = engine.sc_worktrees.len() > 1;
+                        let wt_count = engine.sc_worktrees.len();
+                        let log_count = engine.sc_log.len();
+                        let expanded = engine.sc_sections_expanded;
+
+                        // Build section descriptors: (item_count, is_shown, expanded)
+                        let sections: [(usize, bool, bool); 4] = [
+                            (staged_count, true, expanded[0]),
+                            (unstaged_count, true, expanded[1]),
+                            (wt_count, show_worktrees, expanded[2]),
+                            (log_count, true, expanded[3]),
+                        ];
+
+                        let mut ry = section_top;
+                        let mut flat: usize = 0;
+                        let mut result: Option<(usize, bool)> = None;
+
+                        'walk: for &(count, shown, exp) in &sections {
+                            if !shown {
+                                continue;
+                            }
+                            // Section header (line_height)
+                            if y >= ry && y < ry + lh {
+                                result = Some((flat, true));
+                                break 'walk;
+                            }
+                            ry += lh;
+                            let header_flat = flat;
+                            flat += 1;
+                            if exp {
+                                for i in 0..count {
+                                    if y >= ry && y < ry + item_height {
+                                        result = Some((header_flat + 1 + i, false));
+                                        break 'walk;
+                                    }
+                                    ry += item_height;
+                                }
+                                flat += count;
+                            }
+                        }
+
+                        match result {
                             Some((flat_idx, is_header)) => {
                                 engine.sc_selected = flat_idx;
                                 if is_header {
@@ -6679,19 +7420,37 @@ impl SimpleComponent for App {
                             }
                             None => None,
                         }
+                    } else {
+                        // Gap/padding area — no-op
+                        engine.sc_commit_input_active = false;
+                        None
                     }
                 };
                 if let Some(key) = action {
-                    self.engine.borrow_mut().handle_sc_key(key, false, None);
-                    // Click opens the file but keeps panel focus so s/d work immediately.
-                    // (Keyboard Enter clears sc_has_focus to return to the editor.)
                     if key == "Return" {
-                        let mut engine = self.engine.borrow_mut();
-                        engine.sc_has_focus = true;
-                        drop(engine);
-                        if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
-                            da.grab_focus();
-                        }
+                        // Defer all heavy work (file open + git show) so
+                        // the sidebar repaints the selection highlight first.
+                        let engine_rc = self.engine.clone();
+                        let git_da = self.git_sidebar_da_ref.clone();
+                        let drawing = self.drawing_area.clone();
+                        let draw_needed = self.draw_needed.clone();
+                        gtk4::glib::idle_add_local_once(move || {
+                            let done = engine_rc.borrow_mut().sc_open_selected_async();
+                            if done {
+                                let still_focused = engine_rc.borrow().sc_has_focus;
+                                if !still_focused {
+                                    if let Some(ref da) = *drawing.borrow() {
+                                        da.grab_focus();
+                                    }
+                                }
+                            }
+                            if let Some(ref da) = *git_da.borrow() {
+                                da.queue_draw();
+                            }
+                            draw_needed.set(true);
+                        });
+                    } else {
+                        self.engine.borrow_mut().handle_sc_key(key, false, None);
                     }
                 }
                 if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
@@ -6699,8 +7458,177 @@ impl SimpleComponent for App {
                 }
                 self.draw_needed.set(true);
             }
+            Msg::ScSidebarMotion(mx, my) => {
+                // Determine which button (if any) the mouse is over.
+                let lh = if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
+                    let font_desc = FontDescription::from_string(UI_FONT);
+                    let pango_ctx = da.pango_context();
+                    let fm = pango_ctx.metrics(Some(&font_desc), None);
+                    (fm.ascent() + fm.descent()) as f64 / pango::SCALE as f64
+                } else {
+                    16.0
+                };
+                let mut engine = self.engine.borrow_mut();
+                let gap = (lh * 0.3).round();
+                let commit_rows = engine.sc_commit_message.split('\n').count().max(1);
+                let commit_h = commit_rows as f64 * lh;
+                // Button row Y range: after header + gap + commit + gap
+                let btn_top = lh + gap + commit_h + gap;
+                let btn_bottom = btn_top + lh;
+                let old = engine.sc_button_hovered;
+                if mx < 0.0 || my < btn_top || my >= btn_bottom {
+                    engine.sc_button_hovered = None;
+                } else if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
+                    let da_w = da.width() as f64;
+                    let margin = 4.0;
+                    let btn_w = da_w - margin * 2.0;
+                    let rel_x = mx - margin;
+                    if rel_x < 0.0 || rel_x >= btn_w {
+                        engine.sc_button_hovered = None;
+                    } else {
+                        let commit_w = btn_w / 2.0;
+                        engine.sc_button_hovered = Some(if rel_x < commit_w {
+                            0
+                        } else {
+                            let icon_w = (btn_w - commit_w) / 3.0;
+                            ((1.0 + (rel_x - commit_w) / icon_w) as usize).min(3)
+                        });
+                    }
+                } else {
+                    engine.sc_button_hovered = None;
+                }
+                if engine.sc_button_hovered != old {
+                    drop(engine);
+                    if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
+                        da.queue_draw();
+                    }
+                } else {
+                    // Panel hover dwell tracking for SC items.
+                    let item_height = (lh * 1.4).round();
+                    let btn_pad = gap;
+                    let section_top = btn_bottom + btn_pad;
+                    if mx >= 0.0 && my >= section_top {
+                        // Accumulator walk matching draw_source_control_panel layout.
+                        let staged_count = engine
+                            .sc_file_statuses
+                            .iter()
+                            .filter(|f| f.staged.is_some())
+                            .count();
+                        let unstaged_count = engine
+                            .sc_file_statuses
+                            .iter()
+                            .filter(|f| f.unstaged.is_some())
+                            .count();
+                        let show_worktrees = engine.sc_worktrees.len() > 1;
+                        let wt_count = engine.sc_worktrees.len();
+                        let log_count = engine.sc_log.len();
+
+                        let mut y_off = section_top;
+                        let mut flat_idx = 0usize;
+                        let mut hit_flat: Option<usize> = None;
+
+                        // Walk each section: header(lh) + items(item_height) if expanded
+                        struct Section {
+                            count: usize,
+                            expanded: bool,
+                        }
+                        let sections = [
+                            Section {
+                                count: staged_count,
+                                expanded: engine.sc_sections_expanded[0],
+                            },
+                            Section {
+                                count: unstaged_count,
+                                expanded: engine.sc_sections_expanded[1],
+                            },
+                        ];
+                        for sec in &sections {
+                            // Header
+                            if my >= y_off && my < y_off + lh {
+                                hit_flat = Some(flat_idx);
+                                break;
+                            }
+                            y_off += lh;
+                            flat_idx += 1;
+                            if sec.expanded {
+                                for _ in 0..sec.count {
+                                    if my >= y_off && my < y_off + item_height {
+                                        hit_flat = Some(flat_idx);
+                                        break;
+                                    }
+                                    y_off += item_height;
+                                    flat_idx += 1;
+                                }
+                                if hit_flat.is_some() {
+                                    break;
+                                }
+                            }
+                        }
+                        if hit_flat.is_none() && show_worktrees {
+                            // Worktrees header
+                            if my >= y_off && my < y_off + lh {
+                                hit_flat = Some(flat_idx);
+                            }
+                            y_off += lh;
+                            flat_idx += 1;
+                            if hit_flat.is_none() && engine.sc_sections_expanded[2] {
+                                for _ in 0..wt_count {
+                                    if my >= y_off && my < y_off + item_height {
+                                        hit_flat = Some(flat_idx);
+                                        break;
+                                    }
+                                    y_off += item_height;
+                                    flat_idx += 1;
+                                }
+                            }
+                        }
+                        if hit_flat.is_none() {
+                            // Log header
+                            if my >= y_off && my < y_off + lh {
+                                hit_flat = Some(flat_idx);
+                            }
+                            y_off += lh;
+                            flat_idx += 1;
+                            if hit_flat.is_none() && engine.sc_sections_expanded[3] {
+                                for _ in 0..log_count {
+                                    if my >= y_off && my < y_off + item_height {
+                                        hit_flat = Some(flat_idx);
+                                        break;
+                                    }
+                                    y_off += item_height;
+                                    flat_idx += 1;
+                                }
+                            }
+                        }
+
+                        if let Some(fi) = hit_flat {
+                            if engine.panel_hover_mouse_move("source_control", "", fi) {
+                                drop(engine);
+                                if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
+                                    da.queue_draw();
+                                }
+                            }
+                        } else {
+                            engine.dismiss_panel_hover();
+                        }
+                    } else if mx < 0.0 {
+                        // Mouse left the panel. Use delayed dismiss so the overlay's
+                        // motion controller can cancel it if the mouse enters the popup.
+                        engine.dismiss_panel_hover();
+                    }
+                }
+            }
             Msg::ScKey(key_name, ctrl) => {
                 let mut engine = self.engine.borrow_mut();
+                if engine.dialog.is_some() {
+                    engine.handle_key(&key_name, key_name.chars().next(), ctrl);
+                    drop(engine);
+                    if let Some(ref drawing) = *self.drawing_area.borrow() {
+                        drawing.grab_focus();
+                    }
+                    self.draw_needed.set(true);
+                    return;
+                }
                 if engine.sc_commit_input_active
                     || engine.sc_branch_picker_open
                     || engine.sc_branch_create_mode
@@ -6711,8 +7639,13 @@ impl SimpleComponent for App {
                         "Return" | "KP_Enter" => ("Return", None),
                         "Escape" => ("Escape", None),
                         "BackSpace" => ("BackSpace", None),
+                        "Delete" => ("Delete", None),
                         "Up" => ("Up", None),
                         "Down" => ("Down", None),
+                        "Left" => ("Left", None),
+                        "Right" => ("Right", None),
+                        "Home" => ("Home", None),
+                        "End" => ("End", None),
                         other => {
                             let mut chars = other.chars();
                             if let (Some(ch), None) = (chars.next(), chars.next()) {
@@ -6769,12 +7702,36 @@ impl SimpleComponent for App {
                 }
                 self.draw_needed.set(true);
             }
-            Msg::ExtSidebarKey(key_name) => {
+            Msg::ExtSidebarKey(key_name, unicode) => {
+                // Map GDK key names to the strings the engine expects.
+                let mapped: &str = match key_name.as_str() {
+                    "slash" => "/",
+                    "Return" | "KP_Enter" => "Return",
+                    "Escape" => "Escape",
+                    "BackSpace" => "BackSpace",
+                    "Up" => "Up",
+                    "Down" => "Down",
+                    "Tab" | "ISO_Left_Tab" => "Tab",
+                    other => other,
+                };
                 let mut engine = self.engine.borrow_mut();
-                engine.handle_ext_sidebar_key(&key_name, false, None);
+                if engine.dialog.is_some() {
+                    engine.handle_key(mapped, unicode, false);
+                    drop(engine);
+                    if let Some(ref drawing) = *self.drawing_area.borrow() {
+                        drawing.grab_focus();
+                    }
+                    self.draw_needed.set(true);
+                    if let Some(ref da) = *self.ext_sidebar_da_ref.borrow() {
+                        da.queue_draw();
+                    }
+                    return;
+                }
+                engine.handle_ext_sidebar_key(mapped, false, unicode);
                 let still_focused = engine.ext_sidebar_has_focus;
+                let has_dialog = engine.dialog.is_some();
                 drop(engine);
-                if !still_focused {
+                if !still_focused || has_dialog {
                     if let Some(ref drawing) = *self.drawing_area.borrow() {
                         drawing.grab_focus();
                     }
@@ -6784,7 +7741,7 @@ impl SimpleComponent for App {
                 }
                 self.draw_needed.set(true);
             }
-            Msg::ExtSidebarClick(x_click, y_click) => {
+            Msg::ExtSidebarClick(x_click, y_click, n_press) => {
                 let mut engine = self.engine.borrow_mut();
                 // Compute line_height from UI font (not editor font) to match drawing.
                 let line_height = if let Some(ref da) = *self.ext_sidebar_da_ref.borrow() {
@@ -6796,46 +7753,266 @@ impl SimpleComponent for App {
                     self.cached_line_height
                 }
                 .max(1.0);
-                let row = (y_click / line_height) as usize;
-                // Row 0 = header, Row 1 = search, Row 2+ = sections
-                // Focus the panel on any click
+                // Item rows use 1.4× line_height for spacing.
+                let item_height = (line_height * 1.4_f64).ceil();
+                // Walk the layout to determine which row was clicked.
+                // Headers use line_height, items use item_height.
+                let mut ry: f64 = 0.0;
                 engine.ext_sidebar_has_focus = true;
-                // Rows 0-1 are header/search — clicking row 1 activates search input
-                if row == 1 {
+
+                // Row 0: panel header (line_height)
+                if y_click < ry + line_height {
+                    // no action on header click
+                } else {
+                    ry += line_height;
+                }
+                // Row 1: search box (line_height)
+                if y_click >= ry && y_click < ry + line_height {
                     engine.ext_sidebar_input_active = true;
-                } else if row >= 2 {
-                    // Determine flat index from click position
-                    // Row 2 = INSTALLED header, rows 3..N = installed items, N+1 = AVAILABLE header, N+2.. = available items
+                } else if y_click >= ry + line_height {
+                    ry += line_height;
+                    // INSTALLED section header (line_height)
                     let installed = engine.ext_installed_items().len();
-                    let installed_len = if engine.ext_sidebar_sections_expanded[0] {
-                        installed
+                    let inst_expanded = engine.ext_sidebar_sections_expanded[0];
+                    if y_click >= ry && y_click < ry + line_height {
+                        engine.ext_sidebar_sections_expanded[0] = !inst_expanded;
                     } else {
-                        0
-                    };
-                    let installed_header_row = 2usize;
-                    let available_header_row = installed_header_row + 1 + installed_len.max(1);
-                    if row == installed_header_row {
-                        engine.ext_sidebar_sections_expanded[0] =
-                            !engine.ext_sidebar_sections_expanded[0];
-                    } else if row > installed_header_row && row < available_header_row {
-                        let idx = row - installed_header_row - 1;
-                        engine.ext_sidebar_selected = idx;
-                    } else if row == available_header_row {
-                        engine.ext_sidebar_sections_expanded[1] =
-                            !engine.ext_sidebar_sections_expanded[1];
-                    } else if row > available_header_row {
-                        let idx = installed_len + (row - available_header_row - 1);
-                        engine.ext_sidebar_selected = idx;
+                        ry += line_height;
+                        if inst_expanded {
+                            let inst_len = if installed == 0 { 1 } else { installed };
+                            let items_h = inst_len as f64 * item_height;
+                            if installed > 0 && y_click >= ry && y_click < ry + items_h {
+                                let idx = ((y_click - ry) / item_height) as usize;
+                                engine.ext_sidebar_selected = idx.min(installed.saturating_sub(1));
+                            }
+                            ry += items_h;
+                        }
+                        // AVAILABLE section header (line_height)
+                        let avail_expanded = engine.ext_sidebar_sections_expanded[1];
+                        if y_click >= ry && y_click < ry + line_height {
+                            engine.ext_sidebar_sections_expanded[1] = !avail_expanded;
+                        } else {
+                            ry += line_height;
+                            if avail_expanded {
+                                let available = engine.ext_available_items().len();
+                                if available > 0 && y_click >= ry {
+                                    let idx = ((y_click - ry) / item_height) as usize;
+                                    engine.ext_sidebar_selected =
+                                        installed + idx.min(available.saturating_sub(1));
+                                }
+                            }
+                        }
                     }
                 }
                 let _ = x_click;
-                drop(engine);
+                // Double-click opens the README
+                if n_press >= 2 {
+                    engine.ext_open_selected_readme();
+                    let still_focused = engine.ext_sidebar_has_focus;
+                    drop(engine);
+                    if !still_focused {
+                        if let Some(ref drawing) = *self.drawing_area.borrow() {
+                            drawing.grab_focus();
+                        }
+                    }
+                } else {
+                    drop(engine);
+                }
                 if let Some(ref da) = *self.ext_sidebar_da_ref.borrow() {
                     da.queue_draw();
                 }
                 self.draw_needed.set(true);
             }
+            Msg::ExtPanelKey(key_name, unicode) => {
+                let mapped: &str = match key_name.as_str() {
+                    "Return" | "KP_Enter" => "Return",
+                    "Escape" => "Escape",
+                    "Up" => "Up",
+                    "Down" => "Down",
+                    "Tab" | "ISO_Left_Tab" => "Tab",
+                    other => other,
+                };
+                let mut engine = self.engine.borrow_mut();
+                if engine.dialog.is_some() {
+                    engine.handle_key(mapped, unicode, false);
+                    drop(engine);
+                    if let Some(ref drawing) = *self.drawing_area.borrow() {
+                        drawing.grab_focus();
+                    }
+                } else {
+                    engine.handle_ext_panel_key(mapped, false, unicode);
+                    let still_focused = engine.ext_panel_has_focus;
+                    drop(engine);
+                    if !still_focused {
+                        if let Some(ref drawing) = *self.drawing_area.borrow() {
+                            drawing.grab_focus();
+                        }
+                    }
+                }
+                if let Some(ref da) = *self.ext_dyn_panel_da_ref.borrow() {
+                    da.queue_draw();
+                }
+                self.draw_needed.set(true);
+            }
+            Msg::ExtPanelClick(x_click, y_click, n_press) => {
+                // Dismiss any hover popup (links are handled by the overlay DA).
+                {
+                    let had_hover = self.engine.borrow().panel_hover.is_some();
+                    if had_hover {
+                        self.engine.borrow_mut().dismiss_panel_hover_now();
+                        if let Some(ref da) = *self.panel_hover_da.borrow() {
+                            da.queue_draw();
+                        }
+                    }
+                }
+                let mut engine = self.engine.borrow_mut();
+                let line_height = if let Some(ref da) = *self.ext_dyn_panel_da_ref.borrow() {
+                    let font_desc = FontDescription::from_string(UI_FONT);
+                    let pango_ctx = da.pango_context();
+                    let fm = pango_ctx.metrics(Some(&font_desc), None);
+                    (fm.ascent() + fm.descent()) as f64 / pango::SCALE as f64
+                } else {
+                    self.cached_line_height
+                }
+                .max(1.0);
+
+                engine.ext_panel_has_focus = true;
+
+                // Row 0 is the header (height = line_height) — skip.
+                if y_click >= line_height {
+                    // Content rows: each row is line_height tall.
+                    let row_idx = ((y_click - line_height) / line_height) as usize;
+                    let flat_idx = engine.ext_panel_scroll_top + row_idx;
+                    let flat_len = engine.ext_panel_flat_len();
+                    if flat_idx < flat_len {
+                        engine.ext_panel_selected = flat_idx;
+                    }
+                }
+                let _ = x_click;
+                // Double-click fires panel_double_click event + confirms selection.
+                if n_press >= 2 {
+                    engine.handle_ext_panel_double_click();
+                    engine.handle_ext_panel_key("Return", false, None);
+                    let still_focused = engine.ext_panel_has_focus;
+                    drop(engine);
+                    if !still_focused {
+                        if let Some(ref drawing) = *self.drawing_area.borrow() {
+                            drawing.grab_focus();
+                        }
+                    }
+                } else {
+                    drop(engine);
+                }
+                if let Some(ref da) = *self.ext_dyn_panel_da_ref.borrow() {
+                    da.queue_draw();
+                }
+                self.draw_needed.set(true);
+            }
+            Msg::ExtPanelRightClick(x_click, y_click) => {
+                let mut engine = self.engine.borrow_mut();
+                let line_height = self.cached_line_height.max(1.0);
+                engine.ext_panel_has_focus = true;
+                // Map click to flat index (same as left-click).
+                if y_click >= line_height {
+                    let row_idx = ((y_click - line_height) / line_height) as usize;
+                    let flat_idx = engine.ext_panel_scroll_top + row_idx;
+                    let flat_len = engine.ext_panel_flat_len();
+                    if flat_idx < flat_len {
+                        engine.ext_panel_selected = flat_idx;
+                    }
+                }
+                engine.open_ext_panel_context_menu(x_click as u16, y_click as u16);
+                drop(engine);
+                if let Some(ref da) = *self.ext_dyn_panel_da_ref.borrow() {
+                    da.queue_draw();
+                }
+                self.draw_needed.set(true);
+            }
+            Msg::ExtPanelMouseMove(x_move, y_move) => {
+                // Determine which flat item the mouse is over (row 0 is the header).
+                let line_height = self.cached_line_height.max(1.0);
+                let panel_name = if let SidebarPanel::ExtPanel(ref name) = self.active_panel {
+                    name.clone()
+                } else {
+                    return;
+                };
+                // Header row occupies row 0; content rows start at line_height.
+                if y_move < line_height {
+                    self.engine.borrow_mut().dismiss_panel_hover();
+                    if let Some(ref da) = *self.ext_dyn_panel_da_ref.borrow() {
+                        da.queue_draw();
+                    }
+                    return;
+                }
+                let scroll_top = self.engine.borrow().ext_panel_scroll_top;
+                let row_idx = ((y_move - line_height) / line_height) as usize;
+                let flat_idx = scroll_top + row_idx;
+                let _ = x_move;
+                let changed =
+                    self.engine
+                        .borrow_mut()
+                        .panel_hover_mouse_move(&panel_name, "", flat_idx);
+                if changed {
+                    if let Some(ref da) = *self.ext_dyn_panel_da_ref.borrow() {
+                        da.queue_draw();
+                    }
+                }
+            }
+            Msg::PanelHoverClick(click_x, click_y) => {
+                // Check if click hit a link rect in the hover popup.
+                let rects = self.panel_hover_link_rects.borrow();
+                let hit = rects
+                    .iter()
+                    .find(|(rx, ry, rw, rh, _, _)| {
+                        click_x >= *rx && click_x <= rx + rw && click_y >= *ry && click_y <= ry + rh
+                    })
+                    .cloned();
+                drop(rects);
+                if let Some((_rx, _ry, _rw, _rh, url, is_native)) = hit {
+                    use crate::core::engine::DialogButton;
+                    if is_native {
+                        // Trusted link from native panel — open directly.
+                        open_url(&url);
+                    } else {
+                        // Extension-provided link — show confirmation dialog.
+                        let tag = format!("open_ext_url:{}", url);
+                        self.engine.borrow_mut().show_dialog(
+                            &tag,
+                            "Open URL?",
+                            vec![url],
+                            vec![
+                                DialogButton {
+                                    label: "Cancel".to_string(),
+                                    hotkey: 'c',
+                                    action: "cancel".to_string(),
+                                },
+                                DialogButton {
+                                    label: "Open".to_string(),
+                                    hotkey: 'o',
+                                    action: "open".to_string(),
+                                },
+                            ],
+                        );
+                        self.draw_needed.set(true);
+                    }
+                }
+                // Dismiss popup after click.
+                self.engine.borrow_mut().dismiss_panel_hover_now();
+                if let Some(ref da) = *self.panel_hover_da.borrow() {
+                    da.queue_draw();
+                }
+            }
             Msg::AiSidebarKey(key_name, ctrl, unicode) => {
+                if self.engine.borrow().dialog.is_some() {
+                    let mut engine = self.engine.borrow_mut();
+                    engine.handle_key(&key_name, key_name.chars().next(), ctrl);
+                    drop(engine);
+                    if let Some(ref drawing) = *self.drawing_area.borrow() {
+                        drawing.grab_focus();
+                    }
+                    self.draw_needed.set(true);
+                    return;
+                }
                 // Ctrl-V: paste from system clipboard into AI input.
                 if ctrl && key_name == "v" {
                     if let Some(ref mut ctx) = self.clipboard {
@@ -7652,6 +8829,7 @@ fn draw_editor(
     diff_btn_map_out: &Rc<RefCell<DiffBtnMap>>,
     split_btn_map_out: &Rc<RefCell<SplitBtnMap>>,
     dialog_btn_rects_out: &Rc<RefCell<DialogBtnRects>>,
+    editor_hover_rect_out: &Rc<Cell<Option<(f64, f64, f64, f64)>>>,
 ) {
     let theme = Theme::from_name(&engine.settings.colorscheme);
 
@@ -7911,6 +9089,16 @@ fn draw_editor(
 
     // 5c3. Draw diff peek popup (inline git hunk preview)
     draw_diff_peek_popup(cr, &layout, &screen, &theme, line_height, char_width);
+
+    // 5c4. Draw editor hover popup (gh key, diagnostic/annotation/plugin hovers)
+    editor_hover_rect_out.set(draw_editor_hover_popup(
+        cr,
+        &layout,
+        &screen,
+        &theme,
+        line_height,
+        char_width,
+    ));
 
     // 5d. Draw fuzzy file-picker modal (on top of everything else)
     draw_fuzzy_popup(
@@ -9644,6 +10832,274 @@ fn draw_hover_popup(
     }
 }
 
+fn draw_editor_hover_popup(
+    cr: &Context,
+    layout: &pango::Layout,
+    screen: &render::ScreenLayout,
+    theme: &Theme,
+    line_height: f64,
+    char_width: f64,
+) -> Option<(f64, f64, f64, f64)> {
+    use crate::core::markdown::MdStyle;
+
+    let eh = screen.editor_hover.as_ref()?;
+    let active_win = screen
+        .windows
+        .iter()
+        .find(|w| w.window_id == screen.active_window_id)?;
+    let lines = &eh.rendered.lines;
+    if lines.is_empty() {
+        return None;
+    }
+
+    let padding = 4.0;
+    let scroll = eh.scroll_top;
+
+    // Popup width: use a comfortable reading width, clamped to editor area
+    let da_width = active_win.rect.x + active_win.rect.width;
+    let popup_w = ((eh.popup_width + 2) as f64 * char_width)
+        .clamp(100.0, (da_width - active_win.rect.x) * 0.9)
+        .min(80.0 * char_width);
+    let text_w = popup_w - padding * 2.0;
+    let pango_text_w = (text_w * pango::SCALE as f64) as i32;
+
+    // Pre-compute wrapped height of each logical line using Pango word wrap
+    let mut line_heights: Vec<f64> = Vec::with_capacity(lines.len());
+    for text_line in lines {
+        let display = format!(" {}", text_line);
+        layout.set_text(&display);
+        layout.set_width(pango_text_w);
+        layout.set_wrap(pango::WrapMode::WordChar);
+        let (_pw, ph) = layout.pixel_size();
+        line_heights.push(ph as f64);
+    }
+    layout.set_width(-1); // reset for later use
+
+    // Determine which lines are visible within a max pixel height
+    let max_popup_content_h = 20.0 * line_height;
+    let total_content_h: f64 = line_heights.iter().sum();
+    let can_scroll = total_content_h > max_popup_content_h;
+    let scrollbar_w = if can_scroll { char_width } else { 0.0 };
+    let popup_w = popup_w + scrollbar_w;
+
+    // Calculate visible content height (lines from scroll onward, capped)
+    let mut visible_content_h = 0.0;
+    let mut visible_end = scroll;
+    for (i, h) in line_heights.iter().enumerate().skip(scroll) {
+        let h = *h;
+        if visible_content_h + h > max_popup_content_h && visible_end > scroll {
+            break;
+        }
+        visible_content_h += h;
+        visible_end = i + 1;
+    }
+    visible_content_h = visible_content_h.min(max_popup_content_h);
+
+    let focus_bar_h = if eh.has_focus { line_height } else { 0.0 };
+    let popup_h = visible_content_h + padding * 2.0 + focus_bar_h;
+
+    let gutter_width = active_win.gutter_char_width as f64 * char_width;
+    // Use frozen scroll offsets so the popup stays fixed on screen
+    let h_scroll_offset = eh.frozen_scroll_left as f64 * char_width;
+    let anchor_view_line = eh.anchor_line.saturating_sub(eh.frozen_scroll_top);
+    let mut popup_x =
+        active_win.rect.x + gutter_width + eh.anchor_col as f64 * char_width - h_scroll_offset;
+
+    // Prefer above the word (like VSCode); below only near the top
+    let space_above = anchor_view_line as f64 * line_height;
+    let space_below = active_win.rect.height - (anchor_view_line as f64 + 1.0) * line_height;
+    let popup_y = if space_above >= popup_h {
+        active_win.rect.y + anchor_view_line as f64 * line_height - popup_h
+    } else if space_below >= popup_h {
+        active_win.rect.y + (anchor_view_line as f64 + 1.0) * line_height
+    } else {
+        // Neither fits perfectly — use the larger space
+        if space_above >= space_below {
+            (active_win.rect.y + anchor_view_line as f64 * line_height - popup_h).max(0.0)
+        } else {
+            active_win.rect.y + (anchor_view_line as f64 + 1.0) * line_height
+        }
+    };
+    // Keep popup on-screen horizontally
+    if popup_x + popup_w > da_width {
+        popup_x = (da_width - popup_w).max(active_win.rect.x);
+    }
+
+    // Background
+    let (r, g, b) = theme.hover_bg.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
+    cr.fill().ok();
+
+    // Border — use link color when focused to indicate keyboard mode
+    let border_color = if eh.has_focus {
+        theme.md_link
+    } else {
+        theme.hover_border
+    };
+    let (r, g, b) = border_color.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    cr.set_line_width(if eh.has_focus { 2.0 } else { 1.0 });
+    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
+    cr.stroke().ok();
+
+    // Clip rendering to popup bounds so text doesn't spill outside
+    cr.save().ok();
+    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
+    cr.clip();
+
+    // Render styled markdown lines with word wrapping
+    let mut y_offset = 0.0;
+    for (li, text_line) in lines.iter().enumerate().take(visible_end).skip(scroll) {
+        let display = format!(" {}", text_line);
+        let actual_line = li;
+        let line_spans = eh.rendered.spans.get(actual_line);
+        let code_hl = eh.rendered.code_highlights.get(actual_line);
+        let has_code_hl = code_hl.is_some_and(|h| !h.is_empty());
+
+        let attrs = pango::AttrList::new();
+        if has_code_hl {
+            // Use tree-sitter syntax highlighting for code block lines.
+            for hl in code_hl.unwrap() {
+                let start = hl.start_byte as u32 + 1; // +1 for leading space
+                let end = hl.end_byte as u32 + 1;
+                let color = theme.scope_color(&hl.scope);
+                let (r, g, b) = color.to_pango_u16();
+                let mut attr = pango::AttrColor::new_foreground(r, g, b);
+                attr.set_start_index(start);
+                attr.set_end_index(end);
+                attrs.insert(attr);
+            }
+        } else if let Some(spans) = line_spans {
+            for sp in spans {
+                let start = sp.start_byte as u32 + 1; // +1 for leading space
+                let end = sp.end_byte as u32 + 1;
+                match sp.style {
+                    MdStyle::Heading(1) => {
+                        let (r, g, b) = theme.md_heading1.to_pango_u16();
+                        let mut attr = pango::AttrColor::new_foreground(r, g, b);
+                        attr.set_start_index(start);
+                        attr.set_end_index(end);
+                        attrs.insert(attr);
+                        let mut attr = pango::AttrInt::new_weight(pango::Weight::Bold);
+                        attr.set_start_index(start);
+                        attr.set_end_index(end);
+                        attrs.insert(attr);
+                    }
+                    MdStyle::Heading(2) => {
+                        let (r, g, b) = theme.md_heading2.to_pango_u16();
+                        let mut attr = pango::AttrColor::new_foreground(r, g, b);
+                        attr.set_start_index(start);
+                        attr.set_end_index(end);
+                        attrs.insert(attr);
+                        let mut attr = pango::AttrInt::new_weight(pango::Weight::Bold);
+                        attr.set_start_index(start);
+                        attr.set_end_index(end);
+                        attrs.insert(attr);
+                    }
+                    MdStyle::Heading(_) => {
+                        let (r, g, b) = theme.md_heading3.to_pango_u16();
+                        let mut attr = pango::AttrColor::new_foreground(r, g, b);
+                        attr.set_start_index(start);
+                        attr.set_end_index(end);
+                        attrs.insert(attr);
+                    }
+                    MdStyle::Bold | MdStyle::BoldItalic => {
+                        let mut attr = pango::AttrInt::new_weight(pango::Weight::Bold);
+                        attr.set_start_index(start);
+                        attr.set_end_index(end);
+                        attrs.insert(attr);
+                    }
+                    MdStyle::Code | MdStyle::CodeBlock => {
+                        let (r, g, b) = theme.md_code.to_pango_u16();
+                        let mut attr = pango::AttrColor::new_foreground(r, g, b);
+                        attr.set_start_index(start);
+                        attr.set_end_index(end);
+                        attrs.insert(attr);
+                    }
+                    MdStyle::Link | MdStyle::LinkUrl => {
+                        let (r, g, b) = theme.md_link.to_pango_u16();
+                        let mut attr = pango::AttrColor::new_foreground(r, g, b);
+                        attr.set_start_index(start);
+                        attr.set_end_index(end);
+                        attrs.insert(attr);
+                        // Underline focused link
+                        if eh.has_focus {
+                            if let Some(focused) = eh.focused_link {
+                                if let Some(&(link_line, sb, eb, _)) = eh.links.get(focused) {
+                                    if link_line == actual_line
+                                        && sp.start_byte >= sb
+                                        && sp.end_byte <= eb
+                                    {
+                                        let mut attr =
+                                            pango::AttrInt::new_underline(pango::Underline::Single);
+                                        attr.set_start_index(start);
+                                        attr.set_end_index(end);
+                                        attrs.insert(attr);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        layout.set_text(&display);
+        layout.set_attributes(Some(&attrs));
+        layout.set_width(pango_text_w);
+        layout.set_wrap(pango::WrapMode::WordChar);
+        let (r, g, b) = theme.hover_fg.to_cairo();
+        cr.set_source_rgb(r, g, b);
+        cr.move_to(popup_x + padding, popup_y + padding + y_offset);
+        pangocairo::show_layout(cr, layout);
+        let (_pw, ph) = layout.pixel_size();
+        y_offset += ph as f64;
+    }
+    layout.set_width(-1);
+    layout.set_attributes(None);
+
+    // Scrollbar when content overflows
+    if can_scroll {
+        let track_h = visible_content_h;
+        let visible_ratio = visible_content_h / total_content_h;
+        let thumb_h = (track_h * visible_ratio).max(line_height);
+        let scroll_range_h: f64 = line_heights.iter().take(scroll).sum();
+        let thumb_top = if total_content_h > visible_content_h {
+            scroll_range_h / (total_content_h - visible_content_h) * (track_h - thumb_h)
+        } else {
+            0.0
+        };
+        let sb_x = popup_x + popup_w - char_width;
+        // Track background
+        let (r, g, b) = theme.hover_border.to_cairo();
+        cr.set_source_rgba(r, g, b, 0.2);
+        cr.rectangle(sb_x, popup_y + padding, char_width, track_h);
+        cr.fill().ok();
+        // Thumb
+        cr.set_source_rgba(r, g, b, 0.6);
+        cr.rectangle(sb_x, popup_y + padding + thumb_top, char_width, thumb_h);
+        cr.fill().ok();
+    }
+
+    // Focus indicator
+    if eh.has_focus {
+        let indicator = "Tab:links  Esc:close";
+        let (r, g, b) = theme.line_number_fg.to_cairo();
+        cr.set_source_rgb(r, g, b);
+        layout.set_text(indicator);
+        layout.set_attributes(None);
+        cr.move_to(popup_x + padding, popup_y + popup_h - line_height - 2.0);
+        pangocairo::show_layout(cr, layout);
+    }
+
+    // Restore clip
+    cr.restore().ok();
+
+    Some((popup_x, popup_y, popup_w, popup_h))
+}
+
 fn draw_diff_peek_popup(
     cr: &Context,
     layout: &pango::Layout,
@@ -10315,9 +11771,12 @@ fn draw_dialog_popup(
     ui_layout.set_text(&dialog.title);
     let (title_w, _) = ui_layout.pixel_size();
 
+    let has_input = dialog.input.is_some();
+    let input_rows = if has_input { 1.0 } else { 0.0 };
     let content_w = body_max_w.max(title_w as f64 + 16.0).max(btn_total_w);
     let popup_w = (content_w + 32.0).clamp(350.0, editor_width - 40.0);
-    let popup_h = ((3.0 + dialog.body.len() as f64 + 2.0) * line_height).min(editor_height - 40.0);
+    let popup_h = ((3.0 + dialog.body.len() as f64 + input_rows + 2.0) * line_height)
+        .min(editor_height - 40.0);
 
     let popup_x = (editor_width - popup_w) / 2.0;
     let popup_y = (editor_height - popup_h) / 2.0;
@@ -10351,6 +11810,29 @@ fn draw_dialog_popup(
         layout.set_text(line);
         layout.set_attributes(None);
         cr.move_to(popup_x + 12.0, body_y + i as f64 * line_height);
+        pangocairo::show_layout(cr, layout);
+    }
+
+    // Input field (if present).
+    if let Some(ref input) = dialog.input {
+        let input_y = body_y + dialog.body.len() as f64 * line_height + line_height * 0.3;
+        // Draw input background.
+        let (ibg_r, ibg_g, ibg_b) = theme.completion_bg.to_cairo();
+        cr.set_source_rgb(ibg_r, ibg_g, ibg_b);
+        cr.rectangle(popup_x + 12.0, input_y, popup_w - 24.0, line_height);
+        cr.fill().ok();
+        // Draw input border.
+        let (br_r, br_g, br_b) = theme.fuzzy_border.to_cairo();
+        cr.set_source_rgb(br_r, br_g, br_b);
+        cr.rectangle(popup_x + 12.0, input_y, popup_w - 24.0, line_height);
+        cr.stroke().ok();
+        // Draw input text.
+        let (r, g, b) = theme.fuzzy_fg.to_cairo();
+        cr.set_source_rgb(r, g, b);
+        layout.set_text(&format!(" {}", input.display));
+        layout.set_attributes(None);
+        let (_, ilh) = layout.pixel_size();
+        cr.move_to(popup_x + 14.0, input_y + (line_height - ilh as f64) / 2.0);
         pangocairo::show_layout(cr, layout);
     }
 
@@ -11456,125 +12938,174 @@ fn draw_source_control_panel(
     let _ = (lw, lh);
     row += 1;
 
-    // ── Row 1: commit input row ───────────────────────────────────────────────
-    if row as f64 * line_height < h {
+    // Vertical gap after header.
+    let gap = (line_height * 0.3).round();
+
+    // ── Row 1+: commit input row(s) ─────────────────────────────────────────
+    // Use float y_commit to track position with gaps.
+    let mut y_commit = y + row as f64 * line_height + gap;
+    if y_commit < y + h {
+        let lines: Vec<&str> = sc.commit_message.split('\n').collect();
+        let commit_rows = lines.len().max(1);
+        let commit_h = commit_rows as f64 * line_height;
         let (inp_bg_r, inp_bg_g, inp_bg_b) = if sc.commit_input_active {
             theme.fuzzy_selected_bg.to_cairo()
         } else {
             theme.completion_bg.to_cairo()
         };
+        // Draw background for all commit input rows with horizontal margin.
+        let margin = 4.0;
         cr.set_source_rgb(inp_bg_r, inp_bg_g, inp_bg_b);
-        cr.rectangle(x, y + row as f64 * line_height, w, line_height);
+        cr.rectangle(x + margin, y_commit, w - margin * 2.0, commit_h);
         cr.fill().ok();
-        let prompt = if sc.commit_input_active {
-            format!(" \u{f044}  {}|", sc.commit_message)
-        } else if sc.commit_message.is_empty() {
-            " \u{f044}  Message (press c to type)".to_string()
-        } else {
-            format!(" \u{f044}  {}", sc.commit_message)
-        };
+
         let (prompt_r, prompt_g, prompt_b) = if sc.commit_input_active {
             (fg_r, fg_g, fg_b)
         } else {
             (dim_r, dim_g, dim_b)
         };
         cr.set_source_rgb(prompt_r, prompt_g, prompt_b);
-        layout.set_text(&prompt);
-        let (_, lh2) = layout.pixel_size();
-        cr.move_to(
-            x + 2.0,
-            y + row as f64 * line_height + (line_height - lh2 as f64) / 2.0,
-        );
-        pangocairo::show_layout(cr, layout);
-        row += 1;
+
+        // Compute cursor line/col for active input.
+        let (cursor_line, cursor_col) = if sc.commit_input_active {
+            let before_cursor = &sc.commit_message[..sc.commit_cursor.min(sc.commit_message.len())];
+            let cl = before_cursor.matches('\n').count();
+            let line_start = before_cursor.rfind('\n').map(|i| i + 1).unwrap_or(0);
+            (cl, before_cursor[line_start..].chars().count())
+        } else {
+            (0, 0)
+        };
+        let prefix = " \u{f044}  ";
+        let pad_str = "    "; // 4 spaces — same visual width as prefix
+
+        if sc.commit_message.is_empty() && !sc.commit_input_active {
+            let prompt = format!("{}Message (press c to type)", prefix);
+            layout.set_text(&prompt);
+            let (_, lh2) = layout.pixel_size();
+            cr.move_to(
+                x + margin + 2.0,
+                y_commit + (line_height - lh2 as f64) / 2.0,
+            );
+            pangocairo::show_layout(cr, layout);
+        } else {
+            for (i, line) in lines.iter().enumerate() {
+                let pfx = if i == 0 { prefix } else { pad_str };
+                let text = format!("{}{}", pfx, line);
+                layout.set_text(&text);
+                let (_, lh2) = layout.pixel_size();
+                let row_y = y_commit + i as f64 * line_height + (line_height - lh2 as f64) / 2.0;
+                cr.move_to(x + margin + 2.0, row_y);
+                pangocairo::show_layout(cr, layout);
+
+                // Draw beam cursor (thin vertical line) at cursor position.
+                if sc.commit_input_active && i == cursor_line {
+                    let pfx_len = pfx.chars().count();
+                    let before_cursor_text: String =
+                        text.chars().take(pfx_len + cursor_col).collect();
+                    layout.set_text(&before_cursor_text);
+                    let (cursor_px, _) = layout.pixel_size();
+                    cr.set_source_rgb(fg_r, fg_g, fg_b);
+                    cr.rectangle(
+                        x + margin + 2.0 + cursor_px as f64,
+                        y_commit + i as f64 * line_height,
+                        1.5,
+                        line_height,
+                    );
+                    cr.fill().ok();
+                    cr.set_source_rgb(prompt_r, prompt_g, prompt_b);
+                }
+            }
+        }
+        y_commit += commit_h;
     }
 
-    // ── Row 2: action buttons ────────────────────────────────────────────────
-    if row as f64 * line_height < h {
+    // ── Action buttons (with padding above and below) ──────────────────────
+    {
+        let btn_pad = gap; // same gap as after header
+        let btn_y_base = y_commit + btn_pad;
+        let btn_h = line_height;
+        let margin = 4.0;
+        let btn_x = x + margin;
+        let btn_w = w - margin * 2.0;
+
         // Commit gets ~50% of the width (with label text).
         // Push / Pull / Sync get equal shares of the remaining width, icon only.
-        let commit_w = w / 2.0;
-        let remain_w = w - commit_w;
+        let commit_w = btn_w / 2.0;
+        let remain_w = btn_w - commit_w;
         let icon_w = remain_w / 3.0;
-        let btn_y_base = y + row as f64 * line_height;
+
+        // Button background color (slightly contrasting).
+        let (btn_bg_r, btn_bg_g, btn_bg_b) = theme.status_bg.to_cairo();
+        // Hover: lighten the button bg slightly.
+        let lighten = |c: f64| (c + 0.08).min(1.0);
+        let (hover_bg_r, hover_bg_g, hover_bg_b) =
+            (lighten(btn_bg_r), lighten(btn_bg_g), lighten(btn_bg_b));
 
         // Helper: fill and label one button segment.
-        let draw_btn = |bx: f64, seg_w: f64, text: &str, focused: bool| {
+        let draw_btn = |bx: f64, seg_w: f64, text: &str, focused: bool, hovered: bool| {
             let (fill_r, fill_g, fill_b) = if focused {
                 (hdr_r, hdr_g, hdr_b)
+            } else if hovered {
+                (hover_bg_r, hover_bg_g, hover_bg_b)
             } else {
-                (bg_r, bg_g, bg_b)
-            };
-            let (text_r, text_g, text_b) = if focused {
-                (fg_r, fg_g, fg_b)
-            } else {
-                (dim_r, dim_g, dim_b)
+                (btn_bg_r, btn_bg_g, btn_bg_b)
             };
             cr.set_source_rgb(fill_r, fill_g, fill_b);
-            cr.rectangle(bx, btn_y_base, seg_w, line_height);
+            cr.rectangle(bx, btn_y_base, seg_w, btn_h);
             cr.fill().ok();
-            cr.set_source_rgb(text_r, text_g, text_b);
+            cr.set_source_rgb(fg_r, fg_g, fg_b);
             layout.set_text(text);
             let (_, lh_btn) = layout.pixel_size();
-            cr.move_to(bx + 2.0, btn_y_base + (line_height - lh_btn as f64) / 2.0);
+            cr.move_to(bx + 2.0, btn_y_base + (btn_h - lh_btn as f64) / 2.0);
             pangocairo::show_layout(cr, layout);
         };
 
-        // Commit button (index 0)
-        draw_btn(
-            x,
-            commit_w,
-            " \u{e729} Commit",
-            sc.button_focused == Some(0),
-        );
-        // Push (index 1)
-        draw_btn(
-            x + commit_w,
-            icon_w,
-            " \u{f093}",
-            sc.button_focused == Some(1),
-        );
-        // Pull (index 2)
-        draw_btn(
-            x + commit_w + icon_w,
-            icon_w,
-            " \u{f019}",
-            sc.button_focused == Some(2),
-        );
-        // Sync (index 3): fill to the right edge
-        draw_btn(
-            x + commit_w + icon_w * 2.0,
-            w - (commit_w + icon_w * 2.0),
-            " \u{f021}",
-            sc.button_focused == Some(3),
-        );
+        for (i, (bx, bw, label)) in [
+            (btn_x, commit_w, " \u{e729} Commit"),
+            (btn_x + commit_w, icon_w, " \u{f093}"),
+            (btn_x + commit_w + icon_w, icon_w, " \u{f019}"),
+            (
+                btn_x + commit_w + icon_w * 2.0,
+                btn_w - (commit_w + icon_w * 2.0),
+                " \u{f021}",
+            ),
+        ]
+        .iter()
+        .enumerate()
+        {
+            draw_btn(
+                *bx,
+                *bw,
+                label,
+                sc.button_focused == Some(i),
+                sc.button_hovered == Some(i),
+            );
+        }
 
-        row += 1;
+        y_commit = btn_y_base + btn_h + btn_pad;
     }
 
-    // Helper to draw a section
+    // Helper to draw a section — uses y_off (float) for vertical positioning.
+    let item_height = (line_height * 1.4).round();
     let draw_section = |cr: &Context,
                         layout: &pango::Layout,
                         title: &str,
                         items: &[String],
                         expanded: bool,
-                        base_row: &mut usize,
+                        y_off: &mut f64,
                         flat_start: usize,
                         selected: usize| {
         let arrow = if expanded { "▼" } else { "▶" };
         let header_text = format!("  {} {} ({})", arrow, title, items.len());
         cr.set_source_rgb(hdr_r, hdr_g, hdr_b);
-        cr.rectangle(x, y + *base_row as f64 * line_height, w, line_height);
+        cr.rectangle(x, *y_off, w, line_height);
         cr.fill().ok();
         cr.set_source_rgb(fg_r, fg_g, fg_b);
         layout.set_text(&header_text);
         let (_, lh) = layout.pixel_size();
-        cr.move_to(
-            x + 2.0,
-            y + *base_row as f64 * line_height + (line_height - lh as f64) / 2.0,
-        );
+        cr.move_to(x + 2.0, *y_off + (line_height - lh as f64) / 2.0);
         pangocairo::show_layout(cr, layout);
-        *base_row += 1;
+        *y_off += line_height;
 
         if expanded {
             for (i, item) in items.iter().enumerate() {
@@ -11582,7 +13113,7 @@ fn draw_source_control_panel(
                 let is_sel = flat_idx == selected;
                 if is_sel {
                     cr.set_source_rgb(sel_r, sel_g, sel_b);
-                    cr.rectangle(x, y + *base_row as f64 * line_height, w, line_height);
+                    cr.rectangle(x, *y_off, w, item_height);
                     cr.fill().ok();
                 }
                 cr.set_source_rgb(
@@ -11592,13 +13123,10 @@ fn draw_source_control_panel(
                 );
                 layout.set_text(&format!("    {}", item));
                 let (_, lh) = layout.pixel_size();
-                cr.move_to(
-                    x + 2.0,
-                    y + *base_row as f64 * line_height + (line_height - lh as f64) / 2.0,
-                );
+                cr.move_to(x + 2.0, *y_off + (item_height - lh as f64) / 2.0);
                 pangocairo::show_layout(cr, layout);
-                *base_row += 1;
-                if y + *base_row as f64 * line_height > y + h {
+                *y_off += item_height;
+                if *y_off > y + h {
                     break;
                 }
             }
@@ -11651,15 +13179,18 @@ fn draw_source_control_panel(
         wt_flat_start
     };
 
+    // Track vertical position for sections (float, since item_height != line_height).
+    let mut y_off = y_commit;
+
     // Draw staged section
-    if row as f64 * line_height < h {
+    if y_off < y + h {
         draw_section(
             cr,
             layout,
             "STAGED CHANGES",
             &staged_items,
             sc.sections_expanded[0],
-            &mut row,
+            &mut y_off,
             staged_flat_start,
             sc.selected,
         );
@@ -11669,35 +13200,35 @@ fn draw_source_control_panel(
     let _ = (add_r, add_g, add_b, del_r, del_g, del_b);
 
     // Draw unstaged section
-    if row as f64 * line_height < h {
+    if y_off < y + h {
         draw_section(
             cr,
             layout,
             "CHANGES",
             &unstaged_items,
             sc.sections_expanded[1],
-            &mut row,
+            &mut y_off,
             unstaged_flat_start,
             sc.selected,
         );
     }
 
     // Draw worktrees section (only when there are linked worktrees beyond the main one).
-    if row as f64 * line_height < h && show_worktrees {
+    if y_off < y + h && show_worktrees {
         draw_section(
             cr,
             layout,
             "WORKTREES",
             &wt_items,
             sc.sections_expanded[2],
-            &mut row,
+            &mut y_off,
             wt_flat_start,
             sc.selected,
         );
     }
 
     // Draw log section (RECENT COMMITS) — always present.
-    if row as f64 * line_height < h {
+    if y_off < y + h {
         let log_items: Vec<String> = sc
             .log
             .iter()
@@ -11709,7 +13240,7 @@ fn draw_source_control_panel(
             "\u{f417} RECENT COMMITS",
             &log_items,
             sc.sections_expanded[3],
-            &mut row,
+            &mut y_off,
             log_flat_start,
             sc.selected,
         );
@@ -11857,6 +13388,555 @@ fn draw_source_control_panel(
     }
 }
 
+// ─── Extension-provided panel (e.g. git-insights GIT LOG) ─────────────────────
+
+#[allow(clippy::too_many_arguments)]
+fn draw_ext_dyn_panel(
+    cr: &Context,
+    layout: &pango::Layout,
+    screen: &render::ScreenLayout,
+    theme: &Theme,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    line_height: f64,
+) {
+    use crate::core::plugin::ExtPanelStyle;
+
+    let Some(ref panel) = screen.ext_panel else {
+        return;
+    };
+
+    let (bg_r, bg_g, bg_b) = theme.tab_bar_bg.to_cairo();
+    let (hdr_r, hdr_g, hdr_b) = theme.status_bg.to_cairo();
+    let (fg_r, fg_g, fg_b) = theme.status_fg.to_cairo();
+    let (item_r, item_g, item_b) = theme.foreground.to_cairo();
+    let (dim_r, dim_g, dim_b) = theme.line_number_fg.to_cairo();
+    let (accent_r, accent_g, accent_b) = theme.keyword.to_cairo();
+    let (sel_r, sel_g, sel_b) = theme.fuzzy_selected_bg.to_cairo();
+
+    // Background
+    cr.set_source_rgb(bg_r, bg_g, bg_b);
+    cr.rectangle(x, y, w, h);
+    cr.fill().ok();
+
+    layout.set_attributes(None);
+    let mut ry: f64 = 0.0;
+
+    // ── Row 0: panel header ─────────────────────────────────────────────────
+    cr.set_source_rgb(hdr_r, hdr_g, hdr_b);
+    cr.rectangle(x, y + ry, w, line_height);
+    cr.fill().ok();
+    let hdr_text = format!("  {}", panel.title);
+    cr.set_source_rgb(fg_r, fg_g, fg_b);
+    layout.set_text(&hdr_text);
+    let (_, lh) = layout.pixel_size();
+    cr.move_to(x + 2.0, y + ry + (line_height - lh as f64) / 2.0);
+    pangocairo::show_layout(cr, layout);
+    ry += line_height;
+
+    if ry >= h {
+        return;
+    }
+
+    // ── Build flat list of rows ─────────────────────────────────────────────
+    struct FlatRow {
+        text: String,
+        hint: String,
+        is_header: bool,
+        style: ExtPanelStyle,
+        is_separator: bool,
+        badges: Vec<crate::core::plugin::ExtPanelBadge>,
+        actions: Vec<crate::core::plugin::ExtPanelAction>,
+    }
+    let mut flat_rows: Vec<FlatRow> = Vec::new();
+    for section in &panel.sections {
+        let arrow = if section.expanded { "▼" } else { "▶" };
+        flat_rows.push(FlatRow {
+            text: format!(" {} {}", arrow, section.name),
+            hint: String::new(),
+            is_header: true,
+            style: ExtPanelStyle::Header,
+            is_separator: false,
+            badges: Vec::new(),
+            actions: Vec::new(),
+        });
+        if section.expanded {
+            for item in &section.items {
+                if item.is_separator {
+                    flat_rows.push(FlatRow {
+                        text: String::new(),
+                        hint: String::new(),
+                        is_header: false,
+                        style: ExtPanelStyle::Dim,
+                        is_separator: true,
+                        badges: Vec::new(),
+                        actions: Vec::new(),
+                    });
+                    continue;
+                }
+                let indent = "  ".repeat(item.indent as usize + 1);
+                let chevron = if item.expandable {
+                    if item.expanded {
+                        "▼ "
+                    } else {
+                        "▶ "
+                    }
+                } else {
+                    ""
+                };
+                let icon_part = if item.icon.is_empty() {
+                    String::new()
+                } else {
+                    format!("{} ", item.icon)
+                };
+                flat_rows.push(FlatRow {
+                    text: format!("{}{}{}{}", indent, chevron, icon_part, item.text),
+                    hint: item.hint.clone(),
+                    style: item.style,
+                    is_header: false,
+                    is_separator: false,
+                    badges: item.badges.clone(),
+                    actions: item.actions.clone(),
+                });
+            }
+        }
+    }
+
+    // ── Render visible rows with scroll offset ──────────────────────────────
+    let content_h = h - ry;
+    let max_rows = (content_h / line_height) as usize;
+    let scroll = panel.scroll_top;
+    let visible = &flat_rows[scroll.min(flat_rows.len())..];
+
+    for (ri, row) in visible.iter().enumerate().take(max_rows) {
+        let row_y = y + ry + ri as f64 * line_height;
+        let is_sel = (scroll + ri) == panel.selected;
+
+        // Separator: horizontal line
+        if row.is_separator {
+            let sep_y = row_y + line_height / 2.0;
+            cr.set_source_rgb(dim_r, dim_g, dim_b);
+            cr.set_line_width(1.0);
+            cr.move_to(x + 8.0, sep_y);
+            cr.line_to(x + w - 8.0, sep_y);
+            cr.stroke().ok();
+            continue;
+        }
+
+        // Selection highlight
+        if is_sel && panel.has_focus {
+            cr.set_source_rgb(sel_r, sel_g, sel_b);
+            cr.rectangle(x, row_y, w, line_height);
+            cr.fill().ok();
+        }
+
+        // Choose foreground color based on style
+        let (text_r, text_g, text_b) = if row.is_header {
+            (fg_r, fg_g, fg_b)
+        } else {
+            match row.style {
+                ExtPanelStyle::Header => (fg_r, fg_g, fg_b),
+                ExtPanelStyle::Dim => (dim_r, dim_g, dim_b),
+                ExtPanelStyle::Accent => (accent_r, accent_g, accent_b),
+                ExtPanelStyle::Normal => (item_r, item_g, item_b),
+            }
+        };
+
+        // Measure right-side decorations: badges + actions + hint
+        let mut right_w: f64 = 0.0;
+
+        // Measure badges
+        for badge in &row.badges {
+            let badge_text = format!(" {} ", badge.text);
+            layout.set_text(&badge_text);
+            right_w += layout.pixel_size().0 as f64 + 4.0;
+        }
+
+        // Measure actions (only shown on selected row)
+        if is_sel && panel.has_focus {
+            for action in &row.actions {
+                let action_text = format!(" {} ", action.label);
+                layout.set_text(&action_text);
+                right_w += layout.pixel_size().0 as f64 + 4.0;
+            }
+        }
+
+        // Measure hint
+        let hint_w = if !row.hint.is_empty() {
+            layout.set_text(&row.hint);
+            let pw = layout.pixel_size().0 as f64;
+            right_w += pw + 4.0;
+            pw
+        } else {
+            0.0
+        };
+
+        // Draw text with ellipsis
+        let name_max = (w - 6.0 - right_w).max(20.0) as i32;
+        cr.set_source_rgb(text_r, text_g, text_b);
+        layout.set_text(&row.text);
+        layout.set_width(name_max * pango::SCALE);
+        layout.set_ellipsize(pango::EllipsizeMode::End);
+        let (_, text_h) = layout.pixel_size();
+        cr.move_to(x + 2.0, row_y + (line_height - text_h as f64) / 2.0);
+        pangocairo::show_layout(cr, layout);
+        layout.set_width(-1);
+        layout.set_ellipsize(pango::EllipsizeMode::None);
+
+        // Draw right-side decorations from right to left
+        let mut rx = x + w - 4.0;
+        let text_y = row_y + (line_height - text_h as f64) / 2.0;
+
+        // Hint (rightmost)
+        if hint_w > 0.0 {
+            rx -= hint_w;
+            cr.set_source_rgb(dim_r, dim_g, dim_b);
+            layout.set_text(&row.hint);
+            cr.move_to(rx, text_y);
+            pangocairo::show_layout(cr, layout);
+            rx -= 4.0;
+        }
+
+        // Actions (only on selected row)
+        if is_sel && panel.has_focus {
+            for action in row.actions.iter().rev() {
+                let action_text = format!(" {} ", action.label);
+                layout.set_text(&action_text);
+                let aw = layout.pixel_size().0 as f64;
+                rx -= aw;
+                // Draw action button background
+                cr.set_source_rgb(accent_r, accent_g, accent_b);
+                cr.rectangle(rx, row_y + 2.0, aw, line_height - 4.0);
+                cr.fill().ok();
+                cr.set_source_rgb(bg_r, bg_g, bg_b);
+                cr.move_to(rx, text_y);
+                pangocairo::show_layout(cr, layout);
+                rx -= 4.0;
+            }
+        }
+
+        // Badges
+        for badge in row.badges.iter().rev() {
+            let badge_text = format!(" {} ", badge.text);
+            layout.set_text(&badge_text);
+            let bw = layout.pixel_size().0 as f64;
+            rx -= bw;
+            // Parse badge color (try hex, fallback to dim)
+            let (br, bg, bb) = parse_badge_color(&badge.color).unwrap_or((dim_r, dim_g, dim_b));
+            // Draw badge pill background (slightly transparent)
+            cr.set_source_rgba(br, bg, bb, 0.25);
+            cr.rectangle(rx, row_y + 2.0, bw, line_height - 4.0);
+            cr.fill().ok();
+            // Badge text in badge color
+            cr.set_source_rgb(br, bg, bb);
+            cr.move_to(rx, text_y);
+            pangocairo::show_layout(cr, layout);
+            rx -= 4.0;
+        }
+    }
+
+    // ── Scrollbar ───────────────────────────────────────────────────────────
+    let total = flat_rows.len();
+    if total > max_rows && max_rows > 0 {
+        let track_h = content_h;
+        let thumb_h = (track_h * max_rows as f64 / total as f64).max(4.0);
+        let thumb_top = scroll as f64 * track_h / total as f64;
+        let sb_x = x + w - 5.0;
+        cr.set_source_rgb(dim_r, dim_g, dim_b);
+        cr.rectangle(sb_x, y + ry + thumb_top, 4.0, thumb_h);
+        cr.fill().ok();
+    }
+}
+
+/// Parse a badge color string (hex like "#4ec9b0" or named colors) to cairo RGB.
+fn parse_badge_color(color: &str) -> Option<(f64, f64, f64)> {
+    if let Some(hex) = color.strip_prefix('#') {
+        if hex.len() == 6 {
+            let r = u8::from_str_radix(&hex[0..2], 16).ok()? as f64 / 255.0;
+            let g = u8::from_str_radix(&hex[2..4], 16).ok()? as f64 / 255.0;
+            let b = u8::from_str_radix(&hex[4..6], 16).ok()? as f64 / 255.0;
+            return Some((r, g, b));
+        }
+    }
+    match color {
+        "red" => Some((0.9, 0.3, 0.3)),
+        "green" => Some((0.3, 0.8, 0.4)),
+        "blue" => Some((0.3, 0.5, 0.9)),
+        "yellow" => Some((0.9, 0.8, 0.3)),
+        "orange" => Some((0.9, 0.6, 0.2)),
+        "cyan" => Some((0.3, 0.8, 0.8)),
+        "magenta" | "purple" => Some((0.7, 0.3, 0.8)),
+        _ => None,
+    }
+}
+
+// ─── Panel hover popup (sidebar item dwell tooltip with markdown) ──────────────
+
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn draw_panel_hover_popup(
+    cr: &Context,
+    layout: &pango::Layout,
+    screen: &render::ScreenLayout,
+    theme: &Theme,
+    sidebar_right_x: f64,
+    _sidebar_y: f64,
+    window_w: f64,
+    window_h: f64,
+    line_height: f64,
+    is_native: bool,
+) -> (
+    Vec<(f64, f64, f64, f64, String, bool)>,
+    Option<(f64, f64, f64, f64)>,
+) {
+    use crate::core::markdown::MdStyle;
+
+    let Some(ref hover) = screen.panel_hover else {
+        return (vec![], None);
+    };
+
+    let rendered = &hover.rendered;
+    if rendered.lines.is_empty() {
+        return (vec![], None);
+    }
+
+    // Measure popup dimensions.
+    const MAX_POPUP_W: f64 = 400.0;
+    const MAX_POPUP_H: f64 = 300.0;
+    const PADDING: f64 = 6.0;
+
+    let num_lines = rendered.lines.len().min(20);
+
+    // Measure the widest line to set popup width.
+    let mut max_line_w = 0i32;
+    for line_text in rendered.lines.iter().take(num_lines) {
+        let display = format!(" {} ", line_text);
+        layout.set_text(&display);
+        layout.set_attributes(None);
+        let (w, _) = layout.pixel_size();
+        if w > max_line_w {
+            max_line_w = w;
+        }
+    }
+    let popup_w = (max_line_w as f64 + PADDING * 2.0).clamp(80.0, MAX_POPUP_W);
+    let popup_h = (num_lines as f64 * line_height + PADDING * 2.0).min(MAX_POPUP_H);
+
+    // Y position: align with the hovered item row.
+    let item_row_y = if hover.panel_name == "source_control" {
+        // SC layout: header(lh) + gap + commit(lh*rows) + gap + buttons(lh) + gap + sections
+        // The flat index maps into the sections area. Use SC-specific geometry.
+        let gap = (line_height * 0.3).round();
+        let item_height = (line_height * 1.4).round();
+        let commit_rows = screen
+            .source_control
+            .as_ref()
+            .map(|sc| sc.commit_message.split('\n').count().max(1))
+            .unwrap_or(1) as f64;
+        let section_top = line_height + gap + commit_rows * line_height + gap + line_height + gap;
+        // Walk sections to find the accumulated Y offset for the hovered flat_idx.
+        // Headers use line_height, items use item_height.
+        // Staged + Unstaged always show; Worktrees only when > 1; Log always shows.
+        if let Some(ref sc) = screen.source_control {
+            let show_worktrees = sc.worktrees.len() > 1;
+            let mut sections: Vec<(usize, bool)> = vec![
+                (sc.staged.len(), sc.sections_expanded[0]),
+                (sc.unstaged.len(), sc.sections_expanded[1]),
+            ];
+            if show_worktrees {
+                sections.push((sc.worktrees.len(), sc.sections_expanded[2]));
+            }
+            sections.push((sc.log.len(), sc.sections_expanded[3]));
+
+            let mut y_off = section_top;
+            let mut fi = 0usize;
+            'outer: for &(count, expanded) in &sections {
+                if fi == hover.item_index {
+                    break;
+                }
+                y_off += line_height; // section header
+                fi += 1;
+                if expanded {
+                    for _ in 0..count {
+                        if fi == hover.item_index {
+                            break 'outer;
+                        }
+                        y_off += item_height;
+                        fi += 1;
+                    }
+                }
+            }
+            y_off
+        } else {
+            section_top + hover.item_index as f64 * line_height
+        }
+    } else {
+        // Ext panels: header row + item_index rows (uniform line_height)
+        line_height + hover.item_index as f64 * line_height
+    };
+    let popup_y = if item_row_y + popup_h <= window_h {
+        item_row_y
+    } else {
+        (item_row_y + line_height - popup_h).max(0.0)
+    };
+
+    // X position: right edge of sidebar, extending into the editor area.
+    // Clamp width so it doesn't extend past the window.
+    let avail_w = (window_w - sidebar_right_x).max(0.0);
+    let popup_w = popup_w.min(avail_w);
+    if popup_w < 40.0 {
+        return (vec![], None);
+    }
+    let popup_x = sidebar_right_x;
+
+    // Background.
+    let (bg_r, bg_g, bg_b) = theme.hover_bg.to_cairo();
+    cr.set_source_rgb(bg_r, bg_g, bg_b);
+    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
+    cr.fill().ok();
+
+    // Border.
+    let (br, bg_brd, bb) = theme.hover_border.to_cairo();
+    cr.set_source_rgb(br, bg_brd, bb);
+    cr.set_line_width(1.0);
+    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
+    cr.stroke().ok();
+
+    // Render each line with markdown styling.
+    let max_text_w = (popup_w - PADDING * 2.0).max(20.0) as i32;
+    let mut link_rects: Vec<(f64, f64, f64, f64, String, bool)> = Vec::new();
+    for (line_idx, line_text) in rendered.lines.iter().enumerate().take(num_lines) {
+        let row_y = popup_y + PADDING + line_idx as f64 * line_height;
+        if row_y + line_height > popup_y + popup_h {
+            break;
+        }
+
+        let display = format!(" {}", line_text);
+        let line_spans = rendered
+            .spans
+            .get(line_idx)
+            .map(|s| s.as_slice())
+            .unwrap_or(&[]);
+        let code_hl = rendered.code_highlights.get(line_idx);
+        let has_code_hl = code_hl.is_some_and(|h| !h.is_empty());
+
+        // Build pango attr list for this line.
+        let attrs = AttrList::new();
+
+        // Base foreground color for the whole line.
+        let (base_r, base_g, base_b) = theme.hover_fg.to_pango_u16();
+        let mut base_fg = AttrColor::new_foreground(base_r, base_g, base_b);
+        base_fg.set_start_index(0);
+        base_fg.set_end_index(display.len() as u32 + 1);
+        attrs.insert(base_fg);
+
+        // Apply span styles (offset by 1 byte for the leading space).
+        const OFFSET: u32 = 1;
+
+        if has_code_hl {
+            // Use tree-sitter syntax highlighting for code block lines.
+            for hl in code_hl.unwrap() {
+                let start = hl.start_byte as u32 + OFFSET;
+                let end = (hl.end_byte as u32 + OFFSET).min(display.len() as u32 + 1);
+                if start >= end {
+                    continue;
+                }
+                let color = theme.scope_color(&hl.scope);
+                let (r, g, b) = color.to_pango_u16();
+                let mut fg_attr = AttrColor::new_foreground(r, g, b);
+                fg_attr.set_start_index(start);
+                fg_attr.set_end_index(end);
+                attrs.insert(fg_attr);
+            }
+        } else {
+            for span in line_spans {
+                let start = span.start_byte as u32 + OFFSET;
+                let end = (span.end_byte as u32 + OFFSET).min(display.len() as u32 + 1);
+                if start >= end {
+                    continue;
+                }
+
+                let (fg_color, bold, italic): (render::Color, bool, bool) = match span.style {
+                    MdStyle::Heading(1) => (theme.md_heading1, true, false),
+                    MdStyle::Heading(2) => (theme.md_heading2, true, false),
+                    MdStyle::Heading(_) => (theme.md_heading3, true, false),
+                    MdStyle::Bold => (theme.hover_fg, true, false),
+                    MdStyle::Italic => (theme.hover_fg, false, true),
+                    MdStyle::BoldItalic => (theme.hover_fg, true, true),
+                    MdStyle::Code | MdStyle::CodeBlock => (theme.md_code, false, false),
+                    MdStyle::Link => (theme.md_link, false, false),
+                    MdStyle::LinkUrl => (theme.md_link, false, true),
+                    MdStyle::BlockQuote => (theme.md_heading3, false, true),
+                    MdStyle::ListBullet => (theme.md_heading1, true, false),
+                    MdStyle::HorizontalRule => (theme.line_number_fg, false, false),
+                    MdStyle::Image => (theme.md_link, false, true),
+                };
+
+                let (fr, fg_g, fb) = fg_color.to_pango_u16();
+                let mut fg_attr = AttrColor::new_foreground(fr, fg_g, fb);
+                fg_attr.set_start_index(start);
+                fg_attr.set_end_index(end);
+                attrs.insert(fg_attr);
+
+                if bold {
+                    let mut w = pango::AttrInt::new_weight(pango::Weight::Bold);
+                    w.set_start_index(start);
+                    w.set_end_index(end);
+                    attrs.insert(w);
+                }
+                if italic {
+                    let mut s = pango::AttrInt::new_style(pango::Style::Italic);
+                    s.set_start_index(start);
+                    s.set_end_index(end);
+                    attrs.insert(s);
+                }
+                if span.style == MdStyle::Link {
+                    let mut u = pango::AttrInt::new_underline(pango::Underline::Single);
+                    u.set_start_index(start);
+                    u.set_end_index(end);
+                    attrs.insert(u);
+                }
+            }
+        }
+
+        layout.set_text(&display);
+        layout.set_attributes(Some(&attrs));
+        layout.set_width(max_text_w * pango::SCALE);
+        layout.set_ellipsize(pango::EllipsizeMode::End);
+        let (_, text_h) = layout.pixel_size();
+        cr.move_to(
+            popup_x + PADDING,
+            row_y + (line_height - text_h as f64) / 2.0,
+        );
+        pangocairo::show_layout(cr, layout);
+
+        // Compute link hit rects for clickable URLs in this line.
+        for link in &hover.links {
+            if link.0 != line_idx {
+                continue;
+            }
+            // link = (line_idx, start_byte, end_byte, url)
+            // Measure the pixel position of the link text within the layout.
+            // The display string has a 1-byte " " prefix, so offset by 1.
+            let link_start = link.1 + 1; // byte offset in display string
+            let link_end = link.2 + 1;
+            // Use pango to convert byte indices to pixel positions.
+            let start_idx = layout.index_to_pos(link_start as i32);
+            let end_idx = layout.index_to_pos(link_end.min(display.len()) as i32);
+            let lx = popup_x + PADDING + start_idx.x() as f64 / pango::SCALE as f64;
+            let ly = row_y;
+            let lw = (end_idx.x() - start_idx.x()) as f64 / pango::SCALE as f64;
+            let lh = line_height;
+            link_rects.push((lx, ly, lw, lh, link.3.clone(), is_native));
+        }
+
+        layout.set_attributes(None);
+        layout.set_width(-1);
+        layout.set_ellipsize(pango::EllipsizeMode::None);
+    }
+    (link_rects, Some((popup_x, popup_y, popup_w, popup_h)))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_ext_sidebar(
     cr: &Context,
@@ -11884,12 +13964,73 @@ fn draw_ext_sidebar(
     cr.rectangle(x, y, w, h);
     cr.fill().ok();
 
+    // Item rows get extra vertical padding for readability.
+    let item_height = (line_height * 1.4).ceil();
+    let pad = (item_height - line_height) / 2.0;
+
     layout.set_attributes(None);
-    let mut row: usize = 0;
+    let mut ry: f64 = 0.0;
+
+    // Helper: draw a text row with optional right-aligned hint (only on selected).
+    // Returns the row height used.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_item_row(
+        cr: &Context,
+        layout: &pango::Layout,
+        x: f64,
+        y: f64,
+        ry: f64,
+        w: f64,
+        item_height: f64,
+        pad: f64,
+        is_selected: bool,
+        sel_rgb: (f64, f64, f64),
+        fg_rgb: (f64, f64, f64),
+        dim_rgb: (f64, f64, f64),
+        name_text: &str,
+        hint: &str,
+    ) {
+        if is_selected {
+            cr.set_source_rgb(sel_rgb.0, sel_rgb.1, sel_rgb.2);
+            cr.rectangle(x, y + ry, w, item_height);
+            cr.fill().ok();
+        }
+        // Measure hint width.
+        let hint_w = if is_selected && !hint.is_empty() {
+            layout.set_text(hint);
+            layout.pixel_size().0
+        } else {
+            0
+        };
+        // Draw name with ellipsis if needed.
+        let name_max = (w - 6.0 - hint_w as f64).max(20.0) as i32;
+        cr.set_source_rgb(fg_rgb.0, fg_rgb.1, fg_rgb.2);
+        layout.set_text(name_text);
+        layout.set_width(name_max * pango::SCALE);
+        layout.set_ellipsize(pango::EllipsizeMode::End);
+        let (_, text_h) = layout.pixel_size();
+        cr.move_to(
+            x + 2.0,
+            y + ry + pad + (item_height - pad * 2.0 - text_h as f64) / 2.0,
+        );
+        pangocairo::show_layout(cr, layout);
+        layout.set_width(-1);
+        layout.set_ellipsize(pango::EllipsizeMode::None);
+        // Right-aligned hint.
+        if hint_w > 0 {
+            cr.set_source_rgb(dim_rgb.0, dim_rgb.1, dim_rgb.2);
+            layout.set_text(hint);
+            cr.move_to(
+                x + w - hint_w as f64 - 4.0,
+                y + ry + pad + (item_height - pad * 2.0 - text_h as f64) / 2.0,
+            );
+            pangocairo::show_layout(cr, layout);
+        }
+    }
 
     // ── Row 0: panel header ──────────────────────────────────────────────────
     cr.set_source_rgb(hdr_r, hdr_g, hdr_b);
-    cr.rectangle(x, y + row as f64 * line_height, w, line_height);
+    cr.rectangle(x, y + ry, w, line_height);
     cr.fill().ok();
     let hdr_text = if ext.fetching {
         "  \u{eae6} EXTENSIONS  (fetching…)".to_string()
@@ -11899,22 +14040,19 @@ fn draw_ext_sidebar(
     cr.set_source_rgb(fg_r, fg_g, fg_b);
     layout.set_text(&hdr_text);
     let (_, lh) = layout.pixel_size();
-    cr.move_to(
-        x + 2.0,
-        y + row as f64 * line_height + (line_height - lh as f64) / 2.0,
-    );
+    cr.move_to(x + 2.0, y + ry + (line_height - lh as f64) / 2.0);
     pangocairo::show_layout(cr, layout);
-    row += 1;
+    ry += line_height;
 
     // ── Row 1: search box ─────────────────────────────────────────────────────
-    if row as f64 * line_height < h {
+    if ry < h {
         let (inp_bg_r, inp_bg_g, inp_bg_b) = if ext.input_active {
             theme.fuzzy_selected_bg.to_cairo()
         } else {
             theme.completion_bg.to_cairo()
         };
         cr.set_source_rgb(inp_bg_r, inp_bg_g, inp_bg_b);
-        cr.rectangle(x, y + row as f64 * line_height, w, line_height);
+        cr.rectangle(x, y + ry, w, line_height);
         cr.fill().ok();
         let search_text = if ext.input_active {
             format!(" \u{f002}  {}|", ext.query)
@@ -11931,18 +14069,14 @@ fn draw_ext_sidebar(
         cr.set_source_rgb(text_r, text_g, text_b);
         layout.set_text(&search_text);
         let (_, lh2) = layout.pixel_size();
-        cr.move_to(
-            x + 2.0,
-            y + row as f64 * line_height + (line_height - lh2 as f64) / 2.0,
-        );
+        cr.move_to(x + 2.0, y + ry + (line_height - lh2 as f64) / 2.0);
         pangocairo::show_layout(cr, layout);
-        row += 1;
+        ry += line_height;
     }
 
     // ── INSTALLED section ─────────────────────────────────────────────────────
     let installed_count = ext.items_installed.len();
-    if row as f64 * line_height < h {
-        // Section header
+    if ry < h {
         let arrow = if ext.sections_expanded[0] {
             "▼"
         } else {
@@ -11950,77 +14084,65 @@ fn draw_ext_sidebar(
         };
         let sec_hdr = format!("  {} INSTALLED ({})", arrow, installed_count);
         cr.set_source_rgb(hdr_r * 0.85, hdr_g * 0.85, hdr_b * 0.85);
-        cr.rectangle(x, y + row as f64 * line_height, w, line_height);
+        cr.rectangle(x, y + ry, w, line_height);
         cr.fill().ok();
         cr.set_source_rgb(dim_r, dim_g, dim_b);
         layout.set_text(&sec_hdr);
         let (_, lh3) = layout.pixel_size();
-        cr.move_to(
-            x + 2.0,
-            y + row as f64 * line_height + (line_height - lh3 as f64) / 2.0,
-        );
+        cr.move_to(x + 2.0, y + ry + (line_height - lh3 as f64) / 2.0);
         pangocairo::show_layout(cr, layout);
-        row += 1;
+        ry += line_height;
     }
 
     if ext.sections_expanded[0] {
         for (idx, item) in ext.items_installed.iter().enumerate() {
-            if row as f64 * line_height >= h {
+            if ry >= h {
                 break;
             }
-            let flat_idx = idx;
-            let is_selected = ext.has_focus && ext.selected == flat_idx;
-            if is_selected {
-                cr.set_source_rgb(sel_r, sel_g, sel_b);
-                cr.rectangle(x, y + row as f64 * line_height, w, line_height);
-                cr.fill().ok();
-            }
-            // Status dot + name + update indicator
+            let is_selected = ext.has_focus && ext.selected == idx;
             let name_text = if item.update_available {
-                format!("  ● {} \u{2191}", item.display_name) // ↑ update indicator
+                format!("  ● {} \u{2191}", item.display_name)
             } else {
                 format!("  ● {}", item.display_name)
             };
-            cr.set_source_rgb(fg_r, fg_g, fg_b);
-            layout.set_text(&name_text);
-            let (_, lh4) = layout.pixel_size();
-            cr.move_to(
-                x + 2.0,
-                y + row as f64 * line_height + (line_height - lh4 as f64) / 2.0,
-            );
-            pangocairo::show_layout(cr, layout);
-            // Right-aligned hint
-            let hint = if item.update_available {
-                "  [u] update"
+            let hint = if !is_selected {
+                ""
+            } else if item.update_available {
+                "[u]update"
             } else {
-                "  [d] remove"
+                "[d]remove"
             };
-            cr.set_source_rgb(dim_r, dim_g, dim_b);
-            layout.set_text(hint);
-            let (hint_w, _) = layout.pixel_size();
-            cr.move_to(
-                x + w - hint_w as f64 - 4.0,
-                y + row as f64 * line_height + (line_height - lh4 as f64) / 2.0,
+            draw_item_row(
+                cr,
+                layout,
+                x,
+                y,
+                ry,
+                w,
+                item_height,
+                pad,
+                is_selected,
+                (sel_r, sel_g, sel_b),
+                (fg_r, fg_g, fg_b),
+                (dim_r, dim_g, dim_b),
+                &name_text,
+                hint,
             );
-            pangocairo::show_layout(cr, layout);
-            row += 1;
+            ry += item_height;
         }
-        if installed_count == 0 && row as f64 * line_height < h {
+        if installed_count == 0 && ry < h {
             cr.set_source_rgb(dim_r, dim_g, dim_b);
             layout.set_text("    (none installed)");
             let (_, lhn) = layout.pixel_size();
-            cr.move_to(
-                x + 2.0,
-                y + row as f64 * line_height + (line_height - lhn as f64) / 2.0,
-            );
+            cr.move_to(x + 2.0, y + ry + (item_height - lhn as f64) / 2.0);
             pangocairo::show_layout(cr, layout);
-            row += 1;
+            ry += item_height;
         }
     }
 
     // ── AVAILABLE section ─────────────────────────────────────────────────────
     let available_count = ext.items_available.len();
-    if row as f64 * line_height < h {
+    if ry < h {
         let arrow = if ext.sections_expanded[1] {
             "▼"
         } else {
@@ -12028,55 +14150,44 @@ fn draw_ext_sidebar(
         };
         let sec_hdr = format!("  {} AVAILABLE ({})", arrow, available_count);
         cr.set_source_rgb(hdr_r * 0.85, hdr_g * 0.85, hdr_b * 0.85);
-        cr.rectangle(x, y + row as f64 * line_height, w, line_height);
+        cr.rectangle(x, y + ry, w, line_height);
         cr.fill().ok();
         cr.set_source_rgb(dim_r, dim_g, dim_b);
         layout.set_text(&sec_hdr);
         let (_, lh5) = layout.pixel_size();
-        cr.move_to(
-            x + 2.0,
-            y + row as f64 * line_height + (line_height - lh5 as f64) / 2.0,
-        );
+        cr.move_to(x + 2.0, y + ry + (line_height - lh5 as f64) / 2.0);
         pangocairo::show_layout(cr, layout);
-        row += 1;
+        ry += line_height;
     }
 
     if ext.sections_expanded[1] {
         for (idx, item) in ext.items_available.iter().enumerate() {
-            if row as f64 * line_height >= h {
+            if ry >= h {
                 break;
             }
-            // flat index matches engine: installed items (no placeholder) + available index
             let flat_idx = installed_count + idx;
             let is_selected = ext.has_focus && ext.selected == flat_idx;
-            if is_selected {
-                cr.set_source_rgb(sel_r, sel_g, sel_b);
-                cr.rectangle(x, y + row as f64 * line_height, w, line_height);
-                cr.fill().ok();
-            }
             let name_text = format!("  ○ {}", item.display_name);
-            cr.set_source_rgb(fg_r, fg_g, fg_b);
-            layout.set_text(&name_text);
-            let (_, lh6) = layout.pixel_size();
-            cr.move_to(
-                x + 2.0,
-                y + row as f64 * line_height + (line_height - lh6 as f64) / 2.0,
+            let hint = if is_selected { "[i]install" } else { "" };
+            draw_item_row(
+                cr,
+                layout,
+                x,
+                y,
+                ry,
+                w,
+                item_height,
+                pad,
+                is_selected,
+                (sel_r, sel_g, sel_b),
+                (fg_r, fg_g, fg_b),
+                (dim_r, dim_g, dim_b),
+                &name_text,
+                hint,
             );
-            pangocairo::show_layout(cr, layout);
-            // Right-aligned hint
-            let hint = "  [i] install";
-            cr.set_source_rgb(dim_r, dim_g, dim_b);
-            layout.set_text(hint);
-            let (hint_w, _) = layout.pixel_size();
-            cr.move_to(
-                x + w - hint_w as f64 - 4.0,
-                y + row as f64 * line_height + (line_height - lh6 as f64) / 2.0,
-            );
-            pangocairo::show_layout(cr, layout);
-            // Description row (dim, smaller - we skip to keep it simple, one row per item)
-            row += 1;
+            ry += item_height;
         }
-        if available_count == 0 && row as f64 * line_height < h {
+        if available_count == 0 && ry < h {
             let msg = if ext.fetching {
                 "    Fetching registry…"
             } else {
@@ -12085,12 +14196,9 @@ fn draw_ext_sidebar(
             cr.set_source_rgb(dim_r, dim_g, dim_b);
             layout.set_text(msg);
             let (_, lhn) = layout.pixel_size();
-            cr.move_to(
-                x + 2.0,
-                y + row as f64 * line_height + (line_height - lhn as f64) / 2.0,
-            );
+            cr.move_to(x + 2.0, y + ry + (item_height - lhn as f64) / 2.0);
             pangocairo::show_layout(cr, layout);
-            row += 1;
+            ry += item_height;
         }
     }
 
@@ -12102,7 +14210,7 @@ fn draw_ext_sidebar(
         cr.stroke().ok();
     }
 
-    let _ = (sel_r, sel_g, sel_b, row);
+    let _ = ry;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -12661,6 +14769,11 @@ fn pixel_to_click_target(
             engine.active_tab_mut().active_window = window_id;
             engine.view_mut().cursor.line = line;
             engine.open_diff_peek();
+        } else if engine.has_diagnostic_on_line(line) {
+            // Diagnostic gutter indicator — show hover popup with details.
+            engine.active_tab_mut().active_window = window_id;
+            engine.view_mut().cursor.line = line;
+            engine.trigger_editor_hover_for_line(line);
         } else {
             engine.toggle_fold_at_line(line);
         }

@@ -1235,20 +1235,24 @@ fn reader_thread(
                     });
                 }
                 Some("textDocument/semanticTokens/full") => {
-                    let raw_data = result
-                        .and_then(|r| r.get("data"))
-                        .and_then(|d| d.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|v| v.as_u64().map(|n| n as u32))
-                                .collect::<Vec<u32>>()
-                        })
-                        .unwrap_or_default();
-                    let _ = tx.send(LspEvent::SemanticTokensResponse {
-                        server_id,
-                        request_id: id,
-                        raw_data,
-                    });
+                    // Only send when we have a valid result (not an error response).
+                    // Suppressing error responses prevents wiping existing tokens.
+                    if let Some(r) = result {
+                        let raw_data = r
+                            .get("data")
+                            .and_then(|d| d.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_u64().map(|n| n as u32))
+                                    .collect::<Vec<u32>>()
+                            })
+                            .unwrap_or_default();
+                        let _ = tx.send(LspEvent::SemanticTokensResponse {
+                            server_id,
+                            request_id: id,
+                            raw_data,
+                        });
+                    }
                 }
                 Some("textDocument/rename") => {
                     let null = serde_json::Value::Null;

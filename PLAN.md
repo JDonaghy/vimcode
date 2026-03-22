@@ -5,13 +5,22 @@
 ---
 
 ## Recently Completed
-- **Session 191**: Subprocess stderr safety audit — Audited all `Command::new()` call sites (~50); only `registry.rs` `download_script()` had inherited stderr (`.status()` without redirect); fixed by adding `.stdout(null()).stderr(null())`. All other sites already use `.output()` (auto-captures) or explicit `Stdio` redirection. 4511 tests.
-- **Session 190**: LSP Go-to-Definition Fix + Kitty Keyboard Fix — Fixed `gd`/`gi`/`gy` appearing to hang (message not cleared after successful jump); Kitty `shift_map_us()` fix for shifted symbols; context menu mode-aware shortcuts; LSP response robustness (string ID fallback, `unwrap_or` on definition/hover parse). 4511 tests.
-- **Session 189**: VSCode-style Editor Context Menu — Full 9-item editor right-click menu; engine-driven for both GTK and TUI; 8 new tests (4510 total).
-- **Session 188**: Centralize Context Menus + Editor Right-Click — GTK context menus driven by engine items; 4 new tests (4501 total).
-- **Session 187**: Tab Context Menu Splits Fix — Fixed GTK/TUI split inconsistency; added 4 split options; 4 new tests (4498 total).
+- **Session 203**: VSCode Mode Git Insights + Hover Popup Fixes — `fire_cursor_move_hook()` in `handle_vscode_key()`; annotation rendering + hover dwell gates allow VSCode mode; GTK Pango word-wrap in hover popups; `lsp_hover_text` cleared on dismiss; `editor_hover_popup_rect` click-to-focus; `SearchPollTick` popup-aware motion skip. 4649 tests.
+- **Session 202**: Panel Event Enhancements — `panel_double_click` (GTK + TUI double-click fires event before `panel_select`), `panel_context_menu` (right-click fires event, `ContextMenuTarget::ExtPanel` variant, GTK button-3 gesture + TUI `MouseButton::Right`), `panel_input` (per-panel input field activated with `/`, live filtering via keystroke events, Lua `get_input/set_input` API). 10 new tests. 4636 tests.
+- **Session 201**: Hover Popup Enhancements — tree-sitter syntax highlighting in hover code blocks; TUI editor hover click-to-copy links; VSCode-style "Go to" navigation links (vim mode only, "Go to" in default fg, labels in link color, `(:gd)` format); LSP semantic token reliability fixes (don't wipe tokens on error/null responses, missing legend, or edits). 12 new tests. 4626 tests.
 
-> Sessions 189 and earlier in **SESSION_HISTORY.md**.
+> Sessions 200 and earlier in **SESSION_HISTORY.md**.
+
+### Bug Fixes
+- [x] Save message shows relative path instead of full absolute path
+- [x] Status line shows filename only instead of full path
+- [x] Unrecognized file types (.md, .txt, etc.) no longer default to Rust syntax highlighting
+- [x] Tree-sitter upgrade to 0.26 + Lua and Markdown syntax highlighting (20 languages)
+- [x] TUI clipboard broken (copypasta_ext xclip stdin pipe not closed, DISPLAY env missing)
+- [x] VSCode edit mode: git insights ghost text + hovers now work (cursor_move hook, annotation/dwell gates)
+- [x] GTK hover popup text overflow — Pango word wrapping instead of clipping
+- [x] Stale LSP hover following clicks — clear `lsp_hover_text` on dismiss
+- [x] GTK hover popup click-to-focus — cached popup rect, SearchPollTick race fix
 
 ## Roadmap
 - [x] **Spell checker** — Vim-compatible `]s`/`[s`/`z=`/`zg`/`zw`; spellbook Hunspell parser; bundled en_US dictionary; tree-sitter-aware; `spell`/`spelllang` settings; user dictionary at `~/.config/vimcode/user.dic`
@@ -20,6 +29,7 @@
 ### Git
 - [x] **Stage hunks** — `]c`/`[c` navigation, `gs`/`:Ghs` to stage hunk under cursor
 - [x] **Inline diff peek** — `gD`/`:DiffPeek`/gutter click shows hunk popup with Revert/Stage, deleted-line `▾` gutter marker, `]c`/`[c` on real files
+- [x] **Git side panel polish** — Multi-line commit messages (Enter inserts newline, commit input box grows in height like VSCode); GTK panel spacing (1.4× line_height like extensions panel); SSH passphrase dialog (git pull/push/fetch currently leak SSH passphrase prompt to parent terminal in GTK or corrupt TUI display — pipe stdin, detect passphrase prompt, show modal dialog; pass `GIT_SSH_COMMAND="ssh -o BatchMode=yes"` or use `SSH_ASKPASS` with a helper that communicates back to the editor)
 
 ### Editor Features
 - [x] **`:set` command** — runtime setting changes; write-through to settings.json; number/rnu/expandtab/tabstop/shiftwidth/autoindent/incsearch; query with `?`
@@ -40,6 +50,11 @@
 - [x] **Multiple cursors** — `Alt-D` (configurable) adds cursor at next match of word under cursor; all cursors receive identical keystrokes; Escape collapses to one
 - [x] **Themes / plugin system** — named color themes selectable via `:colorscheme`; 4 built-in themes + VSCode `.json` theme import from `~/.config/vimcode/themes/` (sessions 116, 145)
 - [x] **LSP semantic tokens** — `textDocument/semanticTokens/full` overlay on tree-sitter; 8 semantic theme colors; binary-search span overlay; legend caching (sessions 131–132)
+
+### Extensions (vimcode-ext)
+- [x] **Lua extension** — `lua-language-server` with Linux (GitHub releases) + macOS (Homebrew) install commands; comment style config
+- [x] **Markdown extension** — `marksman` with Linux (GitHub releases) + macOS (Homebrew) install commands
+- [x] **OS-specific install commands for all extensions** — backfill `install_linux`/`install_macos`/`install_windows` on existing extensions (cpp, bicep, terraform, xml, latex); cross-platform tools (npm, cargo, go, gem, dotnet) use generic `install` field
 
 ### Enhanced Editor
 - [x] **Autosuggestions (inline ghost text)** — as-you-type completions shown as dimmed ghost text inline after the cursor; sources: buffer word scan (sync) + LSP `textDocument/completion` (async); Tab accepts, any other key dismisses; coexists with Ctrl-N/Ctrl-P popup (ghost hidden when popup active)
@@ -86,6 +101,24 @@
 ### Robustness
 - [x] **Centralize context menu definitions** — GTK backend hardcodes its own `gio::Menu` items separately from the engine's `open_explorer_context_menu()` / `open_tab_context_menu()`. This causes drift (e.g. "Open in Integrated Terminal" was missing from GTK). GTK should read from the engine's `ContextMenuState.items` to build its native menus, so new items only need to be added once in the engine.
 - [x] **Subprocess stderr safety audit** — Audit all `Command::spawn()` calls across the codebase to ensure stdout/stderr are redirected (null or piped). Unguarded spawns let child process output corrupt the TUI display. Fixed `xdg-open`/`open` calls; need to verify LSP, DAP, git, terminal, and any other subprocess spawns are safe.
+
+### Extension Panel System
+- [x] **GTK extension panel rendering** — Implement `draw_ext_panel()` in GTK backend matching TUI's `render_ext_panel()`; wire `SidebarPanel::ExtPanel(String)` into panel switching logic; add dynamic activity bar icons for registered panels; keyboard routing via engine focus flags; mouse click handling with accumulator walk. **This is the critical fix for git-insights "GIT LOG" panel not appearing in GUI mode.**
+- [x] **Rich panel layout API** — Extend `ExtPanelItem` and Lua `vimcode.panel` API with richer layout primitives:
+  - Tree items: `children`/`expandable`/`expanded` fields for nested expand/collapse nodes
+  - Action buttons: `actions: Vec<{label, key}>` rendered as clickable badges on items
+  - Input fields: `vimcode.panel.add_input(panel, section, opts)` for inline search/filter
+  - Separator/divider items and badge/tag styling (colored pills for branch status, etc.)
+- [x] **Panel event enhancements** — Richer event callbacks beyond `panel_select`/`panel_action`: `panel_expand`/`panel_collapse` for tree nodes, `panel_input` for text field changes, `panel_double_click`, `panel_context_menu`
+- [x] **Hover popups with rendered markdown** — Mouse-hover popups on panel items (and available to core engine code) that display markdown content rendered with proper formatting (headings, bold/italic, code blocks, lists) and clickable links. Both GTK and TUI backends. Reuse existing markdown rendering infrastructure (already used for editor tab markdown preview). Core API: engine-level `HoverPopup { target_rect, markdown_content, links }` state + render structs. Lua API: `vimcode.panel.set_hover(panel, item_id, markdown_string)` to define hover content per item. Hover triggers on mouse dwell (~300ms), dismisses on mouse-out. Links clickable in GTK (native URI handler) and TUI (`xdg-open`/`open`).
+- [x] **Native git panel hover popups** — Use the hover popup system in the built-in Source Control panel to show rich commit info on log items (author, date, full message, changed files summary) — similar to VSCode's SCM hover cards. Also useful for showing diff stats on changed files, branch details (ahead/behind, tracking remote), and stash contents preview.
+- [x] **Keyboard-driven hover popups** — Open hover popup for the selected panel item via Enter (or a dedicated key like `K`); popup takes focus until Escape is pressed; Tab/Shift-Tab cycles through links in the popup; Enter on a focused link opens it; arrow keys still scroll the popup content if it overflows. Both GTK and TUI backends.
+
+### Hover Popups
+- [ ] **Selectable/copyable popup text** — Allow selecting and copying text in hover popups (editor hover + panel hover) via mouse drag or keyboard. Currently popup text is read-only with no selection support.
+
+### LSP
+- [ ] **Code action gutter indicator** — Show a lightbulb (or similar) gutter indicator on lines where LSP code actions are available (like VSCode's yellow lightbulb). Clicking or pressing a key on the indicator shows the code action description. Initial implementation shows the action text only (no integrated menu or auto-apply).
 
 ### Documentation
 - [x] **GitHub Wiki** — 9 pages: Home, Getting Started, Key Remapping, Settings Reference, Extension Development, Lua Plugin API, Theme Customization, DAP Debugger Setup, LSP Configuration; README Documentation section links to wiki

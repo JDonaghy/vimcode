@@ -267,6 +267,10 @@ pub struct Settings {
     /// Auto-close brackets and quotes in Insert mode.
     #[serde(default = "default_auto_pairs")]
     pub auto_pairs: bool,
+
+    /// Mouse dwell delay (ms) before auto-showing hover popups. 0 = disabled.
+    #[serde(default = "default_hover_delay")]
+    pub hover_delay: u32,
 }
 
 fn default_indent_guides() -> bool {
@@ -279,6 +283,10 @@ fn default_match_brackets() -> bool {
 
 fn default_auto_pairs() -> bool {
     true
+}
+
+fn default_hover_delay() -> u32 {
+    300
 }
 
 fn default_swap_file() -> bool {
@@ -651,6 +659,7 @@ impl Default for Settings {
             indent_guides: default_indent_guides(),
             match_brackets: default_match_brackets(),
             auto_pairs: default_auto_pairs(),
+            hover_delay: default_hover_delay(),
         }
     }
 }
@@ -951,6 +960,12 @@ impl Settings {
                     .filter(|s| !s.is_empty())
                     .collect();
             }
+            "hover_delay" | "hd" => {
+                let n: u32 = value
+                    .parse()
+                    .map_err(|_| format!("Invalid value for {name}: '{value}'"))?;
+                self.hover_delay = n;
+            }
             _ => return Err(format!("Unknown option: {name}")),
         }
         Ok(())
@@ -1098,6 +1113,7 @@ impl Settings {
                 "extension_registries={}",
                 self.extension_registries.join(",")
             )),
+            "hover_delay" | "hd" => Ok(format!("hover_delay={}", self.hover_delay)),
             _ => Err(format!("Unknown option: {opt}")),
         }
     }
@@ -1186,6 +1202,7 @@ impl Settings {
             "indent_guides" | "indentguides" => self.indent_guides.to_string(),
             "match_brackets" | "matchbrackets" => self.match_brackets.to_string(),
             "auto_pairs" | "autopairs" => self.auto_pairs.to_string(),
+            "hover_delay" => self.hover_delay.to_string(),
             "extension_registries" => self.extension_registries.join(", "),
             _ => String::new(),
         }
@@ -1284,6 +1301,11 @@ impl Settings {
             "indent_guides" | "indentguides" => self.indent_guides = value == "true",
             "match_brackets" | "matchbrackets" => self.match_brackets = value == "true",
             "auto_pairs" | "autopairs" => self.auto_pairs = value == "true",
+            "hover_delay" => {
+                self.hover_delay = value
+                    .parse()
+                    .map_err(|_| format!("Invalid hover_delay: {value}"))?;
+            }
             "extension_registries" => {
                 self.extension_registries = value
                     .split(',')
@@ -1676,6 +1698,13 @@ pub static SETTING_DEFS: &[SettingDef] = &[
         description: "Auto-close brackets and quotes in Insert mode",
         category: "Editor",
         setting_type: SettingType::Bool,
+    },
+    SettingDef {
+        key: "hover_delay",
+        label: "Hover Delay",
+        description: "Mouse dwell delay (ms) before showing hover popups (0 = disabled)",
+        category: "Editor",
+        setting_type: SettingType::Integer { min: 0, max: 5000 },
     },
     // ── Extensions ────────────────────────────────────────────────────────────
     SettingDef {

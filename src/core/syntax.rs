@@ -21,7 +21,8 @@ pub enum SyntaxLanguage {
     Toml,
     Yaml,
     Latex,
-    // TODO: Lua (tree-sitter-lua 0.4 requires tree-sitter 0.25+, language version 15)
+    Lua,
+    Markdown,
 }
 
 impl SyntaxLanguage {
@@ -85,8 +86,44 @@ impl SyntaxLanguage {
             || path_lower.ends_with(".ltx")
         {
             Some(Self::Latex)
+        } else if path_lower.ends_with(".lua") {
+            Some(Self::Lua)
+        } else if path_lower.ends_with(".md")
+            || path_lower.ends_with(".markdown")
+            || path_lower.ends_with(".mdx")
+        {
+            Some(Self::Markdown)
         } else {
             None
+        }
+    }
+
+    /// Map a markdown fence language tag (e.g. "rust", "python", "js") to a
+    /// `SyntaxLanguage`.  Used for syntax-highlighting code blocks in hover
+    /// popups and markdown previews.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.to_lowercase().as_str() {
+            "rust" | "rs" => Some(Self::Rust),
+            "python" | "py" => Some(Self::Python),
+            "javascript" | "js" | "jsx" => Some(Self::JavaScript),
+            "typescript" | "ts" => Some(Self::TypeScript),
+            "tsx" => Some(Self::TypeScriptReact),
+            "go" | "golang" => Some(Self::Go),
+            "c" => Some(Self::C),
+            "cpp" | "c++" | "cxx" | "cc" => Some(Self::Cpp),
+            "csharp" | "c#" | "cs" => Some(Self::CSharp),
+            "java" => Some(Self::Java),
+            "ruby" | "rb" => Some(Self::Ruby),
+            "bash" | "sh" | "shell" | "zsh" => Some(Self::Bash),
+            "json" | "jsonc" => Some(Self::Json),
+            "toml" => Some(Self::Toml),
+            "yaml" | "yml" => Some(Self::Yaml),
+            "html" | "htm" => Some(Self::Html),
+            "css" => Some(Self::Css),
+            "lua" => Some(Self::Lua),
+            "latex" | "tex" => Some(Self::Latex),
+            "markdown" | "md" => Some(Self::Markdown),
+            _ => None,
         }
     }
 
@@ -118,6 +155,8 @@ impl SyntaxLanguage {
                     unsafe { tree_sitter_language::LanguageFn::from_raw(tree_sitter_latex) };
                 lang_fn.into()
             }
+            Self::Lua => tree_sitter_lua::LANGUAGE.into(),
+            Self::Markdown => tree_sitter_md::LANGUAGE.into(),
         }
     }
 
@@ -603,6 +642,30 @@ impl SyntaxLanguage {
                 (math_environment) @type
                 (displayed_equation) @type
             ",
+            Self::Lua => "
+                (function_declaration name: (identifier) @function)
+                (function_call name: (identifier) @function)
+                (string) @string
+                (comment) @comment
+                (number) @number
+                [
+                  \"function\" \"end\" \"local\" \"return\" \"if\" \"then\" \"else\" \"elseif\"
+                  \"for\" \"while\" \"do\" \"repeat\" \"until\" \"in\" \"not\"
+                  \"and\" \"or\"
+                ] @keyword
+                (break_statement) @keyword
+                (goto_statement) @keyword
+                (true) @keyword
+                (false) @keyword
+                (nil) @keyword
+            ",
+            Self::Markdown => "
+                (atx_heading) @function
+                (setext_heading) @function
+                (fenced_code_block) @string
+                (indented_code_block) @string
+                (thematic_break) @comment
+            ",
         }
     }
 }
@@ -654,14 +717,36 @@ impl Syntax {
     }
 
     pub fn parse(&mut self, text: &str) -> Vec<(usize, usize, String)> {
-        // Pass the previous tree for incremental re-parsing.  Tree-sitter can
-        // reuse unchanged subtrees even without explicit InputEdit calls, giving
-        // a significant speedup on large files where only a small region changed.
+        self.reparse(text);
+        self.extract_highlights(text)
+    }
+
+    /// Incrementally re-parse the text without extracting highlights.
+    /// This is fast (tree-sitter reuses unchanged subtrees) and should be
+    /// called on every keystroke. Highlight extraction can be deferred.
+    pub fn reparse(&mut self, text: &str) {
+        // Skip incremental parsing for Markdown: tree-sitter-md's external
+        // scanner can corrupt the parser's logger struct when reusing an old
+        // tree, causing a SIGSEGV in ts_parser__log.
+        let old_tree = if self.language == SyntaxLanguage::Markdown {
+            None
+        } else {
+            self.last_tree.as_ref()
+        };
         let tree = self
             .parser
-            .parse(text, self.last_tree.as_ref())
+            .parse(text, old_tree)
             .expect("tree-sitter parse failed");
+        self.last_tree = Some(tree);
+    }
 
+    /// Extract highlights from the most recent parse tree.
+    /// This is the expensive part — O(number of captures in the file).
+    pub fn extract_highlights(&self, text: &str) -> Vec<(usize, usize, String)> {
+        let tree = match &self.last_tree {
+            Some(t) => t,
+            None => return Vec::new(),
+        };
         let mut cursor = QueryCursor::new();
         let mut highlights = Vec::new();
 
@@ -676,7 +761,36 @@ impl Syntax {
             }
         }
 
-        self.last_tree = Some(tree);
+        highlights
+    }
+
+    /// Extract highlights only for a byte range (e.g. visible viewport).
+    /// Much faster than full extraction for large files.
+    pub fn extract_highlights_range(
+        &self,
+        text: &str,
+        start_byte: usize,
+        end_byte: usize,
+    ) -> Vec<(usize, usize, String)> {
+        let tree = match &self.last_tree {
+            Some(t) => t,
+            None => return Vec::new(),
+        };
+        let mut cursor = QueryCursor::new();
+        cursor.set_byte_range(start_byte..end_byte);
+        let mut highlights = Vec::new();
+
+        let mut matches = cursor.matches(&self.query, tree.root_node(), text.as_bytes());
+
+        while let Some(m) = matches.next() {
+            for capture in m.captures {
+                let start = capture.node.start_byte();
+                let end = capture.node.end_byte();
+                let capture_name = self.query.capture_names()[capture.index as usize].to_string();
+                highlights.push((start, end, capture_name));
+            }
+        }
+
         highlights
     }
 
@@ -771,6 +885,8 @@ impl Syntax {
                 "subsection",
                 "subsubsection",
             ],
+            SyntaxLanguage::Lua => &["function_declaration", "function_definition"],
+            SyntaxLanguage::Markdown => &["atx_heading", "setext_heading", "section"],
             _ => &[],
         }
     }
@@ -789,7 +905,7 @@ impl Syntax {
         }
         // Fallback: scan children for an identifier-like node
         for i in 0..node.child_count() {
-            if let Some(child) = node.child(i) {
+            if let Some(child) = node.child(i as u32) {
                 let k = child.kind();
                 if k == "identifier"
                     || k == "type_identifier"
@@ -999,8 +1115,45 @@ mod tests {
 
     #[test]
     fn test_language_detection_lua() {
-        // Lua not yet supported (tree-sitter-lua requires tree-sitter 0.25+)
-        assert_eq!(SyntaxLanguage::from_path("init.lua"), None);
+        assert_eq!(
+            SyntaxLanguage::from_path("init.lua"),
+            Some(SyntaxLanguage::Lua)
+        );
+    }
+
+    #[test]
+    fn test_language_detection_markdown() {
+        assert_eq!(
+            SyntaxLanguage::from_path("README.md"),
+            Some(SyntaxLanguage::Markdown)
+        );
+        assert_eq!(
+            SyntaxLanguage::from_path("notes.markdown"),
+            Some(SyntaxLanguage::Markdown)
+        );
+        assert_eq!(
+            SyntaxLanguage::from_path("page.mdx"),
+            Some(SyntaxLanguage::Markdown)
+        );
+    }
+
+    #[test]
+    fn test_lua_parse_basic() {
+        let mut syntax = Syntax::new_for_language(SyntaxLanguage::Lua);
+        let highlights = syntax.parse("function hello()\n  local x = 42\nend\n");
+        assert!(!highlights.is_empty());
+        // Should have keyword and function captures
+        assert!(highlights.iter().any(|(_, _, s)| s == "keyword"));
+        assert!(highlights.iter().any(|(_, _, s)| s == "function"));
+    }
+
+    #[test]
+    fn test_markdown_parse_basic() {
+        let mut syntax = Syntax::new_for_language(SyntaxLanguage::Markdown);
+        let highlights = syntax.parse("# Hello World\n\nSome text.\n\n```rust\nlet x = 1;\n```\n");
+        assert!(!highlights.is_empty());
+        // Should have heading (function) captures
+        assert!(highlights.iter().any(|(_, _, s)| s == "function"));
     }
 
     #[test]
@@ -1093,9 +1246,61 @@ mod tests {
 
     #[test]
     fn test_language_detection_unknown() {
-        assert_eq!(SyntaxLanguage::from_path("README.md"), None);
         assert_eq!(SyntaxLanguage::from_path("file.txt"), None);
         assert_eq!(SyntaxLanguage::from_path("no_extension"), None);
+    }
+
+    #[test]
+    fn test_from_name() {
+        assert_eq!(
+            SyntaxLanguage::from_name("rust"),
+            Some(SyntaxLanguage::Rust)
+        );
+        assert_eq!(SyntaxLanguage::from_name("rs"), Some(SyntaxLanguage::Rust));
+        assert_eq!(
+            SyntaxLanguage::from_name("Rust"),
+            Some(SyntaxLanguage::Rust)
+        );
+        assert_eq!(
+            SyntaxLanguage::from_name("python"),
+            Some(SyntaxLanguage::Python)
+        );
+        assert_eq!(
+            SyntaxLanguage::from_name("py"),
+            Some(SyntaxLanguage::Python)
+        );
+        assert_eq!(
+            SyntaxLanguage::from_name("js"),
+            Some(SyntaxLanguage::JavaScript)
+        );
+        assert_eq!(
+            SyntaxLanguage::from_name("typescript"),
+            Some(SyntaxLanguage::TypeScript)
+        );
+        assert_eq!(
+            SyntaxLanguage::from_name("tsx"),
+            Some(SyntaxLanguage::TypeScriptReact)
+        );
+        assert_eq!(
+            SyntaxLanguage::from_name("golang"),
+            Some(SyntaxLanguage::Go)
+        );
+        assert_eq!(SyntaxLanguage::from_name("c++"), Some(SyntaxLanguage::Cpp));
+        assert_eq!(
+            SyntaxLanguage::from_name("c#"),
+            Some(SyntaxLanguage::CSharp)
+        );
+        assert_eq!(
+            SyntaxLanguage::from_name("shell"),
+            Some(SyntaxLanguage::Bash)
+        );
+        assert_eq!(SyntaxLanguage::from_name("yml"), Some(SyntaxLanguage::Yaml));
+        assert_eq!(
+            SyntaxLanguage::from_name("tex"),
+            Some(SyntaxLanguage::Latex)
+        );
+        assert_eq!(SyntaxLanguage::from_name("unknown_lang"), None);
+        assert_eq!(SyntaxLanguage::from_name(""), None);
     }
 
     #[test]

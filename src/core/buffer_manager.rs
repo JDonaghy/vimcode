@@ -69,6 +69,10 @@ pub struct BufferState {
     pub syntax: Option<Syntax>,
     /// Cached syntax highlights (byte ranges + scope names).
     pub highlights: Vec<(usize, usize, String)>,
+    /// Whether highlights are stale (tree was re-parsed but highlights not yet re-extracted).
+    pub syntax_stale: bool,
+    /// When the syntax was last marked stale (for debounced re-parse in insert mode).
+    pub syntax_stale_since: Option<std::time::Instant>,
     /// Undo stack (most recent at the end).
     pub undo_stack: Vec<UndoEntry>,
     /// Redo stack (most recent at the end).
@@ -110,6 +114,8 @@ pub struct BufferState {
     pub cmdline_is_search: bool,
     /// Display name for plugin-created scratch buffers (shown in tab bar).
     pub scratch_name: Option<String>,
+    /// Override display name without brackets (e.g. for diff tabs).
+    pub diff_label: Option<String>,
     /// Last-known modification time of the file on disk.
     /// Set on file open and save; used by `check_file_changes()` to detect external edits.
     pub file_mtime: Option<SystemTime>,
@@ -143,6 +149,8 @@ impl BufferState {
             source_file: None,
             syntax: None,
             highlights: Vec::new(),
+            syntax_stale: false,
+            syntax_stale_since: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             current_undo_group: None,
@@ -162,6 +170,7 @@ impl BufferState {
             is_cmdline_buf: false,
             cmdline_is_search: false,
             scratch_name: None,
+            diff_label: None,
             file_mtime: None,
             file_change_warned: false,
         };
@@ -185,6 +194,8 @@ impl BufferState {
             source_file: None,
             syntax,
             highlights: Vec::new(),
+            syntax_stale: false,
+            syntax_stale_since: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             current_undo_group: None,
@@ -204,6 +215,7 @@ impl BufferState {
             is_cmdline_buf: false,
             cmdline_is_search: false,
             scratch_name: None,
+            diff_label: None,
             file_mtime,
             file_change_warned: false,
         };
@@ -220,6 +232,51 @@ impl BufferState {
             Vec::new()
         };
         // Cache max line length while we have the text; avoids O(N) scan every render.
+        self.max_col = text.lines().map(|l| l.chars().count()).max().unwrap_or(0);
+    }
+
+    /// Mark syntax as needing a re-parse. Does NO work — just records the
+    /// timestamp so the idle handler can debounce and re-parse after the user
+    /// pauses typing. Call this on every keystroke in insert mode.
+    pub fn mark_syntax_stale(&mut self) {
+        self.syntax_stale = true;
+        self.syntax_stale_since = Some(std::time::Instant::now());
+    }
+
+    /// Full re-parse + highlight extraction if syntax is stale.
+    /// Called on insert mode exit (Escape) where we need full highlights.
+    pub fn refresh_syntax_if_stale(&mut self) {
+        if !self.syntax_stale {
+            return;
+        }
+        self.syntax_stale = false;
+        self.syntax_stale_since = None;
+        self.update_syntax();
+    }
+
+    /// Re-parse + extract highlights only for the visible viewport.
+    /// Much faster than full extraction for large files.
+    #[allow(dead_code)]
+    pub fn refresh_syntax_visible(&mut self, scroll_top: usize, visible_lines: usize) {
+        if !self.syntax_stale {
+            return;
+        }
+        self.syntax_stale = false;
+        self.syntax_stale_since = None;
+        let text = self.buffer.to_string();
+        if let Some(ref mut syn) = self.syntax {
+            syn.reparse(&text);
+            let total_lines = self.buffer.len_lines();
+            let start_line = scroll_top.min(total_lines);
+            let end_line = (scroll_top + visible_lines + 1).min(total_lines);
+            let start_byte = self.buffer.content.line_to_byte(start_line);
+            let end_byte = if end_line < total_lines {
+                self.buffer.content.line_to_byte(end_line)
+            } else {
+                self.buffer.content.len_bytes()
+            };
+            self.highlights = syn.extract_highlights_range(&text, start_byte, end_byte);
+        }
         self.max_col = text.lines().map(|l| l.chars().count()).max().unwrap_or(0);
     }
 
@@ -270,6 +327,9 @@ impl BufferState {
         }
         if self.is_registries_buf {
             return "[Registries]".to_string();
+        }
+        if let Some(ref label) = self.diff_label {
+            return label.clone();
         }
         if let Some(ref name) = self.scratch_name {
             return format!("[{}]", name);

@@ -35,7 +35,7 @@ For detailed how-to guides and configuration references, see the **[VimCode Wiki
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 4511 tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 4626 tests, zero async runtime dependency
 
 > **Note:** VimCode does not implement VimScript. Extension and scripting is handled via
 > the built-in Lua 5.4 plugin system. The goal is full Vim *keybinding* and *editing*
@@ -490,7 +490,8 @@ Click the git branch icon in the activity bar to open the Source Control panel �
 **Commit input row** (always visible, below the header):
 - `c` — enter commit message input mode (row highlights, `|` cursor appears)
 - Type your message; `BackSpace` deletes; `Escape` exits input mode (message is preserved)
-- `Enter` — commits staged changes with the typed message (clears message on success)
+- `Enter` — inserts a newline (multi-line commit messages; input box grows in height)
+- `Ctrl+Enter` — commits staged changes with the typed message (clears message on success)
 
 **Four expandable sections** (Tab to collapse/expand):
 - **Staged Changes** — files indexed for the next commit (`A` added, `M` modified, `D` deleted, `R` renamed)
@@ -606,7 +607,7 @@ Built-in AI chat panel supporting Anthropic Claude, OpenAI, or local Ollama. Cli
 
 Automatic language server integration — open a file and diagnostics, completions, go-to-definition, and hover just work if the server is on `PATH`. Install language support via `:ExtInstall <lang>`.
 
-**Features:** inline diagnostics, `]d`/`[d` navigation, auto-popup completions (`Ctrl-Space` manual trigger), `gd` definition, `gr` references, `gi` implementation, `gy` type definition, `K` hover, signature help, `<leader>gf` format, `<leader>rn` rename, semantic token highlighting.
+**Features:** inline diagnostics, `]d`/`[d` navigation, auto-popup completions (`Ctrl-Space` manual trigger), `gd` definition, `gr` references, `gi` implementation, `gy` type definition, `K` hover, `gh` editor hover popup, signature help, `<leader>gf` format, `<leader>rn` rename, semantic token highlighting.
 
 **Commands:** `:LspInfo` | `:LspRestart` | `:LspStop` | `:Lformat` | `:Rename <name>`
 
@@ -718,7 +719,7 @@ All state lives in `~/.config/vimcode/`. Open files, cursor positions, command/s
 ### Rendering
 
 **Syntax highlighting** (Tree-sitter, auto-detected by extension)
-- Rust, Python, JavaScript, TypeScript/TSX, Go, C, C++, C#, Java, Ruby, Bash, JSON, TOML, CSS, YAML, HTML
+- Rust, Python, JavaScript, TypeScript/TSX, Go, C, C++, C#, Java, Ruby, Bash, Lua, JSON, TOML, CSS, YAML, HTML, Markdown
 
 **Line numbers** — absolute / relative / hybrid (both on = hybrid)
 
@@ -833,6 +834,7 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `gy` | Go to type definition (LSP) |
 | `gs` | Stage hunk (in `:Gdiff` buffer) |
 | `gD` | Diff peek — preview hunk popup with Revert/Stage |
+| `gh` | Editor hover popup — aggregates diagnostics, annotations, plugin content, and LSP hover at cursor |
 | `gR` | Enter virtual replace mode (expands tabs to spaces when overwriting) |
 | `g+` / `g-` | Go to newer / older text state (chronological undo timeline) |
 | `K` | Show hover info (LSP) |
@@ -1065,7 +1067,7 @@ src/
     ├── session.rs      (~235 lines)  Session state persistence + per-workspace paths
     ├── git.rs        (~1,821 lines)  Git subprocesses: diff, blame, stage_hunk, SC panel, worktrees, git log, branches
     ├── spell.rs        (~375 lines)  Spell checker (spellbook/Hunspell; tree-sitter-aware; LaTeX-aware; user dictionary)
-    ├── syntax.rs     (~1,319 lines)  Tree-sitter highlighting for 18 languages (incl. LaTeX via vendored grammar)
+    ├── syntax.rs     (~1,380 lines)  Tree-sitter highlighting for 20 languages (incl. LaTeX via vendored grammar)
     └── window.rs, tab.rs, view.rs, cursor.rs, mode.rs (~700 lines)
 ```
 
@@ -1093,7 +1095,7 @@ VimCode is built on the shoulders of giants, and I take very little credit for i
 | TUI UI | ratatui 0.27 + crossterm |
 | Rendering | Pango + Cairo (CPU, no GPU) |
 | Text | Ropey (rope data structure) |
-| Parsing | Tree-sitter (18 languages incl. LaTeX) |
+| Parsing | Tree-sitter (20 languages incl. LaTeX, Lua, Markdown) |
 | LSP | lsp-types (protocol definitions) |
 | Config | serde + serde_json |
 | Plugins | mlua 0.9 (Lua 5.4, vendored) |

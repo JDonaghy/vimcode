@@ -1,9 +1,9 @@
 # VimCode Project State
 
-**Last updated:** Mar 16, 2026 (Session 191 — Subprocess stderr safety audit) | **Tests:** 4511
+**Last updated:** Mar 21, 2026 (Session 203 — VSCode Mode Git Insights + Hover Popup Fixes) | **Tests:** 4649
 
 > Feature documentation lives in **README.md**.
-> Per-session implementation notes through Session 191 are in **SESSION_HISTORY.md**.
+> Per-session implementation notes through Session 203 are in **SESSION_HISTORY.md**.
 
 ---
 
@@ -26,18 +26,18 @@ When implementing a new key/command, add tests covering:
 
 ## Recent Work
 
-### Session 191 — Subprocess stderr safety audit (Mar 16, 2026)
-- Audited all ~50 `Command::new()` call sites across the codebase
-- Only one unsafe site found: `registry.rs` `download_script()` used `.status()` with inherited stderr — could corrupt TUI display during extension downloads
-- Fixed by adding `.stdout(Stdio::null()).stderr(Stdio::null())` to the curl call
-- All other sites already safe: `.output()` auto-captures both streams; `.spawn()` calls all have explicit `Stdio` redirection
-- Breakdown: `git.rs` (~20 calls, all `.output()`), `engine.rs` (~8 calls, all redirected or `.output()`), `ai.rs` (3 curl `.output()`), `dap.rs`/`lsp.rs` (`.spawn()` with explicit piped/null), `dap_manager.rs`/`lsp_manager.rs` (all `.output()`)
+### Session 203 — VSCode Mode Git Insights + Hover Popup Fixes (Mar 21, 2026)
+- **VSCode edit mode git insights**: `fire_cursor_move_hook()` added to all exit paths in `handle_vscode_key()` so Lua plugins (blame.lua) receive `cursor_move` events; annotation rendering gate in `render.rs` updated to allow VSCode mode (Insert + VSCode); hover dwell gates in both GTK and TUI backends updated to include VSCode mode
+- **GTK hover popup word wrapping**: Pango word wrapping (`WrapMode::WordChar`) replaces fixed-width overflow; pixel-based height cap; Cairo clip for bounds
+- **Stale LSP hover fix**: `lsp_hover_text` cleared on dismiss and mouse-off, preventing cached hover from following clicks
+- **GTK hover popup click-to-focus**: `editor_hover_popup_rect` caches popup bounds from draw; clicks on popup set focus (blue border, keyboard control); clicks outside dismiss
+- **20Hz SearchPollTick dismiss race fix**: Skip `editor_hover_mouse_move()` when mouse is within popup bounds, preventing continuous dismiss cycle that made popups unclickable
+- 4649 total tests (13 new from test count delta)
 
-### Session 190 — LSP Go-to-Definition Fix + Kitty Keyboard Fix (Mar 16, 2026)
-- **Context menu mode-aware shortcuts**: Editor right-click context menu shows Vim shortcuts (`gd`, `gr`, `gD`) in Vim mode and VSCode shortcuts (`F12`, `Shift+F12`, `F2`) in VSCode mode.
-- **Kitty terminal ":" fix**: `shift_map_us()` in TUI translates base key + SHIFT modifier to correct shifted character when Kitty's `REPORT_ALL_KEYS_AS_ESCAPE_CODES` keyboard enhancement sends `; + Shift` instead of `:`.
-- **LSP `gd` "hanging" fix**: `DefinitionResponse`, `ImplementationResponse`, and `TypeDefinitionResponse` handlers now clear `self.message` after processing. Previously "Jumping to definition..." message persisted after successful jump, appearing as if the operation was still pending.
-- **LSP response robustness**: Added `unwrap_or()` fallback for definition/hover responses (empty result instead of silent drop); string ID fallback for response parsing (some servers echo IDs as strings).
-- LSP debug logging infrastructure (gated behind `VIMCODE_LSP_DEBUG` env var) retained in `lsp.rs` reader thread.
+### Session 202 — Panel Event Enhancements (Mar 21, 2026)
+- **`panel_double_click` event**: Fires on double-click of extension panel items (both GTK and TUI backends); separate from `panel_select` to allow plugins to distinguish single-click from double-click
+- **`panel_context_menu` event**: Fires on right-click of extension panel items; new GTK button-3 gesture + TUI `MouseButton::Right` handling; `ContextMenuTarget::ExtPanel` variant; plugins can build custom context menus in response
+- **`panel_input` event + input field**: `/` activates per-panel input field for search/filtering; typing fires `panel_input` on every keystroke for live filtering; Escape/Return deactivates; `ext_panel_input_text`/`ext_panel_input_active` engine state; Lua API: `vimcode.panel.get_input(name)` / `vimcode.panel.set_input(name, text)`; `panel_input_snapshot` in `PluginCallContext`; `ExtPanelData.input_text/input_active` in render layer
+- 10 new tests in `tests/ext_panel.rs`; 4636 total
 
-> Sessions 189 and earlier archived in **SESSION_HISTORY.md**.
+> Sessions 201 and earlier archived in **SESSION_HISTORY.md**.

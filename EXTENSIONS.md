@@ -386,18 +386,26 @@ local info = vimcode.panel.parse_event(arg)
 | Key | Action |
 |-----|--------|
 | `j` / `k` | Navigate items |
-| `Tab` | Expand/collapse section |
+| `Tab` | Expand/collapse section or tree node |
 | `Enter` | Fire `panel_select` event for current item |
-| `q` / `Escape` | Unfocus panel |
+| `/` | Activate panel input field (search/filter) |
+| `q` / `Escape` | Unfocus panel (or deactivate input field) |
 | Other keys | Fire `panel_action` event with the key |
+
+**Panel input field:** Press `/` to activate an inline input field at the top of the panel. Typing fires `panel_input` events on every keystroke for live filtering. Press `Escape` to deactivate or `Return` to confirm and deactivate. Plugins can read/write the input text via `vimcode.panel.get_input(name)` and `vimcode.panel.set_input(name, text)`.
 
 **Panel events:**
 
 | Event | Argument | When |
 |-------|----------|------|
 | `panel_focus` | panel name | Panel gains focus in sidebar |
-| `panel_select` | `"panel:section:index:label"` | Enter pressed on item |
-| `panel_action` | `"key:panel:section:index:label"` | Other key pressed on item |
+| `panel_select` | `"panel\|section\|id\|\|index"` | Enter pressed on item |
+| `panel_action` | `"panel\|section\|id\|key\|index"` | Other key pressed on item |
+| `panel_expand` | `"panel\|section\|id\|\|index"` | Tree node expanded via Tab |
+| `panel_collapse` | `"panel\|section\|id\|\|index"` | Tree node collapsed via Tab |
+| `panel_double_click` | `"panel\|section\|id\|\|index"` | Double-click on item |
+| `panel_context_menu` | `"panel\|section\|id\|\|index"` | Right-click on item |
+| `panel_input` | `"panel\|\|\|text\|"` | Input field text changed or confirmed |
 
 **Item styles:**
 
@@ -436,8 +444,13 @@ vimcode.set_comment_style("haskell", {
 | `InsertLeave` | mode name | Left Insert mode |
 | `ModeChanged` | `"Old->New"` | Any mode change (e.g., `"Normal->Insert"`) |
 | `panel_focus` | panel name | Extension panel gains focus |
-| `panel_select` | `"panel:section:index:label"` | Enter pressed on extension panel item |
-| `panel_action` | `"key:panel:section:index:label"` | Other key pressed on extension panel item |
+| `panel_select` | `"panel\|section\|id\|\|index"` | Enter pressed on extension panel item |
+| `panel_action` | `"panel\|section\|id\|key\|index"` | Other key pressed on extension panel item |
+| `panel_expand` | `"panel\|section\|id\|\|index"` | Tree node expanded via Tab |
+| `panel_collapse` | `"panel\|section\|id\|\|index"` | Tree node collapsed via Tab |
+| `panel_double_click` | `"panel\|section\|id\|\|index"` | Double-click on panel item |
+| `panel_context_menu` | `"panel\|section\|id\|\|index"` | Right-click on panel item |
+| `panel_input` | `"panel\|\|\|text\|"` | Panel input field text changed |
 | Custom | shell output | `async_shell()` callback event |
 
 ---

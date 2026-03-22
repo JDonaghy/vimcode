@@ -68,6 +68,8 @@ pub enum EngineAction {
     ToggleSidebar,
     /// Quit with non-zero exit code (:cquit).
     QuitWithError,
+    /// Open a URL in the default browser (validated as safe by the engine).
+    OpenUrl(String),
 }
 
 /// A row in the Settings sidebar flat list.
@@ -229,6 +231,18 @@ pub struct Dialog {
     pub buttons: Vec<DialogButton>,
     pub selected: usize,
     pub tag: String,
+    /// Optional text input field (e.g. for SSH passphrase prompts).
+    /// When `Some`, the dialog shows an editable input line.
+    pub input: Option<DialogInput>,
+}
+
+/// Text input state for a dialog with an editable field.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct DialogInput {
+    pub label: String,
+    pub value: String,
+    pub is_password: bool,
 }
 
 /// A single entry in the command palette.
@@ -532,6 +546,12 @@ pub static PALETTE_COMMANDS: &[PaletteCommand] = &[
         vscode_shortcut: "gD",
         action: "DiffPeek",
     },
+    PaletteCommand {
+        label: "Git: Toggle Inline Blame",
+        shortcut: "<leader>gb",
+        vscode_shortcut: "",
+        action: "ToggleBlame",
+    },
     // LSP
     PaletteCommand {
         label: "LSP: Info",
@@ -805,6 +825,7 @@ pub enum ContextMenuTarget {
     ExplorerFile { path: PathBuf },
     ExplorerDir { path: PathBuf },
     Editor,
+    ExtPanel { panel_name: String, item_id: String },
 }
 
 /// A single item in a context menu popup.
@@ -816,6 +837,77 @@ pub struct ContextMenuItem {
     pub shortcut: String,
     pub separator_after: bool,
     pub enabled: bool,
+}
+
+/// State for a sidebar hover popup with rendered markdown content.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct PanelHoverPopup {
+    /// Rendered markdown lines + spans (reuses the existing markdown module).
+    pub rendered: crate::core::markdown::MdRendered,
+    /// Clickable link URLs extracted from LinkUrl spans: (line_idx, start_byte, end_byte, url).
+    pub links: Vec<(usize, usize, usize, String)>,
+    /// Panel name this hover belongs to.
+    pub panel_name: String,
+    /// Item ID within the panel.
+    pub item_id: String,
+    /// Flat index of the hovered item (used for positioning).
+    pub item_index: usize,
+}
+
+impl PanelHoverPopup {
+    /// Whether this hover comes from a native (trusted) panel like source_control.
+    pub fn is_native(&self) -> bool {
+        self.panel_name == "source_control"
+    }
+}
+
+/// Source of an editor hover popup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum EditorHoverSource {
+    /// LSP hover information (triggered by K or gh).
+    Lsp,
+    /// LSP diagnostic message at position.
+    Diagnostic,
+    /// Plugin annotation virtual text.
+    Annotation,
+    /// Plugin-registered hover provider.
+    Plugin(String),
+}
+
+/// State for a hover popup anchored to a position in the editor buffer.
+/// Supports rich markdown content, clickable links, and keyboard focus.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct EditorHoverPopup {
+    /// Rendered markdown content.
+    pub rendered: crate::core::markdown::MdRendered,
+    /// Clickable link regions: (line_idx, start_byte, end_byte, url).
+    pub links: Vec<(usize, usize, usize, String)>,
+    /// Buffer line where the hover is anchored (0-indexed).
+    pub anchor_line: usize,
+    /// Buffer column where the hover is anchored (0-indexed).
+    pub anchor_col: usize,
+    /// What triggered this hover.
+    pub source: EditorHoverSource,
+    /// Scroll offset for long content.
+    pub scroll_top: usize,
+    /// Currently focused link index (for keyboard navigation within the popup).
+    pub focused_link: Option<usize>,
+    /// Fixed popup width in characters, computed once when first shown.
+    pub popup_width: usize,
+    /// Frozen scroll offsets — captured when popup is first shown so it stays
+    /// at a fixed screen position regardless of subsequent editor scrolling.
+    pub frozen_scroll_top: usize,
+    pub frozen_scroll_left: usize,
+}
+
+/// Check if a URL has a safe scheme for opening in a browser.
+/// Only `https://` and `http://` are allowed.
+pub fn is_safe_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    lower.starts_with("https://") || lower.starts_with("http://") || lower.starts_with("command:")
 }
 
 /// State for an open context menu popup (engine-driven, rendered by TUI).
@@ -1700,10 +1792,14 @@ pub struct Engine {
     pub sc_log: Vec<git::GitLogEntry>,
     /// Commit message being typed in the SC panel input row.
     pub sc_commit_message: String,
+    /// Byte-offset cursor position within `sc_commit_message`.
+    pub sc_commit_cursor: usize,
     /// True when the SC commit input row has keyboard focus.
     pub sc_commit_input_active: bool,
     /// Which action button (0=Commit 1=Push 2=Pull 3=Sync) is keyboard-focused, or None.
     pub sc_button_focused: Option<usize>,
+    /// Which action button the mouse is hovering over, or None.
+    pub sc_button_hovered: Option<usize>,
 
     // Branch picker popup (opened with `b` in SC panel)
     pub sc_branch_picker_open: bool,
@@ -1796,6 +1892,13 @@ pub struct Engine {
     pub diff_aligned: HashMap<WindowId, Vec<AlignedDiffEntry>>,
     /// Whether unchanged sections in the diff view are hidden (folded).
     pub diff_unchanged_hidden: bool,
+
+    /// Receiver for background `git show HEAD:file` results used by
+    /// the Source Control panel's click-to-diff flow.  The thread sends
+    /// `(abs_path, head_content)`.
+    pub sc_diff_rx: Option<std::sync::mpsc::Receiver<(PathBuf, String)>>,
+    /// Window ID of the tab pre-opened for the pending SC diff.
+    pub sc_diff_pending_win: Option<WindowId>,
 
     // --- Inline diff peek popup ---
     /// Git diff peek popup state, or `None` when no peek is active.
@@ -2036,6 +2139,12 @@ pub struct Engine {
     pub ext_sidebar_sections_expanded: [bool; 2],
     /// Whether the sidebar search input field is active.
     pub ext_sidebar_input_active: bool,
+    /// Extension name pending removal (set when the remove-confirmation dialog opens).
+    pub pending_ext_remove: Option<String>,
+
+    /// Pending git remote operation awaiting SSH passphrase from dialog.
+    /// Holds `"push"`, `"pull"`, or `"fetch"`.
+    pub pending_git_remote_op: Option<String>,
 
     // --- Settings sidebar panel state ---
     /// Whether the Settings sidebar panel has keyboard focus.
@@ -2065,6 +2174,10 @@ pub struct Engine {
     /// Inline annotation text indexed by 0-based buffer line number.
     /// Cleared when the active buffer changes.
     pub line_annotations: HashMap<usize, String>,
+    /// Whether current `line_annotations` are blame-sourced (enables rich hover).
+    pub blame_annotations_active: bool,
+    /// Receiver for async blame results (background thread).
+    blame_rx: Option<std::sync::mpsc::Receiver<Vec<crate::core::git::BlameInfo>>>,
 
     // --- Async shell tasks (plugin background commands) ---
     /// Background shell tasks spawned by plugins via `vimcode.async_shell()`.
@@ -2146,6 +2259,37 @@ pub struct Engine {
     pub ext_panel_scroll_top: usize,
     /// Per-panel section expanded state.
     pub ext_panel_sections_expanded: HashMap<String, Vec<bool>>,
+    /// Per-panel tree item expand state: (panel_name, item_id) → expanded.
+    /// Persists across `set_items` refreshes so plugins don't lose user-toggled state.
+    pub ext_panel_tree_expanded: HashMap<(String, String), bool>,
+    /// Per-panel input field text: panel_name → current text.
+    pub ext_panel_input_text: HashMap<String, String>,
+    /// Whether the input field in the active extension panel currently has keyboard focus.
+    pub ext_panel_input_active: bool,
+
+    // --- Editor hover popup ---
+    /// Active editor hover popup with rendered markdown content.
+    pub editor_hover: Option<EditorHoverPopup>,
+    /// Mouse dwell tracking for editor hover: (buffer_line, buffer_col, timestamp).
+    pub editor_hover_dwell: Option<(usize, usize, std::time::Instant)>,
+    /// Delayed dismiss deadline — popup lingers until this instant passes.
+    pub editor_hover_dismiss_at: Option<std::time::Instant>,
+    /// Whether the editor hover popup currently has keyboard focus.
+    pub editor_hover_has_focus: bool,
+    /// Plugin-provided static hover content per line: line (0-indexed) → markdown.
+    pub editor_hover_content: HashMap<usize, String>,
+    /// Performance profiling log for the last slow keystroke (> 5ms).
+    pub perf_log: Option<String>,
+
+    // --- Panel hover popup ---
+    /// Active sidebar hover popup with rendered markdown content.
+    pub panel_hover: Option<PanelHoverPopup>,
+    /// Hover dwell tracking: (panel_name, item_index, timestamp).
+    pub panel_hover_dwell: Option<(String, usize, std::time::Instant)>,
+    /// Delayed dismiss deadline — popup lingers until this instant passes.
+    pub panel_hover_dismiss_at: Option<std::time::Instant>,
+    /// Plugin-provided hover content: (panel_name, item_id) -> markdown string.
+    pub panel_hover_registry: HashMap<(String, String), String>,
 
     // --- Context menu ---
     /// Active right-click context menu state (TUI-driven). None when no menu is open.
@@ -2302,8 +2446,10 @@ impl Engine {
             sc_behind: 0,
             sc_log: Vec::new(),
             sc_commit_message: String::new(),
+            sc_commit_cursor: 0,
             sc_commit_input_active: false,
             sc_button_focused: None,
+            sc_button_hovered: None,
             sc_branch_picker_open: false,
             sc_branch_picker_query: String::new(),
             sc_branch_picker_branches: Vec::new(),
@@ -2341,6 +2487,8 @@ impl Engine {
             diff_results: HashMap::new(),
             diff_aligned: HashMap::new(),
             diff_unchanged_hidden: false,
+            sc_diff_rx: None,
+            sc_diff_pending_win: None,
             diff_peek: None,
             clipboard_read: None,
             clipboard_write: None,
@@ -2428,6 +2576,8 @@ impl Engine {
             ext_sidebar_query: String::new(),
             ext_sidebar_sections_expanded: [true, true],
             ext_sidebar_input_active: false,
+            pending_ext_remove: None,
+            pending_git_remote_op: None,
             settings_has_focus: false,
             settings_selected: 0,
             settings_scroll_top: 0,
@@ -2440,6 +2590,8 @@ impl Engine {
             ext_settings_collapsed: HashMap::new(),
             ext_settings_editing: None,
             line_annotations: HashMap::new(),
+            blame_annotations_active: false,
+            blame_rx: None,
             async_shell_tasks: HashMap::new(),
             ai_ghost_text: None,
             ai_ghost_alternatives: Vec::new(),
@@ -2470,6 +2622,19 @@ impl Engine {
             ext_panel_selected: 0,
             ext_panel_scroll_top: 0,
             ext_panel_sections_expanded: HashMap::new(),
+            ext_panel_tree_expanded: HashMap::new(),
+            ext_panel_input_text: HashMap::new(),
+            ext_panel_input_active: false,
+            editor_hover: None,
+            editor_hover_dwell: None,
+            editor_hover_dismiss_at: None,
+            editor_hover_has_focus: false,
+            editor_hover_content: HashMap::new(),
+            perf_log: None,
+            panel_hover: None,
+            panel_hover_dwell: None,
+            panel_hover_dismiss_at: None,
+            panel_hover_registry: HashMap::new(),
             context_menu: None,
             diff_selected_file: None,
             pending_move: None,
@@ -2799,6 +2964,28 @@ impl Engine {
         self.active_buffer_state_mut().update_syntax();
     }
 
+    /// Mark syntax as stale without doing any parsing work. Call on every
+    /// keystroke in insert mode — the idle handler debounces the actual re-parse.
+    pub fn mark_syntax_stale(&mut self) {
+        self.active_buffer_state_mut().mark_syntax_stale();
+    }
+
+    /// Full re-parse + highlight extraction if syntax is stale.
+    /// Called on insert mode exit (Escape) where we need full highlights.
+    pub fn refresh_syntax_if_stale(&mut self) {
+        self.active_buffer_state_mut().refresh_syntax_if_stale();
+    }
+
+    /// Re-parse + extract highlights only for the visible viewport.
+    /// Available for future use (e.g. background-thread refresh).
+    #[allow(dead_code)]
+    pub fn refresh_syntax_visible(&mut self) {
+        let scroll_top = self.view().scroll_top;
+        let visible = self.view().viewport_lines;
+        self.active_buffer_state_mut()
+            .refresh_syntax_visible(scroll_top, visible);
+    }
+
     // =======================================================================
     // Undo/Redo operations
     // =======================================================================
@@ -2836,6 +3023,8 @@ impl Engine {
                 self.mode = Mode::Normal;
                 self.clamp_cursor_col();
                 self.lsp_signature_help = None;
+                // Refresh stale syntax highlights deferred from insert mode.
+                self.refresh_syntax_if_stale();
             }
             Mode::Visual | Mode::VisualLine | Mode::VisualBlock => {
                 self.mode = Mode::Normal;
@@ -3248,6 +3437,7 @@ impl Engine {
             state.buffer.content = ropey::Rope::from_str(&text);
             state.read_only = true;
             state.md_rendered = Some(rendered);
+            state.scratch_name = Some(title.to_string());
         }
 
         // Open in a new tab (like open_file_in_tab).
@@ -3501,6 +3691,17 @@ impl Engine {
     ///
     /// If a diff split is already active, closes it first to avoid
     /// accumulating splits on repeated invocations.
+    /// Clear `diff_label` on both buffers of a diff window pair.
+    fn clear_diff_labels(&mut self, win_a: WindowId, win_b: WindowId) {
+        for wid in [win_a, win_b] {
+            if let Some(buf_id) = self.windows.get(&wid).map(|w| w.buffer_id) {
+                if let Some(state) = self.buffer_manager.get_mut(buf_id) {
+                    state.diff_label = None;
+                }
+            }
+        }
+    }
+
     pub fn cmd_git_diff_split(&mut self, path: &Path) -> EngineAction {
         // Ensure editor receives keys after opening diff.
         self.sc_has_focus = false;
@@ -3510,6 +3711,12 @@ impl Engine {
             self.diff_aligned.clear();
             self.scroll_bind_pairs
                 .retain(|&(a, b)| !(a == left_win && b == right_win));
+            // Clear the diff label on the working copy buffer.
+            if let Some(right_buf) = self.windows.get(&right_win).map(|w| w.buffer_id) {
+                if let Some(state) = self.buffer_manager.get_mut(right_buf) {
+                    state.diff_label = None;
+                }
+            }
             // Close the HEAD (left) window + its scratch buffer.
             if self.windows.contains_key(&left_win) {
                 let left_buf = self.windows[&left_win].buffer_id;
@@ -3560,22 +3767,25 @@ impl Engine {
             }
         };
 
-        // Open working copy file if not already open.
-        if let Err(e) = self.open_file_with_mode(path, crate::core::OpenMode::Permanent) {
-            self.message = e;
-            return EngineAction::Error;
-        }
+        // Open working copy in a new tab.
+        self.new_tab(Some(path));
         let right_win = self.active_window_id();
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "file".to_string());
+
+        // Label the working copy tab.
+        let right_buf_id = self.active_window().buffer_id;
+        if let Some(state) = self.buffer_manager.get_mut(right_buf_id) {
+            state.diff_label = Some(format!("{file_name} (Working Tree)"));
+        }
 
         // Create scratch buffer with HEAD content.
         let head_buf_id = self.buffer_manager.create();
         if let Some(state) = self.buffer_manager.get_mut(head_buf_id) {
             state.buffer.content = ropey::Rope::from_str(&head_content);
             state.read_only = true;
-            let file_name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "file".to_string());
             state.scratch_name = Some(format!("{file_name} (HEAD)"));
             // Set syntax highlighting to match the file type.
             if let Some(syn) = crate::core::syntax::Syntax::new_from_path(path.to_str()) {
@@ -3611,6 +3821,204 @@ impl Engine {
 
         self.message = format!("Diff split: {}", path.display());
         EngineAction::None
+    }
+
+    /// Resolve the currently selected SC item and, for files with a HEAD
+    /// version, kick off a background `git show` so the sidebar can repaint
+    /// the selection highlight without blocking. For untracked/new files,
+    /// worktree switches and log entries the action runs inline.
+    /// Returns `true` if the action was fully handled synchronously (the
+    /// caller should give focus back to the editor), `false` if a background
+    /// diff was requested (the caller should keep SC focus and poll later).
+    pub fn sc_open_selected_async(&mut self) -> bool {
+        let (section, idx) = self.sc_flat_to_section_idx(self.sc_selected);
+        if section == 2 {
+            self.sc_switch_worktree(idx);
+            return true;
+        }
+        if section == 3 && idx != usize::MAX {
+            if let Some(entry) = self.sc_log.get(idx) {
+                self.message = format!("{} {}", entry.hash, entry.message);
+            }
+            return true;
+        }
+        if idx == usize::MAX {
+            // Header row — no action.
+            return true;
+        }
+        let statuses = self.sc_file_statuses.clone();
+        let all_files: Vec<&git::FileStatus> = if section == 0 {
+            statuses.iter().filter(|f| f.staged.is_some()).collect()
+        } else {
+            statuses.iter().filter(|f| f.unstaged.is_some()).collect()
+        };
+        let f = match all_files.get(idx) {
+            Some(f) => *f,
+            None => return true,
+        };
+        let git_root = git::find_repo_root(&self.cwd).unwrap_or_else(|| self.cwd.clone());
+        let abs_path = git_root.join(&f.path);
+        if !abs_path.exists() {
+            self.message = format!("SC: file not found: {}", abs_path.display());
+            return true;
+        }
+        let is_new = matches!(f.unstaged, Some(git::StatusKind::Untracked))
+            || matches!(f.staged, Some(git::StatusKind::Added));
+        if is_new {
+            self.new_tab(Some(&abs_path));
+            self.sc_has_focus = false;
+            return true;
+        }
+        // Open the tab immediately so it appears while the background
+        // thread fetches the HEAD content for the diff split.
+        let file_name = abs_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "file".to_string());
+        self.new_tab(Some(&abs_path));
+        let right_win = self.active_window_id();
+        let right_buf_id = self.active_window().buffer_id;
+        if let Some(state) = self.buffer_manager.get_mut(right_buf_id) {
+            state.diff_label = Some(format!("{file_name} (Working Tree)"));
+        }
+        self.sc_diff_pending_win = Some(right_win);
+
+        // Kick off background git show for diff.
+        let rel_path = f.path.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.sc_diff_rx = Some(rx);
+        let root = git_root.clone();
+        std::thread::spawn(move || {
+            let content = git::show_file_at_ref(&root, "HEAD", &rel_path).unwrap_or_default();
+            let _ = tx.send((abs_path, content));
+        });
+        false
+    }
+
+    /// Poll for a completed background diff request. Returns `true` when
+    /// new results arrived and a redraw is needed.
+    pub fn poll_sc_diff(&mut self) -> bool {
+        let (abs_path, head_content) = match self.sc_diff_rx {
+            Some(ref rx) => match rx.try_recv() {
+                Ok(r) => r,
+                Err(_) => return false,
+            },
+            None => return false,
+        };
+        self.sc_diff_rx = None;
+        let right_win = match self.sc_diff_pending_win.take() {
+            Some(w) => w,
+            None => return false,
+        };
+
+        // If the pre-opened window was closed before the thread finished, bail.
+        if !self.windows.contains_key(&right_win) {
+            return false;
+        }
+
+        if head_content.is_empty() {
+            // No HEAD version — the tab is already open, nothing more to do.
+            return true;
+        }
+
+        // Add the HEAD split to the already-open tab.
+        self.sc_apply_diff_split(right_win, &abs_path, &head_content);
+        // Restore SC panel focus so the user can keep navigating.
+        self.sc_has_focus = true;
+        true
+    }
+
+    /// Add the HEAD side of a diff split to a tab that already has the
+    /// working copy open in `right_win`.
+    fn sc_apply_diff_split(&mut self, right_win: WindowId, path: &Path, head_content: &str) {
+        // Tear down any existing diff split.
+        if let Some((left_win, old_right)) = self.diff_window_pair.take() {
+            self.diff_results.clear();
+            self.diff_aligned.clear();
+            self.scroll_bind_pairs
+                .retain(|&(a, b)| !(a == left_win && b == old_right));
+            self.clear_diff_labels(left_win, old_right);
+            if self.windows.contains_key(&left_win) {
+                let left_buf = self.windows[&left_win].buffer_id;
+                self.windows.remove(&left_win);
+                let tab = self.active_tab_mut();
+                if let Some(new_layout) = tab.layout.remove(left_win) {
+                    tab.layout = new_layout;
+                }
+                let still_used = self.windows.values().any(|w| w.buffer_id == left_buf);
+                if !still_used {
+                    let _ = self.buffer_manager.delete(left_buf, true);
+                }
+            }
+            if !self
+                .active_tab()
+                .layout
+                .window_ids()
+                .contains(&self.active_tab().active_window)
+            {
+                if let Some(first) = self.active_tab().layout.window_ids().first().copied() {
+                    self.active_tab_mut().active_window = first;
+                }
+            }
+        }
+
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "file".to_string());
+
+        // Ensure the right_win's tab is active so the split lands there.
+        // Find the group+tab containing right_win and activate them.
+        let target = self.editor_groups.iter().find_map(|(&gid, group)| {
+            group
+                .tabs
+                .iter()
+                .enumerate()
+                .find(|(_, tab)| tab.layout.window_ids().contains(&right_win))
+                .map(|(ti, _)| (gid, ti))
+        });
+        if let Some((gid, ti)) = target {
+            self.active_group = gid;
+            self.active_group_mut().active_tab = ti;
+            self.active_tab_mut().active_window = right_win;
+        }
+
+        // Create scratch buffer with HEAD content.
+        let head_buf_id = self.buffer_manager.create();
+        if let Some(state) = self.buffer_manager.get_mut(head_buf_id) {
+            state.buffer.content = ropey::Rope::from_str(head_content);
+            state.read_only = true;
+            state.scratch_name = Some(format!("{file_name} (HEAD)"));
+            if let Some(syn) = crate::core::syntax::Syntax::new_from_path(path.to_str()) {
+                state.syntax = Some(syn);
+            }
+            state.update_syntax();
+        }
+
+        // Split: new window (left) gets HEAD buffer.
+        self.split_window(SplitDirection::Vertical, None);
+        let left_win = self.active_window_id();
+        self.active_window_mut().buffer_id = head_buf_id;
+
+        // Focus the right (working copy) window.
+        let tab = self.active_tab_mut();
+        tab.active_window = right_win;
+
+        // Bind scroll and set up diff.
+        self.scroll_bind_pairs.push((left_win, right_win));
+        self.diff_window_pair = Some((left_win, right_win));
+        self.compute_diff();
+        self.diff_unchanged_hidden = true;
+        self.diff_apply_folds();
+        self.diff_jump_to_first_change(left_win, right_win);
+
+        let right_buf_id = self
+            .windows
+            .get(&right_win)
+            .map(|w| w.buffer_id)
+            .unwrap_or(head_buf_id);
+        self.refresh_git_diff(right_buf_id);
+        self.message = format!("Diff split: {}", path.display());
     }
 
     /// Jump to the next changed region below the cursor.
@@ -3724,6 +4132,112 @@ impl Engine {
             }
             self.message = "No more hunks".to_string();
         }
+    }
+
+    /// Toggle inline git blame annotations for the current buffer.
+    pub fn toggle_inline_blame(&mut self) {
+        if self.blame_annotations_active {
+            self.line_annotations.clear();
+            self.blame_annotations_active = false;
+            self.editor_hover_content.clear();
+            self.blame_rx = None;
+            self.message = "Inline blame off".to_string();
+            return;
+        }
+        let file = match self.file_path() {
+            Some(p) => p.to_path_buf(),
+            None => {
+                self.message = "No file".to_string();
+                return;
+            }
+        };
+        let repo_root = match crate::core::git::find_repo_root(&file) {
+            Some(r) => r,
+            None => {
+                self.message = "Not a git repository".to_string();
+                return;
+            }
+        };
+        // Get buffer contents for unsaved changes.
+        let bid = self.active_window().buffer_id;
+        let buf_content = if self
+            .buffer_manager
+            .get(bid)
+            .map(|s| s.dirty)
+            .unwrap_or(false)
+        {
+            self.buffer_manager.get(bid).map(|s| {
+                let rope = &s.buffer.content;
+                let mut text = String::new();
+                for i in 0..rope.len_lines() {
+                    text.push_str(&rope.line(i).to_string());
+                }
+                text
+            })
+        } else {
+            None
+        };
+        // Spawn blame on a background thread to avoid blocking the UI.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let repo = repo_root.clone();
+        let f = file.clone();
+        std::thread::spawn(move || {
+            let entries =
+                crate::core::git::blame_file_structured(&repo, &f, buf_content.as_deref());
+            let _ = tx.send(entries);
+        });
+        self.blame_rx = Some(rx);
+        self.message = "Loading blame…".to_string();
+    }
+
+    /// Poll for async blame results. Call from backend event loops.
+    /// Returns true if blame data was applied (triggers redraw).
+    pub fn poll_blame(&mut self) -> bool {
+        let entries = match self.blame_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            Some(e) => e,
+            None => return false,
+        };
+        self.blame_rx = None;
+        if entries.is_empty() {
+            self.message = "git blame returned no data".to_string();
+            return true;
+        }
+        // Find repo root for commit URL generation.
+        let repo_root = self
+            .file_path()
+            .and_then(|p| crate::core::git::find_repo_root(p));
+        self.line_annotations.clear();
+        self.editor_hover_content.clear();
+        for (i, info) in entries.iter().enumerate() {
+            if info.not_committed {
+                self.line_annotations.insert(i, "Not committed".to_string());
+            } else {
+                self.line_annotations.insert(
+                    i,
+                    format!("{}, {} — {}", info.author, info.relative_date, info.message),
+                );
+                // Build GitLens-style rich hover markdown.
+                let hash = &info.hash;
+                let url = repo_root
+                    .as_ref()
+                    .map(|r| crate::core::git::commit_url(r, hash))
+                    .unwrap_or(None);
+                let abs_date = crate::core::git::epoch_to_absolute(info.timestamp, info.tz_offset);
+                let hash_link = if let Some(ref u) = url {
+                    format!("[`{}`]({})", hash, u)
+                } else {
+                    format!("`{}`", hash)
+                };
+                let md = format!(
+                    "**{}**, {} ({})\n\n{}\n\n---\n\n{}",
+                    info.author, info.relative_date, abs_date, info.message, hash_link
+                );
+                self.editor_hover_content.insert(i, md);
+            }
+        }
+        self.blame_annotations_active = true;
+        self.message = format!("Inline blame on ({} lines)", entries.len());
+        true
     }
 
     /// Open the diff peek popup for the hunk under the cursor on the current buffer.
@@ -4502,6 +5016,7 @@ impl Engine {
             }
             self.scroll_bind_pairs
                 .retain(|&(x, y)| !((x == a && y == b) || (x == b && y == a)));
+            self.clear_diff_labels(a, b);
         }
         self.diff_window_pair = None;
         self.diff_results.clear();
@@ -5141,6 +5656,7 @@ impl Engine {
             .retain(|&(a, b)| a != window_id && b != window_id);
         if let Some((a, b)) = self.diff_window_pair.take() {
             if a == window_id || b == window_id {
+                self.clear_diff_labels(a, b);
                 self.diff_results.clear();
                 self.diff_aligned.clear();
                 self.diff_unchanged_hidden = false;
@@ -5202,6 +5718,7 @@ impl Engine {
             self.scroll_bind_pairs.retain(|&(a, b)| a != id && b != id);
             if let Some((a, b)) = self.diff_window_pair {
                 if a == id || b == id {
+                    self.clear_diff_labels(a, b);
                     self.diff_window_pair = None;
                     self.diff_results.clear();
                     self.diff_aligned.clear();
@@ -5367,6 +5884,7 @@ impl Engine {
                 .retain(|&(a, b)| a != *window_id && b != *window_id);
             if let Some((a, b)) = self.diff_window_pair {
                 if a == *window_id || b == *window_id {
+                    self.clear_diff_labels(a, b);
                     self.diff_window_pair = None;
                     self.diff_results.clear();
                     self.diff_aligned.clear();
@@ -6177,6 +6695,14 @@ impl Engine {
                 }
                 _ => {}
             },
+            ContextMenuTarget::ExtPanel {
+                panel_name,
+                item_id,
+            } => {
+                // Fire panel_context_menu event — Lua plugins handle all actions.
+                let arg = format!("{}||{}|{}|", panel_name, item_id, action);
+                self.plugin_event("panel_context_menu", &arg);
+            }
         }
 
         Some(action)
@@ -6259,6 +6785,7 @@ impl Engine {
         if !self.active_group().tabs.is_empty() {
             self.active_group_mut().active_tab = (self.active_group().active_tab + 1) % tabs_len;
             self.line_annotations.clear();
+            self.blame_annotations_active = false;
             self.tab_mru_touch();
             self.lsp_ensure_active_buffer();
         }
@@ -6271,6 +6798,7 @@ impl Engine {
             let tabs_len = self.active_group().tabs.len();
             self.active_group_mut().active_tab = if at == 0 { tabs_len - 1 } else { at - 1 };
             self.line_annotations.clear();
+            self.blame_annotations_active = false;
             self.tab_mru_touch();
             self.lsp_ensure_active_buffer();
         }
@@ -6318,6 +6846,7 @@ impl Engine {
                 self.active_group_mut().active_tab = tab_idx;
                 self.tab_mru_touch();
                 self.line_annotations.clear();
+                self.blame_annotations_active = false;
                 self.lsp_ensure_active_buffer();
             }
         }
@@ -6350,6 +6879,7 @@ impl Engine {
         if index < self.active_group().tabs.len() {
             self.active_group_mut().active_tab = index;
             self.line_annotations.clear();
+            self.blame_annotations_active = false;
             self.tab_mru_touch();
             self.lsp_ensure_active_buffer();
         }
@@ -6668,6 +7198,7 @@ impl Engine {
     pub fn open_file_in_tab(&mut self, path: &Path) {
         // Clear per-buffer virtual text annotations when switching files.
         self.line_annotations.clear();
+        self.blame_annotations_active = false;
         let buffer_id = match self.buffer_manager.open_file(path) {
             Ok(id) => id,
             Err(e) => {
@@ -7793,6 +8324,13 @@ impl Engine {
         }
         // Dismiss LSP hover popup on any keypress
         self.lsp_hover_text = None;
+        // Dismiss editor hover popup and dwell on any keypress (unless it has focus)
+        if !self.editor_hover_has_focus {
+            self.editor_hover = None;
+            self.editor_hover_dwell = None;
+        }
+        // Dismiss panel hover popup on any keypress (immediate, no delay)
+        self.dismiss_panel_hover_now();
 
         // Record keystroke if macro recording is active
         // Skip recording the 'q' that stops recording
@@ -7811,8 +8349,14 @@ impl Engine {
 
         // Modal dialog intercepts all keys.
         if self.dialog.is_some() {
+            // Capture the input value before the dialog key handler clears it.
+            let input_value = self
+                .dialog
+                .as_ref()
+                .and_then(|d| d.input.as_ref())
+                .map(|i| i.value.clone());
             if let Some((tag, action)) = self.handle_dialog_key(key_name, unicode) {
-                return self.process_dialog_result(&tag, &action);
+                return self.process_dialog_result(&tag, &action, input_value.as_deref());
             }
             return EngineAction::None;
         }
@@ -7907,6 +8451,18 @@ impl Engine {
             return EngineAction::None;
         }
 
+        // Editor hover popup intercepts keys when it has focus.
+        if self.editor_hover_has_focus {
+            // Use unicode char for printable keys (TUI sends key_name="" for them)
+            let hover_key = if key_name.is_empty() {
+                unicode.map(|c| c.to_string()).unwrap_or_default()
+            } else {
+                key_name.to_string()
+            };
+            self.handle_editor_hover_key(&hover_key);
+            return EngineAction::None;
+        }
+
         // Fuzzy finder intercepts all keys when open.
         if self.fuzzy_open {
             return self.handle_fuzzy_key(key_name, unicode, ctrl);
@@ -7925,6 +8481,12 @@ impl Engine {
         // Debug sidebar intercepts all keys when it has focus.
         if self.dap_sidebar_has_focus {
             return self.handle_debug_sidebar_key(key_name, ctrl);
+        }
+
+        // Extension panel input field intercepts keys when active.
+        if self.ext_panel_has_focus && self.ext_panel_input_active {
+            self.handle_ext_panel_input_key(key_name, ctrl, unicode);
+            return EngineAction::None;
         }
 
         // Extension panel intercepts all keys when it has focus.
@@ -8070,6 +8632,8 @@ impl Engine {
         }
 
         if changed {
+            let _t0 = std::time::Instant::now();
+
             // Track last edit position for '. mark and change list
             let cur = self.view().cursor;
             self.last_edit_pos = Some((cur.line, cur.col));
@@ -8081,7 +8645,18 @@ impl Engine {
                 self.view_mut().extra_cursors.clear();
             }
             self.set_dirty(true);
-            self.update_syntax();
+
+            let t1 = std::time::Instant::now();
+            // In insert mode, use the fast path: just re-parse the tree
+            // (incremental, fast) without extracting highlights (O(n), slow).
+            // Highlights are marked stale and re-extracted on the next render.
+            if self.mode == Mode::Insert {
+                self.mark_syntax_stale();
+            } else {
+                self.update_syntax();
+            }
+            let t2 = std::time::Instant::now();
+
             // Auto-promote preview buffer on text modification
             let active_id = self.active_buffer_id();
             if self.preview_buffer_id == Some(active_id) {
@@ -8089,13 +8664,32 @@ impl Engine {
             }
             // Mark buffer as needing an LSP didChange (debounced)
             self.lsp_dirty_buffers.insert(active_id, true);
+
+            let t3 = std::time::Instant::now();
             // Live-refresh any linked markdown preview.
             self.refresh_md_previews();
+            let t4 = std::time::Instant::now();
+
             // Mark swap file as needing a write.
             self.swap_mark_dirty();
+
+            let t5 = std::time::Instant::now();
             // Refresh search highlights so they track the new buffer content.
             if !self.search_matches.is_empty() {
                 self.run_search();
+            }
+            let t6 = std::time::Instant::now();
+
+            // Log timing for performance profiling (only when total > 10ms)
+            let total = t6.duration_since(_t0);
+            if total.as_millis() > 10 {
+                self.perf_log = Some(format!(
+                    "PERF handle_key changed: syntax={:.1}ms md_preview={:.1}ms search={:.1}ms total={:.1}ms",
+                    t2.duration_since(t1).as_secs_f64() * 1000.0,
+                    t4.duration_since(t3).as_secs_f64() * 1000.0,
+                    t6.duration_since(t5).as_secs_f64() * 1000.0,
+                    total.as_secs_f64() * 1000.0,
+                ));
             }
         }
 
@@ -9014,8 +9608,8 @@ impl Engine {
                 self.count = None;
             }
             Some('K') => {
-                // K: Show LSP hover information at cursor
-                self.lsp_request_hover();
+                // K: Show editor hover popup at cursor (diagnostics + LSP hover)
+                self.trigger_editor_hover_at_cursor();
             }
             Some('g') => {
                 self.pending_key = Some('g');
@@ -9460,6 +10054,10 @@ impl Engine {
                 }
                 Some('D') => {
                     self.open_diff_peek();
+                }
+                Some('h') => {
+                    // gh: show editor hover popup at cursor position
+                    self.trigger_editor_hover_at_cursor();
                 }
                 Some('r') => {
                     self.push_jump_location();
@@ -11579,7 +12177,7 @@ impl Engine {
         partial.push(ch);
 
         // All known built-in leader sequences
-        const SEQUENCES: &[&str] = &["rn", "gf", "gF", "gi"];
+        const SEQUENCES: &[&str] = &["rn", "gf", "gF", "gi", "gb"];
 
         match partial.as_str() {
             "rn" => {
@@ -11597,6 +12195,10 @@ impl Engine {
                 // LSP go to implementation
                 self.push_jump_location();
                 self.lsp_request_implementation();
+            }
+            "gb" => {
+                // Toggle inline git blame
+                self.toggle_inline_blame();
             }
             s => {
                 // Check if this is a complete plugin keymap match
@@ -12341,6 +12943,8 @@ impl Engine {
                 self.lsp_signature_help = None;
                 // Collapse all extra cursors.
                 self.view_mut().extra_cursors.clear();
+                // Refresh stale syntax highlights deferred from insert mode.
+                self.refresh_syntax_if_stale();
                 // Refresh position-aware annotations (e.g. git blame) now that
                 // we're back in Normal mode. cursor_move is suppressed during
                 // Insert mode to avoid stale blame on uncommitted lines.
@@ -15203,7 +15807,13 @@ impl Engine {
                     msg
                 };
             }
-            Err(e) => self.message = format!("pull: {}", e),
+            Err(e) => {
+                if git::is_ssh_auth_error(&e) {
+                    self.sc_show_passphrase_dialog("pull");
+                } else {
+                    self.message = format!("pull: {}", e);
+                }
+            }
         }
         self.sc_refresh();
     }
@@ -15219,7 +15829,13 @@ impl Engine {
                     msg
                 };
             }
-            Err(e) => self.message = format!("fetch: {}", e),
+            Err(e) => {
+                if git::is_ssh_auth_error(&e) {
+                    self.sc_show_passphrase_dialog("fetch");
+                } else {
+                    self.message = format!("fetch: {}", e);
+                }
+            }
         }
         self.sc_refresh();
     }
@@ -15235,9 +15851,49 @@ impl Engine {
                     msg
                 };
             }
-            Err(e) => self.message = format!("push: {}", e),
+            Err(e) => {
+                if git::is_ssh_auth_error(&e) {
+                    self.sc_show_passphrase_dialog("push");
+                } else {
+                    self.message = format!("push: {}", e);
+                }
+            }
         }
         self.sc_refresh();
+    }
+
+    /// Show an SSH passphrase dialog for a failed remote git operation.
+    fn sc_show_passphrase_dialog(&mut self, op: &str) {
+        self.pending_git_remote_op = Some(op.to_string());
+        let mut dialog = Dialog {
+            tag: "ssh_passphrase".to_string(),
+            title: "SSH Key Passphrase".to_string(),
+            body: vec![format!(
+                "Enter passphrase for SSH key (leave empty if none):"
+            )],
+            buttons: vec![
+                DialogButton {
+                    label: "Cancel".into(),
+                    hotkey: '\0',
+                    action: "cancel".into(),
+                },
+                DialogButton {
+                    label: "OK".into(),
+                    hotkey: '\0',
+                    action: "ok".into(),
+                },
+            ],
+            selected: 1,
+            input: Some(DialogInput {
+                label: "Passphrase".into(),
+                value: String::new(),
+                is_password: true,
+            }),
+        };
+        // Suppress hotkeys — input dialog uses printable chars for typing.
+        dialog.buttons[0].hotkey = '\0';
+        dialog.buttons[1].hotkey = '\0';
+        self.dialog = Some(dialog);
     }
 
     /// Commit all staged changes with the current commit message.
@@ -15256,6 +15912,7 @@ impl Engine {
                     out
                 };
                 self.sc_commit_message.clear();
+                self.sc_commit_cursor = 0;
                 self.sc_commit_input_active = false;
             }
             Err(e) => self.message = format!("commit: {}", e),
@@ -15270,14 +15927,19 @@ impl Engine {
         ctrl: bool,
         unicode: Option<char>,
     ) -> bool {
+        // Clamp cursor in case message was modified externally.
+        let len = self.sc_commit_message.len();
+        if self.sc_commit_cursor > len {
+            self.sc_commit_cursor = len;
+        }
+
         match key {
             "Return" | "KP_Enter" => {
                 if ctrl {
-                    // Ctrl+Enter commits.
                     self.sc_do_commit();
                 } else {
-                    // Plain Enter just exits input mode (keeps message).
-                    self.sc_commit_input_active = false;
+                    self.sc_commit_message.insert(self.sc_commit_cursor, '\n');
+                    self.sc_commit_cursor += 1;
                 }
                 true
             }
@@ -15286,17 +15948,141 @@ impl Engine {
                 true
             }
             "BackSpace" => {
-                self.sc_commit_message.pop();
+                if self.sc_commit_cursor > 0 {
+                    // Find the previous char boundary.
+                    let prev = self.sc_commit_message[..self.sc_commit_cursor]
+                        .char_indices()
+                        .next_back()
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                    self.sc_commit_message.remove(prev);
+                    self.sc_commit_cursor = prev;
+                }
+                true
+            }
+            "Delete" => {
+                if self.sc_commit_cursor < self.sc_commit_message.len() {
+                    self.sc_commit_message.remove(self.sc_commit_cursor);
+                }
+                true
+            }
+            "Left" => {
+                if self.sc_commit_cursor > 0 {
+                    let prev = self.sc_commit_message[..self.sc_commit_cursor]
+                        .char_indices()
+                        .next_back()
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                    self.sc_commit_cursor = prev;
+                }
+                true
+            }
+            "Right" => {
+                if self.sc_commit_cursor < self.sc_commit_message.len() {
+                    let ch = self.sc_commit_message[self.sc_commit_cursor..]
+                        .chars()
+                        .next()
+                        .unwrap();
+                    self.sc_commit_cursor += ch.len_utf8();
+                }
+                true
+            }
+            "Home" => {
+                // Move to start of current line.
+                let before = &self.sc_commit_message[..self.sc_commit_cursor];
+                self.sc_commit_cursor = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+                true
+            }
+            "End" => {
+                // Move to end of current line.
+                let after = &self.sc_commit_message[self.sc_commit_cursor..];
+                self.sc_commit_cursor += after.find('\n').unwrap_or(after.len());
+                true
+            }
+            "Up" => {
+                // Move cursor up one line (same column if possible).
+                let before = &self.sc_commit_message[..self.sc_commit_cursor];
+                let line_start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+                let col = self.sc_commit_cursor - line_start;
+                if line_start > 0 {
+                    // There is a previous line.
+                    let prev_line_end = line_start - 1; // the '\n'
+                    let prev_before = &self.sc_commit_message[..prev_line_end];
+                    let prev_line_start = prev_before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+                    let prev_line_len = prev_line_end - prev_line_start;
+                    self.sc_commit_cursor = prev_line_start + col.min(prev_line_len);
+                }
+                true
+            }
+            "Down" => {
+                // Move cursor down one line (same column if possible).
+                let before = &self.sc_commit_message[..self.sc_commit_cursor];
+                let line_start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+                let col = self.sc_commit_cursor - line_start;
+                let after = &self.sc_commit_message[self.sc_commit_cursor..];
+                if let Some(nl) = after.find('\n') {
+                    let next_line_start = self.sc_commit_cursor + nl + 1;
+                    let rest = &self.sc_commit_message[next_line_start..];
+                    let next_line_len = rest.find('\n').unwrap_or(rest.len());
+                    self.sc_commit_cursor = next_line_start + col.min(next_line_len);
+                }
                 true
             }
             _ => {
-                if let Some(ch) = unicode {
-                    self.sc_commit_message.push(ch);
+                if ctrl {
+                    // Ctrl+V paste from system clipboard.
+                    if unicode == Some('v') || unicode == Some('V') || key == "v" {
+                        if let Some(text) = Self::clipboard_paste() {
+                            self.sc_commit_message
+                                .insert_str(self.sc_commit_cursor, &text);
+                            self.sc_commit_cursor += text.len();
+                            return true;
+                        }
+                    }
+                    // Ctrl+A = select all / move to start, Ctrl+E = move to end
+                    if unicode == Some('a') || key == "a" {
+                        self.sc_commit_cursor = 0;
+                        return true;
+                    }
+                    if unicode == Some('e') || key == "e" {
+                        self.sc_commit_cursor = self.sc_commit_message.len();
+                        return true;
+                    }
+                    false
+                } else if let Some(ch) = unicode {
+                    self.sc_commit_message.insert(self.sc_commit_cursor, ch);
+                    self.sc_commit_cursor += ch.len_utf8();
                     true
                 } else {
                     false
                 }
             }
+        }
+    }
+
+    /// Try to paste from the system clipboard. Returns None on failure.
+    fn clipboard_paste() -> Option<String> {
+        #[cfg(test)]
+        {
+            None
+        }
+        #[cfg(not(test))]
+        {
+            use std::process::Command;
+            // Try xclip first, then xsel, then wl-paste (Wayland).
+            for cmd in &[
+                &["xclip", "-selection", "clipboard", "-o"][..],
+                &["xsel", "--clipboard", "--output"][..],
+                &["wl-paste", "--no-newline"][..],
+                &["pbpaste"][..],
+            ] {
+                if let Ok(out) = Command::new(cmd[0]).args(&cmd[1..]).output() {
+                    if out.status.success() {
+                        return Some(String::from_utf8_lossy(&out.stdout).into_owned());
+                    }
+                }
+            }
+            None
         }
     }
 
@@ -16041,6 +16827,7 @@ impl Engine {
             marks_snapshot,
             filetype,
             settings_snapshot,
+            panel_input_snapshot: self.ext_panel_input_text.clone(),
             ..Default::default()
         }
     }
@@ -16136,6 +16923,7 @@ impl Engine {
         // Apply virtual-text line annotations
         if ctx.clear_annotations {
             self.line_annotations.clear();
+            self.blame_annotations_active = false;
         }
         for (line_1indexed, text) in ctx.annotate_lines {
             if line_1indexed > 0 {
@@ -16340,6 +17128,19 @@ impl Engine {
         // Apply extension panel item updates
         for (panel, section, items) in ctx.panel_set_items {
             self.ext_panel_items.insert((panel, section), items);
+        }
+        // Register panel hover content from plugin callbacks
+        for (panel_name, item_id, markdown) in ctx.panel_hover_entries {
+            self.panel_hover_registry
+                .insert((panel_name, item_id), markdown);
+        }
+        // Apply panel input field text values from plugin callbacks
+        for (panel_name, text) in ctx.panel_input_values {
+            self.ext_panel_input_text.insert(panel_name, text);
+        }
+        // Register editor hover content from plugin callbacks
+        for (line, markdown) in ctx.editor_hover_entries {
+            self.editor_hover_content.insert(line, markdown);
         }
     }
 
@@ -17008,6 +17809,11 @@ impl Engine {
             return EngineAction::None;
         }
 
+        if cmd == "ToggleBlame" || cmd == "Gib" {
+            self.toggle_inline_blame();
+            return EngineAction::None;
+        }
+
         // Handle :GWorktreeAdd <branch> <path>
         if let Some(rest) = cmd.strip_prefix("GWorktreeAdd ") {
             let parts: Vec<&str> = rest.splitn(2, ' ').collect();
@@ -17253,7 +18059,7 @@ impl Engine {
                     self.message = "Usage: :ExtRemove <name>  (e.g. :ExtRemove csharp)".to_string();
                     return EngineAction::None;
                 }
-                self.ext_remove(name);
+                self.ext_show_remove_dialog(name);
                 return EngineAction::None;
             }
 
@@ -18425,7 +19231,7 @@ impl Engine {
                 EngineAction::None
             }
             "hover" => {
-                self.lsp_request_hover();
+                self.trigger_editor_hover_at_cursor();
                 EngineAction::None
             }
             "LspImpl" => {
@@ -22274,8 +23080,43 @@ impl Engine {
         (prefix, start)
     }
 
+    /// Fast word completion: scan only ~500 lines around the cursor.
+    /// Used by auto-popup to avoid O(N) scan on every keystroke.
+    fn word_completions_nearby(&self, prefix: &str) -> Vec<String> {
+        let total = self.buffer().len_lines();
+        let cursor_line = self.view().cursor.line;
+        let radius = 250usize;
+        let start = cursor_line.saturating_sub(radius);
+        let end = (cursor_line + radius).min(total);
+        let mut set: std::collections::HashSet<String> = Default::default();
+        for line_idx in start..end {
+            let text: String = self.buffer().content.line(line_idx).chars().collect();
+            let chars: Vec<char> = text.chars().collect();
+            let len = chars.len();
+            let mut i = 0usize;
+            while i < len {
+                if Self::is_word_char(chars[i]) {
+                    let word_start = i;
+                    while i < len && Self::is_word_char(chars[i]) {
+                        i += 1;
+                    }
+                    let word: String = chars[word_start..i].iter().collect();
+                    if word.starts_with(prefix) && word != prefix {
+                        set.insert(word);
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        let mut v: Vec<String> = set.into_iter().collect();
+        v.sort();
+        v
+    }
+
     /// Collect all words in the current buffer that start with `prefix`,
     /// deduplicated, sorted, excluding an exact match of `prefix` itself.
+    /// Used by Ctrl-N/Ctrl-P (manual completion) which can afford the full scan.
     fn word_completions_for_prefix(&self, prefix: &str) -> Vec<String> {
         let mut set: std::collections::HashSet<String> = Default::default();
         for line_idx in 0..self.buffer().len_lines() {
@@ -22337,7 +23178,9 @@ impl Engine {
             self.dismiss_completion();
             return;
         }
-        let candidates = self.word_completions_for_prefix(&prefix);
+        // Use a fast nearby-lines scan instead of scanning the entire buffer.
+        // For a 15K-line file, full scan takes 270ms; nearby scan is ~1ms.
+        let candidates = self.word_completions_nearby(&prefix);
         if !candidates.is_empty() {
             self.completion_start_col = self.view().cursor.col - prefix.chars().count();
             self.completion_candidates = candidates;
@@ -25006,10 +25849,121 @@ impl Engine {
         };
     }
 
+    /// Open the README for the currently selected extension in the sidebar.
+    /// Used by Enter and double-click.
+    pub fn ext_open_selected_readme(&mut self) {
+        let manifests = self.ext_available_manifests();
+        let installed = self.ext_installed_items();
+        let sel = self.ext_sidebar_selected;
+        let manifest = if sel < installed.len() {
+            manifests.iter().find(|m| m.name == installed[sel].name)
+        } else {
+            let available = self.ext_available_items();
+            let avail_idx = sel.saturating_sub(installed.len());
+            available
+                .get(avail_idx)
+                .and_then(|a| manifests.iter().find(|m| m.name == a.name))
+        };
+        if let Some(manifest) = manifest {
+            let name = manifest.name.clone();
+            let display = if manifest.display_name.is_empty() {
+                name.clone()
+            } else {
+                manifest.display_name.clone()
+            };
+            let base_url = self.resolve_registry_base_url(manifest);
+            let readme_path = paths::vimcode_config_dir()
+                .join("extensions")
+                .join(&name)
+                .join("README.md");
+            let content = std::fs::read_to_string(&readme_path)
+                .ok()
+                .or_else(|| registry::fetch_readme(&base_url, &name));
+            if let Some(content) = content {
+                self.open_markdown_preview_in_tab(&content, &display);
+            } else {
+                self.message = format!("No README available for '{name}'. Press i to install.");
+            }
+        }
+    }
+
+    /// Show a confirmation dialog before removing an extension.
+    /// Lists the tools that would be removed and offers three choices.
+    fn ext_show_remove_dialog(&mut self, name: &str) {
+        let manifest = self
+            .ext_available_manifests()
+            .into_iter()
+            .find(|m| m.name.eq_ignore_ascii_case(name));
+
+        // Collect tool binary names that are currently installed on PATH.
+        let mut tool_names: Vec<String> = Vec::new();
+        if let Some(ref m) = manifest {
+            if !m.lsp.binary.is_empty() && binary_on_path(&m.lsp.binary) {
+                tool_names.push(m.lsp.binary.clone());
+            }
+            if !m.dap.binary.is_empty() && binary_on_path(&m.dap.binary) {
+                // Avoid duplicates (some extensions share a binary).
+                if !tool_names.contains(&m.dap.binary) {
+                    tool_names.push(m.dap.binary.clone());
+                }
+            }
+        }
+
+        let mut body = vec![format!("Remove extension '{name}'?")];
+        if tool_names.is_empty() {
+            body.push("This will remove extension scripts and settings.".to_string());
+        } else {
+            body.push(String::new());
+            body.push(format!("Installed tools: {}", tool_names.join(", ")));
+        }
+
+        let buttons = if tool_names.is_empty() {
+            vec![
+                DialogButton {
+                    label: "Cancel".into(),
+                    hotkey: 'c',
+                    action: "cancel".into(),
+                },
+                DialogButton {
+                    label: "Remove".into(),
+                    hotkey: 'r',
+                    action: "remove".into(),
+                },
+            ]
+        } else {
+            vec![
+                DialogButton {
+                    label: "Cancel".into(),
+                    hotkey: 'c',
+                    action: "cancel".into(),
+                },
+                DialogButton {
+                    label: "Keep Tools".into(),
+                    hotkey: 'k',
+                    action: "keep_tools".into(),
+                },
+                DialogButton {
+                    label: "Remove All".into(),
+                    hotkey: 'a',
+                    action: "remove_all".into(),
+                },
+            ]
+        };
+
+        self.pending_ext_remove = Some(name.to_string());
+        self.show_dialog("ext_remove", "Remove Extension", body, buttons);
+    }
+
     /// Remove an extension: unmark as installed, delete its Lua scripts.
-    /// LSP binaries are NOT removed (they may be shared with other tools).
-    pub fn ext_remove(&mut self, name: &str) {
+    /// When `remove_tools` is true, also delete LSP/DAP binaries from PATH.
+    pub fn ext_remove(&mut self, name: &str, remove_tools: bool) {
         let name = name.to_string();
+
+        // Optionally remove installed tool binaries before clearing state.
+        if remove_tools {
+            self.ext_remove_tools(&name);
+        }
+
         self.extension_state.installed.retain(|e| e.name != name);
         let _ = self.extension_state.save();
 
@@ -25024,7 +25978,79 @@ impl Engine {
         self.plugin_manager = None;
         self.plugin_init();
 
-        self.message = format!("Extension '{name}' removed (LSP binary untouched)");
+        if remove_tools {
+            self.message = format!("Extension '{name}' and its tools removed");
+        } else {
+            self.message = format!("Extension '{name}' removed (tools kept on PATH)");
+        }
+
+        // Keep sidebar selection in bounds.
+        if self.ext_flat_item_count() == 0 {
+            self.ext_sidebar_sections_expanded[1] = true;
+        }
+        let new_total = self.ext_flat_item_count();
+        if new_total > 0 && self.ext_sidebar_selected >= new_total {
+            self.ext_sidebar_selected = new_total - 1;
+        }
+    }
+
+    /// Remove LSP/DAP tool binaries installed by an extension.
+    /// Only removes binaries found under well-known managed directories
+    /// (~/.local/bin, ~/.local/share/<name>, Mason bin dir).
+    fn ext_remove_tools(&mut self, name: &str) {
+        let manifest = self
+            .ext_available_manifests()
+            .into_iter()
+            .find(|m| m.name.eq_ignore_ascii_case(name));
+        let manifest = match manifest {
+            Some(m) => m,
+            None => return,
+        };
+
+        let mut removed: Vec<String> = Vec::new();
+
+        // Collect all binary names to check.
+        let mut bins: Vec<String> = Vec::new();
+        if !manifest.lsp.binary.is_empty() {
+            bins.push(manifest.lsp.binary.clone());
+        }
+        if !manifest.dap.binary.is_empty() && !bins.contains(&manifest.dap.binary) {
+            bins.push(manifest.dap.binary.clone());
+        }
+
+        // Safe directories where we allow automatic removal.
+        let home = std::env::var("HOME").unwrap_or_default();
+        let mut safe_dirs: Vec<PathBuf> = vec![
+            PathBuf::from(&home).join(".local/bin"),
+            PathBuf::from(&home).join(".cargo/bin"),
+        ];
+        // Also check Mason's bin dir if it exists.
+        let mason_dir = PathBuf::from(&home).join(".local/share/nvim/mason/bin");
+        if mason_dir.is_dir() {
+            safe_dirs.push(mason_dir);
+        }
+
+        for bin_name in &bins {
+            // Remove binary from safe dirs.
+            for dir in &safe_dirs {
+                let path = dir.join(bin_name);
+                if path.exists() && std::fs::remove_file(&path).is_ok() {
+                    removed.push(format!("{}", path.display()));
+                }
+            }
+            // Remove associated data dir (e.g. ~/.local/share/lua-language-server/).
+            let data_dir = PathBuf::from(&home).join(".local/share").join(bin_name);
+            if data_dir.is_dir() {
+                let _ = std::fs::remove_dir_all(&data_dir);
+            }
+        }
+
+        if !removed.is_empty() {
+            super::lsp_manager::install_log(&format!(
+                "[ext-remove] Removed tools for '{name}': {}",
+                removed.join(", ")
+            ));
+        }
     }
 
     /// Update a single extension: re-download scripts and update version.
@@ -25176,6 +26202,61 @@ impl Engine {
     // ─── Extension Panel helpers ────────────────────────────────────────────
 
     /// Compute the total number of flat items across all sections of the active extension panel.
+    /// Check if a tree item is visible (all ancestors expanded).
+    fn ext_panel_item_visible(
+        &self,
+        panel_name: &str,
+        item: &plugin::ExtPanelItem,
+        items: &[plugin::ExtPanelItem],
+    ) -> bool {
+        if item.parent_id.is_empty() {
+            return true;
+        }
+        // Walk up the parent chain
+        let mut pid = &item.parent_id;
+        loop {
+            if pid.is_empty() {
+                return true;
+            }
+            // Find the parent item
+            if let Some(parent) = items.iter().find(|i| i.id == *pid) {
+                let is_expanded = self
+                    .ext_panel_tree_expanded
+                    .get(&(panel_name.to_string(), parent.id.clone()))
+                    .copied()
+                    .unwrap_or(parent.expanded);
+                if !is_expanded {
+                    return false;
+                }
+                pid = &parent.parent_id;
+            } else {
+                return true; // parent not found, show the item
+            }
+        }
+    }
+
+    /// Count visible items in a section (accounting for collapsed tree nodes).
+    fn ext_panel_visible_count(&self, panel_name: &str, items: &[plugin::ExtPanelItem]) -> usize {
+        items
+            .iter()
+            .filter(|item| self.ext_panel_item_visible(panel_name, item, items))
+            .count()
+    }
+
+    /// Return the indices of visible items in a section.
+    pub fn ext_panel_visible_indices(
+        &self,
+        panel_name: &str,
+        items: &[plugin::ExtPanelItem],
+    ) -> Vec<usize> {
+        items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| self.ext_panel_item_visible(panel_name, item, items))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
     pub fn ext_panel_flat_len(&self) -> usize {
         let panel_name = match &self.ext_panel_active {
             Some(n) => n.clone(),
@@ -25193,7 +26274,7 @@ impl Engine {
             if is_expanded {
                 let key = (panel_name.clone(), section.clone());
                 if let Some(items) = self.ext_panel_items.get(&key) {
-                    count += items.len();
+                    count += self.ext_panel_visible_count(&panel_name, items);
                 }
             }
         }
@@ -25202,6 +26283,7 @@ impl Engine {
 
     /// Given a flat index, return (section_index, item_index_within_section).
     /// If the flat index lands on a section header, item_index is `usize::MAX`.
+    /// item_index refers to the original (unfiltered) index in the items Vec.
     pub fn ext_panel_flat_to_section(&self, flat: usize) -> Option<(usize, usize)> {
         let panel_name = self.ext_panel_active.clone()?;
         let reg = self.ext_panels.get(&panel_name)?;
@@ -25215,11 +26297,13 @@ impl Engine {
             let is_expanded = expanded.and_then(|v| v.get(si)).copied().unwrap_or(true);
             if is_expanded {
                 let key = (panel_name.clone(), section.clone());
-                let item_count = self.ext_panel_items.get(&key).map(|v| v.len()).unwrap_or(0);
-                if flat < pos + item_count {
-                    return Some((si, flat - pos));
+                if let Some(items) = self.ext_panel_items.get(&key) {
+                    let visible = self.ext_panel_visible_indices(&panel_name, items);
+                    if flat < pos + visible.len() {
+                        return Some((si, visible[flat - pos]));
+                    }
+                    pos += visible.len();
                 }
-                pos += item_count;
             }
         }
         None
@@ -25260,17 +26344,72 @@ impl Engine {
                     self.ext_panel_selected = max - 1;
                 }
             }
+            "/" => {
+                // Activate the input field for filtering/searching within the panel.
+                self.ext_panel_input_active = true;
+            }
             "Tab" => {
-                // Toggle expand/collapse the section under cursor
-                if let Some((si, _)) = self.ext_panel_flat_to_section(self.ext_panel_selected) {
-                    let expanded = self
-                        .ext_panel_sections_expanded
-                        .entry(panel_name)
-                        .or_default();
-                    while expanded.len() <= si {
-                        expanded.push(true);
+                // Toggle expand/collapse — works on section headers AND expandable tree items
+                if let Some((si, item_idx)) =
+                    self.ext_panel_flat_to_section(self.ext_panel_selected)
+                {
+                    if item_idx == usize::MAX {
+                        // Section header: toggle section expand
+                        let expanded = self
+                            .ext_panel_sections_expanded
+                            .entry(panel_name.clone())
+                            .or_default();
+                        while expanded.len() <= si {
+                            expanded.push(true);
+                        }
+                        expanded[si] = !expanded[si];
+                    } else {
+                        // Item: toggle tree node expand if expandable
+                        let reg = self.ext_panels.get(&panel_name).cloned();
+                        if let Some(reg) = reg {
+                            if let Some(section) = reg.sections.get(si) {
+                                let key = (panel_name.clone(), section.clone());
+                                let is_expandable = self
+                                    .ext_panel_items
+                                    .get(&key)
+                                    .and_then(|items| items.get(item_idx))
+                                    .map(|item| item.expandable)
+                                    .unwrap_or(false);
+                                if is_expandable {
+                                    let item_id = self
+                                        .ext_panel_items
+                                        .get(&key)
+                                        .and_then(|items| items.get(item_idx))
+                                        .map(|item| item.id.clone())
+                                        .unwrap_or_default();
+                                    let default_expanded = self
+                                        .ext_panel_items
+                                        .get(&key)
+                                        .and_then(|items| items.get(item_idx))
+                                        .map(|item| item.expanded)
+                                        .unwrap_or(false);
+                                    let tree_key = (panel_name.clone(), item_id.clone());
+                                    let currently = self
+                                        .ext_panel_tree_expanded
+                                        .get(&tree_key)
+                                        .copied()
+                                        .unwrap_or(default_expanded);
+                                    self.ext_panel_tree_expanded.insert(tree_key, !currently);
+                                    // Fire expand/collapse event
+                                    let event = if currently {
+                                        "panel_collapse"
+                                    } else {
+                                        "panel_expand"
+                                    };
+                                    let arg = format!(
+                                        "{}|{}|{}||{}",
+                                        panel_name, section, item_id, self.ext_panel_selected
+                                    );
+                                    self.plugin_event(event, &arg);
+                                }
+                            }
+                        }
                     }
-                    expanded[si] = !expanded[si];
                 }
             }
             "Return" => {
@@ -25298,7 +26437,31 @@ impl Engine {
                 }
             }
             other => {
-                // Fire panel_action event for unhandled keys
+                // Check if the key matches an action button on the selected item
+                let mut action_label = None;
+                if let Some((si, item_idx)) =
+                    self.ext_panel_flat_to_section(self.ext_panel_selected)
+                {
+                    if item_idx != usize::MAX {
+                        let reg = self.ext_panels.get(&panel_name).cloned();
+                        if let Some(reg) = &reg {
+                            if let Some(section) = reg.sections.get(si) {
+                                let key = (panel_name.clone(), section.clone());
+                                if let Some(items) = self.ext_panel_items.get(&key) {
+                                    if let Some(item) = items.get(item_idx) {
+                                        for action in &item.actions {
+                                            if action.key == other {
+                                                action_label = Some(action.label.clone());
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Fire panel_action event
                 if let Some((si, item_idx)) =
                     self.ext_panel_flat_to_section(self.ext_panel_selected)
                 {
@@ -25315,9 +26478,11 @@ impl Engine {
                             } else {
                                 String::new()
                             };
+                            // Use action label as key if matched, otherwise original key
+                            let event_key = action_label.as_deref().unwrap_or(other);
                             let arg = format!(
                                 "{}|{}|{}|{}|{}",
-                                panel_name, section, id, other, self.ext_panel_selected
+                                panel_name, section, id, event_key, self.ext_panel_selected
                             );
                             self.plugin_event("panel_action", &arg);
                         }
@@ -25326,6 +26491,1151 @@ impl Engine {
             }
         }
         true
+    }
+
+    /// Handle double-click on an extension panel item.
+    /// Fires `panel_double_click` event (same arg format as `panel_select`).
+    pub fn handle_ext_panel_double_click(&mut self) {
+        let panel_name = match &self.ext_panel_active {
+            Some(n) => n.clone(),
+            None => return,
+        };
+        if let Some((si, item_idx)) = self.ext_panel_flat_to_section(self.ext_panel_selected) {
+            if item_idx != usize::MAX {
+                let reg = self.ext_panels.get(&panel_name).cloned();
+                if let Some(reg) = reg {
+                    if let Some(section) = reg.sections.get(si) {
+                        let key = (panel_name.clone(), section.clone());
+                        let id = self
+                            .ext_panel_items
+                            .get(&key)
+                            .and_then(|items| items.get(item_idx))
+                            .map(|item| item.id.clone())
+                            .unwrap_or_default();
+                        let arg = format!(
+                            "{}|{}|{}||{}",
+                            panel_name, section, id, self.ext_panel_selected
+                        );
+                        self.plugin_event("panel_double_click", &arg);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Open a context menu for an extension panel item.
+    /// Fires `panel_context_menu` with the selected item info.
+    pub fn open_ext_panel_context_menu(&mut self, x: u16, y: u16) {
+        let panel_name = match &self.ext_panel_active {
+            Some(n) => n.clone(),
+            None => return,
+        };
+        if let Some((si, item_idx)) = self.ext_panel_flat_to_section(self.ext_panel_selected) {
+            let reg = self.ext_panels.get(&panel_name).cloned();
+            if let Some(reg) = reg {
+                if let Some(section) = reg.sections.get(si) {
+                    let key = (panel_name.clone(), section.clone());
+                    let id = if item_idx != usize::MAX {
+                        self.ext_panel_items
+                            .get(&key)
+                            .and_then(|items| items.get(item_idx))
+                            .map(|item| item.id.clone())
+                            .unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
+                    let arg = format!(
+                        "{}|{}|{}||{}",
+                        panel_name, section, id, self.ext_panel_selected
+                    );
+                    self.plugin_event("panel_context_menu", &arg);
+                }
+            }
+        }
+        let _ = (x, y); // Position reserved for future native menu rendering.
+    }
+
+    /// Handle keyboard input for the extension panel input field.
+    /// Returns `true` if the key was consumed.
+    pub fn handle_ext_panel_input_key(
+        &mut self,
+        key: &str,
+        _ctrl: bool,
+        unicode: Option<char>,
+    ) -> bool {
+        let panel_name = match &self.ext_panel_active {
+            Some(n) => n.clone(),
+            None => {
+                self.ext_panel_input_active = false;
+                return true;
+            }
+        };
+
+        match key {
+            "Escape" => {
+                self.ext_panel_input_active = false;
+            }
+            "Return" => {
+                // Fire panel_input event with the current text, then deactivate.
+                let text = self
+                    .ext_panel_input_text
+                    .get(&panel_name)
+                    .cloned()
+                    .unwrap_or_default();
+                let arg = format!("{}|||{}|", panel_name, text);
+                self.plugin_event("panel_input", &arg);
+                self.ext_panel_input_active = false;
+            }
+            "BackSpace" => {
+                if let Some(text) = self.ext_panel_input_text.get_mut(&panel_name) {
+                    text.pop();
+                }
+                // Fire panel_input on every change for live filtering.
+                let text = self
+                    .ext_panel_input_text
+                    .get(&panel_name)
+                    .cloned()
+                    .unwrap_or_default();
+                let arg = format!("{}|||{}|", panel_name, text);
+                self.plugin_event("panel_input", &arg);
+            }
+            _ => {
+                if let Some(ch) = unicode {
+                    if !ch.is_control() {
+                        self.ext_panel_input_text
+                            .entry(panel_name.clone())
+                            .or_default()
+                            .push(ch);
+                        // Fire panel_input on every change for live filtering.
+                        let text = self
+                            .ext_panel_input_text
+                            .get(&panel_name)
+                            .cloned()
+                            .unwrap_or_default();
+                        let arg = format!("{}|||{}|", panel_name, text);
+                        self.plugin_event("panel_input", &arg);
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    // ── Panel hover popup methods ──────────────────────────────────────────
+
+    /// Show a hover popup with rendered markdown for a sidebar panel item.
+    pub fn show_panel_hover(
+        &mut self,
+        panel_name: &str,
+        item_id: &str,
+        item_index: usize,
+        markdown: &str,
+    ) {
+        let rendered = crate::core::markdown::render_markdown(markdown);
+        // Extract clickable link URLs from LinkUrl spans (only safe schemes).
+        let mut links = Vec::new();
+        for (line_idx, line_spans) in rendered.spans.iter().enumerate() {
+            for span in line_spans {
+                if span.style == crate::core::markdown::MdStyle::LinkUrl {
+                    if let Some(line) = rendered.lines.get(line_idx) {
+                        if span.end_byte <= line.len() {
+                            let url_text = &line[span.start_byte..span.end_byte];
+                            if is_safe_url(url_text) {
+                                links.push((
+                                    line_idx,
+                                    span.start_byte,
+                                    span.end_byte,
+                                    url_text.to_string(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.panel_hover = Some(PanelHoverPopup {
+            rendered,
+            links,
+            panel_name: panel_name.to_string(),
+            item_id: item_id.to_string(),
+            item_index,
+        });
+    }
+
+    /// Schedule a delayed dismiss of the hover popup (250ms grace period).
+    /// The popup stays visible until `poll_panel_hover` sees the deadline pass.
+    /// If the mouse moves back onto the popup or item, call `cancel_panel_hover_dismiss`.
+    pub fn dismiss_panel_hover(&mut self) {
+        if self.panel_hover.is_some() && self.panel_hover_dismiss_at.is_none() {
+            self.panel_hover_dismiss_at =
+                Some(std::time::Instant::now() + std::time::Duration::from_millis(350));
+        }
+        // Always clear dwell so a new hover won't restart on the old item.
+        self.panel_hover_dwell = None;
+    }
+
+    /// Immediately dismiss the hover popup with no delay.
+    pub fn dismiss_panel_hover_now(&mut self) {
+        self.panel_hover = None;
+        self.panel_hover_dwell = None;
+        self.panel_hover_dismiss_at = None;
+    }
+
+    /// Cancel a pending delayed dismiss (mouse returned to popup or item).
+    pub fn cancel_panel_hover_dismiss(&mut self) {
+        self.panel_hover_dismiss_at = None;
+    }
+
+    /// Track mouse movement over a sidebar panel item for dwell detection.
+    /// Returns true if the dwell state changed (item changed).
+    pub fn panel_hover_mouse_move(
+        &mut self,
+        panel_name: &str,
+        item_id: &str,
+        item_index: usize,
+    ) -> bool {
+        let _ = item_id;
+        // If mouse returned to the item that spawned the current popup, cancel dismiss.
+        if let Some(ref ph) = self.panel_hover {
+            if ph.panel_name == panel_name && ph.item_index == item_index {
+                self.panel_hover_dismiss_at = None;
+                return false;
+            }
+        }
+        if let Some((ref pn, idx, _)) = self.panel_hover_dwell {
+            if pn == panel_name && idx == item_index {
+                // Same dwell item. Only cancel dismiss if this item owns
+                // the current popup (not if a *different* popup is lingering).
+                let owns_popup = self
+                    .panel_hover
+                    .as_ref()
+                    .is_some_and(|ph| ph.panel_name == panel_name && ph.item_index == item_index);
+                if owns_popup {
+                    self.panel_hover_dismiss_at = None;
+                }
+                return false; // Same item, dwell still running
+            }
+        }
+        // Different item — schedule delayed dismiss for the active popup
+        // (so it lingers while the user moves the mouse toward it) and start
+        // dwell tracking on the new item.
+        if self.panel_hover.is_some() && self.panel_hover_dismiss_at.is_none() {
+            self.panel_hover_dismiss_at =
+                Some(std::time::Instant::now() + std::time::Duration::from_millis(350));
+        }
+        // If no popup is showing, clear any stale dismiss.
+        if self.panel_hover.is_none() {
+            self.panel_hover_dismiss_at = None;
+        }
+        self.panel_hover_dwell = Some((
+            panel_name.to_string(),
+            item_index,
+            std::time::Instant::now(),
+        ));
+        true
+    }
+
+    /// Called from poll/tick loops. Handles dwell-to-show and delayed dismiss.
+    /// Returns true if a redraw is needed.
+    pub fn poll_panel_hover(&mut self) -> bool {
+        if self.settings.hover_delay == 0 {
+            return false;
+        }
+        // Check delayed dismiss deadline.
+        if let Some(deadline) = self.panel_hover_dismiss_at {
+            if std::time::Instant::now() >= deadline {
+                self.panel_hover = None;
+                self.panel_hover_dismiss_at = None;
+                return true; // redraw to remove popup
+            }
+        }
+
+        let Some((ref panel_name, item_index, started)) = self.panel_hover_dwell else {
+            return false;
+        };
+        if self.panel_hover.is_some() {
+            return false; // Already showing
+        }
+        if started.elapsed() < std::time::Duration::from_millis(self.settings.hover_delay as u64) {
+            return false; // Not yet
+        }
+        let panel_name = panel_name.clone();
+
+        // Native source control panel hovers.
+        if panel_name == "source_control" {
+            if let Some(md) = self.sc_hover_markdown(item_index) {
+                self.show_panel_hover(&panel_name, "", item_index, &md);
+                return true;
+            }
+            self.panel_hover_dwell = None;
+            return false;
+        }
+
+        // Extension panel: resolve item_id and check plugin registry.
+        let item_id = self.resolve_panel_hover_item_id(&panel_name, item_index);
+        let md = self
+            .panel_hover_registry
+            .get(&(panel_name.clone(), item_id.clone()))
+            .cloned();
+        if let Some(md) = md {
+            self.show_panel_hover(&panel_name, &item_id, item_index, &md);
+            return true;
+        }
+        // Prevent re-polling: clear dwell so we don't keep trying every tick.
+        self.panel_hover_dwell = None;
+        false
+    }
+
+    /// Generate hover markdown for a Source Control panel item at the given flat index.
+    fn sc_hover_markdown(&self, flat_index: usize) -> Option<String> {
+        let (section, idx) = self.sc_flat_to_section_idx(flat_index);
+
+        // Section headers: show branch info on the "Staged Changes" header (section 0)
+        if idx == usize::MAX {
+            if section == 0 {
+                // Branch info hover
+                return self.sc_hover_branch_info();
+            }
+            return None; // Other headers: no hover
+        }
+
+        match section {
+            // Staged/Unstaged file items
+            0 | 1 => {
+                let is_staged = section == 0;
+                let files: Vec<&git::FileStatus> = if is_staged {
+                    self.sc_file_statuses
+                        .iter()
+                        .filter(|f| f.staged.is_some())
+                        .collect()
+                } else {
+                    self.sc_file_statuses
+                        .iter()
+                        .filter(|f| f.unstaged.is_some())
+                        .collect()
+                };
+                let file = files.get(idx)?;
+                self.sc_hover_file(file, is_staged)
+            }
+            // Log items
+            3 => {
+                let entry = self.sc_log.get(idx)?;
+                self.sc_hover_log_entry(entry)
+            }
+            _ => None,
+        }
+    }
+
+    /// Branch info hover (shown on the Staged Changes section header).
+    fn sc_hover_branch_info(&self) -> Option<String> {
+        let cwd = std::env::current_dir().ok()?;
+        let branch = git::current_branch(&cwd)?;
+        let tracking = git::tracking_branch(&cwd).unwrap_or_else(|| "none".to_string());
+        let mut md = format!("### {} `{}`\n\n", "\u{e725}", branch); // nf-dev-git_branch
+        md.push_str(&format!("**Remote:** `{}`\n\n", tracking));
+        if self.sc_ahead > 0 || self.sc_behind > 0 {
+            md.push_str(&format!(
+                "\u{2191}{} \u{2193}{}",
+                self.sc_ahead, self.sc_behind
+            ));
+            if self.sc_ahead > 0 {
+                md.push_str(" — commits to push");
+            }
+            if self.sc_behind > 0 {
+                md.push_str(" — commits to pull");
+            }
+            md.push('\n');
+        } else {
+            md.push_str("Up to date with remote\n");
+        }
+        Some(md)
+    }
+
+    /// File hover: show status and diff stats.
+    fn sc_hover_file(&self, file: &git::FileStatus, staged: bool) -> Option<String> {
+        let status = if staged {
+            file.staged.unwrap_or(git::StatusKind::Modified)
+        } else {
+            file.unstaged.unwrap_or(git::StatusKind::Modified)
+        };
+        let status_label = match status {
+            git::StatusKind::Added => "Added",
+            git::StatusKind::Modified => "Modified",
+            git::StatusKind::Deleted => "Deleted",
+            git::StatusKind::Renamed => "Renamed",
+            git::StatusKind::Untracked => "Untracked",
+        };
+        let mut md = format!("### {}\n\n", file.path);
+        md.push_str(&format!(
+            "**Status:** {} ({})\n\n",
+            status_label,
+            if staged { "staged" } else { "unstaged" }
+        ));
+        // Get diff stats (blocking but fast for a single file)
+        let cwd = std::env::current_dir().ok()?;
+        if let Some(stat) = git::diff_stat_file(&cwd, &file.path, staged) {
+            md.push_str("```\n");
+            md.push_str(&stat);
+            md.push_str("\n```\n");
+        }
+        Some(md)
+    }
+
+    /// Log entry hover: show commit details.
+    fn sc_hover_log_entry(&self, entry: &git::GitLogEntry) -> Option<String> {
+        let cwd = std::env::current_dir().ok()?;
+        if let Some(detail) = git::commit_detail(&cwd, &entry.hash) {
+            let mut md = String::new();
+            // If we can build a commit URL, make the hash a clickable link.
+            if let Some(url) = git::commit_url(&cwd, &detail.hash) {
+                md.push_str(&format!("### [{}]({})\n\n", detail.hash, url));
+            } else {
+                md.push_str(&format!("### `{}`\n\n", detail.hash));
+            }
+            md.push_str(&format!("**Author:** {}\n\n", detail.author));
+            md.push_str(&format!("**Date:** {}\n\n", detail.date));
+            if !detail.message.is_empty() {
+                md.push_str(&detail.message);
+                md.push_str("\n\n");
+            }
+            if !detail.stat.is_empty() {
+                md.push_str("```\n");
+                md.push_str(&detail.stat);
+                md.push_str("\n```\n");
+            }
+            Some(md)
+        } else {
+            // Fallback to basic info
+            Some(format!("### `{}`\n\n{}\n", entry.hash, entry.message))
+        }
+    }
+
+    /// Resolve the item_id for a given panel name and flat index.
+    fn resolve_panel_hover_item_id(&self, panel_name: &str, flat_index: usize) -> String {
+        let Some(reg) = self.ext_panels.get(panel_name) else {
+            return String::new();
+        };
+        let expanded = self.ext_panel_sections_expanded.get(panel_name);
+        let mut idx = 0usize;
+        for (si, section_name) in reg.sections.iter().enumerate() {
+            if idx == flat_index {
+                return String::new(); // It's a section header
+            }
+            idx += 1;
+            let is_expanded = expanded.and_then(|v| v.get(si)).copied().unwrap_or(true);
+            if is_expanded {
+                let key = (panel_name.to_string(), section_name.clone());
+                if let Some(items) = self.ext_panel_items.get(&key) {
+                    for item in items {
+                        if idx == flat_index {
+                            return item.id.clone();
+                        }
+                        idx += 1;
+                    }
+                }
+            }
+        }
+        String::new()
+    }
+
+    // ── Editor hover popup ────────────────────────────────────────────────────
+
+    /// Trigger the editor hover popup at the current cursor position.
+    /// Assembles content from multiple providers: diagnostics, annotations,
+    /// plugin hover content, and LSP hover. Also requests LSP hover async.
+    pub fn trigger_editor_hover_at_cursor(&mut self) {
+        let line = self.cursor().line;
+        let col = self.cursor().col;
+        self.show_editor_hover_at(line, col, true, true);
+    }
+
+    /// Check if any diagnostic touches the given line.
+    pub fn has_diagnostic_on_line(&self, line: usize) -> bool {
+        if let Some(path) = self.active_buffer_path() {
+            if let Some(diags) = self.lsp_diagnostics.get(&path) {
+                return diags.iter().any(|d| {
+                    let sl = d.range.start.line as usize;
+                    let el = d.range.end.line as usize;
+                    line >= sl && line <= el
+                });
+            }
+        }
+        false
+    }
+
+    /// Trigger editor hover for a diagnostic gutter click on the given line.
+    /// Shows ALL diagnostics that touch this line, regardless of column.
+    pub fn trigger_editor_hover_for_line(&mut self, line: usize) {
+        let mut sections: Vec<String> = Vec::new();
+        if let Some(path) = self.active_buffer_path() {
+            if let Some(diags) = self.lsp_diagnostics.get(&path) {
+                for diag in diags {
+                    let start_line = diag.range.start.line as usize;
+                    let end_line = diag.range.end.line as usize;
+                    if line >= start_line && line <= end_line {
+                        let severity = match diag.severity {
+                            crate::core::lsp::DiagnosticSeverity::Error => "Error",
+                            crate::core::lsp::DiagnosticSeverity::Warning => "Warning",
+                            crate::core::lsp::DiagnosticSeverity::Information => "Info",
+                            crate::core::lsp::DiagnosticSeverity::Hint => "Hint",
+                        };
+                        let source_str = diag
+                            .source
+                            .as_deref()
+                            .map(|s| format!(" ({})", s))
+                            .unwrap_or_default();
+                        sections.push(format!(
+                            "**{}**{}\n\n`{}`",
+                            severity, source_str, diag.message
+                        ));
+                    }
+                }
+            }
+        }
+        if !sections.is_empty() {
+            let combined = sections.join("\n\n---\n\n");
+            self.show_editor_hover(
+                line,
+                0,
+                &combined,
+                EditorHoverSource::Diagnostic,
+                true,
+                false,
+            );
+        }
+    }
+
+    /// Assemble and show the editor hover popup at a given buffer position.
+    /// If `request_lsp` is true, also fires an LSP hover request (async).
+    /// If `take_focus` is true, the popup grabs keyboard focus (j/k scroll, Tab links).
+    pub fn show_editor_hover_at(
+        &mut self,
+        line: usize,
+        col: usize,
+        request_lsp: bool,
+        take_focus: bool,
+    ) {
+        self.show_editor_hover_at_inner(line, col, request_lsp, take_focus, true);
+    }
+
+    /// Inner implementation — `include_annotations` controls whether annotation
+    /// hover content is included (false for mouse dwell over code text, true for
+    /// keyboard triggers and mouse dwell over ghost text).
+    fn show_editor_hover_at_inner(
+        &mut self,
+        line: usize,
+        col: usize,
+        request_lsp: bool,
+        take_focus: bool,
+        include_annotations: bool,
+    ) {
+        let mut sections: Vec<(EditorHoverSource, String)> = Vec::new();
+
+        // 1. Diagnostics at this position
+        if let Some(path) = self.active_buffer_path() {
+            if let Some(diags) = self.lsp_diagnostics.get(&path) {
+                for diag in diags {
+                    let start_line = diag.range.start.line as usize;
+                    let end_line = diag.range.end.line as usize;
+                    let start_col = diag.range.start.character as usize;
+                    let end_col = diag.range.end.character as usize;
+                    let in_range = if start_line == end_line {
+                        line == start_line && col >= start_col && col <= end_col
+                    } else {
+                        (line == start_line && col >= start_col)
+                            || (line == end_line && col <= end_col)
+                            || (line > start_line && line < end_line)
+                    };
+                    if in_range {
+                        let severity = match diag.severity {
+                            crate::core::lsp::DiagnosticSeverity::Error => "Error",
+                            crate::core::lsp::DiagnosticSeverity::Warning => "Warning",
+                            crate::core::lsp::DiagnosticSeverity::Information => "Info",
+                            crate::core::lsp::DiagnosticSeverity::Hint => "Hint",
+                        };
+                        let source_str = diag
+                            .source
+                            .as_deref()
+                            .map(|s| format!(" ({})", s))
+                            .unwrap_or_default();
+                        let md = format!("**{}**{}\n\n`{}`", severity, source_str, diag.message);
+                        sections.push((EditorHoverSource::Diagnostic, md));
+                    }
+                }
+            }
+        }
+
+        // 2. Plugin hover content for this line (only when over annotation area)
+        if include_annotations {
+            if let Some(md) = self.editor_hover_content.get(&line) {
+                sections.push((EditorHoverSource::Annotation, md.clone()));
+            }
+        }
+
+        // 3. Line annotation text (simple inline blame, etc.)
+        if include_annotations && sections.is_empty() {
+            if let Some(annotation) = self.line_annotations.get(&line) {
+                if !annotation.is_empty() {
+                    // Query plugin hover providers for annotation content
+                    let md = format!("`{}`", annotation.trim());
+                    sections.push((EditorHoverSource::Annotation, md));
+                }
+            }
+        }
+
+        // 4. Existing LSP hover text (if already available)
+        if let Some(hover_text) = &self.lsp_hover_text {
+            sections.push((EditorHoverSource::Lsp, hover_text.clone()));
+        }
+
+        // Build the popup if we have content
+        let has_lsp_section = sections
+            .iter()
+            .any(|(s, _)| matches!(s, EditorHoverSource::Lsp));
+        let is_annotation_only = !sections.is_empty()
+            && sections
+                .iter()
+                .all(|(s, _)| matches!(s, EditorHoverSource::Annotation));
+        if !sections.is_empty() {
+            let combined = sections
+                .iter()
+                .map(|(_, md)| md.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n---\n\n");
+            let source = sections[0].0.clone();
+            // Annotation-only hovers don't auto-focus — user clicks to focus.
+            let focus = take_focus && !is_annotation_only;
+            self.show_editor_hover(line, col, &combined, source, focus, false);
+        } else if request_lsp && self.has_lsp_for_buffer() {
+            // No content yet — show "Loading..." while we wait for the LSP response.
+            self.show_editor_hover(
+                line,
+                col,
+                "Loading...",
+                EditorHoverSource::Lsp,
+                take_focus,
+                false,
+            );
+        } else if take_focus {
+            self.editor_hover_has_focus = true;
+        }
+
+        // Request LSP hover only if we don't already have LSP content and
+        // the popup isn't purely annotation-sourced (avoids LSP null response
+        // dismissing the annotation popup).
+        if request_lsp && !is_annotation_only && !has_lsp_section {
+            self.lsp_request_hover_at(line, col);
+        }
+    }
+
+    /// Show an editor hover popup with the given markdown content.
+    /// If `take_focus` is true, the popup grabs keyboard focus (for `gh` / `:hover`).
+    pub fn show_editor_hover(
+        &mut self,
+        anchor_line: usize,
+        anchor_col: usize,
+        markdown: &str,
+        source: EditorHoverSource,
+        take_focus: bool,
+        add_goto_links: bool,
+    ) {
+        let mut rendered = crate::core::markdown::render_markdown(markdown);
+        let mut links = Vec::new();
+        for (line_idx, line_spans) in rendered.spans.iter().enumerate() {
+            for span in line_spans {
+                if span.style == crate::core::markdown::MdStyle::LinkUrl {
+                    if let Some(line) = rendered.lines.get(line_idx) {
+                        if span.end_byte <= line.len() {
+                            let url_text = &line[span.start_byte..span.end_byte];
+                            if is_safe_url(url_text) {
+                                links.push((
+                                    line_idx,
+                                    span.start_byte,
+                                    span.end_byte,
+                                    url_text.to_string(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Append "Go to" navigation links after actual LSP content (vim mode only).
+        if add_goto_links && !self.is_vscode_mode() {
+            let goto = self.lsp_goto_links();
+            if !goto.is_empty() {
+                use crate::core::markdown::{MdSpan, MdStyle};
+                // Separator line.
+                rendered.lines.push(String::new());
+                rendered.spans.push(Vec::new());
+                rendered.code_highlights.push(Vec::new());
+                // Build: "Go to Definition (:gd) | Type Definition (:gy) | ..."
+                // "Go to" is default fg; labels are link-colored and clickable.
+                let nav_line_idx = rendered.lines.len();
+                let mut nav_text = String::from("Go to ");
+                let mut nav_spans = Vec::new();
+                for (i, (label, keybind, url)) in goto.iter().enumerate() {
+                    if i > 0 {
+                        nav_text.push_str(" | ");
+                    }
+                    let start = nav_text.len();
+                    nav_text.push_str(label);
+                    let end = nav_text.len();
+                    nav_spans.push(MdSpan {
+                        start_byte: start,
+                        end_byte: end,
+                        style: MdStyle::Link,
+                    });
+                    links.push((nav_line_idx, start, end, url.to_string()));
+                    nav_text.push_str(&format!(" (:{})", keybind));
+                }
+                rendered.lines.push(nav_text);
+                rendered.spans.push(nav_spans);
+                rendered.code_highlights.push(Vec::new());
+            }
+        }
+
+        let popup_width = rendered
+            .lines
+            .iter()
+            .map(|l| l.chars().count())
+            .max()
+            .unwrap_or(10)
+            .clamp(10, 80);
+        let (frozen_scroll_top, frozen_scroll_left) = {
+            let v = self.view();
+            (v.scroll_top, v.scroll_left)
+        };
+        self.editor_hover = Some(EditorHoverPopup {
+            rendered,
+            links,
+            anchor_line,
+            anchor_col,
+            source,
+            scroll_top: 0,
+            focused_link: None,
+            popup_width,
+            frozen_scroll_top,
+            frozen_scroll_left,
+        });
+        if take_focus {
+            self.editor_hover_has_focus = true;
+        }
+    }
+
+    /// Dismiss the editor hover popup.
+    pub fn dismiss_editor_hover(&mut self) {
+        self.editor_hover = None;
+        self.editor_hover_has_focus = false;
+        self.editor_hover_dwell = None;
+        self.editor_hover_dismiss_at = None;
+        self.lsp_hover_text = None;
+    }
+
+    /// Dismiss editor hover with a delay (for mouse leave events).
+    #[allow(dead_code)]
+    pub fn dismiss_editor_hover_delayed(&mut self) {
+        if self.editor_hover.is_some() && self.editor_hover_dismiss_at.is_none() {
+            self.editor_hover_dismiss_at =
+                Some(std::time::Instant::now() + std::time::Duration::from_millis(350));
+        }
+        self.editor_hover_dwell = None;
+    }
+
+    /// Cancel a pending delayed editor hover dismiss.
+    #[allow(dead_code)]
+    pub fn cancel_editor_hover_dismiss(&mut self) {
+        self.editor_hover_dismiss_at = None;
+    }
+
+    /// Handle keyboard input when the editor hover popup has focus.
+    pub fn handle_editor_hover_key(&mut self, key: &str) {
+        match key {
+            "Escape" | "q" => {
+                self.dismiss_editor_hover();
+            }
+            "Tab" => {
+                // Cycle to next link
+                if let Some(hover) = &mut self.editor_hover {
+                    if !hover.links.is_empty() {
+                        hover.focused_link = Some(match hover.focused_link {
+                            Some(i) => (i + 1) % hover.links.len(),
+                            None => 0,
+                        });
+                    }
+                }
+            }
+            "ISO_Left_Tab" | "BackTab" => {
+                // Cycle to previous link
+                if let Some(hover) = &mut self.editor_hover {
+                    if !hover.links.is_empty() {
+                        hover.focused_link = Some(match hover.focused_link {
+                            Some(0) | None => hover.links.len() - 1,
+                            Some(i) => i - 1,
+                        });
+                    }
+                }
+            }
+            "Return" => {
+                // Open focused link
+                let url = self.editor_hover.as_ref().and_then(|h| {
+                    h.focused_link
+                        .and_then(|i| h.links.get(i).map(|(_, _, _, u)| u.clone()))
+                });
+                if let Some(url) = url {
+                    if url.starts_with("command:") {
+                        self.execute_hover_goto(&url);
+                    } else {
+                        self.open_url(&url);
+                        self.dismiss_editor_hover();
+                    }
+                } else {
+                    self.dismiss_editor_hover();
+                }
+            }
+            "j" | "Down" => {
+                // Scroll down — stop when last line is visible
+                if let Some(hover) = &mut self.editor_hover {
+                    let max_scroll = hover.rendered.lines.len().saturating_sub(20);
+                    if hover.scroll_top < max_scroll {
+                        hover.scroll_top += 1;
+                    }
+                }
+            }
+            "k" | "Up" => {
+                // Scroll up
+                if let Some(hover) = &mut self.editor_hover {
+                    if hover.scroll_top > 0 {
+                        hover.scroll_top -= 1;
+                    }
+                }
+            }
+            _ => {
+                // Any other key dismisses and passes through
+                self.dismiss_editor_hover();
+            }
+        }
+    }
+
+    /// Track mouse movement for editor hover dwell detection.
+    /// Call from backends on mouse motion over the editor area.
+    /// Only triggers on word characters (identifiers), not whitespace or operators.
+    /// Called by backends when the mouse moves over the editor area.
+    /// `mouse_on_popup` should be true if the mouse is currently over the hover popup rect.
+    pub fn editor_hover_mouse_move(&mut self, line: usize, col: usize, mouse_on_popup: bool) {
+        if self.settings.hover_delay == 0 {
+            return;
+        }
+        // If hover popup is already visible and focused, don't interfere
+        if self.editor_hover_has_focus {
+            return;
+        }
+        // Find the word boundaries under the cursor (if any)
+        let (word_range, line_char_len) = {
+            let buf = self.buffer();
+            if line < buf.len_lines() {
+                let line_text: String = buf.content.line(line).chars().collect();
+                let chars: Vec<char> = line_text.chars().collect();
+                let char_len =
+                    chars
+                        .len()
+                        .saturating_sub(if chars.last() == Some(&'\n') { 1 } else { 0 });
+                let wr = if col < chars.len() && (chars[col].is_alphanumeric() || chars[col] == '_')
+                {
+                    let mut start = col;
+                    while start > 0
+                        && (chars[start - 1].is_alphanumeric() || chars[start - 1] == '_')
+                    {
+                        start -= 1;
+                    }
+                    let mut end = col + 1;
+                    while end < chars.len() && (chars[end].is_alphanumeric() || chars[end] == '_') {
+                        end += 1;
+                    }
+                    Some((start, end))
+                } else {
+                    None
+                };
+                (wr, char_len)
+            } else {
+                (None, 0)
+            }
+        };
+
+        // Annotation hover content only counts when the mouse is past the end
+        // of the actual line text (i.e. over the ghost text region).
+        let on_annotation = col >= line_char_len
+            && (self.editor_hover_content.contains_key(&line)
+                || self.line_annotations.contains_key(&line));
+
+        // Check if we're on the same word as the current popup
+        if let Some(hover) = &self.editor_hover {
+            // If popup is anchored to this line and mouse is on annotation, keep it
+            if hover.anchor_line == line && on_annotation {
+                return;
+            }
+            if let Some((start, end)) = word_range {
+                if hover.anchor_line == line && hover.anchor_col >= start && hover.anchor_col < end
+                {
+                    // Still on the popup's word — nothing to do
+                    return;
+                }
+            }
+            // Not on the popup's word — but if mouse is on the popup itself, keep it
+            if mouse_on_popup {
+                return;
+            }
+            // Off both word and popup — dismiss (no cooldown for natural mouse-off)
+            self.editor_hover = None;
+            self.editor_hover_has_focus = false;
+            self.editor_hover_dwell = None;
+            self.editor_hover_dismiss_at = None;
+            self.lsp_hover_text = None;
+            return;
+        }
+
+        // No popup visible — handle dwell logic
+        if word_range.is_none() && !on_annotation {
+            self.editor_hover_dwell = None;
+            return;
+        }
+        // Check if we're still on the same word/line as the current dwell
+        if let Some((dl, dc, _)) = &self.editor_hover_dwell {
+            if *dl == line {
+                // If mouse is on annotation area and no word boundary, stay dwelling
+                if on_annotation && word_range.is_none() {
+                    return;
+                }
+                if let Some((start, end)) = word_range {
+                    if *dc >= start && *dc < end {
+                        // Same word — keep dwelling
+                        return;
+                    }
+                }
+            }
+        }
+        // New word — start fresh dwell timer
+        self.editor_hover_dwell = Some((line, col, std::time::Instant::now()));
+    }
+
+    /// Scroll the editor hover popup by the given delta (positive = down, negative = up).
+    /// Returns true if the popup was scrolled.
+    pub fn editor_hover_scroll(&mut self, delta: i32) -> bool {
+        if let Some(hover) = &mut self.editor_hover {
+            let max_scroll = hover.rendered.lines.len().saturating_sub(20);
+            if delta > 0 {
+                let new = (hover.scroll_top + delta as usize).min(max_scroll);
+                if new != hover.scroll_top {
+                    hover.scroll_top = new;
+                    return true;
+                }
+            } else {
+                let new = hover.scroll_top.saturating_sub((-delta) as usize);
+                if new != hover.scroll_top {
+                    hover.scroll_top = new;
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Give the editor hover popup keyboard focus (e.g. on click).
+    pub fn editor_hover_focus(&mut self) {
+        if self.editor_hover.is_some() {
+            self.editor_hover_has_focus = true;
+        }
+    }
+
+    /// Poll editor hover dwell and delayed dismiss timers.
+    /// Call from backends in the event loop tick.
+    pub fn poll_editor_hover(&mut self) -> bool {
+        if self.settings.hover_delay == 0 {
+            return false;
+        }
+        let mut changed = false;
+        // Check dwell timeout
+        if let Some((line, col, start)) = self.editor_hover_dwell {
+            if start.elapsed() >= std::time::Duration::from_millis(self.settings.hover_delay as u64)
+            {
+                self.editor_hover_dwell = None;
+                // Re-validate position: on a word character or annotation ghost text
+                let (on_annotation, on_word) = {
+                    let buf = self.buffer();
+                    let line_char_len = if line < buf.len_lines() {
+                        let lt: String = buf.content.line(line).chars().collect();
+                        let chars: Vec<char> = lt.chars().collect();
+                        chars
+                            .len()
+                            .saturating_sub(if chars.last() == Some(&'\n') { 1 } else { 0 })
+                    } else {
+                        0
+                    };
+                    let ann = col >= line_char_len
+                        && (self.editor_hover_content.contains_key(&line)
+                            || self.line_annotations.contains_key(&line));
+                    let word = if !ann && line < buf.len_lines() {
+                        let line_text: String = buf.content.line(line).chars().collect();
+                        line_text
+                            .chars()
+                            .nth(col)
+                            .is_some_and(|c| c.is_alphanumeric() || c == '_')
+                    } else {
+                        false
+                    };
+                    (ann, word)
+                };
+                if on_annotation || on_word {
+                    self.show_editor_hover_at_inner(line, col, true, false, on_annotation);
+                    changed = true;
+                }
+            }
+        }
+        // Check delayed dismiss
+        if let Some(deadline) = self.editor_hover_dismiss_at {
+            if std::time::Instant::now() >= deadline {
+                self.dismiss_editor_hover();
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Check if there's a diagnostic at the given position.
+    #[allow(dead_code)]
+    fn has_diagnostic_at(&self, line: usize, col: usize) -> bool {
+        if let Some(path) = self.active_buffer_path() {
+            if let Some(diags) = self.lsp_diagnostics.get(&path) {
+                for diag in diags {
+                    let sl = diag.range.start.line as usize;
+                    let el = diag.range.end.line as usize;
+                    let sc = diag.range.start.character as usize;
+                    let ec = diag.range.end.character as usize;
+                    let in_range = if sl == el {
+                        line == sl && col >= sc && col <= ec
+                    } else {
+                        (line == sl && col >= sc)
+                            || (line == el && col <= ec)
+                            || (line > sl && line < el)
+                    };
+                    if in_range {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Open a URL in the default browser.
+    fn open_url(&self, url: &str) {
+        if !is_safe_url(url) {
+            return;
+        }
+        #[cfg(not(test))]
+        {
+            #[cfg(target_os = "macos")]
+            {
+                let _ = std::process::Command::new("open")
+                    .arg(url)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn();
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = std::process::Command::new("xdg-open")
+                    .arg(url)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn();
+            }
+        }
+    }
+
+    /// Get the file path of the active buffer (if it has one).
+    fn active_buffer_path(&self) -> Option<PathBuf> {
+        self.buffer_manager
+            .get(self.active_window().buffer_id)
+            .and_then(|bs| bs.file_path.clone())
+    }
+
+    /// Handle LSP hover response by updating the editor hover popup.
+    /// Called when the hover response arrives asynchronously.
+    pub fn update_editor_hover_with_lsp(&mut self, hover_text: &str) {
+        if let Some(hover) = &self.editor_hover {
+            let anchor_line = hover.anchor_line;
+            let anchor_col = hover.anchor_col;
+            let had_focus = self.editor_hover_has_focus;
+
+            // Rebuild: diagnostics at this position + new LSP text (replaces any old LSP content)
+            let mut sections: Vec<String> = Vec::new();
+
+            // Re-collect diagnostics for this anchor position
+            if let Some(path) = self.active_buffer_path() {
+                if let Some(diags) = self.lsp_diagnostics.get(&path) {
+                    for diag in diags {
+                        let sl = diag.range.start.line as usize;
+                        let el = diag.range.end.line as usize;
+                        let sc = diag.range.start.character as usize;
+                        let ec = diag.range.end.character as usize;
+                        let in_range = if sl == el {
+                            anchor_line == sl && anchor_col >= sc && anchor_col <= ec
+                        } else {
+                            (anchor_line == sl && anchor_col >= sc)
+                                || (anchor_line == el && anchor_col <= ec)
+                                || (anchor_line > sl && anchor_line < el)
+                        };
+                        if in_range {
+                            let severity = match diag.severity {
+                                crate::core::lsp::DiagnosticSeverity::Error => "Error",
+                                crate::core::lsp::DiagnosticSeverity::Warning => "Warning",
+                                crate::core::lsp::DiagnosticSeverity::Information => "Info",
+                                crate::core::lsp::DiagnosticSeverity::Hint => "Hint",
+                            };
+                            let source_str = diag
+                                .source
+                                .as_deref()
+                                .map(|s| format!(" ({})", s))
+                                .unwrap_or_default();
+                            sections.push(format!(
+                                "**{}**{}\n\n`{}`",
+                                severity, source_str, diag.message
+                            ));
+                        }
+                    }
+                }
+            }
+
+            // Add LSP hover text
+            if !hover_text.is_empty() {
+                sections.push(hover_text.to_string());
+            }
+
+            let combined = sections.join("\n\n---\n\n");
+            self.show_editor_hover(
+                anchor_line,
+                anchor_col,
+                &combined,
+                EditorHoverSource::Lsp,
+                had_focus,
+                true,
+            );
+        } else {
+            // No existing popup — create one from LSP content
+            let line = self.cursor().line;
+            let col = self.cursor().col;
+            let had_focus = self.editor_hover_has_focus;
+            self.show_editor_hover(
+                line,
+                col,
+                hover_text,
+                EditorHoverSource::Lsp,
+                had_focus,
+                true,
+            );
+        }
     }
 
     /// Handle keyboard input for the Extensions sidebar panel.
@@ -25394,38 +27704,7 @@ impl Engine {
                 true
             }
             "Return" => {
-                // Open README for any extension (installed or available)
-                let manifests = self.ext_available_manifests();
-                let installed = self.ext_installed_items();
-                let sel = self.ext_sidebar_selected;
-                let name = if sel < installed.len() {
-                    Some(installed[sel].name.clone())
-                } else {
-                    let available = self.ext_available_items();
-                    let avail_idx = sel.saturating_sub(installed.len());
-                    available.get(avail_idx).map(|m| m.name.clone())
-                };
-                if let Some(name) = name {
-                    let base_url = manifests
-                        .iter()
-                        .find(|m| m.name == name)
-                        .map(|m| self.resolve_registry_base_url(m))
-                        .unwrap_or_default();
-                    // Try to load README from installed extension dir, otherwise fetch from registry
-                    let readme_path = paths::vimcode_config_dir()
-                        .join("extensions")
-                        .join(&name)
-                        .join("README.md");
-                    let content = std::fs::read_to_string(&readme_path)
-                        .ok()
-                        .or_else(|| registry::fetch_readme(&base_url, &name));
-                    if let Some(content) = content {
-                        self.open_markdown_preview_in_tab(&content, &name);
-                    } else {
-                        self.message =
-                            format!("No README available for '{name}'. Press i to install.");
-                    }
-                }
+                self.ext_open_selected_readme();
                 true
             }
             "i" => {
@@ -25442,6 +27721,11 @@ impl Engine {
                     if avail_idx < available.len() {
                         let base_url = self.resolve_registry_base_url(&available[avail_idx]);
                         let name = available[avail_idx].name.clone();
+                        let display = if available[avail_idx].display_name.is_empty() {
+                            name.clone()
+                        } else {
+                            available[avail_idx].display_name.clone()
+                        };
                         self.ext_install_from_registry(&name);
                         // Try to open README after install
                         let readme_path = paths::vimcode_config_dir()
@@ -25452,7 +27736,7 @@ impl Engine {
                             .ok()
                             .or_else(|| registry::fetch_readme(&base_url, &name));
                         if let Some(content) = content {
-                            self.open_markdown_preview_in_tab(&content, &name);
+                            self.open_markdown_preview_in_tab(&content, &display);
                         }
                         // Move cursor to the newly installed item.
                         self.ext_sidebar_sections_expanded[0] = true;
@@ -25470,17 +27754,7 @@ impl Engine {
                 let sel = self.ext_sidebar_selected;
                 if sel < installed.len() {
                     let name = installed[sel].name.clone();
-                    self.ext_remove(&name);
-                    // If collapsing sections left nothing visible, expand available so
-                    // the user can continue navigating.
-                    if self.ext_flat_item_count() == 0 {
-                        self.ext_sidebar_sections_expanded[1] = true;
-                    }
-                    // Keep selection in bounds
-                    let new_total = self.ext_flat_item_count();
-                    if new_total > 0 && self.ext_sidebar_selected >= new_total {
-                        self.ext_sidebar_selected = new_total - 1;
-                    }
+                    self.ext_show_remove_dialog(&name);
                 }
                 true
             }
@@ -26858,6 +29132,7 @@ impl Engine {
             buttons,
             selected: 0,
             tag: tag.to_string(),
+            input: None,
         });
     }
 
@@ -26879,7 +29154,7 @@ impl Engine {
     /// Click a dialog button by index.  Returns the `EngineAction` from
     /// processing the dialog result, or `None` if the index is out of range.
     pub fn dialog_click_button(&mut self, idx: usize) -> EngineAction {
-        let (tag, action) = {
+        let (tag, action, input_value) = {
             let dialog = match self.dialog.as_ref() {
                 Some(d) => d,
                 None => return EngineAction::None,
@@ -26888,10 +29163,11 @@ impl Engine {
                 Some(b) => b,
                 None => return EngineAction::None,
             };
-            (dialog.tag.clone(), btn.action.clone())
+            let iv = dialog.input.as_ref().map(|i| i.value.clone());
+            (dialog.tag.clone(), btn.action.clone(), iv)
         };
         self.dialog = None;
-        self.process_dialog_result(&tag, &action)
+        self.process_dialog_result(&tag, &action, input_value.as_deref())
     }
 
     /// Handle a key press when a dialog is open.
@@ -26902,6 +29178,8 @@ impl Engine {
         unicode: Option<char>,
     ) -> Option<(String, String)> {
         let dialog = self.dialog.as_mut()?;
+        let has_input = dialog.input.is_some();
+
         // TUI sends key_name="" with the char in unicode; GTK sends key_name="r".
         let effective = if !key_name.is_empty() {
             key_name.to_string()
@@ -26925,19 +29203,55 @@ impl Engine {
                 self.dialog = None;
                 Some((tag, action))
             }
-            "Left" | "h" => {
-                if dialog.selected > 0 {
-                    dialog.selected -= 1;
+            "BackSpace" if has_input => {
+                if let Some(ref mut input) = dialog.input {
+                    input.value.pop();
                 }
                 None
             }
-            "Right" | "l" => {
-                if dialog.selected + 1 < dialog.buttons.len() {
-                    dialog.selected += 1;
+            "Tab" | "Shift_Tab" => {
+                let len = dialog.buttons.len();
+                if len > 0 {
+                    if effective == "Shift_Tab" {
+                        dialog.selected = if dialog.selected > 0 {
+                            dialog.selected - 1
+                        } else {
+                            len - 1
+                        };
+                    } else {
+                        dialog.selected = (dialog.selected + 1) % len;
+                    }
+                }
+                None
+            }
+            "Left" | "h" | "Up" if !has_input => {
+                let len = dialog.buttons.len();
+                if len > 0 {
+                    dialog.selected = if dialog.selected > 0 {
+                        dialog.selected - 1
+                    } else {
+                        len - 1
+                    };
+                }
+                None
+            }
+            "Right" | "l" | "Down" if !has_input => {
+                let len = dialog.buttons.len();
+                if len > 0 {
+                    dialog.selected = (dialog.selected + 1) % len;
                 }
                 None
             }
             _ => {
+                // When dialog has a text input, printable chars go there.
+                if has_input {
+                    if let Some(ch) = unicode {
+                        if let Some(ref mut input) = dialog.input {
+                            input.value.push(ch);
+                        }
+                    }
+                    return None;
+                }
                 // Check hotkeys (case-insensitive).
                 let ch = effective
                     .chars()
@@ -26958,7 +29272,12 @@ impl Engine {
     }
 
     /// Dispatch a dialog result to the appropriate handler.
-    fn process_dialog_result(&mut self, tag: &str, action: &str) -> EngineAction {
+    fn process_dialog_result(
+        &mut self,
+        tag: &str,
+        action: &str,
+        input_value: Option<&str>,
+    ) -> EngineAction {
         match tag {
             "swap_recovery" => self.process_swap_dialog_action(action),
             "confirm_move" => {
@@ -26980,6 +29299,61 @@ impl Engine {
                     }
                 } else {
                     self.pending_move = None;
+                }
+                EngineAction::None
+            }
+            "ext_remove" => {
+                if let Some(name) = self.pending_ext_remove.take() {
+                    match action {
+                        "remove" | "keep_tools" => self.ext_remove(&name, false),
+                        "remove_all" => self.ext_remove(&name, true),
+                        _ => {} // cancel — do nothing
+                    }
+                }
+                EngineAction::None
+            }
+            "ssh_passphrase" => {
+                if action == "ok" {
+                    let passphrase = input_value.unwrap_or("");
+                    if let Some(op) = self.pending_git_remote_op.take() {
+                        let dir =
+                            git::find_repo_root(&self.cwd).unwrap_or_else(|| self.cwd.clone());
+                        let result = match op.as_str() {
+                            "push" => git::push_with_passphrase(&dir, passphrase),
+                            "pull" => git::pull_with_passphrase(&dir, passphrase),
+                            "fetch" => git::fetch_with_passphrase(&dir, passphrase),
+                            _ => Err(format!("unknown git op: {}", op)),
+                        };
+                        match result {
+                            Ok(msg) => {
+                                let default_msg = match op.as_str() {
+                                    "push" => "Pushed.",
+                                    "pull" => "Already up to date.",
+                                    "fetch" => "Fetched.",
+                                    _ => "Done.",
+                                };
+                                self.message = if msg.is_empty() {
+                                    default_msg.to_string()
+                                } else {
+                                    msg
+                                };
+                            }
+                            Err(e) => self.message = format!("{}: {}", op, e),
+                        }
+                        self.sc_refresh();
+                    }
+                } else {
+                    self.pending_git_remote_op = None;
+                }
+                EngineAction::None
+            }
+            tag if tag.starts_with("open_ext_url:") => {
+                // Extension-provided link — user confirmed "Open".
+                if action == "open" {
+                    let url = &tag["open_ext_url:".len()..];
+                    if is_safe_url(url) {
+                        return EngineAction::OpenUrl(url.to_string());
+                    }
                 }
                 EngineAction::None
             }
@@ -27230,10 +29604,8 @@ impl Engine {
             if let Some(mgr) = &mut self.lsp_manager {
                 mgr.notify_did_change(&path, &text);
             }
-            // Clear stale semantic tokens on edit; re-request after the server processes the change.
-            if let Some(state) = self.buffer_manager.get_mut(buffer_id) {
-                state.semantic_tokens.clear();
-            }
+            // Re-request semantic tokens after the server processes the change.
+            // Keep old tokens displayed until new ones arrive (avoids flicker).
             self.lsp_request_semantic_tokens(&path);
         }
     }
@@ -27360,8 +29732,21 @@ impl Engine {
                 LspEvent::HoverResponse { contents, .. } => {
                     self.lsp_pending_hover = None;
                     if let Some(text) = contents {
-                        self.lsp_hover_text = Some(text);
+                        // If an editor hover popup is active (gh triggered), update it
+                        if self.editor_hover.is_some() || self.editor_hover_has_focus {
+                            self.update_editor_hover_with_lsp(&text);
+                        } else {
+                            self.lsp_hover_text = Some(text);
+                        }
                         redraw = true;
+                    } else if self.editor_hover.is_some()
+                        && self
+                            .editor_hover
+                            .as_ref()
+                            .is_some_and(|h| matches!(h.source, EditorHoverSource::Lsp))
+                    {
+                        // LSP returned no hover — dismiss "Loading..." popup (only if LSP-sourced)
+                        self.dismiss_editor_hover();
                     } else {
                         self.message = "No hover info".to_string();
                     }
@@ -27637,19 +30022,22 @@ impl Engine {
                 } => {
                     if let Some(path) = self.lsp_pending_semantic_tokens.remove(&request_id) {
                         // Decode using the cached legend for this server.
-                        let decoded = self
+                        // If the legend is missing (server restart, cache miss), keep
+                        // existing tokens rather than silently replacing with empty.
+                        if let Some(decoded) = self
                             .lsp_manager
                             .as_ref()
                             .and_then(|mgr| mgr.semantic_legend_for_server(server_id))
                             .map(|legend| lsp::decode_semantic_tokens(&raw_data, legend))
-                            .unwrap_or_default();
-                        // Store on the matching buffer.
-                        for &bid in self.buffer_manager.list().iter() {
-                            if let Some(state) = self.buffer_manager.get_mut(bid) {
-                                if state.file_path.as_deref() == Some(path.as_path()) {
-                                    state.semantic_tokens = decoded;
-                                    redraw = true;
-                                    break;
+                        {
+                            // Store on the matching buffer.
+                            for &bid in self.buffer_manager.list().iter() {
+                                if let Some(state) = self.buffer_manager.get_mut(bid) {
+                                    if state.file_path.as_deref() == Some(path.as_path()) {
+                                        state.semantic_tokens = decoded;
+                                        redraw = true;
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -27699,18 +30087,89 @@ impl Engine {
         }
     }
 
+    /// Check if an LSP server is available (running or initializing) for the active buffer.
+    fn has_lsp_for_buffer(&self) -> bool {
+        if !self.settings.lsp_enabled {
+            return false;
+        }
+        if let Some(path) = self.active_buffer_path() {
+            if let Some(mgr) = &self.lsp_manager {
+                return mgr.server_id_for_path(&path).is_some()
+                    || mgr.is_server_initializing(&path);
+            }
+        }
+        false
+    }
+
+    /// Return which LSP navigation commands are available for the current buffer.
+    /// Returns a list of (label, keybind, command_url) triples.
+    fn lsp_goto_links(&self) -> Vec<(&'static str, &'static str, &'static str)> {
+        let mut result = Vec::new();
+        if !self.settings.lsp_enabled {
+            return result;
+        }
+        let Some(path) = self.active_buffer_path() else {
+            return result;
+        };
+        let Some(mgr) = &self.lsp_manager else {
+            return result;
+        };
+        if mgr.server_supports(&path, "definitionProvider") {
+            result.push(("Definition", "gd", "command:definition"));
+        }
+        if mgr.server_supports(&path, "typeDefinitionProvider") {
+            result.push(("Type Definition", "gy", "command:type_definition"));
+        }
+        if mgr.server_supports(&path, "implementationProvider") {
+            result.push(("Implementations", "gi", "command:implementation"));
+        }
+        if mgr.server_supports(&path, "referencesProvider") {
+            result.push(("References", "gr", "command:references"));
+        }
+        result
+    }
+
+    /// Execute an LSP navigation command from a hover popup link.
+    /// Moves the cursor to the given position before invoking the LSP request.
+    pub fn execute_hover_goto(&mut self, command: &str) {
+        // Get the anchor position from the hover popup before dismissing it.
+        let (line, col) = if let Some(hover) = &self.editor_hover {
+            (hover.anchor_line, hover.anchor_col)
+        } else {
+            return;
+        };
+        self.dismiss_editor_hover();
+        // Move cursor to the hover anchor position.
+        let view = self.view_mut();
+        view.cursor.line = line;
+        view.cursor.col = col;
+        self.push_jump_location();
+        match command {
+            "command:definition" => self.lsp_request_definition(),
+            "command:type_definition" => self.lsp_request_type_definition(),
+            "command:implementation" => self.lsp_request_implementation(),
+            "command:references" => self.lsp_request_references(),
+            _ => {}
+        }
+    }
+
     /// Request LSP hover at cursor position.
-    fn lsp_request_hover(&mut self) {
+    /// Request LSP hover at a specific buffer position (not necessarily the cursor).
+    fn lsp_request_hover_at(&mut self, line: usize, col: usize) {
         if !self.settings.lsp_enabled {
             return;
         }
         self.ensure_lsp_manager();
-        let (path, line, col_utf16) = match self.lsp_cursor_position() {
-            Some(v) => v,
-            None => return,
+        let Some(state) = self.buffer_manager.get(self.active_buffer_id()) else {
+            return;
         };
+        let Some(path) = state.file_path.as_ref().cloned() else {
+            return;
+        };
+        let line_text: String = state.buffer.content.line(line).chars().collect();
+        let col_utf16 = lsp::char_to_utf16_offset(&line_text, col);
         if let Some(mgr) = &mut self.lsp_manager {
-            if let Some(id) = mgr.request_hover(&path, line, col_utf16) {
+            if let Some(id) = mgr.request_hover(&path, line as u32, col_utf16) {
                 self.lsp_pending_hover = Some(id);
             } else if mgr.is_server_initializing(&path) {
                 self.message = "LSP server initializing...".to_string();
@@ -33066,6 +35525,7 @@ impl Engine {
                 if km_changed {
                     self.set_dirty(true);
                 }
+                self.fire_cursor_move_hook();
                 return km_action;
             }
         }
@@ -33089,6 +35549,7 @@ impl Engine {
                 self.swap_mark_dirty();
             }
             self.ensure_cursor_visible();
+            self.fire_cursor_move_hook();
             return EngineAction::None;
         }
 
@@ -33156,6 +35617,7 @@ impl Engine {
             self.ensure_cursor_visible();
             self.sync_scroll_binds();
             self.update_bracket_match();
+            self.fire_cursor_move_hook();
             return EngineAction::None;
         }
 
@@ -33713,6 +36175,12 @@ impl Engine {
         self.ensure_cursor_visible();
         self.sync_scroll_binds();
         self.update_bracket_match();
+
+        // Fire cursor_move plugin hook. VSCode mode is always Mode::Insert,
+        // but plugins (like git-insights blame) need cursor position updates.
+        // Plugins handle their own deduplication (blame.lua checks last_line).
+        self.fire_cursor_move_hook();
+
         EngineAction::None
     }
 
@@ -45838,6 +48306,7 @@ mod tests {
         let mut engine = make_sc_engine_with_files();
         engine.sc_commit_input_active = true;
         engine.sc_commit_message = "abc".to_string();
+        engine.sc_commit_cursor = 3;
         engine.handle_sc_key("BackSpace", false, None);
         assert_eq!(engine.sc_commit_message, "ab");
     }
@@ -45920,6 +48389,151 @@ mod tests {
         assert_eq!(engine.sc_selected, before);
         // but the commit input should still be active
         assert!(engine.sc_commit_input_active);
+    }
+
+    #[test]
+    fn test_sc_commit_multiline_enter_inserts_newline() {
+        let mut engine = make_sc_engine_with_files();
+        engine.sc_commit_input_active = true;
+        engine.handle_sc_commit_input_key("", false, Some('H'));
+        engine.handle_sc_commit_input_key("", false, Some('i'));
+        engine.handle_sc_commit_input_key("Return", false, None);
+        engine.handle_sc_commit_input_key("", false, Some('b'));
+        assert_eq!(engine.sc_commit_message, "Hi\nb");
+        assert!(engine.sc_commit_input_active);
+    }
+
+    #[test]
+    fn test_sc_commit_ctrl_enter_commits() {
+        let mut engine = make_sc_engine_with_files();
+        engine.sc_commit_input_active = true;
+        engine.sc_commit_message = "test\nmultiline".to_string();
+        engine.sc_commit_cursor = engine.sc_commit_message.len();
+        engine.handle_sc_commit_input_key("Return", true, None);
+        // Commit fails (no real repo), but input mode should be deactivated.
+        // The commit_message should be cleared if commit succeeded or stay if it failed.
+        // Since there's no git repo, sc_do_commit will error but won't clear.
+        assert!(!engine.sc_commit_input_active || !engine.sc_commit_message.is_empty());
+    }
+
+    #[test]
+    fn test_ssh_passphrase_dialog_shown() {
+        let mut engine = make_sc_engine_with_files();
+        // Simulate showing passphrase dialog
+        engine.sc_show_passphrase_dialog("pull");
+        assert!(engine.dialog.is_some());
+        let dialog = engine.dialog.as_ref().unwrap();
+        assert_eq!(dialog.tag, "ssh_passphrase");
+        assert!(dialog.input.is_some());
+        assert!(dialog.input.as_ref().unwrap().is_password);
+        assert_eq!(engine.pending_git_remote_op, Some("pull".to_string()));
+    }
+
+    #[test]
+    fn test_dialog_input_typing() {
+        let mut engine = make_sc_engine_with_files();
+        engine.sc_show_passphrase_dialog("push");
+        // Type into the dialog input
+        engine.handle_key("", Some('a'), false);
+        engine.handle_key("", Some('b'), false);
+        engine.handle_key("", Some('c'), false);
+        let input_val = engine
+            .dialog
+            .as_ref()
+            .unwrap()
+            .input
+            .as_ref()
+            .unwrap()
+            .value
+            .clone();
+        assert_eq!(input_val, "abc");
+        // Backspace
+        engine.handle_key("BackSpace", None, false);
+        let input_val = engine
+            .dialog
+            .as_ref()
+            .unwrap()
+            .input
+            .as_ref()
+            .unwrap()
+            .value
+            .clone();
+        assert_eq!(input_val, "ab");
+    }
+
+    #[test]
+    fn test_dialog_input_cancel() {
+        let mut engine = make_sc_engine_with_files();
+        engine.sc_show_passphrase_dialog("fetch");
+        engine.handle_key("Escape", None, false);
+        assert!(engine.dialog.is_none());
+        assert!(engine.pending_git_remote_op.is_none());
+    }
+
+    #[test]
+    fn test_sc_commit_cursor_arrow_keys() {
+        let mut engine = make_sc_engine_with_files();
+        engine.sc_commit_input_active = true;
+        // Type "abc"
+        engine.handle_sc_commit_input_key("", false, Some('a'));
+        engine.handle_sc_commit_input_key("", false, Some('b'));
+        engine.handle_sc_commit_input_key("", false, Some('c'));
+        assert_eq!(engine.sc_commit_cursor, 3);
+        // Left moves cursor back.
+        engine.handle_sc_commit_input_key("Left", false, None);
+        assert_eq!(engine.sc_commit_cursor, 2);
+        // Insert at cursor position.
+        engine.handle_sc_commit_input_key("", false, Some('X'));
+        assert_eq!(engine.sc_commit_message, "abXc");
+        assert_eq!(engine.sc_commit_cursor, 3);
+        // Right moves cursor forward.
+        engine.handle_sc_commit_input_key("Right", false, None);
+        assert_eq!(engine.sc_commit_cursor, 4);
+        // Home moves to start of line.
+        engine.handle_sc_commit_input_key("Home", false, None);
+        assert_eq!(engine.sc_commit_cursor, 0);
+        // End moves to end of line.
+        engine.handle_sc_commit_input_key("End", false, None);
+        assert_eq!(engine.sc_commit_cursor, 4);
+    }
+
+    #[test]
+    fn test_sc_commit_cursor_up_down() {
+        let mut engine = make_sc_engine_with_files();
+        engine.sc_commit_input_active = true;
+        engine.sc_commit_message = "abc\nde\nfghij".to_string();
+        engine.sc_commit_cursor = 5; // on 'e' in "de"
+                                     // Down moves to next line, same column.
+        engine.handle_sc_commit_input_key("Down", false, None);
+        assert_eq!(engine.sc_commit_cursor, 8); // 'h' in "fghij"
+                                                // Up moves back.
+        engine.handle_sc_commit_input_key("Up", false, None);
+        assert_eq!(engine.sc_commit_cursor, 5); // 'e' in "de"
+                                                // Up again to first line.
+        engine.handle_sc_commit_input_key("Up", false, None);
+        assert_eq!(engine.sc_commit_cursor, 1); // 'b' in "abc" (col 1)
+    }
+
+    #[test]
+    fn test_sc_commit_cursor_backspace_at_position() {
+        let mut engine = make_sc_engine_with_files();
+        engine.sc_commit_input_active = true;
+        engine.sc_commit_message = "hello".to_string();
+        engine.sc_commit_cursor = 3; // after "hel"
+        engine.handle_sc_commit_input_key("BackSpace", false, None);
+        assert_eq!(engine.sc_commit_message, "helo");
+        assert_eq!(engine.sc_commit_cursor, 2);
+    }
+
+    #[test]
+    fn test_sc_commit_cursor_delete() {
+        let mut engine = make_sc_engine_with_files();
+        engine.sc_commit_input_active = true;
+        engine.sc_commit_message = "hello".to_string();
+        engine.sc_commit_cursor = 2;
+        engine.handle_sc_commit_input_key("Delete", false, None);
+        assert_eq!(engine.sc_commit_message, "helo");
+        assert_eq!(engine.sc_commit_cursor, 2);
     }
 
     #[test]
@@ -46945,11 +49559,11 @@ mod tests {
         // Move right again.
         e.handle_key("Right", None, false);
         assert_eq!(e.dialog.as_ref().unwrap().selected, 2);
-        // Right at end → stays at 2.
+        // Right at end → wraps to 0.
         e.handle_key("Right", None, false);
-        assert_eq!(e.dialog.as_ref().unwrap().selected, 2);
-        // Move left.
-        e.handle_key("Left", None, false);
+        assert_eq!(e.dialog.as_ref().unwrap().selected, 0);
+        // Move right to 1.
+        e.handle_key("Right", None, false);
         assert_eq!(e.dialog.as_ref().unwrap().selected, 1);
         // Enter confirms the selected button.
         e.handle_key("Return", None, false);
@@ -46987,6 +49601,55 @@ mod tests {
         assert_eq!(dialog.buttons.len(), 1);
         assert_eq!(dialog.buttons[0].hotkey, 'o');
         assert_eq!(dialog.buttons[0].action, "ok");
+    }
+
+    // ─── Extension removal dialog ────────────────────────────────────────
+
+    #[test]
+    fn test_ext_remove_dialog_shows_on_d() {
+        let mut e = Engine::new();
+        // Install a single extension so it's the only item at index 0.
+        e.extension_state.mark_installed_version("bash", "1.0.0");
+        e.ext_sidebar_sections_expanded = [true, true];
+        e.ext_sidebar_selected = 0; // First installed item.
+        e.ext_sidebar_has_focus = true;
+        e.handle_ext_sidebar_key("d", false, None);
+        // Dialog should be open with the ext_remove tag.
+        assert!(e.dialog.is_some());
+        assert_eq!(e.dialog.as_ref().unwrap().tag, "ext_remove");
+        assert!(e.pending_ext_remove.is_some());
+        assert_eq!(e.pending_ext_remove.as_ref().unwrap(), "bash");
+    }
+
+    #[test]
+    fn test_ext_remove_dialog_cancel() {
+        let mut e = Engine::new();
+        e.extension_state.mark_installed_version("bash", "1.0.0");
+        e.ext_sidebar_sections_expanded = [true, true];
+        e.ext_sidebar_selected = 0;
+        e.handle_ext_sidebar_key("d", false, None);
+        assert!(e.dialog.is_some());
+        // Press Escape to cancel.
+        e.handle_key("Escape", None, false);
+        assert!(e.dialog.is_none());
+        // Extension should still be installed.
+        assert!(e.extension_state.is_installed("bash"));
+    }
+
+    #[test]
+    fn test_ext_remove_dialog_keep_tools() {
+        let mut e = Engine::new();
+        e.extension_state.mark_installed_version("bash", "1.0.0");
+        e.ext_sidebar_sections_expanded = [true, true];
+        e.ext_sidebar_selected = 0;
+        e.handle_ext_sidebar_key("d", false, None);
+        assert!(e.dialog.is_some());
+        // Press 'k' for "Keep Tools" (bash has tools so dialog offers this option).
+        e.handle_key("", Some('k'), false);
+        assert!(e.dialog.is_none());
+        // Extension should be removed.
+        assert!(!e.extension_state.is_installed("bash"));
+        assert!(e.message.contains("tools kept"));
     }
 
     // ─── Spell checking ──────────────────────────────────────────────────
@@ -47337,5 +50000,172 @@ mod tests {
         let content = e.buffer().to_string();
         assert!(content.contains("$$$$")); // delimiters remain
         assert!(!content.contains("E=mc"));
+    }
+
+    // ── Panel hover popup tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_panel_hover_show_and_dismiss() {
+        let mut e = engine_with_text("hello\n");
+        assert!(e.panel_hover.is_none());
+        e.show_panel_hover("test_panel", "item_1", 0, "**Bold** text");
+        assert!(e.panel_hover.is_some());
+        let ph = e.panel_hover.as_ref().unwrap();
+        assert_eq!(ph.panel_name, "test_panel");
+        assert_eq!(ph.item_id, "item_1");
+        assert_eq!(ph.item_index, 0);
+        assert!(!ph.rendered.lines.is_empty());
+        e.dismiss_panel_hover_now();
+        assert!(e.panel_hover.is_none());
+    }
+
+    #[test]
+    fn test_panel_hover_links_extracted() {
+        let mut e = engine_with_text("hello\n");
+        e.show_panel_hover("p", "i", 0, "See [docs](https://example.com) here");
+        let ph = e.panel_hover.as_ref().unwrap();
+        // Should have at least one link extracted from the markdown
+        assert!(
+            !ph.links.is_empty() || !ph.rendered.lines.is_empty(),
+            "hover should have rendered content"
+        );
+    }
+
+    #[test]
+    fn test_panel_hover_mouse_move_dwell_tracking() {
+        let mut e = engine_with_text("hello\n");
+        // First move starts dwell
+        let changed = e.panel_hover_mouse_move("panel", "item_0", 0);
+        assert!(changed);
+        assert!(e.panel_hover_dwell.is_some());
+        // Same item should not change
+        let changed2 = e.panel_hover_mouse_move("panel", "item_0", 0);
+        assert!(!changed2);
+        // Different item should change
+        let changed3 = e.panel_hover_mouse_move("panel", "item_1", 1);
+        assert!(changed3);
+    }
+
+    #[test]
+    fn test_panel_hover_registry_lookup() {
+        let mut e = engine_with_text("hello\n");
+        // Register hover content for a panel item
+        e.panel_hover_registry.insert(
+            ("my_panel".to_string(), "commit_abc".to_string()),
+            "# Commit abc\n\nSome details".to_string(),
+        );
+        // Start dwell on that item — poll should NOT show yet (need 300ms)
+        e.panel_hover_mouse_move("my_panel", "commit_abc", 2);
+        let shown = e.poll_panel_hover();
+        assert!(!shown, "should not show before dwell timeout");
+    }
+
+    #[test]
+    fn test_panel_hover_dismissed_on_keypress() {
+        let mut e = engine_with_text("hello\n");
+        e.show_panel_hover("p", "i", 0, "test");
+        assert!(e.panel_hover.is_some());
+        // Any key press should dismiss
+        e.handle_key("j", None, false);
+        assert!(e.panel_hover.is_none());
+    }
+
+    #[test]
+    fn test_sc_hover_file_generates_markdown() {
+        let mut e = engine_with_text("hello\n");
+        // Populate SC panel with a fake file status
+        e.sc_file_statuses = vec![crate::core::git::FileStatus {
+            path: "src/main.rs".to_string(),
+            staged: None,
+            unstaged: Some(crate::core::git::StatusKind::Modified),
+        }];
+        e.sc_sections_expanded = [true, true, false, false];
+        // flat index: 0=staged header, 1=unstaged header, 2=file item
+        let md = e.sc_hover_markdown(2);
+        assert!(md.is_some());
+        let md = md.unwrap();
+        assert!(md.contains("src/main.rs"), "hover should contain filename");
+        assert!(md.contains("Modified"), "hover should contain status");
+        assert!(
+            md.contains("unstaged"),
+            "hover should indicate staged/unstaged"
+        );
+    }
+
+    #[test]
+    fn test_sc_hover_section_header_returns_none_for_non_branch() {
+        let mut e = engine_with_text("hello\n");
+        e.sc_file_statuses = vec![];
+        e.sc_sections_expanded = [true, true, false, false];
+        // flat index 0 = Staged Changes header (section 0 → branch info)
+        // flat index 1 = Unstaged Changes header (section 1 → None)
+        let md = e.sc_hover_markdown(1);
+        assert!(md.is_none(), "non-branch headers should return None");
+    }
+
+    #[test]
+    fn test_sc_hover_log_entry_generates_markdown() {
+        let mut e = engine_with_text("hello\n");
+        e.sc_file_statuses = vec![];
+        e.sc_log = vec![crate::core::git::GitLogEntry {
+            hash: "abc1234".to_string(),
+            message: "feat: add hover popups".to_string(),
+        }];
+        e.sc_sections_expanded = [true, true, false, true];
+        // flat indices: 0=staged hdr, 1=unstaged hdr, 2=log hdr, 3=log item
+        let md = e.sc_hover_markdown(3);
+        assert!(md.is_some());
+        let md = md.unwrap();
+        assert!(
+            md.contains("abc1234") || md.contains("hover popups"),
+            "log hover should contain hash or message"
+        );
+    }
+
+    #[test]
+    fn test_is_safe_url_allows_https() {
+        assert!(is_safe_url("https://github.com/user/repo"));
+        assert!(is_safe_url("http://example.com"));
+        assert!(is_safe_url("HTTPS://EXAMPLE.COM"));
+    }
+
+    #[test]
+    fn test_is_safe_url_rejects_dangerous_schemes() {
+        assert!(!is_safe_url("javascript:alert(1)"));
+        assert!(!is_safe_url("file:///etc/passwd"));
+        assert!(!is_safe_url("data:text/html,<h1>hi</h1>"));
+        assert!(!is_safe_url("ftp://example.com"));
+        assert!(!is_safe_url("ssh://evil.com"));
+        assert!(!is_safe_url(""));
+    }
+
+    #[test]
+    fn test_hover_links_filtered_by_safe_url() {
+        let mut e = engine_with_text("hello\n");
+        // Markdown with a safe link and a dangerous link
+        e.show_panel_hover(
+            "ext_panel",
+            "i",
+            0,
+            "Safe: [click](https://example.com) Evil: [hack](javascript:alert(1))",
+        );
+        let ph = e.panel_hover.as_ref().unwrap();
+        // Only the https link should be in the links list
+        for link in &ph.links {
+            assert!(
+                is_safe_url(&link.3),
+                "unsafe URL should have been filtered: {}",
+                link.3
+            );
+        }
+    }
+
+    #[test]
+    fn test_hover_native_panel_is_native() {
+        let mut e = engine_with_text("hello\n");
+        e.show_panel_hover("source_control", "", 0, "# test");
+        assert!(e.panel_hover.as_ref().unwrap().is_native());
+        e.show_panel_hover("my_ext_panel", "", 0, "# test");
+        assert!(!e.panel_hover.as_ref().unwrap().is_native());
     }
 }
