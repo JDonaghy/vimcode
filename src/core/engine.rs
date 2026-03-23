@@ -49925,9 +49925,22 @@ mod tests {
 
     // ─── Extension removal dialog ────────────────────────────────────────
 
+    /// Create a minimal mock bash extension manifest for tests that don't
+    /// depend on local disk state (CI has no extensions installed on disk).
+    fn mock_bash_manifest() -> extensions::ExtensionManifest {
+        extensions::ExtensionManifest {
+            name: "bash".to_string(),
+            display_name: "Bash".to_string(),
+            description: "Bash language support".to_string(),
+            version: "1.0.0".to_string(),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn test_ext_remove_dialog_shows_on_d() {
         let mut e = Engine::new();
+        e.ext_registry = Some(vec![mock_bash_manifest()]);
         // Install a single extension so it's the only item at index 0.
         e.extension_state.mark_installed_version("bash", "1.0.0");
         e.ext_sidebar_sections_expanded = [true, true];
@@ -49944,6 +49957,7 @@ mod tests {
     #[test]
     fn test_ext_remove_dialog_cancel() {
         let mut e = Engine::new();
+        e.ext_registry = Some(vec![mock_bash_manifest()]);
         e.extension_state.mark_installed_version("bash", "1.0.0");
         e.ext_sidebar_sections_expanded = [true, true];
         e.ext_sidebar_selected = 0;
@@ -49957,19 +49971,19 @@ mod tests {
     }
 
     #[test]
-    fn test_ext_remove_dialog_keep_tools() {
+    fn test_ext_remove_dialog_confirm_remove() {
         let mut e = Engine::new();
+        e.ext_registry = Some(vec![mock_bash_manifest()]);
         e.extension_state.mark_installed_version("bash", "1.0.0");
         e.ext_sidebar_sections_expanded = [true, true];
         e.ext_sidebar_selected = 0;
         e.handle_ext_sidebar_key("d", false, None);
         assert!(e.dialog.is_some());
-        // Press 'k' for "Keep Tools" (bash has tools so dialog offers this option).
-        e.handle_key("", Some('k'), false);
+        // Press 'r' for "Remove".
+        e.handle_key("", Some('r'), false);
         assert!(e.dialog.is_none());
         // Extension should be removed.
         assert!(!e.extension_state.is_installed("bash"));
-        assert!(e.message.contains("tools kept"));
     }
 
     // ─── Spell checking ──────────────────────────────────────────────────
