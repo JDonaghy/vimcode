@@ -4,7 +4,9 @@
 //! offset style spans that both the GTK and TUI backends can render using their
 //! native bold/italic/colour support.
 
-use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+
+use super::syntax::{Syntax, SyntaxLanguage};
 
 // ─── Output types ────────────────────────────────────────────────────────────
 
@@ -33,6 +35,14 @@ pub struct MdSpan {
     pub style: MdStyle,
 }
 
+/// A syntax-highlight span within a code-block line (byte offsets + tree-sitter scope).
+#[derive(Debug, Clone)]
+pub struct MdCodeHighlight {
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub scope: String,
+}
+
 /// The complete result of rendering a markdown document to styled plain text.
 #[derive(Debug, Clone)]
 pub struct MdRendered {
@@ -40,6 +50,9 @@ pub struct MdRendered {
     pub lines: Vec<String>,
     /// Per-line style spans (byte offsets into the corresponding `lines` entry).
     pub spans: Vec<Vec<MdSpan>>,
+    /// Per-line tree-sitter highlights for code-block lines.
+    /// Empty for non-code-block lines.
+    pub code_highlights: Vec<Vec<MdCodeHighlight>>,
 }
 
 // ─── Rendering ───────────────────────────────────────────────────────────────
@@ -48,6 +61,7 @@ pub struct MdRendered {
 pub fn render_markdown(input: &str) -> MdRendered {
     let mut lines: Vec<String> = Vec::new();
     let mut spans: Vec<Vec<MdSpan>> = Vec::new();
+    let mut code_highlights: Vec<Vec<MdCodeHighlight>> = Vec::new();
     // Current line being built.
     let mut cur_line = String::new();
     let mut cur_spans: Vec<MdSpan> = Vec::new();
@@ -63,6 +77,11 @@ pub fn render_markdown(input: &str) -> MdRendered {
     let mut in_code_block = false;
     let mut in_image = false;
 
+    // Code block language + accumulated raw text for syntax highlighting.
+    let mut code_block_lang: Option<SyntaxLanguage> = None;
+    let mut code_block_text = String::new();
+    let mut code_block_start_line: usize = 0;
+
     // List tracking: stack of (ordered?, counter).
     let mut list_stack: Vec<(bool, u64)> = Vec::new();
     let mut need_list_bullet = false;
@@ -73,10 +92,12 @@ pub fn render_markdown(input: &str) -> MdRendered {
 
     let flush_line = |lines: &mut Vec<String>,
                       spans: &mut Vec<Vec<MdSpan>>,
+                      code_highlights: &mut Vec<Vec<MdCodeHighlight>>,
                       cur_line: &mut String,
                       cur_spans: &mut Vec<MdSpan>| {
         lines.push(std::mem::take(cur_line));
         spans.push(std::mem::take(cur_spans));
+        code_highlights.push(Vec::new());
     };
 
     let opts = Options::ENABLE_STRIKETHROUGH
@@ -93,12 +114,28 @@ pub fn render_markdown(input: &str) -> MdRendered {
                 }
                 Tag::Emphasis => italic = true,
                 Tag::Strong => bold = true,
-                Tag::CodeBlock(_) => {
+                Tag::CodeBlock(kind) => {
                     in_code_block = true;
+                    // Capture language from fenced code block.
+                    code_block_lang = match &kind {
+                        CodeBlockKind::Fenced(lang) => {
+                            let lang_str = lang.split_whitespace().next().unwrap_or("");
+                            SyntaxLanguage::from_name(lang_str)
+                        }
+                        CodeBlockKind::Indented => None,
+                    };
+                    code_block_text.clear();
                     // Start code block on a new line.
                     if !cur_line.is_empty() {
-                        flush_line(&mut lines, &mut spans, &mut cur_line, &mut cur_spans);
+                        flush_line(
+                            &mut lines,
+                            &mut spans,
+                            &mut code_highlights,
+                            &mut cur_line,
+                            &mut cur_spans,
+                        );
                     }
+                    code_block_start_line = lines.len();
                 }
                 Tag::Link { dest_url, .. } => {
                     in_link = true;
@@ -124,7 +161,13 @@ pub fn render_markdown(input: &str) -> MdRendered {
                 Tag::Paragraph => {
                     // Ensure paragraph starts on its own line.
                     if !cur_line.is_empty() {
-                        flush_line(&mut lines, &mut spans, &mut cur_line, &mut cur_spans);
+                        flush_line(
+                            &mut lines,
+                            &mut spans,
+                            &mut code_highlights,
+                            &mut cur_line,
+                            &mut cur_spans,
+                        );
                     }
                     at_line_start = true;
                 }
@@ -134,26 +177,86 @@ pub fn render_markdown(input: &str) -> MdRendered {
             Event::End(tag_end) => match tag_end {
                 TagEnd::Heading(_) => {
                     heading = None;
-                    flush_line(&mut lines, &mut spans, &mut cur_line, &mut cur_spans);
+                    flush_line(
+                        &mut lines,
+                        &mut spans,
+                        &mut code_highlights,
+                        &mut cur_line,
+                        &mut cur_spans,
+                    );
                     // Blank line after heading.
                     lines.push(String::new());
                     spans.push(Vec::new());
+                    code_highlights.push(Vec::new());
                     at_line_start = true;
                 }
                 TagEnd::Emphasis => italic = false,
                 TagEnd::Strong => bold = false,
                 TagEnd::CodeBlock => {
+                    // Flush any remaining code line.
+                    if !cur_line.is_empty() {
+                        flush_line(
+                            &mut lines,
+                            &mut spans,
+                            &mut code_highlights,
+                            &mut cur_line,
+                            &mut cur_spans,
+                        );
+                    }
+                    // Run tree-sitter on the accumulated code block text.
+                    if let Some(lang) = code_block_lang.take() {
+                        let mut syntax = Syntax::new_for_language(lang);
+                        let highlights = syntax.parse(&code_block_text);
+                        // Map highlights (byte offsets into code_block_text)
+                        // back to per-line MdCodeHighlight spans, adjusting
+                        // for the 4-space indent prefix.
+                        let indent = 4usize;
+                        // Build a line-start-byte map for the raw code text.
+                        let raw_lines: Vec<&str> = code_block_text.split('\n').collect();
+                        let mut line_byte_starts = Vec::with_capacity(raw_lines.len());
+                        let mut offset = 0usize;
+                        for raw in &raw_lines {
+                            line_byte_starts.push(offset);
+                            offset += raw.len() + 1; // +1 for '\n'
+                        }
+                        for (start, end, scope) in &highlights {
+                            // Find which raw line this highlight starts on.
+                            let raw_line_idx = match line_byte_starts.binary_search(start) {
+                                Ok(i) => i,
+                                Err(i) => i.saturating_sub(1),
+                            };
+                            let out_line_idx = code_block_start_line + raw_line_idx;
+                            if out_line_idx >= code_highlights.len() {
+                                continue;
+                            }
+                            let line_start = line_byte_starts[raw_line_idx];
+                            let local_start = start - line_start + indent;
+                            let local_end = end - line_start + indent;
+                            code_highlights[out_line_idx].push(MdCodeHighlight {
+                                start_byte: local_start,
+                                end_byte: local_end,
+                                scope: scope.clone(),
+                            });
+                        }
+                    }
+                    code_block_text.clear();
                     in_code_block = false;
                     at_line_start = true;
                 }
                 TagEnd::Link => {
                     // Append " (url)" after link text.
+                    // For command: URIs, display as "(:Name?args)" instead.
                     if let Some(url) = link_url.take() {
                         if !url.is_empty() {
+                            let display_url = if let Some(rest) = url.strip_prefix("command:") {
+                                format!(":{}", rest)
+                            } else {
+                                url.clone()
+                            };
                             let prefix = " (";
                             cur_line.push_str(prefix);
                             let url_start = cur_line.len();
-                            cur_line.push_str(&url);
+                            cur_line.push_str(&display_url);
                             let url_end = cur_line.len();
                             cur_line.push(')');
                             cur_spans.push(MdSpan {
@@ -172,23 +275,42 @@ pub fn render_markdown(input: &str) -> MdRendered {
                     list_stack.pop();
                     // Blank line after top-level list.
                     if list_stack.is_empty() && !cur_line.is_empty() {
-                        flush_line(&mut lines, &mut spans, &mut cur_line, &mut cur_spans);
+                        flush_line(
+                            &mut lines,
+                            &mut spans,
+                            &mut code_highlights,
+                            &mut cur_line,
+                            &mut cur_spans,
+                        );
                     }
                 }
                 TagEnd::Item => {
                     in_list_item = false;
                     if !cur_line.is_empty() {
-                        flush_line(&mut lines, &mut spans, &mut cur_line, &mut cur_spans);
+                        flush_line(
+                            &mut lines,
+                            &mut spans,
+                            &mut code_highlights,
+                            &mut cur_line,
+                            &mut cur_spans,
+                        );
                     }
                 }
                 TagEnd::Paragraph => {
                     if !cur_line.is_empty() {
-                        flush_line(&mut lines, &mut spans, &mut cur_line, &mut cur_spans);
+                        flush_line(
+                            &mut lines,
+                            &mut spans,
+                            &mut code_highlights,
+                            &mut cur_line,
+                            &mut cur_spans,
+                        );
                     }
                     // Blank line after paragraph (but not inside list items).
                     if !in_list_item {
                         lines.push(String::new());
                         spans.push(Vec::new());
+                        code_highlights.push(Vec::new());
                     }
                     at_line_start = true;
                 }
@@ -212,10 +334,18 @@ pub fn render_markdown(input: &str) -> MdRendered {
                 }
 
                 if in_code_block {
+                    // Accumulate raw text for tree-sitter.
+                    code_block_text.push_str(&text);
                     // Code block: 4-space indent each line.
                     for (i, code_line) in text.split('\n').enumerate() {
                         if i > 0 {
-                            flush_line(&mut lines, &mut spans, &mut cur_line, &mut cur_spans);
+                            flush_line(
+                                &mut lines,
+                                &mut spans,
+                                &mut code_highlights,
+                                &mut cur_line,
+                                &mut cur_spans,
+                            );
                         }
                         if !code_line.is_empty() || i == 0 {
                             let start = cur_line.len();
@@ -234,7 +364,13 @@ pub fn render_markdown(input: &str) -> MdRendered {
                 // Process text line by line (handles literal newlines in source).
                 for (i, chunk) in text.split('\n').enumerate() {
                     if i > 0 {
-                        flush_line(&mut lines, &mut spans, &mut cur_line, &mut cur_spans);
+                        flush_line(
+                            &mut lines,
+                            &mut spans,
+                            &mut code_highlights,
+                            &mut cur_line,
+                            &mut cur_spans,
+                        );
                         at_line_start = true;
                     }
 
@@ -326,13 +462,25 @@ pub fn render_markdown(input: &str) -> MdRendered {
             }
 
             Event::HardBreak => {
-                flush_line(&mut lines, &mut spans, &mut cur_line, &mut cur_spans);
+                flush_line(
+                    &mut lines,
+                    &mut spans,
+                    &mut code_highlights,
+                    &mut cur_line,
+                    &mut cur_spans,
+                );
                 at_line_start = true;
             }
 
             Event::Rule => {
                 if !cur_line.is_empty() {
-                    flush_line(&mut lines, &mut spans, &mut cur_line, &mut cur_spans);
+                    flush_line(
+                        &mut lines,
+                        &mut spans,
+                        &mut code_highlights,
+                        &mut cur_line,
+                        &mut cur_spans,
+                    );
                 }
                 let rule = "────────────────────────────────────────";
                 let start = cur_line.len();
@@ -342,10 +490,17 @@ pub fn render_markdown(input: &str) -> MdRendered {
                     end_byte: cur_line.len(),
                     style: MdStyle::HorizontalRule,
                 });
-                flush_line(&mut lines, &mut spans, &mut cur_line, &mut cur_spans);
+                flush_line(
+                    &mut lines,
+                    &mut spans,
+                    &mut code_highlights,
+                    &mut cur_line,
+                    &mut cur_spans,
+                );
                 // Blank line after rule.
                 lines.push(String::new());
                 spans.push(Vec::new());
+                code_highlights.push(Vec::new());
                 at_line_start = true;
             }
 
@@ -355,10 +510,20 @@ pub fn render_markdown(input: &str) -> MdRendered {
 
     // Flush any remaining content.
     if !cur_line.is_empty() {
-        flush_line(&mut lines, &mut spans, &mut cur_line, &mut cur_spans);
+        flush_line(
+            &mut lines,
+            &mut spans,
+            &mut code_highlights,
+            &mut cur_line,
+            &mut cur_spans,
+        );
     }
 
-    MdRendered { lines, spans }
+    MdRendered {
+        lines,
+        spans,
+        code_highlights,
+    }
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -492,6 +657,49 @@ mod tests {
             r.lines.iter().any(|l| l.contains("inner")),
             "missing 'inner' in: {:?}",
             r.lines
+        );
+    }
+
+    #[test]
+    fn code_block_syntax_highlights() {
+        let r = render_markdown("```rust\nfn main() { let x = 42; }\n```");
+        // Should have at least one code block line.
+        let code_line_idx = r
+            .lines
+            .iter()
+            .position(|l| l.contains("fn main"))
+            .expect("expected code line");
+        // Tree-sitter should produce highlights for Rust code.
+        assert!(
+            !r.code_highlights[code_line_idx].is_empty(),
+            "expected syntax highlights for Rust code block, got none"
+        );
+        // Check that a "keyword" scope exists (for `fn` or `let`).
+        assert!(
+            r.code_highlights[code_line_idx]
+                .iter()
+                .any(|h| h.scope == "keyword"),
+            "expected 'keyword' scope in highlights: {:?}",
+            r.code_highlights[code_line_idx]
+        );
+    }
+
+    #[test]
+    fn code_block_unknown_lang_no_highlights() {
+        let r = render_markdown("```unknownlang\nsome code here\n```");
+        // Unknown language should have no code highlights.
+        for hl in &r.code_highlights {
+            assert!(hl.is_empty());
+        }
+    }
+
+    #[test]
+    fn code_highlights_parallel_to_lines() {
+        let r = render_markdown("Hello\n\n```rust\nlet x = 1;\n```\n\nWorld");
+        assert_eq!(
+            r.lines.len(),
+            r.code_highlights.len(),
+            "code_highlights length must match lines length"
         );
     }
 }

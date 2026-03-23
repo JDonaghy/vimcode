@@ -52,6 +52,17 @@ You can develop and test extensions entirely locally without publishing to the r
 Local extensions override registry extensions with the same name, so you can fork and modify
 an existing extension by copying it to `~/.config/vimcode/extensions/<name>/`.
 
+### Updating an Existing Extension
+
+When modifying a published extension (e.g. `git-insights`), always update the **registry repo first**, then sync to the local cache:
+
+1. **Edit in the `vimcode-ext` repo** (`~/src/vimcode-ext/<extension>/`)
+2. **Commit and push** the changes to the registry repo
+3. **Copy the updated files** to the local cache (`~/.config/vimcode/extensions/<extension>/`)
+4. **Reload** in VimCode with `:Plugin reload`
+
+This ensures the registry repo is the source of truth. Never edit the local cache without propagating changes back to the repo — the local cache will be overwritten on reinstall.
+
 ### Submitting to the Registry
 
 When your extension is ready, submit a PR to
@@ -333,6 +344,23 @@ local diff = vimcode.git.stash_show(0)                   -- string or nil
 -- List all branches with tracking info
 local branches = vimcode.git.branches()
 -- branches = {{name="main", tracking="origin/main", is_current=true}, ...}
+
+-- List files changed in a commit
+local files = vimcode.git.commit_files("abc123")
+-- files = {"src/main.rs", "src/lib.rs", ...}
+
+-- Get diff for a specific file at a commit
+local diff = vimcode.git.diff_file("abc123", "src/main.rs")  -- string or nil
+
+-- Get file contents at a specific commit
+local content = vimcode.git.show_file("abc123", "src/main.rs")  -- string or nil
+
+-- Get detailed commit info (author, date, message, stat)
+local detail = vimcode.git.commit_detail("abc123")
+-- detail = {hash="abc123", author="Name", date="2026-03-22", message="Fix bug", stat="2 files changed, 10 insertions(+)"}
+
+-- Open a side-by-side diff for a file at a commit (uses engine diff infrastructure)
+vimcode.git.open_diff("abc123", "src/main.rs")
 ```
 
 ### Async Shell Execution
@@ -354,6 +382,34 @@ vimcode.on("my_result_event", function(output)
     vimcode.message("Result: " .. output)
 end)
 ```
+
+### Command URIs
+
+Hover popups and panel hovers support `command:` URIs in markdown links. When a user clicks (or presses Enter on) a command URI link, VimCode dispatches it to the matching plugin command registered via `vimcode.command()`.
+
+**Format:** `[Label](command:CommandName?args)`
+
+The `?args` portion is optional and is percent-decoded before being passed to the command handler. This enables interactive hover popups with clickable action links.
+
+```lua
+-- Register commands that can be invoked from hover popup links
+vimcode.command("GitShow", function(hash)
+    vimcode.command_run("Gshow " .. hash)
+end)
+
+vimcode.command("CopyHash", function(hash)
+    vimcode.state.set_register("+", hash, false)
+    vimcode.message("Copied " .. hash)
+end)
+
+-- Use command URIs in hover markdown
+local md = "**Commit info**\n\n"
+    .. "[Open Commit](command:GitShow?abc1234)"
+    .. " | [Copy Hash](command:CopyHash?abc1234)"
+vimcode.editor.set_hover(line, md)
+```
+
+Built-in LSP commands (`command:definition`, `command:type_definition`, `command:implementation`, `command:references`) are handled internally and take precedence over plugin commands of the same name.
 
 ### Panel API (`vimcode.panel.*`)
 
@@ -379,6 +435,10 @@ vimcode.panel.set_items("my_panel", "Section A", {
 -- Parse event argument from panel_select/panel_action hooks
 local info = vimcode.panel.parse_event(arg)
 -- info = {panel="my_panel", section="Section A", index=0, label="Item 1", key="a"}
+
+-- Programmatically navigate to a panel item (focus panel, select section, expand item)
+vimcode.panel.reveal("my_panel", "Section A", "item_id")
+-- Useful for blame-to-log navigation: reveal a commit in the Git Log panel
 ```
 
 **Panel navigation keys** (when panel has focus):
@@ -386,18 +446,26 @@ local info = vimcode.panel.parse_event(arg)
 | Key | Action |
 |-----|--------|
 | `j` / `k` | Navigate items |
-| `Tab` | Expand/collapse section |
+| `Tab` | Expand/collapse section or tree node |
 | `Enter` | Fire `panel_select` event for current item |
-| `q` / `Escape` | Unfocus panel |
+| `/` | Activate panel input field (search/filter) |
+| `q` / `Escape` | Unfocus panel (or deactivate input field) |
 | Other keys | Fire `panel_action` event with the key |
+
+**Panel input field:** Press `/` to activate an inline input field at the top of the panel. Typing fires `panel_input` events on every keystroke for live filtering. Press `Escape` to deactivate or `Return` to confirm and deactivate. Plugins can read/write the input text via `vimcode.panel.get_input(name)` and `vimcode.panel.set_input(name, text)`.
 
 **Panel events:**
 
 | Event | Argument | When |
 |-------|----------|------|
 | `panel_focus` | panel name | Panel gains focus in sidebar |
-| `panel_select` | `"panel:section:index:label"` | Enter pressed on item |
-| `panel_action` | `"key:panel:section:index:label"` | Other key pressed on item |
+| `panel_select` | `"panel\|section\|id\|\|index"` | Enter pressed on item |
+| `panel_action` | `"panel\|section\|id\|key\|index"` | Other key pressed on item |
+| `panel_expand` | `"panel\|section\|id\|\|index"` | Tree node expanded via Tab |
+| `panel_collapse` | `"panel\|section\|id\|\|index"` | Tree node collapsed via Tab |
+| `panel_double_click` | `"panel\|section\|id\|\|index"` | Double-click on item |
+| `panel_context_menu` | `"panel\|section\|id\|\|index"` | Right-click on item |
+| `panel_input` | `"panel\|\|\|text\|"` | Input field text changed or confirmed |
 
 **Item styles:**
 
@@ -436,8 +504,13 @@ vimcode.set_comment_style("haskell", {
 | `InsertLeave` | mode name | Left Insert mode |
 | `ModeChanged` | `"Old->New"` | Any mode change (e.g., `"Normal->Insert"`) |
 | `panel_focus` | panel name | Extension panel gains focus |
-| `panel_select` | `"panel:section:index:label"` | Enter pressed on extension panel item |
-| `panel_action` | `"key:panel:section:index:label"` | Other key pressed on extension panel item |
+| `panel_select` | `"panel\|section\|id\|\|index"` | Enter pressed on extension panel item |
+| `panel_action` | `"panel\|section\|id\|key\|index"` | Other key pressed on extension panel item |
+| `panel_expand` | `"panel\|section\|id\|\|index"` | Tree node expanded via Tab |
+| `panel_collapse` | `"panel\|section\|id\|\|index"` | Tree node collapsed via Tab |
+| `panel_double_click` | `"panel\|section\|id\|\|index"` | Double-click on panel item |
+| `panel_context_menu` | `"panel\|section\|id\|\|index"` | Right-click on panel item |
+| `panel_input` | `"panel\|\|\|text\|"` | Panel input field text changed |
 | Custom | shell output | `async_shell()` callback event |
 
 ---

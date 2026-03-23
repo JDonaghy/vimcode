@@ -638,63 +638,119 @@ impl Drop for StderrGuard {
 // Clipboard setup helpers
 // =============================================================================
 
-/// Build the best clipboard context for the current platform.
-///
-/// On X11 we explicitly use `x11_bin::ClipboardContext` (xclip/xsel subprocesses)
-/// rather than letting `try_context()` pick `x11_fork` first.  The fork-based
-/// provider delegates `get_contents()` to `X11ClipboardContext::get_contents()`
-/// which can stall or return empty when another app owns the clipboard (competing
-/// X11 events).  Subprocess reads each open their own independent X11 connection
-/// and have no such conflict.
-fn build_clipboard_ctx() -> Option<Box<dyn copypasta_ext::ClipboardProviderExt>> {
-    // Suppress stderr to prevent "Can't open display" from corrupting the TUI
-    // when clipboard providers probe for X11/Wayland availability.
-    let _guard = suppress_stderr();
+/// Check if a binary exists on PATH.
+fn has_binary(name: &str) -> bool {
+    std::process::Command::new("which")
+        .arg(name)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
 
-    // On Unix (Linux / BSDs) but not macOS, prefer the binary (subprocess) X11
-    // context when running under X11.
-    #[cfg(all(
-        unix,
-        not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))
-    ))]
-    {
-        if copypasta_ext::display::is_x11() {
-            if let Ok(ctx) = copypasta_ext::x11_bin::ClipboardContext::new() {
-                return Some(Box::new(ctx));
-            }
+/// Find the first available clipboard write command (program + args).
+fn find_clipboard_write_cmd() -> Option<(&'static str, &'static [&'static str])> {
+    let candidates: &[(&str, &[&str])] = &[
+        ("xclip", &["-selection", "clipboard"]),
+        ("xsel", &["--clipboard", "--input"]),
+        ("wl-copy", &[]),
+        #[cfg(target_os = "macos")]
+        ("pbcopy", &[]),
+    ];
+    for &(prog, args) in candidates {
+        if has_binary(prog) {
+            return Some((prog, args));
         }
     }
-    copypasta_ext::try_context()
+    None
+}
+
+/// Find the first available clipboard read command (program + args).
+fn find_clipboard_read_cmd() -> Option<(&'static str, &'static [&'static str])> {
+    let candidates: &[(&str, &[&str])] = &[
+        ("xclip", &["-selection", "clipboard", "-o"]),
+        ("xsel", &["--clipboard", "--output"]),
+        ("wl-paste", &[]),
+        #[cfg(target_os = "macos")]
+        ("pbpaste", &[]),
+    ];
+    for &(prog, args) in candidates {
+        if has_binary(prog) {
+            return Some((prog, args));
+        }
+    }
+    None
 }
 
 /// Set up system clipboard callbacks on the engine.
 ///
-/// Backends (first match wins):
-///   X11      → X11BinClipboardContext (xclip/xsel subprocesses — no X11 event conflict)
-///   Wayland  → WaylandBinClipboardContext (wl-paste/wl-copy)
-///   macOS    → native NSPasteboard
-///   Windows  → native Win32
-///   headless → None (message shown to user)
+/// Spawns xclip/xsel/wl-copy/wl-paste/pbcopy/pbpaste directly rather than
+/// using copypasta_ext, which has a bug where it doesn't close the child's
+/// stdin pipe before calling wait() — causing xclip to exit with status 1
+/// under crossterm raw mode.
 fn setup_tui_clipboard(engine: &mut Engine) {
-    match build_clipboard_ctx() {
-        Some(ctx) => {
-            use std::sync::{Arc, Mutex};
-            let cb = Arc::new(Mutex::new(ctx));
-            let cb_read = cb.clone();
-            engine.clipboard_read = Some(Box::new(move || {
-                let mut g = cb_read.lock().map_err(|e| format!("clipboard: {e}"))?;
-                g.get_contents().map_err(|e| format!("{e}"))
-            }));
-            let cb_write = cb;
-            engine.clipboard_write = Some(Box::new(move |text: &str| {
-                let mut g = cb_write.lock().map_err(|e| format!("clipboard: {e}"))?;
-                g.set_contents(text.to_string()).map_err(|e| format!("{e}"))
-            }));
-        }
-        None => {
-            engine.message = "Clipboard unavailable — \"+/\"* registers unavailable".to_string();
+    // Ensure DISPLAY is set for xclip/xsel — TUI sessions (e.g. tmux, SSH)
+    // may not inherit it even when an X server is running on :0.
+    if std::env::var("DISPLAY").unwrap_or_default().is_empty() {
+        unsafe { std::env::set_var("DISPLAY", ":0") };
+    }
+    if let Some((prog, args)) = find_clipboard_read_cmd() {
+        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        engine.clipboard_read = Some(Box::new(move || {
+            let _guard = suppress_stderr();
+            let output = std::process::Command::new(prog)
+                .args(&args)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .output()
+                .map_err(|e| format!("clipboard read: {e}"))?;
+            if !output.status.success() {
+                return Err(format!("{} exited with status {}", prog, output.status));
+            }
+            String::from_utf8(output.stdout).map_err(|e| format!("clipboard: {e}"))
+        }));
+    }
+
+    if let Some((prog, args)) = find_clipboard_write_cmd() {
+        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        engine.clipboard_write = Some(Box::new(move |text: &str| {
+            let _guard = suppress_stderr();
+            let mut child = std::process::Command::new(prog)
+                .args(&args)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .map_err(|e| format!("clipboard write: {e}"))?;
+            // Write text then DROP stdin to send EOF — critical for xclip.
+            if let Some(mut stdin) = child.stdin.take() {
+                use std::io::Write;
+                let _ = stdin.write_all(text.as_bytes());
+                // stdin dropped here, pipe closed, xclip sees EOF
+            }
+            let status = child.wait().map_err(|e| format!("clipboard: {e}"))?;
+            if !status.success() {
+                return Err(format!("{} exited with status {}", prog, status));
+            }
+            Ok(())
+        }));
+    }
+
+    if engine.clipboard_write.is_none() && engine.clipboard_read.is_none() {
+        engine.message = "Clipboard unavailable — install xclip or xsel".to_string();
+    }
+}
+
+/// Copy text to the system clipboard and show a status message.
+fn tui_copy_to_clipboard(text: &str, engine: &mut Engine) {
+    if let Some(ref cb) = engine.clipboard_write {
+        if cb(text).is_ok() {
+            engine.message = format!("Copied: {}", text);
+            return;
         }
     }
+    engine.message = format!("Link: {} (clipboard unavailable)", text);
 }
 
 /// Sync the unnamed `"` register to the system clipboard if its content changed.
@@ -950,6 +1006,14 @@ fn event_loop(
     let mut close_tab_confirm = false;
 
     let mut needs_redraw = true;
+    // Link hit rects from the hover popup render: (x, y, w, h, url).
+    let mut hover_link_rects: Vec<(u16, u16, u16, u16, String)> = Vec::new();
+    // Bounding rect of the panel hover popup (x, y, w, h) — used to suppress dismiss on mouse-over.
+    let mut hover_popup_rect: Option<(u16, u16, u16, u16)> = None;
+    // Bounding rect of the editor hover popup (x, y, w, h) — for scroll wheel + click + dismiss.
+    let mut editor_hover_popup_rect: Option<(u16, u16, u16, u16)> = None;
+    // Link hit rects from the editor hover popup: (x, y, w, h, url).
+    let mut editor_hover_link_rects: Vec<(u16, u16, u16, u16, String)> = Vec::new();
     // Track last draw time to cap frame rate at ~60 fps and keep CPU low.
     let min_frame = Duration::from_millis(16);
     let mut last_draw = Instant::now()
@@ -1012,6 +1076,7 @@ fn event_loop(
         }
 
         if needs_redraw && last_draw.elapsed() >= min_frame {
+            let redraw_t0 = std::time::Instant::now();
             // Build layout before drawing so mouse handler can use it
             let screen = if let Ok(size) = terminal.size() {
                 let area = Rect {
@@ -1073,7 +1138,6 @@ fn event_loop(
                 }
             }
 
-            debug_log!(">>> terminal.draw() begin");
             terminal
                 .draw(|frame| {
                     if let Some(s) = &screen {
@@ -1095,11 +1159,14 @@ fn event_loop(
                             close_tab_confirm,
                             cmd_sel,
                             drop_target,
+                            &mut hover_link_rects,
+                            &mut hover_popup_rect,
+                            &mut editor_hover_popup_rect,
+                            &mut editor_hover_link_rects,
                         );
                     }
                 })
                 .expect("draw frame");
-            debug_log!("<<< terminal.draw() done");
 
             // Set terminal cursor shape to match mode / pending key.
             let cursor_style = if !sidebar.has_focus && engine.pending_key == Some('r') {
@@ -1121,6 +1188,10 @@ fn event_loop(
                 .unwrap_or_else(|| "VimCode".to_string());
             let _ = execute!(terminal.backend_mut(), SetTitle(tui_title.as_str()));
 
+            let redraw_ms = redraw_t0.elapsed();
+            if redraw_ms.as_millis() > 16 {
+                debug_log!("PERF redraw: {:.1}ms", redraw_ms.as_secs_f64() * 1000.0);
+            }
             last_draw = Instant::now();
             needs_redraw = false;
         }
@@ -1163,10 +1234,21 @@ fn event_loop(
                 continue;
             }
             // No input — good time to do background work without blocking typing.
+            let idle_t0 = std::time::Instant::now();
             // Flush LSP didChange (may block briefly on pipe write for large buffers).
             engine.lsp_flush_changes();
+            let lsp_flush_ms = idle_t0.elapsed().as_secs_f64() * 1000.0;
+            let poll_t0 = std::time::Instant::now();
             if engine.poll_lsp() {
                 needs_redraw = true;
+            }
+            let lsp_poll_ms = poll_t0.elapsed().as_secs_f64() * 1000.0;
+            if lsp_flush_ms > 5.0 || lsp_poll_ms > 5.0 {
+                debug_log!(
+                    "PERF idle: lsp_flush={:.1}ms lsp_poll={:.1}ms",
+                    lsp_flush_ms,
+                    lsp_poll_ms
+                );
             }
             // Format-on-save + :wq/:x deferred quit
             if engine.format_save_quit_ready {
@@ -1247,6 +1329,10 @@ fn event_loop(
             if engine.poll_ext_registry() {
                 needs_redraw = true;
             }
+            // Poll for completed SC diff background request.
+            if engine.poll_sc_diff() {
+                needs_redraw = true;
+            }
             if engine.poll_ai() {
                 needs_redraw = true;
             }
@@ -1254,10 +1340,32 @@ fn event_loop(
             if engine.poll_async_shells() {
                 needs_redraw = true;
             }
+            // Check for panel reveal request from plugins.
+            if let Some(panel_name) = engine.ext_panel_focus_pending.take() {
+                sidebar.ext_panel_name = Some(panel_name);
+                sidebar.visible = true;
+                sidebar.has_focus = true;
+                needs_redraw = true;
+            }
+            // Poll panel hover dwell timer (shows popup after brief mouse hover).
+            if engine.poll_panel_hover() {
+                needs_redraw = true;
+            }
+            // Poll editor hover dwell / delayed dismiss timers.
+            if engine.poll_editor_hover() {
+                needs_redraw = true;
+            }
+            // Poll async blame results.
+            if engine.poll_blame() {
+                needs_redraw = true;
+            }
             // Tick AI inline completion debounce counter each event-loop frame.
             if engine.tick_ai_completion() {
                 needs_redraw = true;
             }
+            // Syntax refresh is deferred entirely until leaving insert mode
+            // (Escape calls refresh_syntax_if_stale). This avoids blocking the
+            // event loop with a 100-250ms reparse during active typing.
             // Tick swap file writes (only does work when updatetime elapsed).
             engine.tick_swap_files();
             continue;
@@ -1417,6 +1525,31 @@ fn event_loop(
                         needs_redraw = true;
                         continue;
                     }
+                }
+
+                // ── Modal dialog intercepts ALL keys ──────────────────────
+                if engine.dialog.is_some() {
+                    if let Some((key_name, unicode, ctrl)) =
+                        translate_key(key_event, keyboard_enhanced)
+                    {
+                        let action = engine.handle_key(&key_name, unicode, ctrl);
+                        if action == EngineAction::Quit {
+                            return;
+                        }
+                    } else if key_event.kind != KeyEventKind::Release {
+                        // translate_key doesn't map Tab — handle it directly.
+                        match key_event.code {
+                            KeyCode::Tab => {
+                                engine.handle_key("Tab", None, false);
+                            }
+                            KeyCode::BackTab => {
+                                engine.handle_key("Shift_Tab", None, false);
+                            }
+                            _ => {}
+                        }
+                    }
+                    needs_redraw = true;
+                    continue;
                 }
 
                 // ── Inline rename in explorer ────────────────────────────────
@@ -1735,10 +1868,13 @@ fn event_loop(
                 }
 
                 // ── Sidebar focused ─────────────────────────────────────────
-                // Note: sidebar key handling is suppressed when fuzzy modal is open.
+                // Note: sidebar key handling is suppressed when fuzzy modal is open
+                // and when terminal has focus (e.g. "Press Enter to close..." after
+                // extension install).
                 if sidebar.has_focus
                     && !engine.fuzzy_open
                     && !engine.grep_open
+                    && !engine.terminal_has_focus
                     && key_event.kind != KeyEventKind::Release
                 {
                     let ctrl = key_event.modifiers.contains(KeyModifiers::CONTROL);
@@ -2054,6 +2190,27 @@ fn event_loop(
                             needs_redraw = true;
                             continue;
                         }
+                        // When the input field is active, pass characters as
+                        // input text instead of navigation commands.
+                        if engine.ext_panel_input_active {
+                            let (ikey, ich): (&str, Option<char>) = match key_event.code {
+                                KeyCode::Esc => ("Escape", None),
+                                KeyCode::Enter => ("Return", None),
+                                KeyCode::Backspace => ("BackSpace", None),
+                                KeyCode::Char(ch) => ("char", Some(ch)),
+                                _ => ("", None),
+                            };
+                            if !ikey.is_empty() {
+                                let name = if ikey == "char" {
+                                    ich.map(|c| c.to_string()).unwrap_or_default()
+                                } else {
+                                    ikey.to_string()
+                                };
+                                engine.handle_ext_panel_input_key(&name, ctrl, ich);
+                            }
+                            needs_redraw = true;
+                            continue;
+                        }
                         let (key_name, unicode): (&str, Option<char>) = match key_event.code {
                             KeyCode::Char('j') | KeyCode::Down => ("j", None),
                             KeyCode::Char('k') | KeyCode::Up => ("k", None),
@@ -2315,8 +2472,13 @@ fn event_loop(
                                 KeyCode::Enter => ("Return", None),
                                 KeyCode::Esc => ("Escape", None),
                                 KeyCode::Backspace => ("BackSpace", None),
+                                KeyCode::Delete => ("Delete", None),
                                 KeyCode::Up => ("Up", None),
                                 KeyCode::Down => ("Down", None),
+                                KeyCode::Left => ("Left", None),
+                                KeyCode::Right => ("Right", None),
+                                KeyCode::Home => ("Home", None),
+                                KeyCode::End => ("End", None),
                                 KeyCode::Char(ch) => ("char", Some(ch)),
                                 _ => ("", None),
                             };
@@ -2357,9 +2519,18 @@ fn event_loop(
                                 _ => None,
                             };
                             if let Some(name) = key_name {
-                                engine.handle_sc_key(name, ctrl, None);
-                                if !engine.sc_has_focus {
-                                    sidebar.has_focus = false;
+                                if name == "Return" {
+                                    // Open tab immediately, diff arrives
+                                    // asynchronously via poll_sc_diff.
+                                    let done = engine.sc_open_selected_async();
+                                    if done && !engine.sc_has_focus {
+                                        sidebar.has_focus = false;
+                                    }
+                                } else {
+                                    engine.handle_sc_key(name, ctrl, None);
+                                    if !engine.sc_has_focus {
+                                        sidebar.has_focus = false;
+                                    }
                                 }
                             }
                         }
@@ -3066,34 +3237,51 @@ fn event_loop(
                     // ── Command-line selection: Ctrl-C copies, any other key clears ──
                     {
                         use crate::core::Mode;
-                        if matches!(engine.mode, Mode::Command | Mode::Search) {
-                            if ctrl && matches!(unicode, Some('c') | Some('C')) {
-                                // Copy selected command-line text to clipboard
-                                if let Some((start, end)) = cmd_sel {
-                                    let lo = start.min(end);
-                                    let hi = start.max(end);
-                                    // lo/hi are column indices on screen (col 0 = ':' prefix, col 1+ = buffer chars)
+                        if ctrl && matches!(unicode, Some('c') | Some('C')) && cmd_sel.is_some() {
+                            debug_log!(
+                                "CMD_SEL Ctrl+C: cmd_sel={:?} msg_len={}",
+                                cmd_sel,
+                                engine.message.len()
+                            );
+                            if let Some((start, end)) = cmd_sel {
+                                let lo = start.min(end);
+                                let hi = start.max(end);
+                                // Determine the source text for the selection.
+                                let source = if matches!(engine.mode, Mode::Command | Mode::Search)
+                                {
+                                    // col 0 = ':' prefix, col 1+ = buffer chars
                                     let buf_lo = lo.saturating_sub(1);
                                     let buf_hi = hi.saturating_sub(1);
-                                    let text: String = engine
+                                    engine
                                         .command_buffer
                                         .chars()
                                         .enumerate()
                                         .filter(|(i, _)| *i >= buf_lo && *i <= buf_hi)
                                         .map(|(_, c)| c)
-                                        .collect();
-                                    if !text.is_empty() {
-                                        if let Some(ref cb) = engine.clipboard_write {
-                                            let _ = cb(&text);
-                                        }
-                                        engine.message = "Copied".to_string();
-                                    }
+                                        .collect::<String>()
+                                } else {
+                                    // Normal mode message line — no prefix offset
+                                    engine
+                                        .message
+                                        .chars()
+                                        .enumerate()
+                                        .filter(|(i, _)| *i >= lo && *i <= hi)
+                                        .map(|(_, c)| c)
+                                        .collect::<String>()
+                                };
+                                if !source.is_empty() {
+                                    tui_copy_to_clipboard(&source, engine);
                                 }
-                                cmd_sel = None;
-                                needs_redraw = true;
-                                continue;
                             }
+                            cmd_sel = None;
+                            needs_redraw = true;
+                            continue;
+                        }
+                        if matches!(engine.mode, Mode::Command | Mode::Search) {
                             // Any other key clears the selection
+                            cmd_sel = None;
+                        } else if cmd_sel.is_some() {
+                            // In normal mode, any non-Ctrl-C key clears message selection
                             cmd_sel = None;
                         }
                     }
@@ -3139,7 +3327,9 @@ fn event_loop(
                             engine.group_layout.leaf_count(),
                             engine.active_group
                         );
+                        let _key_t0 = std::time::Instant::now();
                         let action = engine.handle_key(&key_name, unicode, ctrl);
+                        let key_elapsed = _key_t0.elapsed();
                         // After any key in insert mode, reset AI completion timer.
                         if engine.mode == crate::core::Mode::Insert
                             && engine.settings.ai_completions
@@ -3147,10 +3337,14 @@ fn event_loop(
                             engine.ai_completion_reset_timer();
                         }
                         debug_log!(
-                            "handle_key result: action={:?} groups_after={}",
+                            "handle_key result: action={:?} groups_after={} elapsed={:.1}ms",
                             action,
-                            engine.group_layout.leaf_count()
+                            engine.group_layout.leaf_count(),
+                            key_elapsed.as_secs_f64() * 1000.0,
                         );
+                        if let Some(perf) = engine.perf_log.take() {
+                            debug_log!("  {}", perf);
+                        }
                         // Handle OpenTerminal specially (needs terminal size info)
                         if action == EngineAction::OpenTerminal {
                             let cols = terminal.size().ok().map(|s| s.width).unwrap_or(80);
@@ -3364,6 +3558,10 @@ fn event_loop(
                                 &mut mouse_should_quit,
                                 &mut explorer_drag_src,
                                 &mut explorer_drag_active,
+                                &hover_link_rects,
+                                hover_popup_rect,
+                                editor_hover_popup_rect,
+                                &editor_hover_link_rects,
                             );
                             if mouse_should_quit {
                                 return;
@@ -3376,6 +3574,7 @@ fn event_loop(
                     }
                 }
                 let mut mouse_should_quit = false;
+                let hover_before = engine.sc_button_hovered;
                 sidebar_width = handle_mouse(
                     mouse_event,
                     &mut sidebar,
@@ -3406,9 +3605,24 @@ fn event_loop(
                     &mut mouse_should_quit,
                     &mut explorer_drag_src,
                     &mut explorer_drag_active,
+                    &hover_link_rects,
+                    hover_popup_rect,
+                    editor_hover_popup_rect,
+                    &editor_hover_link_rects,
                 );
                 if mouse_should_quit {
                     return;
+                }
+                if engine.sc_button_hovered != hover_before {
+                    needs_redraw = true;
+                }
+                // Poll editor hover dwell after mouse events so the timer
+                // can fire even when continuous mouse events prevent idle polling.
+                if engine.poll_editor_hover() {
+                    needs_redraw = true;
+                }
+                if engine.poll_blame() {
+                    needs_redraw = true;
                 }
             }
             Event::Paste(text) => {
@@ -3565,6 +3779,10 @@ fn handle_mouse(
     should_quit: &mut bool,
     explorer_drag_src: &mut Option<usize>,
     explorer_drag_active: &mut Option<(usize, Option<usize>)>,
+    hover_link_rects: &[(u16, u16, u16, u16, String)],
+    hover_popup_rect: Option<(u16, u16, u16, u16)>,
+    editor_hover_popup_rect: Option<(u16, u16, u16, u16)>,
+    editor_hover_link_rects: &[(u16, u16, u16, u16, String)],
 ) -> u16 {
     let col = ev.column;
     let row = ev.row;
@@ -3581,6 +3799,34 @@ fn handle_mouse(
         } else {
             0
         };
+
+    // Check if the mouse cursor is currently inside or adjacent to the hover
+    // popup bounding rect. We include 1 column to the left (the sidebar
+    // separator) so the popup doesn't dismiss while the mouse crosses to it.
+    let mouse_on_hover_popup = hover_popup_rect.is_some_and(|(px, py, pw, ph)| {
+        col >= px.saturating_sub(1) && col < px + pw && row >= py && row < py + ph
+    });
+
+    // Check if mouse is on the editor hover popup (exact bounds).
+    let mouse_on_editor_hover = editor_hover_popup_rect
+        .is_some_and(|(px, py, pw, ph)| col >= px && col < px + pw && row >= py && row < py + ph);
+
+    // ── Hover link click-to-copy ────────────────────────────────────────────────
+    if !hover_link_rects.is_empty() {
+        if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
+            for &(lx, ly, lw, _lh, ref url) in hover_link_rects {
+                if row == ly && col >= lx && col < lx + lw {
+                    if url.starts_with("command:") {
+                        engine.execute_command_uri(url);
+                    } else {
+                        tui_copy_to_clipboard(url, engine);
+                    }
+                    engine.dismiss_panel_hover_now();
+                    return sidebar_width;
+                }
+            }
+        }
+    }
 
     // ── Dialog popup click handling ─────────────────────────────────────────────
     if engine.dialog.is_some() {
@@ -3738,6 +3984,37 @@ fn handle_mouse(
                         new_scroll.min(drag.total.saturating_sub(drag.track_len as usize));
                 }
                 return sidebar_width;
+            }
+            // Extension panel scrollbar drag — stateless, recomputes on each drag event
+            if sidebar.visible
+                && sidebar.ext_panel_name.is_some()
+                && col >= ab_width
+                && col < ab_width + sidebar_width
+            {
+                let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
+                let sb_col = ab_width + sidebar_width - 1;
+                let input_rows: u16 = if engine.ext_panel_input_active
+                    || engine
+                        .ext_panel_active
+                        .as_ref()
+                        .and_then(|n| engine.ext_panel_input_text.get(n))
+                        .map(|t| !t.is_empty())
+                        .unwrap_or(false)
+                {
+                    1
+                } else {
+                    0
+                };
+                let content_start = 1 + input_rows + menu_rows;
+                let flat_len = engine.ext_panel_flat_len();
+                let content_h = term_height.saturating_sub(2 + content_start) as usize;
+                if col == sb_col && flat_len > content_h && row >= content_start {
+                    let rel_row = (row - content_start) as usize;
+                    let ratio = rel_row as f64 / content_h as f64;
+                    let new_top = (ratio * flat_len as f64) as usize;
+                    engine.ext_panel_scroll_top = new_top.min(flat_len.saturating_sub(1));
+                    return sidebar_width;
+                }
             }
             // Settings panel scrollbar drag
             if let Some(ref drag) = *dragging_settings_sb {
@@ -3955,9 +4232,28 @@ fn handle_mouse(
         }
         // Scroll wheel — sidebar or editor
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            // Editor hover popup scroll wheel — scroll content without focusing
+            if mouse_on_editor_hover && engine.editor_hover.is_some() {
+                let delta = if matches!(ev.kind, MouseEventKind::ScrollUp) {
+                    -3
+                } else {
+                    3
+                };
+                engine.editor_hover_scroll(delta);
+                return sidebar_width;
+            }
             // Sidebar scroll wheel
             if sidebar.visible && col >= ab_width && col < ab_width + sidebar_width {
-                if sidebar.active_panel == TuiPanel::Explorer {
+                if sidebar.ext_panel_name.is_some() {
+                    // Extension-provided panel (e.g. Git Log): scroll viewport
+                    let flat_len = engine.ext_panel_flat_len();
+                    if matches!(ev.kind, MouseEventKind::ScrollUp) {
+                        engine.ext_panel_scroll_top = engine.ext_panel_scroll_top.saturating_sub(3);
+                    } else {
+                        engine.ext_panel_scroll_top =
+                            (engine.ext_panel_scroll_top + 3).min(flat_len.saturating_sub(1));
+                    }
+                } else if sidebar.active_panel == TuiPanel::Explorer {
                     let tree_height = term_height.saturating_sub(3) as usize;
                     let total = sidebar.rows.len();
                     if total > tree_height {
@@ -4294,8 +4590,164 @@ fn handle_mouse(
         return sidebar_width;
     }
 
+    // ── Cancel hover dismiss if mouse is on the popup ─────────────────────
+    if matches!(ev.kind, MouseEventKind::Moved) && mouse_on_hover_popup {
+        engine.cancel_panel_hover_dismiss();
+    }
+    // Cancel editor hover dismiss if mouse is on the editor hover popup
+    if matches!(ev.kind, MouseEventKind::Moved) && mouse_on_editor_hover {
+        engine.cancel_editor_hover_dismiss();
+    }
+
+    // ── SC button hover (mouse moved) ───────────────────────────────────────
+    if matches!(ev.kind, MouseEventKind::Moved) {
+        let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
+        if sidebar.visible
+            && sidebar.active_panel == TuiPanel::Git
+            && col >= ab_width
+            && col < ab_width + sidebar_width
+        {
+            let sidebar_row = row.saturating_sub(menu_rows);
+            let commit_rows = engine.sc_commit_message.split('\n').count().max(1) as u16;
+            let btn_row = 1 + commit_rows + 1; // header + commit + pad_above
+            if sidebar_row == btn_row {
+                let rel_col = col.saturating_sub(ab_width);
+                let commit_w = sidebar_width / 2;
+                let btn_idx = if rel_col < commit_w {
+                    0
+                } else {
+                    let icon_w = (sidebar_width - commit_w) / 3;
+                    (1 + ((rel_col - commit_w) / icon_w.max(1))).min(3) as usize
+                };
+                engine.sc_button_hovered = Some(btn_idx);
+            } else {
+                engine.sc_button_hovered = None;
+                // SC item hover dwell tracking (sections area).
+                let section_start = 4 + commit_rows; // btn + pad_below + 1
+                if sidebar_row >= section_start {
+                    let adjusted = sidebar_row - section_start + 3;
+                    if let Some((flat_idx, _is_header)) =
+                        engine.sc_visual_row_to_flat(adjusted as usize, true)
+                    {
+                        engine.panel_hover_mouse_move("source_control", "", flat_idx);
+                    } else if !mouse_on_hover_popup {
+                        engine.dismiss_panel_hover();
+                    }
+                } else if !mouse_on_hover_popup {
+                    engine.dismiss_panel_hover();
+                }
+            }
+        } else {
+            engine.sc_button_hovered = None;
+            // If we were showing an SC hover and mouse left Git panel, dismiss
+            // — unless the mouse is over the popup itself.
+            if engine.panel_hover.is_some() && !mouse_on_hover_popup {
+                engine.dismiss_panel_hover();
+            }
+        }
+    }
+
+    // ── Ext panel hover (mouse moved) ───────────────────────────────────────
+    if matches!(ev.kind, MouseEventKind::Moved) {
+        let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
+        if sidebar.visible
+            && sidebar.ext_panel_name.is_some()
+            && col >= ab_width
+            && col < ab_width + sidebar_width
+        {
+            if let Some(ref panel_name) = sidebar.ext_panel_name.clone() {
+                let sidebar_row = row.saturating_sub(menu_rows);
+                // Row 0 is the header; content items start at row 1.
+                if sidebar_row >= 1 {
+                    let flat_idx =
+                        engine.ext_panel_scroll_top + (sidebar_row as usize).saturating_sub(1);
+                    engine.panel_hover_mouse_move(panel_name, "", flat_idx);
+                } else if !mouse_on_hover_popup {
+                    engine.dismiss_panel_hover();
+                }
+            }
+        } else if sidebar.ext_panel_name.is_some() && !mouse_on_hover_popup {
+            // Mouse moved outside the ext panel area — dismiss hover.
+            engine.dismiss_panel_hover();
+        }
+    }
+
+    // ── Editor hover dwell (mouse moved over editor area) ───────────────────
+    if matches!(ev.kind, MouseEventKind::Moved)
+        && !mouse_on_editor_hover
+        && col >= editor_left
+        && engine.settings.hover_delay > 0
+        && !engine.editor_hover_has_focus
+        && (matches!(
+            engine.mode,
+            Mode::Normal | Mode::Visual | Mode::VisualLine | Mode::VisualBlock
+        ) || engine.is_vscode_mode())
+    {
+        if let Some(layout) = last_layout {
+            let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
+            let editor_row = row.saturating_sub(menu_rows);
+            let mut found = false;
+            for rw in &layout.windows {
+                let wx = rw.rect.x as u16;
+                let wy = rw.rect.y as u16;
+                let ww = rw.rect.width as u16;
+                let wh = rw.rect.height as u16;
+                let gutter = rw.gutter_char_width as u16;
+                let rel_col = col - editor_left;
+                if rel_col >= wx + gutter
+                    && rel_col < wx + ww
+                    && editor_row >= wy
+                    && editor_row < wy + wh
+                {
+                    let view_row = (editor_row - wy) as usize;
+                    let buf_line = rw
+                        .lines
+                        .get(view_row)
+                        .map(|l| l.line_idx)
+                        .unwrap_or_else(|| rw.scroll_top + view_row);
+                    let text_col = (rel_col - wx).saturating_sub(gutter) as usize + rw.scroll_left;
+                    engine.editor_hover_mouse_move(buf_line, text_col, mouse_on_editor_hover);
+                    found = true;
+                    break;
+                }
+            }
+            if !found
+                && engine.editor_hover.is_some()
+                && !engine.editor_hover_has_focus
+                && !mouse_on_editor_hover
+            {
+                engine.dismiss_editor_hover();
+            }
+        }
+    }
+
     // Only process left-click presses from here on
     if ev.kind != MouseEventKind::Down(MouseButton::Left) {
+        return sidebar_width;
+    }
+
+    // ── Click on editor hover popup link → execute command or copy URL ─────
+    if mouse_on_editor_hover && !editor_hover_link_rects.is_empty() {
+        for &(lx, ly, lw, _lh, ref url) in editor_hover_link_rects {
+            if row == ly && col >= lx && col < lx + lw {
+                if url.starts_with("command:") {
+                    engine.execute_hover_goto(url);
+                } else {
+                    tui_copy_to_clipboard(url, engine);
+                    engine.dismiss_editor_hover();
+                }
+                return sidebar_width;
+            }
+        }
+    }
+    // ── Click on editor hover popup → focus it ───────────────────────────────
+    if mouse_on_editor_hover && engine.editor_hover.is_some() {
+        engine.editor_hover_focus();
+        return sidebar_width;
+    }
+    // Click elsewhere dismisses editor hover and consumes the click
+    if engine.editor_hover.is_some() && !mouse_on_editor_hover {
+        engine.dismiss_editor_hover();
         return sidebar_width;
     }
 
@@ -4308,6 +4760,24 @@ fn handle_mouse(
             engine.command_cursor = char_idx.saturating_sub(1).min(buf_len);
             *cmd_sel = Some((char_idx, char_idx));
             *cmd_dragging = true;
+            return sidebar_width;
+        }
+        // Also allow selection on the message/command line in Normal mode.
+        if row + 1 == term_height
+            && matches!(
+                engine.mode,
+                Mode::Normal | Mode::Visual | Mode::VisualLine | Mode::VisualBlock
+            )
+            && !engine.message.is_empty()
+        {
+            let char_idx = col as usize;
+            *cmd_sel = Some((char_idx, char_idx));
+            *cmd_dragging = true;
+            debug_log!(
+                "MSG_SEL start: col={} msg={:?}",
+                char_idx,
+                &engine.message[..engine.message.len().min(40)]
+            );
             return sidebar_width;
         }
     }
@@ -4656,7 +5126,73 @@ fn handle_mouse(
         let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
         let sidebar_row = row.saturating_sub(menu_rows);
 
-        if sidebar.active_panel == TuiPanel::Explorer {
+        // Extension panel must be checked FIRST — ext_panel_name overrides active_panel
+        if sidebar.ext_panel_name.is_some() {
+            sidebar.has_focus = true;
+            engine.ext_panel_has_focus = true;
+
+            // Account for the search input row when it's visible
+            let input_rows: u16 = if engine.ext_panel_input_active
+                || engine
+                    .ext_panel_active
+                    .as_ref()
+                    .and_then(|n| engine.ext_panel_input_text.get(n))
+                    .map(|t| !t.is_empty())
+                    .unwrap_or(false)
+            {
+                1
+            } else {
+                0
+            };
+            let content_start = 1 + input_rows; // header + optional input
+
+            // Right-click fires panel_context_menu event.
+            if ev.kind == MouseEventKind::Down(MouseButton::Right) {
+                if sidebar_row >= content_start {
+                    let flat_idx =
+                        engine.ext_panel_scroll_top + (sidebar_row - content_start) as usize;
+                    let flat_len = engine.ext_panel_flat_len();
+                    if flat_idx < flat_len {
+                        engine.ext_panel_selected = flat_idx;
+                    }
+                }
+                engine.open_ext_panel_context_menu(col, row);
+                return sidebar_width;
+            }
+
+            // Scrollbar click/drag → jump-scroll
+            let flat_len = engine.ext_panel_flat_len();
+            let content_h = term_height.saturating_sub(2 + menu_rows + content_start) as usize;
+            if col == sb_col && flat_len > content_h && sidebar_row >= content_start {
+                let rel_row = (sidebar_row - content_start) as usize;
+                let ratio = rel_row as f64 / content_h as f64;
+                let new_top = (ratio * flat_len as f64) as usize;
+                engine.ext_panel_scroll_top = new_top.min(flat_len.saturating_sub(1));
+                return sidebar_width;
+            }
+
+            if sidebar_row == 0 {
+                // Header — no-op
+            } else if sidebar_row >= content_start {
+                // Map sidebar_row to flat index
+                let flat_idx = engine.ext_panel_scroll_top + (sidebar_row - content_start) as usize;
+                if flat_idx < flat_len {
+                    engine.ext_panel_selected = flat_idx;
+                    // Check for double-click
+                    let now = Instant::now();
+                    let is_double = now.duration_since(*last_click_time)
+                        < Duration::from_millis(400)
+                        && *last_click_pos == (col, row);
+                    *last_click_time = now;
+                    *last_click_pos = (col, row);
+                    if is_double {
+                        engine.handle_ext_panel_double_click();
+                    }
+                    // Single-click toggles sections/expandable items
+                    engine.handle_ext_panel_key("Return", false, None);
+                }
+            }
+        } else if sidebar.active_panel == TuiPanel::Explorer {
             // tree_height = (total height - 2 status rows) - 1 header row
             let tree_height = term_height.saturating_sub(3) as usize;
             let total_rows = sidebar.rows.len();
@@ -4821,13 +5357,25 @@ fn handle_mouse(
             engine.sc_has_focus = true;
 
             // sidebar_row layout:
-            //   0 = header, 1 = commit input, 2 = button row, 3+ = section rows
+            //   0 = header
+            //   1 .. commit_rows = commit input
+            //   1+commit_rows = pad above
+            //   2+commit_rows = button row
+            //   3+commit_rows = pad below
+            //   4+commit_rows .. = sections
+            let commit_rows = engine.sc_commit_message.split('\n').count().max(1) as u16;
+            let commit_end = 1 + commit_rows; // first row after commit input
+            let btn_row = 2 + commit_rows; // pad_above + 1
+            let section_start = 4 + commit_rows; // btn + pad_below + 1
             if sidebar_row == 0 {
                 // Panel header — no-op
-            } else if sidebar_row == 1 {
-                // Commit input row — enter commit mode
+                engine.sc_commit_input_active = false;
+            } else if sidebar_row >= 1 && sidebar_row < commit_end {
+                // Commit input row(s) — enter commit mode
                 engine.sc_commit_input_active = true;
-            } else if sidebar_row == 2 {
+                engine.sc_commit_cursor = engine.sc_commit_message.len();
+            } else if sidebar_row == btn_row {
+                engine.sc_commit_input_active = false;
                 // Button row: Commit (~50%), Push/Pull/Sync (~17% each, icon-only).
                 // Use column relative to the sidebar content area start.
                 let rel_col = col.saturating_sub(ab_width);
@@ -4840,19 +5388,23 @@ fn handle_mouse(
                     (1 + (x / icon_w.max(1))).min(3) as usize
                 };
                 engine.sc_activate_button(btn_idx);
-            } else {
+            } else if sidebar_row >= section_start {
+                engine.sc_commit_input_active = false;
+                // Sections area — map to flat index.
+                // sc_visual_row_to_flat expects: 0=header,1=commit,2=buttons,3+=sections.
+                let adjusted = sidebar_row - section_start + 3;
                 // TUI shows a "(no changes)" hint for expanded-but-empty sections
                 // (extra visual row with no flat-index entry), so empty_section_hint = true.
                 if let Some((flat_idx, is_header)) =
-                    engine.sc_visual_row_to_flat(sidebar_row as usize, true)
+                    engine.sc_visual_row_to_flat(adjusted as usize, true)
                 {
                     engine.sc_selected = flat_idx;
                     if is_header {
                         engine.handle_sc_key("Tab", false, None);
                     } else {
-                        // Click opens the file but keeps panel focus so s/d work immediately.
-                        // (Keyboard Enter clears sc_has_focus to return to the editor.)
-                        engine.handle_sc_key("Return", false, None);
+                        // Open tab immediately, diff arrives
+                        // asynchronously via poll_sc_diff.
+                        engine.sc_open_selected_async();
                         engine.sc_has_focus = true;
                         sidebar.has_focus = true;
                     }
@@ -4961,8 +5513,16 @@ fn handle_mouse(
                 {
                     let idx = (sidebar_row - installed_header_row - 1) as usize;
                     if idx < installed_len {
+                        let now = Instant::now();
+                        let is_double = now.duration_since(*last_click_time)
+                            < Duration::from_millis(400)
+                            && *last_click_pos == (col, row);
+                        *last_click_time = now;
+                        *last_click_pos = (col, row);
                         engine.ext_sidebar_selected = idx;
-                        engine.handle_ext_sidebar_key("Return", false, None);
+                        if is_double {
+                            engine.ext_open_selected_readme();
+                        }
                     }
                 } else if sidebar_row == available_header_row {
                     engine.ext_sidebar_sections_expanded[1] =
@@ -4983,8 +5543,8 @@ fn handle_mouse(
                         *last_click_pos = (col, row);
                         engine.ext_sidebar_selected = installed_len + avail_idx;
                         if is_double {
-                            // Double-click installs
-                            engine.handle_ext_sidebar_key("Return", false, None);
+                            // Double-click opens README
+                            engine.ext_open_selected_readme();
                         }
                         // Single-click just selects
                     }
@@ -5030,31 +5590,6 @@ fn handle_mouse(
                     *last_click_pos = (col, row);
                     if is_double {
                         engine.handle_settings_key("Return", false, None);
-                    }
-                }
-            }
-        // Extension panel (plugin-provided) click handling
-        } else if sidebar.ext_panel_name.is_some() {
-            sidebar.has_focus = true;
-            engine.ext_panel_has_focus = true;
-
-            if sidebar_row == 0 {
-                // Header — no-op
-            } else if sidebar_row >= 1 {
-                // Map sidebar_row to flat index (row 1 = flat 0 + scroll_top)
-                let flat_idx = engine.ext_panel_scroll_top + (sidebar_row - 1) as usize;
-                let flat_len = engine.ext_panel_flat_len();
-                if flat_idx < flat_len {
-                    engine.ext_panel_selected = flat_idx;
-                    // Check for double-click → trigger Enter
-                    let now = Instant::now();
-                    let is_double = now.duration_since(*last_click_time)
-                        < Duration::from_millis(400)
-                        && *last_click_pos == (col, row);
-                    *last_click_time = now;
-                    *last_click_pos = (col, row);
-                    if is_double {
-                        engine.handle_ext_panel_key("Return", false, None);
                     }
                 }
             }
@@ -5421,6 +5956,11 @@ fn handle_mouse(
                             engine.active_tab_mut().active_window = rw.window_id;
                             engine.view_mut().cursor.line = rl.line_idx;
                             engine.open_diff_peek();
+                        } else if engine.has_diagnostic_on_line(rl.line_idx) {
+                            // Diagnostic gutter indicator — show hover popup.
+                            engine.active_tab_mut().active_window = rw.window_id;
+                            engine.view_mut().cursor.line = rl.line_idx;
+                            engine.trigger_editor_hover_for_line(rl.line_idx);
                         } else {
                             let has_fold_indicator =
                                 rl.gutter_text.chars().any(|c| c == '+' || c == '-');
@@ -5537,7 +6077,16 @@ fn build_screen_for_tui(
             r.height
         );
     }
-    build_screen_layout(engine, theme, &window_rects, 1.0, 1.0, true)
+    let bsl_t0 = std::time::Instant::now();
+    let result = build_screen_layout(engine, theme, &window_rects, 1.0, 1.0, true);
+    let bsl_elapsed = bsl_t0.elapsed();
+    if bsl_elapsed.as_millis() > 10 {
+        debug_log!(
+            "PERF build_screen_layout: {:.1}ms",
+            bsl_elapsed.as_secs_f64() * 1000.0
+        );
+    }
+    result
 }
 
 // ─── Frame rendering ──────────────────────────────────────────────────────────
@@ -5560,6 +6109,10 @@ fn draw_frame(
     close_tab_confirm: bool,
     cmd_sel: Option<(usize, usize)>,
     explorer_drop_target: Option<usize>,
+    hover_link_rects_out: &mut Vec<(u16, u16, u16, u16, String)>,
+    hover_popup_rect_out: &mut Option<(u16, u16, u16, u16)>,
+    editor_hover_popup_rect_out: &mut Option<(u16, u16, u16, u16)>,
+    editor_hover_link_rects_out: &mut Vec<(u16, u16, u16, u16, String)>,
 ) {
     let area = frame.size();
 
@@ -5840,6 +6393,29 @@ fn draw_frame(
         }
     }
 
+    // ── Editor hover popup (rich markdown, triggered by gh or mouse dwell) ─
+    *editor_hover_popup_rect_out = None; // Clear stale rect before rendering
+    if let Some(ref eh) = screen.editor_hover {
+        if let Some(active_win) = screen
+            .windows
+            .iter()
+            .find(|w| w.window_id == screen.active_window_id)
+        {
+            let gutter_w = active_win.gutter_char_width as u16;
+            let win_x = editor_area.x + active_win.rect.x as u16;
+            let win_y = editor_area.y + active_win.rect.y as u16;
+            // Use frozen scroll offsets so the popup stays fixed on screen
+            let anchor_view = eh.anchor_line.saturating_sub(eh.frozen_scroll_top) as u16;
+            let vis_col = eh.anchor_col.saturating_sub(eh.frozen_scroll_left) as u16;
+            let popup_x = win_x + gutter_w + vis_col;
+            let popup_y = win_y + anchor_view;
+            let (eh_links, eh_rect) =
+                render_editor_hover_popup(frame, eh, popup_x, popup_y, frame.size(), theme);
+            *editor_hover_link_rects_out = eh_links;
+            *editor_hover_popup_rect_out = eh_rect;
+        }
+    }
+
     // ── Diff peek popup (inline git hunk preview) ──────────────────────────
     if let Some(ref peek) = screen.diff_peek {
         if let Some(active_win) = screen
@@ -6008,6 +6584,26 @@ fn draw_frame(
                     cell.set_fg(old_bg).set_bg(old_fg);
                 }
             }
+        }
+    }
+
+    // ── Panel hover popup (drawn after editor so it's not overwritten) ─────
+    hover_link_rects_out.clear();
+    *hover_popup_rect_out = None;
+    if sidebar.visible && sidebar_sep_area.width > 1 {
+        let sep_x = sidebar_sep_area.x + sidebar_sep_area.width - 1;
+        if sidebar.ext_panel_name.is_some() || sidebar.active_panel == TuiPanel::Git {
+            let (rects, popup_rect) = render_panel_hover_popup(
+                frame,
+                screen,
+                theme,
+                sep_x + 1,
+                sidebar_sep_area.y,
+                sidebar_sep_area.height,
+                area,
+            );
+            *hover_link_rects_out = rects;
+            *hover_popup_rect_out = popup_rect;
         }
     }
 
@@ -7803,8 +8399,11 @@ fn render_dialog_popup(
         + 2;
     let content_width = body_max.max(dialog.title.len() + 4).max(btn_row_len);
     let width = (content_width as u16 + 4).clamp(40, term_area.width.saturating_sub(4));
-    // Height: top border + title + blank + body lines + blank + button row + bottom border.
-    let height = (3 + dialog.body.len() as u16 + 2 + 1).min(term_area.height.saturating_sub(4));
+    let has_input = dialog.input.is_some();
+    let input_rows: u16 = if has_input { 1 } else { 0 };
+    // Height: top border + title + blank + body lines + input + blank + button row + bottom border.
+    let height =
+        (3 + dialog.body.len() as u16 + input_rows + 2 + 1).min(term_area.height.saturating_sub(4));
 
     let x = (term_area.width.saturating_sub(width)) / 2;
     let y = (term_area.height.saturating_sub(height)) / 2;
@@ -7865,6 +8464,26 @@ fn render_dialog_popup(
             let cx = x + 2 + j as u16;
             if cx + 1 < x + width && cx < term_area.width && row < term_area.height {
                 set_cell(buf, cx, row, ch, fg, bg);
+            }
+        }
+    }
+
+    // Input field (if present) — between body and buttons.
+    if let Some(ref input) = dialog.input {
+        let input_y = body_y + dialog.body.len() as u16 + 1;
+        if input_y < y + height - 2 && input_y < term_area.height {
+            // Draw input background.
+            let inp_bg = rc(theme.completion_bg);
+            for col_i in (x + 2)..(x + width - 1).min(term_area.width) {
+                set_cell(buf, col_i, input_y, ' ', fg, inp_bg);
+            }
+            // Draw input text.
+            let display = format!(" {}", input.display);
+            for (j, ch) in display.chars().enumerate() {
+                let cx = x + 2 + j as u16;
+                if cx + 1 < x + width && cx < term_area.width {
+                    set_cell(buf, cx, input_y, ch, fg, inp_bg);
+                }
             }
         }
     }
@@ -8007,10 +8626,10 @@ fn render_window(frame: &mut ratatui::Frame, area: Rect, window: &RenderedWindow
             // Diagnostic gutter icon (overwrite leftmost gutter char)
             if let Some(severity) = window.diagnostic_gutter.get(&line.line_idx) {
                 let (diag_ch, diag_color) = match severity {
-                    DiagnosticSeverity::Error => ('E', rc(theme.diagnostic_error)),
-                    DiagnosticSeverity::Warning => ('W', rc(theme.diagnostic_warning)),
-                    DiagnosticSeverity::Information => ('I', rc(theme.diagnostic_info)),
-                    DiagnosticSeverity::Hint => ('H', rc(theme.diagnostic_hint)),
+                    DiagnosticSeverity::Error => ('●', rc(theme.diagnostic_error)),
+                    DiagnosticSeverity::Warning => ('●', rc(theme.diagnostic_warning)),
+                    DiagnosticSeverity::Information => ('●', rc(theme.diagnostic_info)),
+                    DiagnosticSeverity::Hint => ('●', rc(theme.diagnostic_hint)),
                 };
                 set_cell(
                     frame.buffer_mut(),
@@ -10638,6 +11257,21 @@ fn handle_action(engine: &mut Engine, action: EngineAction) -> bool {
             save_session(engine);
             std::process::exit(1);
         }
+        EngineAction::OpenUrl(url) => {
+            #[cfg(target_os = "macos")]
+            let cmd = "open";
+            #[cfg(not(target_os = "macos"))]
+            let cmd = "xdg-open";
+            if crate::core::engine::is_safe_url(&url) {
+                std::process::Command::new(cmd)
+                    .arg(&url)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .ok();
+            }
+            false
+        }
         EngineAction::None | EngineAction::Error => false,
     }
 }
@@ -10743,43 +11377,109 @@ fn render_source_control(
         return;
     }
 
-    // ── Row 1: commit input row ───────────────────────────────────────────────
+    // ── Row 1+: commit input row(s) ──────────────────────────────────────────
+    let commit_lines: Vec<&str> = sc.commit_message.split('\n').collect();
+    let commit_rows = commit_lines.len().max(1) as u16;
     {
-        let commit_y = area.y + 1;
         let inp_bg = if sc.commit_input_active {
             sel_bg
         } else {
             row_bg
-        };
-        for x in area.x..area.x + area.width {
-            set_cell(buf, x, commit_y, ' ', item_fg, inp_bg);
-        }
-        let prompt = if sc.commit_input_active {
-            format!(" \u{f044}  {}|", sc.commit_message)
-        } else if sc.commit_message.is_empty() {
-            " \u{f044}  Message (press c)".to_string()
-        } else {
-            format!(" \u{f044}  {}", sc.commit_message)
         };
         let prompt_fg = if sc.commit_input_active {
             item_fg
         } else {
             dim_fg
         };
-        for (i, ch) in prompt.chars().enumerate().take(area.width as usize) {
-            set_cell(buf, area.x + i as u16, commit_y, ch, prompt_fg, inp_bg);
+
+        // Compute cursor line/col for active input.
+        let (cursor_line, cursor_col) = if sc.commit_input_active {
+            let before_cursor = &sc.commit_message[..sc.commit_cursor.min(sc.commit_message.len())];
+            let cl = before_cursor.matches('\n').count();
+            let line_start = before_cursor.rfind('\n').map(|i| i + 1).unwrap_or(0);
+            (cl, before_cursor[line_start..].chars().count())
+        } else {
+            (0, 0)
+        };
+        let prefix = " \u{f044}  ";
+        let pad = "    "; // 4 spaces — same visual width as prefix
+
+        if sc.commit_message.is_empty() && !sc.commit_input_active {
+            let commit_y = area.y + 1;
+            let prompt = format!("{}Message (press c)", prefix);
+            for x in area.x..area.x + area.width {
+                set_cell(buf, x, commit_y, ' ', prompt_fg, inp_bg);
+            }
+            for (i, ch) in prompt.chars().enumerate().take(area.width as usize) {
+                set_cell(buf, area.x + i as u16, commit_y, ch, prompt_fg, inp_bg);
+            }
+        } else {
+            for (line_idx, line) in commit_lines.iter().enumerate() {
+                let commit_y = area.y + 1 + line_idx as u16;
+                if commit_y >= area.y + area.height {
+                    break;
+                }
+                for x in area.x..area.x + area.width {
+                    set_cell(buf, x, commit_y, ' ', prompt_fg, inp_bg);
+                }
+                let pfx = if line_idx == 0 { prefix } else { pad };
+                let text = format!("{}{}", pfx, line);
+                let pfx_len = pfx.chars().count();
+                for (i, ch) in text.chars().enumerate().take(area.width as usize) {
+                    // Show cursor by inverting fg/bg at cursor position.
+                    let (fg, bg) = if sc.commit_input_active
+                        && line_idx == cursor_line
+                        && i == pfx_len + cursor_col
+                    {
+                        (inp_bg, prompt_fg)
+                    } else {
+                        (prompt_fg, inp_bg)
+                    };
+                    set_cell(buf, area.x + i as u16, commit_y, ch, fg, bg);
+                }
+                // If cursor is at end of line, show inverted space after text.
+                if sc.commit_input_active
+                    && line_idx == cursor_line
+                    && cursor_col >= line.chars().count()
+                {
+                    let cx = area.x + (pfx_len + cursor_col) as u16;
+                    if cx < area.x + area.width {
+                        set_cell(buf, cx, commit_y, ' ', inp_bg, prompt_fg);
+                    }
+                }
+            }
         }
     }
 
-    if area.height < 3 {
+    if area.height < 2 + commit_rows + 3 {
         return;
     }
 
-    // ── Row 2: action buttons ────────────────────────────────────────────────
+    // ── Button row (after commit input, with 1 row padding above and below) ──
     {
+        let pad_above = area.y + 1 + commit_rows;
+        let btn_y = pad_above + 1;
+        let pad_below = btn_y + 1;
+
+        // Clear padding rows.
+        for px in area.x..area.x + area.width {
+            set_cell(buf, px, pad_above, ' ', dim_fg, row_bg);
+            set_cell(buf, px, pad_below, ' ', dim_fg, row_bg);
+        }
+
+        // Button background — use a distinct bg so they look like buttons.
+        let btn_bg = hdr_bg; // slightly lighter than panel_bg
+        let hover_bg = match hdr_bg {
+            RColor::Rgb(r, g, b) => RColor::Rgb(
+                r.saturating_add(20),
+                g.saturating_add(20),
+                b.saturating_add(20),
+            ),
+            other => other,
+        };
+
         // Commit gets ~50% of the width (with label text).
         // Push / Pull / Sync get equal shares of the remaining width, icon only.
-        let btn_y = area.y + 2;
         let commit_w = (area.width / 2).max(1);
         let remain = area.width.saturating_sub(commit_w);
         let icon_w = (remain / 3).max(1);
@@ -10804,10 +11504,13 @@ fn render_source_control(
                 (bx + seg_w).min(area.x + area.width)
             };
             let is_focused = sc.button_focused == Some(*btn_idx);
+            let is_hovered = sc.button_hovered == Some(*btn_idx);
             let (fg, bg) = if is_focused {
                 (hdr_bg, hdr_fg) // inverted = highlighted
+            } else if is_hovered {
+                (item_fg, hover_bg)
             } else {
-                (hdr_fg, row_bg)
+                (item_fg, btn_bg)
             };
             for px in bx..seg_end {
                 set_cell(buf, px, btn_y, ' ', fg, bg);
@@ -10821,7 +11524,8 @@ fn render_source_control(
         }
     }
 
-    if area.height < 4 {
+    let section_start_y = area.y + 4 + commit_rows; // +2 for padding rows, +1 for btn row, +1 for next
+    if section_start_y >= area.y + area.height {
         return;
     }
 
@@ -10840,7 +11544,7 @@ fn render_source_control(
     // Only show WORKTREES section when there are linked worktrees (>1 total).
     let show_worktrees = sc.worktrees.len() > 1;
 
-    let mut row_y = area.y + 3; // start after header + commit row + button row
+    let mut row_y = section_start_y; // start after header + commit rows + button row
     let max_y = area.y + area.height;
     let mut flat_row: usize = 0; // tracks position in flat selection space
 
@@ -11320,8 +12024,47 @@ fn render_ext_panel(buf: &mut ratatui::buffer::Buffer, area: Rect, engine: &Engi
         return;
     }
 
+    // Row 1: search input field (when active or has text)
+    let input_row_count = if panel.input_active || !panel.input_text.is_empty() {
+        1
+    } else {
+        0
+    };
+    if input_row_count > 0 {
+        let iy = area.y + 1;
+        let search_bg = rc(theme.tab_bar_bg);
+        let search_fg = if panel.input_active {
+            rc(theme.foreground)
+        } else {
+            dim_fg
+        };
+        for x in area.x..area.x + area.width {
+            set_cell(buf, x, iy, ' ', search_fg, search_bg);
+        }
+        let prefix = " / ";
+        for (i, ch) in prefix.chars().enumerate() {
+            let x = area.x + i as u16;
+            if x < area.x + area.width {
+                set_cell(buf, x, iy, ch, dim_fg, search_bg);
+            }
+        }
+        let text_start = area.x + prefix.len() as u16;
+        for (i, ch) in panel.input_text.chars().enumerate() {
+            let x = text_start + i as u16;
+            if x < area.x + area.width {
+                set_cell(buf, x, iy, ch, search_fg, search_bg);
+            }
+        }
+        if panel.input_active {
+            let cursor_x = text_start + panel.input_text.chars().count() as u16;
+            if cursor_x < area.x + area.width {
+                set_cell(buf, cursor_x, iy, '▏', rc(theme.cursor), search_bg);
+            }
+        }
+    }
+
     // Build flat list of rows
-    let content_area_height = (area.height - 1) as usize;
+    let content_area_height = (area.height - 1 - input_row_count as u16) as usize;
     let mut flat_rows: Vec<(String, String, bool, bool)> = Vec::new(); // (text, hint, is_header, is_selected)
     let mut flat_idx = 0usize;
     for section in &panel.sections {
@@ -11336,6 +12079,11 @@ fn render_ext_panel(buf: &mut ratatui::buffer::Buffer, area: Rect, engine: &Engi
         flat_idx += 1;
         if section.expanded {
             for item in &section.items {
+                if item.is_separator {
+                    flat_rows.push(("─".repeat(area.width as usize), String::new(), false, false));
+                    flat_idx += 1;
+                    continue;
+                }
                 let is_sel = flat_idx == panel.selected;
                 let indent = "  ".repeat(item.indent as usize + 1);
                 let icon_part = if item.icon.is_empty() {
@@ -11343,15 +12091,43 @@ fn render_ext_panel(buf: &mut ratatui::buffer::Buffer, area: Rect, engine: &Engi
                 } else {
                     format!("{} ", item.icon)
                 };
+                // Tree chevron for expandable items
+                let chevron = if item.expandable {
+                    let tree_key = (panel.name.clone(), item.id.clone());
+                    let is_expanded = engine
+                        .ext_panel_tree_expanded
+                        .get(&tree_key)
+                        .copied()
+                        .unwrap_or(item.expanded);
+                    if is_expanded {
+                        "▼ "
+                    } else {
+                        "▶ "
+                    }
+                } else {
+                    ""
+                };
                 let fg_marker = match item.style {
                     ExtPanelStyle::Header => 'H',
                     ExtPanelStyle::Dim => 'D',
                     ExtPanelStyle::Accent => 'A',
                     ExtPanelStyle::Normal => 'N',
                 };
+                // Build hint with optional badges and action labels
+                let mut hint_parts = Vec::new();
+                for badge in &item.badges {
+                    hint_parts.push(format!("[{}]", badge.text));
+                }
+                for action in &item.actions {
+                    hint_parts.push(format!("⟨{}⟩", action.label));
+                }
+                if !item.hint.is_empty() {
+                    hint_parts.push(item.hint.clone());
+                }
+                let hint_combined = hint_parts.join(" ");
                 flat_rows.push((
-                    format!("{}{}{}", indent, icon_part, item.text),
-                    format!("{}|{}", fg_marker, item.hint),
+                    format!("{}{}{}{}", indent, chevron, icon_part, item.text),
+                    format!("{}|{}", fg_marker, hint_combined),
                     false,
                     is_sel,
                 ));
@@ -11367,7 +12143,7 @@ fn render_ext_panel(buf: &mut ratatui::buffer::Buffer, area: Rect, engine: &Engi
     for (ri, (text, hint_raw, is_header, is_sel)) in
         visible_rows.iter().enumerate().take(content_area_height)
     {
-        let y = area.y + 1 + ri as u16;
+        let y = area.y + 1 + input_row_count as u16 + ri as u16;
         let bg = if *is_sel && panel.has_focus {
             sel_bg
         } else {
@@ -11388,9 +12164,6 @@ fn render_ext_panel(buf: &mut ratatui::buffer::Buffer, area: Rect, engine: &Engi
         }
 
         let w = area.width as usize;
-        for (i, ch) in text.chars().enumerate().take(w) {
-            set_cell(buf, area.x + i as u16, y, ch, fg, bg);
-        }
 
         // Right-aligned hint (skip the style marker char and pipe)
         let hint = if hint_raw.len() > 2 {
@@ -11398,8 +12171,27 @@ fn render_ext_panel(buf: &mut ratatui::buffer::Buffer, area: Rect, engine: &Engi
         } else {
             ""
         };
+        let hint_len = hint.chars().count();
+
+        // Truncate text before the hint area, adding "…" if clipped
+        let text_max = if !hint.is_empty() {
+            w.saturating_sub(hint_len + 2) // 1 space gap + 1 for safety
+        } else {
+            w
+        };
+        let text_char_count = text.chars().count();
+        if text_char_count > text_max && text_max > 1 {
+            for (i, ch) in text.chars().take(text_max - 1).enumerate() {
+                set_cell(buf, area.x + i as u16, y, ch, fg, bg);
+            }
+            set_cell(buf, area.x + (text_max - 1) as u16, y, '…', fg, bg);
+        } else {
+            for (i, ch) in text.chars().enumerate().take(text_max) {
+                set_cell(buf, area.x + i as u16, y, ch, fg, bg);
+            }
+        }
+
         if !hint.is_empty() {
-            let hint_len = hint.chars().count();
             let start = w.saturating_sub(hint_len + 1);
             for (i, ch) in hint.chars().enumerate() {
                 let x = area.x + (start + i) as u16;
@@ -11418,7 +12210,7 @@ fn render_ext_panel(buf: &mut ratatui::buffer::Buffer, area: Rect, engine: &Engi
         let thumb_h = (track_h * content_area_height / total).max(1);
         let thumb_top = scroll * track_h / total;
         for i in 0..track_h {
-            let y = area.y + 1 + i as u16;
+            let y = area.y + 1 + input_row_count as u16 + i as u16;
             let ch = if i >= thumb_top && i < thumb_top + thumb_h {
                 '█'
             } else {
@@ -11427,6 +12219,539 @@ fn render_ext_panel(buf: &mut ratatui::buffer::Buffer, area: Rect, engine: &Engi
             set_cell(buf, sb_x, y, ch, dim_fg, row_bg);
         }
     }
+
+    // ── Help popup overlay ──────────────────────────────────────────────────
+    if panel.help_open && !panel.help_bindings.is_empty() {
+        let popup_bg = rc(theme.completion_bg);
+        let popup_fg = rc(theme.completion_fg);
+        let popup_border = rc(theme.completion_border);
+        let bindings = &panel.help_bindings;
+        let popup_w = area.width.saturating_sub(2).min(36);
+        let popup_h = (bindings.len() as u16 + 3).min(area.height.saturating_sub(2));
+        let popup_x = area.x + (area.width.saturating_sub(popup_w)) / 2;
+        let popup_y = area.y + (area.height.saturating_sub(popup_h)) / 2;
+        for y in popup_y..popup_y + popup_h {
+            for x in popup_x..popup_x + popup_w {
+                set_cell(buf, x, y, ' ', popup_fg, popup_bg);
+            }
+        }
+        set_cell(buf, popup_x, popup_y, '┌', popup_border, popup_bg);
+        set_cell(
+            buf,
+            popup_x + popup_w - 1,
+            popup_y,
+            '┐',
+            popup_border,
+            popup_bg,
+        );
+        for x in popup_x + 1..popup_x + popup_w - 1 {
+            set_cell(buf, x, popup_y, '─', popup_border, popup_bg);
+        }
+        let title = " Keybindings ";
+        let tx = popup_x + (popup_w.saturating_sub(title.len() as u16)) / 2;
+        for (i, ch) in title.chars().enumerate() {
+            let x = tx + i as u16;
+            if x > popup_x && x < popup_x + popup_w - 1 {
+                set_cell(buf, x, popup_y, ch, popup_border, popup_bg);
+            }
+        }
+        let close_x = popup_x + popup_w - 2;
+        if close_x > popup_x {
+            set_cell(buf, close_x, popup_y, 'x', popup_border, popup_bg);
+        }
+        let key_fg = rc(theme.function);
+        for (i, (key, desc)) in bindings.iter().enumerate() {
+            let y = popup_y + 1 + i as u16;
+            if y >= popup_y + popup_h - 1 {
+                break;
+            }
+            for (j, ch) in key.chars().enumerate() {
+                let x = popup_x + 2 + j as u16;
+                if x < popup_x + popup_w - 1 {
+                    set_cell(buf, x, y, ch, key_fg, popup_bg);
+                }
+            }
+            let desc_x = popup_x + 12;
+            for (j, ch) in desc.chars().enumerate() {
+                let x = desc_x + j as u16;
+                if x < popup_x + popup_w - 1 {
+                    set_cell(buf, x, y, ch, popup_fg, popup_bg);
+                }
+            }
+        }
+        let by = popup_y + popup_h - 1;
+        set_cell(buf, popup_x, by, '└', popup_border, popup_bg);
+        set_cell(buf, popup_x + popup_w - 1, by, '┘', popup_border, popup_bg);
+        for x in popup_x + 1..popup_x + popup_w - 1 {
+            set_cell(buf, x, by, '─', popup_border, popup_bg);
+        }
+        for y in popup_y + 1..popup_y + popup_h - 1 {
+            set_cell(buf, popup_x, y, '│', popup_border, popup_bg);
+            set_cell(buf, popup_x + popup_w - 1, y, '│', popup_border, popup_bg);
+        }
+    }
+}
+
+// ─── Panel hover popup ─────────────────────────────────────────────────────────
+
+/// Render a panel-item hover popup to the right of the sidebar.
+///
+/// The popup displays rendered markdown content and appears to the right of
+/// the sidebar at the vertical position of the hovered item.
+/// Returns (link_rects, popup_rect) where popup_rect is (x, y, w, h).
+#[allow(clippy::type_complexity)]
+fn render_panel_hover_popup(
+    frame: &mut ratatui::Frame,
+    screen: &render::ScreenLayout,
+    theme: &Theme,
+    sidebar_right_x: u16,
+    sidebar_y: u16,
+    sidebar_height: u16,
+    term_area: Rect,
+) -> (
+    Vec<(u16, u16, u16, u16, String)>,
+    Option<(u16, u16, u16, u16)>,
+) {
+    use crate::core::markdown::MdStyle;
+
+    let Some(ref ph) = screen.panel_hover else {
+        return (vec![], None);
+    };
+
+    let lines = &ph.rendered.lines;
+    if lines.is_empty() {
+        return (vec![], None);
+    }
+    const MAX_HEIGHT: u16 = 20;
+
+    let num_lines = lines.len().min(MAX_HEIGHT as usize) as u16;
+    let max_len = lines.iter().map(|l| l.chars().count()).max().unwrap_or(10);
+    // Available width to the right of the sidebar.
+    let avail_w = term_area.width.saturating_sub(sidebar_right_x);
+    if avail_w < 10 {
+        return (vec![], None);
+    }
+    // +4 for left/right border + padding; +2 for top/bottom border rows.
+    let width = (max_len as u16 + 4).clamp(12, avail_w);
+    let height = num_lines + 2; // content rows + top/bottom border
+
+    // Vertically align with the hovered item.
+    let item_row = if ph.panel_name == "source_control" {
+        let section_start: u16 = 5;
+        section_start + ph.item_index as u16
+    } else {
+        ph.item_index as u16 + 1
+    };
+    let raw_y = sidebar_y + item_row;
+
+    let x = sidebar_right_x;
+    let y = raw_y.min(
+        term_area
+            .height
+            .saturating_sub(height)
+            .min(sidebar_y + sidebar_height.saturating_sub(1)),
+    );
+
+    let bg = rc(theme.hover_bg);
+    let fg = rc(theme.hover_fg);
+    let border = rc(theme.hover_border);
+    let h1_fg = rc(theme.md_heading1);
+    let h2_fg = rc(theme.md_heading2);
+    let h3_fg = rc(theme.md_heading3);
+    let code_fg = rc(theme.md_code);
+    let link_fg = rc(theme.md_link);
+
+    let buf = frame.buffer_mut();
+
+    // ── Top border ───────────────────────────────────────────────────────────
+    let top_y = y;
+    if top_y < term_area.height {
+        for col in 0..width {
+            let cx = x + col;
+            if cx >= term_area.width {
+                break;
+            }
+            let ch = if col == 0 {
+                '┌'
+            } else if col == width - 1 {
+                '┐'
+            } else {
+                '─'
+            };
+            let cell = buf.get_mut(cx, top_y);
+            cell.set_char(ch).set_fg(border).set_bg(bg);
+        }
+    }
+
+    // ── Content rows ─────────────────────────────────────────────────────────
+    for (li, text_line) in lines.iter().enumerate().take(num_lines as usize) {
+        let row_y = y + 1 + li as u16; // +1 for top border
+        if row_y >= term_area.height {
+            break;
+        }
+
+        // Fill row background with left/right borders.
+        for col in 0..width {
+            let cx = x + col;
+            if cx >= term_area.width {
+                break;
+            }
+            let cell = buf.get_mut(cx, row_y);
+            cell.set_bg(bg);
+            let ch = if col == 0 || col == width - 1 {
+                '│'
+            } else {
+                ' '
+            };
+            cell.set_char(ch).set_fg(border);
+        }
+
+        // Render styled text inside the border.
+        let line_spans = ph.rendered.spans.get(li);
+        let code_hl = ph.rendered.code_highlights.get(li);
+        let has_code_hl = code_hl.is_some_and(|h| !h.is_empty());
+        let display_text = format!(" {}", text_line);
+
+        let mut col_x: u16 = 1; // inside left border
+        let mut byte_pos: usize = 0;
+        for ch in display_text.chars() {
+            let ch_len = ch.len_utf8();
+            let adj_byte = byte_pos.saturating_sub(1);
+            let (ch_fg, bold) = if has_code_hl && byte_pos > 0 {
+                // Use tree-sitter syntax highlighting for code block lines.
+                code_hl
+                    .unwrap()
+                    .iter()
+                    .find(|h| adj_byte >= h.start_byte && adj_byte < h.end_byte)
+                    .map(|h| (rc(theme.scope_color(&h.scope)), false))
+                    .unwrap_or((code_fg, false))
+            } else if let Some(spans) = line_spans {
+                spans
+                    .iter()
+                    .find(|sp| byte_pos > 0 && adj_byte >= sp.start_byte && adj_byte < sp.end_byte)
+                    .map(|sp| match sp.style {
+                        MdStyle::Heading(1) => (h1_fg, true),
+                        MdStyle::Heading(2) => (h2_fg, true),
+                        MdStyle::Heading(_) => (h3_fg, true),
+                        MdStyle::Bold => (fg, true),
+                        MdStyle::Italic => (fg, false),
+                        MdStyle::BoldItalic => (fg, true),
+                        MdStyle::Code | MdStyle::CodeBlock => (code_fg, false),
+                        MdStyle::Link => (link_fg, false),
+                        MdStyle::LinkUrl => (link_fg, false),
+                        MdStyle::BlockQuote => (h3_fg, false),
+                        MdStyle::ListBullet => (h1_fg, true),
+                        _ => (fg, false),
+                    })
+                    .unwrap_or((fg, false))
+            } else {
+                (fg, false)
+            };
+
+            let cx = x + col_x;
+            if col_x + 1 < width && cx < term_area.width {
+                let cell = buf.get_mut(cx, row_y);
+                cell.set_char(ch).set_fg(ch_fg).set_bg(bg);
+                if bold {
+                    cell.set_style(cell.style().add_modifier(ratatui::style::Modifier::BOLD));
+                }
+            }
+
+            byte_pos += ch_len;
+            col_x += 1;
+        }
+    }
+
+    // ── Bottom border ────────────────────────────────────────────────────────
+    let bot_y = y + 1 + num_lines;
+    if bot_y < term_area.height {
+        for col in 0..width {
+            let cx = x + col;
+            if cx >= term_area.width {
+                break;
+            }
+            let ch = if col == 0 {
+                '└'
+            } else if col == width - 1 {
+                '┘'
+            } else {
+                '─'
+            };
+            let cell = buf.get_mut(cx, bot_y);
+            cell.set_char(ch).set_fg(border).set_bg(bg);
+        }
+    }
+
+    // ── Compute link hit rects ───────────────────────────────────────────────
+    let mut link_rects = Vec::new();
+    for &(line_idx, start_byte, end_byte, ref url) in &ph.links {
+        if line_idx >= num_lines as usize {
+            continue;
+        }
+        if let Some(line_text) = lines.get(line_idx) {
+            // Count characters before start_byte and between start/end to get column range.
+            // The display has a 1-char " " prefix inside the left border.
+            let prefix_chars = line_text[..start_byte.min(line_text.len())].chars().count() as u16;
+            let link_chars = line_text
+                [start_byte.min(line_text.len())..end_byte.min(line_text.len())]
+                .chars()
+                .count() as u16;
+            let row = y + 1 + line_idx as u16; // +1 for top border
+            let col_start = x + 2 + prefix_chars; // +2 for border + space prefix
+            link_rects.push((col_start, row, link_chars, 1, url.clone()));
+        }
+    }
+    (link_rects, Some((x, y, width, height)))
+}
+
+// ─── Editor hover popup ─────────────────────────────────────────────────────
+
+/// Render an editor hover popup with rich markdown content.
+/// Positioned above or below the anchor position in the editor viewport.
+/// Returns (link_rects, popup bounding rect) for mouse hit-testing.
+#[allow(clippy::type_complexity)]
+fn render_editor_hover_popup(
+    frame: &mut ratatui::Frame,
+    eh: &render::EditorHoverPopupData,
+    popup_x: u16,
+    popup_y: u16,
+    term_area: Rect,
+    theme: &Theme,
+) -> (
+    Vec<(u16, u16, u16, u16, String)>,
+    Option<(u16, u16, u16, u16)>,
+) {
+    use crate::core::markdown::MdStyle;
+
+    let lines = &eh.rendered.lines;
+    if lines.is_empty() {
+        return (vec![], None);
+    }
+    const MAX_HEIGHT: u16 = 20;
+    let scroll = eh.scroll_top;
+    let visible_count = lines.len().saturating_sub(scroll).min(MAX_HEIGHT as usize) as u16;
+    if visible_count == 0 {
+        return (vec![], None);
+    }
+    // Fixed height based on total content (capped), so scrolling doesn't shrink the popup
+    let num_lines = lines.len().min(MAX_HEIGHT as usize) as u16;
+    // Content width: 1 char left padding + content + 1 char right padding
+    let content_w = (eh.popup_width as u16 + 2).clamp(12, term_area.width.saturating_sub(4));
+    // Total width/height including border
+    let width = content_w + 2;
+    let height = num_lines + 2;
+
+    // Place directly above the word (touching), otherwise below
+    let y = if popup_y >= height {
+        popup_y - height
+    } else {
+        popup_y + 1
+    };
+    let x = popup_x.min(term_area.width.saturating_sub(width));
+    let y = y.min(term_area.height.saturating_sub(height));
+
+    let bg = rc(theme.hover_bg);
+    let fg = rc(theme.hover_fg);
+    let border = rc(theme.hover_border);
+    let h1_fg = rc(theme.md_heading1);
+    let h2_fg = rc(theme.md_heading2);
+    let h3_fg = rc(theme.md_heading3);
+    let code_fg = rc(theme.md_code);
+    let link_fg = rc(theme.md_link);
+
+    // Border color: subtle when unfocused, blue when focused
+    let border_fg = if eh.has_focus {
+        rc(theme.md_link)
+    } else {
+        border
+    };
+
+    let buf = frame.buffer_mut();
+
+    // Top border
+    if y < term_area.height {
+        for c in 0..width {
+            let cx = x + c;
+            if cx >= term_area.width {
+                break;
+            }
+            let ch = if c == 0 {
+                '┌'
+            } else if c == width - 1 {
+                '┐'
+            } else {
+                '─'
+            };
+            buf.get_mut(cx, y).set_char(ch).set_fg(border_fg).set_bg(bg);
+        }
+    }
+
+    // Content rows with left/right borders
+    for (li, text_line) in lines
+        .iter()
+        .skip(scroll)
+        .enumerate()
+        .take(num_lines as usize)
+    {
+        let row_y = y + 1 + li as u16;
+        if row_y >= term_area.height {
+            break;
+        }
+
+        // Fill row with background + borders
+        for col in 0..width {
+            let cx = x + col;
+            if cx >= term_area.width {
+                break;
+            }
+            if col == 0 || col == width - 1 {
+                buf.get_mut(cx, row_y)
+                    .set_char('│')
+                    .set_fg(border_fg)
+                    .set_bg(bg);
+            } else {
+                buf.get_mut(cx, row_y).set_char(' ').set_bg(bg);
+            }
+        }
+
+        // Draw text with 1-char padding inside left border
+        let actual_line = scroll + li;
+        let line_spans = eh.rendered.spans.get(actual_line);
+        let code_hl = eh.rendered.code_highlights.get(actual_line);
+        let has_code_hl = code_hl.is_some_and(|h| !h.is_empty());
+        let mut col_x: u16 = 2; // border + 1 padding
+        let mut byte_pos: usize = 0;
+        for ch in text_line.chars() {
+            let ch_len = ch.len_utf8();
+            let (ch_fg, bold) = if has_code_hl {
+                // Use tree-sitter syntax highlighting for code block lines.
+                code_hl
+                    .unwrap()
+                    .iter()
+                    .find(|h| byte_pos >= h.start_byte && byte_pos < h.end_byte)
+                    .map(|h| (rc(theme.scope_color(&h.scope)), false))
+                    .unwrap_or((code_fg, false))
+            } else if let Some(spans) = line_spans {
+                spans
+                    .iter()
+                    .find(|sp| byte_pos >= sp.start_byte && byte_pos < sp.end_byte)
+                    .map(|sp| match sp.style {
+                        MdStyle::Heading(1) => (h1_fg, true),
+                        MdStyle::Heading(2) => (h2_fg, true),
+                        MdStyle::Heading(_) => (h3_fg, true),
+                        MdStyle::Bold => (fg, true),
+                        MdStyle::Italic => (fg, false),
+                        MdStyle::BoldItalic => (fg, true),
+                        MdStyle::Code | MdStyle::CodeBlock => (code_fg, false),
+                        MdStyle::Link => (link_fg, false),
+                        MdStyle::LinkUrl => (link_fg, false),
+                        MdStyle::BlockQuote => (h3_fg, false),
+                        MdStyle::ListBullet => (h1_fg, true),
+                        _ => (fg, false),
+                    })
+                    .unwrap_or((fg, false))
+            } else {
+                (fg, false)
+            };
+
+            let cx = x + col_x;
+            if col_x + 1 < width && cx < term_area.width {
+                let cell = buf.get_mut(cx, row_y);
+                cell.set_char(ch).set_fg(ch_fg).set_bg(bg);
+                if bold {
+                    cell.set_style(cell.style().add_modifier(ratatui::style::Modifier::BOLD));
+                }
+                // Highlight focused link
+                if eh.has_focus {
+                    if let Some(focused) = eh.focused_link {
+                        if let Some(&(link_line, start_b, end_b, _)) = eh.links.get(focused) {
+                            if link_line == scroll + li && byte_pos >= start_b && byte_pos < end_b {
+                                cell.set_style(
+                                    cell.style()
+                                        .add_modifier(ratatui::style::Modifier::UNDERLINED),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            byte_pos += ch_len;
+            col_x += 1;
+        }
+    }
+
+    // Bottom border
+    let bot_y = y + 1 + num_lines;
+    if bot_y < term_area.height {
+        for c in 0..width {
+            let cx = x + c;
+            if cx >= term_area.width {
+                break;
+            }
+            let ch = if c == 0 {
+                '└'
+            } else if c == width - 1 {
+                '┘'
+            } else {
+                '─'
+            };
+            buf.get_mut(cx, bot_y)
+                .set_char(ch)
+                .set_fg(border_fg)
+                .set_bg(bg);
+        }
+    }
+
+    // Scrollbar on right border when content overflows
+    let total = lines.len();
+    let can_scroll = total > MAX_HEIGHT as usize;
+    if can_scroll && num_lines > 0 {
+        let sb_x = x + width - 1;
+        if sb_x < term_area.width {
+            let track_h = num_lines as usize;
+            let thumb_h = (track_h * track_h / total).max(1);
+            let max_scroll = total.saturating_sub(MAX_HEIGHT as usize);
+            let thumb_top = if max_scroll > 0 {
+                scroll * (track_h - thumb_h) / max_scroll
+            } else {
+                0
+            };
+            for i in 0..track_h {
+                let ry = y + 1 + i as u16;
+                if ry >= term_area.height {
+                    break;
+                }
+                let cell = buf.get_mut(sb_x, ry);
+                if i >= thumb_top && i < thumb_top + thumb_h {
+                    cell.set_char('█').set_fg(border_fg).set_bg(bg);
+                } else {
+                    cell.set_char('░').set_fg(border).set_bg(bg);
+                }
+            }
+        }
+    }
+
+    // Compute link hit rects for click-to-copy.
+    let mut link_rects = Vec::new();
+    for &(line_idx, start_byte, end_byte, ref url) in &eh.links {
+        if line_idx < scroll || line_idx >= scroll + num_lines as usize {
+            continue;
+        }
+        let vis_line = line_idx - scroll;
+        if let Some(line_text) = lines.get(line_idx) {
+            let prefix_chars = line_text[..start_byte.min(line_text.len())].chars().count() as u16;
+            let link_chars = line_text
+                [start_byte.min(line_text.len())..end_byte.min(line_text.len())]
+                .chars()
+                .count() as u16;
+            let link_row = y + 1 + vis_line as u16;
+            let link_col = x + 2 + prefix_chars; // border + padding
+            link_rects.push((link_col, link_row, link_chars, 1u16, url.clone()));
+        }
+    }
+
+    (link_rects, Some((x, y, width, height)))
 }
 
 // ─── Extensions sidebar panel ─────────────────────────────────────────────────

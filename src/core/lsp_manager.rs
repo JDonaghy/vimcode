@@ -722,6 +722,19 @@ impl LspManager {
         self.language_to_server.get(&language_id).copied()
     }
 
+    /// Check if the server for a given file supports a specific LSP capability.
+    pub fn server_supports(&self, path: &Path, capability: &str) -> bool {
+        let Some(server_id) = self.server_id_for_path(path) else {
+            return false;
+        };
+        if let Some(server) = self.servers.get(server_id) {
+            let v = &server.capabilities[capability];
+            v.as_bool().unwrap_or(false) || v.is_object()
+        } else {
+            false
+        }
+    }
+
     /// Shutdown all running servers.
     pub fn shutdown_all(&mut self) {
         for server in &mut self.servers {

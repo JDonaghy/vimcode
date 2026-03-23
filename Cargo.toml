@@ -1,6 +1,6 @@
 [package]
 name = "vimcode"
-version = "0.3.8"
+version = "0.4.0"
 edition = "2021"
 description = "Vim-like code editor with GTK4 and tree-sitter"
 license = "MIT"
@@ -41,26 +41,27 @@ gtk4 = { version = "0.7", features = ["v4_10"], optional = true }
 relm4 = { version = "0.7", optional = true }
 pangocairo = { version = "0.18", optional = true }
 ropey = "1.6.1"
-tree-sitter = "0.24"
-tree-sitter-rust = "0.23"
-tree-sitter-python = "0.23"
-tree-sitter-javascript = "0.23"
-tree-sitter-go = "0.23"
+tree-sitter = "0.26"
+tree-sitter-rust = "0.24"
+tree-sitter-python = "0.25"
+tree-sitter-javascript = "0.25"
+tree-sitter-go = "0.25"
 tree-sitter-cpp = "0.23"
-tree-sitter-c = "0.23"
+tree-sitter-c = "0.24"
 tree-sitter-typescript = "0.23"
 tree-sitter-html = "0.23"
-tree-sitter-css = "0.23"
+tree-sitter-css = "0.25"
 tree-sitter-json = "0.24"
-tree-sitter-bash = "0.23"
+tree-sitter-bash = "0.25"
 tree-sitter-ruby = "0.23"
 tree-sitter-c-sharp = "0.23"
 tree-sitter-java = "0.23"
 tree-sitter-toml-ng = "0.7"
 tree-sitter-yaml = "0.7"
+tree-sitter-lua = "0.5"
+tree-sitter-md = "0.5"
 tree-sitter-language = "0.1"
 # tree-sitter-latex: vendored from latex-lsp/tree-sitter-latex v0.3.0 (language version 14)
-# tree-sitter-lua requires tree-sitter 0.25+ (language version 15)
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 gio = { version = "0.17", optional = true }

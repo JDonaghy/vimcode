@@ -170,6 +170,10 @@ pub fn check_line(
                         // Inverted: check everything EXCEPT commands/math
                         !is_in_latex_command_or_math(highlights, abs_start, abs_end)
                     }
+                    Some(SyntaxLanguage::Markdown) => {
+                        // Markdown is prose — check all words like plain text
+                        true
+                    }
                     Some(_) => is_in_comment_or_string(highlights, abs_start, abs_end),
                 };
 

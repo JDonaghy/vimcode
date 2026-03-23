@@ -522,6 +522,30 @@ pub struct HoverPopup {
     pub anchor_col: usize,
 }
 
+/// Data for rendering an editor hover popup with rich markdown content.
+#[derive(Debug, Clone)]
+pub struct EditorHoverPopupData {
+    /// Rendered markdown content.
+    pub rendered: crate::core::markdown::MdRendered,
+    /// Clickable link regions: (line_idx, start_byte, end_byte, url).
+    pub links: Vec<(usize, usize, usize, String)>,
+    /// Buffer line where the hover is anchored (0-indexed).
+    pub anchor_line: usize,
+    /// Buffer column where the hover is anchored (0-indexed).
+    pub anchor_col: usize,
+    /// Scroll offset for long content.
+    pub scroll_top: usize,
+    /// Currently focused link index (for keyboard navigation).
+    pub focused_link: Option<usize>,
+    /// Whether the popup currently has keyboard focus (clicked or keyboard-triggered).
+    pub has_focus: bool,
+    /// Fixed popup width in characters, computed once when first shown.
+    pub popup_width: usize,
+    /// Frozen scroll offsets — used so the popup stays at a fixed screen position.
+    pub frozen_scroll_top: usize,
+    pub frozen_scroll_left: usize,
+}
+
 // ─── SignatureHelp ────────────────────────────────────────────────────────────
 
 /// Data needed to render the signature help popup (shown above cursor in insert mode).
@@ -677,10 +701,14 @@ pub struct SourceControlData {
     pub has_focus: bool,
     /// Commit message being typed in the input row.
     pub commit_message: String,
+    /// Byte-offset cursor position within the commit message.
+    pub commit_cursor: usize,
     /// True when the commit input row is in edit mode.
     pub commit_input_active: bool,
     /// Which action button is keyboard-focused (0=Commit 1=Push 2=Pull 3=Sync), or None.
     pub button_focused: Option<usize>,
+    /// Which action button the mouse is hovering over, or None.
+    pub button_hovered: Option<usize>,
     /// Branch picker popup data (None when closed).
     pub branch_picker: Option<BranchPickerData>,
     /// SC help dialog visible.
@@ -751,6 +779,10 @@ pub struct ExtPanelData {
     pub selected: usize,
     pub has_focus: bool,
     pub scroll_top: usize,
+    pub input_text: String,
+    pub input_active: bool,
+    pub help_open: bool,
+    pub help_bindings: Vec<(String, String)>,
 }
 
 /// A single section within an extension panel.
@@ -759,6 +791,21 @@ pub struct ExtPanelSectionData {
     pub name: String,
     pub items: Vec<crate::core::plugin::ExtPanelItem>,
     pub expanded: bool,
+}
+
+// ─── PanelHoverPopupData ──────────────────────────────────────────────────────
+
+/// Rendering data for a sidebar panel hover popup (rendered markdown).
+#[derive(Debug, Clone)]
+pub struct PanelHoverPopupData {
+    /// Rendered markdown content.
+    pub rendered: crate::core::markdown::MdRendered,
+    /// Clickable link regions: (line_idx, start_byte, end_byte, url).
+    pub links: Vec<(usize, usize, usize, String)>,
+    /// Flat item index being hovered (for positioning relative to panel).
+    pub item_index: usize,
+    /// The panel this hover belongs to (e.g. "source_control", ext panel name).
+    pub panel_name: String,
 }
 
 // ─── AiPanelData ─────────────────────────────────────────────────────────────
@@ -1582,6 +1629,10 @@ pub struct ScreenLayout {
     pub ext_panel: Option<ExtPanelData>,
     /// Breadcrumb bars for each editor group (empty when breadcrumbs are disabled).
     pub breadcrumbs: Vec<BreadcrumbBar>,
+    /// Panel hover popup — `Some` when hovering over a sidebar panel item.
+    pub panel_hover: Option<PanelHoverPopupData>,
+    /// Editor hover popup — `Some` when hovering over an editor element (diagnostic, annotation, etc.).
+    pub editor_hover: Option<EditorHoverPopupData>,
     /// Git diff peek popup — `Some` when the user is previewing a diff hunk.
     pub diff_peek: Option<DiffPeekPopup>,
     /// Diff toolbar data for the single-group tab bar.
@@ -1617,6 +1668,15 @@ pub struct DialogPanel {
     pub body: Vec<String>,
     /// Each button is `(formatted_label, is_selected)`.
     pub buttons: Vec<(String, bool)>,
+    /// Optional text input field (e.g. for SSH passphrase).
+    pub input: Option<DialogInputPanel>,
+}
+
+/// Render data for a dialog text input field.
+#[derive(Debug, Clone)]
+pub struct DialogInputPanel {
+    /// Display text (masked for passwords).
+    pub display: String,
 }
 
 /// Format a button label with the hotkey character bracketed.
@@ -3469,6 +3529,24 @@ pub fn build_screen_layout(
             hunk_lines: dp.hunk_lines.clone(),
         }),
         diff_toolbar,
+        panel_hover: engine.panel_hover.as_ref().map(|ph| PanelHoverPopupData {
+            rendered: ph.rendered.clone(),
+            links: ph.links.clone(),
+            item_index: ph.item_index,
+            panel_name: ph.panel_name.clone(),
+        }),
+        editor_hover: engine.editor_hover.as_ref().map(|eh| EditorHoverPopupData {
+            rendered: eh.rendered.clone(),
+            links: eh.links.clone(),
+            anchor_line: eh.anchor_line,
+            anchor_col: eh.anchor_col,
+            scroll_top: eh.scroll_top,
+            focused_link: eh.focused_link,
+            has_focus: engine.editor_hover_has_focus,
+            popup_width: eh.popup_width,
+            frozen_scroll_top: eh.frozen_scroll_top,
+            frozen_scroll_left: eh.frozen_scroll_left,
+        }),
         dialog: engine.dialog.as_ref().map(|d| DialogPanel {
             title: d.title.clone(),
             body: d.body.clone(),
@@ -3478,6 +3556,13 @@ pub fn build_screen_layout(
                 .enumerate()
                 .map(|(i, btn)| (format_button_label(&btn.label, btn.hotkey), i == d.selected))
                 .collect(),
+            input: d.input.as_ref().map(|inp| DialogInputPanel {
+                display: if inp.is_password {
+                    format!("{}|", "*".repeat(inp.value.len()))
+                } else {
+                    format!("{}|", inp.value)
+                },
+            }),
         }),
         context_menu: engine.context_menu.as_ref().map(|cm| ContextMenuPanel {
             items: cm
@@ -3561,8 +3646,10 @@ fn build_source_control_data(engine: &Engine) -> Option<SourceControlData> {
         selected: engine.sc_selected,
         has_focus: engine.sc_has_focus,
         commit_message: engine.sc_commit_message.clone(),
+        commit_cursor: engine.sc_commit_cursor,
         commit_input_active: engine.sc_commit_input_active,
         button_focused: engine.sc_button_focused,
+        button_hovered: engine.sc_button_hovered,
         branch_picker: if engine.sc_branch_picker_open {
             let filtered = engine.sc_branch_picker_filtered();
             let results = filtered
@@ -3665,11 +3752,17 @@ fn build_ext_panel_data(engine: &Engine) -> Option<ExtPanelData> {
         .map(|(i, name)| {
             let expanded = expanded_vec.and_then(|v| v.get(i)).copied().unwrap_or(true);
             let key = (panel_name.clone(), name.clone());
-            let items = engine
+            let all_items = engine
                 .ext_panel_items
                 .get(&key)
                 .cloned()
                 .unwrap_or_default();
+            // Filter items for tree visibility (hide children of collapsed tree nodes)
+            let visible_indices = engine.ext_panel_visible_indices(panel_name, &all_items);
+            let items: Vec<_> = visible_indices
+                .into_iter()
+                .filter_map(|idx| all_items.get(idx).cloned())
+                .collect();
             ExtPanelSectionData {
                 name: name.clone(),
                 items,
@@ -3684,6 +3777,18 @@ fn build_ext_panel_data(engine: &Engine) -> Option<ExtPanelData> {
         selected: engine.ext_panel_selected,
         has_focus: engine.ext_panel_has_focus,
         scroll_top: engine.ext_panel_scroll_top,
+        input_text: engine
+            .ext_panel_input_text
+            .get(panel_name)
+            .cloned()
+            .unwrap_or_default(),
+        input_active: engine.ext_panel_input_active,
+        help_open: engine.ext_panel_help_open,
+        help_bindings: engine
+            .ext_panel_help_bindings
+            .get(panel_name)
+            .cloned()
+            .unwrap_or_default(),
     })
 }
 
@@ -4064,9 +4169,11 @@ fn build_breadcrumbs_for_group(engine: &Engine, group_id: GroupId) -> Vec<Breadc
     {
         let cursor = &window.view.cursor;
         let text = buf_state.buffer.to_string();
-        let scopes = buf_state
-            .syntax
-            .enclosing_scopes(&text, cursor.line, cursor.col);
+        let scopes = if let Some(ref syn) = buf_state.syntax {
+            syn.enclosing_scopes(&text, cursor.line, cursor.col)
+        } else {
+            Vec::new()
+        };
         for scope in scopes {
             segments.push(BreadcrumbSegment {
                 label: scope.name,
@@ -4499,7 +4606,8 @@ fn build_rendered_window(
 
         let spans = if let Some(ref md) = buffer_state.md_rendered {
             if line_idx < md.spans.len() {
-                md_spans_to_styled(&md.spans[line_idx], theme, color_headings)
+                let code_hl = md.code_highlights.get(line_idx);
+                md_spans_to_styled(&md.spans[line_idx], code_hl, theme, color_headings)
             } else {
                 vec![]
             }
@@ -4705,7 +4813,9 @@ fn build_rendered_window(
                     is_dap_current,
                     is_wrap_continuation: is_cont,
                     segment_col_offset: seg_start_char,
-                    annotation: if is_cont || engine.mode == crate::core::Mode::Insert {
+                    annotation: if is_cont
+                        || (engine.mode == crate::core::Mode::Insert && !engine.is_vscode_mode())
+                    {
                         None
                     } else {
                         engine.line_annotations.get(&line_idx).cloned()
@@ -4768,7 +4878,8 @@ fn build_rendered_window(
                 is_dap_current,
                 is_wrap_continuation: false,
                 segment_col_offset: 0,
-                annotation: if engine.mode == crate::core::Mode::Insert {
+                annotation: if engine.mode == crate::core::Mode::Insert && !engine.is_vscode_mode()
+                {
                     None
                 } else {
                     engine.line_annotations.get(&line_idx).cloned()
@@ -5055,12 +5166,33 @@ fn build_rendered_window(
 }
 
 /// Convert markdown style spans into rendering `StyledSpan`s.
+/// When `code_highlights` is non-empty, tree-sitter colors override CodeBlock spans.
 fn md_spans_to_styled(
     md_spans: &[crate::core::markdown::MdSpan],
+    code_highlights: Option<&Vec<crate::core::markdown::MdCodeHighlight>>,
     theme: &Theme,
     color_headings: bool,
 ) -> Vec<StyledSpan> {
     use crate::core::markdown::MdStyle;
+    // If this line has tree-sitter code highlights, use those instead.
+    if let Some(highlights) = code_highlights {
+        if !highlights.is_empty() {
+            return highlights
+                .iter()
+                .map(|h| StyledSpan {
+                    start_byte: h.start_byte,
+                    end_byte: h.end_byte,
+                    style: Style {
+                        fg: theme.scope_color(&h.scope),
+                        bg: None,
+                        bold: false,
+                        italic: false,
+                        font_scale: 1.0,
+                    },
+                })
+                .collect();
+        }
+    }
     md_spans
         .iter()
         .map(|s| {
@@ -5456,7 +5588,10 @@ fn build_status_line(engine: &Engine) -> (String, String) {
     let mode_str = engine.mode_str();
 
     let filename = match engine.file_path() {
-        Some(p) => p.display().to_string(),
+        Some(p) => p
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_else(|| p.display().to_string()),
         None => "[No Name]".to_string(),
     };
 

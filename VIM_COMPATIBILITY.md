@@ -301,9 +301,10 @@ See [README.md](README.md) for full feature documentation.
 | `gR` | Virtual replace mode | ✅ | Tab-aware overwrite; `gr` is LSP references |
 | `g'` / `` g` `` | Mark without jumplist | ✅ | |
 | `g&` | Repeat `:s` all lines | ✅ | |
+| `gh` | Editor hover popup (diagnostics, annotations, LSP hover) | ✅ | VimCode-specific (Vim: Select mode) |
 | `gH` / `gV` | Select mode | N/A | No Select mode |
 
-**g-commands: 34/34 (100%)**
+**g-commands: 35/35 (100%)**
 
 ---
 
@@ -610,14 +611,14 @@ These are not in Vim but are part of VimCode:
 | Search & Marks | 26 | 26 | 100% |
 | Normal — Other | 32 | 33 | 97% |
 | Text Objects | 16 | 16 | 100% |
-| g-Commands | 34 | 34 | 100% |
+| g-Commands | 35 | 35 | 100% |
 | z-Commands | 23 | 23 | 100% |
 | Window (CTRL-W) | 33 | 33 | 100% |
 | Bracket ([ / ]) | 13 | 13 | 100% |
 | Operator-Pending | 21 | 21 | 100% |
 | Visual Mode | 26 | 26 | 100% |
 | Ex Commands | 70 | 70 | 100% |
-| **Total** | **414** | **417** | **99%** |
+| **Total** | **415** | **418** | **99%** |
 
 N/A commands (VimScript, digraphs, spelling, etc.) are excluded from totals.
 

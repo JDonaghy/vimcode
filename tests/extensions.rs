@@ -26,7 +26,8 @@ fn test_manifests() -> Vec<vimcode_core::core::extensions::ExtensionManifest> {
             language_ids: vec!["c".to_string(), "cpp".to_string()],
             lsp: LspConfig {
                 binary: "clangd".to_string(),
-                install: "sudo apt-get install -y clangd".to_string(),
+                install_linux: "sudo apt-get install -y clangd".to_string(),
+                install_macos: "brew install llvm".to_string(),
                 ..Default::default()
             },
             dap: DapConfig {
@@ -401,8 +402,11 @@ fn ext_remove_unmarks_installed_extension() {
     e.extension_state.mark_installed("python");
     assert!(e.extension_state.is_installed("python"));
 
-    // Remove it via command
+    // Remove it via command — now shows a confirmation dialog
     exec(&mut e, "ExtRemove python");
+    assert!(e.dialog.is_some(), "dialog should be open");
+    // Confirm removal by pressing 'r' (Remove hotkey)
+    e.handle_key("", Some('r'), false);
     assert!(
         !e.extension_state.is_installed("python"),
         "python should no longer be installed after :ExtRemove"
@@ -413,6 +417,10 @@ fn ext_remove_unmarks_installed_extension() {
 fn ext_remove_unknown_extension_shows_message() {
     let mut e = engine_with("");
     exec(&mut e, "ExtRemove nonexistent-xyz");
+    // Dialog opens even for unknown extensions
+    assert!(e.dialog.is_some(), "dialog should be open");
+    // Confirm removal
+    e.handle_key("", Some('r'), false);
     let msg = e.message.to_lowercase();
     // Should show some kind of error or removal message
     assert!(
@@ -428,6 +436,8 @@ fn ext_remove_does_not_affect_other_extensions() {
     e.extension_state.mark_installed("rust");
 
     exec(&mut e, "ExtRemove python");
+    // Confirm dialog
+    e.handle_key("", Some('r'), false);
 
     assert!(
         !e.extension_state.is_installed("python"),
@@ -1026,6 +1036,13 @@ fn ext_sidebar_d_removes_installed_extension() {
     e.ext_sidebar_selected = 0; // first (and only) installed item
 
     e.handle_ext_sidebar_key("d", false, None);
+    // Dialog should be open — confirm removal.
+    // Navigate Right (past Cancel) then Enter. In 2-button dialog this is
+    // "Remove"; in 3-button (tools on PATH) this is "Keep Tools".
+    // Both remove the extension without deleting system tool binaries.
+    assert!(e.dialog.is_some(), "removal dialog should be open");
+    e.handle_key("Right", None, false);
+    e.handle_key("Return", None, false);
 
     assert!(
         !e.extension_state.is_installed("csharp"),
@@ -1252,6 +1269,9 @@ fn ext_remove_on_not_installed_extension_shows_message() {
     assert!(!e.extension_state.is_installed("ruby"));
 
     exec(&mut e, "ExtRemove ruby");
+    // Confirm dialog
+    assert!(e.dialog.is_some(), "dialog should be open");
+    e.handle_key("", Some('r'), false);
 
     // ext_remove always shows a message even when the extension wasn't installed
     let msg = e.message.to_lowercase();
@@ -1474,6 +1494,9 @@ fn ext_install_via_return_resets_selection_to_installed_item() {
 
     // d should now work immediately (without extra navigation)
     e.handle_ext_sidebar_key("d", false, None);
+    assert!(e.dialog.is_some(), "removal dialog should be open");
+    e.handle_key("Right", None, false);
+    e.handle_key("Return", None, false);
     assert!(
         !e.extension_state.is_installed("rust"),
         "rust should be removed after pressing d on newly installed item"
@@ -1505,8 +1528,11 @@ fn ext_delete_last_installed_expands_available_if_collapsed() {
         "should have 1 installed item (bash)"
     );
 
-    // Delete bash
+    // Delete bash — confirm dialog (Right past Cancel, then Enter)
     e.handle_ext_sidebar_key("d", false, None);
+    assert!(e.dialog.is_some(), "removal dialog should be open");
+    e.handle_key("Right", None, false);
+    e.handle_key("Return", None, false);
 
     assert!(
         !e.extension_state.is_installed("bash"),

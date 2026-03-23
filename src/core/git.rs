@@ -362,14 +362,53 @@ pub fn commit(dir: &Path, message: &str) -> Result<String, String> {
     }
 }
 
-/// Run `git push`. Returns Ok(summary) or Err(message).
-pub fn push(dir: &Path) -> Result<String, String> {
+/// Run a git remote command (push/pull/fetch) with SSH passphrase handling.
+///
+/// Uses `SSH_ASKPASS` + `SSH_ASKPASS_REQUIRE=force` to prevent SSH from
+/// prompting on the parent terminal.  When `passphrase` is `Some`, an
+/// ephemeral askpass script echoes it; when `None`, the askpass script
+/// prints an empty line (handles keys with empty passphrases or keys
+/// already loaded in ssh-agent).
+fn run_git_remote(
+    dir: &Path,
+    args: &[&str],
+    label: &str,
+    passphrase: Option<&str>,
+) -> Result<String, String> {
+    // Build an ephemeral askpass script that echoes the passphrase.
+    let phrase = passphrase.unwrap_or("");
+    let askpass_dir = std::env::temp_dir();
+    let askpass_path = askpass_dir.join(format!("vimcode_askpass_{}", std::process::id()));
+    std::fs::write(
+        &askpass_path,
+        format!("#!/bin/sh\necho '{}'\n", phrase.replace('\'', "'\\''")),
+    )
+    .map_err(|e| format!("{} failed: cannot create askpass helper: {}", label, e))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&askpass_path, std::fs::Permissions::from_mode(0o700)).ok();
+    }
+
     let output = Command::new("git")
         .arg("-C")
         .arg(dir)
-        .args(["push"])
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("SSH_ASKPASS", &askpass_path)
+        .env("SSH_ASKPASS_REQUIRE", "force")
+        // DISPLAY must be set for SSH_ASKPASS to work on some systems.
+        .env("DISPLAY", std::env::var("DISPLAY").unwrap_or_default())
         .output()
-        .map_err(|e| format!("git push failed: {}", e))?;
+        .map_err(|e| format!("{} failed: {}", label, e));
+
+    // Clean up the askpass script.
+    let _ = std::fs::remove_file(&askpass_path);
+
+    let output = output?;
     if output.status.success() {
         let out = String::from_utf8_lossy(&output.stdout).trim().to_string();
         let err_out = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -377,55 +416,52 @@ pub fn push(dir: &Path) -> Result<String, String> {
     } else {
         let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
         Err(if err.is_empty() {
-            "git push failed".to_string()
+            format!("{} failed", label)
         } else {
             err
         })
     }
+}
+
+/// Returns `true` when the error message looks like an SSH authentication
+/// failure that might be resolved by providing a passphrase.
+pub fn is_ssh_auth_error(err: &str) -> bool {
+    let low = err.to_lowercase();
+    low.contains("permission denied")
+        || low.contains("passphrase")
+        || low.contains("authentication failed")
+        || low.contains("could not read from remote")
+        || low.contains("host key verification failed")
+}
+
+/// Run `git push`. Returns Ok(summary) or Err(message).
+pub fn push(dir: &Path) -> Result<String, String> {
+    run_git_remote(dir, &["push"], "git push", None)
+}
+
+/// Run `git push` with an explicit SSH passphrase.
+pub fn push_with_passphrase(dir: &Path, passphrase: &str) -> Result<String, String> {
+    run_git_remote(dir, &["push"], "git push", Some(passphrase))
 }
 
 /// Run `git pull`. Returns Ok(summary) or Err(message).
 pub fn pull(dir: &Path) -> Result<String, String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(["pull"])
-        .output()
-        .map_err(|e| format!("git pull failed: {}", e))?;
-    if output.status.success() {
-        let out = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let err_out = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        Ok(if out.is_empty() { err_out } else { out })
-    } else {
-        let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        Err(if err.is_empty() {
-            "git pull failed".to_string()
-        } else {
-            err
-        })
-    }
+    run_git_remote(dir, &["pull"], "git pull", None)
+}
+
+/// Run `git pull` with an explicit SSH passphrase.
+pub fn pull_with_passphrase(dir: &Path, passphrase: &str) -> Result<String, String> {
+    run_git_remote(dir, &["pull"], "git pull", Some(passphrase))
 }
 
 /// Run `git fetch`. Returns Ok(summary) or Err(message).
 pub fn fetch(dir: &Path) -> Result<String, String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(["fetch"])
-        .output()
-        .map_err(|e| format!("git fetch failed: {}", e))?;
-    if output.status.success() {
-        let out = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let err_out = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        Ok(if out.is_empty() { err_out } else { out })
-    } else {
-        let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        Err(if err.is_empty() {
-            "git fetch failed".to_string()
-        } else {
-            err
-        })
-    }
+    run_git_remote(dir, &["fetch"], "git fetch", None)
+}
+
+/// Run `git fetch` with an explicit SSH passphrase.
+pub fn fetch_with_passphrase(dir: &Path, passphrase: &str) -> Result<String, String> {
+    run_git_remote(dir, &["fetch"], "git fetch", Some(passphrase))
 }
 
 /// Unstage all staged files (`git restore --staged .`).
@@ -480,6 +516,79 @@ fn epoch_to_date(secs: i64) -> String {
         month += 1;
     }
     format!("{:04}-{:02}-{:02}", year, month, remaining + 1)
+}
+
+/// Format a Unix epoch timestamp as a human-readable absolute date string,
+/// e.g. "March 21, 2026 4:30 PM" (GitLens-style).
+/// `tz_offset_secs` is the author timezone offset in seconds east of UTC.
+pub fn epoch_to_absolute(secs: i64, tz_offset_secs: i32) -> String {
+    let secs = secs + tz_offset_secs as i64;
+    // Date portion (reuse epoch_to_date logic)
+    let mut remaining_days = (secs / 86400) as i32;
+    let mut year = 1970i32;
+    loop {
+        let days_in_year = if is_leap_year(year) { 366 } else { 365 };
+        if remaining_days < days_in_year {
+            break;
+        }
+        remaining_days -= days_in_year;
+        year += 1;
+    }
+    let month_days: [i32; 12] = [
+        31,
+        if is_leap_year(year) { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    let mut month = 0usize;
+    for &m in &month_days {
+        if remaining_days < m {
+            break;
+        }
+        remaining_days -= m;
+        month += 1;
+    }
+    let day = remaining_days + 1;
+    let month_names = [
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
+    ];
+    let month_name = month_names.get(month).unwrap_or(&"???");
+    // Time portion
+    let time_of_day = secs.rem_euclid(86400);
+    let hour24 = (time_of_day / 3600) as u32;
+    let minute = ((time_of_day % 3600) / 60) as u32;
+    let (hour12, ampm) = if hour24 == 0 {
+        (12, "AM")
+    } else if hour24 < 12 {
+        (hour24, "AM")
+    } else if hour24 == 12 {
+        (12, "PM")
+    } else {
+        (hour24 - 12, "PM")
+    };
+    format!(
+        "{} {}, {} {}:{:02} {}",
+        month_name, day, year, hour12, minute, ampm
+    )
 }
 
 /// Parse `git blame --porcelain` output into a human-readable per-line format.
@@ -1071,6 +1180,52 @@ mod tests {
         assert!(checkout_branch(&dir, "feature-x").is_ok());
         assert_eq!(current_branch(&dir).as_deref(), Some("feature-x"));
     }
+
+    // ── normalize_remote_url ────────────────────────────────────────────────
+
+    #[test]
+    fn test_normalize_https_url() {
+        assert_eq!(
+            normalize_remote_url("https://github.com/user/repo.git"),
+            "https://github.com/user/repo"
+        );
+        assert_eq!(
+            normalize_remote_url("https://github.com/user/repo"),
+            "https://github.com/user/repo"
+        );
+    }
+
+    #[test]
+    fn test_normalize_ssh_shorthand() {
+        assert_eq!(
+            normalize_remote_url("git@github.com:user/repo.git"),
+            "https://github.com/user/repo"
+        );
+        assert_eq!(
+            normalize_remote_url("git@gitlab.com:org/project.git"),
+            "https://gitlab.com/org/project"
+        );
+    }
+
+    #[test]
+    fn test_normalize_ssh_scheme() {
+        assert_eq!(
+            normalize_remote_url("ssh://git@github.com/user/repo.git"),
+            "https://github.com/user/repo"
+        );
+    }
+
+    #[test]
+    fn test_epoch_to_absolute() {
+        // 1707426480 = 2024-02-08 21:08:00 UTC
+        let s = super::epoch_to_absolute(1707426480, 0);
+        assert!(s.contains("February"), "got: {}", s);
+        assert!(s.contains("2024"), "got: {}", s);
+        assert!(s.contains("9:08 PM"), "got: {}", s);
+        // With timezone offset +0100 (3600s), should shift by 1 hour → 10:08 PM
+        let s2 = super::epoch_to_absolute(1707426480, 3600);
+        assert!(s2.contains("10:08 PM"), "got: {}", s2);
+    }
 }
 
 // ─── Source Control helpers ───────────────────────────────────────────────────
@@ -1257,7 +1412,7 @@ pub struct StashEntry {
 /// Return the last `limit` commits as `GitLogEntry` items.
 pub fn git_log(dir: &Path, limit: usize) -> Vec<GitLogEntry> {
     let limit_str = format!("-{}", limit);
-    let output = match run_git(dir, &["log", "--oneline", &limit_str]) {
+    let output = match run_git(dir, &["log", "--format=%H %s", &limit_str]) {
         Some(o) => o,
         None => return Vec::new(),
     };
@@ -1273,6 +1428,17 @@ pub fn git_log(dir: &Path, limit: usize) -> Vec<GitLogEntry> {
         .collect()
 }
 
+/// Fetch a single commit's info by hash (for revealing commits not in the top N).
+pub fn git_log_commit(dir: &Path, hash: &str) -> Option<GitLogEntry> {
+    let output = run_git(dir, &["log", "--format=%H %s", "-1", hash])?;
+    let line = output.lines().next()?;
+    let (full_hash, message) = line.split_once(' ')?;
+    Some(GitLogEntry {
+        hash: full_hash.to_string(),
+        message: message.to_string(),
+    })
+}
+
 // ─── blame_line / log_file (for Lua plugin API) ───────────────────────────────
 
 /// Parsed blame information for a single line.
@@ -1284,6 +1450,8 @@ pub struct BlameInfo {
     pub author: String,
     /// Unix timestamp of the commit.
     pub timestamp: i64,
+    /// Timezone offset in seconds east of UTC (e.g. +0100 = 3600).
+    pub tz_offset: i32,
     /// Commit subject line.
     pub message: String,
     /// Human-readable relative date (e.g. "3 days ago").
@@ -1371,6 +1539,7 @@ pub fn blame_line(
         hash,
         author,
         timestamp,
+        tz_offset: 0,
         message: summary,
         relative_date,
     })
@@ -1458,6 +1627,137 @@ pub fn show_commit(dir: &Path, hash: &str) -> Option<String> {
     run_git(dir, &["show", hash])
 }
 
+/// Return a `DetailedLogEntry` for a single commit hash.
+pub fn commit_detail(dir: &Path, hash: &str) -> Option<DetailedLogEntry> {
+    let out = run_git(
+        dir,
+        &["log", "-1", "--format=%H%n%an%n%ar%n%B", "--stat", hash],
+    )?;
+    // Format: hash\nauthor\ndate\n<full body>\n\n<stat lines>\n summary line
+    let mut lines = out.lines();
+    let full_hash = lines.next()?.to_string();
+    let author = lines.next()?.to_string();
+    let date = lines.next()?.to_string();
+    // Rest is body + stat; split at the stat block (lines matching "file | N ++-")
+    let remaining: Vec<&str> = lines.collect();
+    // The stat block starts after an empty line following the body,
+    // and ends with a summary line like " N files changed, ..."
+    let mut body_end = remaining.len();
+    let mut stat_start = remaining.len();
+    for (i, line) in remaining.iter().enumerate().rev() {
+        if line.starts_with(' ')
+            && line.contains("changed")
+            && (line.contains("insertion") || line.contains("deletion"))
+        {
+            // This is the stat summary line — stat block starts a few lines before
+            stat_start = i;
+            // Walk backwards to find where stat lines begin (lines with " | ")
+            for j in (0..i).rev() {
+                if remaining[j].contains(" | ") {
+                    stat_start = j;
+                } else {
+                    break;
+                }
+            }
+            // Body ends at the blank line before stat
+            body_end = if stat_start > 0 && remaining[stat_start - 1].is_empty() {
+                stat_start - 1
+            } else {
+                stat_start
+            };
+            break;
+        }
+    }
+    let message = remaining[..body_end].join("\n").trim().to_string();
+    let stat = remaining[stat_start..].join("\n").trim().to_string();
+    Some(DetailedLogEntry {
+        hash: full_hash.chars().take(8).collect(),
+        author,
+        date,
+        message,
+        stat,
+    })
+}
+
+/// Return `git diff --stat` output for a single file (staged or unstaged).
+pub fn diff_stat_file(dir: &Path, path: &str, staged: bool) -> Option<String> {
+    let args = if staged {
+        vec!["diff", "--cached", "--stat", "--", path]
+    } else {
+        vec!["diff", "--stat", "--", path]
+    };
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_ref()).collect();
+    let out = run_git(dir, &arg_refs)?;
+    if out.trim().is_empty() {
+        None
+    } else {
+        Some(out.trim().to_string())
+    }
+}
+
+/// Return the tracking remote branch for the current branch (e.g. "origin/main").
+pub fn tracking_branch(dir: &Path) -> Option<String> {
+    run_git(
+        dir,
+        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+    )
+    .map(|s| s.trim().to_string())
+    .filter(|s| !s.is_empty())
+}
+
+/// Return the remote URL for `origin` (or the first remote), normalized to HTTPS.
+pub fn remote_url(dir: &Path) -> Option<String> {
+    let raw = run_git(dir, &["config", "--get", "remote.origin.url"])
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())?;
+    Some(normalize_remote_url(&raw))
+}
+
+/// Normalize a git remote URL to an HTTPS web URL (no `.git` suffix).
+///
+/// Handles: `https://github.com/user/repo.git`, `git@github.com:user/repo.git`,
+/// `ssh://git@github.com/user/repo`.
+fn normalize_remote_url(url: &str) -> String {
+    let mut s = url.to_string();
+    // SSH shorthand: git@host:user/repo → https://host/user/repo
+    if let Some(rest) = s.strip_prefix("git@") {
+        if let Some(colon) = rest.find(':') {
+            let host = &rest[..colon];
+            let path = &rest[colon + 1..];
+            s = format!("https://{}/{}", host, path);
+        }
+    }
+    // ssh:// scheme
+    if s.starts_with("ssh://") {
+        s = s.replacen("ssh://", "https://", 1);
+        // Remove user@ if present (e.g. https://git@github.com/...)
+        let after_scheme = &s["https://".len()..];
+        if let Some(at) = after_scheme.find('@') {
+            let first_slash = after_scheme.find('/').unwrap_or(after_scheme.len());
+            if at < first_slash {
+                s = format!("https://{}", &after_scheme[at + 1..]);
+            }
+        }
+    }
+    // Strip trailing .git
+    if s.ends_with(".git") {
+        s.truncate(s.len() - 4);
+    }
+    s
+}
+
+/// Build a web URL for a commit on the hosting platform.
+///
+/// Returns `None` if the remote URL can't be resolved or isn't HTTPS.
+pub fn commit_url(dir: &Path, hash: &str) -> Option<String> {
+    let base = remote_url(dir)?;
+    if !base.starts_with("https://") {
+        return None;
+    }
+    // GitHub/GitLab/Bitbucket all use /commit/<hash>
+    Some(format!("{}/commit/{}", base, hash))
+}
+
 /// Retrieve the contents of a file at a given git revision.
 ///
 /// `rev` is typically `"HEAD"` but can be any ref/commit.
@@ -1501,15 +1801,17 @@ pub fn blame_file_structured(
     let mut hash = String::new();
     let mut author = String::new();
     let mut timestamp: i64 = 0;
+    let mut tz_offset: i32 = 0;
     let mut summary = String::new();
-    let mut commit_info: HashMap<String, (String, i64, String)> = HashMap::new();
+    let mut commit_info: HashMap<String, (String, i64, i32, String)> = HashMap::new();
 
     for line in raw.lines() {
         if line.starts_with('\t') {
             // Source content line — emit blame entry
-            if let Some((a, t, s)) = commit_info.get(&hash) {
+            if let Some((a, t, tz, s)) = commit_info.get(&hash) {
                 author = a.clone();
                 timestamp = *t;
+                tz_offset = *tz;
                 summary = s.clone();
             }
             let short_hash: String = hash.chars().take(8).collect();
@@ -1519,12 +1821,15 @@ pub fn blame_file_structured(
                 hash: short_hash,
                 author: author.clone(),
                 timestamp,
+                tz_offset,
                 message: summary.clone(),
             });
         } else if let Some(a) = line.strip_prefix("author ") {
             author = a.to_string();
         } else if let Some(t) = line.strip_prefix("author-time ") {
             timestamp = t.trim().parse().unwrap_or(0);
+        } else if let Some(tz) = line.strip_prefix("author-tz ") {
+            tz_offset = parse_tz_offset(tz.trim());
         } else if let Some(s) = line.strip_prefix("summary ") {
             summary = s.to_string();
         } else {
@@ -1538,7 +1843,7 @@ pub fn blame_file_structured(
                 if !hash.is_empty() {
                     commit_info
                         .entry(hash.clone())
-                        .or_insert_with(|| (author.clone(), timestamp, summary.clone()));
+                        .or_insert_with(|| (author.clone(), timestamp, tz_offset, summary.clone()));
                 }
                 hash = full_hash;
             }
@@ -1546,6 +1851,18 @@ pub fn blame_file_structured(
     }
 
     results
+}
+
+/// Parse a git timezone offset string like "+0100" or "-0530" into seconds east of UTC.
+fn parse_tz_offset(s: &str) -> i32 {
+    if s.len() < 5 {
+        return 0;
+    }
+    let sign = if s.starts_with('-') { -1 } else { 1 };
+    let digits = &s[1..];
+    let hours: i32 = digits[..2].parse().unwrap_or(0);
+    let minutes: i32 = digits[2..4].parse().unwrap_or(0);
+    sign * (hours * 3600 + minutes * 60)
 }
 
 /// Run `git log -L start,end:file` and return detailed log entries for a line range.
@@ -2009,6 +2326,7 @@ pub(crate) fn parse_blame_line_porcelain(raw: &str) -> Option<BlameInfo> {
         hash,
         author,
         timestamp,
+        tz_offset: 0,
         message: summary,
     })
 }
@@ -2094,14 +2412,16 @@ fn parse_blame_file_porcelain(raw: &str) -> Vec<BlameInfo> {
     let mut hash = String::new();
     let mut author = String::new();
     let mut timestamp: i64 = 0;
+    let mut tz_offset: i32 = 0;
     let mut summary = String::new();
-    let mut commit_info: HashMap<String, (String, i64, String)> = HashMap::new();
+    let mut commit_info: HashMap<String, (String, i64, i32, String)> = HashMap::new();
 
     for line in raw.lines() {
         if line.starts_with('\t') {
-            if let Some((a, t, s)) = commit_info.get(&hash) {
+            if let Some((a, t, tz, s)) = commit_info.get(&hash) {
                 author = a.clone();
                 timestamp = *t;
+                tz_offset = *tz;
                 summary = s.clone();
             }
             let short_hash: String = hash.chars().take(8).collect();
@@ -2111,12 +2431,15 @@ fn parse_blame_file_porcelain(raw: &str) -> Vec<BlameInfo> {
                 hash: short_hash,
                 author: author.clone(),
                 timestamp,
+                tz_offset,
                 message: summary.clone(),
             });
         } else if let Some(a) = line.strip_prefix("author ") {
             author = a.to_string();
         } else if let Some(t) = line.strip_prefix("author-time ") {
             timestamp = t.trim().parse().unwrap_or(0);
+        } else if let Some(tz) = line.strip_prefix("author-tz ") {
+            tz_offset = parse_tz_offset(tz.trim());
         } else if let Some(s) = line.strip_prefix("summary ") {
             summary = s.to_string();
         } else {
@@ -2129,7 +2452,7 @@ fn parse_blame_file_porcelain(raw: &str) -> Vec<BlameInfo> {
                 if !hash.is_empty() {
                     commit_info
                         .entry(hash.clone())
-                        .or_insert_with(|| (author.clone(), timestamp, summary.clone()));
+                        .or_insert_with(|| (author.clone(), timestamp, tz_offset, summary.clone()));
                 }
                 hash = full_hash;
             }
@@ -2172,4 +2495,44 @@ fn parse_detailed_log(output: &str) -> Vec<DetailedLogEntry> {
         });
     }
     entries
+}
+
+// ─── Commit file list ────────────────────────────────────────────────────────
+
+/// A single file changed in a commit.
+#[derive(Debug, Clone)]
+pub struct CommitFileEntry {
+    /// Status character: 'A' (added), 'M' (modified), 'D' (deleted), 'R' (renamed).
+    pub status: char,
+    pub path: String,
+}
+
+/// List files changed in a given commit.
+pub fn commit_files(dir: &Path, hash: &str) -> Vec<CommitFileEntry> {
+    let output = match run_git(
+        dir,
+        &["diff-tree", "--no-commit-id", "-r", "--name-status", hash],
+    ) {
+        Some(o) => o,
+        None => return Vec::new(),
+    };
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(2, '\t');
+            let status = parts.next()?.chars().next()?;
+            let path = parts.next()?.to_string();
+            Some(CommitFileEntry { status, path })
+        })
+        .collect()
+}
+
+/// Show a specific file's content at a given commit.
+pub fn diff_file_at_commit(dir: &Path, hash: &str, path: &str) -> Option<String> {
+    run_git(dir, &["show", &format!("{hash}:{path}")])
+}
+
+/// Show the diff for a specific file within a commit (like `git show <hash> -- <path>`).
+pub fn show_commit_file(dir: &Path, hash: &str, path: &str) -> Option<String> {
+    run_git(dir, &["show", hash, "--", path])
 }
