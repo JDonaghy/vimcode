@@ -29981,8 +29981,31 @@ impl Engine {
                         self.message = "No hover info".to_string();
                     }
                 }
-                LspEvent::ServerExited(id) => {
-                    self.message = format!("LSP server {} exited", id);
+                LspEvent::ServerExited {
+                    server_id,
+                    stderr,
+                    was_initialized,
+                } => {
+                    let desc = self
+                        .lsp_manager
+                        .as_mut()
+                        .map(|mgr| mgr.handle_server_exited(server_id))
+                        .unwrap_or_else(|| format!("server {}", server_id));
+                    if was_initialized {
+                        self.message = format!("LSP {} exited", desc);
+                    } else {
+                        let snippet = stderr
+                            .lines()
+                            .find(|l| !l.trim().is_empty())
+                            .unwrap_or("no output")
+                            .trim();
+                        let snippet = if snippet.len() > 100 {
+                            &snippet[..100]
+                        } else {
+                            snippet
+                        };
+                        self.message = format!("LSP {} failed to start: {}", desc, snippet);
+                    }
                     redraw = true;
                 }
                 LspEvent::RegistryLookup { lang_id, .. } => {

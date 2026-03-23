@@ -296,6 +296,8 @@ pub struct LspManager {
     semantic_legends: HashMap<LspServerId, SemanticTokensLegend>,
     /// Extension manifests from the registry (updated by engine when registry changes).
     ext_manifests: Vec<extensions::ExtensionManifest>,
+    /// Servers that crashed or exited (for display in :LspInfo).
+    crashed_servers: Vec<String>,
 }
 
 impl LspManager {
@@ -326,6 +328,7 @@ impl LspManager {
             initialized: HashMap::new(),
             semantic_legends: HashMap::new(),
             ext_manifests: Vec::new(),
+            crashed_servers: Vec::new(),
         }
     }
 
@@ -798,7 +801,34 @@ impl LspManager {
         }
     }
 
-    /// Get status information about running servers.
+    /// Clean up a server that exited or crashed. Returns a description string
+    /// (command + languages) for use in the user-facing message.
+    pub fn handle_server_exited(&mut self, server_id: LspServerId) -> String {
+        let cmd = self
+            .servers
+            .get(server_id)
+            .map(|s| s.command().to_string())
+            .unwrap_or_else(|| format!("server {}", server_id));
+
+        let langs: Vec<String> = self
+            .language_to_server
+            .iter()
+            .filter(|(_, &id)| id == server_id)
+            .map(|(lang, _)| lang.clone())
+            .collect();
+
+        self.language_to_server.retain(|_, &mut id| id != server_id);
+        self.initialized.remove(&server_id);
+
+        let desc = if langs.is_empty() {
+            cmd
+        } else {
+            format!("{} ({})", cmd, langs.join(", "))
+        };
+        self.crashed_servers.push(desc.clone());
+        desc
+    }
+
     /// Get status information about running servers.
     /// If `current_lang` is provided, marks the server handling that language with ●.
     pub fn server_info(&self, current_lang: Option<&str>) -> Vec<String> {
@@ -819,14 +849,10 @@ impl LspManager {
             } else {
                 "initializing"
             };
-            let cmd = langs
-                .first()
-                .and_then(|lang| {
-                    self.registry
-                        .iter()
-                        .find(|c| c.languages.iter().any(|l| l == *lang))
-                        .map(|c| c.command.as_str())
-                })
+            let cmd = self
+                .servers
+                .get(server_id)
+                .map(|s| s.command())
                 .unwrap_or("unknown");
             let mut sorted_langs: Vec<&str> = langs.to_vec();
             sorted_langs.sort();
@@ -837,6 +863,9 @@ impl LspManager {
                 "  "
             };
             info.push(format!("{marker}{cmd}: {status} ({lang_list})"));
+        }
+        for entry in &self.crashed_servers {
+            info.push(format!("  {}: crashed", entry));
         }
         if info.is_empty() {
             info.push("No LSP servers running".to_string());
