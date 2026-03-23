@@ -298,6 +298,9 @@ pub struct LspManager {
     ext_manifests: Vec<extensions::ExtensionManifest>,
     /// Servers that crashed or exited (for display in :LspInfo).
     crashed_servers: Vec<String>,
+    /// Last error from `ensure_server_for_language` (dependency check failure, etc.).
+    /// Engine reads and clears this after calling ensure_server.
+    pub last_start_error: Option<String>,
 }
 
 impl LspManager {
@@ -329,6 +332,7 @@ impl LspManager {
             semantic_legends: HashMap::new(),
             ext_manifests: Vec::new(),
             crashed_servers: Vec::new(),
+            last_start_error: None,
         }
     }
 
@@ -344,6 +348,35 @@ impl LspManager {
         // Already running?
         if let Some(&id) = self.language_to_server.get(language_id) {
             return Some(id);
+        }
+
+        self.last_start_error = None;
+
+        // Check declared dependencies from the extension manifest.
+        if let Some(manifest) =
+            extensions::find_manifest_for_language_id(&self.ext_manifests, language_id)
+        {
+            let missing: Vec<&str> = manifest
+                .lsp
+                .dependencies
+                .iter()
+                .filter(|dep| resolve_command(dep).is_none())
+                .map(|s| s.as_str())
+                .collect();
+            if !missing.is_empty() {
+                let name = if manifest.display_name.is_empty() {
+                    &manifest.name
+                } else {
+                    &manifest.display_name
+                };
+                self.last_start_error = Some(format!(
+                    "{} requires {} — install {} and try again",
+                    name,
+                    missing.join(", "),
+                    missing.join(", "),
+                ));
+                return None;
+            }
         }
 
         // Build candidate list: extension manifest entries first (primary + fallbacks),
@@ -512,8 +545,12 @@ impl LspManager {
         match self.ensure_server_for_language(&language_id) {
             Some(_) => Ok(()),
             None => {
-                // No server available — let the engine handle the registry lookup
-                Err(format!("No LSP server found for {language_id}"))
+                // Return specific dependency error if available, otherwise generic
+                let msg = self
+                    .last_start_error
+                    .take()
+                    .unwrap_or_else(|| format!("No LSP server found for {language_id}"));
+                Err(msg)
             }
         }
     }

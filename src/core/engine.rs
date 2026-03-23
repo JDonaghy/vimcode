@@ -25724,9 +25724,9 @@ impl Engine {
                     manifest.display_name, name
                 );
             }
-        } else if no_server.is_some() {
-            // No VimCode extension for this language and no LSP binary found either.
-            self.message = format!("No LSP for {lang_id} — add to lsp_servers in settings.json");
+        } else if let Some(err) = no_server {
+            // Show dependency errors prominently; generic "no server" only as fallback.
+            self.message = err;
         }
     }
 
