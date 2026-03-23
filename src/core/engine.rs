@@ -29831,11 +29831,15 @@ impl Engine {
                 }
                 (path, state.buffer.to_string())
             };
+            // Clear stale semantic tokens immediately — they have line numbers
+            // from the previous buffer state and would highlight wrong lines.
+            if let Some(state) = self.buffer_manager.get_mut(buffer_id) {
+                state.semantic_tokens.clear();
+            }
             if let Some(mgr) = &mut self.lsp_manager {
                 mgr.notify_did_change(&path, &text);
             }
             // Re-request semantic tokens after the server processes the change.
-            // Keep old tokens displayed until new ones arrive (avoids flicker).
             self.lsp_request_semantic_tokens(&path);
         }
     }
