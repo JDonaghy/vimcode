@@ -245,12 +245,18 @@ pub fn render_markdown(input: &str) -> MdRendered {
                 }
                 TagEnd::Link => {
                     // Append " (url)" after link text.
+                    // For command: URIs, display as "(:Name?args)" instead.
                     if let Some(url) = link_url.take() {
                         if !url.is_empty() {
+                            let display_url = if let Some(rest) = url.strip_prefix("command:") {
+                                format!(":{}", rest)
+                            } else {
+                                url.clone()
+                            };
                             let prefix = " (";
                             cur_line.push_str(prefix);
                             let url_start = cur_line.len();
-                            cur_line.push_str(&url);
+                            cur_line.push_str(&display_url);
                             let url_end = cur_line.len();
                             cur_line.push(')');
                             cur_spans.push(MdSpan {

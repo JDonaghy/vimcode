@@ -52,6 +52,17 @@ You can develop and test extensions entirely locally without publishing to the r
 Local extensions override registry extensions with the same name, so you can fork and modify
 an existing extension by copying it to `~/.config/vimcode/extensions/<name>/`.
 
+### Updating an Existing Extension
+
+When modifying a published extension (e.g. `git-insights`), always update the **registry repo first**, then sync to the local cache:
+
+1. **Edit in the `vimcode-ext` repo** (`~/src/vimcode-ext/<extension>/`)
+2. **Commit and push** the changes to the registry repo
+3. **Copy the updated files** to the local cache (`~/.config/vimcode/extensions/<extension>/`)
+4. **Reload** in VimCode with `:Plugin reload`
+
+This ensures the registry repo is the source of truth. Never edit the local cache without propagating changes back to the repo — the local cache will be overwritten on reinstall.
+
 ### Submitting to the Registry
 
 When your extension is ready, submit a PR to
@@ -333,6 +344,23 @@ local diff = vimcode.git.stash_show(0)                   -- string or nil
 -- List all branches with tracking info
 local branches = vimcode.git.branches()
 -- branches = {{name="main", tracking="origin/main", is_current=true}, ...}
+
+-- List files changed in a commit
+local files = vimcode.git.commit_files("abc123")
+-- files = {"src/main.rs", "src/lib.rs", ...}
+
+-- Get diff for a specific file at a commit
+local diff = vimcode.git.diff_file("abc123", "src/main.rs")  -- string or nil
+
+-- Get file contents at a specific commit
+local content = vimcode.git.show_file("abc123", "src/main.rs")  -- string or nil
+
+-- Get detailed commit info (author, date, message, stat)
+local detail = vimcode.git.commit_detail("abc123")
+-- detail = {hash="abc123", author="Name", date="2026-03-22", message="Fix bug", stat="2 files changed, 10 insertions(+)"}
+
+-- Open a side-by-side diff for a file at a commit (uses engine diff infrastructure)
+vimcode.git.open_diff("abc123", "src/main.rs")
 ```
 
 ### Async Shell Execution
@@ -354,6 +382,34 @@ vimcode.on("my_result_event", function(output)
     vimcode.message("Result: " .. output)
 end)
 ```
+
+### Command URIs
+
+Hover popups and panel hovers support `command:` URIs in markdown links. When a user clicks (or presses Enter on) a command URI link, VimCode dispatches it to the matching plugin command registered via `vimcode.command()`.
+
+**Format:** `[Label](command:CommandName?args)`
+
+The `?args` portion is optional and is percent-decoded before being passed to the command handler. This enables interactive hover popups with clickable action links.
+
+```lua
+-- Register commands that can be invoked from hover popup links
+vimcode.command("GitShow", function(hash)
+    vimcode.command_run("Gshow " .. hash)
+end)
+
+vimcode.command("CopyHash", function(hash)
+    vimcode.state.set_register("+", hash, false)
+    vimcode.message("Copied " .. hash)
+end)
+
+-- Use command URIs in hover markdown
+local md = "**Commit info**\n\n"
+    .. "[Open Commit](command:GitShow?abc1234)"
+    .. " | [Copy Hash](command:CopyHash?abc1234)"
+vimcode.editor.set_hover(line, md)
+```
+
+Built-in LSP commands (`command:definition`, `command:type_definition`, `command:implementation`, `command:references`) are handled internally and take precedence over plugin commands of the same name.
 
 ### Panel API (`vimcode.panel.*`)
 
@@ -379,6 +435,10 @@ vimcode.panel.set_items("my_panel", "Section A", {
 -- Parse event argument from panel_select/panel_action hooks
 local info = vimcode.panel.parse_event(arg)
 -- info = {panel="my_panel", section="Section A", index=0, label="Item 1", key="a"}
+
+-- Programmatically navigate to a panel item (focus panel, select section, expand item)
+vimcode.panel.reveal("my_panel", "Section A", "item_id")
+-- Useful for blame-to-log navigation: reveal a commit in the Git Log panel
 ```
 
 **Panel navigation keys** (when panel has focus):

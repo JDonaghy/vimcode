@@ -781,6 +781,8 @@ pub struct ExtPanelData {
     pub scroll_top: usize,
     pub input_text: String,
     pub input_active: bool,
+    pub help_open: bool,
+    pub help_bindings: Vec<(String, String)>,
 }
 
 /// A single section within an extension panel.
@@ -3781,6 +3783,12 @@ fn build_ext_panel_data(engine: &Engine) -> Option<ExtPanelData> {
             .cloned()
             .unwrap_or_default(),
         input_active: engine.ext_panel_input_active,
+        help_open: engine.ext_panel_help_open,
+        help_bindings: engine
+            .ext_panel_help_bindings
+            .get(panel_name)
+            .cloned()
+            .unwrap_or_default(),
     })
 }
 

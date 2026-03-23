@@ -133,6 +133,8 @@ pub struct PluginManager {
     hooks: HashMap<String, Vec<LuaRegistryKey>>,
     /// Extension panel registrations harvested from plugin scripts.
     pub panels: HashMap<String, PanelRegistration>,
+    /// Extension panel help bindings harvested from plugin scripts.
+    pub help_bindings: HashMap<String, Vec<(String, String)>>,
 }
 
 /// Metadata about a single plugin file / directory.
@@ -211,10 +213,20 @@ pub struct PluginCallContext {
     pub panel_set_items: Vec<(String, String, Vec<ExtPanelItem>)>,
     /// Panel hover content registrations: `(panel_name, item_id, markdown)`.
     pub panel_hover_entries: Vec<(String, String, String)>,
+    /// Panel help bindings: `(panel_name, [(key, description)])`.
+    pub panel_help_entries: Vec<(String, Vec<(String, String)>)>,
     /// Panel input field text values to set: `(panel_name, text)`.
     pub panel_input_values: Vec<(String, String)>,
     /// Editor hover content registrations: `(0-indexed line, markdown)`.
     pub editor_hover_entries: Vec<(usize, String)>,
+    /// Panel reveal request: `(panel_name, section_name, item_id)`.
+    /// Causes the sidebar to switch to the named panel and highlight the item.
+    pub panel_reveal_request: Option<(String, String, String)>,
+    /// Commit file diff request: `(hash, rel_path)`.
+    /// Opens a side-by-side diff of the file at `hash` vs `hash~1`.
+    pub commit_file_diff: Option<(String, String)>,
+    /// URLs to open in the default browser.
+    pub open_urls: Vec<String>,
 }
 
 // ─── Internal registration accumulator ───────────────────────────────────────
@@ -228,6 +240,7 @@ struct PluginRegistrations {
     keymaps: HashMap<(String, String), LuaRegistryKey>,
     hooks: HashMap<String, Vec<LuaRegistryKey>>,
     panels: Vec<PanelRegistration>,
+    help_bindings: Vec<(String, Vec<(String, String)>)>,
 }
 
 // ─── PluginManager implementation ────────────────────────────────────────────
@@ -244,6 +257,7 @@ impl PluginManager {
             keymaps: HashMap::new(),
             hooks: HashMap::new(),
             panels: HashMap::new(),
+            help_bindings: HashMap::new(),
         })
     }
 
@@ -321,6 +335,9 @@ impl PluginManager {
             }
             for panel in reg.panels {
                 self.panels.insert(panel.name.clone(), panel);
+            }
+            for (panel_name, bindings) in reg.help_bindings {
+                self.help_bindings.insert(panel_name, bindings);
             }
         }
 
@@ -492,6 +509,17 @@ impl PluginManager {
             lua.create_function(|lua, cmd: String| {
                 if let Some(mut ctx) = lua.app_data_mut::<PluginCallContext>() {
                     ctx.run_commands.push(cmd);
+                }
+                Ok(())
+            })?,
+        )?;
+
+        // vimcode.open_url(url)
+        vimcode.set(
+            "open_url",
+            lua.create_function(|lua, url: String| {
+                if let Some(mut ctx) = lua.app_data_mut::<PluginCallContext>() {
+                    ctx.open_urls.push(url);
                 }
                 Ok(())
             })?,
@@ -1198,6 +1226,29 @@ impl PluginManager {
             })?,
         )?;
 
+        // vimcode.git.log_commit(hash) → {hash, message} or nil
+        git_tbl.set(
+            "log_commit",
+            lua.create_function(|lua, hash: String| {
+                let cwd_path = lua
+                    .app_data_ref::<PluginCallContext>()
+                    .and_then(|ctx| ctx.cwd_path.clone());
+                let dir = match cwd_path {
+                    Some(p) => p,
+                    None => return Ok(LuaValue::Nil),
+                };
+                match git::git_log_commit(&dir, &hash) {
+                    Some(e) => {
+                        let row = lua.create_table()?;
+                        row.set("hash", e.hash)?;
+                        row.set("message", e.message)?;
+                        Ok(LuaValue::Table(row))
+                    }
+                    None => Ok(LuaValue::Nil),
+                }
+            })?,
+        )?;
+
         // vimcode.git.branches() → [{name, is_current, upstream, ahead_behind}]
         git_tbl.set(
             "branches",
@@ -1274,6 +1325,109 @@ impl PluginManager {
                 let repo_root = git::find_repo_root(&dir).unwrap_or(dir);
                 match git::remote_url(&repo_root) {
                     Some(url) => Ok(LuaValue::String(lua.create_string(&url)?)),
+                    None => Ok(LuaValue::Nil),
+                }
+            })?,
+        )?;
+
+        // vimcode.git.commit_files(hash) → [{status="M", path="src/main.rs"}, ...] or nil
+        git_tbl.set(
+            "commit_files",
+            lua.create_function(|lua, hash: String| {
+                let cwd_path = lua
+                    .app_data_ref::<PluginCallContext>()
+                    .and_then(|ctx| ctx.cwd_path.clone());
+                let dir = match cwd_path {
+                    Some(p) => p,
+                    None => return Ok(LuaValue::Nil),
+                };
+                let repo_root = git::find_repo_root(&dir).unwrap_or(dir);
+                let files = git::commit_files(&repo_root, &hash);
+                if files.is_empty() {
+                    return Ok(LuaValue::Nil);
+                }
+                let t = lua.create_table()?;
+                for (i, f) in files.iter().enumerate() {
+                    let row = lua.create_table()?;
+                    row.set("status", lua.create_string(f.status.to_string())?)?;
+                    row.set("path", lua.create_string(&f.path)?)?;
+                    t.set(i + 1, row)?;
+                }
+                Ok(LuaValue::Table(t))
+            })?,
+        )?;
+
+        // vimcode.git.diff_file(hash, path) → string or nil (file content at commit)
+        git_tbl.set(
+            "diff_file",
+            lua.create_function(|lua, (hash, path): (String, String)| {
+                let cwd_path = lua
+                    .app_data_ref::<PluginCallContext>()
+                    .and_then(|ctx| ctx.cwd_path.clone());
+                let dir = match cwd_path {
+                    Some(p) => p,
+                    None => return Ok(LuaValue::Nil),
+                };
+                let repo_root = git::find_repo_root(&dir).unwrap_or(dir);
+                match git::diff_file_at_commit(&repo_root, &hash, &path) {
+                    Some(content) => Ok(LuaValue::String(lua.create_string(&content)?)),
+                    None => Ok(LuaValue::Nil),
+                }
+            })?,
+        )?;
+
+        // vimcode.git.open_diff(hash, path) — open side-by-side diff (hash~1 vs hash)
+        git_tbl.set(
+            "open_diff",
+            lua.create_function(|lua, (hash, path): (String, String)| {
+                if let Some(mut ctx) = lua.app_data_mut::<PluginCallContext>() {
+                    ctx.commit_file_diff = Some((hash, path));
+                }
+                Ok(())
+            })?,
+        )?;
+
+        // vimcode.git.show_file(hash, path) → string or nil (diff for a file in a commit)
+        git_tbl.set(
+            "show_file",
+            lua.create_function(|lua, (hash, path): (String, String)| {
+                let cwd_path = lua
+                    .app_data_ref::<PluginCallContext>()
+                    .and_then(|ctx| ctx.cwd_path.clone());
+                let dir = match cwd_path {
+                    Some(p) => p,
+                    None => return Ok(LuaValue::Nil),
+                };
+                let repo_root = git::find_repo_root(&dir).unwrap_or(dir);
+                match git::show_commit_file(&repo_root, &hash, &path) {
+                    Some(content) => Ok(LuaValue::String(lua.create_string(&content)?)),
+                    None => Ok(LuaValue::Nil),
+                }
+            })?,
+        )?;
+
+        // vimcode.git.commit_detail(hash) → {hash, author, date, message, stat} or nil
+        git_tbl.set(
+            "commit_detail",
+            lua.create_function(|lua, hash: String| {
+                let cwd_path = lua
+                    .app_data_ref::<PluginCallContext>()
+                    .and_then(|ctx| ctx.cwd_path.clone());
+                let dir = match cwd_path {
+                    Some(p) => p,
+                    None => return Ok(LuaValue::Nil),
+                };
+                let repo_root = git::find_repo_root(&dir).unwrap_or(dir);
+                match git::commit_detail(&repo_root, &hash) {
+                    Some(detail) => {
+                        let t = lua.create_table()?;
+                        t.set("hash", lua.create_string(&detail.hash)?)?;
+                        t.set("author", lua.create_string(&detail.author)?)?;
+                        t.set("date", lua.create_string(&detail.date)?)?;
+                        t.set("message", lua.create_string(&detail.message)?)?;
+                        t.set("stat", lua.create_string(&detail.stat)?)?;
+                        Ok(LuaValue::Table(t))
+                    }
                     None => Ok(LuaValue::Nil),
                 }
             })?,
@@ -1397,6 +1551,27 @@ impl PluginManager {
             )?,
         )?;
 
+        // vimcode.panel.set_help(panel_name, bindings) — register help popup bindings
+        // bindings is a table of {key, description} pairs
+        panel_tbl.set(
+            "set_help",
+            lua.create_function(|lua, (panel_name, bindings): (String, LuaTable)| {
+                let mut entries = Vec::new();
+                for pair in bindings.sequence_values::<LuaTable>() {
+                    let t = pair?;
+                    let key: String = t.get(1)?;
+                    let desc: String = t.get(2)?;
+                    entries.push((key, desc));
+                }
+                if let Some(mut ctx) = lua.app_data_mut::<PluginCallContext>() {
+                    ctx.panel_help_entries.push((panel_name, entries));
+                } else if let Some(mut reg) = lua.app_data_mut::<PluginRegistrations>() {
+                    reg.help_bindings.push((panel_name, entries));
+                }
+                Ok(())
+            })?,
+        )?;
+
         // vimcode.panel.parse_event(arg) — split "|"-delimited event arg into table
         panel_tbl.set(
             "parse_event",
@@ -1440,6 +1615,19 @@ impl PluginManager {
                 }
                 Ok(())
             })?,
+        )?;
+
+        // vimcode.panel.reveal(panel_name, section_name, item_id) — switch to panel and highlight item
+        panel_tbl.set(
+            "reveal",
+            lua.create_function(
+                |lua, (panel_name, section_name, item_id): (String, String, String)| {
+                    if let Some(mut ctx) = lua.app_data_mut::<PluginCallContext>() {
+                        ctx.panel_reveal_request = Some((panel_name, section_name, item_id));
+                    }
+                    Ok(())
+                },
+            )?,
         )?;
 
         vimcode.set("panel", panel_tbl)?;

@@ -904,10 +904,20 @@ pub struct EditorHoverPopup {
 }
 
 /// Check if a URL has a safe scheme for opening in a browser.
-/// Only `https://` and `http://` are allowed.
+/// Allows `https://`, `http://`, and `command:` schemes.
 pub fn is_safe_url(url: &str) -> bool {
     let lower = url.to_ascii_lowercase();
     lower.starts_with("https://") || lower.starts_with("http://") || lower.starts_with("command:")
+}
+
+/// Convert a hex ASCII byte to its numeric value (0–15), or `None`.
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// State for an open context menu popup (engine-driven, rendered by TUI).
@@ -2266,6 +2276,13 @@ pub struct Engine {
     pub ext_panel_input_text: HashMap<String, String>,
     /// Whether the input field in the active extension panel currently has keyboard focus.
     pub ext_panel_input_active: bool,
+    /// Signals backends to switch the sidebar to this extension panel on the next frame.
+    /// Set by `panel.reveal()` — backends check + clear each frame.
+    pub ext_panel_focus_pending: Option<String>,
+    /// Extension panel help popup state
+    pub ext_panel_help_open: bool,
+    /// Extension panel help bindings: panel_name -> [(key, description)]
+    pub ext_panel_help_bindings: HashMap<String, Vec<(String, String)>>,
 
     // --- Editor hover popup ---
     /// Active editor hover popup with rendered markdown content.
@@ -2625,6 +2642,9 @@ impl Engine {
             ext_panel_tree_expanded: HashMap::new(),
             ext_panel_input_text: HashMap::new(),
             ext_panel_input_active: false,
+            ext_panel_focus_pending: None,
+            ext_panel_help_open: false,
+            ext_panel_help_bindings: HashMap::new(),
             editor_hover: None,
             editor_hover_dwell: None,
             editor_hover_dismiss_at: None,
@@ -4019,6 +4039,76 @@ impl Engine {
             .unwrap_or(head_buf_id);
         self.refresh_git_diff(right_buf_id);
         self.message = format!("Diff split: {}", path.display());
+    }
+
+    /// Open a side-by-side diff for a file at a specific commit vs its parent.
+    /// Both sides are read-only scratch buffers showing `hash~1` (left) and `hash` (right).
+    pub fn open_commit_file_diff(&mut self, hash: &str, rel_path: &str) {
+        let git_root = git::find_repo_root(&self.cwd).unwrap_or_else(|| self.cwd.clone());
+        let file_name = std::path::Path::new(rel_path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| rel_path.to_string());
+        let short = &hash[..hash.len().min(8)];
+
+        // Fetch "after" (the commit) and "before" (parent commit)
+        let after = git::show_file_at_ref(&git_root, hash, rel_path).unwrap_or_default();
+        let parent_ref = format!("{hash}~1");
+        let before = git::show_file_at_ref(&git_root, &parent_ref, rel_path).unwrap_or_default();
+
+        // If both are empty, nothing to show
+        if after.is_empty() && before.is_empty() {
+            self.message = format!("No content for {rel_path} at {short}");
+            return;
+        }
+
+        // Create "after" buffer (right pane)
+        let right_buf_id = self.buffer_manager.create();
+        if let Some(state) = self.buffer_manager.get_mut(right_buf_id) {
+            state.buffer.content = ropey::Rope::from_str(&after);
+            state.read_only = true;
+            state.scratch_name = Some(format!("{file_name} ({short})"));
+            state.diff_label = Some(format!("{file_name} ({short})"));
+            if let Some(syn) = crate::core::syntax::Syntax::new_from_path(Some(rel_path)) {
+                state.syntax = Some(syn);
+                state.update_syntax();
+            }
+        }
+
+        // Open in a new tab
+        self.new_tab(None);
+        let right_win = self.active_window_id();
+        self.active_window_mut().buffer_id = right_buf_id;
+        self.active_window_mut().view.cursor = crate::core::cursor::Cursor::default();
+
+        // Create "before" buffer (left pane)
+        let left_buf_id = self.buffer_manager.create();
+        if let Some(state) = self.buffer_manager.get_mut(left_buf_id) {
+            state.buffer.content = ropey::Rope::from_str(&before);
+            state.read_only = true;
+            state.scratch_name = Some(format!("{file_name} ({short}~1)"));
+            if let Some(syn) = crate::core::syntax::Syntax::new_from_path(Some(rel_path)) {
+                state.syntax = Some(syn);
+                state.update_syntax();
+            }
+        }
+
+        // Split vertically — new window (left) gets the "before" buffer
+        self.split_window(SplitDirection::Vertical, None);
+        let left_win = self.active_window_id();
+        self.active_window_mut().buffer_id = left_buf_id;
+
+        // Focus the right (after) window
+        self.active_tab_mut().active_window = right_win;
+
+        // Bind scroll and compute diff
+        self.scroll_bind_pairs.push((left_win, right_win));
+        self.diff_window_pair = Some((left_win, right_win));
+        self.compute_diff();
+        self.diff_unchanged_hidden = true;
+        self.diff_apply_folds();
+        self.diff_jump_to_first_change(left_win, right_win);
+        self.message = format!("Diff: {} @ {}", rel_path, short);
     }
 
     /// Jump to the next changed region below the cursor.
@@ -16722,6 +16812,10 @@ impl Engine {
                     }
                     self.ext_panels.insert(name.clone(), panel.clone());
                 }
+                for (panel_name, bindings) in &mgr.help_bindings {
+                    self.ext_panel_help_bindings
+                        .insert(panel_name.clone(), bindings.clone());
+                }
                 self.plugin_manager = Some(mgr);
                 // Load per-extension settings for installed extensions
                 let installed_names: Vec<String> = self
@@ -16952,6 +17046,11 @@ impl Engine {
         }
         // Apply register writes
         for (ch, content, linewise) in ctx.set_registers {
+            if ch == '+' || ch == '*' {
+                if let Some(ref cb) = self.clipboard_write {
+                    let _ = cb(&content);
+                }
+            }
             self.registers.insert(ch, (content, linewise));
         }
         // Apply line insertions (process in reverse to keep indices stable)
@@ -17134,6 +17233,10 @@ impl Engine {
             self.panel_hover_registry
                 .insert((panel_name, item_id), markdown);
         }
+        // Register panel help bindings from plugin callbacks
+        for (panel, bindings) in ctx.panel_help_entries {
+            self.ext_panel_help_bindings.insert(panel, bindings);
+        }
         // Apply panel input field text values from plugin callbacks
         for (panel_name, text) in ctx.panel_input_values {
             self.ext_panel_input_text.insert(panel_name, text);
@@ -17141,6 +17244,28 @@ impl Engine {
         // Register editor hover content from plugin callbacks
         for (line, markdown) in ctx.editor_hover_entries {
             self.editor_hover_content.insert(line, markdown);
+        }
+        // Handle panel reveal request: switch to panel, fire panel_focus, highlight item
+        if let Some((panel_name, section_name, item_id)) = ctx.panel_reveal_request {
+            self.ext_panel_active = Some(panel_name.clone());
+            self.ext_panel_has_focus = true;
+            // Clear tree expanded state so all nodes start collapsed — this ensures
+            // the flat index calculation matches the freshly populated items.
+            self.ext_panel_tree_expanded
+                .retain(|(p, _), _| p != &panel_name);
+            // Fire panel_focus event so the plugin populates items
+            self.plugin_event("panel_focus", &panel_name);
+            // Now find and reveal the item
+            self.ext_panel_reveal_item(&panel_name, &section_name, &item_id);
+            // Signal backends to switch the sidebar to this panel
+            self.ext_panel_focus_pending = Some(panel_name);
+        }
+        // Handle commit file diff request: open side-by-side diff
+        if let Some((hash, path)) = ctx.commit_file_diff {
+            self.open_commit_file_diff(&hash, &path);
+        }
+        for url in ctx.open_urls {
+            self.open_url(&url);
         }
     }
 
@@ -26309,6 +26434,78 @@ impl Engine {
         None
     }
 
+    /// Find the flat index of an item by its ID within a specific section.
+    /// Returns `None` if the panel, section, or item is not found.
+    pub fn ext_panel_find_flat_index(
+        &self,
+        panel_name: &str,
+        section_name: &str,
+        item_id: &str,
+    ) -> Option<usize> {
+        let reg = self.ext_panels.get(panel_name)?;
+        let expanded = self.ext_panel_sections_expanded.get(panel_name);
+        let mut pos = 0;
+        for (si, section) in reg.sections.iter().enumerate() {
+            pos += 1; // section header
+            let is_expanded = expanded.and_then(|v| v.get(si)).copied().unwrap_or(true);
+            if is_expanded {
+                let key = (panel_name.to_string(), section.clone());
+                if let Some(items) = self.ext_panel_items.get(&key) {
+                    let visible = self.ext_panel_visible_indices(panel_name, items);
+                    if section == section_name {
+                        for &vi in &visible {
+                            if items[vi].id == item_id
+                                || items[vi].id.starts_with(item_id)
+                                || item_id.starts_with(&items[vi].id)
+                            {
+                                return Some(pos + visible.iter().position(|&x| x == vi).unwrap());
+                            }
+                        }
+                    }
+                    pos += visible.len();
+                }
+            } else if section == section_name {
+                // Section is collapsed — can't find the item
+                return None;
+            }
+        }
+        None
+    }
+
+    /// Programmatically reveal an item in an extension panel: expand its section,
+    /// set the selection to point at it, and adjust scroll.
+    pub fn ext_panel_reveal_item(&mut self, panel_name: &str, section_name: &str, item_id: &str) {
+        // Ensure the target section is expanded
+        if let Some(reg) = self.ext_panels.get(panel_name) {
+            if let Some(si) = reg.sections.iter().position(|s| s == section_name) {
+                let expanded = self
+                    .ext_panel_sections_expanded
+                    .entry(panel_name.to_string())
+                    .or_insert_with(|| vec![true; reg.sections.len()]);
+                if let Some(v) = expanded.get_mut(si) {
+                    *v = true;
+                }
+            }
+        }
+        // Find the flat index and set selection
+        if let Some(flat_idx) = self.ext_panel_find_flat_index(panel_name, section_name, item_id) {
+            self.ext_panel_selected = flat_idx;
+            // Center the item in the viewport
+            self.ext_panel_scroll_top = flat_idx.saturating_sub(5);
+        }
+    }
+
+    /// Ensure the selected ext panel item is visible by adjusting scroll.
+    /// `visible_rows` is the approximate number of rows visible in the panel viewport.
+    fn ext_panel_ensure_visible(&mut self, visible_rows: usize) {
+        let rows = if visible_rows == 0 { 20 } else { visible_rows };
+        if self.ext_panel_selected < self.ext_panel_scroll_top {
+            self.ext_panel_scroll_top = self.ext_panel_selected;
+        } else if self.ext_panel_selected >= self.ext_panel_scroll_top + rows {
+            self.ext_panel_scroll_top = self.ext_panel_selected.saturating_sub(rows - 1);
+        }
+    }
+
     /// Handle keyboard input for an extension panel.
     /// Returns `true` if the key was consumed.
     pub fn handle_ext_panel_key(&mut self, key: &str, _ctrl: bool, _unicode: Option<char>) -> bool {
@@ -26320,6 +26517,12 @@ impl Engine {
             }
         };
 
+        // Any key closes help popup
+        if self.ext_panel_help_open {
+            self.ext_panel_help_open = false;
+            return true;
+        }
+
         match key {
             "q" | "Escape" => {
                 self.ext_panel_has_focus = false;
@@ -26329,20 +26532,24 @@ impl Engine {
                 if max > 0 && self.ext_panel_selected + 1 < max {
                     self.ext_panel_selected += 1;
                 }
+                self.ext_panel_ensure_visible(0);
             }
             "k" | "Up" => {
                 if self.ext_panel_selected > 0 {
                     self.ext_panel_selected -= 1;
                 }
+                self.ext_panel_ensure_visible(0);
             }
             "g" => {
                 self.ext_panel_selected = 0;
+                self.ext_panel_scroll_top = 0;
             }
             "G" => {
                 let max = self.ext_panel_flat_len();
                 if max > 0 {
                     self.ext_panel_selected = max - 1;
                 }
+                self.ext_panel_ensure_visible(0);
             }
             "/" => {
                 // Activate the input field for filtering/searching within the panel.
@@ -26413,27 +26620,89 @@ impl Engine {
                 }
             }
             "Return" => {
-                // Fire panel_select event
                 if let Some((si, item_idx)) =
                     self.ext_panel_flat_to_section(self.ext_panel_selected)
                 {
-                    if item_idx != usize::MAX {
+                    if item_idx == usize::MAX {
+                        // Section header: toggle section expand
+                        let expanded = self
+                            .ext_panel_sections_expanded
+                            .entry(panel_name.clone())
+                            .or_default();
+                        while expanded.len() <= si {
+                            expanded.push(true);
+                        }
+                        expanded[si] = !expanded[si];
+                    } else {
+                        // Check if item is expandable — if so, toggle expand
                         let reg = self.ext_panels.get(&panel_name).cloned();
-                        if let Some(reg) = reg {
+                        let mut toggled = false;
+                        if let Some(ref reg) = reg {
                             if let Some(section) = reg.sections.get(si) {
                                 let key = (panel_name.clone(), section.clone());
-                                let id = self
+                                let is_expandable = self
                                     .ext_panel_items
                                     .get(&key)
                                     .and_then(|items| items.get(item_idx))
-                                    .map(|item| item.id.clone())
-                                    .unwrap_or_default();
-                                let arg =
-                                    format!("{}|{}|{}||{}", panel_name, section, id, item_idx);
-                                self.plugin_event("panel_select", &arg);
+                                    .map(|item| item.expandable)
+                                    .unwrap_or(false);
+                                if is_expandable {
+                                    let item_id = self
+                                        .ext_panel_items
+                                        .get(&key)
+                                        .and_then(|items| items.get(item_idx))
+                                        .map(|item| item.id.clone())
+                                        .unwrap_or_default();
+                                    let default_expanded = self
+                                        .ext_panel_items
+                                        .get(&key)
+                                        .and_then(|items| items.get(item_idx))
+                                        .map(|item| item.expanded)
+                                        .unwrap_or(false);
+                                    let tree_key = (panel_name.clone(), item_id.clone());
+                                    let currently = self
+                                        .ext_panel_tree_expanded
+                                        .get(&tree_key)
+                                        .copied()
+                                        .unwrap_or(default_expanded);
+                                    self.ext_panel_tree_expanded.insert(tree_key, !currently);
+                                    let event = if currently {
+                                        "panel_collapse"
+                                    } else {
+                                        "panel_expand"
+                                    };
+                                    let arg = format!(
+                                        "{}|{}|{}||{}",
+                                        panel_name, section, item_id, self.ext_panel_selected
+                                    );
+                                    self.plugin_event(event, &arg);
+                                    toggled = true;
+                                }
+                            }
+                        }
+                        // If not expandable, fire panel_select
+                        if !toggled {
+                            if let Some(reg) = reg {
+                                if let Some(section) = reg.sections.get(si) {
+                                    let key = (panel_name.clone(), section.clone());
+                                    let id = self
+                                        .ext_panel_items
+                                        .get(&key)
+                                        .and_then(|items| items.get(item_idx))
+                                        .map(|item| item.id.clone())
+                                        .unwrap_or_default();
+                                    let arg =
+                                        format!("{}|{}|{}||{}", panel_name, section, id, item_idx);
+                                    self.plugin_event("panel_select", &arg);
+                                }
                             }
                         }
                     }
+                }
+            }
+            "?" => {
+                if self.ext_panel_help_bindings.contains_key(&panel_name) {
+                    self.ext_panel_help_open = true;
                 }
             }
             other => {
@@ -26632,27 +26901,7 @@ impl Engine {
         markdown: &str,
     ) {
         let rendered = crate::core::markdown::render_markdown(markdown);
-        // Extract clickable link URLs from LinkUrl spans (only safe schemes).
-        let mut links = Vec::new();
-        for (line_idx, line_spans) in rendered.spans.iter().enumerate() {
-            for span in line_spans {
-                if span.style == crate::core::markdown::MdStyle::LinkUrl {
-                    if let Some(line) = rendered.lines.get(line_idx) {
-                        if span.end_byte <= line.len() {
-                            let url_text = &line[span.start_byte..span.end_byte];
-                            if is_safe_url(url_text) {
-                                links.push((
-                                    line_idx,
-                                    span.start_byte,
-                                    span.end_byte,
-                                    url_text.to_string(),
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        let links = Self::extract_hover_links(&rendered);
         self.panel_hover = Some(PanelHoverPopup {
             rendered,
             links,
@@ -27140,26 +27389,7 @@ impl Engine {
         add_goto_links: bool,
     ) {
         let mut rendered = crate::core::markdown::render_markdown(markdown);
-        let mut links = Vec::new();
-        for (line_idx, line_spans) in rendered.spans.iter().enumerate() {
-            for span in line_spans {
-                if span.style == crate::core::markdown::MdStyle::LinkUrl {
-                    if let Some(line) = rendered.lines.get(line_idx) {
-                        if span.end_byte <= line.len() {
-                            let url_text = &line[span.start_byte..span.end_byte];
-                            if is_safe_url(url_text) {
-                                links.push((
-                                    line_idx,
-                                    span.start_byte,
-                                    span.end_byte,
-                                    url_text.to_string(),
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        let mut links = Self::extract_hover_links(&rendered);
 
         // Append "Go to" navigation links after actual LSP content (vim mode only).
         if add_goto_links && !self.is_vscode_mode() {
@@ -30129,6 +30359,54 @@ impl Engine {
         result
     }
 
+    /// Extract clickable links from rendered markdown.
+    ///
+    /// Pairs each `Link` span (the label text) with the following `LinkUrl` span
+    /// (the URL) on the same line. The returned click region covers the label,
+    /// while the URL is used for dispatch. Command URIs displayed as `:Name?args`
+    /// are restored to `command:Name?args`.
+    fn extract_hover_links(
+        rendered: &crate::core::markdown::MdRendered,
+    ) -> Vec<(usize, usize, usize, String)> {
+        use crate::core::markdown::MdStyle;
+        let mut links = Vec::new();
+        for (line_idx, line_spans) in rendered.spans.iter().enumerate() {
+            let Some(line) = rendered.lines.get(line_idx) else {
+                continue;
+            };
+            // Find each Link span and pair it with the next LinkUrl on the same line.
+            let mut span_iter = line_spans.iter().peekable();
+            while let Some(span) = span_iter.next() {
+                if span.style == MdStyle::Link {
+                    // Look for the following LinkUrl span to get the URL.
+                    let url = span_iter
+                        .peek()
+                        .filter(|next| next.style == MdStyle::LinkUrl)
+                        .and_then(|next| {
+                            if next.end_byte <= line.len() {
+                                Some(&line[next.start_byte..next.end_byte])
+                            } else {
+                                None
+                            }
+                        });
+                    if let Some(url_text) = url {
+                        // Command URIs display as ":Name?args" — restore prefix.
+                        let url = if url_text.starts_with(':') {
+                            format!("command{}", url_text)
+                        } else {
+                            url_text.to_string()
+                        };
+                        if is_safe_url(&url) {
+                            // Click region = the Link label span.
+                            links.push((line_idx, span.start_byte, span.end_byte, url));
+                        }
+                    }
+                }
+            }
+        }
+        links
+    }
+
     /// Execute an LSP navigation command from a hover popup link.
     /// Moves the cursor to the given position before invoking the LSP request.
     pub fn execute_hover_goto(&mut self, command: &str) {
@@ -30149,8 +30427,50 @@ impl Engine {
             "command:type_definition" => self.lsp_request_type_definition(),
             "command:implementation" => self.lsp_request_implementation(),
             "command:references" => self.lsp_request_references(),
-            _ => {}
+            _ => {
+                // Try dispatching as a command URI to plugin commands.
+                self.execute_command_uri(command);
+            }
         }
+    }
+
+    /// Decode percent-encoded characters in a string (e.g. `%20` → space).
+    pub fn percent_decode(input: &str) -> String {
+        let mut result = String::with_capacity(input.len());
+        let bytes = input.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' && i + 2 < bytes.len() {
+                if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                    result.push((hi << 4 | lo) as char);
+                    i += 3;
+                    continue;
+                }
+            }
+            result.push(bytes[i] as char);
+            i += 1;
+        }
+        result
+    }
+
+    /// Execute a `command:Name` or `command:Name?args` URI.
+    /// Returns `true` if a matching command was found and executed.
+    pub fn execute_command_uri(&mut self, url: &str) -> bool {
+        let rest = match url.strip_prefix("command:") {
+            Some(r) => r,
+            None => return false,
+        };
+        if rest.is_empty() {
+            return false;
+        }
+        let (cmd_name, cmd_args) = match rest.split_once('?') {
+            Some((name, args)) => (name, Self::percent_decode(args)),
+            None => (rest, String::new()),
+        };
+        if cmd_name.is_empty() {
+            return false;
+        }
+        self.plugin_run_command(cmd_name, &cmd_args)
     }
 
     /// Request LSP hover at cursor position.
@@ -50167,5 +50487,53 @@ mod tests {
         assert!(e.panel_hover.as_ref().unwrap().is_native());
         e.show_panel_hover("my_ext_panel", "", 0, "# test");
         assert!(!e.panel_hover.as_ref().unwrap().is_native());
+    }
+
+    #[test]
+    fn test_percent_decode_basic() {
+        assert_eq!(Engine::percent_decode("hello"), "hello");
+        assert_eq!(Engine::percent_decode("hello%20world"), "hello world");
+        assert_eq!(Engine::percent_decode("%3F"), "?");
+        assert_eq!(Engine::percent_decode("%2F"), "/");
+        assert_eq!(Engine::percent_decode("a%2Fb%2Fc"), "a/b/c");
+    }
+
+    #[test]
+    fn test_percent_decode_edge_cases() {
+        // Incomplete percent encoding left as-is
+        assert_eq!(Engine::percent_decode("abc%2"), "abc%2");
+        assert_eq!(Engine::percent_decode("abc%"), "abc%");
+        // Invalid hex digits left as-is
+        assert_eq!(Engine::percent_decode("%GG"), "%GG");
+        // Empty string
+        assert_eq!(Engine::percent_decode(""), "");
+        // Mixed valid and plain text
+        assert_eq!(
+            Engine::percent_decode("key%3Dvalue%26other"),
+            "key=value&other"
+        );
+    }
+
+    #[test]
+    fn test_execute_command_uri_no_prefix() {
+        let mut e = engine_with_text("hello\n");
+        assert!(!e.execute_command_uri("https://example.com"));
+        assert!(!e.execute_command_uri(""));
+        assert!(!e.execute_command_uri("notcommand:foo"));
+    }
+
+    #[test]
+    fn test_execute_command_uri_empty_name() {
+        let mut e = engine_with_text("hello\n");
+        assert!(!e.execute_command_uri("command:"));
+        assert!(!e.execute_command_uri("command:?args"));
+    }
+
+    #[test]
+    fn test_execute_command_uri_unknown_command() {
+        let mut e = engine_with_text("hello\n");
+        // Unknown plugin commands return false, no panic.
+        assert!(!e.execute_command_uri("command:NonExistent"));
+        assert!(!e.execute_command_uri("command:NonExistent?arg1"));
     }
 }

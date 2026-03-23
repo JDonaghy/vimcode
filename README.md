@@ -35,7 +35,7 @@ For detailed how-to guides and configuration references, see the **[VimCode Wiki
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 4626 tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 4654 tests, zero async runtime dependency
 
 > **Note:** VimCode does not implement VimScript. Extension and scripting is handled via
 > the built-in Lua 5.4 plugin system. The goal is full Vim *keybinding* and *editing*
@@ -475,6 +475,7 @@ For full details on adapters, launch.json, conditional breakpoints, and the debu
 | `:Gswitch <branch>` | `:Gsw` | Switch to an existing branch |
 | `:Gbranch <name>` | | Create a new branch and switch to it |
 | `:Ghs` | `:Ghunk` | Stage hunk under cursor (in a `:Gdiff` buffer) |
+| `:Gshow <hash>` | | Show commit in Git Log panel (navigates and expands) |
 
 **Hunk staging workflow**
 1. `:Gdiff` — open diff in a vertical split
@@ -532,6 +533,25 @@ Click the git branch icon in the activity bar to open the Source Control panel �
 
 ---
 
+### Git Log Panel
+
+The Git Log panel (provided by the `git-insights` extension) shows branches, commit history, and stashes in a dedicated sidebar panel. Commits are expandable tree nodes — expanding a commit reveals the files it changed.
+
+**Commit interaction:**
+- `Tab` — expand/collapse commit to show changed files
+- `o` — open side-by-side diff for the selected file (within an expanded commit)
+- `y` — copy commit hash (on a commit) or file path (on a file)
+- `b` — open commit in browser (GitHub/GitLab)
+- `r` — refresh the log
+- `d` — pop stash (on a stash entry)
+- `p` — push stash
+- `/` — activate search/filter input field
+- `K` / `Enter` — show hover popup with commit details (author, date, message, stat)
+
+**Blame-to-panel navigation:** The `:Gshow <hash>` command navigates to the Git Log panel and expands the specified commit, replacing the old scratch-buffer behavior. This is also triggered by "Open Commit" links in blame hover popups.
+
+---
+
 ### Workspaces
 
 A `.vimcode-workspace` file at the project root captures per-project settings and enables session restoration. Workspace settings overlay your global `settings.json`. Sessions (open files, cursor positions) are stored per-directory and restored automatically.
@@ -556,6 +576,8 @@ vimcode.on("save", function(path)
   vimcode.message("Saved: " .. path)
 end)
 ```
+
+**Command URIs** — Hover popup markdown supports `[label](command:Name?args)` links that dispatch to plugin commands registered with `vimcode.command()`. Arguments are percent-decoded automatically.
 
 **Commands:** `:Plugin list` | `:Plugin reload` | `:Plugin enable <name>` | `:Plugin disable <name>`
 
@@ -969,6 +991,7 @@ All ex commands support Vim-style abbreviations (e.g., `:j` for `:join`, `:y` fo
 | `:Gswitch <branch>` / `:Gsw` | Switch to existing branch |
 | `:Gbranch <name>` | Create new branch and switch to it |
 | `:Ghs` / `:Ghunk` | Stage hunk under cursor |
+| `:Gshow <hash>` | Show commit in Git Log panel (navigates and expands) |
 | `:DiffPeek` | Open diff hunk peek popup at cursor (revert/stage) |
 | `:GWorktreeAdd <branch> <path>` | Add git worktree |
 | `:GWorktreeRemove <path>` | Remove git worktree |
@@ -1046,14 +1069,14 @@ All ex commands support Vim-style abbreviations (e.g., `:j` for `:join`, `:y` fo
 
 ```
 src/
-├── main.rs         (~13,000 lines)  GTK4/Relm4 UI, rendering, sidebar resize, fuzzy popup, context menu, drag-and-drop
-├── tui_main.rs     (~11,711 lines)  ratatui/crossterm TUI backend, fuzzy popup, rename/move prompts
-├── render.rs        (~5,616 lines)  Platform-agnostic ScreenLayout bridge (DebugSidebarData, SourceControlData, ExtPanelData, BottomPanelTabs)
+├── main.rs         (~16,339 lines)  GTK4/Relm4 UI, rendering, sidebar resize, fuzzy popup, context menu, drag-and-drop
+├── tui_main.rs     (~13,793 lines)  ratatui/crossterm TUI backend, fuzzy popup, rename/move prompts
+├── render.rs        (~5,877 lines)  Platform-agnostic ScreenLayout bridge (DebugSidebarData, SourceControlData, ExtPanelData, BottomPanelTabs)
 ├── icons.rs            (~30 lines)  Nerd Font file-type icons (GTK + TUI)
-└── core/            (~63,448 lines)  Zero GTK/rendering deps — fully testable
-    ├── engine.rs    (~44,021 lines)  Orchestrator: keys, commands, git, macros, LSP, DAP, plugins, workspaces
-    ├── markdown.rs     (~497 lines)  Markdown → styled plain text converter (pulldown-cmark)
-    ├── plugin.rs     (~1,534 lines)  Lua 5.4 plugin manager (mlua vendored; vimcode.* API; async_shell; panel API)
+└── core/            (~70,878 lines)  Zero GTK/rendering deps — fully testable
+    ├── engine.rs    (~50,539 lines)  Orchestrator: keys, commands, git, macros, LSP, DAP, plugins, workspaces
+    ├── markdown.rs     (~705 lines)  Markdown → styled plain text converter (pulldown-cmark)
+    ├── plugin.rs     (~1,915 lines)  Lua 5.4 plugin manager (mlua vendored; vimcode.* API; async_shell; panel API)
     ├── terminal.rs     (~320 lines)  PTY-backed terminal pane (portable-pty + vt100, history ring buffer)
     ├── lsp.rs        (~2,329 lines)  LSP protocol transport + single-server client (request ID tracking, JSON-RPC framing, semantic tokens)
     ├── lsp_manager.rs  (~868 lines)  Multi-server coordinator with initialization guards + built-in registry + semantic legends
@@ -1061,11 +1084,11 @@ src/
     ├── dap_manager.rs (~1,423 lines)  DAP multi-adapter coordinator + launch.json + tasks.json support + install scripts
     ├── ai.rs               (~336 lines)  AI provider integration (Anthropic/OpenAI/Ollama via curl subprocess)
     ├── project_search.rs (~630 lines)  Regex/case/whole-word search + replace (ignore + regex crates)
-    ├── buffer_manager.rs (~803 lines)  Buffer lifecycle, undo/redo stacks, semantic tokens
+    ├── buffer_manager.rs (~908 lines)  Buffer lifecycle, undo/redo stacks, semantic tokens
     ├── buffer.rs       (~120 lines)  Rope-based text storage (ropey)
     ├── settings.rs   (~2,131 lines)  JSON config, :set parsing, key binding notation, SETTING_DEFS
     ├── session.rs      (~235 lines)  Session state persistence + per-workspace paths
-    ├── git.rs        (~1,821 lines)  Git subprocesses: diff, blame, stage_hunk, SC panel, worktrees, git log, branches
+    ├── git.rs        (~2,538 lines)  Git subprocesses: diff, blame, stage_hunk, SC panel, worktrees, git log, branches, commit details
     ├── spell.rs        (~375 lines)  Spell checker (spellbook/Hunspell; tree-sitter-aware; LaTeX-aware; user dictionary)
     ├── syntax.rs     (~1,380 lines)  Tree-sitter highlighting for 20 languages (incl. LaTeX via vendored grammar)
     └── window.rs, tab.rs, view.rs, cursor.rs, mode.rs (~700 lines)

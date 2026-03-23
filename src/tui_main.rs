@@ -1340,6 +1340,13 @@ fn event_loop(
             if engine.poll_async_shells() {
                 needs_redraw = true;
             }
+            // Check for panel reveal request from plugins.
+            if let Some(panel_name) = engine.ext_panel_focus_pending.take() {
+                sidebar.ext_panel_name = Some(panel_name);
+                sidebar.visible = true;
+                sidebar.has_focus = true;
+                needs_redraw = true;
+            }
             // Poll panel hover dwell timer (shows popup after brief mouse hover).
             if engine.poll_panel_hover() {
                 needs_redraw = true;
@@ -2180,6 +2187,27 @@ fn event_loop(
                                 .position(|n| Some(n) == sidebar.ext_panel_name.as_ref())
                                 .unwrap_or(0);
                             sidebar.toolbar_selected = 8 + idx as u16;
+                            needs_redraw = true;
+                            continue;
+                        }
+                        // When the input field is active, pass characters as
+                        // input text instead of navigation commands.
+                        if engine.ext_panel_input_active {
+                            let (ikey, ich): (&str, Option<char>) = match key_event.code {
+                                KeyCode::Esc => ("Escape", None),
+                                KeyCode::Enter => ("Return", None),
+                                KeyCode::Backspace => ("BackSpace", None),
+                                KeyCode::Char(ch) => ("char", Some(ch)),
+                                _ => ("", None),
+                            };
+                            if !ikey.is_empty() {
+                                let name = if ikey == "char" {
+                                    ich.map(|c| c.to_string()).unwrap_or_default()
+                                } else {
+                                    ikey.to_string()
+                                };
+                                engine.handle_ext_panel_input_key(&name, ctrl, ich);
+                            }
                             needs_redraw = true;
                             continue;
                         }
@@ -3788,7 +3816,11 @@ fn handle_mouse(
         if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
             for &(lx, ly, lw, _lh, ref url) in hover_link_rects {
                 if row == ly && col >= lx && col < lx + lw {
-                    tui_copy_to_clipboard(url, engine);
+                    if url.starts_with("command:") {
+                        engine.execute_command_uri(url);
+                    } else {
+                        tui_copy_to_clipboard(url, engine);
+                    }
                     engine.dismiss_panel_hover_now();
                     return sidebar_width;
                 }
@@ -3952,6 +3984,37 @@ fn handle_mouse(
                         new_scroll.min(drag.total.saturating_sub(drag.track_len as usize));
                 }
                 return sidebar_width;
+            }
+            // Extension panel scrollbar drag — stateless, recomputes on each drag event
+            if sidebar.visible
+                && sidebar.ext_panel_name.is_some()
+                && col >= ab_width
+                && col < ab_width + sidebar_width
+            {
+                let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
+                let sb_col = ab_width + sidebar_width - 1;
+                let input_rows: u16 = if engine.ext_panel_input_active
+                    || engine
+                        .ext_panel_active
+                        .as_ref()
+                        .and_then(|n| engine.ext_panel_input_text.get(n))
+                        .map(|t| !t.is_empty())
+                        .unwrap_or(false)
+                {
+                    1
+                } else {
+                    0
+                };
+                let content_start = 1 + input_rows + menu_rows;
+                let flat_len = engine.ext_panel_flat_len();
+                let content_h = term_height.saturating_sub(2 + content_start) as usize;
+                if col == sb_col && flat_len > content_h && row >= content_start {
+                    let rel_row = (row - content_start) as usize;
+                    let ratio = rel_row as f64 / content_h as f64;
+                    let new_top = (ratio * flat_len as f64) as usize;
+                    engine.ext_panel_scroll_top = new_top.min(flat_len.saturating_sub(1));
+                    return sidebar_width;
+                }
             }
             // Settings panel scrollbar drag
             if let Some(ref drag) = *dragging_settings_sb {
@@ -4181,7 +4244,16 @@ fn handle_mouse(
             }
             // Sidebar scroll wheel
             if sidebar.visible && col >= ab_width && col < ab_width + sidebar_width {
-                if sidebar.active_panel == TuiPanel::Explorer {
+                if sidebar.ext_panel_name.is_some() {
+                    // Extension-provided panel (e.g. Git Log): scroll viewport
+                    let flat_len = engine.ext_panel_flat_len();
+                    if matches!(ev.kind, MouseEventKind::ScrollUp) {
+                        engine.ext_panel_scroll_top = engine.ext_panel_scroll_top.saturating_sub(3);
+                    } else {
+                        engine.ext_panel_scroll_top =
+                            (engine.ext_panel_scroll_top + 3).min(flat_len.saturating_sub(1));
+                    }
+                } else if sidebar.active_panel == TuiPanel::Explorer {
                     let tree_height = term_height.saturating_sub(3) as usize;
                     let total = sidebar.rows.len();
                     if total > tree_height {
@@ -5054,7 +5126,73 @@ fn handle_mouse(
         let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
         let sidebar_row = row.saturating_sub(menu_rows);
 
-        if sidebar.active_panel == TuiPanel::Explorer {
+        // Extension panel must be checked FIRST — ext_panel_name overrides active_panel
+        if sidebar.ext_panel_name.is_some() {
+            sidebar.has_focus = true;
+            engine.ext_panel_has_focus = true;
+
+            // Account for the search input row when it's visible
+            let input_rows: u16 = if engine.ext_panel_input_active
+                || engine
+                    .ext_panel_active
+                    .as_ref()
+                    .and_then(|n| engine.ext_panel_input_text.get(n))
+                    .map(|t| !t.is_empty())
+                    .unwrap_or(false)
+            {
+                1
+            } else {
+                0
+            };
+            let content_start = 1 + input_rows; // header + optional input
+
+            // Right-click fires panel_context_menu event.
+            if ev.kind == MouseEventKind::Down(MouseButton::Right) {
+                if sidebar_row >= content_start {
+                    let flat_idx =
+                        engine.ext_panel_scroll_top + (sidebar_row - content_start) as usize;
+                    let flat_len = engine.ext_panel_flat_len();
+                    if flat_idx < flat_len {
+                        engine.ext_panel_selected = flat_idx;
+                    }
+                }
+                engine.open_ext_panel_context_menu(col, row);
+                return sidebar_width;
+            }
+
+            // Scrollbar click/drag → jump-scroll
+            let flat_len = engine.ext_panel_flat_len();
+            let content_h = term_height.saturating_sub(2 + menu_rows + content_start) as usize;
+            if col == sb_col && flat_len > content_h && sidebar_row >= content_start {
+                let rel_row = (sidebar_row - content_start) as usize;
+                let ratio = rel_row as f64 / content_h as f64;
+                let new_top = (ratio * flat_len as f64) as usize;
+                engine.ext_panel_scroll_top = new_top.min(flat_len.saturating_sub(1));
+                return sidebar_width;
+            }
+
+            if sidebar_row == 0 {
+                // Header — no-op
+            } else if sidebar_row >= content_start {
+                // Map sidebar_row to flat index
+                let flat_idx = engine.ext_panel_scroll_top + (sidebar_row - content_start) as usize;
+                if flat_idx < flat_len {
+                    engine.ext_panel_selected = flat_idx;
+                    // Check for double-click
+                    let now = Instant::now();
+                    let is_double = now.duration_since(*last_click_time)
+                        < Duration::from_millis(400)
+                        && *last_click_pos == (col, row);
+                    *last_click_time = now;
+                    *last_click_pos = (col, row);
+                    if is_double {
+                        engine.handle_ext_panel_double_click();
+                    }
+                    // Single-click toggles sections/expandable items
+                    engine.handle_ext_panel_key("Return", false, None);
+                }
+            }
+        } else if sidebar.active_panel == TuiPanel::Explorer {
             // tree_height = (total height - 2 status rows) - 1 header row
             let tree_height = term_height.saturating_sub(3) as usize;
             let total_rows = sidebar.rows.len();
@@ -5452,45 +5590,6 @@ fn handle_mouse(
                     *last_click_pos = (col, row);
                     if is_double {
                         engine.handle_settings_key("Return", false, None);
-                    }
-                }
-            }
-        // Extension panel (plugin-provided) click handling
-        } else if sidebar.ext_panel_name.is_some() {
-            sidebar.has_focus = true;
-            engine.ext_panel_has_focus = true;
-
-            // Right-click fires panel_context_menu event.
-            if ev.kind == MouseEventKind::Down(MouseButton::Right) {
-                if sidebar_row >= 1 {
-                    let flat_idx = engine.ext_panel_scroll_top + (sidebar_row - 1) as usize;
-                    let flat_len = engine.ext_panel_flat_len();
-                    if flat_idx < flat_len {
-                        engine.ext_panel_selected = flat_idx;
-                    }
-                }
-                engine.open_ext_panel_context_menu(col, row);
-                return sidebar_width;
-            }
-
-            if sidebar_row == 0 {
-                // Header — no-op
-            } else if sidebar_row >= 1 {
-                // Map sidebar_row to flat index (row 1 = flat 0 + scroll_top)
-                let flat_idx = engine.ext_panel_scroll_top + (sidebar_row - 1) as usize;
-                let flat_len = engine.ext_panel_flat_len();
-                if flat_idx < flat_len {
-                    engine.ext_panel_selected = flat_idx;
-                    // Check for double-click → fire panel_double_click + trigger Enter
-                    let now = Instant::now();
-                    let is_double = now.duration_since(*last_click_time)
-                        < Duration::from_millis(400)
-                        && *last_click_pos == (col, row);
-                    *last_click_time = now;
-                    *last_click_pos = (col, row);
-                    if is_double {
-                        engine.handle_ext_panel_double_click();
-                        engine.handle_ext_panel_key("Return", false, None);
                     }
                 }
             }
@@ -11925,8 +12024,47 @@ fn render_ext_panel(buf: &mut ratatui::buffer::Buffer, area: Rect, engine: &Engi
         return;
     }
 
+    // Row 1: search input field (when active or has text)
+    let input_row_count = if panel.input_active || !panel.input_text.is_empty() {
+        1
+    } else {
+        0
+    };
+    if input_row_count > 0 {
+        let iy = area.y + 1;
+        let search_bg = rc(theme.tab_bar_bg);
+        let search_fg = if panel.input_active {
+            rc(theme.foreground)
+        } else {
+            dim_fg
+        };
+        for x in area.x..area.x + area.width {
+            set_cell(buf, x, iy, ' ', search_fg, search_bg);
+        }
+        let prefix = " / ";
+        for (i, ch) in prefix.chars().enumerate() {
+            let x = area.x + i as u16;
+            if x < area.x + area.width {
+                set_cell(buf, x, iy, ch, dim_fg, search_bg);
+            }
+        }
+        let text_start = area.x + prefix.len() as u16;
+        for (i, ch) in panel.input_text.chars().enumerate() {
+            let x = text_start + i as u16;
+            if x < area.x + area.width {
+                set_cell(buf, x, iy, ch, search_fg, search_bg);
+            }
+        }
+        if panel.input_active {
+            let cursor_x = text_start + panel.input_text.chars().count() as u16;
+            if cursor_x < area.x + area.width {
+                set_cell(buf, cursor_x, iy, '▏', rc(theme.cursor), search_bg);
+            }
+        }
+    }
+
     // Build flat list of rows
-    let content_area_height = (area.height - 1) as usize;
+    let content_area_height = (area.height - 1 - input_row_count as u16) as usize;
     let mut flat_rows: Vec<(String, String, bool, bool)> = Vec::new(); // (text, hint, is_header, is_selected)
     let mut flat_idx = 0usize;
     for section in &panel.sections {
@@ -12005,7 +12143,7 @@ fn render_ext_panel(buf: &mut ratatui::buffer::Buffer, area: Rect, engine: &Engi
     for (ri, (text, hint_raw, is_header, is_sel)) in
         visible_rows.iter().enumerate().take(content_area_height)
     {
-        let y = area.y + 1 + ri as u16;
+        let y = area.y + 1 + input_row_count as u16 + ri as u16;
         let bg = if *is_sel && panel.has_focus {
             sel_bg
         } else {
@@ -12026,9 +12164,6 @@ fn render_ext_panel(buf: &mut ratatui::buffer::Buffer, area: Rect, engine: &Engi
         }
 
         let w = area.width as usize;
-        for (i, ch) in text.chars().enumerate().take(w) {
-            set_cell(buf, area.x + i as u16, y, ch, fg, bg);
-        }
 
         // Right-aligned hint (skip the style marker char and pipe)
         let hint = if hint_raw.len() > 2 {
@@ -12036,8 +12171,27 @@ fn render_ext_panel(buf: &mut ratatui::buffer::Buffer, area: Rect, engine: &Engi
         } else {
             ""
         };
+        let hint_len = hint.chars().count();
+
+        // Truncate text before the hint area, adding "…" if clipped
+        let text_max = if !hint.is_empty() {
+            w.saturating_sub(hint_len + 2) // 1 space gap + 1 for safety
+        } else {
+            w
+        };
+        let text_char_count = text.chars().count();
+        if text_char_count > text_max && text_max > 1 {
+            for (i, ch) in text.chars().take(text_max - 1).enumerate() {
+                set_cell(buf, area.x + i as u16, y, ch, fg, bg);
+            }
+            set_cell(buf, area.x + (text_max - 1) as u16, y, '…', fg, bg);
+        } else {
+            for (i, ch) in text.chars().enumerate().take(text_max) {
+                set_cell(buf, area.x + i as u16, y, ch, fg, bg);
+            }
+        }
+
         if !hint.is_empty() {
-            let hint_len = hint.chars().count();
             let start = w.saturating_sub(hint_len + 1);
             for (i, ch) in hint.chars().enumerate() {
                 let x = area.x + (start + i) as u16;
@@ -12056,13 +12210,84 @@ fn render_ext_panel(buf: &mut ratatui::buffer::Buffer, area: Rect, engine: &Engi
         let thumb_h = (track_h * content_area_height / total).max(1);
         let thumb_top = scroll * track_h / total;
         for i in 0..track_h {
-            let y = area.y + 1 + i as u16;
+            let y = area.y + 1 + input_row_count as u16 + i as u16;
             let ch = if i >= thumb_top && i < thumb_top + thumb_h {
                 '█'
             } else {
                 '░'
             };
             set_cell(buf, sb_x, y, ch, dim_fg, row_bg);
+        }
+    }
+
+    // ── Help popup overlay ──────────────────────────────────────────────────
+    if panel.help_open && !panel.help_bindings.is_empty() {
+        let popup_bg = rc(theme.completion_bg);
+        let popup_fg = rc(theme.completion_fg);
+        let popup_border = rc(theme.completion_border);
+        let bindings = &panel.help_bindings;
+        let popup_w = area.width.saturating_sub(2).min(36);
+        let popup_h = (bindings.len() as u16 + 3).min(area.height.saturating_sub(2));
+        let popup_x = area.x + (area.width.saturating_sub(popup_w)) / 2;
+        let popup_y = area.y + (area.height.saturating_sub(popup_h)) / 2;
+        for y in popup_y..popup_y + popup_h {
+            for x in popup_x..popup_x + popup_w {
+                set_cell(buf, x, y, ' ', popup_fg, popup_bg);
+            }
+        }
+        set_cell(buf, popup_x, popup_y, '┌', popup_border, popup_bg);
+        set_cell(
+            buf,
+            popup_x + popup_w - 1,
+            popup_y,
+            '┐',
+            popup_border,
+            popup_bg,
+        );
+        for x in popup_x + 1..popup_x + popup_w - 1 {
+            set_cell(buf, x, popup_y, '─', popup_border, popup_bg);
+        }
+        let title = " Keybindings ";
+        let tx = popup_x + (popup_w.saturating_sub(title.len() as u16)) / 2;
+        for (i, ch) in title.chars().enumerate() {
+            let x = tx + i as u16;
+            if x > popup_x && x < popup_x + popup_w - 1 {
+                set_cell(buf, x, popup_y, ch, popup_border, popup_bg);
+            }
+        }
+        let close_x = popup_x + popup_w - 2;
+        if close_x > popup_x {
+            set_cell(buf, close_x, popup_y, 'x', popup_border, popup_bg);
+        }
+        let key_fg = rc(theme.function);
+        for (i, (key, desc)) in bindings.iter().enumerate() {
+            let y = popup_y + 1 + i as u16;
+            if y >= popup_y + popup_h - 1 {
+                break;
+            }
+            for (j, ch) in key.chars().enumerate() {
+                let x = popup_x + 2 + j as u16;
+                if x < popup_x + popup_w - 1 {
+                    set_cell(buf, x, y, ch, key_fg, popup_bg);
+                }
+            }
+            let desc_x = popup_x + 12;
+            for (j, ch) in desc.chars().enumerate() {
+                let x = desc_x + j as u16;
+                if x < popup_x + popup_w - 1 {
+                    set_cell(buf, x, y, ch, popup_fg, popup_bg);
+                }
+            }
+        }
+        let by = popup_y + popup_h - 1;
+        set_cell(buf, popup_x, by, '└', popup_border, popup_bg);
+        set_cell(buf, popup_x + popup_w - 1, by, '┘', popup_border, popup_bg);
+        for x in popup_x + 1..popup_x + popup_w - 1 {
+            set_cell(buf, x, by, '─', popup_border, popup_bg);
+        }
+        for y in popup_y + 1..popup_y + popup_h - 1 {
+            set_cell(buf, popup_x, y, '│', popup_border, popup_bg);
+            set_cell(buf, popup_x + popup_w - 1, y, '│', popup_border, popup_bg);
         }
     }
 }

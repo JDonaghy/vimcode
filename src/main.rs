@@ -240,6 +240,9 @@ struct App {
     /// Editor hover popup bounding rect (x, y, w, h) — set during draw, used for click hit-testing.
     #[allow(clippy::type_complexity)]
     editor_hover_popup_rect: Rc<Cell<Option<(f64, f64, f64, f64)>>>,
+    /// Link hit rects populated during editor hover popup draw: (x, y, w, h, url).
+    #[allow(clippy::type_complexity)]
+    editor_hover_link_rects: Rc<RefCell<Vec<(f64, f64, f64, f64, String)>>>,
     /// Cached line height shared with menu_dropdown_da draw/click closures.
     menu_dd_line_height: Rc<Cell<f64>>,
     /// CSS provider registered with the GTK display — updated when colorscheme changes.
@@ -493,6 +496,8 @@ enum Msg {
     ExtPanelRightClick(f64, f64),
     /// Mouse motion in an extension-provided panel DrawingArea (x, y).
     ExtPanelMouseMove(f64, f64),
+    /// Scroll in an extension-provided panel DrawingArea (dy).
+    ExtPanelScroll(f64),
     /// Click on the panel hover popup overlay (x, y in window coords).
     PanelHoverClick(f64, f64),
     /// Key press in the AI sidebar DrawingArea.
@@ -2098,6 +2103,9 @@ impl SimpleComponent for App {
         #[allow(clippy::type_complexity)]
         let editor_hover_popup_rect: Rc<Cell<Option<(f64, f64, f64, f64)>>> =
             Rc::new(Cell::new(None));
+        #[allow(clippy::type_complexity)]
+        let editor_hover_link_rects: Rc<RefCell<Vec<(f64, f64, f64, f64, String)>>> =
+            Rc::new(RefCell::new(Vec::new()));
         let menu_dd_lh: Rc<Cell<f64>> = Rc::new(Cell::new(24.0));
         let debug_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> =
             Rc::new(RefCell::new(None));
@@ -2244,6 +2252,7 @@ impl SimpleComponent for App {
             panel_hover_link_rects: panel_hover_link_rects.clone(),
             panel_hover_popup_rect: panel_hover_popup_rect.clone(),
             editor_hover_popup_rect: editor_hover_popup_rect.clone(),
+            editor_hover_link_rects: editor_hover_link_rects.clone(),
             menu_dd_line_height: menu_dd_lh.clone(),
             css_provider,
             last_colorscheme,
@@ -3010,6 +3019,58 @@ impl SimpleComponent for App {
                 sender_motion.send(Msg::ExtPanelMouseMove(x, y)).ok();
             });
             widgets.ext_dyn_panel_da.add_controller(motion);
+        }
+        {
+            let sender_scroll = sender.input_sender().clone();
+            let scroll_ctrl =
+                gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
+            scroll_ctrl.connect_scroll(move |_, _dx, dy| {
+                sender_scroll.send(Msg::ExtPanelScroll(dy)).ok();
+                gtk4::glib::Propagation::Stop
+            });
+            widgets.ext_dyn_panel_da.add_controller(scroll_ctrl);
+        }
+        // Scrollbar drag: when dragging on the scrollbar area, proportionally scroll.
+        {
+            let engine_drag = engine.clone();
+            let da_ref_drag = ext_dyn_panel_da_ref.clone();
+            let draw_needed = model.draw_needed.clone();
+            let gesture = gtk4::GestureDrag::new();
+            gesture.connect_drag_update(move |g, _dx, dy| {
+                let Some((start_x, start_y)) = g.start_point() else {
+                    return;
+                };
+                let da_w = if let Some(ref da) = *da_ref_drag.borrow() {
+                    da.width() as f64
+                } else {
+                    return;
+                };
+                // Only handle scrollbar drag (rightmost 8px)
+                if start_x < da_w - 8.0 {
+                    return;
+                }
+                let da_h = if let Some(ref da) = *da_ref_drag.borrow() {
+                    da.height() as f64
+                } else {
+                    return;
+                };
+                let y = start_y + dy;
+                let mut engine = engine_drag.borrow_mut();
+                let flat_len = engine.ext_panel_flat_len();
+                if flat_len == 0 || da_h <= 0.0 {
+                    return;
+                }
+                let ratio = (y / da_h).clamp(0.0, 1.0);
+                engine.ext_panel_scroll_top = (ratio * flat_len as f64) as usize;
+                engine.ext_panel_scroll_top =
+                    engine.ext_panel_scroll_top.min(flat_len.saturating_sub(1));
+                drop(engine);
+                if let Some(ref da) = *da_ref_drag.borrow() {
+                    da.queue_draw();
+                }
+                draw_needed.set(true);
+            });
+            widgets.ext_dyn_panel_da.add_controller(gesture);
         }
         *ext_dyn_panel_da_ref.borrow_mut() = Some(widgets.ext_dyn_panel_da.clone());
 
@@ -3858,6 +3919,7 @@ impl SimpleComponent for App {
         let split_btn_for_draw = split_btn_map_cell.clone();
         let dialog_btn_for_draw = model.dialog_btn_rects.clone();
         let editor_hover_rect_for_draw = model.editor_hover_popup_rect.clone();
+        let editor_hover_links_for_draw = model.editor_hover_link_rects.clone();
         widgets
             .drawing_area
             .set_draw_func(move |_, cr, width, height| {
@@ -3877,6 +3939,7 @@ impl SimpleComponent for App {
                     &split_btn_for_draw,
                     &dialog_btn_for_draw,
                     &editor_hover_rect_for_draw,
+                    &editor_hover_links_for_draw,
                 );
             });
 
@@ -4106,6 +4169,8 @@ impl SimpleComponent for App {
                     let mut engine = self.engine.borrow_mut();
                     if engine.ext_panel_has_focus {
                         let mapped: &str = match key_name.as_str() {
+                            "slash" => "/",
+                            "question" => "?",
                             "Return" | "KP_Enter" => "Return",
                             "Escape" => "Escape",
                             "Up" => "Up",
@@ -4115,6 +4180,8 @@ impl SimpleComponent for App {
                         };
                         if engine.dialog.is_some() {
                             engine.handle_key(mapped, unicode, false);
+                        } else if engine.ext_panel_input_active {
+                            engine.handle_ext_panel_input_key(mapped, false, unicode);
                         } else {
                             engine.handle_ext_panel_key(mapped, false, unicode);
                         }
@@ -4129,6 +4196,7 @@ impl SimpleComponent for App {
                         if let Some(ref da) = *self.ext_dyn_panel_da_ref.borrow() {
                             da.queue_draw();
                         }
+                        self.sync_plus_register_to_clipboard();
                         self.draw_needed.set(true);
                         return;
                     }
@@ -4915,7 +4983,23 @@ impl SimpleComponent for App {
                         let has_focus = engine.editor_hover_has_focus;
                         drop(engine);
                         if on_popup {
-                            if !has_focus {
+                            // Check if click hit a link rect.
+                            let link_hit = self
+                                .editor_hover_link_rects
+                                .borrow()
+                                .iter()
+                                .find(|(lx, ly, lw, lh, _)| {
+                                    x >= *lx && x <= lx + lw && y >= *ly && y <= ly + lh
+                                })
+                                .cloned();
+                            if let Some((_, _, _, _, url)) = link_hit {
+                                if url.starts_with("command:") {
+                                    self.engine.borrow_mut().execute_command_uri(&url);
+                                } else {
+                                    open_url(&url);
+                                }
+                                self.engine.borrow_mut().dismiss_editor_hover();
+                            } else if !has_focus {
                                 self.engine.borrow_mut().editor_hover_has_focus = true;
                             }
                             // Consume click — don't process as editor click
@@ -5753,10 +5837,13 @@ impl SimpleComponent for App {
                     // Focus + fire panel_focus event for ext panels
                     if let SidebarPanel::ExtPanel(ref name) = self.active_panel {
                         let mut engine = self.engine.borrow_mut();
+                        let already_active = engine.ext_panel_active.as_deref() == Some(name);
                         engine.ext_panel_has_focus = true;
                         engine.ext_panel_active = Some(name.clone());
-                        engine.ext_panel_selected = 0;
-                        engine.plugin_event("panel_focus", name);
+                        if !already_active {
+                            engine.ext_panel_selected = 0;
+                            engine.plugin_event("panel_focus", name);
+                        }
                     }
                     // Rebuild settings form so widgets reflect current engine.settings
                     // (e.g. toggles changed via :set command since the panel was last open).
@@ -6640,6 +6727,19 @@ impl SimpleComponent for App {
                 // Poll for completed async shell tasks (plugin background commands).
                 {
                     if self.engine.borrow_mut().poll_async_shells() {
+                        self.draw_needed.set(true);
+                    }
+                }
+                // Check for panel reveal request from plugins.
+                {
+                    let engine = self.engine.borrow_mut();
+                    if let Some(panel_name) = engine.ext_panel_focus_pending.clone() {
+                        drop(engine);
+                        // Switch directly — don't go through SwitchPanel which
+                        // would toggle visibility or reset selection set by reveal.
+                        self.active_panel = SidebarPanel::ExtPanel(panel_name);
+                        self.sidebar_visible = true;
+                        self.engine.borrow_mut().ext_panel_focus_pending = None;
                         self.draw_needed.set(true);
                     }
                 }
@@ -7825,6 +7925,8 @@ impl SimpleComponent for App {
             }
             Msg::ExtPanelKey(key_name, unicode) => {
                 let mapped: &str = match key_name.as_str() {
+                    "slash" => "/",
+                    "question" => "?",
                     "Return" | "KP_Enter" => "Return",
                     "Escape" => "Escape",
                     "Up" => "Up",
@@ -7839,6 +7941,9 @@ impl SimpleComponent for App {
                     if let Some(ref drawing) = *self.drawing_area.borrow() {
                         drawing.grab_focus();
                     }
+                } else if engine.ext_panel_input_active {
+                    engine.handle_ext_panel_input_key(mapped, false, unicode);
+                    drop(engine);
                 } else {
                     engine.handle_ext_panel_key(mapped, false, unicode);
                     let still_focused = engine.ext_panel_has_focus;
@@ -7849,6 +7954,7 @@ impl SimpleComponent for App {
                         }
                     }
                 }
+                self.sync_plus_register_to_clipboard();
                 if let Some(ref da) = *self.ext_dyn_panel_da_ref.borrow() {
                     da.queue_draw();
                 }
@@ -7878,19 +7984,55 @@ impl SimpleComponent for App {
 
                 engine.ext_panel_has_focus = true;
 
-                // Row 0 is the header (height = line_height) — skip.
-                if y_click >= line_height {
-                    // Content rows: each row is line_height tall.
-                    let row_idx = ((y_click - line_height) / line_height) as usize;
-                    let flat_idx = engine.ext_panel_scroll_top + row_idx;
-                    let flat_len = engine.ext_panel_flat_len();
-                    if flat_idx < flat_len {
-                        engine.ext_panel_selected = flat_idx;
+                // Row 0 is the header; optional input row follows when active/has text.
+                let has_input_row = engine.ext_panel_input_active
+                    || engine
+                        .ext_panel_active
+                        .as_ref()
+                        .and_then(|n| engine.ext_panel_input_text.get(n))
+                        .map(|t| !t.is_empty())
+                        .unwrap_or(false);
+                let content_top = line_height * if has_input_row { 2.0 } else { 1.0 };
+
+                // Scrollbar click — proportional jump scroll
+                let da_w = if let Some(ref da) = *self.ext_dyn_panel_da_ref.borrow() {
+                    da.width() as f64
+                } else {
+                    200.0
+                };
+                let flat_len = engine.ext_panel_flat_len();
+                if x_click >= da_w - 8.0 && y_click >= content_top && flat_len > 0 {
+                    let da_h = if let Some(ref da) = *self.ext_dyn_panel_da_ref.borrow() {
+                        da.height() as f64
+                    } else {
+                        400.0
+                    };
+                    let content_h = da_h - content_top;
+                    if content_h > 0.0 {
+                        let ratio = (y_click - content_top) / content_h;
+                        let new_top = (ratio * flat_len as f64) as usize;
+                        engine.ext_panel_scroll_top = new_top.min(flat_len.saturating_sub(1));
+                        drop(engine);
+                        if let Some(ref da) = *self.ext_dyn_panel_da_ref.borrow() {
+                            da.queue_draw();
+                        }
+                        self.draw_needed.set(true);
+                        return;
                     }
                 }
-                let _ = x_click;
-                // Double-click fires panel_double_click event + confirms selection.
+
+                let mut clicked_valid = false;
+                if y_click >= content_top {
+                    // Content rows: each row is line_height tall.
+                    let row_idx = ((y_click - content_top) / line_height) as usize;
+                    let flat_idx = engine.ext_panel_scroll_top + row_idx;
+                    if flat_idx < flat_len {
+                        engine.ext_panel_selected = flat_idx;
+                        clicked_valid = true;
+                    }
+                }
                 if n_press >= 2 {
+                    // Double-click fires panel_double_click event + confirms selection.
                     engine.handle_ext_panel_double_click();
                     engine.handle_ext_panel_key("Return", false, None);
                     let still_focused = engine.ext_panel_has_focus;
@@ -7900,6 +8042,10 @@ impl SimpleComponent for App {
                             drawing.grab_focus();
                         }
                     }
+                } else if clicked_valid {
+                    // Single-click: toggle section headers and expandable items
+                    engine.handle_ext_panel_key("Return", false, None);
+                    drop(engine);
                 } else {
                     drop(engine);
                 }
@@ -7958,6 +8104,22 @@ impl SimpleComponent for App {
                     }
                 }
             }
+            Msg::ExtPanelScroll(dy) => {
+                let scroll_amount = (dy.abs() * 3.0).ceil() as usize;
+                let mut engine = self.engine.borrow_mut();
+                let flat_len = engine.ext_panel_flat_len();
+                if dy > 0.0 {
+                    engine.ext_panel_scroll_top = (engine.ext_panel_scroll_top + scroll_amount)
+                        .min(flat_len.saturating_sub(1));
+                } else {
+                    engine.ext_panel_scroll_top =
+                        engine.ext_panel_scroll_top.saturating_sub(scroll_amount);
+                }
+                drop(engine);
+                if let Some(ref da) = *self.ext_dyn_panel_da_ref.borrow() {
+                    da.queue_draw();
+                }
+            }
             Msg::PanelHoverClick(click_x, click_y) => {
                 // Check if click hit a link rect in the hover popup.
                 let rects = self.panel_hover_link_rects.borrow();
@@ -7970,7 +8132,10 @@ impl SimpleComponent for App {
                 drop(rects);
                 if let Some((_rx, _ry, _rw, _rh, url, is_native)) = hit {
                     use crate::core::engine::DialogButton;
-                    if is_native {
+                    if url.starts_with("command:") {
+                        // Command URI — dispatch to engine.
+                        self.engine.borrow_mut().execute_command_uri(&url);
+                    } else if is_native {
                         // Trusted link from native panel — open directly.
                         open_url(&url);
                     } else {
@@ -8408,17 +8573,24 @@ impl App {
         std::process::exit(0);
     }
 
-    /// Sync the unnamed `"` register to the system clipboard whenever its content changes
-    /// (clipboard=unnamedplus semantics: every yank/cut is auto-copied).
-    /// Uses the background arboard thread to avoid blocking GTK's X11 connection.
+    /// Sync the unnamed `"` register (and explicit `+` register) to the system clipboard
+    /// whenever their content changes (clipboard=unnamedplus semantics).
     fn sync_plus_register_to_clipboard(&mut self) {
-        let new_content = self
-            .engine
-            .borrow()
+        let engine = self.engine.borrow();
+        // Check both `"` (auto-yank) and `+` (explicit clipboard writes from plugins)
+        let new_content = engine
             .registers
-            .get(&'"')
+            .get(&'+')
             .filter(|(s, _)| !s.is_empty())
-            .map(|(s, _)| s.clone());
+            .map(|(s, _)| s.clone())
+            .or_else(|| {
+                engine
+                    .registers
+                    .get(&'"')
+                    .filter(|(s, _)| !s.is_empty())
+                    .map(|(s, _)| s.clone())
+            });
+        drop(engine);
 
         if new_content != self.last_clipboard_content {
             if let (Some(ref content), Some(ref mut ctx)) = (&new_content, &mut self.clipboard) {
@@ -8830,6 +9002,7 @@ fn draw_editor(
     split_btn_map_out: &Rc<RefCell<SplitBtnMap>>,
     dialog_btn_rects_out: &Rc<RefCell<DialogBtnRects>>,
     editor_hover_rect_out: &Rc<Cell<Option<(f64, f64, f64, f64)>>>,
+    editor_hover_link_rects_out: &Rc<RefCell<Vec<(f64, f64, f64, f64, String)>>>,
 ) {
     let theme = Theme::from_name(&engine.settings.colorscheme);
 
@@ -9091,14 +9264,10 @@ fn draw_editor(
     draw_diff_peek_popup(cr, &layout, &screen, &theme, line_height, char_width);
 
     // 5c4. Draw editor hover popup (gh key, diagnostic/annotation/plugin hovers)
-    editor_hover_rect_out.set(draw_editor_hover_popup(
-        cr,
-        &layout,
-        &screen,
-        &theme,
-        line_height,
-        char_width,
-    ));
+    let (eh_rect, eh_links) =
+        draw_editor_hover_popup(cr, &layout, &screen, &theme, line_height, char_width);
+    editor_hover_rect_out.set(eh_rect);
+    *editor_hover_link_rects_out.borrow_mut() = eh_links;
 
     // 5d. Draw fuzzy file-picker modal (on top of everything else)
     draw_fuzzy_popup(
@@ -10832,6 +11001,7 @@ fn draw_hover_popup(
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn draw_editor_hover_popup(
     cr: &Context,
     layout: &pango::Layout,
@@ -10839,17 +11009,26 @@ fn draw_editor_hover_popup(
     theme: &Theme,
     line_height: f64,
     char_width: f64,
-) -> Option<(f64, f64, f64, f64)> {
+) -> (
+    Option<(f64, f64, f64, f64)>,
+    Vec<(f64, f64, f64, f64, String)>,
+) {
     use crate::core::markdown::MdStyle;
 
-    let eh = screen.editor_hover.as_ref()?;
-    let active_win = screen
+    let empty = (None, Vec::new());
+    let Some(eh) = screen.editor_hover.as_ref() else {
+        return empty;
+    };
+    let Some(active_win) = screen
         .windows
         .iter()
-        .find(|w| w.window_id == screen.active_window_id)?;
+        .find(|w| w.window_id == screen.active_window_id)
+    else {
+        return empty;
+    };
     let lines = &eh.rendered.lines;
     if lines.is_empty() {
-        return None;
+        return empty;
     }
 
     let padding = 4.0;
@@ -10949,6 +11128,7 @@ fn draw_editor_hover_popup(
     cr.clip();
 
     // Render styled markdown lines with word wrapping
+    let mut link_rects: Vec<(f64, f64, f64, f64, String)> = Vec::new();
     let mut y_offset = 0.0;
     for (li, text_line) in lines.iter().enumerate().take(visible_end).skip(scroll) {
         let display = format!(" {}", text_line);
@@ -11052,8 +11232,28 @@ fn draw_editor_hover_popup(
         layout.set_wrap(pango::WrapMode::WordChar);
         let (r, g, b) = theme.hover_fg.to_cairo();
         cr.set_source_rgb(r, g, b);
-        cr.move_to(popup_x + padding, popup_y + padding + y_offset);
+        let line_draw_x = popup_x + padding;
+        let line_draw_y = popup_y + padding + y_offset;
+        cr.move_to(line_draw_x, line_draw_y);
         pangocairo::show_layout(cr, layout);
+
+        // Compute pixel rects for any clickable links on this line.
+        for (link_line, sb, eb, url) in &eh.links {
+            if *link_line == actual_line {
+                // +1 for the leading space added to `display`
+                let start_idx = (*sb + 1) as i32;
+                let end_idx = (*eb + 1) as i32;
+                let start_rect = layout.index_to_pos(start_idx);
+                let end_rect = layout.index_to_pos(end_idx.saturating_sub(1));
+                let lx = line_draw_x + start_rect.x() as f64 / pango::SCALE as f64;
+                let ly = line_draw_y + start_rect.y() as f64 / pango::SCALE as f64;
+                let lw =
+                    (end_rect.x() + end_rect.width() - start_rect.x()) as f64 / pango::SCALE as f64;
+                let lh = start_rect.height() as f64 / pango::SCALE as f64;
+                link_rects.push((lx, ly, lw.max(char_width), lh, url.clone()));
+            }
+        }
+
         let (_pw, ph) = layout.pixel_size();
         y_offset += ph as f64;
     }
@@ -11097,7 +11297,7 @@ fn draw_editor_hover_popup(
     // Restore clip
     cr.restore().ok();
 
-    Some((popup_x, popup_y, popup_w, popup_h))
+    (Some((popup_x, popup_y, popup_w, popup_h)), link_rects)
 }
 
 fn draw_diff_peek_popup(
@@ -13440,6 +13640,36 @@ fn draw_ext_dyn_panel(
         return;
     }
 
+    // ── Search input row (when active or has text) ──────────────────────────
+    if panel.input_active || !panel.input_text.is_empty() {
+        cr.set_source_rgb(bg_r, bg_g, bg_b);
+        cr.rectangle(x, y + ry, w, line_height);
+        cr.fill().ok();
+        cr.set_source_rgb(dim_r, dim_g, dim_b);
+        layout.set_text(" / ");
+        cr.move_to(x, y + ry);
+        pangocairo::show_layout(cr, layout);
+        let (prefix_w, _) = layout.pixel_size();
+        if panel.input_active {
+            cr.set_source_rgb(item_r, item_g, item_b);
+        } else {
+            cr.set_source_rgb(dim_r, dim_g, dim_b);
+        }
+        layout.set_text(&panel.input_text);
+        cr.move_to(x + prefix_w as f64, y + ry);
+        pangocairo::show_layout(cr, layout);
+        if panel.input_active {
+            let (tw, _) = layout.pixel_size();
+            cr.set_source_rgb(item_r, item_g, item_b);
+            cr.rectangle(x + prefix_w as f64 + tw as f64, y + ry, 1.5, line_height);
+            cr.fill().ok();
+        }
+        ry += line_height;
+        if ry >= h {
+            return;
+        }
+    }
+
     // ── Build flat list of rows ─────────────────────────────────────────────
     struct FlatRow {
         text: String,
@@ -13647,6 +13877,55 @@ fn draw_ext_dyn_panel(
         cr.set_source_rgb(dim_r, dim_g, dim_b);
         cr.rectangle(sb_x, y + ry + thumb_top, 4.0, thumb_h);
         cr.fill().ok();
+    }
+
+    // ── Help popup overlay ──────────────────────────────────────────────────
+    if panel.help_open && !panel.help_bindings.is_empty() {
+        let bindings = &panel.help_bindings;
+        let popup_w = w.min(280.0);
+        let popup_h = line_height * (bindings.len() as f64 + 2.0);
+        let popup_x = x + (w - popup_w) / 2.0;
+        let popup_y = y + (h - popup_h) / 2.0;
+
+        let (r, g, b) = theme.completion_bg.to_cairo();
+        cr.set_source_rgb(r, g, b);
+        cr.rectangle(popup_x, popup_y, popup_w, popup_h);
+        cr.fill().ok();
+        let (r, g, b) = theme.completion_border.to_cairo();
+        cr.set_source_rgb(r, g, b);
+        cr.set_line_width(1.0);
+        cr.rectangle(popup_x, popup_y, popup_w, popup_h);
+        cr.stroke().ok();
+
+        // Title + close hint
+        let (r, g, b) = theme.completion_fg.to_cairo();
+        cr.set_source_rgb(r, g, b);
+        layout.set_text("Keybindings");
+        layout.set_attributes(None);
+        cr.move_to(popup_x + 8.0, popup_y);
+        pangocairo::show_layout(cr, layout);
+
+        layout.set_text("x");
+        cr.move_to(popup_x + popup_w - 16.0, popup_y);
+        pangocairo::show_layout(cr, layout);
+
+        // Bindings
+        for (i, (key, desc)) in bindings.iter().enumerate() {
+            let bind_y = popup_y + line_height * (i as f64 + 1.0);
+            let (r, g, b) = theme.function.to_cairo();
+            cr.set_source_rgb(r, g, b);
+            layout.set_text(key);
+            layout.set_attributes(None);
+            cr.move_to(popup_x + 12.0, bind_y);
+            pangocairo::show_layout(cr, layout);
+
+            let (r, g, b) = theme.completion_fg.to_cairo();
+            cr.set_source_rgb(r, g, b);
+            layout.set_text(desc);
+            layout.set_attributes(None);
+            cr.move_to(popup_x + 100.0, bind_y);
+            pangocairo::show_layout(cr, layout);
+        }
     }
 }
 

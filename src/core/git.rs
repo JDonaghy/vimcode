@@ -1412,7 +1412,7 @@ pub struct StashEntry {
 /// Return the last `limit` commits as `GitLogEntry` items.
 pub fn git_log(dir: &Path, limit: usize) -> Vec<GitLogEntry> {
     let limit_str = format!("-{}", limit);
-    let output = match run_git(dir, &["log", "--oneline", &limit_str]) {
+    let output = match run_git(dir, &["log", "--format=%H %s", &limit_str]) {
         Some(o) => o,
         None => return Vec::new(),
     };
@@ -1426,6 +1426,17 @@ pub fn git_log(dir: &Path, limit: usize) -> Vec<GitLogEntry> {
             })
         })
         .collect()
+}
+
+/// Fetch a single commit's info by hash (for revealing commits not in the top N).
+pub fn git_log_commit(dir: &Path, hash: &str) -> Option<GitLogEntry> {
+    let output = run_git(dir, &["log", "--format=%H %s", "-1", hash])?;
+    let line = output.lines().next()?;
+    let (full_hash, message) = line.split_once(' ')?;
+    Some(GitLogEntry {
+        hash: full_hash.to_string(),
+        message: message.to_string(),
+    })
 }
 
 // ─── blame_line / log_file (for Lua plugin API) ───────────────────────────────
@@ -2484,4 +2495,44 @@ fn parse_detailed_log(output: &str) -> Vec<DetailedLogEntry> {
         });
     }
     entries
+}
+
+// ─── Commit file list ────────────────────────────────────────────────────────
+
+/// A single file changed in a commit.
+#[derive(Debug, Clone)]
+pub struct CommitFileEntry {
+    /// Status character: 'A' (added), 'M' (modified), 'D' (deleted), 'R' (renamed).
+    pub status: char,
+    pub path: String,
+}
+
+/// List files changed in a given commit.
+pub fn commit_files(dir: &Path, hash: &str) -> Vec<CommitFileEntry> {
+    let output = match run_git(
+        dir,
+        &["diff-tree", "--no-commit-id", "-r", "--name-status", hash],
+    ) {
+        Some(o) => o,
+        None => return Vec::new(),
+    };
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(2, '\t');
+            let status = parts.next()?.chars().next()?;
+            let path = parts.next()?.to_string();
+            Some(CommitFileEntry { status, path })
+        })
+        .collect()
+}
+
+/// Show a specific file's content at a given commit.
+pub fn diff_file_at_commit(dir: &Path, hash: &str, path: &str) -> Option<String> {
+    run_git(dir, &["show", &format!("{hash}:{path}")])
+}
+
+/// Show the diff for a specific file within a commit (like `git show <hash> -- <path>`).
+pub fn show_commit_file(dir: &Path, hash: &str, path: &str) -> Option<String> {
+    run_git(dir, &["show", hash, "--", path])
 }
