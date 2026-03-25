@@ -345,7 +345,7 @@ fn test_vscode_ctrl_p_fuzzy_finder() {
     let mut e = engine_with("hello\n");
     vscode_mode(&mut e);
     e.handle_key("p", Some('p'), true);
-    assert!(e.fuzzy_open);
+    assert!(e.picker_open);
 }
 
 #[test]
@@ -353,7 +353,7 @@ fn test_vscode_ctrl_shift_p_command_palette() {
     let mut e = engine_with("hello\n");
     vscode_mode(&mut e);
     e.handle_key("P", None, true);
-    assert!(e.palette_open);
+    assert!(e.picker_open);
 }
 
 #[test]

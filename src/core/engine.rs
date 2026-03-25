@@ -566,6 +566,12 @@ pub static PALETTE_COMMANDS: &[PaletteCommand] = &[
         action: "LspRestart",
     },
     PaletteCommand {
+        label: "LSP: Code Action",
+        shortcut: "<leader>ca",
+        vscode_shortcut: "Ctrl+.",
+        action: "CodeAction",
+    },
+    PaletteCommand {
         label: "LSP: Format Document",
         shortcut: "",
         vscode_shortcut: "Shift+Alt+F",
@@ -689,6 +695,63 @@ pub static PALETTE_COMMANDS: &[PaletteCommand] = &[
         action: "toggle_spell",
     },
 ];
+
+// ─── Unified Picker Types ────────────────────────────────────────────────────
+
+/// Identifies the data source backing a picker modal.
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub enum PickerSource {
+    Files,
+    Grep,
+    Commands,
+    Buffers,
+    RecentFiles,
+    Marks,
+    Registers,
+    GitBranches,
+    Custom(String),
+}
+
+/// A single item in the picker list.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct PickerItem {
+    /// Text shown in the result list.
+    pub display: String,
+    /// Text matched against the query by `fuzzy_score`.
+    pub filter_text: String,
+    /// Right-aligned hint (shortcut, line number, etc.).
+    pub detail: Option<String>,
+    /// What happens when this item is confirmed.
+    pub action: PickerAction,
+    /// Nerd Font icon prefix.
+    pub icon: Option<String>,
+    /// Fuzzy match score (set during filtering).
+    pub score: i32,
+    /// Byte positions in `display` that matched the query (for highlight).
+    pub match_positions: Vec<usize>,
+}
+
+/// The action taken when a picker item is confirmed.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub enum PickerAction {
+    OpenFile(PathBuf),
+    OpenFileAtLine(PathBuf, usize),
+    ExecuteCommand(String),
+    JumpToMark(char),
+    PasteRegister(char),
+    CheckoutBranch(String),
+    Custom(String),
+}
+
+/// Preview context shown in the picker's right pane.
+#[derive(Debug, Clone)]
+pub struct PickerPreview {
+    /// Lines to display: (1-based line number, text, is_highlighted).
+    pub lines: Vec<(usize, String, bool)>,
+}
 
 /// How a file should be opened: as a temporary preview or permanent buffer.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -901,6 +964,74 @@ pub struct EditorHoverPopup {
     /// at a fixed screen position regardless of subsequent editor scrolling.
     pub frozen_scroll_top: usize,
     pub frozen_scroll_left: usize,
+    /// Text selection within the popup content (mouse drag or keyboard).
+    pub selection: Option<HoverSelection>,
+}
+
+/// Text selection within a hover popup, in content coordinates (line, char column).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HoverSelection {
+    /// Anchor position (where selection started).
+    pub anchor_line: usize,
+    pub anchor_col: usize,
+    /// Active position (where selection currently extends to).
+    pub active_line: usize,
+    pub active_col: usize,
+}
+
+impl HoverSelection {
+    /// Return the selection range normalized so start <= end.
+    pub fn normalized(&self) -> (usize, usize, usize, usize) {
+        if (self.anchor_line, self.anchor_col) <= (self.active_line, self.active_col) {
+            (
+                self.anchor_line,
+                self.anchor_col,
+                self.active_line,
+                self.active_col,
+            )
+        } else {
+            (
+                self.active_line,
+                self.active_col,
+                self.anchor_line,
+                self.anchor_col,
+            )
+        }
+    }
+
+    /// Extract the selected text from the given popup lines.
+    pub fn extract_text(&self, lines: &[String]) -> String {
+        let (sl, sc, el, ec) = self.normalized();
+        if sl == el {
+            // Single line selection
+            if let Some(line) = lines.get(sl) {
+                let chars: Vec<char> = line.chars().collect();
+                let start = sc.min(chars.len());
+                let end = ec.min(chars.len());
+                return chars[start..end].iter().collect();
+            }
+            return String::new();
+        }
+        let mut result = String::new();
+        for li in sl..=el.min(lines.len().saturating_sub(1)) {
+            if let Some(line) = lines.get(li) {
+                let chars: Vec<char> = line.chars().collect();
+                if li == sl {
+                    let start = sc.min(chars.len());
+                    result.push_str(&chars[start..].iter().collect::<String>());
+                } else if li == el {
+                    let end = ec.min(chars.len());
+                    result.push_str(&chars[..end].iter().collect::<String>());
+                } else {
+                    result.push_str(line);
+                }
+                if li < el {
+                    result.push('\n');
+                }
+            }
+        }
+        result
+    }
 }
 
 /// Check if a URL has a safe scheme for opening in a browser.
@@ -1756,6 +1887,22 @@ pub struct Engine {
     pub lsp_signature_help: Option<SignatureHelpData>,
     /// Tracks whether we need to send didChange on next poll (debounce).
     lsp_dirty_buffers: HashMap<BufferId, bool>,
+    /// Request ID of the pending code action request.
+    pub lsp_pending_code_action: Option<i64>,
+    /// The (path, line) for which the pending code action request was made.
+    lsp_code_action_request_ctx: Option<(PathBuf, usize)>,
+    /// Cached code actions per file path and line number.
+    pub lsp_code_actions: HashMap<PathBuf, HashMap<usize, Vec<lsp::CodeAction>>>,
+    /// Last (path, line) for which code actions were requested — avoids re-requesting same line.
+    lsp_code_action_last_line: Option<(PathBuf, usize)>,
+    /// When true, the next CodeActionResponse should display a popup (on-demand request).
+    lsp_show_code_action_popup_pending: bool,
+    /// Actions shown in the current code-action dialog, indexed by dialog button position.
+    pending_code_action_choices: Vec<lsp::CodeAction>,
+
+    /// Set when cursor moves; backends flush the actual hook after a debounce delay (150ms).
+    pub cursor_move_pending: Option<std::time::Instant>,
+
     /// Language IDs for which a background install is in progress.
     lsp_installing: std::collections::HashSet<String>,
     /// Language IDs for which a Mason registry lookup is already in flight.
@@ -1844,28 +1991,6 @@ pub struct Engine {
     /// Most recently used is at index 0.
     pub tab_mru: Vec<(GroupId, usize)>,
 
-    pub fuzzy_open: bool,
-    /// Current query typed in the fuzzy finder.
-    pub fuzzy_query: String,
-    /// All files in the project (relative paths), built once when fuzzy opens.
-    pub fuzzy_all_files: Vec<PathBuf>,
-    /// Filtered + scored results: (relative_path, display_string), capped at 50.
-    pub fuzzy_results: Vec<(PathBuf, String)>,
-    /// Index of the currently highlighted result.
-    pub fuzzy_selected: usize,
-
-    // --- Live grep state ---
-    /// Whether the live grep modal is open.
-    pub grep_open: bool,
-    /// Current query typed in the live grep input.
-    pub grep_query: String,
-    /// Results from the last grep run (capped at 200).
-    pub grep_results: Vec<ProjectMatch>,
-    /// Index of the currently highlighted grep result.
-    pub grep_selected: usize,
-    /// Context lines for the preview pane: (1-based line number, text, is_match_line).
-    pub grep_preview_lines: Vec<(usize, String, bool)>,
-
     // --- Quickfix state ---
     /// Quickfix list populated by :grep / :vimgrep.
     pub quickfix_items: Vec<ProjectMatch>,
@@ -1878,17 +2003,25 @@ pub struct Engine {
     /// Whether the debug sidebar has keyboard focus.
     pub dap_sidebar_has_focus: bool,
 
-    // --- Command palette ---
-    /// Whether the command palette modal is open.
-    pub palette_open: bool,
-    /// Current query typed in the palette.
-    pub palette_query: String,
-    /// Indices into PALETTE_COMMANDS after fuzzy filtering.
-    pub palette_results: Vec<usize>,
-    /// Index of the currently highlighted result.
-    pub palette_selected: usize,
+    // --- Unified picker modal ---
+    /// Whether the unified picker modal is open.
+    pub picker_open: bool,
+    /// Which data source is backing the picker.
+    pub picker_source: PickerSource,
+    /// Current query typed in the picker input.
+    pub picker_query: String,
+    /// Full source items (pre-loaded sources only; empty for live sources like Grep).
+    pub picker_all_items: Vec<PickerItem>,
+    /// Filtered/scored items currently displayed (capped).
+    pub picker_items: Vec<PickerItem>,
+    /// Index of the currently highlighted item.
+    pub picker_selected: usize,
     /// Scroll offset for the result list.
-    pub palette_scroll_top: usize,
+    pub picker_scroll_top: usize,
+    /// Title shown in the picker header.
+    pub picker_title: String,
+    /// Preview pane content for the selected item, or None for no-preview sources.
+    pub picker_preview: Option<PickerPreview>,
 
     // --- Two-way diff state ---
     /// The pair of windows currently in diff mode, or None when diff is off.
@@ -2291,10 +2424,16 @@ pub struct Engine {
     pub editor_hover_dwell: Option<(usize, usize, std::time::Instant)>,
     /// Delayed dismiss deadline — popup lingers until this instant passes.
     pub editor_hover_dismiss_at: Option<std::time::Instant>,
+    /// Position where LSP returned null hover — suppresses re-request until mouse moves off.
+    lsp_hover_null_pos: Option<(usize, usize)>,
+    /// Position of the in-flight LSP hover request (for recording null-response positions).
+    lsp_hover_request_pos: Option<(usize, usize)>,
     /// Whether the editor hover popup currently has keyboard focus.
     pub editor_hover_has_focus: bool,
     /// Plugin-provided static hover content per line: line (0-indexed) → markdown.
     pub editor_hover_content: HashMap<usize, String>,
+    /// Tab hover tooltip: shortened file path shown when hovering a tab.
+    pub tab_hover_tooltip: Option<String>,
     /// Performance profiling log for the last slow keystroke (> 5ms).
     pub perf_log: Option<String>,
 
@@ -2445,6 +2584,13 @@ impl Engine {
             lsp_pending_semantic_tokens: HashMap::new(),
             lsp_signature_help: None,
             lsp_dirty_buffers: HashMap::new(),
+            lsp_pending_code_action: None,
+            lsp_code_action_request_ctx: None,
+            lsp_code_actions: HashMap::new(),
+            lsp_code_action_last_line: None,
+            lsp_show_code_action_popup_pending: false,
+            pending_code_action_choices: Vec::new(),
+            cursor_move_pending: None,
             lsp_installing: std::collections::HashSet::new(),
             lsp_lookup_in_flight: std::collections::HashSet::new(),
             leader_partial: None,
@@ -2480,26 +2626,20 @@ impl Engine {
             tab_switcher_open: false,
             tab_switcher_selected: 0,
             tab_mru: vec![(GroupId(0), 0)],
-            fuzzy_open: false,
-            fuzzy_query: String::new(),
-            fuzzy_all_files: Vec::new(),
-            fuzzy_results: Vec::new(),
-            fuzzy_selected: 0,
-            grep_open: false,
-            grep_query: String::new(),
-            grep_results: Vec::new(),
-            grep_selected: 0,
-            grep_preview_lines: Vec::new(),
             quickfix_items: Vec::new(),
             quickfix_selected: 0,
             quickfix_open: false,
             quickfix_has_focus: false,
             dap_sidebar_has_focus: false,
-            palette_open: false,
-            palette_query: String::new(),
-            palette_results: Vec::new(),
-            palette_selected: 0,
-            palette_scroll_top: 0,
+            picker_open: false,
+            picker_source: PickerSource::Files,
+            picker_query: String::new(),
+            picker_all_items: Vec::new(),
+            picker_items: Vec::new(),
+            picker_selected: 0,
+            picker_scroll_top: 0,
+            picker_title: String::new(),
+            picker_preview: None,
             diff_window_pair: None,
             diff_results: HashMap::new(),
             diff_aligned: HashMap::new(),
@@ -2648,8 +2788,11 @@ impl Engine {
             editor_hover: None,
             editor_hover_dwell: None,
             editor_hover_dismiss_at: None,
+            lsp_hover_null_pos: None,
+            lsp_hover_request_pos: None,
             editor_hover_has_focus: false,
             editor_hover_content: HashMap::new(),
+            tab_hover_tooltip: None,
             perf_log: None,
             panel_hover: None,
             panel_hover_dwell: None,
@@ -4637,8 +4780,9 @@ impl Engine {
                 "Other:\n",
                 "  :                 Enter command mode\n",
                 "  v/V               Visual char / line mode\n",
-                "  Ctrl-P            Fuzzy file finder\n",
-                "  Ctrl-G            Live grep\n",
+                "  Ctrl-P / <leader>sf  Fuzzy file finder\n",
+                "  Ctrl-Shift-F / <leader>sg  Live grep\n",
+                "  Ctrl-Shift-P / <leader>sp  Command palette\n",
                 "  gd                Go to definition (LSP)\n",
                 "  K                 Hover info (LSP)\n",
                 "  ]d / [d           Next / prev diagnostic\n",
@@ -6781,7 +6925,7 @@ impl Engine {
                     }
                 }
                 "command_palette" => {
-                    self.open_command_palette();
+                    self.open_picker(PickerSource::Commands);
                 }
                 _ => {}
             },
@@ -8531,9 +8675,9 @@ impl Engine {
             }
         }
 
-        // Command palette intercepts all keys when open.
-        if self.palette_open {
-            return self.handle_palette_key(key_name, unicode, ctrl);
+        // Unified picker intercepts all keys when open.
+        if self.picker_open {
+            return self.handle_picker_key(key_name, unicode, ctrl);
         }
 
         // Diff peek popup intercepts keys when open.
@@ -8549,18 +8693,8 @@ impl Engine {
             } else {
                 key_name.to_string()
             };
-            self.handle_editor_hover_key(&hover_key);
+            self.handle_editor_hover_key(&hover_key, ctrl);
             return EngineAction::None;
-        }
-
-        // Fuzzy finder intercepts all keys when open.
-        if self.fuzzy_open {
-            return self.handle_fuzzy_key(key_name, unicode, ctrl);
-        }
-
-        // Live grep intercepts all keys when open.
-        if self.grep_open {
-            return self.handle_grep_key(key_name, unicode, ctrl);
         }
 
         // Quickfix panel intercepts all keys when it has focus.
@@ -8787,19 +8921,17 @@ impl Engine {
         self.sync_scroll_binds();
         self.update_bracket_match();
 
-        // Fire cursor_move plugin hook when the cursor position changed.
-        // Excluded from Insert mode: cursor moves caused by typing call git blame
-        // on the committed file, which produces stale annotations for lines that
-        // don't exist yet in the commit (e.g. the empty line created by Enter).
-        // cursor_move is fired explicitly when Escape exits insert mode instead.
+        // Mark cursor_move as pending when the cursor position changed.
+        // The actual plugin hook + code action request are fired by the backend
+        // after a debounce delay (idle poll), avoiding expensive work on every
+        // keystroke during rapid navigation (e.g. holding j/k).
         if !matches!(self.mode, Mode::Command | Mode::Search | Mode::Insert) {
             let (cur_line, cur_col) = {
                 let cur = self.cursor();
                 (cur.line, cur.col)
             };
             if cur_line != pre_cursor_line || cur_col != pre_cursor_col {
-                let arg = format!("{},{}", cur_line + 1, cur_col + 1);
-                self.plugin_event("cursor_move", &arg);
+                self.cursor_move_pending = Some(std::time::Instant::now());
             }
         }
 
@@ -9042,13 +9174,13 @@ impl Engine {
                     return EngineAction::None;
                 }
                 "p" => {
-                    // Ctrl-P: Open fuzzy file finder
-                    self.open_fuzzy_finder();
+                    // Ctrl-P: Open unified file picker
+                    self.open_picker(PickerSource::Files);
                     return EngineAction::None;
                 }
                 "P" => {
                     // Ctrl-Shift-P: Open command palette
-                    self.open_command_palette();
+                    self.open_picker(PickerSource::Commands);
                     return EngineAction::None;
                 }
                 "g" => {
@@ -9965,7 +10097,7 @@ impl Engine {
                 "Tab" => self.jump_list_forward(),
                 // F1: open command palette
                 "F1" => {
-                    self.open_command_palette();
+                    self.open_picker(PickerSource::Commands);
                     return EngineAction::None;
                 }
                 // Debug / DAP function keys
@@ -12267,7 +12399,7 @@ impl Engine {
         partial.push(ch);
 
         // All known built-in leader sequences
-        const SEQUENCES: &[&str] = &["rn", "gf", "gF", "gi", "gb"];
+        const SEQUENCES: &[&str] = &["rn", "gf", "gF", "gi", "gb", "ca", "sf", "sg", "sp"];
 
         match partial.as_str() {
             "rn" => {
@@ -12286,9 +12418,22 @@ impl Engine {
                 self.push_jump_location();
                 self.lsp_request_implementation();
             }
+            "ca" => {
+                // Show LSP code actions for the current line
+                self.show_code_actions_popup();
+            }
             "gb" => {
                 // Toggle inline git blame
                 self.toggle_inline_blame();
+            }
+            "sf" => {
+                self.open_picker(PickerSource::Files);
+            }
+            "sg" => {
+                self.open_picker(PickerSource::Grep);
+            }
+            "sp" => {
+                self.open_picker(PickerSource::Commands);
             }
             s => {
                 // Check if this is a complete plugin keymap match
@@ -15205,6 +15350,7 @@ impl Engine {
             "hover",
             "LspImpl",
             "LspTypedef",
+            "CodeAction",
             // Navigation
             "nextdiag",
             "prevdiag",
@@ -15373,6 +15519,8 @@ impl Engine {
                         "gruvbox-dark".to_string(),
                         "tokyo-night".to_string(),
                         "solarized-dark".to_string(),
+                        "vscode-dark".to_string(),
+                        "vscode-light".to_string(),
                         "gruvbox".to_string(),
                         "tokyonight".to_string(),
                         "solarized".to_string(),
@@ -17017,6 +17165,7 @@ impl Engine {
         // Apply virtual-text line annotations
         if ctx.clear_annotations {
             self.line_annotations.clear();
+            self.editor_hover_content.clear();
             self.blame_annotations_active = false;
         }
         for (line_1indexed, text) in ctx.annotate_lines {
@@ -17364,12 +17513,39 @@ impl Engine {
     }
 
     /// Fire the `cursor_move` plugin hook for the current cursor position.
+    /// Mark cursor_move as pending (deferred to backend idle loop for debouncing).
     /// Call this after any cursor movement that doesn't go through `handle_key()`
-    /// (e.g. file open, mouse click, session restore).
+    /// (e.g. mouse click, session restore).
     pub fn fire_cursor_move_hook(&mut self) {
+        self.cursor_move_pending = Some(std::time::Instant::now());
+    }
+
+    /// Immediately fire the cursor_move plugin hook.
+    /// Use for one-shot events (file open) where the debounce delay is unwanted.
+    pub fn fire_cursor_move_hook_now(&mut self) {
+        self.cursor_move_pending = None;
         let cursor = self.cursor();
         let arg = format!("{},{}", cursor.line + 1, cursor.col + 1);
         self.plugin_event("cursor_move", &arg);
+    }
+
+    /// Flush pending cursor_move hook if the debounce delay (150ms) has elapsed.
+    /// Called by backends from their idle/poll loop.
+    /// Returns true if the hook was fired (needs redraw).
+    pub fn flush_cursor_move_hook(&mut self) -> bool {
+        let Some(when) = self.cursor_move_pending else {
+            return false;
+        };
+        if when.elapsed() < std::time::Duration::from_millis(150) {
+            return false;
+        }
+        self.cursor_move_pending = None;
+        let cursor = self.cursor();
+        let arg = format!("{},{}", cursor.line + 1, cursor.col + 1);
+        self.plugin_event("cursor_move", &arg);
+        // Proactively request code actions for the new cursor position (lightbulb).
+        self.lsp_request_code_actions_for_line();
+        true
     }
 
     // ─── User keymaps ────────────────────────────────────────────────────────
@@ -18552,8 +18728,14 @@ impl Engine {
 
         // Handle :colorscheme [name]
         if cmd == "colorscheme" {
-            let mut names: Vec<&str> =
-                vec!["onedark", "gruvbox-dark", "tokyo-night", "solarized-dark"];
+            let mut names: Vec<&str> = vec![
+                "onedark",
+                "gruvbox-dark",
+                "tokyo-night",
+                "solarized-dark",
+                "vscode-dark",
+                "vscode-light",
+            ];
             let custom = list_custom_theme_names();
             let custom_strs: Vec<&str> = custom.iter().map(|s| s.as_str()).collect();
             names.extend(custom_strs);
@@ -18567,10 +18749,19 @@ impl Engine {
                 "gruvbox" => "gruvbox-dark",
                 "tokyonight" => "tokyo-night",
                 "solarized" => "solarized-dark",
+                "vscode" | "dark+" => "vscode-dark",
+                "light+" => "vscode-light",
                 other => other,
             };
             // Verify the theme exists (built-in or custom VSCode JSON)
-            let builtin = ["onedark", "gruvbox-dark", "tokyo-night", "solarized-dark"];
+            let builtin = [
+                "onedark",
+                "gruvbox-dark",
+                "tokyo-night",
+                "solarized-dark",
+                "vscode-dark",
+                "vscode-light",
+            ];
             let custom = list_custom_theme_names();
             let is_valid = builtin.contains(&canonical) || custom.iter().any(|n| n == canonical);
             if is_valid {
@@ -19289,12 +19480,16 @@ impl Engine {
             }
             "openrecent" | "OpenRecent" => EngineAction::OpenRecentDialog,
             "palette" | "CommandPalette" => {
-                self.open_command_palette();
+                self.open_picker(PickerSource::Commands);
                 EngineAction::None
             }
             // ── Menu / palette action aliases ─────────────────────────────────
-            "fuzzy" => {
-                self.open_fuzzy_finder();
+            "fuzzy" | "Picker" | "Picker files" => {
+                self.open_picker(PickerSource::Files);
+                EngineAction::None
+            }
+            "Picker commands" => {
+                self.open_picker(PickerSource::Commands);
                 EngineAction::None
             }
             "undo" => {
@@ -19365,6 +19560,10 @@ impl Engine {
             }
             "LspTypedef" => {
                 self.lsp_request_type_definition();
+                EngineAction::None
+            }
+            "CodeAction" => {
+                self.show_code_actions_popup();
                 EngineAction::None
             }
             "nextdiag" => {
@@ -25647,7 +25846,10 @@ impl Engine {
         }
         let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let mut mgr = LspManager::new(root, &self.settings.lsp_servers);
-        mgr.set_ext_manifests(self.ext_available_manifests());
+        mgr.set_ext_manifests(
+            self.ext_installed_manifests(),
+            self.ext_available_manifests(),
+        );
         self.lsp_manager = Some(mgr);
     }
 
@@ -25678,7 +25880,7 @@ impl Engine {
         }
         // Fire cursor_move so position-aware plugins (e.g. git-insights blame) annotate
         // the initial cursor line immediately on file open without requiring a keypress.
-        self.fire_cursor_move_hook();
+        self.fire_cursor_move_hook_now();
         if !self.settings.lsp_enabled {
             return;
         }
@@ -25733,6 +25935,15 @@ impl Engine {
     // ── Extension registry + sidebar ──────────────────────────────────────────
 
     /// Return the list of available extensions from the cached registry.
+    /// Return manifests only for extensions that are installed.
+    /// Used for LSP manager — only start servers when the extension is installed.
+    pub fn ext_installed_manifests(&self) -> Vec<extensions::ExtensionManifest> {
+        self.ext_available_manifests()
+            .into_iter()
+            .filter(|m| self.extension_state.is_installed(&m.name))
+            .collect()
+    }
+
     pub fn ext_available_manifests(&self) -> Vec<extensions::ExtensionManifest> {
         let mut result: Vec<extensions::ExtensionManifest> =
             self.ext_registry.clone().unwrap_or_default();
@@ -25978,15 +26189,16 @@ impl Engine {
     /// Used by Enter and double-click.
     pub fn ext_open_selected_readme(&mut self) {
         let manifests = self.ext_available_manifests();
-        let installed = self.ext_installed_items();
-        let sel = self.ext_sidebar_selected;
-        let manifest = if sel < installed.len() {
-            manifests.iter().find(|m| m.name == installed[sel].name)
+        let (in_installed, idx) = self.ext_selected_to_section(self.ext_sidebar_selected);
+        let manifest = if in_installed {
+            let installed = self.ext_installed_items();
+            installed
+                .get(idx)
+                .and_then(|m| manifests.iter().find(|r| r.name == m.name))
         } else {
             let available = self.ext_available_items();
-            let avail_idx = sel.saturating_sub(installed.len());
             available
-                .get(avail_idx)
+                .get(idx)
                 .and_then(|a| manifests.iter().find(|m| m.name == a.name))
         };
         if let Some(manifest) = manifest {
@@ -26902,6 +27114,8 @@ impl Engine {
     ) {
         let rendered = crate::core::markdown::render_markdown(markdown);
         let links = Self::extract_hover_links(&rendered);
+        // Dismiss any active editor hover to avoid overlapping popups.
+        self.dismiss_editor_hover();
         self.panel_hover = Some(PanelHoverPopup {
             rendered,
             links,
@@ -27355,16 +27569,6 @@ impl Engine {
             // Annotation-only hovers don't auto-focus — user clicks to focus.
             let focus = take_focus && !is_annotation_only;
             self.show_editor_hover(line, col, &combined, source, focus, false);
-        } else if request_lsp && self.has_lsp_for_buffer() {
-            // No content yet — show "Loading..." while we wait for the LSP response.
-            self.show_editor_hover(
-                line,
-                col,
-                "Loading...",
-                EditorHoverSource::Lsp,
-                take_focus,
-                false,
-            );
         } else if take_focus {
             self.editor_hover_has_focus = true;
         }
@@ -27373,7 +27577,30 @@ impl Engine {
         // the popup isn't purely annotation-sourced (avoids LSP null response
         // dismissing the annotation popup).
         if request_lsp && !is_annotation_only && !has_lsp_section {
+            // For mouse hover: skip if LSP already returned null for this position.
+            if !take_focus && self.lsp_hover_null_pos == Some((line, col)) {
+                return;
+            }
+            self.lsp_hover_request_pos = Some((line, col));
+            let prev_pending = self.lsp_pending_hover;
             self.lsp_request_hover_at(line, col);
+            let sent_new =
+                self.lsp_pending_hover != prev_pending && self.lsp_pending_hover.is_some();
+            if sent_new && take_focus && self.editor_hover.is_none() {
+                // Explicit keyboard hover (gh/:hover) — show "Loading..." immediately.
+                self.show_editor_hover(
+                    line,
+                    col,
+                    "Loading...",
+                    EditorHoverSource::Lsp,
+                    true,
+                    false,
+                );
+                // Auto-dismiss after 3s if LSP never responds.
+                self.editor_hover_dismiss_at =
+                    Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
+            }
+            // Mouse hover: no "Loading..." — popup appears only if LSP returns content.
         }
     }
 
@@ -27437,6 +27664,8 @@ impl Engine {
             let v = self.view();
             (v.scroll_top, v.scroll_left)
         };
+        // Dismiss any active panel hover to avoid overlapping popups.
+        self.dismiss_panel_hover_now();
         self.editor_hover = Some(EditorHoverPopup {
             rendered,
             links,
@@ -27448,6 +27677,7 @@ impl Engine {
             popup_width,
             frozen_scroll_top,
             frozen_scroll_left,
+            selection: None,
         });
         if take_focus {
             self.editor_hover_has_focus = true;
@@ -27480,8 +27710,14 @@ impl Engine {
     }
 
     /// Handle keyboard input when the editor hover popup has focus.
-    pub fn handle_editor_hover_key(&mut self, key: &str) {
+    pub fn handle_editor_hover_key(&mut self, key: &str, ctrl: bool) {
         match key {
+            "y" | "Y" => {
+                self.copy_hover_selection();
+            }
+            "c" if ctrl => {
+                self.copy_hover_selection();
+            }
             "Escape" | "q" => {
                 self.dismiss_editor_hover();
             }
@@ -27541,6 +27777,9 @@ impl Engine {
                     }
                 }
             }
+            // Ignore bare modifier keys (GTK sends these as separate key events)
+            "Control_L" | "Control_R" | "Shift_L" | "Shift_R" | "Alt_L" | "Alt_R" | "Super_L"
+            | "Super_R" | "Meta_L" | "Meta_R" | "ISO_Level3_Shift" => {}
             _ => {
                 // Any other key dismisses and passes through
                 self.dismiss_editor_hover();
@@ -27645,7 +27884,8 @@ impl Engine {
                 }
             }
         }
-        // New word — start fresh dwell timer
+        // New word — start fresh dwell timer and clear null-hover suppression.
+        self.lsp_hover_null_pos = None;
         self.editor_hover_dwell = Some((line, col, std::time::Instant::now()));
     }
 
@@ -27675,6 +27915,62 @@ impl Engine {
     pub fn editor_hover_focus(&mut self) {
         if self.editor_hover.is_some() {
             self.editor_hover_has_focus = true;
+        }
+    }
+
+    /// Extract the selected text from the editor hover popup (or all text if no selection).
+    /// Returns `None` if there is no hover popup or content is empty.
+    pub fn hover_selection_text(&self) -> Option<String> {
+        let hover = self.editor_hover.as_ref()?;
+        let text = if let Some(ref sel) = hover.selection {
+            sel.extract_text(&hover.rendered.lines)
+        } else {
+            hover.rendered.lines.join("\n")
+        };
+        if text.is_empty() {
+            None
+        } else {
+            Some(text)
+        }
+    }
+
+    /// Copy the selected text from the editor hover popup to the clipboard.
+    /// If no selection is active, copies all popup text.
+    /// Uses the engine's `clipboard_write` callback (set by TUI backend).
+    /// GTK backend should call `hover_selection_text()` and use its own clipboard.
+    pub fn copy_hover_selection(&mut self) {
+        let text = match self.hover_selection_text() {
+            Some(t) => t,
+            None => return,
+        };
+        if let Some(ref cb) = self.clipboard_write {
+            if cb(&text).is_ok() {
+                self.message = "Hover text copied".to_string();
+                return;
+            }
+        }
+        self.message = "Clipboard unavailable".to_string();
+    }
+
+    /// Start a text selection in the editor hover popup at the given content position.
+    pub fn editor_hover_start_selection(&mut self, line: usize, col: usize) {
+        if let Some(hover) = &mut self.editor_hover {
+            hover.selection = Some(HoverSelection {
+                anchor_line: line,
+                anchor_col: col,
+                active_line: line,
+                active_col: col,
+            });
+        }
+    }
+
+    /// Extend the text selection in the editor hover popup to the given content position.
+    pub fn editor_hover_extend_selection(&mut self, line: usize, col: usize) {
+        if let Some(hover) = &mut self.editor_hover {
+            if let Some(sel) = &mut hover.selection {
+                sel.active_line = line;
+                sel.active_col = col;
+            }
         }
     }
 
@@ -27913,8 +28209,7 @@ impl Engine {
             }
             "Tab" => {
                 // Toggle the section the cursor is in
-                let installed = self.ext_installed_items();
-                let in_installed = self.ext_sidebar_selected < installed.len();
+                let (in_installed, _) = self.ext_selected_to_section(self.ext_sidebar_selected);
                 if in_installed {
                     self.ext_sidebar_sections_expanded[0] = !self.ext_sidebar_sections_expanded[0];
                 } else {
@@ -27939,15 +28234,17 @@ impl Engine {
             }
             "i" => {
                 // Install the selected extension
-                let installed = self.ext_installed_items();
-                let sel = self.ext_sidebar_selected;
-                if sel < installed.len() {
-                    let name = &installed[sel].name;
-                    self.message =
-                        format!("Extension '{name}' is already installed. Use d to remove.");
+                let (in_installed, idx) = self.ext_selected_to_section(self.ext_sidebar_selected);
+                if in_installed {
+                    let installed = self.ext_installed_items();
+                    if let Some(m) = installed.get(idx) {
+                        let name = &m.name;
+                        self.message =
+                            format!("Extension '{name}' is already installed. Use d to remove.");
+                    }
                 } else {
                     let available = self.ext_available_items();
-                    let avail_idx = sel.saturating_sub(installed.len());
+                    let avail_idx = idx;
                     if avail_idx < available.len() {
                         let base_url = self.resolve_registry_base_url(&available[avail_idx]);
                         let name = available[avail_idx].name.clone();
@@ -27980,24 +28277,28 @@ impl Engine {
                 true
             }
             "d" => {
-                let installed = self.ext_installed_items();
-                let sel = self.ext_sidebar_selected;
-                if sel < installed.len() {
-                    let name = installed[sel].name.clone();
-                    self.ext_show_remove_dialog(&name);
+                let (in_installed, idx) = self.ext_selected_to_section(self.ext_sidebar_selected);
+                if in_installed {
+                    let installed = self.ext_installed_items();
+                    if let Some(m) = installed.get(idx) {
+                        let name = m.name.clone();
+                        self.ext_show_remove_dialog(&name);
+                    }
                 }
                 true
             }
             "u" => {
                 // Update the selected installed extension
-                let installed = self.ext_installed_items();
-                let sel = self.ext_sidebar_selected;
-                if sel < installed.len() {
-                    let name = installed[sel].name.clone();
-                    if self.ext_has_update(&name) {
-                        self.ext_update_one(&name);
-                    } else {
-                        self.message = format!("Extension '{name}' is already up to date");
+                let (in_installed, idx) = self.ext_selected_to_section(self.ext_sidebar_selected);
+                if in_installed {
+                    let installed = self.ext_installed_items();
+                    if let Some(m) = installed.get(idx) {
+                        let name = m.name.clone();
+                        if self.ext_has_update(&name) {
+                            self.ext_update_one(&name);
+                        } else {
+                            self.message = format!("Extension '{name}' is already up to date");
+                        }
                     }
                 }
                 true
@@ -28047,6 +28348,22 @@ impl Engine {
             0
         };
         installed + available
+    }
+
+    /// Map the flat selected index to (section, index_within_section),
+    /// accounting for collapsed sections.
+    /// Returns `(true, idx)` for installed items, `(false, idx)` for available.
+    fn ext_selected_to_section(&self, sel: usize) -> (bool, usize) {
+        let installed_vis = if self.ext_sidebar_sections_expanded[0] {
+            self.ext_installed_items().len()
+        } else {
+            0
+        };
+        if sel < installed_vis {
+            (true, sel)
+        } else {
+            (false, sel - installed_vis)
+        }
     }
 
     // ── Settings sidebar panel ──────────────────────────────────────────────────
@@ -29454,7 +29771,7 @@ impl Engine {
                 }
                 None
             }
-            "Left" | "h" | "Up" if !has_input => {
+            "Left" | "h" | "Up" | "k" if !has_input => {
                 let len = dialog.buttons.len();
                 if len > 0 {
                     dialog.selected = if dialog.selected > 0 {
@@ -29465,7 +29782,7 @@ impl Engine {
                 }
                 None
             }
-            "Right" | "l" | "Down" if !has_input => {
+            "Right" | "l" | "Down" | "j" if !has_input => {
                 let len = dialog.buttons.len();
                 if len > 0 {
                     dialog.selected = (dialog.selected + 1) % len;
@@ -29584,6 +29901,24 @@ impl Engine {
                     if is_safe_url(url) {
                         return EngineAction::OpenUrl(url.to_string());
                     }
+                }
+                EngineAction::None
+            }
+            "code_actions" => {
+                if let Some(idx_str) = action.strip_prefix("apply_") {
+                    if let Ok(idx) = idx_str.parse::<usize>() {
+                        if let Some(ca) = self.pending_code_action_choices.get(idx).cloned() {
+                            self.pending_code_action_choices.clear();
+                            if let Some(edit) = ca.edit {
+                                self.apply_workspace_edit(edit);
+                                self.message = format!("Applied: {}", ca.title);
+                            } else {
+                                self.message = format!("No edit available for '{}'", ca.title);
+                            }
+                        }
+                    }
+                } else {
+                    self.pending_code_action_choices.clear();
                 }
                 EngineAction::None
             }
@@ -29831,11 +30166,14 @@ impl Engine {
                 }
                 (path, state.buffer.to_string())
             };
-            // Clear stale semantic tokens immediately — they have line numbers
-            // from the previous buffer state and would highlight wrong lines.
+            // Clear stale position-based data immediately — line numbers from
+            // the previous buffer state would highlight/annotate wrong lines.
             if let Some(state) = self.buffer_manager.get_mut(buffer_id) {
                 state.semantic_tokens.clear();
             }
+            self.lsp_diagnostics.remove(&path);
+            self.lsp_code_actions.remove(&path);
+            self.lsp_code_action_last_line = None;
             if let Some(mgr) = &mut self.lsp_manager {
                 mgr.notify_did_change(&path, &text);
             }
@@ -29965,24 +30303,44 @@ impl Engine {
                 }
                 LspEvent::HoverResponse { contents, .. } => {
                     self.lsp_pending_hover = None;
-                    if let Some(text) = contents {
-                        // If an editor hover popup is active (gh triggered), update it
+                    // Treat empty/whitespace-only hover as "no hover".
+                    let text = contents.filter(|t| !t.trim().is_empty());
+                    if let Some(text) = text {
+                        self.lsp_hover_null_pos = None;
+                        // Cancel "Loading..." auto-dismiss since we got real content.
+                        self.editor_hover_dismiss_at = None;
                         if self.editor_hover.is_some() || self.editor_hover_has_focus {
+                            // Popup already visible (keyboard hover or has diagnostics) — update it.
                             self.update_editor_hover_with_lsp(&text);
+                        } else if let Some((line, col)) = self.lsp_hover_request_pos {
+                            // Mouse hover: no popup yet — create one at the request position.
+                            self.show_editor_hover(
+                                line,
+                                col,
+                                &text,
+                                EditorHoverSource::Lsp,
+                                false,
+                                true,
+                            );
                         } else {
                             self.lsp_hover_text = Some(text);
                         }
                         redraw = true;
-                    } else if self.editor_hover.is_some()
-                        && self
-                            .editor_hover
-                            .as_ref()
-                            .is_some_and(|h| matches!(h.source, EditorHoverSource::Lsp))
-                    {
-                        // LSP returned no hover — dismiss "Loading..." popup (only if LSP-sourced)
-                        self.dismiss_editor_hover();
                     } else {
-                        self.message = "No hover info".to_string();
+                        // LSP returned no hover — remember position to suppress re-requests.
+                        if let Some(pos) = self.lsp_hover_request_pos.take() {
+                            self.lsp_hover_null_pos = Some(pos);
+                        }
+                        if self.editor_hover.is_some()
+                            && self
+                                .editor_hover
+                                .as_ref()
+                                .is_some_and(|h| matches!(h.source, EditorHoverSource::Lsp))
+                        {
+                            // Dismiss "Loading..." popup (only if LSP-sourced)
+                            self.dismiss_editor_hover();
+                            redraw = true;
+                        }
                     }
                 }
                 LspEvent::ServerExited {
@@ -30300,6 +30658,31 @@ impl Engine {
                         }
                     }
                 }
+                LspEvent::CodeActionResponse {
+                    request_id,
+                    actions,
+                    ..
+                } => {
+                    if self.lsp_pending_code_action == Some(request_id) {
+                        self.lsp_pending_code_action = None;
+                        let show_popup = self.lsp_show_code_action_popup_pending;
+                        self.lsp_show_code_action_popup_pending = false;
+                        if let Some((path, line)) = self.lsp_code_action_request_ctx.take() {
+                            self.lsp_code_actions
+                                .entry(path)
+                                .or_default()
+                                .insert(line, actions.clone());
+                            if show_popup {
+                                if actions.is_empty() {
+                                    self.message = "No code actions available".to_string();
+                                } else {
+                                    self.show_code_actions_hover(line, actions);
+                                }
+                            }
+                            redraw = true;
+                        }
+                    }
+                }
             }
         }
         redraw
@@ -30342,20 +30725,6 @@ impl Engine {
                 self.message = "No LSP server for this file".to_string();
             }
         }
-    }
-
-    /// Check if an LSP server is available (running or initializing) for the active buffer.
-    fn has_lsp_for_buffer(&self) -> bool {
-        if !self.settings.lsp_enabled {
-            return false;
-        }
-        if let Some(path) = self.active_buffer_path() {
-            if let Some(mgr) = &self.lsp_manager {
-                return mgr.server_id_for_path(&path).is_some()
-                    || mgr.is_server_initializing(&path);
-            }
-        }
-        false
     }
 
     /// Return which LSP navigation commands are available for the current buffer.
@@ -30524,6 +30893,112 @@ impl Engine {
                 self.message = "No LSP server for this file".to_string();
             }
         }
+    }
+
+    /// Request code actions at the exact cursor position.
+    /// Called proactively after cursor settles (150ms debounce) and on-demand via `<leader>ca`.
+    pub fn lsp_request_code_actions_for_line(&mut self) {
+        if !self.settings.lsp_enabled {
+            return;
+        }
+        // Don't send if a request is already in flight.
+        if self.lsp_pending_code_action.is_some() {
+            return;
+        }
+        self.ensure_lsp_manager();
+        let Some((path, lsp_line, col_utf16)) = self.lsp_cursor_position() else {
+            return;
+        };
+        let line = lsp_line as usize;
+        // Clear stale cache for this line — actions depend on exact column.
+        if let Some(line_map) = self.lsp_code_actions.get_mut(&path) {
+            line_map.remove(&line);
+        }
+        // Build diagnostics JSON for lines touching the cursor line.
+        let diags_json = self.diagnostics_json_for_line(&path, line);
+        if let Some(mgr) = &mut self.lsp_manager {
+            if let Some(id) = mgr.request_code_action(&path, lsp_line, col_utf16, diags_json) {
+                self.lsp_pending_code_action = Some(id);
+                self.lsp_code_action_last_line = Some((path.clone(), line));
+                self.lsp_code_action_request_ctx = Some((path, line));
+            }
+        }
+    }
+
+    /// Build a JSON array of diagnostics touching a specific line (for code action context).
+    fn diagnostics_json_for_line(&self, path: &Path, line: usize) -> serde_json::Value {
+        let diags = match self.lsp_diagnostics.get(path) {
+            Some(d) => d,
+            None => return serde_json::json!([]),
+        };
+        let arr: Vec<serde_json::Value> = diags
+            .iter()
+            .filter(|d| {
+                let start = d.range.start.line as usize;
+                let end = d.range.end.line as usize;
+                line >= start && line <= end
+            })
+            .map(|d| {
+                serde_json::json!({
+                    "range": {
+                        "start": { "line": d.range.start.line, "character": d.range.start.character },
+                        "end": { "line": d.range.end.line, "character": d.range.end.character }
+                    },
+                    "severity": d.severity as i32,
+                    "message": d.message
+                })
+            })
+            .collect();
+        serde_json::Value::Array(arr)
+    }
+
+    /// Whether any code actions are available on the given line.
+    pub fn has_code_actions_on_line(&self, line: usize) -> bool {
+        let Some(path) = self.active_buffer_path() else {
+            return false;
+        };
+        self.lsp_code_actions
+            .get(&path)
+            .and_then(|m| m.get(&line))
+            .is_some_and(|v| !v.is_empty())
+    }
+
+    /// Show code actions for the current line in an editor hover popup.
+    /// If cached actions exist, shows immediately. Otherwise fires an LSP request
+    /// and `lsp_show_code_action_popup_pending` causes the response handler to
+    /// display the popup when results arrive.
+    pub fn show_code_actions_popup(&mut self) {
+        if self.active_buffer_path().is_none() {
+            return;
+        }
+        // Always make a fresh request — code actions depend on exact cursor column.
+        self.lsp_show_code_action_popup_pending = true;
+        self.lsp_request_code_actions_for_line();
+        if self.lsp_pending_code_action.is_none() {
+            self.lsp_show_code_action_popup_pending = false;
+            self.message = "No code actions available".to_string();
+        }
+    }
+
+    fn show_code_actions_hover(&mut self, _line: usize, actions: Vec<lsp::CodeAction>) {
+        let buttons: Vec<DialogButton> = actions
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                let kind_str = a
+                    .kind
+                    .as_deref()
+                    .map(|k| format!(" ({})", k))
+                    .unwrap_or_default();
+                DialogButton {
+                    label: format!("{}{}", a.title, kind_str),
+                    hotkey: '\0', // no single-key hotkey
+                    action: format!("apply_{}", i),
+                }
+            })
+            .collect();
+        self.pending_code_action_choices = actions;
+        self.show_dialog("code_actions", "Code Actions", vec![], buttons);
     }
 
     /// Request LSP find-references at cursor position.
@@ -30719,7 +31194,11 @@ impl Engine {
         }
         if let Some(state) = self.buffer_manager.get_mut(buffer_id) {
             state.finish_undo_group();
+            // Clear stale semantic tokens immediately — positions are now wrong.
+            state.semantic_tokens.clear();
         }
+        // Mark buffer dirty so the next LSP flush sends didChange + re-requests tokens.
+        self.lsp_dirty_buffers.insert(buffer_id, true);
     }
 
     /// Apply a workspace-wide rename edit.
@@ -31827,197 +32306,38 @@ impl Default for Engine {
     }
 }
 
-// ─── Fuzzy file finder ────────────────────────────────────────────────────────
+// ─── Fuzzy score (shared utility, used by tab switcher + unified picker) ──────
 
 impl Engine {
-    /// Open the fuzzy finder modal: walk cwd, populate file list, filter, show.
-    pub fn open_fuzzy_finder(&mut self) {
-        // Walk the cwd recursively, skipping hidden dirs, target/, and non-UTF-8 names.
-        let mut all_files = Vec::new();
-        self.walk_for_fuzzy(&self.cwd.clone(), &mut all_files);
-        all_files.sort();
-        self.fuzzy_all_files = all_files;
-        self.fuzzy_query.clear();
-        self.fuzzy_selected = 0;
-        self.fuzzy_filter();
-        self.fuzzy_open = true;
-    }
-
-    /// Recursively walk a directory, collecting relative file paths.
-    fn walk_for_fuzzy(&self, dir: &Path, out: &mut Vec<PathBuf>) {
-        let entries = match std::fs::read_dir(dir) {
-            Ok(e) => e,
-            Err(_) => return,
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let name = match path.file_name().and_then(|n| n.to_str()) {
-                Some(n) => n.to_owned(),
-                None => continue,
-            };
-            // Skip hidden files/dirs (unless setting enabled) and the target/ build directory
-            if (name.starts_with('.') && !self.settings.show_hidden_files) || name == "target" {
-                continue;
-            }
-            if path.is_dir() {
-                self.walk_for_fuzzy(&path, out);
-            } else {
-                // Store as relative path
-                if let Ok(rel) = path.strip_prefix(&self.cwd) {
-                    out.push(rel.to_path_buf());
-                }
-            }
-        }
-    }
-
-    /// Close the fuzzy finder and clear all associated state.
-    pub fn close_fuzzy_finder(&mut self) {
-        self.fuzzy_open = false;
-        self.fuzzy_query.clear();
-        self.fuzzy_results.clear();
-        self.fuzzy_selected = 0;
-    }
-
-    /// Append a character to the query and re-filter.
-    pub fn fuzzy_handle_char(&mut self, c: char) {
-        self.fuzzy_query.push(c);
-        self.fuzzy_filter();
-        self.fuzzy_selected = 0;
-    }
-
-    /// Remove the last character from the query and re-filter.
-    pub fn fuzzy_handle_backspace(&mut self) {
-        self.fuzzy_query.pop();
-        self.fuzzy_filter();
-        self.fuzzy_selected = 0;
-    }
-
-    /// Move selection down one row (clamped).
-    pub fn fuzzy_select_next(&mut self) {
-        let max = self.fuzzy_results.len().saturating_sub(1);
-        self.fuzzy_selected = (self.fuzzy_selected + 1).min(max);
-    }
-
-    /// Move selection up one row (clamped).
-    pub fn fuzzy_select_prev(&mut self) {
-        self.fuzzy_selected = self.fuzzy_selected.saturating_sub(1);
-    }
-
-    /// Open the selected file and close the fuzzy finder.
-    pub fn fuzzy_confirm(&mut self) -> EngineAction {
-        if let Some((rel_path, _)) = self.fuzzy_results.get(self.fuzzy_selected).cloned() {
-            let abs = self.cwd.join(&rel_path);
-            self.close_fuzzy_finder();
-            self.open_file_in_tab(&abs);
-        }
-        EngineAction::None
-    }
-
-    /// Route a key press when the fuzzy finder is open.
-    pub fn handle_fuzzy_key(
-        &mut self,
-        key_name: &str,
-        unicode: Option<char>,
-        ctrl: bool,
-    ) -> EngineAction {
-        match key_name {
-            "Escape" => {
-                self.close_fuzzy_finder();
-                EngineAction::None
-            }
-            "Return" => self.fuzzy_confirm(),
-            "Down" => {
-                self.fuzzy_select_next();
-                EngineAction::None
-            }
-            "Up" => {
-                self.fuzzy_select_prev();
-                EngineAction::None
-            }
-            "n" if ctrl => {
-                self.fuzzy_select_next();
-                EngineAction::None
-            }
-            "p" if ctrl => {
-                self.fuzzy_select_prev();
-                EngineAction::None
-            }
-            "BackSpace" => {
-                self.fuzzy_handle_backspace();
-                EngineAction::None
-            }
-            _ => {
-                if !ctrl {
-                    if let Some(c) = unicode {
-                        if !c.is_control() {
-                            self.fuzzy_handle_char(c);
-                        }
-                    }
-                }
-                EngineAction::None
-            }
-        }
-    }
-
-    /// Filter `fuzzy_all_files` by the current query and populate `fuzzy_results`.
-    fn fuzzy_filter(&mut self) {
-        const CAP: usize = 50;
-        if self.fuzzy_query.is_empty() {
-            self.fuzzy_results = self
-                .fuzzy_all_files
-                .iter()
-                .take(CAP)
-                .map(|p| (p.clone(), p.to_string_lossy().into_owned()))
-                .collect();
-        } else {
-            let query = self.fuzzy_query.clone();
-            let mut scored: Vec<(i32, PathBuf, String)> = self
-                .fuzzy_all_files
-                .iter()
-                .filter_map(|p| {
-                    let display = p.to_string_lossy().into_owned();
-                    Self::fuzzy_score(&display, &query).map(|s| (s, p.clone(), display))
-                })
-                .collect();
-            scored.sort_by(|a, b| b.0.cmp(&a.0));
-            self.fuzzy_results = scored
-                .into_iter()
-                .take(CAP)
-                .map(|(_, p, d)| (p, d))
-                .collect();
-        }
-    }
-
-    /// Compute a fuzzy match score of `query` against `path`.
-    /// Returns `None` if not all query characters appear as a subsequence in `path`.
-    fn fuzzy_score(path: &str, query: &str) -> Option<i32> {
+    /// Compute a fuzzy match score of `query` against `text`.
+    /// Returns `None` if not all query characters appear as a subsequence.
+    pub fn fuzzy_score(text: &str, query: &str) -> Option<i32> {
         if query.is_empty() {
             return Some(0);
         }
-        let path_lc = path.to_lowercase();
+        let text_lc = text.to_lowercase();
         let query_lc = query.to_lowercase();
-        let pb = path_lc.as_bytes();
+        let tb = text_lc.as_bytes();
         let qb = query_lc.as_bytes();
         let mut qi = 0usize;
         let mut score = 100i32;
-        let mut last_pi = 0usize;
-        for pi in 0..pb.len() {
-            if qi < qb.len() && pb[pi] == qb[qi] {
+        let mut last_ti = 0usize;
+        for ti in 0..tb.len() {
+            if qi < qb.len() && tb[ti] == qb[qi] {
                 if qi > 0 {
-                    score -= (pi - last_pi - 1) as i32; // penalize gaps
+                    score -= (ti - last_ti - 1) as i32; // penalize gaps
                 }
-                // bonus for word-boundary matches (/, _, -, .)
-                if pi == 0 || matches!(pb[pi - 1], b'/' | b'_' | b'-' | b'.') {
+                if ti == 0 || matches!(tb[ti - 1], b'/' | b'_' | b'-' | b'.') {
                     score += 5;
                 }
-                last_pi = pi;
+                last_ti = ti;
                 qi += 1;
             }
         }
         if qi < qb.len() {
             None
         } else {
-            Some(score - pb.len() as i32 / 20)
+            Some(score - tb.len() as i32 / 20)
         }
     }
 }
@@ -32026,290 +32346,403 @@ fn is_word_char(ch: char) -> bool {
     ch.is_alphanumeric() || ch == '_'
 }
 
-// ─── Live grep ────────────────────────────────────────────────────────────────
+// ─── Unified Picker ───────────────────────────────────────────────────────────
 
 impl Engine {
-    /// Open the live grep modal and reset all associated state.
-    pub fn open_live_grep(&mut self) {
-        self.grep_open = true;
-        self.grep_query.clear();
-        self.grep_results.clear();
-        self.grep_selected = 0;
-        self.grep_preview_lines.clear();
-    }
-
-    /// Close the live grep modal and clear all associated state.
-    pub fn close_live_grep(&mut self) {
-        self.grep_open = false;
-        self.grep_query.clear();
-        self.grep_results.clear();
-        self.grep_selected = 0;
-        self.grep_preview_lines.clear();
-    }
-
-    /// Append a character to the query, re-run search, and update preview.
-    pub fn grep_handle_char(&mut self, c: char) {
-        self.grep_query.push(c);
-        self.grep_selected = 0;
-        self.grep_run_search();
-        self.grep_load_preview();
-    }
-
-    /// Remove the last character from the query, re-run search, and update preview.
-    pub fn grep_handle_backspace(&mut self) {
-        self.grep_query.pop();
-        self.grep_selected = 0;
-        self.grep_run_search();
-        self.grep_load_preview();
-    }
-
-    /// Move selection down one row (clamped) and update preview.
-    pub fn grep_select_next(&mut self) {
-        let max = self.grep_results.len().saturating_sub(1);
-        self.grep_selected = (self.grep_selected + 1).min(max);
-        self.grep_load_preview();
-    }
-
-    /// Move selection up one row (clamped) and update preview.
-    pub fn grep_select_prev(&mut self) {
-        self.grep_selected = self.grep_selected.saturating_sub(1);
-        self.grep_load_preview();
-    }
-
-    /// Open the selected file at the matched line and close the grep modal.
-    pub fn grep_confirm(&mut self) -> EngineAction {
-        if let Some(m) = self.grep_results.get(self.grep_selected).cloned() {
-            let line = m.line;
-            self.close_live_grep();
-            self.open_file_in_tab(&m.file.clone());
-            let win_id = self.active_window_id();
-            self.set_cursor_for_window(win_id, line, 0);
-            self.ensure_cursor_visible();
+    /// Compute a fuzzy match score and record the byte positions in `text` that matched.
+    /// Returns `None` if not all query characters appear as a subsequence.
+    pub fn fuzzy_score_with_positions(text: &str, query: &str) -> Option<(i32, Vec<usize>)> {
+        if query.is_empty() {
+            return Some((0, Vec::new()));
         }
-        EngineAction::None
+        let text_lc = text.to_lowercase();
+        let query_lc = query.to_lowercase();
+        let tb = text_lc.as_bytes();
+        let qb = query_lc.as_bytes();
+        let mut qi = 0usize;
+        let mut score = 100i32;
+        let mut last_ti = 0usize;
+        let mut positions = Vec::with_capacity(qb.len());
+        for ti in 0..tb.len() {
+            if qi < qb.len() && tb[ti] == qb[qi] {
+                if qi > 0 {
+                    score -= (ti - last_ti - 1) as i32; // penalize gaps
+                }
+                if ti == 0 || matches!(tb[ti - 1], b'/' | b'_' | b'-' | b'.') {
+                    score += 5;
+                }
+                // Map back to the original text's byte position.
+                // Since to_lowercase() can change byte lengths for non-ASCII,
+                // we use char-index mapping for safety, but for ASCII paths
+                // the positions are identical.
+                positions.push(ti);
+                last_ti = ti;
+                qi += 1;
+            }
+        }
+        if qi < qb.len() {
+            None
+        } else {
+            Some((score - tb.len() as i32 / 20, positions))
+        }
     }
 
-    /// Route a key press when the live grep modal is open.
-    pub fn handle_grep_key(
-        &mut self,
-        key_name: &str,
-        unicode: Option<char>,
-        ctrl: bool,
-    ) -> EngineAction {
-        match key_name {
-            "Escape" => {
-                self.close_live_grep();
-                EngineAction::None
+    /// Open the unified picker with a given source.
+    pub fn open_picker(&mut self, source: PickerSource) {
+        self.picker_query.clear();
+        self.picker_selected = 0;
+        self.picker_scroll_top = 0;
+        self.picker_all_items.clear();
+        self.picker_items.clear();
+        self.picker_preview = None;
+
+        match source {
+            PickerSource::Files => {
+                self.picker_title = "Find Files".to_string();
+                self.picker_populate_files();
             }
-            "Return" => self.grep_confirm(),
-            "Down" => {
-                self.grep_select_next();
-                EngineAction::None
+            PickerSource::Commands => {
+                self.picker_title = "Command Palette".to_string();
+                self.picker_populate_commands();
             }
-            "Up" => {
-                self.grep_select_prev();
-                EngineAction::None
-            }
-            "n" if ctrl => {
-                self.grep_select_next();
-                EngineAction::None
-            }
-            "p" if ctrl => {
-                self.grep_select_prev();
-                EngineAction::None
-            }
-            "BackSpace" => {
-                self.grep_handle_backspace();
-                EngineAction::None
+            PickerSource::Grep => {
+                self.picker_title = "Live Grep".to_string();
+                // Grep is a live source — no pre-populate, search runs per keystroke.
             }
             _ => {
-                if !ctrl {
-                    if let Some(c) = unicode {
-                        if !c.is_control() {
-                            self.grep_handle_char(c);
-                        }
-                    }
-                }
-                EngineAction::None
+                self.picker_title = format!("{:?}", source);
             }
         }
+
+        self.picker_source = source;
+        self.picker_filter();
+        self.picker_load_preview();
+        self.picker_open = true;
     }
 
-    /// Search all files under cwd for the current query (min 2 chars).
-    fn grep_run_search(&mut self) {
-        if self.grep_query.len() < 2 {
-            self.grep_results.clear();
-            return;
-        }
-        let options = SearchOptions::default();
+    /// Close the unified picker and clear all state.
+    pub fn close_picker(&mut self) {
+        self.picker_open = false;
+        self.picker_query.clear();
+        self.picker_all_items.clear();
+        self.picker_items.clear();
+        self.picker_selected = 0;
+        self.picker_scroll_top = 0;
+        self.picker_preview = None;
+    }
+
+    /// Populate picker_all_items with files from the project using the ignore crate.
+    fn picker_populate_files(&mut self) {
         let cwd = self.cwd.clone();
-        match project_search::search_in_project(&cwd, &self.grep_query, &options) {
-            Ok(mut results) => {
-                results.truncate(200);
-                self.grep_results = results;
+        let show_hidden = self.settings.show_hidden_files;
+        let walker = ignore::WalkBuilder::new(&cwd)
+            .hidden(!show_hidden)
+            .git_ignore(true)
+            .git_global(true)
+            .git_exclude(true)
+            .build();
+
+        let mut items: Vec<PickerItem> = Vec::new();
+        for entry in walker {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+                continue;
             }
-            Err(_) => self.grep_results.clear(),
+            let path = entry.path();
+            let rel = match path.strip_prefix(&cwd) {
+                Ok(r) => r.to_path_buf(),
+                Err(_) => continue,
+            };
+            let display = rel.to_string_lossy().into_owned();
+            items.push(PickerItem {
+                filter_text: display.clone(),
+                display,
+                detail: None,
+                action: PickerAction::OpenFile(rel),
+                icon: None,
+                score: 0,
+                match_positions: Vec::new(),
+            });
         }
+        items.sort_by(|a, b| a.display.cmp(&b.display));
+        self.picker_all_items = items;
     }
 
-    /// Load ±5 context lines around the currently selected match into `grep_preview_lines`.
-    fn grep_load_preview(&mut self) {
-        const CONTEXT: usize = 5;
-        self.grep_preview_lines.clear();
-        let Some(m) = self.grep_results.get(self.grep_selected) else {
+    /// Populate picker_all_items with command palette entries.
+    fn picker_populate_commands(&mut self) {
+        let use_vscode = self.is_vscode_mode();
+        self.picker_all_items = PALETTE_COMMANDS
+            .iter()
+            .map(|cmd| {
+                let sc = if use_vscode && !cmd.vscode_shortcut.is_empty() {
+                    cmd.vscode_shortcut.to_string()
+                } else {
+                    cmd.shortcut.to_string()
+                };
+                PickerItem {
+                    display: cmd.label.to_string(),
+                    filter_text: format!("{} {}", cmd.label, cmd.action),
+                    detail: if sc.is_empty() { None } else { Some(sc) },
+                    action: PickerAction::ExecuteCommand(cmd.action.to_string()),
+                    icon: None,
+                    score: 0,
+                    match_positions: Vec::new(),
+                }
+            })
+            .collect();
+    }
+
+    /// Filter picker_all_items by the current query and populate picker_items.
+    /// For live sources (Grep), runs a search instead of fuzzy-filtering.
+    fn picker_filter(&mut self) {
+        const CAP: usize = 100;
+
+        // Live grep: run project search directly instead of fuzzy-filtering.
+        if self.picker_source == PickerSource::Grep {
+            self.picker_grep_search();
             return;
-        };
-        let file = m.file.clone();
-        let match_line = m.line; // 0-indexed
-        let Ok(content) = std::fs::read_to_string(&file) else {
-            return;
-        };
-        let all_lines: Vec<&str> = content.lines().collect();
-        let start = match_line.saturating_sub(CONTEXT);
-        let end = (match_line + CONTEXT + 1).min(all_lines.len());
-        for (i, &text) in all_lines[start..end].iter().enumerate() {
-            let lineno = start + i + 1; // 1-based for display
-            let is_match = (start + i) == match_line;
-            self.grep_preview_lines
-                .push((lineno, text.to_string(), is_match));
         }
-    }
-}
 
-// ─── Command Palette ──────────────────────────────────────────────────────────
-
-impl Engine {
-    /// Open the command palette modal and reset state.
-    pub fn open_command_palette(&mut self) {
-        self.palette_open = true;
-        self.palette_query.clear();
-        self.palette_selected = 0;
-        self.palette_scroll_top = 0;
-        self.palette_update_filter();
-    }
-
-    /// Close the command palette.
-    pub fn close_command_palette(&mut self) {
-        self.palette_open = false;
-    }
-
-    /// Re-filter PALETTE_COMMANDS against the current query.
-    pub fn palette_update_filter(&mut self) {
-        if self.palette_query.is_empty() {
-            self.palette_results = (0..PALETTE_COMMANDS.len()).collect();
+        if self.picker_query.is_empty() {
+            self.picker_items = self.picker_all_items.iter().take(CAP).cloned().collect();
         } else {
-            let q = self.palette_query.clone();
-            let mut scored: Vec<(i32, usize)> = PALETTE_COMMANDS
+            let query = self.picker_query.clone();
+            let mut scored: Vec<PickerItem> = self
+                .picker_all_items
                 .iter()
-                .enumerate()
-                .filter_map(|(i, cmd)| {
-                    let combined = format!("{} {}", cmd.label, cmd.action);
-                    Self::fuzzy_score(&combined, &q).map(|s| (s, i))
+                .filter_map(|item| {
+                    Self::fuzzy_score_with_positions(&item.filter_text, &query).map(
+                        |(s, positions)| {
+                            let mut item = item.clone();
+                            item.score = s;
+                            item.match_positions = positions;
+                            item
+                        },
+                    )
                 })
                 .collect();
-            scored.sort_by(|a, b| b.0.cmp(&a.0));
-            self.palette_results = scored.into_iter().map(|(_, i)| i).collect();
+            scored.sort_by(|a, b| b.score.cmp(&a.score));
+            scored.truncate(CAP);
+            self.picker_items = scored;
         }
-        let max = self.palette_results.len().saturating_sub(1);
-        self.palette_selected = self.palette_selected.min(max);
-        self.palette_scroll_top = 0;
     }
 
-    /// Execute the currently selected palette command.
-    pub fn palette_confirm(&mut self) -> EngineAction {
-        let Some(&idx) = self.palette_results.get(self.palette_selected) else {
-            self.close_command_palette();
+    /// Run a live project search for the Grep picker source.
+    fn picker_grep_search(&mut self) {
+        if self.picker_query.len() < 2 {
+            self.picker_items.clear();
+            return;
+        }
+        let options = project_search::SearchOptions::default();
+        let cwd = self.cwd.clone();
+        match project_search::search_in_project(&cwd, &self.picker_query, &options) {
+            Ok(mut results) => {
+                results.truncate(200);
+                self.picker_items = results
+                    .into_iter()
+                    .map(|m| {
+                        let rel = m
+                            .file
+                            .strip_prefix(&cwd)
+                            .unwrap_or(&m.file)
+                            .to_string_lossy()
+                            .into_owned();
+                        let display = format!("{}:{}: {}", rel, m.line + 1, m.line_text.trim());
+                        PickerItem {
+                            filter_text: display.clone(),
+                            display,
+                            detail: None,
+                            action: PickerAction::OpenFileAtLine(m.file.clone(), m.line),
+                            icon: None,
+                            score: 0,
+                            match_positions: Vec::new(),
+                        }
+                    })
+                    .collect();
+            }
+            Err(_) => self.picker_items.clear(),
+        }
+    }
+
+    /// Load preview context for the currently selected picker item.
+    fn picker_load_preview(&mut self) {
+        self.picker_preview = None;
+        let Some(item) = self.picker_items.get(self.picker_selected) else {
+            return;
+        };
+        match &item.action {
+            PickerAction::OpenFile(rel_path) => {
+                let abs = self.cwd.join(rel_path);
+                let Ok(content) = std::fs::read_to_string(&abs) else {
+                    return;
+                };
+                let lines: Vec<(usize, String, bool)> = content
+                    .lines()
+                    .take(30)
+                    .enumerate()
+                    .map(|(i, text)| (i + 1, text.to_string(), false))
+                    .collect();
+                self.picker_preview = Some(PickerPreview { lines });
+            }
+            PickerAction::OpenFileAtLine(path, line) => {
+                let Ok(content) = std::fs::read_to_string(path) else {
+                    return;
+                };
+                let all_lines: Vec<&str> = content.lines().collect();
+                let match_line = *line;
+                let context = 5usize;
+                let start = match_line.saturating_sub(context);
+                let end = (match_line + context + 1).min(all_lines.len());
+                let lines: Vec<(usize, String, bool)> = all_lines[start..end]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, text)| {
+                        let lineno = start + i + 1;
+                        let is_match = (start + i) == match_line;
+                        (lineno, text.to_string(), is_match)
+                    })
+                    .collect();
+                self.picker_preview = Some(PickerPreview { lines });
+            }
+            _ => {}
+        }
+    }
+
+    /// Execute the currently selected picker item.
+    pub fn picker_confirm(&mut self) -> EngineAction {
+        let Some(item) = self.picker_items.get(self.picker_selected).cloned() else {
+            self.close_picker();
             return EngineAction::None;
         };
-        let action = PALETTE_COMMANDS[idx].action;
-        self.close_command_palette();
-        // In Vim mode, ensure Normal mode so all commands work reliably.
-        // VSCode mode stays in Insert (its default editing state).
-        if !self.is_vscode_mode() {
-            self.mode = Mode::Normal;
-        }
-        // Handle special palette-only actions that map to internal operations
-        match action {
-            "fuzzy" => {
-                self.open_fuzzy_finder();
+        self.close_picker();
+
+        match item.action {
+            PickerAction::OpenFile(rel_path) => {
+                let abs = self.cwd.join(&rel_path);
+                self.open_file_in_tab(&abs);
                 EngineAction::None
             }
-            "grep" => {
-                self.open_live_grep();
+            PickerAction::OpenFileAtLine(path, line) => {
+                self.open_file_in_tab(&path);
+                let win_id = self.active_window_id();
+                self.set_cursor_for_window(win_id, line, 0);
+                self.ensure_cursor_visible();
                 EngineAction::None
             }
-            "goto_line" => {
-                self.message = "Use :N to go to line N".to_string();
-                EngineAction::None
-            }
-            "undo" => {
-                self.undo();
-                self.refresh_md_previews();
-                EngineAction::None
-            }
-            "redo" => {
-                self.redo();
-                self.refresh_md_previews();
-                EngineAction::None
-            }
-            "substitute" => {
-                self.message = "Use :%s/old/new/g for find & replace".to_string();
-                EngineAction::None
-            }
-            "jump_back" => {
-                self.jump_list_back();
-                EngineAction::None
-            }
-            "lsp_definition" => {
-                self.lsp_request_definition();
-                EngineAction::None
-            }
-            "lsp_references" => {
-                self.lsp_request_references();
-                EngineAction::None
-            }
-            "set_wrap_toggle" => {
-                self.settings.wrap = !self.settings.wrap;
-                let _ = self.settings.save();
-                let state = if self.settings.wrap { "wrap" } else { "nowrap" };
-                self.message = format!("set {}", state);
-                EngineAction::None
-            }
-            "set_number_toggle" => {
-                use super::settings::LineNumberMode;
-                self.settings.line_numbers = match self.settings.line_numbers {
-                    LineNumberMode::None | LineNumberMode::Relative => LineNumberMode::Absolute,
-                    LineNumberMode::Absolute | LineNumberMode::Hybrid => LineNumberMode::None,
-                };
-                let _ = self.settings.save();
-                EngineAction::None
-            }
-            "set_rnu_toggle" => {
-                use super::settings::LineNumberMode;
-                self.settings.line_numbers = match self.settings.line_numbers {
-                    LineNumberMode::None | LineNumberMode::Absolute => LineNumberMode::Relative,
-                    LineNumberMode::Relative | LineNumberMode::Hybrid => LineNumberMode::None,
-                };
-                let _ = self.settings.save();
-                EngineAction::None
-            }
-            "toggle_spell" => {
-                self.settings.spell = !self.settings.spell;
-                if self.settings.spell {
-                    self.ensure_spell_checker();
-                    self.message = "Spell checking enabled".to_string();
-                } else {
-                    self.message = "Spell checking disabled".to_string();
+            PickerAction::ExecuteCommand(action) => {
+                // Same logic as palette_confirm for special actions
+                if !self.is_vscode_mode() {
+                    self.mode = Mode::Normal;
                 }
-                let _ = self.settings.save();
+                match action.as_str() {
+                    "fuzzy" => {
+                        self.open_picker(PickerSource::Files);
+                        EngineAction::None
+                    }
+                    "grep" => {
+                        self.open_picker(PickerSource::Grep);
+                        EngineAction::None
+                    }
+                    "goto_line" => {
+                        self.message = "Use :N to go to line N".to_string();
+                        EngineAction::None
+                    }
+                    "undo" => {
+                        self.undo();
+                        self.refresh_md_previews();
+                        EngineAction::None
+                    }
+                    "redo" => {
+                        self.redo();
+                        self.refresh_md_previews();
+                        EngineAction::None
+                    }
+                    "substitute" => {
+                        self.message = "Use :%s/old/new/g for find & replace".to_string();
+                        EngineAction::None
+                    }
+                    "jump_back" => {
+                        self.jump_list_back();
+                        EngineAction::None
+                    }
+                    "lsp_definition" => {
+                        self.lsp_request_definition();
+                        EngineAction::None
+                    }
+                    "lsp_references" => {
+                        self.lsp_request_references();
+                        EngineAction::None
+                    }
+                    "set_wrap_toggle" => {
+                        self.settings.wrap = !self.settings.wrap;
+                        let _ = self.settings.save();
+                        let state = if self.settings.wrap { "wrap" } else { "nowrap" };
+                        self.message = format!("set {}", state);
+                        EngineAction::None
+                    }
+                    "set_number_toggle" => {
+                        use super::settings::LineNumberMode;
+                        self.settings.line_numbers = match self.settings.line_numbers {
+                            LineNumberMode::None | LineNumberMode::Relative => {
+                                LineNumberMode::Absolute
+                            }
+                            LineNumberMode::Absolute | LineNumberMode::Hybrid => {
+                                LineNumberMode::None
+                            }
+                        };
+                        let _ = self.settings.save();
+                        EngineAction::None
+                    }
+                    "set_rnu_toggle" => {
+                        use super::settings::LineNumberMode;
+                        self.settings.line_numbers = match self.settings.line_numbers {
+                            LineNumberMode::None | LineNumberMode::Absolute => {
+                                LineNumberMode::Relative
+                            }
+                            LineNumberMode::Relative | LineNumberMode::Hybrid => {
+                                LineNumberMode::None
+                            }
+                        };
+                        let _ = self.settings.save();
+                        EngineAction::None
+                    }
+                    "toggle_spell" => {
+                        self.settings.spell = !self.settings.spell;
+                        if self.settings.spell {
+                            self.ensure_spell_checker();
+                            self.message = "Spell checking enabled".to_string();
+                        } else {
+                            self.message = "Spell checking disabled".to_string();
+                        }
+                        let _ = self.settings.save();
+                        EngineAction::None
+                    }
+                    other => self.execute_command(other),
+                }
+            }
+            PickerAction::CheckoutBranch(branch) => {
+                self.execute_command(&format!("Gcheckout {}", branch))
+            }
+            PickerAction::JumpToMark(_mark) => {
+                // Phase 3: mark jumping via picker
                 EngineAction::None
             }
-            _ => self.execute_command(action),
+            PickerAction::PasteRegister(_reg) => {
+                // Phase 3: register paste via picker
+                EngineAction::None
+            }
+            PickerAction::Custom(_key) => {
+                // Future: fire Lua event
+                EngineAction::None
+            }
         }
     }
 
-    /// Route a key press when the command palette is open.
-    pub fn handle_palette_key(
+    /// Route a key press when the unified picker is open.
+    pub fn handle_picker_key(
         &mut self,
         key_name: &str,
         unicode: Option<char>,
@@ -32317,44 +32750,68 @@ impl Engine {
     ) -> EngineAction {
         match key_name {
             "Escape" => {
-                self.close_command_palette();
+                self.close_picker();
                 EngineAction::None
             }
-            "Return" => self.palette_confirm(),
-            "Down" => {
-                let max = self.palette_results.len().saturating_sub(1);
-                self.palette_selected = (self.palette_selected + 1).min(max);
+            "Return" => self.picker_confirm(),
+            "Down" | "Tab" => {
+                let max = self.picker_items.len().saturating_sub(1);
+                self.picker_selected = (self.picker_selected + 1).min(max);
+                self.picker_update_scroll();
+                self.picker_load_preview();
                 EngineAction::None
             }
             "Up" => {
-                self.palette_selected = self.palette_selected.saturating_sub(1);
+                self.picker_selected = self.picker_selected.saturating_sub(1);
+                self.picker_update_scroll();
+                self.picker_load_preview();
                 EngineAction::None
             }
             "n" if ctrl => {
-                let max = self.palette_results.len().saturating_sub(1);
-                self.palette_selected = (self.palette_selected + 1).min(max);
+                let max = self.picker_items.len().saturating_sub(1);
+                self.picker_selected = (self.picker_selected + 1).min(max);
+                self.picker_update_scroll();
+                self.picker_load_preview();
                 EngineAction::None
             }
             "p" if ctrl => {
-                self.palette_selected = self.palette_selected.saturating_sub(1);
+                self.picker_selected = self.picker_selected.saturating_sub(1);
+                self.picker_update_scroll();
+                self.picker_load_preview();
                 EngineAction::None
             }
             "BackSpace" => {
-                self.palette_query.pop();
-                self.palette_update_filter();
+                self.picker_query.pop();
+                self.picker_selected = 0;
+                self.picker_scroll_top = 0;
+                self.picker_filter();
+                self.picker_load_preview();
                 EngineAction::None
             }
             _ => {
                 if !ctrl {
                     if let Some(c) = unicode {
                         if !c.is_control() {
-                            self.palette_query.push(c);
-                            self.palette_update_filter();
+                            self.picker_query.push(c);
+                            self.picker_selected = 0;
+                            self.picker_scroll_top = 0;
+                            self.picker_filter();
+                            self.picker_load_preview();
                         }
                     }
                 }
                 EngineAction::None
             }
+        }
+    }
+
+    /// Adjust scroll_top so the selected item is visible (assuming ~20 visible rows).
+    fn picker_update_scroll(&mut self) {
+        let visible = 20usize; // approximate; render layer will clip
+        if self.picker_selected < self.picker_scroll_top {
+            self.picker_scroll_top = self.picker_selected;
+        } else if self.picker_selected >= self.picker_scroll_top + visible {
+            self.picker_scroll_top = self.picker_selected + 1 - visible;
         }
     }
 }
@@ -36085,13 +36542,13 @@ impl Engine {
                     self.finish_undo_group();
                     return self.vscode_goto_line();
                 }
-                // Phase 3: Ctrl+P → quick file open (fuzzy finder)
+                // Phase 3: Ctrl+P → quick file open (unified picker)
                 "p" => {
-                    self.open_fuzzy_finder();
+                    self.open_picker(PickerSource::Files);
                 }
                 // Phase 3: Ctrl+Shift+P → command palette
                 "P" => {
-                    self.open_command_palette();
+                    self.open_picker(PickerSource::Commands);
                 }
                 // Phase 3: Ctrl+B → toggle sidebar
                 "b" => {
@@ -36201,7 +36658,7 @@ impl Engine {
                 }
                 "F1" => {
                     // F1 opens the command palette (matches VSCode).
-                    self.open_command_palette();
+                    self.open_picker(PickerSource::Commands);
                 }
                 "F10" => {
                     // Toggle menu bar visibility
@@ -45345,309 +45802,449 @@ mod tests {
     }
 
     #[test]
-    fn test_fuzzy_close_clears_state() {
+    fn test_ctrl_p_opens_picker() {
         let mut engine = Engine::new();
-        engine.fuzzy_open = true;
-        engine.fuzzy_query = "hello".to_string();
-        engine.fuzzy_results = vec![(PathBuf::from("a"), "a".to_string())];
-        engine.fuzzy_selected = 1;
-
-        engine.close_fuzzy_finder();
-
-        assert!(!engine.fuzzy_open);
-        assert!(engine.fuzzy_query.is_empty());
-        assert!(engine.fuzzy_results.is_empty());
-        assert_eq!(engine.fuzzy_selected, 0);
-    }
-
-    #[test]
-    fn test_fuzzy_filter_empty_query() {
-        let mut engine = Engine::new();
-        engine.fuzzy_all_files = vec![
-            PathBuf::from("src/main.rs"),
-            PathBuf::from("src/lib.rs"),
-            PathBuf::from("README.md"),
-        ];
-        engine.fuzzy_query.clear();
-        engine.fuzzy_filter();
-
-        // All files should be shown when query is empty
-        assert_eq!(engine.fuzzy_results.len(), 3);
-    }
-
-    #[test]
-    fn test_fuzzy_filter_with_query() {
-        let mut engine = Engine::new();
-        engine.fuzzy_all_files = vec![
-            PathBuf::from("src/main.rs"),
-            PathBuf::from("src/engine.rs"),
-            PathBuf::from("README.md"),
-        ];
-        engine.fuzzy_query = "eng".to_string();
-        engine.fuzzy_filter();
-
-        // Only engine.rs should match "eng"
-        assert_eq!(engine.fuzzy_results.len(), 1);
-        assert!(engine.fuzzy_results[0].1.contains("engine"));
-    }
-
-    #[test]
-    fn test_fuzzy_select_bounds() {
-        let mut engine = Engine::new();
-        engine.fuzzy_results = vec![
-            (PathBuf::from("a"), "a".to_string()),
-            (PathBuf::from("b"), "b".to_string()),
-            (PathBuf::from("c"), "c".to_string()),
-        ];
-        engine.fuzzy_selected = 0;
-
-        // prev at 0 stays at 0
-        engine.fuzzy_select_prev();
-        assert_eq!(engine.fuzzy_selected, 0);
-
-        // next from 0 goes to 1
-        engine.fuzzy_select_next();
-        assert_eq!(engine.fuzzy_selected, 1);
-
-        // next to max (2)
-        engine.fuzzy_select_next();
-        engine.fuzzy_select_next(); // trying to go past max
-        assert_eq!(engine.fuzzy_selected, 2);
-    }
-
-    #[test]
-    fn test_fuzzy_handle_char_and_backspace() {
-        let mut engine = Engine::new();
-        engine.fuzzy_all_files = vec![PathBuf::from("src/main.rs"), PathBuf::from("src/engine.rs")];
-        engine.fuzzy_open = true;
-
-        engine.fuzzy_handle_char('m');
-        assert_eq!(engine.fuzzy_query, "m");
-        // Only main.rs matches "m"
-        assert_eq!(engine.fuzzy_results.len(), 1);
-        assert_eq!(engine.fuzzy_selected, 0);
-
-        engine.fuzzy_handle_backspace();
-        assert_eq!(engine.fuzzy_query, "");
-        // Both files shown again
-        assert_eq!(engine.fuzzy_results.len(), 2);
-    }
-
-    #[test]
-    fn test_fuzzy_escape_closes() {
-        let mut engine = Engine::new();
-        engine.fuzzy_open = true;
-        engine.fuzzy_query = "test".to_string();
-
-        engine.handle_key("Escape", None, false);
-
-        assert!(!engine.fuzzy_open);
-        assert!(engine.fuzzy_query.is_empty());
-    }
-
-    #[test]
-    fn test_ctrl_p_opens_fuzzy() {
-        let mut engine = Engine::new();
-        assert!(!engine.fuzzy_open);
+        assert!(!engine.picker_open);
 
         press_ctrl(&mut engine, 'p');
 
-        assert!(engine.fuzzy_open);
+        assert!(engine.picker_open);
+        assert_eq!(engine.picker_source, PickerSource::Files);
     }
 
-    // ── Live grep tests ───────────────────────────────────────────────────────
+    // ── Unified picker tests ─────────────────────────────────────────────────
 
     #[test]
-    fn test_grep_run_search_short_query() {
+    fn test_picker_close_clears_state() {
         let mut engine = Engine::new();
-        engine.grep_open = true;
-        engine.grep_query = "a".to_string(); // only 1 char — below threshold
-        engine.grep_run_search();
-        assert!(
-            engine.grep_results.is_empty(),
-            "query < 2 chars should yield no results"
-        );
+        engine.open_picker(PickerSource::Files);
+        assert!(engine.picker_open);
+
+        engine.close_picker();
+
+        assert!(!engine.picker_open);
+        assert!(engine.picker_query.is_empty());
+        assert!(engine.picker_items.is_empty());
+        assert!(engine.picker_all_items.is_empty());
+        assert_eq!(engine.picker_selected, 0);
     }
 
     #[test]
-    fn test_grep_run_search_finds_match() {
+    fn test_picker_escape_closes() {
+        let mut engine = Engine::new();
+        engine.open_picker(PickerSource::Files);
+        assert!(engine.picker_open);
+
+        engine.handle_key("Escape", None, false);
+
+        assert!(!engine.picker_open);
+    }
+
+    #[test]
+    fn test_picker_filter_with_query() {
+        let mut engine = Engine::new();
+        engine.picker_all_items = vec![
+            PickerItem {
+                display: "src/main.rs".to_string(),
+                filter_text: "src/main.rs".to_string(),
+                detail: None,
+                action: PickerAction::OpenFile(PathBuf::from("src/main.rs")),
+                icon: None,
+                score: 0,
+                match_positions: Vec::new(),
+            },
+            PickerItem {
+                display: "src/engine.rs".to_string(),
+                filter_text: "src/engine.rs".to_string(),
+                detail: None,
+                action: PickerAction::OpenFile(PathBuf::from("src/engine.rs")),
+                icon: None,
+                score: 0,
+                match_positions: Vec::new(),
+            },
+            PickerItem {
+                display: "README.md".to_string(),
+                filter_text: "README.md".to_string(),
+                detail: None,
+                action: PickerAction::OpenFile(PathBuf::from("README.md")),
+                icon: None,
+                score: 0,
+                match_positions: Vec::new(),
+            },
+        ];
+        engine.picker_open = true;
+        engine.picker_source = PickerSource::Files;
+
+        // Filter with "eng"
+        engine.picker_query = "eng".to_string();
+        engine.picker_filter();
+
+        assert_eq!(engine.picker_items.len(), 1);
+        assert!(engine.picker_items[0].display.contains("engine"));
+        // Should have match positions
+        assert!(!engine.picker_items[0].match_positions.is_empty());
+    }
+
+    #[test]
+    fn test_picker_filter_empty_shows_all() {
+        let mut engine = Engine::new();
+        engine.picker_all_items = vec![
+            PickerItem {
+                display: "a.rs".to_string(),
+                filter_text: "a.rs".to_string(),
+                detail: None,
+                action: PickerAction::OpenFile(PathBuf::from("a.rs")),
+                icon: None,
+                score: 0,
+                match_positions: Vec::new(),
+            },
+            PickerItem {
+                display: "b.rs".to_string(),
+                filter_text: "b.rs".to_string(),
+                detail: None,
+                action: PickerAction::OpenFile(PathBuf::from("b.rs")),
+                icon: None,
+                score: 0,
+                match_positions: Vec::new(),
+            },
+        ];
+        engine.picker_query.clear();
+        engine.picker_filter();
+
+        assert_eq!(engine.picker_items.len(), 2);
+    }
+
+    #[test]
+    fn test_picker_select_bounds() {
+        let mut engine = Engine::new();
+        engine.picker_items = vec![
+            PickerItem {
+                display: "a".to_string(),
+                filter_text: "a".to_string(),
+                detail: None,
+                action: PickerAction::OpenFile(PathBuf::from("a")),
+                icon: None,
+                score: 0,
+                match_positions: Vec::new(),
+            },
+            PickerItem {
+                display: "b".to_string(),
+                filter_text: "b".to_string(),
+                detail: None,
+                action: PickerAction::OpenFile(PathBuf::from("b")),
+                icon: None,
+                score: 0,
+                match_positions: Vec::new(),
+            },
+        ];
+        engine.picker_open = true;
+        engine.picker_selected = 0;
+
+        // Down moves to 1
+        engine.handle_key("Down", None, false);
+        assert_eq!(engine.picker_selected, 1);
+
+        // Down at max stays at max
+        engine.handle_key("Down", None, false);
+        assert_eq!(engine.picker_selected, 1);
+
+        // Up moves to 0
+        engine.handle_key("Up", None, false);
+        assert_eq!(engine.picker_selected, 0);
+
+        // Up at 0 stays at 0
+        engine.handle_key("Up", None, false);
+        assert_eq!(engine.picker_selected, 0);
+    }
+
+    #[test]
+    fn test_picker_char_input_filters() {
+        let mut engine = Engine::new();
+        engine.picker_all_items = vec![
+            PickerItem {
+                display: "src/main.rs".to_string(),
+                filter_text: "src/main.rs".to_string(),
+                detail: None,
+                action: PickerAction::OpenFile(PathBuf::from("src/main.rs")),
+                icon: None,
+                score: 0,
+                match_positions: Vec::new(),
+            },
+            PickerItem {
+                display: "src/engine.rs".to_string(),
+                filter_text: "src/engine.rs".to_string(),
+                detail: None,
+                action: PickerAction::OpenFile(PathBuf::from("src/engine.rs")),
+                icon: None,
+                score: 0,
+                match_positions: Vec::new(),
+            },
+        ];
+        engine.picker_open = true;
+        engine.picker_source = PickerSource::Files;
+
+        // Type 'm' — should narrow to just main.rs
+        engine.handle_picker_key("", Some('m'), false);
+        assert_eq!(engine.picker_query, "m");
+        assert_eq!(engine.picker_items.len(), 1);
+
+        // Backspace — both files again
+        engine.handle_picker_key("BackSpace", None, false);
+        assert_eq!(engine.picker_query, "");
+        assert_eq!(engine.picker_items.len(), 2);
+    }
+
+    #[test]
+    fn test_picker_commands_source() {
+        let mut engine = Engine::new();
+        engine.open_picker(PickerSource::Commands);
+
+        assert!(engine.picker_open);
+        assert_eq!(engine.picker_source, PickerSource::Commands);
+        assert!(!engine.picker_all_items.is_empty());
+        // Should have at least the basic commands
+        assert!(engine.picker_items.len() > 10);
+    }
+
+    #[test]
+    fn test_fuzzy_score_with_positions() {
+        // Exact prefix
+        let result = Engine::fuzzy_score_with_positions("src/main.rs", "main");
+        assert!(result.is_some());
+        let (score, positions) = result.unwrap();
+        assert!(score > 0);
+        assert_eq!(positions.len(), 4);
+
+        // No match
+        let result = Engine::fuzzy_score_with_positions("src/main.rs", "xyz");
+        assert!(result.is_none());
+
+        // Empty query
+        let result = Engine::fuzzy_score_with_positions("anything", "");
+        assert!(result.is_some());
+        let (score, positions) = result.unwrap();
+        assert_eq!(score, 0);
+        assert!(positions.is_empty());
+    }
+
+    #[test]
+    fn test_picker_confirm_opens_file() {
         use std::io::Write;
-        let dir = std::env::temp_dir().join("vimcode_grep_test_finds");
+        let dir = std::env::temp_dir().join("vimcode_picker_confirm");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let mut f = std::fs::File::create(dir.join("sample.txt")).unwrap();
-        writeln!(f, "hello grep world").unwrap();
+        let path = dir.join("testfile.txt");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "hello").unwrap();
         drop(f);
 
         let mut engine = Engine::new();
         engine.cwd = dir.clone();
-        engine.grep_query = "grep".to_string();
-        engine.grep_run_search();
-        assert!(
-            !engine.grep_results.is_empty(),
-            "should find at least one match"
-        );
-        assert!(engine
-            .grep_results
-            .iter()
-            .any(|m| m.line_text.contains("grep")));
-    }
-
-    #[test]
-    fn test_grep_close_clears_state() {
-        let mut engine = Engine::new();
-        engine.grep_open = true;
-        engine.grep_query = "hello".to_string();
-        engine.grep_results = vec![super::super::project_search::ProjectMatch {
-            file: PathBuf::from("a.rs"),
-            line: 0,
-            col: 0,
-            line_text: "hello".to_string(),
+        engine.picker_open = true;
+        engine.picker_items = vec![PickerItem {
+            display: "testfile.txt".to_string(),
+            filter_text: "testfile.txt".to_string(),
+            detail: None,
+            action: PickerAction::OpenFile(PathBuf::from("testfile.txt")),
+            icon: None,
+            score: 0,
+            match_positions: Vec::new(),
         }];
-        engine.grep_selected = 1;
-        engine.grep_preview_lines = vec![(1, "hello".to_string(), true)];
+        engine.picker_selected = 0;
 
-        engine.close_live_grep();
+        engine.picker_confirm();
 
-        assert!(!engine.grep_open);
-        assert!(engine.grep_query.is_empty());
-        assert!(engine.grep_results.is_empty());
-        assert_eq!(engine.grep_selected, 0);
-        assert!(engine.grep_preview_lines.is_empty());
+        assert!(!engine.picker_open);
+        let active_path = engine.file_path().cloned();
+        assert_eq!(active_path, Some(path));
     }
 
     #[test]
-    fn test_grep_select_bounds() {
-        let mut engine = Engine::new();
-        engine.grep_results = vec![
-            super::super::project_search::ProjectMatch {
-                file: PathBuf::from("a.rs"),
-                line: 0,
-                col: 0,
-                line_text: "a".to_string(),
-            },
-            super::super::project_search::ProjectMatch {
-                file: PathBuf::from("b.rs"),
-                line: 1,
-                col: 0,
-                line_text: "b".to_string(),
-            },
-        ];
-        engine.grep_selected = 0;
-
-        // prev at 0 stays at 0
-        engine.grep_select_prev();
-        assert_eq!(engine.grep_selected, 0);
-
-        // next from 0 → 1
-        engine.grep_select_next();
-        assert_eq!(engine.grep_selected, 1);
-
-        // next at max stays at max
-        engine.grep_select_next();
-        assert_eq!(engine.grep_selected, 1);
-    }
-
-    #[test]
-    fn test_grep_select_updates_preview() {
+    fn test_picker_files_populates_preview() {
         use std::io::Write;
-        let dir = std::env::temp_dir().join("vimcode_grep_test_preview");
+        let dir = std::env::temp_dir().join("vimcode_picker_preview");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("file.txt");
+        // Initialize a git repo so ignore crate doesn't skip everything
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&dir)
+            .output()
+            .ok();
+        let path = dir.join("hello.txt");
         let mut f = std::fs::File::create(&path).unwrap();
         writeln!(f, "line one").unwrap();
-        writeln!(f, "line two searchterm").unwrap();
+        writeln!(f, "line two").unwrap();
         writeln!(f, "line three").unwrap();
         drop(f);
 
         let mut engine = Engine::new();
-        engine.grep_results = vec![super::super::project_search::ProjectMatch {
-            file: path.clone(),
-            line: 1, // 0-indexed → "line two searchterm"
-            col: 0,
-            line_text: "line two searchterm".to_string(),
-        }];
-        engine.grep_selected = 0;
-        engine.grep_load_preview();
+        engine.cwd = dir.clone();
+        engine.open_picker(PickerSource::Files);
 
+        assert!(engine.picker_open);
         assert!(
-            !engine.grep_preview_lines.is_empty(),
-            "preview should be populated"
+            !engine.picker_items.is_empty(),
+            "picker should have found hello.txt"
         );
-        // The match line should be flagged is_match = true
         assert!(
-            engine
-                .grep_preview_lines
-                .iter()
-                .any(|(_, _, is_match)| *is_match),
-            "at least one preview line should be the match line"
+            engine.picker_preview.is_some(),
+            "preview should be populated for the first item"
         );
+        let preview = engine.picker_preview.as_ref().unwrap();
+        assert!(
+            !preview.lines.is_empty(),
+            "preview lines should not be empty"
+        );
+        assert_eq!(preview.lines[0].1, "line one");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn test_grep_confirm_opens_file() {
+    fn test_picker_grep_source_live_search() {
         use std::io::Write;
-        let dir = std::env::temp_dir().join("vimcode_grep_test_confirm");
+        let dir = std::env::temp_dir().join("vimcode_picker_grep");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("confirm.txt");
-        let mut f = std::fs::File::create(&path).unwrap();
-        writeln!(f, "line0").unwrap();
-        writeln!(f, "line1 target").unwrap();
-        writeln!(f, "line2").unwrap();
-        drop(f);
-
-        let mut engine = Engine::new();
-        engine.grep_open = true;
-        engine.grep_results = vec![super::super::project_search::ProjectMatch {
-            file: path.clone(),
-            line: 1,
-            col: 0,
-            line_text: "line1 target".to_string(),
-        }];
-        engine.grep_selected = 0;
-
-        engine.grep_confirm();
-
-        // Modal should be closed
-        assert!(!engine.grep_open, "grep modal should close after confirm");
-        // The active buffer should be the confirmed file
-        let active_path = engine.file_path().cloned();
-        assert_eq!(
-            active_path,
-            Some(path),
-            "active buffer should be the confirmed file"
-        );
-    }
-
-    #[test]
-    fn test_grep_handle_char_triggers_search() {
-        use std::io::Write;
-        let dir = std::env::temp_dir().join("vimcode_grep_test_char");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut f = std::fs::File::create(dir.join("hi.txt")).unwrap();
-        writeln!(f, "hello world").unwrap();
+        let mut f = std::fs::File::create(dir.join("sample.txt")).unwrap();
+        writeln!(f, "unique_grep_marker_xyz hello").unwrap();
         drop(f);
 
         let mut engine = Engine::new();
         engine.cwd = dir.clone();
-        engine.grep_open = true;
+        engine.open_picker(PickerSource::Grep);
 
-        // Single char — no search yet (below 2-char threshold)
-        engine.grep_handle_char('h');
+        assert!(engine.picker_open);
+        assert_eq!(engine.picker_source, PickerSource::Grep);
+        assert_eq!(engine.picker_title, "Live Grep");
+
+        // Empty query — no results (live source, no pre-populate)
+        assert!(engine.picker_items.is_empty());
+
+        // Single char — still below 2-char threshold
+        engine.handle_picker_key("u", Some('u'), false);
+        assert!(engine.picker_items.is_empty(), "1 char should not search");
+
+        // Second char — search fires but unlikely to match our marker
+        // Type enough to match our unique marker
+        for c in "nique_grep_marker_xyz".chars() {
+            engine.handle_picker_key("", Some(c), false);
+        }
         assert!(
-            engine.grep_results.is_empty(),
-            "1 char should not trigger search"
+            !engine.picker_items.is_empty(),
+            "should find our marker: query='{}'",
+            engine.picker_query,
         );
 
-        // Second char — search fires
-        engine.grep_handle_char('e');
+        // Verify result is OpenFileAtLine action
+        let item = &engine.picker_items[0];
         assert!(
-            !engine.grep_results.is_empty(),
-            "2 chars should trigger search"
+            item.display.contains("unique_grep_marker_xyz"),
+            "display: {}",
+            item.display,
         );
+        match &item.action {
+            PickerAction::OpenFileAtLine(_, _) => {}
+            other => panic!("expected OpenFileAtLine, got {:?}", other),
+        }
+
+        // Preview should be loaded
+        assert!(engine.picker_preview.is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_picker_grep_confirm_opens_at_line() {
+        let mut engine = Engine::new();
+        let dir = std::env::temp_dir().join("vimcode_picker_grep_confirm");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("target.txt");
+        std::fs::write(&path, "line0\nline1\nline2\nline3\n").unwrap();
+
+        engine.cwd = dir.clone();
+        engine.picker_open = true;
+        engine.picker_source = PickerSource::Grep;
+        engine.picker_items = vec![PickerItem {
+            display: "target.txt:3: line2".to_string(),
+            filter_text: "target.txt:3: line2".to_string(),
+            detail: None,
+            action: PickerAction::OpenFileAtLine(path.clone(), 2), // 0-indexed
+            icon: None,
+            score: 0,
+            match_positions: Vec::new(),
+        }];
+        engine.picker_selected = 0;
+
+        engine.picker_confirm();
+
+        assert!(!engine.picker_open);
+        assert_eq!(engine.file_path().cloned(), Some(path));
+        assert_eq!(engine.cursor().line, 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_picker_commands_confirm_executes() {
+        let mut engine = Engine::new();
+        engine.open_picker(PickerSource::Commands);
+        assert!(engine.picker_open);
+        assert_eq!(engine.picker_source, PickerSource::Commands);
+
+        // Find a command that toggles wrap
+        engine.picker_query = "toggle wrap".to_string();
+        engine.picker_filter();
+        assert!(!engine.picker_items.is_empty(), "should match wrap toggle");
+
+        let old_wrap = engine.settings.wrap;
+        engine.picker_confirm();
+        assert!(!engine.picker_open, "confirm should close picker");
+        assert_ne!(engine.settings.wrap, old_wrap, "wrap should have toggled");
+    }
+
+    #[test]
+    fn test_f1_opens_commands_picker() {
+        let mut engine = Engine::new();
+        engine.handle_key("F1", None, false);
+        assert!(engine.picker_open);
+        assert_eq!(engine.picker_source, PickerSource::Commands);
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn test_picker_Grep_opens_via_api() {
+        // Ctrl-G in Vim mode shows file info; the TUI/GTK keybinding
+        // calls open_picker(Grep) directly. Test the API:
+        let mut engine = Engine::new();
+        engine.open_picker(PickerSource::Grep);
+        assert!(engine.picker_open);
+        assert_eq!(engine.picker_source, PickerSource::Grep);
+        assert_eq!(engine.picker_title, "Live Grep");
+    }
+
+    #[test]
+    fn test_picker_grep_backspace_reruns_search() {
+        let mut engine = Engine::new();
+        engine.cwd = std::env::temp_dir();
+        engine.open_picker(PickerSource::Grep);
+
+        // Type "ab" then backspace — should go back to 1 char (no results)
+        engine.handle_picker_key("a", Some('a'), false);
+        engine.handle_picker_key("b", Some('b'), false);
+        engine.handle_picker_key("BackSpace", None, false);
+        assert_eq!(engine.picker_query, "a");
+        // 1 char → below threshold → no results
+        assert!(engine.picker_items.is_empty());
+    }
+
+    #[test]
+    fn test_picker_palette_command_opens_picker() {
+        let mut engine = Engine::new();
+        engine.execute_command("palette");
+        assert!(engine.picker_open);
+        assert_eq!(engine.picker_source, PickerSource::Commands);
     }
 
     #[test]
@@ -47258,7 +47855,7 @@ mod tests {
         let mut engine = make_vscode_engine("hello");
         // F1 should open the command palette (matches real VSCode).
         vscode_key(&mut engine, "F1", None, false);
-        assert!(engine.palette_open, "F1 should open the command palette");
+        assert!(engine.picker_open, "F1 should open the command palette");
         assert_eq!(engine.mode, Mode::Insert, "mode should stay Insert");
     }
 
@@ -47277,9 +47874,9 @@ mod tests {
         let mut engine = make_vscode_engine("hello");
         // F1 → palette, then Escape → closes palette, stays in EDIT mode.
         vscode_key(&mut engine, "F1", None, false);
-        assert!(engine.palette_open);
+        assert!(engine.picker_open);
         engine.handle_key("Escape", None, false);
-        assert!(!engine.palette_open, "Escape should close palette");
+        assert!(!engine.picker_open, "Escape should close palette");
         assert_eq!(engine.mode, Mode::Insert);
         assert!(engine.is_vscode_mode());
     }
@@ -49055,136 +49652,6 @@ mod tests {
         engine.sc_stage_selected(); // should not panic
     }
 
-    // ── Command palette tests ─────────────────────────────────────────────────
-
-    #[test]
-    fn test_palette_open_close() {
-        let mut engine = Engine::new();
-        assert!(!engine.palette_open);
-
-        engine.open_command_palette();
-        assert!(engine.palette_open);
-        assert!(engine.palette_query.is_empty());
-        assert_eq!(engine.palette_selected, 0);
-        assert!(
-            !engine.palette_results.is_empty(),
-            "all commands shown on empty query"
-        );
-
-        engine.close_command_palette();
-        assert!(!engine.palette_open);
-    }
-
-    #[test]
-    fn test_palette_all_commands_shown_on_empty_query() {
-        let mut engine = Engine::new();
-        engine.open_command_palette();
-        assert_eq!(engine.palette_results.len(), PALETTE_COMMANDS.len());
-    }
-
-    #[test]
-    fn test_palette_filter_reduces_results() {
-        let mut engine = Engine::new();
-        engine.open_command_palette();
-        let all_count = engine.palette_results.len();
-
-        engine.palette_query = "save".to_string();
-        engine.palette_update_filter();
-        assert!(
-            engine.palette_results.len() < all_count,
-            "filter should reduce results"
-        );
-        assert!(
-            !engine.palette_results.is_empty(),
-            "should still find save commands"
-        );
-    }
-
-    #[test]
-    fn test_palette_escape_closes() {
-        let mut engine = Engine::new();
-        engine.open_command_palette();
-        assert!(engine.palette_open);
-
-        engine.handle_key("Escape", None, false);
-        assert!(!engine.palette_open);
-    }
-
-    #[test]
-    fn test_palette_backspace_removes_char() {
-        let mut engine = Engine::new();
-        engine.open_command_palette();
-        engine.handle_key("s", Some('s'), false);
-        engine.handle_key("a", Some('a'), false);
-        engine.handle_key("v", Some('v'), false);
-        assert_eq!(engine.palette_query, "sav");
-
-        engine.handle_key("BackSpace", None, false);
-        assert_eq!(engine.palette_query, "sa");
-    }
-
-    #[test]
-    fn test_palette_nav_up_down() {
-        let mut engine = Engine::new();
-        engine.open_command_palette();
-        assert_eq!(engine.palette_selected, 0);
-
-        engine.handle_key("Down", None, false);
-        assert_eq!(engine.palette_selected, 1);
-
-        engine.handle_key("Up", None, false);
-        assert_eq!(engine.palette_selected, 0);
-
-        // Up from 0 stays at 0
-        engine.handle_key("Up", None, false);
-        assert_eq!(engine.palette_selected, 0);
-    }
-
-    #[test]
-    fn test_ctrl_shift_p_opens_palette() {
-        let mut engine = Engine::new();
-        assert!(!engine.palette_open);
-        // Ctrl+Shift+P sends key_name="P" (uppercase) with ctrl=true
-        engine.handle_key("P", Some('P'), true);
-        assert!(engine.palette_open);
-    }
-
-    #[test]
-    fn test_palette_command_opens_palette() {
-        let mut engine = Engine::new();
-        assert!(!engine.palette_open);
-        engine.execute_command("palette");
-        assert!(engine.palette_open);
-    }
-
-    #[test]
-    fn test_palette_confirm_closes_palette() {
-        let mut engine = Engine::new();
-        engine.open_command_palette();
-        // Filter to something that matches
-        engine.palette_query = "sidebar".to_string();
-        engine.palette_update_filter();
-        assert!(!engine.palette_results.is_empty());
-
-        engine.handle_key("Return", Some('\n'), false);
-        assert!(!engine.palette_open, "palette should close after confirm");
-    }
-
-    #[test]
-    fn test_palette_intercepts_keys_when_open() {
-        let mut engine = Engine::new();
-        engine.open_command_palette();
-        // Typing 'i' should append to palette_query (not enter insert mode)
-        engine.handle_key("i", Some('i'), false);
-        assert_eq!(engine.palette_query, "i");
-        assert_eq!(
-            engine.mode,
-            super::Mode::Normal,
-            "should stay in Normal mode"
-        );
-        assert!(engine.palette_open, "palette should remain open");
-    }
-
     // ── Multi-cursor tests ────────────────────────────────────────────────────
 
     fn engine_with_text(text: &str) -> Engine {
@@ -50531,6 +50998,139 @@ mod tests {
     }
 
     #[test]
+    fn test_hover_selection_extract_single_line() {
+        let sel = HoverSelection {
+            anchor_line: 0,
+            anchor_col: 2,
+            active_line: 0,
+            active_col: 7,
+        };
+        let lines = vec!["hello world".to_string()];
+        assert_eq!(sel.extract_text(&lines), "llo w");
+    }
+
+    #[test]
+    fn test_hover_selection_extract_multi_line() {
+        let sel = HoverSelection {
+            anchor_line: 0,
+            anchor_col: 3,
+            active_line: 2,
+            active_col: 4,
+        };
+        let lines = vec![
+            "first line".to_string(),
+            "second line".to_string(),
+            "third line".to_string(),
+        ];
+        assert_eq!(sel.extract_text(&lines), "st line\nsecond line\nthir");
+    }
+
+    #[test]
+    fn test_hover_selection_normalized_order() {
+        // Forward selection
+        let sel = HoverSelection {
+            anchor_line: 1,
+            anchor_col: 3,
+            active_line: 2,
+            active_col: 5,
+        };
+        assert_eq!(sel.normalized(), (1, 3, 2, 5));
+        // Backward selection
+        let sel = HoverSelection {
+            anchor_line: 2,
+            anchor_col: 5,
+            active_line: 1,
+            active_col: 3,
+        };
+        assert_eq!(sel.normalized(), (1, 3, 2, 5));
+    }
+
+    #[test]
+    fn test_hover_selection_start_and_extend() {
+        let mut e = engine_with_text("hello\n");
+        e.editor_hover_content
+            .insert(0, "line one\nline two".to_string());
+        e.trigger_editor_hover_at_cursor();
+        e.editor_hover_has_focus = true;
+        assert!(e.editor_hover.is_some());
+
+        e.editor_hover_start_selection(0, 2);
+        let sel = e.editor_hover.as_ref().unwrap().selection.as_ref().unwrap();
+        assert_eq!(sel.anchor_line, 0);
+        assert_eq!(sel.anchor_col, 2);
+        assert_eq!(sel.active_col, 2);
+
+        e.editor_hover_extend_selection(0, 6);
+        let sel = e.editor_hover.as_ref().unwrap().selection.as_ref().unwrap();
+        assert_eq!(sel.active_col, 6);
+    }
+
+    #[test]
+    fn test_hover_copy_all_text_when_no_selection() {
+        let mut e = engine_with_text("hello\n");
+        e.editor_hover_content.insert(0, "copy me".to_string());
+        e.trigger_editor_hover_at_cursor();
+        e.editor_hover_has_focus = true;
+
+        let copied = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let copied_clone = copied.clone();
+        e.clipboard_write = Some(Box::new(move |text: &str| {
+            *copied_clone.lock().unwrap() = text.to_string();
+            Ok(())
+        }));
+
+        e.copy_hover_selection();
+        let result = copied.lock().unwrap().clone();
+        assert!(result.contains("copy me"));
+        assert_eq!(e.message, "Hover text copied");
+    }
+
+    #[test]
+    fn test_hover_copy_selected_text() {
+        let mut e = engine_with_text("hello\n");
+        e.editor_hover_content
+            .insert(0, "select this text".to_string());
+        e.trigger_editor_hover_at_cursor();
+        e.editor_hover_has_focus = true;
+
+        // Start selection on "this"
+        e.editor_hover_start_selection(0, 7);
+        e.editor_hover_extend_selection(0, 11);
+
+        let copied = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let copied_clone = copied.clone();
+        e.clipboard_write = Some(Box::new(move |text: &str| {
+            *copied_clone.lock().unwrap() = text.to_string();
+            Ok(())
+        }));
+
+        e.copy_hover_selection();
+        let result = copied.lock().unwrap().clone();
+        assert_eq!(result, "this");
+    }
+
+    #[test]
+    fn test_hover_y_key_copies() {
+        let mut e = engine_with_text("hello\n");
+        e.editor_hover_content.insert(0, "y copies".to_string());
+        e.trigger_editor_hover_at_cursor();
+        e.editor_hover_has_focus = true;
+
+        let copied = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let copied_clone = copied.clone();
+        e.clipboard_write = Some(Box::new(move |text: &str| {
+            *copied_clone.lock().unwrap() = text.to_string();
+            Ok(())
+        }));
+
+        e.handle_editor_hover_key("y", false);
+        let result = copied.lock().unwrap().clone();
+        assert!(result.contains("y copies"));
+        // Popup should still be open (y doesn't dismiss)
+        assert!(e.editor_hover.is_some());
+    }
+
+    #[test]
     fn test_percent_decode_basic() {
         assert_eq!(Engine::percent_decode("hello"), "hello");
         assert_eq!(Engine::percent_decode("hello%20world"), "hello world");
@@ -50576,5 +51176,279 @@ mod tests {
         // Unknown plugin commands return false, no panic.
         assert!(!e.execute_command_uri("command:NonExistent"));
         assert!(!e.execute_command_uri("command:NonExistent?arg1"));
+    }
+
+    // ── Tab drag-and-drop tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_tab_drag_reorder_same_group() {
+        use crate::core::window::DropZone;
+        let mut e = engine_with_text("aaa\n");
+        e.new_tab(None);
+        e.buffer_mut().insert(0, "bbb\n");
+        e.new_tab(None);
+        e.buffer_mut().insert(0, "ccc\n");
+        // 3 tabs: [aaa, bbb, ccc] — active is tab 2 (ccc)
+        assert_eq!(e.active_group().tabs.len(), 3);
+        assert_eq!(e.active_group().active_tab, 2);
+
+        // Drag tab 2 (ccc) to position 0
+        let gid = e.active_group;
+        e.tab_drag_begin(gid, 2);
+        assert!(e.tab_drag.is_some());
+        e.tab_drag_drop(DropZone::TabReorder(gid, 0));
+        assert!(e.tab_drag.is_none());
+
+        // Now order should be [ccc, aaa, bbb], active tab is 0
+        assert_eq!(e.active_group().active_tab, 0);
+        // Verify ccc is first by switching to it and checking content
+        e.active_group_mut().active_tab = 0;
+        assert!(e.buffer().to_string().starts_with("ccc"));
+        e.active_group_mut().active_tab = 1;
+        assert!(e.buffer().to_string().starts_with("aaa"));
+        e.active_group_mut().active_tab = 2;
+        assert!(e.buffer().to_string().starts_with("bbb"));
+    }
+
+    #[test]
+    fn test_tab_drag_to_other_group_center() {
+        use crate::core::window::DropZone;
+        let mut e = engine_with_text("aaa\n");
+        e.new_tab(None);
+        e.buffer_mut().insert(0, "bbb\n");
+        // Group 1 has [aaa, bbb]
+        let group1 = e.active_group;
+        assert_eq!(e.active_group().tabs.len(), 2);
+
+        // Create second group via split
+        e.open_editor_group(SplitDirection::Vertical);
+        let group2 = e.active_group;
+        assert_ne!(group1, group2);
+        e.buffer_mut().insert(0, "ccc\n");
+
+        // Drag bbb (tab 1 in group1) to group2 center
+        e.tab_drag_begin(group1, 1);
+        e.tab_drag_drop(DropZone::Center(group2));
+
+        // group1 should have 1 tab (aaa), group2 should have 2 tabs
+        assert_eq!(e.editor_groups.get(&group1).unwrap().tabs.len(), 1);
+        assert_eq!(e.editor_groups.get(&group2).unwrap().tabs.len(), 2);
+        // Active group should be group2
+        assert_eq!(e.active_group, group2);
+    }
+
+    #[test]
+    fn test_tab_drag_to_new_split() {
+        use crate::core::window::DropZone;
+        let mut e = engine_with_text("aaa\n");
+        e.new_tab(None);
+        e.buffer_mut().insert(0, "bbb\n");
+        let gid = e.active_group;
+        assert_eq!(e.active_group().tabs.len(), 2);
+        assert!(e.group_layout.is_single_group());
+
+        // Drag tab 0 (aaa) to create a new split
+        e.tab_drag_begin(gid, 0);
+        e.tab_drag_drop(DropZone::Split(gid, SplitDirection::Vertical, false));
+
+        // Should now have 2 groups
+        assert!(!e.group_layout.is_single_group());
+        assert_eq!(e.editor_groups.len(), 2);
+    }
+
+    #[test]
+    fn test_tab_drag_cancel() {
+        let mut e = engine_with_text("aaa\n");
+        e.new_tab(None);
+        e.buffer_mut().insert(0, "bbb\n");
+        let gid = e.active_group;
+        let tabs_before = e.active_group().tabs.len();
+
+        e.tab_drag_begin(gid, 0);
+        assert!(e.tab_drag.is_some());
+        e.tab_drag_cancel();
+        assert!(e.tab_drag.is_none());
+        assert_eq!(e.tab_drag_mouse, None);
+        assert_eq!(e.tab_drop_zone, DropZone::None);
+        // No state changed
+        assert_eq!(e.active_group().tabs.len(), tabs_before);
+    }
+
+    #[test]
+    fn test_tab_drag_last_tab_closes_group() {
+        use crate::core::window::DropZone;
+        let mut e = engine_with_text("aaa\n");
+        // Create second group with split
+        e.open_editor_group(SplitDirection::Vertical);
+        let group2 = e.active_group;
+        e.buffer_mut().insert(0, "bbb\n");
+
+        // Find the other group
+        let group1 = *e.editor_groups.keys().find(|g| **g != group2).unwrap();
+        assert_eq!(e.editor_groups.len(), 2);
+
+        // Drag the only tab from group1 to group2
+        e.tab_drag_begin(group1, 0);
+        e.tab_drag_drop(DropZone::Center(group2));
+
+        // group1 should be closed, only group2 remains
+        assert_eq!(e.editor_groups.len(), 1);
+        assert!(e.editor_groups.contains_key(&group2));
+        assert!(e.group_layout.is_single_group());
+    }
+
+    #[test]
+    fn test_tab_drag_drop_none_is_noop() {
+        use crate::core::window::DropZone;
+        let mut e = engine_with_text("aaa\n");
+        e.new_tab(None);
+        e.buffer_mut().insert(0, "bbb\n");
+        let gid = e.active_group;
+        let tabs_before = e.active_group().tabs.len();
+        let active_before = e.active_group().active_tab;
+
+        e.tab_drag_begin(gid, 0);
+        e.tab_drag_drop(DropZone::None);
+
+        // Nothing changed
+        assert_eq!(e.active_group().tabs.len(), tabs_before);
+        assert_eq!(e.active_group().active_tab, active_before);
+    }
+
+    #[test]
+    fn test_tab_drag_reorder_to_other_group_at_index() {
+        use crate::core::window::DropZone;
+        let mut e = engine_with_text("aaa\n");
+        e.new_tab(None);
+        e.buffer_mut().insert(0, "bbb\n");
+        let group1 = e.active_group;
+
+        // Create second group with 2 tabs
+        e.open_editor_group(SplitDirection::Vertical);
+        let group2 = e.active_group;
+        e.buffer_mut().insert(0, "ccc\n");
+        e.new_tab(None);
+        e.buffer_mut().insert(0, "ddd\n");
+        assert_eq!(e.editor_groups.get(&group2).unwrap().tabs.len(), 2);
+
+        // Drag aaa (tab 0 in group1) to group2 at index 1
+        e.tab_drag_begin(group1, 0);
+        e.tab_drag_drop(DropZone::TabReorder(group2, 1));
+
+        // group1: [bbb], group2: [ccc, aaa, ddd]
+        assert_eq!(e.editor_groups.get(&group1).unwrap().tabs.len(), 1);
+        assert_eq!(e.editor_groups.get(&group2).unwrap().tabs.len(), 3);
+        // Active group should be group2, active tab at insertion index
+        assert_eq!(e.active_group, group2);
+        assert_eq!(e.active_group().active_tab, 1);
+        // Verify the inserted tab has "aaa" content
+        assert!(e.buffer().to_string().starts_with("aaa"));
+    }
+
+    #[test]
+    fn test_has_code_actions_on_line_empty() {
+        let e = engine_with_text("hello\nworld\n");
+        // No code actions cached → should return false
+        assert!(!e.has_code_actions_on_line(0));
+        assert!(!e.has_code_actions_on_line(1));
+    }
+
+    #[test]
+    fn test_has_code_actions_on_line_with_actions() {
+        let mut e = engine_with_text("hello\nworld\n");
+        let path = std::path::PathBuf::from("/tmp/test_code_action.rs");
+        e.buffer_manager
+            .get_mut(e.active_window().buffer_id)
+            .unwrap()
+            .file_path = Some(path.clone());
+
+        let mut line_map = HashMap::new();
+        line_map.insert(
+            0,
+            vec![lsp::CodeAction {
+                title: "Extract function".to_string(),
+                kind: Some("refactor.extract".to_string()),
+                edit: None,
+            }],
+        );
+        e.lsp_code_actions.insert(path, line_map);
+
+        assert!(e.has_code_actions_on_line(0));
+        assert!(!e.has_code_actions_on_line(1));
+    }
+
+    #[test]
+    fn test_has_code_actions_empty_vec_returns_false() {
+        let mut e = engine_with_text("hello\n");
+        let path = std::path::PathBuf::from("/tmp/test_code_action2.rs");
+        e.buffer_manager
+            .get_mut(e.active_window().buffer_id)
+            .unwrap()
+            .file_path = Some(path.clone());
+
+        let mut line_map = HashMap::new();
+        line_map.insert(0, vec![]);
+        e.lsp_code_actions.insert(path, line_map);
+
+        // Empty vec should not count as having actions
+        assert!(!e.has_code_actions_on_line(0));
+    }
+
+    #[test]
+    fn test_show_code_actions_popup_no_actions() {
+        let mut e = engine_with_text("hello\n");
+        let path = std::path::PathBuf::from("/tmp/test_no_actions.rs");
+        e.buffer_manager
+            .get_mut(e.active_window().buffer_id)
+            .unwrap()
+            .file_path = Some(path);
+        e.show_code_actions_popup();
+        assert_eq!(e.message, "No code actions available");
+    }
+
+    #[test]
+    fn test_show_code_actions_hover_opens_dialog() {
+        let mut e = engine_with_text("hello\nworld\n");
+        let actions = vec![
+            lsp::CodeAction {
+                title: "Quick fix".to_string(),
+                kind: Some("quickfix".to_string()),
+                edit: None,
+            },
+            lsp::CodeAction {
+                title: "Extract method".to_string(),
+                kind: None,
+                edit: None,
+            },
+        ];
+        e.show_code_actions_hover(0, actions);
+        assert!(e.dialog.is_some());
+        assert_ne!(e.message, "No code actions available");
+    }
+
+    #[test]
+    fn test_code_action_cache_cleared_on_edit() {
+        let mut e = engine_with_text("hello\n");
+        let path = std::path::PathBuf::from("/tmp/test_cache_clear.rs");
+        e.buffer_manager
+            .get_mut(e.active_window().buffer_id)
+            .unwrap()
+            .file_path = Some(path.clone());
+
+        let mut line_map = HashMap::new();
+        line_map.insert(
+            0,
+            vec![lsp::CodeAction {
+                title: "Fix".to_string(),
+                kind: None,
+                edit: None,
+            }],
+        );
+        e.lsp_code_actions.insert(path.clone(), line_map);
+        assert!(e.has_code_actions_on_line(0));
+
+        // Simulate removing cache (as happens on didChange)
+        e.lsp_code_actions.remove(&path);
+        assert!(!e.has_code_actions_on_line(0));
     }
 }

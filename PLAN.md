@@ -5,6 +5,13 @@
 ---
 
 ## Recently Completed
+- **Session 213**: Unified Picker Phase 1+2 + Bug Fixes — unified `PickerSource`/`PickerItem`/`PickerAction` types replacing separate fuzzy/grep/palette systems; `.gitignore`-aware file walking via `ignore` crate; fuzzy match highlighting; unified `PickerPanel` render struct + single draw function per backend; `<leader>sf`/`sg`/`sp` bindings; `Ctrl-Shift-F` for live grep, `Ctrl-Shift-P` for command palette (remappable via `panel_keys`); fixed GTK core dump (catch_unwind in draw callback); fixed GStrInteriorNulError from NUL hotkey; fixed lightbulb duplication on wrapped lines; improved markdown inline syntax highlighting (bold/italic/code/links); fixed phantom "Loading..." hover popup (only installed extensions start LSP servers; mouse hover shows no "Loading..." — popup appears only when LSP returns content; null-position suppression prevents re-request loops; 3s auto-dismiss timeout for keyboard hover). 4706 tests.
+- **Session 212**: Selectable/Copyable Hover Popup Text — `HoverSelection` struct; mouse drag selection in focused popup (TUI + GTK); `y`/Ctrl-C copies selection or all text to clipboard; Pango background highlight (GTK) + fg/bg swap (TUI); fixed GTK modifier key dismiss + GTK clipboard copy; 7 new tests. 4710 tests.
+- **Session 211**: Code Action Apply + Semantic Token Fix — selectable vertical code action dialog (j/k navigate, Enter applies); `CodeAction.edit: Option<WorkspaceEdit>` parsed + applied via `apply_workspace_edit()`; proactive code action request on cursor settle (150ms debounce); always-fresh requests (no stale cache); `apply_lsp_edits()` clears semantic tokens + marks LSP-dirty (fixes stale highlighting after rename/format/code actions). 4703 tests.
+- **Session 210**: Code Action Gutter Indicator — LSP `textDocument/codeAction` protocol support; `CodeAction` struct + `CodeActionResponse` event; engine caching per file/line; `<leader>ca` / `:CodeAction` / gutter click triggers hover popup; lightbulb gutter icon (yellow, all 6 themes); both GTK and TUI rendering + click handling; 6 new tests. 4703 tests.
+- **Session 209**: TUI Tab Drag-and-Drop — mouse drag tabs between editor groups in TUI backend; drop zone computation (reorder/center/split); visual overlay (highlight, insertion bar, ghost label); 7 new engine unit tests. 4671 tests.
+- **Session 208**: Bug Fixes: Extension Update Key + Flatpak Build — `ext_selected_to_section()` helper fixes "u"/"i"/"d"/Tab/readme handlers when sections collapsed; regenerated `flatpak/cargo-sources.json` (stale tree-sitter 0.24→0.26); added cargo-sources regeneration to CLAUDE.md release checklist. 4664 tests.
+- **Session 207**: Bug Fixes + VS Code Light Theme — TUI mouse drag capture fix; GTK ext panel scrollbar drag claim; tab hover tooltip (Cairo/overlay); double hover popup mutual exclusion; VS Code Light (`vscode-light`) built-in theme. 4664 tests.
 - **Session 206**: Git Log Panel Bug Fixes + Release v0.4.0 — GTK hover popup link clicking (Pango link rects); panel reveal fixes (no sidebar toggle, clear expanded state, center scroll); ext panel scroll+scrollbar in both backends; full git hashes + `git_log_commit()` for older commit reveal; async reveal target timing fix. 4664 tests.
 - **Session 205**: Enhanced Git Log Panel + Blame-to-Panel Navigation — expandable commits showing changed files as tree children; hover content on commits (author/date/message/stat); action keys (o=open diff, y=copy hash/path, b=open in browser, r=refresh, d=pop stash, p=push stash); `/` search/filter; side-by-side diff from expanded commit files; `GitShow`/`:Gshow` navigates to Git Log panel instead of scratch buffer; `panel.reveal()` API; new git.rs functions (`commit_files()`, `diff_file_at_commit()`, `show_commit_file()`); 6 new Lua bindings (`commit_files`, `diff_file`, `show_file`, `commit_detail`, `open_diff`, `panel.reveal`). 4654 tests.
 - **Session 204**: Command URI Dispatch for Extensions — `execute_command_uri()` + `percent_decode()` in engine.rs; `execute_hover_goto()` fallback to plugins; GTK/TUI panel hover click `command:` routing; git-insights blame.lua "Open Commit" + "Copy Hash" action links. 5 new tests. 4654 tests.
@@ -15,6 +22,10 @@
 > Sessions 200 and earlier in **SESSION_HISTORY.md**.
 
 ### Bug Fixes
+- [x] GTK core dump from panic in extern "C" draw callback — `catch_unwind` + `.ok()` on Cairo operations
+- [x] GStrInteriorNulError crash from NUL byte in dialog button hotkey
+- [x] Lightbulb code action icon duplicated on wrapped lines
+- [x] Phantom "Loading..." hover popup when no LSP / LSP returns null — mouse hover deferred, null-position suppression, auto-dismiss timeout
 - [x] Save message shows relative path instead of full absolute path
 - [x] Status line shows filename only instead of full path
 - [x] Unrecognized file types (.md, .txt, etc.) no longer default to Rust syntax highlighting
@@ -24,6 +35,13 @@
 - [x] GTK hover popup text overflow — Pango word wrapping instead of clipping
 - [x] Stale LSP hover following clicks — clear `lsp_hover_text` on dismiss
 - [x] GTK hover popup click-to-focus — cached popup rect, SearchPollTick race fix
+- [x] TUI mouse drag capture — `dragging_generic_sb` cleared on MouseUp
+- [x] GTK ext panel scrollbar drag leak — `set_state(Claimed)` in `drag_begin`
+- [x] Tab hover tooltip — full file path with `~` shortening (GTK Cairo + TUI overlay)
+- [x] Double hover popup — mutual exclusion between panel hover and editor hover
+- [x] VS Code Light theme — `vscode-light` / `light+` built-in colorscheme
+- [x] Extension "u" update key does nothing — `ext_selected_to_section()` helper for collapsed-section-aware flat index mapping
+- [x] Flatpak CI build broken — regenerated `cargo-sources.json` (stale tree-sitter vendored crate)
 
 ## Roadmap
 - [x] **Spell checker** — Vim-compatible `]s`/`[s`/`z=`/`zg`/`zw`; spellbook Hunspell parser; bundled en_US dictionary; tree-sitter-aware; `spell`/`spelllang` settings; user dictionary at `~/.config/vimcode/user.dic`
@@ -73,6 +91,12 @@
 - [x] **Terminal: horizontal split view** — `⊞`/`󰤼` toolbar button toggles two panes side-by-side; independent PTY sessions; mouse click or Ctrl-W switches active pane; `│` divider
 - [x] **Debugger (DAP)** — Transport + adapter registry + `:DapInstall` (S83); poll loop + breakpoint gutter + stopped-line highlight (S84); variables/call-stack/output panel (S85-86); VSCode-like UI with launch.json (S88); codelldb compat (S89); interactive sidebar + conditional breakpoints (S90)
 
+### Editor Groups
+- [x] **Drag tab between editor groups** — drag a tab from one group's tab bar and drop it onto another group's tab bar to move the buffer; visual drop indicator (highlight bar between tabs or at group edge); dropping on the editor area creates a new split; GTK `DragSource`/`DropTarget` + TUI mouse drag tracking
+
+### Extensions (Planned)
+- [x] **Unified Picker (Telescope-style)** — core Rust-native unified picker replacing separate fuzzy/grep/palette modals; `PickerSource`/`PickerItem`/`PickerAction` types; `.gitignore`-aware file walking; fuzzy match highlighting; `<leader>sf`/`sg`/`sp` bindings; remappable via `panel_keys`; Phases 1-2 complete (files, grep, commands). Remaining: Phase 3 (buffers, marks, registers, branches), Phase 4 (Lua `vimcode.picker.show()` API)
+
 ### UI & Menus
 - [x] **VSCode-style menus** — application menu bar (File / Edit / View / Go / Run / Terminal / Help) in GTK; command palette (`Ctrl-Shift-P`) lists all commands + key bindings; fuzzy-searchable; both GTK native menus and TUI pop-up menu overlay (sessions 81–82, 100–101)
 - [x] **Command palette** — `Ctrl-Shift-P` floating modal; lists named commands with descriptions and current keybindings; typing filters; Enter executes; shared GTK + TUI (session 101)
@@ -118,10 +142,13 @@
 - [x] **Keyboard-driven hover popups** — Open hover popup for the selected panel item via Enter (or a dedicated key like `K`); popup takes focus until Escape is pressed; Tab/Shift-Tab cycles through links in the popup; Enter on a focused link opens it; arrow keys still scroll the popup content if it overflows. Both GTK and TUI backends.
 
 ### Hover Popups
-- [ ] **Selectable/copyable popup text** — Allow selecting and copying text in hover popups (editor hover + panel hover) via mouse drag or keyboard. Currently popup text is read-only with no selection support.
+- [x] **Selectable/copyable popup text** — Allow selecting and copying text in hover popups (editor hover + panel hover) via mouse drag or keyboard. Currently popup text is read-only with no selection support.
 
 ### LSP
-- [ ] **Code action gutter indicator** — Show a lightbulb (or similar) gutter indicator on lines where LSP code actions are available (like VSCode's yellow lightbulb). Clicking or pressing a key on the indicator shows the code action description. Initial implementation shows the action text only (no integrated menu or auto-apply).
+- [x] **Code action gutter indicator** — Lightbulb gutter indicator on lines where LSP code actions are available (like VSCode). Proactive request on cursor settle (150ms debounce). `<leader>ca` / `:CodeAction` / gutter click opens vertical selection dialog; j/k navigate, Enter applies the selected action's workspace edit.
+
+### Robustness (Low Priority)
+- [ ] **Consolidate sidebar focus state into engine** — TUI's `sidebar.has_focus` is a local variable not accessible to engine tests, making sidebar focus bugs (like the search panel input regression) impossible to catch with unit/integration tests. Move sidebar focus tracking into the engine so key routing correctness can be tested.
 
 ### Documentation
 - [x] **GitHub Wiki** — 9 pages: Home, Getting Started, Key Remapping, Settings Reference, Extension Development, Lua Plugin API, Theme Customization, DAP Debugger Setup, LSP Configuration; README Documentation section links to wiki

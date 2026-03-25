@@ -294,8 +294,12 @@ pub struct LspManager {
     initialized: HashMap<LspServerId, bool>,
     /// Cached semantic tokens legends per server (extracted on initialization).
     semantic_legends: HashMap<LspServerId, SemanticTokensLegend>,
-    /// Extension manifests from the registry (updated by engine when registry changes).
+    /// Extension manifests for *installed* extensions only (used for server config lookup).
     ext_manifests: Vec<extensions::ExtensionManifest>,
+    /// All extension manifests (installed + available) — used to check if a language is
+    /// covered by an extension, so we don't fall back to the built-in registry for languages
+    /// that have a (not-yet-installed) extension.
+    all_ext_manifests: Vec<extensions::ExtensionManifest>,
     /// Servers that crashed or exited (for display in :LspInfo).
     crashed_servers: Vec<String>,
     /// Last error from `ensure_server_for_language` (dependency check failure, etc.).
@@ -331,14 +335,23 @@ impl LspManager {
             initialized: HashMap::new(),
             semantic_legends: HashMap::new(),
             ext_manifests: Vec::new(),
+            all_ext_manifests: Vec::new(),
             crashed_servers: Vec::new(),
             last_start_error: None,
         }
     }
 
     /// Update the cached extension manifests (called by engine when registry changes).
-    pub fn set_ext_manifests(&mut self, manifests: Vec<extensions::ExtensionManifest>) {
-        self.ext_manifests = manifests;
+    /// `installed` — only installed extensions (used for server config lookup).
+    /// `all` — all available extensions (used to check if a language is covered by an
+    /// extension, so the built-in registry doesn't start servers for uninstalled extensions).
+    pub fn set_ext_manifests(
+        &mut self,
+        installed: Vec<extensions::ExtensionManifest>,
+        all: Vec<extensions::ExtensionManifest>,
+    ) {
+        self.ext_manifests = installed;
+        self.all_ext_manifests = all;
     }
 
     /// Ensure a server is running for the given language. Returns the server ID
@@ -387,12 +400,20 @@ impl LspManager {
         {
             candidates.extend(server_configs_from_manifest(manifest, language_id));
         }
-        candidates.extend(
-            self.registry
-                .iter()
-                .filter(|c| c.languages.iter().any(|l| l == language_id))
-                .cloned(),
-        );
+        // Only fall back to the built-in registry for languages that have NO corresponding
+        // extension at all.  If an extension exists but isn't installed, we respect that
+        // choice and don't auto-start a server from a binary that happens to be on PATH.
+        let has_extension =
+            extensions::find_manifest_for_language_id(&self.all_ext_manifests, language_id)
+                .is_some();
+        if !has_extension {
+            candidates.extend(
+                self.registry
+                    .iter()
+                    .filter(|c| c.languages.iter().any(|l| l == language_id))
+                    .cloned(),
+            );
+        }
 
         // Use the resolved full path so the spawn works regardless of the process's PATH.
         let (mut config, resolved) = candidates
@@ -700,6 +721,18 @@ impl LspManager {
         Some(self.servers[sid].request_signature_help(&uri, line, character))
     }
 
+    /// Request code actions for a line from the appropriate server.
+    pub fn request_code_action(
+        &mut self,
+        path: &Path,
+        line: u32,
+        col: u32,
+        diagnostics_json: serde_json::Value,
+    ) -> Option<i64> {
+        let (sid, uri) = self.server_and_uri(path)?;
+        Some(self.servers[sid].request_code_action(&uri, line, col, diagnostics_json))
+    }
+
     /// Request whole-file formatting from the appropriate server.
     pub fn request_formatting(
         &mut self,
@@ -802,12 +835,17 @@ impl LspManager {
         {
             candidates.extend(server_configs_from_manifest(manifest, language_id));
         }
-        candidates.extend(
-            self.registry
-                .iter()
-                .filter(|c| c.languages.iter().any(|l| l == language_id))
-                .cloned(),
-        );
+        let has_extension =
+            extensions::find_manifest_for_language_id(&self.all_ext_manifests, language_id)
+                .is_some();
+        if !has_extension {
+            candidates.extend(
+                self.registry
+                    .iter()
+                    .filter(|c| c.languages.iter().any(|l| l == language_id))
+                    .cloned(),
+            );
+        }
         let (mut config, resolved) = candidates
             .into_iter()
             .find_map(|c| resolve_command(&c.command).map(|p| (c, p)))?;

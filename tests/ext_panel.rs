@@ -491,7 +491,7 @@ fn editor_hover_dismiss_on_escape() {
     e.trigger_editor_hover_at_cursor();
     assert!(e.editor_hover.is_some());
     // Escape should dismiss
-    e.handle_editor_hover_key("Escape");
+    e.handle_editor_hover_key("Escape", false);
     assert!(e.editor_hover.is_none());
     assert!(!e.editor_hover_has_focus);
 }
@@ -509,9 +509,9 @@ fn editor_hover_keyboard_scroll() {
     e.trigger_editor_hover_at_cursor();
     assert!(e.editor_hover.is_some());
     assert_eq!(e.editor_hover.as_ref().unwrap().scroll_top, 0);
-    e.handle_editor_hover_key("j");
+    e.handle_editor_hover_key("j", false);
     assert_eq!(e.editor_hover.as_ref().unwrap().scroll_top, 1);
-    e.handle_editor_hover_key("k");
+    e.handle_editor_hover_key("k", false);
     assert_eq!(e.editor_hover.as_ref().unwrap().scroll_top, 0);
 }
 

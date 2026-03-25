@@ -96,6 +96,12 @@ pub enum LspEvent {
         /// Error message from the server, if the response contained an error.
         error_message: Option<String>,
     },
+    /// Code action response (textDocument/codeAction).
+    CodeActionResponse {
+        server_id: LspServerId,
+        request_id: i64,
+        actions: Vec<CodeAction>,
+    },
     /// Semantic tokens full response (textDocument/semanticTokens/full).
     SemanticTokensResponse {
         server_id: LspServerId,
@@ -238,6 +244,15 @@ impl DiagnosticSeverity {
             DiagnosticSeverity::Hint => "H",
         }
     }
+}
+
+/// An LSP code action (quickfix, refactor, etc.).
+#[derive(Debug, Clone)]
+pub struct CodeAction {
+    pub title: String,
+    pub kind: Option<String>,
+    /// The workspace edit to apply when this action is selected.
+    pub edit: Option<WorkspaceEdit>,
 }
 
 #[derive(Debug, Clone)]
@@ -723,6 +738,17 @@ impl LspServer {
                     "publishDiagnostics": {
                         "relatedInformation": false
                     },
+                    "codeAction": {
+                        "codeActionLiteralSupport": {
+                            "codeActionKind": {
+                                "valueSet": [
+                                    "quickfix", "refactor", "refactor.extract",
+                                    "refactor.inline", "refactor.rewrite",
+                                    "source", "source.organizeImports"
+                                ]
+                            }
+                        }
+                    },
                     "definition": {},
                     "rename": {
                         "dynamicRegistration": false,
@@ -920,6 +946,29 @@ impl LspServer {
             serde_json::json!({
                 "textDocument": { "uri": uri },
                 "position": { "line": line, "character": character }
+            }),
+        )
+    }
+
+    /// Request code actions for a range.
+    pub fn request_code_action(
+        &mut self,
+        uri: &str,
+        line: u32,
+        col: u32,
+        diagnostics_json: serde_json::Value,
+    ) -> i64 {
+        self.send_request(
+            "textDocument/codeAction",
+            serde_json::json!({
+                "textDocument": { "uri": uri },
+                "range": {
+                    "start": { "line": line, "character": col },
+                    "end": { "line": line, "character": col }
+                },
+                "context": {
+                    "diagnostics": diagnostics_json
+                }
             }),
         )
     }
@@ -1279,18 +1328,18 @@ fn reader_thread(
                     });
                 }
                 Some("textDocument/semanticTokens/full") => {
-                    // Only send when we have a valid result (not an error response).
-                    // Suppressing error responses prevents wiping existing tokens.
-                    if let Some(r) = result {
-                        let raw_data = r
-                            .get("data")
-                            .and_then(|d| d.as_array())
-                            .map(|arr| {
-                                arr.iter()
-                                    .filter_map(|v| v.as_u64().map(|n| n as u32))
-                                    .collect::<Vec<u32>>()
-                            })
-                            .unwrap_or_default();
+                    // Only send when we have a valid result with a "data" array.
+                    // Null results (server busy) and error responses are suppressed
+                    // to avoid wiping existing tokens.
+                    if let Some(raw_data) = result
+                        .and_then(|r| r.get("data"))
+                        .and_then(|d| d.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_u64().map(|n| n as u32))
+                                .collect::<Vec<u32>>()
+                        })
+                    {
                         let _ = tx.send(LspEvent::SemanticTokensResponse {
                             server_id,
                             request_id: id,
@@ -1315,6 +1364,27 @@ fn reader_thread(
                         request_id: id,
                         workspace_edit,
                         error_message,
+                    });
+                }
+                Some("textDocument/codeAction") => {
+                    let actions = result
+                        .and_then(|r| r.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|item| {
+                                    let title = item.get("title")?.as_str()?.to_string();
+                                    let kind =
+                                        item.get("kind").and_then(|k| k.as_str()).map(String::from);
+                                    let edit = item.get("edit").map(try_parse_workspace_edit);
+                                    Some(CodeAction { title, kind, edit })
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    let _ = tx.send(LspEvent::CodeActionResponse {
+                        server_id,
+                        request_id: id,
+                        actions,
                     });
                 }
                 _ => {
