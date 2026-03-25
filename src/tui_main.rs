@@ -70,7 +70,7 @@ use ratatui::Terminal;
 use crate::core::engine::{DiffLine, EngineAction};
 use crate::core::lsp::DiagnosticSeverity;
 use crate::core::settings::ExplorerAction;
-use crate::core::window::SplitDirection;
+use crate::core::window::{GroupId, SplitDirection};
 use crate::core::{Engine, GitLineStatus, Mode, OpenMode, WindowRect};
 use crate::render::{
     self, build_screen_layout, Color, CompletionMenu, CursorShape, RenderedLine, RenderedWindow,
@@ -951,10 +951,7 @@ fn event_loop(
     let mut sidebar_width: u16 = SIDEBAR_WIDTH;
     // Folder picker modal state (None = closed)
     let mut folder_picker: Option<FolderPickerState> = None;
-    // Scroll offset for the fuzzy finder results list
-    let mut fuzzy_scroll_top: usize = 0;
-    // Scroll offset for the live grep results list
-    let mut grep_scroll_top: usize = 0;
+    // Scroll offset for the quickfix panel (fuzzy/grep scroll is handled by unified picker)
     // Scroll offset for the quickfix panel
     let mut quickfix_scroll_top: usize = 0;
     // True while user is dragging the sidebar resize handle
@@ -975,12 +972,17 @@ fn event_loop(
     let mut dragging_debug_output_sb: Option<(u16, u16, usize)> = None;
     // Non-None while user is dragging the settings panel scrollbar.
     let mut dragging_settings_sb: Option<SidebarScrollDrag> = None;
+    // Non-None while user is dragging a sidebar scrollbar that has no dedicated drag state.
+    // Used for explorer and ext panel scrollbars to prevent text selection leaking.
+    let mut dragging_generic_sb: Option<SidebarScrollDrag> = None;
     // True while user drags the terminal header row to resize the panel.
     let mut dragging_terminal_resize: bool = false;
     // True while user drags the terminal split divider left/right.
     let mut dragging_terminal_split: bool = false;
     // Non-None while user is dragging a group divider (stores split_index).
     let mut dragging_group_divider: Option<usize> = None;
+    // True while user is drag-selecting text inside the editor hover popup.
+    let mut hover_selecting: bool = false;
     // Cache of the last rendered layout for mouse hit-testing
     let mut last_layout: Option<render::ScreenLayout> = None;
     // Double-click detection state
@@ -997,6 +999,10 @@ fn event_loop(
     let mut explorer_drag_src: Option<usize> = None;
     // Active explorer drag state: (source row index, current target row index or None).
     let mut explorer_drag_active: Option<(usize, Option<usize>)> = None;
+    // Tab drag-and-drop: position where mouse-down occurred on a tab (potential drag start).
+    let mut tab_drag_start: Option<(u16, u16)> = None;
+    // True while a tab drag is actively in progress.
+    let mut tab_dragging: bool = false;
 
     // Track unnamed register content so we only write to clipboard on changes.
     let mut last_clipboard_content: Option<String> = None;
@@ -1150,8 +1156,6 @@ fn event_loop(
                             engine,
                             &sidebar_prompt,
                             sidebar_width,
-                            fuzzy_scroll_top,
-                            grep_scroll_top,
                             quickfix_scroll_top,
                             debug_output_scroll,
                             folder_picker.as_ref(),
@@ -1234,6 +1238,10 @@ fn event_loop(
                 continue;
             }
             // No input — good time to do background work without blocking typing.
+            // Flush debounced cursor_move hook (plugin events + code action requests).
+            if engine.flush_cursor_move_hook() {
+                needs_redraw = true;
+            }
             let idle_t0 = std::time::Instant::now();
             // Flush LSP didChange (may block briefly on pipe write for large buffers).
             engine.lsp_flush_changes();
@@ -1733,8 +1741,7 @@ fn event_loop(
 
                 // ── Activity bar (toolbar) focused ────────────────────────────
                 if sidebar.toolbar_focused
-                    && !engine.fuzzy_open
-                    && !engine.grep_open
+                    && !engine.picker_open
                     && key_event.kind != KeyEventKind::Release
                 {
                     match key_event.code {
@@ -1868,12 +1875,11 @@ fn event_loop(
                 }
 
                 // ── Sidebar focused ─────────────────────────────────────────
-                // Note: sidebar key handling is suppressed when fuzzy modal is open
-                // and when terminal has focus (e.g. "Press Enter to close..." after
-                // extension install).
+                // Note: sidebar key handling is suppressed when a picker modal is
+                // open and when terminal has focus (e.g. "Press Enter to close..."
+                // after extension install).
                 if sidebar.has_focus
-                    && !engine.fuzzy_open
-                    && !engine.grep_open
+                    && !engine.picker_open
                     && !engine.terminal_has_focus
                     && key_event.kind != KeyEventKind::Release
                 {
@@ -2813,6 +2819,10 @@ fn event_loop(
                             let data = translate_key_to_pty(key_event);
                             if !data.is_empty() {
                                 engine.terminal_write(&data);
+                                // Poll PTY output immediately so held keys (e.g.
+                                // backspace) show feedback each frame instead of
+                                // batching until the key is released.
+                                engine.poll_terminal();
                                 needs_redraw = true;
                             }
                             continue;
@@ -2857,13 +2867,19 @@ fn event_loop(
                         }
 
                         if matches_tui_key(&pk.fuzzy_finder, code, mods) {
-                            engine.open_fuzzy_finder();
+                            engine.open_picker(crate::core::engine::PickerSource::Files);
                             needs_redraw = true;
                             continue;
                         }
 
                         if matches_tui_key(&pk.live_grep, code, mods) {
-                            engine.open_live_grep();
+                            engine.open_picker(crate::core::engine::PickerSource::Grep);
+                            needs_redraw = true;
+                            continue;
+                        }
+
+                        if matches_tui_key(&pk.command_palette, code, mods) {
+                            engine.open_picker(crate::core::engine::PickerSource::Commands);
                             needs_redraw = true;
                             continue;
                         }
@@ -2987,7 +3003,9 @@ fn event_loop(
                                             let action = item.action.to_string();
                                             if action == "open_file_dialog" {
                                                 engine.close_menu();
-                                                engine.open_fuzzy_finder();
+                                                engine.open_picker(
+                                                    crate::core::engine::PickerSource::Files,
+                                                );
                                             } else {
                                                 let act = engine.menu_activate_item(
                                                     menu_idx, item_idx, &action,
@@ -3458,36 +3476,6 @@ fn event_loop(
                             sidebar.reveal_path(&path, h);
                         }
                     }
-                    // Adjust fuzzy scroll to keep selected item visible
-                    if engine.fuzzy_open {
-                        if let Ok(size) = terminal.size() {
-                            let popup_h = ((size.height as usize) * 55 / 100).max(15);
-                            let visible_rows = popup_h.saturating_sub(4); // title+query+sep+border
-                            if engine.fuzzy_selected < fuzzy_scroll_top {
-                                fuzzy_scroll_top = engine.fuzzy_selected;
-                            }
-                            if engine.fuzzy_selected >= fuzzy_scroll_top + visible_rows {
-                                fuzzy_scroll_top = engine.fuzzy_selected + 1 - visible_rows;
-                            }
-                        }
-                    } else {
-                        fuzzy_scroll_top = 0;
-                    }
-                    // Adjust grep scroll to keep selected item visible
-                    if engine.grep_open {
-                        if let Ok(size) = terminal.size() {
-                            let popup_h = ((size.height as usize) * 65 / 100).max(18);
-                            let visible_rows = popup_h.saturating_sub(4); // title+query+sep+border
-                            if engine.grep_selected < grep_scroll_top {
-                                grep_scroll_top = engine.grep_selected;
-                            }
-                            if engine.grep_selected >= grep_scroll_top + visible_rows {
-                                grep_scroll_top = engine.grep_selected + 1 - visible_rows;
-                            }
-                        }
-                    } else {
-                        grep_scroll_top = 0;
-                    }
                     // Adjust quickfix scroll to keep selected item visible
                     if engine.quickfix_open {
                         const QF_VISIBLE: usize = 5; // 6 rows - 1 header
@@ -3498,22 +3486,6 @@ fn event_loop(
                         }
                     } else {
                         quickfix_scroll_top = 0;
-                    }
-                    // Sync palette scroll_top back to engine from TUI scroll state
-                    if engine.palette_open {
-                        if let Ok(size) = terminal.size() {
-                            let popup_h = ((size.height as usize) * 60 / 100).max(16);
-                            let visible_rows = popup_h.saturating_sub(4); // title+query+sep+border
-                            if engine.palette_selected < engine.palette_scroll_top {
-                                engine.palette_scroll_top = engine.palette_selected;
-                            }
-                            if engine.palette_selected >= engine.palette_scroll_top + visible_rows {
-                                engine.palette_scroll_top =
-                                    engine.palette_selected + 1 - visible_rows;
-                            }
-                        }
-                    } else {
-                        engine.palette_scroll_top = 0;
                     }
                 }
             }
@@ -3545,6 +3517,7 @@ fn event_loop(
                                 &mut dragging_terminal_split,
                                 &mut dragging_group_divider,
                                 &mut dragging_settings_sb,
+                                &mut dragging_generic_sb,
                                 last_layout.as_ref(),
                                 &mut sidebar_prompt,
                                 &mut last_click_time,
@@ -3558,10 +3531,13 @@ fn event_loop(
                                 &mut mouse_should_quit,
                                 &mut explorer_drag_src,
                                 &mut explorer_drag_active,
+                                &mut tab_drag_start,
+                                &mut tab_dragging,
                                 &hover_link_rects,
                                 hover_popup_rect,
                                 editor_hover_popup_rect,
                                 &editor_hover_link_rects,
+                                &mut hover_selecting,
                             );
                             if mouse_should_quit {
                                 return;
@@ -3592,6 +3568,7 @@ fn event_loop(
                     &mut dragging_terminal_split,
                     &mut dragging_group_divider,
                     &mut dragging_settings_sb,
+                    &mut dragging_generic_sb,
                     last_layout.as_ref(),
                     &mut sidebar_prompt,
                     &mut last_click_time,
@@ -3605,10 +3582,13 @@ fn event_loop(
                     &mut mouse_should_quit,
                     &mut explorer_drag_src,
                     &mut explorer_drag_active,
+                    &mut tab_drag_start,
+                    &mut tab_dragging,
                     &hover_link_rects,
                     hover_popup_rect,
                     editor_hover_popup_rect,
                     &editor_hover_link_rects,
+                    &mut hover_selecting,
                 );
                 if mouse_should_quit {
                     return;
@@ -3740,7 +3720,7 @@ fn handle_explorer_context_action(
         // select_for_diff and diff_with_selected are handled by the engine
         "select_for_diff" | "diff_with_selected" => {}
         "find_in_folder" => {
-            engine.grep_open = true;
+            engine.open_picker(crate::core::engine::PickerSource::Grep);
         }
         _ => {}
     }
@@ -3766,6 +3746,7 @@ fn handle_mouse(
     dragging_terminal_split: &mut bool,
     dragging_group_divider: &mut Option<usize>,
     dragging_settings_sb: &mut Option<SidebarScrollDrag>,
+    dragging_generic_sb: &mut Option<SidebarScrollDrag>,
     last_layout: Option<&render::ScreenLayout>,
     sidebar_prompt: &mut Option<SidebarPrompt>,
     last_click_time: &mut Instant,
@@ -3779,10 +3760,13 @@ fn handle_mouse(
     should_quit: &mut bool,
     explorer_drag_src: &mut Option<usize>,
     explorer_drag_active: &mut Option<(usize, Option<usize>)>,
+    tab_drag_start: &mut Option<(u16, u16)>,
+    tab_dragging: &mut bool,
     hover_link_rects: &[(u16, u16, u16, u16, String)],
     hover_popup_rect: Option<(u16, u16, u16, u16)>,
     editor_hover_popup_rect: Option<(u16, u16, u16, u16)>,
     editor_hover_link_rects: &[(u16, u16, u16, u16, String)],
+    hover_selecting: &mut bool,
 ) -> u16 {
     let col = ev.column;
     let row = ev.row;
@@ -3921,6 +3905,20 @@ fn handle_mouse(
             let new_w = col.saturating_sub(ab_width);
             return new_w.clamp(15, 150);
         }
+        MouseEventKind::Drag(MouseButton::Left) if *hover_selecting => {
+            // Extend text selection in the editor hover popup
+            if let Some((px, py, _pw, _ph)) = editor_hover_popup_rect {
+                let scroll = engine
+                    .editor_hover
+                    .as_ref()
+                    .map(|h| h.scroll_top)
+                    .unwrap_or(0);
+                let content_line = (row.saturating_sub(py + 1)) as usize + scroll;
+                let content_col = col.saturating_sub(px + 2) as usize;
+                engine.editor_hover_extend_selection(content_line, content_col);
+            }
+            return sidebar_width;
+        }
         MouseEventKind::Drag(MouseButton::Left) => {
             // Explorer drag-and-drop: activate or update target row.
             if explorer_drag_src.is_some() || explorer_drag_active.is_some() {
@@ -3954,6 +3952,34 @@ fn handle_mouse(
                     return sidebar_width;
                 }
             }
+            // Tab drag-and-drop: update drop zone while dragging.
+            if *tab_dragging {
+                engine.tab_drag_mouse = Some((col as f64, row as f64));
+                engine.tab_drop_zone =
+                    compute_tui_tab_drop_zone(engine, col, row, editor_left, last_layout);
+                return sidebar_width;
+            }
+            // Tab drag-and-drop: detect drag start (mouse moved far enough).
+            if let Some((sx, sy)) = *tab_drag_start {
+                let dx = col.abs_diff(sx);
+                let dy = row.abs_diff(sy);
+                if dx + dy >= 2 {
+                    // Use the active group + active tab as the drag source.
+                    let gid = engine.active_group;
+                    let tidx = engine
+                        .editor_groups
+                        .get(&gid)
+                        .map(|g| g.active_tab)
+                        .unwrap_or(0);
+                    engine.tab_drag_begin(gid, tidx);
+                    engine.tab_drag_mouse = Some((col as f64, row as f64));
+                    *tab_dragging = true;
+                    *tab_drag_start = None;
+                    return sidebar_width;
+                }
+                // Haven't moved enough yet — don't start any drag.
+                return sidebar_width;
+            }
             // Command-line text selection drag
             if *cmd_dragging {
                 if let Some(ref mut sel) = *cmd_sel {
@@ -3985,36 +4011,22 @@ fn handle_mouse(
                 }
                 return sidebar_width;
             }
-            // Extension panel scrollbar drag — stateless, recomputes on each drag event
-            if sidebar.visible
-                && sidebar.ext_panel_name.is_some()
-                && col >= ab_width
-                && col < ab_width + sidebar_width
-            {
-                let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
-                let sb_col = ab_width + sidebar_width - 1;
-                let input_rows: u16 = if engine.ext_panel_input_active
-                    || engine
-                        .ext_panel_active
-                        .as_ref()
-                        .and_then(|n| engine.ext_panel_input_text.get(n))
-                        .map(|t| !t.is_empty())
-                        .unwrap_or(false)
-                {
-                    1
-                } else {
-                    0
-                };
-                let content_start = 1 + input_rows + menu_rows;
-                let flat_len = engine.ext_panel_flat_len();
-                let content_h = term_height.saturating_sub(2 + content_start) as usize;
-                if col == sb_col && flat_len > content_h && row >= content_start {
-                    let rel_row = (row - content_start) as usize;
-                    let ratio = rel_row as f64 / content_h as f64;
-                    let new_top = (ratio * flat_len as f64) as usize;
-                    engine.ext_panel_scroll_top = new_top.min(flat_len.saturating_sub(1));
-                    return sidebar_width;
+            // Generic sidebar scrollbar drag (explorer, ext panel, etc.)
+            if let Some(ref drag) = *dragging_generic_sb {
+                if drag.track_len > 0 && drag.total > 0 {
+                    let end = drag.track_abs_start + drag.track_len - 1;
+                    let clamped = row.clamp(drag.track_abs_start, end);
+                    let ratio = (clamped - drag.track_abs_start) as f64 / drag.track_len as f64;
+                    let new_scroll = (ratio * drag.total as f64) as usize;
+                    let max_scroll = drag.total.saturating_sub(drag.track_len as usize);
+                    // Route to the right panel's scroll state
+                    if sidebar.ext_panel_name.is_some() {
+                        engine.ext_panel_scroll_top = new_scroll.min(drag.total.saturating_sub(1));
+                    } else if sidebar.active_panel == TuiPanel::Explorer {
+                        sidebar.scroll_top = new_scroll.min(max_scroll);
+                    }
                 }
+                return sidebar_width;
             }
             // Settings panel scrollbar drag
             if let Some(ref drag) = *dragging_settings_sb {
@@ -4169,6 +4181,15 @@ fn handle_mouse(
             }
         }
         MouseEventKind::Up(MouseButton::Left) => {
+            // Tab drag-and-drop: execute drop on release.
+            if *tab_dragging {
+                *tab_dragging = false;
+                *tab_drag_start = None;
+                let zone = engine.tab_drop_zone;
+                engine.tab_drag_drop(zone);
+                return sidebar_width;
+            }
+            *tab_drag_start = None;
             // Explorer drag-and-drop: execute move on release.
             if let Some((src_row, Some(target_row))) = explorer_drag_active.take() {
                 *explorer_drag_src = None;
@@ -4197,8 +4218,10 @@ fn handle_mouse(
             *dragging_terminal_sb = None;
             *dragging_debug_output_sb = None;
             *dragging_settings_sb = None;
+            *dragging_generic_sb = None;
             *dragging_group_divider = None;
             *cmd_dragging = false;
+            *hover_selecting = false;
             if *dragging_terminal_resize {
                 *dragging_terminal_resize = false;
                 let rows = engine.session.terminal_panel_rows;
@@ -4672,6 +4695,39 @@ fn handle_mouse(
         }
     }
 
+    // ── Tab hover tooltip (mouse moved over tab bar) ────────────────────────
+    if matches!(ev.kind, MouseEventKind::Moved) {
+        let mut tooltip: Option<String> = None;
+        if col >= editor_left {
+            if let Some(layout) = last_layout {
+                let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
+                let rel_col = col - editor_left;
+
+                if let Some(ref split) = layout.editor_group_split {
+                    let click_tbh: u16 = if engine.settings.breadcrumbs { 2 } else { 1 };
+                    for gtb in split.group_tab_bars.iter() {
+                        let tab_bar_row =
+                            menu_rows + (gtb.bounds.y as u16).saturating_sub(click_tbh);
+                        let gx = gtb.bounds.x as u16;
+                        let gw = gtb.bounds.width as u16;
+                        if row == tab_bar_row && rel_col >= gx && rel_col < gx + gw {
+                            let local_col = rel_col - gx;
+                            tooltip =
+                                tab_tooltip_at_col(engine, gtb.group_id, local_col, &gtb.tabs);
+                            break;
+                        }
+                    }
+                } else if row == menu_rows {
+                    tooltip =
+                        tab_tooltip_at_col(engine, engine.active_group, rel_col, &layout.tab_bar);
+                }
+            }
+        }
+        if tooltip != engine.tab_hover_tooltip {
+            engine.tab_hover_tooltip = tooltip;
+        }
+    }
+
     // ── Editor hover dwell (mouse moved over editor area) ───────────────────
     if matches!(ev.kind, MouseEventKind::Moved)
         && !mouse_on_editor_hover
@@ -4740,9 +4796,24 @@ fn handle_mouse(
             }
         }
     }
-    // ── Click on editor hover popup → focus it ───────────────────────────────
+    // ── Click on editor hover popup → focus or start selection ─────────────
     if mouse_on_editor_hover && engine.editor_hover.is_some() {
-        engine.editor_hover_focus();
+        if engine.editor_hover_has_focus {
+            // Already focused — start text selection
+            if let Some((px, py, _pw, _ph)) = editor_hover_popup_rect {
+                let scroll = engine
+                    .editor_hover
+                    .as_ref()
+                    .map(|h| h.scroll_top)
+                    .unwrap_or(0);
+                let content_line = (row.saturating_sub(py + 1)) as usize + scroll;
+                let content_col = col.saturating_sub(px + 2) as usize;
+                engine.editor_hover_start_selection(content_line, content_col);
+                *hover_selecting = true;
+            }
+        } else {
+            engine.editor_hover_focus();
+        }
         return sidebar_width;
     }
     // Click elsewhere dismisses editor hover and consumes the click
@@ -4829,7 +4900,7 @@ fn handle_mouse(
                     let action = items[item_idx].action.to_string();
                     if action == "open_file_dialog" {
                         engine.close_menu();
-                        engine.open_fuzzy_finder();
+                        engine.open_picker(crate::core::engine::PickerSource::Files);
                     } else {
                         let act = engine.menu_activate_item(open_idx, item_idx, &action);
                         if act == EngineAction::OpenTerminal {
@@ -5160,7 +5231,7 @@ fn handle_mouse(
                 return sidebar_width;
             }
 
-            // Scrollbar click/drag → jump-scroll
+            // Scrollbar click/drag → jump-scroll + arm drag
             let flat_len = engine.ext_panel_flat_len();
             let content_h = term_height.saturating_sub(2 + menu_rows + content_start) as usize;
             if col == sb_col && flat_len > content_h && sidebar_row >= content_start {
@@ -5168,6 +5239,11 @@ fn handle_mouse(
                 let ratio = rel_row as f64 / content_h as f64;
                 let new_top = (ratio * flat_len as f64) as usize;
                 engine.ext_panel_scroll_top = new_top.min(flat_len.saturating_sub(1));
+                *dragging_generic_sb = Some(SidebarScrollDrag {
+                    track_abs_start: content_start + menu_rows,
+                    track_len: content_h as u16,
+                    total: flat_len,
+                });
                 return sidebar_width;
             }
 
@@ -5197,12 +5273,18 @@ fn handle_mouse(
             let tree_height = term_height.saturating_sub(3) as usize;
             let total_rows = sidebar.rows.len();
 
-            // Click on the scrollbar column → jump-scroll
+            // Click on the scrollbar column → jump-scroll + arm drag
             if col == sb_col && total_rows > tree_height && sidebar_row >= 1 {
                 let rel_row = sidebar_row.saturating_sub(1) as usize;
                 let ratio = rel_row as f64 / tree_height as f64;
                 let new_top = (ratio * total_rows as f64) as usize;
                 sidebar.scroll_top = new_top.min(total_rows.saturating_sub(tree_height));
+                let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
+                *dragging_generic_sb = Some(SidebarScrollDrag {
+                    track_abs_start: 1 + menu_rows,
+                    track_len: tree_height as u16,
+                    total: total_rows,
+                });
                 return sidebar_width;
             }
 
@@ -5412,6 +5494,7 @@ fn handle_mouse(
             }
             return sidebar_width;
         } else if sidebar.active_panel == TuiPanel::Search {
+            sidebar.has_focus = true;
             // results_height = (total height - 2 status rows) - 5 panel header rows
             let results_height = term_height.saturating_sub(7) as usize;
             let results = &engine.project_search_results;
@@ -5686,6 +5769,8 @@ fn handle_mouse(
                             engine.close_tab();
                         }
                     } else {
+                        // Record drag start position for tab drag-and-drop.
+                        *tab_drag_start = Some((col, row));
                         engine.lsp_ensure_active_buffer();
                         if let Some(path) = engine.file_path().cloned() {
                             sidebar.reveal_path(&path, term_height.saturating_sub(4) as usize);
@@ -5778,6 +5863,8 @@ fn handle_mouse(
                         } else {
                             engine.active_group_mut().active_tab = i;
                             engine.line_annotations.clear();
+                            // Record drag start position for tab drag-and-drop.
+                            *tab_drag_start = Some((col, row));
                             engine.lsp_ensure_active_buffer();
                             if let Some(path) = engine.file_path().cloned() {
                                 sidebar.reveal_path(&path, term_height.saturating_sub(4) as usize);
@@ -5961,6 +6048,11 @@ fn handle_mouse(
                             engine.active_tab_mut().active_window = rw.window_id;
                             engine.view_mut().cursor.line = rl.line_idx;
                             engine.trigger_editor_hover_for_line(rl.line_idx);
+                        } else if engine.has_code_actions_on_line(rl.line_idx) {
+                            // Code action lightbulb — show code actions popup.
+                            engine.active_tab_mut().active_window = rw.window_id;
+                            engine.view_mut().cursor.line = rl.line_idx;
+                            engine.show_code_actions_popup();
                         } else {
                             let has_fold_indicator =
                                 rl.gutter_text.chars().any(|c| c == '+' || c == '-');
@@ -6100,8 +6192,6 @@ fn draw_frame(
     engine: &Engine,
     sidebar_prompt: &Option<SidebarPrompt>,
     sidebar_width: u16,
-    fuzzy_scroll_top: usize,
-    grep_scroll_top: usize,
     quickfix_scroll_top: usize,
     debug_output_scroll: usize,
     folder_picker: Option<&FolderPickerState>,
@@ -6350,6 +6440,27 @@ fn draw_frame(
         render_all_windows(frame, editor_area, &screen.windows, theme);
     }
 
+    // ── Tab drag overlay ────────────────────────────────────────────────────
+    if engine.tab_drag.is_some() {
+        render_tab_drag_overlay(frame, engine, editor_area, screen, theme);
+    }
+
+    // ── Tab hover tooltip (rendered on top of editor, below tab bar) ──────
+    if let Some(ref tooltip_text) = screen.tab_tooltip {
+        let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
+        let tooltip_row = menu_rows + 1; // just below the tab bar row
+        let len = tooltip_text.chars().count() as u16;
+        // Position at the right edge of the editor area, or where the tooltip fits.
+        let tooltip_x = editor_area.x;
+        let tooltip_w = len.min(editor_area.width);
+        let fg = rc(theme.hover_fg);
+        let bg = rc(theme.hover_bg);
+        for dx in 0..tooltip_w {
+            let ch = tooltip_text.chars().nth(dx as usize).unwrap_or(' ');
+            set_cell(frame.buffer_mut(), tooltip_x + dx, tooltip_row, ch, fg, bg);
+        }
+    }
+
     // ── Completion popup (rendered on top of editor) ───────────────────────
     if let Some(ref menu) = screen.completion {
         if let Some(active_win) = screen
@@ -6451,24 +6562,14 @@ fn draw_frame(
         }
     }
 
-    // ── Fuzzy file-picker modal (rendered on top of everything) ───────────────
-    if let Some(ref fuzzy) = screen.fuzzy {
-        render_fuzzy_popup(frame, fuzzy, area, theme, fuzzy_scroll_top);
-    }
-
     // ── Folder / workspace picker modal ──────────────────────────────────────
     if let Some(picker) = folder_picker {
         render_folder_picker(frame, picker, area, theme);
     }
 
-    // ── Live grep modal (rendered on top of everything) ───────────────────────
-    if let Some(ref grep) = screen.live_grep {
-        render_live_grep_popup(frame, grep, area, theme, grep_scroll_top);
-    }
-
-    // ── Command palette modal (rendered on top of everything) ─────────────────
-    if let Some(ref palette) = screen.command_palette {
-        render_command_palette_popup(frame, palette, area, theme);
+    // ── Unified picker modal (rendered on top of everything) ─────────────────
+    if let Some(ref picker) = screen.picker {
+        render_picker_popup(frame, picker, area, theme);
     }
 
     // ── Tab switcher popup ───────────────────────────────────────────────────
@@ -6788,6 +6889,286 @@ const TAB_SPLIT_BOTH_COLS: u16 = TAB_SPLIT_BTN_COLS * 2;
 const DIFF_BTN_COLS: u16 = 3;
 /// Total columns for all three diff toolbar buttons.
 const DIFF_TOOLBAR_BTN_COLS: u16 = DIFF_BTN_COLS * 3;
+
+/// Given a column within a group's tab bar, return the shortened file path of
+/// the tab at that column, or `None` if the column doesn't hit a tab with a file.
+fn tab_tooltip_at_col(
+    engine: &Engine,
+    group_id: GroupId,
+    local_col: u16,
+    tabs: &[render::TabInfo],
+) -> Option<String> {
+    let mut x: u16 = 0;
+    for (i, tab) in tabs.iter().enumerate() {
+        let name_width = tab.name.chars().count() as u16;
+        let tab_width = name_width + TAB_CLOSE_COLS;
+        if local_col >= x && local_col < x + tab_width {
+            // Found the tab — look up its file path.
+            let group = engine.editor_groups.get(&group_id)?;
+            let tab_data = group.tabs.get(i)?;
+            let window = engine.windows.get(&tab_data.active_window)?;
+            let state = engine.buffer_manager.get(window.buffer_id)?;
+            let path = state.file_path.as_ref()?;
+            let home = crate::core::paths::home_dir();
+            if let Ok(rest) = path.strip_prefix(&home) {
+                return Some(format!("~/{}", rest.display()));
+            }
+            return Some(path.display().to_string());
+        }
+        x += tab_width;
+    }
+    None
+}
+
+/// Draw the tab drag-and-drop overlay (highlight drop zone + ghost label).
+fn render_tab_drag_overlay(
+    frame: &mut ratatui::Frame,
+    engine: &Engine,
+    editor_area: Rect,
+    screen: &render::ScreenLayout,
+    theme: &render::Theme,
+) {
+    use crate::core::window::{DropZone, SplitDirection};
+
+    let tui_tbh: u16 = if engine.settings.breadcrumbs { 2 } else { 1 };
+    let zone = engine.tab_drop_zone;
+
+    // Accent color for the drop zone highlight.
+    let highlight_bg = RColor::Indexed(24); // dark blue
+
+    // Compute the highlight rectangle in absolute terminal coordinates.
+    let highlight: Option<(u16, u16, u16, u16)> = if let Some(ref split) = screen.editor_group_split
+    {
+        match zone {
+            DropZone::Center(gid) => {
+                split
+                    .group_tab_bars
+                    .iter()
+                    .find(|g| g.group_id == gid)
+                    .map(|g| {
+                        let x = editor_area.x + g.bounds.x as u16;
+                        let y = editor_area.y + (g.bounds.y as u16).saturating_sub(tui_tbh);
+                        let w = g.bounds.width as u16;
+                        let h = g.bounds.height as u16 + tui_tbh;
+                        (x, y, w, h)
+                    })
+            }
+            DropZone::Split(gid, dir, new_first) => split
+                .group_tab_bars
+                .iter()
+                .find(|g| g.group_id == gid)
+                .map(|g| {
+                    let x = editor_area.x + g.bounds.x as u16;
+                    let full_y = editor_area.y + (g.bounds.y as u16).saturating_sub(tui_tbh);
+                    let w = g.bounds.width as u16;
+                    let full_h = g.bounds.height as u16 + tui_tbh;
+                    match (dir, new_first) {
+                        (SplitDirection::Vertical, true) => (x, full_y, w / 2, full_h),
+                        (SplitDirection::Vertical, false) => (x + w / 2, full_y, w - w / 2, full_h),
+                        (SplitDirection::Horizontal, true) => (x, full_y, w, full_h / 2),
+                        (SplitDirection::Horizontal, false) => {
+                            (x, full_y + full_h / 2, w, full_h - full_h / 2)
+                        }
+                    }
+                }),
+            DropZone::TabReorder(gid, _) => split
+                .group_tab_bars
+                .iter()
+                .find(|g| g.group_id == gid)
+                .map(|g| {
+                    let x = editor_area.x + g.bounds.x as u16;
+                    let y = editor_area.y + (g.bounds.y as u16).saturating_sub(tui_tbh);
+                    let w = g.bounds.width as u16;
+                    (x, y, w, 1)
+                }),
+            DropZone::None => None,
+        }
+    } else {
+        match zone {
+            DropZone::TabReorder(_, _) => {
+                Some((editor_area.x, editor_area.y, editor_area.width, 1))
+            }
+            _ => None,
+        }
+    };
+
+    // Draw the highlight area.
+    if let Some((hx, hy, hw, hh)) = highlight {
+        let buf = frame.buffer_mut();
+        for dy in 0..hh {
+            for dx in 0..hw {
+                let cx = hx + dx;
+                let cy = hy + dy;
+                let area = buf.area;
+                if cx < area.x + area.width && cy < area.y + area.height {
+                    buf.get_mut(cx, cy).set_bg(highlight_bg);
+                }
+            }
+        }
+    }
+
+    // For TabReorder, draw a vertical insertion bar at the target position.
+    if let DropZone::TabReorder(gid, idx) = zone {
+        let tab_bar_info: Option<(u16, u16, &[render::TabInfo])> =
+            if let Some(ref split) = screen.editor_group_split {
+                split
+                    .group_tab_bars
+                    .iter()
+                    .find(|g| g.group_id == gid)
+                    .map(|g| {
+                        let x = editor_area.x + g.bounds.x as u16;
+                        let y = editor_area.y + (g.bounds.y as u16).saturating_sub(tui_tbh);
+                        (x, y, g.tabs.as_slice())
+                    })
+            } else {
+                Some((editor_area.x, editor_area.y, screen.tab_bar.as_slice()))
+            };
+
+        if let Some((bar_x, bar_y, tabs)) = tab_bar_info {
+            let mut insert_x: u16 = 0;
+            for (i, tab) in tabs.iter().enumerate() {
+                if i == idx {
+                    break;
+                }
+                insert_x += tab.name.chars().count() as u16 + TAB_CLOSE_COLS;
+            }
+            let abs_x = bar_x + insert_x;
+            set_cell_styled(
+                frame.buffer_mut(),
+                abs_x,
+                bar_y,
+                '▎',
+                RColor::Indexed(39),
+                rc(theme.tab_bar_bg),
+                Modifier::empty(),
+            );
+        }
+    }
+
+    // Draw ghost label near cursor.
+    if let (Some((mx, my)), Some(ref drag)) = (engine.tab_drag_mouse, &engine.tab_drag) {
+        let label = &drag.tab_name;
+        if !label.is_empty() {
+            let gx = (mx as u16) + 2;
+            let gy = my as u16;
+            let ghost_fg = RColor::White;
+            let ghost_bg = RColor::Indexed(238);
+            let buf = frame.buffer_mut();
+            for (i, ch) in label.chars().enumerate() {
+                let cx = gx + i as u16;
+                let area = buf.area;
+                if cx < area.x + area.width && gy < area.y + area.height {
+                    buf.get_mut(cx, gy)
+                        .set_char(ch)
+                        .set_fg(ghost_fg)
+                        .set_bg(ghost_bg);
+                }
+            }
+        }
+    }
+}
+
+/// Compute the drop zone for a tab drag in TUI based on cursor cell position.
+fn compute_tui_tab_drop_zone(
+    engine: &Engine,
+    col: u16,
+    row: u16,
+    editor_left: u16,
+    last_layout: Option<&render::ScreenLayout>,
+) -> crate::core::window::DropZone {
+    use crate::core::window::{DropZone, SplitDirection};
+
+    let layout = match last_layout {
+        Some(l) => l,
+        None => return DropZone::None,
+    };
+
+    let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
+    let click_tbh: u16 = if engine.settings.breadcrumbs { 2 } else { 1 };
+
+    if col < editor_left {
+        return DropZone::None;
+    }
+    let rel_col = col - editor_left;
+
+    if let Some(ref split) = layout.editor_group_split {
+        // Multi-group mode: check each group's tab bar and content area.
+        for gtb in split.group_tab_bars.iter() {
+            let tab_bar_row = menu_rows + (gtb.bounds.y as u16).saturating_sub(click_tbh);
+            let gx = gtb.bounds.x as u16;
+            let gw = gtb.bounds.width as u16;
+            let group_id = gtb.group_id;
+
+            // Tab bar region — determine reorder insertion index.
+            if row == tab_bar_row && rel_col >= gx && rel_col < gx + gw {
+                let local_col = rel_col - gx;
+                let mut x: u16 = 0;
+                for (i, tab) in gtb.tabs.iter().enumerate() {
+                    let name_w = tab.name.chars().count() as u16;
+                    let tab_w = name_w + TAB_CLOSE_COLS;
+                    let mid = x + tab_w / 2;
+                    if local_col < mid {
+                        return DropZone::TabReorder(group_id, i);
+                    }
+                    x += tab_w;
+                }
+                return DropZone::TabReorder(group_id, gtb.tabs.len());
+            }
+
+            // Content area — edge zones for split, center for merge.
+            let content_top = menu_rows + gtb.bounds.y as u16;
+            let content_left = gx;
+            let content_right = gx + gw;
+            let content_h = gtb.bounds.height as u16;
+            let content_bottom = content_top + content_h;
+            if rel_col >= content_left
+                && rel_col < content_right
+                && row >= content_top
+                && row < content_bottom
+            {
+                let w = gw;
+                let h = content_h;
+                let rx = rel_col - content_left;
+                let ry = row - content_top;
+                // Edge zones: ~20% of each dimension, minimum 3 cells.
+                let edge_w = (w / 5).max(3).min(w / 2);
+                let edge_h = (h / 5).max(2).min(h / 2);
+
+                if rx < edge_w {
+                    return DropZone::Split(group_id, SplitDirection::Vertical, true);
+                }
+                if rx >= w - edge_w {
+                    return DropZone::Split(group_id, SplitDirection::Vertical, false);
+                }
+                if ry < edge_h {
+                    return DropZone::Split(group_id, SplitDirection::Horizontal, true);
+                }
+                if ry >= h - edge_h {
+                    return DropZone::Split(group_id, SplitDirection::Horizontal, false);
+                }
+                return DropZone::Center(group_id);
+            }
+        }
+    } else {
+        // Single-group mode: tab bar reorder only.
+        if row == menu_rows {
+            let local_col = rel_col;
+            let mut x: u16 = 0;
+            for (i, tab) in layout.tab_bar.iter().enumerate() {
+                let name_w = tab.name.chars().count() as u16;
+                let tab_w = name_w + TAB_CLOSE_COLS;
+                let mid = x + tab_w / 2;
+                if local_col < mid {
+                    return DropZone::TabReorder(engine.active_group, i);
+                }
+                x += tab_w;
+            }
+            return DropZone::TabReorder(engine.active_group, layout.tab_bar.len());
+        }
+    }
+
+    DropZone::None
+}
 
 fn render_tab_bar(
     buf: &mut ratatui::buffer::Buffer,
@@ -7269,166 +7650,6 @@ fn render_signature_popup(
     }
 }
 
-fn render_fuzzy_popup(
-    frame: &mut ratatui::Frame,
-    fuzzy: &render::FuzzyPanel,
-    term_area: Rect,
-    theme: &Theme,
-    scroll_top: usize,
-) {
-    let term_cols = term_area.width;
-    let term_rows = term_area.height;
-
-    // Size: 3/5 of terminal width (min 50), 55% of terminal rows (min 15)
-    let width = (term_cols * 3 / 5).max(50);
-    let height = (term_rows * 55 / 100).max(15);
-
-    // Centered
-    let x = (term_cols.saturating_sub(width)) / 2;
-    let y = (term_rows.saturating_sub(height)) / 2;
-
-    let bg_color = rc(theme.fuzzy_bg);
-    let sel_bg_color = rc(theme.fuzzy_selected_bg);
-    let fg_color = rc(theme.fuzzy_fg);
-    let query_fg = rc(theme.fuzzy_query_fg);
-    let border_fg = rc(theme.fuzzy_border);
-    let title_fg = rc(theme.fuzzy_title_fg);
-
-    let buf = frame.buffer_mut();
-
-    // Row 0: top border ╭─ Find Files ── N/M ──╮
-    let title_text = format!(
-        " Find Files  {}/{} ",
-        fuzzy.results.len(),
-        fuzzy.total_files
-    );
-    for col in 0..width {
-        let cx = x + col;
-        if cx < term_area.width && y < term_area.height {
-            let ch = if col == 0 {
-                '╭'
-            } else if col == width - 1 {
-                '╮'
-            } else {
-                '─'
-            };
-            set_cell(buf, cx, y, ch, border_fg, bg_color);
-        }
-    }
-    // Overlay title text starting at col 2
-    for (i, ch) in title_text.chars().enumerate() {
-        let cx = x + 2 + i as u16;
-        if cx + 1 < x + width && cx < term_area.width && y < term_area.height {
-            set_cell(buf, cx, y, ch, title_fg, bg_color);
-        }
-    }
-
-    // Row 1: query line │ > query_ │
-    let row1 = y + 1;
-    if row1 < term_area.height {
-        // Left border
-        set_cell(buf, x, row1, '│', border_fg, bg_color);
-        // Right border
-        if x + width - 1 < term_area.width {
-            set_cell(buf, x + width - 1, row1, '│', border_fg, bg_color);
-        }
-        // Fill background
-        for col in 1..width - 1 {
-            let cx = x + col;
-            if cx < term_area.width {
-                set_cell(buf, cx, row1, ' ', fg_color, bg_color);
-            }
-        }
-        // Query text "> query"
-        let query_display = format!("> {}", fuzzy.query);
-        for (i, ch) in query_display.chars().enumerate() {
-            let cx = x + 1 + i as u16;
-            if cx + 1 < x + width && cx < term_area.width {
-                set_cell(buf, cx, row1, ch, query_fg, bg_color);
-            }
-        }
-        // Cursor block after query
-        let cursor_col = x + 1 + query_display.chars().count() as u16;
-        if cursor_col + 1 < x + width && cursor_col < term_area.width {
-            set_cell(buf, cursor_col, row1, '▌', query_fg, bg_color);
-        }
-    }
-
-    // Row 2: separator ├───────┤
-    let row2 = y + 2;
-    if row2 < term_area.height {
-        for col in 0..width {
-            let cx = x + col;
-            if cx < term_area.width {
-                let ch = if col == 0 {
-                    '├'
-                } else if col == width - 1 {
-                    '┤'
-                } else {
-                    '─'
-                };
-                set_cell(buf, cx, row2, ch, border_fg, bg_color);
-            }
-        }
-    }
-
-    // Result rows: rows 3..height-1
-    let results_start = y + 3;
-    let results_end = y + height - 1;
-    let visible_rows = (results_end.saturating_sub(results_start)) as usize;
-
-    for row_idx in 0..visible_rows {
-        let result_idx = scroll_top + row_idx;
-        let ry = results_start + row_idx as u16;
-        if ry >= results_end || ry >= term_area.height {
-            break;
-        }
-        // Left/right border
-        set_cell(buf, x, ry, '│', border_fg, bg_color);
-        if x + width - 1 < term_area.width {
-            set_cell(buf, x + width - 1, ry, '│', border_fg, bg_color);
-        }
-        // Fill row background
-        let is_selected = result_idx == fuzzy.selected_idx;
-        let row_bg = if is_selected { sel_bg_color } else { bg_color };
-        for col in 1..width - 1 {
-            let cx = x + col;
-            if cx < term_area.width {
-                set_cell(buf, cx, ry, ' ', fg_color, row_bg);
-            }
-        }
-        // Result text
-        if let Some(display) = fuzzy.results.get(result_idx) {
-            let prefix = if is_selected { "▶ " } else { "  " };
-            let row_text = format!("{}{}", prefix, display);
-            for (j, ch) in row_text.chars().enumerate() {
-                let cx = x + 1 + j as u16;
-                if cx + 1 < x + width && cx < term_area.width {
-                    set_cell(buf, cx, ry, ch, fg_color, row_bg);
-                }
-            }
-        }
-    }
-
-    // Bottom border ╰───────╯
-    let bottom = y + height - 1;
-    if bottom < term_area.height {
-        for col in 0..width {
-            let cx = x + col;
-            if cx < term_area.width {
-                let ch = if col == 0 {
-                    '╰'
-                } else if col == width - 1 {
-                    '╯'
-                } else {
-                    '─'
-                };
-                set_cell(buf, cx, bottom, ch, border_fg, bg_color);
-            }
-        }
-    }
-}
-
 fn render_folder_picker(
     frame: &mut ratatui::Frame,
     picker: &FolderPickerState,
@@ -7603,21 +7824,30 @@ fn render_folder_picker(
     }
 }
 
-fn render_live_grep_popup(
+/// Render the unified picker popup. Supports single-pane (no preview) and
+/// two-pane (with preview) layouts, fuzzy match highlighting, and scrollbar.
+fn render_picker_popup(
     frame: &mut ratatui::Frame,
-    grep: &render::LiveGrepPanel,
+    picker: &render::PickerPanel,
     term_area: Rect,
     theme: &Theme,
-    scroll_top: usize,
 ) {
     let term_cols = term_area.width;
     let term_rows = term_area.height;
+    let has_preview = picker.preview.is_some();
 
-    // Size: 4/5 of terminal width (min 60), 65% of terminal rows (min 18)
-    let width = (term_cols * 4 / 5).max(60);
-    let height = (term_rows * 65 / 100).max(18);
+    // Size adapts based on whether we have a preview pane
+    let width = if has_preview {
+        (term_cols * 4 / 5).max(60)
+    } else {
+        (term_cols * 55 / 100).max(55)
+    };
+    let height = if has_preview {
+        (term_rows * 65 / 100).max(18)
+    } else {
+        (term_rows * 60 / 100).max(16)
+    };
 
-    // Centered
     let x = (term_cols.saturating_sub(width)) / 2;
     let y = (term_rows.saturating_sub(height)) / 2;
 
@@ -7627,11 +7857,24 @@ fn render_live_grep_popup(
     let query_fg = rc(theme.fuzzy_query_fg);
     let border_fg = rc(theme.fuzzy_border);
     let title_fg = rc(theme.fuzzy_title_fg);
+    let match_fg = rc(theme.fuzzy_match_fg);
 
     let buf = frame.buffer_mut();
 
-    // Row 0: top border ╭─ Live Grep ── N matches ──╮
-    let title_text = format!(" Live Grep  {} matches ", grep.total_matches);
+    // Left pane width for two-pane mode
+    let left_w = if has_preview {
+        (width as usize * 35 / 100) as u16
+    } else {
+        0
+    };
+
+    // Row 0: top border ╭─ Title ── N/M ──╮
+    let title_text = format!(
+        " {}  {}/{} ",
+        picker.title,
+        picker.items.len(),
+        picker.total_count
+    );
     for col in 0..width {
         let cx = x + col;
         if cx < term_area.width && y < term_area.height {
@@ -7645,193 +7888,6 @@ fn render_live_grep_popup(
             set_cell(buf, cx, y, ch, border_fg, bg_color);
         }
     }
-    // Overlay title text starting at col 2
-    for (i, ch) in title_text.chars().enumerate() {
-        let cx = x + 2 + i as u16;
-        if cx + 1 < x + width && cx < term_area.width && y < term_area.height {
-            set_cell(buf, cx, y, ch, title_fg, bg_color);
-        }
-    }
-
-    // Row 1: query line │ > query_ │
-    let row1 = y + 1;
-    if row1 < term_area.height {
-        set_cell(buf, x, row1, '│', border_fg, bg_color);
-        if x + width - 1 < term_area.width {
-            set_cell(buf, x + width - 1, row1, '│', border_fg, bg_color);
-        }
-        for col in 1..width - 1 {
-            let cx = x + col;
-            if cx < term_area.width {
-                set_cell(buf, cx, row1, ' ', fg_color, bg_color);
-            }
-        }
-        let query_display = format!("> {}", grep.query);
-        for (i, ch) in query_display.chars().enumerate() {
-            let cx = x + 1 + i as u16;
-            if cx + 1 < x + width && cx < term_area.width {
-                set_cell(buf, cx, row1, ch, query_fg, bg_color);
-            }
-        }
-        let cursor_col = x + 1 + query_display.chars().count() as u16;
-        if cursor_col + 1 < x + width && cursor_col < term_area.width {
-            set_cell(buf, cursor_col, row1, '▌', query_fg, bg_color);
-        }
-    }
-
-    // Row 2: separator ├───────────────┬───────────────────────────────┤
-    let row2 = y + 2;
-    // Left pane width: 35% of popup (in columns)
-    let left_w = (width as usize * 35 / 100) as u16;
-    if row2 < term_area.height {
-        for col in 0..width {
-            let cx = x + col;
-            if cx < term_area.width {
-                let ch = if col == 0 {
-                    '├'
-                } else if col == width - 1 {
-                    '┤'
-                } else if col == left_w {
-                    '┬'
-                } else {
-                    '─'
-                };
-                set_cell(buf, cx, row2, ch, border_fg, bg_color);
-            }
-        }
-    }
-
-    // Result rows: rows 3..height-1
-    let results_start = y + 3;
-    let results_end = y + height - 1;
-    let visible_rows = (results_end.saturating_sub(results_start)) as usize;
-
-    for row_idx in 0..visible_rows {
-        let result_idx = scroll_top + row_idx;
-        let ry = results_start + row_idx as u16;
-        if ry >= results_end || ry >= term_area.height {
-            break;
-        }
-
-        // Left border
-        set_cell(buf, x, ry, '│', border_fg, bg_color);
-        // Vertical separator between panes
-        if x + left_w < term_area.width {
-            set_cell(buf, x + left_w, ry, '│', border_fg, bg_color);
-        }
-        // Right border
-        if x + width - 1 < term_area.width {
-            set_cell(buf, x + width - 1, ry, '│', border_fg, bg_color);
-        }
-
-        // Fill left pane background
-        let is_selected = result_idx == grep.selected_idx;
-        let left_bg = if is_selected { sel_bg_color } else { bg_color };
-        for col in 1..left_w {
-            let cx = x + col;
-            if cx < term_area.width {
-                set_cell(buf, cx, ry, ' ', fg_color, left_bg);
-            }
-        }
-        // Fill right pane background
-        for col in (left_w + 1)..(width - 1) {
-            let cx = x + col;
-            if cx < term_area.width {
-                set_cell(buf, cx, ry, ' ', fg_color, bg_color);
-            }
-        }
-
-        // Left pane: result text
-        if let Some(display) = grep.results.get(result_idx) {
-            let prefix = if is_selected { "▶" } else { " " };
-            let row_text = format!("{}{}", prefix, display);
-            let left_inner = left_w.saturating_sub(1) as usize; // inner cols
-            for (j, ch) in row_text.chars().enumerate().take(left_inner) {
-                let cx = x + 1 + j as u16;
-                if cx < x + left_w && cx < term_area.width {
-                    set_cell(buf, cx, ry, ch, fg_color, left_bg);
-                }
-            }
-        }
-
-        // Right pane: preview line for this row_idx
-        if let Some((lineno, text, is_match)) = grep.preview_lines.get(row_idx) {
-            let preview_text = format!("{:4}: {}", lineno, text);
-            let preview_fg = if *is_match { title_fg } else { fg_color };
-            let right_start = x + left_w + 1;
-            let right_inner = (width - left_w - 2) as usize;
-            for (j, ch) in preview_text.chars().enumerate().take(right_inner) {
-                let cx = right_start + j as u16;
-                if cx + 1 < x + width && cx < term_area.width {
-                    set_cell(buf, cx, ry, ch, preview_fg, bg_color);
-                }
-            }
-        }
-    }
-
-    // Bottom border ╰───────────────┴───────────────────────────────╯
-    let bottom = y + height - 1;
-    if bottom < term_area.height {
-        for col in 0..width {
-            let cx = x + col;
-            if cx < term_area.width {
-                let ch = if col == 0 {
-                    '╰'
-                } else if col == width - 1 {
-                    '╯'
-                } else if col == left_w {
-                    '┴'
-                } else {
-                    '─'
-                };
-                set_cell(buf, cx, bottom, ch, border_fg, bg_color);
-            }
-        }
-    }
-}
-
-fn render_command_palette_popup(
-    frame: &mut ratatui::Frame,
-    palette: &render::CommandPalettePanel,
-    term_area: Rect,
-    theme: &Theme,
-) {
-    let term_cols = term_area.width;
-    let term_rows = term_area.height;
-
-    // Size: 55% of terminal width (min 55), 60% of terminal rows (min 16)
-    let width = (term_cols * 55 / 100).max(55);
-    let height = (term_rows * 60 / 100).max(16);
-
-    // Centered
-    let x = (term_cols.saturating_sub(width)) / 2;
-    let y = (term_rows.saturating_sub(height)) / 2;
-
-    let bg_color = rc(theme.fuzzy_bg);
-    let sel_bg_color = rc(theme.fuzzy_selected_bg);
-    let fg_color = rc(theme.fuzzy_fg);
-    let query_fg = rc(theme.fuzzy_query_fg);
-    let border_fg = rc(theme.fuzzy_border);
-    let title_fg = rc(theme.fuzzy_title_fg);
-
-    let buf = frame.buffer_mut();
-
-    // Row 0: top border ╭─ Command Palette ── N/M ──╮
-    let title_text = format!(" Command Palette  {} ", palette.items.len());
-    for col in 0..width {
-        let cx = x + col;
-        if cx < term_area.width && y < term_area.height {
-            let ch = if col == 0 {
-                '╭'
-            } else if col == width - 1 {
-                '╮'
-            } else {
-                '─'
-            };
-            set_cell(buf, cx, y, ch, border_fg, bg_color);
-        }
-    }
-    // Overlay title text starting at col 2
     for (i, ch) in title_text.chars().enumerate() {
         let cx = x + 2 + i as u16;
         if cx + 1 < x + width && cx < term_area.width && y < term_area.height {
@@ -7852,7 +7908,7 @@ fn render_command_palette_popup(
                 set_cell(buf, cx, row1, ' ', fg_color, bg_color);
             }
         }
-        let query_display = format!("> {}", palette.query);
+        let query_display = format!("> {}", picker.query);
         for (i, ch) in query_display.chars().enumerate() {
             let cx = x + 1 + i as u16;
             if cx + 1 < x + width && cx < term_area.width {
@@ -7865,7 +7921,7 @@ fn render_command_palette_popup(
         }
     }
 
-    // Row 2: separator ├────────────────────────────────────────────────┤
+    // Row 2: separator
     let row2 = y + 2;
     if row2 < term_area.height {
         for col in 0..width {
@@ -7875,6 +7931,8 @@ fn render_command_palette_popup(
                     '├'
                 } else if col == width - 1 {
                     '┤'
+                } else if has_preview && col == left_w {
+                    '┬'
                 } else {
                     '─'
                 };
@@ -7883,82 +7941,141 @@ fn render_command_palette_popup(
         }
     }
 
-    // Result rows (title+query+sep = 3 rows, bottom border = 1 row)
-    let inner_rows = height.saturating_sub(4) as usize;
-    let total_items = palette.items.len();
-    // Scrollbar: use the last inner column when content overflows
-    let has_scrollbar = total_items > inner_rows;
-    // Inner content width: strip left │, right │, and scrollbar column if present
-    let inner_w = width.saturating_sub(2 + if has_scrollbar { 1 } else { 0 }) as usize;
-    let visible_count = inner_rows.min(total_items.saturating_sub(palette.scroll_top));
+    // Result rows
+    let results_start = y + 3;
+    let results_end = y + height - 1;
+    let visible_rows = (results_end.saturating_sub(results_start)) as usize;
 
-    for i in 0..visible_count {
-        let display_idx = palette.scroll_top + i;
-        let ry = row2 + 1 + i as u16;
-        if ry >= y + height - 1 || ry >= term_area.height {
+    // Determine effective item width for the left pane
+    let item_end_col = if has_preview { left_w } else { width - 1 };
+
+    // Scrollbar when content overflows (single-pane only)
+    let total_items = picker.items.len();
+    let has_scrollbar = !has_preview && total_items > visible_rows;
+    let content_end = if has_scrollbar {
+        item_end_col.saturating_sub(1)
+    } else {
+        item_end_col
+    };
+
+    for row_idx in 0..visible_rows {
+        let result_idx = picker.scroll_top + row_idx;
+        let ry = results_start + row_idx as u16;
+        if ry >= results_end || ry >= term_area.height {
             break;
         }
 
-        let is_selected = display_idx == palette.selected_idx;
-
-        // Fill row background
-        let row_bg = if is_selected { sel_bg_color } else { bg_color };
+        // Borders
         set_cell(buf, x, ry, '│', border_fg, bg_color);
         if x + width - 1 < term_area.width {
             set_cell(buf, x + width - 1, ry, '│', border_fg, bg_color);
         }
-        // Fill inner content columns (excluding scrollbar column)
-        let content_end = width - 1 - if has_scrollbar { 1 } else { 0 };
-        for col in 1..content_end {
+        if has_preview && x + left_w < term_area.width {
+            set_cell(buf, x + left_w, ry, '│', border_fg, bg_color);
+        }
+
+        let is_selected = result_idx == picker.selected_idx;
+        let row_bg = if is_selected { sel_bg_color } else { bg_color };
+
+        // Fill left pane background
+        let fill_end = if has_preview { left_w } else { width - 1 };
+        for col in 1..fill_end {
             let cx = x + col;
             if cx < term_area.width {
                 set_cell(buf, cx, ry, ' ', fg_color, row_bg);
             }
         }
 
-        let (label, shortcut) = &palette.items[display_idx];
-        let prefix = if is_selected { "▶ " } else { "  " };
-        let label_text = format!("{}{}", prefix, label);
-
-        // Draw label (left-aligned)
-        for (j, ch) in label_text.chars().enumerate() {
-            let cx = x + 1 + j as u16;
-            let limit = x + 1 + content_end - 1;
-            if cx < limit && cx < term_area.width {
-                set_cell(buf, cx, ry, ch, fg_color, row_bg);
+        // Fill right pane background (two-pane mode)
+        if has_preview {
+            for col in (left_w + 1)..(width - 1) {
+                let cx = x + col;
+                if cx < term_area.width {
+                    set_cell(buf, cx, ry, ' ', fg_color, bg_color);
+                }
             }
         }
 
-        // Draw shortcut (right-aligned within content area, dimmed)
-        if !shortcut.is_empty() {
-            let sc_with_pad = format!("{}  ", shortcut);
-            let sc_len = sc_with_pad.chars().count();
-            let sc_start = (inner_w + 1).saturating_sub(sc_len);
-            for (j, ch) in sc_with_pad.chars().enumerate() {
-                let cx = x + sc_start as u16 + j as u16;
-                let limit = x + 1 + content_end - 1;
-                if cx < limit && cx < term_area.width {
-                    set_cell(buf, cx, ry, ch, border_fg, row_bg);
+        // Left pane: item text with fuzzy match highlighting
+        if let Some(item) = picker.items.get(result_idx) {
+            let prefix = if is_selected { "▶ " } else { "  " };
+            let prefix_len = prefix.chars().count();
+            let inner_cols = (content_end.saturating_sub(1)) as usize;
+
+            // Draw prefix
+            for (j, ch) in prefix.chars().enumerate() {
+                let cx = x + 1 + j as u16;
+                if cx < x + content_end && cx < term_area.width {
+                    set_cell(buf, cx, ry, ch, fg_color, row_bg);
+                }
+            }
+
+            // Draw display text with match highlighting
+            for (j, ch) in item.display.chars().enumerate() {
+                let col_pos = prefix_len + j;
+                if col_pos >= inner_cols {
+                    break;
+                }
+                let cx = x + 1 + col_pos as u16;
+                if cx < x + content_end && cx < term_area.width {
+                    let char_fg = if item.match_positions.contains(&j) {
+                        match_fg
+                    } else {
+                        fg_color
+                    };
+                    set_cell(buf, cx, ry, ch, char_fg, row_bg);
+                }
+            }
+
+            // Right-aligned detail (shortcut) in single-pane mode
+            if !has_preview {
+                if let Some(ref detail) = item.detail {
+                    let detail_padded = format!("{}  ", detail);
+                    let detail_len = detail_padded.chars().count();
+                    let sc_start = inner_cols.saturating_sub(detail_len);
+                    for (j, ch) in detail_padded.chars().enumerate() {
+                        let cx = x + 1 + (sc_start + j) as u16;
+                        let limit = x + 1 + content_end - 1;
+                        if cx < limit && cx < term_area.width {
+                            set_cell(buf, cx, ry, ch, border_fg, row_bg);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Right pane: preview line
+        if has_preview {
+            if let Some(ref preview) = picker.preview {
+                if let Some((lineno, text, is_match)) = preview.get(row_idx) {
+                    let preview_text = format!("{:4}: {}", lineno, text);
+                    let preview_fg = if *is_match { title_fg } else { fg_color };
+                    let right_start = x + left_w + 1;
+                    let right_inner = (width - left_w - 2) as usize;
+                    for (j, ch) in preview_text.chars().enumerate().take(right_inner) {
+                        let cx = right_start + j as u16;
+                        if cx + 1 < x + width && cx < term_area.width {
+                            set_cell(buf, cx, ry, ch, preview_fg, bg_color);
+                        }
+                    }
                 }
             }
         }
     }
 
-    // Scrollbar column (between content and right border)
-    if has_scrollbar && inner_rows > 0 {
-        let sb_col = x + width - 2; // column to the left of right border
-        let track_start = (row2 + 1) as usize;
-        let track_len = inner_rows;
-        let thumb_size = ((inner_rows * inner_rows) / total_items).max(1);
-        let max_scroll = total_items.saturating_sub(inner_rows);
+    // Scrollbar (single-pane only)
+    if has_scrollbar && visible_rows > 0 {
+        let sb_col = x + width - 2;
+        let track_len = visible_rows;
+        let thumb_size = ((visible_rows * visible_rows) / total_items).max(1);
+        let max_scroll = total_items.saturating_sub(visible_rows);
         let thumb_offset = if max_scroll > 0 {
-            (palette.scroll_top * (track_len.saturating_sub(thumb_size))) / max_scroll
+            (picker.scroll_top * (track_len.saturating_sub(thumb_size))) / max_scroll
         } else {
             0
         };
-
         for row_off in 0..track_len {
-            let ry = (track_start + row_off) as u16;
+            let ry = results_start + row_off as u16;
             if ry >= y + height - 1 || ry >= term_area.height {
                 break;
             }
@@ -7970,7 +8087,7 @@ fn render_command_palette_popup(
         }
     }
 
-    // Bottom border ╰────────────────────────────────────────────────────╯
+    // Bottom border
     let bottom = y + height - 1;
     if bottom < term_area.height {
         for col in 0..width {
@@ -7980,6 +8097,8 @@ fn render_command_palette_popup(
                     '╰'
                 } else if col == width - 1 {
                     '╯'
+                } else if has_preview && col == left_w {
+                    '┴'
                 } else {
                     '─'
                 };
@@ -8391,19 +8510,34 @@ fn render_dialog_popup(
 
     // Compute dimensions: widest line of body or title, at least 40.
     let body_max = dialog.body.iter().map(|l| l.len()).max().unwrap_or(0);
-    let btn_row_len: usize = dialog
+    let btn_max_label = dialog
         .buttons
         .iter()
-        .map(|(lbl, _)| lbl.len() + 4) // "  [label]  "
-        .sum::<usize>()
-        + 2;
+        .map(|(lbl, _)| lbl.len() + 4)
+        .max()
+        .unwrap_or(0);
+    let btn_row_len: usize = if dialog.vertical_buttons {
+        btn_max_label + 2
+    } else {
+        dialog
+            .buttons
+            .iter()
+            .map(|(lbl, _)| lbl.len() + 4)
+            .sum::<usize>()
+            + 2
+    };
     let content_width = body_max.max(dialog.title.len() + 4).max(btn_row_len);
     let width = (content_width as u16 + 4).clamp(40, term_area.width.saturating_sub(4));
     let has_input = dialog.input.is_some();
     let input_rows: u16 = if has_input { 1 } else { 0 };
-    // Height: top border + title + blank + body lines + input + blank + button row + bottom border.
-    let height =
-        (3 + dialog.body.len() as u16 + input_rows + 2 + 1).min(term_area.height.saturating_sub(4));
+    let btn_rows: u16 = if dialog.vertical_buttons {
+        dialog.buttons.len() as u16
+    } else {
+        1
+    };
+    // Height: top border + title + blank + body lines + input + blank + button rows + bottom border.
+    let height = (3 + dialog.body.len() as u16 + input_rows + 1 + btn_rows + 1)
+        .min(term_area.height.saturating_sub(4));
 
     let x = (term_area.width.saturating_sub(width)) / 2;
     let y = (term_area.height.saturating_sub(height)) / 2;
@@ -8488,19 +8622,42 @@ fn render_dialog_popup(
         }
     }
 
-    // Button row — last content row before bottom border.
-    let btn_y = y + height - 2;
-    if btn_y < term_area.height {
-        let mut col_offset = 2u16;
-        for (label, is_selected) in &dialog.buttons {
-            let btn_text = format!("  {}  ", label);
+    // Buttons — vertical list or horizontal row depending on mode.
+    if dialog.vertical_buttons {
+        let btn_start_y = y + height - 1 - btn_rows;
+        for (i, (label, is_selected)) in dialog.buttons.iter().enumerate() {
+            let row = btn_start_y + i as u16;
+            if row >= y + height - 1 || row >= term_area.height {
+                break;
+            }
             let btn_bg = if *is_selected { sel_bg } else { bg };
-            for ch in btn_text.chars() {
-                let cx = x + col_offset;
+            // Clear the row background for selection highlight.
+            for col_i in (x + 1)..(x + width - 1).min(term_area.width) {
+                set_cell(buf, col_i, row, ' ', fg, btn_bg);
+            }
+            let prefix = if *is_selected { "▸ " } else { "  " };
+            let btn_text = format!("{}{}", prefix, label);
+            for (j, ch) in btn_text.chars().enumerate() {
+                let cx = x + 2 + j as u16;
                 if cx + 1 < x + width && cx < term_area.width {
-                    set_cell(buf, cx, btn_y, ch, fg, btn_bg);
+                    set_cell(buf, cx, row, ch, fg, btn_bg);
                 }
-                col_offset += 1;
+            }
+        }
+    } else {
+        let btn_y = y + height - 2;
+        if btn_y < term_area.height {
+            let mut col_offset = 2u16;
+            for (label, is_selected) in &dialog.buttons {
+                let btn_text = format!("  {}  ", label);
+                let btn_bg = if *is_selected { sel_bg } else { bg };
+                for ch in btn_text.chars() {
+                    let cx = x + col_offset;
+                    if cx + 1 < x + width && cx < term_area.width {
+                        set_cell(buf, cx, btn_y, ch, fg, btn_bg);
+                    }
+                    col_offset += 1;
+                }
             }
         }
     }
@@ -8637,6 +8794,18 @@ fn render_window(frame: &mut ratatui::Frame, area: Rect, window: &RenderedWindow
                     screen_y,
                     diag_ch,
                     diag_color,
+                    line_bg,
+                );
+            } else if !line.is_wrap_continuation
+                && window.code_action_lines.contains(&line.line_idx)
+            {
+                // Code action lightbulb (only when no diagnostic icon)
+                set_cell(
+                    frame.buffer_mut(),
+                    area.x,
+                    screen_y,
+                    '\u{f0eb}', // nf-fa-lightbulb_o
+                    rc(theme.lightbulb),
                     line_bg,
                 );
             }
@@ -9693,8 +9862,12 @@ fn render_activity_bar(
     engine: &Engine,
 ) {
     let bar_bg = rc(theme.tab_bar_bg);
-    // All icons rendered in off-white for readability; active indicated by left accent bar.
-    let icon_fg = RColor::Rgb(200, 200, 210);
+    // Icon color adapts to theme brightness for readability.
+    let icon_fg = if theme.is_light() {
+        RColor::Rgb(100, 100, 110)
+    } else {
+        RColor::Rgb(200, 200, 210)
+    };
     let accent_fg = rc(theme.cursor); // left-edge accent bar for active panel
     let toolbar_sel_bg = rc(theme.cursor); // highlight for toolbar-focused selection
 
@@ -12655,14 +12828,34 @@ fn render_editor_hover_popup(
             };
 
             let cx = x + col_x;
+            let char_col = (col_x - 2) as usize; // 0-based char column (border + padding)
             if col_x + 1 < width && cx < term_area.width {
                 let cell = buf.get_mut(cx, row_y);
-                cell.set_char(ch).set_fg(ch_fg).set_bg(bg);
+                // Check if this character is within the text selection
+                let in_selection = if let Some((sl, sc, el, ec)) = eh.selection {
+                    let line = actual_line;
+                    if sl == el {
+                        line == sl && char_col >= sc && char_col < ec
+                    } else if line == sl {
+                        char_col >= sc
+                    } else if line == el {
+                        char_col < ec
+                    } else {
+                        line > sl && line < el
+                    }
+                } else {
+                    false
+                };
+                if in_selection {
+                    cell.set_char(ch).set_fg(bg).set_bg(ch_fg);
+                } else {
+                    cell.set_char(ch).set_fg(ch_fg).set_bg(bg);
+                }
                 if bold {
                     cell.set_style(cell.style().add_modifier(ratatui::style::Modifier::BOLD));
                 }
                 // Highlight focused link
-                if eh.has_focus {
+                if eh.has_focus && !in_selection {
                     if let Some(focused) = eh.focused_link {
                         if let Some(&(link_line, start_b, end_b, _)) = eh.links.get(focused) {
                             if link_line == scroll + li && byte_pos >= start_b && byte_pos < end_b {

@@ -1121,7 +1121,7 @@ fn test_editor_context_menu_command_palette_action() {
     e.context_menu.as_mut().unwrap().selected = palette_idx;
     let action = e.context_menu_confirm();
     assert_eq!(action.as_deref(), Some("command_palette"));
-    assert!(e.palette_open);
+    assert!(e.picker_open);
 }
 
 #[test]

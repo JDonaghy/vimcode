@@ -37,7 +37,11 @@ pub enum LspEvent {
         request_id: i64,
         contents: Option<String>,
     },
-    ServerExited(LspServerId),
+    ServerExited {
+        server_id: LspServerId,
+        stderr: String,
+        was_initialized: bool,
+    },
     /// Background registry lookup result (from Mason registry fetch).
     RegistryLookup {
         lang_id: String,
@@ -91,6 +95,12 @@ pub enum LspEvent {
         workspace_edit: WorkspaceEdit,
         /// Error message from the server, if the response contained an error.
         error_message: Option<String>,
+    },
+    /// Code action response (textDocument/codeAction).
+    CodeActionResponse {
+        server_id: LspServerId,
+        request_id: i64,
+        actions: Vec<CodeAction>,
     },
     /// Semantic tokens full response (textDocument/semanticTokens/full).
     SemanticTokensResponse {
@@ -234,6 +244,15 @@ impl DiagnosticSeverity {
             DiagnosticSeverity::Hint => "H",
         }
     }
+}
+
+/// An LSP code action (quickfix, refactor, etc.).
+#[derive(Debug, Clone)]
+pub struct CodeAction {
+    pub title: String,
+    pub kind: Option<String>,
+    /// The workspace edit to apply when this action is selected.
+    pub edit: Option<WorkspaceEdit>,
 }
 
 #[derive(Debug, Clone)]
@@ -622,7 +641,7 @@ impl LspServer {
         cmd.args(&config.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
@@ -638,11 +657,33 @@ impl LspServer {
             .map_err(|e| format!("Failed to start {}: {}", config.command, e))?;
 
         let stdout = child.stdout.take().ok_or("Failed to get server stdout")?;
+        let stderr = child.stderr.take().ok_or("Failed to get server stderr")?;
         let stdin: Box<dyn IoWrite + Send> =
             Box::new(child.stdin.take().ok_or("Failed to get server stdin")?);
         let stdin = Arc::new(Mutex::new(stdin));
         let pending_requests: Arc<Mutex<HashMap<i64, String>>> =
             Arc::new(Mutex::new(HashMap::new()));
+
+        // Collect stderr in background (capped at 2KB) for crash diagnostics
+        let stderr_buf: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+        let stderr_buf_clone = stderr_buf.clone();
+        thread::spawn(move || {
+            let reader = BufReader::new(stderr);
+            for line in reader.lines() {
+                match line {
+                    Ok(l) => {
+                        let mut buf = stderr_buf_clone.lock().unwrap();
+                        if buf.len() < 2048 {
+                            if !buf.is_empty() {
+                                buf.push('\n');
+                            }
+                            buf.push_str(&l);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
 
         // Start the reader thread
         let reader_server_id = id;
@@ -656,6 +697,7 @@ impl LspServer {
                 reader_server_id,
                 reader_pending,
                 reader_stdin,
+                stderr_buf,
             );
         });
 
@@ -695,6 +737,17 @@ impl LspServer {
                     },
                     "publishDiagnostics": {
                         "relatedInformation": false
+                    },
+                    "codeAction": {
+                        "codeActionLiteralSupport": {
+                            "codeActionKind": {
+                                "valueSet": [
+                                    "quickfix", "refactor", "refactor.extract",
+                                    "refactor.inline", "refactor.rewrite",
+                                    "source", "source.organizeImports"
+                                ]
+                            }
+                        }
                     },
                     "definition": {},
                     "rename": {
@@ -897,6 +950,29 @@ impl LspServer {
         )
     }
 
+    /// Request code actions for a range.
+    pub fn request_code_action(
+        &mut self,
+        uri: &str,
+        line: u32,
+        col: u32,
+        diagnostics_json: serde_json::Value,
+    ) -> i64 {
+        self.send_request(
+            "textDocument/codeAction",
+            serde_json::json!({
+                "textDocument": { "uri": uri },
+                "range": {
+                    "start": { "line": line, "character": col },
+                    "end": { "line": line, "character": col }
+                },
+                "context": {
+                    "diagnostics": diagnostics_json
+                }
+            }),
+        )
+    }
+
     /// Whether the server advertises document formatting support.
     #[allow(dead_code)]
     pub fn supports_formatting(&self) -> bool {
@@ -1007,6 +1083,11 @@ impl LspServer {
     pub fn server_id(&self) -> LspServerId {
         self.id
     }
+
+    /// The command used to start this server (resolved full path).
+    pub fn command(&self) -> &str {
+        &self.config.command
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1019,10 +1100,22 @@ fn reader_thread(
     server_id: LspServerId,
     pending_requests: Arc<Mutex<HashMap<i64, String>>>,
     stdin: Arc<Mutex<Box<dyn IoWrite + Send>>>,
+    stderr_buf: Arc<Mutex<String>>,
 ) {
     let mut reader = BufReader::new(stdout);
     let mut header_buf = String::new();
     let mut initialized_sent = false;
+
+    let send_exit = |was_init: bool, stderr: &Arc<Mutex<String>>, tx: &Sender<LspEvent>| {
+        // Brief pause to let stderr reader finish collecting output
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let stderr_output = stderr.lock().map(|s| s.clone()).unwrap_or_default();
+        let _ = tx.send(LspEvent::ServerExited {
+            server_id,
+            stderr: stderr_output,
+            was_initialized: was_init,
+        });
+    };
 
     loop {
         // Read headers until blank line
@@ -1032,7 +1125,7 @@ fn reader_thread(
             match reader.read_line(&mut header_buf) {
                 Ok(0) => {
                     // EOF — server exited
-                    let _ = tx.send(LspEvent::ServerExited(server_id));
+                    send_exit(initialized_sent, &stderr_buf, &tx);
                     return;
                 }
                 Ok(_) => {
@@ -1045,7 +1138,7 @@ fn reader_thread(
                     }
                 }
                 Err(_) => {
-                    let _ = tx.send(LspEvent::ServerExited(server_id));
+                    send_exit(initialized_sent, &stderr_buf, &tx);
                     return;
                 }
             }
@@ -1059,7 +1152,7 @@ fn reader_thread(
         // Read body
         let mut body = vec![0u8; content_length];
         if reader.read_exact(&mut body).is_err() {
-            let _ = tx.send(LspEvent::ServerExited(server_id));
+            send_exit(initialized_sent, &stderr_buf, &tx);
             return;
         }
 
@@ -1235,18 +1328,18 @@ fn reader_thread(
                     });
                 }
                 Some("textDocument/semanticTokens/full") => {
-                    // Only send when we have a valid result (not an error response).
-                    // Suppressing error responses prevents wiping existing tokens.
-                    if let Some(r) = result {
-                        let raw_data = r
-                            .get("data")
-                            .and_then(|d| d.as_array())
-                            .map(|arr| {
-                                arr.iter()
-                                    .filter_map(|v| v.as_u64().map(|n| n as u32))
-                                    .collect::<Vec<u32>>()
-                            })
-                            .unwrap_or_default();
+                    // Only send when we have a valid result with a "data" array.
+                    // Null results (server busy) and error responses are suppressed
+                    // to avoid wiping existing tokens.
+                    if let Some(raw_data) = result
+                        .and_then(|r| r.get("data"))
+                        .and_then(|d| d.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_u64().map(|n| n as u32))
+                                .collect::<Vec<u32>>()
+                        })
+                    {
                         let _ = tx.send(LspEvent::SemanticTokensResponse {
                             server_id,
                             request_id: id,
@@ -1271,6 +1364,27 @@ fn reader_thread(
                         request_id: id,
                         workspace_edit,
                         error_message,
+                    });
+                }
+                Some("textDocument/codeAction") => {
+                    let actions = result
+                        .and_then(|r| r.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|item| {
+                                    let title = item.get("title")?.as_str()?.to_string();
+                                    let kind =
+                                        item.get("kind").and_then(|k| k.as_str()).map(String::from);
+                                    let edit = item.get("edit").map(try_parse_workspace_edit);
+                                    Some(CodeAction { title, kind, edit })
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    let _ = tx.send(LspEvent::CodeActionResponse {
+                        server_id,
+                        request_id: id,
+                        actions,
                     });
                 }
                 _ => {

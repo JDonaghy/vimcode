@@ -458,6 +458,8 @@ pub struct RenderedWindow {
     pub max_col: usize,
     /// Per-line worst diagnostic severity (line index → severity). Used for gutter icons.
     pub diagnostic_gutter: std::collections::HashMap<usize, crate::core::lsp::DiagnosticSeverity>,
+    /// Lines that have available LSP code actions (for lightbulb gutter icon).
+    pub code_action_lines: std::collections::HashSet<usize>,
     /// Transient yank-highlight region (flashes briefly after a yank). `None` if no active highlight.
     pub yank_highlight: Option<SelectionRange>,
     /// Bracket pair positions to highlight (cursor bracket + matching bracket).
@@ -544,6 +546,8 @@ pub struct EditorHoverPopupData {
     /// Frozen scroll offsets — used so the popup stays at a fixed screen position.
     pub frozen_scroll_top: usize,
     pub frozen_scroll_left: usize,
+    /// Normalized text selection: (start_line, start_col, end_line, end_col).
+    pub selection: Option<(usize, usize, usize, usize)>,
 }
 
 // ─── SignatureHelp ────────────────────────────────────────────────────────────
@@ -563,51 +567,37 @@ pub struct SignatureHelp {
     pub anchor_col: usize,
 }
 
-// ─── FuzzyPanel ──────────────────────────────────────────────────────────────
+// ─── PickerPanel (unified) ─────────────────────────────────────────────────
 
-/// Data needed to render the fuzzy file-picker modal.
+/// A single item in the unified picker display.
 #[derive(Debug, Clone)]
-pub struct FuzzyPanel {
-    /// Current query string typed by the user.
-    pub query: String,
-    /// Display paths for the filtered results (up to 50).
-    pub results: Vec<String>,
-    /// Index of the currently highlighted result.
-    pub selected_idx: usize,
-    /// Total number of files in the project (for the status line).
-    pub total_files: usize,
+pub struct PickerPanelItem {
+    /// Text shown in the result list.
+    pub display: String,
+    /// Right-aligned hint (shortcut, line number, etc.).
+    pub detail: Option<String>,
+    /// Byte positions in `display` that matched the query (for highlight).
+    pub match_positions: Vec<usize>,
 }
 
-// ─── LiveGrepPanel ────────────────────────────────────────────────────────────
-
-/// Data needed to render the live grep modal.
+/// Data needed to render the unified picker modal.
 #[derive(Debug, Clone)]
-pub struct LiveGrepPanel {
+pub struct PickerPanel {
+    /// Title shown in the header bar.
+    pub title: String,
     /// Current query typed by the user.
     pub query: String,
-    /// Result display strings: "basename.rs:N: snippet text"
-    pub results: Vec<String>,
-    /// Index of the currently highlighted result.
-    pub selected_idx: usize,
-    /// Total number of matched lines.
-    pub total_matches: usize,
-    /// Preview lines: (1-based line number, text, is_match_line)
-    pub preview_lines: Vec<(usize, String, bool)>,
-}
-
-// ─── CommandPalettePanel ──────────────────────────────────────────────────────
-
-/// Data needed to render the command palette modal.
-#[derive(Debug, Clone)]
-pub struct CommandPalettePanel {
-    /// Current query typed by the user.
-    pub query: String,
-    /// Filtered command list: (label, shortcut) display pairs.
-    pub items: Vec<(String, String)>,
-    /// Index of the currently highlighted result.
+    /// Filtered items to display.
+    pub items: Vec<PickerPanelItem>,
+    /// Index of the currently highlighted item.
     pub selected_idx: usize,
     /// Scroll offset into the filtered list.
     pub scroll_top: usize,
+    /// Total number of source items (for the "N/M" counter).
+    pub total_count: usize,
+    /// Preview lines: (1-based line number, text, is_highlighted).
+    /// When `Some`, the picker is rendered in two-pane mode.
+    pub preview: Option<Vec<(usize, String, bool)>>,
 }
 
 // ─── TabSwitcherPanel ─────────────────────────────────────────────────────
@@ -1596,10 +1586,6 @@ pub struct ScreenLayout {
     pub completion: Option<CompletionMenu>,
     /// Hover information popup, or `None` when inactive.
     pub hover: Option<HoverPopup>,
-    /// Fuzzy file-picker modal, or `None` when inactive.
-    pub fuzzy: Option<FuzzyPanel>,
-    /// Live grep modal, or `None` when inactive.
-    pub live_grep: Option<LiveGrepPanel>,
     /// Quickfix bottom panel, or `None` when closed.
     pub quickfix: Option<QuickfixPanel>,
     /// Bottom panel tabs (Terminal / Debug Output) — always present.
@@ -1614,8 +1600,8 @@ pub struct ScreenLayout {
     pub debug_sidebar: DebugSidebarData,
     /// Source Control panel data — `Some` when the SC panel is the active sidebar panel.
     pub source_control: Option<SourceControlData>,
-    /// Command palette modal — `Some` when open.
-    pub command_palette: Option<CommandPalettePanel>,
+    /// Unified picker modal — `Some` when open.
+    pub picker: Option<PickerPanel>,
     /// Tab switcher popup (Ctrl+Tab MRU list) — `Some` when open.
     pub tab_switcher: Option<TabSwitcherPanel>,
     /// When the editor is split into two groups, this carries group 1's tab bar
@@ -1641,6 +1627,8 @@ pub struct ScreenLayout {
     pub dialog: Option<DialogPanel>,
     /// Context menu popup — `Some` when an engine context menu is open.
     pub context_menu: Option<ContextMenuPanel>,
+    /// Tab hover tooltip: shortened file path to display near the hovered tab.
+    pub tab_tooltip: Option<String>,
 }
 
 /// Context menu data for TUI rendering.
@@ -1670,6 +1658,8 @@ pub struct DialogPanel {
     pub buttons: Vec<(String, bool)>,
     /// Optional text input field (e.g. for SSH passphrase).
     pub input: Option<DialogInputPanel>,
+    /// When true, buttons are rendered as a vertical list instead of a horizontal row.
+    pub vertical_buttons: bool,
 }
 
 /// Render data for a dialog text input field.
@@ -1682,6 +1672,10 @@ pub struct DialogInputPanel {
 /// Format a button label with the hotkey character bracketed.
 /// e.g., `format_button_label("Recover", 'r')` → `"[R]ecover"`.
 pub fn format_button_label(label: &str, hotkey: char) -> String {
+    // '\0' means no hotkey — return label as-is.
+    if hotkey == '\0' {
+        return label.to_string();
+    }
     let lower = hotkey.to_ascii_lowercase();
     let upper = hotkey.to_ascii_uppercase();
     // Find the first case-insensitive match of the hotkey in the label.
@@ -1803,6 +1797,9 @@ pub struct Theme {
     // Spell checking
     pub spell_error: Color,
 
+    // Code action lightbulb
+    pub lightbulb: Color,
+
     // Hover popup
     pub hover_bg: Color,
     pub hover_fg: Color,
@@ -1815,6 +1812,8 @@ pub struct Theme {
     pub fuzzy_query_fg: Color,
     pub fuzzy_border: Color,
     pub fuzzy_title_fg: Color,
+    /// Highlight color for fuzzy-match character positions.
+    pub fuzzy_match_fg: Color,
 
     // Two-way diff background colours
     pub diff_added_bg: Color,
@@ -1949,6 +1948,7 @@ impl Theme {
             diagnostic_info: Color::from_hex("#61afef"),  // blue
             diagnostic_hint: Color::from_hex("#5c6370"),  // grey
             spell_error: Color::from_hex("#56b6c2"),      // cyan
+            lightbulb: Color::from_hex("#e5c07b"),        // yellow
 
             // Hover popup
             hover_bg: Color::from_hex("#21252b"),
@@ -1962,6 +1962,7 @@ impl Theme {
             fuzzy_query_fg: Color::from_hex("#61afef"),
             fuzzy_border: Color::from_hex("#528bff"),
             fuzzy_title_fg: Color::from_hex("#e5c07b"),
+            fuzzy_match_fg: Color::from_hex("#61afef"),
 
             // Two-way diff backgrounds — must be clearly green/red in terminals
             diff_added_bg: Color::from_hex("#14541a"),
@@ -2072,6 +2073,7 @@ impl Theme {
             diagnostic_info: Color::from_hex("#83a598"),
             diagnostic_hint: Color::from_hex("#928374"),
             spell_error: Color::from_hex("#8ec07c"),
+            lightbulb: Color::from_hex("#fabd2f"),
 
             hover_bg: Color::from_hex("#32302f"),
             hover_fg: Color::from_hex("#ebdbb2"),
@@ -2083,6 +2085,7 @@ impl Theme {
             fuzzy_query_fg: Color::from_hex("#8ec07c"),
             fuzzy_border: Color::from_hex("#458588"),
             fuzzy_title_fg: Color::from_hex("#fabd2f"),
+            fuzzy_match_fg: Color::from_hex("#83a598"),
 
             // (bg #282828)
             diff_added_bg: Color::from_hex("#1e5e24"),
@@ -2187,6 +2190,7 @@ impl Theme {
             diagnostic_info: Color::from_hex("#7aa2f7"),
             diagnostic_hint: Color::from_hex("#565f89"),
             spell_error: Color::from_hex("#7dcfff"),
+            lightbulb: Color::from_hex("#e0af68"),
 
             hover_bg: Color::from_hex("#1f2335"),
             hover_fg: Color::from_hex("#c0caf5"),
@@ -2198,6 +2202,7 @@ impl Theme {
             fuzzy_query_fg: Color::from_hex("#7aa2f7"),
             fuzzy_border: Color::from_hex("#7aa2f7"),
             fuzzy_title_fg: Color::from_hex("#e0af68"),
+            fuzzy_match_fg: Color::from_hex("#7aa2f7"),
 
             // (bg #1a1b26)
             diff_added_bg: Color::from_hex("#14541a"),
@@ -2302,6 +2307,7 @@ impl Theme {
             diagnostic_info: Color::from_hex("#268bd2"),
             diagnostic_hint: Color::from_hex("#586e75"),
             spell_error: Color::from_hex("#2aa198"),
+            lightbulb: Color::from_hex("#b58900"),
 
             hover_bg: Color::from_hex("#073642"),
             hover_fg: Color::from_hex("#93a1a1"),
@@ -2313,6 +2319,7 @@ impl Theme {
             fuzzy_query_fg: Color::from_hex("#268bd2"),
             fuzzy_border: Color::from_hex("#268bd2"),
             fuzzy_title_fg: Color::from_hex("#b58900"),
+            fuzzy_match_fg: Color::from_hex("#268bd2"),
 
             // (bg #002b36)
             diff_added_bg: Color::from_hex("#005e30"),
@@ -2417,6 +2424,7 @@ impl Theme {
             diagnostic_info: Color::from_hex("#3794ff"),
             diagnostic_hint: Color::from_hex("#858585"),
             spell_error: Color::from_hex("#4fc1ff"),
+            lightbulb: Color::from_hex("#cca700"),
 
             hover_bg: Color::from_hex("#252526"),
             hover_fg: Color::from_hex("#d4d4d4"),
@@ -2428,6 +2436,7 @@ impl Theme {
             fuzzy_query_fg: Color::from_hex("#0097fb"),
             fuzzy_border: Color::from_hex("#007acc"),
             fuzzy_title_fg: Color::from_hex("#dcdcaa"),
+            fuzzy_match_fg: Color::from_hex("#0097fb"),
 
             // (bg #1e1e1e)
             diff_added_bg: Color::from_hex("#14541a"),
@@ -2469,6 +2478,122 @@ impl Theme {
         }
     }
 
+    /// VS Code Light+ (Default Light+) colour scheme.
+    pub fn vscode_light() -> Self {
+        Self {
+            background: Color::from_hex("#ffffff"),
+            active_background: Color::from_hex("#f3f3f3"),
+            foreground: Color::from_hex("#333333"),
+
+            keyword: Color::from_hex("#0000ff"),    // blue
+            string_lit: Color::from_hex("#a31515"), // red
+            comment: Color::from_hex("#008000"),    // green
+            function: Color::from_hex("#795e26"),   // brown
+            type_name: Color::from_hex("#267f99"),  // teal
+            variable: Color::from_hex("#001080"),   // dark blue
+            number: Color::from_hex("#098658"),     // green
+            default_fg: Color::from_hex("#333333"),
+
+            selection: Color::from_hex("#add6ff"),
+            selection_alpha: 0.6,
+
+            cursor: Color::from_hex("#000000"),
+            cursor_normal_alpha: 0.6,
+
+            search_match_bg: Color::from_hex("#e8be5a"),
+            search_current_match_bg: Color::from_hex("#a8ac94"),
+            search_match_fg: Color::from_hex("#000000"),
+
+            tab_bar_bg: Color::from_hex("#ececec"),
+            tab_active_bg: Color::from_hex("#ffffff"),
+            tab_active_fg: Color::from_hex("#333333"),
+            tab_inactive_fg: Color::from_hex("#8e8e8e"),
+            tab_preview_active_fg: Color::from_hex("#555555"),
+            tab_preview_inactive_fg: Color::from_hex("#999999"),
+
+            status_bg: Color::from_hex("#007acc"),
+            status_fg: Color::from_hex("#ffffff"),
+
+            wildmenu_bg: Color::from_hex("#f3f3f3"),
+            wildmenu_fg: Color::from_hex("#333333"),
+            wildmenu_sel_bg: Color::from_hex("#0060c0"),
+            wildmenu_sel_fg: Color::from_hex("#ffffff"),
+
+            command_bg: Color::from_hex("#ffffff"),
+            command_fg: Color::from_hex("#333333"),
+
+            line_number_fg: Color::from_hex("#237893"),
+            line_number_active_fg: Color::from_hex("#0b216f"),
+
+            separator: Color::from_hex("#d4d4d4"),
+
+            git_added: Color::from_hex("#48985e"),
+            git_modified: Color::from_hex("#2090d0"),
+            git_deleted: Color::from_hex("#e51400"),
+
+            completion_bg: Color::from_hex("#f3f3f3"),
+            completion_selected_bg: Color::from_hex("#0060c0"),
+            completion_fg: Color::from_hex("#333333"),
+            completion_border: Color::from_hex("#c8c8c8"),
+
+            diagnostic_error: Color::from_hex("#e51400"),
+            diagnostic_warning: Color::from_hex("#bf8803"),
+            diagnostic_info: Color::from_hex("#1a85ff"),
+            diagnostic_hint: Color::from_hex("#6c6c6c"),
+            spell_error: Color::from_hex("#1a85ff"),
+            lightbulb: Color::from_hex("#ddb100"),
+
+            hover_bg: Color::from_hex("#f3f3f3"),
+            hover_fg: Color::from_hex("#333333"),
+            hover_border: Color::from_hex("#c8c8c8"),
+
+            fuzzy_bg: Color::from_hex("#ffffff"),
+            fuzzy_selected_bg: Color::from_hex("#0060c0"),
+            fuzzy_fg: Color::from_hex("#333333"),
+            fuzzy_query_fg: Color::from_hex("#0066bf"),
+            fuzzy_border: Color::from_hex("#007acc"),
+            fuzzy_title_fg: Color::from_hex("#795e26"),
+            fuzzy_match_fg: Color::from_hex("#0066bf"),
+
+            diff_added_bg: Color::from_hex("#dfffdf"),
+            diff_removed_bg: Color::from_hex("#ffdede"),
+            diff_padding_bg: Color::from_hex("#f0f0f0"),
+
+            dap_stopped_bg: Color::from_hex("#ffffcc"),
+
+            yank_highlight_bg: Color::from_hex("#795e26"),
+            yank_highlight_alpha: 0.2,
+
+            annotation_fg: Color::from_hex("#8e8e8e"),
+            ghost_text_fg: Color::from_hex("#b0b0b0"),
+
+            md_heading1: Color::from_hex("#795e26"),
+            md_heading2: Color::from_hex("#0000ff"),
+            md_heading3: Color::from_hex("#af00db"),
+            md_code: Color::from_hex("#a31515"),
+            md_link: Color::from_hex("#0066bf"),
+
+            sidebar_sel_bg: Color::from_hex("#d6ebff"),
+            sidebar_sel_bg_inactive: Color::from_hex("#e4e6f1"),
+            semantic_parameter: Color::from_hex("#001080"), // dark blue
+            semantic_property: Color::from_hex("#001080"),  // dark blue
+            semantic_namespace: Color::from_hex("#267f99"), // teal
+            semantic_enum_member: Color::from_hex("#0070c1"), // blue
+            semantic_interface: Color::from_hex("#267f99"), // teal
+            semantic_type_parameter: Color::from_hex("#267f99"),
+            semantic_decorator: Color::from_hex("#795e26"), // brown
+            semantic_macro: Color::from_hex("#795e26"),     // brown
+
+            breadcrumb_bg: Color::from_hex("#ffffff"),
+            breadcrumb_fg: Color::from_hex("#8e8e8e"),
+            breadcrumb_active_fg: Color::from_hex("#333333"),
+
+            indent_guide_fg: Color::from_hex("#d3d3d3"),
+            indent_guide_active_fg: Color::from_hex("#939393"),
+            bracket_match_bg: Color::from_hex("#dddddd"),
+        }
+    }
+
     /// Return a theme by name. Falls back to `onedark` for unknown names.
     pub fn from_name(name: &str) -> Self {
         match name {
@@ -2476,6 +2601,7 @@ impl Theme {
             "tokyo-night" | "tokyonight" => Self::tokyo_night(),
             "solarized" | "solarized-dark" => Self::solarized_dark(),
             "vscode-dark" | "vscode" | "dark+" => Self::vscode_dark(),
+            "vscode-light" | "light+" => Self::vscode_light(),
             "onedark" => Self::onedark(),
             _ => {
                 // Try loading a VSCode theme from ~/.config/vimcode/themes/
@@ -2488,6 +2614,17 @@ impl Theme {
         }
     }
 
+    /// Returns `true` when the theme has a light background (relative luminance > 0.5).
+    pub fn is_light(&self) -> bool {
+        let (r, g, b) = (
+            self.background.r as f64 / 255.0,
+            self.background.g as f64 / 255.0,
+            self.background.b as f64 / 255.0,
+        );
+        // Perceptual luminance (sRGB)
+        0.299 * r + 0.587 * g + 0.114 * b > 0.5
+    }
+
     /// Return the list of all built-in theme names.
     pub fn available_names() -> Vec<String> {
         let mut names: Vec<String> = vec![
@@ -2496,6 +2633,7 @@ impl Theme {
             "tokyo-night".into(),
             "solarized-dark".into(),
             "vscode-dark".into(),
+            "vscode-light".into(),
         ];
         // Append custom VSCode themes from ~/.config/vimcode/themes/
         if let Some(dir) = Self::themes_dir() {
@@ -2956,37 +3094,6 @@ pub fn build_screen_layout(
         anchor_col: engine.view().cursor.col,
     });
 
-    let fuzzy = engine.fuzzy_open.then(|| FuzzyPanel {
-        query: engine.fuzzy_query.clone(),
-        results: engine
-            .fuzzy_results
-            .iter()
-            .map(|(_, d)| d.clone())
-            .collect(),
-        selected_idx: engine.fuzzy_selected,
-        total_files: engine.fuzzy_all_files.len(),
-    });
-
-    let live_grep = engine.grep_open.then(|| {
-        let results = engine
-            .grep_results
-            .iter()
-            .map(|m| {
-                let basename = m.file.file_name().and_then(|n| n.to_str()).unwrap_or("?");
-                let snippet = m.line_text.trim();
-                let snippet: String = snippet.chars().take(60).collect();
-                format!("{}:{}: {}", basename, m.line + 1, snippet)
-            })
-            .collect();
-        LiveGrepPanel {
-            query: engine.grep_query.clone(),
-            results,
-            selected_idx: engine.grep_selected,
-            total_matches: engine.grep_results.len(),
-            preview_lines: engine.grep_preview_lines.clone(),
-        }
-    });
-
     let quickfix = (engine.quickfix_open && !engine.quickfix_items.is_empty()).then(|| {
         let items = engine
             .quickfix_items
@@ -3315,30 +3422,6 @@ pub fn build_screen_layout(
     // Build Source Control panel data (populated when the panel is visible).
     let source_control = build_source_control_data(engine);
 
-    // Build command palette panel data.
-    let command_palette = engine.palette_open.then(|| {
-        use crate::core::engine::PALETTE_COMMANDS;
-        let use_vscode = engine.is_vscode_mode();
-        CommandPalettePanel {
-            query: engine.palette_query.clone(),
-            items: engine
-                .palette_results
-                .iter()
-                .map(|&i| {
-                    let cmd = &PALETTE_COMMANDS[i];
-                    let sc = if use_vscode && !cmd.vscode_shortcut.is_empty() {
-                        cmd.vscode_shortcut.to_string()
-                    } else {
-                        cmd.shortcut.to_string()
-                    };
-                    (cmd.label.to_string(), sc)
-                })
-                .collect(),
-            selected_idx: engine.palette_selected,
-            scroll_top: engine.palette_scroll_top,
-        }
-    });
-
     let tab_switcher = engine.tab_switcher_open.then(|| TabSwitcherPanel {
         items: engine.tab_switcher_items(),
         selected_idx: engine.tab_switcher_selected,
@@ -3508,8 +3591,6 @@ pub fn build_screen_layout(
         active_window_id,
         completion,
         hover,
-        fuzzy,
-        live_grep,
         quickfix,
         bottom_tabs,
         signature_help,
@@ -3517,7 +3598,42 @@ pub fn build_screen_layout(
         debug_toolbar,
         debug_sidebar,
         source_control,
-        command_palette,
+        picker: engine.picker_open.then(|| {
+            use crate::core::engine::PickerSource;
+            let has_preview = matches!(
+                engine.picker_source,
+                PickerSource::Files | PickerSource::Grep
+            );
+            PickerPanel {
+                title: engine.picker_title.clone(),
+                query: engine.picker_query.clone(),
+                items: engine
+                    .picker_items
+                    .iter()
+                    .map(|item| PickerPanelItem {
+                        display: item.display.clone(),
+                        detail: item.detail.clone(),
+                        match_positions: item.match_positions.clone(),
+                    })
+                    .collect(),
+                selected_idx: engine.picker_selected,
+                scroll_top: engine.picker_scroll_top,
+                total_count: if engine.picker_source == PickerSource::Grep {
+                    engine.picker_items.len()
+                } else {
+                    engine.picker_all_items.len()
+                },
+                preview: if has_preview {
+                    engine
+                        .picker_preview
+                        .as_ref()
+                        .map(|p| p.lines.clone())
+                        .or_else(|| Some(Vec::new()))
+                } else {
+                    None
+                },
+            }
+        }),
         tab_switcher,
         editor_group_split,
         ext_sidebar,
@@ -3546,6 +3662,7 @@ pub fn build_screen_layout(
             popup_width: eh.popup_width,
             frozen_scroll_top: eh.frozen_scroll_top,
             frozen_scroll_left: eh.frozen_scroll_left,
+            selection: eh.selection.as_ref().map(|s| s.normalized()),
         }),
         dialog: engine.dialog.as_ref().map(|d| DialogPanel {
             title: d.title.clone(),
@@ -3563,6 +3680,7 @@ pub fn build_screen_layout(
                     format!("{}|", inp.value)
                 },
             }),
+            vertical_buttons: d.tag == "code_actions",
         }),
         context_menu: engine.context_menu.as_ref().map(|cm| ContextMenuPanel {
             items: cm
@@ -3579,6 +3697,7 @@ pub fn build_screen_layout(
             screen_col: cm.screen_x,
             screen_row: cm.screen_y,
         }),
+        tab_tooltip: engine.tab_hover_tooltip.clone(),
     }
 }
 
@@ -4354,6 +4473,7 @@ fn build_rendered_window(
         has_breakpoints: false,
         max_col: 0,
         diagnostic_gutter: std::collections::HashMap::new(),
+        code_action_lines: std::collections::HashSet::new(),
         bracket_match_positions: Vec::new(),
         active_indent_col: None,
         tabstop: engine.settings.tabstop.max(1) as usize,
@@ -4600,7 +4720,7 @@ fn build_rendered_window(
         let folded_line_count = view.fold_at(line_idx).map(|f| f.end - f.start).unwrap_or(0);
 
         let line = buffer.content.line(line_idx);
-        let line_str = line.to_string();
+        let line_str = line.to_string().replace('\0', "");
         let line_start_byte = buffer.content.line_to_byte(line_idx);
         let line_end_byte = line_start_byte + line.len_bytes();
 
@@ -4612,6 +4732,12 @@ fn build_rendered_window(
                 vec![]
             }
         } else {
+            let is_markdown = buffer_state
+                .file_path
+                .as_ref()
+                .and_then(|p| p.to_str())
+                .and_then(crate::core::syntax::SyntaxLanguage::from_path)
+                == Some(crate::core::syntax::SyntaxLanguage::Markdown);
             build_spans(
                 engine,
                 theme,
@@ -4622,6 +4748,7 @@ fn build_rendered_window(
                 &line_str,
                 line_start_byte,
                 line_end_byte,
+                is_markdown,
             )
         };
 
@@ -5162,6 +5289,21 @@ fn build_rendered_window(
         bracket_match_positions,
         active_indent_col,
         tabstop: engine.settings.tabstop.max(1) as usize,
+        code_action_lines: {
+            // Only show lightbulb on the cursor line (like VSCode) — not on every
+            // line that has cached actions, which would be noisy in Rust files where
+            // rust-analyzer offers refactors on nearly every line.
+            let cl = view.cursor.line;
+            let has = canonical_path
+                .and_then(|p| engine.lsp_code_actions.get(p))
+                .and_then(|m| m.get(&cl))
+                .is_some_and(|v| !v.is_empty());
+            if has {
+                std::collections::HashSet::from([cl])
+            } else {
+                std::collections::HashSet::new()
+            }
+        },
     }
 }
 
@@ -5249,6 +5391,223 @@ fn md_spans_to_styled(
 
 /// Build styled spans for one line: syntax highlights + search matches.
 #[allow(clippy::too_many_arguments)]
+/// Regex-based inline markdown highlighting for bold, italic, inline code, and links.
+/// This compensates for not having tree-sitter inline injection support.
+fn md_inline_spans(line: &str, theme: &Theme, spans: &mut Vec<StyledSpan>) {
+    let bytes = line.as_bytes();
+
+    // Inline code: `code` — requires non-empty content between backticks.
+    // Skip runs of 3+ backticks (fenced code block delimiters).
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'`' {
+            // Count consecutive backticks
+            let tick_run_start = i;
+            while i < bytes.len() && bytes[i] == b'`' {
+                i += 1;
+            }
+            let tick_count = i - tick_run_start;
+            if tick_count >= 3 {
+                // Fenced code delimiter — skip, tree-sitter handles this
+                continue;
+            }
+            // Single or double backtick — find matching closing run
+            let content_start = i;
+            loop {
+                // Find next backtick
+                while i < bytes.len() && bytes[i] != b'`' {
+                    i += 1;
+                }
+                if i >= bytes.len() {
+                    break;
+                }
+                // Count closing backticks
+                let close_start = i;
+                while i < bytes.len() && bytes[i] == b'`' {
+                    i += 1;
+                }
+                if i - close_start == tick_count && i - close_start - tick_count < i {
+                    // Matching close — only highlight if there's content
+                    if content_start < close_start {
+                        spans.push(StyledSpan {
+                            start_byte: tick_run_start,
+                            end_byte: i,
+                            style: Style {
+                                fg: theme.scope_color("string"),
+                                bg: None,
+                                bold: false,
+                                italic: false,
+                                font_scale: 1.0,
+                            },
+                        });
+                    }
+                    break;
+                }
+                // Not matching — keep searching
+            }
+            continue;
+        }
+        i += 1;
+    }
+
+    // Bold: **text** or __text__
+    for delim in &["**", "__"] {
+        let d = delim.as_bytes();
+        let mut pos = 0;
+        while pos + d.len() < bytes.len() {
+            if bytes[pos..].starts_with(d) {
+                // For __, require word boundary (not inside a word)
+                if d[0] == b'_' && pos > 0 && bytes[pos - 1] != b' ' && bytes[pos - 1] != b'\t' {
+                    pos += 1;
+                    continue;
+                }
+                let open = pos;
+                pos += d.len();
+                // Find closing delimiter
+                while pos + d.len() <= bytes.len() && !bytes[pos..].starts_with(d) {
+                    pos += 1;
+                }
+                if pos + d.len() <= bytes.len() && bytes[pos..].starts_with(d) {
+                    let close = pos + d.len();
+                    spans.push(StyledSpan {
+                        start_byte: open,
+                        end_byte: close,
+                        style: Style {
+                            fg: theme.scope_color("variable"),
+                            bg: None,
+                            bold: true,
+                            italic: false,
+                            font_scale: 1.0,
+                        },
+                    });
+                    pos = close;
+                    continue;
+                }
+            }
+            pos += 1;
+        }
+    }
+
+    // Italic: *text* or _text_
+    // For underscore: require word boundary (space or start-of-line before open,
+    // space or end-of-line after close) to avoid matching inside_words_like_this.
+    for &delim_byte in b"*_" {
+        let need_boundary = delim_byte == b'_';
+        let mut pos = 0;
+        while pos < bytes.len() {
+            if bytes[pos] == delim_byte {
+                // Skip if this is a bold delimiter (double)
+                if pos + 1 < bytes.len() && bytes[pos + 1] == delim_byte {
+                    pos += 2;
+                    // Skip past bold content + closing **/__
+                    while pos < bytes.len() {
+                        if bytes[pos] == delim_byte
+                            && pos + 1 < bytes.len()
+                            && bytes[pos + 1] == delim_byte
+                        {
+                            pos += 2;
+                            break;
+                        }
+                        pos += 1;
+                    }
+                    continue;
+                }
+                // Word boundary check for underscore
+                if need_boundary && pos > 0 && bytes[pos - 1] != b' ' && bytes[pos - 1] != b'\t' {
+                    pos += 1;
+                    continue;
+                }
+                let open = pos;
+                pos += 1;
+                while pos < bytes.len() && bytes[pos] != delim_byte {
+                    pos += 1;
+                }
+                if pos < bytes.len() {
+                    let close = pos + 1;
+                    // Check closing word boundary for underscore
+                    let close_ok = !need_boundary
+                        || close >= bytes.len()
+                        || bytes[close] == b' '
+                        || bytes[close] == b'\t'
+                        || bytes[close] == b'.'
+                        || bytes[close] == b','
+                        || bytes[close] == b':'
+                        || bytes[close] == b';'
+                        || bytes[close] == b')'
+                        || bytes[close] == b']';
+                    // Only if there's content between delimiters
+                    if close - open > 2 && close_ok {
+                        spans.push(StyledSpan {
+                            start_byte: open,
+                            end_byte: close,
+                            style: Style {
+                                fg: theme.scope_color("variable"),
+                                bg: None,
+                                bold: false,
+                                italic: true,
+                                font_scale: 1.0,
+                            },
+                        });
+                    }
+                    pos = close;
+                    continue;
+                }
+            }
+            pos += 1;
+        }
+    }
+
+    // Links: [text](url) — color the URL part
+    let mut pos = 0;
+    while pos < bytes.len() {
+        if bytes[pos] == b'[' {
+            let bracket_start = pos;
+            pos += 1;
+            // Find ]
+            while pos < bytes.len() && bytes[pos] != b']' {
+                pos += 1;
+            }
+            if pos + 1 < bytes.len() && bytes[pos] == b']' && bytes[pos + 1] == b'(' {
+                let bracket_end = pos;
+                // Color [text] as link
+                spans.push(StyledSpan {
+                    start_byte: bracket_start,
+                    end_byte: bracket_end + 1,
+                    style: Style {
+                        fg: theme.scope_color("type"),
+                        bg: None,
+                        bold: false,
+                        italic: false,
+                        font_scale: 1.0,
+                    },
+                });
+                pos += 2; // skip ](
+                let url_start = pos;
+                while pos < bytes.len() && bytes[pos] != b')' {
+                    pos += 1;
+                }
+                if pos < bytes.len() {
+                    spans.push(StyledSpan {
+                        start_byte: url_start - 1, // include (
+                        end_byte: pos + 1,         // include )
+                        style: Style {
+                            fg: theme.scope_color("comment"),
+                            bg: None,
+                            bold: false,
+                            italic: false,
+                            font_scale: 1.0,
+                        },
+                    });
+                    pos += 1;
+                    continue;
+                }
+            }
+        }
+        pos += 1;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_spans(
     engine: &Engine,
     theme: &Theme,
@@ -5259,6 +5618,7 @@ fn build_spans(
     line_str: &str,
     line_start_byte: usize,
     line_end_byte: usize,
+    is_markdown: bool,
 ) -> Vec<StyledSpan> {
     let mut spans = Vec::new();
 
@@ -5285,6 +5645,13 @@ fn build_spans(
                 font_scale: 1.0,
             },
         });
+    }
+
+    // Markdown inline highlighting — regex-based since tree-sitter-md's inline parser
+    // requires injection support we don't have. Runs after tree-sitter block highlights
+    // so inline elements layer on top.
+    if is_markdown {
+        md_inline_spans(line_str, theme, &mut spans);
     }
 
     // LSP semantic tokens overlay — these override tree-sitter spans since they're later.

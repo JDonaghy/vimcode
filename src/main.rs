@@ -1629,19 +1629,18 @@ impl SimpleComponent for App {
                                         return gtk4::glib::Propagation::Stop;
                                     }
                                     if matches_gtk_key(&pk.fuzzy_finder, key, modifier) {
-                                        sender.input(Msg::KeyPress {
-                                            key_name: "p".to_string(),
-                                            unicode: Some('p'),
-                                            ctrl: true,
-                                        });
+                                        engine.borrow_mut().open_picker(core::engine::PickerSource::Files);
+                                        sender.input(Msg::Resize);
                                         return gtk4::glib::Propagation::Stop;
                                     }
                                     if matches_gtk_key(&pk.live_grep, key, modifier) {
-                                        sender.input(Msg::KeyPress {
-                                            key_name: "g".to_string(),
-                                            unicode: Some('g'),
-                                            ctrl: true,
-                                        });
+                                        engine.borrow_mut().open_picker(core::engine::PickerSource::Grep);
+                                        sender.input(Msg::Resize);
+                                        return gtk4::glib::Propagation::Stop;
+                                    }
+                                    if matches_gtk_key(&pk.command_palette, key, modifier) {
+                                        engine.borrow_mut().open_picker(core::engine::PickerSource::Commands);
+                                        sender.input(Msg::Resize);
                                         return gtk4::glib::Propagation::Stop;
                                     }
                                     if matches_gtk_key(&pk.add_cursor, key, modifier) {
@@ -2010,12 +2009,7 @@ impl SimpleComponent for App {
         root: Self::Root,
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
-        // Request the dark variant of the active GTK theme. This makes all
-        // native widgets (Switch, SpinButton, DropDown, Entry, etc.) use dark
-        // colours automatically when the GTK theme supports it (e.g. Adwaita).
-        if let Some(gtk_settings) = gtk4::Settings::default() {
-            gtk_settings.set_gtk_application_prefer_dark_theme(true);
-        }
+        // Dark/light preference is set after engine init, once we know the colorscheme.
 
         // Ensure GTK finds our installed SVG icon by adding
         // ~/.local/share/icons to the icon theme search path.
@@ -2045,6 +2039,11 @@ impl SimpleComponent for App {
         let initial_theme = Theme::from_name(&engine.settings.colorscheme);
         let css_provider = load_css(&initial_theme);
         let last_colorscheme = engine.settings.colorscheme.clone();
+
+        // Set GTK dark/light preference based on the active colorscheme.
+        if let Some(gtk_settings) = gtk4::Settings::default() {
+            gtk_settings.set_gtk_application_prefer_dark_theme(!initial_theme.is_light());
+        }
 
         // On X11 use x11_bin (xclip/xsel subprocesses) explicitly: try_context() picks
         // x11_fork first, whose get_contents() uses X11ClipboardContext directly and
@@ -3036,6 +3035,19 @@ impl SimpleComponent for App {
             let da_ref_drag = ext_dyn_panel_da_ref.clone();
             let draw_needed = model.draw_needed.clone();
             let gesture = gtk4::GestureDrag::new();
+            // Claim the gesture when the drag starts in the scrollbar area so that
+            // parent gestures (sidebar resize) cannot steal the sequence.
+            let da_ref_begin = ext_dyn_panel_da_ref.clone();
+            gesture.connect_drag_begin(move |g, x, _y| {
+                let da_w = if let Some(ref da) = *da_ref_begin.borrow() {
+                    da.width() as f64
+                } else {
+                    return;
+                };
+                if x >= da_w - 8.0 {
+                    g.set_state(gtk4::EventSequenceState::Claimed);
+                }
+            });
             gesture.connect_drag_update(move |g, _dx, dy| {
                 let Some((start_x, start_y)) = g.start_point() else {
                     return;
@@ -3118,7 +3130,7 @@ impl SimpleComponent for App {
             let engine = engine.clone();
             widgets.ai_sidebar_da.set_draw_func(move |da, cr, _, _| {
                 let engine = engine.borrow();
-                let theme = Theme::onedark();
+                let theme = Theme::from_name(&engine.settings.colorscheme);
                 let font_size = engine.settings.font_size as f64;
                 let font_family = engine.settings.font_family.clone();
                 let font_desc =
@@ -3920,27 +3932,35 @@ impl SimpleComponent for App {
         let dialog_btn_for_draw = model.dialog_btn_rects.clone();
         let editor_hover_rect_for_draw = model.editor_hover_popup_rect.clone();
         let editor_hover_links_for_draw = model.editor_hover_link_rects.clone();
+        let mouse_pos_for_draw = mouse_pos_cell.clone();
         widgets
             .drawing_area
             .set_draw_func(move |_, cr, width, height| {
-                let engine = engine_clone.borrow();
-                draw_editor(
-                    cr,
-                    &engine,
-                    width,
-                    height,
-                    &sender_for_draw,
-                    h_sb_hovered_for_draw.get(),
-                    tab_close_hover_for_draw.get(),
-                    h_sb_drag_for_draw.get(),
-                    &last_metrics_for_draw,
-                    &tab_slots_for_draw,
-                    &diff_btn_for_draw,
-                    &split_btn_for_draw,
-                    &dialog_btn_for_draw,
-                    &editor_hover_rect_for_draw,
-                    &editor_hover_links_for_draw,
-                );
+                // Wrap in catch_unwind to prevent GTK abort on panic in extern "C" callback.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let engine = engine_clone.borrow();
+                    draw_editor(
+                        cr,
+                        &engine,
+                        width,
+                        height,
+                        &sender_for_draw,
+                        h_sb_hovered_for_draw.get(),
+                        tab_close_hover_for_draw.get(),
+                        h_sb_drag_for_draw.get(),
+                        &last_metrics_for_draw,
+                        &tab_slots_for_draw,
+                        &diff_btn_for_draw,
+                        &split_btn_for_draw,
+                        &dialog_btn_for_draw,
+                        &editor_hover_rect_for_draw,
+                        &editor_hover_links_for_draw,
+                        mouse_pos_for_draw.get(),
+                    );
+                }));
+                if let Err(e) = result {
+                    eprintln!("draw_editor panic: {:?}", e);
+                }
             });
 
         // Motion controller: write mouse position directly into a shared cell.
@@ -4306,6 +4326,26 @@ impl SimpleComponent for App {
                         }
                         self.draw_needed.set(true);
                         return;
+                    }
+                }
+
+                // Hover popup copy: intercept y/Ctrl-C when hover is focused
+                // because GTK doesn't set clipboard_write on the engine.
+                {
+                    let engine = self.engine.borrow();
+                    let is_hover_copy = engine.editor_hover_has_focus
+                        && (key_name == "y" || key_name == "Y" || (ctrl && key_name == "c"));
+                    if is_hover_copy {
+                        if let Some(text) = engine.hover_selection_text() {
+                            drop(engine);
+                            if let Some(ref mut ctx) = self.clipboard {
+                                let _ = ctx.set_contents(text);
+                            }
+                            let mut engine = self.engine.borrow_mut();
+                            engine.message = "Hover text copied".to_string();
+                            self.draw_needed.set(true);
+                            return;
+                        }
                     }
                 }
 
@@ -4929,7 +4969,8 @@ impl SimpleComponent for App {
                     self.engine,
                     self.draw_needed,
                     |eng: &std::cell::RefCell<core::Engine>, dr: &std::cell::Cell<bool>| {
-                        eng.borrow_mut().open_command_palette();
+                        eng.borrow_mut()
+                            .open_picker(core::engine::PickerSource::Commands);
                         dr.set(true);
                     }
                 );
@@ -5001,6 +5042,27 @@ impl SimpleComponent for App {
                                 self.engine.borrow_mut().dismiss_editor_hover();
                             } else if !has_focus {
                                 self.engine.borrow_mut().editor_hover_has_focus = true;
+                            } else {
+                                // Focused, no link hit — start text selection
+                                let cw = self.cached_char_width.max(1.0);
+                                let lh = self.cached_line_height.max(1.0);
+                                if let Some((px, py, _pw, _ph)) = rect {
+                                    let padding = 4.0;
+                                    let rel_x = x - px - padding;
+                                    let rel_y = y - py - padding;
+                                    let engine_ref = self.engine.borrow();
+                                    let scroll = engine_ref
+                                        .editor_hover
+                                        .as_ref()
+                                        .map(|h| h.scroll_top)
+                                        .unwrap_or(0);
+                                    drop(engine_ref);
+                                    let content_line = (rel_y / lh).max(0.0) as usize + scroll;
+                                    let content_col = (rel_x / cw).max(0.0) as usize;
+                                    self.engine
+                                        .borrow_mut()
+                                        .editor_hover_start_selection(content_line, content_col);
+                                }
                             }
                             // Consume click — don't process as editor click
                             self.draw_needed.set(true);
@@ -5451,6 +5513,37 @@ impl SimpleComponent for App {
                 width,
                 height,
             } => {
+                // Editor hover popup text selection drag
+                {
+                    let engine = self.engine.borrow();
+                    if engine.editor_hover_has_focus
+                        && engine
+                            .editor_hover
+                            .as_ref()
+                            .is_some_and(|h| h.selection.is_some())
+                    {
+                        if let Some((px, py, _pw, _ph)) = self.editor_hover_popup_rect.get() {
+                            let padding = 4.0;
+                            let cw = self.cached_char_width.max(1.0);
+                            let lh = self.cached_line_height.max(1.0);
+                            let scroll = engine
+                                .editor_hover
+                                .as_ref()
+                                .map(|h| h.scroll_top)
+                                .unwrap_or(0);
+                            drop(engine);
+                            let rel_x = x - px - padding;
+                            let rel_y = y - py - padding;
+                            let content_line = (rel_y / lh).max(0.0) as usize + scroll;
+                            let content_col = (rel_x / cw).max(0.0) as usize;
+                            self.engine
+                                .borrow_mut()
+                                .editor_hover_extend_selection(content_line, content_col);
+                            self.draw_needed.set(true);
+                            return;
+                        }
+                    }
+                }
                 // Tab drag-and-drop handling.
                 if self.tab_dragging {
                     // Update drop zone while dragging.
@@ -6495,6 +6588,10 @@ impl SimpleComponent for App {
                         let theme = Theme::from_name(&current);
                         let combined = format!("{STATIC_CSS}\n{}", make_theme_css(&theme));
                         self.css_provider.load_from_data(&combined);
+                        // Update GTK dark/light preference for native widgets & menus.
+                        if let Some(gtk_settings) = gtk4::Settings::default() {
+                            gtk_settings.set_gtk_application_prefer_dark_theme(!theme.is_light());
+                        }
                         self.last_colorscheme = current;
                         self.draw_needed.set(true);
                     }
@@ -6523,10 +6620,15 @@ impl SimpleComponent for App {
                             self.draw_needed.set(true);
                         }
 
-                        // Tab close button hover detection.
+                        // Tab close button hover detection + tab tooltip.
                         let engine = self.engine.borrow();
                         let tab_hover = if mx >= 0.0 && lh > 0.0 {
                             tab_close_hit_test(&engine, mx, my, da_w, da_h, lh, cw)
+                        } else {
+                            None
+                        };
+                        let tooltip = if mx >= 0.0 && lh > 0.0 {
+                            tab_tooltip_hit_test(&engine, mx, my, da_w, da_h, lh, cw)
                         } else {
                             None
                         };
@@ -6535,6 +6637,13 @@ impl SimpleComponent for App {
                             self.tab_close_hover = tab_hover;
                             self.tab_close_hover_cell.set(tab_hover);
                             self.draw_needed.set(true);
+                        }
+                        {
+                            let mut engine = self.engine.borrow_mut();
+                            if tooltip != engine.tab_hover_tooltip {
+                                engine.tab_hover_tooltip = tooltip;
+                                self.draw_needed.set(true);
+                            }
                         }
 
                         // Sync per-window viewport dimensions from actual window rects
@@ -6634,6 +6743,10 @@ impl SimpleComponent for App {
                 // LSP: flush debounced didChange notifications and poll for events
                 {
                     let mut engine = self.engine.borrow_mut();
+                    // Flush debounced cursor_move hook (plugin events + code action requests).
+                    if engine.flush_cursor_move_hook() {
+                        self.draw_needed.set(true);
+                    }
                     engine.lsp_flush_changes();
                     if engine.poll_lsp() {
                         self.draw_needed.set(true);
@@ -9003,6 +9116,7 @@ fn draw_editor(
     dialog_btn_rects_out: &Rc<RefCell<DialogBtnRects>>,
     editor_hover_rect_out: &Rc<Cell<Option<(f64, f64, f64, f64)>>>,
     editor_hover_link_rects_out: &Rc<RefCell<Vec<(f64, f64, f64, f64, String)>>>,
+    mouse_pos: (f64, f64),
 ) {
     let theme = Theme::from_name(&engine.settings.colorscheme);
 
@@ -9013,7 +9127,7 @@ fn draw_editor(
     // 1. Background
     let (bg_r, bg_g, bg_b) = theme.background.to_cairo();
     cr.set_source_rgb(bg_r, bg_g, bg_b);
-    cr.paint().expect("Invalid cairo surface");
+    cr.paint().ok();
 
     // 2. Setup Pango
     let pango_ctx = pangocairo::create_context(cr);
@@ -9269,31 +9383,58 @@ fn draw_editor(
     editor_hover_rect_out.set(eh_rect);
     *editor_hover_link_rects_out.borrow_mut() = eh_links;
 
-    // 5d. Draw fuzzy file-picker modal (on top of everything else)
-    draw_fuzzy_popup(
-        cr,
-        &layout,
-        &screen,
-        &theme,
-        width as f64,
-        height as f64,
-        line_height,
-        char_width,
-    );
+    // 5c5. Draw tab hover tooltip (small popup below hovered tab).
+    if let Some(ref tooltip_text) = screen.tab_tooltip {
+        let (mx, _my) = mouse_pos;
+        if mx >= 0.0 {
+            let tab_bar_h = if !screen.breadcrumbs.is_empty() {
+                line_height * 2.0
+            } else {
+                line_height
+            };
+            let tooltip_y = tab_bar_h + 2.0;
+            let padding = 6.0;
+            layout.set_text(tooltip_text);
+            layout.set_width(-1);
+            let (text_w, text_h) = layout.pixel_size();
+            let box_w = text_w as f64 + padding * 2.0;
+            let box_h = text_h as f64 + padding * 2.0;
+            let tooltip_x = mx.max(0.0).min((width as f64 - box_w).max(0.0));
 
-    // 5e. Draw live grep modal (on top of everything else)
-    draw_live_grep_popup(
-        cr,
-        &layout,
-        &screen,
-        &theme,
-        width as f64,
-        height as f64,
-        line_height,
-    );
+            // Background
+            cr.set_source_rgba(
+                theme.hover_bg.r as f64 / 255.0,
+                theme.hover_bg.g as f64 / 255.0,
+                theme.hover_bg.b as f64 / 255.0,
+                0.95,
+            );
+            cr.rectangle(tooltip_x, tooltip_y, box_w, box_h);
+            let _ = cr.fill();
 
-    // 5e2. Draw command palette modal (on top of everything else)
-    draw_command_palette_popup(
+            // Border
+            cr.set_source_rgba(
+                theme.hover_border.r as f64 / 255.0,
+                theme.hover_border.g as f64 / 255.0,
+                theme.hover_border.b as f64 / 255.0,
+                0.8,
+            );
+            cr.rectangle(tooltip_x, tooltip_y, box_w, box_h);
+            cr.set_line_width(1.0);
+            let _ = cr.stroke();
+
+            // Text
+            cr.set_source_rgb(
+                theme.hover_fg.r as f64 / 255.0,
+                theme.hover_fg.g as f64 / 255.0,
+                theme.hover_fg.b as f64 / 255.0,
+            );
+            cr.move_to(tooltip_x + padding, tooltip_y + padding);
+            pangocairo::show_layout(cr, &layout);
+        }
+    }
+
+    // 5d. Draw unified picker modal (on top of everything else)
+    draw_picker_popup(
         cr,
         &layout,
         &screen,
@@ -9611,7 +9752,7 @@ fn tab_close_hit_test(
     let close_pad = char_width;
 
     for (gid, grect) in &group_rects {
-        let tab_y = grect.y - line_height;
+        let tab_y = grect.y - tab_bar_height;
         if my < tab_y || my >= tab_y + line_height || mx < grect.x || mx >= grect.x + grect.width {
             continue;
         }
@@ -9645,6 +9786,82 @@ fn tab_close_hit_test(
         }
     }
     None
+}
+
+/// Returns a shortened display path for the tab under the cursor, or `None` if
+/// the cursor is not over a tab or the tab has no file path.
+fn tab_tooltip_hit_test(
+    engine: &Engine,
+    mx: f64,
+    my: f64,
+    da_w: f64,
+    da_h: f64,
+    line_height: f64,
+    char_width: f64,
+) -> Option<String> {
+    let tab_bar_height = if engine.settings.breadcrumbs {
+        line_height * 2.0
+    } else {
+        line_height
+    };
+    let wildmenu_px = if engine.wildmenu_items.is_empty() {
+        0.0
+    } else {
+        line_height
+    };
+    let status_bar_height = line_height * 2.0 + wildmenu_px;
+    let editor_bottom = da_h - status_bar_height;
+    let content_bounds = core::WindowRect::new(0.0, 0.0, da_w, editor_bottom);
+    let group_rects = engine
+        .group_layout
+        .calculate_group_rects(content_bounds, tab_bar_height);
+
+    let close_w = char_width;
+    let tab_inner_gap = 4.0_f64;
+    let tab_outer_gap = 4.0_f64;
+
+    for (gid, grect) in &group_rects {
+        let tab_y = grect.y - tab_bar_height;
+        if my < tab_y || my >= tab_y + line_height || mx < grect.x || mx >= grect.x + grect.width {
+            continue;
+        }
+        let local_x = mx - grect.x;
+        if let Some(group) = engine.editor_groups.get(gid) {
+            let mut tab_x = 0.0;
+            for (i, tab) in group.tabs.iter().enumerate() {
+                let wid = tab.active_window;
+                let (name, file_path) = if let Some(window) = engine.windows.get(&wid) {
+                    if let Some(state) = engine.buffer_manager.get(window.buffer_id) {
+                        let dirty = if state.dirty { "*" } else { "" };
+                        (
+                            format!(" {}: {}{} ", i + 1, state.display_name(), dirty),
+                            state.file_path.clone(),
+                        )
+                    } else {
+                        (format!(" {}: [No Name] ", i + 1), None)
+                    }
+                } else {
+                    (format!(" {}: [No Name] ", i + 1), None)
+                };
+                let tab_w = name.chars().count() as f64 * char_width;
+                let slot_w = tab_w + tab_inner_gap + close_w + tab_outer_gap;
+                if local_x >= tab_x && local_x < tab_x + slot_w {
+                    return file_path.map(|p| shorten_path(&p));
+                }
+                tab_x += slot_w;
+            }
+        }
+    }
+    None
+}
+
+/// Shorten a path for display: replace the user's home directory with `~`.
+fn shorten_path(path: &std::path::Path) -> String {
+    let home = core::paths::home_dir();
+    if let Ok(rest) = path.strip_prefix(&home) {
+        return format!("~/{}", rest.display());
+    }
+    path.display().to_string()
 }
 
 /// Draw thin Cairo horizontal scrollbars that overlay the bottom of each editor
@@ -9822,7 +10039,7 @@ fn draw_tab_bar(
     let (r, g, b) = theme.tab_bar_bg.to_cairo();
     cr.set_source_rgb(r, g, b);
     cr.rectangle(0.0, y_offset, width, line_height);
-    cr.fill().unwrap();
+    cr.fill().ok();
 
     // Use sans-serif UI font for tabs (like VSCode)
     let saved_font = layout.font_description().unwrap_or_default();
@@ -9913,7 +10130,7 @@ fn draw_tab_bar(
         let (br, bg_g, bb) = bg.to_cairo();
         cr.set_source_rgb(br, bg_g, bb);
         cr.rectangle(x, y_offset, tab_w + tab_inner_gap + close_w, line_height);
-        cr.fill().unwrap();
+        cr.fill().ok();
 
         // Tab text — dimmed colours for preview tabs
         cr.move_to(x, y_offset);
@@ -10097,7 +10314,7 @@ fn draw_breadcrumb_bar(
     let (r, g, b) = theme.breadcrumb_bg.to_cairo();
     cr.set_source_rgb(r, g, b);
     cr.rectangle(0.0, y_offset, width, line_height);
-    cr.fill().unwrap();
+    cr.fill().ok();
 
     let separator = " \u{203A} "; // " › "
     let mut x = 4.0; // small left padding
@@ -10162,7 +10379,7 @@ fn draw_window(
     let (br, bg_g, bb) = bg.to_cairo();
     cr.set_source_rgb(br, bg_g, bb);
     cr.rectangle(rect.x, rect.y, rect.width, rect.height);
-    cr.fill().unwrap();
+    cr.fill().ok();
 
     // Diff / DAP stopped-line background (drawn before selection so selection is on top)
     for (view_idx, rl) in rw.lines.iter().enumerate() {
@@ -10184,7 +10401,7 @@ fn draw_window(
             let (dr, dg, db) = color.to_cairo();
             cr.set_source_rgb(dr, dg, db);
             cr.rectangle(rect.x, y, rect.width, line_height);
-            cr.fill().unwrap();
+            cr.fill().ok();
         }
     }
 
@@ -10321,12 +10538,20 @@ fn draw_window(
                 let dot_cy = y + line_height * 0.5;
                 cr.arc(dot_cx, dot_cy, dot_r, 0.0, 2.0 * std::f64::consts::PI);
                 cr.fill().ok();
+            } else if !rl.is_wrap_continuation && rw.code_action_lines.contains(&rl.line_idx) {
+                // Code action lightbulb gutter icon
+                let (lr, lg, lb) = theme.lightbulb.to_cairo();
+                cr.set_source_rgb(lr, lg, lb);
+                let bulb_layout = layout.clone();
+                bulb_layout.set_text("\u{f0eb}"); // nf-fa-lightbulb_o
+                cr.move_to(rect.x + 1.0, y);
+                pangocairo::show_layout(cr, &bulb_layout);
             }
         }
     } // end gutter rendering block
 
     // Clip text area (excluding gutter)
-    cr.save().unwrap();
+    cr.save().ok();
     cr.rectangle(
         rect.x + gutter_width,
         rect.y,
@@ -10502,7 +10727,7 @@ fn draw_window(
         }
     }
 
-    cr.restore().unwrap();
+    cr.restore().ok();
     // Render cursor
     if let Some((cursor_pos, cursor_shape)) = &rw.cursor {
         if let Some(rl) = rw.lines.get(cursor_pos.view_line) {
@@ -10538,18 +10763,18 @@ fn draw_window(
                 CursorShape::Block => {
                     cr.set_source_rgba(cr_r, cr_g, cr_b, theme.cursor_normal_alpha);
                     cr.rectangle(cursor_x, cursor_y, char_w, line_height);
-                    cr.fill().unwrap();
+                    cr.fill().ok();
                 }
                 CursorShape::Bar => {
                     cr.set_source_rgb(cr_r, cr_g, cr_b);
                     cr.rectangle(cursor_x, cursor_y, 2.0, line_height);
-                    cr.fill().unwrap();
+                    cr.fill().ok();
                 }
                 CursorShape::Underline => {
                     cr.set_source_rgb(cr_r, cr_g, cr_b);
                     let bar_h = (line_height * 0.12).max(2.0);
                     cr.rectangle(cursor_x, cursor_y + line_height - bar_h, char_w, bar_h);
-                    cr.fill().unwrap();
+                    cr.fill().ok();
                 }
             }
         }
@@ -10620,18 +10845,18 @@ fn draw_window(
                 CursorShape::Bar => {
                     cr.set_source_rgb(cr_r, cr_g, cr_b);
                     cr.rectangle(ex, ey, 2.0, line_height);
-                    cr.fill().unwrap();
+                    cr.fill().ok();
                 }
                 CursorShape::Block => {
                     cr.set_source_rgba(cr_r, cr_g, cr_b, theme.cursor_normal_alpha);
                     cr.rectangle(ex, ey, ew, line_height);
-                    cr.fill().unwrap();
+                    cr.fill().ok();
                 }
                 CursorShape::Underline => {
                     cr.set_source_rgb(cr_r, cr_g, cr_b);
                     let bar_h = (line_height * 0.12).max(2.0);
                     cr.rectangle(ex, ey + line_height - bar_h, ew, bar_h);
-                    cr.fill().unwrap();
+                    cr.fill().ok();
                 }
             }
         }
@@ -10704,7 +10929,7 @@ fn draw_visual_selection(
                     cr.rectangle(text_x_offset, y, highlight_width, line_height);
                 }
             }
-            cr.fill().unwrap();
+            cr.fill().ok();
         }
         SelectionKind::Char => {
             if sel.start_line == sel.end_line {
@@ -10735,7 +10960,7 @@ fn draw_visual_selection(
                     let end_x = text_x_offset + end_pos.x() as f64 / pango::SCALE as f64;
 
                     cr.rectangle(start_x, y, end_x - start_x, line_height);
-                    cr.fill().unwrap();
+                    cr.fill().ok();
                 }
             } else {
                 // Multi-line selection
@@ -10764,7 +10989,7 @@ fn draw_visual_selection(
                                 text_x_offset + line_width as f64 - start_x,
                                 line_height,
                             );
-                            cr.fill().unwrap();
+                            cr.fill().ok();
                         } else if line_idx == sel.end_line {
                             let end_col = (sel.end_col + 1).min(line_text.chars().count());
                             let end_byte = line_text
@@ -10775,11 +11000,11 @@ fn draw_visual_selection(
                             let end_pos = layout.index_to_pos(end_byte as i32);
                             let end_x = text_x_offset + end_pos.x() as f64 / pango::SCALE as f64;
                             cr.rectangle(text_x_offset, y, end_x - text_x_offset, line_height);
-                            cr.fill().unwrap();
+                            cr.fill().ok();
                         } else {
                             let (line_width, _) = layout.pixel_size();
                             cr.rectangle(text_x_offset, y, line_width as f64, line_height);
-                            cr.fill().unwrap();
+                            cr.fill().ok();
                         }
                     }
                 }
@@ -10818,7 +11043,7 @@ fn draw_visual_selection(
                     }
                 }
             }
-            cr.fill().unwrap();
+            cr.fill().ok();
         }
     }
 }
@@ -10849,7 +11074,7 @@ fn draw_window_separators(
                 if x_end > x_start {
                     cr.move_to(x_start, rect_a.y + rect_a.height);
                     cr.line_to(x_end, rect_a.y + rect_a.height);
-                    cr.stroke().unwrap();
+                    cr.stroke().ok();
                 }
             }
 
@@ -10860,7 +11085,7 @@ fn draw_window_separators(
                 if y_end > y_start {
                     cr.move_to(rect_a.x + rect_a.width, y_start);
                     cr.line_to(rect_a.x + rect_a.width, y_end);
-                    cr.stroke().unwrap();
+                    cr.stroke().ok();
                 }
             }
         }
@@ -11226,6 +11451,41 @@ fn draw_editor_hover_popup(
             }
         }
 
+        // Selection highlight via Pango background attribute
+        if let Some((sl, sc, el, ec)) = eh.selection {
+            let line_chars: Vec<char> = text_line.chars().collect();
+            let in_sel = if sl == el {
+                actual_line == sl
+            } else {
+                actual_line >= sl && actual_line <= el
+            };
+            if in_sel {
+                let sel_start_char = if actual_line == sl { sc } else { 0 };
+                let sel_end_char = if actual_line == el {
+                    ec
+                } else {
+                    line_chars.len()
+                };
+                if sel_start_char < sel_end_char && sel_start_char < line_chars.len() {
+                    // Convert char offsets to byte offsets in text_line
+                    let byte_start: usize = line_chars[..sel_start_char]
+                        .iter()
+                        .map(|c| c.len_utf8())
+                        .sum();
+                    let byte_end: usize = line_chars[..sel_end_char.min(line_chars.len())]
+                        .iter()
+                        .map(|c| c.len_utf8())
+                        .sum();
+                    // +1 for the leading space in `display`
+                    let (sr, sg, sb) = theme.selection.to_pango_u16();
+                    let mut bg_attr = pango::AttrColor::new_background(sr, sg, sb);
+                    bg_attr.set_start_index((byte_start + 1) as u32);
+                    bg_attr.set_end_index((byte_end + 1) as u32);
+                    attrs.insert(bg_attr);
+                }
+            }
+        }
+
         layout.set_text(&display);
         layout.set_attributes(Some(&attrs));
         layout.set_width(pango_text_w);
@@ -11285,7 +11545,7 @@ fn draw_editor_hover_popup(
 
     // Focus indicator
     if eh.has_focus {
-        let indicator = "Tab:links  Esc:close";
+        let indicator = "y:copy  Tab:links  Esc:close";
         let (r, g, b) = theme.line_number_fg.to_cairo();
         cr.set_source_rgb(r, g, b);
         layout.set_text(indicator);
@@ -11454,8 +11714,9 @@ fn draw_signature_popup(
     layout.set_attributes(None);
 }
 
+/// Draw the unified picker modal (supports single-pane and two-pane with preview).
 #[allow(clippy::too_many_arguments)]
-fn draw_fuzzy_popup(
+fn draw_picker_popup(
     cr: &Context,
     layout: &pango::Layout,
     screen: &render::ScreenLayout,
@@ -11463,17 +11724,25 @@ fn draw_fuzzy_popup(
     editor_width: f64,
     editor_height: f64,
     line_height: f64,
-    _char_width: f64,
 ) {
-    let Some(fuzzy) = &screen.fuzzy else {
+    let Some(picker) = &screen.picker else {
         return;
     };
 
-    // Size: 60% of editor width (min 400px), 55% of editor height (min 300px)
-    let popup_w = (editor_width * 0.6).max(400.0);
-    let popup_h = (editor_height * 0.55).max(300.0);
+    let has_preview = picker.preview.is_some();
 
-    // Centered in editor area
+    // Size adapts based on whether we have a preview pane
+    let popup_w = if has_preview {
+        (editor_width * 0.8).max(600.0)
+    } else {
+        (editor_width * 0.55).max(500.0)
+    };
+    let popup_h = if has_preview {
+        (editor_height * 0.65).max(400.0)
+    } else {
+        (editor_height * 0.60).max(350.0)
+    };
+
     let popup_x = (editor_width - popup_w) / 2.0;
     let popup_y = (editor_height - popup_h) / 2.0;
 
@@ -11490,11 +11759,12 @@ fn draw_fuzzy_popup(
     cr.rectangle(popup_x, popup_y, popup_w, popup_h);
     cr.stroke().ok();
 
-    // Title row: "  Find Files  (N/M files)"
+    // Title row
     let title = format!(
-        "  Find Files  ({}/{} files)",
-        fuzzy.results.len(),
-        fuzzy.total_files
+        "  {}  ({}/{})",
+        picker.title,
+        picker.items.len(),
+        picker.total_count
     );
     let (r, g, b) = theme.fuzzy_title_fg.to_cairo();
     cr.set_source_rgb(r, g, b);
@@ -11503,8 +11773,8 @@ fn draw_fuzzy_popup(
     cr.move_to(popup_x, popup_y);
     pangocairo::show_layout(cr, layout);
 
-    // Query row: "> " + query
-    let query_text = format!("> {}_", fuzzy.query);
+    // Query row
+    let query_text = format!("> {}_", picker.query);
     let (r, g, b) = theme.fuzzy_query_fg.to_cairo();
     cr.set_source_rgb(r, g, b);
     layout.set_text(&query_text);
@@ -11521,255 +11791,41 @@ fn draw_fuzzy_popup(
     cr.line_to(popup_x + popup_w, sep_y);
     cr.stroke().ok();
 
-    // Result rows
-    let rows_area_h = popup_h - 2.0 * line_height - 2.0; // minus title, query, sep
-    let visible_rows = ((rows_area_h / line_height) as usize).min(fuzzy.results.len());
-    for (i, display) in fuzzy.results.iter().enumerate().take(visible_rows) {
-        let item_y = sep_y + 1.0 + i as f64 * line_height;
-        let is_selected = i == fuzzy.selected_idx;
+    // Two-pane layout
+    let left_pane_w = if has_preview { popup_w * 0.4 } else { popup_w };
 
-        // Selected row highlight
-        if is_selected {
-            let (r, g, b) = theme.fuzzy_selected_bg.to_cairo();
-            cr.set_source_rgb(r, g, b);
-            cr.rectangle(popup_x, item_y, popup_w, line_height);
-            cr.fill().ok();
-        }
-
-        // Row text with ▶ prefix for selected
-        let prefix = if is_selected { "▶ " } else { "  " };
-        let row_text = format!("{}{}", prefix, display);
-        let (r, g, b) = theme.fuzzy_fg.to_cairo();
-        cr.set_source_rgb(r, g, b);
-        layout.set_text(&row_text);
-        layout.set_attributes(None);
-        cr.move_to(popup_x, item_y);
-        pangocairo::show_layout(cr, layout);
+    if has_preview {
+        // Vertical separator
+        cr.move_to(popup_x + left_pane_w, sep_y);
+        cr.line_to(popup_x + left_pane_w, popup_y + popup_h);
+        cr.stroke().ok();
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn draw_live_grep_popup(
-    cr: &Context,
-    layout: &pango::Layout,
-    screen: &render::ScreenLayout,
-    theme: &Theme,
-    editor_width: f64,
-    editor_height: f64,
-    line_height: f64,
-) {
-    let Some(grep) = &screen.live_grep else {
-        return;
-    };
-
-    // Size: 80% of editor width (min 600px), 65% of editor height (min 400px)
-    let popup_w = (editor_width * 0.8).max(600.0);
-    let popup_h = (editor_height * 0.65).max(400.0);
-
-    // Centered in editor area
-    let popup_x = (editor_width - popup_w) / 2.0;
-    let popup_y = (editor_height - popup_h) / 2.0;
-
-    // Background
-    let (r, g, b) = theme.fuzzy_bg.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
-    cr.fill().ok();
-
-    // Border
-    let (r, g, b) = theme.fuzzy_border.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    cr.set_line_width(1.0);
-    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
-    cr.stroke().ok();
-
-    // Title row
-    let title = format!("  Live Grep  {} matches", grep.total_matches);
-    let (r, g, b) = theme.fuzzy_title_fg.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    layout.set_text(&title);
-    layout.set_attributes(None);
-    cr.move_to(popup_x, popup_y);
-    pangocairo::show_layout(cr, layout);
-
-    // Query row: "> " + query
-    let query_text = format!("> {}_", grep.query);
-    let (r, g, b) = theme.fuzzy_query_fg.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    layout.set_text(&query_text);
-    layout.set_attributes(None);
-    cr.move_to(popup_x, popup_y + line_height);
-    pangocairo::show_layout(cr, layout);
-
-    // Horizontal separator
-    let sep_y = popup_y + 2.0 * line_height;
-    let (r, g, b) = theme.fuzzy_border.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    cr.set_line_width(1.0);
-    cr.move_to(popup_x, sep_y);
-    cr.line_to(popup_x + popup_w, sep_y);
-    cr.stroke().ok();
-
-    // Two-column layout: left pane = 40% of popup width
-    let left_pane_w = popup_w * 0.4;
-    let right_pane_x = popup_x + left_pane_w + 1.0;
-    let right_pane_w = popup_w - left_pane_w - 1.0;
-
-    // Vertical separator between panes
-    cr.move_to(popup_x + left_pane_w, sep_y);
-    cr.line_to(popup_x + left_pane_w, popup_y + popup_h);
-    cr.stroke().ok();
 
     let rows_area_h = popup_h - 2.0 * line_height - 2.0;
     let visible_rows = (rows_area_h / line_height) as usize;
 
-    // Compute scroll offset so the selected row is always visible.
-    // Stateless: derived entirely from selected_idx each frame.
-    let scroll_top = if grep.selected_idx < visible_rows {
-        0
+    // Scrollbar geometry (single-pane only)
+    let total_items = picker.items.len();
+    let has_scrollbar = !has_preview && total_items > visible_rows;
+    const SB_W: f64 = 6.0;
+    let content_w = if has_scrollbar {
+        left_pane_w - SB_W
     } else {
-        grep.selected_idx + 1 - visible_rows
+        left_pane_w
     };
 
-    // Left pane: result rows — clipped to left_pane_w to prevent text spill
+    // Left pane: result rows — clipped
     cr.save().ok();
-    cr.rectangle(popup_x, sep_y, left_pane_w, rows_area_h + 2.0);
+    cr.rectangle(popup_x, sep_y, content_w, rows_area_h + 2.0);
     cr.clip();
 
     for i in 0..visible_rows {
-        let result_idx = scroll_top + i;
-        let Some(display) = grep.results.get(result_idx) else {
+        let result_idx = picker.scroll_top + i;
+        let Some(item) = picker.items.get(result_idx) else {
             break;
         };
         let item_y = sep_y + 1.0 + i as f64 * line_height;
-        let is_selected = result_idx == grep.selected_idx;
-
-        if is_selected {
-            let (r, g, b) = theme.fuzzy_selected_bg.to_cairo();
-            cr.set_source_rgb(r, g, b);
-            cr.rectangle(popup_x, item_y, left_pane_w, line_height);
-            cr.fill().ok();
-        }
-
-        let prefix = if is_selected { "▶ " } else { "  " };
-        let row_text = format!("{}{}", prefix, display);
-        let (r, g, b) = theme.fuzzy_fg.to_cairo();
-        cr.set_source_rgb(r, g, b);
-        layout.set_text(&row_text);
-        layout.set_attributes(None);
-        cr.move_to(popup_x, item_y);
-        pangocairo::show_layout(cr, layout);
-    }
-
-    cr.restore().ok();
-
-    // Right pane: preview lines — clipped to right pane bounds
-    cr.save().ok();
-    cr.rectangle(right_pane_x, sep_y, right_pane_w, rows_area_h + 2.0);
-    cr.clip();
-
-    for (i, (lineno, text, is_match)) in grep.preview_lines.iter().enumerate().take(visible_rows) {
-        let item_y = sep_y + 1.0 + i as f64 * line_height;
-        let preview_text = format!("{:4}: {}", lineno, text);
-
-        if *is_match {
-            let (r, g, b) = theme.fuzzy_title_fg.to_cairo();
-            cr.set_source_rgb(r, g, b);
-        } else {
-            let (r, g, b) = theme.fuzzy_fg.to_cairo();
-            cr.set_source_rgb(r, g, b);
-        }
-
-        layout.set_text(&preview_text);
-        layout.set_attributes(None);
-        cr.move_to(right_pane_x, item_y);
-        pangocairo::show_layout(cr, layout);
-    }
-
-    cr.restore().ok();
-}
-
-/// Draw the command palette modal (Ctrl+Shift+P) on top of the editor.
-fn draw_command_palette_popup(
-    cr: &Context,
-    layout: &pango::Layout,
-    screen: &render::ScreenLayout,
-    theme: &Theme,
-    editor_width: f64,
-    editor_height: f64,
-    line_height: f64,
-) {
-    let Some(palette) = &screen.command_palette else {
-        return;
-    };
-
-    // Size: 55% of editor width (min 500px), 60% of editor height (min 350px)
-    let popup_w = (editor_width * 0.55).max(500.0);
-    let popup_h = (editor_height * 0.60).max(350.0);
-
-    // Centered in editor area
-    let popup_x = (editor_width - popup_w) / 2.0;
-    let popup_y = (editor_height - popup_h) / 2.0;
-
-    // Background
-    let (r, g, b) = theme.fuzzy_bg.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
-    cr.fill().ok();
-
-    // Border
-    let (r, g, b) = theme.fuzzy_border.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    cr.set_line_width(1.0);
-    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
-    cr.stroke().ok();
-
-    // Title row
-    let title = format!("  Command Palette  ({} commands)", palette.items.len());
-    let (r, g, b) = theme.fuzzy_title_fg.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    layout.set_text(&title);
-    layout.set_attributes(None);
-    cr.move_to(popup_x, popup_y);
-    pangocairo::show_layout(cr, layout);
-
-    // Query row: "> " + query + cursor
-    let query_text = format!("> {}_", palette.query);
-    let (r, g, b) = theme.fuzzy_query_fg.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    layout.set_text(&query_text);
-    layout.set_attributes(None);
-    cr.move_to(popup_x, popup_y + line_height);
-    pangocairo::show_layout(cr, layout);
-
-    // Horizontal separator
-    let sep_y = popup_y + 2.0 * line_height;
-    let (r, g, b) = theme.fuzzy_border.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    cr.set_line_width(1.0);
-    cr.move_to(popup_x, sep_y);
-    cr.line_to(popup_x + popup_w, sep_y);
-    cr.stroke().ok();
-
-    // Result rows (label left, shortcut right-aligned, VSCode style)
-    let rows_area_h = popup_h - 2.0 * line_height - 2.0;
-    let visible_rows = (rows_area_h / line_height) as usize;
-    let total_items = palette.items.len();
-    let items_to_show = palette.items.iter().skip(palette.scroll_top);
-
-    // Scrollbar geometry (6px wide strip on the right edge)
-    const SB_W: f64 = 6.0;
-    let sb_x = popup_x + popup_w - SB_W;
-    let sb_track_y = sep_y + 1.0;
-    let sb_track_h = rows_area_h;
-
-    // Content area is narrowed by scrollbar width
-    let content_w = popup_w - SB_W;
-
-    for (i, (label, shortcut)) in items_to_show.enumerate().take(visible_rows) {
-        let item_y = sep_y + 1.0 + i as f64 * line_height;
-        let display_idx = palette.scroll_top + i;
-        let is_selected = display_idx == palette.selected_idx;
+        let is_selected = result_idx == picker.selected_idx;
 
         // Selected row highlight
         if is_selected {
@@ -11779,43 +11835,123 @@ fn draw_command_palette_popup(
             cr.fill().ok();
         }
 
-        // Label (left-aligned with ▶ prefix for selected)
+        // Build pango attributed string with match highlighting
         let prefix = if is_selected { "▶ " } else { "  " };
-        let row_text = format!("{}{}", prefix, label);
+        let full_text = format!("{}{}", prefix, item.display);
+        let prefix_bytes = prefix.len();
+
+        // Create attributes for match highlighting
+        let attr_list = pango::AttrList::new();
+
+        // Default color
         let (r, g, b) = theme.fuzzy_fg.to_cairo();
-        cr.set_source_rgb(r, g, b);
-        layout.set_text(&row_text);
-        layout.set_attributes(None);
+        let mut attr_fg = pango::AttrColor::new_foreground(
+            (r * 65535.0) as u16,
+            (g * 65535.0) as u16,
+            (b * 65535.0) as u16,
+        );
+        attr_fg.set_start_index(0);
+        attr_fg.set_end_index(full_text.len() as u32);
+        attr_list.insert(attr_fg);
+
+        // Match highlight color for matched positions
+        if !item.match_positions.is_empty() {
+            let (mr, mg, mb) = theme.fuzzy_match_fg.to_cairo();
+            for &pos in &item.match_positions {
+                // pos is a byte index into the display text; offset by prefix length
+                let start = prefix_bytes + pos;
+                if start < full_text.len() {
+                    // Find the byte length of the char at this position
+                    let end = start
+                        + full_text[start..]
+                            .chars()
+                            .next()
+                            .map(|c| c.len_utf8())
+                            .unwrap_or(1);
+                    let mut attr_match = pango::AttrColor::new_foreground(
+                        (mr * 65535.0) as u16,
+                        (mg * 65535.0) as u16,
+                        (mb * 65535.0) as u16,
+                    );
+                    attr_match.set_start_index(start as u32);
+                    attr_match.set_end_index(end as u32);
+                    attr_list.insert(attr_match);
+                }
+            }
+        }
+
+        layout.set_text(&full_text);
+        layout.set_attributes(Some(&attr_list));
         cr.move_to(popup_x, item_y);
         pangocairo::show_layout(cr, layout);
 
-        // Shortcut (right-aligned within content area, dimmed)
-        if !shortcut.is_empty() {
-            let shortcut_text = format!("{}  ", shortcut);
-            let (r, g, b) = theme.fuzzy_border.to_cairo();
-            cr.set_source_rgb(r, g, b);
-            layout.set_text(&shortcut_text);
-            layout.set_attributes(None);
-            let (sc_w, _) = layout.pixel_size();
-            cr.move_to(popup_x + content_w - sc_w as f64, item_y);
-            pangocairo::show_layout(cr, layout);
+        // Right-aligned detail (shortcut) — single-pane only
+        if !has_preview {
+            if let Some(ref detail) = item.detail {
+                if !detail.is_empty() {
+                    let detail_text = format!("{}  ", detail);
+                    let (r, g, b) = theme.fuzzy_border.to_cairo();
+                    cr.set_source_rgb(r, g, b);
+                    layout.set_text(&detail_text);
+                    layout.set_attributes(None);
+                    let (sc_w, _) = layout.pixel_size();
+                    cr.move_to(popup_x + content_w - sc_w as f64, item_y);
+                    pangocairo::show_layout(cr, layout);
+                }
+            }
         }
     }
 
-    // Scrollbar — only draw when content overflows
-    if total_items > visible_rows && visible_rows > 0 {
-        // Track background
+    cr.restore().ok();
+
+    // Right pane: preview lines (two-pane only)
+    if has_preview {
+        let right_pane_x = popup_x + left_pane_w + 1.0;
+        let right_pane_w = popup_w - left_pane_w - 1.0;
+
+        cr.save().ok();
+        cr.rectangle(right_pane_x, sep_y, right_pane_w, rows_area_h + 2.0);
+        cr.clip();
+
+        if let Some(ref preview) = picker.preview {
+            for (i, (lineno, text, is_match)) in preview.iter().enumerate().take(visible_rows) {
+                let item_y = sep_y + 1.0 + i as f64 * line_height;
+                let preview_text = format!("{:4}: {}", lineno, text);
+
+                if *is_match {
+                    let (r, g, b) = theme.fuzzy_title_fg.to_cairo();
+                    cr.set_source_rgb(r, g, b);
+                } else {
+                    let (r, g, b) = theme.fuzzy_fg.to_cairo();
+                    cr.set_source_rgb(r, g, b);
+                }
+
+                layout.set_text(&preview_text);
+                layout.set_attributes(None);
+                cr.move_to(right_pane_x, item_y);
+                pangocairo::show_layout(cr, layout);
+            }
+        }
+
+        cr.restore().ok();
+    }
+
+    // Scrollbar (single-pane only)
+    if has_scrollbar && visible_rows > 0 {
+        let sb_x = popup_x + popup_w - SB_W;
+        let sb_track_y = sep_y + 1.0;
+        let sb_track_h = rows_area_h;
+
         let (tr, tg, tb) = theme.fuzzy_bg.to_cairo();
         cr.set_source_rgb(tr * 0.7, tg * 0.7, tb * 0.7);
         cr.rectangle(sb_x, sb_track_y, SB_W, sb_track_h);
         cr.fill().ok();
 
-        // Thumb position and size
         let thumb_ratio = visible_rows as f64 / total_items as f64;
         let thumb_h = (sb_track_h * thumb_ratio).max(8.0);
         let max_scroll = total_items.saturating_sub(visible_rows) as f64;
         let scroll_frac = if max_scroll > 0.0 {
-            palette.scroll_top as f64 / max_scroll
+            picker.scroll_top as f64 / max_scroll
         } else {
             0.0
         };
@@ -11951,12 +12087,14 @@ fn draw_dialog_popup(
     let ui_layout = pango::Layout::new(&pango_ctx);
     ui_layout.set_font_description(Some(&ui_font_desc));
 
-    // Measure button row width.
+    // Measure button widths.
     let mut btn_total_w = 8.0; // padding
+    let mut btn_max_w = 0.0f64;
     for (label, _) in &dialog.buttons {
         ui_layout.set_text(&format!("  {}  ", label));
         let (w, _) = ui_layout.pixel_size();
         btn_total_w += w as f64 + 4.0;
+        btn_max_w = btn_max_w.max(w as f64 + 4.0);
     }
 
     // Measure body width.
@@ -11973,9 +12111,19 @@ fn draw_dialog_popup(
 
     let has_input = dialog.input.is_some();
     let input_rows = if has_input { 1.0 } else { 0.0 };
-    let content_w = body_max_w.max(title_w as f64 + 16.0).max(btn_total_w);
+    let effective_btn_w = if dialog.vertical_buttons {
+        btn_max_w + 24.0
+    } else {
+        btn_total_w
+    };
+    let content_w = body_max_w.max(title_w as f64 + 16.0).max(effective_btn_w);
     let popup_w = (content_w + 32.0).clamp(350.0, editor_width - 40.0);
-    let popup_h = ((3.0 + dialog.body.len() as f64 + input_rows + 2.0) * line_height)
+    let btn_rows = if dialog.vertical_buttons {
+        dialog.buttons.len() as f64
+    } else {
+        1.0
+    };
+    let popup_h = ((3.0 + dialog.body.len() as f64 + input_rows + btn_rows + 1.0) * line_height)
         .min(editor_height - 40.0);
 
     let popup_x = (editor_width - popup_w) / 2.0;
@@ -12036,33 +12184,58 @@ fn draw_dialog_popup(
         pangocairo::show_layout(cr, layout);
     }
 
-    // Button row.
-    let btn_y = popup_y + popup_h - line_height * 1.5;
-    let mut bx = popup_x + 12.0;
+    // Buttons — vertical list or horizontal row.
     let mut rects = Vec::with_capacity(dialog.buttons.len());
-    for (label, is_selected) in &dialog.buttons {
-        let btn_text = format!("  {}  ", label);
-        ui_layout.set_text(&btn_text);
-        let (bw, bh) = ui_layout.pixel_size();
-        let bw = bw as f64;
-        let bh = bh as f64;
+    if dialog.vertical_buttons {
+        let btn_start_y = popup_y + popup_h - (btn_rows + 0.5) * line_height;
+        for (i, (label, is_selected)) in dialog.buttons.iter().enumerate() {
+            let by = btn_start_y + i as f64 * line_height;
+            let row_w = popup_w - 24.0;
+            rects.push((popup_x + 12.0, by, row_w, line_height));
 
-        rects.push((bx, btn_y, bw, bh));
+            if *is_selected {
+                let (r, g, b) = theme.fuzzy_selected_bg.to_cairo();
+                cr.set_source_rgb(r, g, b);
+                cr.rectangle(popup_x + 12.0, by, row_w, line_height);
+                cr.fill().ok();
+            }
 
-        if *is_selected {
-            let (r, g, b) = theme.fuzzy_selected_bg.to_cairo();
+            let prefix = if *is_selected { "▸ " } else { "  " };
+            let btn_text = format!("{}{}", prefix, label);
+            let (r, g, b) = theme.fuzzy_fg.to_cairo();
             cr.set_source_rgb(r, g, b);
-            cr.rectangle(bx, btn_y, bw, bh);
-            cr.fill().ok();
+            ui_layout.set_text(&btn_text);
+            ui_layout.set_attributes(None);
+            cr.move_to(popup_x + 14.0, by);
+            pangocairo::show_layout(cr, &ui_layout);
         }
+    } else {
+        let btn_y = popup_y + popup_h - line_height * 1.5;
+        let mut bx = popup_x + 12.0;
+        for (label, is_selected) in &dialog.buttons {
+            let btn_text = format!("  {}  ", label);
+            ui_layout.set_text(&btn_text);
+            let (bw, bh) = ui_layout.pixel_size();
+            let bw = bw as f64;
+            let bh = bh as f64;
 
-        let (r, g, b) = theme.fuzzy_fg.to_cairo();
-        cr.set_source_rgb(r, g, b);
-        ui_layout.set_attributes(None);
-        cr.move_to(bx, btn_y);
-        pangocairo::show_layout(cr, &ui_layout);
+            rects.push((bx, btn_y, bw, bh));
 
-        bx += bw + 4.0;
+            if *is_selected {
+                let (r, g, b) = theme.fuzzy_selected_bg.to_cairo();
+                cr.set_source_rgb(r, g, b);
+                cr.rectangle(bx, btn_y, bw, bh);
+                cr.fill().ok();
+            }
+
+            let (r, g, b) = theme.fuzzy_fg.to_cairo();
+            cr.set_source_rgb(r, g, b);
+            ui_layout.set_attributes(None);
+            cr.move_to(bx, btn_y);
+            pangocairo::show_layout(cr, &ui_layout);
+
+            bx += bw + 4.0;
+        }
     }
     rects
 }
@@ -12190,9 +12363,9 @@ fn draw_debug_sidebar(
 ) {
     let sidebar = &screen.debug_sidebar;
 
-    let (bg_r, bg_g, bg_b) = theme.completion_bg.to_cairo();
+    let (bg_r, bg_g, bg_b) = theme.tab_bar_bg.to_cairo();
     let (hdr_r, hdr_g, hdr_b) = theme.status_bg.to_cairo();
-    let (fg_r, fg_g, fg_b) = theme.status_fg.to_cairo();
+    let (hdr_fg_r, hdr_fg_g, hdr_fg_b) = theme.status_fg.to_cairo();
     let (dim_r, dim_g, dim_b) = theme.line_number_fg.to_cairo();
     let (sel_r, sel_g, sel_b) = theme.fuzzy_selected_bg.to_cairo();
     let (act_r, act_g, act_b) = theme.tab_active_fg.to_cairo();
@@ -12211,7 +12384,7 @@ fn draw_debug_sidebar(
 
     let cfg_name = sidebar.launch_config_name.as_deref().unwrap_or("no config");
     let header_text = format!("  \u{f188} DEBUG  |  {cfg_name}");
-    cr.set_source_rgb(fg_r, fg_g, fg_b);
+    cr.set_source_rgb(hdr_fg_r, hdr_fg_g, hdr_fg_b);
     layout.set_text(&header_text);
     cr.move_to(x + 4.0, y);
     pangocairo::show_layout(cr, layout);
@@ -12288,7 +12461,7 @@ fn draw_debug_sidebar(
         let (shr, shg, shb) = if is_active_section {
             (act_r, act_g, act_b)
         } else {
-            (fg_r, fg_g, fg_b)
+            (hdr_fg_r, hdr_fg_g, hdr_fg_b)
         };
         cr.set_source_rgb(hdr_r, hdr_g, hdr_b);
         cr.rectangle(x, cursor_y, w, line_height);
@@ -12339,7 +12512,7 @@ fn draw_debug_sidebar(
                     cr.set_source_rgb(sel_r, sel_g, sel_b);
                     cr.rectangle(x, item_y, w, line_height);
                     cr.fill().ok();
-                    cr.set_source_rgb(fg_r, fg_g, fg_b);
+                    cr.set_source_rgb(hdr_fg_r, hdr_fg_g, hdr_fg_b);
                 } else {
                     cr.set_source_rgb(dim_r, dim_g, dim_b);
                 }
@@ -12801,7 +12974,7 @@ fn draw_status_line(
     let (br, bg, bb) = theme.status_bg.to_cairo();
     cr.set_source_rgb(br, bg, bb);
     cr.rectangle(0.0, y, width, line_height);
-    cr.fill().unwrap();
+    cr.fill().ok();
 
     layout.set_attributes(None);
 
@@ -12843,7 +13016,7 @@ fn draw_wildmenu(
     let (br, bg, bb) = theme.wildmenu_bg.to_cairo();
     cr.set_source_rgb(br, bg, bb);
     cr.rectangle(0.0, y, width, line_height);
-    cr.fill().unwrap();
+    cr.fill().ok();
 
     layout.set_attributes(None);
     layout.set_width(-1);
@@ -12864,7 +13037,7 @@ fn draw_wildmenu(
             let (sbr, sbg, sbb) = theme.wildmenu_sel_bg.to_cairo();
             cr.set_source_rgb(sbr, sbg, sbb);
             cr.rectangle(x, y, item_w as f64, line_height);
-            cr.fill().unwrap();
+            cr.fill().ok();
             // Selected item foreground
             let (sfr, sfg, sfb) = theme.wildmenu_sel_fg.to_cairo();
             cr.set_source_rgb(sfr, sfg, sfb);
@@ -12891,7 +13064,7 @@ fn draw_command_line(
     let (br, bg, bb) = theme.command_bg.to_cairo();
     cr.set_source_rgb(br, bg, bb);
     cr.rectangle(0.0, y, width, line_height);
-    cr.fill().unwrap();
+    cr.fill().ok();
 
     if !cmd.text.is_empty() {
         layout.set_text(&cmd.text);
@@ -12917,7 +13090,7 @@ fn draw_command_line(
         let (cr_r, cr_g, cr_b) = theme.cursor.to_cairo();
         cr.set_source_rgb(cr_r, cr_g, cr_b);
         cr.rectangle(text_w as f64, y, 2.0, line_height);
-        cr.fill().unwrap();
+        cr.fill().ok();
     }
 }
 
@@ -12930,8 +13103,9 @@ fn draw_menu_bar(
     width: f64,
     height: f64,
 ) {
-    // VSCode title bar background: #3c3c3c
-    cr.set_source_rgb(0.235, 0.235, 0.235);
+    // Title bar background: use tab_bar_bg (adapts to light/dark themes).
+    let (tbr, tbg, tbb) = theme.tab_bar_bg.to_cairo();
+    cr.set_source_rgb(tbr, tbg, tbb);
     cr.rectangle(x, y, width, height);
     let _ = cr.fill();
 
@@ -12940,7 +13114,7 @@ fn draw_menu_bar(
     let layout = pango::Layout::new(&pango_ctx);
     layout.set_font_description(Some(&font_desc));
 
-    let (fr, fg, fb) = theme.status_fg.to_cairo();
+    let (fr, fg, fb) = theme.foreground.to_cairo();
     cr.set_source_rgb(fr, fg, fb);
 
     // Menu labels
@@ -13011,13 +13185,15 @@ fn draw_menu_dropdown(
     let popup_height = (item_count + 1.0) * line_height;
     let popup_y = anchor_y;
 
-    // Background — VSCode dropdown: #3c3c3c
-    cr.set_source_rgb(0.235, 0.235, 0.235);
+    // Background — use hover_bg (adapts to light/dark themes).
+    let (hbr, hbg, hbb) = theme.hover_bg.to_cairo();
+    cr.set_source_rgb(hbr, hbg, hbb);
     cr.rectangle(popup_x, popup_y, popup_width, popup_height);
     let _ = cr.fill();
 
-    // Border — VSCode: slightly lighter #454545
-    cr.set_source_rgb(0.271, 0.271, 0.271);
+    // Border
+    let (bdr, bdg, bdb) = theme.hover_border.to_cairo();
+    cr.set_source_rgb(bdr, bdg, bdb);
     cr.rectangle(popup_x, popup_y, popup_width, popup_height);
     let _ = cr.stroke();
 
@@ -13038,7 +13214,8 @@ fn draw_menu_dropdown(
         } else {
             // Draw highlight bar for hovered/keyboard-selected item.
             if data.highlighted_item_idx == Some(i) {
-                cr.set_source_rgb(0.18, 0.40, 0.73); // VSCode hover blue #2d65bb
+                let (slr, slg, slb) = theme.sidebar_sel_bg.to_cairo();
+                cr.set_source_rgb(slr, slg, slb);
                 cr.rectangle(popup_x + 1.0, row_top, popup_width - 2.0, line_height);
                 let _ = cr.fill();
             }
@@ -13101,9 +13278,10 @@ fn draw_source_control_panel(
         h
     };
 
-    let (bg_r, bg_g, bg_b) = theme.completion_bg.to_cairo();
+    let (bg_r, bg_g, bg_b) = theme.tab_bar_bg.to_cairo();
     let (hdr_r, hdr_g, hdr_b) = theme.status_bg.to_cairo();
-    let (fg_r, fg_g, fg_b) = theme.status_fg.to_cairo();
+    let (hdr_fg_r, hdr_fg_g, hdr_fg_b) = theme.status_fg.to_cairo();
+    let (fg_r, fg_g, fg_b) = theme.foreground.to_cairo();
     let (dim_r, dim_g, dim_b) = theme.line_number_fg.to_cairo();
     let (sel_r, sel_g, sel_b) = theme.fuzzy_selected_bg.to_cairo();
     let (add_r, add_g, add_b) = theme.diff_added_bg.to_cairo();
@@ -13127,7 +13305,7 @@ fn draw_source_control_panel(
         "  \u{e702} SOURCE CONTROL   {}  ↑{}↓{}",
         sc.branch, sc.ahead, sc.behind
     );
-    cr.set_source_rgb(fg_r, fg_g, fg_b);
+    cr.set_source_rgb(hdr_fg_r, hdr_fg_g, hdr_fg_b);
     layout.set_text(&branch_str);
     let (lw, lh) = layout.pixel_size();
     cr.move_to(
@@ -13253,7 +13431,7 @@ fn draw_source_control_panel(
             cr.set_source_rgb(fill_r, fill_g, fill_b);
             cr.rectangle(bx, btn_y_base, seg_w, btn_h);
             cr.fill().ok();
-            cr.set_source_rgb(fg_r, fg_g, fg_b);
+            cr.set_source_rgb(hdr_fg_r, hdr_fg_g, hdr_fg_b);
             layout.set_text(text);
             let (_, lh_btn) = layout.pixel_size();
             cr.move_to(bx + 2.0, btn_y_base + (btn_h - lh_btn as f64) / 2.0);
@@ -13300,7 +13478,7 @@ fn draw_source_control_panel(
         cr.set_source_rgb(hdr_r, hdr_g, hdr_b);
         cr.rectangle(x, *y_off, w, line_height);
         cr.fill().ok();
-        cr.set_source_rgb(fg_r, fg_g, fg_b);
+        cr.set_source_rgb(hdr_fg_r, hdr_fg_g, hdr_fg_b);
         layout.set_text(&header_text);
         let (_, lh) = layout.pixel_size();
         cr.move_to(x + 2.0, *y_off + (line_height - lh as f64) / 2.0);
@@ -13317,9 +13495,9 @@ fn draw_source_control_panel(
                     cr.fill().ok();
                 }
                 cr.set_source_rgb(
-                    if is_sel { fg_r } else { dim_r },
-                    if is_sel { fg_g } else { dim_g },
-                    if is_sel { fg_b } else { dim_b },
+                    if is_sel { hdr_fg_r } else { dim_r },
+                    if is_sel { hdr_fg_g } else { dim_g },
+                    if is_sel { hdr_fg_b } else { dim_b },
                 );
                 layout.set_text(&format!("    {}", item));
                 let (_, lh) = layout.pixel_size();
@@ -13610,7 +13788,8 @@ fn draw_ext_dyn_panel(
 
     let (bg_r, bg_g, bg_b) = theme.tab_bar_bg.to_cairo();
     let (hdr_r, hdr_g, hdr_b) = theme.status_bg.to_cairo();
-    let (fg_r, fg_g, fg_b) = theme.status_fg.to_cairo();
+    let (hdr_fg_r, hdr_fg_g, hdr_fg_b) = theme.status_fg.to_cairo();
+    let (fg_r, fg_g, fg_b) = theme.foreground.to_cairo();
     let (item_r, item_g, item_b) = theme.foreground.to_cairo();
     let (dim_r, dim_g, dim_b) = theme.line_number_fg.to_cairo();
     let (accent_r, accent_g, accent_b) = theme.keyword.to_cairo();
@@ -13629,7 +13808,7 @@ fn draw_ext_dyn_panel(
     cr.rectangle(x, y + ry, w, line_height);
     cr.fill().ok();
     let hdr_text = format!("  {}", panel.title);
-    cr.set_source_rgb(fg_r, fg_g, fg_b);
+    cr.set_source_rgb(hdr_fg_r, hdr_fg_g, hdr_fg_b);
     layout.set_text(&hdr_text);
     let (_, lh) = layout.pixel_size();
     cr.move_to(x + 2.0, y + ry + (line_height - lh as f64) / 2.0);
@@ -14232,9 +14411,10 @@ fn draw_ext_sidebar(
         return;
     };
 
-    let (bg_r, bg_g, bg_b) = theme.completion_bg.to_cairo();
+    let (bg_r, bg_g, bg_b) = theme.tab_bar_bg.to_cairo();
     let (hdr_r, hdr_g, hdr_b) = theme.status_bg.to_cairo();
-    let (fg_r, fg_g, fg_b) = theme.status_fg.to_cairo();
+    let (hdr_fg_r, hdr_fg_g, hdr_fg_b) = theme.status_fg.to_cairo();
+    let (fg_r, fg_g, fg_b) = theme.foreground.to_cairo();
     let (dim_r, dim_g, dim_b) = theme.line_number_fg.to_cairo();
     let (sel_r, sel_g, sel_b) = theme.fuzzy_selected_bg.to_cairo();
 
@@ -14265,6 +14445,7 @@ fn draw_ext_sidebar(
         is_selected: bool,
         sel_rgb: (f64, f64, f64),
         fg_rgb: (f64, f64, f64),
+        sel_fg_rgb: (f64, f64, f64),
         dim_rgb: (f64, f64, f64),
         name_text: &str,
         hint: &str,
@@ -14283,7 +14464,8 @@ fn draw_ext_sidebar(
         };
         // Draw name with ellipsis if needed.
         let name_max = (w - 6.0 - hint_w as f64).max(20.0) as i32;
-        cr.set_source_rgb(fg_rgb.0, fg_rgb.1, fg_rgb.2);
+        let text_rgb = if is_selected { sel_fg_rgb } else { fg_rgb };
+        cr.set_source_rgb(text_rgb.0, text_rgb.1, text_rgb.2);
         layout.set_text(name_text);
         layout.set_width(name_max * pango::SCALE);
         layout.set_ellipsize(pango::EllipsizeMode::End);
@@ -14316,7 +14498,7 @@ fn draw_ext_sidebar(
     } else {
         "  \u{eae6} EXTENSIONS".to_string()
     };
-    cr.set_source_rgb(fg_r, fg_g, fg_b);
+    cr.set_source_rgb(hdr_fg_r, hdr_fg_g, hdr_fg_b);
     layout.set_text(&hdr_text);
     let (_, lh) = layout.pixel_size();
     cr.move_to(x + 2.0, y + ry + (line_height - lh as f64) / 2.0);
@@ -14403,6 +14585,7 @@ fn draw_ext_sidebar(
                 is_selected,
                 (sel_r, sel_g, sel_b),
                 (fg_r, fg_g, fg_b),
+                (hdr_fg_r, hdr_fg_g, hdr_fg_b),
                 (dim_r, dim_g, dim_b),
                 &name_text,
                 hint,
@@ -14460,6 +14643,7 @@ fn draw_ext_sidebar(
                 is_selected,
                 (sel_r, sel_g, sel_b),
                 (fg_r, fg_g, fg_b),
+                (hdr_fg_r, hdr_fg_g, hdr_fg_b),
                 (dim_r, dim_g, dim_b),
                 &name_text,
                 hint,
@@ -14483,7 +14667,8 @@ fn draw_ext_sidebar(
 
     // Focus border
     if ext.has_focus {
-        cr.set_source_rgb(fg_r * 0.4, fg_g * 0.4, fg_b * 0.9);
+        let (kr, kg, kb) = theme.keyword.to_cairo();
+        cr.set_source_rgb(kr, kg, kb);
         cr.set_line_width(1.5);
         cr.rectangle(x + 0.75, y + 0.75, w - 1.5, h - 1.5);
         cr.stroke().ok();
@@ -14508,9 +14693,10 @@ fn draw_ai_sidebar(
         return;
     };
 
-    let (bg_r, bg_g, bg_b) = theme.completion_bg.to_cairo();
+    let (bg_r, bg_g, bg_b) = theme.tab_bar_bg.to_cairo();
     let (hdr_r, hdr_g, hdr_b) = theme.status_bg.to_cairo();
-    let (fg_r, fg_g, fg_b) = theme.status_fg.to_cairo();
+    let (hdr_fg_r, hdr_fg_g, hdr_fg_b) = theme.status_fg.to_cairo();
+    let (fg_r, fg_g, fg_b) = theme.foreground.to_cairo();
     let (dim_r, dim_g, dim_b) = theme.line_number_fg.to_cairo();
     let (user_r, user_g, user_b) = theme.keyword.to_cairo();
     let (asst_r, asst_g, asst_b) = theme.string_lit.to_cairo();
@@ -14533,7 +14719,7 @@ fn draw_ai_sidebar(
         } else {
             "  \u{f0e5} AI ASSISTANT"
         };
-        cr.set_source_rgb(fg_r, fg_g, fg_b);
+        cr.set_source_rgb(hdr_fg_r, hdr_fg_g, hdr_fg_b);
         layout.set_text(hdr_text);
         let (_, lh) = layout.pixel_size();
         cr.move_to(
@@ -14712,7 +14898,8 @@ fn draw_ai_sidebar(
 
     // Focus border
     if ai.has_focus {
-        cr.set_source_rgb(fg_r * 0.4, fg_g * 0.4, fg_b * 0.9);
+        let (kr, kg, kb) = theme.keyword.to_cairo();
+        cr.set_source_rgb(kr, kg, kb);
         cr.set_line_width(1.5);
         cr.rectangle(x + 0.75, y + 0.75, w - 1.5, h - 1.5);
         cr.stroke().ok();
@@ -15053,6 +15240,11 @@ fn pixel_to_click_target(
             engine.active_tab_mut().active_window = window_id;
             engine.view_mut().cursor.line = line;
             engine.trigger_editor_hover_for_line(line);
+        } else if engine.has_code_actions_on_line(line) {
+            // Code action lightbulb — show code actions popup.
+            engine.active_tab_mut().active_window = window_id;
+            engine.view_mut().cursor.line = line;
+            engine.show_code_actions_popup();
         } else {
             engine.toggle_fold_at_line(line);
         }
@@ -15333,12 +15525,23 @@ fn handle_mouse_drag(
 /// Generate the full CSS string with colors taken from the active theme.
 fn make_theme_css(theme: &Theme) -> String {
     let bar_bg = theme.tab_bar_bg.to_hex();
-    let bar_fg = theme.status_fg.to_hex();
+    // For light themes, use foreground color for active icons (status_fg is white).
+    let bar_fg = if theme.is_light() {
+        theme.foreground.to_hex()
+    } else {
+        theme.status_fg.to_hex()
+    };
     let active_bg = theme.status_bg.to_hex();
     let editor_bg = theme.background.to_hex();
     let text_fg = theme.foreground.to_hex();
     let accent = theme.function.to_hex();
     let sel_bg = theme.fuzzy_selected_bg.to_hex();
+    // Selected item text: white on dark selection bg for both light/dark themes.
+    let sel_fg = if theme.is_light() {
+        "#ffffff".to_string()
+    } else {
+        bar_fg.clone()
+    };
     let hover_bg = theme.tab_active_bg.to_hex();
     let dim_fg = theme.line_number_fg.to_hex();
     let entry_bg = theme.active_background.to_hex();
@@ -15368,6 +15571,22 @@ fn make_theme_css(theme: &Theme) -> String {
         .activity-button.active {{
             color: {bar_fg};
             border-left: 2px solid {accent};
+        }}
+
+        .custom-titlebar {{
+            background-color: {bar_bg};
+        }}
+
+        /* Window control buttons (min/max/close) */
+        .window-control {{
+            color: {dim_fg};
+        }}
+        .window-control:hover {{
+            background-color: {hover_bg};
+            color: {bar_fg};
+        }}
+        .window-control:active {{
+            background-color: {hover_bg};
         }}
 
         /* Sidebar */
@@ -15400,11 +15619,13 @@ fn make_theme_css(theme: &Theme) -> String {
 
         treeview:selected {{
             background-color: {sel_bg};
+            color: {sel_fg};
             border-left: 3px solid {accent};
         }}
 
         treeview:selected:focus {{
             background-color: {sel_bg};
+            color: {sel_fg};
         }}
 
         treeview row:hover {{
@@ -15448,7 +15669,7 @@ fn make_theme_css(theme: &Theme) -> String {
 
         .search-results-list > row:selected label,
         .search-results-list > row:selected:focus label {{
-            color: {bar_fg};
+            color: {sel_fg};
         }}
 
         .search-results-scroll {{
@@ -15507,6 +15728,56 @@ fn make_theme_css(theme: &Theme) -> String {
             color: {editor_bg};
             border-color: {accent};
         }}
+
+        /* Settings form widgets — theme-aware */
+        .settings-category-header {{
+            color: {dim_fg};
+        }}
+        .sidebar spinbutton {{
+            background-color: {entry_bg};
+            color: {text_fg};
+            border: 1px solid {border_col};
+        }}
+        .sidebar spinbutton entry {{
+            color: {text_fg};
+        }}
+        .sidebar spinbutton button {{
+            background-color: {entry_bg};
+            color: {text_fg};
+        }}
+        .sidebar spinbutton button:hover {{
+            background-color: {hover_bg};
+        }}
+        .sidebar dropdown {{
+            background-color: {entry_bg};
+            color: {text_fg};
+            border: 1px solid {border_col};
+        }}
+        .sidebar dropdown button {{
+            color: {text_fg};
+        }}
+        .sidebar dropdown button:hover {{
+            background-color: {hover_bg};
+        }}
+        popover.menu contents,
+        popover contents {{
+            background-color: {entry_bg};
+            color: {text_fg};
+        }}
+        popover.menu modelbutton,
+        popover modelbutton {{
+            color: {text_fg};
+        }}
+        popover.menu modelbutton:hover,
+        popover modelbutton:hover {{
+            background-color: {sel_bg};
+            color: {sel_fg};
+        }}
+        .sidebar entry {{
+            background-color: {entry_bg};
+            color: {text_fg};
+            border: 1px solid {border_col};
+        }}
         "#
     )
 }
@@ -15517,7 +15788,7 @@ const STATIC_CSS: &str = "
         /* Custom titlebar — matches status bar color.
            CSD provides edge resize handles; WindowHandle enables drag-to-move. */
         .custom-titlebar {
-            background-color: #3c3c3c;
+            background-color: transparent;
             min-height: 0;
             padding: 0;
             margin: 0;
@@ -15551,18 +15822,10 @@ const STATIC_CSS: &str = "
             background: transparent;
             border: none;
             border-radius: 0;
-            color: #cccccc;
             font-size: 13px;
             padding: 0;
             min-width: 46px;
             min-height: 30px;
-        }
-        .window-control:hover {
-            background-color: rgba(255, 255, 255, 0.12);
-            color: #ffffff;
-        }
-        .window-control:active {
-            background-color: rgba(255, 255, 255, 0.08);
         }
         /* Close button: red on hover, matching Windows/VSCode */
         .window-control:last-child:hover {
@@ -15722,9 +15985,8 @@ const STATIC_CSS: &str = "
             font-size: 11px;
         }
 
-        /* Settings sidebar form */
+        /* Settings sidebar form — color-dependent rules in make_theme_css() */
         .settings-category-header {
-            color: #bbbbbb;
             font-size: 11px;
             font-weight: bold;
             letter-spacing: 1px;
@@ -15736,77 +15998,38 @@ const STATIC_CSS: &str = "
             background-color: transparent;
         }
 
-        /* Switch: let prefer_dark_theme (Adwaita dark) handle size and colors */
-
-        /* SpinButton: dark background + text matching the sidebar */
+        /* SpinButton layout */
         .sidebar spinbutton {
-            background-color: #3c3c3c;
-            color: #cccccc;
-            border: 1px solid #555555;
             border-radius: 2px;
         }
         .sidebar spinbutton entry {
             background-color: transparent;
-            color: #cccccc;
             min-width: 44px;
             padding: 2px 4px;
         }
         .sidebar spinbutton button {
-            background-color: #3c3c3c;
-            color: #cccccc;
             border: none;
             min-width: 20px;
             padding: 0 2px;
         }
-        .sidebar spinbutton button:hover {
-            background-color: #505050;
-        }
 
-        /* DropDown */
+        /* DropDown layout */
         .sidebar dropdown {
             min-height: 24px;
             padding: 0 4px;
-            background-color: #3c3c3c;
-            color: #cccccc;
-            border: 1px solid #555555;
             border-radius: 2px;
         }
         .sidebar dropdown button {
             background-color: transparent;
-            color: #cccccc;
             border: none;
             padding: 2px 4px;
         }
-        .sidebar dropdown button:hover {
-            background-color: #505050;
-        }
 
-        /* Popover list for DropDown options */
-        popover.menu contents,
-        popover contents {
-            background-color: #252526;
-            color: #cccccc;
-        }
-        popover.menu modelbutton,
-        popover modelbutton {
-            color: #cccccc;
-        }
-        popover.menu modelbutton:hover,
-        popover modelbutton:hover {
-            background-color: #094771;
-        }
-
-        /* Entry in settings rows */
+        /* Entry layout */
         .sidebar entry {
             min-height: 24px;
             padding: 2px 6px;
-            background-color: #3c3c3c;
-            color: #cccccc;
-            border: 1px solid #555555;
             border-radius: 2px;
-        }
-        .sidebar entry:focus {
-            border-color: #0e639c;
         }
         ";
 

@@ -61,6 +61,7 @@ This prevents CI failures and maintains code quality.
 - All work happens on `develop`; `main` is the release branch
 - Merge `develop` → `main` via GitHub PR (CI runs on the PR before release)
 - Before creating the PR: bump version in `Cargo.toml` (minor for features, patch for fixes)
+- If `Cargo.lock` changed since the last release: regenerate `flatpak/cargo-sources.json` with `python3 flatpak-cargo-generator.py Cargo.lock -o flatpak/cargo-sources.json` (script from `flatpak/flatpak-builder-tools` repo)
 - Merging the PR to `main` triggers `release.yml` which creates a GitHub Release tagged `v$VERSION`
 - Never push directly to `main` — always merge from `develop` via PR
 

@@ -294,8 +294,17 @@ pub struct LspManager {
     initialized: HashMap<LspServerId, bool>,
     /// Cached semantic tokens legends per server (extracted on initialization).
     semantic_legends: HashMap<LspServerId, SemanticTokensLegend>,
-    /// Extension manifests from the registry (updated by engine when registry changes).
+    /// Extension manifests for *installed* extensions only (used for server config lookup).
     ext_manifests: Vec<extensions::ExtensionManifest>,
+    /// All extension manifests (installed + available) — used to check if a language is
+    /// covered by an extension, so we don't fall back to the built-in registry for languages
+    /// that have a (not-yet-installed) extension.
+    all_ext_manifests: Vec<extensions::ExtensionManifest>,
+    /// Servers that crashed or exited (for display in :LspInfo).
+    crashed_servers: Vec<String>,
+    /// Last error from `ensure_server_for_language` (dependency check failure, etc.).
+    /// Engine reads and clears this after calling ensure_server.
+    pub last_start_error: Option<String>,
 }
 
 impl LspManager {
@@ -326,12 +335,23 @@ impl LspManager {
             initialized: HashMap::new(),
             semantic_legends: HashMap::new(),
             ext_manifests: Vec::new(),
+            all_ext_manifests: Vec::new(),
+            crashed_servers: Vec::new(),
+            last_start_error: None,
         }
     }
 
     /// Update the cached extension manifests (called by engine when registry changes).
-    pub fn set_ext_manifests(&mut self, manifests: Vec<extensions::ExtensionManifest>) {
-        self.ext_manifests = manifests;
+    /// `installed` — only installed extensions (used for server config lookup).
+    /// `all` — all available extensions (used to check if a language is covered by an
+    /// extension, so the built-in registry doesn't start servers for uninstalled extensions).
+    pub fn set_ext_manifests(
+        &mut self,
+        installed: Vec<extensions::ExtensionManifest>,
+        all: Vec<extensions::ExtensionManifest>,
+    ) {
+        self.ext_manifests = installed;
+        self.all_ext_manifests = all;
     }
 
     /// Ensure a server is running for the given language. Returns the server ID
@@ -343,6 +363,35 @@ impl LspManager {
             return Some(id);
         }
 
+        self.last_start_error = None;
+
+        // Check declared dependencies from the extension manifest.
+        if let Some(manifest) =
+            extensions::find_manifest_for_language_id(&self.ext_manifests, language_id)
+        {
+            let missing: Vec<&str> = manifest
+                .lsp
+                .dependencies
+                .iter()
+                .filter(|dep| resolve_command(dep).is_none())
+                .map(|s| s.as_str())
+                .collect();
+            if !missing.is_empty() {
+                let name = if manifest.display_name.is_empty() {
+                    &manifest.name
+                } else {
+                    &manifest.display_name
+                };
+                self.last_start_error = Some(format!(
+                    "{} requires {} — install {} and try again",
+                    name,
+                    missing.join(", "),
+                    missing.join(", "),
+                ));
+                return None;
+            }
+        }
+
         // Build candidate list: extension manifest entries first (primary + fallbacks),
         // then the built-in registry.  First candidate with a resolvable binary wins.
         let mut candidates: Vec<LspServerConfig> = Vec::new();
@@ -351,12 +400,20 @@ impl LspManager {
         {
             candidates.extend(server_configs_from_manifest(manifest, language_id));
         }
-        candidates.extend(
-            self.registry
-                .iter()
-                .filter(|c| c.languages.iter().any(|l| l == language_id))
-                .cloned(),
-        );
+        // Only fall back to the built-in registry for languages that have NO corresponding
+        // extension at all.  If an extension exists but isn't installed, we respect that
+        // choice and don't auto-start a server from a binary that happens to be on PATH.
+        let has_extension =
+            extensions::find_manifest_for_language_id(&self.all_ext_manifests, language_id)
+                .is_some();
+        if !has_extension {
+            candidates.extend(
+                self.registry
+                    .iter()
+                    .filter(|c| c.languages.iter().any(|l| l == language_id))
+                    .cloned(),
+            );
+        }
 
         // Use the resolved full path so the spawn works regardless of the process's PATH.
         let (mut config, resolved) = candidates
@@ -509,8 +566,12 @@ impl LspManager {
         match self.ensure_server_for_language(&language_id) {
             Some(_) => Ok(()),
             None => {
-                // No server available — let the engine handle the registry lookup
-                Err(format!("No LSP server found for {language_id}"))
+                // Return specific dependency error if available, otherwise generic
+                let msg = self
+                    .last_start_error
+                    .take()
+                    .unwrap_or_else(|| format!("No LSP server found for {language_id}"));
+                Err(msg)
             }
         }
     }
@@ -660,6 +721,18 @@ impl LspManager {
         Some(self.servers[sid].request_signature_help(&uri, line, character))
     }
 
+    /// Request code actions for a line from the appropriate server.
+    pub fn request_code_action(
+        &mut self,
+        path: &Path,
+        line: u32,
+        col: u32,
+        diagnostics_json: serde_json::Value,
+    ) -> Option<i64> {
+        let (sid, uri) = self.server_and_uri(path)?;
+        Some(self.servers[sid].request_code_action(&uri, line, col, diagnostics_json))
+    }
+
     /// Request whole-file formatting from the appropriate server.
     pub fn request_formatting(
         &mut self,
@@ -762,12 +835,17 @@ impl LspManager {
         {
             candidates.extend(server_configs_from_manifest(manifest, language_id));
         }
-        candidates.extend(
-            self.registry
-                .iter()
-                .filter(|c| c.languages.iter().any(|l| l == language_id))
-                .cloned(),
-        );
+        let has_extension =
+            extensions::find_manifest_for_language_id(&self.all_ext_manifests, language_id)
+                .is_some();
+        if !has_extension {
+            candidates.extend(
+                self.registry
+                    .iter()
+                    .filter(|c| c.languages.iter().any(|l| l == language_id))
+                    .cloned(),
+            );
+        }
         let (mut config, resolved) = candidates
             .into_iter()
             .find_map(|c| resolve_command(&c.command).map(|p| (c, p)))?;
@@ -798,7 +876,34 @@ impl LspManager {
         }
     }
 
-    /// Get status information about running servers.
+    /// Clean up a server that exited or crashed. Returns a description string
+    /// (command + languages) for use in the user-facing message.
+    pub fn handle_server_exited(&mut self, server_id: LspServerId) -> String {
+        let cmd = self
+            .servers
+            .get(server_id)
+            .map(|s| s.command().to_string())
+            .unwrap_or_else(|| format!("server {}", server_id));
+
+        let langs: Vec<String> = self
+            .language_to_server
+            .iter()
+            .filter(|(_, &id)| id == server_id)
+            .map(|(lang, _)| lang.clone())
+            .collect();
+
+        self.language_to_server.retain(|_, &mut id| id != server_id);
+        self.initialized.remove(&server_id);
+
+        let desc = if langs.is_empty() {
+            cmd
+        } else {
+            format!("{} ({})", cmd, langs.join(", "))
+        };
+        self.crashed_servers.push(desc.clone());
+        desc
+    }
+
     /// Get status information about running servers.
     /// If `current_lang` is provided, marks the server handling that language with ●.
     pub fn server_info(&self, current_lang: Option<&str>) -> Vec<String> {
@@ -819,14 +924,10 @@ impl LspManager {
             } else {
                 "initializing"
             };
-            let cmd = langs
-                .first()
-                .and_then(|lang| {
-                    self.registry
-                        .iter()
-                        .find(|c| c.languages.iter().any(|l| l == *lang))
-                        .map(|c| c.command.as_str())
-                })
+            let cmd = self
+                .servers
+                .get(server_id)
+                .map(|s| s.command())
                 .unwrap_or("unknown");
             let mut sorted_langs: Vec<&str> = langs.to_vec();
             sorted_langs.sort();
@@ -837,6 +938,9 @@ impl LspManager {
                 "  "
             };
             info.push(format!("{marker}{cmd}: {status} ({lang_list})"));
+        }
+        for entry in &self.crashed_servers {
+            info.push(format!("  {}: crashed", entry));
         }
         if info.is_empty() {
             info.push("No LSP servers running".to_string());

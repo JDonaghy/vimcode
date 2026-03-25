@@ -665,6 +665,15 @@ impl SyntaxLanguage {
                 (fenced_code_block) @string
                 (indented_code_block) @string
                 (thematic_break) @comment
+                (block_quote_marker) @comment
+                (block_quote (paragraph) @comment)
+                (list_marker_minus) @keyword
+                (list_marker_plus) @keyword
+                (list_marker_star) @keyword
+                (list_marker_dot) @keyword
+                (list_marker_parenthesis) @keyword
+                (fenced_code_block_delimiter) @comment
+                (info_string) @type
             ",
         }
     }

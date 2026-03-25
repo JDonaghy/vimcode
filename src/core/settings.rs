@@ -203,7 +203,7 @@ pub struct Settings {
     extension_registry_url: String,
 
     /// Name of the active colour scheme. Built-in options: "onedark" (default),
-    /// "gruvbox-dark", "tokyo-night", "solarized-dark", "vscode-dark".
+    /// "gruvbox-dark", "tokyo-night", "solarized-dark", "vscode-dark", "vscode-light".
     /// Select with `:colorscheme <name>`.
     #[serde(default = "default_colorscheme")]
     pub colorscheme: String,
@@ -453,7 +453,10 @@ fn pk_fuzzy_finder() -> String {
     "<C-p>".to_string()
 }
 fn pk_live_grep() -> String {
-    "<C-g>".to_string()
+    "<C-S-f>".to_string()
+}
+fn pk_command_palette() -> String {
+    "<C-S-p>".to_string()
 }
 fn pk_open_terminal() -> String {
     "<C-t>".to_string()
@@ -485,9 +488,12 @@ pub struct PanelKeys {
     /// Open fuzzy file finder. Default: `<C-p>`
     #[serde(default = "pk_fuzzy_finder")]
     pub fuzzy_finder: String,
-    /// Open live grep modal. Default: `<C-g>`
+    /// Open live grep modal. Default: `<C-S-f>`
     #[serde(default = "pk_live_grep")]
     pub live_grep: String,
+    /// Open command palette. Default: `<C-S-p>`
+    #[serde(default = "pk_command_palette")]
+    pub command_palette: String,
     /// Toggle integrated terminal panel. Default: `<C-t>`
     #[serde(default = "pk_open_terminal")]
     pub open_terminal: String,
@@ -515,6 +521,7 @@ impl Default for PanelKeys {
             focus_search: pk_focus_search(),
             fuzzy_finder: pk_fuzzy_finder(),
             live_grep: pk_live_grep(),
+            command_palette: pk_command_palette(),
             open_terminal: pk_open_terminal(),
             add_cursor: pk_add_cursor(),
             select_all_matches: pk_select_all_matches(),
@@ -1366,6 +1373,7 @@ pub fn available_colorschemes() -> Vec<String> {
         "tokyo-night".into(),
         "solarized-dark".into(),
         "vscode-dark".into(),
+        "vscode-light".into(),
     ];
     {
         let dir = super::paths::vimcode_config_dir().join("themes");
@@ -2172,7 +2180,8 @@ mod tests {
         assert_eq!(pk.focus_explorer, "<A-e>");
         assert_eq!(pk.focus_search, "<A-f>");
         assert_eq!(pk.fuzzy_finder, "<C-p>");
-        assert_eq!(pk.live_grep, "<C-g>");
+        assert_eq!(pk.live_grep, "<C-S-f>");
+        assert_eq!(pk.command_palette, "<C-S-p>");
         assert_eq!(pk.add_cursor, "<A-d>");
         assert_eq!(pk.select_all_matches, "<C-S-l>");
     }

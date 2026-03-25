@@ -35,7 +35,7 @@ For detailed how-to guides and configuration references, see the **[VimCode Wiki
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 4654 tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 4703 tests, zero async runtime dependency
 
 > **Note:** VimCode does not implement VimScript. Extension and scripting is handled via
 > the built-in Lua 5.4 plugin system. The goal is full Vim *keybinding* and *editing*
@@ -313,6 +313,8 @@ The tab context menu offers both: "Split Right/Down" creates a Vim window split 
 - `:EditorGroupMoveTab` / `:egmt` — move the current tab to the next group
 - `Alt+,` / `Alt+.` — shrink / expand the active group (both GTK and TUI)
 - Drag any group divider — resize that specific split (both GTK and TUI)
+- Drag a tab to another group's tab bar — move it there (both GTK and TUI)
+- Drag a tab to the edge of an editor area — create a new split (both GTK and TUI)
 
 **Quit / Save**
 - `:w` — save; `:wq` — save and quit
@@ -344,26 +346,32 @@ The tab context menu offers both: "Split Right/Down" creates a Vim window split 
 
 ---
 
-### Fuzzy File Finder
+### Unified Picker (Telescope-Style)
 
-- `Ctrl-P` (Normal mode) — open the Telescope-style fuzzy file picker
+VimCode uses a unified picker system for file finding, live grep, and command palette. All pickers share the same UI and keybindings. Fuzzy match characters are highlighted in the results.
+
+#### Fuzzy File Finder
+
+- `Ctrl-P` or `<leader>sf` (Normal mode) — open the fuzzy file picker
 - A centered floating modal appears over the editor
 - Type to instantly filter all project files by fuzzy subsequence match
-- Word-boundary matches (after `/`, `_`, `-`, `.`) are scored higher
+- Word-boundary matches (after `/`, `_`, `-`, `.`) are scored higher; `.gitignore`-aware via `ignore` crate
 - `Ctrl-N` / `↓` and `Ctrl-P` / `↑` — navigate results; `Enter` — open selected file; `Escape` — close
-- Results capped at 50; hidden dirs (`.git`, etc.) and `target/` are excluded
 
----
+#### Live Grep
 
-### Live Grep
-
-- `Ctrl-G` (Normal mode) — show file info (Vim compat); live grep is available via `:grep` or configurable panel key `<C-g>`
+- `Ctrl-Shift-F` or `<leader>sg` (Normal mode) — open the live grep picker
 - A centered floating two-column modal appears over the editor
 - Type to instantly search file *contents* across the entire project (live-as-you-type, query ≥ 2 chars)
 - Left pane shows results in `filename.rs:N: snippet` format; right pane shows ±5 context lines around the match
 - Match line is highlighted in the preview pane
 - `Ctrl-N` / `↓` and `Ctrl-P` / `↑` — navigate results; preview updates as you move; `Enter` — open file at match line; `Escape` — close
 - Results capped at 200; uses `.gitignore`-aware search (same engine as project search panel)
+
+#### Command Palette
+
+- `Ctrl-Shift-P` / `F1` or `<leader>sp` (Normal mode) — open the command palette picker
+- Lists all commands with descriptions and current keybindings; type to fuzzy-filter
 
 ---
 
@@ -629,9 +637,9 @@ Built-in AI chat panel supporting Anthropic Claude, OpenAI, or local Ollama. Cli
 
 Automatic language server integration — open a file and diagnostics, completions, go-to-definition, and hover just work if the server is on `PATH`. Install language support via `:ExtInstall <lang>`.
 
-**Features:** inline diagnostics, `]d`/`[d` navigation, auto-popup completions (`Ctrl-Space` manual trigger), `gd` definition, `gr` references, `gi` implementation, `gy` type definition, `K` hover, `gh` editor hover popup, signature help, `<leader>gf` format, `<leader>rn` rename, semantic token highlighting.
+**Features:** inline diagnostics, `]d`/`[d` navigation, auto-popup completions (`Ctrl-Space` manual trigger), `gd` definition, `gr` references, `gi` implementation, `gy` type definition, `K` hover, `gh` editor hover popup, signature help, `<leader>gf` format, `<leader>rn` rename, `<leader>ca` code actions, lightbulb gutter indicator, semantic token highlighting.
 
-**Commands:** `:LspInfo` | `:LspRestart` | `:LspStop` | `:Lformat` | `:Rename <name>`
+**Commands:** `:LspInfo` | `:LspRestart` | `:LspStop` | `:Lformat` | `:Rename <name>` | `:CodeAction`
 
 For custom server configuration and troubleshooting, see the **[LSP Configuration](https://github.com/JDonaghy/vimcode/wiki/LSP-Configuration)** wiki page.
 
@@ -669,7 +677,7 @@ Runtime changes are written through to `~/.config/vimcode/settings.json` immedia
 
 - `:set option?` — query current value; `:set option!` — toggle boolean; `:set` — show all
 - `:Settings` — open `settings.json` for direct editing
-- `:colorscheme <name>` — switch theme (`onedark`, `gruvbox-dark`, `tokyo-night`, `solarized-dark`, `vscode-dark`, or custom VSCode `.json` themes from `~/.config/vimcode/themes/`)
+- `:colorscheme <name>` — switch theme (`onedark`, `gruvbox-dark`, `tokyo-night`, `solarized-dark`, `vscode-dark`, `vscode-light`, or custom VSCode `.json` themes from `~/.config/vimcode/themes/`)
 - **Settings sidebar** — click the gear icon for a VSCode-style interactive form
 
 Additional settings (AI, terminal, swap files, indent guides, etc.), configurable key bindings (`panel_keys`, `explorer_keys`, `completion_keys`), and user key mappings are documented in the **[Settings Reference](https://github.com/JDonaghy/vimcode/wiki/Settings-Reference)** and **[Key Remapping](https://github.com/JDonaghy/vimcode/wiki/Key-Remapping)** wiki pages.
@@ -856,7 +864,7 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `gy` | Go to type definition (LSP) |
 | `gs` | Stage hunk (in `:Gdiff` buffer) |
 | `gD` | Diff peek — preview hunk popup with Revert/Stage |
-| `gh` | Editor hover popup — aggregates diagnostics, annotations, plugin content, and LSP hover at cursor |
+| `gh` | Editor hover popup — aggregates diagnostics, annotations, plugin content, and LSP hover at cursor; `y`/Ctrl-C copies selected text (or all text if no selection); mouse drag to select |
 | `gR` | Enter virtual replace mode (expands tabs to spaces when overwriting) |
 | `g+` / `g-` | Go to newer / older text state (chronological undo timeline) |
 | `K` | Show hover info (LSP) |
@@ -875,6 +883,10 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `dp` | Diff put (push line to other diff window) |
 | `<leader>gf` | LSP format current buffer (Space=leader by default) |
 | `<leader>rn` | LSP rename symbol — pre-fills `:Rename <word>` |
+| `<leader>ca` | Show LSP code actions for current line |
+| `<leader>sf` | Open fuzzy file finder (same as Ctrl-P) |
+| `<leader>sg` | Open live grep picker (same as Ctrl-Shift-F) |
+| `<leader>sp` | Open command palette (same as Ctrl-Shift-P) |
 | `za` / `zo` / `zc` / `zR` | Fold toggle / open / close / open all |
 | `zA` / `zO` / `zC` | Fold toggle / open / close recursively |
 | `zM` | Close all folds |
@@ -901,8 +913,9 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `Ctrl-W f` | Split and open file under cursor (`:wincmd f`) |
 | `Ctrl-W d` | Split and go to definition (LSP) (`:wincmd d`) |
 | `Ctrl-P` | Open fuzzy file finder |
+| `Ctrl-Shift-F` | Open live grep picker |
 | `Ctrl-G` | Show file info (name, line, col, %) |
-| `F1` | Command palette |
+| `Ctrl-Shift-P` / `F1` | Command palette |
 | `F5` | Start debugging / continue |
 | `Shift+F5` | Stop debugging |
 | `F6` | Pause debugger |
@@ -1016,6 +1029,7 @@ All ex commands support Vim-style abbreviations (e.g., `:j` for `:join`, `:y` fo
 | `:LspInstall <lang>` | Install LSP server for language via Mason |
 | `:Lformat` | Format buffer via LSP |
 | `:Rename <newname>` | Rename symbol under cursor across workspace |
+| `:CodeAction` | Show LSP code actions for current line |
 | `:def` | Go to definition (LSP) |
 | `:refs` | Find references (LSP) |
 | `:hover` | Show hover info (LSP) |

@@ -108,6 +108,11 @@ pub struct LspConfig {
     /// Command-line arguments passed to the LSP binary (default: `["--stdio"]` if needed).
     #[serde(default)]
     pub args: Vec<String>,
+    /// System binaries that must be on PATH for the LSP server to work.
+    /// E.g. `["dotnet"]` for .NET-based servers, `["node"]` for Node-based ones.
+    /// Checked before starting the server; a helpful message is shown if missing.
+    #[serde(default)]
+    pub dependencies: Vec<String>,
 }
 
 impl LspConfig {
