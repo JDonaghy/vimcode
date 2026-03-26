@@ -9973,6 +9973,8 @@ fn setup_git_diff_split_repo(suffix: &str) -> (PathBuf, PathBuf) {
     let dir = std::env::temp_dir().join(format!("vimcode_gds_{suffix}"));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
+    // Canonicalize to resolve symlinks (e.g. /tmp → /private/tmp on macOS)
+    let dir = dir.canonicalize().unwrap();
     // init + commit
     Command::new("git")
         .args(["init"])
@@ -10081,6 +10083,7 @@ fn test_git_diff_split_untracked_file_errors() {
     let dir = std::env::temp_dir().join("vimcode_gds_untracked");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
+    let dir = dir.canonicalize().unwrap();
     Command::new("git")
         .args(["init"])
         .current_dir(&dir)
@@ -14331,4 +14334,299 @@ fn test_explorer_indicators_diagnostics() {
     let counts = diags.get(&path).expect("should have diag entry");
     assert_eq!(counts.0, 2, "expected 2 errors");
     assert_eq!(counts.1, 1, "expected 1 warning");
+}
+
+// ── hide_single_tab setting tests ──────────────────────────────────────────
+
+#[test]
+fn test_hide_single_tab_default_off() {
+    let engine = Engine::new();
+    assert!(!engine.settings.hide_single_tab);
+    assert!(!engine.is_tab_bar_hidden(engine.active_group));
+}
+
+#[test]
+fn test_hide_single_tab_one_tab() {
+    let mut engine = Engine::new();
+    engine.settings.hide_single_tab = true;
+    // Single tab → tab bar should be hidden
+    assert!(engine.is_tab_bar_hidden(engine.active_group));
+}
+
+#[test]
+fn test_hide_single_tab_two_tabs() {
+    let mut engine = Engine::new();
+    engine.settings.hide_single_tab = true;
+    // Open a second tab
+    let dir = std::env::temp_dir().join("vimcode_test_hst_twotabs");
+    let _ = std::fs::create_dir_all(&dir);
+    let f = dir.join("a.txt");
+    std::fs::write(&f, "hello").unwrap();
+    engine.open_file_in_tab(&f);
+    assert!(
+        engine.active_group().tabs.len() >= 2,
+        "should have at least 2 tabs"
+    );
+    // Two tabs → tab bar should NOT be hidden
+    assert!(!engine.is_tab_bar_hidden(engine.active_group));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_hide_single_tab_window_rects_reclaim_space() {
+    let mut engine = Engine::new();
+    engine.settings.breadcrumbs = false;
+    let content = WindowRect::new(0.0, 0.0, 80.0, 24.0);
+    let tab_bar_h = 1.0;
+
+    // Without hide: content starts at y=1 (tab bar takes 1 row)
+    engine.settings.hide_single_tab = false;
+    let (rects_show, _) = engine.calculate_group_window_rects(content, tab_bar_h);
+    assert!(!rects_show.is_empty());
+    let y_show = rects_show[0].1.y;
+    let h_show = rects_show[0].1.height;
+
+    // With hide: content should start 1 row earlier and be 1 row taller
+    engine.settings.hide_single_tab = true;
+    let (rects_hide, _) = engine.calculate_group_window_rects(content, tab_bar_h);
+    assert!(!rects_hide.is_empty());
+    let y_hide = rects_hide[0].1.y;
+    let h_hide = rects_hide[0].1.height;
+
+    assert!(
+        y_hide < y_show,
+        "hidden tab bar should start higher: {} vs {}",
+        y_hide,
+        y_show
+    );
+    assert!(
+        h_hide > h_show,
+        "hidden tab bar should give more height: {} vs {}",
+        h_hide,
+        h_show
+    );
+    assert!(
+        (y_show - y_hide - 1.0).abs() < 0.01,
+        "should gain exactly 1 row: y_show={}, y_hide={}, diff={}",
+        y_show,
+        y_hide,
+        y_show - y_hide
+    );
+}
+
+#[test]
+fn test_hide_single_tab_with_breadcrumbs() {
+    let mut engine = Engine::new();
+    engine.settings.breadcrumbs = true;
+    engine.settings.hide_single_tab = true;
+    let content = WindowRect::new(0.0, 0.0, 80.0, 24.0);
+    let tab_bar_h = 2.0; // tab + breadcrumb
+
+    let (rects, _) = engine.calculate_group_window_rects(content, tab_bar_h);
+    assert!(!rects.is_empty());
+    // Should reclaim 1 row (tab only), breadcrumb stays → y = 1.0
+    let y = rects[0].1.y;
+    assert!(
+        (y - 1.0).abs() < 0.01,
+        "with breadcrumbs, content should start at y=1 (breadcrumb row): got {}",
+        y
+    );
+}
+
+#[test]
+fn test_hide_single_tab_multi_group() {
+    let mut engine = Engine::new();
+    engine.settings.hide_single_tab = true;
+
+    // Create a second group (split)
+    engine.open_editor_group(SplitDirection::Vertical);
+    let groups = engine.group_layout.group_ids();
+    assert_eq!(groups.len(), 2);
+
+    // Multi-group mode: tab bars always visible so users can distinguish groups
+    for &gid in &groups {
+        assert!(
+            !engine.is_tab_bar_hidden(gid),
+            "multi-group should always show tab bars"
+        );
+    }
+
+    // Even after opening a second tab, still visible (multi-group)
+    let dir = std::env::temp_dir().join("vimcode_test_hst_multigroup");
+    let _ = std::fs::create_dir_all(&dir);
+    let f = dir.join("b.txt");
+    std::fs::write(&f, "world").unwrap();
+    engine.open_file_in_tab(&f);
+    for &gid in &groups {
+        assert!(
+            !engine.is_tab_bar_hidden(gid),
+            "multi-group should always show tab bars"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_hide_single_tab_transition_one_to_two() {
+    let mut engine = Engine::new();
+    engine.settings.breadcrumbs = false;
+    engine.settings.hide_single_tab = true;
+    let content = WindowRect::new(0.0, 0.0, 80.0, 24.0);
+    let tab_bar_h = 1.0;
+
+    // 1 tab: window starts at y=0 (tab bar hidden, space reclaimed)
+    let (rects1, _) = engine.calculate_group_window_rects(content, tab_bar_h);
+    assert_eq!(rects1[0].1.y, 0.0, "1 tab: window should start at y=0");
+    assert_eq!(
+        rects1[0].1.height, 24.0,
+        "1 tab: window should use full height"
+    );
+
+    // Open a second tab
+    let dir = std::env::temp_dir().join("vimcode_test_hst_transition");
+    let _ = std::fs::create_dir_all(&dir);
+    let f = dir.join("x.txt");
+    std::fs::write(&f, "test").unwrap();
+    engine.open_file_in_tab(&f);
+    assert!(engine.active_group().tabs.len() >= 2);
+
+    // 2 tabs: window starts at y=1 (tab bar visible, takes 1 row)
+    let (rects2, _) = engine.calculate_group_window_rects(content, tab_bar_h);
+    assert_eq!(rects2[0].1.y, 1.0, "2 tabs: window should start at y=1");
+    assert_eq!(
+        rects2[0].1.height, 23.0,
+        "2 tabs: window should leave room for tab bar"
+    );
+    assert!(
+        !engine.is_tab_bar_hidden(engine.active_group),
+        "2 tabs: tab bar should be visible"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_set_hide_single_tab() {
+    let mut engine = Engine::new();
+    assert!(!engine.settings.hide_single_tab);
+    engine.settings.parse_set_option("hidesingletab").unwrap();
+    assert!(engine.settings.hide_single_tab);
+    engine.settings.parse_set_option("nohidesingletab").unwrap();
+    assert!(!engine.settings.hide_single_tab);
+    engine.settings.parse_set_option("hst").unwrap();
+    assert!(engine.settings.hide_single_tab);
+}
+
+// ==========================================================================
+// Sidebar focus consolidation tests
+// ==========================================================================
+
+#[test]
+fn test_sidebar_has_focus_initially_false() {
+    let engine = Engine::new();
+    assert!(!engine.explorer_has_focus);
+    assert!(!engine.search_has_focus);
+    assert!(!engine.sidebar_has_focus());
+}
+
+#[test]
+fn test_sidebar_has_focus_explorer() {
+    let mut engine = Engine::new();
+    engine.explorer_has_focus = true;
+    assert!(engine.sidebar_has_focus());
+}
+
+#[test]
+fn test_sidebar_has_focus_search() {
+    let mut engine = Engine::new();
+    engine.search_has_focus = true;
+    assert!(engine.sidebar_has_focus());
+}
+
+#[test]
+fn test_sidebar_has_focus_aggregates_all_panels() {
+    let mut engine = Engine::new();
+    assert!(!engine.sidebar_has_focus());
+
+    engine.sc_has_focus = true;
+    assert!(engine.sidebar_has_focus());
+    engine.sc_has_focus = false;
+
+    engine.dap_sidebar_has_focus = true;
+    assert!(engine.sidebar_has_focus());
+    engine.dap_sidebar_has_focus = false;
+
+    engine.ext_sidebar_has_focus = true;
+    assert!(engine.sidebar_has_focus());
+    engine.ext_sidebar_has_focus = false;
+
+    engine.ai_has_focus = true;
+    assert!(engine.sidebar_has_focus());
+    engine.ai_has_focus = false;
+
+    engine.settings_has_focus = true;
+    assert!(engine.sidebar_has_focus());
+    engine.settings_has_focus = false;
+
+    engine.ext_panel_has_focus = true;
+    assert!(engine.sidebar_has_focus());
+    engine.ext_panel_has_focus = false;
+
+    assert!(!engine.sidebar_has_focus());
+}
+
+#[test]
+fn test_clear_sidebar_focus() {
+    let mut engine = Engine::new();
+    engine.explorer_has_focus = true;
+    engine.search_has_focus = true;
+    engine.sc_has_focus = true;
+    engine.dap_sidebar_has_focus = true;
+    engine.ext_sidebar_has_focus = true;
+    engine.ai_has_focus = true;
+    engine.settings_has_focus = true;
+    engine.ext_panel_has_focus = true;
+    assert!(engine.sidebar_has_focus());
+
+    engine.clear_sidebar_focus();
+    assert!(!engine.sidebar_has_focus());
+    assert!(!engine.explorer_has_focus);
+    assert!(!engine.search_has_focus);
+    assert!(!engine.sc_has_focus);
+    assert!(!engine.dap_sidebar_has_focus);
+    assert!(!engine.ext_sidebar_has_focus);
+    assert!(!engine.ai_has_focus);
+    assert!(!engine.settings_has_focus);
+    assert!(!engine.ext_panel_has_focus);
+}
+
+#[test]
+fn test_explorer_focus_blocks_normal_keys() {
+    let mut engine = engine_with_text("hello world\n");
+    engine.explorer_has_focus = true;
+
+    // 'x' should NOT delete when explorer has focus
+    engine.handle_key("x", Some('x'), false);
+    assert_eq!(engine.buffer().to_string(), "hello world\n");
+    assert_eq!(engine.cursor().col, 0);
+}
+
+#[test]
+fn test_search_focus_blocks_normal_keys() {
+    let mut engine = engine_with_text("hello world\n");
+    engine.search_has_focus = true;
+
+    // 'x' should NOT delete when search has focus
+    engine.handle_key("x", Some('x'), false);
+    assert_eq!(engine.buffer().to_string(), "hello world\n");
+}
+
+#[test]
+fn test_unfocused_sidebar_allows_normal_keys() {
+    let mut engine = engine_with_text("hello world\n");
+    assert!(!engine.explorer_has_focus);
+    assert!(!engine.search_has_focus);
+
+    // 'x' should delete a character when sidebar is not focused
+    engine.handle_key("x", Some('x'), false);
+    assert_eq!(engine.buffer().to_string(), "ello world\n");
 }
