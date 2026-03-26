@@ -216,6 +216,8 @@ pub struct Diagnostic {
     pub message: String,
     #[allow(dead_code)] // populated for future diagnostic source display
     pub source: Option<String>,
+    /// Diagnostic code (e.g. "E0133", "syntax-error") — used for explorer deduplication
+    pub code: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -736,7 +738,7 @@ impl LspServer {
                         "contentFormat": ["plaintext", "markdown"]
                     },
                     "publishDiagnostics": {
-                        "relatedInformation": false
+                        "relatedInformation": true
                     },
                     "codeAction": {
                         "codeActionLiteralSupport": {
@@ -1411,17 +1413,23 @@ fn parse_diagnostics(server_id: LspServerId, params: &serde_json::Value) -> Opti
             .get("severity")
             .and_then(|s| s.as_i64())
             .map(|s| DiagnosticSeverity::from_lsp(s as i32))
-            .unwrap_or(DiagnosticSeverity::Error);
+            .unwrap_or(DiagnosticSeverity::Hint);
         let message = d.get("message")?.as_str()?.to_string();
         let source = d
             .get("source")
             .and_then(|s| s.as_str())
             .map(|s| s.to_string());
+        let code = d.get("code").and_then(|c| {
+            c.as_str()
+                .map(|s| s.to_string())
+                .or_else(|| c.as_i64().map(|n| n.to_string()))
+        });
         diagnostics.push(Diagnostic {
             range,
             severity,
             message,
             source,
+            code,
         });
     }
 

@@ -5,21 +5,14 @@
 ---
 
 ## Recently Completed
-- **Session 213**: Unified Picker Phase 1+2 + Bug Fixes — unified `PickerSource`/`PickerItem`/`PickerAction` types replacing separate fuzzy/grep/palette systems; `.gitignore`-aware file walking via `ignore` crate; fuzzy match highlighting; unified `PickerPanel` render struct + single draw function per backend; `<leader>sf`/`sg`/`sp` bindings; `Ctrl-Shift-F` for live grep, `Ctrl-Shift-P` for command palette (remappable via `panel_keys`); fixed GTK core dump (catch_unwind in draw callback); fixed GStrInteriorNulError from NUL hotkey; fixed lightbulb duplication on wrapped lines; improved markdown inline syntax highlighting (bold/italic/code/links); fixed phantom "Loading..." hover popup (only installed extensions start LSP servers; mouse hover shows no "Loading..." — popup appears only when LSP returns content; null-position suppression prevents re-request loops; 3s auto-dismiss timeout for keyboard hover). 4706 tests.
-- **Session 212**: Selectable/Copyable Hover Popup Text — `HoverSelection` struct; mouse drag selection in focused popup (TUI + GTK); `y`/Ctrl-C copies selection or all text to clipboard; Pango background highlight (GTK) + fg/bg swap (TUI); fixed GTK modifier key dismiss + GTK clipboard copy; 7 new tests. 4710 tests.
-- **Session 211**: Code Action Apply + Semantic Token Fix — selectable vertical code action dialog (j/k navigate, Enter applies); `CodeAction.edit: Option<WorkspaceEdit>` parsed + applied via `apply_workspace_edit()`; proactive code action request on cursor settle (150ms debounce); always-fresh requests (no stale cache); `apply_lsp_edits()` clears semantic tokens + marks LSP-dirty (fixes stale highlighting after rename/format/code actions). 4703 tests.
-- **Session 210**: Code Action Gutter Indicator — LSP `textDocument/codeAction` protocol support; `CodeAction` struct + `CodeActionResponse` event; engine caching per file/line; `<leader>ca` / `:CodeAction` / gutter click triggers hover popup; lightbulb gutter icon (yellow, all 6 themes); both GTK and TUI rendering + click handling; 6 new tests. 4703 tests.
-- **Session 209**: TUI Tab Drag-and-Drop — mouse drag tabs between editor groups in TUI backend; drop zone computation (reorder/center/split); visual overlay (highlight, insertion bar, ghost label); 7 new engine unit tests. 4671 tests.
-- **Session 208**: Bug Fixes: Extension Update Key + Flatpak Build — `ext_selected_to_section()` helper fixes "u"/"i"/"d"/Tab/readme handlers when sections collapsed; regenerated `flatpak/cargo-sources.json` (stale tree-sitter 0.24→0.26); added cargo-sources regeneration to CLAUDE.md release checklist. 4664 tests.
-- **Session 207**: Bug Fixes + VS Code Light Theme — TUI mouse drag capture fix; GTK ext panel scrollbar drag claim; tab hover tooltip (Cairo/overlay); double hover popup mutual exclusion; VS Code Light (`vscode-light`) built-in theme. 4664 tests.
-- **Session 206**: Git Log Panel Bug Fixes + Release v0.4.0 — GTK hover popup link clicking (Pango link rects); panel reveal fixes (no sidebar toggle, clear expanded state, center scroll); ext panel scroll+scrollbar in both backends; full git hashes + `git_log_commit()` for older commit reveal; async reveal target timing fix. 4664 tests.
-- **Session 205**: Enhanced Git Log Panel + Blame-to-Panel Navigation — expandable commits showing changed files as tree children; hover content on commits (author/date/message/stat); action keys (o=open diff, y=copy hash/path, b=open in browser, r=refresh, d=pop stash, p=push stash); `/` search/filter; side-by-side diff from expanded commit files; `GitShow`/`:Gshow` navigates to Git Log panel instead of scratch buffer; `panel.reveal()` API; new git.rs functions (`commit_files()`, `diff_file_at_commit()`, `show_commit_file()`); 6 new Lua bindings (`commit_files`, `diff_file`, `show_file`, `commit_detail`, `open_diff`, `panel.reveal`). 4654 tests.
-- **Session 204**: Command URI Dispatch for Extensions — `execute_command_uri()` + `percent_decode()` in engine.rs; `execute_hover_goto()` fallback to plugins; GTK/TUI panel hover click `command:` routing; git-insights blame.lua "Open Commit" + "Copy Hash" action links. 5 new tests. 4654 tests.
-- **Session 203**: VSCode Mode Git Insights + Hover Popup Fixes — `fire_cursor_move_hook()` in `handle_vscode_key()`; annotation rendering + hover dwell gates allow VSCode mode; GTK Pango word-wrap in hover popups; `lsp_hover_text` cleared on dismiss; `editor_hover_popup_rect` click-to-focus; `SearchPollTick` popup-aware motion skip. 4649 tests.
-- **Session 202**: Panel Event Enhancements — `panel_double_click` (GTK + TUI double-click fires event before `panel_select`), `panel_context_menu` (right-click fires event, `ContextMenuTarget::ExtPanel` variant, GTK button-3 gesture + TUI `MouseButton::Right`), `panel_input` (per-panel input field activated with `/`, live filtering via keystroke events, Lua `get_input/set_input` API). 10 new tests. 4636 tests.
-- **Session 201**: Hover Popup Enhancements — tree-sitter syntax highlighting in hover code blocks; TUI editor hover click-to-copy links; VSCode-style "Go to" navigation links (vim mode only, "Go to" in default fg, labels in link color, `(:gd)` format); LSP semantic token reliability fixes (don't wipe tokens on error/null responses, missing legend, or edits). 12 new tests. 4626 tests.
+- **Session 216**: Explorer Tree Indicators — git status + deduplicated LSP diagnostic counts on explorer rows; `explorer_indicators()` engine method with per-extension `ignore_error_sources` config; `Diagnostic.code` field; `relatedInformation: true`; GTK TreeStore 6-column + `update_tree_indicators()`; TUI render-time indicator drawing; 9+ cap; 3 tests. 4721 tests.
+- **Session 215**: Bug Fix Sweep — visual mode `x` delete (alias for `d` with `pending_key.is_none()` guard); Ctrl+V paste in search/command/replace inputs (`handle_search_key`, `handle_command_key`, TUI project search); search highlights in non-active buffers (per-buffer match computation in `build_rendered_window()` via `compute_search_matches_for_buffer()`). No open bugs. 4712 tests.
+- **Session 214**: Bug Sweep — TUI hover dismiss click fall-through, TUI selection with wrap, markdown typing color bleed (debounced syntax refresh), GTK scrollbar/divider overlap, TUI fuzzy finder stale chars. 4706 tests.
+- **Session 213**: Unified Picker Phase 1+2 + Bug Fixes — unified picker system, GTK crash prevention, markdown highlighting, hover popup fixes. 4706 tests.
+- **Session 212**: Selectable/Copyable Hover Popup Text — mouse drag selection, keyboard copy, GTK/TUI highlight rendering. 4710 tests.
+- **Session 211**: Code Action Apply + Semantic Token Fix — vertical dialog, workspace edit, proactive requests, semantic token clearing. 4703 tests.
 
-> Sessions 200 and earlier in **SESSION_HISTORY.md**.
+> Sessions 209 and earlier in **SESSION_HISTORY.md**.
 
 ### Bug Fixes
 - [x] GTK core dump from panic in extern "C" draw callback — `catch_unwind` + `.ok()` on Cairo operations
@@ -42,6 +35,22 @@
 - [x] VS Code Light theme — `vscode-light` / `light+` built-in colorscheme
 - [x] Extension "u" update key does nothing — `ext_selected_to_section()` helper for collapsed-section-aware flat index mapping
 - [x] Flatpak CI build broken — regenerated `cargo-sources.json` (stale tree-sitter vendored crate)
+- [x] TUI hover dismiss consumes click — removed early return, click falls through to editor
+- [x] TUI selection wrong position with wrap — `line.line_idx` + `segment_col_offset` in `render_selection()`
+- [x] Markdown typing color bleed — 150ms debounced `tick_syntax_debounce()` in both backends
+- [x] GTK scrollbar / tab group divider overlap — scrollbar inset 2px, divider gesture scrollbar zone check
+- [x] TUI fuzzy finder stale chars — background clear pass in `render_picker_popup`/`render_folder_picker`
+- [x] Explorer tree blue items / no dir color — `explorer_dir_fg`/`explorer_active_bg` Theme fields
+- [x] :Explore opens new tab — `netrw_activate_entry()` uses `switch_window_buffer()`
+- [x] Search n not scrolling / ?<enter> not reversing — `ensure_cursor_visible()` after search jump
+- [x] Git commit double-line status — `sc_do_commit()` truncates to first line
+- [x] Double-click word-wise drag — word boundary snapping with `mouse_drag_word_mode`/`mouse_drag_word_origin`
+- [x] Ctrl+V paste in fuzzy finder — added handler in `handle_picker_key()`
+- [x] Search panel input broken — TUI click handler sets `sidebar.has_focus = true`
+- [x] Git insights hover on non-cursor lines — clear `editor_hover_content` in `clear_annotations()`
+- [x] Semantic tokens disappear after hover — only accept responses with actual `data` array
+- [x] Terminal backspace key-hold batching — poll immediately after `terminal_write()`
+- [x] Sidebar scrollbar drag leaks — `dragging_generic_sb` state + GTK gesture `set_state(Claimed)`
 
 ## Roadmap
 - [x] **Spell checker** — Vim-compatible `]s`/`[s`/`z=`/`zg`/`zw`; spellbook Hunspell parser; bundled en_US dictionary; tree-sitter-aware; `spell`/`spelllang` settings; user dictionary at `~/.config/vimcode/user.dic`
@@ -146,6 +155,9 @@
 
 ### LSP
 - [x] **Code action gutter indicator** — Lightbulb gutter indicator on lines where LSP code actions are available (like VSCode). Proactive request on cursor settle (150ms debounce). `<leader>ca` / `:CodeAction` / gutter click opens vertical selection dialog; j/k navigate, Enter applies the selected action's workspace edit.
+
+### Explorer
+- [x] **Explorer tree indicators** — Right-aligned git status (`M`/`A`/`?`/`D`/`R`) and deduplicated LSP diagnostic counts (errors/warnings) on explorer tree rows (like VSCode); per-extension `ignore_error_sources` config; `9+` cap. Both GTK and TUI backends.
 
 ### Robustness (Low Priority)
 - [ ] **Consolidate sidebar focus state into engine** — TUI's `sidebar.has_focus` is a local variable not accessible to engine tests, making sidebar focus bugs (like the search panel input regression) impossible to catch with unit/integration tests. Move sidebar focus tracking into the engine so key routing correctness can be tested.

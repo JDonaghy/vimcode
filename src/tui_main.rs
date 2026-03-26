@@ -1280,7 +1280,9 @@ fn event_loop(
             if sidebar.visible && last_sidebar_refresh.elapsed() >= Duration::from_secs(2) {
                 sidebar.show_hidden_files = engine.settings.show_hidden_files;
                 sidebar.build_rows();
-                if sidebar.active_panel == TuiPanel::Git {
+                if sidebar.active_panel == TuiPanel::Git
+                    || sidebar.active_panel == TuiPanel::Explorer
+                {
                     engine.sc_refresh();
                 }
                 last_sidebar_refresh = Instant::now();
@@ -1371,9 +1373,12 @@ fn event_loop(
             if engine.tick_ai_completion() {
                 needs_redraw = true;
             }
-            // Syntax refresh is deferred entirely until leaving insert mode
-            // (Escape calls refresh_syntax_if_stale). This avoids blocking the
-            // event loop with a 100-250ms reparse during active typing.
+            // Debounced syntax refresh during insert mode — after 150ms of no
+            // keystrokes, re-parse + re-extract highlights so stale byte offsets
+            // don't cause wrong colors near edited regions.
+            if engine.tick_syntax_debounce() {
+                needs_redraw = true;
+            }
             // Tick swap file writes (only does work when updatetime elapsed).
             engine.tick_swap_files();
             continue;
@@ -2025,6 +2030,22 @@ fn event_loop(
                                         engine.project_replace_text.pop();
                                     } else {
                                         engine.project_search_query.pop();
+                                    }
+                                }
+                                KeyCode::Char('v')
+                                    if key_event.modifiers.contains(KeyModifiers::CONTROL) =>
+                                {
+                                    if let Some(text) = Engine::clipboard_paste() {
+                                        let line = text.lines().next().unwrap_or("");
+                                        for c in line.chars() {
+                                            if !c.is_control() {
+                                                if sidebar.replace_input_focused {
+                                                    engine.project_replace_text.push(c);
+                                                } else {
+                                                    engine.project_search_query.push(c);
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                                 KeyCode::Char(c)
@@ -4816,10 +4837,10 @@ fn handle_mouse(
         }
         return sidebar_width;
     }
-    // Click elsewhere dismisses editor hover and consumes the click
+    // Click elsewhere dismisses editor hover but lets the click fall through
+    // so the cursor moves to the clicked position (instead of requiring a second click).
     if engine.editor_hover.is_some() && !mouse_on_editor_hover {
         engine.dismiss_editor_hover();
-        return sidebar_width;
     }
 
     // ── Command line click — start text selection ──────────────────────────────
@@ -7674,6 +7695,15 @@ fn render_folder_picker(
 
     let buf = frame.buffer_mut();
 
+    // Clear popup background so stale characters don't persist.
+    for row in y..y + height {
+        for col in x..x + width {
+            if col < term_area.width && row < term_area.height {
+                set_cell(buf, col, row, ' ', fg_color, bg_color);
+            }
+        }
+    }
+
     // Title varies by mode; for folder modes show the current root for orientation
     let root_display = if picker.mode != FolderPickerMode::OpenRecent {
         let r = picker.root.to_string_lossy();
@@ -7860,6 +7890,16 @@ fn render_picker_popup(
     let match_fg = rc(theme.fuzzy_match_fg);
 
     let buf = frame.buffer_mut();
+
+    // Clear popup background so stale characters from previous content
+    // (e.g. cycling through files with different preview lengths) don't persist.
+    for row in y..y + height {
+        for col in x..x + width {
+            if col < term_area.width && row < term_area.height {
+                set_cell(buf, col, row, ' ', fg_color, bg_color);
+            }
+        }
+    }
 
     // Left pane width for two-pane mode
     let left_w = if has_preview {
@@ -9296,36 +9336,51 @@ fn render_selection(
     let text_width = area.width.saturating_sub(gutter_w) as usize;
 
     for (row_idx, line) in window.lines.iter().enumerate() {
-        let buffer_line = window.scroll_top + row_idx;
+        let buffer_line = line.line_idx;
         if buffer_line < sel.start_line || buffer_line > sel.end_line {
             continue;
         }
         let screen_y = area.y + row_idx as u16;
+        let seg_offset = line.segment_col_offset;
 
-        let col_start = match sel.kind {
-            SelectionKind::Line => 0,
+        // Compute selection column range in buffer coordinates, then adjust
+        // to segment-local coordinates for wrapped lines.
+        let (buf_col_start, buf_col_end) = match sel.kind {
+            SelectionKind::Line => (0usize, usize::MAX),
             SelectionKind::Char => {
-                if buffer_line == sel.start_line {
+                let cs = if buffer_line == sel.start_line {
                     sel.start_col
                 } else {
                     0
-                }
-            }
-            SelectionKind::Block => sel.start_col,
-        };
-        let col_end = match sel.kind {
-            SelectionKind::Line => usize::MAX,
-            SelectionKind::Char => {
-                if buffer_line == sel.end_line {
+                };
+                let ce = if buffer_line == sel.end_line {
                     sel.end_col + 1
                 } else {
                     usize::MAX
-                }
+                };
+                (cs, ce)
             }
-            SelectionKind::Block => sel.end_col + 1,
+            SelectionKind::Block => (sel.start_col, sel.end_col + 1),
         };
 
         let char_count = line.raw_text.chars().filter(|&c| c != '\n').count().max(1);
+        let seg_end = seg_offset + char_count;
+
+        // Skip segments that don't overlap the selection column range.
+        if buf_col_start >= seg_end && buf_col_end != usize::MAX {
+            continue;
+        }
+        if buf_col_end <= seg_offset {
+            continue;
+        }
+
+        // Convert buffer columns to segment-local columns.
+        let col_start = buf_col_start.saturating_sub(seg_offset);
+        let col_end = if buf_col_end == usize::MAX {
+            usize::MAX
+        } else {
+            buf_col_end.saturating_sub(seg_offset)
+        };
         let effective_end = col_end.min(char_count);
 
         // Convert char-index column range to visual columns accounting for tabs.
@@ -9984,7 +10039,13 @@ fn render_sidebar(
     let header_bg = rc(theme.status_bg);
     let default_fg = rc(theme.foreground);
     let row_bg = rc(theme.tab_bar_bg);
-    let active_file_fg = rc(theme.keyword);
+    let dir_fg = rc(theme.explorer_dir_fg);
+    let active_bg = rc(theme.explorer_active_bg);
+
+    // The single active buffer path (the file shown in the active window)
+    let active_path: Option<PathBuf> = engine
+        .file_path()
+        .and_then(|p| p.canonicalize().ok().or_else(|| Some(p.clone())));
     let sel_bg = if sidebar.has_focus {
         rc(theme.sidebar_sel_bg)
     } else {
@@ -10033,20 +10094,6 @@ fn render_sidebar(
         render_ai_sidebar(buf, area, engine, theme);
         return;
     }
-
-    // Collect open buffer paths for highlighting active files
-    let open_paths: Vec<PathBuf> = engine
-        .buffer_manager
-        .list()
-        .into_iter()
-        .filter_map(|id| {
-            engine
-                .buffer_manager
-                .get(id)
-                .and_then(|s| s.file_path.as_ref())
-                .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()))
-        })
-        .collect();
 
     // ── Background fill — covers empty space below tree rows ────────────
     if area.height == 0 {
@@ -10107,6 +10154,14 @@ fn render_sidebar(
         }
     }
 
+    // ── Explorer indicators (git status + diagnostics) ─────────────────
+    let (git_statuses, diag_counts) = engine.explorer_indicators();
+    let git_added_fg = rc(theme.git_added);
+    let git_modified_fg = rc(theme.git_modified);
+    let git_deleted_fg = rc(theme.git_deleted);
+    let diag_error_fg = rc(theme.diagnostic_error);
+    let diag_warning_fg = rc(theme.diagnostic_warning);
+
     // ── Tree rows ────────────────────────────────────────────────────────
     let tree_height = area.height.saturating_sub(1) as usize;
     let visible_rows = sidebar
@@ -10130,8 +10185,10 @@ fn render_sidebar(
         // Determine colours
         let is_selected = row_idx == sidebar.selected;
         let is_drop_target = explorer_drop_target == Some(row_idx);
-        let canonical_path = row.path.canonicalize().unwrap_or_else(|_| row.path.clone());
-        let is_active = open_paths.contains(&canonical_path);
+        let is_active = !row.is_dir
+            && active_path.as_ref().is_some_and(|ap| {
+                row.path.canonicalize().unwrap_or_else(|_| row.path.clone()) == *ap
+            });
 
         let drop_bg = rc(render::Color {
             r: 40,
@@ -10141,9 +10198,12 @@ fn render_sidebar(
         let (fg, bg) = if is_drop_target {
             (sel_fg, drop_bg)
         } else if is_selected {
-            (sel_fg, sel_bg)
+            let fg = if row.is_dir { dir_fg } else { sel_fg };
+            (fg, sel_bg)
         } else if is_active {
-            (active_file_fg, row_bg)
+            (default_fg, active_bg)
+        } else if row.is_dir {
+            (dir_fg, row_bg)
         } else {
             (default_fg, row_bg)
         };
@@ -10237,6 +10297,67 @@ fn render_sidebar(
                 }
                 set_cell(buf, x, screen_y, ch, fg, bg);
                 x += 1;
+            }
+
+            // Right-aligned indicators: diagnostics then git status
+            if !row.is_dir {
+                let canon = row.path.canonicalize().unwrap_or_else(|_| row.path.clone());
+                let right_edge = area.x + area.width - 1; // reserve 1 col for scrollbar
+
+                // Build indicator string right-to-left
+                let git_label = git_statuses.get(&canon).copied();
+                let diag = diag_counts.get(&canon).copied();
+
+                // Calculate how many cols we need
+                let mut parts: Vec<(String, ratatui::style::Color)> = Vec::new();
+                if let Some((errors, warnings)) = diag {
+                    if errors > 0 {
+                        let s = if errors > 9 {
+                            "9+".to_string()
+                        } else {
+                            format!("{}", errors)
+                        };
+                        parts.push((s, diag_error_fg));
+                    }
+                    if warnings > 0 {
+                        let s = if warnings > 9 {
+                            "9+".to_string()
+                        } else {
+                            format!("{}", warnings)
+                        };
+                        parts.push((s, diag_warning_fg));
+                    }
+                }
+                if let Some(label) = git_label {
+                    let color = match label {
+                        'A' | '?' => git_added_fg,
+                        'D' => git_deleted_fg,
+                        _ => git_modified_fg,
+                    };
+                    parts.push((format!("{}", label), color));
+                }
+
+                if !parts.is_empty() {
+                    // Total width: parts joined by spaces
+                    let total_width: u16 = parts.iter().map(|(s, _)| s.len() as u16).sum::<u16>()
+                        + (parts.len() as u16).saturating_sub(1); // spaces between
+                    let start_x = right_edge.saturating_sub(total_width);
+                    if x + 1 < start_x {
+                        let mut px = start_x;
+                        for (idx, (text, color)) in parts.iter().enumerate() {
+                            if idx > 0 {
+                                set_cell(buf, px, screen_y, ' ', *color, bg);
+                                px += 1;
+                            }
+                            for ch in text.chars() {
+                                if px < right_edge {
+                                    set_cell(buf, px, screen_y, ch, *color, bg);
+                                    px += 1;
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }

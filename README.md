@@ -35,7 +35,7 @@ For detailed how-to guides and configuration references, see the **[VimCode Wiki
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 4703 tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 4715 tests, zero async runtime dependency
 
 > **Note:** VimCode does not implement VimScript. Extension and scripting is handled via
 > the built-in Lua 5.4 plugin system. The goal is full Vim *keybinding* and *editing*
@@ -454,6 +454,7 @@ For full details on adapters, launch.json, conditional breakpoints, and the debu
   - Double-click → permanent tab
   - Edit or save → auto-promotes to permanent
   - `:ls` shows `[Preview]` suffix
+- **Buffer indicators** — right-aligned badges on explorer rows: git status (`M`/`A`/`?`/`D`/`R`), LSP error count (red), warning count (yellow); capped at `9+`; configurable per-extension error source filtering; updated live in both GTK and TUI
 - Active file highlighted; parent folders auto-expanded
 
 ---

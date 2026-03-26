@@ -226,6 +226,8 @@ struct App {
     last_sc_refresh: std::time::Instant,
     /// Last time check_file_changes() was called for auto-reload detection.
     last_file_check: std::time::Instant,
+    /// Last time explorer tree indicators (modified/diagnostics) were refreshed.
+    last_tree_indicator_update: std::time::Instant,
     /// Full-window overlay DrawingArea that draws the menu dropdown.
     /// Can-target toggles true/false with menu open/close.
     menu_dropdown_da: Rc<RefCell<Option<gtk4::DrawingArea>>>,
@@ -2077,11 +2079,14 @@ impl SimpleComponent for App {
 
         let engine = Rc::new(RefCell::new(engine));
 
-        // Create TreeStore with 3 columns: Icon(String), Name(String), FullPath(String)
+        // Create TreeStore with 6 columns: Icon, Name, FullPath, FgColor, Indicator, IndicatorColor
         let tree_store = gtk4::TreeStore::new(&[
-            gtk4::glib::Type::STRING, // Icon
-            gtk4::glib::Type::STRING, // Name
-            gtk4::glib::Type::STRING, // Full path
+            gtk4::glib::Type::STRING, // 0: Icon
+            gtk4::glib::Type::STRING, // 1: Name
+            gtk4::glib::Type::STRING, // 2: Full path
+            gtk4::glib::Type::STRING, // 3: Foreground color (hex)
+            gtk4::glib::Type::STRING, // 4: Indicator text (e.g. "M", "2⚠", "1✗")
+            gtk4::glib::Type::STRING, // 5: Indicator foreground color (hex)
         ]);
 
         let file_tree_view_ref = Rc::new(RefCell::new(None));
@@ -2246,6 +2251,7 @@ impl SimpleComponent for App {
             tab_drag_start: None,
             last_sc_refresh: std::time::Instant::now(),
             last_file_check: std::time::Instant::now(),
+            last_tree_indicator_update: std::time::Instant::now(),
             menu_dropdown_da: menu_dropdown_da_ref.clone(),
             panel_hover_da: panel_hover_da_ref.clone(),
             panel_hover_link_rects: panel_hover_link_rects.clone(),
@@ -3222,10 +3228,21 @@ impl SimpleComponent for App {
 
         // Build tree from current working directory
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let (dir_fg_hex, file_fg_hex) = {
+            let theme = Theme::from_name(&engine.borrow().settings.colorscheme);
+            let file_fg = if theme.is_light() {
+                theme.foreground.to_hex()
+            } else {
+                theme.status_fg.to_hex()
+            };
+            (theme.explorer_dir_fg.to_hex(), file_fg)
+        };
         build_file_tree_with_root(
             &tree_store,
             &cwd,
             engine.borrow().settings.show_hidden_files,
+            &dir_fg_hex,
+            &file_fg_hex,
         );
 
         // Read font family for nerd font icon rendering
@@ -3240,11 +3257,13 @@ impl SimpleComponent for App {
         icon_cell.set_property("font", &nf_font);
         col.pack_start(&icon_cell, false);
         col.add_attribute(&icon_cell, "text", 0);
+        col.add_attribute(&icon_cell, "foreground", 3);
 
         // Filename cell renderer (expanding) — made editable on demand for inline rename
         let name_cell = gtk4::CellRendererText::new();
         col.pack_start(&name_cell, true);
         col.add_attribute(&name_cell, "text", 1);
+        col.add_attribute(&name_cell, "foreground", 3);
 
         // Handle inline cell editing for rename
         {
@@ -3274,6 +3293,13 @@ impl SimpleComponent for App {
             });
         }
 
+        // Indicator cell renderer (right-aligned, non-expanding) for M/error/warning badges
+        let indicator_cell = gtk4::CellRendererText::new();
+        indicator_cell.set_property("xalign", 1.0f32);
+        col.pack_end(&indicator_cell, false);
+        col.add_attribute(&indicator_cell, "text", 4);
+        col.add_attribute(&indicator_cell, "foreground", 5);
+
         widgets.file_tree_view.append_column(&col);
 
         // Set the model on the TreeView
@@ -3286,8 +3312,23 @@ impl SimpleComponent for App {
             widgets
                 .file_tree_view
                 .connect_row_expanded(move |_tree_view, iter, _tree_path| {
-                    let show_hidden = engine_ref.borrow().settings.show_hidden_files;
-                    tree_row_expanded(&tree_store_ref, iter, show_hidden);
+                    let e = engine_ref.borrow();
+                    let show_hidden = e.settings.show_hidden_files;
+                    let theme = Theme::from_name(&e.settings.colorscheme);
+                    let dir_fg_hex = theme.explorer_dir_fg.to_hex();
+                    let file_fg_hex = if theme.is_light() {
+                        theme.foreground.to_hex()
+                    } else {
+                        theme.status_fg.to_hex()
+                    };
+                    drop(e);
+                    tree_row_expanded(
+                        &tree_store_ref,
+                        iter,
+                        show_hidden,
+                        &dir_fg_hex,
+                        &file_fg_hex,
+                    );
                 });
         }
 
@@ -3786,26 +3827,45 @@ impl SimpleComponent for App {
                 let editor_bottom = height - status_h - dbg_px - qf_px - term_px;
                 let content_bounds = core::window::WindowRect::new(0.0, 0.0, width, editor_bottom);
                 let dividers = engine.group_layout.dividers(content_bounds, &mut 0);
-                for div in &dividers {
-                    let hit = match div.direction {
-                        core::window::SplitDirection::Vertical => {
-                            (x - div.position).abs() < 6.0
-                                && y >= div.cross_start
-                                && y < div.cross_start + div.cross_size
+                // Check if click is in a scrollbar zone (rightmost 10px of any
+                // window rect). If so, skip divider claim to let the scrollbar
+                // handle the click instead.
+                let tab_bar_h = if engine.settings.breadcrumbs {
+                    lh * 2.0
+                } else {
+                    lh
+                };
+                let (window_rects, _) =
+                    engine.calculate_group_window_rects(content_bounds, tab_bar_h);
+                let in_scrollbar = window_rects.iter().any(|(_, r)| {
+                    let sb_zone = 10.0; // scrollbar width + margin
+                    x >= r.x + r.width - sb_zone
+                        && x <= r.x + r.width
+                        && y >= r.y
+                        && y < r.y + r.height
+                });
+                if !in_scrollbar {
+                    for div in &dividers {
+                        let hit = match div.direction {
+                            core::window::SplitDirection::Vertical => {
+                                (x - div.position).abs() < 6.0
+                                    && y >= div.cross_start
+                                    && y < div.cross_start + div.cross_size
+                            }
+                            core::window::SplitDirection::Horizontal => {
+                                (y - div.position).abs() < 6.0
+                                    && x >= div.cross_start
+                                    && x < div.cross_start + div.cross_size
+                            }
+                        };
+                        if hit {
+                            div_active_pressed.set(Some(div.split_index));
+                            g.set_state(gtk4::EventSequenceState::Claimed);
+                            return;
                         }
-                        core::window::SplitDirection::Horizontal => {
-                            (y - div.position).abs() < 6.0
-                                && x >= div.cross_start
-                                && x < div.cross_start + div.cross_size
-                        }
-                    };
-                    if hit {
-                        div_active_pressed.set(Some(div.split_index));
-                        g.set_state(gtk4::EventSequenceState::Claimed);
-                        return;
                     }
                 }
-                // Not on a divider — don't claim, let scrollbar handle it
+                // Not on a divider (or in scrollbar zone) — don't claim, let scrollbar handle it
             });
             gesture.connect_drag_update(move |g, offset_x, offset_y| {
                 if let Some(split_index) = div_active_motion.get() {
@@ -6215,12 +6275,39 @@ impl SimpleComponent for App {
             Msg::RefreshFileTree => {
                 if let Some(ref store) = self.tree_store {
                     let cwd = self.engine.borrow().cwd.clone();
+                    let (dir_fg_hex, file_fg_hex) = {
+                        let theme = Theme::from_name(&self.engine.borrow().settings.colorscheme);
+                        let file_fg = if theme.is_light() {
+                            theme.foreground.to_hex()
+                        } else {
+                            theme.status_fg.to_hex()
+                        };
+                        (theme.explorer_dir_fg.to_hex(), file_fg)
+                    };
                     store.clear();
                     build_file_tree_with_root(
                         store,
                         &cwd,
                         self.engine.borrow().settings.show_hidden_files,
+                        &dir_fg_hex,
+                        &file_fg_hex,
                     );
+                    // Update explorer indicators (modified/diagnostics)
+                    {
+                        let engine = self.engine.borrow();
+                        let (git_statuses, diag_counts) = engine.explorer_indicators();
+                        let theme = Theme::from_name(&engine.settings.colorscheme);
+                        update_tree_indicators(
+                            store,
+                            &git_statuses,
+                            &diag_counts,
+                            &theme.git_added.to_hex(),
+                            &theme.git_modified.to_hex(),
+                            &theme.git_deleted.to_hex(),
+                            &theme.diagnostic_error.to_hex(),
+                            &theme.diagnostic_warning.to_hex(),
+                        );
+                    }
                     if let Some(ref tv) = *self.file_tree_view.borrow() {
                         tv.expand_row(&gtk4::TreePath::from_indices(&[0]), false);
                         // Highlight the active file in the tree after rebuild.
@@ -6799,8 +6886,10 @@ impl SimpleComponent for App {
                     sender.input(Msg::RefreshFileTree);
                 }
                 // Auto-refresh SC panel every 2s to pick up external git changes.
+                // Also refresh when Explorer is active (for git status indicators).
                 if self.sidebar_visible
-                    && self.active_panel == SidebarPanel::Git
+                    && (self.active_panel == SidebarPanel::Git
+                        || self.active_panel == SidebarPanel::Explorer)
                     && self.last_sc_refresh.elapsed() >= std::time::Duration::from_secs(2)
                 {
                     self.engine.borrow_mut().sc_refresh();
@@ -6899,11 +6988,33 @@ impl SimpleComponent for App {
                         self.draw_needed.set(true);
                     }
                 }
-                // Syntax refresh is deferred entirely until leaving insert mode
-                // (Escape calls refresh_syntax_if_stale). This avoids blocking the
-                // GTK idle handler with a 100-250ms reparse during active typing.
+                // Debounced syntax refresh during insert mode — after 150ms of no
+                // keystrokes, re-parse + re-extract highlights so stale byte offsets
+                // don't cause wrong colors near edited regions.
+                if self.engine.borrow_mut().tick_syntax_debounce() {
+                    self.draw_needed.set(true);
+                }
                 // Tick swap file writes (only does work when updatetime elapsed).
                 self.engine.borrow_mut().tick_swap_files();
+                // Update explorer tree indicators (modified/diagnostics) every ~1s.
+                if self.last_tree_indicator_update.elapsed() >= std::time::Duration::from_secs(1) {
+                    self.last_tree_indicator_update = std::time::Instant::now();
+                    if let Some(ref store) = self.tree_store {
+                        let engine = self.engine.borrow();
+                        let (git_statuses, diag_counts) = engine.explorer_indicators();
+                        let theme = Theme::from_name(&engine.settings.colorscheme);
+                        update_tree_indicators(
+                            store,
+                            &git_statuses,
+                            &diag_counts,
+                            &theme.git_added.to_hex(),
+                            &theme.git_modified.to_hex(),
+                            &theme.git_deleted.to_hex(),
+                            &theme.diagnostic_error.to_hex(),
+                            &theme.diagnostic_warning.to_hex(),
+                        );
+                    }
+                }
                 // Sync the OS window title with the active buffer name (taskbar/pager).
                 let win_title = self
                     .engine
@@ -8640,11 +8751,13 @@ fn sync_scrollbar_positions(
         // — Vertical scrollbar —
         // Query the actual allocated width so we position correctly even if
         // GTK's theme enforces a minimum wider than our CSS min-width.
+        // Inset 2px from the right edge so the scrollbar doesn't visually
+        // overlap the group divider or the adjacent group's space.
         let sb_actual_w = ws.vertical.width().max(4) as f64;
         ws.vertical.set_halign(gtk4::Align::Start);
         ws.vertical.set_valign(gtk4::Align::Start);
         ws.vertical
-            .set_margin_start(rect.x as i32 + (rect.width - sb_actual_w) as i32);
+            .set_margin_start(rect.x as i32 + (rect.width - sb_actual_w) as i32 - 2);
         ws.vertical.set_margin_top(rect.y as i32);
         ws.vertical
             .set_height_request((rect.height as i32 - 4).max(0));
@@ -16093,7 +16206,13 @@ const TREE_DUMMY_PATH: &str = "__vimcode_loading__";
 /// Build file tree with a root folder node at the top (like VSCode).
 /// Only the root's immediate children are populated; subdirectories are
 /// lazily expanded via the `row-expanded` signal (see `tree_row_expanded`).
-fn build_file_tree_with_root(store: &gtk4::TreeStore, root: &Path, show_hidden: bool) {
+fn build_file_tree_with_root(
+    store: &gtk4::TreeStore,
+    root: &Path,
+    show_hidden: bool,
+    dir_fg_hex: &str,
+    file_fg_hex: &str,
+) {
     let root_name = root
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -16106,9 +16225,19 @@ fn build_file_tree_with_root(store: &gtk4::TreeStore, root: &Path, show_hidden: 
             (0, &""),
             (1, &root_name),
             (2, &root.to_string_lossy().to_string()),
+            (3, &dir_fg_hex),
+            (4, &""),
+            (5, &""),
         ],
     );
-    build_file_tree_shallow(store, Some(&root_iter), root, show_hidden);
+    build_file_tree_shallow(
+        store,
+        Some(&root_iter),
+        root,
+        show_hidden,
+        dir_fg_hex,
+        file_fg_hex,
+    );
 }
 
 /// Populate one level of children under `parent`.  For each child directory
@@ -16119,6 +16248,8 @@ fn build_file_tree_shallow(
     parent: Option<&gtk4::TreeIter>,
     path: &Path,
     show_hidden: bool,
+    dir_fg_hex: &str,
+    file_fg_hex: &str,
 ) {
     let entries = match fs::read_dir(path) {
         Ok(e) => e,
@@ -16157,6 +16288,7 @@ fn build_file_tree_shallow(
             crate::icons::file_icon(ext)
         };
 
+        let fg_hex: &str = if is_dir { dir_fg_hex } else { file_fg_hex };
         let iter = store.insert_with_values(
             parent,
             None,
@@ -16164,6 +16296,9 @@ fn build_file_tree_shallow(
                 (0, &icon),
                 (1, &name),
                 (2, &child_path.to_string_lossy().to_string()),
+                (3, &fg_hex),
+                (4, &""),
+                (5, &""),
             ],
         );
 
@@ -16172,7 +16307,14 @@ fn build_file_tree_shallow(
             store.insert_with_values(
                 Some(&iter),
                 None,
-                &[(0, &""), (1, &""), (2, &TREE_DUMMY_PATH)],
+                &[
+                    (0, &""),
+                    (1, &""),
+                    (2, &TREE_DUMMY_PATH),
+                    (3, &""),
+                    (4, &""),
+                    (5, &""),
+                ],
             );
         }
     }
@@ -16180,7 +16322,13 @@ fn build_file_tree_shallow(
 
 /// Called when a tree row is expanded.  Replaces the dummy placeholder with
 /// the directory's real contents (one level deep).
-fn tree_row_expanded(store: &gtk4::TreeStore, iter: &gtk4::TreeIter, show_hidden: bool) {
+fn tree_row_expanded(
+    store: &gtk4::TreeStore,
+    iter: &gtk4::TreeIter,
+    show_hidden: bool,
+    dir_fg_hex: &str,
+    file_fg_hex: &str,
+) {
     use gtk4::prelude::TreeModelExt;
     let dir_path: String = store.get_value(iter, 2).get().unwrap_or_default();
     if dir_path.is_empty() {
@@ -16193,11 +16341,127 @@ fn tree_row_expanded(store: &gtk4::TreeStore, iter: &gtk4::TreeIter, show_hidden
         if child_path == TREE_DUMMY_PATH {
             // Remove the dummy and populate real children.
             store.remove(&child);
-            build_file_tree_shallow(store, Some(iter), Path::new(&dir_path), show_hidden);
+            build_file_tree_shallow(
+                store,
+                Some(iter),
+                Path::new(&dir_path),
+                show_hidden,
+                dir_fg_hex,
+                file_fg_hex,
+            );
         }
         // If the first child is NOT the dummy, the directory was already
         // populated (e.g. collapsed and re-expanded) — nothing to do.
     }
+}
+
+/// Walk the entire TreeStore and update columns 4 (indicator text) and 5
+/// (indicator color) based on git status and LSP diagnostics.
+#[allow(clippy::too_many_arguments)]
+fn update_tree_indicators(
+    store: &gtk4::TreeStore,
+    git_statuses: &std::collections::HashMap<PathBuf, char>,
+    diag_counts: &std::collections::HashMap<PathBuf, (usize, usize)>,
+    added_color: &str,
+    modified_color: &str,
+    deleted_color: &str,
+    error_color: &str,
+    warning_color: &str,
+) {
+    use gtk4::prelude::TreeModelExt;
+    #[allow(clippy::too_many_arguments)]
+    fn walk(
+        store: &gtk4::TreeStore,
+        parent: Option<&gtk4::TreeIter>,
+        git_statuses: &std::collections::HashMap<PathBuf, char>,
+        diag_counts: &std::collections::HashMap<PathBuf, (usize, usize)>,
+        added_color: &str,
+        modified_color: &str,
+        deleted_color: &str,
+        error_color: &str,
+        warning_color: &str,
+    ) {
+        let Some(iter) = store.iter_children(parent) else {
+            return;
+        };
+        loop {
+            let path_str: String = store.get_value(&iter, 2).get().unwrap_or_default();
+            if !path_str.is_empty() && path_str != TREE_DUMMY_PATH {
+                let p = PathBuf::from(&path_str);
+                let canon = p.canonicalize().unwrap_or_else(|_| p.clone());
+                let git_label = git_statuses.get(&canon).copied();
+                let (errors, warnings) = diag_counts.get(&canon).copied().unwrap_or((0, 0));
+
+                if git_label.is_some() || errors > 0 || warnings > 0 {
+                    let mut parts = Vec::new();
+                    // Diagnostics first (like VSCode), then git status
+                    let mut color = modified_color;
+                    if errors > 0 {
+                        let s = if errors > 9 {
+                            "9+".to_string()
+                        } else {
+                            format!("{errors}")
+                        };
+                        parts.push(s);
+                        color = error_color;
+                    }
+                    if warnings > 0 {
+                        let s = if warnings > 9 {
+                            "9+".to_string()
+                        } else {
+                            format!("{warnings}")
+                        };
+                        parts.push(s);
+                        if errors == 0 {
+                            color = warning_color;
+                        }
+                    }
+                    if let Some(label) = git_label {
+                        parts.push(label.to_string());
+                        if errors == 0 && warnings == 0 {
+                            color = match label {
+                                'A' | '?' => added_color,
+                                'D' => deleted_color,
+                                _ => modified_color,
+                            };
+                        }
+                    }
+                    let text = parts.join(" ");
+                    store.set_value(&iter, 4, &text.into());
+                    store.set_value(&iter, 5, &color.into());
+                } else {
+                    store.set_value(&iter, 4, &"".into());
+                    store.set_value(&iter, 5, &"".into());
+                }
+            }
+            // Recurse into children
+            walk(
+                store,
+                Some(&iter),
+                git_statuses,
+                diag_counts,
+                added_color,
+                modified_color,
+                deleted_color,
+                error_color,
+                warning_color,
+            );
+            if !store.iter_next(&iter) {
+                break;
+            }
+        }
+    }
+    walk(
+        store,
+        None,
+        git_statuses,
+        diag_counts,
+        added_color,
+        modified_color,
+        deleted_color,
+        error_color,
+        warning_color,
+    );
 }
 
 /// Get the parent directory for creating a new file/folder, based on the
