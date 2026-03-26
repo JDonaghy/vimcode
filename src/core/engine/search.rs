@@ -531,3 +531,112 @@ impl Engine {
         self.project_search_selected = 0;
     }
 }
+
+// ─── Additional methods (extracted from mod.rs) ─────────────────────────
+
+impl Engine {
+    // =======================================================================
+    // Search word under cursor (* / #)
+    // =======================================================================
+
+    /// Extract the word under the cursor. Returns None if cursor is not on a word char.
+    pub(crate) fn word_under_cursor(&self) -> Option<String> {
+        let line = self.view().cursor.line;
+        let col = self.view().cursor.col;
+        let line_content: String = self.buffer().content.line(line).chars().collect();
+        let chars: Vec<char> = line_content.chars().collect();
+
+        if col >= chars.len() {
+            return None;
+        }
+        if !Self::is_word_char(chars[col]) {
+            return None;
+        }
+
+        // Find start of word
+        let start = (0..=col)
+            .rev()
+            .take_while(|&i| Self::is_word_char(chars[i]))
+            .last()
+            .unwrap_or(col);
+        // Find end of word (exclusive)
+        let end = (col..chars.len())
+            .take_while(|&i| Self::is_word_char(chars[i]))
+            .last()
+            .map(|i| i + 1)
+            .unwrap_or(col + 1);
+
+        Some(chars[start..end].iter().collect())
+    }
+
+    /// Search forward (*) or backward (#) for the word under cursor with word boundaries.
+    pub(crate) fn search_word_under_cursor(&mut self, forward: bool) {
+        let word = match self.word_under_cursor() {
+            Some(w) => w,
+            None => {
+                self.message = "No word under cursor".to_string();
+                return;
+            }
+        };
+
+        self.search_query = word.clone();
+        self.search_direction = if forward {
+            SearchDirection::Forward
+        } else {
+            SearchDirection::Backward
+        };
+        self.search_word_bounded = true;
+
+        // Build word-boundary matches manually
+        self.build_word_bounded_matches();
+
+        if self.search_matches.is_empty() {
+            self.message = format!("Pattern not found: {}", word);
+            return;
+        }
+
+        // Jump to first match in the appropriate direction
+        if forward {
+            self.search_next();
+        } else {
+            self.search_prev();
+        }
+    }
+
+    /// Like run_search but only keeps matches that are whole words.
+    pub(crate) fn build_word_bounded_matches(&mut self) {
+        self.search_matches.clear();
+        self.search_index = None;
+
+        if self.search_query.is_empty() {
+            return;
+        }
+
+        let text = self.buffer().to_string();
+        let query = self.search_query.clone();
+        let mut byte_pos = 0;
+
+        while let Some(found) = text[byte_pos..].find(&query) {
+            let start_byte = byte_pos + found;
+            let end_byte = start_byte + query.len();
+
+            // Check word boundaries
+            let before_ok = start_byte == 0 || {
+                let c = text[..start_byte].chars().last().unwrap_or(' ');
+                !Self::is_word_char(c)
+            };
+            let after_ok = end_byte >= text.len() || {
+                let c = text[end_byte..].chars().next().unwrap_or(' ');
+                !Self::is_word_char(c)
+            };
+
+            if before_ok && after_ok {
+                let start_char = self.buffer().content.byte_to_char(start_byte);
+                let end_char = self.buffer().content.byte_to_char(end_byte);
+                self.search_matches.push((start_char, end_char));
+            }
+
+            byte_pos = start_byte + 1;
+        }
+    }
+}

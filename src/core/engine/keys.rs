@@ -6149,3 +6149,908 @@ impl Engine {
         EngineAction::None
     }
 }
+
+// ─── Additional methods (extracted from mod.rs) ─────────────────────────
+
+impl Engine {
+    // =======================================================================
+    // Repeat command (.)
+    // =======================================================================
+
+    pub(crate) fn repeat_last_change(&mut self, repeat_count: usize, changed: &mut bool) {
+        let change = match &self.last_change {
+            Some(c) => c.clone(),
+            None => return, // No change to repeat
+        };
+
+        let final_count = if repeat_count > 1 {
+            repeat_count
+        } else {
+            change.count
+        };
+
+        match change.op {
+            ChangeOp::Insert => {
+                // Repeat insert: insert the same text at current position
+                self.start_undo_group();
+                let line = self.view().cursor.line;
+                let col = self.view().cursor.col;
+                let char_idx = self.buffer().line_to_char(line) + col;
+
+                // Insert the text final_count times
+                let repeated_text = change.text.repeat(final_count);
+                self.insert_with_undo(char_idx, &repeated_text);
+
+                // Update cursor position based on inserted text
+                let newlines = repeated_text.matches('\n').count();
+                if newlines > 0 {
+                    self.view_mut().cursor.line += newlines;
+                    // Find column after last newline
+                    if let Some(last_nl) = repeated_text.rfind('\n') {
+                        self.view_mut().cursor.col = repeated_text[last_nl + 1..].chars().count();
+                    }
+                } else {
+                    self.view_mut().cursor.col += repeated_text.chars().count();
+                }
+                self.finish_undo_group();
+                *changed = true;
+            }
+            ChangeOp::Delete => {
+                // Repeat delete with motion
+                if let Some(motion) = &change.motion {
+                    for _ in 0..final_count {
+                        self.start_undo_group();
+                        match motion {
+                            Motion::Right => {
+                                // Delete character(s) at cursor (like x)
+                                let line = self.view().cursor.line;
+                                let col = self.view().cursor.col;
+                                let char_idx = self.buffer().line_to_char(line) + col;
+                                let line_end = self.buffer().line_to_char(line)
+                                    + self.buffer().line_len_chars(line);
+                                let available = line_end - char_idx;
+                                let to_delete = change.count.min(available);
+
+                                if to_delete > 0 && char_idx < self.buffer().len_chars() {
+                                    let deleted_chars: String = self
+                                        .buffer()
+                                        .content
+                                        .slice(char_idx..char_idx + to_delete)
+                                        .chars()
+                                        .collect();
+                                    let reg = self.active_register();
+                                    self.set_register(reg, deleted_chars, false);
+                                    self.clear_selected_register();
+                                    self.delete_with_undo(char_idx, char_idx + to_delete);
+                                    self.clamp_cursor_col();
+                                    *changed = true;
+                                }
+                            }
+                            Motion::DeleteLine => {
+                                // Repeat dd
+                                self.delete_lines(change.count, changed);
+                            }
+                            _ => {}
+                        }
+                        self.finish_undo_group();
+                    }
+                }
+            }
+            ChangeOp::Change => {
+                // Repeat c{motion}: delete the motion range, then insert the text.
+                if let Some(motion) = &change.motion {
+                    for _ in 0..final_count {
+                        let motion_char = match motion {
+                            Motion::WordForward => 'w',
+                            Motion::WordEnd => 'e',
+                            Motion::WordBackward => 'b',
+                            _ => continue,
+                        };
+                        // Reuse the same code path as the original cw/ce/cb:
+                        // apply_operator_with_motion deletes the range and enters
+                        // insert mode.  We then immediately insert the recorded
+                        // text and return to normal mode instead.
+                        let start_cursor = self.view().cursor;
+                        let start_pos =
+                            self.buffer().line_to_char(start_cursor.line) + start_cursor.col;
+                        for _ in 0..change.count {
+                            match motion_char {
+                                'w' => self.move_word_forward(),
+                                'b' => self.move_word_backward(),
+                                'e' => self.move_word_end(),
+                                _ => {}
+                            }
+                        }
+                        let end_cursor = self.view().cursor;
+                        let end_pos = self.buffer().line_to_char(end_cursor.line) + end_cursor.col;
+                        self.view_mut().cursor = start_cursor;
+
+                        let delete_end = if motion_char == 'e' {
+                            (end_pos + 1).min(self.buffer().len_chars())
+                        } else {
+                            end_pos
+                        };
+                        if start_pos < delete_end {
+                            self.start_undo_group();
+                            self.delete_with_undo(start_pos, delete_end);
+                            if !change.text.is_empty() {
+                                self.insert_with_undo(start_pos, &change.text);
+                                let inserted_chars = change.text.chars().count();
+                                let newlines = change.text.matches('\n').count();
+                                if newlines > 0 {
+                                    self.view_mut().cursor.line += newlines;
+                                    if let Some(last_nl) = change.text.rfind('\n') {
+                                        self.view_mut().cursor.col =
+                                            change.text[last_nl + 1..].chars().count();
+                                    }
+                                } else {
+                                    self.view_mut().cursor.col += inserted_chars;
+                                }
+                            }
+                            self.clamp_cursor_col();
+                            self.finish_undo_group();
+                            *changed = true;
+                        }
+                    }
+                }
+            }
+            ChangeOp::Substitute => {
+                // Repeat s command
+                for _ in 0..final_count {
+                    let line = self.view().cursor.line;
+                    let col = self.view().cursor.col;
+                    let max_col = self.get_max_cursor_col(line);
+                    if max_col > 0 || self.buffer().line_len_chars(line) > 0 {
+                        let char_idx = self.buffer().line_to_char(line) + col;
+                        let line_end =
+                            self.buffer().line_to_char(line) + self.buffer().line_len_chars(line);
+                        let available = line_end - char_idx;
+                        let to_delete = change.count.min(available);
+
+                        self.start_undo_group();
+                        if to_delete > 0 && char_idx < self.buffer().len_chars() {
+                            self.delete_with_undo(char_idx, char_idx + to_delete);
+                            *changed = true;
+                        }
+
+                        // Insert the recorded text
+                        if !change.text.is_empty() {
+                            self.insert_with_undo(char_idx, &change.text);
+                            *changed = true;
+                        }
+                        self.finish_undo_group();
+                    }
+                }
+            }
+            ChangeOp::SubstituteLine | ChangeOp::DeleteToEnd | ChangeOp::ChangeToEnd => {
+                // Handle other operations
+            }
+            ChangeOp::Replace => {
+                // Repeat r command
+                if let Some(replacement_char) = change.text.chars().next() {
+                    for _ in 0..final_count {
+                        self.start_undo_group();
+                        self.replace_chars(replacement_char, change.count, changed);
+                        self.finish_undo_group();
+                    }
+                }
+            }
+            ChangeOp::ToggleCase => {
+                // Repeat ~ command
+                for _ in 0..final_count {
+                    self.toggle_case_at_cursor(change.count, changed);
+                }
+            }
+            ChangeOp::Join => {
+                // Repeat J command
+                for _ in 0..final_count {
+                    self.join_lines(change.count, changed);
+                }
+            }
+            ChangeOp::Indent => {
+                // Repeat >> command
+                let line = self.view().cursor.line;
+                for _ in 0..final_count {
+                    self.indent_lines(line, change.count, changed);
+                }
+            }
+            ChangeOp::Dedent => {
+                // Repeat << command
+                let line = self.view().cursor.line;
+                for _ in 0..final_count {
+                    self.dedent_lines(line, change.count, changed);
+                }
+            }
+        }
+    }
+
+    /// Available commands for auto-completion
+    pub(crate) fn available_commands() -> &'static [&'static str] {
+        &[
+            // File operations
+            "w",
+            "q",
+            "q!",
+            "wq",
+            "wq!",
+            "wa",
+            "wqa",
+            "qa",
+            "qa!",
+            "e ",
+            "e!",
+            "enew",
+            // Buffers
+            "bn",
+            "bp",
+            "bd",
+            "b#",
+            "ls",
+            "buffers",
+            "files",
+            // Splits & tabs
+            "split",
+            "vsplit",
+            "close",
+            "only",
+            "new",
+            "wincmd ",
+            "tabnew",
+            "tabnext",
+            "tabprev",
+            "tabclose",
+            "tabmove",
+            // Search & replace
+            "s/",
+            "%s/",
+            "noh",
+            "nohlsearch",
+            // Settings & config
+            "set ",
+            "config reload",
+            "Settings",
+            "Keymaps",
+            "Keybindings",
+            "Keybindings ",
+            "colorscheme ",
+            // Editor groups
+            "EditorGroupSplit",
+            "EditorGroupSplitDown",
+            "EditorGroupClose",
+            "EditorGroupFocus",
+            "EditorGroupMoveTab",
+            "egsp",
+            "egspd",
+            "egc",
+            "egf",
+            "egmt",
+            // Netrw / file browser
+            "Explore",
+            "Ex",
+            "Sexplore",
+            "Sex",
+            "Vexplore",
+            "Vex",
+            // Git
+            "Gdiff",
+            "Gd",
+            "Gdiffsplit",
+            "Gds",
+            "Gstatus",
+            "Gs",
+            "Gadd",
+            "Ga",
+            "Gcommit",
+            "Gc",
+            "Gpush",
+            "Gp",
+            "Gblame",
+            "Gb",
+            "Ghs",
+            "Ghunk",
+            "Gpull",
+            "Gfetch",
+            "Gswitch",
+            "GSwitch",
+            "Gsw",
+            "Gbranch",
+            "GBranch",
+            "GWorktreeAdd",
+            "GWorktreeRemove",
+            "DiffPeek",
+            "DiffNext",
+            "DiffPrev",
+            "DiffToggleContext",
+            // LSP
+            "LspInfo",
+            "LspRestart",
+            "LspStop",
+            "LspInstall",
+            "Lformat",
+            "Rename",
+            "def",
+            "refs",
+            "hover",
+            "LspImpl",
+            "LspTypedef",
+            "CodeAction",
+            // Navigation
+            "nextdiag",
+            "prevdiag",
+            "nexthunk",
+            "prevhunk",
+            "fuzzy",
+            "sidebar",
+            "palette",
+            // DAP / Debug
+            "DapInfo",
+            "DapInstall",
+            "DapCondition",
+            "DapHitCondition",
+            "DapLogMessage",
+            "DapWatch",
+            "DapBottomPanel",
+            "DapEval",
+            "DapExpand",
+            "debug",
+            "continue",
+            "pause",
+            "stop",
+            "restart",
+            "stepover",
+            "stepin",
+            "stepout",
+            "brkpt",
+            // Extensions
+            "ExtInstall",
+            "ExtList",
+            "ExtEnable",
+            "ExtDisable",
+            "ExtRemove",
+            "ExtRefresh",
+            // AI
+            "AI ",
+            "AiClear",
+            // Markdown
+            "MarkdownPreview",
+            "MdPreview",
+            // Display / info
+            "registers",
+            "display",
+            "marks",
+            "jumps",
+            "changes",
+            "history",
+            "echo ",
+            // Diff
+            "diffthis",
+            "diffoff",
+            "diffsplit",
+            // Misc ex commands
+            "sort",
+            "terminal",
+            "cd ",
+            "make",
+            "copen",
+            "cn",
+            "cp",
+            "cc",
+            "r ",
+            "norm ",
+            "Plugin",
+            "map",
+            "unmap",
+        ]
+    }
+
+    /// All setting names recognized by `:set`.
+    pub(crate) fn setting_names() -> &'static [&'static str] {
+        &[
+            // Boolean options (full names + aliases)
+            "number",
+            "nu",
+            "relativenumber",
+            "rnu",
+            "expandtab",
+            "et",
+            "autoindent",
+            "ai",
+            "incsearch",
+            "is",
+            "lsp",
+            "wrap",
+            "hlsearch",
+            "hls",
+            "ignorecase",
+            "ic",
+            "smartcase",
+            "scs",
+            "cursorline",
+            "cul",
+            "autoread",
+            "ar",
+            "splitbelow",
+            "sb",
+            "splitright",
+            "spr",
+            "ai_completions",
+            "formatonsave",
+            "fos",
+            "showhiddenfiles",
+            "shf",
+            "swapfile",
+            "breadcrumbs",
+            "autohidepanels",
+            // Value options
+            "tabstop",
+            "ts",
+            "shiftwidth",
+            "sw",
+            "scrolloff",
+            "so",
+            "colorcolumn",
+            "cc",
+            "textwidth",
+            "tw",
+            "updatetime",
+            "ut",
+            "mode",
+            "filetype",
+            "ft",
+        ]
+    }
+
+    /// Find completions for partial command, including argument completion.
+    pub(crate) fn complete_command(&self, partial: &str) -> Vec<String> {
+        if partial.is_empty() {
+            return Vec::new();
+        }
+
+        // Check if we're completing an argument (text after a space)
+        if let Some(space_pos) = partial.find(' ') {
+            let cmd_prefix = &partial[..space_pos];
+            let arg_partial = partial[space_pos + 1..].trim_start();
+
+            return match cmd_prefix {
+                "set" => {
+                    // Complete setting names, including "no" prefixed variants
+                    let mut results: Vec<String> = Self::setting_names()
+                        .iter()
+                        .filter(|name| name.starts_with(arg_partial))
+                        .map(|name| format!("set {name}"))
+                        .collect();
+                    // Also offer "no" prefixed boolean disable variants
+                    for name in Self::setting_names() {
+                        let no_name = format!("no{name}");
+                        if no_name.starts_with(arg_partial) && !arg_partial.is_empty() {
+                            results.push(format!("set {no_name}"));
+                        }
+                    }
+                    results.sort();
+                    results.dedup();
+                    results
+                }
+                "Keybindings" | "keybindings" => ["vim", "vscode"]
+                    .iter()
+                    .filter(|m| m.starts_with(arg_partial))
+                    .map(|m| format!("Keybindings {m}"))
+                    .collect(),
+                "colorscheme" => {
+                    // Complete theme names
+                    let mut names = vec![
+                        "onedark".to_string(),
+                        "gruvbox-dark".to_string(),
+                        "tokyo-night".to_string(),
+                        "solarized-dark".to_string(),
+                        "vscode-dark".to_string(),
+                        "vscode-light".to_string(),
+                        "gruvbox".to_string(),
+                        "tokyonight".to_string(),
+                        "solarized".to_string(),
+                    ];
+                    names.extend(list_custom_theme_names());
+                    names.sort();
+                    names.dedup();
+                    names
+                        .into_iter()
+                        .filter(|name| name.starts_with(arg_partial))
+                        .map(|name| format!("colorscheme {name}"))
+                        .collect()
+                }
+                _ => {
+                    // For other commands with trailing space in available_commands,
+                    // fall through to prefix matching
+                    Self::available_commands()
+                        .iter()
+                        .filter(|cmd| cmd.starts_with(partial))
+                        .map(|s| s.to_string())
+                        .collect()
+                }
+            };
+        }
+
+        // First-word completion
+        Self::available_commands()
+            .iter()
+            .filter(|cmd| cmd.starts_with(partial))
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    /// Find common prefix of strings
+    pub(crate) fn find_common_prefix(strings: &[String]) -> String {
+        if strings.is_empty() {
+            return String::new();
+        }
+
+        let first = &strings[0];
+        let mut common = String::new();
+
+        for (i, ch) in first.chars().enumerate() {
+            if strings.iter().all(|s| s.chars().nth(i) == Some(ch)) {
+                common.push(ch);
+            } else {
+                break;
+            }
+        }
+
+        common
+    }
+
+    // ─── User keymaps ────────────────────────────────────────────────────────
+
+    /// Rebuild the parsed user_keymaps cache from settings.keymaps.
+    /// Call after loading or changing settings.
+    pub fn rebuild_user_keymaps(&mut self) {
+        self.user_keymaps = self
+            .settings
+            .keymaps
+            .iter()
+            .filter_map(|s| parse_keymap_def(s))
+            .collect();
+    }
+
+    /// Check user keymaps for the current keypress. Returns `Some(action)` if
+    /// an exact match was found, `None` to fall through to built-in handling.
+    /// Handles multi-key sequences by buffering keypresses.
+    pub(crate) fn try_user_keymap(
+        &mut self,
+        key_name: &str,
+        unicode: Option<char>,
+        ctrl: bool,
+        changed: &mut bool,
+    ) -> Option<EngineAction> {
+        if self.keymap_replaying || self.user_keymaps.is_empty() {
+            return None;
+        }
+
+        let mode_str = if self.is_vscode_mode() {
+            // VSCode mode has no modal distinction; "n" keymaps apply.
+            "n"
+        } else {
+            match self.mode {
+                Mode::Normal => "n",
+                Mode::Visual | Mode::VisualLine | Mode::VisualBlock => "v",
+                Mode::Insert => "i",
+                Mode::Command => "c",
+                _ => return None,
+            }
+        };
+
+        let encoded = encode_keypress(key_name, unicode, ctrl);
+        self.keymap_buf.push(encoded);
+
+        let mut exact_match_action = None;
+        let mut has_prefix = false;
+
+        for km in &self.user_keymaps {
+            if km.mode != mode_str {
+                continue;
+            }
+            if km.keys == self.keymap_buf {
+                exact_match_action = Some(km.action.clone());
+            } else if km.keys.len() > self.keymap_buf.len()
+                && km.keys[..self.keymap_buf.len()] == self.keymap_buf[..]
+            {
+                has_prefix = true;
+            }
+        }
+
+        if let Some(action) = exact_match_action {
+            self.keymap_buf.clear();
+            let count = self.take_count();
+            // Substitute {count} in the action, or append count as argument
+            let cmd = if action.contains("{count}") {
+                action.replace("{count}", &count.to_string())
+            } else if count > 1 {
+                format!("{action} {count}")
+            } else {
+                action
+            };
+            *changed = true;
+            return Some(self.execute_command(&cmd));
+        }
+
+        if has_prefix {
+            // More keys needed — consume this keypress
+            return Some(EngineAction::None);
+        }
+
+        // No match and no prefix. Replay buffered keys.
+        let buf: Vec<String> = self.keymap_buf.drain(..).collect();
+        if buf.len() <= 1 {
+            // Single key, no match — fall through to built-in handling
+            return None;
+        }
+
+        // Multi-key sequence that didn't match any keymap: replay all keys
+        self.keymap_replaying = true;
+        let mut last_action = EngineAction::None;
+        for encoded_key in buf {
+            let (rk_name, rk_unicode, rk_ctrl) = decode_keypress(&encoded_key);
+            last_action = self.handle_key(&rk_name, rk_unicode, rk_ctrl);
+        }
+        self.keymap_replaying = false;
+        Some(last_action)
+    }
+
+    /// Try to run a named plugin command. Returns `true` if the command was found.
+    pub fn plugin_run_command(&mut self, name: &str, args: &str) -> bool {
+        if !self.settings.plugins_enabled {
+            return false;
+        }
+        let pm = match self.plugin_manager.take() {
+            Some(p) => p,
+            None => return false,
+        };
+        let ctx = self.make_plugin_ctx(false);
+        let (found, ctx) = pm.call_command(name, args, ctx);
+        self.plugin_manager = Some(pm);
+        self.apply_plugin_ctx(ctx);
+        found
+    }
+
+    /// Try to run a plugin keymap. Returns `true` if a mapping was found and executed.
+    pub fn plugin_run_keymap(&mut self, mode: &str, key: &str) -> bool {
+        if !self.settings.plugins_enabled {
+            return false;
+        }
+        let pm = match self.plugin_manager.take() {
+            Some(p) => p,
+            None => return false,
+        };
+        let ctx = self.make_plugin_ctx(false);
+        let (found, ctx) = pm.call_keymap(mode, key, ctx);
+        self.plugin_manager = Some(pm);
+        self.apply_plugin_ctx(ctx);
+        found
+    }
+
+    // =======================================================================
+    // Mouse selection (called by UI backends after coordinate conversion)
+    // =======================================================================
+
+    /// Handle a single mouse click at the given buffer position.
+    /// Exits visual mode if active, positions cursor, clears drag state.
+    pub fn mouse_click(&mut self, window_id: WindowId, line: usize, col: usize) {
+        // Exit visual mode if active
+        if matches!(
+            self.mode,
+            Mode::Visual | Mode::VisualLine | Mode::VisualBlock
+        ) {
+            self.mode = Mode::Normal;
+            self.visual_anchor = None;
+        }
+        self.mouse_drag_word_mode = false;
+        self.mouse_drag_word_origin = None;
+        self.mouse_drag_active = false;
+        // Switch to the group that owns this window.
+        self.focus_group_for_window(window_id);
+        self.set_cursor_for_window(window_id, line, col);
+    }
+
+    /// Handle mouse drag to the given buffer position.
+    /// On first drag: enters Visual mode with anchor at current cursor.
+    /// On subsequent drags: extends selection by moving cursor.
+    /// If already in Visual mode (e.g. from double-click word select),
+    /// preserves the existing anchor and just extends.
+    pub fn mouse_drag(&mut self, window_id: WindowId, line: usize, col: usize) {
+        // Ensure this window's group and tab are active.
+        self.focus_group_for_window(window_id);
+        if self.windows.contains_key(&window_id) {
+            self.active_tab_mut().active_window = window_id;
+        }
+
+        if !self.mouse_drag_active {
+            // First drag event — only set anchor if not already in visual mode
+            // (double-click word select already set the anchor at word start).
+            // Also require the drag to actually reach a *different* buffer position
+            // than the click origin; sub-character mouse jitter on mousedown otherwise
+            // silently enters visual mode before `:` can be pressed.
+            let cursor = self.view().cursor;
+            let moved = line != cursor.line || col != cursor.col;
+            if !moved {
+                return; // Sub-pixel jitter at same cell — ignore.
+            }
+            if !matches!(
+                self.mode,
+                Mode::Visual | Mode::VisualLine | Mode::VisualBlock
+            ) {
+                self.visual_anchor = Some(cursor);
+                self.mode = Mode::Visual;
+            }
+            self.mouse_drag_active = true;
+        }
+
+        // Move cursor to drag position (extends visual selection)
+        let buffer = self.buffer();
+        let max_line = buffer.content.len_lines().saturating_sub(1);
+        let clamped_line = line.min(max_line);
+        let max_col = self.get_max_cursor_col(clamped_line);
+        let clamped_col = col.min(max_col);
+
+        if self.mouse_drag_word_mode {
+            // Word-wise drag: snap to word boundaries
+            if let Some((orig_start, orig_end, orig_line)) = self.mouse_drag_word_origin {
+                let line_text: Vec<char> =
+                    self.buffer().content.line(clamped_line).chars().collect();
+                let drag_before_origin = clamped_line < orig_line
+                    || (clamped_line == orig_line && clamped_col < orig_start);
+
+                if drag_before_origin {
+                    // Dragging before the original word — anchor at word end, cursor at word start
+                    let mut word_start = clamped_col.min(line_text.len().saturating_sub(1));
+                    if word_start < line_text.len() && Self::is_word_char(line_text[word_start]) {
+                        while word_start > 0 && Self::is_word_char(line_text[word_start - 1]) {
+                            word_start -= 1;
+                        }
+                    }
+                    self.visual_anchor = Some(Cursor {
+                        line: orig_line,
+                        col: orig_end,
+                    });
+                    let view = self.view_mut();
+                    view.cursor.line = clamped_line;
+                    view.cursor.col = word_start;
+                } else {
+                    // Dragging after the original word — anchor at word start, cursor at word end
+                    let mut word_end = clamped_col.min(line_text.len().saturating_sub(1));
+                    if word_end < line_text.len() && Self::is_word_char(line_text[word_end]) {
+                        while word_end + 1 < line_text.len()
+                            && Self::is_word_char(line_text[word_end + 1])
+                        {
+                            word_end += 1;
+                        }
+                    }
+                    // Exclude trailing newline
+                    if word_end < line_text.len() && line_text[word_end] == '\n' && word_end > 0 {
+                        word_end -= 1;
+                    }
+                    self.visual_anchor = Some(Cursor {
+                        line: orig_line,
+                        col: orig_start,
+                    });
+                    let view = self.view_mut();
+                    view.cursor.line = clamped_line;
+                    view.cursor.col = word_end;
+                }
+            }
+        } else {
+            let view = self.view_mut();
+            view.cursor.line = clamped_line;
+            view.cursor.col = clamped_col;
+        }
+    }
+
+    /// Handle mouse double-click: select the word under the cursor.
+    /// Positions cursor, finds word boundaries, enters Visual mode.
+    pub fn mouse_double_click(&mut self, window_id: WindowId, line: usize, col: usize) {
+        self.mouse_drag_active = false;
+        self.mouse_drag_word_mode = false;
+        self.mouse_drag_word_origin = None;
+        self.focus_group_for_window(window_id);
+        self.set_cursor_for_window(window_id, line, col);
+
+        // Find word boundaries at cursor
+        let cursor_line = self.view().cursor.line;
+        let cursor_col = self.view().cursor.col;
+        let line_text: Vec<char> = self.buffer().content.line(cursor_line).chars().collect();
+
+        if cursor_col >= line_text.len() || !Self::is_word_char(line_text[cursor_col]) {
+            // Clicked on non-word character — don't select
+            return;
+        }
+
+        // Find word start
+        let mut word_start = cursor_col;
+        while word_start > 0 && Self::is_word_char(line_text[word_start - 1]) {
+            word_start -= 1;
+        }
+
+        // Find word end (inclusive)
+        let mut word_end = cursor_col;
+        while word_end + 1 < line_text.len() && Self::is_word_char(line_text[word_end + 1]) {
+            word_end += 1;
+        }
+        // Exclude trailing newline from word end
+        if word_end < line_text.len() && line_text[word_end] == '\n' && word_end > word_start {
+            word_end -= 1;
+        }
+
+        // Enter visual mode with anchor at word start, cursor at word end
+        self.visual_anchor = Some(Cursor {
+            line: cursor_line,
+            col: word_start,
+        });
+        let view = self.view_mut();
+        view.cursor.col = word_end;
+        self.mode = Mode::Visual;
+        self.mouse_drag_word_mode = true;
+        self.mouse_drag_word_origin = Some((word_start, word_end, cursor_line));
+    }
+
+    // =======================================================================
+    // Clipboard paste into command/search mode
+    // =======================================================================
+
+    /// Paste the first line from the system clipboard into the command buffer.
+    /// Works in Command and Search modes. For Search mode with incremental search,
+    /// also triggers a search update.
+    #[allow(dead_code)]
+    pub fn paste_clipboard_to_input(&mut self) {
+        let text = match self.clipboard_read {
+            Some(ref cb_read) => match cb_read() {
+                Ok(t) => t,
+                Err(e) => {
+                    self.message = format!("Clipboard read failed: {}", e);
+                    return;
+                }
+            },
+            None => return,
+        };
+        self.paste_text_to_input(&text);
+    }
+
+    /// Paste the given text into the command/search buffer (first line only).
+    /// Called by backends that have already fetched the clipboard text themselves.
+    pub fn paste_text_to_input(&mut self, text: &str) {
+        let first_line = text.lines().next().unwrap_or("");
+        if first_line.is_empty() {
+            return;
+        }
+        match self.mode {
+            Mode::Command | Mode::Search => {
+                self.command_insert_str(first_line);
+                if self.mode == Mode::Search && self.settings.incremental_search {
+                    self.perform_incremental_search();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Pre-load clipboard text into the `+` and `*` registers.
+    /// Called by GTK backend after an async GDK clipboard read, before paste.
+    pub fn load_clipboard_register(&mut self, text: String) {
+        self.registers.insert('+', (text.clone(), false));
+        self.registers.insert('*', (text, false));
+    }
+
+    /// Pre-load clipboard text into `"`, `+`, and `*` before a p/P keypress.
+    ///
+    /// If the clipboard content exactly matches what is already in `"`, the
+    /// existing `is_linewise` flag is **preserved** — this covers the common
+    /// `yy` → `p` flow where the yank wrote linewise text to both the register
+    /// and the system clipboard.  When the clipboard holds different text (from
+    /// another application) `is_linewise` is set to `false` as usual.
+    pub fn load_clipboard_for_paste(&mut self, text: String) {
+        let existing_lw = self
+            .registers
+            .get(&'"')
+            .map(|(c, lw)| c == &text && *lw)
+            .unwrap_or(false);
+        self.registers.insert('"', (text.clone(), existing_lw));
+        self.registers.insert('+', (text.clone(), false));
+        self.registers.insert('*', (text, false));
+    }
+}

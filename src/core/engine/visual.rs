@@ -394,3 +394,491 @@ impl Engine {
         self.visual_anchor = None;
     }
 }
+
+// ─── Additional methods (extracted from mod.rs) ─────────────────────────
+
+impl Engine {
+    // =======================================================================
+    // Multiple cursors (Alt-D)
+    // =======================================================================
+
+    /// Convert a char index in the current buffer into a `Cursor` (line, col).
+    pub(crate) fn char_idx_to_cursor(&self, char_idx: usize) -> Cursor {
+        let len = self.buffer().content.len_chars();
+        let char_idx = char_idx.min(len);
+        if len == 0 {
+            return Cursor { line: 0, col: 0 };
+        }
+        let line = self.buffer().content.char_to_line(char_idx);
+        let line_start = self.buffer().line_to_char(line);
+        Cursor {
+            line,
+            col: char_idx - line_start,
+        }
+    }
+
+    /// Convert a byte offset in the buffer text into a `Cursor`.
+    pub(crate) fn byte_offset_to_cursor(&self, byte_offset: usize) -> Cursor {
+        let char_idx = self.buffer().content.byte_to_char(byte_offset);
+        self.char_idx_to_cursor(char_idx)
+    }
+
+    /// Search for the next occurrence of `pattern` in the buffer, starting
+    /// one pattern-length past `after`.  Wraps around the document end.
+    /// Returns `None` if `pattern` is not found anywhere in the buffer.
+    pub(crate) fn find_next_occurrence(
+        &self,
+        pattern: &str,
+        after: Cursor,
+        word_bounded: bool,
+    ) -> Option<Cursor> {
+        if pattern.is_empty() {
+            return None;
+        }
+
+        let text = self.buffer().to_string();
+        // Start searching one pattern-length past the given cursor position.
+        let after_char_idx =
+            self.buffer().line_to_char(after.line) + after.col + pattern.chars().count();
+        let after_byte = self
+            .buffer()
+            .content
+            .char_to_byte(after_char_idx.min(self.buffer().content.len_chars()));
+
+        let check_boundary = |sb: usize, eb: usize| -> bool {
+            if !word_bounded {
+                return true;
+            }
+            let before_ok =
+                sb == 0 || !Self::is_word_char(text[..sb].chars().last().unwrap_or(' '));
+            let after_ok =
+                eb >= text.len() || !Self::is_word_char(text[eb..].chars().next().unwrap_or(' '));
+            before_ok && after_ok
+        };
+
+        // Pass 1: from after_byte to end of document.
+        let mut byte_pos = after_byte;
+        while byte_pos < text.len() {
+            match text[byte_pos..].find(pattern) {
+                None => break,
+                Some(found) => {
+                    let sb = byte_pos + found;
+                    let eb = sb + pattern.len();
+                    if check_boundary(sb, eb) {
+                        return Some(self.byte_offset_to_cursor(sb));
+                    }
+                    byte_pos = sb + 1;
+                }
+            }
+        }
+
+        // Pass 2: wrap around from document start to after_byte.
+        byte_pos = 0;
+        while byte_pos < after_byte {
+            match text[byte_pos..].find(pattern) {
+                None => break,
+                Some(found) => {
+                    let sb = byte_pos + found;
+                    if sb >= after_byte {
+                        break;
+                    }
+                    let eb = sb + pattern.len();
+                    if check_boundary(sb, eb) {
+                        return Some(self.byte_offset_to_cursor(sb));
+                    }
+                    byte_pos = sb + 1;
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Collect all byte-offset positions of `pattern` in the current buffer,
+    /// returning them as `Cursor` values.  When `word_bounded` is true only
+    /// whole-word matches are returned.
+    pub(crate) fn collect_all_occurrences(&self, pattern: &str, word_bounded: bool) -> Vec<Cursor> {
+        if pattern.is_empty() {
+            return vec![];
+        }
+        let text = self.buffer().to_string();
+        let mut results = Vec::new();
+        let mut byte_pos = 0;
+        while byte_pos < text.len() {
+            match text[byte_pos..].find(pattern) {
+                None => break,
+                Some(found) => {
+                    let sb = byte_pos + found;
+                    let eb = sb + pattern.len();
+                    let ok = if word_bounded {
+                        let before_ok = sb == 0
+                            || !Self::is_word_char(text[..sb].chars().last().unwrap_or(' '));
+                        let after_ok = eb >= text.len()
+                            || !Self::is_word_char(text[eb..].chars().next().unwrap_or(' '));
+                        before_ok && after_ok
+                    } else {
+                        true
+                    };
+                    if ok {
+                        results.push(self.byte_offset_to_cursor(sb));
+                    }
+                    byte_pos = sb + 1;
+                }
+            }
+        }
+        results
+    }
+
+    /// Add secondary cursors at *every* occurrence of the word under the
+    /// primary cursor.  Called by backends when `select_all_matches` is pressed.
+    pub fn select_all_word_occurrences(&mut self) -> EngineAction {
+        let word = match self.word_under_cursor() {
+            Some(w) => w,
+            None => {
+                self.message = "No word under cursor".to_string();
+                return EngineAction::None;
+            }
+        };
+        let all = self.collect_all_occurrences(&word, true);
+        if all.is_empty() {
+            self.message = format!("No occurrences of '{}'", word);
+            return EngineAction::None;
+        }
+        let primary = *self.cursor();
+        let extras: Vec<Cursor> = all.into_iter().filter(|&c| c != primary).collect();
+        let n = extras.len();
+        self.view_mut().extra_cursors = extras;
+        self.message = format!("{} cursors (all occurrences of '{}')", n + 1, word);
+        EngineAction::None
+    }
+
+    /// Add a secondary cursor at the given `(line, col)` position.
+    /// Does nothing if the position equals the primary cursor or is already
+    /// present in `extra_cursors`.
+    pub fn add_cursor_at_pos(&mut self, line: usize, col: usize) {
+        let new_cursor = Cursor { line, col };
+        if new_cursor == *self.cursor() {
+            return;
+        }
+        if self.view().extra_cursors.contains(&new_cursor) {
+            return;
+        }
+        self.view_mut().extra_cursors.push(new_cursor);
+    }
+
+    /// Add a secondary cursor at the next occurrence of the word under the
+    /// primary cursor (or after the last extra cursor if any exist).
+    /// Called by backends when the configured `add_cursor` key is pressed.
+    pub fn add_cursor_at_next_match(&mut self) -> EngineAction {
+        let word = match self.word_under_cursor() {
+            Some(w) => w,
+            None => {
+                self.message = "No word under cursor".to_string();
+                return EngineAction::None;
+            }
+        };
+        let search_after = self
+            .view()
+            .extra_cursors
+            .last()
+            .copied()
+            .unwrap_or_else(|| *self.cursor());
+        if let Some(new_cursor) = self.find_next_occurrence(&word, search_after, true) {
+            let is_primary = new_cursor == *self.cursor();
+            let already_extra = self.view().extra_cursors.contains(&new_cursor);
+            if !is_primary && !already_extra {
+                self.view_mut().extra_cursors.push(new_cursor);
+                let total = self.view().extra_cursors.len() + 1; // +1 for primary
+                self.message = format!("{} cursors ('{}')", total, word);
+            } else {
+                self.message = format!("No more occurrences of '{}'", word);
+            }
+        } else {
+            self.message = format!("No more occurrences of '{}'", word);
+        }
+        EngineAction::None
+    }
+
+    // ── Multi-cursor editing helpers ─────────────────────────────────────────
+
+    /// Insert `text` at every cursor position (primary + extra) simultaneously.
+    /// Processes in ascending char-index order with a running offset so that
+    /// each subsequent insert uses the correct adjusted position.
+    /// Updates primary cursor and all extra cursors to point just after their
+    /// respective inserted text.
+    pub(crate) fn mc_insert(&mut self, text: &str) {
+        let extra = self.view().extra_cursors.clone();
+        let primary = *self.cursor();
+
+        let primary_orig = self.buffer().line_to_char(primary.line) + primary.col;
+        let extra_origs: Vec<usize> = extra
+            .iter()
+            .map(|c| self.buffer().line_to_char(c.line) + c.col)
+            .collect();
+
+        // All original char indices sorted ascending (safe to sort since positions are distinct).
+        let mut all_origs: Vec<usize> = extra_origs.clone();
+        all_origs.push(primary_orig);
+        all_origs.sort_unstable();
+
+        let insert_chars = text.chars().count();
+
+        // Pre-compute new char indices before modifying the buffer.
+        // Cursor at ascending rank i → new_cidx = orig + (rank+1)*insert_chars.
+        let rank_of = |orig: usize| all_origs.iter().position(|&x| x == orig).unwrap_or(0);
+        let primary_new_cidx = primary_orig + (rank_of(primary_orig) + 1) * insert_chars;
+        let extra_new_cidxs: Vec<usize> = extra_origs
+            .iter()
+            .map(|&orig| orig + (rank_of(orig) + 1) * insert_chars)
+            .collect();
+
+        // Insert in ascending order with cumulative offset.
+        let mut offset = 0usize;
+        for &orig in &all_origs {
+            self.insert_with_undo(orig + offset, text);
+            offset += insert_chars;
+        }
+
+        // Apply updated positions (buffer is now modified; char_idx_to_cursor uses new state).
+        self.view_mut().cursor = self.char_idx_to_cursor(primary_new_cidx);
+        self.view_mut().extra_cursors = extra_new_cidxs
+            .iter()
+            .map(|&cidx| self.char_idx_to_cursor(cidx))
+            .collect();
+    }
+
+    /// Delete one char before every cursor position with col > 0.
+    /// Extra cursors at col == 0 are left in place (line-merge not done in multi-cursor mode).
+    /// Returns `true` if at least one deletion was performed.
+    pub(crate) fn mc_backspace(&mut self) -> bool {
+        let extra = self.view().extra_cursors.clone();
+        let primary = *self.cursor();
+
+        let primary_orig = self.buffer().line_to_char(primary.line) + primary.col;
+
+        // Pre-compute original char indices for extra cursors (before any modification).
+        let extra_data: Vec<(usize, bool)> = extra
+            .iter()
+            .map(|c| {
+                let orig = self.buffer().line_to_char(c.line) + c.col;
+                (orig, c.col > 0)
+            })
+            .collect();
+
+        // Collect eligible (col > 0) original char indices.
+        let mut all_eligible: Vec<usize> = Vec::new();
+        let primary_eligible = primary.col > 0;
+        if primary_eligible {
+            all_eligible.push(primary_orig);
+        }
+        for &(orig, eligible) in &extra_data {
+            if eligible {
+                all_eligible.push(orig);
+            }
+        }
+
+        if all_eligible.is_empty() {
+            return false;
+        }
+
+        all_eligible.sort_unstable();
+
+        // Pre-compute new char indices before modifying the buffer.
+        // Cursor at ascending rank i → new_cidx = orig - (rank+1).
+        let rank_of = |orig: usize| all_eligible.iter().position(|&x| x == orig).unwrap_or(0);
+        let primary_new_cidx = if primary_eligible {
+            Some(primary_orig - (rank_of(primary_orig) + 1))
+        } else {
+            None
+        };
+        let extra_new_cidxs: Vec<Option<usize>> = extra_data
+            .iter()
+            .map(|&(orig, eligible)| {
+                if eligible {
+                    Some(orig - (rank_of(orig) + 1))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Delete in DESCENDING order (no offset adjustment needed).
+        for &orig in all_eligible.iter().rev() {
+            self.delete_with_undo(orig - 1, orig);
+        }
+
+        // Apply updated positions.
+        if let Some(new_cidx) = primary_new_cidx {
+            self.view_mut().cursor = self.char_idx_to_cursor(new_cidx);
+        }
+        self.view_mut().extra_cursors = extra_new_cidxs
+            .iter()
+            .zip(extra.iter())
+            .map(|(&opt, ec)| {
+                if let Some(new_cidx) = opt {
+                    self.char_idx_to_cursor(new_cidx)
+                } else {
+                    *ec // unchanged (was at col == 0)
+                }
+            })
+            .collect();
+
+        true
+    }
+
+    /// Delete one char after every cursor position that is not at end-of-buffer.
+    /// Returns `true` if at least one deletion was performed.
+    pub(crate) fn mc_delete_forward(&mut self) -> bool {
+        let extra = self.view().extra_cursors.clone();
+        let primary = *self.cursor();
+
+        let buf_len = self.buffer().content.len_chars();
+        let primary_orig = self.buffer().line_to_char(primary.line) + primary.col;
+
+        let extra_data: Vec<(usize, bool)> = extra
+            .iter()
+            .map(|c| {
+                let orig = self.buffer().line_to_char(c.line) + c.col;
+                (orig, orig < buf_len)
+            })
+            .collect();
+
+        let mut all_eligible: Vec<usize> = Vec::new();
+        let primary_eligible = primary_orig < buf_len;
+        if primary_eligible {
+            all_eligible.push(primary_orig);
+        }
+        for &(orig, eligible) in &extra_data {
+            if eligible {
+                all_eligible.push(orig);
+            }
+        }
+
+        if all_eligible.is_empty() {
+            return false;
+        }
+
+        all_eligible.sort_unstable();
+
+        // Pre-compute new char indices.
+        // Delete-forward: cursor stays in place; earlier deletions shift it left.
+        // Cursor at ascending rank i → new_cidx = orig - rank (not rank+1).
+        let rank_of = |orig: usize| all_eligible.iter().position(|&x| x == orig).unwrap_or(0);
+        let primary_new_cidx = if primary_eligible {
+            Some(primary_orig - rank_of(primary_orig))
+        } else {
+            None
+        };
+        let extra_new_cidxs: Vec<Option<usize>> = extra_data
+            .iter()
+            .map(|&(orig, eligible)| {
+                if eligible {
+                    Some(orig - rank_of(orig))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Delete in DESCENDING order.
+        for &orig in all_eligible.iter().rev() {
+            self.delete_with_undo(orig, orig + 1);
+        }
+
+        if let Some(new_cidx) = primary_new_cidx {
+            self.view_mut().cursor = self.char_idx_to_cursor(new_cidx);
+        }
+        self.view_mut().extra_cursors = extra_new_cidxs
+            .iter()
+            .zip(extra.iter())
+            .map(|(&opt, ec)| {
+                if let Some(new_cidx) = opt {
+                    self.char_idx_to_cursor(new_cidx)
+                } else {
+                    *ec
+                }
+            })
+            .collect();
+
+        true
+    }
+
+    /// Insert a newline (+ auto-indent) at every cursor position.
+    /// Each cursor gets the indent of its own line computed before any modification.
+    pub(crate) fn mc_return(&mut self) {
+        let extra = self.view().extra_cursors.clone();
+        let primary = *self.cursor();
+
+        // Pre-compute (orig_cidx, insert_text) for every cursor, ascending.
+        struct ReturnOp {
+            orig_cidx: usize,
+            text: String,
+            is_primary: bool,
+            extra_idx: usize,
+        }
+
+        let primary_indent = if self.settings.auto_indent {
+            self.get_line_indent_str(primary.line)
+        } else {
+            String::new()
+        };
+
+        let extra_ops: Vec<(usize, String)> = extra
+            .iter()
+            .map(|c| {
+                let orig = self.buffer().line_to_char(c.line) + c.col;
+                let indent = if self.settings.auto_indent {
+                    self.get_line_indent_str(c.line)
+                } else {
+                    String::new()
+                };
+                (orig, format!("\n{}", indent))
+            })
+            .collect();
+
+        let primary_orig = self.buffer().line_to_char(primary.line) + primary.col;
+        let primary_text = format!("\n{}", primary_indent);
+
+        let mut all_ops: Vec<ReturnOp> = extra_ops
+            .iter()
+            .enumerate()
+            .map(|(i, (orig, text))| ReturnOp {
+                orig_cidx: *orig,
+                text: text.clone(),
+                is_primary: false,
+                extra_idx: i,
+            })
+            .collect();
+        all_ops.push(ReturnOp {
+            orig_cidx: primary_orig,
+            text: primary_text,
+            is_primary: true,
+            extra_idx: 0,
+        });
+        all_ops.sort_by_key(|op| op.orig_cidx);
+
+        // Apply inserts ascending with cumulative offset; cursor goes to end of each insert.
+        let mut running_offset = 0usize;
+        let mut primary_new_cidx = 0usize;
+        let mut extra_new_cidxs = vec![0usize; extra.len()];
+
+        for op in &all_ops {
+            let text_chars = op.text.chars().count();
+            let insert_at = op.orig_cidx + running_offset;
+            self.insert_with_undo(insert_at, &op.text);
+            let new_cidx = insert_at + text_chars;
+            running_offset += text_chars;
+            if op.is_primary {
+                primary_new_cidx = new_cidx;
+            } else {
+                extra_new_cidxs[op.extra_idx] = new_cidx;
+            }
+        }
+
+        self.view_mut().cursor = self.char_idx_to_cursor(primary_new_cidx);
+        self.view_mut().extra_cursors = extra_new_cidxs
+            .iter()
+            .map(|&cidx| self.char_idx_to_cursor(cidx))
+            .collect();
+    }
+}

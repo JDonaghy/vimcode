@@ -2707,3 +2707,383 @@ impl Engine {
         Ok(())
     }
 }
+
+// ─── Additional methods (extracted from mod.rs) ─────────────────────────
+
+impl Engine {
+    // ─── Workspace / Open Folder ──────────────────────────────────────────────
+
+    /// Open a folder as the new working directory.  Clears all buffers/tabs,
+    /// resets the explorer root, and loads any per-project session state.
+    pub fn open_folder(&mut self, path: &Path) {
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+
+        // Save current per-workspace session before switching
+        if let Some(ref root) = self.workspace_root.clone() {
+            self.save_session_for_workspace(root);
+        }
+
+        // Restore user settings baseline before applying any new folder overlay
+        if let Some(base) = self.base_settings.take() {
+            self.settings = *base;
+        }
+
+        // Check if the new folder has a per-folder settings file to apply as overlay
+        let folder_settings_path = canonical.join(".vimcode").join("settings.json");
+        if folder_settings_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&folder_settings_path) {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                    if let Some(obj) = json.as_object() {
+                        // Save baseline before overlay
+                        self.base_settings = Some(Box::new(self.settings.clone()));
+                        for (key, value) in obj {
+                            let arg = match value {
+                                serde_json::Value::Bool(b) => {
+                                    if *b {
+                                        key.clone()
+                                    } else {
+                                        format!("no{}", key)
+                                    }
+                                }
+                                serde_json::Value::Number(n) => format!("{}={}", key, n),
+                                serde_json::Value::String(s) => format!("{}={}", key, s),
+                                _ => continue,
+                            };
+                            self.settings.parse_set_option(&arg).ok();
+                        }
+                    }
+                }
+            }
+        }
+
+        // Delete swap files for all current buffers before discarding them.
+        self.cleanup_all_swaps();
+
+        // Clear all existing buffers and tabs, reset to single empty window
+        self.buffer_manager = crate::core::buffer_manager::BufferManager::new();
+        let buffer_id = self.buffer_manager.create();
+        let window_id = crate::core::window::WindowId(self.next_window_id);
+        self.next_window_id += 1;
+        let window = crate::core::window::Window::new(window_id, buffer_id);
+        self.windows.clear();
+        self.windows.insert(window_id, window);
+        let tab = crate::core::tab::Tab::new(crate::core::tab::TabId(self.next_tab_id), window_id);
+        self.next_tab_id += 1;
+        self.editor_groups.clear();
+        let gid = GroupId(0);
+        self.editor_groups.insert(gid, EditorGroup::new(tab));
+        self.active_group = gid;
+        self.group_layout = GroupLayout::leaf(gid);
+        self.next_group_id = 1;
+        self.mode = Mode::Normal;
+
+        // Update cwd + workspace root + process working directory
+        self.cwd = canonical.clone();
+        self.workspace_root = Some(canonical.clone());
+        let _ = std::env::set_current_dir(&canonical);
+
+        // Update git branch
+        self.git_branch = git::current_branch(&canonical);
+
+        // Load per-project session (restores open files + positions)
+        let ws_session = SessionState::load_for_workspace(&canonical);
+        // Restore open files from session
+        let open_files: Vec<PathBuf> = ws_session.open_files.clone();
+        let active_file = ws_session.active_file.clone();
+        // Merge relevant session fields
+        self.session.file_positions = ws_session.file_positions;
+        // Add to recent workspaces in global session
+        self.session.add_recent_workspace(&canonical);
+
+        // Re-open session files
+        for fp in &open_files {
+            self.open_file_in_tab(fp);
+        }
+        // Focus the previously active file
+        if let Some(ref af) = active_file {
+            self.open_file_in_tab(af);
+        }
+
+        self.message = format!("Opened folder: {}", canonical.display());
+    }
+
+    /// Parse and load a `.vimcode-workspace` JSON file.
+    pub fn open_workspace(&mut self, ws_path: &Path) {
+        let content = match std::fs::read_to_string(ws_path) {
+            Ok(c) => c,
+            Err(e) => {
+                self.message = format!("Cannot read workspace: {}", e);
+                return;
+            }
+        };
+        let json: serde_json::Value = match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(e) => {
+                self.message = format!("Invalid workspace JSON: {}", e);
+                return;
+            }
+        };
+
+        // Resolve folder path relative to workspace file
+        let ws_dir = ws_path.parent().unwrap_or(Path::new("."));
+        let folder_rel = json
+            .get("folders")
+            .and_then(|f| f.as_array())
+            .and_then(|a| a.first())
+            .and_then(|e| e.get("path"))
+            .and_then(|p| p.as_str())
+            .unwrap_or(".");
+        let folder_path = ws_dir.join(folder_rel);
+        self.workspace_file = Some(ws_path.to_path_buf());
+
+        // Apply any settings overrides from workspace
+        if let Some(settings_obj) = json.get("settings").and_then(|s| s.as_object()) {
+            // Save baseline settings before applying workspace overlay (once only)
+            if self.base_settings.is_none() {
+                self.base_settings = Some(Box::new(self.settings.clone()));
+            }
+            for (key, value) in settings_obj {
+                let arg = match value {
+                    serde_json::Value::Bool(b) => {
+                        if *b {
+                            key.clone()
+                        } else {
+                            format!("no{}", key)
+                        }
+                    }
+                    serde_json::Value::Number(n) => format!("{}={}", key, n),
+                    serde_json::Value::String(s) => format!("{}={}", key, s),
+                    _ => continue,
+                };
+                self.settings.parse_set_option(&arg).ok();
+            }
+        }
+
+        self.open_folder(&folder_path);
+        self.message = format!("Workspace loaded: {}", ws_path.display());
+    }
+
+    /// Write a `.vimcode-workspace` file at the given path with the current folder.
+    /// Open or create a workspace in the directory of the currently active file.
+    /// If a `.vimcode-workspace` file already exists there, open it; otherwise
+    /// create one and then open the folder.
+    pub fn open_workspace_from_file(&mut self) {
+        let buf_id = self.active_window().buffer_id;
+        let dir = self
+            .buffer_manager
+            .get(buf_id)
+            .and_then(|bs| bs.file_path.as_ref())
+            .and_then(|fp| fp.parent())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| self.cwd.clone());
+        let ws_path = dir.join(".vimcode-workspace");
+        if ws_path.exists() {
+            self.open_workspace(&ws_path);
+        } else {
+            self.save_workspace_as(&ws_path);
+            self.open_folder(&dir);
+        }
+    }
+
+    pub fn save_workspace_as(&mut self, ws_path: &Path) {
+        let folder_path = if let Some(parent) = ws_path.parent() {
+            // Make folder path relative to workspace file location
+            let canonical_cwd = self.cwd.canonicalize().unwrap_or_else(|_| self.cwd.clone());
+            let canonical_parent = parent
+                .canonicalize()
+                .unwrap_or_else(|_| parent.to_path_buf());
+            if canonical_cwd == canonical_parent {
+                ".".to_string()
+            } else {
+                canonical_cwd.to_string_lossy().into_owned()
+            }
+        } else {
+            ".".to_string()
+        };
+
+        let ws = serde_json::json!({
+            "version": 1,
+            "folders": [{"path": folder_path}],
+            "settings": {}
+        });
+        match std::fs::write(
+            ws_path,
+            serde_json::to_string_pretty(&ws).unwrap_or_default(),
+        ) {
+            Ok(()) => {
+                self.workspace_file = Some(ws_path.to_path_buf());
+                self.message = format!("Workspace saved: {}", ws_path.display());
+            }
+            Err(e) => {
+                self.message = format!("Cannot save workspace: {}", e);
+            }
+        }
+    }
+
+    /// Save per-workspace session state (open files, cursor positions).
+    pub fn save_session_for_workspace(&self, root: &Path) {
+        let mut ws_session = SessionState::default();
+
+        // Collect open file paths per group (by iterating each group's tabs).
+        let files_for_group = |group: &EditorGroup| -> Vec<PathBuf> {
+            let mut files: Vec<PathBuf> = Vec::new();
+            for tab in &group.tabs {
+                if let Some(window) = self.windows.get(&tab.active_window) {
+                    if let Some(bs) = self.buffer_manager.get(window.buffer_id) {
+                        if let Some(ref fp) = bs.file_path {
+                            if !files.contains(fp) {
+                                files.push(fp.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            files
+        };
+
+        let group_ids = self.group_layout.group_ids();
+        if let Some(gid) = group_ids.first() {
+            if let Some(group) = self.editor_groups.get(gid) {
+                ws_session.open_files = files_for_group(group);
+            }
+        }
+        if group_ids.len() >= 2 {
+            if let Some(group) = self.editor_groups.get(&group_ids[1]) {
+                ws_session.open_files_group1 = files_for_group(group);
+            }
+        }
+        ws_session.active_file = self.file_path().cloned();
+        ws_session.file_positions = self.session.file_positions.clone();
+        // Save active_group as index position in leaf order for backward compat
+        ws_session.active_group = group_ids
+            .iter()
+            .position(|&id| id == self.active_group)
+            .unwrap_or(0);
+        // For backward-compat, extract direction and ratio from root split
+        // (old format only supported a single split).
+        if let GroupLayout::Split {
+            direction, ratio, ..
+        } = &self.group_layout
+        {
+            ws_session.group_split_direction = match direction {
+                SplitDirection::Vertical => 0,
+                SplitDirection::Horizontal => 1,
+            };
+            ws_session.group_split_ratio = *ratio;
+        }
+        // Save the full recursive tree layout (new format).
+        ws_session.group_layout = Some(self.build_session_group_layout(&self.group_layout));
+        ws_session.save_for_workspace(root).ok();
+    }
+
+    /// Recursively convert the engine's GroupLayout tree into a SessionGroupLayout
+    /// for serialization, collecting each leaf group's open file paths.
+    pub(crate) fn build_session_group_layout(&self, layout: &GroupLayout) -> SessionGroupLayout {
+        match layout {
+            GroupLayout::Leaf(gid) => {
+                let files = self
+                    .editor_groups
+                    .get(gid)
+                    .map(|group| {
+                        let mut files: Vec<PathBuf> = Vec::new();
+                        for tab in &group.tabs {
+                            if let Some(window) = self.windows.get(&tab.active_window) {
+                                if let Some(bs) = self.buffer_manager.get(window.buffer_id) {
+                                    if let Some(ref fp) = bs.file_path {
+                                        if !files.contains(fp) {
+                                            files.push(fp.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        files
+                    })
+                    .unwrap_or_default();
+                SessionGroupLayout::Leaf { files }
+            }
+            GroupLayout::Split {
+                direction,
+                ratio,
+                first,
+                second,
+            } => SessionGroupLayout::Split {
+                direction: match direction {
+                    SplitDirection::Vertical => 0,
+                    SplitDirection::Horizontal => 1,
+                },
+                ratio: *ratio,
+                first: Box::new(self.build_session_group_layout(first)),
+                second: Box::new(self.build_session_group_layout(second)),
+            },
+        }
+    }
+
+    /// Recursively restore groups from a SessionGroupLayout tree.
+    /// Returns the reconstructed GroupLayout tree.
+    pub(crate) fn restore_session_group_layout(
+        &mut self,
+        session_layout: &SessionGroupLayout,
+    ) -> GroupLayout {
+        match session_layout {
+            SessionGroupLayout::Leaf { files } => {
+                let gid = self.new_group_id();
+                // Create the group with the first file (or a scratch tab if no files).
+                let valid: Vec<&PathBuf> = files.iter().filter(|p| p.exists()).collect();
+                if valid.is_empty() {
+                    // Empty group: create a fresh scratch buffer (don't rely on active_group chain).
+                    let wid = self.new_window_id();
+                    let buf_id = self.buffer_manager.create();
+                    let w = Window::new(wid, buf_id);
+                    self.windows.insert(wid, w);
+                    let tid = self.new_tab_id();
+                    let tab = Tab::new(tid, wid);
+                    self.editor_groups.insert(gid, EditorGroup::new(tab));
+                } else {
+                    // Open files in this group's tabs.
+                    let mut first = true;
+                    for path in &valid {
+                        let wid = self.new_window_id();
+                        let buf_id = self
+                            .buffer_manager
+                            .open_file(path)
+                            .unwrap_or_else(|_| self.buffer_manager.create());
+                        let mut w = Window::new(wid, buf_id);
+                        let view = self.restore_file_position(buf_id);
+                        w.view = view;
+                        self.windows.insert(wid, w);
+                        let tid = self.new_tab_id();
+                        let tab = Tab::new(tid, wid);
+                        if first {
+                            self.editor_groups.insert(gid, EditorGroup::new(tab));
+                            first = false;
+                        } else if let Some(group) = self.editor_groups.get_mut(&gid) {
+                            group.tabs.push(tab);
+                        }
+                    }
+                }
+                GroupLayout::Leaf(gid)
+            }
+            SessionGroupLayout::Split {
+                direction,
+                ratio,
+                first,
+                second,
+            } => {
+                let dir = if *direction == 1 {
+                    SplitDirection::Horizontal
+                } else {
+                    SplitDirection::Vertical
+                };
+                let first_layout = self.restore_session_group_layout(first);
+                let second_layout = self.restore_session_group_layout(second);
+                GroupLayout::Split {
+                    direction: dir,
+                    ratio: *ratio,
+                    first: Box::new(first_layout),
+                    second: Box::new(second_layout),
+                }
+            }
+        }
+    }
+}

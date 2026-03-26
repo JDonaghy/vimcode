@@ -3977,3 +3977,652 @@ impl Engine {
         }
     }
 }
+
+// ─── Additional methods (extracted from mod.rs) ─────────────────────────
+
+impl Engine {
+    // =======================================================================
+    // Bracket navigation ([ and ] commands)
+    // =======================================================================
+
+    /// Jump to next section start (]] or next section end (][).
+    /// `end_section`: false = start ('{' in column 0), true = end ('}' in column 0).
+    /// In LaTeX buffers: ]] jumps to next \section/\chapter/\subsection/\subsubsection,
+    /// ][ jumps to next \end{...}.
+    pub(crate) fn jump_section_forward(&mut self, end_section: bool) {
+        if self.is_latex_buffer() {
+            self.jump_latex_section_forward(end_section);
+            return;
+        }
+        let target_char = if end_section { '}' } else { '{' };
+        let total = self.buffer().len_lines();
+        let start = self.view().cursor.line + 1;
+        for line in start..total {
+            let line_start = self.buffer().line_to_char(line);
+            if self.buffer().line_len_chars(line) > 0
+                && self.buffer().content.char(line_start) == target_char
+            {
+                self.view_mut().cursor.line = line;
+                self.view_mut().cursor.col = 0;
+                return;
+            }
+        }
+    }
+
+    /// Jump to previous section start ([[) or previous section end (][]).
+    /// In LaTeX buffers: [[ jumps to previous \section/etc., [] jumps to previous \end{}.
+    pub(crate) fn jump_section_backward(&mut self, end_section: bool) {
+        if self.is_latex_buffer() {
+            self.jump_latex_section_backward(end_section);
+            return;
+        }
+        let target_char = if end_section { '}' } else { '{' };
+        let cur = self.view().cursor.line;
+        for line in (0..cur).rev() {
+            let line_start = self.buffer().line_to_char(line);
+            if self.buffer().line_len_chars(line) > 0
+                && self.buffer().content.char(line_start) == target_char
+            {
+                self.view_mut().cursor.line = line;
+                self.view_mut().cursor.col = 0;
+                return;
+            }
+        }
+    }
+
+    /// Jump to next method start (]m) — finds next '{' that starts a block.
+    /// In LaTeX buffers: ]m jumps to next \begin{...}.
+    pub(crate) fn jump_method_start_forward(&mut self) {
+        if self.is_latex_buffer() {
+            self.jump_latex_env_forward(false);
+            return;
+        }
+        let total_chars = self.buffer().len_chars();
+        let cur_pos = self.buffer().line_to_char(self.view().cursor.line) + self.view().cursor.col;
+        let mut pos = cur_pos + 1;
+        while pos < total_chars {
+            if self.buffer().content.char(pos) == '{' {
+                let line = self.buffer().content.char_to_line(pos);
+                let line_start = self.buffer().line_to_char(line);
+                self.view_mut().cursor.line = line;
+                self.view_mut().cursor.col = pos - line_start;
+                return;
+            }
+            pos += 1;
+        }
+    }
+
+    /// Jump to previous method start ([m).
+    /// In LaTeX buffers: [m jumps to previous \begin{...}.
+    pub(crate) fn jump_method_start_backward(&mut self) {
+        if self.is_latex_buffer() {
+            self.jump_latex_env_backward(false);
+            return;
+        }
+        let cur_pos = self.buffer().line_to_char(self.view().cursor.line) + self.view().cursor.col;
+        if cur_pos == 0 {
+            return;
+        }
+        let mut pos = cur_pos - 1;
+        loop {
+            if self.buffer().content.char(pos) == '{' {
+                let line = self.buffer().content.char_to_line(pos);
+                let line_start = self.buffer().line_to_char(line);
+                self.view_mut().cursor.line = line;
+                self.view_mut().cursor.col = pos - line_start;
+                return;
+            }
+            if pos == 0 {
+                break;
+            }
+            pos -= 1;
+        }
+    }
+
+    /// Jump to next method end (]M) — finds next '}'.
+    /// In LaTeX buffers: ]M jumps to next \end{...}.
+    pub(crate) fn jump_method_end_forward(&mut self) {
+        if self.is_latex_buffer() {
+            self.jump_latex_env_forward(true);
+            return;
+        }
+        let total_chars = self.buffer().len_chars();
+        let cur_pos = self.buffer().line_to_char(self.view().cursor.line) + self.view().cursor.col;
+        let mut pos = cur_pos + 1;
+        while pos < total_chars {
+            if self.buffer().content.char(pos) == '}' {
+                let line = self.buffer().content.char_to_line(pos);
+                let line_start = self.buffer().line_to_char(line);
+                self.view_mut().cursor.line = line;
+                self.view_mut().cursor.col = pos - line_start;
+                return;
+            }
+            pos += 1;
+        }
+    }
+
+    /// Jump to previous method end ([M).
+    /// In LaTeX buffers: [M jumps to previous \end{...}.
+    pub(crate) fn jump_method_end_backward(&mut self) {
+        if self.is_latex_buffer() {
+            self.jump_latex_env_backward(true);
+            return;
+        }
+        let cur_pos = self.buffer().line_to_char(self.view().cursor.line) + self.view().cursor.col;
+        if cur_pos == 0 {
+            return;
+        }
+        let mut pos = cur_pos - 1;
+        loop {
+            if self.buffer().content.char(pos) == '}' {
+                let line = self.buffer().content.char_to_line(pos);
+                let line_start = self.buffer().line_to_char(line);
+                self.view_mut().cursor.line = line;
+                self.view_mut().cursor.col = pos - line_start;
+                return;
+            }
+            if pos == 0 {
+                break;
+            }
+            pos -= 1;
+        }
+    }
+
+    // --- LaTeX-specific motion helpers ---
+
+    /// LaTeX section commands to match for ]] / [[ jumps.
+    const LATEX_SECTION_COMMANDS: &'static [&'static str] = &[
+        "\\part",
+        "\\chapter",
+        "\\section",
+        "\\subsection",
+        "\\subsubsection",
+        "\\paragraph",
+        "\\subparagraph",
+    ];
+
+    /// Jump forward to next LaTeX section command (]]) or \end{} (][).
+    pub(crate) fn jump_latex_section_forward(&mut self, end_section: bool) {
+        let total = self.buffer().len_lines();
+        let start = self.view().cursor.line + 1;
+        for line in start..total {
+            let line_text = self.buffer().content.line(line).chars().collect::<String>();
+            let trimmed = line_text.trim_start();
+            if end_section {
+                if trimmed.starts_with("\\end{") {
+                    self.view_mut().cursor.line = line;
+                    self.view_mut().cursor.col = 0;
+                    return;
+                }
+            } else {
+                for cmd in Self::LATEX_SECTION_COMMANDS {
+                    if let Some(after) = trimmed.strip_prefix(cmd) {
+                        if after.starts_with('{') || after.starts_with('*') || after.is_empty() {
+                            self.view_mut().cursor.line = line;
+                            self.view_mut().cursor.col = 0;
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Jump backward to previous LaTeX section command ([[) or \end{} ([]).
+    pub(crate) fn jump_latex_section_backward(&mut self, end_section: bool) {
+        let cur = self.view().cursor.line;
+        for line in (0..cur).rev() {
+            let line_text = self.buffer().content.line(line).chars().collect::<String>();
+            let trimmed = line_text.trim_start();
+            if end_section {
+                if trimmed.starts_with("\\end{") {
+                    self.view_mut().cursor.line = line;
+                    self.view_mut().cursor.col = 0;
+                    return;
+                }
+            } else {
+                for cmd in Self::LATEX_SECTION_COMMANDS {
+                    if let Some(after) = trimmed.strip_prefix(cmd) {
+                        if after.starts_with('{') || after.starts_with('*') || after.is_empty() {
+                            self.view_mut().cursor.line = line;
+                            self.view_mut().cursor.col = 0;
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Jump forward to next \begin{} (is_end=false) or \end{} (is_end=true).
+    pub(crate) fn jump_latex_env_forward(&mut self, is_end: bool) {
+        let needle = if is_end { "\\end{" } else { "\\begin{" };
+        let total = self.buffer().len_lines();
+        let start_line = self.view().cursor.line;
+        let start_col = self.view().cursor.col;
+        for line in start_line..total {
+            let line_text = self.buffer().content.line(line).chars().collect::<String>();
+            let search_from = if line == start_line { start_col + 1 } else { 0 };
+            if search_from < line_text.len() {
+                if let Some(rel) = line_text[search_from..].find(needle) {
+                    self.view_mut().cursor.line = line;
+                    self.view_mut().cursor.col = search_from + rel;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Jump backward to previous \begin{} (is_end=false) or \end{} (is_end=true).
+    pub(crate) fn jump_latex_env_backward(&mut self, is_end: bool) {
+        let needle = if is_end { "\\end{" } else { "\\begin{" };
+        let start_line = self.view().cursor.line;
+        let start_col = self.view().cursor.col;
+        for line in (0..=start_line).rev() {
+            let line_text = self.buffer().content.line(line).chars().collect::<String>();
+            let search_end = if line == start_line {
+                start_col
+            } else {
+                line_text.len()
+            };
+            if let Some(pos) = line_text[..search_end].rfind(needle) {
+                self.view_mut().cursor.line = line;
+                self.view_mut().cursor.col = pos;
+                return;
+            }
+        }
+    }
+
+    /// Jump forward to next unmatched close bracket (]} or ])).
+    pub(crate) fn jump_unmatched_forward(&mut self, open: char, close: char) {
+        let total_chars = self.buffer().len_chars();
+        let cur_pos = self.buffer().line_to_char(self.view().cursor.line) + self.view().cursor.col;
+        let mut pos = cur_pos + 1;
+        let mut depth: i32 = 0;
+        while pos < total_chars {
+            let ch = self.buffer().content.char(pos);
+            if ch == open {
+                depth += 1;
+            } else if ch == close {
+                if depth == 0 {
+                    let line = self.buffer().content.char_to_line(pos);
+                    let line_start = self.buffer().line_to_char(line);
+                    self.view_mut().cursor.line = line;
+                    self.view_mut().cursor.col = pos - line_start;
+                    return;
+                }
+                depth -= 1;
+            }
+            pos += 1;
+        }
+    }
+
+    /// Jump backward to previous unmatched open bracket ([{ or [().
+    pub(crate) fn jump_unmatched_backward(&mut self, open: char, close: char) {
+        let cur_pos = self.buffer().line_to_char(self.view().cursor.line) + self.view().cursor.col;
+        if cur_pos == 0 {
+            return;
+        }
+        let mut pos = cur_pos - 1;
+        let mut depth: i32 = 0;
+        loop {
+            let ch = self.buffer().content.char(pos);
+            if ch == close {
+                depth += 1;
+            } else if ch == open {
+                if depth == 0 {
+                    let line = self.buffer().content.char_to_line(pos);
+                    let line_start = self.buffer().line_to_char(line);
+                    self.view_mut().cursor.line = line;
+                    self.view_mut().cursor.col = pos - line_start;
+                    return;
+                }
+                depth -= 1;
+            }
+            if pos == 0 {
+                break;
+            }
+            pos -= 1;
+        }
+    }
+
+    // =======================================================================
+    // Toggle case (~)
+    // =======================================================================
+
+    /// Toggle the case of `count` characters starting at the cursor, advance cursor.
+    pub(crate) fn toggle_case_at_cursor(&mut self, count: usize, changed: &mut bool) {
+        let line = self.view().cursor.line;
+        let col = self.view().cursor.col;
+        let char_idx = self.buffer().line_to_char(line) + col;
+
+        // How many chars are available on this line (excluding trailing newline)?
+        let line_len = self.buffer().line_len_chars(line);
+        let line_content = self.buffer().content.line(line);
+        let available = if line_content.chars().last() == Some('\n') {
+            line_len.saturating_sub(1)
+        } else {
+            line_len
+        };
+        let remaining = available.saturating_sub(col);
+        let to_toggle = count.min(remaining);
+
+        if to_toggle == 0 {
+            return;
+        }
+
+        // Read chars to toggle
+        let chars: Vec<char> = self
+            .buffer()
+            .content
+            .slice(char_idx..char_idx + to_toggle)
+            .chars()
+            .collect();
+
+        // Build replacement: toggle case of each char
+        let toggled: String = chars
+            .iter()
+            .map(|&c| {
+                if c.is_uppercase() {
+                    c.to_lowercase().next().unwrap_or(c)
+                } else if c.is_lowercase() {
+                    c.to_uppercase().next().unwrap_or(c)
+                } else {
+                    c
+                }
+            })
+            .collect();
+
+        self.start_undo_group();
+        self.delete_with_undo(char_idx, char_idx + to_toggle);
+        self.insert_with_undo(char_idx, &toggled);
+        self.finish_undo_group();
+
+        // Advance cursor by number of chars toggled (clamped to line end)
+        let new_col = (col + to_toggle).min(available.saturating_sub(1));
+        self.view_mut().cursor.col = new_col;
+        self.clamp_cursor_col();
+        *changed = true;
+    }
+
+    // =======================================================================
+    // Join lines (J)
+    // =======================================================================
+
+    /// Join `count` lines starting at cursor. Collapses the newline + leading
+    /// whitespace of the next line into a single space (no space before `)`).
+    pub(crate) fn join_lines(&mut self, count: usize, changed: &mut bool) {
+        let total_lines = self.buffer().len_lines();
+        let start_line = self.view().cursor.line;
+
+        // We join (count) times; each join merges current line with next
+        let joins = count.min(total_lines.saturating_sub(start_line + 1));
+        if joins == 0 {
+            return;
+        }
+
+        self.start_undo_group();
+        for _ in 0..joins {
+            let cur_line = self.view().cursor.line;
+            let next_line = cur_line + 1;
+            if next_line >= self.buffer().len_lines() {
+                break;
+            }
+
+            // Find position of newline at end of current line
+            let cur_line_len = self.buffer().line_len_chars(cur_line);
+            let cur_line_start = self.buffer().line_to_char(cur_line);
+            // The newline is the last char of the current line
+            let newline_pos = cur_line_start + cur_line_len - 1;
+
+            // Count leading whitespace on next line
+            let next_line_start = self.buffer().line_to_char(next_line);
+            let next_line_content: String = self.buffer().content.line(next_line).chars().collect();
+            let leading_ws = next_line_content
+                .chars()
+                .take_while(|c| *c == ' ' || *c == '\t')
+                .count();
+
+            // Determine what char comes after the whitespace on the next line
+            let next_non_ws = next_line_content.chars().nth(leading_ws);
+
+            // Delete: newline + leading whitespace of next line
+            let del_end = next_line_start + leading_ws;
+            self.delete_with_undo(newline_pos, del_end);
+
+            // Insert a space unless the next non-ws char is ')' or next line was empty/only ws
+            // Also don't add space if the current line ends with a space
+            let should_add_space = !matches!(next_non_ws, None | Some(')') | Some(']') | Some('}'));
+            // Check if current line ends with space (after the newline was removed)
+            let cur_end_char =
+                self.buffer().line_to_char(cur_line) + self.buffer().line_len_chars(cur_line);
+            let ends_with_space = cur_end_char > self.buffer().line_to_char(cur_line)
+                && self.buffer().content.char(cur_end_char - 1) == ' ';
+
+            if should_add_space && !ends_with_space {
+                self.insert_with_undo(newline_pos, " ");
+            }
+        }
+        self.finish_undo_group();
+
+        // Cursor stays at start of original line
+        self.clamp_cursor_col();
+        *changed = true;
+    }
+
+    // =======================================================================
+    // Scroll cursor to position (zz / zt / zb)
+    // =======================================================================
+
+    /// Scroll so that cursor line is centered in viewport.
+    pub(crate) fn scroll_cursor_center(&mut self) {
+        let cursor_line = self.view().cursor.line;
+        let half = self.viewport_lines() / 2;
+        let new_top = cursor_line.saturating_sub(half);
+        self.view_mut().scroll_top = new_top;
+    }
+
+    /// Scroll so that cursor line is at the top of viewport.
+    pub(crate) fn scroll_cursor_top(&mut self) {
+        let cursor_line = self.view().cursor.line;
+        self.view_mut().scroll_top = cursor_line;
+    }
+
+    /// Scroll so that cursor line is at the bottom of viewport.
+    pub(crate) fn scroll_cursor_bottom(&mut self) {
+        let cursor_line = self.view().cursor.line;
+        let viewport = self.viewport_lines();
+        let new_top = cursor_line.saturating_sub(viewport.saturating_sub(1));
+        self.view_mut().scroll_top = new_top;
+    }
+
+    // =======================================================================
+    // Jump list (Ctrl-O / Ctrl-I)
+    // =======================================================================
+
+    /// Push (line, col) to the change list, capped at 100 entries.
+    pub(crate) fn push_change_location(&mut self, line: usize, col: usize) {
+        // Truncate any forward entries (if we navigated back with g;)
+        self.change_list.truncate(self.change_list_pos);
+        // Avoid duplicate consecutive entries
+        if self.change_list.last() == Some(&(line, col)) {
+            return;
+        }
+        self.change_list.push((line, col));
+        if self.change_list.len() > 100 {
+            self.change_list.remove(0);
+        }
+        self.change_list_pos = self.change_list.len();
+    }
+
+    /// Push the current cursor position onto the jump list.
+    pub fn push_jump_location(&mut self) {
+        // Save pre-jump position for '' / `` marks
+        let line = self.view().cursor.line;
+        let col = self.view().cursor.col;
+        self.last_jump_pos = Some((line, col));
+
+        let file = self.active_buffer_state().file_path.clone();
+        let line = self.view().cursor.line;
+        let col = self.view().cursor.col;
+
+        // Truncate forward history when a new jump is made
+        if self.jump_list_pos < self.jump_list.len() {
+            self.jump_list.truncate(self.jump_list_pos);
+        }
+
+        // Don't push a duplicate of the current top entry
+        if let Some(last) = self.jump_list.last() {
+            if last.0 == file && last.1 == line && last.2 == col {
+                return;
+            }
+        }
+
+        self.jump_list.push((file, line, col));
+
+        // Cap at 100 entries
+        if self.jump_list.len() > 100 {
+            self.jump_list.remove(0);
+        }
+
+        self.jump_list_pos = self.jump_list.len();
+    }
+
+    /// Navigate backward in the jump list (Ctrl-O).
+    pub fn jump_list_back(&mut self) {
+        // When at the "live" end (not stored in list), save current position
+        // so Ctrl-I can return to it, then jump to the previous entry.
+        if self.jump_list_pos == self.jump_list.len() {
+            if self.jump_list.is_empty() {
+                self.message = "Already at oldest position in jump list".to_string();
+                return;
+            }
+            let file = self.active_buffer_state().file_path.clone();
+            let line = self.view().cursor.line;
+            let col = self.view().cursor.col;
+            #[allow(clippy::unnecessary_map_or)] // is_none_or requires Rust 1.82+
+            let should_push = self.jump_list.last().map_or(true, |last| {
+                last.0 != file || last.1 != line || last.2 != col
+            });
+            if should_push {
+                self.jump_list.push((file, line, col));
+                if self.jump_list.len() > 100 {
+                    self.jump_list.remove(0);
+                }
+            }
+            // Jump to the entry BEFORE the one we just saved
+            // (list.len()-1 is current, list.len()-2 is the previous)
+            if self.jump_list.len() < 2 {
+                self.message = "Already at oldest position in jump list".to_string();
+                return;
+            }
+            self.jump_list_pos = self.jump_list.len() - 2;
+            self.apply_jump_list_entry(self.jump_list_pos);
+            return;
+        }
+
+        // We're inside the list — go to the previous entry
+        if self.jump_list_pos == 0 {
+            self.message = "Already at oldest position in jump list".to_string();
+            return;
+        }
+
+        self.jump_list_pos -= 1;
+        self.apply_jump_list_entry(self.jump_list_pos);
+    }
+
+    /// Navigate forward in the jump list (Ctrl-I / Tab).
+    pub fn jump_list_forward(&mut self) {
+        if self.jump_list_pos + 1 >= self.jump_list.len() {
+            self.message = "Already at newest position in jump list".to_string();
+            return;
+        }
+
+        self.jump_list_pos += 1;
+        self.apply_jump_list_entry(self.jump_list_pos);
+    }
+
+    /// Move to the position stored at the given jump list index.
+    pub(crate) fn apply_jump_list_entry(&mut self, idx: usize) {
+        let entry = match self.jump_list.get(idx) {
+            Some(e) => e.clone(),
+            None => return,
+        };
+
+        let (file, line, col) = entry;
+
+        // If cross-file, open the file
+        let current_file = self.active_buffer_state().file_path.clone();
+        if file != current_file {
+            if let Some(path) = &file {
+                let path = path.clone();
+                let _ = self.open_file_with_mode(&path, OpenMode::Permanent);
+            }
+        }
+
+        let max_line = self.buffer().len_lines().saturating_sub(1);
+        self.view_mut().cursor.line = line.min(max_line);
+        self.view_mut().cursor.col = col;
+        self.clamp_cursor_col();
+    }
+
+    // =======================================================================
+    // Indent / Dedent (>> / <<)
+    // =======================================================================
+
+    /// Indent `count` lines starting at `start_line` by shift_width.
+    pub(crate) fn indent_lines(&mut self, start_line: usize, count: usize, changed: &mut bool) {
+        let indent_str = if self.settings.expand_tab {
+            " ".repeat(self.settings.shift_width as usize)
+        } else {
+            "\t".to_string()
+        };
+
+        self.start_undo_group();
+        let total = self.buffer().len_lines();
+        for i in 0..count {
+            let line_idx = start_line + i;
+            if line_idx >= total {
+                break;
+            }
+            let line_start = self.buffer().line_to_char(line_idx);
+            self.insert_with_undo(line_start, &indent_str);
+        }
+        self.finish_undo_group();
+        *changed = true;
+    }
+
+    /// Dedent `count` lines starting at `start_line` by up to shift_width.
+    pub(crate) fn dedent_lines(&mut self, start_line: usize, count: usize, changed: &mut bool) {
+        let sw = self.settings.shift_width as usize;
+        self.start_undo_group();
+        // Work backwards to avoid invalidating positions
+        let total = self.buffer().len_lines();
+        for i in (0..count).rev() {
+            let line_idx = start_line + i;
+            if line_idx >= total {
+                continue;
+            }
+            let line_start = self.buffer().line_to_char(line_idx);
+            let line_content: String = self.buffer().content.line(line_idx).chars().collect();
+            let mut removed = 0;
+            for ch in line_content.chars() {
+                if removed >= sw {
+                    break;
+                }
+                match ch {
+                    ' ' => removed += 1,
+                    '\t' => removed += sw.min(sw - (removed % sw).max(1) + 1).min(sw - removed),
+                    _ => break,
+                }
+            }
+            if removed > 0 {
+                self.delete_with_undo(line_start, line_start + removed);
+            }
+        }
+        self.finish_undo_group();
+        if count > 0 {
+            *changed = true;
+        }
+    }
+}

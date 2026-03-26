@@ -2219,3 +2219,793 @@ impl Engine {
         lines.join("\n")
     }
 }
+
+// ─── Additional methods (extracted from mod.rs) ─────────────────────────
+
+impl Engine {
+    // =======================================================================
+    // Window resize (CTRL-W +/-/</>=/|/_)
+    // =======================================================================
+
+    /// Resize the window's parent split by delta steps.
+    /// `direction`: which split direction to look for (Horizontal for +/-, Vertical for </>).
+    /// `increase`: true = make active group bigger, false = smaller.
+    pub(crate) fn resize_window_split(
+        &mut self,
+        direction: SplitDirection,
+        increase: bool,
+        count: usize,
+    ) {
+        let delta_per_step = 0.05;
+        if let Some((split_idx, split_dir, is_first)) =
+            self.group_layout.parent_split_of(self.active_group)
+        {
+            if split_dir == direction {
+                // Active group is in first child → increasing ratio makes it bigger
+                let delta = if (is_first && increase) || (!is_first && !increase) {
+                    delta_per_step * count as f64
+                } else {
+                    -(delta_per_step * count as f64)
+                };
+                self.group_layout.adjust_ratio_at_index(split_idx, delta);
+            }
+        }
+    }
+
+    /// Equalize all split ratios to 0.5.
+    pub(crate) fn equalize_splits(&mut self) {
+        self.group_layout.set_all_ratios(0.5);
+    }
+
+    /// Maximize window in a given direction (CTRL-W _ for height, CTRL-W | for width).
+    pub(crate) fn maximize_window_split(&mut self, direction: SplitDirection) {
+        if let Some((split_idx, split_dir, is_first)) =
+            self.group_layout.parent_split_of(self.active_group)
+        {
+            if split_dir == direction {
+                let ratio = if is_first { 0.9 } else { 0.1 };
+                self.group_layout.set_ratio_at_index(split_idx, ratio);
+            }
+        }
+    }
+
+    /// Execute a window command by character (`:wincmd {char}` and Ctrl-W {char}).
+    pub(crate) fn execute_wincmd(&mut self, ch: char, count: usize) -> EngineAction {
+        match ch {
+            // Focus
+            'h' => self.focus_window_direction(SplitDirection::Vertical, false),
+            'j' => self.focus_window_direction(SplitDirection::Horizontal, true),
+            'k' => self.focus_window_direction(SplitDirection::Horizontal, false),
+            'l' => self.focus_window_direction(SplitDirection::Vertical, true),
+            'w' | 'W' => self.focus_next_window(),
+            'p' => {
+                if let Some(prev) = self.prev_active_group {
+                    if self.editor_groups.contains_key(&prev) {
+                        let cur = self.active_group;
+                        self.active_group = prev;
+                        self.prev_active_group = Some(cur);
+                    }
+                }
+            }
+            't' => {
+                if let Some(first) = self.group_layout.nth_leaf(0) {
+                    if first != self.active_group {
+                        self.prev_active_group = Some(self.active_group);
+                    }
+                    self.active_group = first;
+                }
+            }
+            'b' => {
+                let ids = self.group_layout.group_ids();
+                if let Some(&last) = ids.last() {
+                    if last != self.active_group {
+                        self.prev_active_group = Some(self.active_group);
+                    }
+                    self.active_group = last;
+                }
+            }
+            // Move
+            'H' => self.move_window_to_edge(SplitDirection::Vertical, false),
+            'J' => self.move_window_to_edge(SplitDirection::Horizontal, true),
+            'K' => self.move_window_to_edge(SplitDirection::Horizontal, false),
+            'L' => self.move_window_to_edge(SplitDirection::Vertical, true),
+            'T' => self.move_window_to_new_group(),
+            'x' => self.exchange_windows(),
+            'r' => self.rotate_windows(true),
+            'R' => self.rotate_windows(false),
+            // Split / Close
+            's' | 'S' => self.split_window(SplitDirection::Horizontal, None),
+            'v' | 'V' => self.split_window(SplitDirection::Vertical, None),
+            'c' | 'C' => {
+                self.close_window();
+            }
+            'q' => {
+                self.close_window();
+            }
+            'o' | 'O' => self.close_other_windows(),
+            'n' => {
+                let _ = self.execute_command("new");
+            }
+            // Editor groups
+            'e' => self.open_editor_group(SplitDirection::Vertical),
+            'E' => self.open_editor_group(SplitDirection::Horizontal),
+            // Resize (count-aware)
+            '+' => self.resize_window_split(SplitDirection::Horizontal, true, count),
+            '-' => self.resize_window_split(SplitDirection::Horizontal, false, count),
+            '>' => self.resize_window_split(SplitDirection::Vertical, true, count),
+            '<' => self.resize_window_split(SplitDirection::Vertical, false, count),
+            '=' => self.equalize_splits(),
+            '_' => self.maximize_window_split(SplitDirection::Horizontal),
+            '|' => self.maximize_window_split(SplitDirection::Vertical),
+            // Composite
+            'f' => {
+                if let Some(path) = self.file_path_under_cursor() {
+                    let abs_path = if path.is_absolute() {
+                        path
+                    } else {
+                        self.cwd.join(&path)
+                    };
+                    self.split_window(SplitDirection::Horizontal, None);
+                    return EngineAction::OpenFile(abs_path);
+                } else {
+                    self.message = "No file path under cursor".to_string();
+                }
+            }
+            'd' => {
+                self.split_window(SplitDirection::Horizontal, None);
+                self.push_jump_location();
+                self.lsp_request_definition();
+            }
+            _ => {
+                self.message = format!("Unknown wincmd: {}", ch);
+            }
+        }
+        EngineAction::None
+    }
+
+    /// Ctrl-W H/J/K/L: move current window to far edge.
+    /// Creates a new editor group at the edge of the entire layout.
+    pub(crate) fn move_window_to_edge(&mut self, direction: SplitDirection, forward: bool) {
+        // Only meaningful with multiple groups
+        let groups = self.group_layout.group_ids();
+        if groups.len() <= 1 {
+            // With a single group, split the group layout at the root
+            let buf_id = self.active_buffer_id();
+            let view_clone = self.view().clone();
+            // Close current window if possible
+            let could_close = self.close_window();
+            if !could_close {
+                return; // Last window, can't move
+            }
+            // Create new group at the edge
+            let new_win_id = self.new_window_id();
+            let mut new_win = Window::new(new_win_id, buf_id);
+            new_win.view = view_clone;
+            self.windows.insert(new_win_id, new_win);
+            let tab = Tab::new(self.new_tab_id(), new_win_id);
+            let new_gid = self.new_group_id();
+            self.editor_groups.insert(new_gid, EditorGroup::new(tab));
+            // Wrap the existing layout in a split with the new group at the desired edge
+            let old_layout =
+                std::mem::replace(&mut self.group_layout, GroupLayout::leaf(GroupId(0)));
+            self.group_layout = if forward {
+                GroupLayout::Split {
+                    direction,
+                    ratio: 0.5,
+                    first: Box::new(old_layout),
+                    second: Box::new(GroupLayout::leaf(new_gid)),
+                }
+            } else {
+                GroupLayout::Split {
+                    direction,
+                    ratio: 0.5,
+                    first: Box::new(GroupLayout::leaf(new_gid)),
+                    second: Box::new(old_layout),
+                }
+            };
+            self.prev_active_group = Some(self.active_group);
+            self.active_group = new_gid;
+            return;
+        }
+        // Multiple groups: remove window, create new group at edge
+        let buf_id = self.active_buffer_id();
+        let view_clone = self.view().clone();
+        let could_close = self.close_window();
+        if !could_close {
+            return;
+        }
+        let new_win_id = self.new_window_id();
+        let mut new_win = Window::new(new_win_id, buf_id);
+        new_win.view = view_clone;
+        self.windows.insert(new_win_id, new_win);
+        let tab = Tab::new(self.new_tab_id(), new_win_id);
+        let new_gid = self.new_group_id();
+        self.editor_groups.insert(new_gid, EditorGroup::new(tab));
+        let old_layout = std::mem::replace(&mut self.group_layout, GroupLayout::leaf(GroupId(0)));
+        self.group_layout = if forward {
+            GroupLayout::Split {
+                direction,
+                ratio: 0.5,
+                first: Box::new(old_layout),
+                second: Box::new(GroupLayout::leaf(new_gid)),
+            }
+        } else {
+            GroupLayout::Split {
+                direction,
+                ratio: 0.5,
+                first: Box::new(GroupLayout::leaf(new_gid)),
+                second: Box::new(old_layout),
+            }
+        };
+        self.prev_active_group = Some(self.active_group);
+        self.active_group = new_gid;
+    }
+
+    /// Ctrl-W T: move current window to a new editor group.
+    pub(crate) fn move_window_to_new_group(&mut self) {
+        // Only meaningful with multiple windows in the current tab
+        let tab = self.active_tab();
+        if tab.layout.is_single_window() && self.active_group().tabs.len() == 1 {
+            self.message = "Already the only window".to_string();
+            return;
+        }
+        let buf_id = self.active_buffer_id();
+        let view_clone = self.view().clone();
+        let could_close = self.close_window();
+        if !could_close {
+            return;
+        }
+        // Open a new editor group with that buffer
+        let new_win_id = self.new_window_id();
+        let mut new_win = Window::new(new_win_id, buf_id);
+        new_win.view = view_clone;
+        self.windows.insert(new_win_id, new_win);
+        let tab = Tab::new(self.new_tab_id(), new_win_id);
+        let new_gid = self.new_group_id();
+        self.editor_groups.insert(new_gid, EditorGroup::new(tab));
+        self.group_layout
+            .split_at(self.active_group, SplitDirection::Vertical, new_gid, false);
+        self.prev_active_group = Some(self.active_group);
+        self.active_group = new_gid;
+    }
+
+    /// Ctrl-W x: exchange current window with next window in the same tab.
+    pub(crate) fn exchange_windows(&mut self) {
+        let tab = self.active_tab();
+        let ids = tab.layout.window_ids();
+        if ids.len() < 2 {
+            return;
+        }
+        let current_id = tab.active_window;
+        let current_idx = ids.iter().position(|&id| id == current_id).unwrap_or(0);
+        let next_idx = (current_idx + 1) % ids.len();
+        let next_id = ids[next_idx];
+        // Swap buffer_id and view between the two windows
+        let current_buf = self.windows[&current_id].buffer_id;
+        let current_view = self.windows[&current_id].view.clone();
+        let next_buf = self.windows[&next_id].buffer_id;
+        let next_view = self.windows[&next_id].view.clone();
+        if let Some(w) = self.windows.get_mut(&current_id) {
+            w.buffer_id = next_buf;
+            w.view = next_view;
+        }
+        if let Some(w) = self.windows.get_mut(&next_id) {
+            w.buffer_id = current_buf;
+            w.view = current_view;
+        }
+    }
+
+    /// Ctrl-W r/R: rotate windows in the current tab.
+    /// `forward=true` rotates downward/rightward, `forward=false` rotates upward/leftward.
+    pub(crate) fn rotate_windows(&mut self, forward: bool) {
+        let tab = self.active_tab();
+        let ids = tab.layout.window_ids();
+        if ids.len() < 2 {
+            return;
+        }
+        // Collect (buffer_id, view) for each window in layout order
+        let mut data: Vec<_> = ids
+            .iter()
+            .map(|&id| {
+                let w = &self.windows[&id];
+                (w.buffer_id, w.view.clone())
+            })
+            .collect();
+        // Rotate the data
+        if forward {
+            // Last element moves to front
+            let last = data.pop().unwrap();
+            data.insert(0, last);
+        } else {
+            // First element moves to back
+            let first = data.remove(0);
+            data.push(first);
+        }
+        // Apply rotated data back
+        for (i, &id) in ids.iter().enumerate() {
+            if let Some(w) = self.windows.get_mut(&id) {
+                w.buffer_id = data[i].0;
+                w.view = data[i].1.clone();
+            }
+        }
+    }
+
+    /// Jump to end of C-style comment block (]*  or  ]/).
+    pub(crate) fn jump_comment_end(&mut self) {
+        let total = self.buffer().len_lines();
+        let start = self.view().cursor.line + 1;
+        for line_idx in start..total {
+            let line: String = self.buffer().content.line(line_idx).chars().collect();
+            let trimmed = line.trim();
+            if trimmed.contains("*/") {
+                self.view_mut().cursor.line = line_idx;
+                // Position cursor at the '*' of '*/'
+                if let Some(pos) = line.find("*/") {
+                    let col = line[..pos].chars().count();
+                    self.view_mut().cursor.col = col;
+                } else {
+                    self.view_mut().cursor.col = 0;
+                }
+                self.clamp_cursor_col();
+                return;
+            }
+        }
+    }
+
+    /// Jump to start of C-style comment block ([*  or  [/).
+    pub(crate) fn jump_comment_start(&mut self) {
+        let cursor_line = self.view().cursor.line;
+        if cursor_line == 0 {
+            return;
+        }
+        for line_idx in (0..cursor_line).rev() {
+            let line: String = self.buffer().content.line(line_idx).chars().collect();
+            let trimmed = line.trim();
+            if trimmed.contains("/*") {
+                self.view_mut().cursor.line = line_idx;
+                // Position cursor at the '/' of '/*'
+                if let Some(pos) = line.find("/*") {
+                    let col = line[..pos].chars().count();
+                    self.view_mut().cursor.col = col;
+                } else {
+                    self.view_mut().cursor.col = 0;
+                }
+                self.clamp_cursor_col();
+                return;
+            }
+        }
+    }
+
+    /// Jump forward to next unmatched `#else` or `#endif` (`]#`).
+    /// Uses depth tracking: `#if`/`#ifdef`/`#ifndef` increase depth,
+    /// `#endif` decreases depth, `#else`/`#elif` match at depth 0.
+    pub(crate) fn jump_preproc_forward(&mut self) {
+        let total = self.buffer().len_lines();
+        let start = self.view().cursor.line + 1;
+        let mut depth: i32 = 0;
+        for line_idx in start..total {
+            let line: String = self.buffer().content.line(line_idx).chars().collect();
+            let trimmed = line.trim();
+            if let Some(directive) = Self::preproc_directive(trimmed) {
+                match directive {
+                    PreprocKind::If => depth += 1,
+                    PreprocKind::ElseElif => {
+                        if depth == 0 {
+                            self.view_mut().cursor.line = line_idx;
+                            self.view_mut().cursor.col = 0;
+                            self.clamp_cursor_col();
+                            return;
+                        }
+                    }
+                    PreprocKind::Endif => {
+                        if depth == 0 {
+                            self.view_mut().cursor.line = line_idx;
+                            self.view_mut().cursor.col = 0;
+                            self.clamp_cursor_col();
+                            return;
+                        }
+                        depth -= 1;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Jump backward to previous unmatched `#if` or `#else` (`[#`).
+    /// Uses depth tracking: `#endif` increases depth,
+    /// `#if`/`#ifdef`/`#ifndef` decrease depth, `#else`/`#elif` match at depth 0.
+    pub(crate) fn jump_preproc_backward(&mut self) {
+        let cursor_line = self.view().cursor.line;
+        if cursor_line == 0 {
+            return;
+        }
+        let mut depth: i32 = 0;
+        for line_idx in (0..cursor_line).rev() {
+            let line: String = self.buffer().content.line(line_idx).chars().collect();
+            let trimmed = line.trim();
+            if let Some(directive) = Self::preproc_directive(trimmed) {
+                match directive {
+                    PreprocKind::Endif => depth += 1,
+                    PreprocKind::ElseElif => {
+                        if depth == 0 {
+                            self.view_mut().cursor.line = line_idx;
+                            self.view_mut().cursor.col = 0;
+                            self.clamp_cursor_col();
+                            return;
+                        }
+                    }
+                    PreprocKind::If => {
+                        if depth == 0 {
+                            self.view_mut().cursor.line = line_idx;
+                            self.view_mut().cursor.col = 0;
+                            self.clamp_cursor_col();
+                            return;
+                        }
+                        depth -= 1;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Classify a trimmed line as a preprocessor directive kind.
+    pub(crate) fn preproc_directive(trimmed: &str) -> Option<PreprocKind> {
+        if !trimmed.starts_with('#') {
+            return None;
+        }
+        // Strip '#' and optional whitespace after it
+        let after_hash = trimmed[1..].trim_start();
+        if after_hash.starts_with("ifdef")
+            || after_hash.starts_with("ifndef")
+            || after_hash.starts_with("if ")
+            || after_hash.starts_with("if\t")
+            || after_hash == "if"
+        {
+            Some(PreprocKind::If)
+        } else if after_hash.starts_with("else") || after_hash.starts_with("elif") {
+            Some(PreprocKind::ElseElif)
+        } else if after_hash.starts_with("endif") {
+            Some(PreprocKind::Endif)
+        } else {
+            None
+        }
+    }
+
+    /// `do` (diff obtain): in a diff view, replace the current line in the active
+    /// window with the corresponding line from the other diff window.
+    pub(crate) fn diff_obtain(&mut self, changed: &mut bool) {
+        let (a_win, b_win) = match self.diff_window_pair {
+            Some(pair) => pair,
+            None => {
+                self.message = "Not in diff mode".to_string();
+                return;
+            }
+        };
+        let active = self.active_window_id();
+        let other = if active == a_win {
+            b_win
+        } else if active == b_win {
+            a_win
+        } else {
+            self.message = "Current window is not part of a diff".to_string();
+            return;
+        };
+        let cursor_line = self.view().cursor.line;
+        // Get the diff status for the active window
+        let diff_status = self
+            .diff_results
+            .get(&active)
+            .and_then(|v| v.get(cursor_line))
+            .cloned();
+        match diff_status {
+            Some(DiffLine::Same) => {
+                self.message = "Line is the same in both files".to_string();
+            }
+            Some(DiffLine::Added) | Some(DiffLine::Removed) | Some(DiffLine::Padding) | None => {
+                // Get the corresponding line from the other window
+                // For simplicity, use the same line number from the other buffer
+                if let Some(other_win) = self.windows.get(&other) {
+                    let other_buf_id = other_win.buffer_id;
+                    if let Some(other_state) = self.buffer_manager.get(other_buf_id) {
+                        if cursor_line < other_state.buffer.len_lines() {
+                            let other_line: String = other_state
+                                .buffer
+                                .content
+                                .line(cursor_line)
+                                .chars()
+                                .collect();
+                            // Replace the current line
+                            let line_start = self.buffer().line_to_char(cursor_line);
+                            let line_end = if cursor_line + 1 < self.buffer().len_lines() {
+                                self.buffer().line_to_char(cursor_line + 1)
+                            } else {
+                                self.buffer().len_chars()
+                            };
+                            self.start_undo_group();
+                            self.delete_with_undo(line_start, line_end);
+                            self.insert_with_undo(line_start, &other_line);
+                            self.finish_undo_group();
+                            self.view_mut().cursor.col = 0;
+                            self.clamp_cursor_col();
+                            *changed = true;
+                            self.compute_diff();
+                        } else {
+                            self.message = "No corresponding line in other file".to_string();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// `dp` (diff put): in a diff view, replace the corresponding line in the
+    /// other diff window with the current line from the active window.
+    pub(crate) fn diff_put(&mut self, changed: &mut bool) {
+        let (a_win, b_win) = match self.diff_window_pair {
+            Some(pair) => pair,
+            None => {
+                self.message = "Not in diff mode".to_string();
+                return;
+            }
+        };
+        let active = self.active_window_id();
+        let other = if active == a_win {
+            b_win
+        } else if active == b_win {
+            a_win
+        } else {
+            self.message = "Current window is not part of a diff".to_string();
+            return;
+        };
+        let cursor_line = self.view().cursor.line;
+        // Get the current line from the active buffer
+        let current_line: String = self.buffer().content.line(cursor_line).chars().collect();
+        // Replace the corresponding line in the other buffer
+        if let Some(other_win) = self.windows.get(&other) {
+            let other_buf_id = other_win.buffer_id;
+            if let Some(other_state) = self.buffer_manager.get_mut(other_buf_id) {
+                if cursor_line < other_state.buffer.len_lines() {
+                    let line_start = other_state.buffer.line_to_char(cursor_line);
+                    let line_end = if cursor_line + 1 < other_state.buffer.len_lines() {
+                        other_state.buffer.line_to_char(cursor_line + 1)
+                    } else {
+                        other_state.buffer.len_chars()
+                    };
+                    other_state.buffer.delete_range(line_start, line_end);
+                    other_state.buffer.insert(line_start, &current_line);
+                    other_state.dirty = true;
+                    *changed = true;
+                    self.compute_diff();
+                } else {
+                    // Other buffer is shorter — append the line
+                    let end = other_state.buffer.len_chars();
+                    let needs_newline = end > 0 && other_state.buffer.content.char(end - 1) != '\n';
+                    if needs_newline {
+                        other_state.buffer.insert(end, "\n");
+                    }
+                    let end = other_state.buffer.len_chars();
+                    other_state.buffer.insert(end, &current_line);
+                    other_state.dirty = true;
+                    *changed = true;
+                    self.compute_diff();
+                }
+            }
+        }
+    }
+
+    /// Apply an operator in blockwise mode (rectangle region).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn apply_blockwise_operator(
+        &mut self,
+        operator: char,
+        start_line: usize,
+        end_line: usize,
+        left_col: usize,
+        right_col: usize,
+        changed: &mut bool,
+    ) {
+        match operator {
+            'd' => {
+                // Delete the block region
+                self.start_undo_group();
+                let mut deleted_text = String::new();
+                // Process lines in reverse to keep indices stable
+                for line_idx in (start_line..=end_line).rev() {
+                    let line_start = self.buffer().line_to_char(line_idx);
+                    let line_len = self.buffer().line_len_chars(line_idx);
+                    let text_len = if line_len > 0
+                        && self.buffer().content.char(line_start + line_len - 1) == '\n'
+                    {
+                        line_len - 1
+                    } else {
+                        line_len
+                    };
+                    let from = left_col.min(text_len);
+                    let to = (right_col + 1).min(text_len);
+                    if from < to {
+                        let del: String = self
+                            .buffer()
+                            .content
+                            .slice((line_start + from)..(line_start + to))
+                            .chars()
+                            .collect();
+                        deleted_text = del + "\n" + &deleted_text;
+                        self.delete_with_undo(line_start + from, line_start + to);
+                    }
+                }
+                let reg = self.active_register();
+                self.set_delete_register(reg, deleted_text, false);
+                self.clear_selected_register();
+                self.view_mut().cursor.line = start_line;
+                self.view_mut().cursor.col = left_col;
+                self.clamp_cursor_col();
+                self.finish_undo_group();
+                *changed = true;
+            }
+            'y' => {
+                // Yank the block region
+                let mut yanked = String::new();
+                for line_idx in start_line..=end_line {
+                    let line_start = self.buffer().line_to_char(line_idx);
+                    let line_len = self.buffer().line_len_chars(line_idx);
+                    let text_len = if line_len > 0
+                        && self.buffer().content.char(line_start + line_len - 1) == '\n'
+                    {
+                        line_len - 1
+                    } else {
+                        line_len
+                    };
+                    let from = left_col.min(text_len);
+                    let to = (right_col + 1).min(text_len);
+                    if from < to {
+                        let chunk: String = self
+                            .buffer()
+                            .content
+                            .slice((line_start + from)..(line_start + to))
+                            .chars()
+                            .collect();
+                        yanked.push_str(&chunk);
+                    }
+                    yanked.push('\n');
+                }
+                let reg = self.active_register();
+                self.set_yank_register(reg, yanked, false);
+                self.clear_selected_register();
+            }
+            _ => {
+                // For other operators (c, ~, u, U, etc.), fall back to charwise
+                let start = self.buffer().line_to_char(start_line) + left_col;
+                let end_char = self.buffer().line_to_char(end_line) + right_col + 1;
+                let max = self.buffer().len_chars();
+                self.apply_charwise_operator(operator, start, end_char.min(max), changed);
+            }
+        }
+    }
+
+    /// Try to parse and execute a range filter command like `1,5!sort` or `.!cmd`.
+    /// Returns Some(action) if it matched, None otherwise.
+    pub(crate) fn try_execute_filter_command(&mut self, cmd: &str) -> Option<EngineAction> {
+        // Match patterns: N,M!cmd  or  .!cmd  or  .,.+N!cmd
+        // Split on '!' — if there's a range before and a command after, it's a filter.
+        let bang_pos = cmd.find('!')?;
+        let range_str = &cmd[..bang_pos];
+        let filter_cmd = cmd[bang_pos + 1..].trim();
+        if filter_cmd.is_empty() || range_str.is_empty() {
+            return None;
+        }
+        // Parse the range. Support: N,M  .,.+N  N  .  %
+        let (start_line, end_line) = self.parse_simple_range(range_str)?;
+        // Extract the text from the range
+        let total_lines = self.buffer().len_lines();
+        let start = start_line.min(total_lines.saturating_sub(1));
+        let end = end_line.min(total_lines.saturating_sub(1));
+        let mut lines_text = String::new();
+        for i in start..=end {
+            let line: String = self.buffer().content.line(i).chars().collect();
+            lines_text.push_str(&line);
+        }
+        // Pipe through the command
+        #[cfg(not(test))]
+        let result = {
+            use std::io::Write;
+            let mut child = match std::process::Command::new("sh")
+                .arg("-c")
+                .arg(filter_cmd)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    self.message = format!("Filter error: {}", e);
+                    return Some(EngineAction::None);
+                }
+            };
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(lines_text.as_bytes());
+            }
+            match child.wait_with_output() {
+                Ok(output) => {
+                    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    if !stderr.is_empty() && stdout.is_empty() {
+                        self.message = format!("Filter error: {}", stderr.trim());
+                        return Some(EngineAction::None);
+                    }
+                    stdout
+                }
+                Err(e) => {
+                    self.message = format!("Filter error: {}", e);
+                    return Some(EngineAction::None);
+                }
+            }
+        };
+        #[cfg(test)]
+        let result = lines_text.clone(); // No-op in tests
+
+        // Replace the range with the result
+        let range_start = self.buffer().line_to_char(start);
+        let range_end = if end + 1 < total_lines {
+            self.buffer().line_to_char(end + 1)
+        } else {
+            self.buffer().len_chars()
+        };
+        self.start_undo_group();
+        self.delete_with_undo(range_start, range_end);
+        self.insert_with_undo(range_start, &result);
+        self.finish_undo_group();
+        self.view_mut().cursor.line = start;
+        self.view_mut().cursor.col = 0;
+        let line_count = result.lines().count();
+        self.message = format!("{} lines filtered", line_count);
+        Some(EngineAction::None)
+    }
+
+    /// Parse a simple line range like "1,5", ".", ".,.+3", "%".
+    /// Returns 0-indexed (start_line, end_line).
+    pub(crate) fn parse_simple_range(&self, range: &str) -> Option<(usize, usize)> {
+        let current_line = self.view().cursor.line;
+        let last_line = self.buffer().len_lines().saturating_sub(1);
+
+        if range == "%" {
+            return Some((0, last_line));
+        }
+        if range == "." {
+            return Some((current_line, current_line));
+        }
+
+        if let Some((left, right)) = range.split_once(',') {
+            let start = self.parse_line_addr(left.trim(), current_line, last_line)?;
+            let end = self.parse_line_addr(right.trim(), current_line, last_line)?;
+            Some((start, end))
+        } else {
+            let line = self.parse_line_addr(range.trim(), current_line, last_line)?;
+            Some((line, line))
+        }
+    }
+
+    /// Parse a single line address: number (1-indexed), ".", "$", ".+N", ".-N".
+    pub(crate) fn parse_line_addr(&self, addr: &str, current: usize, last: usize) -> Option<usize> {
+        if addr == "." {
+            return Some(current);
+        }
+        if addr == "$" {
+            return Some(last);
+        }
+        if let Some(offset) = addr.strip_prefix(".+") {
+            let n: usize = offset.parse().ok()?;
+            return Some((current + n).min(last));
+        }
+        if let Some(offset) = addr.strip_prefix(".-") {
+            let n: usize = offset.parse().ok()?;
+            return Some(current.saturating_sub(n));
+        }
+        // Plain number (1-indexed)
+        let n: usize = addr.parse().ok()?;
+        if n == 0 {
+            return None;
+        }
+        Some((n - 1).min(last))
+    }
+}
