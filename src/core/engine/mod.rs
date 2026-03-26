@@ -1931,6 +1931,12 @@ pub struct Engine {
     /// Set when entering a workspace, restored when leaving. `None` if no overlay active.
     pub base_settings: Option<Box<Settings>>,
 
+    // --- Sidebar focus (shared by all backends) ---
+    /// Whether the Explorer sidebar panel has keyboard focus.
+    pub explorer_has_focus: bool,
+    /// Whether the Search sidebar panel has keyboard focus.
+    pub search_has_focus: bool,
+
     // --- Source Control panel ---
     /// Cached file statuses from the last `sc_refresh()` call.
     pub sc_file_statuses: Vec<git::FileStatus>,
@@ -2604,6 +2610,8 @@ impl Engine {
             workspace_file: None,
             workspace_root: Some(cwd.clone()),
             base_settings: None,
+            explorer_has_focus: false,
+            search_has_focus: false,
             sc_file_statuses: Vec::new(),
             sc_worktrees: Vec::new(),
             sc_selected: 0,

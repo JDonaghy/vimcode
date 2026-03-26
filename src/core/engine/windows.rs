@@ -1626,9 +1626,10 @@ impl Engine {
         content_bounds: WindowRect,
         tab_bar_height: f64,
     ) -> (Vec<(WindowId, WindowRect)>, Vec<GroupDivider>) {
-        let group_rects = self
+        let mut group_rects = self
             .group_layout
             .calculate_group_rects(content_bounds, tab_bar_height);
+        self.adjust_group_rects_for_hidden_tabs(&mut group_rects, tab_bar_height);
         let mut all_rects: Vec<(WindowId, WindowRect)> = Vec::new();
         for (gid, rect) in &group_rects {
             if let Some(group) = self.editor_groups.get(gid) {

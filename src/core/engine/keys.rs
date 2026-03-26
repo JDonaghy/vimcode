@@ -198,6 +198,12 @@ impl Engine {
             return EngineAction::None;
         }
 
+        // Explorer and Search panels intercept all keys when focused.
+        // Key handling is done by the UI backend; engine just blocks normal processing.
+        if self.explorer_has_focus || self.search_has_focus {
+            return EngineAction::None;
+        }
+
         // Ctrl-S: save in any mode (does not change mode).
         if ctrl && key_name == "s" {
             if let Err(e) = self.save_with_format(false) {

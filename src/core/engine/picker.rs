@@ -258,7 +258,7 @@ impl Engine {
     }
 
     /// Load preview context for the currently selected picker item.
-    fn picker_load_preview(&mut self) {
+    pub(crate) fn picker_load_preview(&mut self) {
         self.picker_preview = None;
         let Some(item) = self.picker_items.get(self.picker_selected) else {
             return;

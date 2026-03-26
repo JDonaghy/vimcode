@@ -20,6 +20,46 @@ impl Engine {
         id
     }
 
+    /// Returns true if the tab bar should be hidden for this group
+    /// (hide_single_tab is on, there's only one editor group, and it has at most one tab).
+    /// In multi-group mode, tab bars are always shown so users can distinguish groups.
+    pub fn is_tab_bar_hidden(&self, group_id: GroupId) -> bool {
+        self.settings.hide_single_tab
+            && self.group_layout.leaf_count() <= 1
+            && self
+                .editor_groups
+                .get(&group_id)
+                .is_some_and(|g| g.tabs.len() <= 1)
+    }
+
+    /// Adjust group rects in-place: for groups whose tab bar is hidden,
+    /// expand the content area upward by `tab_row_height` (one row of tabs).
+    pub fn adjust_group_rects_for_hidden_tabs(
+        &self,
+        rects: &mut [(GroupId, WindowRect)],
+        full_tab_bar_height: f64,
+    ) {
+        if !self.settings.hide_single_tab || self.group_layout.leaf_count() > 1 {
+            return;
+        }
+        // The tab row is one unit; breadcrumbs (if any) is the rest.
+        let tab_row_h = if self.settings.breadcrumbs {
+            full_tab_bar_height / 2.0
+        } else {
+            full_tab_bar_height
+        };
+        for (gid, rect) in rects.iter_mut() {
+            if self
+                .editor_groups
+                .get(gid)
+                .is_some_and(|g| g.tabs.len() <= 1)
+            {
+                rect.y -= tab_row_h;
+                rect.height += tab_row_h;
+            }
+        }
+    }
+
     // =======================================================================
     // Accessors for active window/buffer (facade for backward compatibility)
     // =======================================================================
@@ -328,5 +368,34 @@ impl Engine {
         if let Some(window) = self.windows.get_mut(&window_id) {
             window.view.scroll_left = scroll_left;
         }
+    }
+
+    // =======================================================================
+    // Sidebar focus helpers
+    // =======================================================================
+
+    /// Returns true if any sidebar panel currently has keyboard focus.
+    #[allow(dead_code)]
+    pub fn sidebar_has_focus(&self) -> bool {
+        self.explorer_has_focus
+            || self.search_has_focus
+            || self.sc_has_focus
+            || self.dap_sidebar_has_focus
+            || self.ext_sidebar_has_focus
+            || self.ai_has_focus
+            || self.settings_has_focus
+            || self.ext_panel_has_focus
+    }
+
+    /// Clear all sidebar panel focus flags at once.
+    pub fn clear_sidebar_focus(&mut self) {
+        self.explorer_has_focus = false;
+        self.search_has_focus = false;
+        self.sc_has_focus = false;
+        self.dap_sidebar_has_focus = false;
+        self.ext_sidebar_has_focus = false;
+        self.ai_has_focus = false;
+        self.settings_has_focus = false;
+        self.ext_panel_has_focus = false;
     }
 }

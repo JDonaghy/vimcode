@@ -251,6 +251,11 @@ pub struct Settings {
     #[serde(default = "default_breadcrumbs")]
     pub breadcrumbs: bool,
 
+    /// Hide the tab bar when an editor group has only one tab.
+    /// Reclaims the row for editor content. Tab bar reappears when a second tab is opened.
+    #[serde(default)]
+    pub hide_single_tab: bool,
+
     /// Hide toolbar and sidebar panels at startup (TUI only).
     /// When true, panels appear on demand via Ctrl-W l and hide again when unfocused.
     #[serde(default)]
@@ -662,6 +667,7 @@ impl Default for Settings {
             swap_file: default_swap_file(),
             updatetime: default_updatetime(),
             breadcrumbs: default_breadcrumbs(),
+            hide_single_tab: false,
             autohide_panels: false,
             indent_guides: default_indent_guides(),
             match_brackets: default_match_brackets(),
@@ -908,6 +914,7 @@ impl Settings {
             "showhiddenfiles" | "shf" => self.show_hidden_files = enable,
             "swapfile" => self.swap_file = enable,
             "breadcrumbs" => self.breadcrumbs = enable,
+            "hidesingletab" | "hst" => self.hide_single_tab = enable,
             "autohidepanels" => self.autohide_panels = enable,
             "indentguides" => self.indent_guides = enable,
             "matchbrackets" => self.match_brackets = enable,
@@ -1096,6 +1103,11 @@ impl Settings {
             } else {
                 "nobreadcrumbs".to_string()
             }),
+            "hidesingletab" | "hst" => Ok(if self.hide_single_tab {
+                "hidesingletab".to_string()
+            } else {
+                "nohidesingletab".to_string()
+            }),
             "autohidepanels" => Ok(if self.autohide_panels {
                 "autohidepanels".to_string()
             } else {
@@ -1205,6 +1217,7 @@ impl Settings {
             "swapfile" | "swap_file" => self.swap_file.to_string(),
             "updatetime" | "ut" => self.updatetime.to_string(),
             "breadcrumbs" => self.breadcrumbs.to_string(),
+            "hide_single_tab" | "hidesingletab" | "hst" => self.hide_single_tab.to_string(),
             "autohide_panels" | "autohidepanels" => self.autohide_panels.to_string(),
             "indent_guides" | "indentguides" => self.indent_guides.to_string(),
             "match_brackets" | "matchbrackets" => self.match_brackets.to_string(),
@@ -1304,6 +1317,7 @@ impl Settings {
                     .map_err(|_| format!("Invalid updatetime: {value}"))?;
             }
             "breadcrumbs" => self.breadcrumbs = value == "true",
+            "hide_single_tab" | "hidesingletab" | "hst" => self.hide_single_tab = value == "true",
             "autohide_panels" | "autohidepanels" => self.autohide_panels = value == "true",
             "indent_guides" | "indentguides" => self.indent_guides = value == "true",
             "match_brackets" | "matchbrackets" => self.match_brackets = value == "true",
@@ -1445,6 +1459,13 @@ pub static SETTING_DEFS: &[SettingDef] = &[
         key: "breadcrumbs",
         label: "Breadcrumbs",
         description: "Show file path and symbol hierarchy below the tab bar",
+        category: "Appearance",
+        setting_type: SettingType::Bool,
+    },
+    SettingDef {
+        key: "hide_single_tab",
+        label: "Hide Single Tab",
+        description: "Hide the tab bar when an editor group has only one tab",
         category: "Appearance",
         setting_type: SettingType::Bool,
     },
