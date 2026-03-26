@@ -160,6 +160,10 @@
 ### Explorer
 - [x] **Explorer tree indicators** — Right-aligned git status (`M`/`A`/`?`/`D`/`R`) and deduplicated LSP diagnostic counts (errors/warnings) on explorer tree rows (like VSCode); per-extension `ignore_error_sources` config; `9+` cap. Both GTK and TUI backends.
 
+### Refactoring
+- [ ] **Split main.rs into gtk/ directory** — `src/main.rs` (16,826 lines) is the next oversized file. Convert to `src/gtk/mod.rs` + submodules. The `draw_*` free functions (~6K lines) are cleanly separable: `gtk/draw_editor.rs` (editor/window/completion/hover drawing), `gtk/draw_panels.rs` (source control/extensions/AI/debug/terminal panels), `gtk/click.rs` (mouse click/drag/double-click handling), `gtk/tree.rs` (file tree building/highlighting), `gtk/css.rs` (theme CSS generation). The `SimpleComponent` trait impl (~8K lines) must stay in one file. Target: mod.rs ~9K lines. Same approach as engine split — zero API changes, all tests pass.
+- [ ] **Refactor App::update() message handler** — The `update()` method inside `SimpleComponent for App` is 4,495 lines — a single match with hundreds of `Msg::` arms. Extract groups of related arms into helper methods on `App` (e.g. `handle_lsp_msg()`, `handle_dap_msg()`, `handle_sc_msg()`, `handle_terminal_msg()`). Each helper takes the specific message variant and returns the same side-effects. This doesn't require splitting files — just breaking the monolithic match into dispatched calls.
+
 ### Robustness (Low Priority)
 - [ ] **Consolidate sidebar focus state into engine** — TUI's `sidebar.has_focus` is a local variable not accessible to engine tests, making sidebar focus bugs (like the search panel input regression) impossible to catch with unit/integration tests. Move sidebar focus tracking into the engine so key routing correctness can be tested.
 
