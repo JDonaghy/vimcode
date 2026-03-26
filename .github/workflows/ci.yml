@@ -58,6 +58,37 @@ jobs:
     - name: Run tests
       run: cargo test --verbose
 
+  build-macos:
+    name: Build (macOS ARM64)
+    runs-on: macos-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install GTK4 and build dependencies
+      run: brew install gtk4 pkg-config
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+        key: macos-arm64-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: macos-arm64-cargo-
+
+    - name: Build GUI binary
+      run: cargo build --bin vimcode
+
+    - name: Build TUI binary
+      run: cargo build --bin vcd --no-default-features
+
+    - name: Run tests
+      run: cargo test
+
   coverage:
     name: Code Coverage
     runs-on: ubuntu-24.04   # GTK 4.14 — satisfies features = ["v4_10"] in Cargo.toml
