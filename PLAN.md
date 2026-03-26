@@ -5,6 +5,7 @@
 ---
 
 ## Recently Completed
+- **Session 217**: Engine Split Refactor — split monolithic `engine.rs` (51,825 lines) into `src/core/engine/` directory with 20 submodule files; `mod.rs` (3,334 lines) + largest submodules: `tests.rs` (14,334), `keys.rs` (7,056), `motions.rs` (4,628); all 4,721 tests pass; zero public API changes.
 - **Session 216**: Explorer Tree Indicators — git status + deduplicated LSP diagnostic counts on explorer rows; `explorer_indicators()` engine method with per-extension `ignore_error_sources` config; `Diagnostic.code` field; `relatedInformation: true`; GTK TreeStore 6-column + `update_tree_indicators()`; TUI render-time indicator drawing; 9+ cap; 3 tests. 4721 tests.
 - **Session 215**: Bug Fix Sweep — visual mode `x` delete (alias for `d` with `pending_key.is_none()` guard); Ctrl+V paste in search/command/replace inputs (`handle_search_key`, `handle_command_key`, TUI project search); search highlights in non-active buffers (per-buffer match computation in `build_rendered_window()` via `compute_search_matches_for_buffer()`). No open bugs. 4712 tests.
 - **Session 214**: Bug Sweep — TUI hover dismiss click fall-through, TUI selection with wrap, markdown typing color bleed (debounced syntax refresh), GTK scrollbar/divider overlap, TUI fuzzy finder stale chars. 4706 tests.

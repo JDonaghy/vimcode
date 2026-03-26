@@ -1089,7 +1089,7 @@ src/
 ├── render.rs        (~5,877 lines)  Platform-agnostic ScreenLayout bridge (DebugSidebarData, SourceControlData, ExtPanelData, BottomPanelTabs)
 ├── icons.rs            (~30 lines)  Nerd Font file-type icons (GTK + TUI)
 └── core/            (~70,878 lines)  Zero GTK/rendering deps — fully testable
-    ├── engine.rs    (~50,539 lines)  Orchestrator: keys, commands, git, macros, LSP, DAP, plugins, workspaces
+    ├── engine/      (~51,825 lines)  Orchestrator: 20 submodules (mod.rs 3,334 + keys, motions, commands, tests, …)
     ├── markdown.rs     (~705 lines)  Markdown → styled plain text converter (pulldown-cmark)
     ├── plugin.rs     (~1,915 lines)  Lua 5.4 plugin manager (mlua vendored; vimcode.* API; async_shell; panel API)
     ├── terminal.rs     (~320 lines)  PTY-backed terminal pane (portable-pty + vt100, history ring buffer)
