@@ -35,7 +35,7 @@ For detailed how-to guides and configuration references, see the **[VimCode Wiki
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 4715 tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 4,728 tests, zero async runtime dependency
 
 > **Note:** VimCode does not implement VimScript. Extension and scripting is handled via
 > the built-in Lua 5.4 plugin system. The goal is full Vim *keybinding* and *editing*
@@ -660,6 +660,7 @@ Runtime changes are written through to `~/.config/vimcode/settings.json` immedia
 | `autoindent` / `noautoindent` | `ai` | on | Copy indent from current line on Enter/o/O |
 | `incsearch` / `noincsearch` | `is` | on | Incremental search as you type |
 | `hlsearch` / `nohlsearch` | `hls` | on | Highlight all search matches |
+| `hidesingletab` / `nohidesingletab` | `hst` | off | Hide tab bar when editor group has only one tab |
 | `ignorecase` / `noignorecase` | `ic` | off | Case-insensitive search |
 | `smartcase` / `nosmartcase` | `scs` | off | Override `ignorecase` when pattern has uppercase |
 | `scrolloff=N` | `so` | 0 | Lines to keep above/below cursor when scrolling |
@@ -1084,8 +1085,19 @@ All ex commands support Vim-style abbreviations (e.g., `:j` for `:join`, `:y` fo
 
 ```
 src/
-├── main.rs         (~16,339 lines)  GTK4/Relm4 UI, rendering, sidebar resize, fuzzy popup, context menu, drag-and-drop
-├── tui_main.rs     (~13,793 lines)  ratatui/crossterm TUI backend, fuzzy popup, rename/move prompts
+├── main.rs              (~55 lines)  Thin dispatcher: CLI args → gtk::run() or tui_main::run()
+├── gtk/             (~11,786 lines)  GTK4/Relm4 UI backend
+│   ├── mod.rs        (~9,267 lines)  App struct, Msg enum, SimpleComponent, geometry helpers, run()
+│   ├── draw.rs       (~5,519 lines)  All 32 draw_* rendering functions + Pango attrs
+│   ├── click.rs        (~575 lines)  ClickTarget enum, mouse click/drag/double-click handlers
+│   ├── css.rs          (~525 lines)  Theme CSS generation + static CSS
+│   ├── util.rs         (~468 lines)  GTK key mapping, settings form builders, URL/icon helpers
+│   └── tree.rs         (~432 lines)  File tree construction, expansion tracking, name validation
+├── tui_main/        (~14,212 lines)  ratatui/crossterm TUI backend
+│   ├── mod.rs        (~4,166 lines)  Structs, event_loop, key translation, clipboard, run()
+│   ├── panels.rs     (~3,931 lines)  Activity bar, sidebar, status/command lines, all panel renders
+│   ├── render_impl.rs(~3,736 lines)  draw_frame orchestrator, tab bar, editor windows, popups
+│   └── mouse.rs      (~2,379 lines)  All mouse click/drag/scroll interaction handling
 ├── render.rs        (~5,877 lines)  Platform-agnostic ScreenLayout bridge (DebugSidebarData, SourceControlData, ExtPanelData, BottomPanelTabs)
 ├── icons.rs            (~30 lines)  Nerd Font file-type icons (GTK + TUI)
 └── core/            (~70,878 lines)  Zero GTK/rendering deps — fully testable

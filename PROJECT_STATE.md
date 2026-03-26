@@ -1,9 +1,9 @@
 # VimCode Project State
 
-**Last updated:** Mar 25, 2026 (Session 217 — Engine Split Refactor) | **Tests:** 4721
+**Last updated:** Mar 26, 2026 (Session 223 — Sidebar focus consolidation) | **Tests:** 4736
 
 > Feature documentation lives in **README.md**.
-> Per-session implementation notes through Session 216 are in **SESSION_HISTORY.md**.
+> Per-session implementation notes through Session 223 are in **SESSION_HISTORY.md**.
 
 ---
 
@@ -26,7 +26,5 @@ When implementing a new key/command, add tests covering:
 
 ## Recent Work
 
-> Session 216 and earlier archived in **SESSION_HISTORY.md**.
-
-- **Session 217** (Mar 25, 2026): **Engine Split Refactor** — Split monolithic `src/core/engine.rs` (51,825 lines) into `src/core/engine/` directory with 20 submodule files. `engine/mod.rs` (3,334 lines) contains types, structs, enums, Engine struct, `new()`, and free functions. Largest submodules: `tests.rs` (14,334), `keys.rs` (7,056), `motions.rs` (4,628). All 4,721 tests pass with zero changes to public API. No changes to `main.rs`, `tui_main.rs`, `render.rs`, `lib.rs`, or any non-engine files.
+> All sessions through 223 archived in **SESSION_HISTORY.md**. No recent unarchived work.
 

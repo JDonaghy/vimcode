@@ -9,6 +9,22 @@ After completing any feature or significant change, update ALL of these files:
 - **`PROJECT_STATE.md`** — internal progress tracker; update session date, test counts, file sizes, recent work entry, and roadmap checkboxes
 - **`PLAN.md`** — update recently completed section at top; tick off roadmap items
 - **`EXTENSIONS.md`** — extension development guide; update if any Lua API functions, events, manifest fields, or plugin loading behavior change
+- **`SUMMARIES/`** — update any summary file whose source file was modified (new methods, changed types, significant line count changes); see below
+
+## Code Summaries (`SUMMARIES/`)
+The `SUMMARIES/` directory contains concise summaries of every major source file. These save tokens by letting you understand file contents without reading thousands of lines.
+
+**When to read:** At session start or before working on a file you haven't read yet — check the summary first to understand structure and find the right methods.
+
+**When to update:** After modifying any source file that has a summary, update the corresponding summary to reflect:
+- New or removed public methods/functions
+- New or removed structs/enums/types
+- Changed line count (update the number)
+- Changed file purpose or responsibilities
+
+**Format:** Each summary file covers one source file and contains: purpose, line count, key types, and key public methods. Keep entries to one line each — no implementation details.
+
+**Naming:** `SUMMARIES/gtk_mod.md`, `SUMMARIES/engine_keys.md`, `SUMMARIES/render.md`, etc. (path segments joined with `_`, no extension in name).
 
 **README.md update rules:**
 - Add new keys/commands to the appropriate Key Reference table
@@ -20,11 +36,31 @@ After completing any feature or significant change, update ALL of these files:
 
 ## Architecture
 
-**VimCode**: Vim-like code editor in Rust with GTK4/Relm4. Clean separation: `src/core/` (platform-agnostic logic) vs `src/main.rs` (UI).
+**VimCode**: Vim-like code editor in Rust with GTK4/Relm4. Clean separation: `src/core/` (platform-agnostic logic) vs `src/gtk/` (GTK UI) vs `src/tui_main/` (TUI). `src/main.rs` is a thin CLI dispatcher.
 
-**Tech Stack:** Rust 2021, GTK4+Relm4, Ropey (text rope), Tree-sitter (parsing), Pango+Cairo (rendering)
+**Tech Stack:** Rust 2021, GTK4+Relm4, Ropey (text rope), Tree-sitter (parsing), Pango+Cairo (rendering), ratatui+crossterm (TUI)
 
 **Critical Rule:** `src/core/` must NEVER depend on `gtk4`, `relm4`, or `pangocairo`. Must be testable in isolation.
+
+### GTK directory (`src/gtk/`)
+
+| File | What goes here |
+|------|---------------|
+| `mod.rs` | App struct, Msg enum, `SimpleComponent` impl (view/init/update), `impl App`, geometry helpers |
+| `draw.rs` | All `draw_*` free functions (editor, panels, popups, sidebars) |
+| `click.rs` | `ClickTarget` enum, `pixel_to_click_target()`, mouse click/drag/double-click handlers |
+| `css.rs` | `make_theme_css()`, `STATIC_CSS`, `load_css()` |
+| `util.rs` | `matches_gtk_key()`, settings form builders, GTK utilities, icon install |
+| `tree.rs` | File tree building/expansion/indicators, name prompt/validation |
+
+### TUI directory (`src/tui_main/`)
+
+| File | What goes here |
+|------|---------------|
+| `mod.rs` | Structs, `run()`, `event_loop()`, clipboard, key translation, cell helpers |
+| `render_impl.rs` | `draw_frame()`, `build_screen_for_tui()`, tab bar, editor/popup rendering |
+| `panels.rs` | Sidebar panel rendering (activity bar, explorer, git, debug, extensions, AI, search, terminal) |
+| `mouse.rs` | `handle_mouse()` — all click/drag/scroll interactions |
 
 ### Engine directory (`src/core/engine/`)
 
