@@ -337,8 +337,9 @@ fn test_ctrl_o_does_not_activate_for_insert_commands() {
 #[test]
 fn test_filter_command_reverse() {
     let mut e = engine_with("apple\nbanana\ncherry\n");
-    // Use tac (reverse lines)
-    run_cmd(&mut e, "1,3!tac");
+    // tac on Linux, tail -r on macOS (both reverse lines)
+    let cmd = if cfg!(target_os = "macos") { "1,3!tail -r" } else { "1,3!tac" };
+    run_cmd(&mut e, cmd);
     assert_buf(&e, "cherry\nbanana\napple\n");
 }
 
