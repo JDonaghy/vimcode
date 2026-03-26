@@ -1857,6 +1857,12 @@ pub struct Theme {
 
     // Bracket match highlight
     pub bracket_match_bg: Color,
+
+    // Explorer sidebar (TUI)
+    /// Foreground for directory names in the file explorer.
+    pub explorer_dir_fg: Color,
+    /// Background tint for rows whose file is open in a buffer.
+    pub explorer_active_bg: Color,
 }
 
 impl Theme {
@@ -2007,6 +2013,9 @@ impl Theme {
             indent_guide_fg: Color::from_hex("#404040"),
             indent_guide_active_fg: Color::from_hex("#606060"),
             bracket_match_bg: Color::from_hex("#3a3d41"),
+
+            explorer_dir_fg: Color::from_hex("#61afef"), // function blue
+            explorer_active_bg: Color::from_hex("#2c313a"), // subtle tint
         }
     }
 
@@ -2124,6 +2133,9 @@ impl Theme {
             indent_guide_fg: Color::from_hex("#3c3836"),
             indent_guide_active_fg: Color::from_hex("#504945"),
             bracket_match_bg: Color::from_hex("#504945"),
+
+            explorer_dir_fg: Color::from_hex("#83a598"), // gruvbox blue
+            explorer_active_bg: Color::from_hex("#3c3836"), // subtle tint
         }
     }
 
@@ -2241,6 +2253,9 @@ impl Theme {
             indent_guide_fg: Color::from_hex("#292e42"),
             indent_guide_active_fg: Color::from_hex("#3b4261"),
             bracket_match_bg: Color::from_hex("#364a82"),
+
+            explorer_dir_fg: Color::from_hex("#7aa2f7"), // tokyo blue
+            explorer_active_bg: Color::from_hex("#292e42"), // subtle tint
         }
     }
 
@@ -2358,6 +2373,9 @@ impl Theme {
             indent_guide_fg: Color::from_hex("#073642"),
             indent_guide_active_fg: Color::from_hex("#0d4a5a"),
             bracket_match_bg: Color::from_hex("#0d4a5a"),
+
+            explorer_dir_fg: Color::from_hex("#268bd2"), // solarized blue
+            explorer_active_bg: Color::from_hex("#073642"), // subtle tint
         }
     }
 
@@ -2475,6 +2493,9 @@ impl Theme {
             indent_guide_fg: Color::from_hex("#404040"),
             indent_guide_active_fg: Color::from_hex("#707070"),
             bracket_match_bg: Color::from_hex("#3a3d41"),
+
+            explorer_dir_fg: Color::from_hex("#dcdcaa"), // warm yellow (like function names)
+            explorer_active_bg: Color::from_hex("#37373d"), // subtle tint
         }
     }
 
@@ -2591,6 +2612,9 @@ impl Theme {
             indent_guide_fg: Color::from_hex("#d3d3d3"),
             indent_guide_active_fg: Color::from_hex("#939393"),
             bracket_match_bg: Color::from_hex("#dddddd"),
+
+            explorer_dir_fg: Color::from_hex("#795e26"), // warm brown dirs
+            explorer_active_bg: Color::from_hex("#e8e8e8"), // subtle tint
         }
     }
 
@@ -2782,6 +2806,7 @@ impl Theme {
         }
         if let Some(c) = color("list.inactiveSelectionBackground") {
             theme.sidebar_sel_bg_inactive = c;
+            theme.explorer_active_bg = c;
         }
 
         // ── Breadcrumbs ──────────────────────────────────────────────────
@@ -4593,6 +4618,22 @@ fn build_rendered_window(
         .partition_point(|h| h.0 < window_end_byte);
     let visible_hl = &buffer_state.highlights[hl_lo..hl_hi];
 
+    // Compute search matches for this buffer.  The engine's `search_matches`
+    // only indexes the *active* buffer, so for other visible buffers we must
+    // compute matches from `search_query` against this buffer's text.
+    let active_buf_id = engine
+        .windows
+        .get(&engine.active_window_id())
+        .map(|w| w.buffer_id);
+    let buf_search_matches: Vec<(usize, usize)> =
+        if !engine.settings.hlsearch || engine.search_query.is_empty() {
+            Vec::new()
+        } else if Some(window.buffer_id) == active_buf_id {
+            engine.search_matches.clone()
+        } else {
+            compute_search_matches_for_buffer(buffer, &engine.search_query, &engine.settings)
+        };
+
     // Ghost text (AI inline completion): only in the active window, Insert mode.
     // Multi-line completions are stored in full (Tab-accept inserts everything).
     // The first line is shown after the cursor (ghost_suffix on the cursor line).
@@ -4749,6 +4790,8 @@ fn build_rendered_window(
                 line_start_byte,
                 line_end_byte,
                 is_markdown,
+                &buf_search_matches,
+                Some(window.buffer_id) == active_buf_id,
             )
         };
 
@@ -5607,6 +5650,44 @@ fn md_inline_spans(line: &str, theme: &Theme, spans: &mut Vec<StyledSpan>) {
     }
 }
 
+/// Compute search match char-offset pairs for a buffer that is NOT the active one.
+fn compute_search_matches_for_buffer(
+    buffer: &crate::core::buffer::Buffer,
+    query: &str,
+    settings: &crate::core::settings::Settings,
+) -> Vec<(usize, usize)> {
+    let mut matches = Vec::new();
+    let text = buffer.to_string();
+
+    let case_insensitive =
+        settings.ignorecase && !(settings.smartcase && query.chars().any(|c| c.is_uppercase()));
+
+    if case_insensitive {
+        let text_lower = text.to_lowercase();
+        let query_lower = query.to_lowercase();
+        let mut byte_pos = 0;
+        while let Some(found) = text_lower[byte_pos..].find(&query_lower) {
+            let start_byte = byte_pos + found;
+            let end_byte = start_byte + query_lower.len();
+            let start_char = buffer.content.byte_to_char(start_byte);
+            let end_char = buffer.content.byte_to_char(end_byte);
+            matches.push((start_char, end_char));
+            byte_pos = start_byte + 1;
+        }
+    } else {
+        let mut byte_pos = 0;
+        while let Some(found) = text[byte_pos..].find(query) {
+            let start_byte = byte_pos + found;
+            let end_byte = start_byte + query.len();
+            let start_char = buffer.content.byte_to_char(start_byte);
+            let end_char = buffer.content.byte_to_char(end_byte);
+            matches.push((start_char, end_char));
+            byte_pos = start_byte + 1;
+        }
+    }
+    matches
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_spans(
     engine: &Engine,
@@ -5619,6 +5700,8 @@ fn build_spans(
     line_start_byte: usize,
     line_end_byte: usize,
     is_markdown: bool,
+    search_matches: &[(usize, usize)],
+    is_active_buffer: bool,
 ) -> Vec<StyledSpan> {
     let mut spans = Vec::new();
 
@@ -5692,12 +5775,12 @@ fn build_spans(
     }
 
     // Search match highlighting (skipped when hlsearch is disabled)
-    if engine.settings.hlsearch && !engine.search_matches.is_empty() {
+    if engine.settings.hlsearch && !search_matches.is_empty() {
         let line_start_char = buffer.content.line_to_char(line_idx);
         let line_char_count = line_str.chars().count();
         let line_end_char = line_start_char + line_char_count;
 
-        for (match_idx, (match_start, match_end)) in engine.search_matches.iter().enumerate() {
+        for (match_idx, (match_start, match_end)) in search_matches.iter().enumerate() {
             if *match_end <= line_start_char || *match_start >= line_end_char {
                 continue;
             }
@@ -5715,7 +5798,7 @@ fn build_spans(
                 .map(|(i, _)| i)
                 .unwrap_or(line_str.len());
 
-            let is_current = engine.search_index == Some(match_idx);
+            let is_current = is_active_buffer && engine.search_index == Some(match_idx);
             let bg = if is_current {
                 theme.search_current_match_bg
             } else {
@@ -6042,6 +6125,13 @@ fn build_command_line(engine: &Engine) -> CommandLineData {
             }
         }
         _ => (engine.message.clone(), false, false, String::new()),
+    };
+
+    // Safety: strip newlines so the command line never exceeds one row
+    let text = if let Some(first) = text.lines().next() {
+        first.to_string()
+    } else {
+        text
     };
 
     CommandLineData {

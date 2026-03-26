@@ -144,6 +144,8 @@ block_close = "*/"                          # Block comment close
 | `install` | String | Shell command to install the server |
 | `fallback_binaries` | String[] | Alternative binaries tried in order |
 | `args` | String[] | Command-line arguments (e.g., `["--stdio"]`) |
+| `dependencies` | String[] | System binaries required on PATH (checked before starting) |
+| `ignore_error_sources` | String[] | Diagnostic sources whose errors are excluded from explorer counts (e.g., `["rust-analyzer"]` — its internal analysis produces false positives; real errors come from `rustc`) |
 
 #### `[dap]` Section
 

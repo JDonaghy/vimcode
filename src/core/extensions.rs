@@ -113,6 +113,12 @@ pub struct LspConfig {
     /// Checked before starting the server; a helpful message is shown if missing.
     #[serde(default)]
     pub dependencies: Vec<String>,
+    /// Diagnostic sources whose errors should be excluded from explorer counts.
+    /// E.g. `["rust-analyzer"]` — its internal analysis produces false-positive
+    /// errors; real errors come from `"rustc"` (cargo check). Warnings from
+    /// these sources are still counted.
+    #[serde(default)]
+    pub ignore_error_sources: Vec<String>,
 }
 
 impl LspConfig {

@@ -1,9 +1,50 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 212 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 216 archived here. Recent work summary in PROJECT_STATE.md.
 
 ---
+
+**Session 216 — Explorer Tree Indicators (4721 tests):**
+Added right-aligned indicators on explorer tree rows (like VSCode) showing git status and LSP diagnostic counts. Both GTK and TUI backends. Extensive iteration on diagnostic count accuracy to match VSCode behavior.
+- **Engine**: `explorer_indicators()` returns `(HashMap<PathBuf, char>, HashMap<PathBuf, (usize, usize)>)` — git status map (canonical path → `M`/`A`/`?`/`D`/`R`) + per-file deduplicated (error, warning) counts. Git status from `sc_file_statuses` (not dirty-buffer tracking). Diagnostics deduplicated by `(code, message)` pairs. Error-severity diagnostics from sources listed in extension `ignore_error_sources` are excluded (e.g. rust-analyzer's internal analysis produces false positives; real errors come from `rustc` via cargo check).
+- **TUI** (`tui_main.rs`): Indicators computed once before row loop; rendered right-aligned: diagnostic errors (red) → warnings (yellow) → git status letter (colored by type). Counts capped at `9+`. `sc_refresh()` also runs when Explorer panel is active.
+- **GTK** (`main.rs`): TreeStore expanded from 4→6 columns (col 4=indicator text, col 5=indicator color hex). `CellRendererText` with `xalign=1.0` for right-alignment. `update_tree_indicators()` recursive walker. Called on `RefreshFileTree` and periodically (~1s via `SearchPollTick`). Ordering: diagnostics first, then git status (matching VSCode).
+- **LSP** (`lsp.rs`): `Diagnostic` struct gains `code: Option<String>` field parsed from LSP `code` (string or numeric). `relatedInformation` capability set to `true` (was `false`, causing rust-analyzer to flatten related diagnostics into separate entries). Default severity for missing field changed from `Error` to `Hint`.
+- **Extensions** (`extensions.rs`): `LspConfig` gains `ignore_error_sources: Vec<String>` — per-extension list of diagnostic sources whose errors should be excluded from explorer counts. Rust extension sets `ignore_error_sources = ["rust-analyzer"]`. No hardcoded LSP names in core.
+- **Bug logged**: `cargo run -- file.rs` restores entire previous session (added to BUGS.md).
+- 3 tests: `test_explorer_indicators_empty`, `test_explorer_indicators_git_status`, `test_explorer_indicators_diagnostics`.
+Files: `src/core/engine.rs`, `src/core/lsp.rs`, `src/core/extensions.rs`, `src/main.rs`, `src/tui_main.rs`, `vimcode-ext/rust/manifest.toml`.
+
+**Session 215 — Bug Fix Sweep (4712 tests):**
+Fixed 3 remaining BUGS.md items:
+- **Visual mode `x`**: Added `'x'` as alias for `'d'` in `handle_visual_key()` with `pending_key.is_none()` guard (preserves `rx` replace). 2 new tests.
+- **Ctrl+V paste in search/command/replace inputs**: Added `clipboard_paste()` handler to `handle_search_key()` (/ and ? search), `handle_command_key()` (: command), and TUI project search/replace input mode. Made `clipboard_paste()` public for TUI access. GTK project search uses native Entry widgets (already handled paste).
+- **Search highlights wrong text in splits**: `engine.search_matches` stored char offsets from active buffer only, but `build_spans()` applied them to all visible windows. Fixed: `build_rendered_window()` now computes per-buffer matches via `compute_search_matches_for_buffer()` in render.rs. `build_spans()` takes `search_matches` + `is_active_buffer` params. `search_index` (current match highlight) only applies to active buffer.
+Files: `src/core/engine.rs`, `src/render.rs`, `src/tui_main.rs`. No open bugs.
+
+**Session 214 — Bug Sweep Continued (4706 tests):**
+Continued working through BUGS.md items. Five rendering/UI fixes across TUI and GTK backends:
+- **TUI hover dismiss consumes click** (`tui_main.rs:4819`): Removed early `return` after `dismiss_editor_hover()` — click now falls through to editor handler, matching GTK behavior. This also fixed the "off by 2 lines" symptom where double-click selection appeared to select wrong lines.
+- **TUI selection wrong position with wrap** (`tui_main.rs:render_selection`): `render_selection()` used `scroll_top + row_idx` to compute buffer line, which is incorrect for wrapped text where multiple visual rows share one buffer line. Fixed to use `line.line_idx` and adjust selection columns by `segment_col_offset`.
+- **Markdown typing color bleed**: Added `tick_syntax_debounce()` engine method — 150ms debounced syntax refresh during insert mode. Called from both GTK and TUI idle loops. Prevents stale byte offsets in deferred syntax highlights from causing wrong colors near colored sections.
+- **GTK scrollbar / tab group divider overlap**: Scrollbar inset 2px from group edge (`margin_start - 2`); divider gesture `drag_begin` skips claiming when click is in scrollbar zone (rightmost 10px of any window rect).
+- **TUI fuzzy finder stale chars**: `render_picker_popup` and `render_folder_picker` didn't clear their background area before drawing. Added full background clear pass (fill with spaces) to both functions.
+All BUGS.md items now resolved. No open bugs.
+
+**Session 213 — Bug Sweep: All BUGS.md Items Fixed (4710 tests):**
+Worked through every bug in BUGS.md. Fixes across both TUI and GTK backends:
+- **Explorer tree colors** (TUI+GTK): Added `explorer_dir_fg`/`explorer_active_bg` Theme fields; directories get distinct warm color, active buffer row gets subtle background; GTK TreeStore expanded to 4 columns for per-row foreground.
+- **:Explore opens in same window**: `netrw_activate_entry()` uses `switch_window_buffer()` instead of `open_file_in_tab()`.
+- **Search n/N not scrolling**: Added `ensure_cursor_visible()` after `jump_to_search_match()`; empty `?<enter>` repeats previous search.
+- **Git commit double-line status**: `sc_do_commit()` truncates output to first line.
+- **Double-click word-wise drag**: `mouse_drag_word_mode`/`mouse_drag_word_origin` fields; word boundary snapping in `mouse_drag()`.
+- **Ctrl+V paste in fuzzy finder**: Added `"v" if ctrl` arm in `handle_picker_key()`.
+- **TUI hover dismiss consumes click** (`tui_main.rs:4819`): Removed early `return` after `dismiss_editor_hover()` — click now falls through to editor handler, matching GTK.
+- **TUI selection wrong position with wrap** (`tui_main.rs:render_selection`): Replaced `scroll_top + row_idx` with `line.line_idx`; adjusted selection columns by `segment_col_offset`.
+- **Markdown typing color bleed**: Added `tick_syntax_debounce()` — 150ms debounced syntax refresh in both GTK and TUI idle loops.
+- **GTK scrollbar/divider overlap**: Scrollbar inset 2px from group edge; divider gesture skips claiming when click is in scrollbar zone.
+- **TUI fuzzy finder stale chars**: Added full background clear pass to `render_picker_popup()` and `render_folder_picker()`.
 
 **Session 212 — Selectable/Copyable Hover Popup Text (4710 tests):**
 `HoverSelection` struct with anchor/active positions; `EditorHoverPopup.selection` field; `extract_text()` extracts selected range from rendered lines. Mouse drag selection: click on focused popup starts selection, drag extends; TUI: `hover_selecting` state, cell-to-content coordinate conversion; GTK: drag handler extends selection using char_width/line_height. Keyboard copy: `y`/`Y` or Ctrl-C copies selected text (or all popup text if no selection) to system clipboard; `handle_editor_hover_key()` now accepts `ctrl` parameter. Selection highlight rendering: TUI swaps fg/bg for selected chars; GTK uses Pango `AttrColor::new_background()` with theme selection color. Focus indicator updated: GTK shows "y:copy  Tab:links  Esc:close" when popup focused. Bug fix — GTK modifier key dismiss: bare modifier keys (`Control_L`, `Shift_L`, etc.) no longer dismiss focused hover popup. Bug fix — GTK clipboard copy: `hover_selection_text()` accessor + GTK-side intercept using `copypasta` directly. 7 new tests.

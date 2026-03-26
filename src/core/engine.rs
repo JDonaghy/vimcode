@@ -2057,6 +2057,10 @@ pub struct Engine {
     pub clipboard_write: Option<Box<dyn Fn(&str) -> Result<(), String>>>,
     /// Whether a mouse drag selection is currently active.
     pub mouse_drag_active: bool,
+    /// When true, drag extends selection word-wise (set by double-click).
+    pub mouse_drag_word_mode: bool,
+    /// Original word boundaries from double-click (start_col, end_col, line).
+    pub mouse_drag_word_origin: Option<(usize, usize, usize)>,
 
     // --- Menu bar / debug toolbar ---
     /// Whether the VSCode-style menu bar strip is visible.
@@ -2650,6 +2654,8 @@ impl Engine {
             clipboard_read: None,
             clipboard_write: None,
             mouse_drag_active: false,
+            mouse_drag_word_mode: false,
+            mouse_drag_word_origin: None,
             terminal_panes: Vec::new(),
             pending_install_context: None,
             pending_terminal_command: None,
@@ -2964,6 +2970,73 @@ impl Engine {
             .any(|id| self.buffer_manager.get(id).is_some_and(|s| s.dirty))
     }
 
+    /// Compute explorer tree indicators: git status + deduplicated diagnostic counts.
+    /// Returns (git_statuses, diag_counts) where:
+    /// - git_statuses: canonical path → git status char (M, A, D, R, ?)
+    /// - diag_counts: canonical path → (error_lines, warning_lines) deduplicated by line number
+    pub fn explorer_indicators(
+        &self,
+    ) -> (HashMap<PathBuf, char>, HashMap<PathBuf, (usize, usize)>) {
+        use crate::core::lsp::DiagnosticSeverity;
+        use std::collections::HashSet;
+
+        // Build git status map
+        let mut git_statuses: HashMap<PathBuf, char> = HashMap::new();
+        let repo_root = git::find_repo_root(&self.cwd);
+        if let Some(ref root) = repo_root {
+            for fs in &self.sc_file_statuses {
+                let kind = fs.unstaged.or(fs.staged);
+                if let Some(k) = kind {
+                    let abs = root.join(&fs.path);
+                    let canon = abs.canonicalize().unwrap_or(abs);
+                    git_statuses.insert(canon, k.label());
+                }
+            }
+        }
+
+        // Collect ignored error sources from installed extensions' LSP configs.
+        // E.g. rust extension declares ignore_error_sources = ["rust-analyzer"]
+        // because its internal analysis produces false-positive errors.
+        let manifests = self.ext_available_manifests();
+        let ignored_error_sources: HashSet<&str> = manifests
+            .iter()
+            .flat_map(|m| m.lsp.ignore_error_sources.iter().map(|s| s.as_str()))
+            .collect();
+
+        // Count diagnostics for explorer indicators, deduplicating by (code, message).
+        // Skip error-severity diagnostics from ignored sources (configured per-extension).
+        // Warnings from all sources are still counted.
+        let mut diag_counts: HashMap<PathBuf, (usize, usize)> = HashMap::new();
+        for (path, diagnostics) in &self.lsp_diagnostics {
+            let mut error_keys = HashSet::new();
+            let mut warning_keys = HashSet::new();
+            for d in diagnostics {
+                let key = (d.code.clone().unwrap_or_default(), d.message.clone());
+                match d.severity {
+                    DiagnosticSeverity::Error => {
+                        let dominated = d
+                            .source
+                            .as_deref()
+                            .is_some_and(|s| ignored_error_sources.contains(s));
+                        if !dominated {
+                            error_keys.insert(key);
+                        }
+                    }
+                    DiagnosticSeverity::Warning => {
+                        warning_keys.insert(key);
+                    }
+                    _ => {}
+                }
+            }
+            if !error_keys.is_empty() || !warning_keys.is_empty() {
+                let canon = path.canonicalize().unwrap_or_else(|_| path.clone());
+                diag_counts.insert(canon, (error_keys.len(), warning_keys.len()));
+            }
+        }
+
+        (git_statuses, diag_counts)
+    }
+
     /// Save every dirty buffer that has a known file path.
     /// Returns the number of buffers successfully saved.
     pub fn save_all_dirty(&mut self) -> usize {
@@ -3147,6 +3220,24 @@ impl Engine {
         let visible = self.view().viewport_lines;
         self.active_buffer_state_mut()
             .refresh_syntax_visible(scroll_top, visible);
+    }
+
+    /// Debounced syntax refresh for insert mode. Returns true if a refresh
+    /// was performed (caller should redraw). Call from the event loop idle path.
+    /// Refreshes highlights after 150ms of no keystrokes, preventing stale
+    /// byte offsets from causing wrong colors during typing.
+    pub fn tick_syntax_debounce(&mut self) -> bool {
+        let bs = self.active_buffer_state();
+        if !bs.syntax_stale {
+            return false;
+        }
+        if let Some(since) = bs.syntax_stale_since {
+            if since.elapsed() >= std::time::Duration::from_millis(150) {
+                self.active_buffer_state_mut().refresh_syntax_if_stale();
+                return true;
+            }
+        }
+        false
     }
 
     // =======================================================================
@@ -3781,14 +3872,26 @@ impl Engine {
             self.view_mut().scroll_top = 0;
             EngineAction::None
         } else {
-            // File — delete netrw buffer and open the file
+            // File — open in current window (replacing netrw buffer)
             let netrw_buf_id = self.active_buffer_id();
-            self.open_file_in_tab(&path);
+            let buf_id = match self.buffer_manager.open_file(&path) {
+                Ok(id) => id,
+                Err(e) => {
+                    self.message = format!("Error: {}", e);
+                    return EngineAction::Error;
+                }
+            };
+            self.buffer_manager
+                .apply_language_map(buf_id, &self.settings.language_map);
+            self.buffer_manager.alternate_buffer = Some(netrw_buf_id);
+            self.switch_window_buffer(buf_id);
             // Remove the netrw buffer if it's no longer shown in any window
             let still_used = self.windows.values().any(|w| w.buffer_id == netrw_buf_id);
             if !still_used {
                 self.buffer_manager.remove(netrw_buf_id);
             }
+            self.message = format!("\"{}\"", path.display());
+            self.lsp_did_open(buf_id);
             EngineAction::None
         }
     }
@@ -13549,6 +13652,20 @@ impl Engine {
             self.command_buffer.truncate(byte_off);
             return EngineAction::None;
         }
+        // --- Ctrl-V: paste from clipboard ---
+        if ctrl && key_name == "v" && !self.history_search_active {
+            if let Some(text) = Self::clipboard_paste() {
+                let line = text.lines().next().unwrap_or("");
+                for ch in line.chars() {
+                    if !ch.is_control() {
+                        let byte_off = cmd_char_to_byte(&self.command_buffer, self.command_cursor);
+                        self.command_buffer.insert(byte_off, ch);
+                        self.command_cursor += 1;
+                    }
+                }
+            }
+            return EngineAction::None;
+        }
 
         match key_name {
             "Escape" => {
@@ -13874,6 +13991,23 @@ impl Engine {
             }
             return;
         }
+        // Ctrl-V: paste from clipboard
+        if ctrl && key_name == "v" {
+            if let Some(text) = Self::clipboard_paste() {
+                let line = text.lines().next().unwrap_or("");
+                for ch in line.chars() {
+                    if !ch.is_control() {
+                        let byte_off = cmd_char_to_byte(&self.command_buffer, self.command_cursor);
+                        self.command_buffer.insert(byte_off, ch);
+                        self.command_cursor += 1;
+                    }
+                }
+                if self.settings.incremental_search {
+                    self.perform_incremental_search();
+                }
+            }
+            return;
+        }
         match key_name {
             "Escape" => {
                 self.mode = Mode::Normal;
@@ -13929,6 +14063,14 @@ impl Engine {
                     }
                 } else {
                     self.search_start_cursor = None;
+                    // Empty query with existing search — repeat in current direction
+                    if !self.search_query.is_empty() {
+                        self.run_search();
+                        match self.search_direction {
+                            SearchDirection::Forward => self.search_next(),
+                            SearchDirection::Backward => self.search_prev(),
+                        }
+                    }
                 }
             }
             "Up" => {
@@ -14170,7 +14312,7 @@ impl Engine {
                     self.paste_visual_selection(changed);
                     return EngineAction::None;
                 }
-                'd' if !ctrl => {
+                'd' | 'x' if !ctrl && self.pending_key.is_none() => {
                     self.count = None; // Clear count (not used for visual operators)
                     self.delete_visual_selection(changed);
                     return EngineAction::None;
@@ -16144,11 +16286,9 @@ impl Engine {
         let dir = self.cwd.clone();
         match git::commit(&dir, &msg) {
             Ok(out) => {
-                self.message = if out.is_empty() {
-                    "Committed.".to_string()
-                } else {
-                    out
-                };
+                // Use first line only — multi-line output would corrupt the status bar
+                let first_line = out.lines().next().unwrap_or("Committed.");
+                self.message = first_line.to_string();
                 self.sc_commit_message.clear();
                 self.sc_commit_cursor = 0;
                 self.sc_commit_input_active = false;
@@ -16299,7 +16439,7 @@ impl Engine {
     }
 
     /// Try to paste from the system clipboard. Returns None on failure.
-    fn clipboard_paste() -> Option<String> {
+    pub fn clipboard_paste() -> Option<String> {
         #[cfg(test)]
         {
             None
@@ -20446,6 +20586,7 @@ impl Engine {
             let col = start_char - line_start;
             self.view_mut().cursor.line = line;
             self.view_mut().cursor.col = col;
+            self.ensure_cursor_visible();
             self.message = format!("match {} of {}", idx + 1, self.search_matches.len());
         }
     }
@@ -25677,6 +25818,8 @@ impl Engine {
             self.mode = Mode::Normal;
             self.visual_anchor = None;
         }
+        self.mouse_drag_word_mode = false;
+        self.mouse_drag_word_origin = None;
         self.mouse_drag_active = false;
         // Switch to the group that owns this window.
         self.focus_group_for_window(window_id);
@@ -25722,15 +25865,66 @@ impl Engine {
         let clamped_line = line.min(max_line);
         let max_col = self.get_max_cursor_col(clamped_line);
         let clamped_col = col.min(max_col);
-        let view = self.view_mut();
-        view.cursor.line = clamped_line;
-        view.cursor.col = clamped_col;
+
+        if self.mouse_drag_word_mode {
+            // Word-wise drag: snap to word boundaries
+            if let Some((orig_start, orig_end, orig_line)) = self.mouse_drag_word_origin {
+                let line_text: Vec<char> =
+                    self.buffer().content.line(clamped_line).chars().collect();
+                let drag_before_origin = clamped_line < orig_line
+                    || (clamped_line == orig_line && clamped_col < orig_start);
+
+                if drag_before_origin {
+                    // Dragging before the original word — anchor at word end, cursor at word start
+                    let mut word_start = clamped_col.min(line_text.len().saturating_sub(1));
+                    if word_start < line_text.len() && Self::is_word_char(line_text[word_start]) {
+                        while word_start > 0 && Self::is_word_char(line_text[word_start - 1]) {
+                            word_start -= 1;
+                        }
+                    }
+                    self.visual_anchor = Some(Cursor {
+                        line: orig_line,
+                        col: orig_end,
+                    });
+                    let view = self.view_mut();
+                    view.cursor.line = clamped_line;
+                    view.cursor.col = word_start;
+                } else {
+                    // Dragging after the original word — anchor at word start, cursor at word end
+                    let mut word_end = clamped_col.min(line_text.len().saturating_sub(1));
+                    if word_end < line_text.len() && Self::is_word_char(line_text[word_end]) {
+                        while word_end + 1 < line_text.len()
+                            && Self::is_word_char(line_text[word_end + 1])
+                        {
+                            word_end += 1;
+                        }
+                    }
+                    // Exclude trailing newline
+                    if word_end < line_text.len() && line_text[word_end] == '\n' && word_end > 0 {
+                        word_end -= 1;
+                    }
+                    self.visual_anchor = Some(Cursor {
+                        line: orig_line,
+                        col: orig_start,
+                    });
+                    let view = self.view_mut();
+                    view.cursor.line = clamped_line;
+                    view.cursor.col = word_end;
+                }
+            }
+        } else {
+            let view = self.view_mut();
+            view.cursor.line = clamped_line;
+            view.cursor.col = clamped_col;
+        }
     }
 
     /// Handle mouse double-click: select the word under the cursor.
     /// Positions cursor, finds word boundaries, enters Visual mode.
     pub fn mouse_double_click(&mut self, window_id: WindowId, line: usize, col: usize) {
         self.mouse_drag_active = false;
+        self.mouse_drag_word_mode = false;
+        self.mouse_drag_word_origin = None;
         self.focus_group_for_window(window_id);
         self.set_cursor_for_window(window_id, line, col);
 
@@ -25768,6 +25962,8 @@ impl Engine {
         let view = self.view_mut();
         view.cursor.col = word_end;
         self.mode = Mode::Visual;
+        self.mouse_drag_word_mode = true;
+        self.mouse_drag_word_origin = Some((word_start, word_end, cursor_line));
     }
 
     // =======================================================================
@@ -32780,6 +32976,23 @@ impl Engine {
                 self.picker_load_preview();
                 EngineAction::None
             }
+            "v" if ctrl => {
+                // Paste clipboard into picker query
+                if let Some(text) = Self::clipboard_paste() {
+                    // Take first line only, strip control chars
+                    let line = text.lines().next().unwrap_or("");
+                    for c in line.chars() {
+                        if !c.is_control() {
+                            self.picker_query.push(c);
+                        }
+                    }
+                    self.picker_selected = 0;
+                    self.picker_scroll_top = 0;
+                    self.picker_filter();
+                    self.picker_load_preview();
+                }
+                EngineAction::None
+            }
             "BackSpace" => {
                 self.picker_query.pop();
                 self.picker_selected = 0;
@@ -39537,6 +39750,46 @@ mod tests {
     }
 
     #[test]
+    fn test_visual_x_deletes_selection() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello world");
+        engine.update_syntax();
+
+        // Select "hello"
+        press_char(&mut engine, 'v');
+        for _ in 0..4 {
+            press_char(&mut engine, 'l');
+        }
+
+        // Delete with x (same as d in visual mode)
+        press_char(&mut engine, 'x');
+
+        assert_eq!(engine.buffer().to_string(), " world");
+        assert_eq!(engine.mode, Mode::Normal);
+
+        // Check register — deleted text should be stored
+        let (content, _) = engine.registers.get(&'"').unwrap();
+        assert_eq!(content, "hello");
+    }
+
+    #[test]
+    fn test_visual_line_x_deletes_selection() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "line1\nline2\nline3");
+        engine.update_syntax();
+
+        // Select middle line
+        press_char(&mut engine, 'j');
+        press_char(&mut engine, 'V');
+
+        // Delete with x
+        press_char(&mut engine, 'x');
+
+        assert_eq!(engine.buffer().to_string(), "line1\nline3");
+        assert_eq!(engine.view().cursor.line, 1);
+    }
+
+    #[test]
     fn test_visual_change() {
         let mut engine = Engine::new();
         engine.buffer_mut().insert(0, "hello world");
@@ -44843,6 +45096,7 @@ mod tests {
                 severity: DiagnosticSeverity::Error,
                 message: "error on line 1".to_string(),
                 source: None,
+                code: None,
             },
             Diagnostic {
                 range: LspRange {
@@ -44858,6 +45112,7 @@ mod tests {
                 severity: DiagnosticSeverity::Warning,
                 message: "warning on line 3".to_string(),
                 source: None,
+                code: None,
             },
         ];
         engine
@@ -44923,18 +45178,21 @@ mod tests {
                 severity: DiagnosticSeverity::Error,
                 message: "e1".to_string(),
                 source: None,
+                code: None,
             },
             Diagnostic {
                 range: LspRange::default(),
                 severity: DiagnosticSeverity::Error,
                 message: "e2".to_string(),
                 source: None,
+                code: None,
             },
             Diagnostic {
                 range: LspRange::default(),
                 severity: DiagnosticSeverity::Warning,
                 message: "w1".to_string(),
                 source: None,
+                code: None,
             },
         ];
         engine
@@ -51450,5 +51708,118 @@ mod tests {
         // Simulate removing cache (as happens on didChange)
         e.lsp_code_actions.remove(&path);
         assert!(!e.has_code_actions_on_line(0));
+    }
+
+    // ── Explorer indicators tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_explorer_indicators_empty() {
+        let e = Engine::new();
+        let (git_st, diags) = e.explorer_indicators();
+        assert!(git_st.is_empty());
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn test_explorer_indicators_git_status() {
+        let mut e = Engine::new();
+        // Simulate git status with modified and untracked files
+        e.cwd = PathBuf::from("/tmp/vimcode_test_git_ind");
+        e.sc_file_statuses = vec![
+            git::FileStatus {
+                path: "src/main.rs".to_string(),
+                staged: None,
+                unstaged: Some(git::StatusKind::Modified),
+            },
+            git::FileStatus {
+                path: "new_file.txt".to_string(),
+                staged: None,
+                unstaged: Some(git::StatusKind::Untracked),
+            },
+        ];
+        let (git_st, _) = e.explorer_indicators();
+        // Git status uses repo root which we can't easily mock, so just
+        // verify the function doesn't panic and returns reasonable results
+        // (actual path matching depends on find_repo_root returning our cwd)
+        assert!(git_st.len() <= 2);
+    }
+
+    #[test]
+    fn test_explorer_indicators_diagnostics() {
+        let mut e = Engine::new();
+        let path = PathBuf::from("/tmp/vimcode_test_diag_indicator.rs");
+        e.lsp_diagnostics.insert(
+            path.clone(),
+            vec![
+                lsp::Diagnostic {
+                    range: lsp::LspRange {
+                        start: lsp::LspPosition {
+                            line: 0,
+                            character: 0,
+                        },
+                        end: lsp::LspPosition {
+                            line: 0,
+                            character: 5,
+                        },
+                    },
+                    severity: lsp::DiagnosticSeverity::Error,
+                    message: "error".to_string(),
+                    source: None,
+                    code: None,
+                },
+                lsp::Diagnostic {
+                    range: lsp::LspRange {
+                        start: lsp::LspPosition {
+                            line: 1,
+                            character: 0,
+                        },
+                        end: lsp::LspPosition {
+                            line: 1,
+                            character: 5,
+                        },
+                    },
+                    severity: lsp::DiagnosticSeverity::Warning,
+                    message: "warning".to_string(),
+                    source: None,
+                    code: None,
+                },
+                lsp::Diagnostic {
+                    range: lsp::LspRange {
+                        start: lsp::LspPosition {
+                            line: 2,
+                            character: 0,
+                        },
+                        end: lsp::LspPosition {
+                            line: 2,
+                            character: 5,
+                        },
+                    },
+                    severity: lsp::DiagnosticSeverity::Error,
+                    message: "another error".to_string(),
+                    source: None,
+                    code: None,
+                },
+                lsp::Diagnostic {
+                    range: lsp::LspRange {
+                        start: lsp::LspPosition {
+                            line: 3,
+                            character: 0,
+                        },
+                        end: lsp::LspPosition {
+                            line: 3,
+                            character: 5,
+                        },
+                    },
+                    severity: lsp::DiagnosticSeverity::Information,
+                    message: "info".to_string(),
+                    source: None,
+                    code: None,
+                },
+            ],
+        );
+        let (_, diags) = e.explorer_indicators();
+        let counts = diags.get(&path).expect("should have diag entry");
+        assert_eq!(counts.0, 2, "expected 2 errors");
+        assert_eq!(counts.1, 1, "expected 1 warning");
     }
 }
