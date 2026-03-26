@@ -26,6 +26,43 @@ After completing any feature or significant change, update ALL of these files:
 
 **Critical Rule:** `src/core/` must NEVER depend on `gtk4`, `relm4`, or `pangocairo`. Must be testable in isolation.
 
+### Engine directory (`src/core/engine/`)
+
+The Engine is split into focused submodules. Each file adds `impl Engine` blocks — Rust resolves methods across files transparently.
+
+| File | What goes here |
+|------|---------------|
+| `mod.rs` | Types, enums, `Engine` struct def, `new()`, free functions, `mod` declarations |
+| `keys.rs` | `handle_key`, `handle_normal_key`, `handle_pending_key`, operator motions, macros, repeat, user keymaps |
+| `insert.rs` | *(future)* `handle_insert_key`, `handle_replace_key` — currently in keys.rs |
+| `command.rs` | *(future)* `handle_command_key`, `handle_search_key` — currently in keys.rs |
+| `visual.rs` | `handle_visual_key`, visual helpers, multi-cursor |
+| `execute.rs` | `execute_command()` — the ex-command dispatcher |
+| `motions.rs` | Cursor movement, word/paragraph/scroll, bracket nav, join, indent, jump list |
+| `buffers.rs` | File I/O, syntax update, undo/redo, git diff, markdown preview, netrw, workspace |
+| `windows.rs` | Window/tab/group splits, focus, resize, session restore |
+| `accessors.rs` | Group/buffer/window facades |
+| `search.rs` | Project search/replace, search highlighting |
+| `source_control.rs` | All `sc_*` methods, `handle_sc_*` key handlers |
+| `lsp_ops.rs` | All `lsp_*` methods, code actions, diagnostics, hover, completion |
+| `ext_panel.rs` | `ext_*` methods, `handle_ext_*`, extension + settings panel |
+| `panels.rs` | AI (`ai_*`), dialog system, swap files |
+| `plugins.rs` | Plugin init, event dispatch, command/keymap hooks |
+| `dap_ops.rs` | DAP/debug: poll_dap, breakpoints, sidebar, stepping |
+| `vscode.rs` | VSCode mode, menu bar methods |
+| `picker.rs` | Fuzzy score, unified picker, quickfix |
+| `terminal_ops.rs` | All `terminal_*` methods |
+| `spell_ops.rs` | Spell checking methods |
+| `tests.rs` | All test functions + helpers |
+
+**File size rule:** No single file should exceed ~5,000 lines. If a submodule grows past that, split it further (e.g. `keys.rs` → `keys.rs` + `insert.rs` + `command.rs`). Place new `impl Engine` methods in the submodule matching their responsibility — never dump unrelated methods into `mod.rs`.
+
+**Submodule conventions:**
+- Each submodule starts with `use super::*;` to import all engine types
+- Methods that other submodules call must be `pub(crate) fn`, not `fn`
+- References to sibling core modules use `crate::core::module::` (not `super::module::`, which would look inside engine/)
+- Free functions used across submodules stay in `mod.rs` and are accessed via `super::function_name`
+
 ## Data Model
 ```
 Engine
@@ -73,13 +110,13 @@ This prevents CI failures and maintains code quality.
 
 ## Common Patterns
 
-**Add Normal Mode Key:** `engine.rs` → `handle_normal_key()` → add match arm → test
+**Add Normal Mode Key:** `engine/keys.rs` → `handle_normal_key()` → add match arm → test
 
-**Add Command:** `engine.rs` → `execute_command()` → add match arm → test
+**Add Command:** `engine/execute.rs` → `execute_command()` → add match arm → test
 
-**Add Operator+Motion:** Set `pending_operator` → implement in `handle_operator_motion()` → test
+**Add Operator+Motion:** `engine/keys.rs` → set `pending_operator` → implement in `handle_operator_motion()` → test
 
-**Ctrl-W Command:** `handle_pending_key()` under `'\x17'` case
+**Ctrl-W Command:** `engine/keys.rs` → `handle_pending_key()` under `'\x17'` case
 
 **Engine Facade Methods:** `buffer()`, `buffer_mut()`, `view()`, `view_mut()`, `cursor()` — all operate on active window's buffer
 
