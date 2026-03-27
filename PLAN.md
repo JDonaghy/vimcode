@@ -5,7 +5,8 @@
 ---
 
 ## Recently Completed
-- **Session 223**: Consolidate sidebar focus state into engine — `explorer_has_focus`/`search_has_focus` fields on Engine; `sidebar_has_focus()`/`clear_sidebar_focus()` helpers; `handle_key()` guards; TUI `sync_sidebar_focus()`; GTK sync; 8 tests.
+- **Session 224**: Release prep v0.5.1 — bump version, update docs, tick off macOS CI/Homebrew roadmap item (implemented in Session 218, first release with macOS binaries).
+- **Session 223**: Consolidate sidebar focus state into engine.
 > Sessions 222 and earlier in **SESSION_HISTORY.md**.
 
 ### Bug Fixes
@@ -168,7 +169,7 @@
 - [x] **Consolidate sidebar focus state into engine** — `explorer_has_focus`/`search_has_focus` on Engine struct; `sidebar_has_focus()` aggregator + `clear_sidebar_focus()` helper; `handle_key()` guards; TUI `sync_sidebar_focus()` keeps state consistent; GTK sync on focus toggle/editor focus; 8 tests verify key routing correctness
 
 ### CI & Distribution
-- [ ] **macOS builds via GitHub Actions + Homebrew tap** — Add a macOS build target to the GitHub Actions CI/release workflow (build on `macos-latest` with `cargo build --release`). Produce a universal or arch-specific binary artifact. Create a Homebrew tap repository (e.g. `homebrew-vimcode`) with a formula that installs the release binary. Ensure the release workflow updates the tap formula (SHA256 + version) on each release. Test the full `brew install` → launch cycle in CI.
+- [x] **macOS builds via GitHub Actions + Homebrew tap** — Add a macOS build target to the GitHub Actions CI/release workflow (build on `macos-latest` with `cargo build --release`). Produce a universal or arch-specific binary artifact. Create a Homebrew tap repository (e.g. `homebrew-vimcode`) with a formula that installs the release binary. Ensure the release workflow updates the tap formula (SHA256 + version) on each release. Test the full `brew install` → launch cycle in CI.
 - [ ] **Windows portable builds + code signing** — Add a Windows build target to the GitHub Actions CI/release workflow (build on `windows-latest` with `cargo build --release`). Package as a portable app (self-contained `.zip` with `vimcode.exe` + any required DLLs, no installer needed — just extract and run). Attach the `.zip` as a release artifact. Investigate code signing (Authenticode) so the binary doesn't trigger SmartScreen warnings and can be installed/run on corporate machines with restricted execution policies; document the signing process and certificate options (self-signed for testing, trusted CA for production).
 
 ### Documentation

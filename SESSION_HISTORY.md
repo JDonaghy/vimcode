@@ -1,9 +1,12 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 223 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 224 archived here. Recent work summary in PROJECT_STATE.md.
 
 ---
+
+**Session 224 — Release prep v0.5.1 (4769 tests):**
+Bump version to 0.5.1 for patch release. Update test counts across docs (4736→4769). Tick off macOS CI/Homebrew roadmap item in PLAN.md (implemented in Session 218 CI commit, but release.yml changes hadn't reached `main` yet — this release will be the first to produce macOS binaries and update the Homebrew tap). Investigated why macOS build job wasn't running in release workflow: the `build-macos` job definition only existed on `develop`, not `main`.
 
 **Session 223 — Sidebar focus consolidation (4736 tests):**
 Consolidated sidebar focus state into the engine so key routing correctness is testable. Added `explorer_has_focus` and `search_has_focus` fields to Engine struct (previously only tracked in TUI-local `sidebar.has_focus`). Added `sidebar_has_focus()` aggregator (checks all 8 panel focus flags) and `clear_sidebar_focus()` helper in accessors.rs. Added guards in `handle_key()` — explorer/search focus blocks normal-mode key processing. TUI: `sync_sidebar_focus()` helper derives engine focus from TUI sidebar state; called after mouse events and before render; `clear_sidebar_focus()` replaces manual 6-field clears in Ctrl-W navigation. GTK: syncs `explorer_has_focus` in FocusExplorer/ToggleFocusExplorer/FocusEditor handlers. 8 new tests.
