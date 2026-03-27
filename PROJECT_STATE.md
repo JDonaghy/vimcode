@@ -1,9 +1,9 @@
 # VimCode Project State
 
-**Last updated:** Mar 25, 2026 (Session 216 — Explorer Tree Indicators) | **Tests:** 4721
+**Last updated:** Mar 26, 2026 (Session 224 — Release prep v0.5.1) | **Tests:** 4769
 
 > Feature documentation lives in **README.md**.
-> Per-session implementation notes through Session 216 are in **SESSION_HISTORY.md**.
+> Per-session implementation notes through Session 224 are in **SESSION_HISTORY.md**.
 
 ---
 
@@ -26,5 +26,5 @@ When implementing a new key/command, add tests covering:
 
 ## Recent Work
 
-> Session 216 and earlier archived in **SESSION_HISTORY.md**.
+> All sessions through 224 archived in **SESSION_HISTORY.md**. No recent unarchived work.
 

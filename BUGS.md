@@ -1,11 +1,14 @@
 # Known Bugs
 
-- **`cargo run -- file.rs` restores entire previous session** — Opening a specific file via CLI argument should open just that file, but the workspace session restoration loads all previously-open tabs as well. The CLI-specified file should either replace the session or open in a fresh workspace.
+No known bugs.
 
 ## Resolved
 
-All bugs below were fixed in Session 215 or earlier. See SESSION_HISTORY.md for details.
+All bugs below were fixed in Session 220 or earlier. See SESSION_HISTORY.md for details.
 
+- **`cargo run -- file.rs` restores entire previous session** — Skip `restore_session_files()` when CLI file/directory argument is provided. Use `open_file_with_mode(Permanent)` to load the file into the initial scratch window's tab (no leftover "[No Name]" tab).
+- **TUI: cannot drag tab to create new editor group when only one group exists** — `compute_tui_tab_drop_zone()` single-group branch only handled tab bar reorder. Added content area edge zone detection using terminal size, and visual feedback rendering in `render_tab_drag_overlay()` for `Center`/`Split` zones.
+- **GTK: "Don't know color ''" warnings on startup** — Explorer TreeStore rows initialized columns 3 (foreground) and 5 (indicator color) with empty strings `""`. GTK tried to parse these as CSS colors. Replaced with valid hex color defaults (`dir_fg_hex` / `modified_color`).
 - **Search highlights wrong text in non-active buffers** — `engine.search_matches` stored char offsets from the active buffer only, but `build_spans()` applied them to all visible buffers (splits). Non-active buffers highlighted text at the same char positions regardless of content. Fixed by computing per-buffer search matches in `build_rendered_window()` via `compute_search_matches_for_buffer()` helper; `build_spans()` now takes `search_matches` + `is_active_buffer` parameters. `search_index` (current match highlight) only applies to the active buffer.
 - **Can't paste into search/command/replace inputs** — Ctrl+V paste was missing from `/` search, `:` command, and TUI project search/replace input fields. Added `clipboard_paste()` handler to `handle_search_key()`, `handle_command_key()`, and TUI search panel input mode. GTK project search uses native Entry widgets (already supported paste).
 - **Visual mode `x` doesn't delete selection** — `x` in visual mode did nothing because `handle_visual_key()` only matched `'d'`, not `'x'`. Added `'x'` as alias for `'d'` with `pending_key.is_none()` guard (so `rx` still works as replace-with-x). 2 new tests.

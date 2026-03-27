@@ -1,9 +1,44 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 216 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 224 archived here. Recent work summary in PROJECT_STATE.md.
 
 ---
+
+**Session 224 — Release prep v0.5.1 (4769 tests):**
+Bump version to 0.5.1 for patch release. Update test counts across docs (4736→4769). Tick off macOS CI/Homebrew roadmap item in PLAN.md (implemented in Session 218 CI commit, but release.yml changes hadn't reached `main` yet — this release will be the first to produce macOS binaries and update the Homebrew tap). Investigated why macOS build job wasn't running in release workflow: the `build-macos` job definition only existed on `develop`, not `main`.
+
+**Session 223 — Sidebar focus consolidation (4736 tests):**
+Consolidated sidebar focus state into the engine so key routing correctness is testable. Added `explorer_has_focus` and `search_has_focus` fields to Engine struct (previously only tracked in TUI-local `sidebar.has_focus`). Added `sidebar_has_focus()` aggregator (checks all 8 panel focus flags) and `clear_sidebar_focus()` helper in accessors.rs. Added guards in `handle_key()` — explorer/search focus blocks normal-mode key processing. TUI: `sync_sidebar_focus()` helper derives engine focus from TUI sidebar state; called after mouse events and before render; `clear_sidebar_focus()` replaces manual 6-field clears in Ctrl-W navigation. GTK: syncs `explorer_has_focus` in FocusExplorer/ToggleFocusExplorer/FocusEditor handlers. 8 new tests.
+Files: `src/core/engine/mod.rs`, `src/core/engine/accessors.rs`, `src/core/engine/keys.rs`, `src/core/engine/tests.rs`, `src/tui_main/mod.rs`, `src/gtk/mod.rs`.
+
+**Session 222 — Hide single tab (4728 tests):**
+Added `hide_single_tab` setting (default false). When enabled, hides the tab bar row for editor groups with only one tab, reclaiming the row for editor content. Breadcrumbs row preserved when breadcrumbs is enabled. Works in both GTK and TUI backends with proper click/hover/drag handling. `:set hidesingletab`/`:set hst` toggle. Settings sidebar entry in Appearance category. Multi-group guard: tab bars always shown when ≥2 editor groups exist (prevents confusion when session restores multiple groups each with 1 tab). 7 new tests.
+Files: `src/core/settings.rs`, `src/core/engine/accessors.rs`, `src/core/engine/windows.rs`, `src/core/engine/tests.rs`, `src/gtk/draw.rs`, `src/gtk/click.rs`, `src/gtk/mod.rs`, `src/tui_main/render_impl.rs`, `src/tui_main/mouse.rs`, `src/render.rs`.
+
+**Session 221 — Refactor App::update() (4721 tests):**
+Extracted the monolithic `update()` method in `src/gtk/mod.rs` from ~4,495 lines to ~430 lines. Created 19 helper methods on `impl App` that group related `Msg` variants: `handle_key_press()`, `handle_poll_tick()`, `handle_mouse_click_msg()`, `handle_mouse_drag_msg()`, `handle_mouse_up_msg()`, `handle_tab_right_click()`, `handle_editor_right_click()`, `handle_terminal_msg()`, `handle_menu_msg()`, `handle_debug_sidebar_msg()`, `handle_sc_sidebar_msg()`, `handle_ext_sidebar_msg()`, `handle_ext_panel_msg()`, `handle_ai_sidebar_msg()`, `handle_sidebar_panel_msg()`, `handle_explorer_msg()`, `handle_find_replace_msg()`, `handle_file_ops_msg()`, `handle_dialog_msg()`. Added `terminal_cols()` utility replacing 4 duplicated terminal column computations.
+Follow-up /simplify review fixed 5 deduplication issues: extracted `map_gtk_key_name()`/`map_gtk_key_with_unicode()` (7 duplicated key mapping blocks → 2 free functions), `focus_editor_if_needed()` (13 grab_focus patterns → 1 method), `dispatch_engine_action()` (~160 lines duplicated between main key handling and macro playback → 1 method), cached `cached_ui_line_height` field (4 inline Pango font metric computations → 1 cached value), quit arms now call existing `save_session_and_exit()` (also fixed missing window dimension save). File reduced from 9,448 to 9,258 lines (190 lines net removal).
+Files: `src/gtk/mod.rs`.
+
+**Session 220 — Bug Fix Sweep (4721 tests):**
+Fixed all 3 open BUGS.md issues:
+1. **CLI file arg restores session**: Both GTK and TUI backends unconditionally called `restore_session_files()` then opened the CLI file on top. Fix: skip session restore when CLI arg provided; use `open_file_with_mode(path, OpenMode::Permanent)` to load file into the initial scratch window's tab (no leftover "[No Name]" tab). Files: `src/gtk/mod.rs`, `src/tui_main/mod.rs`.
+2. **TUI single-group tab drag**: `compute_tui_tab_drop_zone()` single-group branch only handled `TabReorder`, returning `DropZone::None` for content area. Added edge zone detection using `terminal_size` parameter. `render_tab_drag_overlay()` single-group branch only rendered `TabReorder` highlight — added `Center`/`Split` zone rendering using `editor_area` bounds. Files: `src/tui_main/render_impl.rs`, `src/tui_main/mouse.rs`.
+3. **GTK "Don't know color ''" warnings**: Explorer TreeStore rows initialized columns 3 (foreground) and 5 (indicator color) with `""`. GTK CSS parser warned on empty color strings. Replaced with valid hex defaults (`dir_fg_hex` in initial rows, `modified_color` in `update_tree_indicators()` clear path). File: `src/gtk/tree.rs`.
+Also added `hide_single_tab` setting to PLAN.md roadmap (default false, hides tab bar when single tab for traditional Vim feel).
+
+**Session 219 — Code Summaries System (4721 tests):**
+Created `SUMMARIES/` directory with 16 summary files covering all 45 major source files (~106K total lines). Each summary contains: purpose, line count, key types, key public methods. Added maintenance instructions to CLAUDE.md ("Code Summaries" section) requiring updates when source files are modified. Saves significant tokens in future sessions by providing scannable overviews instead of reading full source files.
+Files: `SUMMARIES/gtk_mod.md`, `gtk_draw.md`, `gtk_helpers.md`, `engine_mod.md`, `engine_keys.md`, `engine_motions.md`, `engine_execute.md`, `engine_visual.md`, `engine_buffers.md`, `engine_windows.md`, `engine_small_submodules.md`, `engine_tests.md`, `render.md`, `tui_modules.md`, `core_modules.md`. Also: `CLAUDE.md` (added summaries section).
+
+**Session 218 — GTK + TUI Split Refactor (4721 tests):**
+Split `src/main.rs` (16,826 lines) → `src/gtk/` directory with 6 submodules: `mod.rs` (9,267 — App, Msg, SimpleComponent), `draw.rs` (5,519 — all draw_* functions), `click.rs` (575), `css.rs` (525), `util.rs` (468), `tree.rs` (432). Split `src/tui_main.rs` (14,190 lines) → `src/tui_main/` directory with 4 submodules: `mod.rs` (4,166 — structs, event_loop), `panels.rs` (3,931), `render_impl.rs` (3,736), `mouse.rs` (2,379). Thin `main.rs` (55 lines) dispatches to `gtk::run()` or `tui_main::run()`. All 4,721 tests pass; zero API changes.
+Files: `src/main.rs`, `src/gtk/mod.rs`, `src/gtk/draw.rs`, `src/gtk/click.rs`, `src/gtk/css.rs`, `src/gtk/util.rs`, `src/gtk/tree.rs`, `src/tui_main/mod.rs`, `src/tui_main/panels.rs`, `src/tui_main/render_impl.rs`, `src/tui_main/mouse.rs`.
+
+**Session 217 — Engine Split Refactor (4721 tests):**
+Split monolithic `src/core/engine.rs` (51,825 lines) into `src/core/engine/` directory with 20 submodule files. `engine/mod.rs` (3,334 lines) contains types, structs, enums, Engine struct, `new()`, and free functions. Largest submodules: `tests.rs` (14,334), `keys.rs` (7,056), `motions.rs` (4,628). All 4,721 tests pass with zero changes to public API. No changes to `main.rs`, `tui_main.rs`, `render.rs`, `lib.rs`, or any non-engine files.
+Files: `src/core/engine/mod.rs` and 19 submodule files in `src/core/engine/`.
 
 **Session 216 — Explorer Tree Indicators (4721 tests):**
 Added right-aligned indicators on explorer tree rows (like VSCode) showing git status and LSP diagnostic counts. Both GTK and TUI backends. Extensive iteration on diagnostic count accuracy to match VSCode behavior.

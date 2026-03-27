@@ -9,19 +9,24 @@ env:
 
 jobs:
   build-and-release:
-    name: Build and publish release
+    name: Build Linux and publish release
     runs-on: ubuntu-24.04   # Ubuntu 24.04 ships GTK 4.14 which satisfies features = ["v4_10"]
 
     permissions:
       contents: write       # needed to create/update the rolling release
 
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
     steps:
     - uses: actions/checkout@v4
 
     - name: Read version from Cargo.toml
+      id: version
       run: |
         VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
         echo "VERSION=$VERSION" >> $GITHUB_ENV
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
 
     - name: Install GTK4 and build dependencies
       run: |
@@ -94,7 +99,9 @@ jobs:
         tag_name: v${{ env.VERSION }}
         name: "VimCode v${{ env.VERSION }}"
         body: |
-          ## Installation (Linux)
+          ## Installation
+
+          ### Linux
 
           **Option A — .deb package (recommended for Ubuntu/Debian)**
           ```
@@ -125,6 +132,24 @@ jobs:
           ```
 
           > GUI binary requires GTK 4.10+. Ubuntu 22.04 ships GTK 4.6 which is too old; Ubuntu 24.04+ recommended.
+
+          ### macOS (Apple Silicon)
+
+          **Option A — Homebrew (recommended)**
+          ```
+          brew tap JDonaghy/vimcode
+          brew install vimcode    # GTK4 GUI + TUI
+          # or
+          brew install vcd        # TUI only (no GTK4 dependency)
+          ```
+
+          **Option B — direct download**
+          Download `vimcode-macos-arm64.tar.gz` (GUI) or `vcd-macos-arm64.tar.gz` (TUI only), extract, and run:
+          ```
+          tar xzf vcd-macos-arm64.tar.gz
+          ./vcd
+          ```
+          > GUI binary requires GTK4 via Homebrew: `brew install gtk4`
         prerelease: false
         make_latest: true
         files: |
@@ -132,6 +157,66 @@ jobs:
           ${{ env.BIN_NAME }}
           ${{ env.TUI_BIN_NAME }}
 
+  # ── macOS Apple Silicon ──────────────────────────────────────────────────────
+  build-macos:
+    name: Build macOS ARM64 binaries
+    runs-on: macos-latest     # Apple Silicon (M1+)
+    needs: build-and-release  # wait for release to be created
+
+    permissions:
+      contents: write
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install GTK4 and build dependencies
+      run: brew install gtk4 pkg-config
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+        key: macos-arm64-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: macos-arm64-cargo-
+
+    - name: Cache build target
+      uses: actions/cache@v4
+      with:
+        path: target
+        key: macos-arm64-release-target-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: macos-arm64-release-target-
+
+    - name: Build release binaries
+      run: |
+        cargo build --release --bin vimcode
+        cargo build --release --bin vcd --no-default-features
+
+    - name: Strip and ad-hoc codesign
+      run: |
+        strip target/release/vimcode
+        strip target/release/vcd
+        codesign --sign - --force target/release/vimcode
+        codesign --sign - --force target/release/vcd
+
+    - name: Package as tarballs
+      run: |
+        tar czf vimcode-macos-arm64.tar.gz -C target/release vimcode
+        tar czf vcd-macos-arm64.tar.gz -C target/release vcd
+
+    - name: Upload to GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: v${{ needs.build-and-release.outputs.version }}
+        files: |
+          vimcode-macos-arm64.tar.gz
+          vcd-macos-arm64.tar.gz
+
+  # ── Flatpak ────────────────────────────────────────────────────────────────
   flatpak:
     name: Build Flatpak bundle
     runs-on: ubuntu-24.04
@@ -168,3 +253,18 @@ jobs:
       with:
         tag_name: v${{ env.VERSION }}
         files: vimcode.flatpak
+
+  # ── Update Homebrew tap ──────────────────────────────────────────────────────
+  update-homebrew:
+    name: Update Homebrew tap
+    runs-on: ubuntu-latest
+    needs: [build-and-release, build-macos]
+
+    steps:
+    - name: Trigger tap formula update
+      env:
+        GH_TOKEN: ${{ secrets.TAP_UPDATE_TOKEN }}
+      run: |
+        gh workflow run update.yml \
+          -R JDonaghy/homebrew-vimcode \
+          -f version=${{ needs.build-and-release.outputs.version }}

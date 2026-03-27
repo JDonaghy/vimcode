@@ -5,14 +5,9 @@
 ---
 
 ## Recently Completed
-- **Session 216**: Explorer Tree Indicators — git status + deduplicated LSP diagnostic counts on explorer rows; `explorer_indicators()` engine method with per-extension `ignore_error_sources` config; `Diagnostic.code` field; `relatedInformation: true`; GTK TreeStore 6-column + `update_tree_indicators()`; TUI render-time indicator drawing; 9+ cap; 3 tests. 4721 tests.
-- **Session 215**: Bug Fix Sweep — visual mode `x` delete (alias for `d` with `pending_key.is_none()` guard); Ctrl+V paste in search/command/replace inputs (`handle_search_key`, `handle_command_key`, TUI project search); search highlights in non-active buffers (per-buffer match computation in `build_rendered_window()` via `compute_search_matches_for_buffer()`). No open bugs. 4712 tests.
-- **Session 214**: Bug Sweep — TUI hover dismiss click fall-through, TUI selection with wrap, markdown typing color bleed (debounced syntax refresh), GTK scrollbar/divider overlap, TUI fuzzy finder stale chars. 4706 tests.
-- **Session 213**: Unified Picker Phase 1+2 + Bug Fixes — unified picker system, GTK crash prevention, markdown highlighting, hover popup fixes. 4706 tests.
-- **Session 212**: Selectable/Copyable Hover Popup Text — mouse drag selection, keyboard copy, GTK/TUI highlight rendering. 4710 tests.
-- **Session 211**: Code Action Apply + Semantic Token Fix — vertical dialog, workspace edit, proactive requests, semantic token clearing. 4703 tests.
-
-> Sessions 209 and earlier in **SESSION_HISTORY.md**.
+- **Session 224**: Release prep v0.5.1 — bump version, update docs, tick off macOS CI/Homebrew roadmap item (implemented in Session 218, first release with macOS binaries).
+- **Session 223**: Consolidate sidebar focus state into engine.
+> Sessions 222 and earlier in **SESSION_HISTORY.md**.
 
 ### Bug Fixes
 - [x] GTK core dump from panic in extern "C" draw callback — `catch_unwind` + `.ok()` on Cairo operations
@@ -51,6 +46,9 @@
 - [x] Semantic tokens disappear after hover — only accept responses with actual `data` array
 - [x] Terminal backspace key-hold batching — poll immediately after `terminal_write()`
 - [x] Sidebar scrollbar drag leaks — `dragging_generic_sb` state + GTK gesture `set_state(Claimed)`
+- [x] CLI file arg restores entire previous session — skip `restore_session_files` when CLI arg given; use `open_file_with_mode(Permanent)` to reuse scratch tab
+- [x] TUI: cannot drag tab to create new editor group with one group — added edge zone detection + visual feedback in `compute_tui_tab_drop_zone` / `render_tab_drag_overlay`
+- [x] GTK "Don't know color ''" warnings — empty TreeStore color columns (3, 5) replaced with valid hex defaults
 
 ## Roadmap
 - [x] **Spell checker** — Vim-compatible `]s`/`[s`/`z=`/`zg`/`zw`; spellbook Hunspell parser; bundled en_US dictionary; tree-sitter-aware; `spell`/`spelllang` settings; user dictionary at `~/.config/vimcode/user.dic`
@@ -159,8 +157,20 @@
 ### Explorer
 - [x] **Explorer tree indicators** — Right-aligned git status (`M`/`A`/`?`/`D`/`R`) and deduplicated LSP diagnostic counts (errors/warnings) on explorer tree rows (like VSCode); per-extension `ignore_error_sources` config; `9+` cap. Both GTK and TUI backends.
 
+### Refactoring
+- [x] **Split main.rs into gtk/ directory** — `src/main.rs` (16,826 lines) → `src/gtk/` directory with 6 submodules: `mod.rs` (9,267 — App, Msg, SimpleComponent impl), `draw.rs` (5,519 — all 32 draw_* functions), `click.rs` (575 — mouse click/drag), `css.rs` (525 — theme CSS), `util.rs` (468 — GTK utilities), `tree.rs` (432 — file tree). Thin `main.rs` (55 lines) dispatches to `gtk::run()` or `tui_main::run()`. Zero API changes, all 4,721 tests pass.
+- [x] **Split tui_main.rs into tui_main/ directory** — `src/tui_main.rs` (14,190 lines) → `src/tui_main/` directory with 4 submodules: `mod.rs` (4,166 — structs, event_loop, setup), `panels.rs` (3,931 — sidebar panel rendering), `render_impl.rs` (3,736 — draw_frame, editor rendering, popups), `mouse.rs` (2,379 — handle_mouse). All files under 5K lines.
+- [x] **Refactor App::update() message handler** — Extracted the ~4,495-line monolithic `update()` match into a ~430-line dispatcher calling 19 helper methods on `impl App` (`handle_key_press`, `handle_poll_tick`, `handle_mouse_*`, `handle_terminal_msg`, `handle_menu_msg`, `handle_*_sidebar_msg`, `handle_explorer_msg`, `handle_find_replace_msg`, `handle_file_ops_msg`, `handle_dialog_msg`). Added `terminal_cols()` utility. All 4,721 tests pass.
+
+### UI & Menus
+- [x] **Hide tab bar when single tab** — `hide_single_tab` setting (default `false`); when enabled, the tab bar row is hidden if the active editor group has only one tab, reclaiming the row for editor content. Applies to both GTK and TUI backends. Gives a more traditional Vim feel by removing chrome when there's nothing to switch between. Tab bar reappears automatically when a second tab is opened.
+
 ### Robustness (Low Priority)
-- [ ] **Consolidate sidebar focus state into engine** — TUI's `sidebar.has_focus` is a local variable not accessible to engine tests, making sidebar focus bugs (like the search panel input regression) impossible to catch with unit/integration tests. Move sidebar focus tracking into the engine so key routing correctness can be tested.
+- [x] **Consolidate sidebar focus state into engine** — `explorer_has_focus`/`search_has_focus` on Engine struct; `sidebar_has_focus()` aggregator + `clear_sidebar_focus()` helper; `handle_key()` guards; TUI `sync_sidebar_focus()` keeps state consistent; GTK sync on focus toggle/editor focus; 8 tests verify key routing correctness
+
+### CI & Distribution
+- [x] **macOS builds via GitHub Actions + Homebrew tap** — Add a macOS build target to the GitHub Actions CI/release workflow (build on `macos-latest` with `cargo build --release`). Produce a universal or arch-specific binary artifact. Create a Homebrew tap repository (e.g. `homebrew-vimcode`) with a formula that installs the release binary. Ensure the release workflow updates the tap formula (SHA256 + version) on each release. Test the full `brew install` → launch cycle in CI.
+- [ ] **Windows portable builds + code signing** — Add a Windows build target to the GitHub Actions CI/release workflow (build on `windows-latest` with `cargo build --release`). Package as a portable app (self-contained `.zip` with `vimcode.exe` + any required DLLs, no installer needed — just extract and run). Attach the `.zip` as a release artifact. Investigate code signing (Authenticode) so the binary doesn't trigger SmartScreen warnings and can be installed/run on corporate machines with restricted execution policies; document the signing process and certificate options (self-signed for testing, trusted CA for production).
 
 ### Documentation
 - [x] **GitHub Wiki** — 9 pages: Home, Getting Started, Key Remapping, Settings Reference, Extension Development, Lua Plugin API, Theme Customization, DAP Debugger Setup, LSP Configuration; README Documentation section links to wiki

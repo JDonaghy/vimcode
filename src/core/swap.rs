@@ -106,8 +106,21 @@ pub fn delete_swap(swap_path: &Path) {
 
 /// Check whether a process with the given PID is still alive.
 pub fn is_pid_alive(pid: u32) -> bool {
-    // On Linux, check `/proc/<pid>` existence.
-    Path::new(&format!("/proc/{}", pid)).exists()
+    #[cfg(target_os = "linux")]
+    {
+        Path::new(&format!("/proc/{}", pid)).exists()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // POSIX: kill(pid, 0) checks process existence without sending a signal.
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
 }
 
 /// Return an ISO-8601-ish timestamp for the current moment.
