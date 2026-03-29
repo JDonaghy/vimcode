@@ -549,6 +549,12 @@ impl Engine {
             return EngineAction::None;
         }
 
+        // Handle :Gbranches — open branch picker
+        if cmd == "Gbranches" || cmd == "GBranches" {
+            self.open_picker(PickerSource::GitBranches);
+            return EngineAction::None;
+        }
+
         // Handle :Plugin list|reload|enable|disable
         if let Some(subcmd) = cmd.strip_prefix("Plugin").map(|s| s.trim()) {
             match subcmd {
@@ -1209,6 +1215,18 @@ impl Engine {
             self.message = "Usage: :grep <pattern>".to_string();
             return EngineAction::None;
         }
+        if cmd == "GrepWord" {
+            let word = self.word_under_cursor().unwrap_or_default();
+            if word.is_empty() {
+                self.message = "No word under cursor".to_string();
+            } else {
+                self.open_picker(PickerSource::Grep);
+                self.picker_query = word;
+                self.picker_filter();
+                self.picker_load_preview();
+            }
+            return EngineAction::None;
+        }
 
         // Handle :h[elp] [topic]
         if cmd == "help" {
@@ -1341,7 +1359,7 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // Handle :tabmove [N] — move current tab to position N (0-based)
+        // Handle :tabmove [N] — move current tab to position N (1-based, 0 = move to end)
         if cmd == "tabmove" || cmd.starts_with("tabmove ") {
             let arg = cmd.strip_prefix("tabmove").unwrap_or("").trim();
             let num_tabs = self.active_group().tabs.len();
@@ -1349,7 +1367,11 @@ impl Engine {
             let dest = if arg.is_empty() {
                 num_tabs.saturating_sub(1) // move to end
             } else if let Ok(n) = arg.parse::<usize>() {
-                n.min(num_tabs.saturating_sub(1))
+                if n == 0 {
+                    num_tabs.saturating_sub(1) // 0 also means end
+                } else {
+                    (n - 1).min(num_tabs.saturating_sub(1)) // 1-based to 0-based
+                }
             } else {
                 self.message = "Usage: :tabmove [N]".to_string();
                 return EngineAction::None;
@@ -1358,8 +1380,18 @@ impl Engine {
                 let tab = self.active_group_mut().tabs.remove(current);
                 self.active_group_mut().tabs.insert(dest, tab);
                 self.active_group_mut().active_tab = dest;
-                self.message = format!("Tab moved to position {}", dest);
+                self.ensure_active_tab_visible();
+                self.message = format!("Tab moved to position {}", dest + 1);
             }
+            return EngineAction::None;
+        }
+
+        if cmd == "navback" {
+            self.tab_nav_back();
+            return EngineAction::None;
+        }
+        if cmd == "navforward" {
+            self.tab_nav_forward();
             return EngineAction::None;
         }
 
@@ -1816,6 +1848,10 @@ impl Engine {
             }
             "Picker commands" => {
                 self.open_picker(PickerSource::Commands);
+                EngineAction::None
+            }
+            "CommandCenter" => {
+                self.open_command_center();
                 EngineAction::None
             }
             "undo" => {

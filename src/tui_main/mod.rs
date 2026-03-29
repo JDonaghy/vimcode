@@ -891,6 +891,9 @@ pub fn run(file_path: Option<PathBuf>, debug_log_path: Option<String>) {
     {
         let prev_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
+            // Emergency: flush swap files for all dirty buffers before anything else.
+            crate::core::swap::run_emergency_flush();
+
             let bt = std::backtrace::Backtrace::force_capture();
             let loc_str = info
                 .location()
@@ -905,6 +908,13 @@ pub fn run(file_path: Option<PathBuf>, debug_log_path: Option<String>) {
         }));
     }
 
+    // Register engine pointer for emergency swap flush from the panic hook.
+    // SAFETY: `engine` lives on the stack until process exit; the pointer is
+    // only dereferenced during panic recovery on the same thread.
+    unsafe {
+        crate::core::swap::register_emergency_engine(&engine as *const _);
+    }
+
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).expect("create terminal");
     terminal.clear().expect("clear terminal");
@@ -916,6 +926,10 @@ pub fn run(file_path: Option<PathBuf>, debug_log_path: Option<String>) {
     restore_terminal(&mut terminal, keyboard_enhanced);
 
     if let Err(e) = result {
+        // Emergency: flush swap files for all dirty buffers before exiting.
+        // This preserves unsaved work that would otherwise be lost.
+        engine.emergency_swap_flush();
+
         // Extract the panic message before aborting — resume_unwind would call
         // abort() on Linux (via the default panic handler), producing a core dump.
         let msg = if let Some(s) = e.downcast_ref::<&str>() {
@@ -926,6 +940,7 @@ pub fn run(file_path: Option<PathBuf>, debug_log_path: Option<String>) {
             "VimCode internal error (unknown panic payload)".to_string()
         };
         eprintln!("{msg}");
+        eprintln!("Unsaved buffers written to swap files for recovery.");
         eprintln!("Crash details written to /tmp/vimcode-crash.log");
         eprintln!("Please report this at https://github.com/anthropics/claude-code/issues");
         std::process::exit(1);
@@ -1060,6 +1075,15 @@ fn event_loop(
     // Timestamp of the last Alt+t press (for tab switcher auto-confirm on timeout).
     let mut tab_switcher_last_cycle: Option<Instant> = None;
 
+    // Reveal the active file in the explorer sidebar at startup (session restore).
+    if let Some(path) = engine.file_path().cloned() {
+        let h = terminal
+            .size()
+            .map(|s| s.height.saturating_sub(4) as usize)
+            .unwrap_or(40);
+        sidebar.reveal_path(&path, h);
+    }
+
     loop {
         // Refresh theme in case :colorscheme was run.
         theme = Theme::from_name(&engine.settings.colorscheme);
@@ -1098,7 +1122,22 @@ fn event_loop(
             let content_cols = size
                 .width
                 .saturating_sub(ab_w + sidebar_cols + gutter_approx);
-            engine.set_viewport_lines(content_rows.saturating_sub(1).max(1) as usize); // -1 for tab bar row inside content_rows
+            // Compute how many rows the tab bar + breadcrumbs consume.
+            let tab_bar_rows: u16 = {
+                let has_single_tab = engine.active_group().tabs.len() <= 1;
+                if engine.settings.hide_single_tab && has_single_tab {
+                    if engine.settings.breadcrumbs {
+                        1
+                    } else {
+                        0
+                    }
+                } else if engine.settings.breadcrumbs {
+                    2
+                } else {
+                    1
+                }
+            };
+            engine.set_viewport_lines(content_rows.saturating_sub(tab_bar_rows).max(1) as usize);
             engine.set_viewport_cols(content_cols.max(1) as usize);
         }
 
@@ -1167,6 +1206,7 @@ fn event_loop(
                 }
             }
 
+            let mut tab_visible_counts: Vec<(crate::core::window::GroupId, usize)> = Vec::new();
             terminal
                 .draw(|frame| {
                     if let Some(s) = &screen {
@@ -1190,10 +1230,16 @@ fn event_loop(
                             &mut hover_popup_rect,
                             &mut editor_hover_popup_rect,
                             &mut editor_hover_link_rects,
+                            &mut tab_visible_counts,
                         );
                     }
                 })
                 .expect("draw frame");
+            // Report rendered tab counts back to the engine so that
+            // ensure_active_tab_visible() knows how many tabs fit.
+            for (gid, count) in &tab_visible_counts {
+                engine.set_tab_visible_count(*gid, *count);
+            }
 
             // Set terminal cursor shape to match mode / pending key.
             let cursor_style = if !sidebar.has_focus && engine.pending_key == Some('r') {
@@ -1712,6 +1758,13 @@ fn event_loop(
                                     engine.open_folder(&path);
                                     sidebar = TuiSidebar::new(engine.cwd.clone(), sidebar.visible);
                                     sidebar.show_hidden_files = engine.settings.show_hidden_files;
+                                    if let Some(fp) = engine.file_path().cloned() {
+                                        let h = terminal
+                                            .size()
+                                            .map(|s| s.height.saturating_sub(4) as usize)
+                                            .unwrap_or(40);
+                                        sidebar.reveal_path(&fp, h);
+                                    }
                                 }
                             } else {
                                 // Check if ".." was selected — navigate up instead of opening
@@ -1732,6 +1785,14 @@ fn event_loop(
                                     }
                                     sidebar = TuiSidebar::new(engine.cwd.clone(), sidebar.visible);
                                     sidebar.show_hidden_files = engine.settings.show_hidden_files;
+                                    // Reveal the active file from the restored session
+                                    if let Some(path) = engine.file_path().cloned() {
+                                        let h = terminal
+                                            .size()
+                                            .map(|s| s.height.saturating_sub(4) as usize)
+                                            .unwrap_or(40);
+                                        sidebar.reveal_path(&path, h);
+                                    }
                                 }
                             }
                         }
@@ -2970,6 +3031,16 @@ fn event_loop(
                                 engine.group_layout.leaf_count(),
                                 engine.group_layout
                             );
+                            needs_redraw = true;
+                            continue;
+                        }
+                        if matches_tui_key(&pk.nav_back, code, mods) {
+                            engine.tab_nav_back();
+                            needs_redraw = true;
+                            continue;
+                        }
+                        if matches_tui_key(&pk.nav_forward, code, mods) {
+                            engine.tab_nav_forward();
                             needs_redraw = true;
                             continue;
                         }

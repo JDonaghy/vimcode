@@ -3010,9 +3010,10 @@ impl Engine {
         if !self.settings.swap_file {
             return false;
         }
-        // Don't overwrite an existing recovery dialog.
+        // Don't overwrite an existing recovery dialog.  Don't create a
+        // fresh swap either — the stale swap must survive until the user
+        // dismisses the current dialog and we re-scan.
         if self.pending_swap_recovery.is_some() {
-            self.swap_create_for_buffer(buf_id);
             return false;
         }
         let (canonical, file_path) = {
@@ -3132,6 +3133,13 @@ impl Engine {
                 self.message.clear();
             }
             _ => {}
+        }
+        // Check remaining open buffers for more stale swaps.
+        // Skip when disk saves are suppressed (integration tests) because
+        // delete_swap/write_swap are no-ops, so the swap file persists on
+        // disk and would trigger an infinite recovery loop.
+        if !crate::core::session::saves_suppressed() {
+            self.swap_recheck_open_buffers();
         }
         EngineAction::None
     }

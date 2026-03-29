@@ -1,14 +1,16 @@
 # Core Modules (src/core/)
 
-## lsp.rs — 2,486 lines
+## lsp.rs — 2,784 lines
 LSP protocol transport and single-server client.
 ### Types
 - `LspServer` — manages a single LSP server process (stdin/stdout/stderr, reader thread)
-- `LspEvent` — enum of all LSP response types (Completion, Definition, Hover, Diagnostics, SemanticTokens, etc.)
+- `LspEvent` — enum of all LSP response types (Completion, Definition, Hover, Diagnostics, SemanticTokens, DocumentSymbolResponse, WorkspaceSymbolResponse, etc.)
 - `Diagnostic` / `DiagnosticSeverity` — diagnostic data
 - `CodeAction` / `CompletionItem` / `Location` / `LspRange` / `LspPosition` — LSP data types
 - `WorkspaceEdit` / `FileEdit` / `FormattingEdit` — edit application types
 - `SemanticToken` / `SemanticTokensLegend` — semantic token data
+- `SymbolInfo` — document/workspace symbol data (name, kind, path, line, col)
+- `SymbolKind` — enum with `from_number()`, `icon()`, `label()` methods
 - `SignatureHelpData` — function signature info
 - `LspServerConfig` — server command + args + language mappings
 - `MasonPackageInfo` — Mason package metadata
@@ -16,11 +18,14 @@ LSP protocol transport and single-server client.
 - `LspServer::start(config)` — spawn LSP process, send initialize, start reader thread
 - `did_open/did_change/did_save/did_close` — document sync notifications
 - `request_completion/definition/hover/references/implementation/rename/code_action/formatting/semantic_tokens_full` — LSP requests
+- `request_document_symbols(uri)` / `request_workspace_symbols(query)` — symbol requests
+- `parse_document_symbols(value)` / `parse_workspace_symbols(value)` — parse symbol responses
+- `flatten_document_symbol(sym, path, out)` / `parse_symbol_information(item, out)` — internal symbol parsers
 - `decode_semantic_tokens(raw, legend)` — delta-decode semantic token array
 - `path_to_uri/uri_to_path` — file path ↔ URI conversion
 - `language_id_from_path(path)` — file extension to language ID
 
-## lsp_manager.rs — 982 lines
+## lsp_manager.rs — 994 lines
 Multi-server LSP coordinator. Manages server lifecycle per language.
 ### Types
 - `LspManager` — holds active servers, registry, extension manifests
@@ -30,6 +35,7 @@ Multi-server LSP coordinator. Manages server lifecycle per language.
 - `poll_events()` — collect events from all active servers
 - `notify_did_open/change/save/close(path)` — route notifications to correct server
 - `request_completion/definition/hover/references/...` — route requests by file path
+- `request_document_symbols(path)` / `request_workspace_symbols(path, query)` — route symbol requests to correct server
 - `restart_server_for_language(lang_id)` / `stop_server_for_language(lang_id)`
 - `server_info(current_lang)` — `:LspInfo` output
 - `default_server_registry()` — built-in server configs
@@ -100,7 +106,7 @@ Buffer storage and management.
 - `BufferManager::create(path)` / `get(id)` / `get_mut(id)` / `remove(id)`
 - `BufferState::from_text(text)` / `from_file(path)` — buffer creation
 
-## syntax.rs — 1,522 lines
+## syntax.rs — 1,525 lines
 Tree-sitter syntax highlighting for 20 languages.
 ### Types
 - `SyntaxHighlighter` — tree-sitter parser + tree per buffer

@@ -208,11 +208,11 @@ fn test_visual_paste_with_uppercase_p() {
 fn test_visual_paste_multichar_selection() {
     // Yank "xx" from register, select "cd" and replace
     let mut e = engine_with("xxcdef\n");
-    // yiw yanks "xxcdef" — use yy + specific register instead
     // Just yank "xx" using visual (cols 0-1)
     type_chars(&mut e, "vly");
-    // After visual yank, cursor stays at col 1. Move to col 2 ('c').
-    press(&mut e, 'l');
+    // After visual yank, cursor moves to start of selection (col 0, Vim behavior).
+    // Move to col 2 ('c').
+    type_chars(&mut e, "ll");
     // select "cd" (cols 2-3)
     press(&mut e, 'v');
     press(&mut e, 'l');

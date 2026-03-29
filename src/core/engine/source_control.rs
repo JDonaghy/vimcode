@@ -523,12 +523,21 @@ impl Engine {
                 self.sc_commit_input_active = true;
                 true
             }
+            "C" => {
+                // Commit immediately if there's a message, otherwise enter input mode.
+                if self.sc_commit_message.trim().is_empty() {
+                    self.sc_commit_input_active = true;
+                } else {
+                    self.sc_do_commit();
+                }
+                true
+            }
             "p" => {
-                self.sc_push();
+                self.sc_pull();
                 true
             }
             "P" => {
-                self.sc_pull();
+                self.sc_push();
                 true
             }
             "f" => {

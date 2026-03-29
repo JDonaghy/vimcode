@@ -737,7 +737,10 @@ impl Syntax {
         // Skip incremental parsing for Markdown: tree-sitter-md's external
         // scanner can corrupt the parser's logger struct when reusing an old
         // tree, causing a SIGSEGV in ts_parser__log.
-        let old_tree = if self.language == SyntaxLanguage::Markdown {
+        let old_tree = if matches!(
+            self.language,
+            SyntaxLanguage::Markdown | SyntaxLanguage::Yaml
+        ) {
             None
         } else {
             self.last_tree.as_ref()

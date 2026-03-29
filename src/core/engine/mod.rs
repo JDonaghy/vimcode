@@ -382,10 +382,22 @@ pub static PALETTE_COMMANDS: &[PaletteCommand] = &[
         action: "fuzzy",
     },
     PaletteCommand {
+        label: "Go: Command Center",
+        shortcut: "",
+        vscode_shortcut: "",
+        action: "CommandCenter",
+    },
+    PaletteCommand {
         label: "Go: Live Grep",
         shortcut: "Ctrl+G",
         vscode_shortcut: "Ctrl+Shift+F",
         action: "grep",
+    },
+    PaletteCommand {
+        label: "Search: Word Under Cursor",
+        shortcut: "<leader>sw",
+        vscode_shortcut: "<leader>sw",
+        action: "GrepWord",
     },
     PaletteCommand {
         label: "Go: Go to Line",
@@ -416,6 +428,18 @@ pub static PALETTE_COMMANDS: &[PaletteCommand] = &[
         shortcut: "Ctrl+O",
         vscode_shortcut: "Alt+Left",
         action: "jump_back",
+    },
+    PaletteCommand {
+        label: "Go: Navigate Back",
+        shortcut: "Ctrl+Alt+Left",
+        vscode_shortcut: "",
+        action: "navback",
+    },
+    PaletteCommand {
+        label: "Go: Navigate Forward",
+        shortcut: "Ctrl+Alt+Right",
+        vscode_shortcut: "",
+        action: "navforward",
     },
     // Run / Debug
     PaletteCommand {
@@ -502,7 +526,7 @@ pub static PALETTE_COMMANDS: &[PaletteCommand] = &[
         label: "Git: Switch Branch",
         shortcut: "",
         vscode_shortcut: "",
-        action: "Gswitch",
+        action: "Gbranches",
     },
     PaletteCommand {
         label: "Git: Create Branch",
@@ -710,6 +734,8 @@ pub enum PickerSource {
     Marks,
     Registers,
     GitBranches,
+    /// Command Center: dynamic prefix routing (>, @, #, :, ?).
+    CommandCenter,
     Custom(String),
 }
 
@@ -743,6 +769,10 @@ pub enum PickerAction {
     JumpToMark(char),
     PasteRegister(char),
     CheckoutBranch(String),
+    /// Go to a specific line number in the active buffer.
+    GotoLine(usize),
+    /// Jump to a symbol location (file, line, col).
+    GotoSymbol(PathBuf, usize, usize),
     Custom(String),
 }
 
@@ -1080,6 +1110,12 @@ pub struct ExplorerRenameState {
 pub struct EditorGroup {
     pub tabs: Vec<Tab>,
     pub active_tab: usize,
+    /// Index of the first visible tab in the tab bar (for scroll-into-view).
+    /// Updated by `ensure_active_tab_visible()` whenever the active tab changes.
+    pub tab_scroll_offset: usize,
+    /// Number of tabs that fit in the rendered tab bar.  Set by the renderer
+    /// each frame via `Engine::set_tab_visible_count()`.  Default 6.
+    pub tab_visible_count: usize,
 }
 
 impl EditorGroup {
@@ -1087,6 +1123,8 @@ impl EditorGroup {
         Self {
             tabs: vec![initial_tab],
             active_tab: 0,
+            tab_scroll_offset: 0,
+            tab_visible_count: 6,
         }
     }
 
@@ -1889,6 +1927,10 @@ pub struct Engine {
     lsp_dirty_buffers: HashMap<BufferId, bool>,
     /// Request ID of the pending code action request.
     pub lsp_pending_code_action: Option<i64>,
+    /// Pending document symbol request ID.
+    pub lsp_pending_document_symbols: Option<i64>,
+    /// Pending workspace symbol request ID.
+    pub lsp_pending_workspace_symbols: Option<i64>,
     /// The (path, line) for which the pending code action request was made.
     lsp_code_action_request_ctx: Option<(PathBuf, usize)>,
     /// Cached code actions per file path and line number.
@@ -1996,6 +2038,14 @@ pub struct Engine {
     /// MRU-ordered list of (group_id, tab_index) pairs.
     /// Most recently used is at index 0.
     pub tab_mru: Vec<(GroupId, usize)>,
+
+    /// Back/forward tab navigation history.
+    /// Each entry is (GroupId, TabId) at the time of the switch.
+    pub tab_nav_history: Vec<(GroupId, TabId)>,
+    /// Current position in `tab_nav_history` (index of the entry we're viewing).
+    pub tab_nav_index: usize,
+    /// True when navigating via back/forward (suppresses pushing to history).
+    tab_nav_navigating: bool,
 
     // --- Quickfix state ---
     /// Quickfix list populated by :grep / :vimgrep.
@@ -2595,6 +2645,8 @@ impl Engine {
             lsp_signature_help: None,
             lsp_dirty_buffers: HashMap::new(),
             lsp_pending_code_action: None,
+            lsp_pending_document_symbols: None,
+            lsp_pending_workspace_symbols: None,
             lsp_code_action_request_ctx: None,
             lsp_code_actions: HashMap::new(),
             lsp_code_action_last_line: None,
@@ -2638,6 +2690,9 @@ impl Engine {
             tab_switcher_open: false,
             tab_switcher_selected: 0,
             tab_mru: vec![(GroupId(0), 0)],
+            tab_nav_history: vec![(GroupId(0), TabId(1))],
+            tab_nav_index: 0,
+            tab_nav_navigating: false,
             quickfix_items: Vec::new(),
             quickfix_selected: 0,
             quickfix_open: false,

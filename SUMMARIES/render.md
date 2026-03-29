@@ -1,4 +1,4 @@
-# src/render.rs — 6,334 lines
+# src/render.rs — 6,380 lines
 
 Platform-agnostic rendering abstraction. Transforms engine state into `ScreenLayout` consumed by both GTK and TUI backends. Contains all themes, render data structs, and the main layout builder.
 
@@ -16,9 +16,9 @@ Platform-agnostic rendering abstraction. Transforms engine state into `ScreenLay
 - `DiagnosticMark` / `SpellMark` — underline markers
 
 ## Key Types — UI Components
-- `ScreenLayout` — top-level render output consumed by backends
+- `ScreenLayout` — top-level render output consumed by backends; `status_branch_range: Option<(usize, usize)>` for click detection
 - `EditorGroupSplitData` — group layout with tab bars and windows
-- `GroupTabBar` / `TabInfo` — tab strip data
+- `GroupTabBar` / `TabInfo` — tab strip data (includes `tab_scroll_offset`)
 - `BreadcrumbBar` / `BreadcrumbSegment` — file path breadcrumbs
 - `CompletionMenu` — LSP/word completion dropdown
 - `HoverPopup` / `EditorHoverPopupData` — hover information popup

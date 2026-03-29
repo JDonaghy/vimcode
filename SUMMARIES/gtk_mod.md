@@ -1,4 +1,4 @@
-# src/gtk/mod.rs — 9,258 lines
+# src/gtk/mod.rs — 9,466 lines
 
 GTK4/Relm4 application shell. Defines the `App` struct, `Msg` enum, and `SimpleComponent` impl (init/view/update). Contains the main event loop, window setup, input handling, and all GTK widget wiring.
 
@@ -16,7 +16,7 @@ GTK4/Relm4 application shell. Defines the `App` struct, `Msg` enum, and `SimpleC
 ## Helper Methods (impl App, called from update)
 - `handle_key_press()` — keyboard input, mode switching, engine key dispatch
 - `handle_poll_tick()` — timer-driven polling (LSP, DAP, terminal, search, extensions)
-- `handle_mouse_click_msg()` — left click dispatching via `pixel_to_click_target()`
+- `handle_mouse_click_msg()` — left click dispatching via `pixel_to_click_target()` (includes status bar branch click handler)
 - `handle_mouse_drag_msg()` — mouse drag (tab, scrollbar, sidebar resize, text selection)
 - `handle_mouse_up_msg()` — mouse release, tab drop, sidebar divider drop
 - `handle_tab_right_click()` — tab context menu (close, split, copy path)

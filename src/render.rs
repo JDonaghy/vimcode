@@ -383,6 +383,8 @@ pub struct GroupTabBar {
     pub bounds: WindowRect,
     /// Diff toolbar data, present when the group is showing a diff view.
     pub diff_toolbar: Option<DiffToolbarData>,
+    /// Index of the first visible tab (scroll offset for overflow tab bars).
+    pub tab_scroll_offset: usize,
 }
 
 /// One segment in the breadcrumb bar (either a path component or a symbol).
@@ -982,6 +984,10 @@ pub struct MenuBarData {
     pub show_window_controls: bool,
     /// When true, use `vscode_shortcut` instead of `shortcut` for menu items.
     pub is_vscode_mode: bool,
+    /// Whether the back navigation arrow is enabled (history available).
+    pub nav_back_enabled: bool,
+    /// Whether the forward navigation arrow is enabled (history available).
+    pub nav_forward_enabled: bool,
 }
 
 /// One button in the debug toolbar strip.
@@ -1578,6 +1584,8 @@ pub struct ScreenLayout {
     pub windows: Vec<RenderedWindow>,
     pub status_left: String,
     pub status_right: String,
+    /// Byte range within `status_left` where the git branch name appears (for click detection).
+    pub status_branch_range: Option<(usize, usize)>,
     pub command: CommandLineData,
     /// Wildmenu bar (Tab completion in command mode), or `None` when inactive.
     pub wildmenu: Option<WildmenuData>,
@@ -1629,6 +1637,8 @@ pub struct ScreenLayout {
     pub context_menu: Option<ContextMenuPanel>,
     /// Tab hover tooltip: shortened file path to display near the hovered tab.
     pub tab_tooltip: Option<String>,
+    /// Tab scroll offset for the single-group tab bar.
+    pub tab_scroll_offset: usize,
 }
 
 /// Context menu data for TUI rendering.
@@ -3077,7 +3087,7 @@ pub fn build_screen_layout(
         })
         .collect();
 
-    let (status_left, status_right) = build_status_line(engine);
+    let (status_left, status_right, status_branch_range) = build_status_line(engine);
     let command = build_command_line(engine);
 
     let wildmenu = if engine.wildmenu_items.is_empty() {
@@ -3171,9 +3181,13 @@ pub fn build_screen_layout(
         } else {
             0
         };
+        // Use workspace directory name (not active file) so the centered
+        // search box stays fixed when switching tabs (like VSCode Command Center).
         let title = engine
-            .active_buffer_name()
-            .map(|n| format!("VimCode \u{2014} {}", n))
+            .cwd
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.to_string())
             .unwrap_or_else(|| "VimCode".to_string());
         MenuBarData {
             open_menu_idx: engine.menu_open_idx,
@@ -3183,6 +3197,8 @@ pub fn build_screen_layout(
             title,
             show_window_controls: false, // GTK backend overrides this
             is_vscode_mode: engine.is_vscode_mode(),
+            nav_back_enabled: engine.tab_nav_can_go_back(),
+            nav_forward_enabled: engine.tab_nav_can_go_forward(),
         }
     });
 
@@ -3513,11 +3529,17 @@ pub fn build_screen_layout(
                 } else {
                     None
                 };
+                let tab_scroll_offset = engine
+                    .editor_groups
+                    .get(&gid)
+                    .map(|g| g.tab_scroll_offset)
+                    .unwrap_or(0);
                 GroupTabBar {
                     group_id: gid,
                     tabs,
                     bounds,
                     diff_toolbar,
+                    tab_scroll_offset,
                 }
             })
             .collect();
@@ -3611,6 +3633,7 @@ pub fn build_screen_layout(
         windows,
         status_left,
         status_right,
+        status_branch_range,
         command,
         wildmenu,
         active_window_id,
@@ -3723,6 +3746,11 @@ pub fn build_screen_layout(
             screen_row: cm.screen_y,
         }),
         tab_tooltip: engine.tab_hover_tooltip.clone(),
+        tab_scroll_offset: engine
+            .editor_groups
+            .get(&engine.active_group)
+            .map(|g| g.tab_scroll_offset)
+            .unwrap_or(0),
     }
 }
 
@@ -6034,7 +6062,7 @@ pub fn calculate_gutter_cols(
     }
 }
 
-fn build_status_line(engine: &Engine) -> (String, String) {
+fn build_status_line(engine: &Engine) -> (String, String, Option<(usize, usize)>) {
     let mode_str = engine.mode_str();
 
     let filename = match engine.file_path() {
@@ -6053,16 +6081,34 @@ fn build_status_line(engine: &Engine) -> (String, String) {
         String::new()
     };
 
-    let branch = engine
-        .git_branch
-        .as_deref()
-        .map(|b| format!(" [{}]", b))
-        .unwrap_or_default();
+    // Build branch segment with ahead/behind counts
+    let branch = if let Some(b) = engine.git_branch.as_deref() {
+        let mut branch_text = b.to_string();
+        if engine.sc_ahead > 0 || engine.sc_behind > 0 {
+            let mut parts = Vec::new();
+            if engine.sc_ahead > 0 {
+                parts.push(format!("↑{}", engine.sc_ahead));
+            }
+            if engine.sc_behind > 0 {
+                parts.push(format!("↓{}", engine.sc_behind));
+            }
+            branch_text = format!("{} {}", branch_text, parts.join(" "));
+        }
+        format!(" [{}]", branch_text)
+    } else {
+        String::new()
+    };
 
-    let left = format!(
-        " -- {}{} -- {}{}{}",
-        mode_str, recording, filename, dirty, branch
-    );
+    let prefix = format!(" -- {}{} -- {}{}", mode_str, recording, filename, dirty);
+    let branch_range = if branch.is_empty() {
+        None
+    } else {
+        let start = prefix.len();
+        let end = start + branch.len();
+        Some((start, end))
+    };
+
+    let left = format!("{}{}", prefix, branch);
 
     let cursor = engine.cursor();
     let (errors, warnings) = engine.diagnostic_counts();
@@ -6079,7 +6125,7 @@ fn build_status_line(engine: &Engine) -> (String, String) {
         diag_str
     );
 
-    (left, right)
+    (left, right, branch_range)
 }
 
 fn build_command_line(engine: &Engine) -> CommandLineData {

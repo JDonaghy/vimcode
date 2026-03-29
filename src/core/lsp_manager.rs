@@ -710,6 +710,18 @@ impl LspManager {
         Some(self.servers[sid].request_type_definition(&uri, line, character))
     }
 
+    /// Request document symbols (outline) from the appropriate server.
+    pub fn request_document_symbols(&mut self, path: &Path) -> Option<i64> {
+        let (sid, uri) = self.server_and_uri(path)?;
+        Some(self.servers[sid].request_document_symbols(&uri))
+    }
+
+    /// Request workspace symbols matching a query from the appropriate server.
+    pub fn request_workspace_symbols(&mut self, path: &Path, query: &str) -> Option<i64> {
+        let (sid, _uri) = self.server_and_uri(path)?;
+        Some(self.servers[sid].request_workspace_symbols(query))
+    }
+
     /// Request signature help from the appropriate server.
     pub fn request_signature_help(
         &mut self,

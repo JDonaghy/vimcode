@@ -1,4 +1,4 @@
-# src/core/engine/visual.rs — 884 lines
+# src/core/engine/visual.rs — 895 lines
 
 Visual mode key handling and multi-cursor support.
 

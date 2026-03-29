@@ -5,9 +5,10 @@
 ---
 
 ## Recently Completed
-- **Session 224**: Release prep v0.5.1 — bump version, update docs, tick off macOS CI/Homebrew roadmap item (implemented in Session 218, first release with macOS binaries).
-- **Session 223**: Consolidate sidebar focus state into engine.
-> Sessions 222 and earlier in **SESSION_HISTORY.md**.
+- **Session 231**: Git branch switcher in status bar — clickable branch name in status bar opens `PickerSource::GitBranches` picker; ahead/behind counts (`↑N ↓N`) displayed; `status_branch_range` on `ScreenLayout`; GTK + TUI click handlers; `:Gbranches` command; fixed `Gcheckout` → `Gswitch` in picker confirm; 6 new tests.
+- **Session 230**: Command Center enhancements + `<leader>sw` — `%` grep prefix, `debug` keyword (launch configs), `task` keyword (tasks.json), placeholder hints dropdown (9 mode items on empty query). `<leader>sw` greps word under cursor; `:GrepWord` command; palette entry. 30 new tests.
+- **Session 229**: Command Center — clickable search box in menu bar opens unified picker with prefix routing: _(none)_ fuzzy files, `>` command palette, `@` document symbols, `#` workspace symbols, `:` go to line, `?` help. LSP `documentSymbol`/`workspaceSymbol` integration. `:CommandCenter` ex command. GTK + TUI click-to-open. 11 new tests.
+> Sessions 228 and earlier in **SESSION_HISTORY.md**.
 
 ### Bug Fixes
 - [x] GTK core dump from panic in extern "C" draw callback — `catch_unwind` + `.ok()` on Cairo operations
@@ -42,6 +43,13 @@
 - [x] Double-click word-wise drag — word boundary snapping with `mouse_drag_word_mode`/`mouse_drag_word_origin`
 - [x] Ctrl+V paste in fuzzy finder — added handler in `handle_picker_key()`
 - [x] Search panel input broken — TUI click handler sets `sidebar.has_focus = true`
+- [x] Search `n` doesn't scroll far enough — viewport_lines missed tab bar/breadcrumbs/hide_single_tab chrome rows in both GTK and TUI
+- [x] Explorer tree doesn't reveal active buffer on folder open — added `reveal_path()` at TUI startup and after `open_folder()`
+- [x] Visual yank doesn't move cursor to selection start — `yank_visual_selection()` moves cursor to start (Vim behavior)
+- [x] YAML syntax breaks after editing — added YAML to tree-sitter reparse exclusion (external scanner corruption)
+- [x] Crash in `completion_prefix_at_cursor` (index out of bounds) — clamped cursor col to `chars.len()`
+- [x] Swap files don't preserve most recent edits on crash — `emergency_swap_flush()` + global engine pointer + panic hooks
+- [x] Crash in `active_window_mut` (stale WindowId after tab/group close) — `repair_active_window()` self-healing + called after all close operations
 - [x] Git insights hover on non-cursor lines — clear `editor_hover_content` in `clear_annotations()`
 - [x] Semantic tokens disappear after hover — only accept responses with actual `data` array
 - [x] Terminal backspace key-hold batching — poll immediately after `terminal_write()`
@@ -103,6 +111,7 @@
 
 ### Extensions (Planned)
 - [x] **Unified Picker (Telescope-style)** — core Rust-native unified picker replacing separate fuzzy/grep/palette modals; `PickerSource`/`PickerItem`/`PickerAction` types; `.gitignore`-aware file walking; fuzzy match highlighting; `<leader>sf`/`sg`/`sp` bindings; remappable via `panel_keys`; Phases 1-2 complete (files, grep, commands). Remaining: Phase 3 (buffers, marks, registers, branches), Phase 4 (Lua `vimcode.picker.show()` API)
+- [x] **Fuzzy grep word under cursor (`<leader>sw`)** — `<leader>sw` opens the unified picker in live grep mode pre-filled with the word under the cursor (like Telescope's `grep_string`). Useful for quickly finding all usages of an identifier without manually typing it. Remappable via `panel_keys`. Also available as `:GrepWord` ex command and "Search: Word Under Cursor" palette entry.
 
 ### UI & Menus
 - [x] **VSCode-style menus** — application menu bar (File / Edit / View / Go / Run / Terminal / Help) in GTK; command palette (`Ctrl-Shift-P`) lists all commands + key bindings; fuzzy-searchable; both GTK native menus and TUI pop-up menu overlay (sessions 81–82, 100–101)
@@ -167,6 +176,38 @@
 
 ### Robustness (Low Priority)
 - [x] **Consolidate sidebar focus state into engine** — `explorer_has_focus`/`search_has_focus` on Engine struct; `sidebar_has_focus()` aggregator + `clear_sidebar_focus()` helper; `handle_key()` guards; TUI `sync_sidebar_focus()` keeps state consistent; GTK sync on focus toggle/editor focus; 8 tests verify key routing correctness
+
+### Tab Navigation & Command Center
+- [x] **Tab scroll-into-view** — When a tab is opened, switched to via explorer click, or navigated to via history arrows, scroll the tab bar so the active tab appears in the center of the visible tab strip (or as close to center as possible given the tab count). Currently new tabs appear at the end and may be off-screen in the tab bar when many tabs are open. Applies to both GTK and TUI backends, per editor group.
+- [x] **Back/Forward navigation arrows** — Add `←` `→` arrow buttons in the menu bar area (between the menu items and the Command Center, matching VSCode's layout). Maintain a per-editor-group **tab access history** stack (`Vec<(GroupId, TabId)>` on Engine) that records every tab focus change. `←` navigates to the previously accessed tab; `→` moves forward through the history after going back. Keyboard shortcuts: `Ctrl-Alt-Left` / `Ctrl-Alt-Right` (remappable via `panel_keys`). The arrows should be clickable in both GTK (drawn in the menu bar row) and TUI (rendered as `◀ ▶` buttons in the menu/tab bar row). History should be bounded (e.g. 100 entries) and deduplicated (consecutive duplicates collapsed). This is distinct from the existing Vim jump list (`Ctrl-O`/`Ctrl-I`), which tracks cursor positions within files rather than tab switches.
+- [x] **Menu bar MRU history arrows** — Add `◀ ▶` arrow buttons in the **menu bar** row (to the left of the Command Center, matching VSCode's layout). These are distinct from the existing per-group tab bar arrows (which cycle L/R within the group). The menu bar arrows navigate a **global MRU tab history** across all editor groups — clicking `◀` jumps back to the previously visited tab (which may be in a different editor group), and `▶` moves forward. This enables quickly jumping between tabs you were working on minutes ago, even across splits. Keyboard shortcuts: configurable via `panel_keys` (e.g. `Ctrl-Alt-Left`/`Ctrl-Alt-Right` or similar, distinct from the per-group tab bar arrow bindings). History: bounded (100 entries), deduplicated (consecutive duplicates collapsed), forward entries truncated on new navigation. Rendered in both GTK (drawn in the menu bar row) and TUI (rendered as `◀ ▶` in the menu bar row). Distinct from the Vim jump list (`Ctrl-O`/`Ctrl-I`), which tracks cursor positions within files.
+- [x] **Command Center** — Clickable search box in the menu bar opens the unified picker with prefix-based mode switching: _(none)_ fuzzy files, `>` command palette, `@` document symbols (LSP), `#` workspace symbols (LSP), `:` go to line, `?` help. Both GTK and TUI backends. `:CommandCenter` ex command. 11 tests.
+
+### Command Center Enhancements
+- [x] **Search for Text prefix (`%`)** — Add `%` prefix to Command Center that opens live grep mode (same as `Ctrl+G` / `PickerSource::Grep`). When the user types `%` as the first character, the picker switches to live project search — matching VSCode's "Search for Text" Command Center entry. The `?` help menu should list this prefix alongside the others.
+- [x] **Start Debugging prefix (`debug`)** — Add `debug` keyword prefix to Command Center. When the user types `debug`, show available launch configurations from `.vimcode/launch.json` (or offer to generate one). Selecting a configuration starts the DAP session (same as F5). If no launch.json exists, show "Create launch.json..." option.
+- [x] **Run Task prefix (`task`)** — Add `task` keyword prefix to Command Center. When the user types `task`, list available tasks from `.vimcode/tasks.json` (build, test, lint, etc.). Selecting a task runs it in the integrated terminal. If no tasks.json exists, show "Configure Tasks..." option.
+- [ ] **Open Quick Chat prefix** — Add a prefix (e.g. `chat` or `ai`) to Command Center that opens the AI chat panel and optionally pre-fills a prompt. Typing `chat <question>` sends the question directly to the AI provider. Requires AI panel to be configured (`ai_provider` setting).
+- [x] **Command Center placeholder hints** — When the Command Center search box is empty and first opened, show a list of available modes as selectable items (matching VSCode's initial dropdown): "Go to File", "Show and Run Commands >", "Search for Text %", "Go to Symbol in Editor @", "Start Debugging debug", "Run Task task", "More ?". Each item should have its keyboard shortcut shown on the right. Selecting an item sets the corresponding prefix.
+
+### Breadcrumbs & Navigation
+- [ ] **Breadcrumb symbol navigation** — Extend the existing breadcrumb bar to show the current symbol at the end (e.g. `src > engine > picker.rs > open_command_center`), populated from LSP `documentSymbol`. Clicking a path segment opens a dropdown of sibling files/folders to navigate; clicking the symbol segment opens a dropdown of sibling symbols in the file to jump between. Both GTK and TUI backends.
+
+### Status Bar Enhancements
+- [x] **Git branch switcher in status bar** — Make the git branch name in the status bar clickable. Clicking opens the unified picker in `PickerSource::GitBranches` mode to switch branches. Show ahead/behind counts next to the branch name. Both GTK (click handler on status bar DA) and TUI (mouse click detection on status bar row).
+- [ ] **Clickable status bar segments** — Make status bar sections interactive: click line/col to open "Go to Line" (Command Center with `:` prefix), click language name to change syntax highlighting mode, click indentation to toggle tabs/spaces and set width, click encoding to change file encoding. Each click opens either a picker or a small settings popup. Both GTK and TUI backends.
+- [ ] **LSP status indicator** — Show LSP server status in the status bar: spinning/pulsing indicator during initialization, server name when ready, error icon on crash. Clicking opens `:LspInfo`. Replaces the transient "LSP server initializing..." message with a persistent, unobtrusive indicator.
+
+### Tab Bar Enhancements
+- [ ] **Editor action menu (`...`) button** — Add a `...` (more actions) button at the right edge of each tab bar group. Clicking opens a dropdown with common editor actions: Close All, Close Others, Close Saved, Close Tabs to the Right/Left, Toggle Word Wrap, Change Language Mode, Reveal in Explorer. Reuses existing engine commands. Both GTK and TUI backends.
+- [ ] **Pinned tabs** — Allow pinning tabs via right-click context menu or `:tabpin` command. Pinned tabs shrink to just an icon (file type icon) and stay at the left of the tab bar. They cannot be closed by `:q` (require `:q!` or explicit unpin). Pinned state persists in session. Both GTK and TUI backends.
+
+### Layout & Chrome
+- [ ] **Layout toggle buttons** — Add small clickable icons to toggle sidebar visibility, bottom panel (terminal) visibility, and editor layout from the menu bar or activity bar. VSCode puts these in the top-right corner of the title bar. Could also be exposed as status bar segments. Reuses existing toggle commands.
+- [ ] **Notification / progress indicator** — Show a subtle indicator in the status bar or menu bar during background operations: LSP indexing, extension install, git operations, project search. Bell icon for completed notifications. Clicking opens an output log or dismisses. Prevents "is it working?" uncertainty during long operations.
+
+### Editor Features
+- [ ] **Minimap** — Code overview minimap on the right edge of each editor pane, showing a scaled-down rendering of the entire file with the viewport highlighted. Click/drag to scroll. Syntax-highlighted. Toggleable via `:set minimap` / settings. Both GTK (Cairo scaled rendering) and TUI (braille/block character approximation).
 
 ### CI & Distribution
 - [x] **macOS builds via GitHub Actions + Homebrew tap** — Add a macOS build target to the GitHub Actions CI/release workflow (build on `macos-latest` with `cargo build --release`). Produce a universal or arch-specific binary artifact. Create a Homebrew tap repository (e.g. `homebrew-vimcode`) with a formula that installs the release binary. Ensure the release workflow updates the tap formula (SHA256 + version) on each release. Test the full `brew install` → launch cycle in CI.

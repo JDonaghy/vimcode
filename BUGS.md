@@ -1,10 +1,18 @@
 # Known Bugs
 
-No known bugs.
+(none)
 
 ## Resolved
 
-All bugs below were fixed in Session 220 or earlier. See SESSION_HISTORY.md for details.
+All bugs below were fixed in Session 225 or earlier. See SESSION_HISTORY.md for details.
+
+- **Search `n` doesn't scroll far enough — match off-screen** — Both TUI and GTK approximate `viewport_lines` missed the tab bar row entirely (GTK) or didn't account for breadcrumbs/hide_single_tab (TUI). The approximate value was set every loop iteration, overwriting the accurate per-window value from the renderer. Fixed by computing correct chrome row count (status + cmd + tab bar + breadcrumbs, minus hidden tab bar) in both backends.
+- **Explorer tree doesn't reveal active buffer on folder open** — TUI sidebar had no `reveal_path()` call at startup or after `open_folder()`. Added initial reveal before the event loop and after folder picker confirmation.
+- **Visual yank doesn't move cursor to selection start** — `yank_visual_selection()` left cursor at end of selection. Vim moves cursor to start (line-wise: col 0; char-wise: start col). Fixed in `visual.rs` + updated integration test.
+- **YAML syntax breaks after editing** — tree-sitter-yaml has an external scanner (like Markdown) that corrupts state during incremental reparsing without `InputEdit`. Fixed by skipping old-tree reuse for YAML in `syntax.rs::reparse()`, same as Markdown.
+- **Crash in `completion_prefix_at_cursor` (index out of bounds)** — cursor col could exceed `chars.len()` after edits; clamped col to valid range in `motions.rs`.
+- **Swap files don't preserve most recent edits on crash** — swap files were only written every 4 seconds (updatetime); edits in the last 0-4s were lost on panic. Added `emergency_swap_flush()` that writes all dirty buffers immediately, invoked from panic hooks (both GTK and TUI) and from the TUI `catch_unwind` error handler. Global engine pointer registered at startup via `swap::register_emergency_engine()`.
+- **Crash in `active_window_mut` (stale WindowId after tab/group close)** — `active_tab().active_window` could point to a `WindowId` no longer in `self.windows` after certain tab/group close sequences. Added `repair_active_window()` self-healing method that finds a valid window from the current tab's layout or creates a scratch window as last resort. Called from `active_window_mut()` and after all close operations (`close_tab`, `close_editor_group`, `close_window`, `close_other_tabs`, `close_tabs_to_right/left`, `close_saved_tabs`).
 
 - **`cargo run -- file.rs` restores entire previous session** — Skip `restore_session_files()` when CLI file/directory argument is provided. Use `open_file_with_mode(Permanent)` to load the file into the initial scratch window's tab (no leftover "[No Name]" tab).
 - **TUI: cannot drag tab to create new editor group when only one group exists** — `compute_tui_tab_drop_zone()` single-group branch only handled tab bar reorder. Added content area edge zone detection using terminal size, and visual feedback rendering in `render_tab_drag_overlay()` for `Center`/`Split` zones.

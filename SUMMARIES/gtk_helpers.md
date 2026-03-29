@@ -1,9 +1,10 @@
 # GTK Helper Files
 
-## src/gtk/click.rs — 575 lines
+## src/gtk/click.rs — 616 lines
 Mouse click/drag/double-click handling for GTK backend. Maps pixel coordinates to logical click targets.
-- `ClickTarget` — enum: TabBar, Editor, Gutter, Scrollbar, Sidebar, StatusLine, etc.
-- `pixel_to_click_target()` — converts (x,y) pixel position to a `ClickTarget`
+- `ClickTarget` — enum: TabBar, Gutter, BufferPos, SplitButton, CloseTab, DiffToolbar*, NavBack, NavForward, None
+- `pixel_to_click_target()` — converts (x,y) pixel position to a `ClickTarget`; uses cached Pango maps
+- `handle_mouse_click()` — dispatches click to engine actions; NavBack/NavForward call `tab_nav_back/forward`
 - Click/drag/double-click handler functions dispatched from `App::update()`
 
 ## src/gtk/css.rs — 525 lines
