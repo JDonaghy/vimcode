@@ -15769,9 +15769,17 @@ fn test_git_branch_picker_populates_items() {
     let dir = std::env::temp_dir().join("vimcode_test_branch_picker_pop");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    // Init a git repo
+    // Init a git repo with user config (needed in CI where no global git config exists)
     let _ = std::process::Command::new("git")
         .args(["init", "-b", "main"])
+        .current_dir(&dir)
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["config", "user.email", "test@test.com"])
+        .current_dir(&dir)
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["config", "user.name", "Test"])
         .current_dir(&dir)
         .output();
     let _ = std::process::Command::new("git")
@@ -15804,6 +15812,14 @@ fn test_git_branch_picker_checkout_action() {
     std::fs::create_dir_all(&dir).unwrap();
     let _ = std::process::Command::new("git")
         .args(["init", "-b", "main"])
+        .current_dir(&dir)
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["config", "user.email", "test@test.com"])
+        .current_dir(&dir)
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["config", "user.name", "Test"])
         .current_dir(&dir)
         .output();
     let _ = std::process::Command::new("git")
@@ -15849,6 +15865,14 @@ fn test_git_branch_picker_filter_typing() {
     std::fs::create_dir_all(&dir).unwrap();
     let _ = std::process::Command::new("git")
         .args(["init", "-b", "main"])
+        .current_dir(&dir)
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["config", "user.email", "test@test.com"])
+        .current_dir(&dir)
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["config", "user.name", "Test"])
         .current_dir(&dir)
         .output();
     let _ = std::process::Command::new("git")
