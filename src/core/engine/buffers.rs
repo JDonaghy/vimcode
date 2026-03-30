@@ -2034,6 +2034,161 @@ impl Engine {
         true
     }
 
+    // ── Inline new file/folder ──────────────────────────────────────────────
+
+    /// Start inline new-file creation in the explorer sidebar.
+    ///
+    /// Creates an empty editable entry under `parent_dir`.  Backends should
+    /// render a temporary row in the tree for this entry.
+    pub fn start_explorer_new_file(&mut self, parent_dir: PathBuf) {
+        self.explorer_new_entry = Some(ExplorerNewEntryState {
+            parent_dir,
+            input: String::new(),
+            cursor: 0,
+            is_folder: false,
+        });
+    }
+
+    /// Start inline new-folder creation in the explorer sidebar.
+    pub fn start_explorer_new_folder(&mut self, parent_dir: PathBuf) {
+        self.explorer_new_entry = Some(ExplorerNewEntryState {
+            parent_dir,
+            input: String::new(),
+            cursor: 0,
+            is_folder: true,
+        });
+    }
+
+    /// Handle a key press while inline new-entry creation is active.
+    ///
+    /// Returns `true` if the key was consumed.  On Enter the file/folder is
+    /// created; on Escape it is cancelled.  Sets `explorer_needs_refresh`
+    /// on success so backends rebuild the tree.
+    pub fn handle_explorer_new_entry_key(
+        &mut self,
+        key_name: &str,
+        unicode: Option<char>,
+        ctrl: bool,
+    ) -> bool {
+        let state = match self.explorer_new_entry.as_mut() {
+            Some(s) => s,
+            None => return false,
+        };
+
+        match key_name {
+            "Escape" => {
+                self.explorer_new_entry = None;
+                return true;
+            }
+            "Return" => {
+                let parent_dir = state.parent_dir.clone();
+                let input = state.input.clone();
+                let is_folder = state.is_folder;
+                self.explorer_new_entry = None;
+                let name = input.trim();
+                if name.is_empty() {
+                    // Silent cancel on empty name
+                    return true;
+                }
+                let path = parent_dir.join(name);
+                if path.exists() {
+                    self.message = format!("'{}' already exists", name);
+                    return true;
+                }
+                if is_folder {
+                    match std::fs::create_dir_all(&path) {
+                        Ok(()) => {
+                            self.explorer_needs_refresh = true;
+                            self.message = format!("Created folder: {}", name);
+                        }
+                        Err(e) => {
+                            self.message = format!("Error creating folder: {}", e);
+                        }
+                    }
+                } else {
+                    match std::fs::write(&path, "") {
+                        Ok(()) => {
+                            self.explorer_needs_refresh = true;
+                            self.message = format!("Created: {}", name);
+                            if let Err(e) = self.open_file_with_mode(
+                                &path,
+                                crate::core::engine::OpenMode::Permanent,
+                            ) {
+                                self.message = e;
+                            }
+                        }
+                        Err(e) => {
+                            self.message = format!("Error creating file: {}", e);
+                        }
+                    }
+                }
+                return true;
+            }
+            "BackSpace" => {
+                if state.cursor > 0 {
+                    let prev = state.input[..state.cursor]
+                        .char_indices()
+                        .next_back()
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                    state.input.remove(prev);
+                    state.cursor = prev;
+                }
+                return true;
+            }
+            "Delete" => {
+                if state.cursor < state.input.len() {
+                    state.input.remove(state.cursor);
+                }
+                return true;
+            }
+            "Left" => {
+                if state.cursor > 0 {
+                    state.cursor = state.input[..state.cursor]
+                        .char_indices()
+                        .next_back()
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                }
+                return true;
+            }
+            "Right" => {
+                if state.cursor < state.input.len() {
+                    let rest = &state.input[state.cursor..];
+                    state.cursor = rest
+                        .char_indices()
+                        .nth(1)
+                        .map(|(i, _)| state.cursor + i)
+                        .unwrap_or(state.input.len());
+                }
+                return true;
+            }
+            "Home" => {
+                state.cursor = 0;
+                return true;
+            }
+            "End" => {
+                state.cursor = state.input.len();
+                return true;
+            }
+            _ => {}
+        }
+
+        // Printable character insertion
+        if !ctrl {
+            if let Some(ch) = unicode {
+                if !ch.is_control() {
+                    state.input.insert(state.cursor, ch);
+                    state.cursor += ch.len_utf8();
+                    return true;
+                }
+            }
+        }
+
+        // Consume all other keys while new-entry is active
+        true
+    }
+
     /// Show a confirmation dialog before moving a file/folder.
     ///
     /// Stores the pending move and displays a Yes/No dialog.  The actual
@@ -2062,6 +2217,77 @@ impl Engine {
                 },
             ],
         );
+    }
+
+    /// Show a confirmation dialog before deleting a file/folder.
+    ///
+    /// Stores the pending delete path and displays a Yes/No dialog.  The actual
+    /// deletion happens when the user confirms via the dialog.
+    pub fn confirm_delete_file(&mut self, path: &Path) {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.to_string_lossy().to_string());
+        let item_type = if path.is_dir() { "folder" } else { "file" };
+        self.pending_delete = Some(path.to_path_buf());
+        self.show_dialog(
+            "confirm_delete",
+            "Confirm Delete",
+            vec![format!("Delete {} '{}'?", item_type, name)],
+            vec![
+                DialogButton {
+                    label: "Delete".into(),
+                    hotkey: 'd',
+                    action: "delete".into(),
+                },
+                DialogButton {
+                    label: "Cancel".into(),
+                    hotkey: '\0',
+                    action: "cancel".into(),
+                },
+            ],
+        );
+    }
+
+    /// Show a dialog with text input for moving a file to a new location.
+    ///
+    /// The dialog pre-fills the input with the file's current relative path.
+    pub fn start_move_file_dialog(&mut self, src: &Path, project_root: &Path) {
+        let name = src
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| src.to_string_lossy().to_string());
+        let prefill = src
+            .strip_prefix(project_root)
+            .unwrap_or(src)
+            .to_string_lossy()
+            .to_string();
+        self.pending_move = Some((src.to_path_buf(), PathBuf::new())); // dest filled on confirm
+        self.show_dialog(
+            "move_file_input",
+            &format!("Move '{}'", name),
+            vec!["Enter destination path:".into()],
+            vec![
+                DialogButton {
+                    label: "Move".into(),
+                    hotkey: '\0',
+                    action: "move".into(),
+                },
+                DialogButton {
+                    label: "Cancel".into(),
+                    hotkey: '\0',
+                    action: "cancel".into(),
+                },
+            ],
+        );
+        // Set up the text input field with pre-filled path
+        if let Some(ref mut dlg) = self.dialog {
+            dlg.input = Some(DialogInput {
+                label: "Destination: ".into(),
+                value: prefill,
+                is_password: false,
+            });
+        }
     }
 
     /// Move `src` into `dest_dir` (a directory).

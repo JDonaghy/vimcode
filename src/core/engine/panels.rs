@@ -187,6 +187,84 @@ impl Engine {
                 }
                 EngineAction::None
             }
+            "confirm_delete" => {
+                if action == "delete" {
+                    if let Some(path) = self.pending_delete.take() {
+                        let name = path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        let is_dir = path.is_dir();
+                        let item_type = if is_dir { "folder" } else { "file" };
+                        if !path.exists() {
+                            self.message = format!("'{}' does not exist", name);
+                        } else {
+                            let result = if is_dir {
+                                std::fs::remove_dir_all(&path)
+                            } else {
+                                std::fs::remove_file(&path)
+                            };
+                            match result {
+                                Ok(()) => {
+                                    self.message = format!("Deleted {}: '{}'", item_type, name);
+                                    // If deleted file was open, close its buffer
+                                    if !is_dir {
+                                        let path_str = path.to_string_lossy();
+                                        if let Some(buffer_id) =
+                                            self.buffer_manager.find_by_path(&path_str)
+                                        {
+                                            let _ = self.delete_buffer(buffer_id, true);
+                                        }
+                                    }
+                                    self.explorer_needs_refresh = true;
+                                }
+                                Err(e) => {
+                                    self.message = format!("Error deleting: {}", e);
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    self.pending_delete = None;
+                }
+                EngineAction::None
+            }
+            "move_file_input" => {
+                if action == "move" {
+                    if let Some((src, _)) = self.pending_move.take() {
+                        let dest_str = input_value.unwrap_or("").trim();
+                        if !dest_str.is_empty() {
+                            let dest = if std::path::Path::new(dest_str).is_absolute() {
+                                PathBuf::from(dest_str)
+                            } else {
+                                self.cwd.join(dest_str)
+                            };
+                            match self.move_file(&src, &dest) {
+                                Ok(()) => {
+                                    let name = src
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().to_string())
+                                        .unwrap_or_default();
+                                    let final_dest = if dest.is_dir() {
+                                        dest.join(src.file_name().unwrap_or_default())
+                                    } else {
+                                        dest.clone()
+                                    };
+                                    self.message =
+                                        format!("Moved '{}' to '{}'", name, final_dest.display());
+                                    self.explorer_needs_refresh = true;
+                                }
+                                Err(e) => {
+                                    self.message = e;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    self.pending_move = None;
+                }
+                EngineAction::None
+            }
             "ext_remove" => {
                 if let Some(name) = self.pending_ext_remove.take() {
                     match action {
@@ -311,10 +389,28 @@ impl Engine {
         }
     }
 
+    /// Emergency flush: write swap files for ALL dirty buffers immediately.
+    /// Called from panic handlers to preserve unsaved work before crashing.
+    /// Bypasses the `updatetime` debounce and `swap_write_needed` set.
+    pub fn emergency_swap_flush(&self) {
+        for buf_id in self.buffer_manager.list() {
+            let is_dirty = self
+                .buffer_manager
+                .get(buf_id)
+                .map(|s| s.dirty)
+                .unwrap_or(false);
+            if is_dirty {
+                self.swap_create_for_buffer(buf_id);
+            }
+        }
+    }
+
     /// Check all open buffers for stale swap files.
     /// Called after session restore to catch any crashed sessions.
-    /// Only the first stale swap triggers a recovery dialog — the rest
-    /// get fresh swap files created silently.
+    /// Check all open buffers for stale swap files.
+    /// Called after session restore and after each swap recovery dialog.
+    /// Only the first stale swap triggers a recovery dialog — remaining
+    /// buffers are left alone so the next dialog dismissal re-scans them.
     pub fn swap_check_all_buffers(&mut self) {
         if !self.settings.swap_file {
             return;
@@ -322,15 +418,30 @@ impl Engine {
         let buf_ids = self.buffer_manager.list();
         for buf_id in buf_ids {
             if self.pending_swap_recovery.is_some() {
-                // Already showing a recovery dialog — just create swaps for the rest.
-                self.swap_create_for_buffer(buf_id);
-            } else {
-                self.swap_check_on_open(buf_id);
+                // Already showing a recovery dialog — don't touch remaining
+                // buffers so their stale swaps survive for the next re-scan.
+                break;
             }
+            self.swap_check_on_open(buf_id);
         }
         // Also scan the swap directory for orphaned swaps (files that
         // aren't in the restored session).
         self.swap_scan_stale();
+    }
+
+    /// Re-check open buffers for stale swaps after a recovery dialog is dismissed.
+    /// Unlike `swap_check_all_buffers`, this does NOT scan for orphaned swaps.
+    pub(crate) fn swap_recheck_open_buffers(&mut self) {
+        if !self.settings.swap_file {
+            return;
+        }
+        let buf_ids = self.buffer_manager.list();
+        for buf_id in buf_ids {
+            if self.pending_swap_recovery.is_some() {
+                break;
+            }
+            self.swap_check_on_open(buf_id);
+        }
     }
 
     /// Scan the swap directory for stale swap files with dead PIDs that
@@ -1017,6 +1128,32 @@ impl Engine {
                                     self.show_code_actions_hover(line, actions);
                                 }
                             }
+                            redraw = true;
+                        }
+                    }
+                }
+                LspEvent::DocumentSymbolResponse {
+                    request_id,
+                    symbols,
+                    ..
+                } => {
+                    if self.lsp_pending_document_symbols == Some(request_id) {
+                        self.lsp_pending_document_symbols = None;
+                        if self.picker_open && self.picker_source == PickerSource::CommandCenter {
+                            self.picker_populate_document_symbols(symbols);
+                            redraw = true;
+                        }
+                    }
+                }
+                LspEvent::WorkspaceSymbolResponse {
+                    request_id,
+                    symbols,
+                    ..
+                } => {
+                    if self.lsp_pending_workspace_symbols == Some(request_id) {
+                        self.lsp_pending_workspace_symbols = None;
+                        if self.picker_open && self.picker_source == PickerSource::CommandCenter {
+                            self.picker_populate_workspace_symbols(symbols);
                             redraw = true;
                         }
                     }

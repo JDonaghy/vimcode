@@ -516,6 +516,19 @@ pub struct PanelKeys {
     /// Example: `"<C-_>"` to bind Ctrl+_.
     #[serde(default)]
     pub split_editor_down: String,
+    /// Navigate back in tab history. Default: `<C-A-Left>`
+    #[serde(default = "pk_nav_back")]
+    pub nav_back: String,
+    /// Navigate forward in tab history. Default: `<C-A-Right>`
+    #[serde(default = "pk_nav_forward")]
+    pub nav_forward: String,
+}
+
+fn pk_nav_back() -> String {
+    "<C-A-Left>".to_string()
+}
+fn pk_nav_forward() -> String {
+    "<C-A-Right>".to_string()
 }
 
 impl Default for PanelKeys {
@@ -532,6 +545,8 @@ impl Default for PanelKeys {
             select_all_matches: pk_select_all_matches(),
             split_editor_right: String::new(),
             split_editor_down: String::new(),
+            nav_back: pk_nav_back(),
+            nav_forward: pk_nav_forward(),
         }
     }
 }

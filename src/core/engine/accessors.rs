@@ -64,6 +64,37 @@ impl Engine {
     // Accessors for active window/buffer (facade for backward compatibility)
     // =======================================================================
 
+    /// Repair inconsistent state where `active_tab().active_window` points
+    /// to a WindowId that no longer exists in `self.windows`.  This can
+    /// happen after certain tab/group close sequences.  The method finds
+    /// a valid window from the current tab's layout, or creates a fresh
+    /// scratch window as a last resort.
+    pub(crate) fn repair_active_window(&mut self) {
+        let wid = self.active_tab().active_window;
+        if self.windows.contains_key(&wid) {
+            return; // already valid
+        }
+
+        // Try to find another valid window in the current tab's layout.
+        let layout_wids = self.active_tab().layout.window_ids();
+        for candidate in &layout_wids {
+            if self.windows.contains_key(candidate) {
+                self.active_tab_mut().active_window = *candidate;
+                return;
+            }
+        }
+
+        // No valid windows in this tab at all — create a scratch window.
+        let buf_id = self.buffer_manager.create();
+        let new_wid = crate::core::window::WindowId(self.next_window_id);
+        self.next_window_id += 1;
+        let window = crate::core::window::Window::new(new_wid, buf_id);
+        self.windows.insert(new_wid, window);
+        let tab = self.active_tab_mut();
+        tab.layout = crate::core::window::WindowLayout::leaf(new_wid);
+        tab.active_window = new_wid;
+    }
+
     pub fn active_tab(&self) -> &Tab {
         self.active_group().active_tab()
     }
@@ -77,12 +108,24 @@ impl Engine {
     }
 
     pub fn active_window(&self) -> &Window {
-        self.windows.get(&self.active_window_id()).unwrap()
+        let id = self.active_window_id();
+        self.windows.get(&id).unwrap_or_else(|| {
+            panic!(
+                "BUG: active_window WindowId({}) not in windows map (map has {} entries). \
+                 Please report this at https://github.com/anthropics/claude-code/issues",
+                id.0,
+                self.windows.len()
+            )
+        })
     }
 
     pub fn active_window_mut(&mut self) -> &mut Window {
+        // Self-heal: if the active window ID is stale, repair before accessing.
+        self.repair_active_window();
         let id = self.active_window_id();
-        self.windows.get_mut(&id).unwrap()
+        self.windows
+            .get_mut(&id)
+            .expect("repair_active_window should have fixed this")
     }
 
     pub fn active_buffer_id(&self) -> BufferId {

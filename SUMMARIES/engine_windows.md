@@ -1,21 +1,28 @@
-# src/core/engine/windows.rs — 3,011 lines
+# src/core/engine/windows.rs — 3,205 lines
 
-Window/tab/editor-group management, splits, focus, resize, tab drag-and-drop, and session restore.
+Window/tab/editor-group management, splits, focus, resize, tab drag-and-drop, tab navigation history, and session restore.
 
 ## Window Operations
 - `split_window(direction)` — create horizontal/vertical split
-- `close_window(id)` — close window, handle last-window logic
+- `close_window(id)` — close window, handle last-window logic; detects empty tab after diff pair cleanup
 - `focus_window(id)` — switch active window
 - `resize_window(direction, delta)` — resize split
 - `cycle_windows()` — Ctrl-W w/W window cycling
 
 ## Tab Operations
 - `new_tab()` — create new tab
-- `close_tab(idx)` — close tab with confirmation if dirty
+- `close_tab(idx)` — close tab with confirmation if dirty; cleans up nav history entries
 - `close_tab_confirm(idx)` — close with save prompt
 - `next_tab()` / `prev_tab()` — gt/gT tab cycling
 - `goto_tab(n)` — go to tab by number
 - `move_tab(delta)` — reorder tabs
+- `ensure_active_tab_visible()` — adjust `tab_scroll_offset` so active tab is on-screen
+
+## Tab Navigation History
+- `tab_nav_push()` — record current tab in history; dedup consecutive, truncate forward, 100-entry bound
+- `tab_nav_back()` / `tab_nav_forward()` — navigate through tab access history
+- `tab_nav_switch_to(group_id, tab_id)` — resolve TabId to index and switch
+- `tab_nav_can_go_back()` / `tab_nav_can_go_forward()` — bool accessors for UI state
 
 ## Editor Groups
 - `split_editor_group(direction)` — create new editor group

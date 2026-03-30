@@ -1,12 +1,13 @@
 # Engine Small Submodules
 
-## accessors.rs — 401 lines
+## accessors.rs — 444 lines
 Convenience facade methods for accessing the active group/buffer/window.
 - `buffer()` / `buffer_mut()` — active window's buffer
 - `view()` / `view_mut()` — active window's viewport
 - `cursor()` — active cursor position
 - `active_group()` / `active_group_mut()` — active editor group
 - `active_tab()` / `active_tab_mut()` — active tab in active group
+- `repair_active_window()` — self-heal stale active_window ID (find valid window or create scratch)
 - `is_tab_bar_hidden(group_id)` — true if tab bar should be hidden (single group, ≤1 tab, setting on)
 - `adjust_group_rects_for_hidden_tabs(rects, height)` — expand content area when tab bar hidden
 - `sidebar_has_focus()` — true if any sidebar panel has keyboard focus
@@ -61,7 +62,7 @@ Extension panel system (Lua panels), hover popups (panel + editor), and source c
 - `sc_hover_markdown(flat_idx)` — generate hover content for SC panel items
 - `sc_hover_file()` / `sc_hover_log_entry()` / `sc_hover_branch_info()` — SC hover helpers
 
-## panels.rs — 1,710 lines
+## panels.rs — 1,726 lines
 AI chat panel, dialog system, and swap file crash recovery.
 - `ai_send_message(msg)` — send message to AI provider
 - `ai_poll()` — poll for AI streaming response
@@ -70,6 +71,7 @@ AI chat panel, dialog system, and swap file crash recovery.
 - `process_dialog_result(id)` — handle dialog button press
 - `tick_swap_files()` — periodic swap file writes
 - `check_swap_recovery(path)` — detect and offer crash recovery
+- `emergency_swap_flush()` — write swap files for ALL dirty buffers immediately (called from panic hooks)
 
 ## plugins.rs — 653 lines
 Lua plugin lifecycle and dispatch.
@@ -97,13 +99,21 @@ VSCode edit mode and menu bar handling.
 - `menu_activate_item(menu, item)` — execute menu action
 - `handle_menu_key(key)` — menu navigation
 
-## picker.rs — 630 lines
-Unified fuzzy finder (Telescope-style) and quickfix.
+## picker.rs — 1,275 lines
+Unified fuzzy picker (Telescope-style), command center, quickfix, and branch picker.
 - `fuzzy_score(query, candidate)` — subsequence match scoring
 - `open_picker(source)` — open picker with file/grep/command/buffer source
 - `handle_picker_key(key, ctrl, unicode)` — picker input and navigation
-- `picker_confirm()` — execute selected picker item
+- `picker_confirm()` — execute selected picker item (includes branch switching via `Gswitch`)
 - `quickfix_jump(idx)` — jump to quickfix entry
+- `open_command_center()` — opens picker in CommandCenter mode
+- `picker_filter_command_center()` — prefix-aware routing (>, @, #, :, ?)
+- `picker_populate_document_symbols()` — populate picker from LSP document symbol response
+- `picker_populate_workspace_symbols()` — populate picker from LSP workspace symbol response
+- `picker_populate_branches()` — populate picker from git branch list
+- `picker_request_document_symbols()` — send LSP documentSymbol request
+- `picker_request_workspace_symbols()` — send LSP workspace/symbol request
+- `fuzzy_filter_items()` — shared fuzzy filter helper
 
 ## terminal_ops.rs — 478 lines
 Integrated terminal management.

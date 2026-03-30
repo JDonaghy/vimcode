@@ -1735,7 +1735,20 @@ impl Engine {
                     }
                 }
                 Some('t') => {
-                    self.next_tab();
+                    if let Some(n) = self.count {
+                        // Ngt → go to tab N (1-based, like Vim)
+                        // Clamp to last tab if N exceeds tab count.
+                        let total = self.active_group().tabs.len();
+                        let idx = if n >= total {
+                            total.saturating_sub(1)
+                        } else {
+                            n.saturating_sub(1)
+                        };
+                        self.goto_tab(idx);
+                        self.count = None;
+                    } else {
+                        self.next_tab();
+                    }
                 }
                 Some('T') => {
                     self.prev_tab();
@@ -3878,7 +3891,7 @@ impl Engine {
         partial.push(ch);
 
         // All known built-in leader sequences
-        const SEQUENCES: &[&str] = &["rn", "gf", "gF", "gi", "gb", "ca", "sf", "sg", "sp"];
+        const SEQUENCES: &[&str] = &["rn", "gf", "gF", "gi", "gb", "ca", "sf", "sg", "sp", "sw"];
 
         match partial.as_str() {
             "rn" => {
@@ -3913,6 +3926,17 @@ impl Engine {
             }
             "sp" => {
                 self.open_picker(PickerSource::Commands);
+            }
+            "sw" => {
+                // Grep word under cursor
+                if let Some(word) = self.word_under_cursor() {
+                    self.open_picker(PickerSource::Grep);
+                    self.picker_query = word;
+                    self.picker_filter();
+                    self.picker_load_preview();
+                } else {
+                    self.open_picker(PickerSource::Grep);
+                }
             }
             s => {
                 // Check if this is a complete plugin keymap match

@@ -1,9 +1,9 @@
 # VimCode Project State
 
-**Last updated:** Mar 26, 2026 (Session 224 — Release prep v0.5.1) | **Tests:** 4769
+**Last updated:** Mar 29, 2026 (Session 233 — Explorer focus UX + GTK fixes) | **Tests:** 4986
 
 > Feature documentation lives in **README.md**.
-> Per-session implementation notes through Session 224 are in **SESSION_HISTORY.md**.
+> Per-session implementation notes through Session 232 are in **SESSION_HISTORY.md**.
 
 ---
 
@@ -26,5 +26,4 @@ When implementing a new key/command, add tests covering:
 
 ## Recent Work
 
-> All sessions through 224 archived in **SESSION_HISTORY.md**. No recent unarchived work.
-
+> All sessions through 233 archived in **SESSION_HISTORY.md**.

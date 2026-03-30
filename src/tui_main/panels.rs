@@ -256,14 +256,44 @@ pub(super) fn render_sidebar(
 
     // ── Tree rows ────────────────────────────────────────────────────────
     let tree_height = area.height.saturating_sub(1) as usize;
-    let visible_rows = sidebar
-        .rows
-        .iter()
-        .enumerate()
-        .skip(sidebar.scroll_top)
-        .take(tree_height);
 
-    for (i, (row_idx, row)) in visible_rows.enumerate() {
+    // Determine where a new-entry row should be inserted (right after parent dir).
+    // `new_entry_after_row` is the sidebar.rows index after which we inject the
+    // virtual new-entry row.  `None` = no active new entry, or parent is root
+    // (insert at index 0 visually, before all rows).
+    let new_entry_insert = engine.explorer_new_entry.as_ref().map(|ne| {
+        // Find the parent dir row index, or usize::MAX for "before all rows"
+        sidebar
+            .rows
+            .iter()
+            .position(|r| r.is_dir && r.path == ne.parent_dir)
+    });
+    // `true` if parent is root (no matching row — insert before first row)
+    let new_entry_at_top = new_entry_insert == Some(None);
+    let new_entry_after_idx = new_entry_insert.and_then(|opt| opt);
+
+    // We manually iterate to interleave the virtual new-entry row.
+    let mut visual_row = 0usize;
+    let mut row_iter_idx = sidebar.scroll_top;
+    // If new entry goes at top and scroll_top == 0, render it first
+    let mut new_entry_rendered = engine.explorer_new_entry.is_none();
+
+    // Handle new-entry-at-top: if scroll_top == 0, render the new entry first
+    if new_entry_at_top && !new_entry_rendered && sidebar.scroll_top == 0 {
+        let ne = engine.explorer_new_entry.as_ref().unwrap();
+        let screen_y = area.y + 1;
+        // depth 0: parent is root, so child is at depth 0
+        render_new_entry_row(buf, area, screen_y, ne, 0, theme);
+        visual_row += 1;
+        new_entry_rendered = true;
+    }
+
+    while visual_row < tree_height && row_iter_idx < sidebar.rows.len() {
+        let row_idx = row_iter_idx;
+        let row = &sidebar.rows[row_iter_idx];
+        row_iter_idx += 1;
+
+        let i = visual_row;
         let screen_y = area.y + 1 + i as u16;
         if screen_y >= area.y + area.height {
             break;
@@ -278,6 +308,7 @@ pub(super) fn render_sidebar(
         let is_selected = row_idx == sidebar.selected;
         let is_drop_target = explorer_drop_target == Some(row_idx);
         let is_active = !row.is_dir
+            && !engine.explorer_has_focus
             && active_path.as_ref().is_some_and(|ap| {
                 row.path.canonicalize().unwrap_or_else(|_| row.path.clone()) == *ap
             });
@@ -452,6 +483,24 @@ pub(super) fn render_sidebar(
                 }
             }
         }
+
+        visual_row += 1;
+
+        // Inject virtual new-entry row after the parent dir row
+        if !new_entry_rendered {
+            if let Some(after_idx) = new_entry_after_idx {
+                if row_idx == after_idx && visual_row < tree_height {
+                    let ne = engine.explorer_new_entry.as_ref().unwrap();
+                    let parent_depth = row.depth;
+                    let screen_y = area.y + 1 + visual_row as u16;
+                    if screen_y < area.y + area.height {
+                        render_new_entry_row(buf, area, screen_y, ne, parent_depth, theme);
+                        visual_row += 1;
+                    }
+                    new_entry_rendered = true;
+                }
+            }
+        }
     }
 
     // Vertical scrollbar (rightmost column, tree rows only — not header)
@@ -477,6 +526,74 @@ pub(super) fn render_sidebar(
             let fg = if in_thumb { thumb_fg } else { track_fg };
             set_cell(buf, sb_x, y, ch, fg, sb_bg);
         }
+    }
+}
+
+/// Render the inline new-file/folder entry row in the explorer tree.
+fn render_new_entry_row(
+    buf: &mut ratatui::buffer::Buffer,
+    area: Rect,
+    screen_y: u16,
+    entry: &crate::core::engine::ExplorerNewEntryState,
+    depth: usize,
+    theme: &Theme,
+) {
+    let input_bg = rc(theme.background);
+    let input_fg = rc(theme.foreground);
+    let dim_fg = rc(theme.line_number_fg);
+    let row_bg = rc(theme.tab_bar_bg);
+
+    // Clear row
+    for x in area.x..area.x + area.width {
+        set_cell(buf, x, screen_y, ' ', input_fg, row_bg);
+    }
+
+    let mut x = area.x;
+
+    // Indent (child of parent, so depth + 1)
+    let indent = "  ".repeat(depth + 1);
+    for ch in indent.chars() {
+        if x >= area.x + area.width {
+            break;
+        }
+        set_cell(buf, x, screen_y, ch, dim_fg, row_bg);
+        x += 1;
+    }
+
+    // Icon prefix
+    let icon_str = if entry.is_folder {
+        "\u{f07b} " // folder icon
+    } else {
+        "  \u{f15b} " // file icon with spacing
+    };
+    for ch in icon_str.chars() {
+        if x >= area.x + area.width {
+            break;
+        }
+        set_cell(buf, x, screen_y, ch, dim_fg, row_bg);
+        x += 1;
+    }
+
+    // Editable input with inverted cursor
+    for (byte_idx, ch) in entry.input.char_indices() {
+        if x >= area.x + area.width {
+            break;
+        }
+        let is_cursor = byte_idx == entry.cursor;
+        let cell_fg = if is_cursor { input_bg } else { input_fg };
+        let cell_bg = if is_cursor { input_fg } else { input_bg };
+        set_cell(buf, x, screen_y, ch, cell_fg, cell_bg);
+        x += 1;
+    }
+    // Cursor at end of input (append position)
+    if entry.cursor >= entry.input.len() && x < area.x + area.width {
+        set_cell(buf, x, screen_y, ' ', input_bg, input_fg);
+        x += 1;
+    }
+    // Fill remaining width with input background
+    while x < area.x + area.width {
+        set_cell(buf, x, screen_y, ' ', input_fg, input_bg);
+        x += 1;
     }
 }
 
@@ -1222,48 +1339,6 @@ pub(super) fn render_search_panel(
             let ch = if in_thumb { '█' } else { '░' };
             let fg_color = if in_thumb { thumb_fg } else { track_fg };
             set_cell(buf, sb_x, y, ch, fg_color, sb_bg);
-        }
-    }
-}
-
-/// Render a one-line prompt in the command area (used for sidebar CRUD input).
-pub(super) fn render_prompt_line(
-    buf: &mut ratatui::buffer::Buffer,
-    area: Rect,
-    text: &str,
-    cursor_char_pos: usize,
-    theme: &Theme,
-) {
-    let fg = rc(theme.command_fg);
-    let bg = rc(theme.command_bg);
-    for x in area.x..area.x + area.width {
-        set_cell(buf, x, area.y, ' ', fg, bg);
-    }
-    let mut x = area.x;
-    let mut char_idx = 0;
-    let mut cursor_x = None;
-    for ch in text.chars() {
-        if x >= area.x + area.width {
-            break;
-        }
-        if char_idx == cursor_char_pos {
-            cursor_x = Some(x);
-        }
-        set_cell(buf, x, area.y, ch, fg, bg);
-        x += 1;
-        char_idx += 1;
-    }
-    // If cursor is at the end (past all chars)
-    if cursor_x.is_none() && char_idx == cursor_char_pos {
-        cursor_x = Some(x);
-    }
-    // Show cursor (inverted colors)
-    if let Some(cx) = cursor_x {
-        if cx < area.x + area.width {
-            let cell = buf.get_mut(cx, area.y);
-            let old_fg = cell.fg;
-            let old_bg = cell.bg;
-            cell.set_fg(old_bg).set_bg(old_fg);
         }
     }
 }

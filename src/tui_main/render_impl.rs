@@ -86,7 +86,6 @@ pub(super) fn draw_frame(
     theme: &Theme,
     sidebar: &mut TuiSidebar,
     engine: &Engine,
-    sidebar_prompt: &Option<SidebarPrompt>,
     sidebar_width: u16,
     quickfix_scroll_top: usize,
     debug_output_scroll: usize,
@@ -99,6 +98,7 @@ pub(super) fn draw_frame(
     hover_popup_rect_out: &mut Option<(u16, u16, u16, u16)>,
     editor_hover_popup_rect_out: &mut Option<(u16, u16, u16, u16)>,
     editor_hover_link_rects_out: &mut Vec<(u16, u16, u16, u16, String)>,
+    tab_visible_counts_out: &mut Vec<(GroupId, usize)>,
 ) {
     let area = frame.size();
 
@@ -248,9 +248,7 @@ pub(super) fn draw_frame(
             let tab_x = gtb.bounds.x as u16 + editor_area.x;
             let tab_w = gtb.bounds.width as u16;
             let is_active = gtb.group_id == split.active_group;
-            // In diff mode, show split buttons on all groups so clicking
-            // an inactive group's toolbar doesn't cause a visual shift.
-            let show_split = is_active || engine.is_in_diff_view();
+            let show_split = is_active;
             if tab_w > 0 {
                 let bar_y = editor_area.y + (gtb.bounds.y as u16).saturating_sub(tui_tbh);
                 let g_tab = Rect {
@@ -259,14 +257,16 @@ pub(super) fn draw_frame(
                     width: tab_w,
                     height: 1,
                 };
-                render_tab_bar(
+                let vis = render_tab_bar(
                     frame.buffer_mut(),
                     g_tab,
                     &gtb.tabs,
                     theme,
                     show_split,
                     gtb.diff_toolbar.as_ref(),
+                    gtb.tab_scroll_offset,
                 );
+                tab_visible_counts_out.push((gtb.group_id, vis));
             }
         }
         // Draw breadcrumb bars (below each group's tab bar).
@@ -317,14 +317,16 @@ pub(super) fn draw_frame(
                 width: editor_area.width,
                 height: 1,
             };
-            render_tab_bar(
+            let vis = render_tab_bar(
                 frame.buffer_mut(),
                 tab_rect,
                 &screen.tab_bar,
                 theme,
                 true,
                 screen.diff_toolbar.as_ref(),
+                screen.tab_scroll_offset,
             );
+            tab_visible_counts_out.push((engine.active_group, vis));
         }
         // Draw breadcrumb bar for the single group.
         if let Some(bc) = screen.breadcrumbs.first() {
@@ -552,44 +554,19 @@ pub(super) fn draw_frame(
         theme,
     );
 
-    if let Some(prompt) = sidebar_prompt {
-        let (prefix, input_cursor) = match &prompt.kind {
-            PromptKind::NewFile(_) => ("New file: ".to_string(), prompt.cursor),
-            PromptKind::NewFolder(_) => ("New folder: ".to_string(), prompt.cursor),
-            PromptKind::DeleteConfirm(path) => {
-                let name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                (format!("Delete '{}'? (y/n)", name), 0)
-            }
-            PromptKind::MoveFile(_) => ("Move to: ".to_string(), prompt.cursor),
-        };
-        let prompt_text = format!("{}{}", prefix, prompt.input);
-        // Cursor position in rendered chars: prefix char count + cursor char count
-        let cursor_char_pos = prefix.chars().count() + prompt.input[..input_cursor].chars().count();
-        render_prompt_line(
-            frame.buffer_mut(),
-            cmd_area,
-            &prompt_text,
-            cursor_char_pos,
-            theme,
-        );
-    } else {
-        render_command_line(frame.buffer_mut(), cmd_area, &screen.command, theme);
-        // Highlight command-line mouse selection (invert fg/bg for selected cells)
-        if let Some((start, end)) = cmd_sel {
-            let lo = start.min(end);
-            let hi = start.max(end);
-            let buf = frame.buffer_mut();
-            for i in lo..=hi {
-                let cx = cmd_area.x + i as u16;
-                if cx < cmd_area.x + cmd_area.width {
-                    let cell = buf.get_mut(cx, cmd_area.y);
-                    let old_fg = cell.fg;
-                    let old_bg = cell.bg;
-                    cell.set_fg(old_bg).set_bg(old_fg);
-                }
+    render_command_line(frame.buffer_mut(), cmd_area, &screen.command, theme);
+    // Highlight command-line mouse selection (invert fg/bg for selected cells)
+    if let Some((start, end)) = cmd_sel {
+        let lo = start.min(end);
+        let hi = start.max(end);
+        let buf = frame.buffer_mut();
+        for i in lo..=hi {
+            let cx = cmd_area.x + i as u16;
+            if cx < cmd_area.x + cmd_area.width {
+                let cell = buf.get_mut(cx, cmd_area.y);
+                let old_fg = cell.fg;
+                let old_bg = cell.bg;
+                cell.set_fg(old_bg).set_bg(old_fg);
             }
         }
     }
@@ -642,85 +619,6 @@ pub(super) fn draw_frame(
     }
 }
 
-// ─── Sidebar CRUD handling ────────────────────────────────────────────────────
-
-pub(super) fn handle_sidebar_prompt(
-    engine: &mut Engine,
-    sidebar: &mut TuiSidebar,
-    kind: PromptKind,
-    input: String,
-    viewport_height: usize,
-) {
-    match kind {
-        PromptKind::NewFile(target_dir) => {
-            let name = input.trim();
-            if !name.is_empty() {
-                let path = target_dir.join(name);
-                if let Err(e) = fs::write(&path, "") {
-                    engine.message = format!("Error creating file: {}", e);
-                } else {
-                    sidebar.reveal_path(&path, viewport_height);
-                    if let Err(e) = engine.open_file_with_mode(&path, OpenMode::Permanent) {
-                        engine.message = e;
-                    }
-                }
-            }
-        }
-        PromptKind::NewFolder(target_dir) => {
-            let name = input.trim();
-            if !name.is_empty() {
-                let path = target_dir.join(name);
-                if let Err(e) = fs::create_dir_all(&path) {
-                    engine.message = format!("Error creating folder: {}", e);
-                } else {
-                    sidebar.reveal_path(&path, viewport_height);
-                }
-            }
-        }
-        PromptKind::DeleteConfirm(path) => {
-            if input == "y" {
-                let result = if path.is_dir() {
-                    fs::remove_dir_all(&path)
-                } else {
-                    fs::remove_file(&path)
-                };
-                if let Err(e) = result {
-                    engine.message = format!("Error deleting: {}", e);
-                } else {
-                    sidebar.build_rows();
-                }
-            }
-        }
-        PromptKind::MoveFile(src) => {
-            let dest_str = input.trim();
-            if !dest_str.is_empty() {
-                // Resolve destination relative to project root
-                let dest = if std::path::Path::new(dest_str).is_absolute() {
-                    std::path::PathBuf::from(dest_str)
-                } else {
-                    sidebar.root.join(dest_str)
-                };
-                match engine.move_file(&src, &dest) {
-                    Ok(()) => {
-                        // engine.move_file resolves the final path; figure out
-                        // the actual destination for reveal_path.
-                        let final_dest = if dest.is_dir() {
-                            dest.join(src.file_name().unwrap_or_default())
-                        } else {
-                            dest.clone()
-                        };
-                        sidebar.reveal_path(&final_dest, viewport_height);
-                        engine.message = format!("Moved to '{}'", final_dest.display());
-                    }
-                    Err(e) => {
-                        engine.message = e;
-                    }
-                }
-            }
-        }
-    }
-}
-
 // ─── Tab bar constants ───────────────────────────────────────────────────────
 
 /// Close-tab × button character (shown on every tab).
@@ -746,9 +644,11 @@ pub(super) fn tab_tooltip_at_col(
     group_id: GroupId,
     local_col: u16,
     tabs: &[render::TabInfo],
+    tab_scroll_offset: usize,
 ) -> Option<String> {
-    let mut x: u16 = 0;
-    for (i, tab) in tabs.iter().enumerate() {
+    let overflow_cols: u16 = if tab_scroll_offset > 0 { 2 } else { 0 };
+    let mut x: u16 = overflow_cols;
+    for (i, tab) in tabs.iter().enumerate().skip(tab_scroll_offset) {
         let name_width = tab.name.chars().count() as u16;
         let tab_width = name_width + TAB_CLOSE_COLS;
         if local_col >= x && local_col < x + tab_width {
@@ -867,7 +767,7 @@ pub(super) fn render_tab_drag_overlay(
 
     // For TabReorder, draw a vertical insertion bar at the target position.
     if let DropZone::TabReorder(gid, idx) = zone {
-        let tab_bar_info: Option<(u16, u16, &[render::TabInfo])> =
+        let tab_bar_info: Option<(u16, u16, &[render::TabInfo], usize)> =
             if let Some(ref split) = screen.editor_group_split {
                 split
                     .group_tab_bars
@@ -876,15 +776,21 @@ pub(super) fn render_tab_drag_overlay(
                     .map(|g| {
                         let x = editor_area.x + g.bounds.x as u16;
                         let y = editor_area.y + (g.bounds.y as u16).saturating_sub(tui_tbh);
-                        (x, y, g.tabs.as_slice())
+                        (x, y, g.tabs.as_slice(), g.tab_scroll_offset)
                     })
             } else {
-                Some((editor_area.x, editor_area.y, screen.tab_bar.as_slice()))
+                Some((
+                    editor_area.x,
+                    editor_area.y,
+                    screen.tab_bar.as_slice(),
+                    screen.tab_scroll_offset,
+                ))
             };
 
-        if let Some((bar_x, bar_y, tabs)) = tab_bar_info {
-            let mut insert_x: u16 = 0;
-            for (i, tab) in tabs.iter().enumerate() {
+        if let Some((bar_x, bar_y, tabs, scroll_off)) = tab_bar_info {
+            let ov_cols: u16 = if scroll_off > 0 { 2 } else { 0 };
+            let mut insert_x: u16 = ov_cols;
+            for (i, tab) in tabs.iter().enumerate().skip(scroll_off) {
                 if i == idx {
                     break;
                 }
@@ -961,8 +867,9 @@ pub(super) fn compute_tui_tab_drop_zone(
             // Tab bar region — determine reorder insertion index.
             if row == tab_bar_row && rel_col >= gx && rel_col < gx + gw {
                 let local_col = rel_col - gx;
-                let mut x: u16 = 0;
-                for (i, tab) in gtb.tabs.iter().enumerate() {
+                let ov_cols: u16 = if gtb.tab_scroll_offset > 0 { 2 } else { 0 };
+                let mut x: u16 = ov_cols;
+                for (i, tab) in gtb.tabs.iter().enumerate().skip(gtb.tab_scroll_offset) {
                     let name_w = tab.name.chars().count() as u16;
                     let tab_w = name_w + TAB_CLOSE_COLS;
                     let mid = x + tab_w / 2;
@@ -1013,8 +920,10 @@ pub(super) fn compute_tui_tab_drop_zone(
         let group_id = engine.active_group;
         if row == menu_rows {
             let local_col = rel_col;
-            let mut x: u16 = 0;
-            for (i, tab) in layout.tab_bar.iter().enumerate() {
+            let sg_offset = layout.tab_scroll_offset;
+            let ov_cols: u16 = if sg_offset > 0 { 2 } else { 0 };
+            let mut x: u16 = ov_cols;
+            for (i, tab) in layout.tab_bar.iter().enumerate().skip(sg_offset) {
                 let name_w = tab.name.chars().count() as u16;
                 let tab_w = name_w + TAB_CLOSE_COLS;
                 let mid = x + tab_w / 2;
@@ -1060,6 +969,9 @@ pub(super) fn compute_tui_tab_drop_zone(
     DropZone::None
 }
 
+/// Render the tab bar.  Returns the number of tabs that were actually drawn
+/// (used to update `EditorGroup::tab_visible_count`).
+#[allow(clippy::too_many_arguments)]
 pub(super) fn render_tab_bar(
     buf: &mut ratatui::buffer::Buffer,
     area: Rect,
@@ -1067,7 +979,8 @@ pub(super) fn render_tab_bar(
     theme: &Theme,
     show_split_btns: bool,
     diff_toolbar: Option<&render::DiffToolbarData>,
-) {
+    tab_scroll_offset: usize,
+) -> usize {
     let bar_bg = rc(theme.tab_bar_bg);
 
     for x in area.x..area.x + area.width {
@@ -1100,7 +1013,10 @@ pub(super) fn render_tab_bar(
     };
 
     let mut x = area.x;
-    for tab in tabs {
+    let tab_end_for_content = tab_end;
+
+    let mut last_rendered_tab = tabs.len(); // track whether we truncated
+    for (i, tab) in tabs.iter().enumerate().skip(tab_scroll_offset) {
         let (fg, bg) = match (tab.active, tab.preview) {
             (true, true) => (rc(theme.tab_preview_active_fg), rc(theme.tab_active_bg)),
             (true, false) => (rc(theme.tab_active_fg), rc(theme.tab_active_bg)),
@@ -1113,15 +1029,23 @@ pub(super) fn render_tab_bar(
             Modifier::empty()
         };
 
+        // Check if this tab would overflow the available space.
+        let name_w = tab.name.chars().count() as u16;
+        let tab_w = name_w + TAB_CLOSE_COLS;
+        if x + tab_w > tab_end_for_content {
+            last_rendered_tab = i;
+            break;
+        }
+
         for ch in tab.name.chars() {
-            if x >= tab_end {
+            if x >= tab_end_for_content {
                 break;
             }
             set_cell_styled(buf, x, area.y, ch, fg, bg, modifier);
             x += 1;
         }
         // Show ● (modified dot) when dirty, × otherwise (VSCode style).
-        if x < tab_end {
+        if x < tab_end_for_content {
             let (close_ch, close_fg) = if tab.dirty {
                 ('●', rc(theme.foreground))
             } else if tab.active {
@@ -1133,7 +1057,7 @@ pub(super) fn render_tab_bar(
             x += 1;
         }
         // Trailing separator space.
-        if x < tab_end {
+        if x < tab_end_for_content {
             set_cell(buf, x, area.y, ' ', bar_bg, bar_bg);
             x += 1;
         }
@@ -1187,6 +1111,9 @@ pub(super) fn render_tab_bar(
         set_cell(buf, bx, area.y, ' ', btn_fg, bar_bg);
         set_cell_wide(buf, bx + 1, area.y, '\u{F0931}', btn_fg, bar_bg);
     }
+
+    // Return how many tabs were actually rendered.
+    last_rendered_tab.saturating_sub(tab_scroll_offset)
 }
 
 pub(super) fn render_breadcrumb_bar(
@@ -3419,21 +3346,74 @@ pub(super) fn render_menu_bar(
         }
     }
 
-    // Title text drawn right-aligned (dimmed)
-    if !data.title.is_empty() {
-        let title_chars: Vec<char> = data.title.chars().collect();
-        let title_len = title_chars.len() as u16;
-        let right_margin = 1u16;
-        if area.width > title_len + right_margin {
-            let title_start = area.x + area.width - title_len - right_margin;
-            if title_start > col {
-                let dim_fg = rc(theme.line_number_fg);
-                for (i, ch) in title_chars.iter().enumerate() {
-                    let tx = title_start + i as u16;
-                    if tx < area.x + area.width {
-                        set_cell(buf, tx, y, *ch, dim_fg, bar_bg);
-                    }
+    // Center nav arrows + search box as one unit between menu labels and right edge.
+    let dim_fg = rc(theme.line_number_fg);
+    let active_fg = bar_fg;
+    let menu_end = col;
+
+    // Compute total unit width: "◀ ▶ [ 🔍 title ]"
+    let arrows_w: u16 = 4; // "◀ ▶" = 4 cols (arrow + space + arrow + space)
+    let display = if data.title.is_empty() {
+        String::new()
+    } else {
+        format!("\u{1f50d} {}", data.title)
+    };
+    let display_chars: Vec<char> = display.chars().collect();
+    let text_len = display_chars.len() as u16;
+    // Box = [ space text space ] = text + 4
+    let box_width = if !display.is_empty() { text_len + 4 } else { 0 };
+    let gap = if box_width > 0 { 1u16 } else { 0 };
+    let total_unit = arrows_w + gap + box_width;
+    let right_edge = area.x + area.width;
+    let available = right_edge.saturating_sub(menu_end);
+
+    if available >= total_unit + 2 {
+        let unit_start = menu_end + (available - total_unit) / 2;
+
+        // Draw arrows.
+        let mut ax = unit_start;
+        let back_fg = if data.nav_back_enabled {
+            active_fg
+        } else {
+            dim_fg
+        };
+        set_cell(buf, ax, y, '◀', back_fg, bar_bg);
+        ax += 1;
+        set_cell(buf, ax, y, ' ', bar_bg, bar_bg);
+        ax += 1;
+        let fwd_fg = if data.nav_forward_enabled {
+            active_fg
+        } else {
+            dim_fg
+        };
+        set_cell(buf, ax, y, '▶', fwd_fg, bar_bg);
+        ax += 1;
+        set_cell(buf, ax, y, ' ', bar_bg, bar_bg);
+        ax += 1;
+
+        // Draw search box.
+        if !display.is_empty() {
+            ax += gap;
+            let box_start = ax;
+            let box_end = box_start + box_width;
+            // Use bar_fg (same as menu text) for box border and text
+            if box_start < right_edge {
+                set_cell(buf, box_start, y, '[', dim_fg, bar_bg);
+            }
+            if box_start + 1 < right_edge {
+                set_cell(buf, box_start + 1, y, ' ', bar_fg, bar_bg);
+            }
+            for (i, ch) in display_chars.iter().enumerate() {
+                let cx = box_start + 2 + i as u16;
+                if cx < right_edge {
+                    set_cell(buf, cx, y, *ch, bar_fg, bar_bg);
                 }
+            }
+            if box_end >= 2 && box_end - 2 < right_edge {
+                set_cell(buf, box_end - 2, y, ' ', bar_fg, bar_bg);
+            }
+            if box_end >= 1 && box_end - 1 < right_edge {
+                set_cell(buf, box_end - 1, y, ']', dim_fg, bar_bg);
             }
         }
     }

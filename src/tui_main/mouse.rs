@@ -22,7 +22,6 @@ pub(super) fn handle_mouse(
     dragging_settings_sb: &mut Option<SidebarScrollDrag>,
     dragging_generic_sb: &mut Option<SidebarScrollDrag>,
     last_layout: Option<&render::ScreenLayout>,
-    sidebar_prompt: &mut Option<SidebarPrompt>,
     last_click_time: &mut Instant,
     last_click_pos: &mut (u16, u16),
     mouse_text_drag: &mut bool,
@@ -762,8 +761,10 @@ pub(super) fn handle_mouse(
                         let gw = gtb.bounds.width as u16;
                         if row == tab_bar_row && rel_col >= gx && rel_col < gx + gw {
                             let local_col = rel_col - gx;
-                            let mut x: u16 = 0;
-                            for (i, tab) in gtb.tabs.iter().enumerate() {
+                            let ov_cols: u16 = if gtb.tab_scroll_offset > 0 { 2 } else { 0 };
+                            let mut x: u16 = ov_cols;
+                            for (i, tab) in gtb.tabs.iter().enumerate().skip(gtb.tab_scroll_offset)
+                            {
                                 let name_w = tab.name.chars().count() as u16;
                                 let tab_w = name_w + TAB_CLOSE_COLS;
                                 if local_col >= x && local_col < x + tab_w {
@@ -778,8 +779,10 @@ pub(super) fn handle_mouse(
                 } else {
                     // Single-group tab bar (row == menu_rows)
                     if row == menu_rows && !engine.is_tab_bar_hidden(engine.active_group) {
-                        let mut x: u16 = 0;
-                        for (i, tab) in layout.tab_bar.iter().enumerate() {
+                        let sg_offset = layout.tab_scroll_offset;
+                        let ov_cols: u16 = if sg_offset > 0 { 2 } else { 0 };
+                        let mut x: u16 = ov_cols;
+                        for (i, tab) in layout.tab_bar.iter().enumerate().skip(sg_offset) {
                             let name_w = tab.name.chars().count() as u16;
                             let tab_w = name_w + TAB_CLOSE_COLS;
                             if rel_col >= x && rel_col < x + tab_w {
@@ -829,7 +832,6 @@ pub(super) fn handle_mouse(
                                         &act,
                                         engine,
                                         sidebar,
-                                        sidebar_prompt,
                                         *terminal_size,
                                     );
                                 }
@@ -992,14 +994,24 @@ pub(super) fn handle_mouse(
                         let gw = gtb.bounds.width as u16;
                         if row == tab_bar_row && rel_col >= gx && rel_col < gx + gw {
                             let local_col = rel_col - gx;
-                            tooltip =
-                                tab_tooltip_at_col(engine, gtb.group_id, local_col, &gtb.tabs);
+                            tooltip = tab_tooltip_at_col(
+                                engine,
+                                gtb.group_id,
+                                local_col,
+                                &gtb.tabs,
+                                gtb.tab_scroll_offset,
+                            );
                             break;
                         }
                     }
                 } else if row == menu_rows && !engine.is_tab_bar_hidden(engine.active_group) {
-                    tooltip =
-                        tab_tooltip_at_col(engine, engine.active_group, rel_col, &layout.tab_bar);
+                    tooltip = tab_tooltip_at_col(
+                        engine,
+                        engine.active_group,
+                        rel_col,
+                        &layout.tab_bar,
+                        layout.tab_scroll_offset,
+                    );
                 }
             }
         }
@@ -1133,8 +1145,24 @@ pub(super) fn handle_mouse(
         }
     }
 
-    // Bottom 2 rows are status + cmd — ignore
-    if row + 2 >= term_height {
+    // ── Status bar branch click — open branch picker ───────────────────────
+    if row + 2 == term_height {
+        if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
+            if let Some(layout) = last_layout {
+                if let Some((start, end)) = layout.status_branch_range {
+                    let click_col = col as usize;
+                    if click_col >= start && click_col < end {
+                        engine.open_picker(crate::core::engine::PickerSource::GitBranches);
+                        return sidebar_width;
+                    }
+                }
+            }
+        }
+        return sidebar_width;
+    }
+
+    // Bottom row is cmd — ignore
+    if row + 1 >= term_height {
         return sidebar_width;
     }
 
@@ -1152,6 +1180,41 @@ pub(super) fn handle_mouse(
                 return sidebar_width;
             }
             col_pos += item_w;
+        }
+        // Nav arrows + search box are centered between menu_end and right edge.
+        let menu_end = col_pos;
+        let arrows_w: u16 = 4; // "◀ ▶ "
+        let title = engine
+            .cwd
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "VimCode".to_string());
+        let display = format!("\u{1f50d} {}", title);
+        let text_len = display.chars().count() as u16;
+        let box_width = if !title.is_empty() { text_len + 4 } else { 0 };
+        let gap: u16 = if box_width > 0 { 1 } else { 0 };
+        let total_unit = arrows_w + gap + box_width;
+        let term_w = terminal_size.map(|r| r.width).unwrap_or(80);
+        let available = term_w.saturating_sub(menu_end);
+        if available >= total_unit + 2 {
+            let unit_start = menu_end + (available - total_unit) / 2;
+            // Back arrow at unit_start, forward at unit_start+2
+            if col == unit_start {
+                engine.tab_nav_back();
+                return sidebar_width;
+            }
+            if col == unit_start + 2 {
+                engine.tab_nav_forward();
+                return sidebar_width;
+            }
+            // Search box area: from arrows_w past unit_start to end of box
+            let search_start = unit_start + arrows_w + gap;
+            let search_end = unit_start + total_unit;
+            if col >= search_start && col < search_end {
+                engine.open_command_center();
+                return sidebar_width;
+            }
         }
         engine.close_menu(); // click in empty area of menu bar
         return sidebar_width;
@@ -1549,6 +1612,8 @@ pub(super) fn handle_mouse(
                 }
             }
         } else if sidebar.active_panel == TuiPanel::Explorer {
+            sidebar.has_focus = true;
+            engine.explorer_has_focus = true;
             // tree_height = (total height - 2 status rows) - 1 header row
             let tree_height = term_height.saturating_sub(3) as usize;
             let total_rows = sidebar.rows.len();
@@ -1579,40 +1644,27 @@ pub(super) fn handle_mouse(
                     match btn {
                         0 | 1 if idx < sidebar.rows.len() => {
                             let target = if selected_is_dir {
-                                &sidebar.rows[idx].path
+                                sidebar.rows[idx].path.clone()
                             } else {
-                                sidebar.rows[idx].path.parent().unwrap_or(&sidebar.root)
+                                sidebar.rows[idx]
+                                    .path
+                                    .parent()
+                                    .unwrap_or(&sidebar.root)
+                                    .to_path_buf()
                             };
-                            let prefill = target
-                                .strip_prefix(&sidebar.root)
-                                .unwrap_or(target)
-                                .to_string_lossy()
-                                .to_string();
-                            let prefill = if prefill.is_empty() {
-                                String::new()
+                            // Expand the target dir so the new entry row is visible
+                            sidebar.expanded.insert(target.clone());
+                            sidebar.build_rows();
+                            if btn == 0 {
+                                engine.start_explorer_new_file(target);
                             } else {
-                                format!("{}/", prefill)
-                            };
-                            let kind = if btn == 0 {
-                                PromptKind::NewFile(sidebar.root.clone())
-                            } else {
-                                PromptKind::NewFolder(sidebar.root.clone())
-                            };
-                            let cursor = prefill.len();
-                            *sidebar_prompt = Some(SidebarPrompt {
-                                kind,
-                                input: prefill,
-                                cursor,
-                            });
+                                engine.start_explorer_new_folder(target);
+                            }
                         }
                         2 => {
                             if idx < sidebar.rows.len() {
                                 let path = sidebar.rows[idx].path.clone();
-                                *sidebar_prompt = Some(SidebarPrompt {
-                                    kind: PromptKind::DeleteConfirm(path),
-                                    input: String::new(),
-                                    cursor: 0,
-                                });
+                                engine.confirm_delete_file(&path);
                             }
                         }
                         _ => {}
@@ -1764,11 +1816,17 @@ pub(super) fn handle_mouse(
                     if is_header {
                         engine.handle_sc_key("Tab", false, None);
                     } else {
-                        // Open tab immediately, diff arrives
-                        // asynchronously via poll_sc_diff.
-                        engine.sc_open_selected_async();
-                        engine.sc_has_focus = true;
-                        sidebar.has_focus = true;
+                        let now = Instant::now();
+                        let is_double = now.duration_since(*last_click_time)
+                            < Duration::from_millis(400)
+                            && *last_click_pos == (col, row);
+                        *last_click_time = now;
+                        *last_click_pos = (col, row);
+                        if is_double {
+                            engine.sc_open_selected_async();
+                            engine.sc_has_focus = true;
+                            sidebar.has_focus = true;
+                        }
                     }
                 }
             }
@@ -2003,6 +2061,7 @@ pub(super) fn handle_mouse(
                         &gtb.tabs,
                         gtb.diff_toolbar.as_ref(),
                         was_active,
+                        gtb.tab_scroll_offset,
                     ));
                     break;
                 }
@@ -2014,6 +2073,7 @@ pub(super) fn handle_mouse(
                 group_tabs,
                 diff_toolbar_ref,
                 was_active,
+                scroll_offset,
             )) = matched_group
             {
                 engine.active_group = group_id;
@@ -2022,7 +2082,7 @@ pub(super) fn handle_mouse(
                 let mut tab_matched = false;
                 // Collect tab hit info from immutable borrow, then apply mutably.
                 let mut hit_info: Option<(usize, bool)> = None;
-                for (i, tab) in group_tabs.iter().enumerate() {
+                for (i, tab) in group_tabs.iter().enumerate().skip(scroll_offset) {
                     let name_width = tab.name.chars().count() as u16;
                     let tab_width = name_width + TAB_CLOSE_COLS;
                     if local_col >= x && local_col < x + tab_width {
@@ -2040,18 +2100,19 @@ pub(super) fn handle_mouse(
                     x += tab_width;
                 }
                 if let Some((tab_idx, is_close)) = hit_info {
-                    if let Some(g) = engine.editor_groups.get_mut(&group_id) {
-                        g.active_tab = tab_idx;
-                    }
                     engine.active_group = group_id;
-                    engine.line_annotations.clear();
                     if is_close {
+                        if let Some(g) = engine.editor_groups.get_mut(&group_id) {
+                            g.active_tab = tab_idx;
+                        }
+                        engine.line_annotations.clear();
                         if engine.dirty() {
                             *close_tab_confirm = true;
                         } else {
                             engine.close_tab();
                         }
                     } else {
+                        engine.goto_tab(tab_idx);
                         // Record drag start position for tab drag-and-drop.
                         *tab_drag_start = Some((col, row));
                         engine.lsp_ensure_active_buffer();
@@ -2129,9 +2190,11 @@ pub(super) fn handle_mouse(
                 .saturating_sub(editor_left);
             let bar_width = editor_col_width;
             let local_col = rel_col;
+            let scroll_offset = layout.tab_scroll_offset;
+
             let mut x: u16 = 0;
             let mut tab_matched = false;
-            for (i, tab) in layout.tab_bar.iter().enumerate() {
+            for (i, tab) in layout.tab_bar.iter().enumerate().skip(scroll_offset) {
                 let name_width = tab.name.chars().count() as u16;
                 let tab_width = name_width + TAB_CLOSE_COLS;
                 if local_col >= x && local_col < x + tab_width {
@@ -2147,8 +2210,7 @@ pub(super) fn handle_mouse(
                                 engine.close_tab();
                             }
                         } else {
-                            engine.active_group_mut().active_tab = i;
-                            engine.line_annotations.clear();
+                            engine.goto_tab(i);
                             // Record drag start position for tab drag-and-drop.
                             *tab_drag_start = Some((col, row));
                             engine.lsp_ensure_active_buffer();

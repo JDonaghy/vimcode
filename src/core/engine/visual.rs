@@ -127,6 +127,17 @@ impl Engine {
             }
         }
 
+        // Vim behavior: move cursor to start of selection after yank
+        if let Some((start, _end)) = self.get_visual_selection_range() {
+            let is_linewise = matches!(self.mode, Mode::VisualLine);
+            self.view_mut().cursor.line = start.line;
+            if is_linewise {
+                self.view_mut().cursor.col = 0;
+            } else {
+                self.view_mut().cursor.col = start.col;
+            }
+        }
+
         // Exit visual mode
         self.mode = Mode::Normal;
         self.visual_anchor = None;

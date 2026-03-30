@@ -109,6 +109,156 @@ pub enum LspEvent {
         /// Raw delta-encoded u32 data from the server.
         raw_data: Vec<u32>,
     },
+    /// Document symbol response (textDocument/documentSymbol).
+    DocumentSymbolResponse {
+        server_id: LspServerId,
+        request_id: i64,
+        symbols: Vec<SymbolInfo>,
+    },
+    /// Workspace symbol response (workspace/symbol).
+    WorkspaceSymbolResponse {
+        server_id: LspServerId,
+        request_id: i64,
+        symbols: Vec<SymbolInfo>,
+    },
+}
+
+/// A symbol returned by documentSymbol or workspace/symbol.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct SymbolInfo {
+    pub name: String,
+    pub kind: SymbolKind,
+    pub detail: Option<String>,
+    /// Container name (e.g. the struct a method belongs to).
+    pub container: Option<String>,
+    /// File path (always set for workspace symbols; for document symbols, same as request file).
+    pub path: Option<PathBuf>,
+    /// 0-indexed line.
+    pub line: u32,
+    /// 0-indexed character (UTF-16).
+    pub character: u32,
+}
+
+/// LSP SymbolKind (subset of the spec).
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(dead_code)]
+pub enum SymbolKind {
+    File,
+    Module,
+    Namespace,
+    Package,
+    Class,
+    Method,
+    Property,
+    Field,
+    Constructor,
+    Enum,
+    Interface,
+    Function,
+    Variable,
+    Constant,
+    String,
+    Number,
+    Boolean,
+    Array,
+    Object,
+    Key,
+    Null,
+    EnumMember,
+    Struct,
+    Event,
+    Operator,
+    TypeParameter,
+    Unknown,
+}
+
+impl SymbolKind {
+    pub fn from_number(n: u64) -> Self {
+        match n {
+            1 => Self::File,
+            2 => Self::Module,
+            3 => Self::Namespace,
+            4 => Self::Package,
+            5 => Self::Class,
+            6 => Self::Method,
+            7 => Self::Property,
+            8 => Self::Field,
+            9 => Self::Constructor,
+            10 => Self::Enum,
+            11 => Self::Interface,
+            12 => Self::Function,
+            13 => Self::Variable,
+            14 => Self::Constant,
+            15 => Self::String,
+            16 => Self::Number,
+            17 => Self::Boolean,
+            18 => Self::Array,
+            19 => Self::Object,
+            20 => Self::Key,
+            21 => Self::Null,
+            22 => Self::EnumMember,
+            23 => Self::Struct,
+            24 => Self::Event,
+            25 => Self::Operator,
+            26 => Self::TypeParameter,
+            _ => Self::Unknown,
+        }
+    }
+
+    pub fn icon(&self) -> &'static str {
+        match self {
+            Self::File => "󰈔",
+            Self::Module | Self::Namespace | Self::Package => "󰏗",
+            Self::Class | Self::Struct => "",
+            Self::Method | Self::Constructor => "󰊕",
+            Self::Function => "󰊕",
+            Self::Property | Self::Field => "",
+            Self::Enum | Self::EnumMember => "",
+            Self::Interface => "",
+            Self::Variable => "",
+            Self::Constant => "",
+            Self::String | Self::Number | Self::Boolean | Self::Null => "󰎠",
+            Self::Array | Self::Object => "󰅪",
+            Self::Key => "",
+            Self::Event => "",
+            Self::Operator => "󰆕",
+            Self::TypeParameter => "",
+            Self::Unknown => "?",
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::File => "file",
+            Self::Module => "module",
+            Self::Namespace => "namespace",
+            Self::Package => "package",
+            Self::Class => "class",
+            Self::Method => "method",
+            Self::Property => "property",
+            Self::Field => "field",
+            Self::Constructor => "constructor",
+            Self::Enum => "enum",
+            Self::Interface => "interface",
+            Self::Function => "function",
+            Self::Variable => "variable",
+            Self::Constant => "constant",
+            Self::String => "string",
+            Self::Number => "number",
+            Self::Boolean => "boolean",
+            Self::Array => "array",
+            Self::Object => "object",
+            Self::Key => "key",
+            Self::Null => "null",
+            Self::EnumMember => "enum member",
+            Self::Struct => "struct",
+            Self::Event => "event",
+            Self::Operator => "operator",
+            Self::TypeParameter => "type param",
+            Self::Unknown => "symbol",
+        }
+    }
 }
 
 /// A single semantic token with absolute (decoded) positions.
@@ -1075,6 +1225,26 @@ impl LspServer {
         )
     }
 
+    /// Request document symbols (outline) for a file.
+    pub fn request_document_symbols(&mut self, uri: &str) -> i64 {
+        self.send_request(
+            "textDocument/documentSymbol",
+            serde_json::json!({
+                "textDocument": { "uri": uri }
+            }),
+        )
+    }
+
+    /// Request workspace symbols matching a query.
+    pub fn request_workspace_symbols(&mut self, query: &str) -> i64 {
+        self.send_request(
+            "workspace/symbol",
+            serde_json::json!({
+                "query": query
+            }),
+        )
+    }
+
     /// Send shutdown request and exit notification.
     pub fn shutdown(&mut self) {
         self.send_request("shutdown", serde_json::json!(null));
@@ -1389,6 +1559,22 @@ fn reader_thread(
                         actions,
                     });
                 }
+                Some("textDocument/documentSymbol") => {
+                    let symbols = result.map(parse_document_symbols).unwrap_or_default();
+                    let _ = tx.send(LspEvent::DocumentSymbolResponse {
+                        server_id,
+                        request_id: id,
+                        symbols,
+                    });
+                }
+                Some("workspace/symbol") => {
+                    let symbols = result.map(parse_workspace_symbols).unwrap_or_default();
+                    let _ = tx.send(LspEvent::WorkspaceSymbolResponse {
+                        server_id,
+                        request_id: id,
+                        symbols,
+                    });
+                }
                 _ => {
                     // Unknown or shutdown response — ignore
                 }
@@ -1568,6 +1754,118 @@ fn parse_locations_response(result: &serde_json::Value) -> Option<Vec<Location>>
         }
     }
     Some(locations)
+}
+
+/// Parse a `textDocument/documentSymbol` response.
+/// Handles both `DocumentSymbol[]` (hierarchical) and `SymbolInformation[]` (flat).
+fn parse_document_symbols(result: &serde_json::Value) -> Vec<SymbolInfo> {
+    let mut symbols = Vec::new();
+    if let Some(arr) = result.as_array() {
+        for item in arr {
+            // Check if this is a DocumentSymbol (has `selectionRange`) or SymbolInformation (has `location`).
+            if item.get("selectionRange").is_some() {
+                flatten_document_symbol(item, None, &mut symbols);
+            } else if item.get("location").is_some() {
+                if let Some(sym) = parse_symbol_information(item) {
+                    symbols.push(sym);
+                }
+            }
+        }
+    }
+    symbols
+}
+
+/// Recursively flatten a hierarchical `DocumentSymbol` into a flat list.
+fn flatten_document_symbol(
+    item: &serde_json::Value,
+    container: Option<&str>,
+    out: &mut Vec<SymbolInfo>,
+) {
+    let name = item
+        .get("name")
+        .and_then(|n| n.as_str())
+        .unwrap_or("")
+        .to_string();
+    let kind = item
+        .get("kind")
+        .and_then(|k| k.as_u64())
+        .map(SymbolKind::from_number)
+        .unwrap_or(SymbolKind::Unknown);
+    let detail = item
+        .get("detail")
+        .and_then(|d| d.as_str())
+        .map(|s| s.to_string());
+    let range = item.get("selectionRange").or_else(|| item.get("range"));
+    let (line, character) = range
+        .and_then(|r| {
+            let start = r.get("start")?;
+            Some((
+                start.get("line")?.as_u64()? as u32,
+                start.get("character")?.as_u64()? as u32,
+            ))
+        })
+        .unwrap_or((0, 0));
+
+    out.push(SymbolInfo {
+        name: name.clone(),
+        kind,
+        detail,
+        container: container.map(|s| s.to_string()),
+        path: None, // Filled in by the caller (same as request file).
+        line,
+        character,
+    });
+
+    // Recurse into children.
+    if let Some(children) = item.get("children").and_then(|c| c.as_array()) {
+        for child in children {
+            flatten_document_symbol(child, Some(&name), out);
+        }
+    }
+}
+
+/// Parse a `SymbolInformation` object (flat format, used by workspace/symbol too).
+fn parse_symbol_information(item: &serde_json::Value) -> Option<SymbolInfo> {
+    let name = item.get("name")?.as_str()?.to_string();
+    let kind = item
+        .get("kind")
+        .and_then(|k| k.as_u64())
+        .map(SymbolKind::from_number)
+        .unwrap_or(SymbolKind::Unknown);
+    let container = item
+        .get("containerName")
+        .and_then(|c| c.as_str())
+        .map(|s| s.to_string());
+    let location = item.get("location")?;
+    let uri = location.get("uri")?.as_str()?;
+    let path = uri_to_path(uri);
+    let range = location.get("range")?;
+    let start = range.get("start")?;
+    let line = start.get("line")?.as_u64()? as u32;
+    let character = start.get("character")?.as_u64()? as u32;
+
+    Some(SymbolInfo {
+        name,
+        kind,
+        detail: None,
+        container,
+        path,
+        line,
+        character,
+    })
+}
+
+/// Parse a `workspace/symbol` response (always `SymbolInformation[]`).
+fn parse_workspace_symbols(result: &serde_json::Value) -> Vec<SymbolInfo> {
+    let mut symbols = Vec::new();
+    if let Some(arr) = result.as_array() {
+        for item in arr {
+            if let Some(sym) = parse_symbol_information(item) {
+                symbols.push(sym);
+            }
+        }
+    }
+    symbols
 }
 
 fn try_parse_signature_help_response(

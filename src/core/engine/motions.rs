@@ -2788,6 +2788,9 @@ impl Engine {
         let line = self.view().cursor.line;
         let col = self.view().cursor.col;
         let chars: Vec<char> = self.buffer().content.line(line).chars().collect();
+        // Clamp col to valid range — cursor can be past end after edits or
+        // on lines shorter than expected (e.g. trailing newline excluded).
+        let col = col.min(chars.len());
         let mut start = col;
         while start > 0 && Self::is_word_char(chars[start - 1]) {
             start -= 1;

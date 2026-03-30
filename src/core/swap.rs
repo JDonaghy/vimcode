@@ -8,6 +8,48 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+/// Wrapper around a raw pointer to Engine, made Send+Sync so it can
+/// live in a global static.  Only used for last-resort panic recovery.
+struct EnginePtr(*const crate::core::Engine);
+// SAFETY: The pointer is set once on the main thread at startup and
+// only read during panic recovery (also on the main thread for both
+// GTK and TUI).  The Engine it points to lives for the entire process.
+unsafe impl Send for EnginePtr {}
+unsafe impl Sync for EnginePtr {}
+
+/// Raw pointer to the active Engine, used by the panic hook to flush
+/// swap files as a last resort before the process exits.
+static EMERGENCY_ENGINE: Mutex<Option<EnginePtr>> = Mutex::new(None);
+
+/// Register the engine pointer for emergency swap flush on panic.
+/// Called once at startup by the active backend.
+///
+/// # Safety
+/// The caller must ensure `engine` lives for the rest of the process.
+pub unsafe fn register_emergency_engine(engine: *const crate::core::Engine) {
+    if let Ok(mut guard) = EMERGENCY_ENGINE.lock() {
+        *guard = Some(EnginePtr(engine));
+    }
+}
+
+/// Flush swap files for all dirty buffers via the registered engine.
+/// Called from the panic hook.  Silently does nothing if no engine
+/// is registered or the mutex is poisoned (double-panic).
+pub fn run_emergency_flush() {
+    // Use try_lock to avoid deadlocking if the panic occurred while
+    // the mutex was held.
+    if let Ok(guard) = EMERGENCY_ENGINE.try_lock() {
+        if let Some(ref ep) = *guard {
+            // SAFETY: The engine pointer was registered at startup and
+            // the engine lives for the entire process.  We only read
+            // buffer content (no mutation) to write swap files.
+            let engine = unsafe { &*ep.0 };
+            engine.emergency_swap_flush();
+        }
+    }
+}
 
 /// Parsed swap-file header.
 #[derive(Debug, Clone)]

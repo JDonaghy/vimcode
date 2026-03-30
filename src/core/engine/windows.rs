@@ -136,12 +136,26 @@ impl Engine {
                         }
                     }
                 }
+                // After removing both diff windows, the tab may have no
+                // valid windows left.  Close the tab to avoid a broken state.
+                let tab_empty = self
+                    .active_tab()
+                    .layout
+                    .window_ids()
+                    .iter()
+                    .all(|wid| !self.windows.contains_key(wid));
+                if tab_empty {
+                    self.close_tab();
+                    return true;
+                }
             } else {
                 // Not our window — restore the pair.
                 self.diff_window_pair = Some((a, b));
             }
         }
 
+        // Ensure the active window is still valid after removal.
+        self.repair_active_window();
         true
     }
 
@@ -297,6 +311,7 @@ impl Engine {
         self.active_group_mut().tabs.push(tab);
         self.active_group_mut().active_tab = self.active_group().tabs.len() - 1;
         self.tab_mru_touch();
+        self.ensure_active_tab_visible();
 
         if file_path.is_some() {
             self.message = String::new();
@@ -342,7 +357,15 @@ impl Engine {
         }
 
         let closed_group = self.active_group;
+        let closed_tab_id = self.active_group().tabs[active_tab_idx].id;
         self.active_group_mut().tabs.remove(active_tab_idx);
+
+        // Remove the closed tab from nav history.
+        self.tab_nav_history
+            .retain(|&(g, t)| !(g == closed_group && t == closed_tab_id));
+        if self.tab_nav_index >= self.tab_nav_history.len() {
+            self.tab_nav_index = self.tab_nav_history.len().saturating_sub(1);
+        }
 
         // Remove the closed tab from MRU and adjust indices
         self.tab_mru
@@ -359,6 +382,9 @@ impl Engine {
             self.active_group_mut().active_tab = tabs_len - 1;
         }
         self.tab_mru_touch();
+        // Ensure the new active tab's window state is consistent.
+        self.repair_active_window();
+        self.ensure_active_tab_visible();
 
         // Remove any buffers that are no longer referenced by any window.
         // This prevents orphaned dirty buffers from falsely triggering `:qa`
@@ -426,6 +452,7 @@ impl Engine {
         // Ensure the originally active tab (now the only one) is selected.
         self.active_group_mut().active_tab = 0;
         self.tab_mru_touch();
+        self.repair_active_window();
     }
 
     /// Close all tabs to the right of the active tab.
@@ -442,6 +469,7 @@ impl Engine {
         }
         self.active_group_mut().active_tab = active_tab_idx;
         self.tab_mru_touch();
+        self.repair_active_window();
     }
 
     /// Close all tabs to the left of the active tab.
@@ -458,6 +486,7 @@ impl Engine {
         }
         self.active_group_mut().active_tab = 0;
         self.tab_mru_touch();
+        self.repair_active_window();
     }
 
     /// Close all non-dirty tabs except the active one.
@@ -496,6 +525,7 @@ impl Engine {
             self.active_group_mut().active_tab = remaining.saturating_sub(1);
         }
         self.tab_mru_touch();
+        self.repair_active_window();
     }
 
     /// Get the file path of a tab's primary window buffer.
@@ -1228,6 +1258,94 @@ impl Engine {
         self.tab_mru.insert(0, entry);
     }
 
+    /// Record the current tab in the back/forward navigation history.
+    /// Only call this on explicit user navigation actions (goto_tab, next/prev tab,
+    /// tab switcher confirm, open file). NOT called on new_tab, close_tab, or session restore.
+    /// Skipped when navigating via back/forward to avoid polluting the stack.
+    pub(crate) fn tab_nav_push(&mut self) {
+        if self.tab_nav_navigating {
+            return;
+        }
+        let tab_id = self.active_tab().id;
+        let entry = (self.active_group, tab_id);
+
+        // Consecutive duplicate suppression.
+        if self.tab_nav_history.last() == Some(&entry)
+            && self.tab_nav_index == self.tab_nav_history.len().saturating_sub(1)
+        {
+            return;
+        }
+
+        // Truncate forward history when navigating to a new tab.
+        if self.tab_nav_index + 1 < self.tab_nav_history.len() {
+            self.tab_nav_history.truncate(self.tab_nav_index + 1);
+        }
+
+        self.tab_nav_history.push(entry);
+
+        // Bound at 100 entries.
+        if self.tab_nav_history.len() > 100 {
+            self.tab_nav_history.remove(0);
+        }
+
+        self.tab_nav_index = self.tab_nav_history.len().saturating_sub(1);
+    }
+
+    /// Navigate backward in tab history (across all editor groups).
+    pub fn tab_nav_back(&mut self) {
+        if self.tab_nav_index == 0 {
+            return;
+        }
+        self.tab_nav_index -= 1;
+        let (group_id, tab_id) = self.tab_nav_history[self.tab_nav_index];
+        self.tab_nav_switch_to(group_id, tab_id);
+    }
+
+    /// Navigate forward in tab history (across all editor groups).
+    pub fn tab_nav_forward(&mut self) {
+        if self.tab_nav_index + 1 >= self.tab_nav_history.len() {
+            return;
+        }
+        self.tab_nav_index += 1;
+        let (group_id, tab_id) = self.tab_nav_history[self.tab_nav_index];
+        self.tab_nav_switch_to(group_id, tab_id);
+    }
+
+    /// Switch to a specific group+tab by TabId, used by back/forward nav.
+    fn tab_nav_switch_to(&mut self, group_id: GroupId, tab_id: TabId) {
+        // Find the group and tab index for this TabId.
+        if let Some(group) = self.editor_groups.get(&group_id) {
+            if let Some(idx) = group.tabs.iter().position(|t| t.id == tab_id) {
+                self.tab_nav_navigating = true;
+                self.active_group = group_id;
+                self.active_group_mut().active_tab = idx;
+                self.line_annotations.clear();
+                self.blame_annotations_active = false;
+                self.tab_mru_touch(); // update MRU but skip nav push (navigating=true)
+                self.lsp_ensure_active_buffer();
+                self.ensure_active_tab_visible();
+                self.tab_nav_navigating = false;
+                return;
+            }
+        }
+        // Tab or group no longer exists — remove stale entries.
+        self.tab_nav_history
+            .retain(|&(g, t)| !(g == group_id && t == tab_id));
+        if self.tab_nav_index >= self.tab_nav_history.len() {
+            self.tab_nav_index = self.tab_nav_history.len().saturating_sub(1);
+        }
+    }
+
+    /// Whether back navigation is available (across all editor groups).
+    pub fn tab_nav_can_go_back(&self) -> bool {
+        self.tab_nav_index > 0
+    }
+
+    /// Whether forward navigation is available (across all editor groups).
+    pub fn tab_nav_can_go_forward(&self) -> bool {
+        self.tab_nav_index + 1 < self.tab_nav_history.len()
+    }
+
     /// Switch to the next tab.
     pub fn next_tab(&mut self) {
         let tabs_len = self.active_group().tabs.len();
@@ -1236,7 +1354,9 @@ impl Engine {
             self.line_annotations.clear();
             self.blame_annotations_active = false;
             self.tab_mru_touch();
+            self.tab_nav_push();
             self.lsp_ensure_active_buffer();
+            self.ensure_active_tab_visible();
         }
     }
 
@@ -1249,7 +1369,9 @@ impl Engine {
             self.line_annotations.clear();
             self.blame_annotations_active = false;
             self.tab_mru_touch();
+            self.tab_nav_push();
             self.lsp_ensure_active_buffer();
+            self.ensure_active_tab_visible();
         }
     }
 
@@ -1294,9 +1416,11 @@ impl Engine {
                 self.active_group = group_id;
                 self.active_group_mut().active_tab = tab_idx;
                 self.tab_mru_touch();
+                self.tab_nav_push();
                 self.line_annotations.clear();
                 self.blame_annotations_active = false;
                 self.lsp_ensure_active_buffer();
+                self.ensure_active_tab_visible();
             }
         }
         self.tab_switcher_open = false;
@@ -1330,7 +1454,53 @@ impl Engine {
             self.line_annotations.clear();
             self.blame_annotations_active = false;
             self.tab_mru_touch();
+            self.tab_nav_push();
             self.lsp_ensure_active_buffer();
+            self.ensure_active_tab_visible();
+        }
+    }
+
+    /// Adjust `tab_scroll_offset` on the active group so that the active tab
+    /// is visible in the tab bar.
+    ///
+    /// Uses `tab_visible_count` (set by the renderer each frame) to know how
+    /// many tabs actually fit.  Falls back to a conservative default of 6.
+    pub(crate) fn ensure_active_tab_visible(&mut self) {
+        let group = match self.editor_groups.get_mut(&self.active_group) {
+            Some(g) => g,
+            None => return,
+        };
+        let active = group.active_tab;
+        let total = group.tabs.len();
+        // Use visible count minus 1 as a safety margin — tab widths vary, so
+        // the count from the previous frame may overestimate how many fit.
+        let visible = group.tab_visible_count.max(1);
+        let safe_visible = if visible > 2 { visible - 1 } else { visible };
+
+        // Clamp offset to valid range first.
+        if group.tab_scroll_offset >= total {
+            group.tab_scroll_offset = total.saturating_sub(1);
+        }
+
+        // If active tab is before the scroll offset, scroll back.
+        if active < group.tab_scroll_offset {
+            group.tab_scroll_offset = active;
+        }
+        // If active tab is past the visible window, scroll forward.
+        // Use safe_visible to avoid the last tab being just off-screen.
+        if active >= group.tab_scroll_offset + safe_visible {
+            group.tab_scroll_offset = active.saturating_sub(safe_visible.saturating_sub(1));
+        }
+    }
+
+    /// Called by the renderer to report how many tabs were actually drawn
+    /// for a given group.  This lets `ensure_active_tab_visible` know the
+    /// real visible count for the next tab switch.
+    pub fn set_tab_visible_count(&mut self, group_id: GroupId, count: usize) {
+        if let Some(g) = self.editor_groups.get_mut(&group_id) {
+            if count > 0 {
+                g.tab_visible_count = count;
+            }
         }
     }
 
@@ -1378,6 +1548,8 @@ impl Engine {
         self.editor_groups.remove(&closing);
         self.group_layout.remove(closing);
         self.active_group = self.group_layout.group_ids()[0];
+        // Ensure the new active group's window state is consistent.
+        self.repair_active_window();
     }
 
     /// Move focus to the next editor group (wraps around).
@@ -1683,6 +1855,8 @@ impl Engine {
         if let Some(tab_idx) = found {
             self.active_group_mut().active_tab = tab_idx;
             self.tab_mru_touch();
+            self.tab_nav_push();
+            self.ensure_active_tab_visible();
             self.refresh_git_diff(buffer_id);
             self.message = format!("\"{}\"", path.display());
             self.lsp_did_open(buffer_id);
@@ -1699,6 +1873,8 @@ impl Engine {
         self.active_group_mut().tabs.push(tab);
         self.active_group_mut().active_tab = self.active_group().tabs.len() - 1;
         self.tab_mru_touch();
+        self.tab_nav_push();
+        self.ensure_active_tab_visible();
 
         // Restore saved cursor/scroll position.
         let view = self.restore_file_position(buffer_id);
@@ -1752,6 +1928,7 @@ impl Engine {
             .map(|(idx, _)| idx);
         if let Some(tab_idx) = found {
             self.active_group_mut().active_tab = tab_idx;
+            self.ensure_active_tab_visible();
             self.refresh_git_diff(buffer_id);
             self.message = format!("\"{}\"", path.display());
             self.lsp_did_open(buffer_id);
@@ -1809,6 +1986,7 @@ impl Engine {
             }
         }
 
+        self.ensure_active_tab_visible();
         self.refresh_git_diff(buffer_id);
         self.message = format!("\"{}\"", path.display());
         self.lsp_did_open(buffer_id);
@@ -2094,6 +2272,14 @@ impl Engine {
             }
         }
 
+        // Seed nav history with just the active tab — arrows are greyed out
+        // (can't go back from index 0) but the first manual switch will record
+        // destination while this entry serves as the origin.
+        self.tab_nav_history.clear();
+        let seed_tab_id = self.active_tab().id;
+        self.tab_nav_history.push((self.active_group, seed_tab_id));
+        self.tab_nav_index = 0;
+
         // Check all restored buffers for stale swap files.
         self.swap_check_all_buffers();
     }
@@ -2156,6 +2342,13 @@ impl Engine {
         if has_file {
             self.lsp_did_open(active_bid);
         }
+
+        // Seed nav history with just the active tab — arrows greyed out until
+        // the user manually switches tabs (matches VSCode behavior).
+        self.tab_nav_history.clear();
+        let seed_tab_id = self.active_tab().id;
+        self.tab_nav_history.push((self.active_group, seed_tab_id));
+        self.tab_nav_index = 0;
 
         // Check all restored buffers for stale swap files.
         self.swap_check_all_buffers();

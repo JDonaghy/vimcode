@@ -333,25 +333,6 @@ fn collect_rows(
     }
 }
 
-/// ─── Prompt kind for CRUD operations ─────────────────────────────────────────
-#[derive(Clone, Debug)]
-enum PromptKind {
-    /// New file inside the given directory.
-    NewFile(PathBuf),
-    /// New folder inside the given directory.
-    NewFolder(PathBuf),
-    DeleteConfirm(PathBuf),
-    /// Move: source path; input is destination dir (relative to project root).
-    MoveFile(PathBuf),
-}
-
-/// State for an active sidebar prompt shown in the command line area.
-struct SidebarPrompt {
-    kind: PromptKind,
-    input: String,
-    cursor: usize, // byte offset into input
-}
-
 // ─── Public entry point ───────────────────────────────────────────────────────
 
 /// State for an active scrollbar drag (vertical or horizontal).
@@ -891,6 +872,9 @@ pub fn run(file_path: Option<PathBuf>, debug_log_path: Option<String>) {
     {
         let prev_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
+            // Emergency: flush swap files for all dirty buffers before anything else.
+            crate::core::swap::run_emergency_flush();
+
             let bt = std::backtrace::Backtrace::force_capture();
             let loc_str = info
                 .location()
@@ -905,6 +889,13 @@ pub fn run(file_path: Option<PathBuf>, debug_log_path: Option<String>) {
         }));
     }
 
+    // Register engine pointer for emergency swap flush from the panic hook.
+    // SAFETY: `engine` lives on the stack until process exit; the pointer is
+    // only dereferenced during panic recovery on the same thread.
+    unsafe {
+        crate::core::swap::register_emergency_engine(&engine as *const _);
+    }
+
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).expect("create terminal");
     terminal.clear().expect("clear terminal");
@@ -916,6 +907,10 @@ pub fn run(file_path: Option<PathBuf>, debug_log_path: Option<String>) {
     restore_terminal(&mut terminal, keyboard_enhanced);
 
     if let Err(e) = result {
+        // Emergency: flush swap files for all dirty buffers before exiting.
+        // This preserves unsaved work that would otherwise be lost.
+        engine.emergency_swap_flush();
+
         // Extract the panic message before aborting — resume_unwind would call
         // abort() on Linux (via the default panic handler), producing a core dump.
         let msg = if let Some(s) = e.downcast_ref::<&str>() {
@@ -926,6 +921,7 @@ pub fn run(file_path: Option<PathBuf>, debug_log_path: Option<String>) {
             "VimCode internal error (unknown panic payload)".to_string()
         };
         eprintln!("{msg}");
+        eprintln!("Unsaved buffers written to swap files for recovery.");
         eprintln!("Crash details written to /tmp/vimcode-crash.log");
         eprintln!("Please report this at https://github.com/anthropics/claude-code/issues");
         std::process::exit(1);
@@ -966,7 +962,6 @@ fn event_loop(
     sidebar.show_hidden_files = engine.settings.show_hidden_files;
 
     // Optional active prompt (for sidebar CRUD operations)
-    let mut sidebar_prompt: Option<SidebarPrompt> = None;
 
     // Mutable sidebar width (default SIDEBAR_WIDTH, clamped 15..60)
     let mut sidebar_width: u16 = SIDEBAR_WIDTH;
@@ -1060,6 +1055,15 @@ fn event_loop(
     // Timestamp of the last Alt+t press (for tab switcher auto-confirm on timeout).
     let mut tab_switcher_last_cycle: Option<Instant> = None;
 
+    // Reveal the active file in the explorer sidebar at startup (session restore).
+    if let Some(path) = engine.file_path().cloned() {
+        let h = terminal
+            .size()
+            .map(|s| s.height.saturating_sub(4) as usize)
+            .unwrap_or(40);
+        sidebar.reveal_path(&path, h);
+    }
+
     loop {
         // Refresh theme in case :colorscheme was run.
         theme = Theme::from_name(&engine.settings.colorscheme);
@@ -1098,7 +1102,22 @@ fn event_loop(
             let content_cols = size
                 .width
                 .saturating_sub(ab_w + sidebar_cols + gutter_approx);
-            engine.set_viewport_lines(content_rows.saturating_sub(1).max(1) as usize); // -1 for tab bar row inside content_rows
+            // Compute how many rows the tab bar + breadcrumbs consume.
+            let tab_bar_rows: u16 = {
+                let has_single_tab = engine.active_group().tabs.len() <= 1;
+                if engine.settings.hide_single_tab && has_single_tab {
+                    if engine.settings.breadcrumbs {
+                        1
+                    } else {
+                        0
+                    }
+                } else if engine.settings.breadcrumbs {
+                    2
+                } else {
+                    1
+                }
+            };
+            engine.set_viewport_lines(content_rows.saturating_sub(tab_bar_rows).max(1) as usize);
             engine.set_viewport_cols(content_cols.max(1) as usize);
         }
 
@@ -1167,6 +1186,7 @@ fn event_loop(
                 }
             }
 
+            let mut tab_visible_counts: Vec<(crate::core::window::GroupId, usize)> = Vec::new();
             terminal
                 .draw(|frame| {
                     if let Some(s) = &screen {
@@ -1177,7 +1197,6 @@ fn event_loop(
                             &theme,
                             &mut sidebar,
                             engine,
-                            &sidebar_prompt,
                             sidebar_width,
                             quickfix_scroll_top,
                             debug_output_scroll,
@@ -1190,10 +1209,16 @@ fn event_loop(
                             &mut hover_popup_rect,
                             &mut editor_hover_popup_rect,
                             &mut editor_hover_link_rects,
+                            &mut tab_visible_counts,
                         );
                     }
                 })
                 .expect("draw frame");
+            // Report rendered tab counts back to the engine so that
+            // ensure_active_tab_visible() knows how many tabs fit.
+            for (gid, count) in &tab_visible_counts {
+                engine.set_tab_visible_count(*gid, *count);
+            }
 
             // Set terminal cursor shape to match mode / pending key.
             let cursor_style = if !sidebar.has_focus && engine.pending_key == Some('r') {
@@ -1603,94 +1628,16 @@ fn event_loop(
                     continue;
                 }
 
-                // ── Prompt mode (sidebar CRUD) ──────────────────────────────
-                if let Some(ref mut prompt) = sidebar_prompt {
-                    match key_event.code {
-                        KeyCode::Esc => {
-                            sidebar_prompt = None;
+                // ── Inline new file/folder in explorer ───────────────────────
+                if engine.explorer_new_entry.is_some() {
+                    if let Some((key_name, unicode, ctrl)) =
+                        translate_key(key_event, keyboard_enhanced)
+                    {
+                        engine.handle_explorer_new_entry_key(&key_name, unicode, ctrl);
+                        if engine.explorer_needs_refresh {
+                            sidebar.build_rows();
+                            engine.explorer_needs_refresh = false;
                         }
-                        KeyCode::Enter => {
-                            let input = prompt.input.clone();
-                            let kind = prompt.kind.clone();
-                            sidebar_prompt = None;
-                            let vh = terminal
-                                .size()
-                                .map(|s| s.height.saturating_sub(4) as usize)
-                                .unwrap_or(40);
-                            handle_sidebar_prompt(engine, &mut sidebar, kind, input, vh);
-                        }
-                        KeyCode::Backspace => {
-                            if prompt.cursor > 0 {
-                                // Find the previous char boundary
-                                let prev = prompt.input[..prompt.cursor]
-                                    .char_indices()
-                                    .next_back()
-                                    .map(|(i, _)| i)
-                                    .unwrap_or(0);
-                                prompt.input.remove(prev);
-                                prompt.cursor = prev;
-                            }
-                        }
-                        KeyCode::Delete => {
-                            if prompt.cursor < prompt.input.len() {
-                                prompt.input.remove(prompt.cursor);
-                            }
-                        }
-                        KeyCode::Left => {
-                            if prompt.cursor > 0 {
-                                prompt.cursor = prompt.input[..prompt.cursor]
-                                    .char_indices()
-                                    .next_back()
-                                    .map(|(i, _)| i)
-                                    .unwrap_or(0);
-                            }
-                        }
-                        KeyCode::Right => {
-                            if prompt.cursor < prompt.input.len() {
-                                let rest = &prompt.input[prompt.cursor..];
-                                let next = rest
-                                    .char_indices()
-                                    .nth(1)
-                                    .map(|(i, _)| prompt.cursor + i)
-                                    .unwrap_or(prompt.input.len());
-                                prompt.cursor = next;
-                            }
-                        }
-                        KeyCode::Home => {
-                            prompt.cursor = 0;
-                        }
-                        KeyCode::End => {
-                            prompt.cursor = prompt.input.len();
-                        }
-                        KeyCode::Char(c)
-                            if key_event.kind != KeyEventKind::Release
-                                && !key_event.modifiers.contains(KeyModifiers::CONTROL) =>
-                        {
-                            // For delete confirm only accept y/n
-                            if matches!(prompt.kind, PromptKind::DeleteConfirm(_)) {
-                                if c == 'y' || c == 'n' {
-                                    let kind = prompt.kind.clone();
-                                    sidebar_prompt = None;
-                                    if c == 'y' {
-                                        let vh = terminal
-                                            .size()
-                                            .map(|s| s.height.saturating_sub(3) as usize)
-                                            .unwrap_or(40);
-                                        handle_sidebar_prompt(
-                                            engine,
-                                            &mut sidebar,
-                                            kind,
-                                            "y".to_string(),
-                                            vh,
-                                        );
-                                    }
-                                }
-                            } else {
-                                prompt.input.insert(prompt.cursor, c);
-                                prompt.cursor += c.len_utf8();
-                            }
-                        }
-                        _ => {}
                     }
                     needs_redraw = true;
                     continue;
@@ -1712,6 +1659,13 @@ fn event_loop(
                                     engine.open_folder(&path);
                                     sidebar = TuiSidebar::new(engine.cwd.clone(), sidebar.visible);
                                     sidebar.show_hidden_files = engine.settings.show_hidden_files;
+                                    if let Some(fp) = engine.file_path().cloned() {
+                                        let h = terminal
+                                            .size()
+                                            .map(|s| s.height.saturating_sub(4) as usize)
+                                            .unwrap_or(40);
+                                        sidebar.reveal_path(&fp, h);
+                                    }
                                 }
                             } else {
                                 // Check if ".." was selected — navigate up instead of opening
@@ -1732,6 +1686,14 @@ fn event_loop(
                                     }
                                     sidebar = TuiSidebar::new(engine.cwd.clone(), sidebar.visible);
                                     sidebar.show_hidden_files = engine.settings.show_hidden_files;
+                                    // Reveal the active file from the restored session
+                                    if let Some(path) = engine.file_path().cloned() {
+                                        let h = terminal
+                                            .size()
+                                            .map(|s| s.height.saturating_sub(4) as usize)
+                                            .unwrap_or(40);
+                                        sidebar.reveal_path(&path, h);
+                                    }
                                 }
                             }
                         }
@@ -2676,38 +2638,20 @@ fn event_loop(
                                                 sidebar.root.clone()
                                             }
                                         };
-                                        // Pre-fill with target dir relative to root + /
-                                        let prefill = target_dir
-                                            .strip_prefix(&sidebar.root)
-                                            .unwrap_or(&target_dir)
-                                            .to_string_lossy()
-                                            .to_string();
-                                        let prefill = if prefill.is_empty() {
-                                            String::new()
+                                        // Expand the target dir so the new entry row is visible
+                                        sidebar.expanded.insert(target_dir.clone());
+                                        sidebar.build_rows();
+                                        if action == ExplorerAction::NewFile {
+                                            engine.start_explorer_new_file(target_dir);
                                         } else {
-                                            format!("{}/", prefill)
-                                        };
-                                        let kind = if action == ExplorerAction::NewFile {
-                                            PromptKind::NewFile(sidebar.root.clone())
-                                        } else {
-                                            PromptKind::NewFolder(sidebar.root.clone())
-                                        };
-                                        let cursor = prefill.len();
-                                        sidebar_prompt = Some(SidebarPrompt {
-                                            kind,
-                                            input: prefill,
-                                            cursor,
-                                        });
+                                            engine.start_explorer_new_folder(target_dir);
+                                        }
                                     }
                                     ExplorerAction::Delete => {
                                         let idx = sidebar.selected;
                                         if idx < sidebar.rows.len() {
                                             let path = sidebar.rows[idx].path.clone();
-                                            sidebar_prompt = Some(SidebarPrompt {
-                                                kind: PromptKind::DeleteConfirm(path),
-                                                input: String::new(),
-                                                cursor: 0,
-                                            });
+                                            engine.confirm_delete_file(&path);
                                         }
                                     }
                                     ExplorerAction::Rename => {
@@ -2721,18 +2665,8 @@ fn event_loop(
                                         let idx = sidebar.selected;
                                         if idx < sidebar.rows.len() {
                                             let path = sidebar.rows[idx].path.clone();
-                                            // Pre-fill with full relative path from root
-                                            let prefill = path
-                                                .strip_prefix(&sidebar.root)
-                                                .unwrap_or(&path)
-                                                .to_string_lossy()
-                                                .to_string();
-                                            let cursor = prefill.len();
-                                            sidebar_prompt = Some(SidebarPrompt {
-                                                kind: PromptKind::MoveFile(path),
-                                                input: prefill,
-                                                cursor,
-                                            });
+                                            let root = sidebar.root.clone();
+                                            engine.start_move_file_dialog(&path, &root);
                                         }
                                     }
                                 }
@@ -2970,6 +2904,16 @@ fn event_loop(
                                 engine.group_layout.leaf_count(),
                                 engine.group_layout
                             );
+                            needs_redraw = true;
+                            continue;
+                        }
+                        if matches_tui_key(&pk.nav_back, code, mods) {
+                            engine.tab_nav_back();
+                            needs_redraw = true;
+                            continue;
+                        }
+                        if matches_tui_key(&pk.nav_forward, code, mods) {
+                            engine.tab_nav_forward();
                             needs_redraw = true;
                             continue;
                         }
@@ -3351,8 +3295,8 @@ fn event_loop(
                         && intercept_paste_key(engine, unicode == Some('P'));
 
                     // ── Context menu keyboard intercept (TUI-side) ──────────
-                    // Handle here so explorer actions (new_file etc.) can set
-                    // sidebar_prompt, which the engine doesn't know about.
+                    // Handle here so explorer actions (new_file etc.) can be
+                    // dispatched to the engine's dialog system.
                     if engine.context_menu.is_some() {
                         let effective_key = if key_name.is_empty() {
                             unicode.map(|c| c.to_string()).unwrap_or_default()
@@ -3366,7 +3310,6 @@ fn event_loop(
                                     &act,
                                     engine,
                                     &sidebar,
-                                    &mut sidebar_prompt,
                                     terminal.size().ok(),
                                 );
                             }
@@ -3455,6 +3398,9 @@ fn event_loop(
                             if sidebar.visible {
                                 sidebar.has_focus = true;
                                 match sidebar.active_panel {
+                                    TuiPanel::Explorer => {
+                                        engine.explorer_has_focus = true;
+                                    }
                                     TuiPanel::Git => engine.sc_has_focus = true,
                                     TuiPanel::Debug => engine.dap_sidebar_has_focus = true,
                                     TuiPanel::Extensions => {
@@ -3559,7 +3505,6 @@ fn event_loop(
                                 &mut dragging_settings_sb,
                                 &mut dragging_generic_sb,
                                 last_layout.as_ref(),
-                                &mut sidebar_prompt,
                                 &mut last_click_time,
                                 &mut last_click_pos,
                                 &mut mouse_text_drag,
@@ -3611,7 +3556,6 @@ fn event_loop(
                     &mut dragging_settings_sb,
                     &mut dragging_generic_sb,
                     last_layout.as_ref(),
-                    &mut sidebar_prompt,
                     &mut last_click_time,
                     &mut last_click_pos,
                     &mut mouse_text_drag,
@@ -3778,7 +3722,6 @@ fn handle_explorer_context_action(
     action: &str,
     engine: &mut Engine,
     sidebar: &TuiSidebar,
-    sidebar_prompt: &mut Option<SidebarPrompt>,
     terminal_size: Option<ratatui::layout::Rect>,
 ) {
     // Get the path from the engine's last context menu target.
@@ -3794,41 +3737,21 @@ fn handle_explorer_context_action(
     match action {
         "new_file" | "new_folder" => {
             let target = if is_dir {
-                &path
+                path.clone()
             } else {
-                path.parent().unwrap_or(&sidebar.root)
+                path.parent().unwrap_or(&sidebar.root).to_path_buf()
             };
-            let prefill = target
-                .strip_prefix(&sidebar.root)
-                .unwrap_or(target)
-                .to_string_lossy()
-                .to_string();
-            let prefill = if prefill.is_empty() {
-                String::new()
+            if action == "new_file" {
+                engine.start_explorer_new_file(target);
             } else {
-                format!("{}/", prefill)
-            };
-            let kind = if action == "new_file" {
-                PromptKind::NewFile(sidebar.root.clone())
-            } else {
-                PromptKind::NewFolder(sidebar.root.clone())
-            };
-            let cursor = prefill.len();
-            *sidebar_prompt = Some(SidebarPrompt {
-                kind,
-                input: prefill,
-                cursor,
-            });
+                engine.start_explorer_new_folder(target);
+            }
         }
         "rename" => {
             engine.start_explorer_rename(path);
         }
         "delete" => {
-            *sidebar_prompt = Some(SidebarPrompt {
-                kind: PromptKind::DeleteConfirm(path),
-                input: String::new(),
-                cursor: 0,
-            });
+            engine.confirm_delete_file(&path);
         }
         // copy_path, copy_relative_path, reveal, open_side, open_side_vsplit handled by engine
         "copy_path" | "copy_relative_path" | "reveal" | "open_side" | "open_side_vsplit" => {}

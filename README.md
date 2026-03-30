@@ -35,7 +35,7 @@ For detailed how-to guides and configuration references, see the **[VimCode Wiki
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 4,769 tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 4,814 tests, zero async runtime dependency
 
 > **Note:** VimCode does not implement VimScript. Extension and scripting is handled via
 > the built-in Lua 5.4 plugin system. The goal is full Vim *keybinding* and *editing*
@@ -350,6 +350,22 @@ The tab context menu offers both: "Split Right/Down" creates a Vim window split 
 
 VimCode uses a unified picker system for file finding, live grep, and command palette. All pickers share the same UI and keybindings. Fuzzy match characters are highlighted in the results.
 
+#### Command Center
+
+Click the search box in the menu bar (or run `:CommandCenter`) to open the unified picker. Type a prefix to switch modes:
+
+| Prefix | Mode |
+|--------|------|
+| _(none)_ | Fuzzy file search (same as `Ctrl-P`) |
+| `>` | Command palette (same as `Ctrl-Shift-P`) |
+| `@` | Go to symbol in current file (LSP `documentSymbol`) |
+| `#` | Workspace symbol search (LSP `workspace/symbol`) |
+| `:` | Go to line number |
+| `%` | Search for text in project (live grep) |
+| `debug` | Start debugging (show launch configurations) |
+| `task` | Run a task (from tasks.json) |
+| `?` | Show available prefix modes |
+
 #### Fuzzy File Finder
 
 - `Ctrl-P` or `<leader>sf` (Normal mode) — open the fuzzy file picker
@@ -361,6 +377,7 @@ VimCode uses a unified picker system for file finding, live grep, and command pa
 #### Live Grep
 
 - `Ctrl-Shift-F` or `<leader>sg` (Normal mode) — open the live grep picker
+- `<leader>sw` — open live grep pre-filled with the word under the cursor
 - A centered floating two-column modal appears over the editor
 - Type to instantly search file *contents* across the entire project (live-as-you-type, query ≥ 2 chars)
 - Left pane shows results in `filename.rs:N: snippet` format; right pane shows ±5 context lines around the match
@@ -483,6 +500,7 @@ For full details on adapters, launch.json, conditional breakpoints, and the debu
 | `:Gblame` | `:Gb` | Open `git blame` in scroll-synced vertical split |
 | `:Gswitch <branch>` | `:Gsw` | Switch to an existing branch |
 | `:Gbranch <name>` | | Create a new branch and switch to it |
+| `:Gbranches` | | Open branch picker (fuzzy-filter, click status bar branch) |
 | `:Ghs` | `:Ghunk` | Stage hunk under cursor (in a `:Gdiff` buffer) |
 | `:Gshow <hash>` | | Show commit in Git Log panel (navigates and expands) |
 
@@ -770,7 +788,7 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 
 - **Layout:** activity bar (3 cols) | sidebar | editor area; status line + command line full-width at bottom
 - **Sidebar:** same file explorer as GTK with Nerd Font icons
-- **Mouse support:** click-to-position, double-click word select, click-and-drag visual selection, window switching, scroll wheel (targets pane under cursor), scrollbar click-to-jump and drag; drag event coalescing for smooth scrollbar tracking; bracketed paste support
+- **Mouse support:** click-to-position, double-click word select, click-and-drag visual selection, window switching, scroll wheel (targets pane under cursor), scrollbar click-to-jump and drag; drag event coalescing for smooth scrollbar tracking; bracketed paste support; click branch name in status bar to open branch picker
 - **Sidebar resize:** drag separator column; `Alt+Left` / `Alt+Right` keyboard resize (min 15, max 60 cols)
 - **Scrollbars:** `█` / `░` thumb/track in uniform grey; vsplit separator doubles as left-pane vertical scrollbar; horizontal scrollbar row when content wider than viewport; `┘` corner when both axes present
 - **Scroll sync:** `:Gblame` pairs stay in sync across keyboard nav and mouse events
@@ -859,6 +877,7 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `gt` / `gT` | Next / previous tab |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | MRU tab switcher (forward / backward) |
 | `Alt+t` | MRU tab switcher (TUI + GTK compatible) |
+| `Ctrl+Alt+Left` / `Ctrl+Alt+Right` | Navigate back / forward through tab history |
 | `gd` | Go to definition (LSP) |
 | `gr` | Find references (LSP) — multiple results open quickfix |
 | `gi` | Insert at last insert position |
@@ -888,6 +907,7 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `<leader>ca` | Show LSP code actions for current line |
 | `<leader>sf` | Open fuzzy file finder (same as Ctrl-P) |
 | `<leader>sg` | Open live grep picker (same as Ctrl-Shift-F) |
+| `<leader>sw` | Grep word under cursor |
 | `<leader>sp` | Open command palette (same as Ctrl-Shift-P) |
 | `za` / `zo` / `zc` / `zR` | Fold toggle / open / close / open all |
 | `zA` / `zO` / `zC` | Fold toggle / open / close recursively |
@@ -994,7 +1014,9 @@ All ex commands support Vim-style abbreviations (e.g., `:j` for `:join`, `:y` fo
 | `:b {name}` | Switch to buffer matching partial file name |
 | `:!{cmd}` | Execute shell command and show output |
 | `:r {file}` | Read file contents into buffer after cursor line |
-| `:tabmove [N]` | Move current tab to position N (0-based, default = end) |
+| `:tabmove [N]` | Move current tab to position N (1-based, 0 = end) |
+| `:navback` | Navigate to previous tab in history |
+| `:navforward` | Navigate to next tab in history |
 | `:Gdiff` / `:Gdiffsplit` | Git diff (unified / side-by-side) |
 | `:Gstatus` | Git status |
 | `:Gadd` / `:Gadd!` | Stage file / stage all |
@@ -1005,6 +1027,7 @@ All ex commands support Vim-style abbreviations (e.g., `:j` for `:join`, `:y` fo
 | `:Gblame` | Blame (scroll-synced split) |
 | `:Gswitch <branch>` / `:Gsw` | Switch to existing branch |
 | `:Gbranch <name>` | Create new branch and switch to it |
+| `:Gbranches` | Open branch picker (status bar click also works) |
 | `:Ghs` / `:Ghunk` | Stage hunk under cursor |
 | `:Gshow <hash>` | Show commit in Git Log panel (navigates and expands) |
 | `:DiffPeek` | Open diff hunk peek popup at cursor (revert/stage) |
@@ -1022,6 +1045,7 @@ All ex commands support Vim-style abbreviations (e.g., `:j` for `:join`, `:y` fo
 | `:DiffToggleContext` | Toggle hiding unchanged sections in diff view |
 | `:diffoff` | Clear diff highlighting |
 | `:grep <pat>` / `:vimgrep <pat>` | Search project, populate quickfix list |
+| `:GrepWord` | Grep the word under cursor (same as `<leader>sw`) |
 | `:copen` / `:ccl` | Open / close quickfix panel |
 | `:cn` / `:cp` | Next / previous quickfix item |
 | `:cc N` | Jump to Nth quickfix item (1-based) |
@@ -1040,6 +1064,7 @@ All ex commands support Vim-style abbreviations (e.g., `:j` for `:join`, `:y` fo
 | `:nextdiag` / `:prevdiag` | Jump to next / previous LSP diagnostic |
 | `:nexthunk` / `:prevhunk` | Jump to next / previous git hunk |
 | `:fuzzy` | Open fuzzy file finder |
+| `:CommandCenter` | Open Command Center (unified picker with prefix modes) |
 | `:sidebar` | Toggle sidebar |
 | `:palette` | Open command palette |
 | `:Comment [N]` | Toggle comment on N lines (46+ languages; `:Commentary` alias) |

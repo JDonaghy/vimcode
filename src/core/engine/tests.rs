@@ -2248,6 +2248,73 @@ fn test_visual_line_yank() {
 }
 
 #[test]
+fn test_visual_line_yank_cursor_moves_to_start() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "line1\nline2\nline3\nline4");
+    engine.update_syntax();
+
+    // Move to line 2, start visual line, select down to line 3
+    press_char(&mut engine, 'j');
+    press_char(&mut engine, 'j');
+    press_char(&mut engine, 'V');
+    press_char(&mut engine, 'j');
+    // Cursor is now on line 3, selection spans lines 2-3
+
+    press_char(&mut engine, 'y');
+
+    // Vim behavior: cursor moves to start of selection (line 2, col 0)
+    assert_eq!(engine.view().cursor.line, 2);
+    assert_eq!(engine.view().cursor.col, 0);
+    // Verify register content
+    let (content, is_linewise) = engine.registers.get(&'"').unwrap();
+    assert_eq!(content, "line3\nline4\n");
+    assert!(is_linewise);
+}
+
+#[test]
+fn test_visual_charwise_yank_cursor_moves_to_start() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello world");
+    engine.update_syntax();
+
+    // Move to col 6 ("w"), start visual, select to col 10 ("d")
+    for _ in 0..6 {
+        press_char(&mut engine, 'l');
+    }
+    press_char(&mut engine, 'v');
+    for _ in 0..4 {
+        press_char(&mut engine, 'l');
+    }
+    // Cursor at col 10, selection from 6..10
+
+    press_char(&mut engine, 'y');
+
+    // Vim: cursor moves to start of selection
+    assert_eq!(engine.view().cursor.line, 0);
+    assert_eq!(engine.view().cursor.col, 6);
+}
+
+#[test]
+fn test_visual_line_yank_upward_selection() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "aaa\nbbb\nccc\nddd");
+    engine.update_syntax();
+
+    // Start on line 2, visual line select upward to line 1
+    press_char(&mut engine, 'j');
+    press_char(&mut engine, 'j');
+    press_char(&mut engine, 'V');
+    press_char(&mut engine, 'k');
+    // Selection: lines 1-2, cursor on line 1
+
+    press_char(&mut engine, 'y');
+
+    // Cursor should be at start of selection (line 1)
+    assert_eq!(engine.view().cursor.line, 1);
+    assert_eq!(engine.view().cursor.col, 0);
+}
+
+#[test]
 fn test_visual_line_delete() {
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "line1\nline2\nline3");
@@ -9020,6 +9087,807 @@ fn test_picker_palette_command_opens_picker() {
     assert_eq!(engine.picker_source, PickerSource::Commands);
 }
 
+// ─── Command Center tests ────────────────────────────────────────────────
+
+#[test]
+fn test_command_center_opens() {
+    let mut engine = Engine::new();
+    engine.open_command_center();
+    assert!(engine.picker_open);
+    assert_eq!(engine.picker_source, PickerSource::CommandCenter);
+    assert_eq!(engine.picker_title, "Search");
+}
+
+#[test]
+fn test_command_center_default_files_mode() {
+    let mut engine = Engine::new();
+    engine.open_command_center();
+    // Default mode shows files (or empty in test environment)
+    assert_eq!(engine.picker_source, PickerSource::CommandCenter);
+    assert_eq!(engine.picker_title, "Search");
+}
+
+#[test]
+fn test_command_center_prefix_commands() {
+    let mut engine = Engine::new();
+    engine.open_command_center();
+    // Type ">" to switch to command mode
+    engine.handle_picker_key(">", Some('>'), false);
+    assert_eq!(engine.picker_title, "Commands");
+    assert!(!engine.picker_items.is_empty(), "should have command items");
+}
+
+#[test]
+fn test_command_center_prefix_goto_line() {
+    let mut engine = Engine::new();
+    engine
+        .buffer_mut()
+        .insert(0, "line1\nline2\nline3\nline4\nline5\n");
+    engine.open_command_center();
+    // Type ":3" to go to line 3
+    engine.handle_picker_key(":", Some(':'), false);
+    engine.handle_picker_key("3", Some('3'), false);
+    assert_eq!(engine.picker_title, "Go to Line");
+    assert_eq!(engine.picker_items.len(), 1);
+    assert!(engine.picker_items[0].display.contains("line 3"));
+    // Confirm should jump to line 3
+    engine.picker_confirm();
+    assert!(!engine.picker_open);
+    assert_eq!(engine.view().cursor.line, 2); // 0-indexed
+}
+
+#[test]
+fn test_command_center_prefix_help() {
+    let mut engine = Engine::new();
+    engine.open_command_center();
+    engine.handle_picker_key("?", Some('?'), false);
+    assert_eq!(engine.picker_title, "Help: Prefix Modes");
+    assert_eq!(engine.picker_items.len(), 9); // 9 help items (including %, debug, task)
+}
+
+#[test]
+fn test_command_center_prefix_symbols_no_lsp() {
+    let mut engine = Engine::new();
+    engine.open_command_center();
+    engine.handle_picker_key("@", Some('@'), false);
+    assert_eq!(engine.picker_title, "Go to Symbol in File");
+}
+
+#[test]
+fn test_command_center_prefix_workspace_symbols() {
+    let mut engine = Engine::new();
+    engine.open_command_center();
+    engine.handle_picker_key("#", Some('#'), false);
+    assert_eq!(engine.picker_title, "Go to Symbol in Workspace");
+}
+
+#[test]
+fn test_command_center_prefix_switch_back_to_files() {
+    let mut engine = Engine::new();
+    engine.open_command_center();
+    // Switch to commands
+    engine.handle_picker_key(">", Some('>'), false);
+    assert_eq!(engine.picker_title, "Commands");
+    // Delete the ">" to go back to files
+    engine.handle_picker_key("BackSpace", None, false);
+    assert_eq!(engine.picker_title, "Search");
+}
+
+#[test]
+fn test_command_center_via_execute() {
+    let mut engine = Engine::new();
+    engine.execute_command("CommandCenter");
+    assert!(engine.picker_open);
+    assert_eq!(engine.picker_source, PickerSource::CommandCenter);
+}
+
+#[test]
+fn test_command_center_goto_line_edge_cases() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a\nb\nc\n");
+    engine.open_command_center();
+    // ":0" should clamp to line 1
+    engine.handle_picker_key(":", Some(':'), false);
+    engine.handle_picker_key("0", Some('0'), false);
+    assert!(engine.picker_items[0].display.contains("line 1"));
+    // ":999" should clamp to last line — clear previous query first
+    let line_count = engine.buffer().content.len_lines();
+    engine.close_picker();
+    engine.open_command_center();
+    engine.handle_picker_key(":", Some(':'), false);
+    engine.handle_picker_key("9", Some('9'), false);
+    engine.handle_picker_key("9", Some('9'), false);
+    engine.handle_picker_key("9", Some('9'), false);
+    let expected = format!("line {}", line_count);
+    assert!(
+        engine.picker_items[0].display.contains(&expected),
+        "expected '{}', got '{}'",
+        expected,
+        engine.picker_items[0].display
+    );
+}
+
+#[test]
+fn test_command_center_help_confirm_sets_prefix() {
+    let mut engine = Engine::new();
+    engine.open_command_center();
+    engine.handle_picker_key("?", Some('?'), false);
+    // Select the ">" command entry (index 1)
+    engine.handle_picker_key("Down", None, false);
+    engine.picker_confirm();
+    // Should re-open with ">" prefix
+    assert!(engine.picker_open);
+    assert_eq!(engine.picker_query, ">");
+    assert_eq!(engine.picker_title, "Commands");
+}
+
+#[test]
+fn test_command_center_prefix_grep() {
+    let mut engine = Engine::new();
+    engine.open_command_center();
+    // Type "%" to switch to grep mode
+    engine.handle_picker_key("%", Some('%'), false);
+    assert_eq!(engine.picker_title, "Search for Text");
+    // With only the prefix, should show a hint (need 2+ chars)
+    assert_eq!(engine.picker_items.len(), 1);
+    assert!(engine.picker_items[0].display.contains("2 characters"));
+}
+
+#[test]
+fn test_command_center_grep_short_query() {
+    let mut engine = Engine::new();
+    engine.open_command_center();
+    // Type "%a" — only 1 char after prefix, still shows hint
+    engine.handle_picker_key("%", Some('%'), false);
+    engine.handle_picker_key("a", Some('a'), false);
+    assert_eq!(engine.picker_title, "Search for Text");
+    assert_eq!(engine.picker_items.len(), 1);
+    assert!(engine.picker_items[0].display.contains("2 characters"));
+}
+
+#[test]
+fn test_command_center_grep_runs_search() {
+    use std::io::Write;
+    let dir = std::env::temp_dir().join("vimcode_test_cc_grep");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // Create a test file with searchable content
+    let test_file = dir.join("searchable.txt");
+    let mut f = std::fs::File::create(&test_file).unwrap();
+    writeln!(f, "hello world").unwrap();
+    writeln!(f, "foo bar baz").unwrap();
+    writeln!(f, "hello again").unwrap();
+
+    let mut engine = Engine::new();
+    engine.cwd = dir.clone();
+    engine.open_command_center();
+    // Type "%hello" — should find matches
+    for ch in "%hello".chars() {
+        engine.handle_picker_key(&ch.to_string(), Some(ch), false);
+    }
+    assert_eq!(engine.picker_title, "Search for Text");
+    assert!(
+        engine.picker_items.len() >= 2,
+        "expected at least 2 grep results, got {}",
+        engine.picker_items.len()
+    );
+    // Results should reference the file
+    assert!(engine.picker_items[0].display.contains("searchable.txt"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_command_center_help_includes_grep_prefix() {
+    let mut engine = Engine::new();
+    engine.open_command_center();
+    engine.handle_picker_key("?", Some('?'), false);
+    // One of the help items should be the % prefix
+    let has_percent = engine.picker_items.iter().any(|item| item.display == "%");
+    assert!(has_percent, "help menu should include % prefix");
+}
+
+#[test]
+fn test_command_center_help_confirm_grep_prefix() {
+    let mut engine = Engine::new();
+    engine.open_command_center();
+    engine.handle_picker_key("?", Some('?'), false);
+    // Find the "%" item index — it's after ":", before "?"
+    let percent_idx = engine
+        .picker_items
+        .iter()
+        .position(|item| item.display == "%")
+        .expect("% should be in help items");
+    // Navigate to it
+    for _ in 0..percent_idx {
+        engine.handle_picker_key("Down", None, false);
+    }
+    engine.picker_confirm();
+    // Should re-open with "%" prefix
+    assert!(engine.picker_open);
+    assert_eq!(engine.picker_query, "%");
+    assert_eq!(engine.picker_title, "Search for Text");
+}
+
+#[test]
+fn test_command_center_debug_prefix_no_launch_json() {
+    let mut engine = Engine::new();
+    // Set cwd to a temp dir with no launch.json
+    let dir = std::env::temp_dir().join("vimcode_test_cc_debug_none");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    engine.cwd = dir.clone();
+    engine.open_command_center();
+    for ch in "debug".chars() {
+        engine.handle_picker_key(&ch.to_string(), Some(ch), false);
+    }
+    assert_eq!(engine.picker_title, "Start Debugging");
+    assert_eq!(engine.picker_items.len(), 1);
+    assert!(engine.picker_items[0]
+        .display
+        .contains("Create launch.json"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_command_center_debug_prefix_with_configs() {
+    use std::io::Write;
+    let dir = std::env::temp_dir().join("vimcode_test_cc_debug_configs");
+    let _ = std::fs::remove_dir_all(&dir);
+    let vimcode_dir = dir.join(".vimcode");
+    std::fs::create_dir_all(&vimcode_dir).unwrap();
+    let launch_json = vimcode_dir.join("launch.json");
+    let mut f = std::fs::File::create(&launch_json).unwrap();
+    write!(
+        f,
+        r#"{{
+  "version": "0.2.0",
+  "configurations": [
+    {{ "type": "lldb", "request": "launch", "name": "Debug App", "program": "target/debug/app" }},
+    {{ "type": "debugpy", "request": "launch", "name": "Debug Python", "program": "main.py" }}
+  ]
+}}"#
+    )
+    .unwrap();
+
+    let mut engine = Engine::new();
+    engine.cwd = dir.clone();
+    engine.open_command_center();
+    for ch in "debug".chars() {
+        engine.handle_picker_key(&ch.to_string(), Some(ch), false);
+    }
+    assert_eq!(engine.picker_title, "Start Debugging");
+    assert_eq!(engine.picker_items.len(), 2);
+    assert_eq!(engine.picker_items[0].display, "Debug App");
+    assert_eq!(engine.picker_items[1].display, "Debug Python");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_command_center_debug_prefix_filter() {
+    use std::io::Write;
+    let dir = std::env::temp_dir().join("vimcode_test_cc_debug_filter");
+    let _ = std::fs::remove_dir_all(&dir);
+    let vimcode_dir = dir.join(".vimcode");
+    std::fs::create_dir_all(&vimcode_dir).unwrap();
+    let launch_json = vimcode_dir.join("launch.json");
+    let mut f = std::fs::File::create(&launch_json).unwrap();
+    write!(
+        f,
+        r#"{{
+  "version": "0.2.0",
+  "configurations": [
+    {{ "type": "lldb", "request": "launch", "name": "Debug App", "program": "target/debug/app" }},
+    {{ "type": "debugpy", "request": "launch", "name": "Python Script", "program": "main.py" }}
+  ]
+}}"#
+    )
+    .unwrap();
+
+    let mut engine = Engine::new();
+    engine.cwd = dir.clone();
+    engine.open_command_center();
+    // Type "debug Python" to filter configs
+    for ch in "debug Python".chars() {
+        engine.handle_picker_key(&ch.to_string(), Some(ch), false);
+    }
+    assert_eq!(engine.picker_title, "Start Debugging");
+    assert_eq!(engine.picker_items.len(), 1);
+    assert_eq!(engine.picker_items[0].display, "Python Script");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_command_center_debug_confirm_sets_config_index() {
+    use std::io::Write;
+    let dir = std::env::temp_dir().join("vimcode_test_cc_debug_confirm");
+    let _ = std::fs::remove_dir_all(&dir);
+    let vimcode_dir = dir.join(".vimcode");
+    std::fs::create_dir_all(&vimcode_dir).unwrap();
+    let launch_json = vimcode_dir.join("launch.json");
+    let mut f = std::fs::File::create(&launch_json).unwrap();
+    write!(
+        f,
+        r#"{{
+  "version": "0.2.0",
+  "configurations": [
+    {{ "type": "lldb", "request": "launch", "name": "Config A", "program": "a" }},
+    {{ "type": "lldb", "request": "launch", "name": "Config B", "program": "b" }}
+  ]
+}}"#
+    )
+    .unwrap();
+
+    let mut engine = Engine::new();
+    engine.cwd = dir.clone();
+    engine.open_command_center();
+    for ch in "debug".chars() {
+        engine.handle_picker_key(&ch.to_string(), Some(ch), false);
+    }
+    // Select the second config
+    engine.handle_picker_key("Down", None, false);
+    engine.picker_confirm();
+    // Picker should be closed and config index set to 1
+    assert!(!engine.picker_open);
+    assert_eq!(engine.dap_selected_launch_config, 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_command_center_help_includes_debug_prefix() {
+    let mut engine = Engine::new();
+    engine.open_command_center();
+    engine.handle_picker_key("?", Some('?'), false);
+    let has_debug = engine
+        .picker_items
+        .iter()
+        .any(|item| item.display == "debug");
+    assert!(has_debug, "help menu should include debug prefix");
+}
+
+#[test]
+fn test_command_center_help_confirm_debug_prefix() {
+    let mut engine = Engine::new();
+    engine.open_command_center();
+    engine.handle_picker_key("?", Some('?'), false);
+    let debug_idx = engine
+        .picker_items
+        .iter()
+        .position(|item| item.display == "debug")
+        .expect("debug should be in help items");
+    for _ in 0..debug_idx {
+        engine.handle_picker_key("Down", None, false);
+    }
+    engine.picker_confirm();
+    // Should re-open with "debug " prefix (with trailing space for keyword)
+    assert!(engine.picker_open);
+    assert_eq!(engine.picker_query, "debug ");
+    assert_eq!(engine.picker_title, "Start Debugging");
+}
+
+#[test]
+fn test_command_center_debug_reads_vscode_fallback() {
+    use std::io::Write;
+    let dir = std::env::temp_dir().join("vimcode_test_cc_debug_vscode");
+    let _ = std::fs::remove_dir_all(&dir);
+    // No .vimcode dir, but .vscode/launch.json exists
+    let vscode_dir = dir.join(".vscode");
+    std::fs::create_dir_all(&vscode_dir).unwrap();
+    let launch_json = vscode_dir.join("launch.json");
+    let mut f = std::fs::File::create(&launch_json).unwrap();
+    write!(
+        f,
+        r#"{{
+  "version": "0.2.0",
+  "configurations": [
+    {{ "type": "node", "request": "launch", "name": "Launch Node", "program": "index.js" }}
+  ]
+}}"#
+    )
+    .unwrap();
+
+    let mut engine = Engine::new();
+    engine.cwd = dir.clone();
+    engine.open_command_center();
+    for ch in "debug".chars() {
+        engine.handle_picker_key(&ch.to_string(), Some(ch), false);
+    }
+    assert_eq!(engine.picker_title, "Start Debugging");
+    assert_eq!(engine.picker_items.len(), 1);
+    assert_eq!(engine.picker_items[0].display, "Launch Node");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_command_center_task_prefix_no_tasks_json() {
+    let mut engine = Engine::new();
+    let dir = std::env::temp_dir().join("vimcode_test_cc_task_none");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    engine.cwd = dir.clone();
+    engine.open_command_center();
+    for ch in "task".chars() {
+        engine.handle_picker_key(&ch.to_string(), Some(ch), false);
+    }
+    assert_eq!(engine.picker_title, "Run Task");
+    assert_eq!(engine.picker_items.len(), 1);
+    assert!(engine.picker_items[0].display.contains("Configure Tasks"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_command_center_task_prefix_with_tasks() {
+    use std::io::Write;
+    let dir = std::env::temp_dir().join("vimcode_test_cc_task_list");
+    let _ = std::fs::remove_dir_all(&dir);
+    let vimcode_dir = dir.join(".vimcode");
+    std::fs::create_dir_all(&vimcode_dir).unwrap();
+    let tasks_json = vimcode_dir.join("tasks.json");
+    let mut f = std::fs::File::create(&tasks_json).unwrap();
+    write!(
+        f,
+        r#"{{
+  "version": "2.0.0",
+  "tasks": [
+    {{ "label": "build", "type": "shell", "command": "cargo build" }},
+    {{ "label": "test", "type": "shell", "command": "cargo test" }},
+    {{ "label": "lint", "type": "shell", "command": "cargo clippy" }}
+  ]
+}}"#
+    )
+    .unwrap();
+
+    let mut engine = Engine::new();
+    engine.cwd = dir.clone();
+    engine.open_command_center();
+    for ch in "task".chars() {
+        engine.handle_picker_key(&ch.to_string(), Some(ch), false);
+    }
+    assert_eq!(engine.picker_title, "Run Task");
+    assert_eq!(engine.picker_items.len(), 3);
+    assert_eq!(engine.picker_items[0].display, "build");
+    assert_eq!(engine.picker_items[1].display, "test");
+    assert_eq!(engine.picker_items[2].display, "lint");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_command_center_task_prefix_filter() {
+    use std::io::Write;
+    let dir = std::env::temp_dir().join("vimcode_test_cc_task_filter");
+    let _ = std::fs::remove_dir_all(&dir);
+    let vimcode_dir = dir.join(".vimcode");
+    std::fs::create_dir_all(&vimcode_dir).unwrap();
+    let tasks_json = vimcode_dir.join("tasks.json");
+    let mut f = std::fs::File::create(&tasks_json).unwrap();
+    write!(
+        f,
+        r#"{{
+  "version": "2.0.0",
+  "tasks": [
+    {{ "label": "build", "type": "shell", "command": "cargo build" }},
+    {{ "label": "test", "type": "shell", "command": "cargo test" }},
+    {{ "label": "lint", "type": "shell", "command": "cargo clippy" }}
+  ]
+}}"#
+    )
+    .unwrap();
+
+    let mut engine = Engine::new();
+    engine.cwd = dir.clone();
+    engine.open_command_center();
+    for ch in "task lint".chars() {
+        engine.handle_picker_key(&ch.to_string(), Some(ch), false);
+    }
+    assert_eq!(engine.picker_title, "Run Task");
+    assert_eq!(engine.picker_items.len(), 1);
+    assert_eq!(engine.picker_items[0].display, "lint");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_command_center_task_confirm_returns_run_in_terminal() {
+    use std::io::Write;
+    let dir = std::env::temp_dir().join("vimcode_test_cc_task_confirm");
+    let _ = std::fs::remove_dir_all(&dir);
+    let vimcode_dir = dir.join(".vimcode");
+    std::fs::create_dir_all(&vimcode_dir).unwrap();
+    let tasks_json = vimcode_dir.join("tasks.json");
+    let mut f = std::fs::File::create(&tasks_json).unwrap();
+    write!(
+        f,
+        r#"{{
+  "version": "2.0.0",
+  "tasks": [
+    {{ "label": "build", "type": "shell", "command": "cargo build" }}
+  ]
+}}"#
+    )
+    .unwrap();
+
+    let mut engine = Engine::new();
+    engine.cwd = dir.clone();
+    engine.open_command_center();
+    for ch in "task".chars() {
+        engine.handle_picker_key(&ch.to_string(), Some(ch), false);
+    }
+    let action = engine.picker_confirm();
+    assert!(!engine.picker_open);
+    assert!(
+        matches!(action, EngineAction::RunInTerminal(ref cmd) if cmd == "cargo build"),
+        "expected RunInTerminal(\"cargo build\"), got {:?}",
+        action
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_command_center_task_reads_vscode_fallback() {
+    use std::io::Write;
+    let dir = std::env::temp_dir().join("vimcode_test_cc_task_vscode");
+    let _ = std::fs::remove_dir_all(&dir);
+    let vscode_dir = dir.join(".vscode");
+    std::fs::create_dir_all(&vscode_dir).unwrap();
+    let tasks_json = vscode_dir.join("tasks.json");
+    let mut f = std::fs::File::create(&tasks_json).unwrap();
+    write!(
+        f,
+        r#"{{
+  "version": "2.0.0",
+  "tasks": [
+    {{ "label": "npm start", "type": "shell", "command": "npm start" }}
+  ]
+}}"#
+    )
+    .unwrap();
+
+    let mut engine = Engine::new();
+    engine.cwd = dir.clone();
+    engine.open_command_center();
+    for ch in "task".chars() {
+        engine.handle_picker_key(&ch.to_string(), Some(ch), false);
+    }
+    assert_eq!(engine.picker_title, "Run Task");
+    assert_eq!(engine.picker_items.len(), 1);
+    assert_eq!(engine.picker_items[0].display, "npm start");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_command_center_help_includes_task_prefix() {
+    let mut engine = Engine::new();
+    engine.open_command_center();
+    engine.handle_picker_key("?", Some('?'), false);
+    let has_task = engine
+        .picker_items
+        .iter()
+        .any(|item| item.display == "task");
+    assert!(has_task, "help menu should include task prefix");
+}
+
+#[test]
+fn test_command_center_help_confirm_task_prefix() {
+    let mut engine = Engine::new();
+    engine.open_command_center();
+    engine.handle_picker_key("?", Some('?'), false);
+    let task_idx = engine
+        .picker_items
+        .iter()
+        .position(|item| item.display == "task")
+        .expect("task should be in help items");
+    for _ in 0..task_idx {
+        engine.handle_picker_key("Down", None, false);
+    }
+    engine.picker_confirm();
+    assert!(engine.picker_open);
+    assert_eq!(engine.picker_query, "task ");
+    assert_eq!(engine.picker_title, "Run Task");
+}
+
+#[test]
+fn test_command_center_task_create_tasks_json() {
+    let dir = std::env::temp_dir().join("vimcode_test_cc_task_create");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mut engine = Engine::new();
+    engine.cwd = dir.clone();
+    engine.open_command_center();
+    for ch in "task".chars() {
+        engine.handle_picker_key(&ch.to_string(), Some(ch), false);
+    }
+    // Should show "Configure Tasks..."
+    assert_eq!(engine.picker_items.len(), 1);
+    assert!(engine.picker_items[0].display.contains("Configure Tasks"));
+    // Confirm should create tasks.json and open it
+    engine.picker_confirm();
+    assert!(!engine.picker_open);
+    let tasks_path = dir.join(".vimcode").join("tasks.json");
+    assert!(tasks_path.exists(), "tasks.json should have been created");
+    let content = std::fs::read_to_string(&tasks_path).unwrap();
+    assert!(content.contains("\"tasks\""));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_command_center_placeholder_hints_on_open() {
+    let mut engine = Engine::new();
+    engine.open_command_center();
+    // Empty query should show placeholder hint items, not files
+    assert_eq!(engine.picker_query, "");
+    assert_eq!(engine.picker_title, "Search");
+    assert_eq!(engine.picker_items.len(), 9);
+    // Verify key hint items exist
+    let labels: Vec<&str> = engine
+        .picker_items
+        .iter()
+        .map(|i| i.display.as_str())
+        .collect();
+    assert!(labels.contains(&"Go to File"));
+    assert!(labels.contains(&"Show and Run Commands"));
+    assert!(labels.contains(&"Go to Line"));
+    assert!(labels.contains(&"Search for Text"));
+    assert!(labels.contains(&"Start Debugging"));
+    assert!(labels.contains(&"Run Task"));
+    assert!(labels.contains(&"More Help"));
+}
+
+#[test]
+fn test_command_center_placeholder_hints_select_commands() {
+    let mut engine = Engine::new();
+    engine.open_command_center();
+    // Select "Show and Run Commands" (index 1)
+    engine.handle_picker_key("Down", None, false);
+    engine.picker_confirm();
+    // Should switch to command mode with ">" prefix
+    assert!(engine.picker_open);
+    assert_eq!(engine.picker_query, ">");
+    assert_eq!(engine.picker_title, "Commands");
+}
+
+#[test]
+fn test_command_center_placeholder_hints_select_goto_line() {
+    let mut engine = Engine::new();
+    engine.open_command_center();
+    // Find "Go to Line" and select it
+    let idx = engine
+        .picker_items
+        .iter()
+        .position(|i| i.display == "Go to Line")
+        .unwrap();
+    for _ in 0..idx {
+        engine.handle_picker_key("Down", None, false);
+    }
+    engine.picker_confirm();
+    assert!(engine.picker_open);
+    assert_eq!(engine.picker_query, ":");
+    assert_eq!(engine.picker_title, "Go to Line");
+}
+
+#[test]
+fn test_command_center_placeholder_hints_select_debug() {
+    let mut engine = Engine::new();
+    engine.open_command_center();
+    let idx = engine
+        .picker_items
+        .iter()
+        .position(|i| i.display == "Start Debugging")
+        .unwrap();
+    for _ in 0..idx {
+        engine.handle_picker_key("Down", None, false);
+    }
+    engine.picker_confirm();
+    assert!(engine.picker_open);
+    assert_eq!(engine.picker_query, "debug ");
+    assert_eq!(engine.picker_title, "Start Debugging");
+}
+
+#[test]
+fn test_command_center_placeholder_hints_disappear_on_typing() {
+    let mut engine = Engine::new();
+    engine.open_command_center();
+    assert_eq!(engine.picker_items.len(), 9); // hints shown
+                                              // Type a character — should switch to file search mode
+    engine.handle_picker_key("a", Some('a'), false);
+    // Items should no longer be the placeholder hints
+    let has_hint = engine
+        .picker_items
+        .iter()
+        .any(|i| i.display == "Go to File");
+    assert!(!has_hint, "placeholder hints should be gone after typing");
+}
+
+#[test]
+fn test_command_center_placeholder_select_go_to_file() {
+    let mut engine = Engine::new();
+    engine.open_command_center();
+    // "Go to File" is first item (index 0), confirm it
+    engine.picker_confirm();
+    // Should stay open in file search mode (hints replaced by file list)
+    assert!(engine.picker_open);
+    let has_hint = engine
+        .picker_items
+        .iter()
+        .any(|i| i.display == "Go to File");
+    assert!(
+        !has_hint,
+        "placeholder hints should be replaced by file list"
+    );
+}
+
+#[test]
+fn test_leader_sw_opens_grep_with_word() {
+    use std::io::Write;
+    let dir = std::env::temp_dir().join("vimcode_test_leader_sw");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // Create a file with the word "foobar" so grep can find it
+    let test_file = dir.join("test.txt");
+    let mut f = std::fs::File::create(&test_file).unwrap();
+    writeln!(f, "hello foobar world").unwrap();
+    writeln!(f, "foobar again").unwrap();
+
+    let mut engine = engine_with_text("hello foobar world");
+    engine.cwd = dir.clone();
+    // Move cursor to "foobar" (col 6)
+    for _ in 0..6 {
+        press_char(&mut engine, 'l');
+    }
+    // Press <leader>sw (default leader is space)
+    press_char(&mut engine, ' ');
+    press_char(&mut engine, 's');
+    press_char(&mut engine, 'w');
+    assert!(engine.picker_open);
+    assert_eq!(engine.picker_source, PickerSource::Grep);
+    assert_eq!(engine.picker_query, "foobar");
+    // Should have grep results
+    assert!(
+        !engine.picker_items.is_empty(),
+        "should have grep results for 'foobar'"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_leader_sw_no_word() {
+    let mut engine = engine_with_text("");
+    // Press <leader>sw on empty buffer (default leader is space)
+    press_char(&mut engine, ' ');
+    press_char(&mut engine, 's');
+    press_char(&mut engine, 'w');
+    // Should open grep picker with empty query (no word found)
+    assert!(engine.picker_open);
+    assert_eq!(engine.picker_source, PickerSource::Grep);
+    assert_eq!(engine.picker_query, "");
+}
+
+#[test]
+fn test_grep_word_command() {
+    use std::io::Write;
+    let dir = std::env::temp_dir().join("vimcode_test_grep_word_cmd");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let test_file = dir.join("test.txt");
+    let mut f = std::fs::File::create(&test_file).unwrap();
+    writeln!(f, "myidentifier is here").unwrap();
+
+    let mut engine = engine_with_text("myidentifier is here");
+    engine.cwd = dir.clone();
+    engine.execute_command("GrepWord");
+    assert!(engine.picker_open);
+    assert_eq!(engine.picker_source, PickerSource::Grep);
+    assert_eq!(engine.picker_query, "myidentifier");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_grep_word_command_no_word() {
+    let mut engine = engine_with_text("");
+    engine.execute_command("GrepWord");
+    assert!(!engine.picker_open);
+    assert!(engine.message.contains("No word"));
+}
+
 #[test]
 fn test_ctrl_g_shows_file_info() {
     let mut engine = Engine::new();
@@ -14629,4 +15497,763 @@ fn test_unfocused_sidebar_allows_normal_keys() {
     // 'x' should delete a character when sidebar is not focused
     engine.handle_key("x", Some('x'), false);
     assert_eq!(engine.buffer().to_string(), "ello world\n");
+}
+
+// ─── Tab scroll offset tests ──────────────────────────────────────────────
+
+#[test]
+fn test_tab_scroll_offset_initial() {
+    let mut engine = Engine::new();
+    assert_eq!(engine.active_group().tab_scroll_offset, 0);
+    engine.new_tab(None);
+    // After opening a new tab, the offset should still allow the active tab to be visible.
+    // With only 2 tabs, offset should be 0 (no scrolling needed).
+    assert_eq!(engine.active_group().tab_scroll_offset, 0);
+}
+
+#[test]
+fn test_tab_scroll_offset_ensure_active_visible() {
+    let mut engine = Engine::new();
+    // Open 10 tabs.
+    for _ in 0..9 {
+        engine.new_tab(None);
+    }
+    assert_eq!(engine.active_group().tabs.len(), 10);
+    assert_eq!(engine.active_group().active_tab, 9);
+    // Manually set scroll offset way past the active tab.
+    engine.active_group_mut().tab_scroll_offset = 15;
+    engine.ensure_active_tab_visible();
+    // Offset should be clamped to valid range (at most total - 1 = 9).
+    assert!(engine.active_group().tab_scroll_offset <= 9);
+}
+
+#[test]
+fn test_tab_scroll_offset_scrolls_back_on_prev() {
+    let mut engine = Engine::new();
+    for _ in 0..5 {
+        engine.new_tab(None);
+    }
+    // Manually set offset to 3 (simulating many tabs offscreen).
+    engine.active_group_mut().tab_scroll_offset = 3;
+    // Active tab is 5 (last one opened).
+    assert_eq!(engine.active_group().active_tab, 5);
+    // Go to tab 0 — ensure offset scrolls back to show tab 0.
+    engine.goto_tab(0);
+    assert_eq!(engine.active_group().active_tab, 0);
+    assert_eq!(
+        engine.active_group().tab_scroll_offset,
+        0,
+        "Offset should scroll back to 0 when navigating to first tab"
+    );
+}
+
+#[test]
+fn test_tab_scroll_offset_adjusted_on_close() {
+    let mut engine = Engine::new();
+    for _ in 0..5 {
+        engine.new_tab(None);
+    }
+    assert_eq!(engine.active_group().tabs.len(), 6);
+    // Set a scroll offset.
+    engine.active_group_mut().tab_scroll_offset = 3;
+    engine.goto_tab(5);
+    // Close tabs until offset becomes too large.
+    engine.close_tab();
+    // After close, offset should still be valid.
+    assert!(engine.active_group().tab_scroll_offset < engine.active_group().tabs.len());
+}
+
+#[test]
+fn test_tab_scroll_offset_next_prev_cycle() {
+    let mut engine = Engine::new();
+    for _ in 0..3 {
+        engine.new_tab(None);
+    }
+    // Set offset to 2.
+    engine.active_group_mut().tab_scroll_offset = 2;
+    engine.goto_tab(3);
+    // Cycle with next_tab (wraps to 0).
+    engine.next_tab();
+    assert_eq!(engine.active_group().active_tab, 0);
+    assert_eq!(
+        engine.active_group().tab_scroll_offset,
+        0,
+        "Offset should scroll to 0 when wrapping to first tab"
+    );
+}
+
+#[test]
+fn test_tab_scroll_offset_new_tab_always_visible() {
+    let mut engine = Engine::new();
+    for _ in 0..10 {
+        engine.new_tab(None);
+    }
+    // New tab is always the last one and is always active.
+    assert_eq!(engine.active_group().active_tab, 10);
+    // The scroll offset should not be past the active tab.
+    assert!(engine.active_group().tab_scroll_offset <= engine.active_group().active_tab);
+}
+
+#[test]
+fn test_tab_nav_history_basic() {
+    let mut engine = Engine::new();
+    // History seeded with initial tab — arrows greyed out.
+    assert!(!engine.tab_nav_can_go_back());
+    assert!(!engine.tab_nav_can_go_forward());
+    engine.new_tab(None); // tab 1
+    engine.new_tab(None); // tab 2
+                          // new_tab does NOT push nav history — arrows still greyed out.
+    assert!(!engine.tab_nav_can_go_back());
+    // First explicit navigation: seed entry (tab 0) + new entry (tab 1).
+    engine.goto_tab(1); // push: tab 1 (seed tab 0 already in history)
+    assert!(engine.tab_nav_can_go_back());
+    engine.goto_tab(2); // push: tab 2
+    assert!(engine.tab_nav_can_go_back());
+    assert!(!engine.tab_nav_can_go_forward());
+    // Go back to tab 1
+    engine.tab_nav_back();
+    assert_eq!(engine.active_group().active_tab, 1);
+    assert!(engine.tab_nav_can_go_forward());
+    // Go back to tab 0 (the seed entry)
+    engine.tab_nav_back();
+    assert_eq!(engine.active_group().active_tab, 0);
+    // Go forward
+    engine.tab_nav_forward();
+    assert_eq!(engine.active_group().active_tab, 1);
+    engine.tab_nav_forward();
+    assert_eq!(engine.active_group().active_tab, 2);
+}
+
+#[test]
+fn test_tab_nav_history_dedup() {
+    let mut engine = Engine::new();
+    engine.new_tab(None); // tab 1
+                          // Switch to tab 0 multiple times via goto_tab
+    engine.goto_tab(0);
+    engine.goto_tab(0); // consecutive duplicate
+                        // Consecutive dedup: switching to same tab shouldn't add extra entries
+    let hist_len = engine.tab_nav_history.len();
+    engine.goto_tab(0); // same tab again
+    assert_eq!(engine.tab_nav_history.len(), hist_len);
+}
+
+#[test]
+fn test_tab_nav_forward_truncation() {
+    let mut engine = Engine::new();
+    engine.new_tab(None); // tab 1
+    engine.new_tab(None); // tab 2
+                          // Build history via explicit navigation.
+    engine.goto_tab(0);
+    engine.goto_tab(1);
+    engine.goto_tab(2);
+    // Go back twice
+    engine.tab_nav_back();
+    engine.tab_nav_back();
+    // Should be able to go forward
+    assert!(engine.tab_nav_can_go_forward());
+    // Navigate to a different tab — forward history should be truncated
+    engine.goto_tab(2);
+    assert!(!engine.tab_nav_can_go_forward());
+}
+
+#[test]
+fn test_tab_nav_close_cleanup() {
+    let mut engine = Engine::new();
+    engine.new_tab(None); // tab 1
+    engine.new_tab(None); // tab 2
+                          // Build history via navigation.
+    engine.goto_tab(0);
+    engine.goto_tab(1);
+    engine.goto_tab(2);
+    // Go back
+    engine.tab_nav_back();
+    assert_eq!(engine.active_group().active_tab, 1);
+    // Close current tab — history entries for this tab should be removed
+    engine.close_tab();
+    // Should still be able to navigate without crashing
+    if engine.tab_nav_can_go_back() {
+        engine.tab_nav_back();
+    }
+}
+
+#[test]
+fn test_tab_nav_bounded() {
+    let mut engine = Engine::new();
+    // Create many tabs and navigate to each one to build history.
+    for _ in 0..120 {
+        engine.new_tab(None);
+    }
+    // Navigate to each tab to build up history.
+    for i in 0..120 {
+        engine.goto_tab(i);
+    }
+    assert!(engine.tab_nav_history.len() <= 100);
+}
+
+#[test]
+fn test_tab_nav_cross_group() {
+    use crate::core::window::SplitDirection;
+    let mut engine = Engine::new();
+    // History seeded with initial tab — arrows greyed out.
+    assert!(!engine.tab_nav_can_go_back());
+    assert!(!engine.tab_nav_can_go_forward());
+
+    // Create two tabs in group 1.
+    engine.new_tab(None);
+    let group1 = engine.active_group;
+    // Navigate between tabs to build history (next_tab pushes to nav history).
+    engine.next_tab(); // switches to tab 0 — first nav seeds origin
+    engine.next_tab(); // switches to tab 1
+
+    // Open a second editor group (switches active_group).
+    engine.open_editor_group(SplitDirection::Vertical);
+    let group2 = engine.active_group;
+    assert_ne!(group1, group2);
+    // Create a tab in group 2 and navigate to build cross-group history.
+    engine.new_tab(None);
+    engine.next_tab(); // navigates within group 2 — pushes history
+
+    // Now we have history entries from both groups.
+    assert!(engine.tab_nav_can_go_back());
+    // Go back — should eventually reach group 1.
+    let mut reached_group1 = false;
+    for _ in 0..10 {
+        if !engine.tab_nav_can_go_back() {
+            break;
+        }
+        engine.tab_nav_back();
+        if engine.active_group == group1 {
+            reached_group1 = true;
+            break;
+        }
+    }
+    assert!(reached_group1, "back nav should cross groups");
+    // Go forward — should return to group 2.
+    let mut reached_group2 = false;
+    for _ in 0..10 {
+        if !engine.tab_nav_can_go_forward() {
+            break;
+        }
+        engine.tab_nav_forward();
+        if engine.active_group == group2 {
+            reached_group2 = true;
+            break;
+        }
+    }
+    assert!(reached_group2, "forward nav should cross groups");
+}
+
+// ── Git branch picker tests ─────────────────────────────────────────────────
+
+#[test]
+fn test_git_branch_picker_opens() {
+    let mut engine = engine_with_text("hello");
+    engine.open_picker(PickerSource::GitBranches);
+    assert!(engine.picker_open);
+    assert_eq!(engine.picker_source, PickerSource::GitBranches);
+    assert_eq!(engine.picker_title, "Switch Branch");
+}
+
+#[test]
+fn test_git_branch_picker_escape_closes() {
+    let mut engine = engine_with_text("hello");
+    engine.open_picker(PickerSource::GitBranches);
+    assert!(engine.picker_open);
+    press_special(&mut engine, "Escape");
+    assert!(!engine.picker_open);
+}
+
+#[test]
+fn test_git_branch_picker_populates_items() {
+    // In a git repo, should show at least one branch
+    let dir = std::env::temp_dir().join("vimcode_test_branch_picker_pop");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // Init a git repo with user config (needed in CI where no global git config exists)
+    let _ = std::process::Command::new("git")
+        .args(["init", "-b", "main"])
+        .current_dir(&dir)
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["config", "user.email", "test@test.com"])
+        .current_dir(&dir)
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["config", "user.name", "Test"])
+        .current_dir(&dir)
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["commit", "--allow-empty", "-m", "init"])
+        .current_dir(&dir)
+        .output();
+    let mut engine = engine_with_text("hello");
+    engine.cwd = dir.clone();
+    engine.open_picker(PickerSource::GitBranches);
+    assert!(engine.picker_open);
+    assert!(
+        !engine.picker_all_items.is_empty(),
+        "should have at least one branch"
+    );
+    // Check that the main branch is listed
+    assert!(
+        engine
+            .picker_all_items
+            .iter()
+            .any(|i| i.filter_text == "main"),
+        "should contain 'main' branch"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_git_branch_picker_checkout_action() {
+    let dir = std::env::temp_dir().join("vimcode_test_branch_checkout");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let _ = std::process::Command::new("git")
+        .args(["init", "-b", "main"])
+        .current_dir(&dir)
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["config", "user.email", "test@test.com"])
+        .current_dir(&dir)
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["config", "user.name", "Test"])
+        .current_dir(&dir)
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["commit", "--allow-empty", "-m", "init"])
+        .current_dir(&dir)
+        .output();
+    // Create a second branch
+    let _ = std::process::Command::new("git")
+        .args(["branch", "feature-test"])
+        .current_dir(&dir)
+        .output();
+    let mut engine = engine_with_text("hello");
+    engine.cwd = dir.clone();
+    engine.open_picker(PickerSource::GitBranches);
+    // Find and select the feature-test branch
+    engine.picker_query = "feature-test".to_string();
+    engine.picker_filter();
+    assert!(!engine.picker_items.is_empty(), "should match feature-test");
+    // Confirm selection (Enter)
+    press_special(&mut engine, "Return");
+    assert!(!engine.picker_open);
+    assert!(
+        engine.message.contains("Switched to feature-test"),
+        "message should confirm branch switch, got: {}",
+        engine.message
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_gbranches_command_opens_picker() {
+    let mut engine = engine_with_text("hello");
+    engine.execute_command("Gbranches");
+    assert!(engine.picker_open);
+    assert_eq!(engine.picker_source, PickerSource::GitBranches);
+    assert_eq!(engine.picker_title, "Switch Branch");
+}
+
+#[test]
+fn test_git_branch_picker_filter_typing() {
+    let dir = std::env::temp_dir().join("vimcode_test_branch_filter");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let _ = std::process::Command::new("git")
+        .args(["init", "-b", "main"])
+        .current_dir(&dir)
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["config", "user.email", "test@test.com"])
+        .current_dir(&dir)
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["config", "user.name", "Test"])
+        .current_dir(&dir)
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["commit", "--allow-empty", "-m", "init"])
+        .current_dir(&dir)
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["branch", "feature-abc"])
+        .current_dir(&dir)
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["branch", "bugfix-xyz"])
+        .current_dir(&dir)
+        .output();
+    let mut engine = engine_with_text("hello");
+    engine.cwd = dir.clone();
+    engine.open_picker(PickerSource::GitBranches);
+    let all_count = engine.picker_all_items.len();
+    assert!(all_count >= 3, "should have at least 3 branches");
+    // Type "feat" to filter
+    press_char(&mut engine, 'f');
+    press_char(&mut engine, 'e');
+    press_char(&mut engine, 'a');
+    press_char(&mut engine, 't');
+    assert_eq!(engine.picker_query, "feat");
+    assert!(
+        engine.picker_items.len() < all_count,
+        "filtered items should be fewer"
+    );
+    assert!(
+        engine
+            .picker_items
+            .iter()
+            .any(|i| i.filter_text.contains("feature")),
+        "should match feature branch"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── Inline new file/folder in explorer ──────────────────────────────────────
+
+#[test]
+fn test_explorer_new_file_start() {
+    let mut engine = Engine::new();
+    let dir = std::env::temp_dir().join("vimcode_test_new_file_start");
+    let _ = std::fs::create_dir_all(&dir);
+    engine.start_explorer_new_file(dir.clone());
+    assert!(engine.explorer_new_entry.is_some());
+    let entry = engine.explorer_new_entry.as_ref().unwrap();
+    assert_eq!(entry.parent_dir, dir);
+    assert!(!entry.is_folder);
+    assert!(entry.input.is_empty());
+    assert_eq!(entry.cursor, 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_explorer_new_folder_start() {
+    let mut engine = Engine::new();
+    let dir = std::env::temp_dir().join("vimcode_test_new_folder_start");
+    let _ = std::fs::create_dir_all(&dir);
+    engine.start_explorer_new_folder(dir.clone());
+    assert!(engine.explorer_new_entry.is_some());
+    let entry = engine.explorer_new_entry.as_ref().unwrap();
+    assert_eq!(entry.parent_dir, dir);
+    assert!(entry.is_folder);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_explorer_new_entry_typing() {
+    let mut engine = Engine::new();
+    let dir = std::env::temp_dir().join("vimcode_test_new_entry_typing");
+    let _ = std::fs::create_dir_all(&dir);
+    engine.start_explorer_new_file(dir.clone());
+
+    // Type "hello.rs"
+    for ch in "hello.rs".chars() {
+        engine.handle_explorer_new_entry_key(&ch.to_string(), Some(ch), false);
+    }
+    let entry = engine.explorer_new_entry.as_ref().unwrap();
+    assert_eq!(entry.input, "hello.rs");
+    assert_eq!(entry.cursor, "hello.rs".len());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_explorer_new_entry_escape_cancels() {
+    let mut engine = Engine::new();
+    let dir = std::env::temp_dir().join("vimcode_test_new_entry_escape");
+    let _ = std::fs::create_dir_all(&dir);
+    engine.start_explorer_new_file(dir.clone());
+    engine.handle_explorer_new_entry_key("a", Some('a'), false);
+    engine.handle_explorer_new_entry_key("Escape", None, false);
+    assert!(engine.explorer_new_entry.is_none());
+    assert!(!engine.explorer_needs_refresh);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_explorer_new_file_enter_creates() {
+    let mut engine = Engine::new();
+    let dir = std::env::temp_dir().join("vimcode_test_new_file_enter");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    engine.start_explorer_new_file(dir.clone());
+
+    for ch in "newfile.txt".chars() {
+        engine.handle_explorer_new_entry_key(&ch.to_string(), Some(ch), false);
+    }
+    engine.handle_explorer_new_entry_key("Return", None, false);
+
+    assert!(engine.explorer_new_entry.is_none());
+    assert!(engine.explorer_needs_refresh);
+    assert!(dir.join("newfile.txt").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_explorer_new_folder_enter_creates() {
+    let mut engine = Engine::new();
+    let dir = std::env::temp_dir().join("vimcode_test_new_folder_enter");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    engine.start_explorer_new_folder(dir.clone());
+
+    for ch in "subdir".chars() {
+        engine.handle_explorer_new_entry_key(&ch.to_string(), Some(ch), false);
+    }
+    engine.handle_explorer_new_entry_key("Return", None, false);
+
+    assert!(engine.explorer_new_entry.is_none());
+    assert!(engine.explorer_needs_refresh);
+    assert!(dir.join("subdir").is_dir());
+    assert!(engine.message.contains("Created folder"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_explorer_new_entry_empty_name_silent_cancel() {
+    let mut engine = Engine::new();
+    let dir = std::env::temp_dir().join("vimcode_test_new_entry_empty");
+    let _ = std::fs::create_dir_all(&dir);
+    engine.start_explorer_new_file(dir.clone());
+    // Press Enter with empty input
+    engine.handle_explorer_new_entry_key("Return", None, false);
+    assert!(engine.explorer_new_entry.is_none());
+    assert!(!engine.explorer_needs_refresh);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_explorer_new_entry_duplicate_shows_error() {
+    let mut engine = Engine::new();
+    let dir = std::env::temp_dir().join("vimcode_test_new_entry_dup");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // Create existing file
+    std::fs::write(dir.join("exists.txt"), "").unwrap();
+
+    engine.start_explorer_new_file(dir.clone());
+    for ch in "exists.txt".chars() {
+        engine.handle_explorer_new_entry_key(&ch.to_string(), Some(ch), false);
+    }
+    engine.handle_explorer_new_entry_key("Return", None, false);
+
+    assert!(engine.explorer_new_entry.is_none());
+    assert!(!engine.explorer_needs_refresh);
+    assert!(engine.message.contains("already exists"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_explorer_new_entry_backspace() {
+    let mut engine = Engine::new();
+    let dir = std::env::temp_dir().join("vimcode_test_new_entry_bs");
+    let _ = std::fs::create_dir_all(&dir);
+    engine.start_explorer_new_file(dir.clone());
+
+    for ch in "abc".chars() {
+        engine.handle_explorer_new_entry_key(&ch.to_string(), Some(ch), false);
+    }
+    engine.handle_explorer_new_entry_key("BackSpace", None, false);
+    let entry = engine.explorer_new_entry.as_ref().unwrap();
+    assert_eq!(entry.input, "ab");
+    assert_eq!(entry.cursor, 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_explorer_new_entry_cursor_movement() {
+    let mut engine = Engine::new();
+    let dir = std::env::temp_dir().join("vimcode_test_new_entry_cursor");
+    let _ = std::fs::create_dir_all(&dir);
+    engine.start_explorer_new_file(dir.clone());
+
+    for ch in "test".chars() {
+        engine.handle_explorer_new_entry_key(&ch.to_string(), Some(ch), false);
+    }
+    // Cursor at end (4)
+    assert_eq!(engine.explorer_new_entry.as_ref().unwrap().cursor, 4);
+
+    // Move left
+    engine.handle_explorer_new_entry_key("Left", None, false);
+    assert_eq!(engine.explorer_new_entry.as_ref().unwrap().cursor, 3);
+
+    // Home
+    engine.handle_explorer_new_entry_key("Home", None, false);
+    assert_eq!(engine.explorer_new_entry.as_ref().unwrap().cursor, 0);
+
+    // End
+    engine.handle_explorer_new_entry_key("End", None, false);
+    assert_eq!(engine.explorer_new_entry.as_ref().unwrap().cursor, 4);
+
+    // Right at end stays
+    engine.handle_explorer_new_entry_key("Right", None, false);
+    assert_eq!(engine.explorer_new_entry.as_ref().unwrap().cursor, 4);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ─── Dialog-based delete confirmation tests ──────────────────────────────────
+
+#[test]
+fn test_confirm_delete_file_shows_dialog() {
+    let dir = std::env::temp_dir().join("vimcode_test_confirm_delete_dialog");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("target.txt");
+    std::fs::write(&file, "content").unwrap();
+
+    let mut e = Engine::new();
+    e.confirm_delete_file(&file);
+
+    assert!(e.dialog.is_some());
+    let dlg = e.dialog.as_ref().unwrap();
+    assert_eq!(dlg.tag, "confirm_delete");
+    assert!(dlg.body[0].contains("target.txt"));
+    assert_eq!(dlg.buttons.len(), 2);
+    assert_eq!(dlg.buttons[0].action, "delete");
+    assert!(e.pending_delete.is_some());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_confirm_delete_file_cancel() {
+    let dir = std::env::temp_dir().join("vimcode_test_confirm_delete_cancel");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("keep.txt");
+    std::fs::write(&file, "keep me").unwrap();
+
+    let mut e = Engine::new();
+    e.confirm_delete_file(&file);
+    assert!(e.dialog.is_some());
+
+    // Cancel via Escape
+    e.handle_key("Escape", None, false);
+    assert!(e.dialog.is_none());
+    assert!(e.pending_delete.is_none());
+    // File still exists
+    assert!(file.exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_confirm_delete_file_confirm() {
+    let dir = std::env::temp_dir().join("vimcode_test_confirm_delete_confirm");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("deleteme.txt");
+    std::fs::write(&file, "gone").unwrap();
+
+    let mut e = Engine::new();
+    e.confirm_delete_file(&file);
+    assert!(e.dialog.is_some());
+
+    // Press 'd' hotkey to confirm delete
+    e.handle_key("", Some('d'), false);
+    assert!(e.dialog.is_none());
+    assert!(e.pending_delete.is_none());
+    // File should be deleted
+    assert!(!file.exists());
+    assert!(e.message.contains("Deleted"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_confirm_delete_folder() {
+    let dir = std::env::temp_dir().join("vimcode_test_confirm_delete_folder");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let subdir = dir.join("mydir");
+    std::fs::create_dir_all(&subdir).unwrap();
+    std::fs::write(subdir.join("file.txt"), "inner").unwrap();
+
+    let mut e = Engine::new();
+    e.confirm_delete_file(&subdir);
+
+    let dlg = e.dialog.as_ref().unwrap();
+    assert!(dlg.body[0].contains("folder"));
+
+    // Confirm delete
+    e.handle_key("", Some('d'), false);
+    assert!(!subdir.exists());
+    assert!(e.message.contains("Deleted folder"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_move_file_dialog_shows_with_input() {
+    let dir = std::env::temp_dir().join("vimcode_test_move_dialog");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("source.txt");
+    std::fs::write(&file, "data").unwrap();
+
+    let mut e = Engine::new();
+    e.start_move_file_dialog(&file, &dir);
+
+    assert!(e.dialog.is_some());
+    let dlg = e.dialog.as_ref().unwrap();
+    assert_eq!(dlg.tag, "move_file_input");
+    assert!(dlg.input.is_some());
+    let input = dlg.input.as_ref().unwrap();
+    assert_eq!(input.value, "source.txt");
+    assert!(!input.is_password);
+    assert_eq!(dlg.buttons[0].action, "move");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_move_file_dialog_cancel() {
+    let dir = std::env::temp_dir().join("vimcode_test_move_dialog_cancel");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("stay.txt");
+    std::fs::write(&file, "stay").unwrap();
+
+    let mut e = Engine::new();
+    e.start_move_file_dialog(&file, &dir);
+
+    // Escape cancels
+    e.handle_key("Escape", None, false);
+    assert!(e.dialog.is_none());
+    assert!(e.pending_move.is_none());
+    assert!(file.exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_move_file_dialog_confirm() {
+    let dir = std::env::temp_dir().join("vimcode_test_move_dialog_confirm");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let dest_dir = dir.join("dest");
+    std::fs::create_dir_all(&dest_dir).unwrap();
+    let file = dir.join("moveme.txt");
+    std::fs::write(&file, "moving").unwrap();
+
+    let mut e = Engine::new();
+    e.cwd = dir.clone();
+    e.start_move_file_dialog(&file, &dir);
+
+    // Clear the input and type new destination
+    if let Some(ref mut dlg) = e.dialog {
+        dlg.input.as_mut().unwrap().value = "dest".to_string();
+    }
+
+    // Press Enter to confirm (selected button is "Move")
+    e.handle_key("Return", None, false);
+    assert!(e.dialog.is_none());
+    assert!(!file.exists());
+    assert!(dest_dir.join("moveme.txt").exists());
+    assert!(e.message.contains("Moved"));
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

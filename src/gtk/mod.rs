@@ -70,11 +70,12 @@ type SplitBtnMap = HashMap<usize, (f64, f64)>;
 /// Cached dialog button hit rects: Vec<(x, y, w, h)> populated by draw_dialog_popup.
 type DialogBtnRects = Vec<(f64, f64, f64, f64)>;
 
-/// Return type of draw_tab_bar: (tab_slot_positions, diff_btn_positions, split_btn_widths).
+/// Return type of draw_tab_bar: (tab_slot_positions, diff_btn_positions, split_btn_widths, visible_tab_count).
 type TabBarDrawResult = (
     Vec<(f64, f64)>,
     Option<(f64, f64, f64, f64, f64, f64)>,
     Option<(f64, f64)>,
+    usize,
 );
 
 struct App {
@@ -87,6 +88,8 @@ struct App {
     tree_store: Option<gtk4::TreeStore>,
     tree_has_focus: bool,
     file_tree_view: Rc<RefCell<Option<gtk4::TreeView>>>,
+    /// Cell renderer for filenames in the explorer tree (for triggering inline editing).
+    name_cell: Rc<RefCell<Option<gtk4::CellRendererText>>>,
     drawing_area: Rc<RefCell<Option<gtk4::DrawingArea>>>,
     menu_bar_da: Rc<RefCell<Option<gtk4::DrawingArea>>>,
     debug_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>>,
@@ -172,6 +175,11 @@ struct App {
     /// Cached diff toolbar button pixel positions, populated during draw_tab_bar.
     diff_btn_map: Rc<RefCell<DiffBtnMap>>,
     split_btn_map: Rc<RefCell<SplitBtnMap>>,
+    /// Cached nav arrow pixel hit rects from draw_menu_bar: (back_x, back_end, fwd_x, fwd_end, unit_end).
+    #[allow(dead_code, clippy::type_complexity)]
+    nav_arrow_rects: Rc<RefCell<(f64, f64, f64, f64, f64)>>,
+    /// Tab visible counts reported by draw callback, applied to engine in tick handler.
+    tab_visible_counts: Rc<RefCell<Vec<(crate::core::window::GroupId, usize)>>>,
     /// True while the user is dragging the terminal panel's scrollbar thumb.
     terminal_sb_dragging: bool,
     /// True while the user drags the terminal header row to resize the panel.
@@ -332,10 +340,15 @@ enum Msg {
     CreateFile(PathBuf, String),
     /// Create a new folder: (parent_dir, name).
     CreateFolder(PathBuf, String),
+    /// Start inline new-file creation in the explorer tree under the given dir.
+    StartInlineNewFile(PathBuf),
+    /// Start inline new-folder creation in the explorer tree under the given dir.
+    StartInlineNewFolder(PathBuf),
+    /// Explorer CRUD action triggered by keyboard shortcut (the char string).
+    ExplorerAction(String),
+    ExplorerActivateSelected,
     /// Show confirmation dialog before deleting.
     ConfirmDeletePath(PathBuf),
-    /// Delete a file or folder at the given path (after confirmation).
-    DeletePath(PathBuf),
     /// Refresh the file tree from current working directory.
     RefreshFileTree,
     /// Focus the explorer panel (Ctrl-Shift-E).
@@ -379,9 +392,15 @@ enum Msg {
     /// Close find dialog.
     CloseFindDialog,
     /// Window size changed.
-    WindowResized { width: i32, height: i32 },
+    WindowResized {
+        width: i32,
+        height: i32,
+    },
     /// Window closing (save session state).
-    WindowClosing { width: i32, height: i32 },
+    WindowClosing {
+        width: i32,
+        height: i32,
+    },
     /// Sidebar was resized via drag handle — save new width.
     SidebarResized,
     /// Project search input text changed (query update, no search yet).
@@ -403,7 +422,10 @@ enum Msg {
     /// User clicked "Replace All" button — run replace across files.
     ProjectReplaceAll,
     /// Mouse scroll wheel on editor drawing area.
-    MouseScroll { delta_x: f64, delta_y: f64 },
+    MouseScroll {
+        delta_x: f64,
+        delta_y: f64,
+    },
     /// Ctrl+Click — plant a secondary cursor at the clicked buffer position.
     CtrlMouseClick {
         x: f64,
@@ -440,7 +462,9 @@ enum Msg {
     /// Open a vsplit diff: current file is right side, stored path is left.
     DiffWithSelected(PathBuf),
     /// GDK clipboard text arrived for pasting into command/search/insert input.
-    ClipboardPasteToInput { text: String },
+    ClipboardPasteToInput {
+        text: String,
+    },
     /// Toggle the integrated terminal panel open/closed.
     ToggleTerminal,
     /// Open a new terminal tab at a specific directory.
@@ -464,9 +488,15 @@ enum Msg {
     /// Paste from system clipboard into the terminal PTY.
     TerminalPasteClipboard,
     /// Mouse pressed at terminal cell (row, col).
-    TerminalMouseDown { row: u16, col: u16 },
+    TerminalMouseDown {
+        row: u16,
+        col: u16,
+    },
     /// Mouse dragged to terminal cell (row, col).
-    TerminalMouseDrag { row: u16, col: u16 },
+    TerminalMouseDrag {
+        row: u16,
+        col: u16,
+    },
     /// Mouse released over terminal.
     TerminalMouseUp,
     /// Open the terminal inline find bar.
@@ -487,6 +517,12 @@ enum Msg {
     OpenMenu(usize),
     /// Close the open menu dropdown.
     CloseMenu,
+    /// Navigate back in MRU tab history.
+    MruNavBack,
+    /// Navigate forward in MRU tab history.
+    MruNavForward,
+    /// Open the Command Center picker (search box click).
+    OpenCommandCenter,
     /// Activate a menu item: (menu_idx, item_idx, action_str).
     MenuActivateItem(usize, usize, String),
     /// Highlight a menu dropdown item by index (mouse hover).
@@ -498,7 +534,7 @@ enum Msg {
     /// Scroll in the debug sidebar DrawingArea (dy value from EventControllerScroll).
     DebugSidebarScroll(f64),
     /// Click in the Source Control sidebar DrawingArea (x, y coordinates in pixels).
-    ScSidebarClick(f64, f64),
+    ScSidebarClick(f64, f64, i32),
     /// Mouse motion in the Source Control sidebar DrawingArea (x, y).
     ScSidebarMotion(f64, f64),
     /// Key press in the Source Control sidebar DrawingArea.
@@ -548,9 +584,14 @@ enum Msg {
     /// User clicked ✕ on a tab with unsaved changes — ask what to do.
     ShowCloseTabConfirm,
     /// User responded to the close-tab unsaved-changes dialog.
-    CloseTabConfirmed { save: bool },
+    CloseTabConfirmed {
+        save: bool,
+    },
     /// A setting was changed via the Settings sidebar form widget.
-    SettingChanged { key: String, value: String },
+    SettingChanged {
+        key: String,
+        value: String,
+    },
     /// Open a buffer editor for the named setting key (e.g. "keymaps", "extension_registries").
     OpenBufferEditor(String),
     /// Alt key released — confirm tab switcher if open.
@@ -563,7 +604,10 @@ enum Msg {
         y: f64,
     },
     /// Right-click on the editor area (buffer text).
-    EditorRightClick { x: f64, y: f64 },
+    EditorRightClick {
+        x: f64,
+        y: f64,
+    },
 }
 
 #[relm4::component]
@@ -807,10 +851,7 @@ impl SimpleComponent for App {
                                 set_height_request: 32,
                                 connect_clicked[sender, file_tree_view] => move |_| {
                                     let parent_dir = selected_parent_dir(&file_tree_view);
-                                    show_name_prompt_dialog("New File", "", None, {
-                                        let s = sender.clone();
-                                        move |name| s.input(Msg::CreateFile(parent_dir.clone(), name))
-                                    });
+                                    sender.input(Msg::StartInlineNewFile(parent_dir));
                                 }
                             },
 
@@ -821,10 +862,7 @@ impl SimpleComponent for App {
                                 set_height_request: 32,
                                 connect_clicked[sender, file_tree_view] => move |_| {
                                     let parent_dir = selected_parent_dir(&file_tree_view);
-                                    show_name_prompt_dialog("New Folder", "", None, {
-                                        let s = sender.clone();
-                                        move |name| s.input(Msg::CreateFolder(parent_dir.clone(), name))
-                                    });
+                                    sender.input(Msg::StartInlineNewFolder(parent_dir));
                                 }
                             },
 
@@ -889,9 +927,32 @@ impl SimpleComponent for App {
                                             sender.input(Msg::ToggleFocusSearch);
                                             return gtk4::glib::Propagation::Stop;
                                         }
-                                        // Arrow keys for navigation - let TreeView handle them
-                                        if matches!(key_name.as_str(), "Up" | "Down" | "Left" | "Right" | "Return" | "space") {
+                                        // Arrow keys + Enter: let TreeView handle natively
+                                        // (Enter fires row_activated which handles dirs+files)
+                                        if matches!(key_name.as_str(), "Up" | "Down" | "Left" | "Right" | "Return" | "KP_Enter" | "space") {
                                             return gtk4::glib::Propagation::Proceed;
+                                        }
+
+                                        // Explorer CRUD keys (a/A/D/r/M etc.)
+                                        if !modifier.contains(gtk4::gdk::ModifierType::CONTROL_MASK) {
+                                            if let Some(ch) = key.to_unicode() {
+                                                let ch_str = ch.to_string();
+                                                // Resolve action with a short-lived borrow
+                                                let is_explorer_key = {
+                                                    let ek = &engine.borrow().settings.explorer_keys;
+                                                    ch_str == ek.new_file || ch_str == ek.new_folder
+                                                        || ch_str == ek.delete || ch_str == ek.rename
+                                                        || ch_str == ek.move_file
+                                                };
+                                                if is_explorer_key {
+                                                    // Defer via idle to avoid any borrow conflicts
+                                                    let s = sender.clone();
+                                                    gtk4::glib::idle_add_local_once(move || {
+                                                        s.input(Msg::ExplorerAction(ch_str));
+                                                    });
+                                                    return gtk4::glib::Propagation::Stop;
+                                                }
+                                            }
                                         }
 
                                         // Stop all other keys from triggering TreeView search
@@ -1491,6 +1552,15 @@ impl SimpleComponent for App {
                                         return gtk4::glib::Propagation::Stop;
                                     }
 
+                                    if matches_gtk_key(&pk.nav_back, key, modifier) {
+                                        engine.borrow_mut().tab_nav_back();
+                                        return gtk4::glib::Propagation::Stop;
+                                    }
+                                    if matches_gtk_key(&pk.nav_forward, key, modifier) {
+                                        engine.borrow_mut().tab_nav_forward();
+                                        return gtk4::glib::Propagation::Stop;
+                                    }
+
                                     // Shift+F5 → stop, Shift+F11 → stepout (debug shortcuts)
                                     if shift && !ctrl && !alt {
                                         match key_name.as_str() {
@@ -1688,6 +1758,7 @@ impl SimpleComponent for App {
                                 // Using take() clears the flag atomically so it fires once per request.
                                 if model.draw_needed.take() {
                                     drawing_area.queue_draw();
+                                    menu_bar_da.queue_draw();
                                 }
                                 // Return static classes — no even/odd alternation — so GTK
                                 // skips CSS re-resolution when classes haven't changed.
@@ -1893,6 +1964,15 @@ impl SimpleComponent for App {
 
         let engine = Rc::new(RefCell::new(engine));
 
+        // Register engine pointer for emergency swap flush from the panic hook.
+        // SAFETY: The Rc<RefCell<Engine>> lives for the GTK app's lifetime.
+        // The pointer is only dereferenced during panic recovery on the main thread.
+        unsafe {
+            crate::core::swap::register_emergency_engine(
+                engine.as_ptr() as *const crate::core::Engine
+            );
+        }
+
         // Create TreeStore with 6 columns: Icon, Name, FullPath, FgColor, Indicator, IndicatorColor
         let tree_store = gtk4::TreeStore::new(&[
             gtk4::glib::Type::STRING, // 0: Icon
@@ -1904,6 +1984,8 @@ impl SimpleComponent for App {
         ]);
 
         let file_tree_view_ref = Rc::new(RefCell::new(None));
+        let name_cell_ref: Rc<RefCell<Option<gtk4::CellRendererText>>> =
+            Rc::new(RefCell::new(None));
         let active_ctx_popover_ref: Rc<RefCell<Option<gtk4::PopoverMenu>>> =
             Rc::new(RefCell::new(None));
         let drawing_area_ref = Rc::new(RefCell::new(None));
@@ -1947,6 +2029,11 @@ impl SimpleComponent for App {
             Rc::new(RefCell::new(HashMap::new()));
         let diff_btn_map_cell: Rc<RefCell<DiffBtnMap>> = Rc::new(RefCell::new(HashMap::new()));
         let split_btn_map_cell: Rc<RefCell<SplitBtnMap>> = Rc::new(RefCell::new(HashMap::new()));
+        let tab_visible_counts_cell: Rc<RefCell<Vec<(crate::core::window::GroupId, usize)>>> =
+            Rc::new(RefCell::new(Vec::new()));
+        #[allow(clippy::type_complexity)]
+        let nav_arrow_rects_cell: Rc<RefCell<(f64, f64, f64, f64, f64)>> =
+            Rc::new(RefCell::new((0.0, 0.0, 0.0, 0.0, 0.0)));
         let sidebar_inner_sw_ref: Rc<RefCell<Option<gtk4::ScrolledWindow>>> =
             Rc::new(RefCell::new(None));
         let sidebar_revealer_ref: Rc<RefCell<Option<gtk4::Revealer>>> = Rc::new(RefCell::new(None));
@@ -2009,6 +2096,7 @@ impl SimpleComponent for App {
             tree_store: Some(tree_store.clone()),
             tree_has_focus: false,
             file_tree_view: file_tree_view_ref.clone(),
+            name_cell: name_cell_ref.clone(),
             drawing_area: drawing_area_ref.clone(),
             menu_bar_da: menu_bar_da_ref.clone(),
             debug_sidebar_da_ref: debug_sidebar_da_ref.clone(),
@@ -2058,6 +2146,8 @@ impl SimpleComponent for App {
             tab_slot_positions: tab_slot_positions_cell.clone(),
             diff_btn_map: diff_btn_map_cell.clone(),
             split_btn_map: split_btn_map_cell.clone(),
+            nav_arrow_rects: nav_arrow_rects_cell.clone(),
+            tab_visible_counts: tab_visible_counts_cell.clone(),
             terminal_sb_dragging: false,
             terminal_resize_dragging: false,
             terminal_split_dragging: false,
@@ -2272,8 +2362,10 @@ impl SimpleComponent for App {
                         }
                     }
                     let title = engine
-                        .active_buffer_name()
-                        .map(|n| format!("VimCode \u{2014} {}", n))
+                        .cwd
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| n.to_string())
                         .unwrap_or_else(|| "VimCode".to_string());
                     let data = render::MenuBarData {
                         open_menu_idx: engine.menu_open_idx,
@@ -2283,6 +2375,8 @@ impl SimpleComponent for App {
                         title,
                         show_window_controls: true,
                         is_vscode_mode: engine.is_vscode_mode(),
+                        nav_back_enabled: engine.tab_nav_can_go_back(),
+                        nav_forward_enabled: engine.tab_nav_can_go_forward(),
                     };
                     let line_height = lh.get();
                     // Draw the dropdown at window-level coordinates.
@@ -2508,6 +2602,7 @@ impl SimpleComponent for App {
         // Draw function: renders menu labels using the same Cairo helper.
         {
             let engine = engine.clone();
+            let nav_rects = nav_arrow_rects_cell.clone();
             widgets.menu_bar_da.set_draw_func(move |da, cr, _w, _h| {
                 let engine = engine.borrow();
                 // Menu bar is always visible in GTK (acts as the window title bar).
@@ -2533,8 +2628,10 @@ impl SimpleComponent for App {
                     0
                 };
                 let title = engine
-                    .active_buffer_name()
-                    .map(|n| format!("VimCode \u{2014} {}", n))
+                    .cwd
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.to_string())
                     .unwrap_or_else(|| "VimCode".to_string());
                 let data = render::MenuBarData {
                     open_menu_idx: engine.menu_open_idx,
@@ -2544,19 +2641,23 @@ impl SimpleComponent for App {
                     title,
                     show_window_controls: true,
                     is_vscode_mode: engine.is_vscode_mode(),
+                    nav_back_enabled: engine.tab_nav_can_go_back(),
+                    nav_forward_enabled: engine.tab_nav_can_go_forward(),
                 };
                 let w = da.width() as f64;
                 let h = da.height() as f64;
-                draw_menu_bar(cr, &data, &theme, 0.0, 0.0, w, h);
+                let rects = draw_menu_bar(cr, &data, &theme, 0.0, 0.0, w, h);
+                *nav_rects.borrow_mut() = rects;
             });
         }
         // Click gesture: open/close individual menus (no hamburger zone here).
         {
             let sender_menu = sender.input_sender().clone();
             let engine_menu = engine.clone();
+            let nav_rects_click = nav_arrow_rects_cell.clone();
             let gesture = gtk4::GestureClick::new();
             gesture.set_button(1);
-            gesture.connect_pressed(move |_, _, x, _y| {
+            gesture.connect_pressed(move |gest, _, x, _y| {
                 let engine = engine_menu.borrow();
                 // Scan menu labels from left edge (no hamburger on this widget).
                 // Use ~7px/char + 10px padding as approximation for UI font metrics.
@@ -2572,6 +2673,30 @@ impl SimpleComponent for App {
                         return;
                     }
                     cursor_x += item_w;
+                }
+                // Use cached arrow pixel positions from draw_menu_bar.
+                let (back_x, back_end, fwd_x, fwd_end, unit_end) = *nav_rects_click.borrow();
+                if x >= back_x && x < back_end {
+                    // Claim the gesture so WindowHandle doesn't maximize on double-click.
+                    gest.set_state(gtk4::EventSequenceState::Claimed);
+                    sender_menu.send(Msg::MruNavBack).ok();
+                    return;
+                }
+                if x >= fwd_x && x < fwd_end {
+                    gest.set_state(gtk4::EventSequenceState::Claimed);
+                    sender_menu.send(Msg::MruNavForward).ok();
+                    return;
+                }
+                // Click on the search box area → open Command Center.
+                if x >= fwd_end && x < unit_end {
+                    gest.set_state(gtk4::EventSequenceState::Claimed);
+                    sender_menu.send(Msg::OpenCommandCenter).ok();
+                    return;
+                }
+                // Claim clicks within the nav+search box area to prevent
+                // WindowHandle double-click-to-maximize on the search box.
+                if x >= back_x && x < unit_end {
+                    gest.set_state(gtk4::EventSequenceState::Claimed);
                 }
                 // Click in empty part of bar → close any open dropdown
                 if engine.menu_open_idx.is_some() {
@@ -2715,8 +2840,8 @@ impl SimpleComponent for App {
             let sender_sc = sender.input_sender().clone();
             let gesture = gtk4::GestureClick::new();
             gesture.set_button(1);
-            gesture.connect_pressed(move |_, _, x, y| {
-                sender_sc.send(Msg::ScSidebarClick(x, y)).ok();
+            gesture.connect_pressed(move |_, n_press, x, y| {
+                sender_sc.send(Msg::ScSidebarClick(x, y, n_press)).ok();
             });
             widgets.git_sidebar_da.add_controller(gesture);
         }
@@ -3080,24 +3205,45 @@ impl SimpleComponent for App {
         col.add_attribute(&name_cell, "text", 1);
         col.add_attribute(&name_cell, "foreground", 3);
 
-        // Handle inline cell editing for rename
+        // Store name_cell for later use by StartInlineNewFile/Folder handlers
+        *name_cell_ref.borrow_mut() = Some(name_cell.clone());
+
+        // Handle inline cell editing for rename and new file/folder creation
         {
             let sender_for_edit = sender.clone();
             let ts_for_edit = tree_store.clone();
             let name_cell_for_cancel = name_cell.clone();
+            let ts_for_cancel = tree_store.clone();
+            let sender_for_cancel = sender.clone();
             name_cell.connect_edited(move |cell, tree_path, new_text| {
                 // Disable editable after edit completes
                 cell.set_property("editable", false);
                 let new_name = new_text.trim();
-                if new_name.is_empty() {
-                    return;
-                }
-                // Get the old path from the TreeStore (column 2)
+                // Get the path/marker from the TreeStore (column 2)
                 if let Some(iter) = ts_for_edit.iter(&tree_path) {
-                    let old_path_str: String =
+                    let path_str: String =
                         ts_for_edit.get_value(&iter, 2).get().unwrap_or_default();
-                    if !old_path_str.is_empty() {
-                        let old_path = PathBuf::from(&old_path_str);
+                    if let Some(parent_dir) = path_str.strip_prefix("__NEW_FILE__") {
+                        // New file creation — remove temporary row
+                        ts_for_edit.remove(&iter);
+                        if !new_name.is_empty() {
+                            sender_for_edit.input(Msg::CreateFile(
+                                PathBuf::from(parent_dir),
+                                new_name.to_string(),
+                            ));
+                        }
+                    } else if let Some(parent_dir) = path_str.strip_prefix("__NEW_FOLDER__") {
+                        // New folder creation — remove temporary row
+                        ts_for_edit.remove(&iter);
+                        if !new_name.is_empty() {
+                            sender_for_edit.input(Msg::CreateFolder(
+                                PathBuf::from(parent_dir),
+                                new_name.to_string(),
+                            ));
+                        }
+                    } else if !new_name.is_empty() && !path_str.is_empty() {
+                        // Regular rename
+                        let old_path = PathBuf::from(&path_str);
                         sender_for_edit.input(Msg::RenameFile(old_path, new_name.to_string()));
                     }
                 }
@@ -3105,6 +3251,11 @@ impl SimpleComponent for App {
             name_cell.connect_editing_canceled(move |_cell| {
                 // Disable editable when editing is cancelled
                 name_cell_for_cancel.set_property("editable", false);
+                // Remove any temporary new-entry rows
+                if let Some(iter) = ts_for_cancel.iter_first() {
+                    remove_new_entry_rows(&ts_for_cancel, &iter);
+                }
+                sender_for_cancel.input(Msg::RefreshFileTree);
             });
         }
 
@@ -3170,8 +3321,13 @@ impl SimpleComponent for App {
                         let path_buf = PathBuf::from(full_path);
                         if path_buf.is_file() {
                             sender_for_tree.input(Msg::OpenFileFromSidebar(path_buf));
+                        } else if path_buf.is_dir() {
+                            if tree_view.row_expanded(tree_path) {
+                                tree_view.collapse_row(tree_path);
+                            } else {
+                                tree_view.expand_row(tree_path, false);
+                            }
                         }
-                        // If directory, do nothing for now (expand/collapse works automatically)
                     }
                 }
             });
@@ -3194,6 +3350,10 @@ impl SimpleComponent for App {
                             let path_buf = PathBuf::from(full_path);
                             if path_buf.is_file() {
                                 sender_for_click.input(Msg::PreviewFileFromSidebar(path_buf));
+                            } else {
+                                // Clicking a directory keeps explorer focus so
+                                // keyboard shortcuts (a/A/D/r) work immediately.
+                                sender_for_click.input(Msg::FocusExplorer);
                             }
                         }
                     }
@@ -3275,11 +3435,7 @@ impl SimpleComponent for App {
                     let pd = parent_dir.clone();
                     let a = gtk4::gio::SimpleAction::new("new_file", None);
                     a.connect_activate(move |_, _| {
-                        let pd2 = pd.clone();
-                        show_name_prompt_dialog("New File", "", None, {
-                            let s2 = s.clone();
-                            move |name| s2.input(Msg::CreateFile(pd2.clone(), name))
-                        });
+                        s.input(Msg::StartInlineNewFile(pd.clone()));
                     });
                     add_action(&actions, &a);
                 }
@@ -3288,11 +3444,7 @@ impl SimpleComponent for App {
                     let pd = parent_dir.clone();
                     let a = gtk4::gio::SimpleAction::new("new_folder", None);
                     a.connect_activate(move |_, _| {
-                        let pd2 = pd.clone();
-                        show_name_prompt_dialog("New Folder", "", None, {
-                            let s2 = s.clone();
-                            move |name| s2.input(Msg::CreateFolder(pd2.clone(), name))
-                        });
+                        s.input(Msg::StartInlineNewFolder(pd.clone()));
                     });
                     add_action(&actions, &a);
                 }
@@ -3753,7 +3905,21 @@ impl SimpleComponent for App {
                 let char_width = cw_cell_resize.get().max(1.0);
 
                 let total_lines = (height as f64 / line_height).floor() as usize;
-                let viewport_lines = total_lines.saturating_sub(2);
+                // Subtract status bar (1) + command line (1) + tab bar (1) +
+                // breadcrumbs (1 if enabled).  The per-window values from
+                // draw are more accurate; this is just the fallback estimate.
+                let chrome_rows = {
+                    let e = engine_for_resize.borrow();
+                    let mut rows = 3usize; // status + cmd + tab bar
+                    if e.settings.breadcrumbs {
+                        rows += 1;
+                    }
+                    if e.settings.hide_single_tab && e.active_group().tabs.len() <= 1 {
+                        rows -= 1; // tab bar hidden
+                    }
+                    rows
+                };
+                let viewport_lines = total_lines.saturating_sub(chrome_rows);
 
                 // viewport_cols here is a rough estimate used by ensure_cursor_visible.
                 // The accurate wrap column is computed in build_rendered_window from
@@ -3808,6 +3974,7 @@ impl SimpleComponent for App {
         let editor_hover_rect_for_draw = model.editor_hover_popup_rect.clone();
         let editor_hover_links_for_draw = model.editor_hover_link_rects.clone();
         let mouse_pos_for_draw = mouse_pos_cell.clone();
+        let tab_vis_for_draw = tab_visible_counts_cell.clone();
         widgets
             .drawing_area
             .set_draw_func(move |_, cr, width, height| {
@@ -3831,6 +3998,7 @@ impl SimpleComponent for App {
                         &editor_hover_rect_for_draw,
                         &editor_hover_links_for_draw,
                         mouse_pos_for_draw.get(),
+                        &tab_vis_for_draw,
                     );
                 }));
                 if let Err(e) = result {
@@ -4099,8 +4267,11 @@ impl SimpleComponent for App {
             | Msg::PreviewFileFromSidebar(_)
             | Msg::CreateFile(_, _)
             | Msg::CreateFolder(_, _)
+            | Msg::StartInlineNewFile(_)
+            | Msg::StartInlineNewFolder(_)
+            | Msg::ExplorerAction(_)
+            | Msg::ExplorerActivateSelected
             | Msg::ConfirmDeletePath(_)
-            | Msg::DeletePath(_)
             | Msg::RefreshFileTree
             | Msg::FocusExplorer
             | Msg::ToggleFocusExplorer
@@ -4374,6 +4545,9 @@ impl SimpleComponent for App {
             Msg::ToggleMenuBar
             | Msg::OpenMenu(_)
             | Msg::CloseMenu
+            | Msg::MruNavBack
+            | Msg::MruNavForward
+            | Msg::OpenCommandCenter
             | Msg::MenuActivateItem(_, _, _)
             | Msg::MenuHighlight(_) => {
                 self.handle_menu_msg(msg, &sender);
@@ -4383,7 +4557,7 @@ impl SimpleComponent for App {
             | Msg::DebugSidebarScroll(_) => {
                 self.handle_debug_sidebar_msg(msg);
             }
-            Msg::ScSidebarClick(_, _) | Msg::ScSidebarMotion(_, _) | Msg::ScKey(_, _) => {
+            Msg::ScSidebarClick(_, _, _) | Msg::ScSidebarMotion(_, _) | Msg::ScKey(_, _) => {
                 self.handle_sc_sidebar_msg(msg);
             }
             Msg::ExtSidebarKey(_, _) | Msg::ExtSidebarClick(_, _, _) => {
@@ -5042,6 +5216,49 @@ impl App {
         // Route keys to sidebar handlers when a sidebar has focus.
         // GTK focus on sidebar DrawingAreas is unreliable, so we check
         // the engine focus flags here (same approach as TUI backend).
+
+        // Explorer sidebar: CRUD keys + navigation
+        if self.engine.borrow().explorer_has_focus {
+            let key_mapped = map_gtk_key_name(key_name.as_str());
+            if key_mapped == "Escape" {
+                self.engine.borrow_mut().explorer_has_focus = false;
+                self.tree_has_focus = false;
+                if let Some(ref drawing) = *self.drawing_area.borrow() {
+                    drawing.grab_focus();
+                }
+                self.draw_needed.set(true);
+                return;
+            }
+            // Explorer CRUD keys
+            if !ctrl {
+                if let Some(ch) = unicode {
+                    let is_crud = self
+                        .engine
+                        .borrow()
+                        .settings
+                        .explorer_keys
+                        .resolve(ch)
+                        .is_some();
+                    if is_crud {
+                        // Defer to avoid borrow conflicts with start_inline_new_entry
+                        let s = sender.clone();
+                        gtk4::glib::idle_add_local_once(move || {
+                            s.input(Msg::ExplorerAction(ch.to_string()));
+                        });
+                        self.draw_needed.set(true);
+                        return;
+                    }
+                }
+            }
+            // Let j/k/Up/Down through to TreeView for navigation
+            if matches!(key_mapped, "j" | "k" | "Up" | "Down") {
+                return; // don't consume — let GTK TreeView handle navigation
+            }
+            // Other keys while explorer focused — ignore (don't pass to editor)
+            self.draw_needed.set(true);
+            return;
+        }
+
         {
             let mut engine = self.engine.borrow_mut();
             if engine.ext_panel_has_focus {
@@ -5191,6 +5408,15 @@ impl App {
             }
         }
 
+        // Ctrl-W h/l overflow: move focus to explorer sidebar
+        {
+            let overflow = self.engine.borrow_mut().window_nav_overflow.take();
+            if let Some(false) = overflow {
+                // Left overflow → focus explorer
+                sender.input(Msg::FocusExplorer);
+            }
+        }
+
         // Sync the unnamed register to the system clipboard if it changed.
         // The comparison is O(1); actual write is deferred to the background thread.
         self.sync_plus_register_to_clipboard();
@@ -5207,6 +5433,17 @@ impl App {
     }
 
     fn handle_poll_tick(&mut self, sender: &ComponentSender<Self>) {
+        // Apply tab visible counts reported by the last draw callback.
+        {
+            let counts = self.tab_visible_counts.borrow().clone();
+            if !counts.is_empty() {
+                let mut engine = self.engine.borrow_mut();
+                for (group_id, count) in &counts {
+                    engine.set_tab_visible_count(*group_id, *count);
+                }
+                self.tab_visible_counts.borrow_mut().clear();
+            }
+        }
         // Reload CSS if the colorscheme changed (e.g. via :colorscheme command).
         {
             let current = self.engine.borrow().settings.colorscheme.clone();
@@ -5680,6 +5917,64 @@ impl App {
             }
             self.draw_needed.set(true);
         } else {
+            // ── Status bar branch click — open branch picker ─────────────
+            if self.cached_line_height > 0.0 {
+                let lh = self.cached_line_height;
+                let engine = self.engine.borrow();
+                let wildmenu_px = if engine.wildmenu_items.is_empty() {
+                    0.0
+                } else {
+                    lh
+                };
+                let status_bar_height = lh * 2.0 + wildmenu_px;
+                let status_y = height - status_bar_height;
+                if y >= status_y && y < status_y + lh && engine.git_branch.is_some() {
+                    // Reconstruct branch column range (matching build_status_line logic)
+                    let mode_str = engine.mode_str();
+                    let filename = match engine.file_path() {
+                        Some(p) => p
+                            .file_name()
+                            .map(|f| f.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| p.display().to_string()),
+                        None => "[No Name]".to_string(),
+                    };
+                    let dirty = if engine.dirty() { " [+]" } else { "" };
+                    let recording = if let Some(reg) = engine.macro_recording {
+                        format!(" [recording @{}]", reg)
+                    } else {
+                        String::new()
+                    };
+                    let prefix = format!(" -- {}{} -- {}{}", mode_str, recording, filename, dirty);
+                    let b = engine.git_branch.as_deref().unwrap();
+                    let mut branch_text = b.to_string();
+                    if engine.sc_ahead > 0 || engine.sc_behind > 0 {
+                        let mut parts = Vec::new();
+                        if engine.sc_ahead > 0 {
+                            parts.push(format!("↑{}", engine.sc_ahead));
+                        }
+                        if engine.sc_behind > 0 {
+                            parts.push(format!("↓{}", engine.sc_behind));
+                        }
+                        branch_text = format!("{} {}", branch_text, parts.join(" "));
+                    }
+                    let branch_str = format!(" [{}]", branch_text);
+                    let start = prefix.len();
+                    let end = start + branch_str.len();
+                    let cw = self.cached_char_width.max(1.0);
+                    let click_col = (x / cw) as usize;
+                    drop(engine);
+                    if click_col >= start && click_col < end {
+                        self.engine
+                            .borrow_mut()
+                            .open_picker(crate::core::engine::PickerSource::GitBranches);
+                        self.draw_needed.set(true);
+                        return;
+                    }
+                } else {
+                    drop(engine);
+                }
+            }
+
             // Snapshot the active file path before processing the click so we
             // can detect tab switches (and only then highlight in the tree).
             let file_before_click = self.engine.borrow().file_path().cloned();
@@ -6939,6 +7234,18 @@ impl App {
                 }
                 self.draw_needed.set(true);
             }
+            Msg::MruNavBack => {
+                self.engine.borrow_mut().tab_nav_back();
+                self.draw_needed.set(true);
+            }
+            Msg::OpenCommandCenter => {
+                self.engine.borrow_mut().open_command_center();
+                self.draw_needed.set(true);
+            }
+            Msg::MruNavForward => {
+                self.engine.borrow_mut().tab_nav_forward();
+                self.draw_needed.set(true);
+            }
             Msg::MenuActivateItem(menu_idx, item_idx, action) => {
                 // Close the menu engine-side for every action.
                 self.engine.borrow_mut().close_menu();
@@ -7170,7 +7477,7 @@ impl App {
 
     fn handle_sc_sidebar_msg(&mut self, msg: Msg) {
         match msg {
-            Msg::ScSidebarClick(x_click, y) => {
+            Msg::ScSidebarClick(x_click, y, n_press) => {
                 let lh = self.cached_ui_line_height;
                 if lh <= 0.0 {
                     return;
@@ -7292,8 +7599,10 @@ impl App {
                                 engine.sc_selected = flat_idx;
                                 if is_header {
                                     Some("Tab")
-                                } else {
+                                } else if n_press >= 2 {
                                     Some("Return")
+                                } else {
+                                    None // single-click: just select
                                 }
                             }
                             None => None,
@@ -8108,10 +8417,13 @@ impl App {
     fn handle_explorer_msg(&mut self, msg: Msg, sender: &ComponentSender<Self>) {
         match msg {
             Msg::OpenFileFromSidebar(path) => {
-                let mut engine = self.engine.borrow_mut();
-                // Open in a new tab, or switch to the existing tab that shows this file.
-                engine.open_file_in_tab(&path);
-                drop(engine);
+                {
+                    let mut engine = self.engine.borrow_mut();
+                    // Open in a new tab, or switch to the existing tab that shows this file.
+                    engine.open_file_in_tab(&path);
+                    engine.explorer_has_focus = false;
+                }
+                self.tree_has_focus = false;
                 if let Some(ref tree) = *self.file_tree_view.borrow() {
                     highlight_file_in_tree(tree, &path);
                 }
@@ -8220,94 +8532,100 @@ impl App {
                 }
                 self.draw_needed.set(true);
             }
-            Msg::ConfirmDeletePath(path) => {
-                let filename = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("unknown")
-                    .to_string();
-                let item_type = if path.is_dir() { "folder" } else { "file" };
-                let parent_win = self
-                    .drawing_area
-                    .borrow()
-                    .as_ref()
-                    .and_then(|da| da.root())
-                    .and_then(|r| r.downcast::<gtk4::Window>().ok());
-                let dialog = gtk4::Dialog::with_buttons(
-                    Some("Confirm Delete"),
-                    parent_win.as_ref(),
-                    gtk4::DialogFlags::MODAL | gtk4::DialogFlags::DESTROY_WITH_PARENT,
-                    &[
-                        ("Delete", gtk4::ResponseType::Accept),
-                        ("Cancel", gtk4::ResponseType::Cancel),
-                    ],
-                );
-                let label =
-                    gtk4::Label::new(Some(&format!("Delete {} '{}'?", item_type, filename)));
-                label.set_margin_all(12);
-                dialog.content_area().append(&label);
-                let s = sender.clone();
-                dialog.connect_response(move |dlg, resp| {
-                    if resp == gtk4::ResponseType::Accept {
-                        s.input(Msg::DeletePath(path.clone()));
-                    }
-                    dlg.close();
-                });
-                dialog.present();
+            Msg::StartInlineNewFile(parent_dir) => {
+                let is_folder = false;
+                self.start_inline_new_entry(parent_dir, is_folder);
             }
-            Msg::DeletePath(path) => {
-                // Get filename for message
-                let filename = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("unknown");
-
-                let is_dir = path.is_dir();
-                let item_type = if is_dir { "folder" } else { "file" };
-
-                // Check if path exists
-                if !path.exists() {
-                    self.engine.borrow_mut().message = format!("'{}' does not exist", filename);
-                    self.draw_needed.set(true);
-                    return;
-                }
-
-                // Attempt deletion
-                let result = if is_dir {
-                    std::fs::remove_dir_all(&path)
-                } else {
-                    std::fs::remove_file(&path)
-                };
-
-                match result {
-                    Ok(_) => {
-                        self.engine.borrow_mut().message =
-                            format!("Deleted {}: '{}'", item_type, filename);
-
-                        // If deleted file was open, close its buffer
-                        // Find buffer by path and delete it
-                        if !is_dir {
-                            let path_str = path.to_string_lossy();
-                            let mut engine = self.engine.borrow_mut();
-                            if let Some(buffer_id) = engine.buffer_manager.find_by_path(&path_str) {
-                                // Delete the buffer (force=true since file is gone anyway)
-                                let _ = engine.delete_buffer(buffer_id, true);
+            Msg::StartInlineNewFolder(parent_dir) => {
+                let is_folder = true;
+                self.start_inline_new_entry(parent_dir, is_folder);
+            }
+            Msg::ExplorerActivateSelected => {
+                if let Some(ref tv) = *self.file_tree_view.borrow() {
+                    // Try cursor position first (tracks arrow-key navigation),
+                    // fall back to selection.
+                    use gtk4::prelude::TreeViewExt;
+                    let tp = TreeViewExt::cursor(tv).0.or_else(|| {
+                        tv.selection()
+                            .selected()
+                            .map(|(_, iter)| tv.model().unwrap().path(&iter))
+                    });
+                    let model = tv.model();
+                    if let (Some(tp), Some(model)) = (tp, model) {
+                        // Sync selection to cursor so visual highlight matches.
+                        tv.selection().select_path(&tp);
+                        if let Some(iter) = model.iter(&tp) {
+                            let full_path: String =
+                                model.get_value(&iter, 2).get().unwrap_or_default();
+                            let path_buf = PathBuf::from(&full_path);
+                            if path_buf.is_dir() {
+                                if tv.row_expanded(&tp) {
+                                    tv.collapse_row(&tp);
+                                } else {
+                                    tv.expand_row(&tp, false);
+                                }
+                            } else if path_buf.is_file() {
+                                sender.input(Msg::OpenFileFromSidebar(path_buf));
                             }
                         }
-
-                        sender.input(Msg::RefreshFileTree);
-                    }
-                    Err(e) => {
-                        let msg = match e.kind() {
-                            std::io::ErrorKind::PermissionDenied => {
-                                format!("Permission denied: '{}'", filename)
-                            }
-                            std::io::ErrorKind::NotFound => format!("'{}' not found", filename),
-                            _ => format!("Error deleting '{}': {}", filename, e),
-                        };
-                        self.engine.borrow_mut().message = msg;
                     }
                 }
+            }
+            Msg::ExplorerAction(key_str) => {
+                use crate::core::settings::ExplorerAction;
+                // Resolve the action first, then drop the engine borrow before
+                // calling methods that may re-borrow (e.g. start_inline_new_entry).
+                let action = key_str
+                    .chars()
+                    .next()
+                    .and_then(|ch| self.engine.borrow().settings.explorer_keys.resolve(ch));
+                if let Some(action) = action {
+                    match action {
+                        ExplorerAction::NewFile => {
+                            let parent_dir = selected_parent_dir_from_app(&self.file_tree_view);
+                            self.start_inline_new_entry(parent_dir, false);
+                        }
+                        ExplorerAction::NewFolder => {
+                            let parent_dir = selected_parent_dir_from_app(&self.file_tree_view);
+                            self.start_inline_new_entry(parent_dir, true);
+                        }
+                        ExplorerAction::Delete => {
+                            if let Some(path) = selected_file_path_from_app(&self.file_tree_view) {
+                                sender.input(Msg::ConfirmDeletePath(path));
+                            }
+                        }
+                        ExplorerAction::Rename => {
+                            // Trigger GTK native inline cell editing
+                            let tv_ref = self.file_tree_view.clone();
+                            let nc_ref = self.name_cell.clone();
+                            gtk4::glib::idle_add_local_once(move || {
+                                if let Some(ref tv) = *tv_ref.borrow() {
+                                    if let Some(ref nc) = *nc_ref.borrow() {
+                                        nc.set_property("editable", true);
+                                        if let Some(column) = tv.column(0) {
+                                            if let Some((model, iter)) = tv.selection().selected() {
+                                                let tree_path = model.path(&iter);
+                                                gtk4::prelude::TreeViewExt::set_cursor(
+                                                    tv,
+                                                    &tree_path,
+                                                    Some(&column),
+                                                    true,
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                        ExplorerAction::MoveFile => {
+                            // Move not yet supported via keyboard in GTK
+                            // (uses status-line prompt in TUI)
+                        }
+                    }
+                }
+            }
+            Msg::ConfirmDeletePath(path) => {
+                self.engine.borrow_mut().confirm_delete_file(&path);
                 self.draw_needed.set(true);
             }
             Msg::RefreshFileTree => {
@@ -8426,6 +8744,73 @@ impl App {
                 self.draw_needed.set(true);
             }
             _ => unreachable!(),
+        }
+    }
+
+    /// Insert a temporary row in the TreeStore and start inline editing for new file/folder.
+    fn start_inline_new_entry(&self, parent_dir: PathBuf, is_folder: bool) {
+        // Extract colorscheme before borrowing tree_view to avoid RefCell conflicts.
+        let colorscheme = self.engine.borrow().settings.colorscheme.clone();
+        let theme = Theme::from_name(&colorscheme);
+        let fg_hex = theme.foreground.to_hex();
+
+        if let Some(ref tree_view) = *self.file_tree_view.borrow() {
+            if let Some(model) = tree_view.model() {
+                if let Some(tree_store) = model.downcast_ref::<gtk4::TreeStore>() {
+                    // Find the parent iter in the tree store
+                    let parent_iter = find_tree_iter_for_path(tree_store, &parent_dir);
+
+                    // Expand the parent row if it exists
+                    if let Some(ref pi) = parent_iter {
+                        let path = tree_store.path(pi);
+                        tree_view.expand_row(&path, false);
+                    }
+
+                    // Insert a new row as the first child
+                    let new_iter = tree_store.prepend(parent_iter.as_ref());
+                    let icon = if is_folder { "\u{f07b}" } else { "\u{f15b}" };
+                    let marker = if is_folder {
+                        format!("__NEW_FOLDER__{}", parent_dir.display())
+                    } else {
+                        format!("__NEW_FILE__{}", parent_dir.display())
+                    };
+                    // Use valid hex colors to avoid GTK "Don't know color ''" warnings
+                    tree_store.set(
+                        &new_iter,
+                        &[
+                            (0, &icon.to_value()),
+                            (1, &"".to_value()),
+                            (2, &marker.to_value()),
+                            (3, &fg_hex.to_value()),
+                            (4, &"".to_value()),
+                            (5, &fg_hex.to_value()),
+                        ],
+                    );
+
+                    // Start inline editing on the new row.
+                    // Wrapped in catch_unwind because GTK set_cursor with
+                    // start_editing=true can abort the process if it panics
+                    // inside an extern "C" callback.
+                    let tv = tree_view.clone();
+                    let name_cell_ref = self.name_cell.clone();
+                    let new_row_path = tree_store.path(&new_iter);
+                    gtk4::glib::idle_add_local_once(move || {
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            if let Some(ref nc) = *name_cell_ref.borrow() {
+                                nc.set_property("editable", true);
+                                if let Some(column) = tv.column(0) {
+                                    gtk4::prelude::TreeViewExt::set_cursor(
+                                        &tv,
+                                        &new_row_path,
+                                        Some(&column),
+                                        true,
+                                    );
+                                }
+                            }
+                        }));
+                    });
+                }
+            }
         }
     }
 
@@ -9247,6 +9632,25 @@ pub(crate) fn run(file_path: Option<PathBuf>) {
     if std::env::var_os("WAYLAND_DISPLAY").is_none() && std::env::var_os("DISPLAY").is_none() {
         std::env::set_var("DISPLAY", ":0");
     }
+
+    // Install panic hook that flushes swap files + writes crash log.
+    {
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            // Emergency: flush swap files for all dirty buffers.
+            crate::core::swap::run_emergency_flush();
+
+            let bt = std::backtrace::Backtrace::force_capture();
+            let loc_str = info
+                .location()
+                .map(|l| format!("  at {}:{}:{}\n", l.file(), l.line(), l.column()))
+                .unwrap_or_default();
+            let crash_msg = format!("PANIC: {}\n{}backtrace:\n{}\n", info, loc_str, bt);
+            let _ = std::fs::write("/tmp/vimcode-crash.log", &crash_msg);
+            prev_hook(info);
+        }));
+    }
+
     install_icon_and_desktop();
     unsafe {
         gtk4::glib::ffi::g_log_set_handler(

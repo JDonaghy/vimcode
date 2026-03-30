@@ -99,6 +99,15 @@ impl Engine {
                 self.picker_title = "Live Grep".to_string();
                 // Grep is a live source — no pre-populate, search runs per keystroke.
             }
+            PickerSource::CommandCenter => {
+                self.picker_title = "Search".to_string();
+                // Default mode: files. Prefix routing handled in picker_filter_command_center.
+                self.picker_populate_files();
+            }
+            PickerSource::GitBranches => {
+                self.picker_title = "Switch Branch".to_string();
+                self.picker_populate_branches();
+            }
             _ => {
                 self.picker_title = format!("{:?}", source);
             }
@@ -108,6 +117,11 @@ impl Engine {
         self.picker_filter();
         self.picker_load_preview();
         self.picker_open = true;
+    }
+
+    /// Open the Command Center picker (called from menu bar search box click).
+    pub fn open_command_center(&mut self) {
+        self.open_picker(PickerSource::CommandCenter);
     }
 
     /// Close the unified picker and clear all state.
@@ -185,8 +199,43 @@ impl Engine {
             .collect();
     }
 
+    /// Populate picker_all_items with git branches.
+    fn picker_populate_branches(&mut self) {
+        let branches = crate::core::git::list_branches(&self.cwd);
+        self.picker_all_items = branches
+            .into_iter()
+            .map(|b| {
+                let mut detail_parts = Vec::new();
+                if b.is_current {
+                    detail_parts.push("● current".to_string());
+                }
+                if let Some(ref ab) = b.ahead_behind {
+                    detail_parts.push(ab.clone());
+                }
+                if let Some(ref up) = b.upstream {
+                    detail_parts.push(format!("→ {}", up));
+                }
+                let detail = if detail_parts.is_empty() {
+                    None
+                } else {
+                    Some(detail_parts.join("  "))
+                };
+                PickerItem {
+                    display: b.name.clone(),
+                    filter_text: b.name.clone(),
+                    detail,
+                    action: PickerAction::CheckoutBranch(b.name),
+                    icon: None,
+                    score: 0,
+                    match_positions: Vec::new(),
+                }
+            })
+            .collect();
+    }
+
     /// Filter picker_all_items by the current query and populate picker_items.
     /// For live sources (Grep), runs a search instead of fuzzy-filtering.
+    /// For CommandCenter, delegates to prefix-aware routing.
     pub(crate) fn picker_filter(&mut self) {
         const CAP: usize = 100;
 
@@ -196,15 +245,34 @@ impl Engine {
             return;
         }
 
-        if self.picker_query.is_empty() {
-            self.picker_items = self.picker_all_items.iter().take(CAP).cloned().collect();
+        // Command Center: dynamic prefix routing.
+        if self.picker_source == PickerSource::CommandCenter {
+            self.picker_filter_command_center();
+            return;
+        }
+
+        Self::fuzzy_filter_items(
+            &self.picker_all_items,
+            &self.picker_query,
+            CAP,
+            &mut self.picker_items,
+        );
+    }
+
+    /// Shared fuzzy filter: score `all_items` against `query`, populate `out`.
+    fn fuzzy_filter_items(
+        all_items: &[PickerItem],
+        query: &str,
+        cap: usize,
+        out: &mut Vec<PickerItem>,
+    ) {
+        if query.is_empty() {
+            *out = all_items.iter().take(cap).cloned().collect();
         } else {
-            let query = self.picker_query.clone();
-            let mut scored: Vec<PickerItem> = self
-                .picker_all_items
+            let mut scored: Vec<PickerItem> = all_items
                 .iter()
                 .filter_map(|item| {
-                    Self::fuzzy_score_with_positions(&item.filter_text, &query).map(
+                    Self::fuzzy_score_with_positions(&item.filter_text, query).map(
                         |(s, positions)| {
                             let mut item = item.clone();
                             item.score = s;
@@ -215,9 +283,358 @@ impl Engine {
                 })
                 .collect();
             scored.sort_by(|a, b| b.score.cmp(&a.score));
-            scored.truncate(CAP);
-            self.picker_items = scored;
+            scored.truncate(cap);
+            *out = scored;
         }
+    }
+
+    /// Detect the prefix in `picker_query` and route to the appropriate mode.
+    fn picker_filter_command_center(&mut self) {
+        const CAP: usize = 100;
+        let query = self.picker_query.clone();
+
+        if let Some(rest) = query.strip_prefix('>') {
+            // Command palette mode
+            self.picker_title = "Commands".to_string();
+            // Re-populate commands if all_items aren't command items
+            if self.picker_all_items.is_empty()
+                || !matches!(
+                    self.picker_all_items.first().map(|i| &i.action),
+                    Some(PickerAction::ExecuteCommand(_))
+                )
+            {
+                self.picker_populate_commands();
+            }
+            let sub_query = rest.trim_start().to_string();
+            Self::fuzzy_filter_items(
+                &self.picker_all_items,
+                &sub_query,
+                CAP,
+                &mut self.picker_items,
+            );
+        } else if let Some(rest) = query.strip_prefix('@') {
+            // Document symbols mode (LSP)
+            self.picker_title = "Go to Symbol in File".to_string();
+            let sub_query = rest.trim_start().to_string();
+            // Clear file/command items and request symbols if we haven't already
+            let has_symbol_items = matches!(
+                self.picker_all_items.first().map(|i| &i.action),
+                Some(PickerAction::GotoSymbol(..))
+            );
+            if !has_symbol_items {
+                self.picker_all_items.clear();
+            }
+            if self.lsp_pending_document_symbols.is_none() && self.picker_all_items.is_empty() {
+                self.picker_request_document_symbols();
+            }
+            // If items are populated (from LSP response), filter them
+            Self::fuzzy_filter_items(
+                &self.picker_all_items,
+                &sub_query,
+                CAP,
+                &mut self.picker_items,
+            );
+            if self.picker_items.is_empty() && self.lsp_pending_document_symbols.is_some() {
+                self.picker_items = vec![PickerItem {
+                    display: "Loading symbols...".to_string(),
+                    filter_text: String::new(),
+                    detail: None,
+                    action: PickerAction::Custom("loading".to_string()),
+                    icon: None,
+                    score: 0,
+                    match_positions: Vec::new(),
+                }];
+            }
+        } else if let Some(rest) = query.strip_prefix('#') {
+            // Workspace symbols mode (LSP)
+            self.picker_title = "Go to Symbol in Workspace".to_string();
+            let sub_query = rest.trim_start().to_string();
+            if sub_query.len() >= 2 {
+                self.picker_request_workspace_symbols(&sub_query);
+            } else if sub_query.is_empty() {
+                self.picker_items = vec![PickerItem {
+                    display: "Type at least 2 characters to search workspace symbols..."
+                        .to_string(),
+                    filter_text: String::new(),
+                    detail: None,
+                    action: PickerAction::Custom("hint".to_string()),
+                    icon: None,
+                    score: 0,
+                    match_positions: Vec::new(),
+                }];
+            }
+        } else if let Some(rest) = query.strip_prefix(':') {
+            // Go to line mode
+            self.picker_title = "Go to Line".to_string();
+            let trimmed = rest.trim();
+            if let Ok(line_num) = trimmed.parse::<usize>() {
+                let line_count = self.buffer().content.len_lines();
+                let clamped = line_num.clamp(1, line_count);
+                self.picker_items = vec![PickerItem {
+                    display: format!("Go to line {}", clamped),
+                    filter_text: String::new(),
+                    detail: Some(format!("of {}", line_count)),
+                    action: PickerAction::GotoLine(clamped.saturating_sub(1)),
+                    icon: None,
+                    score: 0,
+                    match_positions: Vec::new(),
+                }];
+            } else {
+                self.picker_items = vec![PickerItem {
+                    display: "Type a line number...".to_string(),
+                    filter_text: String::new(),
+                    detail: Some(format!("1–{}", self.buffer().content.len_lines())),
+                    action: PickerAction::Custom("hint".to_string()),
+                    icon: None,
+                    score: 0,
+                    match_positions: Vec::new(),
+                }];
+            }
+        } else if let Some(rest) = query.strip_prefix('%') {
+            // Live grep mode (search for text in project)
+            self.picker_title = "Search for Text".to_string();
+            let sub_query = rest.trim_start().to_string();
+            if sub_query.len() < 2 {
+                self.picker_items = vec![PickerItem {
+                    display: "Type at least 2 characters to search project...".to_string(),
+                    filter_text: String::new(),
+                    detail: None,
+                    action: PickerAction::Custom("hint".to_string()),
+                    icon: None,
+                    score: 0,
+                    match_positions: Vec::new(),
+                }];
+            } else {
+                // Reuse the grep search logic with sub_query
+                self.picker_cc_grep_search(&sub_query);
+            }
+        } else if query == "debug" || query.starts_with("debug ") {
+            // Start Debugging mode — show launch configurations
+            self.picker_title = "Start Debugging".to_string();
+            let sub_query = query
+                .strip_prefix("debug")
+                .unwrap_or("")
+                .trim_start()
+                .to_string();
+            self.picker_populate_debug_configs(&sub_query);
+        } else if query == "task" || query.starts_with("task ") {
+            // Run Task mode — show tasks from tasks.json
+            self.picker_title = "Run Task".to_string();
+            let sub_query = query
+                .strip_prefix("task")
+                .unwrap_or("")
+                .trim_start()
+                .to_string();
+            self.picker_populate_tasks(&sub_query);
+        } else if query == "?" {
+            // Help mode: show available prefixes
+            self.picker_title = "Help: Prefix Modes".to_string();
+            self.picker_items = vec![
+                Self::help_item("", "Search files by name (default)"),
+                Self::help_item(">", "Show and run commands"),
+                Self::help_item("@", "Go to symbol in current file (LSP)"),
+                Self::help_item("#", "Go to symbol in workspace (LSP)"),
+                Self::help_item(":", "Go to line number"),
+                Self::help_item("%", "Search for text in project"),
+                Self::help_item("debug", "Start debugging (launch configurations)"),
+                Self::help_item("task", "Run a task (from tasks.json)"),
+                Self::help_item("?", "Show this help"),
+            ];
+        } else if query.is_empty() {
+            // Placeholder hints: show available modes when query is empty
+            self.picker_title = "Search".to_string();
+            self.picker_items = vec![
+                Self::hint_item("Go to File", "", "Type a file name"),
+                Self::hint_item("Show and Run Commands", ">", "Ctrl+Shift+P"),
+                Self::hint_item("Go to Symbol in Editor", "@", ""),
+                Self::hint_item("Go to Symbol in Workspace", "#", ""),
+                Self::hint_item("Go to Line", ":", "Ctrl+G"),
+                Self::hint_item("Search for Text", "%", "Ctrl+G (grep)"),
+                Self::hint_item("Start Debugging", "debug", "F5"),
+                Self::hint_item("Run Task", "task", ""),
+                Self::hint_item("More Help", "?", ""),
+            ];
+        } else {
+            // Default: file search
+            self.picker_title = "Search".to_string();
+            // Re-populate files if all_items aren't file items
+            if self.picker_all_items.is_empty()
+                || matches!(
+                    self.picker_all_items.first().map(|i| &i.action),
+                    Some(PickerAction::ExecuteCommand(_))
+                )
+            {
+                self.picker_populate_files();
+            }
+            Self::fuzzy_filter_items(&self.picker_all_items, &query, CAP, &mut self.picker_items);
+        }
+    }
+
+    /// Create a placeholder hint item for the empty-query Command Center dropdown.
+    /// `label` is the mode name, `prefix` is the prefix to set, `shortcut` is the keyboard shortcut hint.
+    fn hint_item(label: &str, prefix: &str, shortcut: &str) -> PickerItem {
+        let action_prefix = if prefix.is_empty() {
+            // "Go to File" — just clear the query (stay in file mode)
+            String::new()
+        } else {
+            prefix.to_string()
+        };
+        PickerItem {
+            display: label.to_string(),
+            filter_text: String::new(),
+            detail: if shortcut.is_empty() {
+                Some(prefix.to_string())
+            } else {
+                Some(format!("{}  {}", prefix, shortcut))
+            },
+            action: PickerAction::Custom(format!("prefix:{}", action_prefix)),
+            icon: None,
+            score: 0,
+            match_positions: Vec::new(),
+        }
+    }
+
+    /// Create a help item for the "?" prefix mode.
+    fn help_item(prefix: &str, description: &str) -> PickerItem {
+        PickerItem {
+            display: if prefix.is_empty() {
+                "(no prefix)".to_string()
+            } else {
+                prefix.to_string()
+            },
+            filter_text: String::new(),
+            detail: Some(description.to_string()),
+            action: PickerAction::Custom(format!("prefix:{}", prefix)),
+            icon: None,
+            score: 0,
+            match_positions: Vec::new(),
+        }
+    }
+
+    /// Request document symbols from LSP for the current buffer.
+    fn picker_request_document_symbols(&mut self) {
+        if !self.settings.lsp_enabled {
+            return;
+        }
+        self.ensure_lsp_manager();
+        let path = match self.active_buffer_path() {
+            Some(p) => p,
+            None => return,
+        };
+        if let Some(mgr) = &mut self.lsp_manager {
+            if let Some(id) = mgr.request_document_symbols(&path) {
+                self.lsp_pending_document_symbols = Some(id);
+            }
+        }
+    }
+
+    /// Populate picker items from a document symbol LSP response.
+    pub(crate) fn picker_populate_document_symbols(&mut self, symbols: Vec<lsp::SymbolInfo>) {
+        let path = self.active_buffer_path();
+        self.picker_all_items = symbols
+            .into_iter()
+            .map(|sym| {
+                let container_str = sym
+                    .container
+                    .as_ref()
+                    .map(|c| format!("  ({})", c))
+                    .unwrap_or_default();
+                let display = format!("{} {}{}", sym.kind.icon(), sym.name, container_str);
+                let detail = Some(sym.kind.label().to_string());
+                let action = PickerAction::GotoSymbol(
+                    path.clone().unwrap_or_default(),
+                    sym.line as usize,
+                    sym.character as usize,
+                );
+                PickerItem {
+                    filter_text: sym.name.clone(),
+                    display,
+                    detail,
+                    action,
+                    icon: None,
+                    score: 0,
+                    match_positions: Vec::new(),
+                }
+            })
+            .collect();
+        // Re-run filter with current query
+        let sub_query = self
+            .picker_query
+            .strip_prefix('@')
+            .unwrap_or("")
+            .trim_start()
+            .to_string();
+        Self::fuzzy_filter_items(
+            &self.picker_all_items,
+            &sub_query,
+            100,
+            &mut self.picker_items,
+        );
+        self.picker_selected = 0;
+        self.picker_scroll_top = 0;
+        self.picker_load_preview();
+    }
+
+    /// Request workspace symbols from LSP.
+    fn picker_request_workspace_symbols(&mut self, query: &str) {
+        if !self.settings.lsp_enabled {
+            return;
+        }
+        self.ensure_lsp_manager();
+        let path = match self.active_buffer_path() {
+            Some(p) => p,
+            None => return,
+        };
+        if let Some(mgr) = &mut self.lsp_manager {
+            if let Some(id) = mgr.request_workspace_symbols(&path, query) {
+                self.lsp_pending_workspace_symbols = Some(id);
+            }
+        }
+    }
+
+    /// Populate picker items from a workspace symbol LSP response.
+    pub(crate) fn picker_populate_workspace_symbols(&mut self, symbols: Vec<lsp::SymbolInfo>) {
+        let cwd = self.cwd.clone();
+        self.picker_items = symbols
+            .into_iter()
+            .take(100)
+            .map(|sym| {
+                let file_hint = sym
+                    .path
+                    .as_ref()
+                    .and_then(|p| p.strip_prefix(&cwd).ok())
+                    .map(|r| r.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let container_str = sym
+                    .container
+                    .as_ref()
+                    .map(|c| format!("  ({})", c))
+                    .unwrap_or_default();
+                let display = format!("{} {}{}", sym.kind.icon(), sym.name, container_str);
+                let detail = if file_hint.is_empty() {
+                    Some(sym.kind.label().to_string())
+                } else {
+                    Some(format!("{} · {}", sym.kind.label(), file_hint))
+                };
+                let action = PickerAction::GotoSymbol(
+                    sym.path.unwrap_or_default(),
+                    sym.line as usize,
+                    sym.character as usize,
+                );
+                PickerItem {
+                    filter_text: sym.name.clone(),
+                    display,
+                    detail,
+                    action,
+                    icon: None,
+                    score: 0,
+                    match_positions: Vec::new(),
+                }
+            })
+            .collect();
+        self.picker_selected = 0;
+        self.picker_scroll_top = 0;
+        self.picker_load_preview();
     }
 
     /// Run a live project search for the Grep picker source.
@@ -226,9 +643,15 @@ impl Engine {
             self.picker_items.clear();
             return;
         }
+        self.picker_cc_grep_search(&self.picker_query.clone());
+    }
+
+    /// Run a project grep search with a given query string and populate picker_items.
+    /// Shared between the standalone Grep picker source and Command Center `%` prefix.
+    fn picker_cc_grep_search(&mut self, query: &str) {
         let options = project_search::SearchOptions::default();
         let cwd = self.cwd.clone();
-        match project_search::search_in_project(&cwd, &self.picker_query, &options) {
+        match project_search::search_in_project(&cwd, query, &options) {
             Ok(mut results) => {
                 results.truncate(200);
                 self.picker_items = results
@@ -255,6 +678,159 @@ impl Engine {
             }
             Err(_) => self.picker_items.clear(),
         }
+    }
+
+    /// Populate picker items with launch configurations from `.vimcode/launch.json`.
+    /// If no launch.json exists, offers a "Create launch.json..." option.
+    fn picker_populate_debug_configs(&mut self, filter_query: &str) {
+        use crate::core::dap_manager::{find_workspace_root, parse_launch_json};
+
+        let manifests = self.ext_available_manifests();
+        let workspace_root = find_workspace_root(&self.cwd, &manifests);
+        let cwd_str = workspace_root.to_string_lossy().into_owned();
+
+        // Try .vimcode/launch.json first, then .vscode/launch.json
+        let vimcode_path = workspace_root.join(".vimcode").join("launch.json");
+        let vscode_path = workspace_root.join(".vscode").join("launch.json");
+
+        let configs = if let Ok(content) = std::fs::read_to_string(&vimcode_path) {
+            parse_launch_json(&content, &cwd_str)
+        } else if let Ok(content) = std::fs::read_to_string(&vscode_path) {
+            parse_launch_json(&content, &cwd_str)
+        } else {
+            Vec::new()
+        };
+
+        if configs.is_empty() {
+            self.picker_items = vec![PickerItem {
+                display: "Create launch.json...".to_string(),
+                filter_text: "create launch.json".to_string(),
+                detail: Some("No launch configurations found".to_string()),
+                action: PickerAction::Custom("create_launch_json".to_string()),
+                icon: None,
+                score: 0,
+                match_positions: Vec::new(),
+            }];
+            return;
+        }
+
+        let all_items: Vec<PickerItem> = configs
+            .iter()
+            .enumerate()
+            .map(|(idx, cfg)| {
+                let detail = if cfg.program.is_empty() {
+                    cfg.adapter_type.clone()
+                } else {
+                    format!("{} — {}", cfg.adapter_type, cfg.program)
+                };
+                PickerItem {
+                    display: cfg.name.clone(),
+                    filter_text: format!("{} {} {}", cfg.name, cfg.adapter_type, cfg.program),
+                    detail: Some(detail),
+                    action: PickerAction::Custom(format!("debug_config:{}", idx)),
+                    icon: None,
+                    score: 0,
+                    match_positions: Vec::new(),
+                }
+            })
+            .collect();
+
+        if filter_query.is_empty() {
+            self.picker_items = all_items;
+        } else {
+            Self::fuzzy_filter_items(&all_items, filter_query, 100, &mut self.picker_items);
+        }
+    }
+
+    /// Populate picker items with tasks from `.vimcode/tasks.json`.
+    /// If no tasks.json exists, offers a "Configure Tasks..." option.
+    fn picker_populate_tasks(&mut self, filter_query: &str) {
+        use crate::core::dap_manager::{
+            find_workspace_root, parse_tasks_json, task_to_shell_command,
+        };
+
+        let manifests = self.ext_available_manifests();
+        let workspace_root = find_workspace_root(&self.cwd, &manifests);
+        let cwd_str = workspace_root.to_string_lossy().into_owned();
+
+        // Try .vimcode/tasks.json first, then .vscode/tasks.json
+        let vimcode_path = workspace_root.join(".vimcode").join("tasks.json");
+        let vscode_path = workspace_root.join(".vscode").join("tasks.json");
+
+        let tasks = if let Ok(content) = std::fs::read_to_string(&vimcode_path) {
+            parse_tasks_json(&content, &cwd_str)
+        } else if let Ok(content) = std::fs::read_to_string(&vscode_path) {
+            parse_tasks_json(&content, &cwd_str)
+        } else {
+            Vec::new()
+        };
+
+        if tasks.is_empty() {
+            self.picker_items = vec![PickerItem {
+                display: "Configure Tasks...".to_string(),
+                filter_text: "configure tasks".to_string(),
+                detail: Some("No tasks found — create tasks.json".to_string()),
+                action: PickerAction::Custom("create_tasks_json".to_string()),
+                icon: None,
+                score: 0,
+                match_positions: Vec::new(),
+            }];
+            return;
+        }
+
+        let all_items: Vec<PickerItem> = tasks
+            .iter()
+            .map(|task| {
+                let cmd = task_to_shell_command(task);
+                PickerItem {
+                    display: task.label.clone(),
+                    filter_text: format!("{} {}", task.label, cmd),
+                    detail: Some(cmd.clone()),
+                    action: PickerAction::Custom(format!("task_run:{}", cmd)),
+                    icon: None,
+                    score: 0,
+                    match_positions: Vec::new(),
+                }
+            })
+            .collect();
+
+        if filter_query.is_empty() {
+            self.picker_items = all_items;
+        } else {
+            Self::fuzzy_filter_items(&all_items, filter_query, 100, &mut self.picker_items);
+        }
+    }
+
+    /// Create a default tasks.json in `.vimcode/` and open it in a buffer.
+    fn create_and_open_tasks_json(&mut self) {
+        use crate::core::dap_manager::find_workspace_root;
+
+        let manifests = self.ext_available_manifests();
+        let workspace_root = find_workspace_root(&self.cwd, &manifests);
+        let vimcode_dir = workspace_root.join(".vimcode");
+        let tasks_path = vimcode_dir.join("tasks.json");
+
+        if !tasks_path.exists() {
+            let _ = std::fs::create_dir_all(&vimcode_dir);
+            let template = r#"{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "build",
+      "type": "shell",
+      "command": "cargo build"
+    },
+    {
+      "label": "test",
+      "type": "shell",
+      "command": "cargo test"
+    }
+  ]
+}"#;
+            let _ = std::fs::write(&tasks_path, template);
+        }
+
+        self.open_file_in_tab(&tasks_path);
     }
 
     /// Load preview context for the currently selected picker item.
@@ -414,7 +990,7 @@ impl Engine {
                 }
             }
             PickerAction::CheckoutBranch(branch) => {
-                self.execute_command(&format!("Gcheckout {}", branch))
+                self.execute_command(&format!("Gswitch {}", branch))
             }
             PickerAction::JumpToMark(_mark) => {
                 // Phase 3: mark jumping via picker
@@ -424,9 +1000,78 @@ impl Engine {
                 // Phase 3: register paste via picker
                 EngineAction::None
             }
-            PickerAction::Custom(_key) => {
-                // Future: fire Lua event
+            PickerAction::GotoLine(line) => {
+                let win_id = self.active_window_id();
+                self.set_cursor_for_window(win_id, line, 0);
+                self.ensure_cursor_visible();
                 EngineAction::None
+            }
+            PickerAction::GotoSymbol(path, line, _col) => {
+                if !path.as_os_str().is_empty() {
+                    // Check if it's a different file than the current buffer
+                    let cur_path = self
+                        .buffer_manager
+                        .get(self.active_buffer_id())
+                        .and_then(|s| s.file_path.clone())
+                        .unwrap_or_default();
+                    if path != cur_path {
+                        self.open_file_in_tab(&path);
+                    }
+                }
+                let win_id = self.active_window_id();
+                self.set_cursor_for_window(win_id, line, 0);
+                self.ensure_cursor_visible();
+                EngineAction::None
+            }
+            PickerAction::Custom(key) => {
+                // Handle prefix selection from help mode
+                if let Some(prefix) = key.strip_prefix("prefix:") {
+                    self.open_command_center();
+                    if prefix.is_empty() {
+                        // "Go to File" — stay in file search mode with empty query
+                        // (open_command_center already set up files + hints)
+                        // Force file mode by setting a no-op query state
+                        self.picker_populate_files();
+                        self.picker_items =
+                            self.picker_all_items.iter().take(100).cloned().collect();
+                    } else {
+                        self.picker_query = if prefix.contains(char::is_alphabetic) {
+                            format!("{} ", prefix)
+                        } else {
+                            prefix.to_string()
+                        };
+                        self.picker_selected = 0;
+                        self.picker_scroll_top = 0;
+                        self.picker_filter();
+                        self.picker_load_preview();
+                    }
+                    EngineAction::None
+                } else if let Some(idx_str) = key.strip_prefix("debug_config:") {
+                    // Launch a debug configuration by index
+                    if let Ok(idx) = idx_str.parse::<usize>() {
+                        self.dap_selected_launch_config = idx;
+                        self.close_picker();
+                        let _ = self.execute_command("debug");
+                    }
+                    EngineAction::None
+                } else if key == "create_launch_json" {
+                    // Generate launch.json and start debugging
+                    self.close_picker();
+                    let _ = self.execute_command("debug");
+                    EngineAction::None
+                } else if let Some(cmd) = key.strip_prefix("task_run:") {
+                    // Run a task command in the integrated terminal
+                    let cmd = cmd.to_string();
+                    self.close_picker();
+                    EngineAction::RunInTerminal(cmd)
+                } else if key == "create_tasks_json" {
+                    // Open .vimcode/tasks.json for editing
+                    self.close_picker();
+                    self.create_and_open_tasks_json();
+                    EngineAction::None
+                } else {
+                    EngineAction::None
+                }
             }
         }
     }

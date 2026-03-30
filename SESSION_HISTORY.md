@@ -1,9 +1,45 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 224 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 233 archived here. Recent work summary in PROJECT_STATE.md.
 
 ---
+
+**Session 233 — Explorer focus UX polish + GTK fixes (4986 tests):**
+Explorer focus visibility improvements: stronger `sidebar_sel_bg` colors across all 6 themes (OneDark `#373d4a`, Gruvbox `#504945`, Tokyo Night `#33395a`, Solarized `#0a4a5a`, Dark+ `#04395e`, Light+ `#b4d9ff`); brighter `explorer_active_bg` for current-file highlight when explorer unfocused. TUI: suppress current-editor-file highlight (`is_active`) when `explorer_has_focus` is true; clicking explorer tree sets `explorer_has_focus`. Ctrl-W h now focuses explorer: GTK handles `window_nav_overflow` (left overflow → `Msg::FocusExplorer`); TUI adds `Explorer` case to overflow match. GTK: `OpenFileFromSidebar` clears `explorer_has_focus`/`tree_has_focus` (fixes 100% CPU + stuck focus); `row_activated` handles directory expand/collapse; j/k/arrow keys pass through to TreeView; `ExplorerActivateSelected` message for programmatic activation. Swap recovery: skip dialog when swap content matches disk file. Known bug filed: GTK Enter on folder after arrow-key nav requires two presses.
+Files: `render.rs`, `tui_main/panels.rs`, `tui_main/mouse.rs`, `tui_main/mod.rs`, `gtk/mod.rs`, `gtk/css.rs`, `core/engine/ext_panel.rs`, `BUGS.md`.
+
+**Session 232 — Inline new file/folder in explorer tree (4985 tests):**
+`ExplorerNewEntryState` struct with inline editing in explorer tree. Replaced status-line prompt (TUI) and modal dialog (GTK) with inline editable row inserted under target directory. GTK: bordered text field via CSS `treeview entry` styling; `CellRendererText` editable mode; `Msg::StartInlineNewFile/Folder`; `ExplorerAction` dispatch via `idle_add_local_once` to avoid RefCell panics. TUI: inverted-cursor rendering with virtual row interleaving in `render_new_entry_row()`; key routing guard for `explorer_new_entry`. Engine: `start_explorer_new_file/folder()`, `handle_explorer_new_entry_key()` (Escape/Return/BackSpace/Delete/Left/Right/Home/End/printable). Removed `PromptKind::NewFile/NewFolder` and `show_name_prompt_dialog()`. Tree helpers: `find_tree_iter_for_path()`, `remove_new_entry_rows()`. Swap recovery: compare swap content with disk, silently delete if identical. 10 new tests + 1 swap recovery test.
+Files: `core/engine/mod.rs`, `core/engine/buffers.rs`, `core/engine/ext_panel.rs`, `core/engine/tests.rs`, `gtk/mod.rs`, `gtk/tree.rs`, `gtk/css.rs`, `tui_main/mod.rs`, `tui_main/panels.rs`, `tui_main/mouse.rs`, `tui_main/render_impl.rs`, `tests/swap_recovery.rs`.
+
+**Session 231 — Git branch switcher in status bar (4955 tests):**
+Clickable branch name in status bar opens `PickerSource::GitBranches` unified picker. Status bar shows ahead/behind counts (`↑N ↓N`). `status_branch_range: Option<(usize, usize)>` on `ScreenLayout` for click detection. TUI: status bar row click handler in `mouse.rs`. GTK: click handler in `handle_mouse_click_msg()` reconstructs column range from engine state. `:Gbranches` command opens branch picker. Fixed picker confirm using `Gcheckout` (nonexistent) → `Gswitch`. Updated "Git: Switch Branch" palette entry to use `Gbranches`. 6 new tests.
+Files: `render.rs`, `engine/picker.rs`, `engine/execute.rs`, `engine/mod.rs`, `engine/tests.rs`, `tui_main/mouse.rs`, `gtk/mod.rs`.
+
+**Session 230 — Command Center enhancements + `<leader>sw` (4937 tests):**
+Added Command Center prefix routing: `%` for live grep (extracted `picker_cc_grep_search()`), `debug` keyword prefix (reads `.vimcode/launch.json` / `.vscode/launch.json` via `picker_populate_debug_configs()`), `task` keyword prefix (reads tasks.json via `picker_populate_tasks()`, `EngineAction::RunInTerminal`). Placeholder hints dropdown: 9 mode items shown when CC opens with empty query (Go to File, Commands, Symbols, Line, Grep, Debug, Task, Help). `hint_item()` helper. `<leader>sw` greps word under cursor via `word_under_cursor()` + opens Grep picker pre-filled. `:GrepWord` command + "Search: Word Under Cursor" palette entry. 30 new tests.
+Files: `engine/picker.rs`, `engine/keys.rs`, `engine/execute.rs`, `engine/mod.rs`, `engine/tests.rs`.
+
+**Session 229 — Command Center (4847 tests):**
+Clickable search box in menu bar opens unified picker with prefix-based mode switching: no prefix = fuzzy files, `>` = command palette, `@` = document symbols (LSP `textDocument/documentSymbol`), `#` = workspace symbols (LSP `workspace/symbol`), `:` = go to line, `?` = help. Added `PickerSource::CommandCenter`, `PickerAction::GotoLine`/`GotoSymbol`. LSP types: `SymbolInfo`, `SymbolKind` (with icons/labels), hierarchical + flat response parsing. `picker_filter_command_center()` prefix routing, `fuzzy_filter_items()` shared helper. `:CommandCenter` ex command + palette entry. GTK `Msg::OpenCommandCenter` + search box click. TUI search box click. 11 new tests. Also added 14 new roadmap items (Command Center enhancements, breadcrumbs, status bar, tab bar, layout, minimap).
+Files: `engine/mod.rs`, `engine/picker.rs`, `engine/execute.rs`, `engine/panels.rs`, `engine/tests.rs`, `lsp.rs`, `lsp_manager.rs`, `gtk/mod.rs`, `tui_main/mouse.rs`.
+
+**Session 228 — Menu bar MRU history arrows (4814 tests):**
+Moved `◀ ▶` nav arrows from per-group tab bars to the menu bar row, centered alongside a VSCode Command Center-style search box showing the workspace directory name. Nav arrows navigate a global MRU tab history across all editor groups (like VSCode). Removed per-group tab bar nav arrows and overflow indicators. History starts empty on startup (arrows greyed out); seeded with initial tab so first switch records origin. Forward history truncated when navigating to a new tab (undo/redo style). `MenuBarData.title` changed from active filename to workspace dir name. GTK: `nav_arrow_rects: Rc<RefCell<>>` caches exact draw positions for click hit-testing; `EventSequenceState::Claimed` prevents WindowHandle double-click-to-maximize in nav+search area; `menu_bar_da.queue_draw()` for proper redraws. TUI: arrows + search box centered as one unit in menu bar row. `tab_nav_push()` called from explicit navigation methods only; `tab_mru_touch()` no longer pushes to nav history. 7 tab nav tests rewritten.
+Files: `engine/mod.rs`, `engine/windows.rs`, `engine/tests.rs`, `render.rs`, `gtk/draw.rs`, `gtk/mod.rs`, `tui_main/render_impl.rs`, `tui_main/mouse.rs`.
+
+**Session 227 — Back/Forward navigation arrows + bug fixes (4811 tests):**
+Tab access history with clickable nav arrows; `:tabmove` 1-based; `Ngt` to tab N; TUI split button dedup; Explorer preview scroll; multi-swap recovery; `:q` diff tab fix; SC panel single/double-click; `C` to commit; `p`/`P` swap. Engine fields: `tab_nav_history`, `tab_nav_index`, `tab_nav_navigating`. Methods: `tab_nav_push/back/forward/switch_to/can_go_back/can_go_forward`. PanelKeys: `nav_back` (`<C-A-Left>`), `nav_forward` (`<C-A-Right>`). `:navback`, `:navforward` commands + palette entries. GTK: `NavBtnMap`, nav arrows in `draw_tab_bar`, click targets `NavBack`/`NavForward`. TUI: `◀ ▶` at left of tab bar. 5 new tab nav tests.
+Files: `engine/mod.rs`, `engine/windows.rs`, `engine/keys.rs`, `engine/execute.rs`, `engine/source_control.rs`, `engine/panels.rs`, `engine/ext_panel.rs`, `engine/tests.rs`, `settings.rs`, `render.rs`, `gtk/mod.rs`, `gtk/draw.rs`, `gtk/click.rs`, `tui_main/mod.rs`, `tui_main/render_impl.rs`, `tui_main/mouse.rs`.
+
+**Session 226 — Tab scroll-into-view (4784 tests):**
+Added per-group tab bar scrolling so the active tab is always visible. `EditorGroup.tab_scroll_offset: usize` — index of first visible tab. `ensure_active_tab_visible()` called from `goto_tab`, `next_tab`, `prev_tab`, `new_tab`, `close_tab`, `open_file_in_tab`, `tab_switcher_confirm`, and `:tabmove`. `◀`/`▶` overflow indicators when tabs hidden on either side. Both GTK and TUI: rendering, click handling, tooltips, drag-drop adjusted for scroll offset. 6 new tests.
+Files: `engine/mod.rs`, `engine/windows.rs`, `engine/execute.rs`, `render.rs`, `gtk/draw.rs`, `tui_main/render_impl.rs`, `tui_main/mouse.rs`, `engine/tests.rs`.
+
+**Session 225 — Bug fixes & crash hardening (4778 tests):**
+Fixed 7 bugs: explorer reveal on folder open, visual yank cursor position, YAML syntax corruption, completion_prefix crash, swap flush on panic (emergency_swap_flush + global engine pointer), search viewport_lines accounting, stale WindowId crash (repair_active_window self-healing). Added "Tab Navigation & Command Center" plan items.
+Files: `accessors.rs`, `motions.rs`, `panels.rs`, `visual.rs`, `windows.rs`, `tests.rs`, `swap.rs`, `syntax.rs`, `gtk/mod.rs`, `tui_main/mod.rs`, `tests/visual_mode.rs`.
 
 **Session 224 — Release prep v0.5.1 (4769 tests):**
 Bump version to 0.5.1 for patch release. Update test counts across docs (4736→4769). Tick off macOS CI/Homebrew roadmap item in PLAN.md (implemented in Session 218 CI commit, but release.yml changes hadn't reached `main` yet — this release will be the first to produce macOS binaries and update the Homebrew tap). Investigated why macOS build job wasn't running in release workflow: the `build-macos` job definition only existed on `develop`, not `main`.
