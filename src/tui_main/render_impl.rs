@@ -86,7 +86,6 @@ pub(super) fn draw_frame(
     theme: &Theme,
     sidebar: &mut TuiSidebar,
     engine: &Engine,
-    sidebar_prompt: &Option<SidebarPrompt>,
     sidebar_width: u16,
     quickfix_scroll_top: usize,
     debug_output_scroll: usize,
@@ -555,44 +554,19 @@ pub(super) fn draw_frame(
         theme,
     );
 
-    if let Some(prompt) = sidebar_prompt {
-        let (prefix, input_cursor) = match &prompt.kind {
-            PromptKind::NewFile(_) => ("New file: ".to_string(), prompt.cursor),
-            PromptKind::NewFolder(_) => ("New folder: ".to_string(), prompt.cursor),
-            PromptKind::DeleteConfirm(path) => {
-                let name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                (format!("Delete '{}'? (y/n)", name), 0)
-            }
-            PromptKind::MoveFile(_) => ("Move to: ".to_string(), prompt.cursor),
-        };
-        let prompt_text = format!("{}{}", prefix, prompt.input);
-        // Cursor position in rendered chars: prefix char count + cursor char count
-        let cursor_char_pos = prefix.chars().count() + prompt.input[..input_cursor].chars().count();
-        render_prompt_line(
-            frame.buffer_mut(),
-            cmd_area,
-            &prompt_text,
-            cursor_char_pos,
-            theme,
-        );
-    } else {
-        render_command_line(frame.buffer_mut(), cmd_area, &screen.command, theme);
-        // Highlight command-line mouse selection (invert fg/bg for selected cells)
-        if let Some((start, end)) = cmd_sel {
-            let lo = start.min(end);
-            let hi = start.max(end);
-            let buf = frame.buffer_mut();
-            for i in lo..=hi {
-                let cx = cmd_area.x + i as u16;
-                if cx < cmd_area.x + cmd_area.width {
-                    let cell = buf.get_mut(cx, cmd_area.y);
-                    let old_fg = cell.fg;
-                    let old_bg = cell.bg;
-                    cell.set_fg(old_bg).set_bg(old_fg);
-                }
+    render_command_line(frame.buffer_mut(), cmd_area, &screen.command, theme);
+    // Highlight command-line mouse selection (invert fg/bg for selected cells)
+    if let Some((start, end)) = cmd_sel {
+        let lo = start.min(end);
+        let hi = start.max(end);
+        let buf = frame.buffer_mut();
+        for i in lo..=hi {
+            let cx = cmd_area.x + i as u16;
+            if cx < cmd_area.x + cmd_area.width {
+                let cell = buf.get_mut(cx, cmd_area.y);
+                let old_fg = cell.fg;
+                let old_bg = cell.bg;
+                cell.set_fg(old_bg).set_bg(old_fg);
             }
         }
     }
@@ -642,85 +616,6 @@ pub(super) fn draw_frame(
     // ── Close-tab confirm overlay ──────────────────────────────────────────────
     if close_tab_confirm {
         render_close_tab_confirm_overlay(frame.buffer_mut(), area, theme);
-    }
-}
-
-// ─── Sidebar CRUD handling ────────────────────────────────────────────────────
-
-pub(super) fn handle_sidebar_prompt(
-    engine: &mut Engine,
-    sidebar: &mut TuiSidebar,
-    kind: PromptKind,
-    input: String,
-    viewport_height: usize,
-) {
-    match kind {
-        PromptKind::NewFile(target_dir) => {
-            let name = input.trim();
-            if !name.is_empty() {
-                let path = target_dir.join(name);
-                if let Err(e) = fs::write(&path, "") {
-                    engine.message = format!("Error creating file: {}", e);
-                } else {
-                    sidebar.reveal_path(&path, viewport_height);
-                    if let Err(e) = engine.open_file_with_mode(&path, OpenMode::Permanent) {
-                        engine.message = e;
-                    }
-                }
-            }
-        }
-        PromptKind::NewFolder(target_dir) => {
-            let name = input.trim();
-            if !name.is_empty() {
-                let path = target_dir.join(name);
-                if let Err(e) = fs::create_dir_all(&path) {
-                    engine.message = format!("Error creating folder: {}", e);
-                } else {
-                    sidebar.reveal_path(&path, viewport_height);
-                }
-            }
-        }
-        PromptKind::DeleteConfirm(path) => {
-            if input == "y" {
-                let result = if path.is_dir() {
-                    fs::remove_dir_all(&path)
-                } else {
-                    fs::remove_file(&path)
-                };
-                if let Err(e) = result {
-                    engine.message = format!("Error deleting: {}", e);
-                } else {
-                    sidebar.build_rows();
-                }
-            }
-        }
-        PromptKind::MoveFile(src) => {
-            let dest_str = input.trim();
-            if !dest_str.is_empty() {
-                // Resolve destination relative to project root
-                let dest = if std::path::Path::new(dest_str).is_absolute() {
-                    std::path::PathBuf::from(dest_str)
-                } else {
-                    sidebar.root.join(dest_str)
-                };
-                match engine.move_file(&src, &dest) {
-                    Ok(()) => {
-                        // engine.move_file resolves the final path; figure out
-                        // the actual destination for reveal_path.
-                        let final_dest = if dest.is_dir() {
-                            dest.join(src.file_name().unwrap_or_default())
-                        } else {
-                            dest.clone()
-                        };
-                        sidebar.reveal_path(&final_dest, viewport_height);
-                        engine.message = format!("Moved to '{}'", final_dest.display());
-                    }
-                    Err(e) => {
-                        engine.message = e;
-                    }
-                }
-            }
-        }
     }
 }
 

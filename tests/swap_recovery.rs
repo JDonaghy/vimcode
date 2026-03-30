@@ -389,3 +389,45 @@ fn test_swap_recovery_intercepts_normal_keys() {
     let _ = fs::remove_file(&swap_path);
     let _ = fs::remove_file(&path);
 }
+
+// ── 14. No recovery offered when swap matches disk ──────────────────────────
+
+#[test]
+fn test_swap_no_recovery_when_content_matches_disk() {
+    let content = "unchanged content\n";
+    let path = temp_file("unchanged.rs", content);
+    let canonical_path = canonical(&path);
+    let swap_path = swap::swap_path_for(&canonical_path);
+
+    // Create a stale swap with the SAME content as the file on disk.
+    fs::create_dir_all(swap_path.parent().unwrap()).unwrap();
+    {
+        let mut f = fs::File::create(&swap_path).unwrap();
+        writeln!(f, "VIMCODE_SWAP_V1").unwrap();
+        writeln!(f, "path: {}", canonical_path.display()).unwrap();
+        writeln!(f, "pid: 999999999").unwrap(); // dead PID
+        writeln!(f, "modified: 2026-01-01T00:00:00Z").unwrap();
+        writeln!(f, "---").unwrap();
+        write!(f, "{}", content).unwrap();
+    }
+
+    let mut e = engine_with("");
+    e.open_file_in_tab(&path);
+
+    // No recovery should be offered — swap content matches disk.
+    assert!(
+        e.pending_swap_recovery.is_none(),
+        "no recovery should be offered when swap matches file on disk"
+    );
+    assert!(
+        e.dialog.is_none(),
+        "no dialog should be shown for unchanged swap"
+    );
+
+    // In a real run, the stale swap would be deleted and replaced with a
+    // fresh one.  In tests, `delete_swap`/`write_swap` are suppressed, so
+    // we can only verify that the engine state is correct (no dialog).
+
+    let _ = fs::remove_file(&swap_path);
+    let _ = fs::remove_file(&path);
+}

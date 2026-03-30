@@ -128,6 +128,16 @@ pub(super) fn make_theme_css(theme: &Theme) -> String {
             color: {dim_fg};
         }}
 
+        /* Inline editing entry (rename / new file/folder) */
+        treeview entry {{
+            border: 1px solid {accent};
+            border-radius: 2px;
+            padding: 2px 4px;
+            background-color: {editor_bg};
+            color: {text_fg};
+            min-height: 20px;
+        }}
+
         /* Search results */
         .search-results-list {{
             background-color: {bar_bg};

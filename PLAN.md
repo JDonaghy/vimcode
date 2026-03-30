@@ -5,6 +5,8 @@
 ---
 
 ## Recently Completed
+- **Session 233**: Explorer focus UX polish — stronger `sidebar_sel_bg` and `explorer_active_bg` colors across all 6 themes; suppress current-file highlight when explorer has focus (TUI); TUI click on explorer sets `explorer_has_focus`; Ctrl-W h focuses explorer (GTK `window_nav_overflow` handling + TUI Explorer case in overflow match); `OpenFileFromSidebar` clears focus; GTK `row_activated` handles directory expand/collapse; fixed GTK j/k/arrow key passthrough for TreeView navigation. Known bug: GTK Enter on folder after arrow-key nav requires two presses (filed in BUGS.md).
+- **Session 232**: Inline new file/folder in explorer tree — `ExplorerNewEntryState` struct with inline editing; replaced status-line prompt (TUI) and modal dialog (GTK) with inline editable row in tree; GTK bordered text field via CSS `treeview entry` styling; TUI inverted-cursor rendering with virtual row interleaving; generic file/folder icons during input; `start_explorer_new_file/folder()`, `handle_explorer_new_entry_key()`; removed `PromptKind::NewFile/NewFolder` and `show_name_prompt_dialog()`; `find_tree_iter_for_path()` + `remove_new_entry_rows()` tree helpers; 10 new tests.
 - **Session 231**: Git branch switcher in status bar — clickable branch name in status bar opens `PickerSource::GitBranches` picker; ahead/behind counts (`↑N ↓N`) displayed; `status_branch_range` on `ScreenLayout`; GTK + TUI click handlers; `:Gbranches` command; fixed `Gcheckout` → `Gswitch` in picker confirm; 6 new tests.
 - **Session 230**: Command Center enhancements + `<leader>sw` — `%` grep prefix, `debug` keyword (launch configs), `task` keyword (tasks.json), placeholder hints dropdown (9 mode items on empty query). `<leader>sw` greps word under cursor; `:GrepWord` command; palette entry. 30 new tests.
 - **Session 229**: Command Center — clickable search box in menu bar opens unified picker with prefix routing: _(none)_ fuzzy files, `>` command palette, `@` document symbols, `#` workspace symbols, `:` go to line, `?` help. LSP `documentSymbol`/`workspaceSymbol` integration. `:CommandCenter` ex command. GTK + TUI click-to-open. 11 new tests.
@@ -57,6 +59,9 @@
 - [x] CLI file arg restores entire previous session — skip `restore_session_files` when CLI arg given; use `open_file_with_mode(Permanent)` to reuse scratch tab
 - [x] TUI: cannot drag tab to create new editor group with one group — added edge zone detection + visual feedback in `compute_tui_tab_drop_zone` / `render_tab_drag_overlay`
 - [x] GTK "Don't know color ''" warnings — empty TreeStore color columns (3, 5) replaced with valid hex defaults
+- [x] Swap recovery dialog shown for unmodified buffers after crash — compare swap content with disk file, silently delete if identical
+- [x] GTK explorer focus not returning to editor after file open — clear `explorer_has_focus`/`tree_has_focus` in `OpenFileFromSidebar`
+- [x] GTK 100% CPU after opening file from explorer — caused by stuck `explorer_has_focus` state (same fix as above)
 
 ## Roadmap
 - [x] **Spell checker** — Vim-compatible `]s`/`[s`/`z=`/`zg`/`zw`; spellbook Hunspell parser; bundled en_US dictionary; tree-sitter-aware; `spell`/`spelllang` settings; user dictionary at `~/.config/vimcode/user.dic`
@@ -165,6 +170,8 @@
 
 ### Explorer
 - [x] **Explorer tree indicators** — Right-aligned git status (`M`/`A`/`?`/`D`/`R`) and deduplicated LSP diagnostic counts (errors/warnings) on explorer tree rows (like VSCode); per-extension `ignore_error_sources` config; `9+` cap. Both GTK and TUI backends.
+- [x] **Inline new file/folder in explorer tree** — New File and New Folder should create an empty inline editable entry in the explorer tree (inserted under the selected/target directory) rather than prompting for the name in the status line (TUI) or a modal dialog (GTK). The entry uses the same inline editing pattern as rename (`ExplorerRenameState`-style). In GTK mode, both the new entry input and rename input should display with a visible bordered box around the text field. In TUI mode, the existing inverted-cursor inline style is sufficient. On Enter, create the file/folder; on Escape, cancel. File icon should show a generic new-file/new-folder icon during input.
+- [ ] **Replace status-line confirmations with modal dialogs** — Audit all places where a y/n confirmation is collected via the status/command line (e.g. TUI `PromptKind::DeleteConfirm`, file move confirmations) and migrate them to use the engine's modal dialog system (`show_dialog()`/`show_error_dialog()`) instead. Dialogs are more visible, support clickable buttons, and match GTK's native confirmation dialogs. The status line should only be used for transient messages, not interactive prompts.
 
 ### Refactoring
 - [x] **Split main.rs into gtk/ directory** — `src/main.rs` (16,826 lines) → `src/gtk/` directory with 6 submodules: `mod.rs` (9,267 — App, Msg, SimpleComponent impl), `draw.rs` (5,519 — all 32 draw_* functions), `click.rs` (575 — mouse click/drag), `css.rs` (525 — theme CSS), `util.rs` (468 — GTK utilities), `tree.rs` (432 — file tree). Thin `main.rs` (55 lines) dispatches to `gtk::run()` or `tui_main::run()`. Zero API changes, all 4,721 tests pass.

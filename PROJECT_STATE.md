@@ -1,9 +1,9 @@
 # VimCode Project State
 
-**Last updated:** Mar 28, 2026 (Session 231 — Git branch switcher in status bar) | **Tests:** 4955
+**Last updated:** Mar 29, 2026 (Session 233 — Explorer focus UX + GTK fixes) | **Tests:** 4986
 
 > Feature documentation lives in **README.md**.
-> Per-session implementation notes through Session 231 are in **SESSION_HISTORY.md**.
+> Per-session implementation notes through Session 232 are in **SESSION_HISTORY.md**.
 
 ---
 
@@ -26,4 +26,4 @@ When implementing a new key/command, add tests covering:
 
 ## Recent Work
 
-> All sessions through 231 archived in **SESSION_HISTORY.md**.
+> All sessions through 233 archived in **SESSION_HISTORY.md**.

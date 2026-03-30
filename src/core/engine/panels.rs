@@ -187,6 +187,84 @@ impl Engine {
                 }
                 EngineAction::None
             }
+            "confirm_delete" => {
+                if action == "delete" {
+                    if let Some(path) = self.pending_delete.take() {
+                        let name = path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        let is_dir = path.is_dir();
+                        let item_type = if is_dir { "folder" } else { "file" };
+                        if !path.exists() {
+                            self.message = format!("'{}' does not exist", name);
+                        } else {
+                            let result = if is_dir {
+                                std::fs::remove_dir_all(&path)
+                            } else {
+                                std::fs::remove_file(&path)
+                            };
+                            match result {
+                                Ok(()) => {
+                                    self.message = format!("Deleted {}: '{}'", item_type, name);
+                                    // If deleted file was open, close its buffer
+                                    if !is_dir {
+                                        let path_str = path.to_string_lossy();
+                                        if let Some(buffer_id) =
+                                            self.buffer_manager.find_by_path(&path_str)
+                                        {
+                                            let _ = self.delete_buffer(buffer_id, true);
+                                        }
+                                    }
+                                    self.explorer_needs_refresh = true;
+                                }
+                                Err(e) => {
+                                    self.message = format!("Error deleting: {}", e);
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    self.pending_delete = None;
+                }
+                EngineAction::None
+            }
+            "move_file_input" => {
+                if action == "move" {
+                    if let Some((src, _)) = self.pending_move.take() {
+                        let dest_str = input_value.unwrap_or("").trim();
+                        if !dest_str.is_empty() {
+                            let dest = if std::path::Path::new(dest_str).is_absolute() {
+                                PathBuf::from(dest_str)
+                            } else {
+                                self.cwd.join(dest_str)
+                            };
+                            match self.move_file(&src, &dest) {
+                                Ok(()) => {
+                                    let name = src
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().to_string())
+                                        .unwrap_or_default();
+                                    let final_dest = if dest.is_dir() {
+                                        dest.join(src.file_name().unwrap_or_default())
+                                    } else {
+                                        dest.clone()
+                                    };
+                                    self.message =
+                                        format!("Moved '{}' to '{}'", name, final_dest.display());
+                                    self.explorer_needs_refresh = true;
+                                }
+                                Err(e) => {
+                                    self.message = e;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    self.pending_move = None;
+                }
+                EngineAction::None
+            }
             "ext_remove" => {
                 if let Some(name) = self.pending_ext_remove.take() {
                     match action {

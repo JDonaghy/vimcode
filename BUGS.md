@@ -1,6 +1,6 @@
 # Known Bugs
 
-(none)
+- **(Low) GTK Explorer: Enter requires two presses after arrow-key navigation** — After using arrow keys to navigate to a folder in the GTK TreeView, the first Enter press doesn't expand/collapse; the second does. Likely a GTK4 TreeView cursor/selection sync issue or interaction between GTK's built-in key bindings and the `row_activated` signal. Works correctly after the first activation. TUI explorer is unaffected.
 
 ## Resolved
 

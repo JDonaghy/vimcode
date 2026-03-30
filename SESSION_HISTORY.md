@@ -1,9 +1,17 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 231 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 233 archived here. Recent work summary in PROJECT_STATE.md.
 
 ---
+
+**Session 233 — Explorer focus UX polish + GTK fixes (4986 tests):**
+Explorer focus visibility improvements: stronger `sidebar_sel_bg` colors across all 6 themes (OneDark `#373d4a`, Gruvbox `#504945`, Tokyo Night `#33395a`, Solarized `#0a4a5a`, Dark+ `#04395e`, Light+ `#b4d9ff`); brighter `explorer_active_bg` for current-file highlight when explorer unfocused. TUI: suppress current-editor-file highlight (`is_active`) when `explorer_has_focus` is true; clicking explorer tree sets `explorer_has_focus`. Ctrl-W h now focuses explorer: GTK handles `window_nav_overflow` (left overflow → `Msg::FocusExplorer`); TUI adds `Explorer` case to overflow match. GTK: `OpenFileFromSidebar` clears `explorer_has_focus`/`tree_has_focus` (fixes 100% CPU + stuck focus); `row_activated` handles directory expand/collapse; j/k/arrow keys pass through to TreeView; `ExplorerActivateSelected` message for programmatic activation. Swap recovery: skip dialog when swap content matches disk file. Known bug filed: GTK Enter on folder after arrow-key nav requires two presses.
+Files: `render.rs`, `tui_main/panels.rs`, `tui_main/mouse.rs`, `tui_main/mod.rs`, `gtk/mod.rs`, `gtk/css.rs`, `core/engine/ext_panel.rs`, `BUGS.md`.
+
+**Session 232 — Inline new file/folder in explorer tree (4985 tests):**
+`ExplorerNewEntryState` struct with inline editing in explorer tree. Replaced status-line prompt (TUI) and modal dialog (GTK) with inline editable row inserted under target directory. GTK: bordered text field via CSS `treeview entry` styling; `CellRendererText` editable mode; `Msg::StartInlineNewFile/Folder`; `ExplorerAction` dispatch via `idle_add_local_once` to avoid RefCell panics. TUI: inverted-cursor rendering with virtual row interleaving in `render_new_entry_row()`; key routing guard for `explorer_new_entry`. Engine: `start_explorer_new_file/folder()`, `handle_explorer_new_entry_key()` (Escape/Return/BackSpace/Delete/Left/Right/Home/End/printable). Removed `PromptKind::NewFile/NewFolder` and `show_name_prompt_dialog()`. Tree helpers: `find_tree_iter_for_path()`, `remove_new_entry_rows()`. Swap recovery: compare swap content with disk, silently delete if identical. 10 new tests + 1 swap recovery test.
+Files: `core/engine/mod.rs`, `core/engine/buffers.rs`, `core/engine/ext_panel.rs`, `core/engine/tests.rs`, `gtk/mod.rs`, `gtk/tree.rs`, `gtk/css.rs`, `tui_main/mod.rs`, `tui_main/panels.rs`, `tui_main/mouse.rs`, `tui_main/render_impl.rs`, `tests/swap_recovery.rs`.
 
 **Session 231 — Git branch switcher in status bar (4955 tests):**
 Clickable branch name in status bar opens `PickerSource::GitBranches` unified picker. Status bar shows ahead/behind counts (`↑N ↓N`). `status_branch_range: Option<(usize, usize)>` on `ScreenLayout` for click detection. TUI: status bar row click handler in `mouse.rs`. GTK: click handler in `handle_mouse_click_msg()` reconstructs column range from engine state. `:Gbranches` command opens branch picker. Fixed picker confirm using `Gcheckout` (nonexistent) → `Gswitch`. Updated "Git: Switch Branch" palette entry to use `Gbranches`. 6 new tests.

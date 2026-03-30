@@ -15911,3 +15911,349 @@ fn test_git_branch_picker_filter_typing() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ── Inline new file/folder in explorer ──────────────────────────────────────
+
+#[test]
+fn test_explorer_new_file_start() {
+    let mut engine = Engine::new();
+    let dir = std::env::temp_dir().join("vimcode_test_new_file_start");
+    let _ = std::fs::create_dir_all(&dir);
+    engine.start_explorer_new_file(dir.clone());
+    assert!(engine.explorer_new_entry.is_some());
+    let entry = engine.explorer_new_entry.as_ref().unwrap();
+    assert_eq!(entry.parent_dir, dir);
+    assert!(!entry.is_folder);
+    assert!(entry.input.is_empty());
+    assert_eq!(entry.cursor, 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_explorer_new_folder_start() {
+    let mut engine = Engine::new();
+    let dir = std::env::temp_dir().join("vimcode_test_new_folder_start");
+    let _ = std::fs::create_dir_all(&dir);
+    engine.start_explorer_new_folder(dir.clone());
+    assert!(engine.explorer_new_entry.is_some());
+    let entry = engine.explorer_new_entry.as_ref().unwrap();
+    assert_eq!(entry.parent_dir, dir);
+    assert!(entry.is_folder);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_explorer_new_entry_typing() {
+    let mut engine = Engine::new();
+    let dir = std::env::temp_dir().join("vimcode_test_new_entry_typing");
+    let _ = std::fs::create_dir_all(&dir);
+    engine.start_explorer_new_file(dir.clone());
+
+    // Type "hello.rs"
+    for ch in "hello.rs".chars() {
+        engine.handle_explorer_new_entry_key(&ch.to_string(), Some(ch), false);
+    }
+    let entry = engine.explorer_new_entry.as_ref().unwrap();
+    assert_eq!(entry.input, "hello.rs");
+    assert_eq!(entry.cursor, "hello.rs".len());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_explorer_new_entry_escape_cancels() {
+    let mut engine = Engine::new();
+    let dir = std::env::temp_dir().join("vimcode_test_new_entry_escape");
+    let _ = std::fs::create_dir_all(&dir);
+    engine.start_explorer_new_file(dir.clone());
+    engine.handle_explorer_new_entry_key("a", Some('a'), false);
+    engine.handle_explorer_new_entry_key("Escape", None, false);
+    assert!(engine.explorer_new_entry.is_none());
+    assert!(!engine.explorer_needs_refresh);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_explorer_new_file_enter_creates() {
+    let mut engine = Engine::new();
+    let dir = std::env::temp_dir().join("vimcode_test_new_file_enter");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    engine.start_explorer_new_file(dir.clone());
+
+    for ch in "newfile.txt".chars() {
+        engine.handle_explorer_new_entry_key(&ch.to_string(), Some(ch), false);
+    }
+    engine.handle_explorer_new_entry_key("Return", None, false);
+
+    assert!(engine.explorer_new_entry.is_none());
+    assert!(engine.explorer_needs_refresh);
+    assert!(dir.join("newfile.txt").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_explorer_new_folder_enter_creates() {
+    let mut engine = Engine::new();
+    let dir = std::env::temp_dir().join("vimcode_test_new_folder_enter");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    engine.start_explorer_new_folder(dir.clone());
+
+    for ch in "subdir".chars() {
+        engine.handle_explorer_new_entry_key(&ch.to_string(), Some(ch), false);
+    }
+    engine.handle_explorer_new_entry_key("Return", None, false);
+
+    assert!(engine.explorer_new_entry.is_none());
+    assert!(engine.explorer_needs_refresh);
+    assert!(dir.join("subdir").is_dir());
+    assert!(engine.message.contains("Created folder"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_explorer_new_entry_empty_name_silent_cancel() {
+    let mut engine = Engine::new();
+    let dir = std::env::temp_dir().join("vimcode_test_new_entry_empty");
+    let _ = std::fs::create_dir_all(&dir);
+    engine.start_explorer_new_file(dir.clone());
+    // Press Enter with empty input
+    engine.handle_explorer_new_entry_key("Return", None, false);
+    assert!(engine.explorer_new_entry.is_none());
+    assert!(!engine.explorer_needs_refresh);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_explorer_new_entry_duplicate_shows_error() {
+    let mut engine = Engine::new();
+    let dir = std::env::temp_dir().join("vimcode_test_new_entry_dup");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // Create existing file
+    std::fs::write(dir.join("exists.txt"), "").unwrap();
+
+    engine.start_explorer_new_file(dir.clone());
+    for ch in "exists.txt".chars() {
+        engine.handle_explorer_new_entry_key(&ch.to_string(), Some(ch), false);
+    }
+    engine.handle_explorer_new_entry_key("Return", None, false);
+
+    assert!(engine.explorer_new_entry.is_none());
+    assert!(!engine.explorer_needs_refresh);
+    assert!(engine.message.contains("already exists"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_explorer_new_entry_backspace() {
+    let mut engine = Engine::new();
+    let dir = std::env::temp_dir().join("vimcode_test_new_entry_bs");
+    let _ = std::fs::create_dir_all(&dir);
+    engine.start_explorer_new_file(dir.clone());
+
+    for ch in "abc".chars() {
+        engine.handle_explorer_new_entry_key(&ch.to_string(), Some(ch), false);
+    }
+    engine.handle_explorer_new_entry_key("BackSpace", None, false);
+    let entry = engine.explorer_new_entry.as_ref().unwrap();
+    assert_eq!(entry.input, "ab");
+    assert_eq!(entry.cursor, 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_explorer_new_entry_cursor_movement() {
+    let mut engine = Engine::new();
+    let dir = std::env::temp_dir().join("vimcode_test_new_entry_cursor");
+    let _ = std::fs::create_dir_all(&dir);
+    engine.start_explorer_new_file(dir.clone());
+
+    for ch in "test".chars() {
+        engine.handle_explorer_new_entry_key(&ch.to_string(), Some(ch), false);
+    }
+    // Cursor at end (4)
+    assert_eq!(engine.explorer_new_entry.as_ref().unwrap().cursor, 4);
+
+    // Move left
+    engine.handle_explorer_new_entry_key("Left", None, false);
+    assert_eq!(engine.explorer_new_entry.as_ref().unwrap().cursor, 3);
+
+    // Home
+    engine.handle_explorer_new_entry_key("Home", None, false);
+    assert_eq!(engine.explorer_new_entry.as_ref().unwrap().cursor, 0);
+
+    // End
+    engine.handle_explorer_new_entry_key("End", None, false);
+    assert_eq!(engine.explorer_new_entry.as_ref().unwrap().cursor, 4);
+
+    // Right at end stays
+    engine.handle_explorer_new_entry_key("Right", None, false);
+    assert_eq!(engine.explorer_new_entry.as_ref().unwrap().cursor, 4);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ─── Dialog-based delete confirmation tests ──────────────────────────────────
+
+#[test]
+fn test_confirm_delete_file_shows_dialog() {
+    let dir = std::env::temp_dir().join("vimcode_test_confirm_delete_dialog");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("target.txt");
+    std::fs::write(&file, "content").unwrap();
+
+    let mut e = Engine::new();
+    e.confirm_delete_file(&file);
+
+    assert!(e.dialog.is_some());
+    let dlg = e.dialog.as_ref().unwrap();
+    assert_eq!(dlg.tag, "confirm_delete");
+    assert!(dlg.body[0].contains("target.txt"));
+    assert_eq!(dlg.buttons.len(), 2);
+    assert_eq!(dlg.buttons[0].action, "delete");
+    assert!(e.pending_delete.is_some());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_confirm_delete_file_cancel() {
+    let dir = std::env::temp_dir().join("vimcode_test_confirm_delete_cancel");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("keep.txt");
+    std::fs::write(&file, "keep me").unwrap();
+
+    let mut e = Engine::new();
+    e.confirm_delete_file(&file);
+    assert!(e.dialog.is_some());
+
+    // Cancel via Escape
+    e.handle_key("Escape", None, false);
+    assert!(e.dialog.is_none());
+    assert!(e.pending_delete.is_none());
+    // File still exists
+    assert!(file.exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_confirm_delete_file_confirm() {
+    let dir = std::env::temp_dir().join("vimcode_test_confirm_delete_confirm");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("deleteme.txt");
+    std::fs::write(&file, "gone").unwrap();
+
+    let mut e = Engine::new();
+    e.confirm_delete_file(&file);
+    assert!(e.dialog.is_some());
+
+    // Press 'd' hotkey to confirm delete
+    e.handle_key("", Some('d'), false);
+    assert!(e.dialog.is_none());
+    assert!(e.pending_delete.is_none());
+    // File should be deleted
+    assert!(!file.exists());
+    assert!(e.message.contains("Deleted"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_confirm_delete_folder() {
+    let dir = std::env::temp_dir().join("vimcode_test_confirm_delete_folder");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let subdir = dir.join("mydir");
+    std::fs::create_dir_all(&subdir).unwrap();
+    std::fs::write(subdir.join("file.txt"), "inner").unwrap();
+
+    let mut e = Engine::new();
+    e.confirm_delete_file(&subdir);
+
+    let dlg = e.dialog.as_ref().unwrap();
+    assert!(dlg.body[0].contains("folder"));
+
+    // Confirm delete
+    e.handle_key("", Some('d'), false);
+    assert!(!subdir.exists());
+    assert!(e.message.contains("Deleted folder"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_move_file_dialog_shows_with_input() {
+    let dir = std::env::temp_dir().join("vimcode_test_move_dialog");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("source.txt");
+    std::fs::write(&file, "data").unwrap();
+
+    let mut e = Engine::new();
+    e.start_move_file_dialog(&file, &dir);
+
+    assert!(e.dialog.is_some());
+    let dlg = e.dialog.as_ref().unwrap();
+    assert_eq!(dlg.tag, "move_file_input");
+    assert!(dlg.input.is_some());
+    let input = dlg.input.as_ref().unwrap();
+    assert_eq!(input.value, "source.txt");
+    assert!(!input.is_password);
+    assert_eq!(dlg.buttons[0].action, "move");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_move_file_dialog_cancel() {
+    let dir = std::env::temp_dir().join("vimcode_test_move_dialog_cancel");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("stay.txt");
+    std::fs::write(&file, "stay").unwrap();
+
+    let mut e = Engine::new();
+    e.start_move_file_dialog(&file, &dir);
+
+    // Escape cancels
+    e.handle_key("Escape", None, false);
+    assert!(e.dialog.is_none());
+    assert!(e.pending_move.is_none());
+    assert!(file.exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_move_file_dialog_confirm() {
+    let dir = std::env::temp_dir().join("vimcode_test_move_dialog_confirm");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let dest_dir = dir.join("dest");
+    std::fs::create_dir_all(&dest_dir).unwrap();
+    let file = dir.join("moveme.txt");
+    std::fs::write(&file, "moving").unwrap();
+
+    let mut e = Engine::new();
+    e.cwd = dir.clone();
+    e.start_move_file_dialog(&file, &dir);
+
+    // Clear the input and type new destination
+    if let Some(ref mut dlg) = e.dialog {
+        dlg.input.as_mut().unwrap().value = "dest".to_string();
+    }
+
+    // Press Enter to confirm (selected button is "Move")
+    e.handle_key("Return", None, false);
+    assert!(e.dialog.is_none());
+    assert!(!file.exists());
+    assert!(dest_dir.join("moveme.txt").exists());
+    assert!(e.message.contains("Moved"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

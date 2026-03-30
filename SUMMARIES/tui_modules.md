@@ -1,6 +1,6 @@
 # TUI Backend Modules
 
-## src/tui_main/mod.rs — 4,175 lines
+## src/tui_main/mod.rs — 4,230 lines
 TUI application shell using ratatui + crossterm. Contains setup, event loop, key translation, clipboard, and cell rendering helpers.
 - `run(file_path, debug_log)` — entry point; sets up terminal, runs event loop, restores terminal on exit
 - `event_loop(terminal, engine)` — main loop: poll events, dispatch keys, call draw_frame, poll async (LSP/DAP/terminal/search)
@@ -10,7 +10,7 @@ TUI application shell using ratatui + crossterm. Contains setup, event loop, key
 - Clipboard via `copypasta_ext::x11_bin::ClipboardContext`
 - Keyboard enhancement flags for Kitty/WezTerm (disambiguate Ctrl+Shift combos)
 
-## src/tui_main/render_impl.rs — 3,872 lines
+## src/tui_main/render_impl.rs — 3,845 lines
 All TUI rendering. Converts `ScreenLayout` into ratatui `Frame` draws.
 - `draw_frame(frame, engine, theme)` — top-level render function
 - `build_screen_for_tui(engine, cols, rows)` — compute layout geometry
@@ -21,10 +21,10 @@ All TUI rendering. Converts `ScreenLayout` into ratatui `Frame` draws.
 - Menu bar + dropdown rendering (centered nav arrows + Command Center search box)
 - Debug toolbar rendering
 
-## src/tui_main/panels.rs — 3,931 lines
+## src/tui_main/panels.rs — 4,048 lines
 Sidebar panel rendering for all TUI panels.
 - Activity bar (icon column, panel switching)
-- Explorer file tree with git/diagnostic indicators
+- Explorer file tree with git/diagnostic indicators + inline new-entry rows (`render_new_entry_row()`)
 - Source control panel (staged/unstaged files, commit input, worktrees)
 - Debug sidebar (call stack, variables, watch, breakpoints)
 - Extensions marketplace panel (installed/available, search, install/remove)
@@ -34,7 +34,7 @@ Sidebar panel rendering for all TUI panels.
 - Extension dynamic panels (Lua-registered panels)
 - Panel hover popup rendering
 
-## src/tui_main/mouse.rs — 2,466 lines
+## src/tui_main/mouse.rs — 2,459 lines
 All TUI mouse interaction handling.
 - `handle_mouse(event, engine, layout)` — top-level mouse dispatcher
 - Activity bar clicks (panel switching)

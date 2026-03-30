@@ -22,7 +22,6 @@ pub(super) fn handle_mouse(
     dragging_settings_sb: &mut Option<SidebarScrollDrag>,
     dragging_generic_sb: &mut Option<SidebarScrollDrag>,
     last_layout: Option<&render::ScreenLayout>,
-    sidebar_prompt: &mut Option<SidebarPrompt>,
     last_click_time: &mut Instant,
     last_click_pos: &mut (u16, u16),
     mouse_text_drag: &mut bool,
@@ -833,7 +832,6 @@ pub(super) fn handle_mouse(
                                         &act,
                                         engine,
                                         sidebar,
-                                        sidebar_prompt,
                                         *terminal_size,
                                     );
                                 }
@@ -1614,6 +1612,8 @@ pub(super) fn handle_mouse(
                 }
             }
         } else if sidebar.active_panel == TuiPanel::Explorer {
+            sidebar.has_focus = true;
+            engine.explorer_has_focus = true;
             // tree_height = (total height - 2 status rows) - 1 header row
             let tree_height = term_height.saturating_sub(3) as usize;
             let total_rows = sidebar.rows.len();
@@ -1644,40 +1644,27 @@ pub(super) fn handle_mouse(
                     match btn {
                         0 | 1 if idx < sidebar.rows.len() => {
                             let target = if selected_is_dir {
-                                &sidebar.rows[idx].path
+                                sidebar.rows[idx].path.clone()
                             } else {
-                                sidebar.rows[idx].path.parent().unwrap_or(&sidebar.root)
+                                sidebar.rows[idx]
+                                    .path
+                                    .parent()
+                                    .unwrap_or(&sidebar.root)
+                                    .to_path_buf()
                             };
-                            let prefill = target
-                                .strip_prefix(&sidebar.root)
-                                .unwrap_or(target)
-                                .to_string_lossy()
-                                .to_string();
-                            let prefill = if prefill.is_empty() {
-                                String::new()
+                            // Expand the target dir so the new entry row is visible
+                            sidebar.expanded.insert(target.clone());
+                            sidebar.build_rows();
+                            if btn == 0 {
+                                engine.start_explorer_new_file(target);
                             } else {
-                                format!("{}/", prefill)
-                            };
-                            let kind = if btn == 0 {
-                                PromptKind::NewFile(sidebar.root.clone())
-                            } else {
-                                PromptKind::NewFolder(sidebar.root.clone())
-                            };
-                            let cursor = prefill.len();
-                            *sidebar_prompt = Some(SidebarPrompt {
-                                kind,
-                                input: prefill,
-                                cursor,
-                            });
+                                engine.start_explorer_new_folder(target);
+                            }
                         }
                         2 => {
                             if idx < sidebar.rows.len() {
                                 let path = sidebar.rows[idx].path.clone();
-                                *sidebar_prompt = Some(SidebarPrompt {
-                                    kind: PromptKind::DeleteConfirm(path),
-                                    input: String::new(),
-                                    cursor: 0,
-                                });
+                                engine.confirm_delete_file(&path);
                             }
                         }
                         _ => {}

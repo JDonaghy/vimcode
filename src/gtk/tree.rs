@@ -285,43 +285,30 @@ pub(super) fn selected_parent_dir(tv: &gtk4::TreeView) -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
-/// Show a modal dialog with a text entry prompting for a name.
-/// `title` is the dialog title, `prefill` pre-populates the entry,
-/// and `on_accept` is called with the entered text when the user confirms.
-pub(super) fn show_name_prompt_dialog<F: Fn(String) + 'static>(
-    title: &str,
-    prefill: &str,
-    parent: Option<&gtk4::Window>,
-    on_accept: F,
-) {
-    let dialog = gtk4::Dialog::with_buttons(
-        Some(title),
-        parent,
-        gtk4::DialogFlags::MODAL | gtk4::DialogFlags::DESTROY_WITH_PARENT,
-        &[
-            ("Create", gtk4::ResponseType::Accept),
-            ("Cancel", gtk4::ResponseType::Cancel),
-        ],
-    );
-    let entry = gtk4::Entry::new();
-    entry.set_text(prefill);
-    entry.set_placeholder_text(Some("Enter name…"));
-    if !prefill.is_empty() {
-        entry.select_region(0, -1);
+/// Like `selected_parent_dir` but takes the `Rc<RefCell<Option<TreeView>>>` used by `App`.
+pub(super) fn selected_parent_dir_from_app(
+    tv_ref: &std::rc::Rc<std::cell::RefCell<Option<gtk4::TreeView>>>,
+) -> PathBuf {
+    if let Some(ref tv) = *tv_ref.borrow() {
+        return selected_parent_dir(tv);
     }
-    dialog.content_area().append(&entry);
-    dialog.set_default_response(gtk4::ResponseType::Accept);
-    entry.set_activates_default(true);
-    dialog.connect_response(move |dlg, resp| {
-        if resp == gtk4::ResponseType::Accept {
-            let name = entry.text().to_string();
-            if !name.is_empty() {
-                on_accept(name);
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+/// Get the full path of the currently selected tree row (from App's Rc<RefCell>).
+pub(super) fn selected_file_path_from_app(
+    tv_ref: &std::rc::Rc<std::cell::RefCell<Option<gtk4::TreeView>>>,
+) -> Option<PathBuf> {
+    if let Some(ref tv) = *tv_ref.borrow() {
+        if let Some((model, iter)) = tv.selection().selected() {
+            if let Ok(s) = model.get_value(&iter, 2).get::<String>() {
+                if !s.is_empty() {
+                    return Some(PathBuf::from(s));
+                }
             }
         }
-        dlg.close();
-    });
-    dialog.present();
+    }
+    None
 }
 
 /// Validate filename for file/folder creation
@@ -430,4 +417,59 @@ pub(super) fn highlight_file_in_tree(tree_view: &gtk4::TreeView, file_path: &Pat
         0.0,
         0.0,
     );
+}
+
+/// Find a TreeStore iter whose column 2 (path) matches the given filesystem path.
+/// Searches the entire tree recursively.  Returns `None` if not found.
+pub(super) fn find_tree_iter_for_path(
+    store: &gtk4::TreeStore,
+    target: &Path,
+) -> Option<gtk4::TreeIter> {
+    let target_str = target.to_string_lossy();
+    let iter = store.iter_first()?;
+    find_iter_recursive(store, &iter, &target_str)
+}
+
+fn find_iter_recursive(
+    store: &gtk4::TreeStore,
+    iter: &gtk4::TreeIter,
+    target: &str,
+) -> Option<gtk4::TreeIter> {
+    loop {
+        let path_str: String = store.get_value(iter, 2).get().unwrap_or_default();
+        if path_str == target {
+            return Some(*iter);
+        }
+        // Recurse into children
+        if let Some(child) = store.iter_children(Some(iter)) {
+            if let Some(found) = find_iter_recursive(store, &child, target) {
+                return Some(found);
+            }
+        }
+        if !store.iter_next(iter) {
+            break;
+        }
+    }
+    None
+}
+
+/// Recursively remove any rows with `__NEW_FILE__` or `__NEW_FOLDER__` markers
+/// in column 2.  Called when inline editing is cancelled.
+pub(super) fn remove_new_entry_rows(store: &gtk4::TreeStore, iter: &gtk4::TreeIter) {
+    loop {
+        let path_str: String = store.get_value(iter, 2).get().unwrap_or_default();
+        if path_str.starts_with("__NEW_FILE__") || path_str.starts_with("__NEW_FOLDER__") {
+            if !store.remove(iter) {
+                return; // no more siblings
+            }
+            continue; // re-check at same position (remove shifts the next row in)
+        }
+        // Recurse into children
+        if let Some(child) = store.iter_children(Some(iter)) {
+            remove_new_entry_rows(store, &child);
+        }
+        if !store.iter_next(iter) {
+            break;
+        }
+    }
 }

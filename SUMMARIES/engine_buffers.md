@@ -1,4 +1,4 @@
-# src/core/engine/buffers.rs — 3,089 lines
+# src/core/engine/buffers.rs — 3,244 lines
 
 File I/O, buffer management, syntax updates, undo/redo, git diff, markdown preview, netrw directory browser, and workspace operations.
 
@@ -29,6 +29,11 @@ File I/O, buffer management, syntax updates, undo/redo, git diff, markdown previ
 - `open_markdown_preview()` — side-by-side rendered markdown
 - `open_diff_view(path)` — git diff view
 - `sc_open_selected_async()` — async diff for source control panel
+
+## Inline New File/Folder
+- `start_explorer_new_file(parent_dir)` — begin inline new-file entry in explorer
+- `start_explorer_new_folder(parent_dir)` — begin inline new-folder entry in explorer
+- `handle_explorer_new_entry_key(key, unicode, ctrl)` — key dispatch for inline creation (Enter creates, Escape cancels)
 
 ## Workspace
 - `open_folder(path)` — change working directory

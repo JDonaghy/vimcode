@@ -1103,6 +1103,19 @@ pub struct ExplorerRenameState {
     pub cursor: usize,
 }
 
+/// State for inline new-file/folder creation in the explorer sidebar.
+#[derive(Debug, Clone)]
+pub struct ExplorerNewEntryState {
+    /// The directory under which the new entry will be created.
+    pub parent_dir: PathBuf,
+    /// Current text input (the new name).
+    pub input: String,
+    /// Byte-offset cursor position within `input`.
+    pub cursor: usize,
+    /// Whether creating a folder (true) or a file (false).
+    pub is_folder: bool,
+}
+
 /// One panel in a VSCode-style editor-group split.
 /// Each group owns its own tab bar and independent tab navigation.
 /// Single-group mode (the default) is identical to the previous behaviour.
@@ -2514,6 +2527,8 @@ pub struct Engine {
     pub diff_selected_file: Option<PathBuf>,
     /// Pending move awaiting user confirmation: (source_path, dest_dir).
     pub pending_move: Option<(PathBuf, PathBuf)>,
+    /// Pending delete awaiting user confirmation.
+    pub pending_delete: Option<PathBuf>,
     /// Set to true when a file move completes; backends should refresh the explorer tree
     /// and clear this flag.
     pub explorer_needs_refresh: bool,
@@ -2522,6 +2537,10 @@ pub struct Engine {
     /// sidebar row matching `path` should render an editable text input
     /// instead of the plain filename.
     pub explorer_rename: Option<ExplorerRenameState>,
+
+    /// Inline new-file/folder state for the explorer sidebar.  When `Some`,
+    /// a temporary editable row is inserted in the tree under `parent_dir`.
+    pub explorer_new_entry: Option<ExplorerNewEntryState>,
 }
 
 impl Engine {
@@ -2870,8 +2889,10 @@ impl Engine {
             context_menu: None,
             diff_selected_file: None,
             pending_move: None,
+            pending_delete: None,
             explorer_needs_refresh: false,
             explorer_rename: None,
+            explorer_new_entry: None,
         };
         // If vscode mode is configured, start in Insert mode with menu visible
         if engine.is_vscode_mode() {

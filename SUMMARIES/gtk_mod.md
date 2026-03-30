@@ -1,4 +1,4 @@
-# src/gtk/mod.rs — 9,466 lines
+# src/gtk/mod.rs — 9,740 lines
 
 GTK4/Relm4 application shell. Defines the `App` struct, `Msg` enum, and `SimpleComponent` impl (init/view/update). Contains the main event loop, window setup, input handling, and all GTK widget wiring.
 
@@ -29,7 +29,7 @@ GTK4/Relm4 application shell. Defines the `App` struct, `Msg` enum, and `SimpleC
 - `handle_ext_panel_msg()` — extension detail panel key/click/scroll/hover
 - `handle_ai_sidebar_msg()` — AI sidebar key/click
 - `handle_sidebar_panel_msg()` — sidebar toggle/panel switch
-- `handle_explorer_msg()` — file tree open/preview/create/delete/refresh/focus
+- `handle_explorer_msg()` — file tree open/preview/create/delete/refresh/focus/activate-selected
 - `handle_find_replace_msg()` — find/replace dialog and window resize
 - `handle_file_ops_msg()` — rename, move, copy path, diff, clipboard paste, window close
 - `handle_dialog_msg()` — window minimize/maximize/close, file/folder dialogs, quit confirm
@@ -43,6 +43,7 @@ GTK4/Relm4 application shell. Defines the `App` struct, `Msg` enum, and `SimpleC
 - `focus_editor_if_needed(still_focused)` — grab editor focus when sidebar loses focus
 - `dispatch_engine_action(action, sender, is_macro)` — unified EngineAction handler (quit, open file, terminal, etc.)
 - `save_session_and_exit()` — save session state and exit process
+- `start_inline_new_entry(parent_dir, is_folder)` — insert temp TreeStore row and begin inline editing for new file/folder
 
 ## Entry Point
 - `run(file_path)` — creates Relm4 app and launches GTK main loop

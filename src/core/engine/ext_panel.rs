@@ -3065,7 +3065,17 @@ impl Engine {
             );
             return false;
         }
-        // PID is dead → offer recovery via dialog.
+        // PID is dead — but does the swap actually differ from the file on disk?
+        // If the content is identical the buffer was never modified before the
+        // crash, so silently discard the stale swap instead of bothering the user.
+        let disk_content = std::fs::read_to_string(&file_path).unwrap_or_default();
+        if content == disk_content {
+            crate::core::swap::delete_swap(&swap_path);
+            self.swap_create_for_buffer(buf_id);
+            return false;
+        }
+
+        // Content differs → offer recovery via dialog.
         let fname = file_path.file_name().unwrap_or_default().to_string_lossy();
         self.pending_swap_recovery = Some(SwapRecovery {
             swap_path,

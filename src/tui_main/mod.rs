@@ -333,25 +333,6 @@ fn collect_rows(
     }
 }
 
-/// ─── Prompt kind for CRUD operations ─────────────────────────────────────────
-#[derive(Clone, Debug)]
-enum PromptKind {
-    /// New file inside the given directory.
-    NewFile(PathBuf),
-    /// New folder inside the given directory.
-    NewFolder(PathBuf),
-    DeleteConfirm(PathBuf),
-    /// Move: source path; input is destination dir (relative to project root).
-    MoveFile(PathBuf),
-}
-
-/// State for an active sidebar prompt shown in the command line area.
-struct SidebarPrompt {
-    kind: PromptKind,
-    input: String,
-    cursor: usize, // byte offset into input
-}
-
 // ─── Public entry point ───────────────────────────────────────────────────────
 
 /// State for an active scrollbar drag (vertical or horizontal).
@@ -981,7 +962,6 @@ fn event_loop(
     sidebar.show_hidden_files = engine.settings.show_hidden_files;
 
     // Optional active prompt (for sidebar CRUD operations)
-    let mut sidebar_prompt: Option<SidebarPrompt> = None;
 
     // Mutable sidebar width (default SIDEBAR_WIDTH, clamped 15..60)
     let mut sidebar_width: u16 = SIDEBAR_WIDTH;
@@ -1217,7 +1197,6 @@ fn event_loop(
                             &theme,
                             &mut sidebar,
                             engine,
-                            &sidebar_prompt,
                             sidebar_width,
                             quickfix_scroll_top,
                             debug_output_scroll,
@@ -1649,94 +1628,16 @@ fn event_loop(
                     continue;
                 }
 
-                // ── Prompt mode (sidebar CRUD) ──────────────────────────────
-                if let Some(ref mut prompt) = sidebar_prompt {
-                    match key_event.code {
-                        KeyCode::Esc => {
-                            sidebar_prompt = None;
+                // ── Inline new file/folder in explorer ───────────────────────
+                if engine.explorer_new_entry.is_some() {
+                    if let Some((key_name, unicode, ctrl)) =
+                        translate_key(key_event, keyboard_enhanced)
+                    {
+                        engine.handle_explorer_new_entry_key(&key_name, unicode, ctrl);
+                        if engine.explorer_needs_refresh {
+                            sidebar.build_rows();
+                            engine.explorer_needs_refresh = false;
                         }
-                        KeyCode::Enter => {
-                            let input = prompt.input.clone();
-                            let kind = prompt.kind.clone();
-                            sidebar_prompt = None;
-                            let vh = terminal
-                                .size()
-                                .map(|s| s.height.saturating_sub(4) as usize)
-                                .unwrap_or(40);
-                            handle_sidebar_prompt(engine, &mut sidebar, kind, input, vh);
-                        }
-                        KeyCode::Backspace => {
-                            if prompt.cursor > 0 {
-                                // Find the previous char boundary
-                                let prev = prompt.input[..prompt.cursor]
-                                    .char_indices()
-                                    .next_back()
-                                    .map(|(i, _)| i)
-                                    .unwrap_or(0);
-                                prompt.input.remove(prev);
-                                prompt.cursor = prev;
-                            }
-                        }
-                        KeyCode::Delete => {
-                            if prompt.cursor < prompt.input.len() {
-                                prompt.input.remove(prompt.cursor);
-                            }
-                        }
-                        KeyCode::Left => {
-                            if prompt.cursor > 0 {
-                                prompt.cursor = prompt.input[..prompt.cursor]
-                                    .char_indices()
-                                    .next_back()
-                                    .map(|(i, _)| i)
-                                    .unwrap_or(0);
-                            }
-                        }
-                        KeyCode::Right => {
-                            if prompt.cursor < prompt.input.len() {
-                                let rest = &prompt.input[prompt.cursor..];
-                                let next = rest
-                                    .char_indices()
-                                    .nth(1)
-                                    .map(|(i, _)| prompt.cursor + i)
-                                    .unwrap_or(prompt.input.len());
-                                prompt.cursor = next;
-                            }
-                        }
-                        KeyCode::Home => {
-                            prompt.cursor = 0;
-                        }
-                        KeyCode::End => {
-                            prompt.cursor = prompt.input.len();
-                        }
-                        KeyCode::Char(c)
-                            if key_event.kind != KeyEventKind::Release
-                                && !key_event.modifiers.contains(KeyModifiers::CONTROL) =>
-                        {
-                            // For delete confirm only accept y/n
-                            if matches!(prompt.kind, PromptKind::DeleteConfirm(_)) {
-                                if c == 'y' || c == 'n' {
-                                    let kind = prompt.kind.clone();
-                                    sidebar_prompt = None;
-                                    if c == 'y' {
-                                        let vh = terminal
-                                            .size()
-                                            .map(|s| s.height.saturating_sub(3) as usize)
-                                            .unwrap_or(40);
-                                        handle_sidebar_prompt(
-                                            engine,
-                                            &mut sidebar,
-                                            kind,
-                                            "y".to_string(),
-                                            vh,
-                                        );
-                                    }
-                                }
-                            } else {
-                                prompt.input.insert(prompt.cursor, c);
-                                prompt.cursor += c.len_utf8();
-                            }
-                        }
-                        _ => {}
                     }
                     needs_redraw = true;
                     continue;
@@ -2737,38 +2638,20 @@ fn event_loop(
                                                 sidebar.root.clone()
                                             }
                                         };
-                                        // Pre-fill with target dir relative to root + /
-                                        let prefill = target_dir
-                                            .strip_prefix(&sidebar.root)
-                                            .unwrap_or(&target_dir)
-                                            .to_string_lossy()
-                                            .to_string();
-                                        let prefill = if prefill.is_empty() {
-                                            String::new()
+                                        // Expand the target dir so the new entry row is visible
+                                        sidebar.expanded.insert(target_dir.clone());
+                                        sidebar.build_rows();
+                                        if action == ExplorerAction::NewFile {
+                                            engine.start_explorer_new_file(target_dir);
                                         } else {
-                                            format!("{}/", prefill)
-                                        };
-                                        let kind = if action == ExplorerAction::NewFile {
-                                            PromptKind::NewFile(sidebar.root.clone())
-                                        } else {
-                                            PromptKind::NewFolder(sidebar.root.clone())
-                                        };
-                                        let cursor = prefill.len();
-                                        sidebar_prompt = Some(SidebarPrompt {
-                                            kind,
-                                            input: prefill,
-                                            cursor,
-                                        });
+                                            engine.start_explorer_new_folder(target_dir);
+                                        }
                                     }
                                     ExplorerAction::Delete => {
                                         let idx = sidebar.selected;
                                         if idx < sidebar.rows.len() {
                                             let path = sidebar.rows[idx].path.clone();
-                                            sidebar_prompt = Some(SidebarPrompt {
-                                                kind: PromptKind::DeleteConfirm(path),
-                                                input: String::new(),
-                                                cursor: 0,
-                                            });
+                                            engine.confirm_delete_file(&path);
                                         }
                                     }
                                     ExplorerAction::Rename => {
@@ -2782,18 +2665,8 @@ fn event_loop(
                                         let idx = sidebar.selected;
                                         if idx < sidebar.rows.len() {
                                             let path = sidebar.rows[idx].path.clone();
-                                            // Pre-fill with full relative path from root
-                                            let prefill = path
-                                                .strip_prefix(&sidebar.root)
-                                                .unwrap_or(&path)
-                                                .to_string_lossy()
-                                                .to_string();
-                                            let cursor = prefill.len();
-                                            sidebar_prompt = Some(SidebarPrompt {
-                                                kind: PromptKind::MoveFile(path),
-                                                input: prefill,
-                                                cursor,
-                                            });
+                                            let root = sidebar.root.clone();
+                                            engine.start_move_file_dialog(&path, &root);
                                         }
                                     }
                                 }
@@ -3422,8 +3295,8 @@ fn event_loop(
                         && intercept_paste_key(engine, unicode == Some('P'));
 
                     // ── Context menu keyboard intercept (TUI-side) ──────────
-                    // Handle here so explorer actions (new_file etc.) can set
-                    // sidebar_prompt, which the engine doesn't know about.
+                    // Handle here so explorer actions (new_file etc.) can be
+                    // dispatched to the engine's dialog system.
                     if engine.context_menu.is_some() {
                         let effective_key = if key_name.is_empty() {
                             unicode.map(|c| c.to_string()).unwrap_or_default()
@@ -3437,7 +3310,6 @@ fn event_loop(
                                     &act,
                                     engine,
                                     &sidebar,
-                                    &mut sidebar_prompt,
                                     terminal.size().ok(),
                                 );
                             }
@@ -3526,6 +3398,9 @@ fn event_loop(
                             if sidebar.visible {
                                 sidebar.has_focus = true;
                                 match sidebar.active_panel {
+                                    TuiPanel::Explorer => {
+                                        engine.explorer_has_focus = true;
+                                    }
                                     TuiPanel::Git => engine.sc_has_focus = true,
                                     TuiPanel::Debug => engine.dap_sidebar_has_focus = true,
                                     TuiPanel::Extensions => {
@@ -3630,7 +3505,6 @@ fn event_loop(
                                 &mut dragging_settings_sb,
                                 &mut dragging_generic_sb,
                                 last_layout.as_ref(),
-                                &mut sidebar_prompt,
                                 &mut last_click_time,
                                 &mut last_click_pos,
                                 &mut mouse_text_drag,
@@ -3682,7 +3556,6 @@ fn event_loop(
                     &mut dragging_settings_sb,
                     &mut dragging_generic_sb,
                     last_layout.as_ref(),
-                    &mut sidebar_prompt,
                     &mut last_click_time,
                     &mut last_click_pos,
                     &mut mouse_text_drag,
@@ -3849,7 +3722,6 @@ fn handle_explorer_context_action(
     action: &str,
     engine: &mut Engine,
     sidebar: &TuiSidebar,
-    sidebar_prompt: &mut Option<SidebarPrompt>,
     terminal_size: Option<ratatui::layout::Rect>,
 ) {
     // Get the path from the engine's last context menu target.
@@ -3865,41 +3737,21 @@ fn handle_explorer_context_action(
     match action {
         "new_file" | "new_folder" => {
             let target = if is_dir {
-                &path
+                path.clone()
             } else {
-                path.parent().unwrap_or(&sidebar.root)
+                path.parent().unwrap_or(&sidebar.root).to_path_buf()
             };
-            let prefill = target
-                .strip_prefix(&sidebar.root)
-                .unwrap_or(target)
-                .to_string_lossy()
-                .to_string();
-            let prefill = if prefill.is_empty() {
-                String::new()
+            if action == "new_file" {
+                engine.start_explorer_new_file(target);
             } else {
-                format!("{}/", prefill)
-            };
-            let kind = if action == "new_file" {
-                PromptKind::NewFile(sidebar.root.clone())
-            } else {
-                PromptKind::NewFolder(sidebar.root.clone())
-            };
-            let cursor = prefill.len();
-            *sidebar_prompt = Some(SidebarPrompt {
-                kind,
-                input: prefill,
-                cursor,
-            });
+                engine.start_explorer_new_folder(target);
+            }
         }
         "rename" => {
             engine.start_explorer_rename(path);
         }
         "delete" => {
-            *sidebar_prompt = Some(SidebarPrompt {
-                kind: PromptKind::DeleteConfirm(path),
-                input: String::new(),
-                cursor: 0,
-            });
+            engine.confirm_delete_file(&path);
         }
         // copy_path, copy_relative_path, reveal, open_side, open_side_vsplit handled by engine
         "copy_path" | "copy_relative_path" | "reveal" | "open_side" | "open_side_vsplit" => {}

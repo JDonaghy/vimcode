@@ -2005,7 +2005,7 @@ impl Theme {
             md_code: Color::from_hex("#98c379"),     // green (string-like)
             md_link: Color::from_hex("#61afef"),     // blue
 
-            sidebar_sel_bg: Color::from_hex("#2c313a"), // focused: subtle highlight
+            sidebar_sel_bg: Color::from_hex("#373d4a"), // focused: visible highlight
             sidebar_sel_bg_inactive: Color::from_hex("#21252b"), // unfocused: very faint
             semantic_parameter: Color::from_hex("#c8ae9d"), // warm sandy (distinct from variable red)
             semantic_property: Color::from_hex("#d19a66"),  // orange
@@ -2025,7 +2025,7 @@ impl Theme {
             bracket_match_bg: Color::from_hex("#3a3d41"),
 
             explorer_dir_fg: Color::from_hex("#61afef"), // function blue
-            explorer_active_bg: Color::from_hex("#2c313a"), // subtle tint
+            explorer_active_bg: Color::from_hex("#333842"), // current-file tint
         }
     }
 
@@ -2125,7 +2125,7 @@ impl Theme {
             md_code: Color::from_hex("#b8bb26"),
             md_link: Color::from_hex("#83a598"),
 
-            sidebar_sel_bg: Color::from_hex("#3c3836"), // focused
+            sidebar_sel_bg: Color::from_hex("#504945"), // focused: visible highlight
             sidebar_sel_bg_inactive: Color::from_hex("#32302f"), // unfocused
             semantic_parameter: Color::from_hex("#83a598"), // blue
             semantic_property: Color::from_hex("#d3869b"), // purple-pink
@@ -2145,7 +2145,7 @@ impl Theme {
             bracket_match_bg: Color::from_hex("#504945"),
 
             explorer_dir_fg: Color::from_hex("#83a598"), // gruvbox blue
-            explorer_active_bg: Color::from_hex("#3c3836"), // subtle tint
+            explorer_active_bg: Color::from_hex("#45403d"), // current-file tint
         }
     }
 
@@ -2245,7 +2245,7 @@ impl Theme {
             md_code: Color::from_hex("#9ece6a"),
             md_link: Color::from_hex("#7aa2f7"),
 
-            sidebar_sel_bg: Color::from_hex("#292e42"), // focused
+            sidebar_sel_bg: Color::from_hex("#33395a"), // focused: visible highlight
             sidebar_sel_bg_inactive: Color::from_hex("#1f2335"), // unfocused
             semantic_parameter: Color::from_hex("#e0af68"), // orange-gold
             semantic_property: Color::from_hex("#73daca"), // teal
@@ -2265,7 +2265,7 @@ impl Theme {
             bracket_match_bg: Color::from_hex("#364a82"),
 
             explorer_dir_fg: Color::from_hex("#7aa2f7"), // tokyo blue
-            explorer_active_bg: Color::from_hex("#292e42"), // subtle tint
+            explorer_active_bg: Color::from_hex("#2f3550"), // current-file tint
         }
     }
 
@@ -2365,7 +2365,7 @@ impl Theme {
             md_code: Color::from_hex("#859900"),
             md_link: Color::from_hex("#268bd2"),
 
-            sidebar_sel_bg: Color::from_hex("#073642"), // focused
+            sidebar_sel_bg: Color::from_hex("#0a4a5a"), // focused: visible highlight
             sidebar_sel_bg_inactive: Color::from_hex("#002b36"), // unfocused (base03)
             semantic_parameter: Color::from_hex("#268bd2"), // blue
             semantic_property: Color::from_hex("#2aa198"), // cyan
@@ -2385,7 +2385,7 @@ impl Theme {
             bracket_match_bg: Color::from_hex("#0d4a5a"),
 
             explorer_dir_fg: Color::from_hex("#268bd2"), // solarized blue
-            explorer_active_bg: Color::from_hex("#073642"), // subtle tint
+            explorer_active_bg: Color::from_hex("#0a4050"), // current-file tint
         }
     }
 
@@ -2485,7 +2485,7 @@ impl Theme {
             md_code: Color::from_hex("#ce9178"),
             md_link: Color::from_hex("#3794ff"),
 
-            sidebar_sel_bg: Color::from_hex("#37373d"),
+            sidebar_sel_bg: Color::from_hex("#04395e"), // focused: visible blue highlight
             sidebar_sel_bg_inactive: Color::from_hex("#2a2d2e"),
             semantic_parameter: Color::from_hex("#9cdcfe"), // light blue
             semantic_property: Color::from_hex("#9cdcfe"),  // light blue
@@ -2505,7 +2505,7 @@ impl Theme {
             bracket_match_bg: Color::from_hex("#3a3d41"),
 
             explorer_dir_fg: Color::from_hex("#dcdcaa"), // warm yellow (like function names)
-            explorer_active_bg: Color::from_hex("#37373d"), // subtle tint
+            explorer_active_bg: Color::from_hex("#2a2d3e"), // current-file tint
         }
     }
 
@@ -2604,7 +2604,7 @@ impl Theme {
             md_code: Color::from_hex("#a31515"),
             md_link: Color::from_hex("#0066bf"),
 
-            sidebar_sel_bg: Color::from_hex("#d6ebff"),
+            sidebar_sel_bg: Color::from_hex("#b4d9ff"), // focused: visible blue highlight
             sidebar_sel_bg_inactive: Color::from_hex("#e4e6f1"),
             semantic_parameter: Color::from_hex("#001080"), // dark blue
             semantic_property: Color::from_hex("#001080"),  // dark blue
@@ -2624,7 +2624,7 @@ impl Theme {
             bracket_match_bg: Color::from_hex("#dddddd"),
 
             explorer_dir_fg: Color::from_hex("#795e26"), // warm brown dirs
-            explorer_active_bg: Color::from_hex("#e8e8e8"), // subtle tint
+            explorer_active_bg: Color::from_hex("#dce5f0"), // current-file tint
         }
     }
 

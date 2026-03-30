@@ -1,4 +1,4 @@
-# src/core/engine/mod.rs — 3,391 lines
+# src/core/engine/mod.rs — 3,415 lines
 
 Core engine definition. Contains the `Engine` struct (all editor state), enums, types, `new()` constructor, free functions, and `mod` declarations for all submodules.
 
@@ -18,6 +18,7 @@ Core engine definition. Contains the `Engine` struct (all editor state), enums, 
 - `DiffPeekState` — inline diff peek popup state
 - `SwapRecovery` — crash recovery swap file state
 - `SettingsRow` — settings panel row identifier
+- `ExplorerNewEntryState` — inline new-file/folder creation state (parent_dir, input, cursor, is_folder)
 
 ## Key Functions
 - `Engine::new()` — constructor, initializes all state
