@@ -296,7 +296,14 @@ pub(super) fn draw_frame(
                     width: bc_w,
                     height: 1,
                 };
-                render_breadcrumb_bar(frame.buffer_mut(), bc_rect, &bc.segments, theme);
+                render_breadcrumb_bar(
+                    frame.buffer_mut(),
+                    bc_rect,
+                    &bc.segments,
+                    theme,
+                    engine.breadcrumb_focus,
+                    engine.breadcrumb_selected,
+                );
             }
         }
         // Draw divider lines (vertical only — horizontal splits use the tab bar as divider).
@@ -349,7 +356,14 @@ pub(super) fn draw_frame(
                     width: editor_area.width,
                     height: 1,
                 };
-                render_breadcrumb_bar(frame.buffer_mut(), bc_rect, &bc.segments, theme);
+                render_breadcrumb_bar(
+                    frame.buffer_mut(),
+                    bc_rect,
+                    &bc.segments,
+                    theme,
+                    engine.breadcrumb_focus,
+                    engine.breadcrumb_selected,
+                );
             }
         }
         render_all_windows(frame, editor_area, &screen.windows, theme);
@@ -1134,8 +1148,11 @@ pub(super) fn render_breadcrumb_bar(
     area: Rect,
     segments: &[render::BreadcrumbSegment],
     theme: &Theme,
+    focus_active: bool,
+    focus_selected: usize,
 ) {
     let bg = rc(theme.breadcrumb_bg);
+    let sel_bg = rc(theme.breadcrumb_active_fg);
     // Fill the row with breadcrumb bg
     for x in area.x..area.x + area.width {
         set_cell(buf, x, area.y, ' ', bg, bg);
@@ -1144,7 +1161,7 @@ pub(super) fn render_breadcrumb_bar(
     let separator = " \u{203A} "; // " › "
     let mut x = area.x + 1; // small left padding
 
-    for seg in segments {
+    for (i, seg) in segments.iter().enumerate() {
         // Separator before all but the first
         if x > area.x + 2 {
             let sep_fg = rc(theme.breadcrumb_fg);
@@ -1157,17 +1174,20 @@ pub(super) fn render_breadcrumb_bar(
             }
         }
 
-        // Segment label
-        let fg = if seg.is_last {
-            rc(theme.breadcrumb_active_fg)
+        // Segment label — highlight selected segment in focus mode
+        let is_focused = focus_active && i == focus_selected;
+        let (fg, segment_bg) = if is_focused {
+            (rc(theme.breadcrumb_bg), sel_bg)
+        } else if seg.is_last {
+            (rc(theme.breadcrumb_active_fg), bg)
         } else {
-            rc(theme.breadcrumb_fg)
+            (rc(theme.breadcrumb_fg), bg)
         };
         for ch in seg.label.chars() {
             if x >= area.x + area.width {
                 return;
             }
-            set_cell(buf, x, area.y, ch, fg, bg);
+            set_cell(buf, x, area.y, ch, fg, segment_bg);
             x += 1;
         }
     }

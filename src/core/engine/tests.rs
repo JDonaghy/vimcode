@@ -9146,7 +9146,7 @@ fn test_command_center_prefix_help() {
     engine.open_command_center();
     engine.handle_picker_key("?", Some('?'), false);
     assert_eq!(engine.picker_title, "Help: Prefix Modes");
-    assert_eq!(engine.picker_items.len(), 9); // 9 help items (including %, debug, task)
+    assert_eq!(engine.picker_items.len(), 10); // 10 help items (including %, debug, task, chat)
 }
 
 #[test]
@@ -9720,7 +9720,7 @@ fn test_command_center_placeholder_hints_on_open() {
     // Empty query should show placeholder hint items, not files
     assert_eq!(engine.picker_query, "");
     assert_eq!(engine.picker_title, "Search");
-    assert_eq!(engine.picker_items.len(), 9);
+    assert_eq!(engine.picker_items.len(), 10);
     // Verify key hint items exist
     let labels: Vec<&str> = engine
         .picker_items
@@ -9790,8 +9790,8 @@ fn test_command_center_placeholder_hints_select_debug() {
 fn test_command_center_placeholder_hints_disappear_on_typing() {
     let mut engine = Engine::new();
     engine.open_command_center();
-    assert_eq!(engine.picker_items.len(), 9); // hints shown
-                                              // Type a character — should switch to file search mode
+    assert_eq!(engine.picker_items.len(), 10); // hints shown
+                                               // Type a character — should switch to file search mode
     engine.handle_picker_key("a", Some('a'), false);
     // Items should no longer be the placeholder hints
     let has_hint = engine
@@ -17032,4 +17032,336 @@ fn test_smart_indent_uses_detected_width() {
         2,
         "Should use detected 2-space indent, not setting 4"
     );
+}
+
+// ── Command Center chat prefix tests ───────────────────────────────────
+
+#[test]
+fn test_command_center_chat_prefix_opens_items() {
+    let mut e = engine_with_text("hello");
+    e.open_picker(PickerSource::CommandCenter);
+    e.picker_query = "chat".to_string();
+    e.picker_filter();
+    assert!(!e.picker_items.is_empty(), "chat prefix should show items");
+    // Without API key configured, should show "Configure AI" message
+    assert!(
+        e.picker_items
+            .iter()
+            .any(|i| i.display.contains("Configure AI")),
+        "Should prompt to configure AI when no key set"
+    );
+}
+
+#[test]
+fn test_command_center_chat_with_key_shows_open_panel() {
+    let mut e = engine_with_text("hello");
+    e.settings.ai_api_key = "test-key".to_string();
+    e.open_picker(PickerSource::CommandCenter);
+    e.picker_query = "chat".to_string();
+    e.picker_filter();
+    assert!(
+        e.picker_items
+            .iter()
+            .any(|i| i.display.contains("Open AI Panel")),
+        "Should show 'Open AI Panel' when configured"
+    );
+}
+
+#[test]
+fn test_command_center_chat_with_question() {
+    let mut e = engine_with_text("hello");
+    e.settings.ai_api_key = "test-key".to_string();
+    e.open_picker(PickerSource::CommandCenter);
+    e.picker_query = "chat explain this".to_string();
+    e.picker_filter();
+    assert!(
+        e.picker_items
+            .iter()
+            .any(|i| i.display.contains("Ask AI: explain this")),
+        "Should show 'Ask AI: ...' with the question"
+    );
+}
+
+#[test]
+fn test_command_center_help_includes_chat() {
+    let mut e = engine_with_text("hello");
+    e.open_picker(PickerSource::CommandCenter);
+    e.picker_query = "?".to_string();
+    e.picker_filter();
+    assert!(
+        e.picker_items.iter().any(|i| i.display.contains("chat")),
+        "Help should list chat prefix"
+    );
+}
+
+#[test]
+fn test_command_center_hints_include_chat() {
+    let mut e = engine_with_text("hello");
+    e.open_picker(PickerSource::CommandCenter);
+    e.picker_query.clear();
+    e.picker_filter();
+    assert!(
+        e.picker_items.iter().any(|i| i.display.contains("AI")),
+        "Hints should include Ask AI"
+    );
+}
+
+// ── Breadcrumb click tests ─────────────────────────────────────────────
+
+#[test]
+fn test_breadcrumb_click_directory_opens_file_picker() {
+    let mut e = engine_with_text("hello");
+    let dir = std::env::temp_dir().join("vimcode_test_bc_dir");
+    let _ = std::fs::create_dir_all(&dir);
+    // Clicking a directory segment should open the file picker
+    e.breadcrumb_click(false, Some(&dir));
+    assert!(
+        e.picker_open,
+        "breadcrumb directory click should open picker"
+    );
+    assert_eq!(e.picker_source, PickerSource::Files);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_breadcrumb_click_file_opens_symbol_picker() {
+    let mut e = engine_with_text("hello");
+    let file = std::env::temp_dir().join("vimcode_test_bc_file.rs");
+    std::fs::write(&file, "fn foo() {}").unwrap();
+    // Clicking a file segment should open the @ symbol picker
+    e.breadcrumb_click(false, Some(&file));
+    assert!(e.picker_open, "breadcrumb file click should open picker");
+    assert_eq!(e.picker_source, PickerSource::CommandCenter);
+    assert_eq!(e.picker_query, "@");
+    let _ = std::fs::remove_file(&file);
+}
+
+#[test]
+fn test_breadcrumb_click_symbol_opens_symbol_picker() {
+    let mut e = engine_with_text("hello");
+    // Clicking a symbol segment should open the @ symbol picker
+    e.breadcrumb_click(true, None);
+    assert!(e.picker_open, "breadcrumb symbol click should open picker");
+    assert_eq!(e.picker_source, PickerSource::CommandCenter);
+    assert_eq!(e.picker_query, "@");
+}
+
+// Note: breadcrumb segment building is tested via the render module
+// which is only available in the binary crate. The path_prefix field
+// is tested implicitly by the breadcrumb_click tests above.
+
+#[test]
+fn test_leader_so_opens_symbol_picker() {
+    let mut e = engine_with_text("hello");
+    e.handle_key("space", Some(' '), false);
+    e.handle_key("s", Some('s'), false);
+    e.handle_key("o", Some('o'), false);
+    assert!(e.picker_open);
+    assert_eq!(e.picker_source, PickerSource::CommandCenter);
+    assert_eq!(e.picker_query, "@");
+}
+
+#[test]
+fn test_breadcrumb_double_click_symbol_jumps() {
+    let mut e = engine_with_text("line 0\nline 1\nline 2\nline 3\n");
+    e.view_mut().cursor.line = 3;
+    // Double-click a symbol segment with line info should jump
+    e.breadcrumb_double_click(true, None, Some(1));
+    assert_eq!(e.view().cursor.line, 1, "should jump to symbol line");
+}
+
+#[test]
+fn test_breadcrumb_double_click_no_line_falls_back() {
+    let mut e = engine_with_text("hello");
+    // Double-click a symbol with no line info opens symbol picker
+    e.breadcrumb_double_click(true, None, None);
+    assert!(e.picker_open);
+    assert_eq!(e.picker_query, "@");
+}
+
+// ── Breadcrumb focus mode tests ────────────────────────────────────────
+
+#[test]
+fn test_leader_b_enters_breadcrumb_focus() {
+    let mut e = engine_with_lang("fn main() {}\n", "rs");
+    e.handle_key("space", Some(' '), false);
+    e.handle_key("b", Some('b'), false);
+    // Should have breadcrumb segments (at least the file path)
+    assert!(
+        e.breadcrumb_focus || !e.breadcrumb_segments.is_empty(),
+        "leader b should enter breadcrumb focus or have segments"
+    );
+}
+
+#[test]
+fn test_breadcrumb_focus_hl_navigation() {
+    let mut e = engine_with_text("hello");
+    // Manually set up breadcrumb focus with some segments
+    e.breadcrumb_segments = vec![
+        BreadcrumbSegmentInfo {
+            label: "src".to_string(),
+            is_symbol: false,
+            path_prefix: None,
+            symbol_line: None,
+            parent_scope: None,
+        },
+        BreadcrumbSegmentInfo {
+            label: "main.rs".to_string(),
+            is_symbol: false,
+            path_prefix: None,
+            symbol_line: None,
+            parent_scope: None,
+        },
+        BreadcrumbSegmentInfo {
+            label: "main".to_string(),
+            is_symbol: true,
+            path_prefix: None,
+            symbol_line: Some(0),
+            parent_scope: None,
+        },
+    ];
+    e.breadcrumb_focus = true;
+    e.breadcrumb_selected = 2; // start at last
+
+    // h moves left
+    e.handle_key("h", Some('h'), false);
+    assert_eq!(e.breadcrumb_selected, 1);
+    assert!(e.breadcrumb_focus);
+
+    // h again
+    e.handle_key("h", Some('h'), false);
+    assert_eq!(e.breadcrumb_selected, 0);
+
+    // h at 0 stays at 0
+    e.handle_key("h", Some('h'), false);
+    assert_eq!(e.breadcrumb_selected, 0);
+
+    // l moves right
+    e.handle_key("l", Some('l'), false);
+    assert_eq!(e.breadcrumb_selected, 1);
+
+    // l again
+    e.handle_key("l", Some('l'), false);
+    assert_eq!(e.breadcrumb_selected, 2);
+
+    // l at end stays
+    e.handle_key("l", Some('l'), false);
+    assert_eq!(e.breadcrumb_selected, 2);
+}
+
+#[test]
+fn test_breadcrumb_escape_exits() {
+    let mut e = engine_with_text("hello");
+    e.breadcrumb_segments = vec![BreadcrumbSegmentInfo {
+        label: "test".to_string(),
+        is_symbol: false,
+        path_prefix: None,
+        symbol_line: None,
+        parent_scope: None,
+    }];
+    e.breadcrumb_focus = true;
+    e.breadcrumb_selected = 0;
+
+    e.handle_key("Escape", None, false);
+    assert!(!e.breadcrumb_focus);
+}
+
+#[test]
+fn test_breadcrumb_enter_on_symbol_opens_scoped_picker() {
+    let mut e = engine_with_text("hello");
+    e.breadcrumb_segments = vec![
+        BreadcrumbSegmentInfo {
+            label: "Engine".to_string(),
+            is_symbol: true,
+            path_prefix: None,
+            symbol_line: Some(10),
+            parent_scope: None,
+        },
+        BreadcrumbSegmentInfo {
+            label: "handle_key".to_string(),
+            is_symbol: true,
+            path_prefix: None,
+            symbol_line: Some(20),
+            parent_scope: Some("Engine".to_string()),
+        },
+    ];
+    e.breadcrumb_focus = true;
+    e.breadcrumb_selected = 1; // on "handle_key"
+
+    e.handle_key("Return", None, false);
+    assert!(!e.breadcrumb_focus, "Enter should exit focus");
+    assert!(e.picker_open, "Enter should open picker");
+    assert_eq!(e.picker_query, "@");
+    // The scoped parent should have been set to "Engine" (parent of handle_key)
+    // but it's consumed by the filter, so we just verify the picker opened
+}
+
+#[test]
+fn test_breadcrumb_enter_on_path_opens_file_picker() {
+    let mut e = engine_with_text("hello");
+    let dir = std::env::temp_dir().join("vimcode_test_bc_focus");
+    let _ = std::fs::create_dir_all(&dir);
+    e.breadcrumb_segments = vec![BreadcrumbSegmentInfo {
+        label: "test_dir".to_string(),
+        is_symbol: false,
+        path_prefix: Some(dir.clone()),
+        symbol_line: None,
+        parent_scope: None,
+    }];
+    e.breadcrumb_focus = true;
+    e.breadcrumb_selected = 0;
+
+    e.handle_key("Return", None, false);
+    assert!(!e.breadcrumb_focus);
+    assert!(e.picker_open);
+    assert_eq!(e.picker_source, PickerSource::Files);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_scoped_symbol_filtering() {
+    let mut e = engine_with_text("hello");
+    // Set the scoped parent filter to "Engine"
+    e.breadcrumb_scoped_parent = Some(Some("Engine".to_string()));
+
+    // Create symbols with different containers
+    let symbols = vec![
+        crate::core::lsp::SymbolInfo {
+            name: "handle_key".to_string(),
+            kind: crate::core::lsp::SymbolKind::Method,
+            detail: None,
+            container: Some("Engine".to_string()),
+            path: None,
+            line: 10,
+            character: 0,
+        },
+        crate::core::lsp::SymbolInfo {
+            name: "new".to_string(),
+            kind: crate::core::lsp::SymbolKind::Method,
+            detail: None,
+            container: Some("Engine".to_string()),
+            path: None,
+            line: 5,
+            character: 0,
+        },
+        crate::core::lsp::SymbolInfo {
+            name: "main".to_string(),
+            kind: crate::core::lsp::SymbolKind::Function,
+            detail: None,
+            container: None,
+            path: None,
+            line: 1,
+            character: 0,
+        },
+    ];
+
+    e.picker_populate_document_symbols(symbols);
+    // Only "handle_key" and "new" should survive (container == "Engine")
+    assert_eq!(
+        e.picker_all_items.len(),
+        2,
+        "Should only include symbols with container 'Engine'"
+    );
+    // The scoped parent should be consumed
+    assert!(e.breadcrumb_scoped_parent.is_none());
 }

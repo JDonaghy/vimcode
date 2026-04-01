@@ -1,9 +1,9 @@
 # VimCode Project State
 
-**Last updated:** Mar 31, 2026 (Session 237 — VSCode undo coalescing, bicep comments, :$ EOF, buffer picker, crash logging, keybindings picker, smart indent + auto-detect) | **Tests:** 5038
+**Last updated:** Apr 1, 2026 (Session 238 — breadcrumb navigation, chat prefix, picker click fixes, scoped symbol filtering, scroll wheel) | **Tests:** 5055
 
 > Feature documentation lives in **README.md**.
-> Per-session implementation notes through Session 237 are in **SESSION_HISTORY.md**.
+> Per-session implementation notes through Session 238 are in **SESSION_HISTORY.md**.
 
 ---
 
@@ -26,4 +26,4 @@ When implementing a new key/command, add tests covering:
 
 ## Recent Work
 
-> All sessions through 237 archived in **SESSION_HISTORY.md**.
+> All sessions through 238 archived in **SESSION_HISTORY.md**.

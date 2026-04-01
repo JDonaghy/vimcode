@@ -147,6 +147,11 @@ impl Engine {
             return self.handle_picker_key(key_name, unicode, ctrl);
         }
 
+        // Breadcrumb focus mode intercepts keys when active.
+        if self.breadcrumb_focus {
+            return self.handle_breadcrumb_key(key_name, unicode, ctrl);
+        }
+
         // Diff peek popup intercepts keys when open.
         if self.diff_peek.is_some() && self.handle_diff_peek_key(key_name, unicode) {
             return EngineAction::None;
@@ -3874,6 +3879,37 @@ impl Engine {
     }
 
     /// Handle a key press while leader mode is active (after pressing the leader key).
+    /// Handle keys while breadcrumb focus mode is active.
+    /// h/l navigate segments, Enter opens scoped picker, Escape exits.
+    fn handle_breadcrumb_key(
+        &mut self,
+        key_name: &str,
+        unicode: Option<char>,
+        _ctrl: bool,
+    ) -> EngineAction {
+        match (key_name, unicode) {
+            (_, Some('h')) | ("Left", _) => {
+                if self.breadcrumb_selected > 0 {
+                    self.breadcrumb_selected -= 1;
+                }
+            }
+            (_, Some('l')) | ("Right", _) => {
+                if self.breadcrumb_selected + 1 < self.breadcrumb_segments.len() {
+                    self.breadcrumb_selected += 1;
+                }
+            }
+            ("Return", _) => {
+                self.breadcrumb_focus = false;
+                self.breadcrumb_open_scoped();
+            }
+            _ => {
+                // Escape or any other key exits breadcrumb focus
+                self.breadcrumb_focus = false;
+            }
+        }
+        EngineAction::None
+    }
+
     pub(crate) fn handle_leader_key(&mut self, unicode: Option<char>) -> EngineAction {
         let ch = match unicode {
             Some(c) => c,
@@ -3888,10 +3924,20 @@ impl Engine {
 
         // All known built-in leader sequences
         const SEQUENCES: &[&str] = &[
-            "rn", "gf", "gF", "gi", "gb", "ca", "sb", "sf", "sg", "sk", "sp", "sw",
+            "b", "rn", "gf", "gF", "gi", "gb", "ca", "sb", "sf", "sg", "sk", "so", "sp", "sw",
         ];
 
         match partial.as_str() {
+            "b" => {
+                // Enter breadcrumb focus mode
+                self.rebuild_breadcrumb_segments();
+                if !self.breadcrumb_segments.is_empty() {
+                    self.breadcrumb_focus = true;
+                    self.breadcrumb_selected = self.breadcrumb_segments.len() - 1;
+                } else {
+                    self.message = "No breadcrumb segments".to_string();
+                }
+            }
             "rn" => {
                 // LSP rename — enter command mode pre-filled with :Rename <word>
                 let word = self.word_under_cursor().unwrap_or_default();
@@ -3927,6 +3973,13 @@ impl Engine {
             }
             "sk" => {
                 self.open_picker(PickerSource::Keybindings);
+            }
+            "so" => {
+                // Document outline / symbol navigation
+                self.open_picker(PickerSource::CommandCenter);
+                self.picker_query = "@".to_string();
+                self.picker_filter();
+                self.picker_load_preview();
             }
             "sp" => {
                 self.open_picker(PickerSource::Commands);

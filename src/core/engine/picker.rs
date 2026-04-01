@@ -132,6 +132,67 @@ impl Engine {
         self.open_picker(PickerSource::CommandCenter);
     }
 
+    /// Handle a click on a breadcrumb segment.
+    /// `is_symbol`: true if this is a symbol segment (opens `@` symbol picker).
+    /// `path_prefix`: for path segments, the accumulated directory path up to this segment.
+    pub fn breadcrumb_click(&mut self, is_symbol: bool, path_prefix: Option<&std::path::Path>) {
+        if is_symbol {
+            // Open document symbol picker
+            self.open_picker(PickerSource::CommandCenter);
+            self.picker_query = "@".to_string();
+            self.picker_filter();
+            self.picker_load_preview();
+        } else if let Some(path) = path_prefix {
+            if path.is_dir() {
+                // Directory segment: open file picker filtered to that directory
+                self.open_picker(PickerSource::Files);
+                let rel = path
+                    .strip_prefix(&self.cwd)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .to_string();
+                self.picker_query = if rel.is_empty() {
+                    String::new()
+                } else {
+                    format!("{}/", rel)
+                };
+                self.picker_filter();
+                self.picker_load_preview();
+            } else {
+                // File segment (the last path component): open symbol picker
+                self.open_picker(PickerSource::CommandCenter);
+                self.picker_query = "@".to_string();
+                self.picker_filter();
+                self.picker_load_preview();
+            }
+        }
+    }
+
+    /// Handle a double-click on a breadcrumb segment.
+    /// Symbols: jump directly to the symbol's definition line.
+    /// Path segments: same as single click (open picker).
+    pub fn breadcrumb_double_click(
+        &mut self,
+        is_symbol: bool,
+        path_prefix: Option<&std::path::Path>,
+        symbol_line: Option<usize>,
+    ) {
+        if is_symbol {
+            if let Some(line) = symbol_line {
+                self.push_jump_location();
+                let win_id = self.active_window_id();
+                self.set_cursor_for_window(win_id, line, 0);
+                self.ensure_cursor_visible();
+            } else {
+                // No position info — fall back to symbol picker
+                self.breadcrumb_click(is_symbol, path_prefix);
+            }
+        } else {
+            // Path segments: same as single click
+            self.breadcrumb_click(is_symbol, path_prefix);
+        }
+    }
+
     /// Close the unified picker and clear all state.
     pub fn close_picker(&mut self) {
         self.picker_open = false;
@@ -141,6 +202,90 @@ impl Engine {
         self.picker_selected = 0;
         self.picker_scroll_top = 0;
         self.picker_preview = None;
+        self.breadcrumb_scoped_parent = None;
+    }
+
+    /// Rebuild the cached breadcrumb segments from the active group's state.
+    /// Called when entering breadcrumb focus mode.
+    pub(crate) fn rebuild_breadcrumb_segments(&mut self) {
+        self.breadcrumb_segments.clear();
+        let buf_state = match self.buffer_manager.get(self.active_buffer_id()) {
+            Some(s) => s,
+            None => return,
+        };
+
+        // Path segments
+        if let Some(ref file_path) = buf_state.file_path {
+            let display = if let Ok(rel) = file_path.strip_prefix(&self.cwd) {
+                rel.to_string_lossy().to_string()
+            } else {
+                file_path.to_string_lossy().to_string()
+            };
+            let mut accumulated = self.cwd.clone();
+            for part in display.split(std::path::MAIN_SEPARATOR) {
+                accumulated = accumulated.join(part);
+                self.breadcrumb_segments.push(BreadcrumbSegmentInfo {
+                    label: part.to_string(),
+                    is_symbol: false,
+                    path_prefix: Some(accumulated.clone()),
+                    symbol_line: None,
+                    parent_scope: None,
+                });
+            }
+        }
+
+        // Symbol segments from tree-sitter
+        let cursor_line = self.view().cursor.line;
+        let cursor_col = self.view().cursor.col;
+        let text = buf_state.buffer.to_string();
+        let scopes = if let Some(ref syn) = buf_state.syntax {
+            syn.enclosing_scopes(&text, cursor_line, cursor_col)
+        } else {
+            Vec::new()
+        };
+        let mut prev_scope_name: Option<String> = None;
+        for scope in &scopes {
+            self.breadcrumb_segments.push(BreadcrumbSegmentInfo {
+                label: scope.name.clone(),
+                is_symbol: true,
+                path_prefix: None,
+                symbol_line: Some(scope.line),
+                parent_scope: prev_scope_name.clone(),
+            });
+            prev_scope_name = Some(scope.name.clone());
+        }
+
+        // Clamp selection
+        if !self.breadcrumb_segments.is_empty() {
+            self.breadcrumb_selected = self
+                .breadcrumb_selected
+                .min(self.breadcrumb_segments.len() - 1);
+        }
+    }
+
+    /// Open a scoped picker for the currently selected breadcrumb segment.
+    /// Path segments open the file picker for that directory.
+    /// Symbol segments open the `@` symbol picker filtered to siblings
+    /// within the parent scope.
+    pub(crate) fn breadcrumb_open_scoped(&mut self) {
+        let seg = match self.breadcrumb_segments.get(self.breadcrumb_selected) {
+            Some(s) => s.clone(),
+            None => return,
+        };
+
+        if !seg.is_symbol {
+            self.breadcrumb_click(false, seg.path_prefix.as_deref());
+            return;
+        }
+
+        // Symbol segment: show siblings at the same level.
+        // Filter to symbols whose container matches this segment's parent,
+        // matching VSCode behavior (clicking a function shows sibling functions).
+        self.breadcrumb_scoped_parent = Some(seg.parent_scope.clone());
+        self.open_picker(PickerSource::CommandCenter);
+        self.picker_query = "@".to_string();
+        self.picker_filter();
+        self.picker_load_preview();
     }
 
     /// Populate picker_all_items with files from the project using the ignore crate.
@@ -590,6 +735,15 @@ impl Engine {
                 .trim_start()
                 .to_string();
             self.picker_populate_tasks(&sub_query);
+        } else if query == "chat" || query.starts_with("chat ") {
+            // AI Chat mode — open AI panel or send a message
+            self.picker_title = "AI Chat".to_string();
+            let sub_query = query
+                .strip_prefix("chat")
+                .unwrap_or("")
+                .trim_start()
+                .to_string();
+            self.picker_populate_chat(&sub_query);
         } else if query == "?" {
             // Help mode: show available prefixes
             self.picker_title = "Help: Prefix Modes".to_string();
@@ -602,6 +756,7 @@ impl Engine {
                 Self::help_item("%", "Search for text in project"),
                 Self::help_item("debug", "Start debugging (launch configurations)"),
                 Self::help_item("task", "Run a task (from tasks.json)"),
+                Self::help_item("chat", "Ask the AI assistant"),
                 Self::help_item("?", "Show this help"),
             ];
         } else if query.is_empty() {
@@ -616,6 +771,7 @@ impl Engine {
                 Self::hint_item("Search for Text", "%", "Ctrl+G (grep)"),
                 Self::hint_item("Start Debugging", "debug", "F5"),
                 Self::hint_item("Run Task", "task", ""),
+                Self::hint_item("Ask AI", "chat", ":AI"),
                 Self::hint_item("More Help", "?", ""),
             ];
         } else {
@@ -694,8 +850,18 @@ impl Engine {
 
     /// Populate picker items from a document symbol LSP response.
     pub(crate) fn picker_populate_document_symbols(&mut self, symbols: Vec<lsp::SymbolInfo>) {
+        // Apply scoped parent filter if set (from breadcrumb navigation).
+        let scoped = self.breadcrumb_scoped_parent.take();
+        let filtered: Vec<lsp::SymbolInfo> = if let Some(ref parent_filter) = scoped {
+            symbols
+                .into_iter()
+                .filter(|sym| sym.container.as_deref() == parent_filter.as_deref())
+                .collect()
+        } else {
+            symbols
+        };
         let path = self.active_buffer_path();
-        self.picker_all_items = symbols
+        self.picker_all_items = filtered
             .into_iter()
             .map(|sym| {
                 let container_str = sym
@@ -997,6 +1163,60 @@ impl Engine {
         self.open_file_in_tab(&tasks_path);
     }
 
+    /// Populate picker items for AI chat mode.
+    /// If a question is provided, shows a "Send to AI" item.
+    /// Otherwise shows "Open AI Panel".
+    fn picker_populate_chat(&mut self, question: &str) {
+        let configured =
+            !self.settings.ai_api_key.is_empty() || self.settings.ai_provider == "ollama";
+
+        if !configured {
+            self.picker_items = vec![PickerItem {
+                display: "Configure AI provider first".to_string(),
+                filter_text: String::new(),
+                detail: Some(":set ai_provider=anthropic  :set ai_api_key=sk-...".to_string()),
+                action: PickerAction::Custom("chat_configure".to_string()),
+                icon: None,
+                score: 0,
+                match_positions: Vec::new(),
+            }];
+            return;
+        }
+
+        if question.is_empty() {
+            self.picker_items = vec![
+                PickerItem {
+                    display: "Open AI Panel".to_string(),
+                    filter_text: "open ai panel chat".to_string(),
+                    detail: Some("Focus the AI chat sidebar".to_string()),
+                    action: PickerAction::Custom("chat_open".to_string()),
+                    icon: None,
+                    score: 0,
+                    match_positions: Vec::new(),
+                },
+                PickerItem {
+                    display: "Type a question after 'chat '...".to_string(),
+                    filter_text: String::new(),
+                    detail: Some("e.g. chat explain this function".to_string()),
+                    action: PickerAction::Custom("hint".to_string()),
+                    icon: None,
+                    score: 0,
+                    match_positions: Vec::new(),
+                },
+            ];
+        } else {
+            self.picker_items = vec![PickerItem {
+                display: format!("Ask AI: {}", question),
+                filter_text: question.to_string(),
+                detail: Some(format!("Send to {} AI", self.settings.ai_provider)),
+                action: PickerAction::Custom(format!("chat_send:{}", question)),
+                icon: None,
+                score: 0,
+                match_positions: Vec::new(),
+            }];
+        }
+    }
+
     /// Load preview context for the currently selected picker item.
     pub(crate) fn picker_load_preview(&mut self) {
         self.picker_preview = None;
@@ -1051,11 +1271,13 @@ impl Engine {
 
         match item.action {
             PickerAction::OpenFile(rel_path) => {
+                self.push_jump_location();
                 let abs = self.cwd.join(&rel_path);
                 self.open_file_in_tab(&abs);
                 EngineAction::None
             }
             PickerAction::OpenFileAtLine(path, line) => {
+                self.push_jump_location();
                 self.open_file_in_tab(&path);
                 let win_id = self.active_window_id();
                 self.set_cursor_for_window(win_id, line, 0);
@@ -1166,12 +1388,14 @@ impl Engine {
                 EngineAction::None
             }
             PickerAction::GotoLine(line) => {
+                self.push_jump_location();
                 let win_id = self.active_window_id();
                 self.set_cursor_for_window(win_id, line, 0);
                 self.ensure_cursor_visible();
                 EngineAction::None
             }
             PickerAction::GotoSymbol(path, line, _col) => {
+                self.push_jump_location();
                 if !path.as_os_str().is_empty() {
                     // Check if it's a different file than the current buffer
                     let cur_path = self
@@ -1233,6 +1457,24 @@ impl Engine {
                     // Open .vimcode/tasks.json for editing
                     self.close_picker();
                     self.create_and_open_tasks_json();
+                    EngineAction::None
+                } else if key == "chat_open" {
+                    // Focus the AI chat panel
+                    self.close_picker();
+                    self.ai_has_focus = true;
+                    EngineAction::None
+                } else if let Some(question) = key.strip_prefix("chat_send:") {
+                    // Send a question to the AI provider
+                    let question = question.to_string();
+                    self.close_picker();
+                    self.ai_input = question;
+                    self.ai_send_message();
+                    self.ai_has_focus = true;
+                    EngineAction::None
+                } else if key == "chat_configure" {
+                    // Open settings to configure AI
+                    self.close_picker();
+                    self.settings_has_focus = true;
                     EngineAction::None
                 } else {
                     EngineAction::None

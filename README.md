@@ -910,6 +910,8 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `<leader>sw` | Grep word under cursor |
 | `<leader>sb` | Open buffer picker (fuzzy search open buffers) |
 | `<leader>sk` | Search key bindings (fuzzy-filterable reference) |
+| `<leader>so` | Go to symbol in editor (document outline via LSP) |
+| `<leader>b` | Enter breadcrumb focus mode (h/l navigate, Enter opens scoped picker) |
 | `<leader>sp` | Open command palette (same as Ctrl-Shift-P) |
 | `za` / `zo` / `zc` / `zR` | Fold toggle / open / close / open all |
 | `zA` / `zO` / `zC` | Fold toggle / open / close recursively |

@@ -4220,19 +4220,21 @@ impl SimpleComponent for App {
                 height,
             } => {
                 let mut engine = self.engine.borrow_mut();
-                if let ClickTarget::BufferPos(_, line, col) = pixel_to_click_target(
-                    &mut engine,
-                    x,
-                    y,
-                    width,
-                    height,
-                    self.cached_line_height,
-                    self.cached_char_width,
-                    &self.tab_slot_positions.borrow(),
-                    &self.diff_btn_map.borrow(),
-                    &self.split_btn_map.borrow(),
-                ) {
-                    engine.add_cursor_at_pos(line, col);
+                if !engine.picker_open {
+                    if let ClickTarget::BufferPos(_, line, col) = pixel_to_click_target(
+                        &mut engine,
+                        x,
+                        y,
+                        width,
+                        height,
+                        self.cached_line_height,
+                        self.cached_char_width,
+                        &self.tab_slot_positions.borrow(),
+                        &self.diff_btn_map.borrow(),
+                        &self.split_btn_map.borrow(),
+                    ) {
+                        engine.add_cursor_at_pos(line, col);
+                    }
                 }
                 self.draw_needed.set(true);
             }
@@ -4243,18 +4245,51 @@ impl SimpleComponent for App {
                 height,
             } => {
                 let mut engine = self.engine.borrow_mut();
-                handle_mouse_double_click(
-                    &mut engine,
-                    x,
-                    y,
-                    width,
-                    height,
-                    self.cached_line_height,
-                    self.cached_char_width,
-                    &self.tab_slot_positions.borrow(),
-                    &self.diff_btn_map.borrow(),
-                    &self.split_btn_map.borrow(),
-                );
+                if engine.picker_open {
+                    // Double-click on picker: confirm the selected item
+                    let _action = engine.picker_confirm();
+                    self.draw_needed.set(true);
+                } else {
+                    // Check breadcrumb double-click before falling through
+                    let mut bc_handled = false;
+                    if engine.settings.breadcrumbs {
+                        let lh = self.cached_line_height.max(1.0);
+                        let cw = self.cached_char_width.max(1.0);
+                        if y >= lh && y < lh * 2.0 {
+                            let segments =
+                                crate::render::build_breadcrumbs_for_active_group(&engine);
+                            let sep_w = " › ".chars().count() as f64 * cw;
+                            let mut seg_x = cw; // left padding
+                            for seg in &segments {
+                                let label_w = seg.label.chars().count() as f64 * cw;
+                                if x >= seg_x && x < seg_x + label_w {
+                                    engine.breadcrumb_double_click(
+                                        seg.is_symbol,
+                                        seg.path_prefix.as_deref(),
+                                        seg.symbol_line,
+                                    );
+                                    bc_handled = true;
+                                    break;
+                                }
+                                seg_x += label_w + sep_w;
+                            }
+                        }
+                    }
+                    if !bc_handled {
+                        handle_mouse_double_click(
+                            &mut engine,
+                            x,
+                            y,
+                            width,
+                            height,
+                            self.cached_line_height,
+                            self.cached_char_width,
+                            &self.tab_slot_positions.borrow(),
+                            &self.diff_btn_map.borrow(),
+                            &self.split_btn_map.borrow(),
+                        );
+                    }
+                }
                 self.draw_needed.set(true);
             }
             Msg::MouseDrag {
@@ -4307,6 +4342,27 @@ impl SimpleComponent for App {
             }
             Msg::MouseScroll { delta_x, delta_y } => {
                 let mut engine = self.engine.borrow_mut();
+                // Picker open: scroll the picker results
+                if engine.picker_open && delta_y.abs() > 0.01 {
+                    let step = (delta_y * 3.0).round().abs() as usize;
+                    let max = engine.picker_items.len().saturating_sub(1);
+                    if delta_y > 0.0 {
+                        engine.picker_selected = (engine.picker_selected + step).min(max);
+                    } else {
+                        engine.picker_selected = engine.picker_selected.saturating_sub(step);
+                    }
+                    let visible = 20usize;
+                    if engine.picker_selected >= engine.picker_scroll_top + visible {
+                        engine.picker_scroll_top = engine.picker_selected + 1 - visible;
+                    }
+                    if engine.picker_selected < engine.picker_scroll_top {
+                        engine.picker_scroll_top = engine.picker_selected;
+                    }
+                    engine.picker_load_preview();
+                    drop(engine);
+                    self.draw_needed.set(true);
+                    return;
+                }
                 // If editor hover popup is visible, scroll it instead of the editor
                 if engine.editor_hover.is_some() && delta_y.abs() > 0.01 {
                     let delta = (delta_y * 3.0).round() as i32;
@@ -5388,6 +5444,7 @@ impl App {
         };
 
         self.dispatch_engine_action(action, sender, false);
+        self.draw_needed.set(true);
 
         // Process macro playback queue if active
         loop {
@@ -5814,6 +5871,80 @@ impl App {
         alt: bool,
         sender: &ComponentSender<Self>,
     ) {
+        // Picker popup: intercept all clicks when picker is open
+        {
+            let engine = self.engine.borrow();
+            if engine.picker_open {
+                let has_preview = engine.picker_preview.is_some();
+                let popup_w = if has_preview {
+                    (width * 0.8).max(600.0)
+                } else {
+                    (width * 0.55).max(500.0)
+                };
+                let popup_h = if has_preview {
+                    (height * 0.65).max(400.0)
+                } else {
+                    (height * 0.60).max(350.0)
+                };
+                let popup_x = (width - popup_w) / 2.0;
+                let popup_y = (height - popup_h) / 2.0;
+                let lh = self.cached_line_height.max(1.0);
+                // Results start below separator: popup_y + 2*lh + 1px padding
+                let results_top = popup_y + lh * 2.0 + 1.0;
+                let results_bottom = popup_y + popup_h;
+
+                let on_popup =
+                    x >= popup_x && x < popup_x + popup_w && y >= popup_y && y < popup_y + popup_h;
+                let on_results = on_popup && y >= results_top && y < results_bottom;
+
+                drop(engine);
+                if on_results {
+                    let mut engine = self.engine.borrow_mut();
+                    let clicked_idx = engine.picker_scroll_top + ((y - results_top) / lh) as usize;
+                    if clicked_idx < engine.picker_items.len() {
+                        engine.picker_selected = clicked_idx;
+                        engine.picker_load_preview();
+                    }
+                } else if !on_popup {
+                    self.engine.borrow_mut().close_picker();
+                }
+                // Consume click — don't fall through to editor
+                return;
+            }
+        }
+
+        // Breadcrumb click: the breadcrumb row sits at y = line_height (below tab bar).
+        // Use char_width to approximate segment positions.
+        {
+            let engine = self.engine.borrow();
+            if engine.settings.breadcrumbs {
+                let lh = self.cached_line_height.max(1.0);
+                let cw = self.cached_char_width.max(1.0);
+                // Breadcrumb row spans y ∈ [lh, 2*lh)
+                if y >= lh && y < lh * 2.0 {
+                    // Build segments to find what was clicked.
+                    // Also rebuild engine-side segments so scoped filtering works.
+                    let segments = crate::render::build_breadcrumbs_for_active_group(&engine);
+                    drop(engine);
+                    self.engine.borrow_mut().rebuild_breadcrumb_segments();
+                    let sep_w = " › ".chars().count() as f64 * cw;
+                    let pad = cw; // left padding
+                    let mut seg_x = pad;
+                    for (i, seg) in segments.iter().enumerate() {
+                        let label_w = seg.label.chars().count() as f64 * cw;
+                        if x >= seg_x && x < seg_x + label_w {
+                            let mut engine = self.engine.borrow_mut();
+                            engine.breadcrumb_selected = i;
+                            engine.breadcrumb_open_scoped();
+                            return;
+                        }
+                        seg_x += label_w + sep_w;
+                    }
+                    return; // clicked on breadcrumb row but not a segment
+                }
+            }
+        }
+
         // Editor hover: click on the popup focuses it; click elsewhere dismisses it
         {
             let engine = self.engine.borrow();

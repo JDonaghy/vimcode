@@ -263,7 +263,17 @@ pub(super) fn draw_editor(
         let bc_w = bc.bounds.width;
         cr.save().ok();
         cr.translate(bc_x, 0.0);
-        draw_breadcrumb_bar(cr, &layout, &theme, &bc.segments, bc_w, line_height, bc_y);
+        draw_breadcrumb_bar(
+            cr,
+            &layout,
+            &theme,
+            &bc.segments,
+            bc_w,
+            line_height,
+            bc_y,
+            engine.breadcrumb_focus,
+            engine.breadcrumb_selected,
+        );
         cr.restore().ok();
     }
 
@@ -987,6 +997,7 @@ pub(super) fn draw_tab_bar(
     (slot_positions, diff_btn_pos, split_btn_info, available_cols)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn draw_breadcrumb_bar(
     cr: &Context,
     layout: &pango::Layout,
@@ -995,6 +1006,8 @@ pub(super) fn draw_breadcrumb_bar(
     width: f64,
     line_height: f64,
     y_offset: f64,
+    focus_active: bool,
+    focus_selected: usize,
 ) {
     // Background
     let (r, g, b) = theme.breadcrumb_bg.to_cairo();
@@ -1005,7 +1018,7 @@ pub(super) fn draw_breadcrumb_bar(
     let separator = " \u{203A} "; // " › "
     let mut x = 4.0; // small left padding
 
-    for seg in segments {
+    for (i, seg) in segments.iter().enumerate() {
         // Separator before all but the first
         if x > 5.0 {
             let (sr, sg, sb) = theme.breadcrumb_fg.to_cairo();
@@ -1017,18 +1030,31 @@ pub(super) fn draw_breadcrumb_bar(
             x += sw as f64;
         }
 
+        // Measure label width for highlight rect
+        layout.set_text(&seg.label);
+        let (lw, _) = layout.pixel_size();
+
+        // Draw highlight background for focused segment
+        let is_focused = focus_active && i == focus_selected;
+        if is_focused {
+            let (hr, hg, hb) = theme.breadcrumb_active_fg.to_cairo();
+            cr.set_source_rgb(hr, hg, hb);
+            cr.rectangle(x - 2.0, y_offset, lw as f64 + 4.0, line_height);
+            cr.fill().ok();
+        }
+
         // Segment label
-        let fg = if seg.is_last {
+        let fg = if is_focused {
+            theme.breadcrumb_bg
+        } else if seg.is_last {
             theme.breadcrumb_active_fg
         } else {
             theme.breadcrumb_fg
         };
         let (fr, fg_g, fb) = fg.to_cairo();
         cr.set_source_rgb(fr, fg_g, fb);
-        layout.set_text(&seg.label);
         cr.move_to(x, y_offset);
         pangocairo::show_layout(cr, layout);
-        let (lw, _) = layout.pixel_size();
         x += lw as f64;
 
         if x > width {

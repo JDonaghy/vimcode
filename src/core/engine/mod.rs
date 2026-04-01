@@ -406,6 +406,12 @@ pub static PALETTE_COMMANDS: &[PaletteCommand] = &[
         action: "Buffers",
     },
     PaletteCommand {
+        label: "Go to Symbol in Editor (Outline)",
+        shortcut: "<leader>so",
+        vscode_shortcut: "<leader>so",
+        action: "document_outline",
+    },
+    PaletteCommand {
         label: "Help: Search Key Bindings",
         shortcut: "<leader>sk",
         vscode_shortcut: "<leader>sk",
@@ -750,6 +756,20 @@ pub enum PickerSource {
     /// Command Center: dynamic prefix routing (>, @, #, :, ?).
     CommandCenter,
     Custom(String),
+}
+
+/// Cached breadcrumb segment info for keyboard navigation.
+/// Mirrors render::BreadcrumbSegment but lives in the engine (library) crate.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct BreadcrumbSegmentInfo {
+    pub label: String,
+    pub is_symbol: bool,
+    pub path_prefix: Option<PathBuf>,
+    pub symbol_line: Option<usize>,
+    /// For symbol segments: the name of the parent scope (container).
+    /// `None` for top-level symbols and path segments.
+    pub parent_scope: Option<String>,
 }
 
 /// A single item in the picker list.
@@ -2106,6 +2126,17 @@ pub struct Engine {
     /// Preview pane content for the selected item, or None for no-preview sources.
     pub picker_preview: Option<PickerPreview>,
 
+    // --- Breadcrumb focus mode ---
+    /// Whether breadcrumb keyboard navigation is active (entered via `<leader>b`).
+    pub breadcrumb_focus: bool,
+    /// Index of the currently highlighted breadcrumb segment (0-based).
+    pub breadcrumb_selected: usize,
+    /// Cached breadcrumb segments for the active group, rebuilt on focus entry.
+    pub breadcrumb_segments: Vec<BreadcrumbSegmentInfo>,
+    /// When `Some`, `picker_populate_document_symbols` filters to symbols
+    /// whose container matches this value. `Some(None)` = top-level only.
+    pub breadcrumb_scoped_parent: Option<Option<String>>,
+
     // --- Two-way diff state ---
     /// The pair of windows currently in diff mode, or None when diff is off.
     pub diff_window_pair: Option<(WindowId, WindowId)>,
@@ -2753,6 +2784,10 @@ impl Engine {
             picker_scroll_top: 0,
             picker_title: String::new(),
             picker_preview: None,
+            breadcrumb_focus: false,
+            breadcrumb_selected: 0,
+            breadcrumb_segments: Vec::new(),
+            breadcrumb_scoped_parent: None,
             diff_window_pair: None,
             diff_results: HashMap::new(),
             diff_aligned: HashMap::new(),

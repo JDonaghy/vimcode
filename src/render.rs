@@ -394,6 +394,13 @@ pub struct BreadcrumbSegment {
     pub label: String,
     pub is_last: bool,
     pub is_symbol: bool,
+    /// Index of this segment (0-based) — used by click handlers to identify which segment was clicked.
+    pub index: usize,
+    /// Accumulated path up to this segment (for path segments only).
+    /// E.g. for `src > engine > mod.rs`, segment "engine" has path "src/engine".
+    pub path_prefix: Option<std::path::PathBuf>,
+    /// For symbol segments: the line number (0-indexed) where the symbol is defined.
+    pub symbol_line: Option<usize>,
 }
 
 /// Breadcrumb bar data for one editor group.
@@ -4314,6 +4321,11 @@ fn build_terminal_panel(engine: &Engine) -> Option<TerminalPanel> {
     })
 }
 
+/// Build breadcrumb segments for the active editor group (public API for click handlers).
+pub fn build_breadcrumbs_for_active_group(engine: &Engine) -> Vec<BreadcrumbSegment> {
+    build_breadcrumbs_for_group(engine, engine.active_group)
+}
+
 /// Build breadcrumb segments for a single editor group.
 fn build_breadcrumbs_for_group(engine: &Engine, group_id: GroupId) -> Vec<BreadcrumbSegment> {
     let group = match engine.editor_groups.get(&group_id) {
@@ -4331,6 +4343,7 @@ fn build_breadcrumbs_for_group(engine: &Engine, group_id: GroupId) -> Vec<Breadc
     };
 
     let mut segments = Vec::new();
+    let mut idx = 0usize;
 
     // Path segments (relative to cwd)
     if let Some(ref file_path) = buf_state.file_path {
@@ -4340,12 +4353,18 @@ fn build_breadcrumbs_for_group(engine: &Engine, group_id: GroupId) -> Vec<Breadc
             file_path.to_string_lossy().to_string()
         };
         let parts: Vec<&str> = display.split(std::path::MAIN_SEPARATOR).collect();
+        let mut accumulated = engine.cwd.clone();
         for part in &parts {
+            accumulated = accumulated.join(part);
             segments.push(BreadcrumbSegment {
                 label: part.to_string(),
                 is_last: false,
                 is_symbol: false,
+                index: idx,
+                path_prefix: Some(accumulated.clone()),
+                symbol_line: None,
             });
+            idx += 1;
         }
     }
 
@@ -4363,7 +4382,11 @@ fn build_breadcrumbs_for_group(engine: &Engine, group_id: GroupId) -> Vec<Breadc
                 label: scope.name,
                 is_last: false,
                 is_symbol: true,
+                index: idx,
+                path_prefix: None,
+                symbol_line: Some(scope.line),
             });
+            idx += 1;
         }
     }
 

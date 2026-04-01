@@ -1223,6 +1223,13 @@ impl Engine {
             self.open_picker(PickerSource::Keybindings);
             return EngineAction::None;
         }
+        if cmd == "document_outline" {
+            self.open_picker(PickerSource::CommandCenter);
+            self.picker_query = "@".to_string();
+            self.picker_filter();
+            self.picker_load_preview();
+            return EngineAction::None;
+        }
         if cmd == "GrepWord" {
             let word = self.word_under_cursor().unwrap_or_default();
             if word.is_empty() {
