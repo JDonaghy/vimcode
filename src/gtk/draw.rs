@@ -182,6 +182,11 @@ pub(super) fn draw_editor(
                     None
                 }
             });
+            let accent = if is_active {
+                Some(theme.tab_active_accent)
+            } else {
+                None
+            };
             let (positions, dbp, sbp, vis_count) = draw_tab_bar(
                 cr,
                 &layout,
@@ -194,6 +199,7 @@ pub(super) fn draw_editor(
                 hover_idx,
                 gtb.diff_toolbar.as_ref(),
                 gtb.tab_scroll_offset,
+                accent,
             );
             tab_slot_positions_out
                 .borrow_mut()
@@ -208,15 +214,6 @@ pub(super) fn draw_editor(
                 .borrow_mut()
                 .push((gtb.group_id, vis_count));
             cr.restore().ok();
-            // Active-group indicator: bright bottom border.
-            if is_active {
-                let (ar, ag, ab) = theme.tab_active_bg.to_cairo();
-                cr.set_source_rgb(ar, ag, ab);
-                cr.set_line_width(2.0);
-                cr.move_to(tab_x, tab_y + line_height - 1.0);
-                cr.line_to(tab_x + tab_w, tab_y + line_height - 1.0);
-                cr.stroke().ok();
-            }
         }
     } else if !engine.is_tab_bar_hidden(engine.active_group) {
         // Single group: draw tab bar at full width with split buttons.
@@ -233,6 +230,7 @@ pub(super) fn draw_editor(
             hover_idx,
             screen.diff_toolbar.as_ref(),
             screen.tab_scroll_offset,
+            Some(theme.tab_active_accent),
         );
         // Use group_id 0 for single-group mode
         tab_slot_positions_out
@@ -686,6 +684,7 @@ pub(super) fn draw_tab_bar(
     hovered_close_tab: Option<usize>,
     diff_toolbar: Option<&render::DiffToolbarData>,
     tab_scroll_offset: usize,
+    accent_color: Option<render::Color>,
 ) -> TabBarDrawResult {
     // Tab bar background
     let (r, g, b) = theme.tab_bar_bg.to_cairo();
@@ -706,8 +705,10 @@ pub(super) fn draw_tab_bar(
     italic_font.set_style(pango::Style::Italic);
 
     // Measure both split buttons so tabs don't overlap them.
-    let btn_right_text = " \u{F0932}"; // " 󰤲"  split right
-    let btn_down_text = " \u{F0931}"; // " 󰤱"  split down
+    let btn_right_s = format!(" {}", icons::SPLIT_RIGHT.nerd);
+    let btn_down_s = format!(" {}", icons::SPLIT_DOWN.nerd);
+    let btn_right_text = btn_right_s.as_str();
+    let btn_down_text = btn_down_s.as_str();
     let (both_btns_px, btn_right_px) = if show_split_btn {
         layout.set_font_description(Some(&normal_font));
         layout.set_text(btn_right_text);
@@ -719,9 +720,12 @@ pub(super) fn draw_tab_bar(
         (0.0, 0.0)
     };
     // Measure diff toolbar buttons if present.
-    let diff_btn_prev_text = " \u{F0143}"; // " 󰅃"
-    let diff_btn_next_text = " \u{F0140}"; // " 󰅀"
-    let diff_btn_fold_text = " \u{F0233}"; // " 󰈳"
+    let diff_prev_s = format!(" {}", icons::DIFF_PREV.nerd);
+    let diff_next_s = format!(" {}", icons::DIFF_NEXT.nerd);
+    let diff_fold_s = format!(" {}", icons::DIFF_FOLD.nerd);
+    let diff_btn_prev_text = diff_prev_s.as_str();
+    let diff_btn_next_text = diff_next_s.as_str();
+    let diff_btn_fold_text = diff_fold_s.as_str();
     let (diff_btns_px, diff_label_px) = if let Some(dt) = diff_toolbar {
         layout.set_font_description(Some(&normal_font));
         layout.set_text(diff_btn_prev_text);
@@ -764,7 +768,6 @@ pub(super) fn draw_tab_bar(
     for _ in 0..tab_scroll_offset.min(tabs.len()) {
         slot_positions.push((0.0, 0.0));
     }
-    let mut last_rendered_tab = tabs.len();
     for (tab_idx, tab) in tabs.iter().enumerate().skip(tab_scroll_offset) {
         // Use italic font for preview tabs
         if tab.preview {
@@ -781,7 +784,6 @@ pub(super) fn draw_tab_bar(
 
         // Stop drawing tabs if they would overrun the available area.
         if x + slot_w > effective_tab_area {
-            last_rendered_tab = tab_idx;
             break;
         }
         slot_positions.push((x, x + slot_w));
@@ -796,6 +798,16 @@ pub(super) fn draw_tab_bar(
         cr.set_source_rgb(br, bg_g, bb);
         cr.rectangle(x, y_offset, tab_w + tab_inner_gap + close_w, line_height);
         cr.fill().ok();
+
+        // Accent line at top of active tab in focused group.
+        if tab.active {
+            if let Some(accent) = accent_color {
+                let (ar, ag, ab) = accent.to_cairo();
+                cr.set_source_rgb(ar, ag, ab);
+                cr.rectangle(x, y_offset, tab_w + tab_inner_gap + close_w, 2.0);
+                cr.fill().ok();
+            }
+        }
 
         // Tab text — dimmed colours for preview tabs
         cr.move_to(x, y_offset);
@@ -961,10 +973,18 @@ pub(super) fn draw_tab_bar(
         None
     };
 
+    // Measure average character width, then report tab bar width in
+    // character-column equivalents so the engine can compute tab fits
+    // using char-based tab name widths.
+    layout.set_font_description(Some(&normal_font));
+    layout.set_text("M");
+    let (char_px, _) = layout.pixel_size();
+    let char_w = (char_px as f64).max(1.0);
+    let available_cols = (effective_tab_area / char_w).floor().max(0.0) as usize;
+
     // Restore original editor font for subsequent rendering
     layout.set_font_description(Some(&saved_font));
-    let visible_count = last_rendered_tab.saturating_sub(tab_scroll_offset);
-    (slot_positions, diff_btn_pos, split_btn_info, visible_count)
+    (slot_positions, diff_btn_pos, split_btn_info, available_cols)
 }
 
 pub(super) fn draw_breadcrumb_bar(
@@ -1209,7 +1229,7 @@ pub(super) fn draw_window(
                 let (lr, lg, lb) = theme.lightbulb.to_cairo();
                 cr.set_source_rgb(lr, lg, lb);
                 let bulb_layout = layout.clone();
-                bulb_layout.set_text("\u{f0eb}"); // nf-fa-lightbulb_o
+                bulb_layout.set_text(icons::LIGHTBULB.nerd);
                 cr.move_to(rect.x + 1.0, y);
                 pangocairo::show_layout(cr, &bulb_layout);
             }
@@ -3049,7 +3069,7 @@ pub(super) fn draw_debug_sidebar(
     cr.fill().ok();
 
     let cfg_name = sidebar.launch_config_name.as_deref().unwrap_or("no config");
-    let header_text = format!("  \u{f188} DEBUG  |  {cfg_name}");
+    let header_text = format!("  {} DEBUG  |  {cfg_name}", icons::DEBUG.nerd);
     cr.set_source_rgb(hdr_fg_r, hdr_fg_g, hdr_fg_b);
     layout.set_text(&header_text);
     cr.move_to(x + 4.0, y);
@@ -3061,12 +3081,15 @@ pub(super) fn draw_debug_sidebar(
     cr.rectangle(x, btn_y, w, line_height);
     cr.fill().ok();
 
+    let continue_label = format!("{}  Continue", icons::DBG_PLAY.nerd);
+    let stop_label = format!("{}  Stop", icons::DBG_STOP_ALT.nerd);
+    let start_label = format!("{}  Start Debugging", icons::DBG_PLAY.nerd);
     let (btn_label, btn_color) = if sidebar.session_active && sidebar.stopped {
-        ("\u{f04b}  Continue", (0.38_f64, 0.73_f64, 0.45_f64)) // green play
+        (continue_label.as_str(), (0.38_f64, 0.73_f64, 0.45_f64))
     } else if sidebar.session_active {
-        ("\u{f04d}  Stop", (0.86_f64, 0.27_f64, 0.22_f64)) // red stop
+        (stop_label.as_str(), (0.86_f64, 0.27_f64, 0.22_f64))
     } else {
-        ("\u{f04b}  Start Debugging", (0.38_f64, 0.73_f64, 0.45_f64)) // green play
+        (start_label.as_str(), (0.38_f64, 0.73_f64, 0.45_f64))
     };
     cr.set_source_rgb(btn_color.0, btn_color.1, btn_color.2);
     layout.set_text(btn_label);
@@ -3081,25 +3104,25 @@ pub(super) fn draw_debug_sidebar(
         usize,
     ); 4] = [
         (
-            "\u{f6a9} VARIABLES",
+            &format!("{} VARIABLES", icons::DBG_VARIABLES.nerd),
             &sidebar.variables,
             render::DebugSidebarSection::Variables,
             0,
         ),
         (
-            "\u{f06e} WATCH",
+            &format!("{} WATCH", icons::DBG_WATCH.nerd),
             &sidebar.watch,
             render::DebugSidebarSection::Watch,
             1,
         ),
         (
-            "\u{f020e} CALL STACK",
+            &format!("{} CALL STACK", icons::DBG_CALL_STACK.nerd),
             &sidebar.frames,
             render::DebugSidebarSection::CallStack,
             2,
         ),
         (
-            "\u{f111} BREAKPOINTS",
+            &format!("{} BREAKPOINTS", icons::DBG_BREAKPOINTS.nerd),
             &sidebar.breakpoints,
             render::DebugSidebarSection::Breakpoints,
             3,
@@ -4025,8 +4048,11 @@ pub(super) fn draw_source_control_panel(
     cr.fill().ok();
 
     let branch_str = format!(
-        "  \u{e702} SOURCE CONTROL   {}  ↑{}↓{}",
-        sc.branch, sc.ahead, sc.behind
+        "  {} SOURCE CONTROL   {}  ↑{}↓{}",
+        icons::GIT_BRANCH.nerd,
+        sc.branch,
+        sc.ahead,
+        sc.behind
     );
     cr.set_source_rgb(hdr_fg_r, hdr_fg_g, hdr_fg_b);
     layout.set_text(&branch_str);
@@ -4076,7 +4102,8 @@ pub(super) fn draw_source_control_panel(
         } else {
             (0, 0)
         };
-        let prefix = " \u{f044}  ";
+        let prefix_s = format!(" {}  ", icons::GIT_EDIT.nerd);
+        let prefix = prefix_s.as_str();
         let pad_str = "    "; // 4 spaces — same visual width as prefix
 
         if sc.commit_message.is_empty() && !sc.commit_input_active {
@@ -4161,14 +4188,18 @@ pub(super) fn draw_source_control_panel(
             pangocairo::show_layout(cr, layout);
         };
 
+        let commit_lbl = format!(" {} Commit", icons::GIT_COMMIT.nerd);
+        let push_lbl = format!(" {}", icons::GIT_PUSH.nerd);
+        let pull_lbl = format!(" {}", icons::GIT_PULL.nerd);
+        let sync_lbl = format!(" {}", icons::GIT_SYNC.nerd);
         for (i, (bx, bw, label)) in [
-            (btn_x, commit_w, " \u{e729} Commit"),
-            (btn_x + commit_w, icon_w, " \u{f093}"),
-            (btn_x + commit_w + icon_w, icon_w, " \u{f019}"),
+            (btn_x, commit_w, commit_lbl.as_str()),
+            (btn_x + commit_w, icon_w, push_lbl.as_str()),
+            (btn_x + commit_w + icon_w, icon_w, pull_lbl.as_str()),
             (
                 btn_x + commit_w + icon_w * 2.0,
                 btn_w - (commit_w + icon_w * 2.0),
-                " \u{f021}",
+                sync_lbl.as_str(),
             ),
         ]
         .iter()
@@ -4338,7 +4369,7 @@ pub(super) fn draw_source_control_panel(
         draw_section(
             cr,
             layout,
-            "\u{f417} RECENT COMMITS",
+            &format!("{} RECENT COMMITS", icons::GIT_HISTORY.nerd),
             &log_items,
             sc.sections_expanded[3],
             &mut y_off,
@@ -4390,7 +4421,7 @@ pub(super) fn draw_source_control_panel(
             pangocairo::show_layout(cr, layout);
         } else {
             // Query row
-            let query_text = format!("\u{f002} {}", bp.query);
+            let query_text = format!("{} {}", icons::SEARCH.nerd, bp.query);
             let (r, g, b) = theme.completion_fg.to_cairo();
             cr.set_source_rgb(r, g, b);
             layout.set_text(&query_text);
@@ -5217,9 +5248,9 @@ pub(super) fn draw_ext_sidebar(
     cr.rectangle(x, y + ry, w, line_height);
     cr.fill().ok();
     let hdr_text = if ext.fetching {
-        "  \u{eae6} EXTENSIONS  (fetching…)".to_string()
+        format!("  {} EXTENSIONS  (fetching…)", icons::EXTENSIONS.nerd)
     } else {
-        "  \u{eae6} EXTENSIONS".to_string()
+        format!("  {} EXTENSIONS", icons::EXTENSIONS.nerd)
     };
     cr.set_source_rgb(hdr_fg_r, hdr_fg_g, hdr_fg_b);
     layout.set_text(&hdr_text);
@@ -5238,12 +5269,13 @@ pub(super) fn draw_ext_sidebar(
         cr.set_source_rgb(inp_bg_r, inp_bg_g, inp_bg_b);
         cr.rectangle(x, y + ry, w, line_height);
         cr.fill().ok();
+        let si = icons::SEARCH.nerd;
         let search_text = if ext.input_active {
-            format!(" \u{f002}  {}|", ext.query)
+            format!(" {}  {}|", si, ext.query)
         } else if ext.query.is_empty() {
-            " \u{f002}  Search extensions (press /)".to_string()
+            format!(" {}  Search extensions (press /)", si)
         } else {
-            format!(" \u{f002}  {}", ext.query)
+            format!(" {}  {}", si, ext.query)
         };
         let (text_r, text_g, text_b) = if ext.input_active || !ext.query.is_empty() {
             (fg_r, fg_g, fg_b)
@@ -5437,10 +5469,13 @@ pub(super) fn draw_ai_sidebar(
         cr.set_source_rgb(hdr_r, hdr_g, hdr_b);
         cr.rectangle(x, y + row as f64 * line_height, w, line_height);
         cr.fill().ok();
+        let ai_icon = icons::AI_CHAT.nerd;
+        let hdr_thinking = format!("  {} AI ASSISTANT  (thinking…)", ai_icon);
+        let hdr_idle = format!("  {} AI ASSISTANT", ai_icon);
         let hdr_text = if ai.streaming {
-            "  \u{f0e5} AI ASSISTANT  (thinking…)"
+            hdr_thinking.as_str()
         } else {
-            "  \u{f0e5} AI ASSISTANT"
+            hdr_idle.as_str()
         };
         cr.set_source_rgb(hdr_fg_r, hdr_fg_g, hdr_fg_b);
         layout.set_text(hdr_text);

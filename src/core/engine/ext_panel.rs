@@ -763,7 +763,7 @@ impl Engine {
         let cwd = std::env::current_dir().ok()?;
         let branch = git::current_branch(&cwd)?;
         let tracking = git::tracking_branch(&cwd).unwrap_or_else(|| "none".to_string());
-        let mut md = format!("### {} `{}`\n\n", "\u{e725}", branch); // nf-dev-git_branch
+        let mut md = format!("### {} `{}`\n\n", crate::icons::GIT_BRANCH_ALT.nerd, branch);
         md.push_str(&format!("**Remote:** `{}`\n\n", tracking));
         if self.sc_ahead > 0 || self.sc_behind > 0 {
             md.push_str(&format!(

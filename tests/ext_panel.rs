@@ -11,6 +11,7 @@ fn register_ext_panel_adds_to_engine() {
         name: "test_panel".to_string(),
         title: "TEST PANEL".to_string(),
         icon: '\u{f03a}',
+        fallback_icon: None,
         sections: vec!["Section A".to_string(), "Section B".to_string()],
     };
     e.ext_panels.insert("test_panel".to_string(), reg);
@@ -25,6 +26,7 @@ fn register_ext_panel_initializes_expanded_state() {
         name: "tp".to_string(),
         title: "TP".to_string(),
         icon: 'X',
+        fallback_icon: None,
         sections: vec!["A".to_string(), "B".to_string(), "C".to_string()],
     };
     e.ext_panels.insert("tp".to_string(), reg);
@@ -86,6 +88,7 @@ fn setup_panel(e: &mut vimcode_core::Engine) {
         name: "tp".to_string(),
         title: "TP".to_string(),
         icon: 'X',
+        fallback_icon: None,
         sections: vec!["A".to_string(), "B".to_string()],
     };
     e.ext_panels.insert("tp".to_string(), reg);
@@ -352,6 +355,7 @@ fn setup_tree_panel(e: &mut vimcode_core::Engine) {
         name: "tree".to_string(),
         title: "TREE".to_string(),
         icon: 'T',
+        fallback_icon: None,
         sections: vec!["S".to_string()],
     };
     e.ext_panels.insert("tree".to_string(), reg);

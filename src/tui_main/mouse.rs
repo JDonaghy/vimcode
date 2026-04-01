@@ -7,7 +7,7 @@ pub(super) fn handle_mouse(
     ev: MouseEvent,
     sidebar: &mut TuiSidebar,
     engine: &mut Engine,
-    terminal_size: &Option<ratatui::layout::Rect>,
+    terminal_size: &Option<Size>,
     sidebar_width: u16,
     dragging_sidebar: &mut bool,
     dragging_scrollbar: &mut Option<ScrollDragState>,
@@ -521,6 +521,7 @@ pub(super) fn handle_mouse(
             }
             *mouse_text_drag = false;
             engine.mouse_drag_active = false;
+            engine.mouse_drag_origin_window = None;
             // Auto-copy terminal selection to clipboard on mouse-release.
             if engine.terminal_has_focus {
                 let text = engine.active_terminal().and_then(|t| t.selected_text());

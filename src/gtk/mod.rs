@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use crate::core;
+use crate::icons;
 use crate::render;
 
 use core::engine::EngineAction;
@@ -693,7 +694,7 @@ impl SimpleComponent for App {
 
                     #[name = "explorer_button"]
                     gtk4::Button {
-                        set_label: "\u{f07c}",
+                        set_label: icons::EXPLORER.nerd,
                         set_tooltip_text: Some("Explorer (Ctrl+Shift+E)"),
                         set_width_request: 48,
                         set_height_request: 48,
@@ -712,7 +713,7 @@ impl SimpleComponent for App {
 
                     #[name = "search_button"]
                     gtk4::Button {
-                        set_label: "\u{ea6d}",  // nf-cod-search
+                        set_label: icons::SEARCH_COD.nerd,
                         set_tooltip_text: Some("Search (Ctrl+Shift+F)"),
                         set_width_request: 48,
                         set_height_request: 48,
@@ -731,7 +732,7 @@ impl SimpleComponent for App {
 
                     #[name = "debug_button"]
                     gtk4::Button {
-                        set_label: "\u{f188}",  // nf-fa-bug
+                        set_label: icons::DEBUG.nerd,
                         set_tooltip_text: Some("Debug"),
                         set_width_request: 48,
                         set_height_request: 48,
@@ -749,7 +750,7 @@ impl SimpleComponent for App {
                     },
 
                     gtk4::Button {
-                        set_label: "\u{e702}",
+                        set_label: icons::GIT_BRANCH.nerd,
                         set_tooltip_text: Some("Source Control"),
                         set_width_request: 48,
                         set_height_request: 48,
@@ -762,7 +763,7 @@ impl SimpleComponent for App {
                     },
 
                     gtk4::Button {
-                        set_label: "\u{eae6}",
+                        set_label: icons::EXTENSIONS.nerd,
                         set_tooltip_text: Some("Extensions"),
                         set_width_request: 48,
                         set_height_request: 48,
@@ -775,7 +776,7 @@ impl SimpleComponent for App {
                     },
 
                     gtk4::Button {
-                        set_label: "\u{f0e5}",
+                        set_label: icons::AI_CHAT.nerd,
                         set_tooltip_text: Some("AI Assistant"),
                         set_width_request: 48,
                         set_height_request: 48,
@@ -792,7 +793,7 @@ impl SimpleComponent for App {
                     },
 
                     gtk4::Button {
-                        set_label: "\u{f013}",
+                        set_label: icons::SETTINGS.nerd,
                         set_tooltip_text: Some("Settings"),
                         set_width_request: 48,
                         set_height_request: 48,
@@ -845,7 +846,7 @@ impl SimpleComponent for App {
                             set_css_classes: &["explorer-toolbar"],
 
                             gtk4::Button {
-                                set_label: "\u{f15b}",
+                                set_label: icons::FILE_GENERIC.nerd,
                                 set_tooltip_text: Some("New File"),
                                 set_width_request: 32,
                                 set_height_request: 32,
@@ -856,7 +857,7 @@ impl SimpleComponent for App {
                             },
 
                             gtk4::Button {
-                                set_label: "\u{f07b}",
+                                set_label: icons::FOLDER.nerd,
                                 set_tooltip_text: Some("New Folder"),
                                 set_width_request: 32,
                                 set_height_request: 32,
@@ -867,7 +868,7 @@ impl SimpleComponent for App {
                             },
 
                             gtk4::Button {
-                                set_label: "\u{f1f8}",
+                                set_label: icons::TRASH.nerd,
                                 set_tooltip_text: Some("Delete"),
                                 set_width_request: 32,
                                 set_height_request: 32,
@@ -1905,8 +1906,13 @@ impl SimpleComponent for App {
             }
         }
 
+        // Install bundled Nerd Font icon subset so UI glyphs render without
+        // requiring the user to install a Nerd Font system-wide.
+        install_bundled_icon_font();
+
         let engine = {
             let mut e = Engine::new();
+            icons::set_nerd_fonts(e.settings.use_nerd_fonts);
             e.plugin_init();
             if let Some(ref path) = file_path {
                 // CLI argument: open only the specified file/directory, skip session restore
@@ -3054,7 +3060,7 @@ impl SimpleComponent for App {
                 separator_widget.as_ref().and_then(|s| s.prev_sibling());
             for panel in &panels {
                 let btn = gtk4::Button::new();
-                btn.set_label(&panel.icon.to_string());
+                btn.set_label(&panel.resolved_icon().to_string());
                 btn.set_tooltip_text(Some(&panel.title));
                 btn.set_width_request(48);
                 btn.set_height_request(48);
@@ -3185,14 +3191,17 @@ impl SimpleComponent for App {
             &file_fg_hex,
         );
 
-        // Read font family for nerd font icon rendering
-        let nf_font = engine.borrow().settings.font_family.clone();
+        // Read font family for nerd font icon rendering.  Prefer the bundled
+        // "Symbols Nerd Font" (installed at startup) so icons render even if the
+        // user's editor font lacks Nerd Font glyphs.
+        let user_font = engine.borrow().settings.font_family.clone();
+        let nf_font = format!("Symbols Nerd Font, {user_font}");
 
         // Setup TreeView columns
         // Single column with icon + filename (so they indent together)
         let col = gtk4::TreeViewColumn::new();
 
-        // Icon cell renderer (non-expanding) — must use the nerd font for glyph support
+        // Icon cell renderer (non-expanding) — uses bundled nerd font for glyph support
         let icon_cell = gtk4::CellRendererText::new();
         icon_cell.set_property("font", &nf_font);
         col.pack_start(&icon_cell, false);
@@ -6630,6 +6639,7 @@ impl App {
         self.group_divider_dragging = None;
         let mut engine = self.engine.borrow_mut();
         engine.mouse_drag_active = false;
+        engine.mouse_drag_origin_window = None;
         self.draw_needed.set(true);
     }
 
@@ -8768,7 +8778,11 @@ impl App {
 
                     // Insert a new row as the first child
                     let new_iter = tree_store.prepend(parent_iter.as_ref());
-                    let icon = if is_folder { "\u{f07b}" } else { "\u{f15b}" };
+                    let icon = if is_folder {
+                        icons::FOLDER.nerd
+                    } else {
+                        icons::FILE_GENERIC.nerd
+                    };
                     let marker = if is_folder {
                         format!("__NEW_FOLDER__{}", parent_dir.display())
                     } else {
@@ -9640,13 +9654,11 @@ pub(crate) fn run(file_path: Option<PathBuf>) {
             // Emergency: flush swap files for all dirty buffers.
             crate::core::swap::run_emergency_flush();
 
-            let bt = std::backtrace::Backtrace::force_capture();
-            let loc_str = info
-                .location()
-                .map(|l| format!("  at {}:{}:{}\n", l.file(), l.line(), l.column()))
-                .unwrap_or_default();
-            let crash_msg = format!("PANIC: {}\n{}backtrace:\n{}\n", info, loc_str, bt);
-            let _ = std::fs::write("/tmp/vimcode-crash.log", &crash_msg);
+            if let Some(path) = crate::core::swap::write_crash_log(info) {
+                eprintln!("VimCode crashed. Details written to {}", path.display());
+                eprintln!("Unsaved buffers written to swap files for recovery.");
+                eprintln!("Please report this at https://github.com/JDonaghy/vimcode/issues");
+            }
             prev_hook(info);
         }));
     }

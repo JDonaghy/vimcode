@@ -23,6 +23,7 @@ use crate::core::terminal::TermSelection as CoreTermSelection;
 use crate::core::view::View;
 use crate::core::window::{GroupDivider, GroupId};
 use crate::core::{Cursor, GitLineStatus, Mode, WindowId, WindowRect};
+use crate::icons;
 
 // ─── Color ───────────────────────────────────────────────────────────────────
 
@@ -1504,7 +1505,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
                 label: "Key Bindings",
                 shortcut: "",
                 vscode_shortcut: "",
-                action: "keys",
+                action: "Keybindings",
                 enabled: true,
                 separator: false,
             },
@@ -1523,28 +1524,28 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
 /// Static debug toolbar button definitions.
 pub static DEBUG_BUTTONS: &[DebugButton] = &[
     DebugButton {
-        icon: "\u{f040a}",
+        icon: icons::DBG_CONTINUE.nerd,
         label: "Continue",
         key_hint: "F5",
         action: "continue",
         enabled: true,
     },
     DebugButton {
-        icon: "\u{f03e4}",
+        icon: icons::DBG_PAUSE.nerd,
         label: "Pause",
         key_hint: "F6",
         action: "pause",
         enabled: true,
     },
     DebugButton {
-        icon: "\u{f04db}",
+        icon: icons::DBG_STOP.nerd,
         label: "Stop",
         key_hint: "Shift+F5",
         action: "stop",
         enabled: true,
     },
     DebugButton {
-        icon: "\u{f0459}",
+        icon: icons::DBG_RESTART.nerd,
         label: "Restart",
         key_hint: "Ctrl+Shift+F5",
         action: "restart",
@@ -1552,21 +1553,21 @@ pub static DEBUG_BUTTONS: &[DebugButton] = &[
     },
     // separator goes here (rendered between index 3 and 4)
     DebugButton {
-        icon: "\u{f0457}",
+        icon: icons::DBG_STEP_OVER.nerd,
         label: "Step Over",
         key_hint: "F10",
         action: "stepover",
         enabled: true,
     },
     DebugButton {
-        icon: "\u{f0459}",
+        icon: icons::DBG_RESTART.nerd,
         label: "Step Into",
         key_hint: "F11",
         action: "stepin",
         enabled: true,
     },
     DebugButton {
-        icon: "\u{f0458}",
+        icon: icons::DBG_STEP_OUT.nerd,
         label: "Step Out",
         key_hint: "Shift+F11",
         action: "stepout",
@@ -1765,6 +1766,8 @@ pub struct Theme {
     pub tab_inactive_fg: Color,
     pub tab_preview_active_fg: Color,
     pub tab_preview_inactive_fg: Color,
+    /// Accent line color for the active tab in the focused editor group.
+    pub tab_active_accent: Color,
 
     // Status line
     pub status_bg: Color,
@@ -1923,6 +1926,7 @@ impl Theme {
             tab_preview_active_fg: Color::from_hex("#cccccc"),
             // (0.5, 0.5, 0.5)
             tab_preview_inactive_fg: Color::from_hex("#7f7f7f"),
+            tab_active_accent: Color::from_hex("#61afef"),
 
             // (0.2, 0.2, 0.3)
             status_bg: Color::from_hex("#33334c"),
@@ -2061,6 +2065,7 @@ impl Theme {
             tab_inactive_fg: Color::from_hex("#a89984"),
             tab_preview_active_fg: Color::from_hex("#d5c4a1"),
             tab_preview_inactive_fg: Color::from_hex("#7c6f64"),
+            tab_active_accent: Color::from_hex("#d65d0e"),
 
             status_bg: Color::from_hex("#504945"),
             status_fg: Color::from_hex("#ebdbb2"),
@@ -2181,6 +2186,7 @@ impl Theme {
             tab_inactive_fg: Color::from_hex("#545c7e"),
             tab_preview_active_fg: Color::from_hex("#a9b1d6"),
             tab_preview_inactive_fg: Color::from_hex("#3b4261"),
+            tab_active_accent: Color::from_hex("#7aa2f7"),
 
             status_bg: Color::from_hex("#292e42"),
             status_fg: Color::from_hex("#c0caf5"),
@@ -2301,6 +2307,7 @@ impl Theme {
             tab_inactive_fg: Color::from_hex("#586e75"),
             tab_preview_active_fg: Color::from_hex("#839496"),
             tab_preview_inactive_fg: Color::from_hex("#4a6570"),
+            tab_active_accent: Color::from_hex("#268bd2"),
 
             status_bg: Color::from_hex("#073642"),
             status_fg: Color::from_hex("#93a1a1"),
@@ -2421,6 +2428,7 @@ impl Theme {
             tab_inactive_fg: Color::from_hex("#969696"),
             tab_preview_active_fg: Color::from_hex("#cccccc"),
             tab_preview_inactive_fg: Color::from_hex("#7f7f7f"),
+            tab_active_accent: Color::from_hex("#007acc"),
 
             status_bg: Color::from_hex("#007acc"),
             status_fg: Color::from_hex("#ffffff"),
@@ -2541,6 +2549,7 @@ impl Theme {
             tab_inactive_fg: Color::from_hex("#8e8e8e"),
             tab_preview_active_fg: Color::from_hex("#555555"),
             tab_preview_inactive_fg: Color::from_hex("#999999"),
+            tab_active_accent: Color::from_hex("#005fb8"),
 
             status_bg: Color::from_hex("#007acc"),
             status_fg: Color::from_hex("#ffffff"),
@@ -2766,6 +2775,9 @@ impl Theme {
             theme.tab_inactive_fg = c;
             theme.tab_preview_inactive_fg = c.darken(0.3);
             theme.tab_preview_active_fg = c.lighten(0.2);
+        }
+        if let Some(c) = color("tab.activeBorderTop") {
+            theme.tab_active_accent = c;
         }
 
         // ── Status bar ────────────────────────────────────────────────────
@@ -3229,9 +3241,9 @@ pub fn build_screen_layout(
             for v in vars {
                 let prefix = if v.var_ref > 0 {
                     if expanded.contains(&v.var_ref) {
-                        "\u{f0d7} " // ▼
+                        icons::EXPAND_DOWN.nerd
                     } else {
-                        "\u{f0da} " // ▶
+                        icons::COLLAPSE_RIGHT.nerd
                     }
                 } else {
                     "  "
@@ -3269,9 +3281,9 @@ pub fn build_screen_layout(
                 .dap_expanded_vars
                 .contains(&engine.dap_primary_scope_ref);
             let prefix = if expanded {
-                "\u{f0d7} " // ▼
+                icons::EXPAND_DOWN.nerd
             } else {
-                "\u{f0da} " // ▶
+                icons::COLLAPSE_RIGHT.nerd
             };
             var_items.push(DebugSidebarItem {
                 text: format!("{prefix}{}", engine.dap_primary_scope_name),
@@ -3310,9 +3322,9 @@ pub fn build_screen_layout(
         for (scope_name, var_ref) in &engine.dap_scope_groups {
             let expanded = engine.dap_expanded_vars.contains(var_ref);
             let prefix = if expanded {
-                "\u{f0d7} " // ▼
+                icons::EXPAND_DOWN.nerd
             } else {
-                "\u{f0da} " // ▶
+                icons::COLLAPSE_RIGHT.nerd
             };
             var_items.push(DebugSidebarItem {
                 text: format!("{prefix}{scope_name}"),
@@ -3370,7 +3382,7 @@ pub fn build_screen_layout(
                     .and_then(|n| n.to_str())
                     .unwrap_or("?");
                 let prefix = if i == engine.dap_active_frame {
-                    "\u{f0da} " // ▶
+                    icons::COLLAPSE_RIGHT.nerd
                 } else {
                     "  "
                 };
@@ -3405,7 +3417,7 @@ pub fn build_screen_layout(
                 let symbol = if bp.condition.is_some() || bp.hit_condition.is_some() {
                     "\u{25c6}" // ◆ conditional
                 } else {
-                    "\u{f111}" // ●
+                    icons::DBG_BREAKPOINTS.nerd
                 };
                 bp_items.push(DebugSidebarItem {
                     text: format!("{} {}:{}{}", symbol, file_name, bp.line, suffix),

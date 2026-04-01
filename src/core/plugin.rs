@@ -40,7 +40,22 @@ pub struct PanelRegistration {
     pub name: String,
     pub title: String,
     pub icon: char,
+    /// ASCII/Unicode fallback icon for when Nerd Fonts are disabled.
+    /// If `None` and nerd fonts are off, the first letter of `title` is used.
+    pub fallback_icon: Option<char>,
     pub sections: Vec<String>,
+}
+
+impl PanelRegistration {
+    /// Return the icon to display, respecting the global `use_nerd_fonts` flag.
+    pub fn resolved_icon(&self) -> char {
+        if crate::icons::nerd_fonts_enabled() {
+            self.icon
+        } else {
+            self.fallback_icon
+                .unwrap_or_else(|| self.title.chars().next().unwrap_or('?'))
+        }
+    }
 }
 
 /// A single item in an extension panel section.
@@ -1444,7 +1459,12 @@ impl PluginManager {
             lua.create_function(|lua, (name, opts): (String, LuaTable)| {
                 let title: String = opts.get("title").unwrap_or_default();
                 let icon_str: String = opts.get("icon").unwrap_or_default();
-                let icon = icon_str.chars().next().unwrap_or('\u{f03a}');
+                let icon = icon_str
+                    .chars()
+                    .next()
+                    .unwrap_or(crate::icons::PLUGIN_FALLBACK.c());
+                let fb_str: String = opts.get("fallback_icon").unwrap_or_default();
+                let fallback_icon = fb_str.chars().next();
                 let sections_val: LuaTable = opts.get("sections")?;
                 let mut sections = Vec::new();
                 for (_, s) in sections_val.pairs::<usize, String>().flatten() {
@@ -1457,6 +1477,7 @@ impl PluginManager {
                     name: name.clone(),
                     title,
                     icon,
+                    fallback_icon,
                     sections,
                 };
                 // During load_one_plugin: write to PluginRegistrations

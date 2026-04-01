@@ -6617,11 +6617,15 @@ fn test_auto_indent_o() {
     let mut engine = Engine::new();
     engine.settings.auto_indent = true;
     engine.buffer_mut().insert(0, "    fn foo() {");
-    // 'o' opens a new line below with same indent
+    // 'o' opens a new line below — smart indent adds extra level after '{'
     press_special(&mut engine, "Escape"); // ensure normal mode
     press_char(&mut engine, 'o');
     assert_eq!(engine.view().cursor.line, 1);
-    assert_eq!(engine.view().cursor.col, 4);
+    assert_eq!(
+        engine.view().cursor.col,
+        8,
+        "o after {{ should smart-indent: base 4 + shift_width 4"
+    );
     assert_eq!(engine.mode, Mode::Insert);
 }
 
@@ -11115,6 +11119,45 @@ fn test_mouse_drag_multiline() {
     assert_eq!(engine.visual_anchor.unwrap().line, 0);
     assert_eq!(engine.view().cursor.line, 2);
     assert_eq!(engine.view().cursor.col, 4);
+}
+
+#[test]
+fn test_mouse_drag_locked_to_origin_window() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello world");
+    engine.update_syntax();
+
+    // Create a vertical split so we have two windows.
+    engine.split_window(crate::core::window::SplitDirection::Vertical, None);
+    let windows: Vec<_> = engine.windows.keys().copied().collect();
+    assert!(windows.len() >= 2);
+    let wid_a = windows[0];
+    let wid_b = windows[1];
+
+    // Click in window A, start dragging in window A.
+    engine.mouse_click(wid_a, 0, 1);
+    engine.mouse_drag(wid_a, 0, 4);
+    assert!(engine.mouse_drag_active);
+    assert_eq!(engine.mouse_drag_origin_window, Some(wid_a));
+    assert_eq!(engine.view().cursor.col, 4);
+
+    // Drag into window B — should be ignored, cursor stays at col 4.
+    engine.mouse_drag(wid_b, 0, 8);
+    assert_eq!(engine.view().cursor.col, 4);
+
+    // Drag back within window A — should still work.
+    engine.mouse_drag(wid_a, 0, 6);
+    assert_eq!(engine.view().cursor.col, 6);
+
+    // Mouse up clears origin lock.
+    engine.mouse_drag_active = false;
+    engine.mouse_drag_origin_window = None;
+
+    // Now a new click+drag in window B should work.
+    engine.mouse_click(wid_b, 0, 2);
+    engine.mouse_drag(wid_b, 0, 5);
+    assert!(engine.mouse_drag_active);
+    assert_eq!(engine.mouse_drag_origin_window, Some(wid_b));
 }
 
 #[test]
@@ -16256,4 +16299,737 @@ fn test_move_file_dialog_confirm() {
     assert!(e.message.contains("Moved"));
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_search_jump_not_at_viewport_bottom() {
+    let mut engine = Engine::new();
+    // Create a buffer with 100 lines, match on line 95
+    let content: String = (0..100)
+        .map(|i| {
+            if i == 95 {
+                "target_match\n".to_string()
+            } else {
+                format!("line {i}\n")
+            }
+        })
+        .collect();
+    engine.buffer_mut().insert(0, &content);
+    engine.update_syntax();
+
+    // Set a small viewport so we can test scroll behavior
+    engine.view_mut().viewport_lines = 20;
+    engine.view_mut().scroll_top = 0;
+    engine.view_mut().cursor.line = 0;
+    engine.view_mut().cursor.col = 0;
+
+    // Search for "target_match"
+    press_char(&mut engine, '/');
+    for c in "target_match".chars() {
+        press_char(&mut engine, c);
+    }
+    press_special(&mut engine, "Return");
+
+    // Cursor should be on line 95
+    assert_eq!(engine.view().cursor.line, 95);
+
+    // The match should NOT be in the bottom quarter of the viewport.
+    // With viewport_lines=20, the match should be roughly centered.
+    let scroll_top = engine.view().scroll_top;
+    let offset_from_top = engine.view().cursor.line - scroll_top;
+    // Should be somewhere in the middle, not at the very bottom (>= 15 out of 20)
+    assert!(
+        offset_from_top <= 15,
+        "Search match at viewport row {} (scroll_top={}, cursor=95) — should not be in bottom quarter",
+        offset_from_top,
+        scroll_top
+    );
+}
+
+#[test]
+fn test_search_n_centers_when_jumping_far() {
+    let mut engine = Engine::new();
+    // Create buffer with matches spread across 200 lines
+    let content: String = (0..200)
+        .map(|i| {
+            if i == 10 || i == 190 {
+                "findme here\n".to_string()
+            } else {
+                format!("line {i}\n")
+            }
+        })
+        .collect();
+    engine.buffer_mut().insert(0, &content);
+    engine.update_syntax();
+
+    engine.view_mut().viewport_lines = 20;
+    engine.view_mut().scroll_top = 0;
+    engine.view_mut().cursor.line = 0;
+
+    // Search for "findme"
+    press_char(&mut engine, '/');
+    for c in "findme".chars() {
+        press_char(&mut engine, c);
+    }
+    press_special(&mut engine, "Return");
+
+    // First match is at line 10 — may or may not need centering
+    assert_eq!(engine.view().cursor.line, 10);
+
+    // Press n to jump to line 190 (far away)
+    press_char(&mut engine, 'n');
+    assert_eq!(engine.view().cursor.line, 190);
+
+    let scroll_top = engine.view().scroll_top;
+    let offset_from_top = engine.view().cursor.line - scroll_top;
+    // Should NOT be at the very bottom edge
+    assert!(
+        offset_from_top <= 15,
+        "After 'n', match at viewport row {} — should not be at bottom edge",
+        offset_from_top
+    );
+}
+
+#[test]
+fn test_tab_scroll_offset_shows_max_tabs() {
+    let mut engine = Engine::new();
+    // Each "[No Name]" tab is ~18 cols wide. Set width for 5 tabs.
+    engine
+        .editor_groups
+        .get_mut(&engine.active_group)
+        .unwrap()
+        .tab_bar_width = 200;
+
+    // Open 3 tabs total (1 initial + 2 new)
+    engine.new_tab(None);
+    engine.new_tab(None);
+
+    // With 3 tabs and plenty of room, offset should be 0 (all visible)
+    let group = engine.editor_groups.get(&engine.active_group).unwrap();
+    assert_eq!(group.tabs.len(), 3);
+    assert_eq!(
+        group.tab_scroll_offset, 0,
+        "All 3 tabs fit — offset should be 0"
+    );
+}
+
+#[test]
+fn test_tab_scroll_offset_pulls_back_when_room() {
+    let mut engine = Engine::new();
+
+    // Each "[No Name]" tab is ~18 cols. Set width to fit exactly 4.
+    engine
+        .editor_groups
+        .get_mut(&engine.active_group)
+        .unwrap()
+        .tab_bar_width = 72;
+
+    // Open 6 tabs total (1 initial + 5 new) — only ~4 fit
+    for _ in 0..5 {
+        engine.new_tab(None);
+    }
+    let group = engine.editor_groups.get(&engine.active_group).unwrap();
+    assert_eq!(group.tabs.len(), 6);
+    assert_eq!(group.active_tab, 5);
+    // Offset should be non-zero since not all tabs fit
+    assert!(group.tab_scroll_offset > 0);
+
+    // Now close the last tab (go back to tab 4)
+    engine.close_tab();
+    let group = engine.editor_groups.get(&engine.active_group).unwrap();
+    assert_eq!(group.tabs.len(), 5);
+    // After closing, offset should pull back to show as many as possible
+    let offset = group.tab_scroll_offset;
+    // Active is now last tab (4), and tabs should be packed from left
+    assert!(
+        offset <= 1,
+        "5 tabs, room for ~4 — offset should be at most 1, got {}",
+        offset
+    );
+}
+
+#[test]
+fn test_new_tab_visible_in_small_group() {
+    let mut engine = Engine::new();
+
+    // Set large width so all tabs fit
+    engine
+        .editor_groups
+        .get_mut(&engine.active_group)
+        .unwrap()
+        .tab_bar_width = 200;
+
+    // Start with 1 tab, open a second
+    engine.new_tab(None);
+
+    let group = engine.editor_groups.get(&engine.active_group).unwrap();
+    assert_eq!(group.tabs.len(), 2);
+    assert_eq!(group.active_tab, 1);
+    assert_eq!(
+        group.tab_scroll_offset, 0,
+        "2 tabs with plenty of room — offset must be 0, both tabs visible"
+    );
+}
+
+// ── VSCode undo coalescing tests ────────────────────────────────────────
+
+#[test]
+fn test_vscode_undo_coalesces_consecutive_chars() {
+    // Typing several characters in a row should produce a single undo entry.
+    let mut engine = make_vscode_engine("");
+    vscode_key(&mut engine, "", Some('h'), false);
+    vscode_key(&mut engine, "", Some('e'), false);
+    vscode_key(&mut engine, "", Some('l'), false);
+    vscode_key(&mut engine, "", Some('l'), false);
+    vscode_key(&mut engine, "", Some('o'), false);
+    assert_eq!(engine.buffer().to_string().trim(), "hello");
+
+    // One Ctrl+Z should undo the entire "hello", not just the last char.
+    vscode_key(&mut engine, "z", Some('z'), true);
+    assert_eq!(engine.buffer().to_string().trim(), "");
+}
+
+#[test]
+fn test_vscode_undo_breaks_on_cursor_move() {
+    // Type "ab", move cursor, type "cd" — should be two undo groups.
+    let mut engine = make_vscode_engine("");
+    vscode_key(&mut engine, "", Some('a'), false);
+    vscode_key(&mut engine, "", Some('b'), false);
+    // Arrow left moves cursor — breaks the undo group
+    vscode_key(&mut engine, "Left", None, false);
+    vscode_key(&mut engine, "", Some('c'), false);
+    vscode_key(&mut engine, "", Some('d'), false);
+
+    // First Ctrl+Z undoes "cd"
+    vscode_key(&mut engine, "z", Some('z'), true);
+    let text = engine.buffer().to_string();
+    assert!(
+        text.contains("ab"),
+        "First undo should remove 'cd', leaving 'ab': got '{}'",
+        text
+    );
+
+    // Second Ctrl+Z undoes "ab"
+    vscode_key(&mut engine, "z", Some('z'), true);
+    assert_eq!(engine.buffer().to_string().trim(), "");
+}
+
+#[test]
+fn test_vscode_undo_breaks_on_backspace() {
+    // Type "abc", then Backspace, then type "d" — three undo groups.
+    let mut engine = make_vscode_engine("");
+    vscode_key(&mut engine, "", Some('a'), false);
+    vscode_key(&mut engine, "", Some('b'), false);
+    vscode_key(&mut engine, "", Some('c'), false);
+    // Backspace is a non-char action — breaks undo group
+    vscode_key(&mut engine, "BackSpace", None, false);
+    // Type another char — new group
+    vscode_key(&mut engine, "", Some('d'), false);
+    assert_eq!(engine.buffer().to_string().trim(), "abd");
+
+    // First undo: removes "d"
+    vscode_key(&mut engine, "z", Some('z'), true);
+    assert_eq!(engine.buffer().to_string().trim(), "ab");
+
+    // Second undo: undoes the backspace (restores "c")
+    vscode_key(&mut engine, "z", Some('z'), true);
+    assert_eq!(engine.buffer().to_string().trim(), "abc");
+
+    // Third undo: undoes "abc"
+    vscode_key(&mut engine, "z", Some('z'), true);
+    assert_eq!(engine.buffer().to_string().trim(), "");
+}
+
+#[test]
+fn test_vscode_undo_breaks_on_return() {
+    // Type "ab", then Enter, then "cd" — three undo groups.
+    let mut engine = make_vscode_engine("");
+    vscode_key(&mut engine, "", Some('a'), false);
+    vscode_key(&mut engine, "", Some('b'), false);
+    vscode_key(&mut engine, "Return", None, false);
+    vscode_key(&mut engine, "", Some('c'), false);
+    vscode_key(&mut engine, "", Some('d'), false);
+
+    // First undo: removes "cd"
+    vscode_key(&mut engine, "z", Some('z'), true);
+    let text = engine.buffer().to_string();
+    assert!(text.contains("ab"), "got '{}'", text);
+    assert!(!text.contains("cd"), "got '{}'", text);
+}
+
+#[test]
+fn test_vscode_undo_redo_roundtrip() {
+    // Type "hello", undo, redo — should restore "hello".
+    let mut engine = make_vscode_engine("");
+    for ch in "hello".chars() {
+        vscode_key(&mut engine, "", Some(ch), false);
+    }
+    let after = engine.buffer().to_string();
+    vscode_key(&mut engine, "z", Some('z'), true);
+    assert_eq!(engine.buffer().to_string().trim(), "");
+    vscode_key(&mut engine, "y", Some('y'), true);
+    assert_eq!(engine.buffer().to_string(), after);
+}
+
+// ── :$ and line address commands ────────────────────────────────────────
+
+#[test]
+fn test_colon_dollar_goes_to_eof() {
+    let mut e = engine_with_text("line one\nline two\nline three\n");
+    e.execute_command("$");
+    assert_eq!(e.view().cursor.line, 2);
+}
+
+#[test]
+fn test_colon_plus_offset() {
+    let mut e = engine_with_text("a\nb\nc\nd\ne\n");
+    e.view_mut().cursor.line = 1;
+    e.execute_command("+2");
+    assert_eq!(e.view().cursor.line, 3);
+}
+
+#[test]
+fn test_colon_minus_offset() {
+    let mut e = engine_with_text("a\nb\nc\nd\ne\n");
+    e.view_mut().cursor.line = 3;
+    e.execute_command("-2");
+    assert_eq!(e.view().cursor.line, 1);
+}
+
+#[test]
+fn test_colon_dot_stays() {
+    let mut e = engine_with_text("a\nb\nc\n");
+    e.view_mut().cursor.line = 1;
+    e.execute_command(".");
+    assert_eq!(e.view().cursor.line, 1);
+}
+
+// ── Bicep comment style ────────────────────────────────────────────────
+
+#[test]
+fn test_bicep_comment_style() {
+    let style = crate::core::comment::comment_style_for_language("bicep");
+    assert!(
+        style.is_some(),
+        "bicep should have a built-in comment style"
+    );
+    let s = style.unwrap();
+    assert_eq!(s.line, "//");
+    assert_eq!(s.block_open, "/*");
+    assert_eq!(s.block_close, "*/");
+}
+
+// ── Buffer picker ──────────────────────────────────────────────────────
+
+#[test]
+fn test_buffer_picker_opens() {
+    let mut e = engine_with_text("hello");
+    e.open_picker(PickerSource::Buffers);
+    assert!(e.picker_open);
+    assert_eq!(e.picker_title, "Open Buffers");
+    assert!(!e.picker_all_items.is_empty());
+}
+
+#[test]
+fn test_buffer_picker_lists_open_buffers() {
+    let mut e = engine_with_text("hello");
+    let dir = std::env::temp_dir().join("vimcode_test_bufpick");
+    let _ = std::fs::create_dir_all(&dir);
+    let f1 = dir.join("alpha.rs");
+    let f2 = dir.join("beta.rs");
+    std::fs::write(&f1, "fn alpha() {}").unwrap();
+    std::fs::write(&f2, "fn beta() {}").unwrap();
+    e.open_file_in_tab(&f1);
+    e.open_file_in_tab(&f2);
+    e.open_picker(PickerSource::Buffers);
+    let names: Vec<String> = e
+        .picker_all_items
+        .iter()
+        .map(|i| i.display.clone())
+        .collect();
+    assert!(
+        names.iter().any(|n| n.contains("alpha")),
+        "alpha.rs should be in buffer list: {:?}",
+        names
+    );
+    assert!(
+        names.iter().any(|n| n.contains("beta")),
+        "beta.rs should be in buffer list: {:?}",
+        names
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_leader_sb_opens_buffer_picker() {
+    let mut e = engine_with_text("hello");
+    // Default leader is Space
+    e.handle_key("space", Some(' '), false);
+    e.handle_key("s", Some('s'), false);
+    e.handle_key("b", Some('b'), false);
+    assert!(e.picker_open);
+    assert_eq!(e.picker_source, PickerSource::Buffers);
+}
+
+#[test]
+fn test_buffers_command() {
+    let mut e = engine_with_text("hello");
+    e.execute_command("Buffers");
+    assert!(e.picker_open);
+    assert_eq!(e.picker_source, PickerSource::Buffers);
+}
+
+// ── Keybindings picker ─────────────────────────────────────────────────
+
+#[test]
+fn test_keybindings_picker_opens() {
+    let mut e = engine_with_text("hello");
+    e.open_picker(PickerSource::Keybindings);
+    assert!(e.picker_open);
+    assert_eq!(e.picker_title, "Key Bindings");
+    assert!(
+        !e.picker_all_items.is_empty(),
+        "keybindings picker should have items"
+    );
+}
+
+#[test]
+fn test_keybindings_picker_has_movement_items() {
+    let mut e = engine_with_text("hello");
+    e.open_picker(PickerSource::Keybindings);
+    let has_hjkl = e
+        .picker_all_items
+        .iter()
+        .any(|item| item.filter_text.contains("h j k l"));
+    assert!(has_hjkl, "should include h j k l movement keys");
+}
+
+#[test]
+fn test_keybindings_picker_has_panel_keys() {
+    let mut e = engine_with_text("hello");
+    e.open_picker(PickerSource::Keybindings);
+    let has_configurable = e
+        .picker_all_items
+        .iter()
+        .any(|item| item.filter_text.contains("configurable"));
+    assert!(has_configurable, "should include configurable panel keys");
+    // Check that the actual configured key value is shown
+    let sidebar_key = &e.settings.panel_keys.toggle_sidebar;
+    let has_sidebar = e
+        .picker_all_items
+        .iter()
+        .any(|item| item.display.contains(sidebar_key));
+    assert!(
+        has_sidebar,
+        "should show configured toggle_sidebar key: {}",
+        sidebar_key
+    );
+}
+
+#[test]
+fn test_keybindings_picker_shows_user_remaps() {
+    let mut e = engine_with_text("hello");
+    e.settings.keymaps = vec!["n gcc :Commentary".to_string()];
+    e.rebuild_user_keymaps();
+    e.open_picker(PickerSource::Keybindings);
+    let has_remap = e
+        .picker_all_items
+        .iter()
+        .any(|item| item.display.contains("user remap") && item.display.contains("Commentary"));
+    assert!(
+        has_remap,
+        "should show user keymaps with (user remap) marker"
+    );
+}
+
+#[test]
+fn test_keybindings_picker_filterable() {
+    let mut e = engine_with_text("hello");
+    e.open_picker(PickerSource::Keybindings);
+    e.picker_query = "undo".to_string();
+    e.picker_filter();
+    assert!(
+        !e.picker_items.is_empty(),
+        "filtering for 'undo' should find results"
+    );
+}
+
+#[test]
+fn test_leader_sk_opens_keybindings_picker() {
+    let mut e = engine_with_text("hello");
+    e.handle_key("space", Some(' '), false);
+    e.handle_key("s", Some('s'), false);
+    e.handle_key("k", Some('k'), false);
+    assert!(e.picker_open);
+    assert_eq!(e.picker_source, PickerSource::Keybindings);
+}
+
+#[test]
+fn test_help_menu_keybindings_action() {
+    let mut e = engine_with_text("hello");
+    e.execute_command("Keybindings");
+    // Should open the keybindings reference scratch buffer
+    let has_kb_buf = e
+        .buffer_manager
+        .iter()
+        .any(|(_, s)| s.scratch_name.as_deref() == Some("Keybindings (Vim)"));
+    assert!(has_kb_buf, "should open keybindings reference buffer");
+}
+
+// ── Crash log path ─────────────────────────────────────────────────────
+
+#[test]
+fn test_crash_log_path_uses_temp_dir() {
+    let path = crate::core::swap::crash_log_path();
+    assert!(
+        path.starts_with(std::env::temp_dir()),
+        "crash log should be in temp dir: {:?}",
+        path
+    );
+    assert!(path.ends_with("vimcode-crash.log"));
+}
+
+// ── :$ and line address tests ──────────────────────────────────────────
+
+#[test]
+fn test_colon_zero_goes_to_first_line() {
+    let mut e = engine_with_text("a\nb\nc\n");
+    e.view_mut().cursor.line = 2;
+    e.execute_command("0");
+    assert_eq!(e.view().cursor.line, 0);
+}
+
+// ── Smart indent tests ─────────────────────────────────────────────────
+
+/// Create an engine with a fake file path so language detection works.
+fn engine_with_lang(text: &str, ext: &str) -> Engine {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, text);
+    let path = std::path::PathBuf::from(format!("/tmp/test_file.{}", ext));
+    engine
+        .buffer_manager
+        .get_mut(engine.active_buffer_id())
+        .unwrap()
+        .file_path = Some(path);
+    engine
+}
+
+#[test]
+fn test_smart_indent_after_open_brace() {
+    let mut e = engine_with_lang("fn main() {\n", "rs");
+    // Enter insert mode at end of line via A (append at end)
+    e.view_mut().cursor.line = 0;
+    e.handle_key("A", Some('A'), false);
+    assert_eq!(e.mode, Mode::Insert);
+    // Now press Return to create a new line
+    e.handle_key("Return", None, false);
+    let indent = e.get_line_indent_str(1);
+    assert_eq!(indent.len(), e.settings.shift_width as usize);
+}
+
+#[test]
+fn test_smart_indent_after_open_paren() {
+    let mut e = engine_with_lang("foo(\n", "rs");
+    e.start_undo_group();
+    e.mode = Mode::Insert;
+    e.view_mut().cursor.line = 0;
+    e.view_mut().cursor.col = 4;
+    e.handle_key("Return", None, false);
+    let indent = e.get_line_indent_str(1);
+    assert_eq!(indent.len(), e.settings.shift_width as usize);
+}
+
+#[test]
+fn test_smart_indent_python_colon() {
+    let mut e = engine_with_lang("def foo():\n", "py");
+    e.start_undo_group();
+    e.mode = Mode::Insert;
+    e.view_mut().cursor.line = 0;
+    e.view_mut().cursor.col = 10;
+    e.handle_key("Return", None, false);
+    let indent = e.get_line_indent_str(1);
+    assert_eq!(
+        indent.len(),
+        e.settings.shift_width as usize,
+        "Python colon should trigger extra indent"
+    );
+}
+
+#[test]
+fn test_smart_indent_no_trigger() {
+    let mut e = engine_with_lang("let x = 42;\n", "rs");
+    e.start_undo_group();
+    e.mode = Mode::Insert;
+    e.view_mut().cursor.line = 0;
+    e.view_mut().cursor.col = 12;
+    e.handle_key("Return", None, false);
+    let indent = e.get_line_indent_str(1);
+    assert_eq!(indent.len(), 0, "No trigger — should not add extra indent");
+}
+
+#[test]
+fn test_smart_indent_nested() {
+    let mut e = engine_with_lang("    if true {\n", "rs");
+    e.start_undo_group();
+    e.mode = Mode::Insert;
+    e.view_mut().cursor.line = 0;
+    e.view_mut().cursor.col = 13;
+    e.handle_key("Return", None, false);
+    let indent = e.get_line_indent_str(1);
+    let expected = 4 + e.settings.shift_width as usize; // base 4 + extra 4
+    assert_eq!(
+        indent.len(),
+        expected,
+        "Nested: should add to existing indent"
+    );
+}
+
+#[test]
+fn test_auto_outdent_closing_brace() {
+    // Simulate: type "}" on an indented empty line
+    let mut e = engine_with_lang("fn main() {\n        \n}\n", "rs");
+    e.start_undo_group();
+    e.mode = Mode::Insert;
+    // Position cursor at end of the indented blank line (line 1)
+    e.view_mut().cursor.line = 1;
+    e.view_mut().cursor.col = 8; // 8 spaces of indent
+                                 // Type '}'
+    e.handle_key("}", Some('}'), false);
+    // The indent should have been reduced
+    let line_text: String = e.buffer().content.line(1).chars().collect();
+    let trimmed = line_text.trim_end_matches(['\n', '\r']);
+    assert!(
+        trimmed.ends_with('}'),
+        "Line should end with }}: got '{}'",
+        trimmed
+    );
+    let indent = e.get_line_indent_str(1);
+    assert_eq!(
+        indent.len(),
+        4,
+        "Closing brace should outdent by one shift_width: got {}",
+        indent.len()
+    );
+}
+
+#[test]
+fn test_auto_indent_equals_operator_with_brace() {
+    let mut e = engine_with_lang("fn main() {\nlet x = 1;\n}\n", "rs");
+    let mut changed = false;
+    e.auto_indent_lines(1, 1, &mut changed);
+    assert!(changed);
+    let indent = e.get_line_indent_str(1);
+    assert_eq!(
+        indent.len(),
+        e.settings.shift_width as usize,
+        "== should indent line after open brace"
+    );
+}
+
+#[test]
+fn test_smart_indent_lua_do() {
+    let mut e = engine_with_lang("for i=1,10 do\n", "lua");
+    e.start_undo_group();
+    e.mode = Mode::Insert;
+    e.view_mut().cursor.line = 0;
+    e.view_mut().cursor.col = 13;
+    e.handle_key("Return", None, false);
+    let indent = e.get_line_indent_str(1);
+    assert_eq!(
+        indent.len(),
+        e.settings.shift_width as usize,
+        "Lua 'do' should trigger indent"
+    );
+}
+
+// ── Indent detection tests ─────────────────────────────────────────────
+
+#[test]
+fn test_detect_indent_4_spaces() {
+    use crate::core::buffer_manager::BufferState;
+    let text = "{\n    foo\n    bar\n        baz\n    qux\n}\n";
+    let mut buf = crate::core::buffer::Buffer::new(crate::core::buffer::BufferId(999));
+    buf.insert(0, text);
+    let mut state = BufferState::new(buf);
+    state.detect_indent();
+    assert_eq!(state.detected_indent, Some(4));
+}
+
+#[test]
+fn test_detect_indent_2_spaces() {
+    use crate::core::buffer_manager::BufferState;
+    let text = "{\n  foo\n  bar\n    baz\n  qux\n}\n";
+    let mut buf = crate::core::buffer::Buffer::new(crate::core::buffer::BufferId(999));
+    buf.insert(0, text);
+    let mut state = BufferState::new(buf);
+    state.detect_indent();
+    assert_eq!(state.detected_indent, Some(2));
+}
+
+#[test]
+fn test_detect_indent_none_for_flat() {
+    use crate::core::buffer_manager::BufferState;
+    let text = "foo\nbar\nbaz\n";
+    let mut buf = crate::core::buffer::Buffer::new(crate::core::buffer::BufferId(999));
+    buf.insert(0, text);
+    let mut state = BufferState::new(buf);
+    state.detect_indent();
+    assert_eq!(state.detected_indent, None, "No indent in flat file");
+}
+
+#[test]
+fn test_effective_shift_width_uses_detected() {
+    let mut e = engine_with_lang("{\n    foo\n    bar\n        baz\n}\n", "rs");
+    // Detect indent (should find 4)
+    e.buffer_manager
+        .get_mut(e.active_buffer_id())
+        .unwrap()
+        .detect_indent();
+    assert_eq!(
+        e.buffer_manager
+            .get(e.active_buffer_id())
+            .unwrap()
+            .detected_indent,
+        Some(4)
+    );
+    // Even with shift_width=1, effective should be 4
+    e.settings.shift_width = 1;
+    assert_eq!(e.effective_shift_width(), 4);
+}
+
+#[test]
+fn test_effective_shift_width_falls_back_to_setting() {
+    let mut e = engine_with_text("hello\n");
+    // No detected indent
+    assert_eq!(
+        e.buffer_manager
+            .get(e.active_buffer_id())
+            .unwrap()
+            .detected_indent,
+        None
+    );
+    e.settings.shift_width = 3;
+    assert_eq!(e.effective_shift_width(), 3);
+}
+
+#[test]
+fn test_smart_indent_uses_detected_width() {
+    // File with 2-space indentation — smart indent should use 2 even if setting is 4
+    let mut e = engine_with_lang("{\n  foo\n  bar\n    baz\n", "rs");
+    e.settings.shift_width = 4;
+    e.buffer_manager
+        .get_mut(e.active_buffer_id())
+        .unwrap()
+        .detect_indent();
+    assert_eq!(e.effective_shift_width(), 2);
+    // Enter insert mode at end of first line and press Enter
+    e.view_mut().cursor.line = 0;
+    e.handle_key("A", Some('A'), false);
+    e.handle_key("Return", None, false);
+    let indent = e.get_line_indent_str(1);
+    assert_eq!(
+        indent.len(),
+        2,
+        "Should use detected 2-space indent, not setting 4"
+    );
 }

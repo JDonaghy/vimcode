@@ -51,6 +51,24 @@ pub fn run_emergency_flush() {
     }
 }
 
+/// Return the path used for the always-on crash log.
+/// Uses the platform temp directory so it works on Linux, macOS, and Windows.
+pub fn crash_log_path() -> PathBuf {
+    std::env::temp_dir().join("vimcode-crash.log")
+}
+
+/// Write a crash report to the crash log file.  Returns the path on success.
+pub fn write_crash_log(info: &std::panic::PanicHookInfo<'_>) -> Option<PathBuf> {
+    let bt = std::backtrace::Backtrace::force_capture();
+    let loc_str = info
+        .location()
+        .map(|l| format!("  at {}:{}:{}\n", l.file(), l.line(), l.column()))
+        .unwrap_or_default();
+    let crash_msg = format!("PANIC: {}\n{}backtrace:\n{}\n", info, loc_str, bt);
+    let path = crash_log_path();
+    fs::write(&path, &crash_msg).ok().map(|_| path)
+}
+
 /// Parsed swap-file header.
 #[derive(Debug, Clone)]
 pub struct SwapHeader {

@@ -830,7 +830,7 @@ impl Engine {
             }
             // Adjust cursor columns for indent
             let indent_size = if self.settings.expand_tab {
-                self.settings.shift_width as usize
+                self.effective_shift_width()
             } else {
                 1
             };
@@ -857,7 +857,7 @@ impl Engine {
             lines.sort_unstable();
             // Check indent size before dedenting
             let indent_size = if self.settings.expand_tab {
-                self.settings.shift_width as usize
+                self.effective_shift_width()
             } else {
                 1
             };
@@ -884,6 +884,17 @@ impl Engine {
         self.command_buffer.clear();
         self.message.clear();
         EngineAction::None
+    }
+
+    /// Finish any in-progress VSCode typing undo group.  Called before
+    /// non-character actions so that contiguous character insertions coalesce
+    /// into a single undo entry while commands, cursor jumps, etc. get their
+    /// own group.
+    pub(crate) fn vscode_break_undo_group(&mut self) {
+        if self.vscode_undo_group_open {
+            self.finish_undo_group();
+            self.vscode_undo_group_open = false;
+        }
     }
 
     // ── Ctrl+K chord (VSCode mode) ──────────────────────────────────────────
@@ -960,11 +971,56 @@ impl Engine {
 
         let mut changed = false;
 
-        // Start an undo group for this keystroke.  Each sub-helper that
-        // manages its own undo group (vscode_cut line-cut, vscode_paste,
-        // toggle_comment) relies on this outer group; helpers
-        // that used to have inner calls have had them removed.
-        self.start_undo_group();
+        // Determine whether this keystroke is a plain character insertion.
+        // Plain chars reuse / extend the current undo group so consecutive
+        // typing coalesces into a single undo entry.  Everything else
+        // (Ctrl+* commands, cursor movement, Backspace, Return, etc.)
+        // breaks the undo group first, then starts a fresh one.
+        let is_plain_char = !ctrl
+            && !key_name.starts_with("Shift_")
+            && !key_name.starts_with("Alt_")
+            && unicode.is_some()
+            && !matches!(
+                key_name,
+                "Escape"
+                    | "Right"
+                    | "Left"
+                    | "Up"
+                    | "Down"
+                    | "Home"
+                    | "End"
+                    | "Page_Up"
+                    | "Page_Down"
+                    | "BackSpace"
+                    | "Delete"
+                    | "Return"
+                    | "Tab"
+                    | "ISO_Left_Tab"
+                    | "F1"
+                    | "F10"
+            );
+
+        if is_plain_char {
+            // Continue the existing undo group (or open a fresh one for the
+            // first character in a new typing burst).  If the cursor moved
+            // since the last character (e.g. mouse click), break the group
+            // so the new burst becomes a separate undo entry.
+            if self.vscode_undo_group_open {
+                let cur = (self.view().cursor.line, self.view().cursor.col);
+                if cur != self.vscode_undo_cursor {
+                    self.vscode_break_undo_group();
+                }
+            }
+            if !self.vscode_undo_group_open {
+                self.start_undo_group();
+                self.vscode_undo_group_open = true;
+            }
+        } else {
+            // Non-character action: close any in-progress typing group,
+            // then open a one-shot group for this action.
+            self.vscode_break_undo_group();
+            self.start_undo_group();
+        }
 
         // ── Ctrl+K chord: second key dispatch ────────────────────────────
         if self.vscode_pending_ctrl_k && self.vscode_ctrl_k_dispatch(key_name, ctrl, &mut changed) {
@@ -1384,11 +1440,7 @@ impl Engine {
                     let line = self.view().cursor.line;
                     let col = self.view().cursor.col;
                     let char_idx = self.buffer().line_to_char(line) + col;
-                    let indent = if self.settings.auto_indent {
-                        self.get_line_indent_str(line)
-                    } else {
-                        String::new()
-                    };
+                    let indent = self.smart_indent_for_newline(line);
                     let indent_len = indent.len();
                     let text = format!("\n{}", indent);
                     self.insert_with_undo(char_idx, &text);
@@ -1585,7 +1637,16 @@ impl Engine {
         }
 
         if changed {
-            self.finish_undo_group();
+            // For plain character insertions keep the undo group open so the
+            // next typed character extends the same group.  For everything
+            // else (commands, Backspace, Return, etc.) close the group now.
+            if is_plain_char {
+                // Record cursor so we can detect external moves before the
+                // next keystroke.
+                self.vscode_undo_cursor = (self.view().cursor.line, self.view().cursor.col);
+            } else {
+                self.finish_undo_group();
+            }
             self.set_dirty(true);
             self.update_syntax();
             let active_id = self.active_buffer_id();

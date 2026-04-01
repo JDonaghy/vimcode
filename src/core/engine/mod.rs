@@ -400,6 +400,18 @@ pub static PALETTE_COMMANDS: &[PaletteCommand] = &[
         action: "GrepWord",
     },
     PaletteCommand {
+        label: "Search: Open Buffers",
+        shortcut: "<leader>sb",
+        vscode_shortcut: "<leader>sb",
+        action: "Buffers",
+    },
+    PaletteCommand {
+        label: "Help: Search Key Bindings",
+        shortcut: "<leader>sk",
+        vscode_shortcut: "<leader>sk",
+        action: "search_keybindings",
+    },
+    PaletteCommand {
         label: "Go: Go to Line",
         shortcut: "",
         vscode_shortcut: "Ctrl+G",
@@ -730,6 +742,7 @@ pub enum PickerSource {
     Grep,
     Commands,
     Buffers,
+    Keybindings,
     RecentFiles,
     Marks,
     Registers,
@@ -1126,9 +1139,10 @@ pub struct EditorGroup {
     /// Index of the first visible tab in the tab bar (for scroll-into-view).
     /// Updated by `ensure_active_tab_visible()` whenever the active tab changes.
     pub tab_scroll_offset: usize,
-    /// Number of tabs that fit in the rendered tab bar.  Set by the renderer
-    /// each frame via `Engine::set_tab_visible_count()`.  Default 6.
-    pub tab_visible_count: usize,
+    /// Available width of the tab bar in character columns.  Set by the
+    /// renderer each frame via `Engine::set_tab_bar_width()`.  Defaults to
+    /// `usize::MAX` so that before the first render, we assume all tabs fit.
+    pub tab_bar_width: usize,
 }
 
 impl EditorGroup {
@@ -1137,7 +1151,7 @@ impl EditorGroup {
             tabs: vec![initial_tab],
             active_tab: 0,
             tab_scroll_offset: 0,
-            tab_visible_count: 6,
+            tab_bar_width: usize::MAX,
         }
     }
 
@@ -1215,7 +1229,7 @@ fn parse_keymap_def(s: &str) -> Option<UserKeymap> {
 
 // ── Keybinding reference generators ──────────────────────────────────────────
 
-fn keybindings_reference_vim() -> String {
+pub(super) fn keybindings_reference_vim() -> String {
     "\
 VimCode — Vim Mode Keybinding Reference
 ========================================
@@ -1473,7 +1487,7 @@ q  Escape           Close popup
     .to_string()
 }
 
-fn keybindings_reference_vscode() -> String {
+pub(super) fn keybindings_reference_vscode() -> String {
     "\
 VimCode — VSCode Mode Keybinding Reference
 ===========================================
@@ -2126,6 +2140,10 @@ pub struct Engine {
     pub clipboard_write: Option<Box<dyn Fn(&str) -> Result<(), String>>>,
     /// Whether a mouse drag selection is currently active.
     pub mouse_drag_active: bool,
+    /// Window where the current drag selection originated.  Drag events in
+    /// other windows are ignored until mouse-up so selections don't leak
+    /// across editor groups.
+    pub mouse_drag_origin_window: Option<WindowId>,
     /// When true, drag extends selection word-wise (set by double-click).
     pub mouse_drag_word_mode: bool,
     /// Original word boundaries from double-click (start_col, end_col, line).
@@ -2459,6 +2477,15 @@ pub struct Engine {
     // --- VSCode mode state ---
     /// Ctrl+K chord pending: waiting for the second key of a Ctrl+K combo.
     pub vscode_pending_ctrl_k: bool,
+    /// True while a VSCode-mode undo group is held open across consecutive
+    /// character insertions.  Broken by any non-character action (cursor move,
+    /// Ctrl+* command, Backspace, Return, etc.) so that contiguous typing
+    /// bursts coalesce into a single undo entry.
+    pub vscode_undo_group_open: bool,
+    /// Cursor position after the last VSCode-mode character insertion.
+    /// Used to detect external cursor moves (mouse click, etc.) that should
+    /// break the undo group even though the next key is a character.
+    pub vscode_undo_cursor: (usize, usize),
 
     // --- Extension panels ---
     /// Registered extension panels (name → registration).
@@ -2736,6 +2763,7 @@ impl Engine {
             clipboard_read: None,
             clipboard_write: None,
             mouse_drag_active: false,
+            mouse_drag_origin_window: None,
             mouse_drag_word_mode: false,
             mouse_drag_word_origin: None,
             terminal_panes: Vec::new(),
@@ -2860,6 +2888,8 @@ impl Engine {
             spell_checker: None,
             spell_suggestions: None,
             vscode_pending_ctrl_k: false,
+            vscode_undo_group_open: false,
+            vscode_undo_cursor: (0, 0),
             ext_panels: HashMap::new(),
             ext_panel_items: HashMap::new(),
             ext_panel_active: None,

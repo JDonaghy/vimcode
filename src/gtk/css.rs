@@ -36,6 +36,7 @@ pub(super) fn make_theme_css(theme: &Theme) -> String {
             background: transparent;
             border: none;
             border-radius: 0;
+            font-family: 'Symbols Nerd Font', monospace;
             font-size: 24px;
             color: {dim_fg};
             padding: 0;

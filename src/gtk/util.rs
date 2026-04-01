@@ -355,6 +355,40 @@ pub(super) fn swap_ctx_popover(
     *guard = Some(new);
 }
 
+/// Install the bundled Nerd Font icon subset to `~/.local/share/fonts/` so
+/// GTK/Pango can resolve the Nerd Font glyphs without a user-installed Nerd Font.
+/// The font file is embedded in the binary via `include_bytes!` and only written
+/// to disk if it's missing or has the wrong size.
+pub(super) fn install_bundled_icon_font() {
+    static FONT_BYTES: &[u8] = include_bytes!("../../data/fonts/vimcode-icons.ttf");
+
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return;
+    };
+    let fonts_dir = home.join(".local/share/fonts");
+    let _ = fs::create_dir_all(&fonts_dir);
+    let dest = fonts_dir.join("vimcode-icons.ttf");
+
+    // Skip write if the file already exists with the correct size.
+    if dest.exists() {
+        if let Ok(meta) = fs::metadata(&dest) {
+            if meta.len() == FONT_BYTES.len() as u64 {
+                return;
+            }
+        }
+    }
+
+    if fs::write(&dest, FONT_BYTES).is_ok() {
+        // Trigger fontconfig cache rebuild so the font is available immediately.
+        let _ = std::process::Command::new("fc-cache")
+            .arg("-f")
+            .arg(&fonts_dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+}
+
 pub(super) fn install_icon_and_desktop() {
     use std::fs;
     use std::path::PathBuf;

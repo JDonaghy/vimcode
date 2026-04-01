@@ -100,7 +100,7 @@ pub(super) fn draw_frame(
     editor_hover_link_rects_out: &mut Vec<(u16, u16, u16, u16, String)>,
     tab_visible_counts_out: &mut Vec<(GroupId, usize)>,
 ) {
-    let area = frame.size();
+    let area = frame.area();
 
     // ── Global vertical split: [menu] / [main] / [qf?] / [tabs?] / [term?] / [dbg?] / [status] / [cmd] ──
     let qf_height: u16 = if screen.quickfix.is_some() { 6 } else { 0 };
@@ -257,6 +257,11 @@ pub(super) fn draw_frame(
                     width: tab_w,
                     height: 1,
                 };
+                let accent = if is_active {
+                    Some(rc(theme.tab_active_accent))
+                } else {
+                    None
+                };
                 let vis = render_tab_bar(
                     frame.buffer_mut(),
                     g_tab,
@@ -265,6 +270,7 @@ pub(super) fn draw_frame(
                     show_split,
                     gtb.diff_toolbar.as_ref(),
                     gtb.tab_scroll_offset,
+                    accent,
                 );
                 tab_visible_counts_out.push((gtb.group_id, vis));
             }
@@ -325,6 +331,7 @@ pub(super) fn draw_frame(
                 true,
                 screen.diff_toolbar.as_ref(),
                 screen.tab_scroll_offset,
+                Some(rc(theme.tab_active_accent)),
             );
             tab_visible_counts_out.push((engine.active_group, vis));
         }
@@ -389,7 +396,7 @@ pub(super) fn draw_frame(
                     .saturating_sub(active_win.scroll_left) as u16;
                 let popup_x = win_x + gutter_w + vis_col;
                 let popup_y = win_y + cursor_pos.view_line as u16 + 1;
-                render_completion_popup(frame, menu, popup_x, popup_y, frame.size(), theme);
+                render_completion_popup(frame, menu, popup_x, popup_y, frame.area(), theme);
             }
         }
     }
@@ -408,7 +415,7 @@ pub(super) fn draw_frame(
             let vis_col = hover.anchor_col.saturating_sub(active_win.scroll_left) as u16;
             let popup_x = win_x + gutter_w + vis_col;
             let popup_y = win_y + anchor_view;
-            render_hover_popup(frame, hover, popup_x, popup_y, frame.size(), theme);
+            render_hover_popup(frame, hover, popup_x, popup_y, frame.area(), theme);
         }
     }
 
@@ -429,7 +436,7 @@ pub(super) fn draw_frame(
             let popup_x = win_x + gutter_w + vis_col;
             let popup_y = win_y + anchor_view;
             let (eh_links, eh_rect) =
-                render_editor_hover_popup(frame, eh, popup_x, popup_y, frame.size(), theme);
+                render_editor_hover_popup(frame, eh, popup_x, popup_y, frame.area(), theme);
             *editor_hover_link_rects_out = eh_links;
             *editor_hover_popup_rect_out = eh_rect;
         }
@@ -448,7 +455,7 @@ pub(super) fn draw_frame(
             let anchor_view = peek.anchor_line.saturating_sub(active_win.scroll_top) as u16;
             let popup_x = win_x + gutter_w;
             let popup_y = win_y + anchor_view + 1; // below anchor line
-            render_diff_peek_popup(frame, peek, popup_x, popup_y, frame.size(), theme);
+            render_diff_peek_popup(frame, peek, popup_x, popup_y, frame.area(), theme);
         }
     }
 
@@ -466,7 +473,7 @@ pub(super) fn draw_frame(
             let vis_col = sig.anchor_col.saturating_sub(active_win.scroll_left) as u16;
             let popup_x = win_x + gutter_w + vis_col;
             let popup_y = win_y + anchor_view;
-            render_signature_popup(frame, sig, popup_x, popup_y, frame.size(), theme);
+            render_signature_popup(frame, sig, popup_x, popup_y, frame.area(), theme);
         }
     }
 
@@ -563,7 +570,7 @@ pub(super) fn draw_frame(
         for i in lo..=hi {
             let cx = cmd_area.x + i as u16;
             if cx < cmd_area.x + cmd_area.width {
-                let cell = buf.get_mut(cx, cmd_area.y);
+                let cell = &mut buf[(cx, cmd_area.y)];
                 let old_fg = cell.fg;
                 let old_bg = cell.bg;
                 cell.set_fg(old_bg).set_bg(old_fg);
@@ -759,7 +766,7 @@ pub(super) fn render_tab_drag_overlay(
                 let cy = hy + dy;
                 let area = buf.area;
                 if cx < area.x + area.width && cy < area.y + area.height {
-                    buf.get_mut(cx, cy).set_bg(highlight_bg);
+                    buf[(cx, cy)].set_bg(highlight_bg);
                 }
             }
         }
@@ -805,6 +812,7 @@ pub(super) fn render_tab_drag_overlay(
                 RColor::Indexed(39),
                 rc(theme.tab_bar_bg),
                 Modifier::empty(),
+                None,
             );
         }
     }
@@ -822,10 +830,7 @@ pub(super) fn render_tab_drag_overlay(
                 let cx = gx + i as u16;
                 let area = buf.area;
                 if cx < area.x + area.width && gy < area.y + area.height {
-                    buf.get_mut(cx, gy)
-                        .set_char(ch)
-                        .set_fg(ghost_fg)
-                        .set_bg(ghost_bg);
+                    buf[(cx, gy)].set_char(ch).set_fg(ghost_fg).set_bg(ghost_bg);
                 }
             }
         }
@@ -839,7 +844,7 @@ pub(super) fn compute_tui_tab_drop_zone(
     row: u16,
     editor_left: u16,
     last_layout: Option<&render::ScreenLayout>,
-    terminal_size: Option<ratatui::layout::Rect>,
+    terminal_size: Option<Size>,
 ) -> crate::core::window::DropZone {
     use crate::core::window::{DropZone, SplitDirection};
 
@@ -980,6 +985,7 @@ pub(super) fn render_tab_bar(
     show_split_btns: bool,
     diff_toolbar: Option<&render::DiffToolbarData>,
     tab_scroll_offset: usize,
+    focused_accent: Option<ratatui::style::Color>,
 ) -> usize {
     let bar_bg = rc(theme.tab_bar_bg);
 
@@ -1015,15 +1021,20 @@ pub(super) fn render_tab_bar(
     let mut x = area.x;
     let tab_end_for_content = tab_end;
 
-    let mut last_rendered_tab = tabs.len(); // track whether we truncated
-    for (i, tab) in tabs.iter().enumerate().skip(tab_scroll_offset) {
+    for tab in tabs.iter().skip(tab_scroll_offset) {
         let (fg, bg) = match (tab.active, tab.preview) {
             (true, true) => (rc(theme.tab_preview_active_fg), rc(theme.tab_active_bg)),
             (true, false) => (rc(theme.tab_active_fg), rc(theme.tab_active_bg)),
             (false, true) => (rc(theme.tab_preview_inactive_fg), rc(theme.tab_bar_bg)),
             (false, false) => (rc(theme.tab_inactive_fg), rc(theme.tab_bar_bg)),
         };
-        let modifier = if tab.preview {
+        let modifier = if tab.active && focused_accent.is_some() {
+            if tab.preview {
+                Modifier::ITALIC | Modifier::UNDERLINED
+            } else {
+                Modifier::UNDERLINED
+            }
+        } else if tab.preview {
             Modifier::ITALIC
         } else {
             Modifier::empty()
@@ -1033,7 +1044,6 @@ pub(super) fn render_tab_bar(
         let name_w = tab.name.chars().count() as u16;
         let tab_w = name_w + TAB_CLOSE_COLS;
         if x + tab_w > tab_end_for_content {
-            last_rendered_tab = i;
             break;
         }
 
@@ -1041,7 +1051,8 @@ pub(super) fn render_tab_bar(
             if x >= tab_end_for_content {
                 break;
             }
-            set_cell_styled(buf, x, area.y, ch, fg, bg, modifier);
+            let ul_color = if tab.active { focused_accent } else { None };
+            set_cell_styled(buf, x, area.y, ch, fg, bg, modifier, ul_color);
             x += 1;
         }
         // Show ● (modified dot) when dirty, × otherwise (VSCode style).
@@ -1112,8 +1123,10 @@ pub(super) fn render_tab_bar(
         set_cell_wide(buf, bx + 1, area.y, '\u{F0931}', btn_fg, bar_bg);
     }
 
-    // Return how many tabs were actually rendered.
-    last_rendered_tab.saturating_sub(tab_scroll_offset)
+    // Return the available tab bar width in columns so the engine can compute
+    // how many tabs fit.  (Returning a count caused a feedback-loop bug where
+    // the engine treated the count as column width, shrinking tabs each frame.)
+    (tab_end_for_content - area.x) as usize
 }
 
 pub(super) fn render_breadcrumb_bar(
@@ -1215,7 +1228,7 @@ pub(super) fn render_completion_popup(
         for col in 0..width {
             let cell_x = x + col;
             if cell_x < term_area.width && row_y < term_area.height {
-                let cell = buf.get_mut(cell_x, row_y);
+                let cell = &mut buf[(cell_x, row_y)];
                 cell.set_bg(row_bg).set_fg(fg_color);
                 // Draw border chars on leftmost/rightmost or blank fill
                 let ch = if col == 0 || col == width - 1 {
@@ -1231,7 +1244,7 @@ pub(super) fn render_completion_popup(
         for (j, ch) in display.chars().enumerate() {
             let cell_x = x + 1 + j as u16;
             if cell_x + 1 < x + width && cell_x < term_area.width && row_y < term_area.height {
-                let cell = buf.get_mut(cell_x, row_y);
+                let cell = &mut buf[(cell_x, row_y)];
                 cell.set_char(ch).set_fg(fg_color).set_bg(row_bg);
             }
         }
@@ -1276,7 +1289,7 @@ pub(super) fn render_hover_popup(
         for col in 0..width {
             let cell_x = x + col;
             if cell_x < term_area.width && row_y < term_area.height {
-                let cell = buf.get_mut(cell_x, row_y);
+                let cell = &mut buf[(cell_x, row_y)];
                 cell.set_bg(bg_color);
                 let ch = if col == 0 || col == width - 1 {
                     '│'
@@ -1291,7 +1304,7 @@ pub(super) fn render_hover_popup(
         for (j, ch) in display.chars().enumerate() {
             let cell_x = x + 1 + j as u16;
             if cell_x + 1 < x + width && cell_x < term_area.width && row_y < term_area.height {
-                let cell = buf.get_mut(cell_x, row_y);
+                let cell = &mut buf[(cell_x, row_y)];
                 cell.set_char(ch).set_fg(fg_color).set_bg(bg_color);
             }
         }
@@ -1336,7 +1349,7 @@ pub(super) fn render_diff_peek_popup(
         for col in 0..width {
             let cell_x = x + col;
             if cell_x < term_area.width {
-                let cell = buf.get_mut(cell_x, row_y);
+                let cell = &mut buf[(cell_x, row_y)];
                 cell.set_bg(bg_color);
                 let ch = if col == 0 || col == width - 1 {
                     '│'
@@ -1358,7 +1371,7 @@ pub(super) fn render_diff_peek_popup(
         for (j, ch) in display.chars().enumerate() {
             let cell_x = x + 1 + j as u16;
             if cell_x + 1 < x + width && cell_x < term_area.width {
-                buf.get_mut(cell_x, row_y)
+                buf[(cell_x, row_y)]
                     .set_char(ch)
                     .set_fg(line_fg)
                     .set_bg(bg_color);
@@ -1373,7 +1386,7 @@ pub(super) fn render_diff_peek_popup(
         for col in 0..width {
             let cell_x = x + col;
             if cell_x < term_area.width {
-                let cell = buf.get_mut(cell_x, action_row);
+                let cell = &mut buf[(cell_x, action_row)];
                 cell.set_bg(bg_color);
                 let ch = if col == 0 || col == width - 1 {
                     '│'
@@ -1388,7 +1401,7 @@ pub(super) fn render_diff_peek_popup(
         for label in &labels {
             for ch in label.chars() {
                 if cx + 1 < x + width && cx < term_area.width {
-                    buf.get_mut(cx, action_row)
+                    buf[(cx, action_row)]
                         .set_char(ch)
                         .set_fg(fg_color)
                         .set_bg(bg_color);
@@ -1443,7 +1456,7 @@ pub(super) fn render_signature_popup(
     for col in 0..width {
         let cell_x = x + col;
         if cell_x < term_area.width && y < term_area.height {
-            let cell = buf.get_mut(cell_x, y);
+            let cell = &mut buf[(cell_x, y)];
             cell.set_bg(bg_color);
             let ch = if col == 0 || col == width - 1 {
                 '│'
@@ -1461,7 +1474,7 @@ pub(super) fn render_signature_popup(
                 .map(|(s, e)| j >= s && j < e)
                 .unwrap_or(false);
             let color = if in_active { kw_color } else { fg_color };
-            let cell = buf.get_mut(cell_x, y);
+            let cell = &mut buf[(cell_x, y)];
             cell.set_char(ch).set_fg(color).set_bg(bg_color);
         }
     }
@@ -2688,7 +2701,7 @@ pub(super) fn render_window(
                 }
                 let cx = text_area_x + vis_col;
                 if cx < area.x + area.width && screen_y < area.y + area.height {
-                    let cell = frame.buffer_mut().get_mut(cx, screen_y);
+                    let cell = &mut frame.buffer_mut()[(cx, screen_y)];
                     // Only draw guide if the cell is a space (don't overwrite text)
                     if cell.symbol() == " " {
                         let is_active = window.active_indent_col == Some(guide_col);
@@ -2732,9 +2745,10 @@ pub(super) fn render_window(
                 }
                 let cx = text_area_x + vis_col;
                 if cx < area.x + area.width && screen_y < area.y + area.height {
-                    let cell = frame.buffer_mut().get_mut(cx, screen_y);
+                    let cell = &mut frame.buffer_mut()[(cx, screen_y)];
                     cell.set_fg(diag_fg);
                     cell.modifier |= Modifier::UNDERLINED;
+                    cell.underline_color = diag_fg;
                 }
             }
         }
@@ -2752,9 +2766,10 @@ pub(super) fn render_window(
                 }
                 let cx = text_area_x + vis_col;
                 if cx < area.x + area.width && screen_y < area.y + area.height {
-                    let cell = frame.buffer_mut().get_mut(cx, screen_y);
+                    let cell = &mut frame.buffer_mut()[(cx, screen_y)];
                     cell.set_fg(spell_fg);
                     cell.modifier |= Modifier::UNDERLINED;
+                    cell.underline_color = spell_fg;
                 }
             }
         }
@@ -2773,7 +2788,7 @@ pub(super) fn render_window(
                 }
                 let cx = text_area_x + vis_col;
                 if cx < area.x + area.width && screen_y < area.y + area.height {
-                    let cell = frame.buffer_mut().get_mut(cx, screen_y);
+                    let cell = &mut frame.buffer_mut()[(cx, screen_y)];
                     cell.set_bg(bracket_bg);
                 }
             }
@@ -2866,14 +2881,14 @@ pub(super) fn render_window(
                 if cursor_screen_x < buf_area.x + buf_area.width
                     && cursor_screen_y < buf_area.y + buf_area.height
                 {
-                    let cell = buf.get_mut(cursor_screen_x, cursor_screen_y);
+                    let cell = &mut buf[(cursor_screen_x, cursor_screen_y)];
                     let old_fg = cell.fg;
                     let old_bg = cell.bg;
                     cell.set_fg(old_bg).set_bg(old_fg);
                 }
             }
             CursorShape::Bar | CursorShape::Underline => {
-                frame.set_cursor(cursor_screen_x, cursor_screen_y);
+                frame.set_cursor_position((cursor_screen_x, cursor_screen_y));
             }
         }
     }
@@ -2920,7 +2935,7 @@ pub(super) fn render_window(
         let sx = area.x + gutter_w + vis_col;
         let buf = frame.buffer_mut();
         if sx < buf.area.x + buf.area.width && sy < buf.area.y + buf.area.height {
-            let cell = buf.get_mut(sx, sy);
+            let cell = &mut buf[(sx, sy)];
             cell.set_bg(cursor_color).set_fg(ratatui::style::Color::Rgb(
                 theme.background.r,
                 theme.background.g,
@@ -3107,7 +3122,7 @@ pub(super) fn render_text_line(
         if char_mods[ci].is_empty() {
             set_cell(buf, x_start + col, y, ch, fg, bg);
         } else {
-            set_cell_styled(buf, x_start + col, y, ch, fg, bg, char_mods[ci]);
+            set_cell_styled(buf, x_start + col, y, ch, fg, bg, char_mods[ci], None);
         }
     }
 
@@ -3203,7 +3218,7 @@ pub(super) fn render_selection(
             let sx = text_area_x + screen_col;
             let buf_area = buf.area;
             if sx < buf_area.x + buf_area.width && screen_y < buf_area.y + buf_area.height {
-                let cell = buf.get_mut(sx, screen_y);
+                let cell = &mut buf[(sx, screen_y)];
                 let old_fg = cell.fg;
                 cell.set_bg(sel_bg);
                 // Keep text visible against selection background

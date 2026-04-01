@@ -104,6 +104,14 @@ impl Engine {
                 // Default mode: files. Prefix routing handled in picker_filter_command_center.
                 self.picker_populate_files();
             }
+            PickerSource::Buffers => {
+                self.picker_title = "Open Buffers".to_string();
+                self.picker_populate_buffers();
+            }
+            PickerSource::Keybindings => {
+                self.picker_title = "Key Bindings".to_string();
+                self.picker_populate_keybindings();
+            }
             PickerSource::GitBranches => {
                 self.picker_title = "Switch Branch".to_string();
                 self.picker_populate_branches();
@@ -200,6 +208,162 @@ impl Engine {
     }
 
     /// Populate picker_all_items with git branches.
+    fn picker_populate_buffers(&mut self) {
+        let active_id = self.active_buffer_id();
+        let ids = self.buffer_manager.list();
+        self.picker_all_items = ids
+            .iter()
+            .enumerate()
+            .map(|(i, &id)| {
+                let state = self.buffer_manager.get(id).unwrap();
+                let buf_num = i + 1;
+                let name = state.display_name();
+                let mut flags = String::new();
+                if id == active_id {
+                    flags.push_str("%a ");
+                }
+                if state.dirty {
+                    flags.push('+');
+                }
+                let detail = if flags.is_empty() {
+                    None
+                } else {
+                    Some(flags.trim().to_string())
+                };
+                let action = if let Some(ref p) = state.file_path {
+                    PickerAction::OpenFile(p.clone())
+                } else {
+                    PickerAction::ExecuteCommand(format!("buffer {}", buf_num))
+                };
+                let icon = state
+                    .file_path
+                    .as_ref()
+                    .and_then(|p| p.extension())
+                    .and_then(|e| e.to_str())
+                    .map(|ext| crate::icons::file_icon(ext).to_string());
+                PickerItem {
+                    display: name,
+                    filter_text: state
+                        .file_path
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default(),
+                    detail,
+                    action,
+                    icon,
+                    score: 0,
+                    match_positions: Vec::new(),
+                }
+            })
+            .collect();
+    }
+
+    fn picker_populate_keybindings(&mut self) {
+        let is_vscode = self.is_vscode_mode();
+        let content = if is_vscode {
+            super::keybindings_reference_vscode()
+        } else {
+            super::keybindings_reference_vim()
+        };
+        let mut section = String::new();
+        for line in content.lines() {
+            let trimmed = line.trim();
+            // Section headers: "── Foo ──"
+            if trimmed.starts_with("──") {
+                // Extract section name between ── markers
+                section = trimmed
+                    .trim_start_matches('─')
+                    .trim_end_matches('─')
+                    .trim()
+                    .to_string();
+                continue;
+            }
+            // Skip empty, title, or decoration lines
+            if trimmed.is_empty()
+                || trimmed.starts_with('=')
+                || trimmed.starts_with("VimCode")
+                || trimmed.starts_with("Use ")
+                || trimmed.starts_with("Remap ")
+                || trimmed.starts_with("Commands shown")
+            {
+                continue;
+            }
+            // Parse "key(s)   description   [:command]"
+            // Split at first run of 2+ spaces
+            if let Some(idx) = trimmed.find("  ") {
+                let keys = trimmed[..idx].trim();
+                let desc = trimmed[idx..].trim();
+                if !keys.is_empty() && !desc.is_empty() {
+                    let detail = if section.is_empty() {
+                        None
+                    } else {
+                        Some(section.clone())
+                    };
+                    // Check for user remaps
+                    let display = format!("{:<24}{}", keys, desc);
+                    self.picker_all_items.push(PickerItem {
+                        display,
+                        filter_text: format!("{} {} {}", keys, desc, section),
+                        detail,
+                        action: PickerAction::ExecuteCommand("nop".to_string()),
+                        icon: None,
+                        score: 0,
+                        match_positions: Vec::new(),
+                    });
+                }
+            }
+        }
+
+        // Append configurable panel keys with their actual values
+        let pk = &self.settings.panel_keys;
+        let panel_bindings: &[(&str, &str, &str)] = &[
+            (&pk.toggle_sidebar, "Toggle sidebar", "Panel"),
+            (&pk.focus_explorer, "Focus explorer", "Panel"),
+            (&pk.focus_search, "Focus search panel", "Panel"),
+            (&pk.fuzzy_finder, "Fuzzy file finder", "Panel"),
+            (&pk.live_grep, "Live grep", "Panel"),
+            (&pk.command_palette, "Command palette", "Panel"),
+            (&pk.open_terminal, "Toggle terminal", "Panel"),
+            (&pk.add_cursor, "Add cursor at next match", "Panel"),
+            (&pk.select_all_matches, "Select all occurrences", "Panel"),
+            (&pk.nav_back, "Navigate back in history", "Panel"),
+            (&pk.nav_forward, "Navigate forward in history", "Panel"),
+        ];
+        for &(key, desc, cat) in panel_bindings {
+            if key.is_empty() {
+                continue;
+            }
+            let display = format!("{:<24}{} (configurable)", key, desc);
+            self.picker_all_items.push(PickerItem {
+                display,
+                filter_text: format!("{} {} {} configurable", key, desc, cat),
+                detail: Some(cat.to_string()),
+                action: PickerAction::ExecuteCommand("nop".to_string()),
+                icon: None,
+                score: 0,
+                match_positions: Vec::new(),
+            });
+        }
+
+        // Append user keymaps (`:map` remaps) with a marker
+        for km in &self.user_keymaps {
+            let keys_str = km.keys.join("");
+            let display = format!(
+                "{:<24}:{} [mode: {}] (user remap)",
+                keys_str, km.action, km.mode
+            );
+            self.picker_all_items.push(PickerItem {
+                display,
+                filter_text: format!("{} {} {} user remap", keys_str, km.action, km.mode),
+                detail: Some("User Keymaps".to_string()),
+                action: PickerAction::ExecuteCommand("nop".to_string()),
+                icon: None,
+                score: 0,
+                match_positions: Vec::new(),
+            });
+        }
+    }
+
     fn picker_populate_branches(&mut self) {
         let branches = crate::core::git::list_branches(&self.cwd);
         self.picker_all_items = branches
@@ -986,6 +1150,7 @@ impl Engine {
                         let _ = self.settings.save();
                         EngineAction::None
                     }
+                    "nop" => EngineAction::None,
                     other => self.execute_command(other),
                 }
             }

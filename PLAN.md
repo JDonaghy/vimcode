@@ -1,10 +1,31 @@
 # VimCode Implementation Plan
 
+- ~~investigate bundling the nerd font glyphs~~ **Done** — centralized icon registry (`icons.rs`), `use_nerd_fonts` setting with ASCII fallback, bundled 13KB Nerd Font subset for GTK, extension `fallback_icon` API
+
+- ~~add a way to clearly indicate the current tab that works across editor groups~~ **Done** — `tab_active_accent` theme color; GTK draws 2px colored top border on active tab in focused group; TUI uses colored underline (ratatui 0.29); 6 built-in themes + VSCode JSON importer (`tab.activeBorderTop`)
+
+- ~~upgrade ratatui to 0.28+ to unlock colored underlines for TUI tab accent~~ **Done** — upgraded ratatui 0.27→0.29; colored underlines for tab accent, diagnostics, and spell errors; migrated deprecated `buf.get_mut()`→index syntax, `frame.size()`→`frame.area()`; fixed TUI tab bar scroll feedback loop (was returning count instead of width in columns)
+
+- ~~add a smart indent and outdent feature that is language aware~~ **Done** — `smart_indent_for_newline()` + `line_triggers_indent()` + `auto_outdent_for_closing()` in `motions.rs`; Enter in insert mode and `o` in normal mode now add extra indent after `{`/`(`/`[` (universal), `:` (Python), `do`/`then` (Lua/Ruby/Shell); typing `}`/`)`/`]` as first non-blank auto-outdents; `==` operator also language-aware. **Auto-detect indentation**: `BufferState.detected_indent` + `detect_indent()` analyzes indent deltas on file open; `effective_shift_width()` on Engine prefers detected value over `settings.shift_width`; all indent operations (>>, <<, Ctrl+T/D, smart indent, ==) use it. 15 new tests
+
+- ~~update the bicep extension to indicate that comments are "//" not "#"~~ **Done** — added `"bicep"` to the `//`-family in the built-in comment style table (`comment.rs`)
+
+- ~~implement ":$" to go to EOF and check if any related commands remain unimplemented~~ **Done** — `:$` goes to last line; also `:+N`, `:-N`, `:.` line address commands in `execute.rs`
+
+- ~~implement a fuzzy find to search open buffers with the default key combo being `<leader>sb`~~ **Done** — `PickerSource::Buffers` with `picker_populate_buffers()`; `<leader>sb` binding; `:Buffers` command; "Search: Open Buffers" palette entry; shows file icons, dirty/active flags
+
+- ~~**Help > Key Bindings overhaul**~~ **Done** — Help > Key Bindings now opens the `:Keybindings` scratch buffer reference. Added `PickerSource::Keybindings` for fuzzy-searchable key bindings via `<leader>sk`; parses reference text into picker items by category with user remaps marked; "Help: Search Key Bindings" palette entry; `"nop"` picker action for view-only items
+
+- ~~ensure a crash report is always logged to a tmp file and make a best effort to notify the user of its location so they can submit a bug report~~ **Done** — `crash_log_path()` + `write_crash_log()` helpers in `swap.rs` using `std::env::temp_dir()` (cross-platform); GTK panic hook now prints crash log path + issue URL to stderr; fixed issues URL to `github.com/JDonaghy/vimcode/issues`
+
 > Session history archived in **SESSION_HISTORY.md**. Recent work summary in **PROJECT_STATE.md**.
 
 ---
 
 ## Recently Completed
+- **Session 236**: ratatui 0.27→0.29 upgrade — colored underlines for TUI tab accent (`tab_active_accent` theme color), diagnostics (severity-colored), and spell errors; migrated all deprecated APIs (`buf.get_mut()`→`buf[(x,y)]`, `frame.size()`→`frame.area()`, `frame.set_cursor()`→`frame.set_cursor_position()`); `set_cell_styled()` gains `underline_color` parameter; `Size` replaces `Rect` for terminal size params. Bug fix: TUI tab bar scroll feedback loop — `render_tab_bar()` returned tab count instead of available width in columns, causing death spiral where each frame showed fewer tabs; also fixed `tab_display_width()` off-by-one (+3→+2).
+- **Session 235**: Active tab accent indicator — `tab_active_accent` theme color; GTK 2px colored top border on active tab in focused group (drawn inside `draw_tab_bar()`); TUI underlined text on focused group's active tab; 6 built-in theme accents + VSCode JSON importer (`tab.activeBorderTop`).
+- **Session 234**: Nerd Font icon handling — centralized ~45 icon constants in `icons.rs` with `Icon { nerd, fallback }` struct; replaced ~90+ hardcoded `\u{...}` escapes across 11 files; `use_nerd_fonts` setting (`:set nerdfonts`/`:set nonerdfonts`) toggles ASCII fallback at runtime; bundled 13KB Nerd Font subset (`data/fonts/vimcode-icons.ttf`) auto-installed at GTK startup; CSS + file tree icon renderer prefer bundled font; extension panel `fallback_icon` Lua API with auto-fallback to first title letter; `PanelRegistration.resolved_icon()` used by both backends. Also fixed drag-to-select text leaking across editor groups (`mouse_drag_origin_window` locks drag to originating window). 1 new test.
 - **Session 233**: Explorer focus UX polish — stronger `sidebar_sel_bg` and `explorer_active_bg` colors across all 6 themes; suppress current-file highlight when explorer has focus (TUI); TUI click on explorer sets `explorer_has_focus`; Ctrl-W h focuses explorer (GTK `window_nav_overflow` handling + TUI Explorer case in overflow match); `OpenFileFromSidebar` clears focus; GTK `row_activated` handles directory expand/collapse; fixed GTK j/k/arrow key passthrough for TreeView navigation. Known bug: GTK Enter on folder after arrow-key nav requires two presses (filed in BUGS.md).
 - **Session 232**: Inline new file/folder in explorer tree — `ExplorerNewEntryState` struct with inline editing; replaced status-line prompt (TUI) and modal dialog (GTK) with inline editable row in tree; GTK bordered text field via CSS `treeview entry` styling; TUI inverted-cursor rendering with virtual row interleaving; generic file/folder icons during input; `start_explorer_new_file/folder()`, `handle_explorer_new_entry_key()`; removed `PromptKind::NewFile/NewFolder` and `show_name_prompt_dialog()`; `find_tree_iter_for_path()` + `remove_new_entry_rows()` tree helpers; 10 new tests.
 - **Session 231**: Git branch switcher in status bar — clickable branch name in status bar opens `PickerSource::GitBranches` picker; ahead/behind counts (`↑N ↓N`) displayed; `status_branch_range` on `ScreenLayout`; GTK + TUI click handlers; `:Gbranches` command; fixed `Gcheckout` → `Gswitch` in picker confirm; 6 new tests.
@@ -62,6 +83,7 @@
 - [x] Swap recovery dialog shown for unmodified buffers after crash — compare swap content with disk file, silently delete if identical
 - [x] GTK explorer focus not returning to editor after file open — clear `explorer_has_focus`/`tree_has_focus` in `OpenFileFromSidebar`
 - [x] GTK 100% CPU after opening file from explorer — caused by stuck `explorer_has_focus` state (same fix as above)
+- [x] Drag-to-select text leaks across editor groups — `mouse_drag_origin_window` field locks drag to originating window until mouse-up; cross-window drag events ignored
 
 ## Roadmap
 - [x] **Spell checker** — Vim-compatible `]s`/`[s`/`z=`/`zg`/`zw`; spellbook Hunspell parser; bundled en_US dictionary; tree-sitter-aware; `spell`/`spelllang` settings; user dictionary at `~/.config/vimcode/user.dic`
