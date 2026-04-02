@@ -1,6 +1,6 @@
 # Core Modules (src/core/)
 
-## lsp.rs — 2,784 lines
+## lsp.rs — ~2,870 lines
 LSP protocol transport and single-server client.
 ### Types
 - `LspServer` — manages a single LSP server process (stdin/stdout/stderr, reader thread)
@@ -9,18 +9,19 @@ LSP protocol transport and single-server client.
 - `CodeAction` / `CompletionItem` / `Location` / `LspRange` / `LspPosition` — LSP data types
 - `WorkspaceEdit` / `FileEdit` / `FormattingEdit` — edit application types
 - `SemanticToken` / `SemanticTokensLegend` — semantic token data
-- `SymbolInfo` — document/workspace symbol data (name, kind, path, line, col)
-- `SymbolKind` — enum with `from_number()`, `icon()`, `label()` methods
+- `SymbolInfo` — document/workspace symbol data (name, kind, path, line, col, children)
+- `SymbolKind` — enum with `from_number()`, `icon()`, `label()`, `sort_order()` methods
 - `SignatureHelpData` — function signature info
 - `LspServerConfig` — server command + args + language mappings
 - `MasonPackageInfo` — Mason package metadata
 ### Key Functions
-- `LspServer::start(config)` — spawn LSP process, send initialize, start reader thread
+- `LspServer::start(config)` — spawn LSP process, send initialize (incl. `hierarchicalDocumentSymbolSupport`), start reader thread
 - `did_open/did_change/did_save/did_close` — document sync notifications
 - `request_completion/definition/hover/references/implementation/rename/code_action/formatting/semantic_tokens_full` — LSP requests
 - `request_document_symbols(uri)` / `request_workspace_symbols(query)` — symbol requests
-- `parse_document_symbols(value)` / `parse_workspace_symbols(value)` — parse symbol responses
-- `flatten_document_symbol(sym, path, out)` / `parse_symbol_information(item, out)` — internal symbol parsers
+- `parse_document_symbols_hierarchical(value)` — parse hierarchical `DocumentSymbol[]` preserving children
+- `parse_document_symbol_tree(item, container)` — recursive single-node parser
+- `parse_workspace_symbols(value)` / `parse_symbol_information(item)` — flat symbol parsers
 - `decode_semantic_tokens(raw, legend)` — delta-decode semantic token array
 - `path_to_uri/uri_to_path` — file path ↔ URI conversion
 - `language_id_from_path(path)` — file extension to language ID

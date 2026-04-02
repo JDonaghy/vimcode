@@ -75,7 +75,7 @@ use ratatui::crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement, EnterAlternateScreen,
     LeaveAlternateScreen, SetTitle,
 };
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Rect, Size};
 use ratatui::style::{Color as RColor, Modifier};
 use ratatui::Terminal;
 
@@ -84,6 +84,7 @@ use crate::core::lsp::DiagnosticSeverity;
 use crate::core::settings::ExplorerAction;
 use crate::core::window::{GroupId, SplitDirection};
 use crate::core::{Engine, GitLineStatus, Mode, OpenMode, WindowRect};
+use crate::icons;
 use crate::render::{
     self, build_screen_layout, Color, CompletionMenu, CursorShape, RenderedLine, RenderedWindow,
     SelectionKind, Theme, WildmenuData,
@@ -821,6 +822,7 @@ pub fn run(file_path: Option<PathBuf>, debug_log_path: Option<String>) {
     }
 
     let mut engine = Engine::new();
+    icons::set_nerd_fonts(engine.settings.use_nerd_fonts);
     engine.plugin_init();
     if let Some(path) = file_path {
         // CLI argument: open only the specified file/directory, skip session restore
@@ -875,16 +877,10 @@ pub fn run(file_path: Option<PathBuf>, debug_log_path: Option<String>) {
             // Emergency: flush swap files for all dirty buffers before anything else.
             crate::core::swap::run_emergency_flush();
 
-            let bt = std::backtrace::Backtrace::force_capture();
-            let loc_str = info
-                .location()
-                .map(|l| format!("  at {}:{}:{}\n", l.file(), l.line(), l.column()))
-                .unwrap_or_default();
-            let crash_msg = format!("PANIC: {}\n{}backtrace:\n{}\n", info, loc_str, bt);
-            // Write to always-on crash log so it survives without --debug.
-            let _ = std::fs::write("/tmp/vimcode-crash.log", &crash_msg);
-            // Also mirror to the debug log when --debug is active.
-            debug_log!("{}", crash_msg);
+            if let Some(path) = crate::core::swap::write_crash_log(info) {
+                // Also mirror to the debug log when --debug is active.
+                debug_log!("Crash log written to {}", path.display());
+            }
             prev_hook(info);
         }));
     }
@@ -920,10 +916,11 @@ pub fn run(file_path: Option<PathBuf>, debug_log_path: Option<String>) {
         } else {
             "VimCode internal error (unknown panic payload)".to_string()
         };
+        let crash_path = crate::core::swap::crash_log_path();
         eprintln!("{msg}");
         eprintln!("Unsaved buffers written to swap files for recovery.");
-        eprintln!("Crash details written to /tmp/vimcode-crash.log");
-        eprintln!("Please report this at https://github.com/anthropics/claude-code/issues");
+        eprintln!("Crash details written to {}", crash_path.display());
+        eprintln!("Please report this at https://github.com/JDonaghy/vimcode/issues");
         std::process::exit(1);
     }
 }
@@ -1214,11 +1211,14 @@ fn event_loop(
                     }
                 })
                 .expect("draw frame");
-            // Report rendered tab counts back to the engine so that
-            // ensure_active_tab_visible() knows how many tabs fit.
-            for (gid, count) in &tab_visible_counts {
-                engine.set_tab_visible_count(*gid, *count);
+            // Report available tab bar width (in columns) back to the engine
+            // so that ensure_active_tab_visible() can compute how many tabs fit.
+            for (gid, width_cols) in &tab_visible_counts {
+                engine.set_tab_visible_count(*gid, *width_cols);
             }
+            // After updating counts (e.g. after a terminal resize), re-check
+            // that every group's active tab is still visible.
+            engine.ensure_all_groups_tabs_visible();
 
             // Set terminal cursor shape to match mode / pending key.
             let cursor_style = if !sidebar.has_focus && engine.pending_key == Some('r') {
@@ -2707,6 +2707,13 @@ fn event_loop(
                             continue;
                         }
 
+                        // Ctrl+L: force full screen redraw (clears rendering artifacts)
+                        if ctrl && matches!(code, KeyCode::Char('l') | KeyCode::Char('L')) {
+                            terminal.clear().ok();
+                            needs_redraw = true;
+                            continue;
+                        }
+
                         // When terminal has focus, route all keys to PTY
                         if engine.terminal_has_focus {
                             // Alt+1–9: switch terminal tab.
@@ -3722,7 +3729,7 @@ fn handle_explorer_context_action(
     action: &str,
     engine: &mut Engine,
     sidebar: &TuiSidebar,
-    terminal_size: Option<ratatui::layout::Rect>,
+    terminal_size: Option<Size>,
 ) {
     // Get the path from the engine's last context menu target.
     // Note: context_menu_confirm() already took the menu, so we reconstruct
@@ -3777,7 +3784,7 @@ fn handle_explorer_context_action(
 fn set_cell(buf: &mut ratatui::buffer::Buffer, x: u16, y: u16, ch: char, fg: RColor, bg: RColor) {
     let area = buf.area;
     if x < area.x + area.width && y < area.y + area.height {
-        buf.get_mut(x, y).set_char(ch).set_fg(fg).set_bg(bg);
+        buf[(x, y)].set_char(ch).set_fg(fg).set_bg(bg);
     }
 }
 
@@ -3802,15 +3809,16 @@ fn set_cell_wide(
         // column).
         let mut s = String::with_capacity(4);
         s.push(ch);
-        buf.get_mut(x, y).set_symbol(&s).set_fg(fg).set_bg(bg);
+        buf[(x, y)].set_symbol(&s).set_fg(fg).set_bg(bg);
         if x + 1 < area.x + area.width {
-            let next = buf.get_mut(x + 1, y);
+            let next = &mut buf[(x + 1, y)];
             next.reset();
             next.set_skip(true);
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn set_cell_styled(
     buf: &mut ratatui::buffer::Buffer,
     x: u16,
@@ -3819,12 +3827,16 @@ fn set_cell_styled(
     fg: RColor,
     bg: RColor,
     modifier: Modifier,
+    underline_color: Option<RColor>,
 ) {
     let area = buf.area;
     if x < area.x + area.width && y < area.y + area.height {
-        let cell = buf.get_mut(x, y);
+        let cell = &mut buf[(x, y)];
         cell.set_char(ch).set_fg(fg).set_bg(bg);
         cell.modifier = modifier;
+        if let Some(ul) = underline_color {
+            cell.underline_color = ul;
+        }
     }
 }
 

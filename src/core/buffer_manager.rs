@@ -122,6 +122,10 @@ pub struct BufferState {
     /// Whether a "file changed on disk" warning has already been shown for the
     /// current external modification.  Reset when the mtime is updated (reload / save).
     pub file_change_warned: bool,
+    /// Auto-detected indent width from the file's existing content.
+    /// When `Some(n)`, overrides `settings.shift_width` for this buffer.
+    /// Detected on file open by analyzing indent deltas between lines.
+    pub detected_indent: Option<u8>,
 }
 
 impl std::fmt::Debug for BufferState {
@@ -173,6 +177,7 @@ impl BufferState {
             diff_label: None,
             file_mtime: None,
             file_change_warned: false,
+            detected_indent: None,
         };
         state.update_syntax();
         state
@@ -218,7 +223,9 @@ impl BufferState {
             diff_label: None,
             file_mtime,
             file_change_warned: false,
+            detected_indent: None,
         };
+        state.detect_indent();
         state.update_syntax();
         state
     }
@@ -233,6 +240,48 @@ impl BufferState {
         };
         // Cache max line length while we have the text; avoids O(N) scan every render.
         self.max_col = text.lines().map(|l| l.chars().count()).max().unwrap_or(0);
+    }
+
+    /// Analyze the buffer's existing indentation to detect the indent width.
+    /// Looks at indent deltas between consecutive non-empty lines and picks
+    /// the most common delta.  Sets `detected_indent` to `Some(n)` if a
+    /// consistent pattern is found, or `None` if the file is empty / has no
+    /// indented lines.
+    pub fn detect_indent(&mut self) {
+        let mut counts = [0u32; 9]; // counts[1..8] = how many deltas of that size
+        let mut prev_indent: Option<usize> = None;
+
+        for line in self.buffer.content.lines() {
+            let text: String = line.chars().collect();
+            let trimmed = text.trim_end_matches(['\n', '\r']);
+            if trimmed.is_empty() {
+                continue;
+            }
+            // Count leading spaces (tabs count as 1 unit for detection purposes)
+            let indent: usize = trimmed
+                .chars()
+                .take_while(|&c| c == ' ' || c == '\t')
+                .map(|c| if c == '\t' { 4 } else { 1 })
+                .sum();
+
+            if let Some(prev) = prev_indent {
+                let delta = indent.abs_diff(prev);
+                if delta > 0 && delta <= 8 {
+                    counts[delta] += 1;
+                }
+            }
+            prev_indent = Some(indent);
+        }
+
+        // Find the most common non-zero delta
+        let best = counts[1..]
+            .iter()
+            .enumerate()
+            .max_by_key(|&(_, &count)| count)
+            .filter(|&(_, &count)| count >= 2) // need at least 2 occurrences
+            .map(|(i, _)| (i + 1) as u8);
+
+        self.detected_indent = best;
     }
 
     /// Mark syntax as needing a re-parse. Does NO work — just records the

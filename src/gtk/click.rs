@@ -37,10 +37,11 @@ pub(super) fn pixel_to_click_target(
     diff_btn_map: &DiffBtnMap,
     split_btn_map: &SplitBtnMap,
 ) -> ClickTarget {
+    let tab_row_height = (line_height * 1.6).ceil();
     let tab_bar_height = if engine.settings.breadcrumbs {
-        line_height * 2.0
+        tab_row_height + line_height
     } else {
-        line_height
+        tab_row_height
     };
 
     // Check if click is in a group's tab bar region.
@@ -84,7 +85,7 @@ pub(super) fn pixel_to_click_target(
             let tab_x_start = grect.x;
             let bar_width = grect.width;
             if y >= tab_y
-                && y < tab_y + line_height
+                && y < tab_y + tab_row_height
                 && x >= tab_x_start
                 && x < tab_x_start + bar_width
             {
@@ -429,10 +430,11 @@ pub(super) fn compute_tab_drop_zone(
 ) -> crate::core::window::DropZone {
     use crate::core::window::{DropZone, SplitDirection, WindowRect};
 
+    let tab_row_height = (line_height * 1.6).ceil();
     let tab_bar_height = if engine.settings.breadcrumbs {
-        line_height * 2.0
+        tab_row_height + line_height
     } else {
-        line_height
+        tab_row_height
     };
     let wildmenu_px = if engine.wildmenu_items.is_empty() {
         0.0
@@ -472,7 +474,7 @@ pub(super) fn compute_tab_drop_zone(
         let tab_y = grect.y - tab_bar_height;
         if !tab_hidden
             && y >= tab_y
-            && y < tab_y + line_height
+            && y < tab_y + tab_row_height
             && x >= tab_x
             && x < tab_x + grect.width
         {

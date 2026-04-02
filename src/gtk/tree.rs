@@ -83,7 +83,7 @@ pub(super) fn build_file_tree_shallow(
             .and_then(|e| e.to_str())
             .unwrap_or("");
         let icon = if is_dir {
-            "\u{f07b}" // nf-fa-folder
+            crate::icons::FOLDER.nerd
         } else {
             crate::icons::file_icon(ext)
         };

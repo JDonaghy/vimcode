@@ -85,6 +85,7 @@ impl Engine {
         self.picker_all_items.clear();
         self.picker_items.clear();
         self.picker_preview = None;
+        self.breadcrumb_scoped_parent = None;
 
         match source {
             PickerSource::Files => {
@@ -103,6 +104,14 @@ impl Engine {
                 self.picker_title = "Search".to_string();
                 // Default mode: files. Prefix routing handled in picker_filter_command_center.
                 self.picker_populate_files();
+            }
+            PickerSource::Buffers => {
+                self.picker_title = "Open Buffers".to_string();
+                self.picker_populate_buffers();
+            }
+            PickerSource::Keybindings => {
+                self.picker_title = "Key Bindings".to_string();
+                self.picker_populate_keybindings();
             }
             PickerSource::GitBranches => {
                 self.picker_title = "Switch Branch".to_string();
@@ -124,6 +133,67 @@ impl Engine {
         self.open_picker(PickerSource::CommandCenter);
     }
 
+    /// Handle a click on a breadcrumb segment.
+    /// `is_symbol`: true if this is a symbol segment (opens `@` symbol picker).
+    /// `path_prefix`: for path segments, the accumulated directory path up to this segment.
+    pub fn breadcrumb_click(&mut self, is_symbol: bool, path_prefix: Option<&std::path::Path>) {
+        if is_symbol {
+            // Open document symbol picker
+            self.open_picker(PickerSource::CommandCenter);
+            self.picker_query = "@".to_string();
+            self.picker_filter();
+            self.picker_load_preview();
+        } else if let Some(path) = path_prefix {
+            if path.is_dir() {
+                // Directory segment: open file picker filtered to that directory
+                self.open_picker(PickerSource::Files);
+                let rel = path
+                    .strip_prefix(&self.cwd)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .to_string();
+                self.picker_query = if rel.is_empty() {
+                    String::new()
+                } else {
+                    format!("{}/", rel)
+                };
+                self.picker_filter();
+                self.picker_load_preview();
+            } else {
+                // File segment (the last path component): open symbol picker
+                self.open_picker(PickerSource::CommandCenter);
+                self.picker_query = "@".to_string();
+                self.picker_filter();
+                self.picker_load_preview();
+            }
+        }
+    }
+
+    /// Handle a double-click on a breadcrumb segment.
+    /// Symbols: jump directly to the symbol's definition line.
+    /// Path segments: same as single click (open picker).
+    pub fn breadcrumb_double_click(
+        &mut self,
+        is_symbol: bool,
+        path_prefix: Option<&std::path::Path>,
+        symbol_line: Option<usize>,
+    ) {
+        if is_symbol {
+            if let Some(line) = symbol_line {
+                self.push_jump_location();
+                let win_id = self.active_window_id();
+                self.set_cursor_for_window(win_id, line, 0);
+                self.ensure_cursor_visible();
+            } else {
+                // No position info — fall back to symbol picker
+                self.breadcrumb_click(is_symbol, path_prefix);
+            }
+        } else {
+            // Path segments: same as single click
+            self.breadcrumb_click(is_symbol, path_prefix);
+        }
+    }
+
     /// Close the unified picker and clear all state.
     pub fn close_picker(&mut self) {
         self.picker_open = false;
@@ -133,6 +203,90 @@ impl Engine {
         self.picker_selected = 0;
         self.picker_scroll_top = 0;
         self.picker_preview = None;
+        self.breadcrumb_scoped_parent = None;
+    }
+
+    /// Rebuild the cached breadcrumb segments from the active group's state.
+    /// Called when entering breadcrumb focus mode.
+    pub(crate) fn rebuild_breadcrumb_segments(&mut self) {
+        self.breadcrumb_segments.clear();
+        let buf_state = match self.buffer_manager.get(self.active_buffer_id()) {
+            Some(s) => s,
+            None => return,
+        };
+
+        // Path segments
+        if let Some(ref file_path) = buf_state.file_path {
+            let display = if let Ok(rel) = file_path.strip_prefix(&self.cwd) {
+                rel.to_string_lossy().to_string()
+            } else {
+                file_path.to_string_lossy().to_string()
+            };
+            let mut accumulated = self.cwd.clone();
+            for part in display.split(std::path::MAIN_SEPARATOR) {
+                accumulated = accumulated.join(part);
+                self.breadcrumb_segments.push(BreadcrumbSegmentInfo {
+                    label: part.to_string(),
+                    is_symbol: false,
+                    path_prefix: Some(accumulated.clone()),
+                    symbol_line: None,
+                    parent_scope: None,
+                });
+            }
+        }
+
+        // Symbol segments from tree-sitter
+        let cursor_line = self.view().cursor.line;
+        let cursor_col = self.view().cursor.col;
+        let text = buf_state.buffer.to_string();
+        let scopes = if let Some(ref syn) = buf_state.syntax {
+            syn.enclosing_scopes(&text, cursor_line, cursor_col)
+        } else {
+            Vec::new()
+        };
+        let mut prev_scope_name: Option<String> = None;
+        for scope in &scopes {
+            self.breadcrumb_segments.push(BreadcrumbSegmentInfo {
+                label: scope.name.clone(),
+                is_symbol: true,
+                path_prefix: None,
+                symbol_line: Some(scope.line),
+                parent_scope: prev_scope_name.clone(),
+            });
+            prev_scope_name = Some(scope.name.clone());
+        }
+
+        // Clamp selection
+        if !self.breadcrumb_segments.is_empty() {
+            self.breadcrumb_selected = self
+                .breadcrumb_selected
+                .min(self.breadcrumb_segments.len() - 1);
+        }
+    }
+
+    /// Open a scoped picker for the currently selected breadcrumb segment.
+    /// Path segments open the file picker for that directory.
+    /// Symbol segments open the `@` symbol picker filtered to siblings
+    /// within the parent scope.
+    pub(crate) fn breadcrumb_open_scoped(&mut self) {
+        let seg = match self.breadcrumb_segments.get(self.breadcrumb_selected) {
+            Some(s) => s.clone(),
+            None => return,
+        };
+
+        if !seg.is_symbol {
+            self.breadcrumb_click(false, seg.path_prefix.as_deref());
+            return;
+        }
+
+        // Symbol segment: show siblings at the same level.
+        // Filter to symbols whose container matches this segment's parent,
+        // matching VSCode behavior (clicking a function shows sibling functions).
+        self.breadcrumb_scoped_parent = Some(seg.parent_scope.clone());
+        self.open_picker(PickerSource::CommandCenter);
+        self.picker_query = "@".to_string();
+        self.picker_filter();
+        self.picker_load_preview();
     }
 
     /// Populate picker_all_items with files from the project using the ignore crate.
@@ -169,6 +323,9 @@ impl Engine {
                 icon: None,
                 score: 0,
                 match_positions: Vec::new(),
+                depth: 0,
+                expandable: false,
+                expanded: false,
             });
         }
         items.sort_by(|a, b| a.display.cmp(&b.display));
@@ -194,12 +351,183 @@ impl Engine {
                     icon: None,
                     score: 0,
                     match_positions: Vec::new(),
+                    depth: 0,
+                    expandable: false,
+                    expanded: false,
                 }
             })
             .collect();
     }
 
     /// Populate picker_all_items with git branches.
+    fn picker_populate_buffers(&mut self) {
+        let active_id = self.active_buffer_id();
+        let ids = self.buffer_manager.list();
+        self.picker_all_items = ids
+            .iter()
+            .enumerate()
+            .map(|(i, &id)| {
+                let state = self.buffer_manager.get(id).unwrap();
+                let buf_num = i + 1;
+                let name = state.display_name();
+                let mut flags = String::new();
+                if id == active_id {
+                    flags.push_str("%a ");
+                }
+                if state.dirty {
+                    flags.push('+');
+                }
+                let detail = if flags.is_empty() {
+                    None
+                } else {
+                    Some(flags.trim().to_string())
+                };
+                let action = if let Some(ref p) = state.file_path {
+                    PickerAction::OpenFile(p.clone())
+                } else {
+                    PickerAction::ExecuteCommand(format!("buffer {}", buf_num))
+                };
+                let icon = state
+                    .file_path
+                    .as_ref()
+                    .and_then(|p| p.extension())
+                    .and_then(|e| e.to_str())
+                    .map(|ext| crate::icons::file_icon(ext).to_string());
+                PickerItem {
+                    display: name,
+                    filter_text: state
+                        .file_path
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default(),
+                    detail,
+                    action,
+                    icon,
+                    score: 0,
+                    match_positions: Vec::new(),
+                    depth: 0,
+                    expandable: false,
+                    expanded: false,
+                }
+            })
+            .collect();
+    }
+
+    fn picker_populate_keybindings(&mut self) {
+        let is_vscode = self.is_vscode_mode();
+        let content = if is_vscode {
+            super::keybindings_reference_vscode()
+        } else {
+            super::keybindings_reference_vim()
+        };
+        let mut section = String::new();
+        for line in content.lines() {
+            let trimmed = line.trim();
+            // Section headers: "── Foo ──"
+            if trimmed.starts_with("──") {
+                // Extract section name between ── markers
+                section = trimmed
+                    .trim_start_matches('─')
+                    .trim_end_matches('─')
+                    .trim()
+                    .to_string();
+                continue;
+            }
+            // Skip empty, title, or decoration lines
+            if trimmed.is_empty()
+                || trimmed.starts_with('=')
+                || trimmed.starts_with("VimCode")
+                || trimmed.starts_with("Use ")
+                || trimmed.starts_with("Remap ")
+                || trimmed.starts_with("Commands shown")
+            {
+                continue;
+            }
+            // Parse "key(s)   description   [:command]"
+            // Split at first run of 2+ spaces
+            if let Some(idx) = trimmed.find("  ") {
+                let keys = trimmed[..idx].trim();
+                let desc = trimmed[idx..].trim();
+                if !keys.is_empty() && !desc.is_empty() {
+                    let detail = if section.is_empty() {
+                        None
+                    } else {
+                        Some(section.clone())
+                    };
+                    // Check for user remaps
+                    let display = format!("{:<24}{}", keys, desc);
+                    self.picker_all_items.push(PickerItem {
+                        display,
+                        filter_text: format!("{} {} {}", keys, desc, section),
+                        detail,
+                        action: PickerAction::ExecuteCommand("nop".to_string()),
+                        icon: None,
+                        score: 0,
+                        match_positions: Vec::new(),
+                        depth: 0,
+                        expandable: false,
+                        expanded: false,
+                    });
+                }
+            }
+        }
+
+        // Append configurable panel keys with their actual values
+        let pk = &self.settings.panel_keys;
+        let panel_bindings: &[(&str, &str, &str)] = &[
+            (&pk.toggle_sidebar, "Toggle sidebar", "Panel"),
+            (&pk.focus_explorer, "Focus explorer", "Panel"),
+            (&pk.focus_search, "Focus search panel", "Panel"),
+            (&pk.fuzzy_finder, "Fuzzy file finder", "Panel"),
+            (&pk.live_grep, "Live grep", "Panel"),
+            (&pk.command_palette, "Command palette", "Panel"),
+            (&pk.open_terminal, "Toggle terminal", "Panel"),
+            (&pk.add_cursor, "Add cursor at next match", "Panel"),
+            (&pk.select_all_matches, "Select all occurrences", "Panel"),
+            (&pk.nav_back, "Navigate back in history", "Panel"),
+            (&pk.nav_forward, "Navigate forward in history", "Panel"),
+        ];
+        for &(key, desc, cat) in panel_bindings {
+            if key.is_empty() {
+                continue;
+            }
+            let display = format!("{:<24}{} (configurable)", key, desc);
+            self.picker_all_items.push(PickerItem {
+                display,
+                filter_text: format!("{} {} {} configurable", key, desc, cat),
+                detail: Some(cat.to_string()),
+                action: PickerAction::ExecuteCommand("nop".to_string()),
+                icon: None,
+                score: 0,
+                match_positions: Vec::new(),
+                depth: 0,
+                expandable: false,
+                expanded: false,
+            });
+        }
+
+        // Append user keymaps (`:map` remaps) with a marker
+        for km in &self.user_keymaps {
+            let keys_str = km.keys.join("");
+            let display = format!(
+                "{:<24}:{} [mode: {}] (user remap)",
+                keys_str, km.action, km.mode
+            );
+            self.picker_all_items.push(PickerItem {
+                display,
+                filter_text: format!("{} {} {} user remap", keys_str, km.action, km.mode),
+                detail: Some("User Keymaps".to_string()),
+                action: PickerAction::ExecuteCommand("nop".to_string()),
+                icon: None,
+                score: 0,
+                match_positions: Vec::new(),
+                depth: 0,
+                expandable: false,
+                expanded: false,
+            });
+        }
+    }
+
     fn picker_populate_branches(&mut self) {
         let branches = crate::core::git::list_branches(&self.cwd);
         self.picker_all_items = branches
@@ -228,6 +556,9 @@ impl Engine {
                     icon: None,
                     score: 0,
                     match_positions: Vec::new(),
+                    depth: 0,
+                    expandable: false,
+                    expanded: false,
                 }
             })
             .collect();
@@ -327,13 +658,22 @@ impl Engine {
             if self.lsp_pending_document_symbols.is_none() && self.picker_all_items.is_empty() {
                 self.picker_request_document_symbols();
             }
-            // If items are populated (from LSP response), filter them
-            Self::fuzzy_filter_items(
-                &self.picker_all_items,
-                &sub_query,
-                CAP,
-                &mut self.picker_items,
-            );
+            // Tree view when no query; flat fuzzy filter when typing
+            if sub_query.is_empty() {
+                self.picker_rebuild_visible_tree();
+            } else {
+                Self::fuzzy_filter_items(
+                    &self.picker_all_items,
+                    &sub_query,
+                    CAP,
+                    &mut self.picker_items,
+                );
+                // Reset depth on filtered items so they display flat
+                for item in &mut self.picker_items {
+                    item.depth = 0;
+                    item.expandable = false;
+                }
+            }
             if self.picker_items.is_empty() && self.lsp_pending_document_symbols.is_some() {
                 self.picker_items = vec![PickerItem {
                     display: "Loading symbols...".to_string(),
@@ -343,6 +683,9 @@ impl Engine {
                     icon: None,
                     score: 0,
                     match_positions: Vec::new(),
+                    depth: 0,
+                    expandable: false,
+                    expanded: false,
                 }];
             }
         } else if let Some(rest) = query.strip_prefix('#') {
@@ -361,6 +704,9 @@ impl Engine {
                     icon: None,
                     score: 0,
                     match_positions: Vec::new(),
+                    depth: 0,
+                    expandable: false,
+                    expanded: false,
                 }];
             }
         } else if let Some(rest) = query.strip_prefix(':') {
@@ -378,6 +724,9 @@ impl Engine {
                     icon: None,
                     score: 0,
                     match_positions: Vec::new(),
+                    depth: 0,
+                    expandable: false,
+                    expanded: false,
                 }];
             } else {
                 self.picker_items = vec![PickerItem {
@@ -388,6 +737,9 @@ impl Engine {
                     icon: None,
                     score: 0,
                     match_positions: Vec::new(),
+                    depth: 0,
+                    expandable: false,
+                    expanded: false,
                 }];
             }
         } else if let Some(rest) = query.strip_prefix('%') {
@@ -403,6 +755,9 @@ impl Engine {
                     icon: None,
                     score: 0,
                     match_positions: Vec::new(),
+                    depth: 0,
+                    expandable: false,
+                    expanded: false,
                 }];
             } else {
                 // Reuse the grep search logic with sub_query
@@ -426,6 +781,15 @@ impl Engine {
                 .trim_start()
                 .to_string();
             self.picker_populate_tasks(&sub_query);
+        } else if query == "chat" || query.starts_with("chat ") {
+            // AI Chat mode — open AI panel or send a message
+            self.picker_title = "AI Chat".to_string();
+            let sub_query = query
+                .strip_prefix("chat")
+                .unwrap_or("")
+                .trim_start()
+                .to_string();
+            self.picker_populate_chat(&sub_query);
         } else if query == "?" {
             // Help mode: show available prefixes
             self.picker_title = "Help: Prefix Modes".to_string();
@@ -438,6 +802,7 @@ impl Engine {
                 Self::help_item("%", "Search for text in project"),
                 Self::help_item("debug", "Start debugging (launch configurations)"),
                 Self::help_item("task", "Run a task (from tasks.json)"),
+                Self::help_item("chat", "Ask the AI assistant"),
                 Self::help_item("?", "Show this help"),
             ];
         } else if query.is_empty() {
@@ -452,6 +817,7 @@ impl Engine {
                 Self::hint_item("Search for Text", "%", "Ctrl+G (grep)"),
                 Self::hint_item("Start Debugging", "debug", "F5"),
                 Self::hint_item("Run Task", "task", ""),
+                Self::hint_item("Ask AI", "chat", ":AI"),
                 Self::hint_item("More Help", "?", ""),
             ];
         } else {
@@ -491,6 +857,9 @@ impl Engine {
             icon: None,
             score: 0,
             match_positions: Vec::new(),
+            depth: 0,
+            expandable: false,
+            expanded: false,
         }
     }
 
@@ -508,6 +877,9 @@ impl Engine {
             icon: None,
             score: 0,
             match_positions: Vec::new(),
+            depth: 0,
+            expandable: false,
+            expanded: false,
         }
     }
 
@@ -529,34 +901,36 @@ impl Engine {
     }
 
     /// Populate picker items from a document symbol LSP response.
+    /// Builds a tree structure: `picker_all_items` holds the full depth-first tree,
+    /// `picker_items` holds only visible items (respecting expand/collapse state).
+    /// When a filter query is active, the tree is flattened for fuzzy matching.
     pub(crate) fn picker_populate_document_symbols(&mut self, symbols: Vec<lsp::SymbolInfo>) {
-        let path = self.active_buffer_path();
-        self.picker_all_items = symbols
-            .into_iter()
-            .map(|sym| {
-                let container_str = sym
-                    .container
-                    .as_ref()
-                    .map(|c| format!("  ({})", c))
-                    .unwrap_or_default();
-                let display = format!("{} {}{}", sym.kind.icon(), sym.name, container_str);
-                let detail = Some(sym.kind.label().to_string());
-                let action = PickerAction::GotoSymbol(
-                    path.clone().unwrap_or_default(),
-                    sym.line as usize,
-                    sym.character as usize,
-                );
-                PickerItem {
-                    filter_text: sym.name.clone(),
-                    display,
-                    detail,
-                    action,
-                    icon: None,
-                    score: 0,
-                    match_positions: Vec::new(),
-                }
-            })
-            .collect();
+        // Apply scoped parent filter if set (from breadcrumb navigation).
+        let scoped = self.breadcrumb_scoped_parent.take();
+        let filtered: Vec<lsp::SymbolInfo> = if let Some(ref parent_filter) = scoped {
+            symbols
+                .into_iter()
+                .filter(|sym| sym.container.as_deref() == parent_filter.as_deref())
+                .collect()
+        } else {
+            symbols
+        };
+        let path = self.active_buffer_path().unwrap_or_default();
+
+        // Check if the symbols already have hierarchy (DocumentSymbol format)
+        // or need reconstruction from the `container` field (SymbolInformation format).
+        // Skip reconstruction when showing scoped siblings (breadcrumb filter active).
+        let has_hierarchy = filtered.iter().any(|s| !s.children.is_empty());
+        let tree_symbols = if scoped.is_some() || has_hierarchy {
+            filtered
+        } else {
+            Self::rebuild_tree_from_containers(filtered)
+        };
+
+        // Build tree items depth-first, sorted by kind then name at each level
+        self.picker_all_items.clear();
+        Self::build_symbol_tree_items(&tree_symbols, &path, 0, &mut self.picker_all_items);
+
         // Re-run filter with current query
         let sub_query = self
             .picker_query
@@ -564,15 +938,213 @@ impl Engine {
             .unwrap_or("")
             .trim_start()
             .to_string();
-        Self::fuzzy_filter_items(
-            &self.picker_all_items,
-            &sub_query,
-            100,
-            &mut self.picker_items,
-        );
-        self.picker_selected = 0;
+        if sub_query.is_empty() {
+            // No query: show tree view with expand/collapse
+            self.picker_rebuild_visible_tree();
+        } else {
+            // With query: flatten tree, fuzzy-filter all items
+            Self::fuzzy_filter_items(
+                &self.picker_all_items,
+                &sub_query,
+                100,
+                &mut self.picker_items,
+            );
+            // Reset depth on filtered items so they display flat
+            for item in &mut self.picker_items {
+                item.depth = 0;
+                item.expandable = false;
+            }
+        }
+        // Pre-select the symbol closest to (and at or before) the cursor line,
+        // matching VSCode's behavior of highlighting the current function.
+        let cursor_line = self.view().cursor.line;
+        let mut best_idx = 0usize;
+        let mut best_line: Option<usize> = None;
+        for (i, item) in self.picker_items.iter().enumerate() {
+            if let PickerAction::GotoSymbol(_, line, _) = &item.action {
+                if *line <= cursor_line && (best_line.is_none() || *line > best_line.unwrap()) {
+                    best_line = Some(*line);
+                    best_idx = i;
+                }
+            }
+        }
+        self.picker_selected = best_idx;
         self.picker_scroll_top = 0;
+        self.picker_update_scroll();
         self.picker_load_preview();
+    }
+
+    /// Reconstruct a tree from a flat symbol list using the `container` field.
+    /// Groups symbols by their container name, creating parent SymbolInfo nodes
+    /// with children populated. Symbols without a container stay at the top level.
+    fn rebuild_tree_from_containers(flat: Vec<lsp::SymbolInfo>) -> Vec<lsp::SymbolInfo> {
+        use std::collections::HashMap;
+
+        // Collect children grouped by container name
+        let mut children_map: HashMap<String, Vec<lsp::SymbolInfo>> = HashMap::new();
+        let mut top_level: Vec<lsp::SymbolInfo> = Vec::new();
+
+        for sym in &flat {
+            if let Some(ref container) = sym.container {
+                children_map
+                    .entry(container.clone())
+                    .or_default()
+                    .push(sym.clone());
+            }
+        }
+
+        // Build top-level: symbols that are containers (have children grouped under them)
+        // or have no container themselves.
+        let mut seen_containers: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for sym in flat {
+            if sym.container.is_none() {
+                // Top-level symbol — check if it's also a container for other symbols
+                let mut s = sym;
+                if let Some(kids) = children_map.remove(&s.name) {
+                    s.children = kids;
+                    seen_containers.insert(s.name.clone());
+                }
+                top_level.push(s);
+            }
+        }
+
+        // Any remaining containers that weren't found as top-level symbols:
+        // create synthetic parent nodes for them.
+        for (container_name, kids) in children_map {
+            if seen_containers.contains(&container_name) {
+                continue;
+            }
+            // Find the first child to infer a reasonable line/kind for the synthetic parent
+            let first = kids.first().cloned();
+            let (line, character) = first
+                .as_ref()
+                .map(|k| (k.line.saturating_sub(1), 0))
+                .unwrap_or((0, 0));
+            top_level.push(lsp::SymbolInfo {
+                name: container_name,
+                kind: lsp::SymbolKind::Class, // Best guess for a container
+                detail: None,
+                container: None,
+                path: first.and_then(|f| f.path),
+                line,
+                character,
+                children: kids,
+            });
+        }
+
+        top_level
+    }
+
+    /// Recursively build picker items from hierarchical symbols in depth-first order.
+    /// Sorts children by (kind.sort_order(), name) at each level.
+    fn build_symbol_tree_items(
+        symbols: &[lsp::SymbolInfo],
+        path: &std::path::Path,
+        depth: usize,
+        out: &mut Vec<PickerItem>,
+    ) {
+        // Sort by kind then name
+        let mut sorted: Vec<&lsp::SymbolInfo> = symbols.iter().collect();
+        sorted.sort_by(|a, b| {
+            a.kind
+                .sort_order()
+                .cmp(&b.kind.sort_order())
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
+
+        for sym in sorted {
+            let has_children = !sym.children.is_empty();
+            let display = format!("{} {}", sym.kind.icon(), sym.name);
+            let detail = Some(sym.kind.label().to_string());
+            let action = PickerAction::GotoSymbol(
+                path.to_path_buf(),
+                sym.line as usize,
+                sym.character as usize,
+            );
+            out.push(PickerItem {
+                filter_text: sym.name.clone(),
+                display,
+                detail,
+                action,
+                icon: None,
+                score: 0,
+                match_positions: Vec::new(),
+                depth,
+                expandable: has_children,
+                expanded: depth == 0, // Top-level items start expanded
+            });
+            if has_children {
+                Self::build_symbol_tree_items(&sym.children, path, depth + 1, out);
+            }
+        }
+    }
+
+    /// Rebuild `picker_items` from `picker_all_items` respecting expand/collapse state.
+    /// Only shows items whose ancestors are all expanded.
+    pub(crate) fn picker_rebuild_visible_tree(&mut self) {
+        self.picker_items.clear();
+        let mut skip_depth: Option<usize> = None;
+        for item in &self.picker_all_items {
+            // If we're skipping collapsed children, check if we've exited the scope
+            if let Some(sd) = skip_depth {
+                if item.depth > sd {
+                    continue; // Still inside collapsed parent
+                } else {
+                    skip_depth = None; // Exited collapsed parent's scope
+                }
+            }
+            self.picker_items.push(item.clone());
+            // If this item is expandable but not expanded, skip its children
+            if item.expandable && !item.expanded {
+                skip_depth = Some(item.depth);
+            }
+        }
+    }
+
+    /// Toggle expand/collapse on the currently selected picker item.
+    /// Returns true if the item was expandable and was toggled.
+    pub(crate) fn picker_toggle_expand(&mut self) -> bool {
+        let sel = self.picker_selected;
+        if sel >= self.picker_items.len() {
+            return false;
+        }
+        let item = &self.picker_items[sel];
+        if !item.expandable {
+            return false;
+        }
+
+        // Find this item in picker_all_items and toggle its expanded state
+        let target_display = item.display.clone();
+        let target_depth = item.depth;
+        let target_line = match &item.action {
+            PickerAction::GotoSymbol(_, line, _) => Some(*line),
+            _ => None,
+        };
+        for all_item in &mut self.picker_all_items {
+            if all_item.display == target_display
+                && all_item.depth == target_depth
+                && matches!(&all_item.action, PickerAction::GotoSymbol(_, l, _) if Some(*l) == target_line)
+            {
+                all_item.expanded = !all_item.expanded;
+                break;
+            }
+        }
+
+        // Rebuild visible items
+        self.picker_rebuild_visible_tree();
+        // Try to keep selection on the same item
+        self.picker_selected = self
+            .picker_items
+            .iter()
+            .position(|i| {
+                i.display == target_display
+                    && i.depth == target_depth
+                    && matches!(&i.action, PickerAction::GotoSymbol(_, l, _) if Some(*l) == target_line)
+            })
+            .unwrap_or(sel.min(self.picker_items.len().saturating_sub(1)));
+        self.picker_update_scroll();
+        true
     }
 
     /// Request workspace symbols from LSP.
@@ -629,6 +1201,9 @@ impl Engine {
                     icon: None,
                     score: 0,
                     match_positions: Vec::new(),
+                    depth: 0,
+                    expandable: false,
+                    expanded: false,
                 }
             })
             .collect();
@@ -672,6 +1247,9 @@ impl Engine {
                             icon: None,
                             score: 0,
                             match_positions: Vec::new(),
+                            depth: 0,
+                            expandable: false,
+                            expanded: false,
                         }
                     })
                     .collect();
@@ -710,6 +1288,9 @@ impl Engine {
                 icon: None,
                 score: 0,
                 match_positions: Vec::new(),
+                depth: 0,
+                expandable: false,
+                expanded: false,
             }];
             return;
         }
@@ -731,6 +1312,9 @@ impl Engine {
                     icon: None,
                     score: 0,
                     match_positions: Vec::new(),
+                    depth: 0,
+                    expandable: false,
+                    expanded: false,
                 }
             })
             .collect();
@@ -774,6 +1358,9 @@ impl Engine {
                 icon: None,
                 score: 0,
                 match_positions: Vec::new(),
+                depth: 0,
+                expandable: false,
+                expanded: false,
             }];
             return;
         }
@@ -790,6 +1377,9 @@ impl Engine {
                     icon: None,
                     score: 0,
                     match_positions: Vec::new(),
+                    depth: 0,
+                    expandable: false,
+                    expanded: false,
                 }
             })
             .collect();
@@ -831,6 +1421,72 @@ impl Engine {
         }
 
         self.open_file_in_tab(&tasks_path);
+    }
+
+    /// Populate picker items for AI chat mode.
+    /// If a question is provided, shows a "Send to AI" item.
+    /// Otherwise shows "Open AI Panel".
+    fn picker_populate_chat(&mut self, question: &str) {
+        let configured =
+            !self.settings.ai_api_key.is_empty() || self.settings.ai_provider == "ollama";
+
+        if !configured {
+            self.picker_items = vec![PickerItem {
+                display: "Configure AI provider first".to_string(),
+                filter_text: String::new(),
+                detail: Some(":set ai_provider=anthropic  :set ai_api_key=sk-...".to_string()),
+                action: PickerAction::Custom("chat_configure".to_string()),
+                icon: None,
+                score: 0,
+                match_positions: Vec::new(),
+                depth: 0,
+                expandable: false,
+                expanded: false,
+            }];
+            return;
+        }
+
+        if question.is_empty() {
+            self.picker_items = vec![
+                PickerItem {
+                    display: "Open AI Panel".to_string(),
+                    filter_text: "open ai panel chat".to_string(),
+                    detail: Some("Focus the AI chat sidebar".to_string()),
+                    action: PickerAction::Custom("chat_open".to_string()),
+                    icon: None,
+                    score: 0,
+                    match_positions: Vec::new(),
+                    depth: 0,
+                    expandable: false,
+                    expanded: false,
+                },
+                PickerItem {
+                    display: "Type a question after 'chat '...".to_string(),
+                    filter_text: String::new(),
+                    detail: Some("e.g. chat explain this function".to_string()),
+                    action: PickerAction::Custom("hint".to_string()),
+                    icon: None,
+                    score: 0,
+                    match_positions: Vec::new(),
+                    depth: 0,
+                    expandable: false,
+                    expanded: false,
+                },
+            ];
+        } else {
+            self.picker_items = vec![PickerItem {
+                display: format!("Ask AI: {}", question),
+                filter_text: question.to_string(),
+                detail: Some(format!("Send to {} AI", self.settings.ai_provider)),
+                action: PickerAction::Custom(format!("chat_send:{}", question)),
+                icon: None,
+                score: 0,
+                match_positions: Vec::new(),
+                depth: 0,
+                expandable: false,
+                expanded: false,
+            }];
+        }
     }
 
     /// Load preview context for the currently selected picker item.
@@ -887,15 +1543,17 @@ impl Engine {
 
         match item.action {
             PickerAction::OpenFile(rel_path) => {
+                self.push_jump_location();
                 let abs = self.cwd.join(&rel_path);
                 self.open_file_in_tab(&abs);
                 EngineAction::None
             }
             PickerAction::OpenFileAtLine(path, line) => {
+                self.push_jump_location();
                 self.open_file_in_tab(&path);
                 let win_id = self.active_window_id();
                 self.set_cursor_for_window(win_id, line, 0);
-                self.ensure_cursor_visible();
+                self.scroll_cursor_center();
                 EngineAction::None
             }
             PickerAction::ExecuteCommand(action) => {
@@ -986,6 +1644,7 @@ impl Engine {
                         let _ = self.settings.save();
                         EngineAction::None
                     }
+                    "nop" => EngineAction::None,
                     other => self.execute_command(other),
                 }
             }
@@ -1001,12 +1660,14 @@ impl Engine {
                 EngineAction::None
             }
             PickerAction::GotoLine(line) => {
+                self.push_jump_location();
                 let win_id = self.active_window_id();
                 self.set_cursor_for_window(win_id, line, 0);
-                self.ensure_cursor_visible();
+                self.scroll_cursor_center();
                 EngineAction::None
             }
             PickerAction::GotoSymbol(path, line, _col) => {
+                self.push_jump_location();
                 if !path.as_os_str().is_empty() {
                     // Check if it's a different file than the current buffer
                     let cur_path = self
@@ -1020,7 +1681,7 @@ impl Engine {
                 }
                 let win_id = self.active_window_id();
                 self.set_cursor_for_window(win_id, line, 0);
-                self.ensure_cursor_visible();
+                self.scroll_cursor_center();
                 EngineAction::None
             }
             PickerAction::Custom(key) => {
@@ -1069,6 +1730,24 @@ impl Engine {
                     self.close_picker();
                     self.create_and_open_tasks_json();
                     EngineAction::None
+                } else if key == "chat_open" {
+                    // Focus the AI chat panel
+                    self.close_picker();
+                    self.ai_has_focus = true;
+                    EngineAction::None
+                } else if let Some(question) = key.strip_prefix("chat_send:") {
+                    // Send a question to the AI provider
+                    let question = question.to_string();
+                    self.close_picker();
+                    self.ai_input = question;
+                    self.ai_send_message();
+                    self.ai_has_focus = true;
+                    EngineAction::None
+                } else if key == "chat_configure" {
+                    // Open settings to configure AI
+                    self.close_picker();
+                    self.settings_has_focus = true;
+                    EngineAction::None
                 } else {
                     EngineAction::None
                 }
@@ -1088,7 +1767,48 @@ impl Engine {
                 self.close_picker();
                 EngineAction::None
             }
-            "Return" => self.picker_confirm(),
+            "Return" => {
+                // In symbol tree mode (@), Enter on expandable items toggles expand
+                if self.picker_source == PickerSource::CommandCenter
+                    && self.picker_query.starts_with('@')
+                {
+                    let sub_query = self.picker_query.strip_prefix('@').unwrap_or("").trim();
+                    if sub_query.is_empty() {
+                        // Tree view active — check if selected item is expandable
+                        if self.picker_toggle_expand() {
+                            self.picker_load_preview();
+                            return EngineAction::None;
+                        }
+                    }
+                }
+                self.picker_confirm()
+            }
+            "Right" => {
+                // In symbol tree mode, Right expands collapsed item
+                if self.picker_source == PickerSource::CommandCenter && self.picker_query == "@" {
+                    if let Some(item) = self.picker_items.get(self.picker_selected) {
+                        if item.expandable && !item.expanded {
+                            self.picker_toggle_expand();
+                            self.picker_load_preview();
+                            return EngineAction::None;
+                        }
+                    }
+                }
+                EngineAction::None
+            }
+            "Left" => {
+                // In symbol tree mode, Left collapses expanded item
+                if self.picker_source == PickerSource::CommandCenter && self.picker_query == "@" {
+                    if let Some(item) = self.picker_items.get(self.picker_selected) {
+                        if item.expandable && item.expanded {
+                            self.picker_toggle_expand();
+                            self.picker_load_preview();
+                            return EngineAction::None;
+                        }
+                    }
+                }
+                EngineAction::None
+            }
             "Down" | "Tab" => {
                 let max = self.picker_items.len().saturating_sub(1);
                 self.picker_selected = (self.picker_selected + 1).min(max);

@@ -147,6 +147,11 @@ impl Engine {
             return self.handle_picker_key(key_name, unicode, ctrl);
         }
 
+        // Breadcrumb focus mode intercepts keys when active.
+        if self.breadcrumb_focus {
+            return self.handle_breadcrumb_key(key_name, unicode, ctrl);
+        }
+
         // Diff peek popup intercepts keys when open.
         if self.diff_peek.is_some() && self.handle_diff_peek_key(key_name, unicode) {
             return EngineAction::None;
@@ -871,11 +876,7 @@ impl Engine {
                 let count = self.take_count();
                 self.start_undo_group();
                 let line = self.view().cursor.line;
-                let indent = if self.settings.auto_indent {
-                    self.get_line_indent_str(line)
-                } else {
-                    String::new()
-                };
+                let indent = self.smart_indent_for_newline(line);
                 let indent_len = indent.len();
                 let line_end =
                     self.buffer().line_to_char(line) + self.buffer().line_len_chars(line);
@@ -3878,6 +3879,37 @@ impl Engine {
     }
 
     /// Handle a key press while leader mode is active (after pressing the leader key).
+    /// Handle keys while breadcrumb focus mode is active.
+    /// h/l navigate segments, Enter opens scoped picker, Escape exits.
+    fn handle_breadcrumb_key(
+        &mut self,
+        key_name: &str,
+        unicode: Option<char>,
+        _ctrl: bool,
+    ) -> EngineAction {
+        match (key_name, unicode) {
+            (_, Some('h')) | ("Left", _) => {
+                if self.breadcrumb_selected > 0 {
+                    self.breadcrumb_selected -= 1;
+                }
+            }
+            (_, Some('l')) | ("Right", _) => {
+                if self.breadcrumb_selected + 1 < self.breadcrumb_segments.len() {
+                    self.breadcrumb_selected += 1;
+                }
+            }
+            ("Return", _) => {
+                self.breadcrumb_focus = false;
+                self.breadcrumb_open_scoped();
+            }
+            _ => {
+                // Escape or any other key exits breadcrumb focus
+                self.breadcrumb_focus = false;
+            }
+        }
+        EngineAction::None
+    }
+
     pub(crate) fn handle_leader_key(&mut self, unicode: Option<char>) -> EngineAction {
         let ch = match unicode {
             Some(c) => c,
@@ -3891,9 +3923,21 @@ impl Engine {
         partial.push(ch);
 
         // All known built-in leader sequences
-        const SEQUENCES: &[&str] = &["rn", "gf", "gF", "gi", "gb", "ca", "sf", "sg", "sp", "sw"];
+        const SEQUENCES: &[&str] = &[
+            "b", "rn", "gf", "gF", "gi", "gb", "ca", "sb", "sf", "sg", "sk", "so", "sp", "sw",
+        ];
 
         match partial.as_str() {
+            "b" => {
+                // Enter breadcrumb focus mode
+                self.rebuild_breadcrumb_segments();
+                if !self.breadcrumb_segments.is_empty() {
+                    self.breadcrumb_focus = true;
+                    self.breadcrumb_selected = self.breadcrumb_segments.len() - 1;
+                } else {
+                    self.message = "No breadcrumb segments".to_string();
+                }
+            }
             "rn" => {
                 // LSP rename — enter command mode pre-filled with :Rename <word>
                 let word = self.word_under_cursor().unwrap_or_default();
@@ -3918,11 +3962,24 @@ impl Engine {
                 // Toggle inline git blame
                 self.toggle_inline_blame();
             }
+            "sb" => {
+                self.open_picker(PickerSource::Buffers);
+            }
             "sf" => {
                 self.open_picker(PickerSource::Files);
             }
             "sg" => {
                 self.open_picker(PickerSource::Grep);
+            }
+            "sk" => {
+                self.open_picker(PickerSource::Keybindings);
+            }
+            "so" => {
+                // Document outline / symbol navigation
+                self.open_picker(PickerSource::CommandCenter);
+                self.picker_query = "@".to_string();
+                self.picker_filter();
+                self.picker_load_preview();
             }
             "sp" => {
                 self.open_picker(PickerSource::Commands);
@@ -4429,7 +4486,7 @@ impl Engine {
         if ctrl && key_name == "t" {
             let line = self.view().cursor.line;
             let line_start = self.buffer().line_to_char(line);
-            let sw = self.settings.shift_width as usize;
+            let sw = self.effective_shift_width();
             let indent = if self.settings.expand_tab {
                 " ".repeat(sw)
             } else {
@@ -4587,7 +4644,7 @@ impl Engine {
         if ctrl && key_name == "d" {
             let line = self.view().cursor.line;
             let line_start = self.buffer().line_to_char(line);
-            let sw = self.settings.shift_width as usize;
+            let sw = self.effective_shift_width();
             // Count leading spaces
             let line_text: String = self.buffer().content.line(line).chars().take(sw).collect();
             let spaces = line_text.chars().take_while(|c| *c == ' ').count();
@@ -4759,11 +4816,7 @@ impl Engine {
                     let line = self.view().cursor.line;
                     let col = self.view().cursor.col;
                     let char_idx = self.buffer().line_to_char(line) + col;
-                    let indent = if self.settings.auto_indent {
-                        self.get_line_indent_str(line)
-                    } else {
-                        String::new()
-                    };
+                    let indent = self.smart_indent_for_newline(line);
                     let indent_len = indent.len();
                     let text = format!("\n{}", indent);
                     self.insert_with_undo(char_idx, &text);
@@ -4889,6 +4942,25 @@ impl Engine {
                             self.insert_text_buffer.push(ch);
                             self.view_mut().cursor.col += 1;
                             *changed = true;
+                        }
+                    }
+                    // Auto-outdent when typing a closing bracket as the
+                    // first non-blank character on a line.
+                    if matches!(ch, '}' | ')' | ']') {
+                        let line = self.view().cursor.line;
+                        if let Some(new_indent) = self.auto_outdent_for_closing(line) {
+                            let old_indent = self.get_line_indent_str(line);
+                            if new_indent != old_indent {
+                                let line_start = self.buffer().line_to_char(line);
+                                let old_len = old_indent.chars().count();
+                                self.delete_with_undo(line_start, line_start + old_len);
+                                if !new_indent.is_empty() {
+                                    self.insert_with_undo(line_start, &new_indent);
+                                }
+                                let diff = old_len - new_indent.chars().count();
+                                self.view_mut().cursor.col =
+                                    self.view().cursor.col.saturating_sub(diff);
+                            }
                         }
                     }
                     // Trigger signature help after '(' or ','
@@ -6874,6 +6946,7 @@ impl Engine {
         self.mouse_drag_word_mode = false;
         self.mouse_drag_word_origin = None;
         self.mouse_drag_active = false;
+        self.mouse_drag_origin_window = None;
         // Switch to the group that owns this window.
         self.focus_group_for_window(window_id);
         self.set_cursor_for_window(window_id, line, col);
@@ -6885,6 +6958,14 @@ impl Engine {
     /// If already in Visual mode (e.g. from double-click word select),
     /// preserves the existing anchor and just extends.
     pub fn mouse_drag(&mut self, window_id: WindowId, line: usize, col: usize) {
+        // Lock drag to the originating window so selections don't leak
+        // across editor groups.
+        if let Some(origin) = self.mouse_drag_origin_window {
+            if window_id != origin {
+                return; // Drag crossed into another window — ignore.
+            }
+        }
+
         // Ensure this window's group and tab are active.
         self.focus_group_for_window(window_id);
         if self.windows.contains_key(&window_id) {
@@ -6910,6 +6991,7 @@ impl Engine {
                 self.mode = Mode::Visual;
             }
             self.mouse_drag_active = true;
+            self.mouse_drag_origin_window = Some(window_id);
         }
 
         // Move cursor to drag position (extends visual selection)
@@ -6976,6 +7058,7 @@ impl Engine {
     /// Positions cursor, finds word boundaries, enters Visual mode.
     pub fn mouse_double_click(&mut self, window_id: WindowId, line: usize, col: usize) {
         self.mouse_drag_active = false;
+        self.mouse_drag_origin_window = None;
         self.mouse_drag_word_mode = false;
         self.mouse_drag_word_origin = None;
         self.focus_group_for_window(window_id);

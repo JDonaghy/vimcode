@@ -831,9 +831,12 @@ impl Syntax {
             if scope_kinds.contains(&kind) {
                 let name = Self::extract_node_name(&n, text);
                 if !name.is_empty() {
+                    let start = n.start_position();
                     result.push(BreadcrumbSymbol {
                         name,
                         kind: kind.to_string(),
+                        line: start.row,
+                        col: start.column,
                     });
                 }
             }
@@ -933,11 +936,121 @@ impl Syntax {
     }
 }
 
+#[allow(dead_code)]
+impl Syntax {
+    /// Find all direct scope-defining children of the scope node that starts
+    /// at `parent_line`.  Returns sibling symbols at one level of nesting.
+    /// Used as a tree-sitter fallback when LSP is unavailable.
+    pub fn children_of_scope(&self, text: &str, parent_line: usize) -> Vec<BreadcrumbSymbol> {
+        let tree = match self.last_tree.as_ref() {
+            Some(t) => t,
+            None => return vec![],
+        };
+        let scope_kinds = Self::scope_kinds_for(self.language);
+        if scope_kinds.is_empty() {
+            return vec![];
+        }
+
+        // Find the scope node at parent_line by walking the tree
+        let point = tree_sitter::Point::new(parent_line, 0);
+        let target = match tree.root_node().descendant_for_point_range(point, point) {
+            Some(n) => n,
+            None => return vec![],
+        };
+
+        // Walk up to find the actual scope node at this line
+        let mut scope_node = None;
+        let mut cur = Some(target);
+        while let Some(n) = cur {
+            if scope_kinds.contains(&n.kind()) && n.start_position().row == parent_line {
+                scope_node = Some(n);
+                break;
+            }
+            cur = n.parent();
+        }
+
+        let parent = match scope_node {
+            Some(n) => n,
+            None => return vec![],
+        };
+
+        // Walk all descendants looking for direct child scopes
+        let mut result = Vec::new();
+        Self::collect_child_scopes(&parent, text, scope_kinds, &mut result);
+        result
+    }
+
+    /// Find all top-level scope-defining nodes in the file.
+    pub fn top_level_scopes(&self, text: &str) -> Vec<BreadcrumbSymbol> {
+        let tree = match self.last_tree.as_ref() {
+            Some(t) => t,
+            None => return vec![],
+        };
+        let scope_kinds = Self::scope_kinds_for(self.language);
+        if scope_kinds.is_empty() {
+            return vec![];
+        }
+
+        let root = tree.root_node();
+        let mut result = Vec::new();
+        for i in 0..root.child_count() {
+            if let Some(child) = root.child(i as u32) {
+                if scope_kinds.contains(&child.kind()) {
+                    let name = Self::extract_node_name(&child, text);
+                    if !name.is_empty() {
+                        let start = child.start_position();
+                        result.push(BreadcrumbSymbol {
+                            name,
+                            kind: child.kind().to_string(),
+                            line: start.row,
+                            col: start.column,
+                        });
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    /// Collect direct child scope nodes (one level deep) of a parent node.
+    fn collect_child_scopes(
+        parent: &tree_sitter::Node,
+        text: &str,
+        scope_kinds: &[&str],
+        out: &mut Vec<BreadcrumbSymbol>,
+    ) {
+        for i in 0..parent.child_count() {
+            if let Some(child) = parent.child(i as u32) {
+                if scope_kinds.contains(&child.kind()) {
+                    let name = Self::extract_node_name(&child, text);
+                    if !name.is_empty() {
+                        let start = child.start_position();
+                        out.push(BreadcrumbSymbol {
+                            name,
+                            kind: child.kind().to_string(),
+                            line: start.row,
+                            col: start.column,
+                        });
+                    }
+                } else {
+                    // Recurse into non-scope nodes (e.g. `impl_item` body block)
+                    // to find nested scope children
+                    Self::collect_child_scopes(&child, text, scope_kinds, out);
+                }
+            }
+        }
+    }
+}
+
 /// A symbol in the breadcrumb hierarchy (e.g. a function, struct, class).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BreadcrumbSymbol {
     pub name: String,
     pub kind: String,
+    /// Start line (0-indexed) of the scope-defining node.
+    pub line: usize,
+    /// Start column (0-indexed) of the scope-defining node.
+    pub col: usize,
 }
 
 #[cfg(test)]

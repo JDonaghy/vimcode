@@ -589,6 +589,45 @@ impl Engine {
 
     // --- Auto-indent lines (= operator) ---
 
+    /// Check whether a line's content (trimmed of trailing newlines) should
+    /// trigger an indent increase for the next line.  Language-aware: handles
+    /// `{`/`(`/`[` for C-family, `:` for Python, `do`/`then` for Lua/Ruby/Shell.
+    fn line_triggers_indent(&self, trimmed: &str) -> bool {
+        if trimmed.ends_with('{') || trimmed.ends_with('(') || trimmed.ends_with('[') {
+            return true;
+        }
+        let lang = self
+            .buffer_manager
+            .get(self.active_buffer_id())
+            .and_then(|s| s.file_path.as_ref())
+            .and_then(|p| crate::core::lsp::language_id_from_path(p));
+        let lang_str = lang.as_deref().unwrap_or("");
+        let stripped = trimmed.trim();
+
+        if lang_str == "python" && trimmed.ends_with(':') {
+            return true;
+        }
+        if matches!(lang_str, "lua" | "ruby" | "shellscript" | "bash")
+            && (stripped.ends_with(" do")
+                || stripped == "do"
+                || stripped.ends_with(" then")
+                || stripped == "then")
+        {
+            return true;
+        }
+        if lang_str == "ruby"
+            && (stripped.ends_with(" def")
+                || stripped.ends_with(" class")
+                || stripped.ends_with(" module")
+                || stripped.ends_with(" if")
+                || stripped.ends_with(" unless")
+                || stripped.ends_with(" begin"))
+        {
+            return true;
+        }
+        false
+    }
+
     pub(crate) fn auto_indent_lines(&mut self, line: usize, count: usize, changed: &mut bool) {
         let total_lines = self.buffer().len_lines();
         let end_line = (line + count).min(total_lines);
@@ -596,7 +635,7 @@ impl Engine {
             return;
         }
 
-        let sw = self.settings.shift_width as usize;
+        let sw = self.effective_shift_width();
 
         self.start_undo_group();
 
@@ -615,13 +654,9 @@ impl Engine {
                     prev -= 1;
                     if !self.is_line_empty(prev) {
                         let prev_indent = self.get_line_indent_str(prev);
-                        // Check if prev line ends with '{', '(', or '[' — increase indent
                         let prev_text: String = self.buffer().content.line(prev).chars().collect();
                         let prev_trimmed = prev_text.trim_end_matches(['\n', '\r']);
-                        if prev_trimmed.ends_with('{')
-                            || prev_trimmed.ends_with('(')
-                            || prev_trimmed.ends_with('[')
-                        {
+                        if self.line_triggers_indent(prev_trimmed) {
                             let extra = if self.settings.expand_tab {
                                 " ".repeat(sw)
                             } else {
@@ -1040,7 +1075,7 @@ impl Engine {
 
         let cur_line = self.view().cursor.line;
         let cur_indent = self.get_line_indent_str(cur_line);
-        let sw = self.settings.shift_width as usize;
+        let sw = self.effective_shift_width();
 
         // Adjust each pasted line's indent to match current line
         let adjusted = self.adjust_paste_indent(&content, &cur_indent, sw);
@@ -1083,7 +1118,7 @@ impl Engine {
 
         let cur_line = self.view().cursor.line;
         let cur_indent = self.get_line_indent_str(cur_line);
-        let sw = self.settings.shift_width as usize;
+        let sw = self.effective_shift_width();
 
         let adjusted = self.adjust_paste_indent(&content, &cur_indent, sw);
 
@@ -2762,6 +2797,63 @@ impl Engine {
 
     // ── Indent / completion helpers ───────────────────────────────────────────
 
+    /// Compute the indent string for a new line inserted after `line_idx`.
+    /// When `auto_indent` is on this copies the previous line's indent *and*
+    /// adds an extra indent level when the line ends with an indent-trigger
+    /// (language-aware via `line_triggers_indent`).
+    pub(crate) fn smart_indent_for_newline(&self, line_idx: usize) -> String {
+        if !self.settings.auto_indent {
+            return String::new();
+        }
+        let base = self.get_line_indent_str(line_idx);
+        let line_text: String = self.buffer().content.line(line_idx).chars().collect();
+        let trimmed = line_text.trim_end_matches(['\n', '\r']);
+
+        if self.line_triggers_indent(trimmed) {
+            let sw = self.effective_shift_width();
+            let extra = if self.settings.expand_tab {
+                " ".repeat(sw)
+            } else {
+                "\t".to_string()
+            };
+            format!("{}{}", base, extra)
+        } else {
+            base
+        }
+    }
+
+    /// Check whether a closing character (`}`, `)`, `]`) just typed on a
+    /// line that was previously only whitespace should auto-outdent (reduce
+    /// indent by one `shift_width`).  Called *after* the character has been
+    /// inserted.  Returns the new indent string if outdenting is appropriate,
+    /// or `None` to leave indent unchanged.
+    pub(crate) fn auto_outdent_for_closing(&self, line_idx: usize) -> Option<String> {
+        if !self.settings.auto_indent {
+            return None;
+        }
+        let line_text: String = self.buffer().content.line(line_idx).chars().collect();
+        let trimmed = line_text.trim_end_matches(['\n', '\r']);
+        // The closing bracket is already inserted.  Outdent only if
+        // everything before it is whitespace (i.e. it's the first
+        // non-blank character on the line).
+        let before = trimmed.trim_end_matches(['}', ')', ']']);
+        if !before.chars().all(|c| c == ' ' || c == '\t') {
+            return None;
+        }
+        let sw = self.effective_shift_width();
+        let cur_indent = self.get_line_indent_str(line_idx);
+        if cur_indent.len() >= sw {
+            let new_len = cur_indent.len() - sw;
+            if self.settings.expand_tab {
+                Some(" ".repeat(new_len))
+            } else {
+                Some(cur_indent[..cur_indent.len().saturating_sub(1)].to_string())
+            }
+        } else {
+            Some(String::new())
+        }
+    }
+
     /// Return the leading whitespace string (spaces/tabs) of the given buffer line.
     pub(crate) fn get_line_indent_str(&self, line_idx: usize) -> String {
         let total = self.buffer().len_lines();
@@ -2774,6 +2866,17 @@ impl Engine {
             .chars()
             .take_while(|&c| c == ' ' || c == '\t')
             .collect()
+    }
+
+    /// Return the effective shift width for the active buffer.
+    /// Uses the buffer's auto-detected indent width if available,
+    /// otherwise falls back to `settings.shift_width`.
+    pub(crate) fn effective_shift_width(&self) -> usize {
+        self.buffer_manager
+            .get(self.active_buffer_id())
+            .and_then(|s| s.detected_indent)
+            .map(|n| n as usize)
+            .unwrap_or(self.settings.shift_width as usize)
     }
 
     /// True for word characters: [a-zA-Z0-9_].
@@ -4576,7 +4679,7 @@ impl Engine {
     /// Indent `count` lines starting at `start_line` by shift_width.
     pub(crate) fn indent_lines(&mut self, start_line: usize, count: usize, changed: &mut bool) {
         let indent_str = if self.settings.expand_tab {
-            " ".repeat(self.settings.shift_width as usize)
+            " ".repeat(self.effective_shift_width())
         } else {
             "\t".to_string()
         };
@@ -4597,7 +4700,7 @@ impl Engine {
 
     /// Dedent `count` lines starting at `start_line` by up to shift_width.
     pub(crate) fn dedent_lines(&mut self, start_line: usize, count: usize, changed: &mut bool) {
-        let sw = self.settings.shift_width as usize;
+        let sw = self.effective_shift_width();
         self.start_undo_group();
         // Work backwards to avoid invalidating positions
         let total = self.buffer().len_lines();

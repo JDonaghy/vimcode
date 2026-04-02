@@ -32,7 +32,7 @@ pub fn comment_style_for_language(lang_id: &str) -> Option<&'static CommentStyle
         // `//` languages
         "rust" | "go" | "c" | "cpp" | "csharp" | "java" | "javascript" | "typescript"
         | "typescriptreact" | "javascriptreact" | "php" | "swift" | "kotlin" | "scala" | "dart"
-        | "jsonc" | "zig" | "v" => {
+        | "jsonc" | "zig" | "v" | "bicep" => {
             static S: CommentStyle = CommentStyle {
                 line: "//",
                 block_open: "/*",

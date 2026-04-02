@@ -1460,48 +1460,109 @@ impl Engine {
         }
     }
 
+    /// Compute the display width (in columns) of a single tab at index `i`
+    /// in the given group.  Matches the TUI render format:
+    /// `" N: name " + close(2) + separator(1)`.
+    fn tab_display_width(&self, group: &EditorGroup, i: usize) -> usize {
+        let tab = &group.tabs[i];
+        let window_id = tab.active_window;
+        let name_len = if let Some(window) = self.windows.get(&window_id) {
+            if let Some(state) = self.buffer_manager.get(window.buffer_id) {
+                // " N: display_name "
+                let dn = state.display_name();
+                // leading space + digits + ": " + name + trailing space
+                1 + (i + 1).to_string().len() + 2 + dn.chars().count() + 1
+            } else {
+                // " N: [No Name] "
+                1 + (i + 1).to_string().len() + 2 + 9 + 1
+            }
+        } else {
+            1 + (i + 1).to_string().len() + 2 + 9 + 1
+        };
+        name_len + 2 // +1 close button + 1 separator
+    }
+
+    /// Count how many tabs fit in the available width starting from `offset`.
+    fn tabs_fitting_from(&self, group: &EditorGroup, offset: usize, width: usize) -> usize {
+        let mut used = 0;
+        let mut count = 0;
+        for i in offset..group.tabs.len() {
+            let tw = self.tab_display_width(group, i);
+            if used + tw > width {
+                break;
+            }
+            used += tw;
+            count += 1;
+        }
+        count
+    }
+
     /// Adjust `tab_scroll_offset` on the active group so that the active tab
-    /// is visible in the tab bar.
+    /// is visible in the tab bar, while showing as many tabs as possible.
     ///
-    /// Uses `tab_visible_count` (set by the renderer each frame) to know how
-    /// many tabs actually fit.  Falls back to a conservative default of 6.
+    /// Strategy: start from offset 0 (maximize visible tabs), then only
+    /// increase the offset if the active tab wouldn't fit.  Uses actual
+    /// tab name widths and the reported tab bar width for accuracy.
     pub(crate) fn ensure_active_tab_visible(&mut self) {
-        let group = match self.editor_groups.get_mut(&self.active_group) {
+        let group = match self.editor_groups.get(&self.active_group) {
             Some(g) => g,
             None => return,
         };
         let active = group.active_tab;
-        let total = group.tabs.len();
-        // Use visible count minus 1 as a safety margin — tab widths vary, so
-        // the count from the previous frame may overestimate how many fit.
-        let visible = group.tab_visible_count.max(1);
-        let safe_visible = if visible > 2 { visible - 1 } else { visible };
+        let width = group.tab_bar_width;
 
-        // Clamp offset to valid range first.
-        if group.tab_scroll_offset >= total {
-            group.tab_scroll_offset = total.saturating_sub(1);
+        // How many tabs fit starting from offset 0?
+        let from_zero = self.tabs_fitting_from(group, 0, width);
+
+        if active < from_zero {
+            // Active tab is visible from offset 0 — use it.
+            self.editor_groups
+                .get_mut(&self.active_group)
+                .unwrap()
+                .tab_scroll_offset = 0;
+            return;
         }
 
-        // If active tab is before the scroll offset, scroll back.
-        if active < group.tab_scroll_offset {
-            group.tab_scroll_offset = active;
+        // Active tab doesn't fit from offset 0.  Find the smallest offset
+        // that makes the active tab visible (i.e. at the right edge).
+        // Walk backwards from the active tab, accumulating widths.
+        let mut used = 0;
+        let mut best_offset = active;
+        for i in (0..=active).rev() {
+            let tw = self.tab_display_width(group, i);
+            if used + tw > width {
+                break;
+            }
+            used += tw;
+            best_offset = i;
         }
-        // If active tab is past the visible window, scroll forward.
-        // Use safe_visible to avoid the last tab being just off-screen.
-        if active >= group.tab_scroll_offset + safe_visible {
-            group.tab_scroll_offset = active.saturating_sub(safe_visible.saturating_sub(1));
+        self.editor_groups
+            .get_mut(&self.active_group)
+            .unwrap()
+            .tab_scroll_offset = best_offset;
+    }
+
+    /// Called by the renderer to report the available tab bar width in
+    /// character columns for a given group.
+    pub fn set_tab_visible_count(&mut self, group_id: GroupId, width_cols: usize) {
+        if let Some(g) = self.editor_groups.get_mut(&group_id) {
+            if width_cols > 0 {
+                g.tab_bar_width = width_cols;
+            }
         }
     }
 
-    /// Called by the renderer to report how many tabs were actually drawn
-    /// for a given group.  This lets `ensure_active_tab_visible` know the
-    /// real visible count for the next tab switch.
-    pub fn set_tab_visible_count(&mut self, group_id: GroupId, count: usize) {
-        if let Some(g) = self.editor_groups.get_mut(&group_id) {
-            if count > 0 {
-                g.tab_visible_count = count;
-            }
+    /// Re-run `ensure_active_tab_visible` logic for every editor group.
+    /// Called after the renderer reports updated tab bar widths (e.g. after
+    /// a terminal resize) so that no group's active tab is off-screen.
+    pub fn ensure_all_groups_tabs_visible(&mut self) {
+        let group_ids: Vec<GroupId> = self.editor_groups.keys().copied().collect();
+        let saved = self.active_group;
+        for gid in group_ids {
+            self.active_group = gid;
+            self.ensure_active_tab_visible();
         }
+        self.active_group = saved;
     }
 
     // =======================================================================

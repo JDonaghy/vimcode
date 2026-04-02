@@ -1215,6 +1215,21 @@ impl Engine {
             self.message = "Usage: :grep <pattern>".to_string();
             return EngineAction::None;
         }
+        if cmd == "Buffers" {
+            self.open_picker(PickerSource::Buffers);
+            return EngineAction::None;
+        }
+        if cmd == "search_keybindings" {
+            self.open_picker(PickerSource::Keybindings);
+            return EngineAction::None;
+        }
+        if cmd == "document_outline" {
+            self.open_picker(PickerSource::CommandCenter);
+            self.picker_query = "@".to_string();
+            self.picker_filter();
+            self.picker_load_preview();
+            return EngineAction::None;
+        }
         if cmd == "GrepWord" {
             let word = self.word_under_cursor().unwrap_or_default();
             if word.is_empty() {
@@ -1515,6 +1530,18 @@ impl Engine {
                 format!("make {}", args)
             };
             return self.execute_command(&format!("!{}", shell_cmd));
+        }
+
+        // Handle :$ (jump to last line), :+N, :-N, :. (current line)
+        if matches!(cmd, "$" | "." | "0") || cmd.starts_with('+') || cmd.starts_with('-') {
+            let current = self.view().cursor.line;
+            let total = self.buffer().len_lines();
+            let target = self.parse_line_address(cmd, current, total);
+            self.view_mut().cursor.line = target;
+            self.view_mut().cursor.col = 0;
+            self.clamp_cursor_col();
+            self.ensure_cursor_visible();
+            return EngineAction::None;
         }
 
         // Handle :N (jump to line number)
@@ -2809,6 +2836,16 @@ impl Engine {
             self.view_mut().cursor.line = line;
             self.view_mut().cursor.col = col;
             self.ensure_cursor_visible();
+            // If the match landed in the bottom quarter of the viewport,
+            // center it so it's not barely visible at the edge (Vim-like behavior).
+            let vp = self.view().viewport_lines;
+            if vp > 4 {
+                let cursor_line = self.view().cursor.line;
+                let scroll_top = self.view().scroll_top;
+                if cursor_line > scroll_top + vp * 3 / 4 {
+                    self.scroll_cursor_center();
+                }
+            }
             self.message = format!("match {} of {}", idx + 1, self.search_matches.len());
         }
     }

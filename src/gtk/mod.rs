@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use crate::core;
+use crate::icons;
 use crate::render;
 
 use core::engine::EngineAction;
@@ -693,7 +694,7 @@ impl SimpleComponent for App {
 
                     #[name = "explorer_button"]
                     gtk4::Button {
-                        set_label: "\u{f07c}",
+                        set_label: icons::EXPLORER.nerd,
                         set_tooltip_text: Some("Explorer (Ctrl+Shift+E)"),
                         set_width_request: 48,
                         set_height_request: 48,
@@ -712,7 +713,7 @@ impl SimpleComponent for App {
 
                     #[name = "search_button"]
                     gtk4::Button {
-                        set_label: "\u{ea6d}",  // nf-cod-search
+                        set_label: icons::SEARCH_COD.nerd,
                         set_tooltip_text: Some("Search (Ctrl+Shift+F)"),
                         set_width_request: 48,
                         set_height_request: 48,
@@ -731,7 +732,7 @@ impl SimpleComponent for App {
 
                     #[name = "debug_button"]
                     gtk4::Button {
-                        set_label: "\u{f188}",  // nf-fa-bug
+                        set_label: icons::DEBUG.nerd,
                         set_tooltip_text: Some("Debug"),
                         set_width_request: 48,
                         set_height_request: 48,
@@ -749,7 +750,7 @@ impl SimpleComponent for App {
                     },
 
                     gtk4::Button {
-                        set_label: "\u{e702}",
+                        set_label: icons::GIT_BRANCH.nerd,
                         set_tooltip_text: Some("Source Control"),
                         set_width_request: 48,
                         set_height_request: 48,
@@ -762,7 +763,7 @@ impl SimpleComponent for App {
                     },
 
                     gtk4::Button {
-                        set_label: "\u{eae6}",
+                        set_label: icons::EXTENSIONS.nerd,
                         set_tooltip_text: Some("Extensions"),
                         set_width_request: 48,
                         set_height_request: 48,
@@ -775,7 +776,7 @@ impl SimpleComponent for App {
                     },
 
                     gtk4::Button {
-                        set_label: "\u{f0e5}",
+                        set_label: icons::AI_CHAT.nerd,
                         set_tooltip_text: Some("AI Assistant"),
                         set_width_request: 48,
                         set_height_request: 48,
@@ -792,7 +793,7 @@ impl SimpleComponent for App {
                     },
 
                     gtk4::Button {
-                        set_label: "\u{f013}",
+                        set_label: icons::SETTINGS.nerd,
                         set_tooltip_text: Some("Settings"),
                         set_width_request: 48,
                         set_height_request: 48,
@@ -845,7 +846,7 @@ impl SimpleComponent for App {
                             set_css_classes: &["explorer-toolbar"],
 
                             gtk4::Button {
-                                set_label: "\u{f15b}",
+                                set_label: icons::FILE_GENERIC.nerd,
                                 set_tooltip_text: Some("New File"),
                                 set_width_request: 32,
                                 set_height_request: 32,
@@ -856,7 +857,7 @@ impl SimpleComponent for App {
                             },
 
                             gtk4::Button {
-                                set_label: "\u{f07b}",
+                                set_label: icons::FOLDER.nerd,
                                 set_tooltip_text: Some("New Folder"),
                                 set_width_request: 32,
                                 set_height_request: 32,
@@ -867,7 +868,7 @@ impl SimpleComponent for App {
                             },
 
                             gtk4::Button {
-                                set_label: "\u{f1f8}",
+                                set_label: icons::TRASH.nerd,
                                 set_tooltip_text: Some("Delete"),
                                 set_width_request: 32,
                                 set_height_request: 32,
@@ -1905,8 +1906,13 @@ impl SimpleComponent for App {
             }
         }
 
+        // Install bundled Nerd Font icon subset so UI glyphs render without
+        // requiring the user to install a Nerd Font system-wide.
+        install_bundled_icon_font();
+
         let engine = {
             let mut e = Engine::new();
+            icons::set_nerd_fonts(e.settings.use_nerd_fonts);
             e.plugin_init();
             if let Some(ref path) = file_path {
                 // CLI argument: open only the specified file/directory, skip session restore
@@ -3054,7 +3060,7 @@ impl SimpleComponent for App {
                 separator_widget.as_ref().and_then(|s| s.prev_sibling());
             for panel in &panels {
                 let btn = gtk4::Button::new();
-                btn.set_label(&panel.icon.to_string());
+                btn.set_label(&panel.resolved_icon().to_string());
                 btn.set_tooltip_text(Some(&panel.title));
                 btn.set_width_request(48);
                 btn.set_height_request(48);
@@ -3185,14 +3191,17 @@ impl SimpleComponent for App {
             &file_fg_hex,
         );
 
-        // Read font family for nerd font icon rendering
-        let nf_font = engine.borrow().settings.font_family.clone();
+        // Read font family for nerd font icon rendering.  Prefer the bundled
+        // "Symbols Nerd Font" (installed at startup) so icons render even if the
+        // user's editor font lacks Nerd Font glyphs.
+        let user_font = engine.borrow().settings.font_family.clone();
+        let nf_font = format!("Symbols Nerd Font, {user_font}");
 
         // Setup TreeView columns
         // Single column with icon + filename (so they indent together)
         let col = gtk4::TreeViewColumn::new();
 
-        // Icon cell renderer (non-expanding) — must use the nerd font for glyph support
+        // Icon cell renderer (non-expanding) — uses bundled nerd font for glyph support
         let icon_cell = gtk4::CellRendererText::new();
         icon_cell.set_property("font", &nf_font);
         col.pack_start(&icon_cell, false);
@@ -4211,19 +4220,21 @@ impl SimpleComponent for App {
                 height,
             } => {
                 let mut engine = self.engine.borrow_mut();
-                if let ClickTarget::BufferPos(_, line, col) = pixel_to_click_target(
-                    &mut engine,
-                    x,
-                    y,
-                    width,
-                    height,
-                    self.cached_line_height,
-                    self.cached_char_width,
-                    &self.tab_slot_positions.borrow(),
-                    &self.diff_btn_map.borrow(),
-                    &self.split_btn_map.borrow(),
-                ) {
-                    engine.add_cursor_at_pos(line, col);
+                if !engine.picker_open {
+                    if let ClickTarget::BufferPos(_, line, col) = pixel_to_click_target(
+                        &mut engine,
+                        x,
+                        y,
+                        width,
+                        height,
+                        self.cached_line_height,
+                        self.cached_char_width,
+                        &self.tab_slot_positions.borrow(),
+                        &self.diff_btn_map.borrow(),
+                        &self.split_btn_map.borrow(),
+                    ) {
+                        engine.add_cursor_at_pos(line, col);
+                    }
                 }
                 self.draw_needed.set(true);
             }
@@ -4234,18 +4245,58 @@ impl SimpleComponent for App {
                 height,
             } => {
                 let mut engine = self.engine.borrow_mut();
-                handle_mouse_double_click(
-                    &mut engine,
-                    x,
-                    y,
-                    width,
-                    height,
-                    self.cached_line_height,
-                    self.cached_char_width,
-                    &self.tab_slot_positions.borrow(),
-                    &self.diff_btn_map.borrow(),
-                    &self.split_btn_map.borrow(),
-                );
+                if engine.picker_open {
+                    // Double-click on picker: toggle expand for tree items, or confirm
+                    let in_tree_mode = engine.picker_source
+                        == crate::core::engine::PickerSource::CommandCenter
+                        && engine.picker_query == "@";
+                    if in_tree_mode && engine.picker_toggle_expand() {
+                        engine.picker_load_preview();
+                    } else {
+                        let _action = engine.picker_confirm();
+                    }
+                    self.draw_needed.set(true);
+                } else {
+                    // Check breadcrumb double-click before falling through
+                    let mut bc_handled = false;
+                    if engine.settings.breadcrumbs {
+                        let lh = self.cached_line_height.max(1.0);
+                        let cw = self.cached_char_width.max(1.0);
+                        if y >= lh && y < lh * 2.0 {
+                            let segments =
+                                crate::render::build_breadcrumbs_for_active_group(&engine);
+                            let sep_w = " › ".chars().count() as f64 * cw;
+                            let mut seg_x = cw; // left padding
+                            for seg in &segments {
+                                let label_w = seg.label.chars().count() as f64 * cw;
+                                if x >= seg_x && x < seg_x + label_w {
+                                    engine.breadcrumb_double_click(
+                                        seg.is_symbol,
+                                        seg.path_prefix.as_deref(),
+                                        seg.symbol_line,
+                                    );
+                                    bc_handled = true;
+                                    break;
+                                }
+                                seg_x += label_w + sep_w;
+                            }
+                        }
+                    }
+                    if !bc_handled {
+                        handle_mouse_double_click(
+                            &mut engine,
+                            x,
+                            y,
+                            width,
+                            height,
+                            self.cached_line_height,
+                            self.cached_char_width,
+                            &self.tab_slot_positions.borrow(),
+                            &self.diff_btn_map.borrow(),
+                            &self.split_btn_map.borrow(),
+                        );
+                    }
+                }
                 self.draw_needed.set(true);
             }
             Msg::MouseDrag {
@@ -4298,6 +4349,27 @@ impl SimpleComponent for App {
             }
             Msg::MouseScroll { delta_x, delta_y } => {
                 let mut engine = self.engine.borrow_mut();
+                // Picker open: scroll the picker results
+                if engine.picker_open && delta_y.abs() > 0.01 {
+                    let step = (delta_y * 3.0).round().abs() as usize;
+                    let max = engine.picker_items.len().saturating_sub(1);
+                    if delta_y > 0.0 {
+                        engine.picker_selected = (engine.picker_selected + step).min(max);
+                    } else {
+                        engine.picker_selected = engine.picker_selected.saturating_sub(step);
+                    }
+                    let visible = 20usize;
+                    if engine.picker_selected >= engine.picker_scroll_top + visible {
+                        engine.picker_scroll_top = engine.picker_selected + 1 - visible;
+                    }
+                    if engine.picker_selected < engine.picker_scroll_top {
+                        engine.picker_scroll_top = engine.picker_selected;
+                    }
+                    engine.picker_load_preview();
+                    drop(engine);
+                    self.draw_needed.set(true);
+                    return;
+                }
                 // If editor hover popup is visible, scroll it instead of the editor
                 if engine.editor_hover.is_some() && delta_y.abs() > 0.01 {
                     let delta = (delta_y * 3.0).round() as i32;
@@ -4619,10 +4691,11 @@ fn sync_scrollbar_positions(
     if da_width < 20.0 || da_height < 20.0 || line_height < 1.0 {
         return;
     }
+    let tab_row_height = (line_height * 1.6).ceil();
     let tab_bar_height = if engine.settings.breadcrumbs {
-        line_height * 2.0
+        tab_row_height + line_height
     } else {
-        line_height
+        tab_row_height
     };
     let wildmenu_px = if engine.wildmenu_items.is_empty() {
         0.0
@@ -4958,10 +5031,11 @@ impl App {
         }
 
         let line_height = self.cached_line_height;
+        let tab_row_height = (line_height * 1.6).ceil();
         let tab_bar_height = if engine.settings.breadcrumbs {
-            line_height * 2.0
+            tab_row_height + line_height
         } else {
-            line_height
+            tab_row_height
         };
         let wildmenu_px = if engine.wildmenu_items.is_empty() {
             0.0
@@ -5379,6 +5453,7 @@ impl App {
         };
 
         self.dispatch_engine_action(action, sender, false);
+        self.draw_needed.set(true);
 
         // Process macro playback queue if active
         loop {
@@ -5805,6 +5880,80 @@ impl App {
         alt: bool,
         sender: &ComponentSender<Self>,
     ) {
+        // Picker popup: intercept all clicks when picker is open
+        {
+            let engine = self.engine.borrow();
+            if engine.picker_open {
+                let has_preview = engine.picker_preview.is_some();
+                let popup_w = if has_preview {
+                    (width * 0.8).max(600.0)
+                } else {
+                    (width * 0.55).max(500.0)
+                };
+                let popup_h = if has_preview {
+                    (height * 0.65).max(400.0)
+                } else {
+                    (height * 0.60).max(350.0)
+                };
+                let popup_x = (width - popup_w) / 2.0;
+                let popup_y = (height - popup_h) / 2.0;
+                let lh = self.cached_line_height.max(1.0);
+                // Results start below separator: popup_y + 2*lh + 1px padding
+                let results_top = popup_y + lh * 2.0 + 1.0;
+                let results_bottom = popup_y + popup_h;
+
+                let on_popup =
+                    x >= popup_x && x < popup_x + popup_w && y >= popup_y && y < popup_y + popup_h;
+                let on_results = on_popup && y >= results_top && y < results_bottom;
+
+                drop(engine);
+                if on_results {
+                    let mut engine = self.engine.borrow_mut();
+                    let clicked_idx = engine.picker_scroll_top + ((y - results_top) / lh) as usize;
+                    if clicked_idx < engine.picker_items.len() {
+                        engine.picker_selected = clicked_idx;
+                        engine.picker_load_preview();
+                    }
+                } else if !on_popup {
+                    self.engine.borrow_mut().close_picker();
+                }
+                // Consume click — don't fall through to editor
+                return;
+            }
+        }
+
+        // Breadcrumb click: the breadcrumb row sits at y = line_height (below tab bar).
+        // Use char_width to approximate segment positions.
+        {
+            let engine = self.engine.borrow();
+            if engine.settings.breadcrumbs {
+                let lh = self.cached_line_height.max(1.0);
+                let cw = self.cached_char_width.max(1.0);
+                // Breadcrumb row spans y ∈ [lh, 2*lh)
+                if y >= lh && y < lh * 2.0 {
+                    // Build segments to find what was clicked.
+                    // Also rebuild engine-side segments so scoped filtering works.
+                    let segments = crate::render::build_breadcrumbs_for_active_group(&engine);
+                    drop(engine);
+                    self.engine.borrow_mut().rebuild_breadcrumb_segments();
+                    let sep_w = " › ".chars().count() as f64 * cw;
+                    let pad = cw; // left padding
+                    let mut seg_x = pad;
+                    for (i, seg) in segments.iter().enumerate() {
+                        let label_w = seg.label.chars().count() as f64 * cw;
+                        if x >= seg_x && x < seg_x + label_w {
+                            let mut engine = self.engine.borrow_mut();
+                            engine.breadcrumb_selected = i;
+                            engine.breadcrumb_open_scoped();
+                            return;
+                        }
+                        seg_x += label_w + sep_w;
+                    }
+                    return; // clicked on breadcrumb row but not a segment
+                }
+            }
+        }
+
         // Editor hover: click on the popup focuses it; click elsewhere dismisses it
         {
             let engine = self.engine.borrow();
@@ -6630,6 +6779,7 @@ impl App {
         self.group_divider_dragging = None;
         let mut engine = self.engine.borrow_mut();
         engine.mouse_drag_active = false;
+        engine.mouse_drag_origin_window = None;
         self.draw_needed.set(true);
     }
 
@@ -8768,7 +8918,11 @@ impl App {
 
                     // Insert a new row as the first child
                     let new_iter = tree_store.prepend(parent_iter.as_ref());
-                    let icon = if is_folder { "\u{f07b}" } else { "\u{f15b}" };
+                    let icon = if is_folder {
+                        icons::FOLDER.nerd
+                    } else {
+                        icons::FILE_GENERIC.nerd
+                    };
                     let marker = if is_folder {
                         format!("__NEW_FOLDER__{}", parent_dir.display())
                     } else {
@@ -9354,10 +9508,11 @@ fn compute_editor_window_rects(
     da_height: f64,
     line_height: f64,
 ) -> Vec<(core::WindowId, core::WindowRect)> {
+    let tab_row_height = (line_height * 1.6).ceil();
     let tab_bar_height = if engine.settings.breadcrumbs {
-        line_height * 2.0
+        tab_row_height + line_height
     } else {
-        line_height
+        tab_row_height
     };
     let wildmenu_px = if engine.wildmenu_items.is_empty() {
         0.0
@@ -9484,10 +9639,11 @@ fn tab_close_hit_test(
     line_height: f64,
     char_width: f64,
 ) -> Option<(usize, usize)> {
+    let tab_row_height = (line_height * 1.6).ceil();
     let tab_bar_height = if engine.settings.breadcrumbs {
-        line_height * 2.0
+        tab_row_height + line_height
     } else {
-        line_height
+        tab_row_height
     };
     let wildmenu_px = if engine.wildmenu_items.is_empty() {
         0.0
@@ -9503,8 +9659,9 @@ fn tab_close_hit_test(
     engine.adjust_group_rects_for_hidden_tabs(&mut group_rects, tab_bar_height);
 
     let close_w = char_width;
-    let tab_inner_gap = 4.0_f64;
-    let tab_outer_gap = 4.0_f64;
+    let tab_pad = 14.0_f64;
+    let tab_inner_gap = 10.0_f64;
+    let tab_outer_gap = 1.0_f64;
     let close_pad = char_width;
 
     for (gid, grect) in &group_rects {
@@ -9512,7 +9669,8 @@ fn tab_close_hit_test(
             continue;
         }
         let tab_y = grect.y - tab_bar_height;
-        if my < tab_y || my >= tab_y + line_height || mx < grect.x || mx >= grect.x + grect.width {
+        if my < tab_y || my >= tab_y + tab_row_height || mx < grect.x || mx >= grect.x + grect.width
+        {
             continue;
         }
         let local_x = mx - grect.x;
@@ -9531,10 +9689,11 @@ fn tab_close_hit_test(
                     format!(" {}: [No Name] ", i + 1)
                 };
                 let tab_w = name.chars().count() as f64 * char_width;
-                let slot_w = tab_w + tab_inner_gap + close_w + tab_outer_gap;
+                let tab_content_w = tab_pad + tab_w + tab_inner_gap + close_w + tab_pad;
+                let slot_w = tab_content_w + tab_outer_gap;
                 if local_x >= tab_x && local_x < tab_x + slot_w {
-                    let close_x_start = tab_x + tab_w + tab_inner_gap - close_pad;
-                    let close_x_end = tab_x + slot_w;
+                    let close_x_start = tab_x + tab_pad + tab_w + tab_inner_gap - close_pad;
+                    let close_x_end = tab_x + tab_content_w;
                     if local_x >= close_x_start && local_x < close_x_end {
                         return Some((gid.0, i));
                     }
@@ -9558,10 +9717,11 @@ fn tab_tooltip_hit_test(
     line_height: f64,
     char_width: f64,
 ) -> Option<String> {
+    let tab_row_height = (line_height * 1.6).ceil();
     let tab_bar_height = if engine.settings.breadcrumbs {
-        line_height * 2.0
+        tab_row_height + line_height
     } else {
-        line_height
+        tab_row_height
     };
     let wildmenu_px = if engine.wildmenu_items.is_empty() {
         0.0
@@ -9577,15 +9737,17 @@ fn tab_tooltip_hit_test(
     engine.adjust_group_rects_for_hidden_tabs(&mut group_rects, tab_bar_height);
 
     let close_w = char_width;
-    let tab_inner_gap = 4.0_f64;
-    let tab_outer_gap = 4.0_f64;
+    let tab_pad = 14.0_f64;
+    let tab_inner_gap = 10.0_f64;
+    let tab_outer_gap = 1.0_f64;
 
     for (gid, grect) in &group_rects {
         if engine.is_tab_bar_hidden(*gid) {
             continue;
         }
         let tab_y = grect.y - tab_bar_height;
-        if my < tab_y || my >= tab_y + line_height || mx < grect.x || mx >= grect.x + grect.width {
+        if my < tab_y || my >= tab_y + tab_row_height || mx < grect.x || mx >= grect.x + grect.width
+        {
             continue;
         }
         let local_x = mx - grect.x;
@@ -9607,7 +9769,7 @@ fn tab_tooltip_hit_test(
                     (format!(" {}: [No Name] ", i + 1), None)
                 };
                 let tab_w = name.chars().count() as f64 * char_width;
-                let slot_w = tab_w + tab_inner_gap + close_w + tab_outer_gap;
+                let slot_w = tab_pad + tab_w + tab_inner_gap + close_w + tab_pad + tab_outer_gap;
                 if local_x >= tab_x && local_x < tab_x + slot_w {
                     return file_path.map(|p| shorten_path(&p));
                 }
@@ -9640,13 +9802,11 @@ pub(crate) fn run(file_path: Option<PathBuf>) {
             // Emergency: flush swap files for all dirty buffers.
             crate::core::swap::run_emergency_flush();
 
-            let bt = std::backtrace::Backtrace::force_capture();
-            let loc_str = info
-                .location()
-                .map(|l| format!("  at {}:{}:{}\n", l.file(), l.line(), l.column()))
-                .unwrap_or_default();
-            let crash_msg = format!("PANIC: {}\n{}backtrace:\n{}\n", info, loc_str, bt);
-            let _ = std::fs::write("/tmp/vimcode-crash.log", &crash_msg);
+            if let Some(path) = crate::core::swap::write_crash_log(info) {
+                eprintln!("VimCode crashed. Details written to {}", path.display());
+                eprintln!("Unsaved buffers written to swap files for recovery.");
+                eprintln!("Please report this at https://github.com/JDonaghy/vimcode/issues");
+            }
             prev_hook(info);
         }));
     }

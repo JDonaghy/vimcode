@@ -400,6 +400,24 @@ pub static PALETTE_COMMANDS: &[PaletteCommand] = &[
         action: "GrepWord",
     },
     PaletteCommand {
+        label: "Search: Open Buffers",
+        shortcut: "<leader>sb",
+        vscode_shortcut: "<leader>sb",
+        action: "Buffers",
+    },
+    PaletteCommand {
+        label: "Go to Symbol in Editor (Outline)",
+        shortcut: "<leader>so",
+        vscode_shortcut: "<leader>so",
+        action: "document_outline",
+    },
+    PaletteCommand {
+        label: "Help: Search Key Bindings",
+        shortcut: "<leader>sk",
+        vscode_shortcut: "<leader>sk",
+        action: "search_keybindings",
+    },
+    PaletteCommand {
         label: "Go: Go to Line",
         shortcut: "",
         vscode_shortcut: "Ctrl+G",
@@ -730,6 +748,7 @@ pub enum PickerSource {
     Grep,
     Commands,
     Buffers,
+    Keybindings,
     RecentFiles,
     Marks,
     Registers,
@@ -737,6 +756,20 @@ pub enum PickerSource {
     /// Command Center: dynamic prefix routing (>, @, #, :, ?).
     CommandCenter,
     Custom(String),
+}
+
+/// Cached breadcrumb segment info for keyboard navigation.
+/// Mirrors render::BreadcrumbSegment but lives in the engine (library) crate.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct BreadcrumbSegmentInfo {
+    pub label: String,
+    pub is_symbol: bool,
+    pub path_prefix: Option<PathBuf>,
+    pub symbol_line: Option<usize>,
+    /// For symbol segments: the name of the parent scope (container).
+    /// `None` for top-level symbols and path segments.
+    pub parent_scope: Option<String>,
 }
 
 /// A single item in the picker list.
@@ -757,6 +790,12 @@ pub struct PickerItem {
     pub score: i32,
     /// Byte positions in `display` that matched the query (for highlight).
     pub match_positions: Vec<usize>,
+    /// Tree nesting depth (0 = top-level). Used for symbol outline tree view.
+    pub depth: usize,
+    /// Whether this item has children that can be expanded.
+    pub expandable: bool,
+    /// Whether this item's children are currently visible.
+    pub expanded: bool,
 }
 
 /// The action taken when a picker item is confirmed.
@@ -1126,9 +1165,10 @@ pub struct EditorGroup {
     /// Index of the first visible tab in the tab bar (for scroll-into-view).
     /// Updated by `ensure_active_tab_visible()` whenever the active tab changes.
     pub tab_scroll_offset: usize,
-    /// Number of tabs that fit in the rendered tab bar.  Set by the renderer
-    /// each frame via `Engine::set_tab_visible_count()`.  Default 6.
-    pub tab_visible_count: usize,
+    /// Available width of the tab bar in character columns.  Set by the
+    /// renderer each frame via `Engine::set_tab_bar_width()`.  Defaults to
+    /// `usize::MAX` so that before the first render, we assume all tabs fit.
+    pub tab_bar_width: usize,
 }
 
 impl EditorGroup {
@@ -1137,7 +1177,7 @@ impl EditorGroup {
             tabs: vec![initial_tab],
             active_tab: 0,
             tab_scroll_offset: 0,
-            tab_visible_count: 6,
+            tab_bar_width: usize::MAX,
         }
     }
 
@@ -1215,7 +1255,7 @@ fn parse_keymap_def(s: &str) -> Option<UserKeymap> {
 
 // ── Keybinding reference generators ──────────────────────────────────────────
 
-fn keybindings_reference_vim() -> String {
+pub(super) fn keybindings_reference_vim() -> String {
     "\
 VimCode — Vim Mode Keybinding Reference
 ========================================
@@ -1473,7 +1513,7 @@ q  Escape           Close popup
     .to_string()
 }
 
-fn keybindings_reference_vscode() -> String {
+pub(super) fn keybindings_reference_vscode() -> String {
     "\
 VimCode — VSCode Mode Keybinding Reference
 ===========================================
@@ -2092,6 +2132,17 @@ pub struct Engine {
     /// Preview pane content for the selected item, or None for no-preview sources.
     pub picker_preview: Option<PickerPreview>,
 
+    // --- Breadcrumb focus mode ---
+    /// Whether breadcrumb keyboard navigation is active (entered via `<leader>b`).
+    pub breadcrumb_focus: bool,
+    /// Index of the currently highlighted breadcrumb segment (0-based).
+    pub breadcrumb_selected: usize,
+    /// Cached breadcrumb segments for the active group, rebuilt on focus entry.
+    pub breadcrumb_segments: Vec<BreadcrumbSegmentInfo>,
+    /// When `Some`, `picker_populate_document_symbols` filters to symbols
+    /// whose container matches this value. `Some(None)` = top-level only.
+    pub breadcrumb_scoped_parent: Option<Option<String>>,
+
     // --- Two-way diff state ---
     /// The pair of windows currently in diff mode, or None when diff is off.
     pub diff_window_pair: Option<(WindowId, WindowId)>,
@@ -2126,6 +2177,10 @@ pub struct Engine {
     pub clipboard_write: Option<Box<dyn Fn(&str) -> Result<(), String>>>,
     /// Whether a mouse drag selection is currently active.
     pub mouse_drag_active: bool,
+    /// Window where the current drag selection originated.  Drag events in
+    /// other windows are ignored until mouse-up so selections don't leak
+    /// across editor groups.
+    pub mouse_drag_origin_window: Option<WindowId>,
     /// When true, drag extends selection word-wise (set by double-click).
     pub mouse_drag_word_mode: bool,
     /// Original word boundaries from double-click (start_col, end_col, line).
@@ -2459,6 +2514,15 @@ pub struct Engine {
     // --- VSCode mode state ---
     /// Ctrl+K chord pending: waiting for the second key of a Ctrl+K combo.
     pub vscode_pending_ctrl_k: bool,
+    /// True while a VSCode-mode undo group is held open across consecutive
+    /// character insertions.  Broken by any non-character action (cursor move,
+    /// Ctrl+* command, Backspace, Return, etc.) so that contiguous typing
+    /// bursts coalesce into a single undo entry.
+    pub vscode_undo_group_open: bool,
+    /// Cursor position after the last VSCode-mode character insertion.
+    /// Used to detect external cursor moves (mouse click, etc.) that should
+    /// break the undo group even though the next key is a character.
+    pub vscode_undo_cursor: (usize, usize),
 
     // --- Extension panels ---
     /// Registered extension panels (name → registration).
@@ -2726,6 +2790,10 @@ impl Engine {
             picker_scroll_top: 0,
             picker_title: String::new(),
             picker_preview: None,
+            breadcrumb_focus: false,
+            breadcrumb_selected: 0,
+            breadcrumb_segments: Vec::new(),
+            breadcrumb_scoped_parent: None,
             diff_window_pair: None,
             diff_results: HashMap::new(),
             diff_aligned: HashMap::new(),
@@ -2736,6 +2804,7 @@ impl Engine {
             clipboard_read: None,
             clipboard_write: None,
             mouse_drag_active: false,
+            mouse_drag_origin_window: None,
             mouse_drag_word_mode: false,
             mouse_drag_word_origin: None,
             terminal_panes: Vec::new(),
@@ -2860,6 +2929,8 @@ impl Engine {
             spell_checker: None,
             spell_suggestions: None,
             vscode_pending_ctrl_k: false,
+            vscode_undo_group_open: false,
+            vscode_undo_cursor: (0, 0),
             ext_panels: HashMap::new(),
             ext_panel_items: HashMap::new(),
             ext_panel_active: None,

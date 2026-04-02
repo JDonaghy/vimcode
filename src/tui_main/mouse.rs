@@ -7,7 +7,7 @@ pub(super) fn handle_mouse(
     ev: MouseEvent,
     sidebar: &mut TuiSidebar,
     engine: &mut Engine,
-    terminal_size: &Option<ratatui::layout::Rect>,
+    terminal_size: &Option<Size>,
     sidebar_width: u16,
     dragging_sidebar: &mut bool,
     dragging_scrollbar: &mut Option<ScrollDragState>,
@@ -165,6 +165,81 @@ pub(super) fn handle_mouse(
             }
             return sidebar_width;
         }
+    }
+
+    // ── Unified picker mouse handling ────────────────────────────────────────
+    if engine.picker_open {
+        match ev.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let term_cols = terminal_size.map(|s| s.width).unwrap_or(80);
+                let term_rows = terminal_size.map(|s| s.height).unwrap_or(24);
+                let has_preview = engine.picker_preview.is_some();
+                let popup_w = if has_preview {
+                    (term_cols * 4 / 5).max(60)
+                } else {
+                    (term_cols * 55 / 100).max(55)
+                };
+                let popup_h = if has_preview {
+                    (term_rows * 65 / 100).max(18)
+                } else {
+                    (term_rows * 60 / 100).max(16)
+                };
+                let popup_x = (term_cols.saturating_sub(popup_w)) / 2;
+                let popup_y = (term_rows.saturating_sub(popup_h)) / 2;
+                let results_start = popup_y + 3;
+                let results_end = popup_y + popup_h - 1;
+
+                if col >= popup_x
+                    && col < popup_x + popup_w
+                    && row >= results_start
+                    && row < results_end
+                {
+                    let clicked_idx = engine.picker_scroll_top + (row - results_start) as usize;
+                    if clicked_idx < engine.picker_items.len() {
+                        if engine.picker_selected == clicked_idx {
+                            // Second click on same item — toggle expand or confirm
+                            let in_tree_mode = engine.picker_source
+                                == crate::core::engine::PickerSource::CommandCenter
+                                && engine.picker_query == "@";
+                            if in_tree_mode && engine.picker_toggle_expand() {
+                                engine.picker_load_preview();
+                            } else {
+                                engine.picker_confirm();
+                            }
+                        } else {
+                            engine.picker_selected = clicked_idx;
+                            engine.picker_load_preview();
+                        }
+                    }
+                } else if col < popup_x
+                    || col >= popup_x + popup_w
+                    || row < popup_y
+                    || row >= popup_y + popup_h
+                {
+                    engine.close_picker();
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                let step = 3;
+                let max = engine.picker_items.len().saturating_sub(1);
+                engine.picker_selected = (engine.picker_selected + step).min(max);
+                let visible = 20usize;
+                if engine.picker_selected >= engine.picker_scroll_top + visible {
+                    engine.picker_scroll_top = engine.picker_selected + 1 - visible;
+                }
+                engine.picker_load_preview();
+            }
+            MouseEventKind::ScrollUp => {
+                let step = 3;
+                engine.picker_selected = engine.picker_selected.saturating_sub(step);
+                if engine.picker_selected < engine.picker_scroll_top {
+                    engine.picker_scroll_top = engine.picker_selected;
+                }
+                engine.picker_load_preview();
+            }
+            _ => {} // consume all other events
+        }
+        return sidebar_width;
     }
 
     // ── Sidebar separator drag (works anywhere, regardless of row) ────────────
@@ -521,6 +596,7 @@ pub(super) fn handle_mouse(
             }
             *mouse_text_drag = false;
             engine.mouse_drag_active = false;
+            engine.mouse_drag_origin_window = None;
             // Auto-copy terminal selection to clipboard on mouse-release.
             if engine.terminal_has_focus {
                 let text = engine.active_terminal().and_then(|t| t.selected_text());
@@ -2034,6 +2110,42 @@ pub(super) fn handle_mouse(
     // The menu bar (if visible) occupies absolute row 0, pushing the tab bar
     // and editor content down by `menu_rows`.
     let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
+
+    // ── Breadcrumb click ────────────────────────────────────────────────────
+    if engine.settings.breadcrumbs {
+        if let Some(layout) = last_layout {
+            for bc in &layout.breadcrumbs {
+                // Match the renderer: bc_y = editor_area.y + bounds.y - 1
+                // where editor_area.y == menu_rows in TUI coordinates.
+                let bc_row = if bc.bounds.y >= 1.0 {
+                    menu_rows + bc.bounds.y as u16 - 1
+                } else {
+                    menu_rows
+                };
+                let bc_x = editor_left + bc.bounds.x as u16;
+                let bc_w = bc.bounds.width as u16;
+                if row == bc_row && col >= bc_x && col < bc_x + bc_w {
+                    if !matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
+                        return sidebar_width; // consume non-click events on breadcrumb row
+                    }
+                    let local_col = (col - bc_x) as usize;
+                    let sep_len = 3; // " › "
+                    let mut x = 1usize; // match left padding in renderer
+                    engine.rebuild_breadcrumb_segments();
+                    for (i, seg) in bc.segments.iter().enumerate() {
+                        let label_len = seg.label.chars().count();
+                        if local_col >= x && local_col < x + label_len {
+                            engine.breadcrumb_selected = i;
+                            engine.breadcrumb_open_scoped();
+                            return sidebar_width;
+                        }
+                        x += label_len + sep_len;
+                    }
+                    return sidebar_width;
+                }
+            }
+        }
+    }
 
     // ── Tab bar click ──────────────────────────────────────────────────────
     // For split groups, any group's tab bar row is clickable (not just the top row).

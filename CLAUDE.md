@@ -34,6 +34,7 @@ The `SUMMARIES/` directory contains concise summaries of every major source file
 - Update architecture section if new files are added or line counts change significantly
 - Do NOT add speculative/planned features — only document what is implemented
 
+
 ## Architecture
 
 **VimCode**: Vim-like code editor in Rust with GTK4/Relm4. Clean separation: `src/core/` (platform-agnostic logic) vs `src/gtk/` (GTK UI) vs `src/tui_main/` (TUI). `src/main.rs` is a thin CLI dispatcher.

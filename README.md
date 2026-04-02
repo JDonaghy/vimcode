@@ -35,7 +35,7 @@ For detailed how-to guides and configuration references, see the **[VimCode Wiki
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 4,814 tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 5,199 tests, zero async runtime dependency
 
 > **Note:** VimCode does not implement VimScript. Extension and scripting is handled via
 > the built-in Lua 5.4 plugin system. The goal is full Vim *keybinding* and *editing*
@@ -92,7 +92,7 @@ VimCode requires **GTK4 development libraries** for the GUI backend. The TUI mod
 **Platform notes:**
 - **macOS:** GTK4 works via Homebrew; this is not a native AppKit app. See [Homebrew install](#homebrew-macos) below
 - **Windows:** Use the MSYS2 MinGW64 shell and set `rustup default stable-x86_64-pc-windows-gnu`
-- **Nerd Font recommended:** VimCode uses Nerd Font icons throughout the UI — the file explorer, activity bar, tab bar, terminal toolbar, and debug panel all rely on Nerd Font glyphs. Install any [Nerd Font](https://www.nerdfonts.com/) (e.g. JetBrainsMono Nerd Font, FiraCode Nerd Font) and set it as your terminal font (TUI) or configure `font_family` in `settings.json` (GTK). Without a Nerd Font, icons will display as missing-glyph boxes.
+- **Nerd Font icons:** VimCode uses Nerd Font icons throughout the UI — the file explorer, activity bar, tab bar, terminal toolbar, and debug panel. **GTK mode** bundles a Nerd Font icon subset and works out of the box. **TUI mode** requires a [Nerd Font](https://www.nerdfonts.com/) (e.g. JetBrainsMono Nerd Font) as your terminal font. If your terminal font lacks Nerd Font glyphs, set `"use_nerd_fonts": false` in `settings.json` (or `:set nonerdfonts`) to switch all icons to ASCII/Unicode fallbacks.
 
 ### Homebrew (macOS)
 
@@ -358,7 +358,7 @@ Click the search box in the menu bar (or run `:CommandCenter`) to open the unifi
 |--------|------|
 | _(none)_ | Fuzzy file search (same as `Ctrl-P`) |
 | `>` | Command palette (same as `Ctrl-Shift-P`) |
-| `@` | Go to symbol in current file (LSP `documentSymbol`) |
+| `@` | Go to symbol in current file — expandable tree view (LSP `documentSymbol`) |
 | `#` | Workspace symbol search (LSP `workspace/symbol`) |
 | `:` | Go to line number |
 | `%` | Search for text in project (live grep) |
@@ -682,7 +682,7 @@ Runtime changes are written through to `~/.config/vimcode/settings.json` immedia
 | `ignorecase` / `noignorecase` | `ic` | off | Case-insensitive search |
 | `smartcase` / `nosmartcase` | `scs` | off | Override `ignorecase` when pattern has uppercase |
 | `scrolloff=N` | `so` | 0 | Lines to keep above/below cursor when scrolling |
-| `cursorline` / `nocursorline` | `cul` | off | Highlight the line the cursor is on |
+| `cursorline` / `nocursorline` | `cul` | on | Highlight the line the cursor is on |
 | `colorcolumn=N` | `cc` | "" | Comma-list of column guides to highlight |
 | `textwidth=N` | `tw` | 0 | Auto-wrap inserted text at column N (0=off) |
 | `wrap` / `nowrap` | | off | Soft-wrap long lines at viewport edge |
@@ -908,6 +908,10 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
 | `<leader>sf` | Open fuzzy file finder (same as Ctrl-P) |
 | `<leader>sg` | Open live grep picker (same as Ctrl-Shift-F) |
 | `<leader>sw` | Grep word under cursor |
+| `<leader>sb` | Open buffer picker (fuzzy search open buffers) |
+| `<leader>sk` | Search key bindings (fuzzy-filterable reference) |
+| `<leader>so` | Go to symbol in editor (document outline via LSP) |
+| `<leader>b` | Enter breadcrumb focus mode (h/l navigate, Enter opens scoped picker) |
 | `<leader>sp` | Open command palette (same as Ctrl-Shift-P) |
 | `za` / `zo` / `zc` / `zR` | Fold toggle / open / close / open all |
 | `zA` / `zO` / `zC` | Fold toggle / open / close recursively |
@@ -1046,6 +1050,7 @@ All ex commands support Vim-style abbreviations (e.g., `:j` for `:join`, `:y` fo
 | `:diffoff` | Clear diff highlighting |
 | `:grep <pat>` / `:vimgrep <pat>` | Search project, populate quickfix list |
 | `:GrepWord` | Grep the word under cursor (same as `<leader>sw`) |
+| `:Buffers` | Open buffer picker (same as `<leader>sb`) |
 | `:copen` / `:ccl` | Open / close quickfix panel |
 | `:cn` / `:cp` | Next / previous quickfix item |
 | `:cc N` | Jump to Nth quickfix item (1-based) |
@@ -1124,7 +1129,7 @@ src/
 │   ├── render_impl.rs(~3,736 lines)  draw_frame orchestrator, tab bar, editor windows, popups
 │   └── mouse.rs      (~2,379 lines)  All mouse click/drag/scroll interaction handling
 ├── render.rs        (~5,877 lines)  Platform-agnostic ScreenLayout bridge (DebugSidebarData, SourceControlData, ExtPanelData, BottomPanelTabs)
-├── icons.rs            (~30 lines)  Nerd Font file-type icons (GTK + TUI)
+├── icons.rs           (~160 lines)  Icon registry with Nerd Font + ASCII fallback (GTK + TUI)
 └── core/            (~70,878 lines)  Zero GTK/rendering deps — fully testable
     ├── engine/      (~51,825 lines)  Orchestrator: 20 submodules (mod.rs 3,334 + keys, motions, commands, tests, …)
     ├── markdown.rs     (~705 lines)  Markdown → styled plain text converter (pulldown-cmark)
@@ -1167,7 +1172,7 @@ VimCode is built on the shoulders of giants, and I take very little credit for i
 |-----------|---------|
 | Language | Rust 2021 |
 | GTK UI | GTK4 + Relm4 |
-| TUI UI | ratatui 0.27 + crossterm |
+| TUI UI | ratatui 0.29 + crossterm |
 | Rendering | Pango + Cairo (CPU, no GPU) |
 | Text | Ropey (rope data structure) |
 | Parsing | Tree-sitter (20 languages incl. LaTeX, Lua, Markdown) |

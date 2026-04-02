@@ -2,7 +2,21 @@
 
 - **(Low) GTK Explorer: Enter requires two presses after arrow-key navigation** — After using arrow keys to navigate to a folder in the GTK TreeView, the first Enter press doesn't expand/collapse; the second does. Likely a GTK4 TreeView cursor/selection sync issue or interaction between GTK's built-in key bindings and the `row_activated` signal. Works correctly after the first activation. TUI explorer is unaffected.
 
+- **(Intermittent) TUI rendering artifacts** — Stale characters from a previous view sometimes linger on screen. Not reliably reproducible yet. Workaround: Ctrl+L forces a full screen redraw.
+
+- **(Low) Hardcoded colors in rendering code — 59 instances across 5 files.** These colors don't adapt to the user's chosen theme. Should all use `Theme` struct fields instead. Breakdown:
+  - `src/gtk/css.rs` (23) — Button, dialog, toggle, and find bar CSS colors are hardcoded hex. Should be interpolated from the theme via `make_theme_css()`.
+  - `src/gtk/draw.rs` (12) — Scrollbar track/thumb RGBA, tooltip popup bg/fg, terminal pane background, extension section headers. Should use theme fields.
+  - `src/tui_main/panels.rs` (15) — Git status colors (`RColor::Rgb(90,180,90)` etc.) ignore existing `theme.git_added/modified/deleted`; activity bar icon colors, scrollbar thumb, terminal background/find match colors all hardcoded.
+  - `src/tui_main/render_impl.rs` (3) — Scrollbar thumb color `RColor::Rgb(128,128,128)` repeated 3 times. Should be a theme field (e.g. `theme.scrollbar_thumb`).
+  - `src/gtk/mod.rs` (3) — Cursor indicator box RGBA, search result markup hex colors.
+
 ## Resolved
+
+- **VSCode mode undo granularity** — Every character typed created its own undo entry. Fixed by keeping the undo group open across consecutive character insertions in `handle_vscode_key()`, breaking only on non-character actions (cursor movement, Backspace, Return, Ctrl+* commands) or external cursor moves (mouse clicks). `vscode_undo_group_open` + `vscode_undo_cursor` fields on Engine. 5 new tests.
+- **Search `/` results land at viewport bottom** — `jump_to_search_match()` called `ensure_cursor_visible()` which with `scrolloff=0` placed the match at the absolute bottom edge. Fixed by centering the match when it lands in the bottom quarter of the viewport.
+- **Tab bar hides tabs when there's room** — `tab_visible_count` feedback loop: TUI renderer returned tab **count** but `set_tab_visible_count()` stored it as `tab_bar_width` (column width). With 5 tabs visible, engine thought it had 5 columns of space, causing a death spiral where each frame hid more tabs. Fixed by returning actual available width in columns (`tab_end_for_content - area.x`), matching the GTK backend. Also fixed `tab_display_width()` off-by-one (+3→+2 for close+separator).
+- **Tab bar doesn't update on terminal resize** — After shrinking the terminal, active tab could be off-screen because `tab_bar_width` was stale. Fixed by calling `ensure_all_groups_tabs_visible()` after each render frame reports updated widths.
 
 All bugs below were fixed in Session 225 or earlier. See SESSION_HISTORY.md for details.
 

@@ -1,12 +1,12 @@
-# src/render.rs — 6,380 lines
+# src/render.rs — 6,463 lines
 
 Platform-agnostic rendering abstraction. Transforms engine state into `ScreenLayout` consumed by both GTK and TUI backends. Contains all themes, render data structs, and the main layout builder.
 
 ## Key Types — Colors & Styling
-- `Color` — RGB color with hex parsing, lighten/darken, Cairo/Pango conversion
+- `Color` — RGB color with hex parsing, lighten/darken, `cursorline_tint()`, Cairo/Pango conversion
 - `Style` — fg/bg/bold/italic/underline
 - `StyledSpan` — text span with style + column range
-- `Theme` — complete color scheme (70+ color fields); 6 built-ins (OneDark, Gruvbox, TokyoNight, Solarized, VSCode Dark/Light) + VSCode JSON import
+- `Theme` — complete color scheme (70+ color fields incl. `cursorline_bg`); 6 built-ins (OneDark, Gruvbox, TokyoNight, Solarized, VSCode Dark/Light) + VSCode JSON import
 
 ## Key Types — Editor Content
 - `RenderedLine` — single visual line with spans, gutter, diagnostics, git markers, fold state, wrap info

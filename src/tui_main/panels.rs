@@ -1361,7 +1361,7 @@ pub(super) fn render_wildmenu(
 
     // Fill background
     for x in area.x..area.x + area.width {
-        let cell = buf.get_mut(x, area.y);
+        let cell = &mut buf[(x, area.y)];
         cell.set_char(' ').set_fg(fg).set_bg(bg);
     }
 
@@ -1377,7 +1377,7 @@ pub(super) fn render_wildmenu(
 
         // Leading space
         if col < area.x + area.width {
-            buf.get_mut(col, area.y)
+            buf[(col, area.y)]
                 .set_char(' ')
                 .set_fg(item_fg)
                 .set_bg(item_bg);
@@ -1388,7 +1388,7 @@ pub(super) fn render_wildmenu(
             if col >= area.x + area.width {
                 break;
             }
-            buf.get_mut(col, area.y)
+            buf[(col, area.y)]
                 .set_char(ch)
                 .set_fg(item_fg)
                 .set_bg(item_bg);
@@ -1397,7 +1397,7 @@ pub(super) fn render_wildmenu(
 
         // Trailing space for selected item padding
         if is_selected && col < area.x + area.width {
-            buf.get_mut(col, area.y)
+            buf[(col, area.y)]
                 .set_char(' ')
                 .set_fg(item_fg)
                 .set_bg(item_bg);
@@ -1501,7 +1501,7 @@ pub(super) fn render_command_line(
         let cx = area.x + cursor_col.min(area.width.saturating_sub(1));
         let buf_area = buf.area;
         if cx < buf_area.x + buf_area.width {
-            let cell = buf.get_mut(cx, area.y);
+            let cell = &mut buf[(cx, area.y)];
             let old_fg = cell.fg;
             let old_bg = cell.bg;
             cell.set_fg(old_bg).set_bg(old_fg);
@@ -2592,7 +2592,7 @@ pub(super) fn render_panel_hover_popup(
             } else {
                 '─'
             };
-            let cell = buf.get_mut(cx, top_y);
+            let cell = &mut buf[(cx, top_y)];
             cell.set_char(ch).set_fg(border).set_bg(bg);
         }
     }
@@ -2610,7 +2610,7 @@ pub(super) fn render_panel_hover_popup(
             if cx >= term_area.width {
                 break;
             }
-            let cell = buf.get_mut(cx, row_y);
+            let cell = &mut buf[(cx, row_y)];
             cell.set_bg(bg);
             let ch = if col == 0 || col == width - 1 {
                 '│'
@@ -2664,7 +2664,7 @@ pub(super) fn render_panel_hover_popup(
 
             let cx = x + col_x;
             if col_x + 1 < width && cx < term_area.width {
-                let cell = buf.get_mut(cx, row_y);
+                let cell = &mut buf[(cx, row_y)];
                 cell.set_char(ch).set_fg(ch_fg).set_bg(bg);
                 if bold {
                     cell.set_style(cell.style().add_modifier(ratatui::style::Modifier::BOLD));
@@ -2691,7 +2691,7 @@ pub(super) fn render_panel_hover_popup(
             } else {
                 '─'
             };
-            let cell = buf.get_mut(cx, bot_y);
+            let cell = &mut buf[(cx, bot_y)];
             cell.set_char(ch).set_fg(border).set_bg(bg);
         }
     }
@@ -2796,7 +2796,7 @@ pub(super) fn render_editor_hover_popup(
             } else {
                 '─'
             };
-            buf.get_mut(cx, y).set_char(ch).set_fg(border_fg).set_bg(bg);
+            buf[(cx, y)].set_char(ch).set_fg(border_fg).set_bg(bg);
         }
     }
 
@@ -2819,12 +2819,9 @@ pub(super) fn render_editor_hover_popup(
                 break;
             }
             if col == 0 || col == width - 1 {
-                buf.get_mut(cx, row_y)
-                    .set_char('│')
-                    .set_fg(border_fg)
-                    .set_bg(bg);
+                buf[(cx, row_y)].set_char('│').set_fg(border_fg).set_bg(bg);
             } else {
-                buf.get_mut(cx, row_y).set_char(' ').set_bg(bg);
+                buf[(cx, row_y)].set_char(' ').set_bg(bg);
             }
         }
 
@@ -2871,7 +2868,7 @@ pub(super) fn render_editor_hover_popup(
             let cx = x + col_x;
             let char_col = (col_x - 2) as usize; // 0-based char column (border + padding)
             if col_x + 1 < width && cx < term_area.width {
-                let cell = buf.get_mut(cx, row_y);
+                let cell = &mut buf[(cx, row_y)];
                 // Check if this character is within the text selection
                 let in_selection = if let Some((sl, sc, el, ec)) = eh.selection {
                     let line = actual_line;
@@ -2930,10 +2927,7 @@ pub(super) fn render_editor_hover_popup(
             } else {
                 '─'
             };
-            buf.get_mut(cx, bot_y)
-                .set_char(ch)
-                .set_fg(border_fg)
-                .set_bg(bg);
+            buf[(cx, bot_y)].set_char(ch).set_fg(border_fg).set_bg(bg);
         }
     }
 
@@ -2956,7 +2950,7 @@ pub(super) fn render_editor_hover_popup(
                 if ry >= term_area.height {
                     break;
                 }
-                let cell = buf.get_mut(sb_x, ry);
+                let cell = &mut buf[(sb_x, ry)];
                 if i >= thumb_top && i < thumb_top + thumb_h {
                     cell.set_char('█').set_fg(border_fg).set_bg(bg);
                 } else {
@@ -4000,7 +3994,7 @@ pub(super) fn render_terminal_pane_cells(
         if modifier.is_empty() {
             set_cell(buf, x, screen_row, ch, draw_fg, draw_bg);
         } else {
-            set_cell_styled(buf, x, screen_row, ch, draw_fg, draw_bg, modifier);
+            set_cell_styled(buf, x, screen_row, ch, draw_fg, draw_bg, modifier, None);
         }
     }
 }

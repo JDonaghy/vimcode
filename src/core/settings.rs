@@ -167,8 +167,8 @@ pub struct Settings {
     #[serde(default)]
     pub scrolloff: usize,
 
-    /// Highlight the line the cursor is on (default false).
-    #[serde(default)]
+    /// Highlight the line the cursor is on (default true).
+    #[serde(default = "default_cursorline")]
     pub cursorline: bool,
 
     /// Automatically reload files when changed externally (default true).
@@ -276,6 +276,11 @@ pub struct Settings {
     /// Mouse dwell delay (ms) before auto-showing hover popups. 0 = disabled.
     #[serde(default = "default_hover_delay")]
     pub hover_delay: u32,
+
+    /// Use Nerd Font icons in the UI (activity bar, file explorer, panels).
+    /// Disable if your terminal/font lacks Nerd Font glyphs to get ASCII fallbacks.
+    #[serde(default = "default_use_nerd_fonts")]
+    pub use_nerd_fonts: bool,
 }
 
 fn default_indent_guides() -> bool {
@@ -292,6 +297,10 @@ fn default_auto_pairs() -> bool {
 
 fn default_hover_delay() -> u32 {
     300
+}
+
+fn default_use_nerd_fonts() -> bool {
+    true
 }
 
 fn default_swap_file() -> bool {
@@ -343,6 +352,10 @@ fn default_plugins_enabled() -> bool {
 }
 
 fn default_hlsearch() -> bool {
+    true
+}
+
+fn default_cursorline() -> bool {
     true
 }
 
@@ -664,7 +677,7 @@ impl Default for Settings {
             ignorecase: false,
             smartcase: false,
             scrolloff: 0,
-            cursorline: false,
+            cursorline: default_cursorline(),
             autoread: default_autoread(),
             splitbelow: false,
             splitright: false,
@@ -688,6 +701,7 @@ impl Default for Settings {
             match_brackets: default_match_brackets(),
             auto_pairs: default_auto_pairs(),
             hover_delay: default_hover_delay(),
+            use_nerd_fonts: default_use_nerd_fonts(),
         }
     }
 }
@@ -862,8 +876,13 @@ impl Settings {
         } else {
             "nosmartcase"
         };
+        let nf = if self.use_nerd_fonts {
+            "nerdfonts"
+        } else {
+            "nonerdfonts"
+        };
         format!(
-            "{}  {}  ts={}  sw={}  {}  {}  {}  {}  {}  {}  {}  {}  {}  {}  so={}  tw={}",
+            "{}  {}  ts={}  sw={}  {}  {}  {}  {}  {}  {}  {}  {}  {}  {}  so={}  tw={}  {}",
             num,
             et,
             self.tabstop,
@@ -879,7 +898,8 @@ impl Settings {
             ic,
             sc,
             self.scrolloff,
-            self.textwidth
+            self.textwidth,
+            nf
         )
     }
 
@@ -934,6 +954,10 @@ impl Settings {
             "indentguides" => self.indent_guides = enable,
             "matchbrackets" => self.match_brackets = enable,
             "autopairs" => self.auto_pairs = enable,
+            "nerdfonts" | "nf" => {
+                self.use_nerd_fonts = enable;
+                crate::icons::set_nerd_fonts(enable);
+            }
             _ => return Err(format!("Unknown option: {opt}")),
         }
         Ok(())
@@ -1148,6 +1172,11 @@ impl Settings {
                 self.extension_registries.join(",")
             )),
             "hover_delay" | "hd" => Ok(format!("hover_delay={}", self.hover_delay)),
+            "nerdfonts" | "nf" => Ok(if self.use_nerd_fonts {
+                "nerdfonts".to_string()
+            } else {
+                "nonerdfonts".to_string()
+            }),
             _ => Err(format!("Unknown option: {opt}")),
         }
     }
@@ -1238,6 +1267,7 @@ impl Settings {
             "match_brackets" | "matchbrackets" => self.match_brackets.to_string(),
             "auto_pairs" | "autopairs" => self.auto_pairs.to_string(),
             "hover_delay" => self.hover_delay.to_string(),
+            "use_nerd_fonts" | "nerdfonts" | "nf" => self.use_nerd_fonts.to_string(),
             "extension_registries" => self.extension_registries.join(", "),
             _ => String::new(),
         }
@@ -1341,6 +1371,10 @@ impl Settings {
                 self.hover_delay = value
                     .parse()
                     .map_err(|_| format!("Invalid hover_delay: {value}"))?;
+            }
+            "use_nerd_fonts" | "nerdfonts" | "nf" => {
+                self.use_nerd_fonts = value == "true";
+                crate::icons::set_nerd_fonts(self.use_nerd_fonts);
             }
             "extension_registries" => {
                 self.extension_registries = value
@@ -1455,6 +1489,13 @@ pub static SETTING_DEFS: &[SettingDef] = &[
         description: "Editor font size in points",
         category: "Appearance",
         setting_type: SettingType::Integer { min: 6, max: 48 },
+    },
+    SettingDef {
+        key: "use_nerd_fonts",
+        label: "Nerd Font Icons",
+        description: "Use Nerd Font glyphs for UI icons (disable for ASCII fallbacks)",
+        category: "Appearance",
+        setting_type: SettingType::Bool,
     },
     SettingDef {
         key: "line_numbers",
