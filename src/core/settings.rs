@@ -167,8 +167,8 @@ pub struct Settings {
     #[serde(default)]
     pub scrolloff: usize,
 
-    /// Highlight the line the cursor is on (default false).
-    #[serde(default)]
+    /// Highlight the line the cursor is on (default true).
+    #[serde(default = "default_cursorline")]
     pub cursorline: bool,
 
     /// Automatically reload files when changed externally (default true).
@@ -352,6 +352,10 @@ fn default_plugins_enabled() -> bool {
 }
 
 fn default_hlsearch() -> bool {
+    true
+}
+
+fn default_cursorline() -> bool {
     true
 }
 
@@ -673,7 +677,7 @@ impl Default for Settings {
             ignorecase: false,
             smartcase: false,
             scrolloff: 0,
-            cursorline: false,
+            cursorline: default_cursorline(),
             autoread: default_autoread(),
             splitbelow: false,
             splitright: false,

@@ -1,9 +1,9 @@
 # VimCode Project State
 
-**Last updated:** Apr 1, 2026 (Session 238 — breadcrumb navigation, chat prefix, picker click fixes, scoped symbol filtering, scroll wheel) | **Tests:** 5055
+**Last updated:** Apr 1, 2026 (Session 240 — cursorline highlight, GTK tab padding, breadcrumb picker pre-selection) | **Tests:** 5199
 
 > Feature documentation lives in **README.md**.
-> Per-session implementation notes through Session 238 are in **SESSION_HISTORY.md**.
+> Per-session implementation notes through Session 240 are in **SESSION_HISTORY.md**.
 
 ---
 
@@ -26,4 +26,4 @@ When implementing a new key/command, add tests covering:
 
 ## Recent Work
 
-> All sessions through 238 archived in **SESSION_HISTORY.md**.
+> All sessions through 240 archived in **SESSION_HISTORY.md**.

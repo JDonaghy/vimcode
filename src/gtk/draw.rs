@@ -63,10 +63,11 @@ pub(super) fn draw_editor(
     }
 
     // Calculate layout regions
+    let tab_row_height = (line_height * 1.6).ceil();
     let tab_bar_height = if engine.settings.breadcrumbs {
-        line_height * 2.0
+        tab_row_height + line_height
     } else {
-        line_height
+        tab_row_height
     };
     let wildmenu_px = if engine.wildmenu_items.is_empty() {
         0.0
@@ -312,10 +313,11 @@ pub(super) fn draw_editor(
     if let Some(ref tooltip_text) = screen.tab_tooltip {
         let (mx, _my) = mouse_pos;
         if mx >= 0.0 {
+            let tab_row_h = (line_height * 1.4).ceil();
             let tab_bar_h = if !screen.breadcrumbs.is_empty() {
-                line_height * 2.0
+                tab_row_h + line_height
             } else {
-                line_height
+                tab_row_h
             };
             let tooltip_y = tab_bar_h + 2.0;
             let padding = 6.0;
@@ -568,10 +570,11 @@ pub(super) fn draw_tab_drag_overlay(
 ) {
     use crate::core::window::{DropZone, SplitDirection, WindowRect};
 
+    let tab_row_height = (line_height * 1.6).ceil();
     let tab_bar_height = if engine.settings.breadcrumbs {
-        line_height * 2.0
+        tab_row_height + line_height
     } else {
-        line_height
+        tab_row_height
     };
     let wildmenu_px = if engine.wildmenu_items.is_empty() {
         0.0
@@ -696,10 +699,14 @@ pub(super) fn draw_tab_bar(
     tab_scroll_offset: usize,
     accent_color: Option<render::Color>,
 ) -> TabBarDrawResult {
+    // Tab row is taller than line_height for vertical padding.
+    let tab_row_height = (line_height * 1.6).ceil();
+    let text_y_offset = y_offset + (tab_row_height - line_height) / 2.0;
+
     // Tab bar background
     let (r, g, b) = theme.tab_bar_bg.to_cairo();
     cr.set_source_rgb(r, g, b);
-    cr.rectangle(0.0, y_offset, width, line_height);
+    cr.rectangle(0.0, y_offset, width, tab_row_height);
     cr.fill().ok();
 
     // Clear any leftover Pango attributes (e.g. syntax highlighting from draw_window).
@@ -766,8 +773,9 @@ pub(super) fn draw_tab_bar(
     let (close_w_i, _) = layout.pixel_size();
     let close_w = close_w_i as f64;
     // Gap between tab name and ×, and gap between tabs.
-    let tab_inner_gap = 4.0; // space between name and ×
-    let tab_outer_gap = 4.0; // space between tabs
+    let tab_pad = 14.0; // horizontal padding inside each tab
+    let tab_inner_gap = 10.0; // space between name and ×
+    let tab_outer_gap = 1.0; // space between tabs
 
     let mut x = 0.0_f64;
     let effective_tab_area = tab_area_width;
@@ -789,8 +797,9 @@ pub(super) fn draw_tab_bar(
         layout.set_text(&tab.name);
         let (tab_width, _) = layout.pixel_size();
         let tab_w = tab_width as f64;
-        // Total per-tab slot: name + gap + × + outer_gap
-        let slot_w = tab_w + tab_inner_gap + close_w + tab_outer_gap;
+        // Total per-tab slot: pad + name + gap + × + pad + outer_gap
+        let tab_content_w = tab_pad + tab_w + tab_inner_gap + close_w + tab_pad;
+        let slot_w = tab_content_w + tab_outer_gap;
 
         // Stop drawing tabs if they would overrun the available area.
         if x + slot_w > effective_tab_area {
@@ -798,7 +807,7 @@ pub(super) fn draw_tab_bar(
         }
         slot_positions.push((x, x + slot_w));
 
-        // Tab background (covers name + gap + ×)
+        // Tab background (covers pad + name + gap + × + pad)
         let bg = if tab.active {
             theme.tab_active_bg
         } else {
@@ -806,7 +815,7 @@ pub(super) fn draw_tab_bar(
         };
         let (br, bg_g, bb) = bg.to_cairo();
         cr.set_source_rgb(br, bg_g, bb);
-        cr.rectangle(x, y_offset, tab_w + tab_inner_gap + close_w, line_height);
+        cr.rectangle(x, y_offset, tab_content_w, tab_row_height);
         cr.fill().ok();
 
         // Accent line at top of active tab in focused group.
@@ -814,13 +823,13 @@ pub(super) fn draw_tab_bar(
             if let Some(accent) = accent_color {
                 let (ar, ag, ab) = accent.to_cairo();
                 cr.set_source_rgb(ar, ag, ab);
-                cr.rectangle(x, y_offset, tab_w + tab_inner_gap + close_w, 2.0);
+                cr.rectangle(x, y_offset, tab_content_w, 2.0);
                 cr.fill().ok();
             }
         }
 
         // Tab text — dimmed colours for preview tabs
-        cr.move_to(x, y_offset);
+        cr.move_to(x + tab_pad, text_y_offset);
         let fg = if tab.preview {
             if tab.active {
                 theme.tab_preview_active_fg
@@ -844,13 +853,13 @@ pub(super) fn draw_tab_bar(
         pangocairo::show_layout(cr, layout);
 
         // Close (×) button — dim on inactive, matches active fg on the active tab.
-        let close_x = x + tab_w + tab_inner_gap;
+        let close_x = x + tab_pad + tab_w + tab_inner_gap;
         let is_close_hovered = hovered_close_tab == Some(tab_idx);
         if is_close_hovered {
             // Draw a subtle rounded background behind the × on hover.
             let pad = 2.0;
             let rx = close_x - pad;
-            let ry = y_offset + pad;
+            let ry = text_y_offset + pad;
             let rw = close_w + pad * 2.0;
             let rh = line_height - pad * 2.0;
             let (hr, hg, hb) = theme.foreground.to_cairo();
@@ -907,7 +916,7 @@ pub(super) fn draw_tab_bar(
         cr.set_source_rgb(xr, xg, xb);
         layout.set_font_description(Some(&normal_font));
         layout.set_text(close_glyph);
-        cr.move_to(close_x, y_offset);
+        cr.move_to(close_x, text_y_offset);
         pangocairo::show_layout(cr, layout);
 
         x += slot_w;
@@ -923,7 +932,7 @@ pub(super) fn draw_tab_bar(
             let (fr2, fg2, fb2) = theme.foreground.to_cairo();
             cr.set_source_rgb(fr2, fg2, fb2);
             layout.set_text(&format!(" {lbl}"));
-            cr.move_to(dx, y_offset);
+            cr.move_to(dx, text_y_offset);
             pangocairo::show_layout(cr, layout);
             dx += diff_label_px;
         }
@@ -931,7 +940,7 @@ pub(super) fn draw_tab_bar(
         let prev_start = dx;
         cr.set_source_rgb(fr, fg_g, fb);
         layout.set_text(diff_btn_prev_text);
-        cr.move_to(dx, y_offset);
+        cr.move_to(dx, text_y_offset);
         pangocairo::show_layout(cr, layout);
         let (wp, _) = layout.pixel_size();
         dx += wp as f64;
@@ -939,7 +948,7 @@ pub(super) fn draw_tab_bar(
         // Next button
         let next_start = dx;
         layout.set_text(diff_btn_next_text);
-        cr.move_to(dx, y_offset);
+        cr.move_to(dx, text_y_offset);
         pangocairo::show_layout(cr, layout);
         let (wn, _) = layout.pixel_size();
         dx += wn as f64;
@@ -951,7 +960,7 @@ pub(super) fn draw_tab_bar(
             cr.set_source_rgb(ar, ag, ab);
         }
         layout.set_text(diff_btn_fold_text);
-        cr.move_to(dx, y_offset);
+        cr.move_to(dx, text_y_offset);
         pangocairo::show_layout(cr, layout);
         let (wf, _) = layout.pixel_size();
         let fold_end = dx + wf as f64;
@@ -969,11 +978,11 @@ pub(super) fn draw_tab_bar(
         cr.set_source_rgb(fr, fg_g, fb);
         // Split-right button
         layout.set_text(btn_right_text);
-        cr.move_to(width - both_btns_px, y_offset);
+        cr.move_to(width - both_btns_px, text_y_offset);
         pangocairo::show_layout(cr, layout);
         // Split-down button
         layout.set_text(btn_down_text);
-        cr.move_to(width - both_btns_px + btn_right_px, y_offset);
+        cr.move_to(width - both_btns_px + btn_right_px, text_y_offset);
         pangocairo::show_layout(cr, layout);
     }
 
@@ -1093,7 +1102,7 @@ pub(super) fn draw_window(
     cr.rectangle(rect.x, rect.y, rect.width, rect.height);
     cr.fill().ok();
 
-    // Diff / DAP stopped-line background (drawn before selection so selection is on top)
+    // Cursorline / Diff / DAP stopped-line background (drawn before selection so selection is on top)
     for (view_idx, rl) in rw.lines.iter().enumerate() {
         let y = rect.y + view_idx as f64 * line_height;
         let bg_color = if rl.is_dap_current {
@@ -1106,6 +1115,8 @@ pub(super) fn draw_window(
                 DiffLine::Padding => Some(theme.diff_padding_bg),
                 DiffLine::Same => None,
             }
+        } else if rl.is_current_line && rw.is_active && rw.cursorline {
+            Some(theme.cursorline_bg)
         } else {
             None
         };
@@ -2531,6 +2542,8 @@ pub(super) fn draw_picker_popup(
     cr.rectangle(popup_x, sep_y, content_w, rows_area_h + 2.0);
     cr.clip();
 
+    let has_tree = picker.items.iter().any(|i| i.expandable || i.depth > 0);
+
     for i in 0..visible_rows {
         let result_idx = picker.scroll_top + i;
         let Some(item) = picker.items.get(result_idx) else {
@@ -2548,7 +2561,20 @@ pub(super) fn draw_picker_popup(
         }
 
         // Build pango attributed string with match highlighting
-        let prefix = if is_selected { "▶ " } else { "  " };
+        let sel_prefix = if is_selected { "▶ " } else { "  " };
+        let indent: String = "  ".repeat(item.depth);
+        let arrow = if item.expandable {
+            if item.expanded {
+                "▼ "
+            } else {
+                "▷ "
+            }
+        } else if has_tree {
+            "  "
+        } else {
+            ""
+        };
+        let prefix = format!("{}{}{}", sel_prefix, indent, arrow);
         let full_text = format!("{}{}", prefix, item.display);
         let prefix_bytes = prefix.len();
 
@@ -3814,6 +3840,7 @@ pub(super) fn draw_menu_bar(
         format!("\u{1f50d}  {}", data.title)
     };
     let box_pad = 12.0;
+    let min_box_w = 280.0; // minimum search bar width to match VSCode proportions
     let (box_text_w, _) = if !display.is_empty() {
         layout.set_text(&display);
         layout.pixel_size()
@@ -3821,7 +3848,7 @@ pub(super) fn draw_menu_bar(
         (0, 0)
     };
     let box_w = if !display.is_empty() {
-        box_text_w as f64 + box_pad * 2.0
+        (box_text_w as f64 + box_pad * 2.0).max(min_box_w)
     } else {
         0.0
     };

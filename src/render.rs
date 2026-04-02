@@ -118,6 +118,17 @@ impl Color {
         }
     }
 
+    /// Derive a subtle cursorline background from this colour.
+    /// Dark backgrounds get lightened; light backgrounds get darkened.
+    pub fn cursorline_tint(self) -> Self {
+        let lum = 0.299 * self.r as f64 + 0.587 * self.g as f64 + 0.114 * self.b as f64;
+        if lum < 128.0 {
+            self.lighten(0.06)
+        } else {
+            self.darken(0.04)
+        }
+    }
+
     /// Normalise to the (0.0..=1.0, 0.0..=1.0, 0.0..=1.0) triple expected by
     /// Cairo's `set_source_rgb` / `set_source_rgba`.
     pub fn to_cairo(self) -> (f64, f64, f64) {
@@ -479,6 +490,8 @@ pub struct RenderedWindow {
     pub active_indent_col: Option<usize>,
     /// Tab stop width for expanding `\t` to spaces in TUI rendering.
     pub tabstop: usize,
+    /// Whether to draw cursorline highlight (from `settings.cursorline`).
+    pub cursorline: bool,
 }
 
 // ─── CommandLineData ──────────────────────────────────────────────────────────
@@ -588,6 +601,12 @@ pub struct PickerPanelItem {
     pub detail: Option<String>,
     /// Byte positions in `display` that matched the query (for highlight).
     pub match_positions: Vec<usize>,
+    /// Tree nesting depth (0 = top-level).
+    pub depth: usize,
+    /// Whether this item has children (shows expand arrow).
+    pub expandable: bool,
+    /// Whether this item's children are currently visible.
+    pub expanded: bool,
 }
 
 /// Data needed to render the unified picker modal.
@@ -1843,6 +1862,11 @@ pub struct Theme {
     // DAP stopped-line highlight
     pub dap_stopped_bg: Color,
 
+    // Cursor line highlight (subtle background for the current line).
+    // Derived from `background` by default; overridden by VSCode theme
+    // `editor.lineHighlightBackground`.
+    pub cursorline_bg: Color,
+
     // Markdown preview colours
     pub md_heading1: Color,
     pub md_heading2: Color,
@@ -1999,6 +2023,9 @@ impl Theme {
             // DAP stopped-line (dark amber)
             dap_stopped_bg: Color::from_hex("#3a3000"),
 
+            // Cursor line highlight (subtle lightening of background)
+            cursorline_bg: Color::from_hex("#1a1a1a").cursorline_tint(), // derived from background
+
             // Yank highlight flash (green, matching Neovim default)
             yank_highlight_bg: Color::from_hex("#57d45e"),
             yank_highlight_alpha: 0.35,
@@ -2125,6 +2152,8 @@ impl Theme {
 
             dap_stopped_bg: Color::from_hex("#3a3000"),
 
+            cursorline_bg: Color::from_hex("#282828").cursorline_tint(), // derived from background
+
             yank_highlight_bg: Color::from_hex("#b8bb26"),
             yank_highlight_alpha: 0.35,
 
@@ -2245,6 +2274,8 @@ impl Theme {
             diff_padding_bg: Color::from_hex("#252530"),
 
             dap_stopped_bg: Color::from_hex("#2a2500"),
+
+            cursorline_bg: Color::from_hex("#1a1b26").cursorline_tint(), // derived from background
 
             yank_highlight_bg: Color::from_hex("#9ece6a"),
             yank_highlight_alpha: 0.35,
@@ -2367,6 +2398,8 @@ impl Theme {
 
             dap_stopped_bg: Color::from_hex("#2b2000"),
 
+            cursorline_bg: Color::from_hex("#002b36").cursorline_tint(), // derived from background
+
             yank_highlight_bg: Color::from_hex("#859900"),
             yank_highlight_alpha: 0.35,
 
@@ -2488,6 +2521,8 @@ impl Theme {
 
             dap_stopped_bg: Color::from_hex("#3a3000"),
 
+            cursorline_bg: Color::from_hex("#1e1e1e").cursorline_tint(), // derived from background
+
             yank_highlight_bg: Color::from_hex("#dcdcaa"),
             yank_highlight_alpha: 0.25,
 
@@ -2607,6 +2642,8 @@ impl Theme {
             diff_padding_bg: Color::from_hex("#f0f0f0"),
 
             dap_stopped_bg: Color::from_hex("#ffffcc"),
+
+            cursorline_bg: Color::from_hex("#ffffff").cursorline_tint(), // derived from background
 
             yank_highlight_bg: Color::from_hex("#795e26"),
             yank_highlight_alpha: 0.2,
@@ -2737,6 +2774,7 @@ impl Theme {
             theme.background = c;
             theme.active_background = c.lighten(0.02);
             theme.command_bg = c;
+            theme.cursorline_bg = c.cursorline_tint();
         }
         if let Some(c) = color("editor.foreground") {
             theme.foreground = c;
@@ -2750,6 +2788,11 @@ impl Theme {
         }
         if let Some(c) = color("editorCursor.foreground") {
             theme.cursor = c;
+        }
+
+        // ── Cursor line highlight ─────────────────────────────────────────
+        if let Some(c) = color("editor.lineHighlightBackground") {
+            theme.cursorline_bg = c;
         }
 
         // ── Search ────────────────────────────────────────────────────────
@@ -3681,6 +3724,9 @@ pub fn build_screen_layout(
                         display: item.display.clone(),
                         detail: item.detail.clone(),
                         match_positions: item.match_positions.clone(),
+                        depth: item.depth,
+                        expandable: item.expandable,
+                        expanded: item.expanded,
                     })
                     .collect(),
                 selected_idx: engine.picker_selected,
@@ -4565,6 +4611,7 @@ fn build_rendered_window(
         bracket_match_positions: Vec::new(),
         active_indent_col: None,
         tabstop: engine.settings.tabstop.max(1) as usize,
+        cursorline: engine.settings.cursorline,
     };
 
     let window = match engine.windows.get(&window_id) {
@@ -5410,6 +5457,7 @@ fn build_rendered_window(
                 std::collections::HashSet::new()
             }
         },
+        cursorline: engine.settings.cursorline,
     }
 }
 

@@ -138,6 +138,8 @@ pub struct SymbolInfo {
     pub line: u32,
     /// 0-indexed character (UTF-16).
     pub character: u32,
+    /// Child symbols (preserved from hierarchical DocumentSymbol responses).
+    pub children: Vec<SymbolInfo>,
 }
 
 /// LSP SymbolKind (subset of the spec).
@@ -225,6 +227,25 @@ impl SymbolKind {
             Self::Operator => "󰆕",
             Self::TypeParameter => "",
             Self::Unknown => "?",
+        }
+    }
+
+    /// Sort order for Outline/symbol views: group by category, matching VSCode's
+    /// Outline ordering (classes/structs first, then functions, then variables, etc.).
+    pub fn sort_order(&self) -> u32 {
+        match self {
+            Self::Module | Self::Namespace | Self::Package => 0,
+            Self::Class | Self::Struct | Self::Interface => 1,
+            Self::Enum => 2,
+            Self::Constructor => 3,
+            Self::Method => 4,
+            Self::Function => 5,
+            Self::Property | Self::Field => 6,
+            Self::Variable | Self::Constant => 7,
+            Self::EnumMember => 8,
+            Self::TypeParameter => 9,
+            Self::Event | Self::Operator => 10,
+            _ => 11,
         }
     }
 
@@ -901,6 +922,9 @@ impl LspServer {
                             }
                         }
                     },
+                    "documentSymbol": {
+                        "hierarchicalDocumentSymbolSupport": true
+                    },
                     "definition": {},
                     "rename": {
                         "dynamicRegistration": false,
@@ -1560,7 +1584,9 @@ fn reader_thread(
                     });
                 }
                 Some("textDocument/documentSymbol") => {
-                    let symbols = result.map(parse_document_symbols).unwrap_or_default();
+                    let symbols = result
+                        .map(parse_document_symbols_hierarchical)
+                        .unwrap_or_default();
                     let _ = tx.send(LspEvent::DocumentSymbolResponse {
                         server_id,
                         request_id: id,
@@ -1756,36 +1782,12 @@ fn parse_locations_response(result: &serde_json::Value) -> Option<Vec<Location>>
     Some(locations)
 }
 
-/// Parse a `textDocument/documentSymbol` response.
-/// Handles both `DocumentSymbol[]` (hierarchical) and `SymbolInformation[]` (flat).
-fn parse_document_symbols(result: &serde_json::Value) -> Vec<SymbolInfo> {
-    let mut symbols = Vec::new();
-    if let Some(arr) = result.as_array() {
-        for item in arr {
-            // Check if this is a DocumentSymbol (has `selectionRange`) or SymbolInformation (has `location`).
-            if item.get("selectionRange").is_some() {
-                flatten_document_symbol(item, None, &mut symbols);
-            } else if item.get("location").is_some() {
-                if let Some(sym) = parse_symbol_information(item) {
-                    symbols.push(sym);
-                }
-            }
-        }
-    }
-    symbols
-}
-
-/// Recursively flatten a hierarchical `DocumentSymbol` into a flat list.
-fn flatten_document_symbol(
+/// Parse a single `DocumentSymbol` node into a `SymbolInfo` with nested children preserved.
+fn parse_document_symbol_tree(
     item: &serde_json::Value,
     container: Option<&str>,
-    out: &mut Vec<SymbolInfo>,
-) {
-    let name = item
-        .get("name")
-        .and_then(|n| n.as_str())
-        .unwrap_or("")
-        .to_string();
+) -> Option<SymbolInfo> {
+    let name = item.get("name")?.as_str()?.to_string();
     let kind = item
         .get("kind")
         .and_then(|k| k.as_u64())
@@ -1806,22 +1808,47 @@ fn flatten_document_symbol(
         })
         .unwrap_or((0, 0));
 
-    out.push(SymbolInfo {
-        name: name.clone(),
+    let children = item
+        .get("children")
+        .and_then(|c| c.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|child| parse_document_symbol_tree(child, Some(&name)))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Some(SymbolInfo {
+        name,
         kind,
         detail,
         container: container.map(|s| s.to_string()),
-        path: None, // Filled in by the caller (same as request file).
+        path: None,
         line,
         character,
-    });
+        children,
+    })
+}
 
-    // Recurse into children.
-    if let Some(children) = item.get("children").and_then(|c| c.as_array()) {
-        for child in children {
-            flatten_document_symbol(child, Some(&name), out);
+/// Parse a `textDocument/documentSymbol` response preserving hierarchy.
+/// Returns top-level symbols with nested children intact.
+pub fn parse_document_symbols_hierarchical(result: &serde_json::Value) -> Vec<SymbolInfo> {
+    let mut symbols = Vec::new();
+    if let Some(arr) = result.as_array() {
+        for item in arr {
+            if item.get("selectionRange").is_some() {
+                if let Some(sym) = parse_document_symbol_tree(item, None) {
+                    symbols.push(sym);
+                }
+            } else if item.get("location").is_some() {
+                // Flat SymbolInformation — no hierarchy to preserve
+                if let Some(sym) = parse_symbol_information(item) {
+                    symbols.push(sym);
+                }
+            }
         }
     }
+    symbols
 }
 
 /// Parse a `SymbolInformation` object (flat format, used by workspace/symbol too).
@@ -1852,6 +1879,7 @@ fn parse_symbol_information(item: &serde_json::Value) -> Option<SymbolInfo> {
         path,
         line,
         character,
+        children: Vec::new(),
     })
 }
 
@@ -2780,5 +2808,52 @@ bin:
         assert_eq!(info.categories, vec!["LSP"]);
         assert!(info.is_lsp());
         assert!(!info.is_dap());
+    }
+
+    #[test]
+    fn test_parse_document_symbols_hierarchical_preserves_children() {
+        let json = serde_json::json!([
+            {
+                "name": "MyStruct",
+                "kind": 23,
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 5, "character": 1}},
+                "selectionRange": {"start": {"line": 0, "character": 11}, "end": {"line": 0, "character": 19}},
+                "children": [
+                    {
+                        "name": "field_a",
+                        "kind": 8,
+                        "range": {"start": {"line": 1, "character": 4}, "end": {"line": 1, "character": 20}},
+                        "selectionRange": {"start": {"line": 1, "character": 8}, "end": {"line": 1, "character": 15}},
+                        "children": []
+                    },
+                    {
+                        "name": "field_b",
+                        "kind": 8,
+                        "range": {"start": {"line": 2, "character": 4}, "end": {"line": 2, "character": 20}},
+                        "selectionRange": {"start": {"line": 2, "character": 8}, "end": {"line": 2, "character": 15}},
+                        "children": []
+                    }
+                ]
+            },
+            {
+                "name": "my_func",
+                "kind": 12,
+                "range": {"start": {"line": 10, "character": 0}, "end": {"line": 15, "character": 1}},
+                "selectionRange": {"start": {"line": 10, "character": 3}, "end": {"line": 10, "character": 10}},
+                "children": []
+            }
+        ]);
+        let symbols = super::parse_document_symbols_hierarchical(&json);
+        assert_eq!(symbols.len(), 2, "Should have 2 top-level symbols");
+        assert_eq!(symbols[0].name, "MyStruct");
+        assert_eq!(
+            symbols[0].children.len(),
+            2,
+            "MyStruct should have 2 children"
+        );
+        assert_eq!(symbols[0].children[0].name, "field_a");
+        assert_eq!(symbols[0].children[1].name, "field_b");
+        assert_eq!(symbols[1].name, "my_func");
+        assert!(symbols[1].children.is_empty());
     }
 }

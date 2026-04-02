@@ -1827,6 +1827,9 @@ pub(super) fn render_picker_popup(
         item_end_col
     };
 
+    // Detect tree mode: any item with depth or expand arrows means we're in tree view
+    let has_tree = picker.items.iter().any(|i| i.expandable || i.depth > 0);
+
     for row_idx in 0..visible_rows {
         let result_idx = picker.scroll_top + row_idx;
         let ry = results_start + row_idx as u16;
@@ -1867,12 +1870,27 @@ pub(super) fn render_picker_popup(
 
         // Left pane: item text with fuzzy match highlighting
         if let Some(item) = picker.items.get(result_idx) {
-            let prefix = if is_selected { "▶ " } else { "  " };
-            let prefix_len = prefix.chars().count();
             let inner_cols = (content_end.saturating_sub(1)) as usize;
 
+            // Build prefix: selection indicator + tree indentation + expand arrow
+            let sel_prefix = if is_selected { "▶ " } else { "  " };
+            let indent: String = "  ".repeat(item.depth);
+            let arrow = if item.expandable {
+                if item.expanded {
+                    "▼ "
+                } else {
+                    "▷ "
+                }
+            } else if has_tree {
+                "  " // Align with expandable siblings
+            } else {
+                ""
+            };
+            let full_prefix = format!("{}{}{}", sel_prefix, indent, arrow);
+            let prefix_len = full_prefix.chars().count();
+
             // Draw prefix
-            for (j, ch) in prefix.chars().enumerate() {
+            for (j, ch) in full_prefix.chars().enumerate() {
                 let cx = x + 1 + j as u16;
                 if cx < x + content_end && cx < term_area.width {
                     set_cell(buf, cx, ry, ch, fg_color, row_bg);
@@ -2593,7 +2611,7 @@ pub(super) fn render_window(
             break;
         }
 
-        // Diff / DAP stopped-line background.
+        // Cursorline / Diff / DAP stopped-line background.
         let line_bg = if line.is_dap_current {
             rc(theme.dap_stopped_bg)
         } else {
@@ -2601,6 +2619,9 @@ pub(super) fn render_window(
                 Some(DiffLine::Added) => rc(theme.diff_added_bg),
                 Some(DiffLine::Removed) => rc(theme.diff_removed_bg),
                 Some(DiffLine::Padding) => rc(theme.diff_padding_bg),
+                _ if line.is_current_line && window.is_active && window.cursorline => {
+                    rc(theme.cursorline_bg)
+                }
                 _ => window_bg,
             }
         };

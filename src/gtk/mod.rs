@@ -4246,8 +4246,15 @@ impl SimpleComponent for App {
             } => {
                 let mut engine = self.engine.borrow_mut();
                 if engine.picker_open {
-                    // Double-click on picker: confirm the selected item
-                    let _action = engine.picker_confirm();
+                    // Double-click on picker: toggle expand for tree items, or confirm
+                    let in_tree_mode = engine.picker_source
+                        == crate::core::engine::PickerSource::CommandCenter
+                        && engine.picker_query == "@";
+                    if in_tree_mode && engine.picker_toggle_expand() {
+                        engine.picker_load_preview();
+                    } else {
+                        let _action = engine.picker_confirm();
+                    }
                     self.draw_needed.set(true);
                 } else {
                     // Check breadcrumb double-click before falling through
@@ -4684,10 +4691,11 @@ fn sync_scrollbar_positions(
     if da_width < 20.0 || da_height < 20.0 || line_height < 1.0 {
         return;
     }
+    let tab_row_height = (line_height * 1.6).ceil();
     let tab_bar_height = if engine.settings.breadcrumbs {
-        line_height * 2.0
+        tab_row_height + line_height
     } else {
-        line_height
+        tab_row_height
     };
     let wildmenu_px = if engine.wildmenu_items.is_empty() {
         0.0
@@ -5023,10 +5031,11 @@ impl App {
         }
 
         let line_height = self.cached_line_height;
+        let tab_row_height = (line_height * 1.6).ceil();
         let tab_bar_height = if engine.settings.breadcrumbs {
-            line_height * 2.0
+            tab_row_height + line_height
         } else {
-            line_height
+            tab_row_height
         };
         let wildmenu_px = if engine.wildmenu_items.is_empty() {
             0.0
@@ -9499,10 +9508,11 @@ fn compute_editor_window_rects(
     da_height: f64,
     line_height: f64,
 ) -> Vec<(core::WindowId, core::WindowRect)> {
+    let tab_row_height = (line_height * 1.6).ceil();
     let tab_bar_height = if engine.settings.breadcrumbs {
-        line_height * 2.0
+        tab_row_height + line_height
     } else {
-        line_height
+        tab_row_height
     };
     let wildmenu_px = if engine.wildmenu_items.is_empty() {
         0.0
@@ -9629,10 +9639,11 @@ fn tab_close_hit_test(
     line_height: f64,
     char_width: f64,
 ) -> Option<(usize, usize)> {
+    let tab_row_height = (line_height * 1.6).ceil();
     let tab_bar_height = if engine.settings.breadcrumbs {
-        line_height * 2.0
+        tab_row_height + line_height
     } else {
-        line_height
+        tab_row_height
     };
     let wildmenu_px = if engine.wildmenu_items.is_empty() {
         0.0
@@ -9648,8 +9659,9 @@ fn tab_close_hit_test(
     engine.adjust_group_rects_for_hidden_tabs(&mut group_rects, tab_bar_height);
 
     let close_w = char_width;
-    let tab_inner_gap = 4.0_f64;
-    let tab_outer_gap = 4.0_f64;
+    let tab_pad = 14.0_f64;
+    let tab_inner_gap = 10.0_f64;
+    let tab_outer_gap = 1.0_f64;
     let close_pad = char_width;
 
     for (gid, grect) in &group_rects {
@@ -9657,7 +9669,8 @@ fn tab_close_hit_test(
             continue;
         }
         let tab_y = grect.y - tab_bar_height;
-        if my < tab_y || my >= tab_y + line_height || mx < grect.x || mx >= grect.x + grect.width {
+        if my < tab_y || my >= tab_y + tab_row_height || mx < grect.x || mx >= grect.x + grect.width
+        {
             continue;
         }
         let local_x = mx - grect.x;
@@ -9676,10 +9689,11 @@ fn tab_close_hit_test(
                     format!(" {}: [No Name] ", i + 1)
                 };
                 let tab_w = name.chars().count() as f64 * char_width;
-                let slot_w = tab_w + tab_inner_gap + close_w + tab_outer_gap;
+                let tab_content_w = tab_pad + tab_w + tab_inner_gap + close_w + tab_pad;
+                let slot_w = tab_content_w + tab_outer_gap;
                 if local_x >= tab_x && local_x < tab_x + slot_w {
-                    let close_x_start = tab_x + tab_w + tab_inner_gap - close_pad;
-                    let close_x_end = tab_x + slot_w;
+                    let close_x_start = tab_x + tab_pad + tab_w + tab_inner_gap - close_pad;
+                    let close_x_end = tab_x + tab_content_w;
                     if local_x >= close_x_start && local_x < close_x_end {
                         return Some((gid.0, i));
                     }
@@ -9703,10 +9717,11 @@ fn tab_tooltip_hit_test(
     line_height: f64,
     char_width: f64,
 ) -> Option<String> {
+    let tab_row_height = (line_height * 1.6).ceil();
     let tab_bar_height = if engine.settings.breadcrumbs {
-        line_height * 2.0
+        tab_row_height + line_height
     } else {
-        line_height
+        tab_row_height
     };
     let wildmenu_px = if engine.wildmenu_items.is_empty() {
         0.0
@@ -9722,15 +9737,17 @@ fn tab_tooltip_hit_test(
     engine.adjust_group_rects_for_hidden_tabs(&mut group_rects, tab_bar_height);
 
     let close_w = char_width;
-    let tab_inner_gap = 4.0_f64;
-    let tab_outer_gap = 4.0_f64;
+    let tab_pad = 14.0_f64;
+    let tab_inner_gap = 10.0_f64;
+    let tab_outer_gap = 1.0_f64;
 
     for (gid, grect) in &group_rects {
         if engine.is_tab_bar_hidden(*gid) {
             continue;
         }
         let tab_y = grect.y - tab_bar_height;
-        if my < tab_y || my >= tab_y + line_height || mx < grect.x || mx >= grect.x + grect.width {
+        if my < tab_y || my >= tab_y + tab_row_height || mx < grect.x || mx >= grect.x + grect.width
+        {
             continue;
         }
         let local_x = mx - grect.x;
@@ -9752,7 +9769,7 @@ fn tab_tooltip_hit_test(
                     (format!(" {}: [No Name] ", i + 1), None)
                 };
                 let tab_w = name.chars().count() as f64 * char_width;
-                let slot_w = tab_w + tab_inner_gap + close_w + tab_outer_gap;
+                let slot_w = tab_pad + tab_w + tab_inner_gap + close_w + tab_pad + tab_outer_gap;
                 if local_x >= tab_x && local_x < tab_x + slot_w {
                     return file_path.map(|p| shorten_path(&p));
                 }

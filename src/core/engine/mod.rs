@@ -790,6 +790,12 @@ pub struct PickerItem {
     pub score: i32,
     /// Byte positions in `display` that matched the query (for highlight).
     pub match_positions: Vec<usize>,
+    /// Tree nesting depth (0 = top-level). Used for symbol outline tree view.
+    pub depth: usize,
+    /// Whether this item has children that can be expanded.
+    pub expandable: bool,
+    /// Whether this item's children are currently visible.
+    pub expanded: bool,
 }
 
 /// The action taken when a picker item is confirmed.

@@ -4,6 +4,13 @@
 
 - **(Intermittent) TUI rendering artifacts** — Stale characters from a previous view sometimes linger on screen. Not reliably reproducible yet. Workaround: Ctrl+L forces a full screen redraw.
 
+- **(Low) Hardcoded colors in rendering code — 59 instances across 5 files.** These colors don't adapt to the user's chosen theme. Should all use `Theme` struct fields instead. Breakdown:
+  - `src/gtk/css.rs` (23) — Button, dialog, toggle, and find bar CSS colors are hardcoded hex. Should be interpolated from the theme via `make_theme_css()`.
+  - `src/gtk/draw.rs` (12) — Scrollbar track/thumb RGBA, tooltip popup bg/fg, terminal pane background, extension section headers. Should use theme fields.
+  - `src/tui_main/panels.rs` (15) — Git status colors (`RColor::Rgb(90,180,90)` etc.) ignore existing `theme.git_added/modified/deleted`; activity bar icon colors, scrollbar thumb, terminal background/find match colors all hardcoded.
+  - `src/tui_main/render_impl.rs` (3) — Scrollbar thumb color `RColor::Rgb(128,128,128)` repeated 3 times. Should be a theme field (e.g. `theme.scrollbar_thumb`).
+  - `src/gtk/mod.rs` (3) — Cursor indicator box RGBA, search result markup hex colors.
+
 ## Resolved
 
 - **VSCode mode undo granularity** — Every character typed created its own undo entry. Fixed by keeping the undo group open across consecutive character insertions in `handle_vscode_key()`, breaking only on non-character actions (cursor movement, Backspace, Return, Ctrl+* commands) or external cursor moves (mouse clicks). `vscode_undo_group_open` + `vscode_undo_cursor` fields on Engine. 5 new tests.

@@ -197,8 +197,15 @@ pub(super) fn handle_mouse(
                     let clicked_idx = engine.picker_scroll_top + (row - results_start) as usize;
                     if clicked_idx < engine.picker_items.len() {
                         if engine.picker_selected == clicked_idx {
-                            // Second click on same item — confirm
-                            engine.picker_confirm();
+                            // Second click on same item — toggle expand or confirm
+                            let in_tree_mode = engine.picker_source
+                                == crate::core::engine::PickerSource::CommandCenter
+                                && engine.picker_query == "@";
+                            if in_tree_mode && engine.picker_toggle_expand() {
+                                engine.picker_load_preview();
+                            } else {
+                                engine.picker_confirm();
+                            }
                         } else {
                             engine.picker_selected = clicked_idx;
                             engine.picker_load_preview();

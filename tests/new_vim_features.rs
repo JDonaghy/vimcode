@@ -544,10 +544,17 @@ fn test_set_hlsearch() {
 #[test]
 fn test_set_cursorline() {
     let mut e = engine_with("hello\n");
-    exec(&mut e, "set cursorline");
+    // Default is true
     assert!(e.settings.cursorline);
     exec(&mut e, "set nocursorline");
     assert!(!e.settings.cursorline);
+    exec(&mut e, "set cursorline");
+    assert!(e.settings.cursorline);
+    // Abbreviation also works
+    exec(&mut e, "set nocul");
+    assert!(!e.settings.cursorline);
+    exec(&mut e, "set cul");
+    assert!(e.settings.cursorline);
 }
 
 #[test]
