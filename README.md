@@ -1,5 +1,7 @@
 # VimCode
 
+**[vimcode.org](https://vimcode.org)** | [Documentation](https://github.com/JDonaghy/vimcode/wiki) | [Releases](https://github.com/JDonaghy/vimcode/releases)
+
 High-performance Vim+VSCode hybrid editor in Rust. Modal editing meets modern UX, no GPU required.
 
 ### Who's this for?
