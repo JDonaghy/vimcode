@@ -1025,6 +1025,10 @@ fn event_loop(
     let mut close_tab_confirm = false;
 
     let mut needs_redraw = true;
+    // Track whether a large overlay popup was visible last frame so we can
+    // force a full redraw when it disappears (prevents stale characters from
+    // the popup lingering due to ratatui's incremental diff).
+    let mut had_popup_overlay = false;
     // Link hit rects from the hover popup render: (x, y, w, h, url).
     let mut hover_link_rects: Vec<(u16, u16, u16, u16, String)> = Vec::new();
     // Bounding rect of the panel hover popup (x, y, w, h) — used to suppress dismiss on mouse-over.
@@ -1182,6 +1186,19 @@ fn event_loop(
                     }
                 }
             }
+
+            // Detect when a large overlay popup (picker, folder picker, dialog)
+            // was visible last frame but isn't now.  Force a full redraw so
+            // ratatui's incremental diff doesn't leave stale popup characters
+            // in the editor area.
+            let has_popup = screen
+                .map(|s| s.picker.is_some())
+                .unwrap_or(false)
+                || folder_picker.is_some();
+            if had_popup_overlay && !has_popup {
+                terminal.clear().ok();
+            }
+            had_popup_overlay = has_popup;
 
             let mut tab_visible_counts: Vec<(crate::core::window::GroupId, usize)> = Vec::new();
             terminal
@@ -3713,6 +3730,11 @@ fn event_loop(
                 // Resize the terminal PTY to match the full new terminal width.
                 let term_rows = engine.session.terminal_panel_rows;
                 engine.terminal_resize(new_w, term_rows);
+                // Force ratatui to do a full redraw.  Terminal emulators reflow
+                // screen content on resize, which can leave the physical display
+                // out of sync with ratatui's previous-frame buffer.  Clearing
+                // resets both buffers so the next draw emits every cell.
+                terminal.clear().ok();
             }
             _ => {}
         }

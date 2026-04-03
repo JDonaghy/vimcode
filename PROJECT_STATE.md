@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 2, 2026 (Session 243 — LSP status indicator) | **Tests:** 5275
+**Last updated:** Apr 2, 2026 (Session 244 — TUI rendering artifact fix + debug panel close bug) | **Tests:** 5275
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 243 are in **SESSION_HISTORY.md**.
@@ -26,4 +26,6 @@ When implementing a new key/command, add tests covering:
 
 ## Recent Work
 
-> All sessions through 242 archived in **SESSION_HISTORY.md**.
+> All sessions through 243 archived in **SESSION_HISTORY.md**.
+
+- **Session 244**: TUI rendering artifact mitigation — `terminal.clear()` on `Event::Resize` (terminal reflow desync) and on picker/folder-picker popup dismiss (ratatui incremental diff miss); removed closed "debug panel close" bug from BUGS.md.

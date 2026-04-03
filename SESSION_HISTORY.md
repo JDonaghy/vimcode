@@ -1,9 +1,12 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 243 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 244 archived here. Recent work summary in PROJECT_STATE.md.
 
 ---
+
+**Session 244 — TUI rendering artifact fix (5275 tests):**
+Mitigated intermittent TUI stale character artifacts. Two fixes in `src/tui_main/mod.rs`: (1) `terminal.clear()` on `Event::Resize` — terminal emulators reflow screen content on resize, desynchronizing the physical display from ratatui's previous-frame buffer; clearing resets both internal buffers so the next draw emits every cell. (2) Popup dismiss detection — track `had_popup_overlay` flag; when picker or folder picker transitions from visible to hidden, call `terminal.clear()` to force full redraw instead of relying on ratatui's incremental diff (which can miss cells where the popup was drawn over the editor). Also removed the "no way to close debug output tab" bug from BUGS.md (already fixed in a prior session).
 
 **Session 243 — LSP status indicator (5275 tests):**
 Persistent LSP server status in per-window status bar. `LspStatus` enum in `lsp_manager.rs`: `None` (no LSP for filetype), `Installing` (binary being installed), `Initializing(server_name)` (server started but not ready), `Running(server_name)` (fully indexed), `Crashed`. Server name extracted from command path (`/usr/bin/rust-analyzer` → `rust-analyzer`). `server_has_responded: HashMap<LspServerId, bool>` on `LspManager` tracks first meaningful response; `mark_server_responded(server_id)` called on non-empty hover, definition, and completion responses in `panels.rs`. `lsp_status_for_language()` on `LspManager` checks `initialized` + `server_has_responded` maps. `lsp_status_for_buffer(buffer_id)` on Engine combines `lsp_installing` check + manager query. Render-side readiness override in `build_window_status_line()`: `Running` downgraded to `Initializing` when `BufferState.semantic_tokens` is empty — semantic tokens arrive after full workspace indexing, aligning with hover/go-to-definition readiness (~20s on large Rust projects). Status bar display: `rust-analyzer` (ready, normal color), `rust-analyzer…` (indexing, dimmed), `LSP↓` (installing, dimmed), `LSP✗` (crashed, red), hidden (no LSP). `StatusAction::LspInfo` click runs `:LspInfo` command. 1 new test.
