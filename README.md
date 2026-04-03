@@ -37,7 +37,7 @@ For detailed how-to guides and configuration references, see the **[VimCode Wiki
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 5,199 tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 5,275 tests, zero async runtime dependency
 
 > **Note:** VimCode does not implement VimScript. Extension and scripting is handled via
 > the built-in Lua 5.4 plugin system. The goal is full Vim *keybinding* and *editing*
@@ -685,6 +685,7 @@ Runtime changes are written through to `~/.config/vimcode/settings.json` immedia
 | `smartcase` / `nosmartcase` | `scs` | off | Override `ignorecase` when pattern has uppercase |
 | `scrolloff=N` | `so` | 0 | Lines to keep above/below cursor when scrolling |
 | `cursorline` / `nocursorline` | `cul` | on | Highlight the line the cursor is on |
+| `windowstatusline` / `nowindowstatusline` | `wsl` | on | Per-window status line instead of single global bar |
 | `colorcolumn=N` | `cc` | "" | Comma-list of column guides to highlight |
 | `textwidth=N` | `tw` | 0 | Auto-wrap inserted text at column N (0=off) |
 | `wrap` / `nowrap` | | off | Soft-wrap long lines at viewport edge |

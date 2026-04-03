@@ -18,6 +18,8 @@ pub(super) enum ClickTarget {
     DiffToolbarNext,
     /// Click was on a diff toolbar toggle-fold button.
     DiffToolbarToggleFold,
+    /// Click was on a per-window status bar segment with an action.
+    StatusBarAction(crate::core::engine::StatusAction),
     /// Click was outside any actionable area.
     None,
 }
@@ -52,7 +54,9 @@ pub(super) fn pixel_to_click_target(
         } else {
             line_height
         };
-        let status_bar_height = line_height * 2.0 + wildmenu_px;
+        let per_window_status = engine.settings.window_status_line;
+        let global_status_rows = if per_window_status { 1.0 } else { 2.0 };
+        let status_bar_height = line_height * global_status_rows + wildmenu_px;
         let qf_px = if engine.quickfix_open {
             let n = engine.quickfix_items.len().clamp(1, 10) as f64;
             (n + 1.0) * line_height
@@ -163,8 +167,29 @@ pub(super) fn pixel_to_click_target(
     } else {
         line_height
     };
-    let status_bar_height = line_height * 2.0 + wildmenu_px;
-    let editor_bottom = height - status_bar_height;
+    let global_status_rows = if engine.settings.window_status_line {
+        1.0
+    } else {
+        2.0
+    };
+    let status_bar_height = line_height * global_status_rows + wildmenu_px;
+    let qf_px2 = if engine.quickfix_open {
+        let n = engine.quickfix_items.len().clamp(1, 10) as f64;
+        (n + 1.0) * line_height
+    } else {
+        0.0
+    };
+    let term_px2 = if engine.terminal_open || engine.bottom_panel_open {
+        (engine.session.terminal_panel_rows as usize + 2) as f64 * line_height
+    } else {
+        0.0
+    };
+    let dbg_px2 = if engine.debug_toolbar_visible {
+        line_height
+    } else {
+        0.0
+    };
+    let editor_bottom = height - status_bar_height - dbg_px2 - qf_px2 - term_px2;
 
     if y >= editor_bottom {
         return ClickTarget::None;
@@ -233,14 +258,27 @@ pub(super) fn pixel_to_click_target(
     );
     let gutter_width = gutter_char_width as f64 * char_width;
 
-    let per_window_status = if engine.windows.len() > 1 {
+    let per_window_status_px = if engine.settings.window_status_line {
         line_height
     } else {
         0.0
     };
-    let text_area_height = rect.height - per_window_status;
+    let text_area_height = rect.height - per_window_status_px;
 
     if y >= rect.y + text_area_height {
+        // Click is in the per-window status bar area — do segment hit-testing
+        if engine.settings.window_status_line {
+            let theme = crate::render::Theme::from_name(&engine.settings.colorscheme);
+            let is_active = window_id == engine.active_window_id();
+            let status =
+                crate::render::build_window_status_line(engine, &theme, window_id, is_active);
+            let local_x = x - rect.x;
+            if let Some(action) =
+                gtk_status_segment_hit_test(&status, local_x, rect.width, char_width)
+            {
+                return ClickTarget::StatusBarAction(action);
+            }
+        }
         return ClickTarget::None;
     }
 
@@ -410,6 +448,10 @@ pub(super) fn handle_mouse_click(
                 return Some(true);
             }
             engine.close_tab();
+            None
+        }
+        ClickTarget::StatusBarAction(action) => {
+            engine.handle_status_action(&action);
             None
         }
         _ => None,
@@ -585,4 +627,43 @@ pub(super) fn handle_mouse_drag(
     ) {
         engine.mouse_drag(wid, line, col);
     }
+}
+
+/// Hit-test a click at `local_x` (relative to window rect) against status bar segments.
+/// Uses pixel-based measurement with `char_width` to approximate segment positions.
+fn gtk_status_segment_hit_test(
+    status: &crate::render::WindowStatusLine,
+    local_x: f64,
+    bar_width: f64,
+    char_width: f64,
+) -> Option<crate::core::engine::StatusAction> {
+    // Compute right-side total width in pixels
+    let right_px: f64 = status
+        .right_segments
+        .iter()
+        .map(|s| s.text.chars().count() as f64 * char_width)
+        .sum();
+    let right_start = (bar_width - right_px).max(0.0);
+
+    // Check left segments
+    let mut px = 0.0;
+    for seg in &status.left_segments {
+        let seg_px = seg.text.chars().count() as f64 * char_width;
+        if local_x >= px && local_x < px + seg_px {
+            return seg.action.clone();
+        }
+        px += seg_px;
+    }
+
+    // Check right segments
+    let mut px = right_start;
+    for seg in &status.right_segments {
+        let seg_px = seg.text.chars().count() as f64 * char_width;
+        if local_x >= px && local_x < px + seg_px {
+            return seg.action.clone();
+        }
+        px += seg_px;
+    }
+
+    None
 }

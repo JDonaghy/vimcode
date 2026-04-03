@@ -1,4 +1,4 @@
-# src/gtk/draw.rs — 5,760 lines
+# src/gtk/draw.rs — 5,884 lines
 
 All Cairo/Pango drawing functions for the GTK backend. Each `draw_*` function renders one UI component onto a Cairo context using data from `ScreenLayout`.
 
@@ -10,6 +10,7 @@ All Cairo/Pango drawing functions for the GTK backend. Each `draw_*` function re
 - `draw_breadcrumb_bar` — file path breadcrumbs below tab bar
 - `draw_h_scrollbars` — horizontal scrollbars
 - `draw_tab_drag_overlay` — drag indicator when moving tabs
+- `draw_window_status_bar` — per-window status bar with styled segments
 - `draw_window_separators` — dividers between split windows
 - `draw_completion_popup` — LSP/word completion dropdown
 - `draw_hover_popup` — LSP hover information popup

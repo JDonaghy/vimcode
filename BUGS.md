@@ -4,6 +4,12 @@
 
 - **(Intermittent) TUI rendering artifacts** — Stale characters from a previous view sometimes linger on screen. Not reliably reproducible yet. Workaround: Ctrl+L forces a full screen redraw.
 
+- **(Medium) Settings button unclickable when debug output tab is open** — The Settings icon in the activity bar cannot be clicked while the bottom debug/terminal panel is visible. Likely a click target overlap or the panel is intercepting the click.
+
+- **(Medium) Spell check underline misaligned** — Misspelled words show underlines that start several characters before the word and end in the middle of it. The underline span offsets appear wrong. May be a byte-vs-char index mismatch in `SpellMark` positioning, or an interaction with tree-sitter/LSP spans shifting offsets.
+
+- **(Medium) No way to close debug output tab after failed session** — When a DAP session fails or ends, the debug output bottom panel remains open with no way to dismiss it. Need a close button or keybinding (e.g., Ctrl-T toggle or a panel close command).
+
 - **(Low) Hardcoded colors in rendering code — 59 instances across 5 files.** These colors don't adapt to the user's chosen theme. Should all use `Theme` struct fields instead. Breakdown:
   - `src/gtk/css.rs` (23) — Button, dialog, toggle, and find bar CSS colors are hardcoded hex. Should be interpolated from the theme via `make_theme_css()`.
   - `src/gtk/draw.rs` (12) — Scrollbar track/thumb RGBA, tooltip popup bg/fg, terminal pane background, extension section headers. Should use theme fields.

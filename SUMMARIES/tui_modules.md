@@ -10,14 +10,15 @@ TUI application shell using ratatui + crossterm. Contains setup, event loop, key
 - Clipboard via `copypasta_ext::x11_bin::ClipboardContext`
 - Keyboard enhancement flags for Kitty/WezTerm (disambiguate Ctrl+Shift combos)
 
-## src/tui_main/render_impl.rs — 3,845 lines
+## src/tui_main/render_impl.rs — 3,924 lines
 All TUI rendering. Converts `ScreenLayout` into ratatui `Frame` draws.
 - `draw_frame(frame, engine, theme)` — top-level render function
 - `build_screen_for_tui(engine, cols, rows)` — compute layout geometry
 - Tab bar rendering per editor group
 - Editor window rendering (syntax spans → ratatui Spans)
 - Popup rendering: completion, hover, picker, dialog, context menu, diff peek, signature help
-- Status line + command line + wildmenu rendering
+- Per-window status line rendering (`render_window_status_line`)
+- Global status line + command line + wildmenu rendering
 - Menu bar + dropdown rendering (centered nav arrows + Command Center search box)
 - Debug toolbar rendering
 

@@ -741,6 +741,18 @@ pub static PALETTE_COMMANDS: &[PaletteCommand] = &[
 // ─── Unified Picker Types ────────────────────────────────────────────────────
 
 /// Identifies the data source backing a picker modal.
+/// Action triggered when a status bar segment is clicked.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StatusAction {
+    GoToLine,
+    ChangeLanguage,
+    ChangeIndentation,
+    ChangeLineEnding,
+    ChangeEncoding,
+    SwitchBranch,
+    LspInfo,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
 pub enum PickerSource {
@@ -755,6 +767,12 @@ pub enum PickerSource {
     GitBranches,
     /// Command Center: dynamic prefix routing (>, @, #, :, ?).
     CommandCenter,
+    /// Language/filetype picker (click on language segment in status bar).
+    Languages,
+    /// Indentation picker (click on indent segment in status bar).
+    Indentation,
+    /// Line ending picker (LF / CRLF).
+    LineEndings,
     Custom(String),
 }
 
@@ -812,6 +830,12 @@ pub enum PickerAction {
     GotoLine(usize),
     /// Jump to a symbol location (file, line, col).
     GotoSymbol(PathBuf, usize, usize),
+    /// Set language/filetype for the active buffer.
+    SetLanguage(String),
+    /// Set indentation: (expand_tab, tabstop/shift_width).
+    SetIndentation(bool, u8),
+    /// Set line ending format: true = CRLF, false = LF.
+    SetLineEnding(bool),
     Custom(String),
 }
 

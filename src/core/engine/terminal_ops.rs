@@ -186,11 +186,21 @@ impl Engine {
     /// - If open and focused → close (hide)
     /// - If open but unfocused → give focus
     /// - If not open → signal UI to open (UI calls terminal_new_tab with correct dimensions)
+    ///
+    /// Also closes the debug output bottom panel if it is the only thing keeping
+    /// the bottom panel visible (no terminal running).
     pub fn toggle_terminal(&mut self) {
         if self.terminal_open && self.terminal_has_focus {
             self.close_terminal();
+            // Also close debug output panel if no terminal remains
+            if self.bottom_panel_open && !self.terminal_open {
+                self.bottom_panel_open = false;
+            }
         } else if self.terminal_open {
             self.terminal_has_focus = true;
+        } else if self.bottom_panel_open {
+            // No terminal but debug output panel is open — close it
+            self.bottom_panel_open = false;
         } else {
             // Signal UI to call terminal_new_tab with correct dimensions
             self.terminal_open = true;

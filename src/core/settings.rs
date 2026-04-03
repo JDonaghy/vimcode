@@ -171,6 +171,10 @@ pub struct Settings {
     #[serde(default = "default_cursorline")]
     pub cursorline: bool,
 
+    /// Per-window status lines instead of a single global status bar (default true).
+    #[serde(default = "default_window_status_line")]
+    pub window_status_line: bool,
+
     /// Automatically reload files when changed externally (default true).
     /// Vim: `autoread`.
     #[serde(default = "default_autoread")]
@@ -352,6 +356,10 @@ fn default_plugins_enabled() -> bool {
 }
 
 fn default_hlsearch() -> bool {
+    true
+}
+
+fn default_window_status_line() -> bool {
     true
 }
 
@@ -678,6 +686,7 @@ impl Default for Settings {
             smartcase: false,
             scrolloff: 0,
             cursorline: default_cursorline(),
+            window_status_line: default_window_status_line(),
             autoread: default_autoread(),
             splitbelow: false,
             splitright: false,
@@ -941,6 +950,7 @@ impl Settings {
             "ignorecase" | "ic" => self.ignorecase = enable,
             "smartcase" | "scs" => self.smartcase = enable,
             "cursorline" | "cul" => self.cursorline = enable,
+            "windowstatusline" | "wsl" => self.window_status_line = enable,
             "autoread" | "ar" => self.autoread = enable,
             "splitbelow" | "sb" => self.splitbelow = enable,
             "splitright" | "spr" => self.splitright = enable,
@@ -1109,6 +1119,11 @@ impl Settings {
             } else {
                 "nocursorline".to_string()
             }),
+            "windowstatusline" | "wsl" => Ok(if self.window_status_line {
+                "windowstatusline".to_string()
+            } else {
+                "nowindowstatusline".to_string()
+            }),
             "splitbelow" | "sb" => Ok(if self.splitbelow {
                 "splitbelow".to_string()
             } else {
@@ -1226,6 +1241,7 @@ impl Settings {
                 LineNumberMode::Hybrid => "hybrid".to_string(),
             },
             "cursorline" => self.cursorline.to_string(),
+            "window_status_line" => self.window_status_line.to_string(),
             "tabstop" => self.tabstop.to_string(),
             "shift_width" => self.shift_width.to_string(),
             "expand_tab" => self.expand_tab.to_string(),
@@ -1295,6 +1311,7 @@ impl Settings {
                 };
             }
             "cursorline" => self.cursorline = value == "true",
+            "window_status_line" => self.window_status_line = value == "true",
             "tabstop" => {
                 self.tabstop = value
                     .parse()
@@ -1508,6 +1525,13 @@ pub static SETTING_DEFS: &[SettingDef] = &[
         key: "cursorline",
         label: "Cursor Line",
         description: "Highlight the line containing the cursor",
+        category: "Appearance",
+        setting_type: SettingType::Bool,
+    },
+    SettingDef {
+        key: "window_status_line",
+        label: "Per-Window Status Line",
+        description: "Show a status line at the bottom of each window instead of a single global bar",
         category: "Appearance",
         setting_type: SettingType::Bool,
     },

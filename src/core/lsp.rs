@@ -566,6 +566,52 @@ pub fn language_id_from_path(path: &Path) -> Option<String> {
     Some(lang.to_string())
 }
 
+/// Return a sorted, deduplicated list of all known language identifiers.
+pub fn all_known_language_ids() -> Vec<&'static str> {
+    let mut langs = vec![
+        "bicep",
+        "bibtex",
+        "c",
+        "cpp",
+        "csharp",
+        "css",
+        "dockerfile",
+        "elixir",
+        "go",
+        "graphql",
+        "haskell",
+        "html",
+        "java",
+        "javascript",
+        "javascriptreact",
+        "json",
+        "kotlin",
+        "latex",
+        "lua",
+        "markdown",
+        "nix",
+        "ocaml",
+        "php",
+        "python",
+        "ruby",
+        "rust",
+        "scala",
+        "shellscript",
+        "solidity",
+        "sql",
+        "swift",
+        "terraform",
+        "toml",
+        "typescript",
+        "typescriptreact",
+        "yaml",
+        "zig",
+    ];
+    langs.sort_unstable();
+    langs.dedup();
+    langs
+}
+
 /// Convert a UTF-16 offset to a char (grapheme-unaware) column index within a line.
 /// LSP positions use UTF-16 code units; Ropey/our engine use char indices.
 pub fn utf16_offset_to_char(line_text: &str, utf16_offset: u32) -> usize {

@@ -26,6 +26,33 @@ pub enum SyntaxLanguage {
 }
 
 impl SyntaxLanguage {
+    /// Map an LSP language identifier (e.g. "rust", "python") to a SyntaxLanguage.
+    pub fn from_language_id(id: &str) -> Option<Self> {
+        match id {
+            "rust" => Some(Self::Rust),
+            "python" => Some(Self::Python),
+            "javascript" | "javascriptreact" => Some(Self::JavaScript),
+            "typescript" => Some(Self::TypeScript),
+            "typescriptreact" => Some(Self::TypeScriptReact),
+            "go" => Some(Self::Go),
+            "c" => Some(Self::C),
+            "cpp" => Some(Self::Cpp),
+            "csharp" => Some(Self::CSharp),
+            "java" => Some(Self::Java),
+            "ruby" => Some(Self::Ruby),
+            "lua" => Some(Self::Lua),
+            "shellscript" => Some(Self::Bash),
+            "json" => Some(Self::Json),
+            "toml" => Some(Self::Toml),
+            "yaml" => Some(Self::Yaml),
+            "html" => Some(Self::Html),
+            "css" => Some(Self::Css),
+            "markdown" => Some(Self::Markdown),
+            "latex" | "bibtex" => Some(Self::Latex),
+            _ => None,
+        }
+    }
+
     /// Detect language from file extension
     pub fn from_path(path: &str) -> Option<Self> {
         let path_lower = path.to_lowercase();
@@ -716,6 +743,11 @@ impl Syntax {
     pub fn new_from_path(path: Option<&str>) -> Option<Self> {
         path.and_then(SyntaxLanguage::from_path)
             .map(Self::new_for_language)
+    }
+
+    /// Create a Syntax from an LSP language identifier (e.g. "rust", "python").
+    pub fn new_from_language_id(id: &str) -> Option<Self> {
+        SyntaxLanguage::from_language_id(id).map(Self::new_for_language)
     }
 }
 

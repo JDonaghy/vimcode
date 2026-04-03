@@ -117,6 +117,18 @@ impl Engine {
                 self.picker_title = "Switch Branch".to_string();
                 self.picker_populate_branches();
             }
+            PickerSource::Languages => {
+                self.picker_title = "Select Language Mode".to_string();
+                self.picker_populate_languages();
+            }
+            PickerSource::Indentation => {
+                self.picker_title = "Select Indentation".to_string();
+                self.picker_populate_indentation();
+            }
+            PickerSource::LineEndings => {
+                self.picker_title = "Select Line Ending Sequence".to_string();
+                self.picker_populate_line_endings();
+            }
             _ => {
                 self.picker_title = format!("{:?}", source);
             }
@@ -553,6 +565,110 @@ impl Engine {
                     filter_text: b.name.clone(),
                     detail,
                     action: PickerAction::CheckoutBranch(b.name),
+                    icon: None,
+                    score: 0,
+                    match_positions: Vec::new(),
+                    depth: 0,
+                    expandable: false,
+                    expanded: false,
+                }
+            })
+            .collect();
+    }
+
+    fn picker_populate_languages(&mut self) {
+        let current = self
+            .buffer_manager
+            .get(self.active_buffer_id())
+            .and_then(|s| s.lsp_language_id.as_deref())
+            .unwrap_or("");
+        self.picker_all_items = crate::core::lsp::all_known_language_ids()
+            .into_iter()
+            .map(|lang| {
+                let detail = if lang == current {
+                    Some("● current".to_string())
+                } else {
+                    None
+                };
+                PickerItem {
+                    display: lang.to_string(),
+                    filter_text: lang.to_string(),
+                    detail,
+                    action: PickerAction::SetLanguage(lang.to_string()),
+                    icon: None,
+                    score: 0,
+                    match_positions: Vec::new(),
+                    depth: 0,
+                    expandable: false,
+                    expanded: false,
+                }
+            })
+            .collect();
+    }
+
+    fn picker_populate_indentation(&mut self) {
+        let et = self.settings.expand_tab;
+        let ts = self.settings.tabstop;
+        let items = [
+            ("Spaces: 2", true, 2u8),
+            ("Spaces: 4", true, 4),
+            ("Spaces: 8", true, 8),
+            ("Tabs (width 2)", false, 2),
+            ("Tabs (width 4)", false, 4),
+            ("Tabs (width 8)", false, 8),
+        ];
+        self.picker_all_items = items
+            .iter()
+            .map(|(label, expand, width)| {
+                let is_current = *expand == et && *width == ts;
+                PickerItem {
+                    display: label.to_string(),
+                    filter_text: label.to_string(),
+                    detail: if is_current {
+                        Some("● current".to_string())
+                    } else {
+                        None
+                    },
+                    action: PickerAction::SetIndentation(*expand, *width),
+                    icon: None,
+                    score: 0,
+                    match_positions: Vec::new(),
+                    depth: 0,
+                    expandable: false,
+                    expanded: false,
+                }
+            })
+            .collect();
+    }
+
+    fn picker_populate_line_endings(&mut self) {
+        use crate::core::buffer_manager::LineEnding;
+        let current = self
+            .buffer_manager
+            .get(self.active_buffer_id())
+            .map(|s| s.line_ending)
+            .unwrap_or(LineEnding::LF);
+        let items = [
+            ("LF", false),  // is_crlf = false
+            ("CRLF", true), // is_crlf = true
+        ];
+        self.picker_all_items = items
+            .iter()
+            .map(|(label, is_crlf)| {
+                let le = if *is_crlf {
+                    LineEnding::Crlf
+                } else {
+                    LineEnding::LF
+                };
+                PickerItem {
+                    display: label.to_string(),
+                    filter_text: label.to_string(),
+                    detail: if le == current {
+                        Some("● current".to_string())
+                    } else {
+                        None
+                    },
+                    action: PickerAction::SetLineEnding(*is_crlf),
                     icon: None,
                     score: 0,
                     match_positions: Vec::new(),
@@ -1650,6 +1766,44 @@ impl Engine {
             }
             PickerAction::CheckoutBranch(branch) => {
                 self.execute_command(&format!("Gswitch {}", branch))
+            }
+            PickerAction::SetLanguage(lang) => {
+                // Set the language ID on the active buffer and re-run syntax
+                let bid = self.active_buffer_id();
+                if let Some(state) = self.buffer_manager.get_mut(bid) {
+                    state.lsp_language_id = Some(lang.clone());
+                    // Update syntax parser for the new language
+                    state.syntax = crate::core::syntax::Syntax::new_from_language_id(&lang);
+                    state.update_syntax();
+                }
+                self.message = format!("Language mode: {}", lang);
+                EngineAction::None
+            }
+            PickerAction::SetIndentation(expand, width) => {
+                self.settings.expand_tab = expand;
+                self.settings.tabstop = width;
+                self.settings.shift_width = width;
+                let _ = self.settings.save();
+                self.message = if expand {
+                    format!("Spaces: {}", width)
+                } else {
+                    format!("Tab Size: {}", width)
+                };
+                EngineAction::None
+            }
+            PickerAction::SetLineEnding(is_crlf) => {
+                use crate::core::buffer_manager::LineEnding;
+                let new = if is_crlf {
+                    LineEnding::Crlf
+                } else {
+                    LineEnding::LF
+                };
+                let bid = self.active_buffer_id();
+                if let Some(state) = self.buffer_manager.get_mut(bid) {
+                    state.set_line_ending(new);
+                }
+                self.message = format!("Line endings: {}", new.as_str());
+                EngineAction::None
             }
             PickerAction::JumpToMark(_mark) => {
                 // Phase 3: mark jumping via picker

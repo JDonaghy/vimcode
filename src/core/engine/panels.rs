@@ -723,7 +723,16 @@ impl Engine {
                     }
                     // else: stale response (request already superseded) — ignore
                 }
-                LspEvent::DefinitionResponse { locations, .. } => {
+                LspEvent::DefinitionResponse {
+                    server_id,
+                    locations,
+                    ..
+                } => {
+                    if !locations.is_empty() {
+                        if let Some(mgr) = self.lsp_manager.as_mut() {
+                            mgr.mark_server_responded(server_id);
+                        }
+                    }
                     self.lsp_pending_definition = None;
                     self.message.clear();
                     if let Some(loc) = locations.first() {
@@ -750,7 +759,16 @@ impl Engine {
                         self.message = "No definition found".to_string();
                     }
                 }
-                LspEvent::HoverResponse { contents, .. } => {
+                LspEvent::HoverResponse {
+                    server_id,
+                    contents,
+                    ..
+                } => {
+                    if contents.is_some() {
+                        if let Some(mgr) = self.lsp_manager.as_mut() {
+                            mgr.mark_server_responded(server_id);
+                        }
+                    }
                     self.lsp_pending_hover = None;
                     // Treat empty/whitespace-only hover as "no hover".
                     let text = contents.filter(|t| !t.trim().is_empty());

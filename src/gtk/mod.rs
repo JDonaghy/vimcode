@@ -6067,15 +6067,18 @@ impl App {
             self.draw_needed.set(true);
         } else {
             // ── Status bar branch click — open branch picker ─────────────
+            // (only when per-window status is off — global bar exists)
             if self.cached_line_height > 0.0 {
                 let lh = self.cached_line_height;
                 let engine = self.engine.borrow();
+                let per_window_status = engine.settings.window_status_line;
                 let wildmenu_px = if engine.wildmenu_items.is_empty() {
                     0.0
                 } else {
                     lh
                 };
-                let status_bar_height = lh * 2.0 + wildmenu_px;
+                let global_status_rows = if per_window_status { 1.0 } else { 2.0 };
+                let status_bar_height = lh * global_status_rows + wildmenu_px;
                 let status_y = height - status_bar_height;
                 if y >= status_y && y < status_y + lh && engine.git_branch.is_some() {
                     // Reconstruct branch column range (matching build_status_line logic)
@@ -6136,7 +6139,12 @@ impl App {
                 if engine.terminal_open || engine.bottom_panel_open {
                     let term_px =
                         (engine.session.terminal_panel_rows as f64 + 2.0) * self.cached_line_height;
-                    let status_h = 2.0 * self.cached_line_height;
+                    let global_status_rows = if engine.settings.window_status_line {
+                        0.0
+                    } else {
+                        1.0
+                    };
+                    let status_h = (1.0 + global_status_rows) * self.cached_line_height;
                     let toolbar_px = if engine.debug_toolbar_visible {
                         self.cached_line_height
                     } else {
@@ -6168,6 +6176,15 @@ impl App {
                     // Sans-serif chars are ~60% of monospace width; use that estimate.
                     let cw = self.cached_char_width.max(1.0) * 0.6;
                     let padding = 12.0;
+                    // Close button (×) at right edge
+                    if x >= width - padding - 10.0 {
+                        let mut engine = self.engine.borrow_mut();
+                        engine.bottom_panel_open = false;
+                        engine.close_terminal();
+                        drop(engine);
+                        sender.input(Msg::Resize);
+                        return;
+                    }
                     let terminal_label = "TERMINAL";
                     let debug_label = "DEBUG CONSOLE";
                     let terminal_w = padding + terminal_label.len() as f64 * cw + padding;
@@ -6624,7 +6641,12 @@ impl App {
         // Terminal panel resize drag.
         } else if self.terminal_resize_dragging {
             if self.cached_line_height > 0.0 {
-                let status_h = 2.0 * self.cached_line_height;
+                let global_status_rows = if self.engine.borrow().settings.window_status_line {
+                    0.0
+                } else {
+                    1.0
+                };
+                let status_h = (1.0 + global_status_rows) * self.cached_line_height;
                 let available = (height - y - status_h).max(0.0);
                 let new_rows = ((available / self.cached_line_height) as u16)
                     .saturating_sub(2)
@@ -6644,7 +6666,12 @@ impl App {
             if term_rows > 0 {
                 let term_px = (self.engine.borrow().session.terminal_panel_rows as f64 + 2.0)
                     * self.cached_line_height;
-                let status_h = 2.0 * self.cached_line_height;
+                let global_status_rows = if self.engine.borrow().settings.window_status_line {
+                    0.0
+                } else {
+                    1.0
+                };
+                let status_h = (1.0 + global_status_rows) * self.cached_line_height;
                 let toolbar_px = if self.engine.borrow().debug_toolbar_visible {
                     self.cached_line_height
                 } else {
@@ -6671,7 +6698,12 @@ impl App {
                 if engine.terminal_open || engine.bottom_panel_open {
                     let term_px =
                         (engine.session.terminal_panel_rows as f64 + 2.0) * self.cached_line_height;
-                    let status_h = 2.0 * self.cached_line_height;
+                    let global_status_rows = if engine.settings.window_status_line {
+                        0.0
+                    } else {
+                        1.0
+                    };
+                    let status_h = (1.0 + global_status_rows) * self.cached_line_height;
                     let toolbar_px = if engine.debug_toolbar_visible {
                         self.cached_line_height
                     } else {
@@ -7441,6 +7473,9 @@ impl App {
                             }
                             EngineAction::ToggleSidebar => {
                                 sender.input(Msg::ToggleSidebar);
+                            }
+                            EngineAction::OpenTerminal => {
+                                sender.input(Msg::NewTerminalTab);
                             }
                             _ => {}
                         }

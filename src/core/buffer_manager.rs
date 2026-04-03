@@ -7,6 +7,32 @@ use super::buffer::{Buffer, BufferId};
 use super::cursor::Cursor;
 use super::syntax::Syntax;
 
+/// Line ending format for a buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineEnding {
+    LF,
+    Crlf,
+}
+
+impl LineEnding {
+    /// Detect line ending from file content bytes. Scans up to 8KB.
+    pub fn detect(text: &str) -> Self {
+        let scan = &text[..text.len().min(8192)];
+        if scan.contains("\r\n") {
+            LineEnding::Crlf
+        } else {
+            LineEnding::LF
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LineEnding::LF => "LF",
+            LineEnding::Crlf => "CRLF",
+        }
+    }
+}
+
 // =============================================================================
 // Undo/Redo Data Structures
 // =============================================================================
@@ -126,6 +152,8 @@ pub struct BufferState {
     /// When `Some(n)`, overrides `settings.shift_width` for this buffer.
     /// Detected on file open by analyzing indent deltas between lines.
     pub detected_indent: Option<u8>,
+    /// Line ending format (LF or CRLF). Detected on file open, default LF.
+    pub line_ending: LineEnding,
 }
 
 impl std::fmt::Debug for BufferState {
@@ -178,6 +206,7 @@ impl BufferState {
             file_mtime: None,
             file_change_warned: false,
             detected_indent: None,
+            line_ending: LineEnding::LF,
         };
         state.update_syntax();
         state
@@ -188,6 +217,7 @@ impl BufferState {
         let lsp_language_id = crate::core::lsp::language_id_from_path(&path);
         let canonical_path = path.canonicalize().ok();
         let file_mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        let line_ending = LineEnding::detect(&buffer.to_string());
 
         let mut state = Self {
             buffer,
@@ -224,6 +254,7 @@ impl BufferState {
             file_mtime,
             file_change_warned: false,
             detected_indent: None,
+            line_ending,
         };
         state.detect_indent();
         state.update_syntax();
@@ -329,6 +360,25 @@ impl BufferState {
         self.max_col = text.lines().map(|l| l.chars().count()).max().unwrap_or(0);
     }
 
+    /// Switch line ending format. Converts all line endings in the buffer content.
+    pub fn set_line_ending(&mut self, new: LineEnding) {
+        if self.line_ending == new {
+            return;
+        }
+        let text = self.buffer.to_string();
+        let converted = match new {
+            LineEnding::Crlf => text.replace('\n', "\r\n"),
+            LineEnding::LF => text.replace("\r\n", "\n"),
+        };
+        let char_len = self.buffer.len_chars();
+        self.buffer.delete_range(0, char_len);
+        if !converted.is_empty() {
+            self.buffer.insert(0, &converted);
+        }
+        self.line_ending = new;
+        self.dirty = true;
+    }
+
     /// Save the buffer to its associated file path.
     pub fn save(&mut self) -> Result<usize, io::Error> {
         if let Some(ref path) = self.file_path {
@@ -348,6 +398,7 @@ impl BufferState {
     pub fn reload_from_disk(&mut self) -> Result<(), io::Error> {
         if let Some(ref path) = self.file_path {
             let text = std::fs::read_to_string(path)?;
+            self.line_ending = LineEnding::detect(&text);
             let char_len = self.buffer.len_chars();
             self.buffer.delete_range(0, char_len);
             if !text.is_empty() {

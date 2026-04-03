@@ -74,7 +74,9 @@ pub(super) fn draw_editor(
     } else {
         line_height
     };
-    let status_bar_height = line_height * 2.0 + wildmenu_px;
+    let per_window_status = engine.settings.window_status_line;
+    let global_status_rows = if per_window_status { 1.0 } else { 2.0 }; // cmd only vs status+cmd
+    let status_bar_height = line_height * global_status_rows + wildmenu_px;
 
     // Reserve space for the quickfix panel when open
     const QUICKFIX_ROWS: usize = 6; // 1 header + 5 result rows
@@ -422,6 +424,8 @@ pub(super) fn draw_editor(
             term_y,
             width as f64,
             line_height,
+            engine.terminal_open,
+            !screen.bottom_tabs.output_lines.is_empty(),
         );
         match screen.bottom_tabs.active {
             render::BottomPanelKind::Terminal => {
@@ -482,21 +486,47 @@ pub(super) fn draw_editor(
         h_sb_dragging_window,
     );
 
-    // 6. Status Line
+    // 5j. Draw per-window status bars (after scrollbars so they paint on top)
+    if per_window_status {
+        for rendered_window in &screen.windows {
+            if let Some(ref status) = rendered_window.status_line {
+                let wr = &rendered_window.rect;
+                let bar_y = wr.y + wr.height - line_height;
+                draw_window_status_bar(
+                    cr,
+                    &layout,
+                    &theme,
+                    status,
+                    wr.x,
+                    bar_y,
+                    wr.width,
+                    line_height,
+                );
+            }
+        }
+    }
+
+    // 6. Status Line (global — only when per-window status is off)
     let status_y = height as f64 - status_bar_height;
-    draw_status_line(
-        cr,
-        &layout,
-        &theme,
-        &screen.status_left,
-        &screen.status_right,
-        width as f64,
-        status_y,
-        line_height,
-    );
+    if !per_window_status {
+        draw_status_line(
+            cr,
+            &layout,
+            &theme,
+            &screen.status_left,
+            &screen.status_right,
+            width as f64,
+            status_y,
+            line_height,
+        );
+    }
 
     // 6b. Wildmenu bar (between status and command line)
-    let mut next_y = status_y + line_height;
+    let mut next_y = if per_window_status {
+        status_y // no global status row — cmd line starts where status_y is
+    } else {
+        status_y + line_height // skip past the global status row
+    };
     if let Some(ref wm) = screen.wildmenu {
         draw_wildmenu(cr, &layout, &theme, wm, width as f64, next_y, line_height);
         next_y += line_height;
@@ -581,7 +611,9 @@ pub(super) fn draw_tab_drag_overlay(
     } else {
         line_height
     };
-    let status_bar_height = line_height * 2.0 + wildmenu_px;
+    let per_window_status = engine.settings.window_status_line;
+    let global_status_rows = if per_window_status { 1.0 } else { 2.0 }; // cmd only vs status+cmd
+    let status_bar_height = line_height * global_status_rows + wildmenu_px;
     let qf_px = if engine.quickfix_open {
         let n = engine.quickfix_items.len().clamp(1, 10) as f64;
         (n + 1.0) * line_height
@@ -2990,6 +3022,8 @@ pub(super) fn draw_bottom_panel_tabs(
     y: f64,
     w: f64,
     line_height: f64,
+    has_terminal: bool,
+    has_debug_output: bool,
 ) {
     let (br, bg, bb) = theme.tab_bar_bg.to_cairo();
     let (fr, fg2, fb) = theme.status_fg.to_cairo();
@@ -3012,14 +3046,21 @@ pub(super) fn draw_bottom_panel_tabs(
     layout.set_font_description(Some(&ui_font_desc));
     layout.set_attributes(None);
 
-    let tabs: &[(&str, render::BottomPanelKind)] = &[
-        ("TERMINAL", render::BottomPanelKind::Terminal),
-        ("DEBUG CONSOLE", render::BottomPanelKind::DebugOutput),
+    let all_tabs: &[(&str, render::BottomPanelKind, bool)] = &[
+        ("TERMINAL", render::BottomPanelKind::Terminal, has_terminal),
+        (
+            "DEBUG CONSOLE",
+            render::BottomPanelKind::DebugOutput,
+            has_debug_output,
+        ),
     ];
 
     let padding = 12.0;
     let mut cursor_x = x + padding;
-    for (label, kind) in tabs {
+    for (label, kind, visible) in all_tabs {
+        if !visible {
+            continue;
+        }
         let is_active = screen.bottom_tabs.active == *kind;
         let (lr, lg, lb) = if is_active {
             (ar, ag, ab)
@@ -3040,6 +3081,13 @@ pub(super) fn draw_bottom_panel_tabs(
         }
         cursor_x += tab_w + padding * 2.0;
     }
+
+    // Close button (×) at right edge
+    let close_x = x + w - padding - 10.0;
+    cr.set_source_rgb(fr, fg2, fb);
+    layout.set_text("\u{00d7}"); // ×
+    cr.move_to(close_x, y);
+    pangocairo::show_layout(cr, layout);
 
     // Restore the original monospace font.
     layout.set_font_description(Some(&saved_font));
@@ -3684,6 +3732,104 @@ pub(super) fn draw_status_line(
     layout.set_text(right);
     cr.move_to(width - right_w as f64, y);
     pangocairo::show_layout(cr, layout);
+}
+
+/// Draw a per-window status bar with styled segments.
+#[allow(clippy::too_many_arguments)]
+fn draw_window_status_bar(
+    cr: &Context,
+    layout: &pango::Layout,
+    theme: &Theme,
+    status: &render::WindowStatusLine,
+    x: f64,
+    y: f64,
+    width: f64,
+    line_height: f64,
+) {
+    // Fill background using the first segment's bg (derived from theme, not status_bg)
+    let fill_bg = status
+        .left_segments
+        .first()
+        .or(status.right_segments.first())
+        .map(|s| s.bg)
+        .unwrap_or(theme.background);
+    let (br, bg, bb) = fill_bg.to_cairo();
+    cr.set_source_rgb(br, bg, bb);
+    cr.rectangle(x, y, width, line_height);
+    cr.fill().ok();
+
+    layout.set_attributes(None);
+    layout.set_width(-1);
+    layout.set_ellipsize(pango::EllipsizeMode::None);
+
+    // Draw left segments
+    let mut cx = x;
+    for seg in &status.left_segments {
+        let (sr, sg, sb) = seg.bg.to_cairo();
+        cr.set_source_rgb(sr, sg, sb);
+        // Measure segment width
+        layout.set_text(&seg.text);
+        if seg.bold {
+            let attrs = pango::AttrList::new();
+            attrs.insert(pango::AttrInt::new_weight(pango::Weight::Bold));
+            layout.set_attributes(Some(&attrs));
+        } else {
+            layout.set_attributes(None);
+        }
+        let (seg_w, _) = layout.pixel_size();
+        let seg_w = seg_w as f64;
+        // Draw segment background
+        cr.rectangle(cx, y, seg_w, line_height);
+        cr.fill().ok();
+        // Draw segment text
+        let (fr, fg, fb) = seg.fg.to_cairo();
+        cr.set_source_rgb(fr, fg, fb);
+        cr.move_to(cx, y);
+        pangocairo::show_layout(cr, layout);
+        cx += seg_w;
+        if cx >= x + width {
+            break;
+        }
+    }
+
+    // Draw right segments, right-aligned
+    let mut right_total_w = 0.0;
+    for seg in &status.right_segments {
+        layout.set_text(&seg.text);
+        if seg.bold {
+            let attrs = pango::AttrList::new();
+            attrs.insert(pango::AttrInt::new_weight(pango::Weight::Bold));
+            layout.set_attributes(Some(&attrs));
+        } else {
+            layout.set_attributes(None);
+        }
+        let (seg_w, _) = layout.pixel_size();
+        right_total_w += seg_w as f64;
+    }
+    let mut rx = (x + width - right_total_w).max(cx);
+    for seg in &status.right_segments {
+        let (sr, sg, sb) = seg.bg.to_cairo();
+        cr.set_source_rgb(sr, sg, sb);
+        layout.set_text(&seg.text);
+        if seg.bold {
+            let attrs = pango::AttrList::new();
+            attrs.insert(pango::AttrInt::new_weight(pango::Weight::Bold));
+            layout.set_attributes(Some(&attrs));
+        } else {
+            layout.set_attributes(None);
+        }
+        let (seg_w, _) = layout.pixel_size();
+        let seg_w = seg_w as f64;
+        cr.rectangle(rx, y, seg_w, line_height);
+        cr.fill().ok();
+        let (fr, fg, fb) = seg.fg.to_cairo();
+        cr.set_source_rgb(fr, fg, fb);
+        cr.move_to(rx, y);
+        pangocairo::show_layout(cr, layout);
+        rx += seg_w;
+    }
+
+    layout.set_attributes(None);
 }
 
 pub(super) fn draw_wildmenu(
@@ -5753,7 +5899,7 @@ pub(super) fn draw_debug_toolbar(
             cursor_x += 8.0;
         }
         cr.move_to(cursor_x, y + height * 0.7);
-        let text = format!("{} ({}) ", btn.icon, btn.key_hint);
+        let text = format!("{} ({}) ", btn.label, btn.key_hint);
         let _ = cr.show_text(&text);
         cursor_x += text.len() as f64 * 7.0;
     }

@@ -3576,6 +3576,8 @@ pub(super) fn render_bottom_panel_tabs(
     buf: &mut ratatui::buffer::Buffer,
     area: Rect,
     active: render::BottomPanelKind,
+    has_terminal: bool,
+    has_debug_output: bool,
     theme: &Theme,
 ) {
     if area.height == 0 {
@@ -3590,12 +3592,23 @@ pub(super) fn render_bottom_panel_tabs(
         set_cell(buf, x, area.y, ' ', inactive_fg, tab_bg);
     }
 
-    let tabs = [
-        ("  Terminal  ", render::BottomPanelKind::Terminal),
-        ("  Debug Output  ", render::BottomPanelKind::DebugOutput),
+    let all_tabs = [
+        (
+            "  Terminal  ",
+            render::BottomPanelKind::Terminal,
+            has_terminal,
+        ),
+        (
+            "  Debug Output  ",
+            render::BottomPanelKind::DebugOutput,
+            has_debug_output,
+        ),
     ];
     let mut cur_x = area.x;
-    for (label, kind) in &tabs {
+    for (label, kind, visible) in &all_tabs {
+        if !visible {
+            continue;
+        }
         let fg = if *kind == active {
             active_fg
         } else {
@@ -3612,6 +3625,12 @@ pub(super) fn render_bottom_panel_tabs(
         if cur_x >= area.x + area.width {
             break;
         }
+    }
+
+    // Close button (×) at right edge
+    let close_x = area.x + area.width.saturating_sub(2);
+    if close_x > cur_x {
+        set_cell(buf, close_x, area.y, '\u{00d7}', inactive_fg, tab_bg); // ×
     }
 }
 

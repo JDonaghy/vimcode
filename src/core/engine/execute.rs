@@ -71,7 +71,7 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // Handle :DapBottomPanel terminal|output — switch the bottom panel tab.
+        // Handle :DapBottomPanel terminal|output|close — switch or close the bottom panel tab.
         if let Some(panel_name) = cmd.strip_prefix("DapBottomPanel").map(|s| s.trim()) {
             match panel_name {
                 "terminal" => {
@@ -82,8 +82,12 @@ impl Engine {
                     self.bottom_panel_kind = BottomPanelKind::DebugOutput;
                     self.message = "Bottom panel: Debug Output".to_string();
                 }
+                "close" => {
+                    self.bottom_panel_open = false;
+                    self.message = "Bottom panel closed".to_string();
+                }
                 _ => {
-                    self.message = "Usage: :DapBottomPanel terminal|output".to_string();
+                    self.message = "Usage: :DapBottomPanel terminal|output|close".to_string();
                 }
             }
             return EngineAction::None;
@@ -3030,6 +3034,36 @@ impl Engine {
             result
         } else {
             text.to_string()
+        }
+    }
+
+    /// Handle a click on an interactive status bar segment.
+    pub fn handle_status_action(&mut self, action: &StatusAction) {
+        match action {
+            StatusAction::GoToLine => {
+                self.open_picker(PickerSource::CommandCenter);
+                self.picker_query = ":".to_string();
+                self.picker_filter();
+                self.picker_load_preview();
+            }
+            StatusAction::ChangeLanguage => {
+                self.open_picker(PickerSource::Languages);
+            }
+            StatusAction::ChangeIndentation => {
+                self.open_picker(PickerSource::Indentation);
+            }
+            StatusAction::ChangeLineEnding => {
+                self.open_picker(PickerSource::LineEndings);
+            }
+            StatusAction::ChangeEncoding => {
+                self.message = "Only UTF-8 encoding is supported".to_string();
+            }
+            StatusAction::SwitchBranch => {
+                self.open_picker(PickerSource::GitBranches);
+            }
+            StatusAction::LspInfo => {
+                let _ = self.execute_command("LspInfo");
+            }
         }
     }
 }
