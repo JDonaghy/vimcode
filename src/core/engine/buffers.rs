@@ -868,7 +868,10 @@ impl Engine {
             state.read_only = true;
             state.scratch_name = Some(format!("{file_name} (HEAD)"));
             // Set syntax highlighting to match the file type.
-            if let Some(syn) = crate::core::syntax::Syntax::new_from_path(path.to_str()) {
+            if let Some(syn) = crate::core::syntax::Syntax::new_from_path_with_overrides(
+                path.to_str(),
+                Some(&self.highlight_overrides),
+            ) {
                 state.syntax = Some(syn);
             }
             state.update_syntax();
@@ -1074,7 +1077,10 @@ impl Engine {
             state.buffer.content = ropey::Rope::from_str(head_content);
             state.read_only = true;
             state.scratch_name = Some(format!("{file_name} (HEAD)"));
-            if let Some(syn) = crate::core::syntax::Syntax::new_from_path(path.to_str()) {
+            if let Some(syn) = crate::core::syntax::Syntax::new_from_path_with_overrides(
+                path.to_str(),
+                Some(&self.highlight_overrides),
+            ) {
                 state.syntax = Some(syn);
             }
             state.update_syntax();
@@ -1134,7 +1140,10 @@ impl Engine {
             state.read_only = true;
             state.scratch_name = Some(format!("{file_name} ({short})"));
             state.diff_label = Some(format!("{file_name} ({short})"));
-            if let Some(syn) = crate::core::syntax::Syntax::new_from_path(Some(rel_path)) {
+            if let Some(syn) = crate::core::syntax::Syntax::new_from_path_with_overrides(
+                Some(rel_path),
+                Some(&self.highlight_overrides),
+            ) {
                 state.syntax = Some(syn);
                 state.update_syntax();
             }
@@ -1152,7 +1161,10 @@ impl Engine {
             state.buffer.content = ropey::Rope::from_str(&before);
             state.read_only = true;
             state.scratch_name = Some(format!("{file_name} ({short}~1)"));
-            if let Some(syn) = crate::core::syntax::Syntax::new_from_path(Some(rel_path)) {
+            if let Some(syn) = crate::core::syntax::Syntax::new_from_path_with_overrides(
+                Some(rel_path),
+                Some(&self.highlight_overrides),
+            ) {
                 state.syntax = Some(syn);
                 state.update_syntax();
             }

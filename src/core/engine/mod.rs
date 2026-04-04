@@ -2103,6 +2103,8 @@ pub struct Engine {
     /// Runtime overrides for comment styles, keyed by LSP language ID.
     /// Populated from extension manifests and `vimcode.set_comment_style()` Lua API.
     pub comment_overrides: HashMap<String, comment::CommentStyleOwned>,
+    /// Highlight query overrides from extension manifests, keyed by LSP language ID.
+    pub highlight_overrides: HashMap<String, String>,
 
     // --- Fuzzy file finder ---
     /// Project root directory for the fuzzy finder.
@@ -2794,6 +2796,7 @@ impl Engine {
             sc_help_open: false,
             plugin_manager: None,
             comment_overrides: HashMap::new(),
+            highlight_overrides: HashMap::new(),
             cwd,
             tab_switcher_open: false,
             tab_switcher_selected: 0,

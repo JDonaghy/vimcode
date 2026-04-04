@@ -66,6 +66,10 @@ pub struct ExtensionManifest {
     /// Optional comment style override for languages handled by this extension.
     #[serde(default)]
     pub comment: Option<CommentConfig>,
+    /// Tree-sitter highlight query (S-expression) for this language.
+    /// Overrides the built-in query in `syntax.rs` when present.
+    #[serde(default)]
+    pub highlights: Option<String>,
     /// User-configurable settings declared by this extension.
     #[serde(default)]
     pub settings: Vec<ExtSettingDef>,

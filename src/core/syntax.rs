@@ -53,6 +53,32 @@ impl SyntaxLanguage {
         }
     }
 
+    /// Return the LSP language ID for this language.
+    pub fn language_id(&self) -> &'static str {
+        match self {
+            Self::Rust => "rust",
+            Self::Python => "python",
+            Self::JavaScript => "javascript",
+            Self::TypeScript => "typescript",
+            Self::TypeScriptReact => "typescriptreact",
+            Self::Go => "go",
+            Self::C => "c",
+            Self::Cpp => "cpp",
+            Self::CSharp => "csharp",
+            Self::Java => "java",
+            Self::Ruby => "ruby",
+            Self::Lua => "lua",
+            Self::Bash => "shellscript",
+            Self::Json => "json",
+            Self::Toml => "toml",
+            Self::Yaml => "yaml",
+            Self::Html => "html",
+            Self::Css => "css",
+            Self::Markdown => "markdown",
+            Self::Latex => "latex",
+        }
+    }
+
     /// Detect language from file extension
     pub fn from_path(path: &str) -> Option<Self> {
         let path_lower = path.to_lowercase();
@@ -703,14 +729,30 @@ pub struct Syntax {
 impl Syntax {
     /// Create a new Syntax highlighter for a specific language
     pub fn new_for_language(language: SyntaxLanguage) -> Self {
+        Self::new_for_language_with_query(language, None)
+    }
+
+    /// Create a Syntax highlighter, optionally using a custom highlight query.
+    /// Falls back to the built-in query if `override_query` is None or fails to compile.
+    pub fn new_for_language_with_query(
+        language: SyntaxLanguage,
+        override_query: Option<&str>,
+    ) -> Self {
         let mut parser = Parser::new();
         let ts_language = language.language();
         parser
             .set_language(&ts_language)
             .expect("Error loading grammar");
 
-        let query_source = language.query_source();
-        let query = Query::new(&ts_language, query_source).expect("Error compiling query");
+        let query = if let Some(oq) = override_query {
+            Query::new(&ts_language, oq).unwrap_or_else(|_| {
+                // Override failed to compile; fall back to built-in
+                Query::new(&ts_language, language.query_source())
+                    .expect("Error compiling built-in query")
+            })
+        } else {
+            Query::new(&ts_language, language.query_source()).expect("Error compiling query")
+        };
 
         Self {
             parser,
@@ -720,15 +762,40 @@ impl Syntax {
         }
     }
 
-    /// Create a new Syntax highlighter, detecting language from file path
+    /// Create a new Syntax highlighter, detecting language from file path.
+    /// Looks up override queries from the provided map keyed by language ID.
     pub fn new_from_path(path: Option<&str>) -> Option<Self> {
-        path.and_then(SyntaxLanguage::from_path)
-            .map(Self::new_for_language)
+        Self::new_from_path_with_overrides(path, None)
+    }
+
+    /// Create a new Syntax highlighter with optional highlight query overrides.
+    pub fn new_from_path_with_overrides(
+        path: Option<&str>,
+        overrides: Option<&std::collections::HashMap<String, String>>,
+    ) -> Option<Self> {
+        let lang = path.and_then(SyntaxLanguage::from_path)?;
+        let override_query = overrides
+            .and_then(|m| m.get(lang.language_id()))
+            .map(|s| s.as_str());
+        Some(Self::new_for_language_with_query(lang, override_query))
     }
 
     /// Create a Syntax from an LSP language identifier (e.g. "rust", "python").
+    #[allow(dead_code)]
     pub fn new_from_language_id(id: &str) -> Option<Self> {
-        SyntaxLanguage::from_language_id(id).map(Self::new_for_language)
+        Self::new_from_language_id_with_overrides(id, None)
+    }
+
+    /// Create a Syntax from an LSP language ID with optional highlight query overrides.
+    pub fn new_from_language_id_with_overrides(
+        id: &str,
+        overrides: Option<&std::collections::HashMap<String, String>>,
+    ) -> Option<Self> {
+        let lang = SyntaxLanguage::from_language_id(id)?;
+        let override_query = overrides
+            .and_then(|m| m.get(lang.language_id()))
+            .map(|s| s.as_str());
+        Some(Self::new_for_language_with_query(lang, override_query))
     }
 }
 
@@ -1699,5 +1766,89 @@ mod tests {
         let scopes = syntax.enclosing_scopes(code, 2, 1);
         assert_eq!(scopes.len(), 1);
         assert_eq!(scopes[0].name, "hello");
+    }
+
+    #[test]
+    fn test_language_id_round_trip() {
+        // Every variant should round-trip through language_id → from_language_id
+        let langs = [
+            SyntaxLanguage::Rust,
+            SyntaxLanguage::Python,
+            SyntaxLanguage::JavaScript,
+            SyntaxLanguage::TypeScript,
+            SyntaxLanguage::Go,
+            SyntaxLanguage::C,
+            SyntaxLanguage::Cpp,
+            SyntaxLanguage::CSharp,
+            SyntaxLanguage::Java,
+            SyntaxLanguage::Ruby,
+            SyntaxLanguage::Lua,
+            SyntaxLanguage::Bash,
+            SyntaxLanguage::Json,
+            SyntaxLanguage::Toml,
+            SyntaxLanguage::Yaml,
+            SyntaxLanguage::Html,
+            SyntaxLanguage::Css,
+            SyntaxLanguage::Markdown,
+            SyntaxLanguage::Latex,
+        ];
+        for lang in &langs {
+            let id = lang.language_id();
+            let back = SyntaxLanguage::from_language_id(id);
+            assert_eq!(
+                back,
+                Some(*lang),
+                "round-trip failed for {:?} (id={id})",
+                lang
+            );
+        }
+    }
+
+    #[test]
+    fn test_override_query_used() {
+        // A valid override query should be used instead of the built-in
+        let override_q = "(line_comment) @comment";
+        let mut syntax =
+            Syntax::new_for_language_with_query(SyntaxLanguage::Rust, Some(override_q));
+        let highlights = syntax.parse("// hello\nfn main() {}");
+        let kinds: std::collections::HashSet<&str> =
+            highlights.iter().map(|(_, _, k)| k.as_str()).collect();
+        // Should have comment from override but NOT keyword (override doesn't capture keywords)
+        assert!(
+            kinds.contains("comment"),
+            "override should capture comments"
+        );
+        assert!(
+            !kinds.contains("keyword"),
+            "override should NOT capture keywords"
+        );
+    }
+
+    #[test]
+    fn test_malformed_override_falls_back() {
+        // A malformed override should fall back to the built-in query
+        let bad_query = "THIS IS NOT A VALID QUERY !!!";
+        let mut syntax = Syntax::new_for_language_with_query(SyntaxLanguage::Rust, Some(bad_query));
+        let highlights = syntax.parse("fn main() { let x = 42; }");
+        let kinds: std::collections::HashSet<&str> =
+            highlights.iter().map(|(_, _, k)| k.as_str()).collect();
+        // Should fall back to built-in and have keywords
+        assert!(
+            kinds.contains("keyword"),
+            "fallback should capture keywords"
+        );
+    }
+
+    #[test]
+    fn test_override_map_lookup() {
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("rust".to_string(), "(line_comment) @comment".to_string());
+        let mut syntax =
+            Syntax::new_from_path_with_overrides(Some("test.rs"), Some(&overrides)).unwrap();
+        let highlights = syntax.parse("// hello\nfn main() {}");
+        let kinds: std::collections::HashSet<&str> =
+            highlights.iter().map(|(_, _, k)| k.as_str()).collect();
+        assert!(kinds.contains("comment"));
+        assert!(!kinds.contains("keyword"));
     }
 }

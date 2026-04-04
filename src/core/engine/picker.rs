@@ -1773,7 +1773,10 @@ impl Engine {
                 if let Some(state) = self.buffer_manager.get_mut(bid) {
                     state.lsp_language_id = Some(lang.clone());
                     // Update syntax parser for the new language
-                    state.syntax = crate::core::syntax::Syntax::new_from_language_id(&lang);
+                    state.syntax = crate::core::syntax::Syntax::new_from_language_id_with_overrides(
+                        &lang,
+                        Some(&self.highlight_overrides),
+                    );
                     state.update_syntax();
                 }
                 self.message = format!("Language mode: {}", lang);

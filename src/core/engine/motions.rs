@@ -785,6 +785,44 @@ impl Engine {
         }
     }
 
+    /// Populate highlight query overrides from installed extension manifests,
+    /// then re-apply to any already-open buffers whose language matches.
+    pub(crate) fn populate_highlight_overrides(&mut self) {
+        for manifest in self.ext_available_manifests() {
+            if !self.extension_state.is_installed(&manifest.name) {
+                continue;
+            }
+            if let Some(ref hl) = manifest.highlights {
+                if hl.is_empty() {
+                    continue;
+                }
+                for lang_id in &manifest.language_ids {
+                    self.highlight_overrides
+                        .entry(lang_id.clone())
+                        .or_insert_with(|| hl.clone());
+                }
+            }
+        }
+        // Re-apply to open buffers so files opened before extensions loaded
+        // pick up the override queries.
+        if !self.highlight_overrides.is_empty() {
+            let ids: Vec<_> = self.buffer_manager.list().to_vec();
+            for bid in ids {
+                if let Some(state) = self.buffer_manager.get_mut(bid) {
+                    if let Some(ref path) = state.file_path.clone() {
+                        if let Some(syn) = crate::core::syntax::Syntax::new_from_path_with_overrides(
+                            path.to_str(),
+                            Some(&self.highlight_overrides),
+                        ) {
+                            state.syntax = Some(syn);
+                            state.update_syntax();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     pub(crate) fn format_lines(&mut self, start_line: usize, end_line: usize, changed: &mut bool) {
         let total = self.buffer().len_lines();
         let start = start_line.min(total.saturating_sub(1));

@@ -78,8 +78,9 @@ impl Engine {
                 for name in &installed_names {
                     self.load_ext_settings(name);
                 }
-                // Populate comment style overrides from installed extension manifests
+                // Populate comment style and highlight query overrides from installed extensions
                 self.populate_comment_overrides();
+                self.populate_highlight_overrides();
                 // Fire VimEnter event after plugin initialization is complete
                 self.plugin_event("VimEnter", "");
             }
@@ -424,7 +425,10 @@ impl Engine {
                         other => other,
                     };
                     let fake_path = format!("scratch.{ext}");
-                    if let Some(syn) = Syntax::new_from_path(Some(&fake_path)) {
+                    if let Some(syn) = Syntax::new_from_path_with_overrides(
+                        Some(&fake_path),
+                        Some(&self.highlight_overrides),
+                    ) {
                         state.syntax = Some(syn);
                         state.update_syntax();
                     }
