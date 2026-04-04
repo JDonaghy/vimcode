@@ -2284,7 +2284,7 @@ pub(super) fn handle_mouse(
                     // Split buttons exist on active group, or all groups in diff mode.
                     let had_split = was_active || engine.is_in_diff_view();
                     let split_cols = if had_split { TAB_SPLIT_BOTH_COLS } else { 0 };
-                    let split_end = bar_width;
+                    let split_end = bar_width.saturating_sub(TAB_ACTION_BTN_COLS);
                     let split_start = split_end.saturating_sub(split_cols);
                     let diff_end = split_start;
                     let diff_start = diff_end.saturating_sub(diff_total_cols);
@@ -2313,15 +2313,19 @@ pub(super) fn handle_mouse(
                         }
                     } else if had_split
                         && local_col >= split_start
+                        && local_col < split_start + TAB_SPLIT_BOTH_COLS
                         && bar_width >= TAB_SPLIT_BOTH_COLS
                     {
-                        // Hit-test split buttons (rightmost).
+                        // Hit-test split buttons.
                         let in_split = local_col - split_start;
                         if in_split >= TAB_SPLIT_BTN_COLS {
                             engine.open_editor_group(SplitDirection::Horizontal);
                         } else {
                             engine.open_editor_group(SplitDirection::Vertical);
                         }
+                    } else if local_col >= bar_width.saturating_sub(TAB_ACTION_BTN_COLS) {
+                        // Editor action menu button ("…") at far right.
+                        engine.open_editor_action_menu(group_id, col, row + 1);
                     }
                 }
                 return sidebar_width;
@@ -2382,7 +2386,7 @@ pub(super) fn handle_mouse(
                 } else {
                     0
                 };
-                let split_end = bar_width;
+                let split_end = bar_width.saturating_sub(TAB_ACTION_BTN_COLS);
                 let split_start = split_end.saturating_sub(TAB_SPLIT_BOTH_COLS);
                 let diff_end = split_start;
                 let diff_start = diff_end.saturating_sub(diff_total_cols);
@@ -2405,13 +2409,19 @@ pub(super) fn handle_mouse(
                     } else {
                         engine.diff_toggle_hide_unchanged();
                     }
-                } else if local_col >= split_start && bar_width >= TAB_SPLIT_BOTH_COLS {
+                } else if local_col >= split_start
+                    && local_col < split_start + TAB_SPLIT_BOTH_COLS
+                    && bar_width >= TAB_SPLIT_BOTH_COLS
+                {
                     let in_split = local_col - split_start;
                     if in_split >= TAB_SPLIT_BTN_COLS {
                         engine.open_editor_group(SplitDirection::Horizontal);
                     } else {
                         engine.open_editor_group(SplitDirection::Vertical);
                     }
+                } else if local_col >= bar_width.saturating_sub(TAB_ACTION_BTN_COLS) {
+                    // Editor action menu button ("…") at far right.
+                    engine.open_editor_action_menu(engine.active_group, col, row + 1);
                 }
             }
             return sidebar_width;

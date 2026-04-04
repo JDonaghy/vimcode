@@ -17869,3 +17869,93 @@ fn test_symbol_tree_synthetic_container() {
         .expect("Should have method_a");
     assert_eq!(method_a.depth, 1);
 }
+
+// ── Editor action menu tests ──────────────────────────────────────────────────
+
+#[test]
+fn test_editor_action_menu_opens() {
+    let mut e = Engine::new();
+    e.buffer_mut().insert(0, "hello\n");
+    let gid = e.active_group;
+    e.open_editor_action_menu(gid, 0, 0);
+    assert!(e.context_menu.is_some());
+    let cm = e.context_menu.as_ref().unwrap();
+    assert!(matches!(
+        cm.target,
+        ContextMenuTarget::EditorActionMenu { .. }
+    ));
+    // Should have 8 items.
+    assert_eq!(cm.items.len(), 8);
+    assert_eq!(cm.items[0].action, "close_all");
+    assert_eq!(cm.items[1].action, "close_others");
+    assert_eq!(cm.items[5].action, "toggle_wrap");
+    assert_eq!(cm.items[6].action, "change_language");
+    assert_eq!(cm.items[7].action, "reveal");
+}
+
+#[test]
+fn test_editor_action_menu_close_others_disabled_with_one_tab() {
+    let mut e = Engine::new();
+    e.buffer_mut().insert(0, "hello\n");
+    let gid = e.active_group;
+    e.open_editor_action_menu(gid, 0, 0);
+    let cm = e.context_menu.as_ref().unwrap();
+    // "Close Others" disabled with only 1 tab.
+    let close_others = cm
+        .items
+        .iter()
+        .find(|i| i.action == "close_others")
+        .unwrap();
+    assert!(!close_others.enabled);
+    // "Close to the Left" disabled when active_tab == 0.
+    let close_left = cm.items.iter().find(|i| i.action == "close_left").unwrap();
+    assert!(!close_left.enabled);
+}
+
+#[test]
+fn test_editor_action_menu_toggle_wrap() {
+    let mut e = Engine::new();
+    e.buffer_mut().insert(0, "hello\n");
+    let gid = e.active_group;
+    assert!(!e.settings.wrap);
+    e.open_editor_action_menu(gid, 0, 0);
+    // Select "toggle_wrap" and confirm.
+    if let Some(ref mut cm) = e.context_menu {
+        if let Some(idx) = cm.items.iter().position(|i| i.action == "toggle_wrap") {
+            cm.selected = idx;
+        }
+    }
+    e.context_menu_confirm();
+    assert!(e.settings.wrap);
+    assert!(e.message.contains("on"));
+}
+
+#[test]
+fn test_editor_action_menu_close_all() {
+    let mut e = Engine::new();
+    e.buffer_mut().insert(0, "hello\n");
+    // Open a second tab.
+    e.new_tab(None);
+    assert!(e.active_group().tabs.len() >= 2);
+    let gid = e.active_group;
+    e.open_editor_action_menu(gid, 0, 0);
+    if let Some(ref mut cm) = e.context_menu {
+        if let Some(idx) = cm.items.iter().position(|i| i.action == "close_all") {
+            cm.selected = idx;
+        }
+    }
+    e.context_menu_confirm();
+    // After closing all, should have 1 scratch tab (close_tab creates one).
+    assert_eq!(e.active_group().tabs.len(), 1);
+}
+
+#[test]
+fn test_close_all_tabs_method() {
+    let mut e = Engine::new();
+    e.new_tab(None);
+    e.new_tab(None);
+    assert_eq!(e.active_group().tabs.len(), 3);
+    e.close_all_tabs();
+    // close_tab always leaves at least 1 scratch buffer.
+    assert_eq!(e.active_group().tabs.len(), 1);
+}

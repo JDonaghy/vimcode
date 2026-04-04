@@ -68,6 +68,9 @@ type DiffBtnMap = HashMap<usize, (f64, f64, f64, f64, f64, f64)>;
 /// Only populated when split buttons are visible (active group in multi-group, or single-group mode).
 type SplitBtnMap = HashMap<usize, (f64, f64)>;
 
+/// Cached action menu button pixel range per group: group_id -> (start_x, end_x).
+type ActionBtnMap = HashMap<usize, (f64, f64)>;
+
 /// Cached dialog button hit rects: Vec<(x, y, w, h)> populated by draw_dialog_popup.
 type DialogBtnRects = Vec<(f64, f64, f64, f64)>;
 
@@ -77,6 +80,7 @@ type TabBarDrawResult = (
     Option<(f64, f64, f64, f64, f64, f64)>,
     Option<(f64, f64)>,
     usize,
+    Option<(f64, f64)>, // action menu button (start_x, end_x)
 );
 
 struct App {
@@ -176,6 +180,7 @@ struct App {
     /// Cached diff toolbar button pixel positions, populated during draw_tab_bar.
     diff_btn_map: Rc<RefCell<DiffBtnMap>>,
     split_btn_map: Rc<RefCell<SplitBtnMap>>,
+    action_btn_map: Rc<RefCell<ActionBtnMap>>,
     /// Cached nav arrow pixel hit rects from draw_menu_bar: (back_x, back_end, fwd_x, fwd_end, unit_end).
     #[allow(dead_code, clippy::type_complexity)]
     nav_arrow_rects: Rc<RefCell<(f64, f64, f64, f64, f64)>>,
@@ -2035,6 +2040,7 @@ impl SimpleComponent for App {
             Rc::new(RefCell::new(HashMap::new()));
         let diff_btn_map_cell: Rc<RefCell<DiffBtnMap>> = Rc::new(RefCell::new(HashMap::new()));
         let split_btn_map_cell: Rc<RefCell<SplitBtnMap>> = Rc::new(RefCell::new(HashMap::new()));
+        let action_btn_map_cell: Rc<RefCell<ActionBtnMap>> = Rc::new(RefCell::new(HashMap::new()));
         let tab_visible_counts_cell: Rc<RefCell<Vec<(crate::core::window::GroupId, usize)>>> =
             Rc::new(RefCell::new(Vec::new()));
         #[allow(clippy::type_complexity)]
@@ -2152,6 +2158,7 @@ impl SimpleComponent for App {
             tab_slot_positions: tab_slot_positions_cell.clone(),
             diff_btn_map: diff_btn_map_cell.clone(),
             split_btn_map: split_btn_map_cell.clone(),
+            action_btn_map: action_btn_map_cell.clone(),
             nav_arrow_rects: nav_arrow_rects_cell.clone(),
             tab_visible_counts: tab_visible_counts_cell.clone(),
             terminal_sb_dragging: false,
@@ -2418,22 +2425,20 @@ impl SimpleComponent for App {
                         }
                         let popup_w = 220.0_f64;
                         let popup_y = 0.0;
-                        let popup_h = (items.len() as f64 + 1.0) * line_height;
+                        let menu_pad = 4.0;
+                        let popup_h = items.len() as f64 * line_height + menu_pad * 2.0;
                         if y >= popup_y
                             && y < popup_y + popup_h
                             && x >= popup_x
                             && x < popup_x + popup_w
                         {
-                            let raw_idx = ((y - popup_y) / line_height) as usize;
-                            let item_real = raw_idx.saturating_sub(1);
-                            if raw_idx >= 1
-                                && item_real < items.len()
-                                && !items[item_real].separator
-                            {
-                                let action = items[item_real].action.to_string();
+                            let item_idx =
+                                ((y - popup_y - menu_pad) / line_height).floor() as usize;
+                            if item_idx < items.len() && !items[item_idx].separator {
+                                let action = items[item_idx].action.to_string();
                                 drop(engine);
                                 sender_dd
-                                    .send(Msg::MenuActivateItem(open_idx, item_real, action))
+                                    .send(Msg::MenuActivateItem(open_idx, item_idx, action))
                                     .ok();
                             } else {
                                 drop(engine);
@@ -2473,21 +2478,19 @@ impl SimpleComponent for App {
                         }
                         let popup_w = 220.0_f64;
                         let popup_y = 0.0;
-                        let popup_h = (items.len() as f64 + 1.0) * line_height;
+                        let menu_pad = 4.0;
+                        let popup_h = items.len() as f64 * line_height + menu_pad * 2.0;
                         if y >= popup_y
                             && y < popup_y + popup_h
                             && x >= popup_x
                             && x < popup_x + popup_w
                         {
-                            let raw_idx = ((y - popup_y) / line_height) as usize;
-                            let item_real = raw_idx.saturating_sub(1);
-                            if raw_idx >= 1
-                                && item_real < items.len()
-                                && !items[item_real].separator
-                            {
-                                if engine.menu_highlighted_item != Some(item_real) {
+                            let item_idx =
+                                ((y - popup_y - menu_pad) / line_height).floor() as usize;
+                            if item_idx < items.len() && !items[item_idx].separator {
+                                if engine.menu_highlighted_item != Some(item_idx) {
                                     drop(engine);
-                                    sender_motion.send(Msg::MenuHighlight(Some(item_real))).ok();
+                                    sender_motion.send(Msg::MenuHighlight(Some(item_idx))).ok();
                                 }
                             } else if engine.menu_highlighted_item.is_some() {
                                 drop(engine);
@@ -3268,14 +3271,19 @@ impl SimpleComponent for App {
             });
         }
 
-        // Indicator cell renderer (right-aligned, non-expanding) for M/error/warning badges
+        col.set_expand(true);
+        widgets.file_tree_view.append_column(&col);
+
+        // Separate right-aligned column for indicators (M/error/warning badges).
+        // A dedicated column ensures indicators are always visible regardless of
+        // tree width — packing them into the name column caused clipping.
+        let indicator_col = gtk4::TreeViewColumn::new();
         let indicator_cell = gtk4::CellRendererText::new();
         indicator_cell.set_property("xalign", 1.0f32);
-        col.pack_end(&indicator_cell, false);
-        col.add_attribute(&indicator_cell, "text", 4);
-        col.add_attribute(&indicator_cell, "foreground", 5);
-
-        widgets.file_tree_view.append_column(&col);
+        indicator_col.pack_start(&indicator_cell, false);
+        indicator_col.add_attribute(&indicator_cell, "text", 4);
+        indicator_col.add_attribute(&indicator_cell, "foreground", 5);
+        widgets.file_tree_view.append_column(&indicator_col);
 
         // Set the model on the TreeView
         widgets.file_tree_view.set_model(Some(&tree_store));
@@ -3779,38 +3787,18 @@ impl SimpleComponent for App {
                 let widget = g.widget();
                 let width = widget.width() as f64;
                 let height = widget.height() as f64;
-                let wildmenu_px = if engine.wildmenu_items.is_empty() {
-                    0.0
+                let editor_bottom = gtk_editor_bottom(&engine, width, height, lh);
+                let tab_row_h = (lh * 1.6).ceil();
+                let tab_bar_h = if engine.settings.breadcrumbs {
+                    tab_row_h + lh
                 } else {
-                    lh
+                    tab_row_h
                 };
-                let status_h = lh * 2.0 + wildmenu_px;
-                let dbg_px = if engine.debug_toolbar_visible {
-                    lh
-                } else {
-                    0.0
-                };
-                let qf_px = if engine.quickfix_open && !engine.quickfix_items.is_empty() {
-                    6.0 * lh
-                } else {
-                    0.0
-                };
-                let term_px = if engine.terminal_open || engine.bottom_panel_open {
-                    (engine.session.terminal_panel_rows as f64 + 2.0) * lh
-                } else {
-                    0.0
-                };
-                let editor_bottom = height - status_h - dbg_px - qf_px - term_px;
                 let content_bounds = core::window::WindowRect::new(0.0, 0.0, width, editor_bottom);
                 let dividers = engine.group_layout.dividers(content_bounds, &mut 0);
                 // Check if click is in a scrollbar zone (rightmost 10px of any
                 // window rect). If so, skip divider claim to let the scrollbar
                 // handle the click instead.
-                let tab_bar_h = if engine.settings.breadcrumbs {
-                    lh * 2.0
-                } else {
-                    lh
-                };
                 let (window_rects, _) =
                     engine.calculate_group_window_rects(content_bounds, tab_bar_h);
                 let in_scrollbar = window_rects.iter().any(|(_, r)| {
@@ -3820,7 +3808,18 @@ impl SimpleComponent for App {
                         && y >= r.y
                         && y < r.y + r.height
                 });
-                if !in_scrollbar {
+                // Check if click is in any group's tab bar region.
+                let group_rects = engine
+                    .group_layout
+                    .calculate_group_rects(content_bounds, tab_bar_h);
+                let in_tab_bar = group_rects.iter().any(|(gid, grect)| {
+                    if engine.is_tab_bar_hidden(*gid) {
+                        return false;
+                    }
+                    let ty = grect.y - tab_bar_h;
+                    y >= ty && y < ty + tab_bar_h && x >= grect.x && x < grect.x + grect.width
+                });
+                if !in_scrollbar && !in_tab_bar {
                     for div in &dividers {
                         let hit = match div.direction {
                             core::window::SplitDirection::Vertical => {
@@ -3979,6 +3978,7 @@ impl SimpleComponent for App {
         let tab_slots_for_draw = tab_slot_positions_cell.clone();
         let diff_btn_for_draw = diff_btn_map_cell.clone();
         let split_btn_for_draw = split_btn_map_cell.clone();
+        let action_btn_for_draw = action_btn_map_cell.clone();
         let dialog_btn_for_draw = model.dialog_btn_rects.clone();
         let editor_hover_rect_for_draw = model.editor_hover_popup_rect.clone();
         let editor_hover_links_for_draw = model.editor_hover_link_rects.clone();
@@ -4003,6 +4003,7 @@ impl SimpleComponent for App {
                         &tab_slots_for_draw,
                         &diff_btn_for_draw,
                         &split_btn_for_draw,
+                        &action_btn_for_draw,
                         &dialog_btn_for_draw,
                         &editor_hover_rect_for_draw,
                         &editor_hover_links_for_draw,
@@ -4039,6 +4040,7 @@ impl SimpleComponent for App {
             let tab_slots_rc = tab_slot_positions_cell.clone();
             let diff_btn_rc = diff_btn_map_cell.clone();
             let split_btn_rc = split_btn_map_cell.clone();
+            let action_btn_rc = action_btn_map_cell.clone();
             let rc_gesture = gtk4::GestureClick::new();
             rc_gesture.set_button(3);
             rc_gesture.connect_pressed(move |gesture, _n_press, x, y| {
@@ -4058,6 +4060,7 @@ impl SimpleComponent for App {
                     &tab_slots_rc.borrow(),
                     &diff_btn_rc.borrow(),
                     &split_btn_rc.borrow(),
+                    &action_btn_rc.borrow(),
                 );
                 match target {
                     ClickTarget::TabBar => {
@@ -4232,6 +4235,7 @@ impl SimpleComponent for App {
                         &self.tab_slot_positions.borrow(),
                         &self.diff_btn_map.borrow(),
                         &self.split_btn_map.borrow(),
+                        &self.action_btn_map.borrow(),
                     ) {
                         engine.add_cursor_at_pos(line, col);
                     }
@@ -4294,6 +4298,7 @@ impl SimpleComponent for App {
                             &self.tab_slot_positions.borrow(),
                             &self.diff_btn_map.borrow(),
                             &self.split_btn_map.borrow(),
+                            &self.action_btn_map.borrow(),
                         );
                     }
                 }
@@ -5848,6 +5853,11 @@ impl App {
                 let engine = self.engine.borrow();
                 let (git_statuses, diag_counts) = engine.explorer_indicators();
                 let theme = Theme::from_name(&engine.settings.colorscheme);
+                let default_fg = if theme.is_light() {
+                    theme.foreground.to_hex()
+                } else {
+                    theme.status_fg.to_hex()
+                };
                 update_tree_indicators(
                     store,
                     &git_statuses,
@@ -5857,6 +5867,7 @@ impl App {
                     &theme.git_deleted.to_hex(),
                     &theme.diagnostic_error.to_hex(),
                     &theme.diagnostic_warning.to_hex(),
+                    &default_fg,
                 );
             }
         }
@@ -6315,49 +6326,53 @@ impl App {
                     let engine = self.engine.borrow();
                     if !engine.group_layout.is_single_group() {
                         let lh = self.cached_line_height;
-                        let wildmenu_px = if engine.wildmenu_items.is_empty() {
-                            0.0
+                        let tab_row_h = (lh * 1.6).ceil();
+                        let tab_bar_h = if engine.settings.breadcrumbs {
+                            tab_row_h + lh
                         } else {
-                            lh
+                            tab_row_h
                         };
-                        let status_h = lh * 2.0 + wildmenu_px;
-                        let dbg_px = if engine.debug_toolbar_visible {
-                            lh
-                        } else {
-                            0.0
-                        };
-                        let qf_px = if engine.quickfix_open && !engine.quickfix_items.is_empty() {
-                            6.0 * lh
-                        } else {
-                            0.0
-                        };
-                        let term_px = if engine.terminal_open || engine.bottom_panel_open {
-                            (engine.session.terminal_panel_rows as f64 + 2.0) * lh
-                        } else {
-                            0.0
-                        };
-                        let editor_bottom = height - status_h - dbg_px - qf_px - term_px;
+                        let editor_bottom = gtk_editor_bottom(&engine, width, height, lh);
                         let content_bounds =
                             core::window::WindowRect::new(0.0, 0.0, width, editor_bottom);
-                        let dividers = engine.group_layout.dividers(content_bounds, &mut 0);
-                        for div in &dividers {
-                            let hit = match div.direction {
-                                core::window::SplitDirection::Vertical => {
-                                    (x - div.position).abs() < 6.0
-                                        && y >= div.cross_start
-                                        && y < div.cross_start + div.cross_size
+
+                        // Compute tab bar regions so we can exclude them from
+                        // divider drag — tab bar clicks should go to tab handlers.
+                        let group_rects = engine
+                            .group_layout
+                            .calculate_group_rects(content_bounds, tab_bar_h);
+                        let in_tab_bar = group_rects.iter().any(|(gid, grect)| {
+                            if engine.is_tab_bar_hidden(*gid) {
+                                return false;
+                            }
+                            let ty = grect.y - tab_bar_h;
+                            y >= ty
+                                && y < ty + tab_bar_h
+                                && x >= grect.x
+                                && x < grect.x + grect.width
+                        });
+
+                        if !in_tab_bar {
+                            let dividers = engine.group_layout.dividers(content_bounds, &mut 0);
+                            for div in &dividers {
+                                let hit = match div.direction {
+                                    core::window::SplitDirection::Vertical => {
+                                        (x - div.position).abs() < 6.0
+                                            && y >= div.cross_start
+                                            && y < div.cross_start + div.cross_size
+                                    }
+                                    core::window::SplitDirection::Horizontal => {
+                                        (y - div.position).abs() < 6.0
+                                            && x >= div.cross_start
+                                            && x < div.cross_start + div.cross_size
+                                    }
+                                };
+                                if hit {
+                                    let si = div.split_index;
+                                    drop(engine);
+                                    self.group_divider_dragging = Some(si);
+                                    return;
                                 }
-                                core::window::SplitDirection::Horizontal => {
-                                    (y - div.position).abs() < 6.0
-                                        && x >= div.cross_start
-                                        && x < div.cross_start + div.cross_size
-                                }
-                            };
-                            if hit {
-                                let si = div.split_index;
-                                drop(engine);
-                                self.group_divider_dragging = Some(si);
-                                return;
                             }
                         }
                     }
@@ -6413,6 +6428,7 @@ impl App {
                             &self.tab_slot_positions.borrow(),
                             &self.diff_btn_map.borrow(),
                             &self.split_btn_map.borrow(),
+                            &self.action_btn_map.borrow(),
                         );
                         match click_result {
                             Some(true) => {
@@ -6425,6 +6441,25 @@ impl App {
                                 // Buffer click — fire hooks and reveal file
                             }
                             None => {
+                                // Check if the click opened an editor action menu.
+                                if engine.context_menu.as_ref().is_some_and(|cm| {
+                                    matches!(
+                                        cm.target,
+                                        core::engine::ContextMenuTarget::EditorActionMenu { .. }
+                                    )
+                                }) {
+                                    let group_id =
+                                        match &engine.context_menu.as_ref().unwrap().target {
+                                            core::engine::ContextMenuTarget::EditorActionMenu {
+                                                group_id,
+                                            } => *group_id,
+                                            _ => unreachable!(),
+                                        };
+                                    drop(engine);
+                                    self.show_action_menu_popover(group_id, x, y, sender);
+                                    self.draw_needed.set(true);
+                                    return;
+                                }
                                 // Tab bar / split button click — skip hooks.
                                 // Record drag start position for tab drag-and-drop.
                                 self.tab_drag_start = Some((x, y));
@@ -6542,6 +6577,7 @@ impl App {
                     &self.tab_slot_positions.borrow(),
                     &self.diff_btn_map.borrow(),
                     &self.split_btn_map.borrow(),
+                    &self.action_btn_map.borrow(),
                 );
                 if let ClickTarget::TabBar = target {
                     // The tab was already switched by pixel_to_click_target.
@@ -6745,6 +6781,7 @@ impl App {
                     &self.tab_slot_positions.borrow(),
                     &self.diff_btn_map.borrow(),
                     &self.split_btn_map.borrow(),
+                    &self.action_btn_map.borrow(),
                 );
                 self.draw_needed.set(true);
             }
@@ -6813,6 +6850,84 @@ impl App {
         engine.mouse_drag_active = false;
         engine.mouse_drag_origin_window = None;
         self.draw_needed.set(true);
+    }
+
+    fn show_action_menu_popover(
+        &mut self,
+        group_id: core::window::GroupId,
+        x: f64,
+        y: f64,
+        _sender: &ComponentSender<Self>,
+    ) {
+        let da = match self.drawing_area.borrow().as_ref() {
+            Some(da) => da.clone(),
+            None => return,
+        };
+
+        // Extract the items from the engine context menu (already populated).
+        let items: Vec<core::engine::ContextMenuItem> = {
+            let engine = self.engine.borrow();
+            engine
+                .context_menu
+                .as_ref()
+                .map(|cm| cm.items.clone())
+                .unwrap_or_default()
+        };
+        // Close the engine-side context menu; GTK handles it natively.
+        self.engine.borrow_mut().close_context_menu();
+
+        let menu = build_gio_menu_from_engine_items(&items, "actmenu");
+
+        let enabled_map: std::collections::HashMap<String, bool> = items
+            .iter()
+            .map(|it| (it.action.clone(), it.enabled))
+            .collect();
+
+        let actions = gtk4::gio::SimpleActionGroup::new();
+
+        // Register an action for each menu item that delegates to engine.
+        for item in &items {
+            let action_name = item.action.clone();
+            let engine_ref = self.engine.clone();
+            let draw_ref = self.draw_needed.clone();
+            let gid = group_id;
+            let a = gtk4::gio::SimpleAction::new(&action_name, None);
+            let act = action_name.clone();
+            a.connect_activate(move |_, _| {
+                let mut e = engine_ref.borrow_mut();
+                e.active_group = gid;
+                // Re-open the context menu so confirm() can find items.
+                e.open_editor_action_menu(gid, 0, 0);
+                // Find and select the matching item.
+                if let Some(ref mut cm) = e.context_menu {
+                    if let Some(idx) = cm.items.iter().position(|i| i.action == act) {
+                        cm.selected = idx;
+                    }
+                }
+                e.context_menu_confirm();
+                draw_ref.set(true);
+            });
+            if enabled_map.get(&action_name) == Some(&false) {
+                a.set_enabled(false);
+            }
+            actions.add_action(&a);
+        }
+
+        da.insert_action_group("actmenu", Some(&actions));
+
+        let n_rows = menu_row_count(&menu);
+        swap_ctx_popover(&self.active_ctx_popover, {
+            let popover = gtk4::PopoverMenu::from_model(Some(&menu));
+            popover.set_parent(&da);
+            popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+            popover.set_has_arrow(false);
+            popover.set_position(gtk4::PositionType::Bottom);
+            popover.set_size_request(-1, n_rows * 22 + 14);
+            popover
+        });
+        if let Some(ref p) = *self.active_ctx_popover.borrow() {
+            p.popup();
+        }
     }
 
     fn handle_tab_right_click(
@@ -8838,6 +8953,11 @@ impl App {
                         let engine = self.engine.borrow();
                         let (git_statuses, diag_counts) = engine.explorer_indicators();
                         let theme = Theme::from_name(&engine.settings.colorscheme);
+                        let default_fg = if theme.is_light() {
+                            theme.foreground.to_hex()
+                        } else {
+                            theme.status_fg.to_hex()
+                        };
                         update_tree_indicators(
                             store,
                             &git_statuses,
@@ -8847,6 +8967,7 @@ impl App {
                             &theme.git_deleted.to_hex(),
                             &theme.diagnostic_error.to_hex(),
                             &theme.diagnostic_warning.to_hex(),
+                            &default_fg,
                         );
                     }
                     if let Some(ref tv) = *self.file_tree_view.borrow() {
@@ -9534,6 +9655,38 @@ fn calculate_gutter_width(mode: LineNumberMode, total_lines: usize, char_width: 
     }
 }
 
+/// Compute the editor area bottom Y coordinate.  Must match draw_editor (draw.rs)
+/// so that group rects and divider positions are consistent across draw and click.
+fn gtk_editor_bottom(engine: &Engine, _da_width: f64, da_height: f64, line_height: f64) -> f64 {
+    let wildmenu_px = if engine.wildmenu_items.is_empty() {
+        0.0
+    } else {
+        line_height
+    };
+    let global_status_rows = if engine.settings.window_status_line {
+        1.0
+    } else {
+        2.0
+    };
+    let status_bar_height = line_height * global_status_rows + wildmenu_px;
+    let qf_px = if engine.quickfix_open && !engine.quickfix_items.is_empty() {
+        6.0 * line_height
+    } else {
+        0.0
+    };
+    let term_px = if engine.terminal_open || engine.bottom_panel_open {
+        (engine.session.terminal_panel_rows as f64 + 2.0) * line_height
+    } else {
+        0.0
+    };
+    let debug_toolbar_px = if engine.debug_toolbar_visible {
+        line_height
+    } else {
+        0.0
+    };
+    da_height - status_bar_height - debug_toolbar_px - qf_px - term_px
+}
+
 /// Compute editor window rects with the same formula used by draw_editor and
 /// sync_scrollbar, so event handlers can do hit-testing without duplicating the
 /// layout logic.
@@ -9549,32 +9702,11 @@ fn compute_editor_window_rects(
     } else {
         tab_row_height
     };
-    let wildmenu_px = if engine.wildmenu_items.is_empty() {
-        0.0
-    } else {
-        line_height
-    };
-    let status_bar_height = line_height * 2.0 + wildmenu_px;
-    let debug_toolbar_px = if engine.debug_toolbar_visible {
-        line_height
-    } else {
-        0.0
-    };
-    let qf_px = if engine.quickfix_open && !engine.quickfix_items.is_empty() {
-        6.0 * line_height
-    } else {
-        0.0
-    };
-    let term_px = if engine.terminal_open || engine.bottom_panel_open {
-        (engine.session.terminal_panel_rows as f64 + 2.0) * line_height
-    } else {
-        0.0
-    };
     let editor_bounds = core::WindowRect::new(
         0.0,
         0.0,
         da_width,
-        da_height - status_bar_height - debug_toolbar_px - qf_px - term_px,
+        gtk_editor_bottom(engine, da_width, da_height, line_height),
     );
     let (rects, _dividers) = engine.calculate_group_window_rects(editor_bounds, tab_bar_height);
     rects

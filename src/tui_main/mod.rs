@@ -1191,10 +1191,8 @@ fn event_loop(
             // was visible last frame but isn't now.  Force a full redraw so
             // ratatui's incremental diff doesn't leave stale popup characters
             // in the editor area.
-            let has_popup = screen
-                .map(|s| s.picker.is_some())
-                .unwrap_or(false)
-                || folder_picker.is_some();
+            let has_popup =
+                screen.map(|s| s.picker.is_some()).unwrap_or(false) || folder_picker.is_some();
             if had_popup_overlay && !has_popup {
                 terminal.clear().ok();
             }

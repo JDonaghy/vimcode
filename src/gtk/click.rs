@@ -20,6 +20,8 @@ pub(super) enum ClickTarget {
     DiffToolbarToggleFold,
     /// Click was on a per-window status bar segment with an action.
     StatusBarAction(crate::core::engine::StatusAction),
+    /// Click was on the editor action menu button ("…").
+    ActionMenuButton(core::window::GroupId),
     /// Click was outside any actionable area.
     None,
 }
@@ -38,6 +40,7 @@ pub(super) fn pixel_to_click_target(
     tab_slot_positions: &TabSlotMap,
     diff_btn_map: &DiffBtnMap,
     split_btn_map: &SplitBtnMap,
+    action_btn_map: &ActionBtnMap,
 ) -> ClickTarget {
     let tab_row_height = (line_height * 1.6).ceil();
     let tab_bar_height = if engine.settings.breadcrumbs {
@@ -80,7 +83,7 @@ pub(super) fn pixel_to_click_target(
             .calculate_group_rects(content_bounds, tab_bar_height);
         engine.adjust_group_rects_for_hidden_tabs(&mut group_rects, tab_bar_height);
 
-        // Check if click is in any group's tab bar (the first line_height of the tab_bar_height region).
+        // Check if click is in any group's tab bar row.
         for (gid, grect) in &group_rects {
             if engine.is_tab_bar_hidden(*gid) {
                 continue;
@@ -89,7 +92,7 @@ pub(super) fn pixel_to_click_target(
             let tab_x_start = grect.x;
             let bar_width = grect.width;
             if y >= tab_y
-                && y < tab_y + tab_row_height
+                && y < tab_y + tab_bar_height
                 && x >= tab_x_start
                 && x < tab_x_start + bar_width
             {
@@ -112,20 +115,35 @@ pub(super) fn pixel_to_click_target(
                 }
 
                 // Hit-test split buttons using cached Pango-measured widths.
-                // Only check if this group actually has split buttons drawn.
+                // Split buttons sit to the left of the action menu button.
                 if let Some(&(both_btns_px, btn_right_px)) = split_btn_map.get(&group_id.0) {
+                    let action_offset = action_btn_map
+                        .get(&group_id.0)
+                        .map(|&(start, end)| end - start)
+                        .unwrap_or(0.0);
                     let btn_down_px = both_btns_px - btn_right_px;
-                    if local_x >= bar_width - btn_down_px {
+                    if local_x >= bar_width - btn_down_px - action_offset
+                        && local_x < bar_width - action_offset
+                    {
                         return ClickTarget::SplitButton(
                             group_id,
                             crate::core::window::SplitDirection::Horizontal,
                         );
                     }
-                    if local_x >= bar_width - both_btns_px {
+                    if local_x >= bar_width - both_btns_px - action_offset
+                        && local_x < bar_width - btn_down_px - action_offset
+                    {
                         return ClickTarget::SplitButton(
                             group_id,
                             crate::core::window::SplitDirection::Vertical,
                         );
+                    }
+                }
+
+                // Hit-test action menu button ("…") at the far right.
+                if let Some(&(start_x, end_x)) = action_btn_map.get(&group_id.0) {
+                    if local_x >= start_x && local_x < end_x {
+                        return ClickTarget::ActionMenuButton(group_id);
                     }
                 }
 
@@ -395,6 +413,7 @@ pub(super) fn handle_mouse_click(
     tab_slot_positions: &TabSlotMap,
     diff_btn_map: &DiffBtnMap,
     split_btn_map: &SplitBtnMap,
+    action_btn_map: &ActionBtnMap,
 ) -> Option<bool> {
     match pixel_to_click_target(
         engine,
@@ -407,6 +426,7 @@ pub(super) fn handle_mouse_click(
         tab_slot_positions,
         diff_btn_map,
         split_btn_map,
+        action_btn_map,
     ) {
         ClickTarget::BufferPos(wid, line, col) => {
             // Alt+Click in VSCode mode → add cursor at position
@@ -452,6 +472,10 @@ pub(super) fn handle_mouse_click(
         }
         ClickTarget::StatusBarAction(action) => {
             engine.handle_status_action(&action);
+            None
+        }
+        ClickTarget::ActionMenuButton(group_id) => {
+            engine.open_editor_action_menu(group_id, 0, 0);
             None
         }
         _ => None,
@@ -582,6 +606,7 @@ pub(super) fn handle_mouse_double_click(
     tab_slot_positions: &TabSlotMap,
     diff_btn_map: &DiffBtnMap,
     split_btn_map: &SplitBtnMap,
+    action_btn_map: &ActionBtnMap,
 ) {
     if let ClickTarget::BufferPos(wid, line, col) = pixel_to_click_target(
         engine,
@@ -594,6 +619,7 @@ pub(super) fn handle_mouse_double_click(
         tab_slot_positions,
         diff_btn_map,
         split_btn_map,
+        action_btn_map,
     ) {
         engine.mouse_double_click(wid, line, col);
     }
@@ -612,6 +638,7 @@ pub(super) fn handle_mouse_drag(
     tab_slot_positions: &TabSlotMap,
     diff_btn_map: &DiffBtnMap,
     split_btn_map: &SplitBtnMap,
+    action_btn_map: &ActionBtnMap,
 ) {
     if let ClickTarget::BufferPos(wid, line, col) = pixel_to_click_target(
         engine,
@@ -624,6 +651,7 @@ pub(super) fn handle_mouse_drag(
         tab_slot_positions,
         diff_btn_map,
         split_btn_map,
+        action_btn_map,
     ) {
         engine.mouse_drag(wid, line, col);
     }

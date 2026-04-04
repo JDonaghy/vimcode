@@ -1,9 +1,9 @@
 # VimCode Project State
 
-**Last updated:** Apr 2, 2026 (Session 244 — TUI rendering artifact fix + debug panel close bug) | **Tests:** 5275
+**Last updated:** Apr 3, 2026 (Session 245 — Editor action menu, richer syntax highlighting, explorer colors) | **Tests:** 5282
 
 > Feature documentation lives in **README.md**.
-> Per-session implementation notes through Session 243 are in **SESSION_HISTORY.md**.
+> Per-session implementation notes through Session 245 are in **SESSION_HISTORY.md**.
 
 ---
 
@@ -26,6 +26,6 @@ When implementing a new key/command, add tests covering:
 
 ## Recent Work
 
-> All sessions through 243 archived in **SESSION_HISTORY.md**.
+> All sessions through 245 archived in **SESSION_HISTORY.md**.
 
-- **Session 244**: TUI rendering artifact mitigation — `terminal.clear()` on `Event::Resize` (terminal reflow desync) and on picker/folder-picker popup dismiss (ratatui incremental diff miss); removed closed "debug panel close" bug from BUGS.md.
+- **Session 245**: Editor action menu (`⋯`) button, richer tree-sitter highlighting, explorer color overhaul. Action menu: 8-item dropdown at right edge of each tab bar; both GTK (PopoverMenu) and TUI. Tree-sitter: 12 new Theme fields (`control_flow`, `operator`, `punctuation`, `macro_call`, `attribute`, `lifetime`, `constant`, `escape`, `boolean`, `property`, `parameter`, `module`); all 20 language queries expanded with operators, punctuation, numbers, booleans, method calls, parameters, escape sequences; keywords split into storage vs control flow; `semantic_token_style()` handles `controlFlow` modifier; fixed tree-sitter reparse (always full parse — old tree without `tree.edit()` produced garbled byte offsets); insert mode immediate re-parse instead of 150ms debounce. Explorer: same base color for files/dirs; git status + diagnostics propagate recursively to parents; GTK indicator column in own TreeViewColumn. Fixes: split-down icon, midline ellipsis, GTK tab bar clip, `gtk_editor_bottom()` shared helper, divider drag excluded from tab bars, GTK menu dropdown padding, LSP status no longer downgrades Running→Initializing on empty semantic tokens. 7 new tests.

@@ -1,4 +1,4 @@
-# src/gtk/mod.rs — 9,740 lines
+# src/gtk/mod.rs — 10,003 lines
 
 GTK4/Relm4 application shell. Defines the `App` struct, `Msg` enum, and `SimpleComponent` impl (init/view/update). Contains the main event loop, window setup, input handling, and all GTK widget wiring.
 
@@ -19,6 +19,7 @@ GTK4/Relm4 application shell. Defines the `App` struct, `Msg` enum, and `SimpleC
 - `handle_mouse_click_msg()` — left click dispatching via `pixel_to_click_target()` (includes status bar branch click handler)
 - `handle_mouse_drag_msg()` — mouse drag (tab, scrollbar, sidebar resize, text selection)
 - `handle_mouse_up_msg()` — mouse release, tab drop, sidebar divider drop
+- `show_action_menu_popover()` — editor action menu (`…` button) popover with gio::Menu
 - `handle_tab_right_click()` — tab context menu (close, split, copy path)
 - `handle_editor_right_click()` — editor context menu (cut, copy, paste, LSP actions)
 - `handle_terminal_msg()` — terminal toggle, tabs, mouse, find, clipboard

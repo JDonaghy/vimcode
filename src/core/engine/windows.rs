@@ -679,6 +679,99 @@ impl Engine {
         });
     }
 
+    /// Open the editor action menu ("..." button) for a tab bar group.
+    pub fn open_editor_action_menu(&mut self, group_id: GroupId, x: u16, y: u16) {
+        let group = match self.editor_groups.get(&group_id) {
+            Some(g) => g,
+            None => return,
+        };
+        let tabs_len = group.tabs.len();
+        let active_tab = group.active_tab;
+        let has_file = self.tab_file_path(group_id, active_tab).is_some();
+        let wrap_label = if self.settings.wrap {
+            "Word Wrap: Off"
+        } else {
+            "Word Wrap: On"
+        };
+
+        let items = vec![
+            ContextMenuItem {
+                label: "Close All".into(),
+                action: "close_all".into(),
+                shortcut: String::new(),
+                separator_after: false,
+                enabled: true,
+            },
+            ContextMenuItem {
+                label: "Close Others".into(),
+                action: "close_others".into(),
+                shortcut: String::new(),
+                separator_after: false,
+                enabled: tabs_len > 1,
+            },
+            ContextMenuItem {
+                label: "Close Saved".into(),
+                action: "close_saved".into(),
+                shortcut: String::new(),
+                separator_after: false,
+                enabled: true,
+            },
+            ContextMenuItem {
+                label: "Close to the Right".into(),
+                action: "close_right".into(),
+                shortcut: String::new(),
+                separator_after: false,
+                enabled: active_tab < tabs_len.saturating_sub(1),
+            },
+            ContextMenuItem {
+                label: "Close to the Left".into(),
+                action: "close_left".into(),
+                shortcut: String::new(),
+                separator_after: true,
+                enabled: active_tab > 0,
+            },
+            ContextMenuItem {
+                label: wrap_label.into(),
+                action: "toggle_wrap".into(),
+                shortcut: String::new(),
+                separator_after: false,
+                enabled: true,
+            },
+            ContextMenuItem {
+                label: "Change Language Mode".into(),
+                action: "change_language".into(),
+                shortcut: String::new(),
+                separator_after: false,
+                enabled: true,
+            },
+            ContextMenuItem {
+                label: "Reveal in File Explorer".into(),
+                action: "reveal".into(),
+                shortcut: String::new(),
+                separator_after: false,
+                enabled: has_file,
+            },
+        ];
+
+        let selected = items.iter().position(|i| i.enabled).unwrap_or(0);
+        self.context_menu = Some(ContextMenuState {
+            target: ContextMenuTarget::EditorActionMenu { group_id },
+            items,
+            selected,
+            screen_x: x,
+            screen_y: y,
+        });
+    }
+
+    /// Close all tabs in the active group.
+    pub fn close_all_tabs(&mut self) {
+        let tabs_len = self.active_group().tabs.len();
+        for _ in 0..tabs_len {
+            self.active_group_mut().active_tab = 0;
+            self.close_tab();
+        }
+    }
+
     /// Open a context menu for an explorer file/directory.
     pub fn open_explorer_context_menu(&mut self, path: PathBuf, is_dir: bool, x: u16, y: u16) {
         let mut items = vec![];
@@ -1174,6 +1267,43 @@ impl Engine {
                 }
                 _ => {}
             },
+            ContextMenuTarget::EditorActionMenu { group_id } => {
+                let group_id = *group_id;
+                self.active_group = group_id;
+                match action.as_str() {
+                    "close_all" => {
+                        self.close_all_tabs();
+                    }
+                    "close_others" => {
+                        self.close_other_tabs();
+                    }
+                    "close_saved" => {
+                        self.close_saved_tabs();
+                    }
+                    "close_right" => {
+                        self.close_tabs_to_right();
+                    }
+                    "close_left" => {
+                        self.close_tabs_to_left();
+                    }
+                    "toggle_wrap" => {
+                        self.settings.wrap = !self.settings.wrap;
+                        self.message = format!(
+                            "Word wrap {}",
+                            if self.settings.wrap { "on" } else { "off" }
+                        );
+                    }
+                    "change_language" => {
+                        self.open_picker(PickerSource::Languages);
+                    }
+                    "reveal" => {
+                        if let Some(path) = self.file_path().map(|p| p.to_path_buf()) {
+                            self.reveal_in_file_manager(&path);
+                        }
+                    }
+                    _ => {}
+                }
+            }
             ContextMenuTarget::ExtPanel {
                 panel_name,
                 item_id,

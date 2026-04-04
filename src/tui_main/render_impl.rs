@@ -661,11 +661,14 @@ pub(super) const TAB_CLOSE_CHAR: char = '×'; // U+00D7 MULTIPLICATION SIGN
 /// Terminal columns used by each tab's close button (the × itself + trailing space).
 pub(super) const TAB_CLOSE_COLS: u16 = 2;
 
-// Split button glyphs: \u{F0932} (split-right), \u{F0931} (split-down).
+// Split button glyphs: \u{F0932} (split-right), \u{f0d7} (caret-down / split-down).
 /// Terminal columns occupied by each split button (1 space + 2-wide NF glyph).
 pub(super) const TAB_SPLIT_BTN_COLS: u16 = 3;
 /// Total columns reserved for both split buttons.
 pub(super) const TAB_SPLIT_BOTH_COLS: u16 = TAB_SPLIT_BTN_COLS * 2;
+
+/// Terminal columns for the editor action menu button ("…").
+pub(super) const TAB_ACTION_BTN_COLS: u16 = 3;
 
 /// Terminal columns per diff toolbar button (1 space + 1 char + 1 space).
 pub(super) const DIFF_BTN_COLS: u16 = 3;
@@ -1037,7 +1040,8 @@ pub(super) fn render_tab_bar(
     } else {
         0
     };
-    let reserved = diff_cols + split_cols;
+    let action_cols = TAB_ACTION_BTN_COLS;
+    let reserved = diff_cols + split_cols + action_cols;
 
     // Reserve columns at the right edge for buttons.
     let tab_end = if area.width >= reserved {
@@ -1138,17 +1142,27 @@ pub(super) fn render_tab_bar(
         }
     }
 
-    // Draw split-right then split-down buttons at the right edge.
-    if show_split_btns && area.width >= split_cols {
+    // Draw split-right then split-down buttons, then the action menu button.
+    if show_split_btns && area.width >= split_cols + action_cols {
         let btn_fg = rc(theme.tab_inactive_fg);
-        let mut bx = area.x + area.width - split_cols;
+        let mut bx = area.x + area.width - split_cols - action_cols;
         // Split-right button (space + 2-wide NF glyph = 3 cols)
         set_cell(buf, bx, area.y, ' ', btn_fg, bar_bg);
         set_cell_wide(buf, bx + 1, area.y, '\u{F0932}', btn_fg, bar_bg);
         bx += TAB_SPLIT_BTN_COLS;
-        // Split-down button
+        // Split-down button (caret-down ▾)
         set_cell(buf, bx, area.y, ' ', btn_fg, bar_bg);
-        set_cell_wide(buf, bx + 1, area.y, '\u{F0931}', btn_fg, bar_bg);
+        set_cell(buf, bx + 1, area.y, '\u{f0d7}', btn_fg, bar_bg);
+        set_cell(buf, bx + 2, area.y, ' ', btn_fg, bar_bg);
+    }
+
+    // Draw the editor action menu button ("…") at the far right.
+    if area.width >= action_cols {
+        let btn_fg = rc(theme.tab_inactive_fg);
+        let bx = area.x + area.width - action_cols;
+        set_cell(buf, bx, area.y, ' ', btn_fg, bar_bg);
+        set_cell(buf, bx + 1, area.y, '\u{22EF}', btn_fg, bar_bg); // ⋯
+        set_cell(buf, bx + 2, area.y, ' ', btn_fg, bar_bg);
     }
 
     // Return the available tab bar width in columns so the engine can compute

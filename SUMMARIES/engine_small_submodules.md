@@ -1,6 +1,6 @@
 # Engine Small Submodules
 
-## accessors.rs — 444 lines
+## accessors.rs — 494 lines
 Convenience facade methods for accessing the active group/buffer/window.
 - `buffer()` / `buffer_mut()` — active window's buffer
 - `view()` / `view_mut()` — active window's viewport
@@ -12,6 +12,7 @@ Convenience facade methods for accessing the active group/buffer/window.
 - `adjust_group_rects_for_hidden_tabs(rects, height)` — expand content area when tab bar hidden
 - `sidebar_has_focus()` — true if any sidebar panel has keyboard focus
 - `clear_sidebar_focus()` — clear all sidebar panel focus flags
+- `explorer_indicators()` — git statuses + diagnostic counts for explorer tree; propagates both recursively to parent dirs
 
 ## search.rs — 642 lines
 Cursor visibility, scroll synchronization, project search/replace, word search.

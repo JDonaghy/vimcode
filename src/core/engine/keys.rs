@@ -349,14 +349,11 @@ impl Engine {
             self.set_dirty(true);
 
             let t1 = std::time::Instant::now();
-            // In insert mode, use the fast path: just re-parse the tree
-            // (incremental, fast) without extracting highlights (O(n), slow).
-            // Highlights are marked stale and re-extracted on the next render.
-            if self.mode == Mode::Insert {
-                self.mark_syntax_stale();
-            } else {
-                self.update_syntax();
-            }
+            // Always do a full re-parse + highlight extraction so byte
+            // offsets stay correct.  Tree-sitter incremental parsing is fast
+            // enough for interactive use; deferring caused garbled colors
+            // because stale byte offsets produced partial-word highlighting.
+            self.update_syntax();
             let t2 = std::time::Instant::now();
 
             // Auto-promote preview buffer on text modification

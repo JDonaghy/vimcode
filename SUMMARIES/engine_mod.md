@@ -1,4 +1,4 @@
-# src/core/engine/mod.rs — 3,415 lines
+# src/core/engine/mod.rs — 3,514 lines
 
 Core engine definition. Contains the `Engine` struct (all editor state), enums, types, `new()` constructor, free functions, and `mod` declarations for all submodules.
 
@@ -11,7 +11,7 @@ Core engine definition. Contains the `Engine` struct (all editor state), enums, 
 - `PaletteCommand` — command palette entry (includes "Go: Command Center")
 - `DiffLine` / `AlignedDiffEntry` — diff display types
 - `TabDragState` — tab drag-and-drop state
-- `ContextMenuState` / `ContextMenuItem` — right-click context menus
+- `ContextMenuState` / `ContextMenuItem` / `ContextMenuTarget` — context menus (Tab, ExplorerFile, ExplorerDir, Editor, EditorActionMenu, ExtPanel)
 - `PanelHoverPopup` / `EditorHoverPopup` — hover popup state
 - `EditorGroup` — tab group with own tab list + `tab_scroll_offset` for overflow scrolling
 - `UserKeymap` — user-defined key remapping

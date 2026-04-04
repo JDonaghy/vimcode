@@ -1,4 +1,4 @@
-# src/core/engine/windows.rs — 3,205 lines
+# src/core/engine/windows.rs — 3,396 lines
 
 Window/tab/editor-group management, splits, focus, resize, tab drag-and-drop, tab navigation history, and session restore.
 
@@ -13,6 +13,7 @@ Window/tab/editor-group management, splits, focus, resize, tab drag-and-drop, ta
 - `new_tab()` — create new tab
 - `close_tab(idx)` — close tab with confirmation if dirty; cleans up nav history entries
 - `close_tab_confirm(idx)` — close with save prompt
+- `close_all_tabs()` — close all tabs in active group
 - `next_tab()` / `prev_tab()` — gt/gT tab cycling
 - `goto_tab(n)` — go to tab by number
 - `move_tab(delta)` — reorder tabs
@@ -31,6 +32,12 @@ Window/tab/editor-group management, splits, focus, resize, tab drag-and-drop, ta
 - `move_tab_to_group(tab_idx, target_group)` — drag tab between groups
 - `resize_group_split(delta)` — resize group divider
 - `calculate_group_window_rects(bounds)` — layout calculation; adjusts rects for hidden tab bars via `adjust_group_rects_for_hidden_tabs`
+
+## Context Menus
+- `open_tab_context_menu(group_id, tab_idx, x, y)` — right-click tab menu
+- `open_editor_action_menu(group_id, x, y)` — `…` button dropdown (Close All/Others/Saved/Right/Left, Toggle Wrap, Change Language, Reveal)
+- `context_menu_confirm()` — dispatch selected context menu action
+- `handle_context_menu_key(key)` — keyboard navigation for context menus
 
 ## Session
 - `save_session()` — persist open tabs/groups/layout to disk

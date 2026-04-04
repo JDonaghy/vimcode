@@ -981,6 +981,7 @@ pub enum ContextMenuTarget {
     ExplorerFile { path: PathBuf },
     ExplorerDir { path: PathBuf },
     Editor,
+    EditorActionMenu { group_id: GroupId },
     ExtPanel { panel_name: String, item_id: String },
 }
 

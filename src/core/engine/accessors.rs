@@ -255,6 +255,56 @@ impl Engine {
             }
         }
 
+        // Propagate git statuses up to parent directories so that a folder
+        // shows modified/added color when any descendant file has that status.
+        // Priority: M > D > R > A > ?
+        fn git_priority(c: char) -> u8 {
+            match c {
+                'M' => 5,
+                'D' => 4,
+                'R' => 3,
+                'A' => 2,
+                '?' => 1,
+                _ => 0,
+            }
+        }
+        let git_file_paths: Vec<PathBuf> = git_statuses.keys().cloned().collect();
+        for file_path in &git_file_paths {
+            let status = git_statuses[file_path];
+            let mut ancestor = file_path.parent();
+            while let Some(dir) = ancestor {
+                let entry = git_statuses.entry(dir.to_path_buf()).or_insert(status);
+                if git_priority(status) > git_priority(*entry) {
+                    *entry = status;
+                }
+                ancestor = dir.parent();
+                if dir == self.cwd {
+                    break;
+                }
+            }
+        }
+
+        // Propagate diagnostic counts up to parent directories so that a
+        // folder shows error/warning color when any descendant file has issues.
+        let file_paths: Vec<PathBuf> = diag_counts.keys().cloned().collect();
+        for file_path in &file_paths {
+            let (errors, warnings) = diag_counts[file_path];
+            if errors == 0 && warnings == 0 {
+                continue;
+            }
+            let mut ancestor = file_path.parent();
+            while let Some(dir) = ancestor {
+                let entry = diag_counts.entry(dir.to_path_buf()).or_insert((0, 0));
+                entry.0 += errors;
+                entry.1 += warnings;
+                ancestor = dir.parent();
+                // Stop at the cwd to avoid propagating to unrelated dirs.
+                if dir == self.cwd {
+                    break;
+                }
+            }
+        }
+
         (git_statuses, diag_counts)
     }
 

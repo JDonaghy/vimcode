@@ -131,7 +131,6 @@ pub(super) fn render_sidebar(
     let header_bg = rc(theme.status_bg);
     let default_fg = rc(theme.foreground);
     let row_bg = rc(theme.tab_bar_bg);
-    let dir_fg = rc(theme.explorer_dir_fg);
     let active_bg = rc(theme.explorer_active_bg);
 
     // The single active buffer path (the file shown in the active window)
@@ -143,7 +142,6 @@ pub(super) fn render_sidebar(
     } else {
         rc(theme.sidebar_sel_bg_inactive)
     };
-    let sel_fg = default_fg;
 
     // Extension panel (plugin-provided)
     if sidebar.ext_panel_name.is_some() {
@@ -318,17 +316,34 @@ pub(super) fn render_sidebar(
             g: 60,
             b: 80,
         }); // muted blue highlight
-        let (fg, bg) = if is_drop_target {
-            (sel_fg, drop_bg)
-        } else if is_selected {
-            let fg = if row.is_dir { dir_fg } else { sel_fg };
-            (fg, sel_bg)
-        } else if is_active {
-            (default_fg, active_bg)
-        } else if row.is_dir {
-            (dir_fg, row_bg)
+            // Determine name color: error > warning > git modified > default.
+        let canon = row.path.canonicalize().unwrap_or_else(|_| row.path.clone());
+        let name_fg = if let Some(&(errors, warnings)) = diag_counts.get(&canon) {
+            if errors > 0 {
+                diag_error_fg
+            } else if warnings > 0 {
+                diag_warning_fg
+            } else {
+                default_fg
+            }
+        } else if let Some(&label) = git_statuses.get(&canon) {
+            match label {
+                'A' | '?' => git_added_fg,
+                'D' => git_deleted_fg,
+                _ => git_modified_fg,
+            }
         } else {
-            (default_fg, row_bg)
+            default_fg
+        };
+
+        let (fg, bg) = if is_drop_target {
+            (name_fg, drop_bg)
+        } else if is_selected {
+            (name_fg, sel_bg)
+        } else if is_active {
+            (name_fg, active_bg)
+        } else {
+            (name_fg, row_bg)
         };
 
         // Build row string: indent + chevron/icon + name

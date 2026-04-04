@@ -131,7 +131,7 @@ pub const DIFF_PREV: Icon = Icon::new("\u{F0143}", "<");
 pub const DIFF_NEXT: Icon = Icon::new("\u{F0140}", ">");
 pub const DIFF_FOLD: Icon = Icon::new("\u{F0233}", "=");
 pub const SPLIT_RIGHT: Icon = Icon::new("\u{F0932}", "|");
-pub const SPLIT_DOWN: Icon = Icon::new("\u{F0931}", "_");
+pub const SPLIT_DOWN: Icon = Icon::new("\u{f0d7}", "_");
 
 // ─── File Icon Lookup ────────────────────────────────────────────────────────
 

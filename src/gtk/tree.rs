@@ -25,9 +25,9 @@ pub(super) fn build_file_tree_with_root(
             (0, &""),
             (1, &root_name),
             (2, &root.to_string_lossy().to_string()),
-            (3, &dir_fg_hex),
+            (3, &file_fg_hex),
             (4, &""),
-            (5, &dir_fg_hex),
+            (5, &file_fg_hex),
         ],
     );
     build_file_tree_shallow(
@@ -88,7 +88,7 @@ pub(super) fn build_file_tree_shallow(
             crate::icons::file_icon(ext)
         };
 
-        let fg_hex: &str = if is_dir { dir_fg_hex } else { file_fg_hex };
+        let fg_hex: &str = file_fg_hex;
         let iter = store.insert_with_values(
             parent,
             None,
@@ -167,6 +167,7 @@ pub(super) fn update_tree_indicators(
     deleted_color: &str,
     error_color: &str,
     warning_color: &str,
+    default_fg: &str,
 ) {
     use gtk4::prelude::TreeModelExt;
     #[allow(clippy::too_many_arguments)]
@@ -180,6 +181,7 @@ pub(super) fn update_tree_indicators(
         deleted_color: &str,
         error_color: &str,
         warning_color: &str,
+        default_fg: &str,
     ) {
         let Some(iter) = store.iter_children(parent) else {
             return;
@@ -229,10 +231,14 @@ pub(super) fn update_tree_indicators(
                     let text = parts.join(" ");
                     store.set_value(&iter, 4, &text.into());
                     store.set_value(&iter, 5, &color.into());
+                    // Set name foreground (column 3) to match the indicator color.
+                    store.set_value(&iter, 3, &color.into());
                 } else {
                     store.set_value(&iter, 4, &"".into());
                     // Use a valid color to avoid GTK "Don't know color ''" warnings.
                     store.set_value(&iter, 5, &modified_color.into());
+                    // Reset name color to default.
+                    store.set_value(&iter, 3, &default_fg.into());
                 }
             }
             // Recurse into children
@@ -246,6 +252,7 @@ pub(super) fn update_tree_indicators(
                 deleted_color,
                 error_color,
                 warning_color,
+                default_fg,
             );
             if !store.iter_next(&iter) {
                 break;
@@ -262,6 +269,7 @@ pub(super) fn update_tree_indicators(
         deleted_color,
         error_color,
         warning_color,
+        default_fg,
     );
 }
 

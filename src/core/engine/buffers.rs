@@ -11,6 +11,7 @@ impl Engine {
 
     /// Mark syntax as stale without doing any parsing work. Call on every
     /// keystroke in insert mode — the idle handler debounces the actual re-parse.
+    #[allow(dead_code)]
     pub fn mark_syntax_stale(&mut self) {
         self.active_buffer_state_mut().mark_syntax_stale();
     }

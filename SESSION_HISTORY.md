@@ -1,7 +1,19 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 244 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 245 archived here. Recent work summary in PROJECT_STATE.md.
+
+---
+
+**Session 245 — Editor action menu, richer syntax highlighting, explorer colors (5282 tests):**
+
+Editor action menu (`⋯`) button at right edge of each tab bar group. 8-item dropdown: Close All, Close Others, Close Saved, Close to Right/Left, Toggle Word Wrap, Change Language Mode, Reveal in File Explorer. `ContextMenuTarget::EditorActionMenu` + `open_editor_action_menu()` + `close_all_tabs()`. TUI: `TAB_ACTION_BTN_COLS` constant, click handling in multi/single-group paths. GTK: `ActionBtnMap` type, `ClickTarget::ActionMenuButton`, `show_action_menu_popover()` with `PopoverMenu`.
+
+Richer tree-sitter highlight queries: 12 new Theme fields (`control_flow`, `operator`, `punctuation`, `macro_call`, `attribute`, `lifetime`, `constant`, `escape`, `boolean`, `property`, `parameter`, `module`) with colors for all 6 built-in themes + VSCode JSON importer (`keyword.control` scope). `scope_color()` expanded from 8→23 capture names. All 20 language queries expanded: keywords split into storage (`@keyword`) vs control flow (`@keyword.control`), plus operators, punctuation, numbers, booleans, method calls, field access, parameters, escape sequences, macros, attributes, lifetimes. `semantic_token_style()` now checks `controlFlow` modifier on keyword tokens, plus handles `operator`, `boolean`, `lifetime`, `attribute`, `builtinType`. Fixed tree-sitter `reparse()`: always full parse (passing old tree without `tree.edit()` caused stale byte offsets → garbled partial-word coloring). Insert mode now does immediate `update_syntax()` instead of 150ms debounce.
+
+Explorer color overhaul: removed `explorer_dir_fg` distinction — folders/files same base color. Git status propagated recursively to parent dirs (priority M>D>R>A>?). Diagnostic counts propagated recursively to parent dirs. Name fg color priority: error > warning > git > default. GTK indicator column split into own `TreeViewColumn` (no longer clipped by filename column).
+
+Bug fixes: split-down icon changed from pushpin `\u{F0931}` to caret-down `\u{f0d7}`; midline ellipsis `⋯` (`\u{22EF}`); GTK tab bar clip height (`line_height`→`tab_row_height`); split/diff buttons shifted left by action button width; `gtk_editor_bottom()` shared helper eliminates coordinate mismatches between draw, click, and divider handlers; capture-phase GestureDrag and click-handler divider hit-tests both exclude tab bar regions; GTK menu dropdown padding (removed blank header row, added 4px symmetric padding); LSP status no longer downgrades Running→Initializing when semantic tokens temporarily empty; TUI settings button bug added to BUGS.md. Removed Pinned Tabs from roadmap.
 
 ---
 

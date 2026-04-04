@@ -265,7 +265,11 @@ impl BufferState {
     pub fn update_syntax(&mut self) {
         let text = self.buffer.to_string();
         self.highlights = if let Some(ref mut syn) = self.syntax {
-            syn.parse(&text)
+            let mut hl = syn.parse(&text);
+            // Ensure sorted by start_byte — the render pipeline uses binary
+            // search (partition_point) to narrow highlights to the viewport.
+            hl.sort_by_key(|h| h.0);
+            hl
         } else {
             Vec::new()
         };
@@ -318,6 +322,7 @@ impl BufferState {
     /// Mark syntax as needing a re-parse. Does NO work — just records the
     /// timestamp so the idle handler can debounce and re-parse after the user
     /// pauses typing. Call this on every keystroke in insert mode.
+    #[allow(dead_code)]
     pub fn mark_syntax_stale(&mut self) {
         self.syntax_stale = true;
         self.syntax_stale_since = Some(std::time::Instant::now());

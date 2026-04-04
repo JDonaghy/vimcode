@@ -37,7 +37,7 @@ For detailed how-to guides and configuration references, see the **[VimCode Wiki
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 5,275 tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 5,282 tests, zero async runtime dependency
 
 > **Note:** VimCode does not implement VimScript. Extension and scripting is handled via
 > the built-in Lua 5.4 plugin system. The goal is full Vim *keybinding* and *editing*
@@ -285,7 +285,7 @@ VimCode has three spatial layers that combine Vim and VSCode concepts:
 - **Tabs** — pages within an editor group, like Vim tabs or browser tabs (`gt`/`gT`, `:tabnew`)
 - **Editor Groups** — VSCode-style side-by-side tab bars (`Ctrl+\`, `Ctrl-W e/E`), each with its own set of tabs
 
-The tab context menu offers both: "Split Right/Down" creates a Vim window split inside the current tab, while "Split Right/Down to New Group" creates a new editor group with its own tab bar.
+The tab context menu offers both: "Split Right/Down" creates a Vim window split inside the current tab, while "Split Right/Down to New Group" creates a new editor group with its own tab bar. Each tab bar also has a `…` (more actions) button at the right edge with Close All, Close Others, Close Saved, Close to Right/Left, Toggle Word Wrap, Change Language Mode, and Reveal in File Explorer.
 
 **Buffers**
 - `:bn` / `:bp` — next/previous buffer

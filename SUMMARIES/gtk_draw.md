@@ -1,4 +1,4 @@
-# src/gtk/draw.rs — 5,884 lines
+# src/gtk/draw.rs — 5,944 lines
 
 All Cairo/Pango drawing functions for the GTK backend. Each `draw_*` function renders one UI component onto a Cairo context using data from `ScreenLayout`.
 
@@ -6,7 +6,7 @@ All Cairo/Pango drawing functions for the GTK backend. Each `draw_*` function re
 - `draw_editor` — main editor area (all windows, gutters, text, cursors)
 - `draw_window` — single editor window with syntax-highlighted lines
 - `draw_visual_selection` — visual mode selection overlay
-- `draw_tab_bar` — tab strip per editor group with scroll offset
+- `draw_tab_bar` — tab strip per editor group with scroll offset + `…` action menu button
 - `draw_breadcrumb_bar` — file path breadcrumbs below tab bar
 - `draw_h_scrollbars` — horizontal scrollbars
 - `draw_tab_drag_overlay` — drag indicator when moving tabs

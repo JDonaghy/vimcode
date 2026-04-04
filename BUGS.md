@@ -6,6 +6,8 @@
 
 - **(Medium) Settings button unclickable when debug output tab is open** — The Settings icon in the activity bar cannot be clicked while the bottom debug/terminal panel is visible. Likely a click target overlap or the panel is intercepting the click.
 
+- **(Medium) TUI: Settings button in activity bar not clickable** — The Settings gear icon at the bottom of the TUI activity bar does not respond to clicks. Separate from the GTK "debug output tab" overlap issue above.
+
 - **(Medium) Spell check underline misaligned** — Misspelled words show underlines that start several characters before the word and end in the middle of it. The underline span offsets appear wrong. May be a byte-vs-char index mismatch in `SpellMark` positioning, or an interaction with tree-sitter/LSP spans shifting offsets.
 
 - **(Low) Hardcoded colors in rendering code — 59 instances across 5 files.** These colors don't adapt to the user's chosen theme. Should all use `Theme` struct fields instead. Breakdown:

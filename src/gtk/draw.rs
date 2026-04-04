@@ -18,6 +18,7 @@ pub(super) fn draw_editor(
     tab_slot_positions_out: &Rc<RefCell<TabSlotMap>>,
     diff_btn_map_out: &Rc<RefCell<DiffBtnMap>>,
     split_btn_map_out: &Rc<RefCell<SplitBtnMap>>,
+    action_btn_map_out: &Rc<RefCell<ActionBtnMap>>,
     dialog_btn_rects_out: &Rc<RefCell<DialogBtnRects>>,
     editor_hover_rect_out: &Rc<Cell<Option<(f64, f64, f64, f64)>>>,
     editor_hover_link_rects_out: &Rc<RefCell<Vec<(f64, f64, f64, f64, String)>>>,
@@ -29,6 +30,7 @@ pub(super) fn draw_editor(
     // Clear cached button positions from previous frame.
     diff_btn_map_out.borrow_mut().clear();
     split_btn_map_out.borrow_mut().clear();
+    action_btn_map_out.borrow_mut().clear();
 
     // 1. Background
     let (bg_r, bg_g, bg_b) = theme.background.to_cairo();
@@ -175,7 +177,7 @@ pub(super) fn draw_editor(
             // an inactive group's toolbar doesn't cause a visual shift.
             let show_split = is_active || engine.is_in_diff_view();
             cr.save().ok();
-            cr.rectangle(tab_x, tab_y, tab_w, line_height);
+            cr.rectangle(tab_x, tab_y, tab_w, tab_row_height);
             cr.clip();
             cr.translate(tab_x, tab_y);
             let hover_idx = tab_close_hover.and_then(|(gid, tidx)| {
@@ -190,7 +192,7 @@ pub(super) fn draw_editor(
             } else {
                 None
             };
-            let (positions, dbp, sbp, vis_count) = draw_tab_bar(
+            let (positions, dbp, sbp, vis_count, abp) = draw_tab_bar(
                 cr,
                 &layout,
                 &theme,
@@ -213,6 +215,9 @@ pub(super) fn draw_editor(
             if let Some(sp) = sbp {
                 split_btn_map_out.borrow_mut().insert(gtb.group_id.0, sp);
             }
+            if let Some(ap) = abp {
+                action_btn_map_out.borrow_mut().insert(gtb.group_id.0, ap);
+            }
             tab_visible_counts_out
                 .borrow_mut()
                 .push((gtb.group_id, vis_count));
@@ -221,7 +226,7 @@ pub(super) fn draw_editor(
     } else if !engine.is_tab_bar_hidden(engine.active_group) {
         // Single group: draw tab bar at full width with split buttons.
         let hover_idx = tab_close_hover.map(|(_gid, tidx)| tidx);
-        let (positions, dbp, sbp, vis_count) = draw_tab_bar(
+        let (positions, dbp, sbp, vis_count, abp) = draw_tab_bar(
             cr,
             &layout,
             &theme,
@@ -248,6 +253,11 @@ pub(super) fn draw_editor(
             split_btn_map_out
                 .borrow_mut()
                 .insert(engine.active_group.0, sp);
+        }
+        if let Some(ap) = abp {
+            action_btn_map_out
+                .borrow_mut()
+                .insert(engine.active_group.0, ap);
         }
         tab_visible_counts_out
             .borrow_mut()
@@ -754,8 +764,8 @@ pub(super) fn draw_tab_bar(
     italic_font.set_style(pango::Style::Italic);
 
     // Measure both split buttons so tabs don't overlap them.
-    let btn_right_s = format!(" {}", icons::SPLIT_RIGHT.nerd);
-    let btn_down_s = format!(" {}", icons::SPLIT_DOWN.nerd);
+    let btn_right_s = format!(" {} ", icons::SPLIT_RIGHT.nerd);
+    let btn_down_s = format!(" {} ", icons::SPLIT_DOWN.nerd);
     let btn_right_text = btn_right_s.as_str();
     let btn_down_text = btn_down_s.as_str();
     let (both_btns_px, btn_right_px) = if show_split_btn {
@@ -797,7 +807,14 @@ pub(super) fn draw_tab_bar(
     };
     let diff_total_px = diff_btns_px + diff_label_px;
 
-    let tab_area_width = width - both_btns_px - diff_total_px;
+    // Measure the action menu button ("…").
+    let action_btn_s = " \u{22EF} "; // " ⋯ " (midline ellipsis)
+    layout.set_font_description(Some(&normal_font));
+    layout.set_text(action_btn_s);
+    let (action_w_i, _) = layout.pixel_size();
+    let action_btn_px = action_w_i as f64;
+
+    let tab_area_width = width - both_btns_px - diff_total_px - action_btn_px;
 
     // Measure the close button (×) once for use in every tab.
     layout.set_font_description(Some(&normal_font));
@@ -958,7 +975,7 @@ pub(super) fn draw_tab_bar(
     let diff_btn_pos: Option<(f64, f64, f64, f64, f64, f64)> = if let Some(dt) = diff_toolbar {
         layout.set_font_description(Some(&normal_font));
         let (fr, fg_g, fb) = theme.tab_inactive_fg.to_cairo();
-        let mut dx = width - both_btns_px - diff_total_px;
+        let mut dx = width - both_btns_px - diff_total_px - action_btn_px;
         // Change label (e.g. " 2 of 5")
         if let Some(lbl) = &dt.change_label {
             let (fr2, fg2, fb2) = theme.foreground.to_cairo();
@@ -1008,13 +1025,16 @@ pub(super) fn draw_tab_bar(
         layout.set_font_description(Some(&normal_font));
         let (fr, fg_g, fb) = theme.tab_inactive_fg.to_cairo();
         cr.set_source_rgb(fr, fg_g, fb);
-        // Split-right button
+        // Split-right button (shifted left to make room for action button)
         layout.set_text(btn_right_text);
-        cr.move_to(width - both_btns_px, text_y_offset);
+        cr.move_to(width - both_btns_px - action_btn_px, text_y_offset);
         pangocairo::show_layout(cr, layout);
         // Split-down button
         layout.set_text(btn_down_text);
-        cr.move_to(width - both_btns_px + btn_right_px, text_y_offset);
+        cr.move_to(
+            width - both_btns_px - action_btn_px + btn_right_px,
+            text_y_offset,
+        );
         pangocairo::show_layout(cr, layout);
     }
 
@@ -1033,9 +1053,27 @@ pub(super) fn draw_tab_bar(
     let char_w = (char_px as f64).max(1.0);
     let available_cols = (effective_tab_area / char_w).floor().max(0.0) as usize;
 
+    // Draw the editor action menu button ("…") at the far right.
+    let action_btn_info = {
+        layout.set_font_description(Some(&normal_font));
+        let (fr, fg_g, fb) = theme.tab_inactive_fg.to_cairo();
+        cr.set_source_rgb(fr, fg_g, fb);
+        let ax = width - action_btn_px;
+        layout.set_text(action_btn_s);
+        cr.move_to(ax, text_y_offset);
+        pangocairo::show_layout(cr, layout);
+        Some((ax, width))
+    };
+
     // Restore original editor font for subsequent rendering
     layout.set_font_description(Some(&saved_font));
-    (slot_positions, diff_btn_pos, split_btn_info, available_cols)
+    (
+        slot_positions,
+        diff_btn_pos,
+        split_btn_info,
+        available_cols,
+        action_btn_info,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4127,7 +4165,8 @@ pub(super) fn draw_menu_dropdown(
     }
     let item_count = data.open_items.len() as f64;
     let popup_width = 220.0_f64;
-    let popup_height = (item_count + 1.0) * line_height;
+    let pad = 4.0; // small top/bottom padding
+    let popup_height = item_count * line_height + pad * 2.0;
     let popup_y = anchor_y;
 
     // Background — use hover_bg (adapts to light/dark themes).
@@ -4142,13 +4181,12 @@ pub(super) fn draw_menu_dropdown(
     cr.rectangle(popup_x, popup_y, popup_width, popup_height);
     let _ = cr.stroke();
 
-    // Items — each occupies one line_height row starting at popup_y + line_height
-    // (row 0 is the "header" behind the menu bar).
+    // Items — each occupies one line_height row starting at popup_y + pad.
     let (fr, fg_c, fb) = theme.foreground.to_cairo();
     let (sr, sg, sb) = theme.line_number_fg.to_cairo();
     cr.set_source_rgb(fr, fg_c, fb);
     for (i, item) in data.open_items.iter().enumerate() {
-        let row_top = popup_y + (i as f64 + 1.0) * line_height;
+        let row_top = popup_y + pad + i as f64 * line_height;
         if item.separator {
             cr.set_source_rgb(sr, sg, sb);
             let sep_y = row_top + line_height * 0.5;

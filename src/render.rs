@@ -1787,6 +1787,18 @@ pub struct Theme {
     pub type_name: Color,
     pub variable: Color,
     pub number: Color,
+    pub control_flow: Color,
+    pub operator: Color,
+    pub punctuation: Color,
+    pub macro_call: Color,
+    pub attribute: Color,
+    pub lifetime: Color,
+    pub constant: Color,
+    pub escape: Color,
+    pub boolean: Color,
+    pub property: Color,
+    pub parameter: Color,
+    pub module: Color,
     /// Fallback foreground for unrecognised scopes.
     pub default_fg: Color,
 
@@ -1959,12 +1971,24 @@ impl Theme {
             foreground: Color::from_hex("#e5e5e5"),
 
             keyword: Color::from_hex("#c678dd"),
+            control_flow: Color::from_hex("#c678dd"),
             string_lit: Color::from_hex("#98c379"),
             comment: Color::from_hex("#5c6370"),
             function: Color::from_hex("#61afef"),
             type_name: Color::from_hex("#e5c07b"),
             variable: Color::from_hex("#e06c75"),
             number: Color::from_hex("#d19a66"),
+            operator: Color::from_hex("#56b6c2"),
+            punctuation: Color::from_hex("#abb2bf"),
+            macro_call: Color::from_hex("#61afef"),
+            attribute: Color::from_hex("#e5c07b"),
+            lifetime: Color::from_hex("#e06c75"),
+            constant: Color::from_hex("#d19a66"),
+            escape: Color::from_hex("#56b6c2"),
+            boolean: Color::from_hex("#d19a66"),
+            property: Color::from_hex("#e06c75"),
+            parameter: Color::from_hex("#e06c75"),
+            module: Color::from_hex("#e5c07b"),
             default_fg: Color::from_hex("#abb2bf"),
 
             // (0.3, 0.5, 0.7) with alpha 0.3
@@ -2116,12 +2140,24 @@ impl Theme {
             foreground: Color::from_hex("#ebdbb2"),
 
             keyword: Color::from_hex("#fb4934"),
+            control_flow: Color::from_hex("#fb4934"),
             string_lit: Color::from_hex("#b8bb26"),
             comment: Color::from_hex("#928374"),
             function: Color::from_hex("#8ec07c"),
             type_name: Color::from_hex("#fabd2f"),
             variable: Color::from_hex("#83a598"),
             number: Color::from_hex("#d3869b"),
+            operator: Color::from_hex("#8ec07c"),
+            punctuation: Color::from_hex("#ebdbb2"),
+            macro_call: Color::from_hex("#8ec07c"),
+            attribute: Color::from_hex("#fabd2f"),
+            lifetime: Color::from_hex("#fb4934"),
+            constant: Color::from_hex("#d3869b"),
+            escape: Color::from_hex("#8ec07c"),
+            boolean: Color::from_hex("#d3869b"),
+            property: Color::from_hex("#83a598"),
+            parameter: Color::from_hex("#83a598"),
+            module: Color::from_hex("#fabd2f"),
             default_fg: Color::from_hex("#ebdbb2"),
 
             selection: Color::from_hex("#458588"),
@@ -2246,12 +2282,24 @@ impl Theme {
             foreground: Color::from_hex("#c0caf5"),
 
             keyword: Color::from_hex("#bb9af7"),
+            control_flow: Color::from_hex("#bb9af7"),
             string_lit: Color::from_hex("#9ece6a"),
             comment: Color::from_hex("#565f89"),
             function: Color::from_hex("#7aa2f7"),
             type_name: Color::from_hex("#e0af68"),
             variable: Color::from_hex("#f7768e"),
             number: Color::from_hex("#ff9e64"),
+            operator: Color::from_hex("#89ddff"),
+            punctuation: Color::from_hex("#a9b1d6"),
+            macro_call: Color::from_hex("#7aa2f7"),
+            attribute: Color::from_hex("#e0af68"),
+            lifetime: Color::from_hex("#f7768e"),
+            constant: Color::from_hex("#ff9e64"),
+            escape: Color::from_hex("#89ddff"),
+            boolean: Color::from_hex("#ff9e64"),
+            property: Color::from_hex("#73daca"),
+            parameter: Color::from_hex("#e0af68"),
+            module: Color::from_hex("#e0af68"),
             default_fg: Color::from_hex("#a9b1d6"),
 
             selection: Color::from_hex("#364a82"),
@@ -2376,12 +2424,24 @@ impl Theme {
             foreground: Color::from_hex("#839496"),
 
             keyword: Color::from_hex("#859900"),
+            control_flow: Color::from_hex("#859900"),
             string_lit: Color::from_hex("#2aa198"),
             comment: Color::from_hex("#586e75"),
             function: Color::from_hex("#268bd2"),
             type_name: Color::from_hex("#b58900"),
             variable: Color::from_hex("#dc322f"),
             number: Color::from_hex("#2aa198"),
+            operator: Color::from_hex("#859900"),
+            punctuation: Color::from_hex("#93a1a1"),
+            macro_call: Color::from_hex("#268bd2"),
+            attribute: Color::from_hex("#b58900"),
+            lifetime: Color::from_hex("#dc322f"),
+            constant: Color::from_hex("#2aa198"),
+            escape: Color::from_hex("#cb4b16"),
+            boolean: Color::from_hex("#2aa198"),
+            property: Color::from_hex("#268bd2"),
+            parameter: Color::from_hex("#93a1a1"),
+            module: Color::from_hex("#b58900"),
             default_fg: Color::from_hex("#93a1a1"),
 
             selection: Color::from_hex("#073642"),
@@ -2505,13 +2565,25 @@ impl Theme {
             active_background: Color::from_hex("#252526"),
             foreground: Color::from_hex("#d4d4d4"),
 
-            keyword: Color::from_hex("#569cd6"),    // blue
+            keyword: Color::from_hex("#569cd6"), // blue (storage: let, fn, struct)
+            control_flow: Color::from_hex("#c586c0"), // purple (if, else, for, return)
             string_lit: Color::from_hex("#ce9178"), // salmon
-            comment: Color::from_hex("#6a9955"),    // green
-            function: Color::from_hex("#dcdcaa"),   // yellow
-            type_name: Color::from_hex("#4ec9b0"),  // teal
-            variable: Color::from_hex("#9cdcfe"),   // light blue
-            number: Color::from_hex("#b5cea8"),     // light green
+            comment: Color::from_hex("#6a9955"), // green
+            function: Color::from_hex("#dcdcaa"), // yellow
+            type_name: Color::from_hex("#4ec9b0"), // teal
+            variable: Color::from_hex("#9cdcfe"), // light blue
+            number: Color::from_hex("#b5cea8"),  // light green
+            operator: Color::from_hex("#d4d4d4"),
+            punctuation: Color::from_hex("#d4d4d4"),
+            macro_call: Color::from_hex("#dcdcaa"),
+            attribute: Color::from_hex("#4ec9b0"),
+            lifetime: Color::from_hex("#569cd6"),
+            constant: Color::from_hex("#4fc1ff"),
+            escape: Color::from_hex("#d7ba7d"),
+            boolean: Color::from_hex("#569cd6"),
+            property: Color::from_hex("#9cdcfe"),
+            parameter: Color::from_hex("#9cdcfe"),
+            module: Color::from_hex("#4ec9b0"),
             default_fg: Color::from_hex("#d4d4d4"),
 
             selection: Color::from_hex("#264f78"),
@@ -2635,13 +2707,25 @@ impl Theme {
             active_background: Color::from_hex("#f3f3f3"),
             foreground: Color::from_hex("#333333"),
 
-            keyword: Color::from_hex("#0000ff"),    // blue
+            keyword: Color::from_hex("#0000ff"), // blue (storage)
+            control_flow: Color::from_hex("#af00db"), // purple (if, else, for, return)
             string_lit: Color::from_hex("#a31515"), // red
-            comment: Color::from_hex("#008000"),    // green
-            function: Color::from_hex("#795e26"),   // brown
-            type_name: Color::from_hex("#267f99"),  // teal
-            variable: Color::from_hex("#001080"),   // dark blue
-            number: Color::from_hex("#098658"),     // green
+            comment: Color::from_hex("#008000"), // green
+            function: Color::from_hex("#795e26"), // brown
+            type_name: Color::from_hex("#267f99"), // teal
+            variable: Color::from_hex("#001080"), // dark blue
+            number: Color::from_hex("#098658"),  // green
+            operator: Color::from_hex("#333333"),
+            punctuation: Color::from_hex("#333333"),
+            macro_call: Color::from_hex("#795e26"),
+            attribute: Color::from_hex("#267f99"),
+            lifetime: Color::from_hex("#0000ff"),
+            constant: Color::from_hex("#0070c1"),
+            escape: Color::from_hex("#ee0000"),
+            boolean: Color::from_hex("#0000ff"),
+            property: Color::from_hex("#001080"),
+            parameter: Color::from_hex("#001080"),
+            module: Color::from_hex("#267f99"),
             default_fg: Color::from_hex("#333333"),
 
             selection: Color::from_hex("#add6ff"),
@@ -3055,9 +3139,16 @@ impl Theme {
                 };
                 for scope in &scopes {
                     match *scope {
-                        "keyword" | "keyword.control" | "keyword.operator" | "storage"
-                        | "storage.type" | "storage.modifier" => {
+                        "keyword" | "storage" | "storage.type" | "storage.modifier" => {
                             theme.keyword = fg;
+                        }
+                        "keyword.control"
+                        | "keyword.control.flow"
+                        | "keyword.control.conditional"
+                        | "keyword.control.loop"
+                        | "keyword.control.trycatch"
+                        | "keyword.control.import" => {
+                            theme.control_flow = fg;
                         }
                         "string"
                         | "string.quoted"
@@ -3104,6 +3195,34 @@ impl Theme {
                         }
                         "entity.name.function.macro" | "support.function.macro" => {
                             theme.semantic_macro = fg;
+                            theme.macro_call = fg;
+                        }
+                        "keyword.operator"
+                        | "keyword.operator.expression"
+                        | "keyword.operator.logical" => {
+                            theme.operator = fg;
+                        }
+                        "punctuation"
+                        | "punctuation.definition"
+                        | "punctuation.bracket"
+                        | "punctuation.separator" => {
+                            theme.punctuation = fg;
+                        }
+                        "entity.other.attribute-name" | "meta.attribute" => {
+                            theme.attribute = fg;
+                        }
+                        "storage.modifier.lifetime" | "punctuation.definition.lifetime" => {
+                            theme.lifetime = fg;
+                        }
+                        "constant" | "constant.language" | "constant.other" => {
+                            theme.constant = fg;
+                            theme.boolean = fg;
+                        }
+                        "constant.character.escape" => {
+                            theme.escape = fg;
+                        }
+                        "entity.name.namespace" | "entity.name.module" => {
+                            theme.module = fg;
                         }
                         _ => {}
                     }
@@ -3129,13 +3248,28 @@ impl Theme {
     /// Return the foreground colour for a Tree-sitter scope name.
     pub fn scope_color(&self, scope: &str) -> Color {
         match scope {
-            "keyword" | "operator" => self.keyword,
+            "keyword" => self.keyword,
+            "keyword.control" => self.control_flow,
+            "operator" => self.operator,
             "string" => self.string_lit,
             "comment" => self.comment,
-            "function" | "method" => self.function,
-            "type" | "class" | "struct" => self.type_name,
+            "function" | "function.call" | "method" | "method.call" => self.function,
+            "type" | "class" | "struct" | "enum" | "interface" => self.type_name,
             "variable" => self.variable,
             "number" => self.number,
+            "boolean" => self.boolean,
+            "constant" => self.constant,
+            "punctuation"
+            | "punctuation.bracket"
+            | "punctuation.delimiter"
+            | "punctuation.special" => self.punctuation,
+            "macro" | "macro_call" => self.macro_call,
+            "attribute" => self.attribute,
+            "lifetime" => self.lifetime,
+            "escape" => self.escape,
+            "module" | "namespace" => self.module,
+            "parameter" => self.parameter,
+            "property" | "field" => self.property,
             _ => self.default_fg,
         }
     }
@@ -3153,14 +3287,25 @@ impl Theme {
             "decorator" => self.semantic_decorator,
             "macro" => self.semantic_macro,
             // Reuse existing syntax colors for standard token types
-            "keyword" | "modifier" => self.keyword,
+            "keyword" | "modifier" => {
+                // rust-analyzer sends "controlFlow" modifier for if/else/for/while/return etc.
+                if modifiers.iter().any(|m| m == "controlFlow") {
+                    self.control_flow
+                } else {
+                    self.keyword
+                }
+            }
             "function" | "method" => self.function,
             "type" | "class" | "struct" | "enum" => self.type_name,
             "variable" => self.variable,
             "string" | "regexp" => self.string_lit,
             "comment" => self.comment,
             "number" => self.number,
-            "operator" => self.keyword,
+            "operator" => self.operator,
+            "boolean" => self.boolean,
+            "lifetime" => self.lifetime,
+            "attribute" | "attributeBracket" => self.attribute,
+            "builtinType" => self.type_name,
             _ => return None,
         };
         let bold = modifiers
@@ -6427,19 +6572,11 @@ pub fn build_window_status_line(
             });
         }
 
-        // LSP status segment — check both server state and whether the buffer
-        // has received semantic tokens (indicates indexing is complete for this file).
+        // LSP status segment — server_has_responded in LspManager already tracks
+        // whether the server is fully ready (responded to hover/definition/etc.).
         let lsp_status = window
             .map(|w| engine.lsp_status_for_buffer(w.buffer_id))
             .unwrap_or(crate::core::lsp_manager::LspStatus::None);
-        let has_semantic_tokens = buffer_state.is_some_and(|s| !s.semantic_tokens.is_empty());
-        // Override "Running" back to "Initializing" if no semantic tokens yet
-        let lsp_status = match lsp_status {
-            crate::core::lsp_manager::LspStatus::Running(ref name) if !has_semantic_tokens => {
-                crate::core::lsp_manager::LspStatus::Initializing(name.clone())
-            }
-            other => other,
-        };
 
         // Right side: LSP  filetype  indent  utf-8  LF/CRLF  Ln:Col
         let mut right = Vec::new();
