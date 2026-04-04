@@ -8,6 +8,8 @@
 
 - **(Medium) TUI: Settings button in activity bar not clickable** — The Settings gear icon at the bottom of the TUI activity bar does not respond to clicks. Separate from the GTK "debug output tab" overlap issue above.
 
+- **(Medium) GTK: Inline rename in explorer disappears immediately** — When triggering rename (F2 or context menu) on a file in the GTK explorer tree, the editable text field appears for about one second then disappears before the user can type anything. The CellRenderer editable state is being cancelled prematurely, likely by a focus change or tree refresh event.
+
 - **(Medium) Spell check underline misaligned** — Misspelled words show underlines that start several characters before the word and end in the middle of it. The underline span offsets appear wrong. May be a byte-vs-char index mismatch in `SpellMark` positioning, or an interaction with tree-sitter/LSP spans shifting offsets.
 
 - **(Low) Hardcoded colors in rendering code — 59 instances across 5 files.** These colors don't adapt to the user's chosen theme. Should all use `Theme` struct fields instead. Breakdown:

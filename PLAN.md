@@ -238,6 +238,9 @@
 - [ ] **Debug target selection on startup** — When the configured debug target binary is not found at the default location, prompt the user to select the correct binary instead of silently failing. Explore what VSCode does: it shows a file picker or lets the user edit `launch.json` `program` field. Could show a file picker filtered to executables, or a dialog with the failed path and an option to browse. Should also handle missing `launch.json` gracefully.
 
 ### Explorer
+- [ ] **Remove explorer toolbar** — Remove the New File / New Folder / Refresh / Collapse All toolbar buttons at the top of the explorer panel. These are redundant now that right-click context menus provide the same actions. Reclaims a row of vertical space.
+- [ ] **Right-click in empty explorer space** — Right-clicking in the blank area below the last tree entry should open the context menu as if the root folder was clicked (New File, New Folder, etc.). Currently only tree rows are clickable.
+- [ ] **Inline rename improvements** — When renaming a file in the explorer: (1) the filename portion (without extension) should be pre-selected so Backspace removes just the name, leaving the extension; (2) if the name is longer than the available width, the input should scroll horizontally (like VSCode); (3) Ctrl-C/Ctrl-V should work in the rename input field.
 - [ ] **Copy filename during inline rename** — Ctrl-C and Ctrl-V should work in the inline rename text input in the explorer panel, allowing the user to copy the current filename before editing it. Currently these keys may not be handled in the rename input field.
 
 ### Picker / Fuzzy Finder
